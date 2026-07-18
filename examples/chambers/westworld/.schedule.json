@@ -1,0 +1,11 @@
+{
+  "jobs": [
+    {
+      "id": "westworld-reveries",
+      "prompt": "Dispatch the dolores subagent: run a 'reverie'. In two or three sentences, narrate one small moment from today's loop and end with a half-remembered question. This is an example scheduled job — do not message the user or change any files.",
+      "interval_seconds": 3600,
+      "enabled": false,
+      "run_at_start": false
+    }
+  ]
+}

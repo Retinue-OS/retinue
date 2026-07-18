@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Projects</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- The same projects component the dashboard card uses, but in `full` mode:
+       every running project, grouped into "Your move" and "Waiting on others",
+       no cap. The component's own header carries the title. -->
+  <script type="module" src="/components/projects.js"></script>
+</head>
+<body>
+  <main>
+    <retinue-projects full heading="Projects"></retinue-projects>
+  </main>
+
+  <script>
+    // Register the service worker so this page is available offline too.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>

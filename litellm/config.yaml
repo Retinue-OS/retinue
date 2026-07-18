@@ -1,0 +1,34 @@
+model_list:
+  - model_name: retinue-claude
+    litellm_params:
+      model: os.environ/LITELLM_PRIMARY_MODEL
+  # Catch-all for direct Claude model IDs: agent files may pin `model: sonnet`
+  # or `model: opus`, which Claude Code resolves to concrete IDs such as
+  # claude-sonnet-5 before sending. The dashboard's connection test also
+  # sends concrete IDs.
+  - model_name: claude-*
+    litellm_params:
+      model: anthropic/claude-*
+  - model_name: retinue-openrouter
+    litellm_params:
+      model: os.environ/LITELLM_FALLBACK_MODEL
+
+general_settings:
+  # Claude Code keeps its subscription OAuth token in the Authorization
+  # header, so the proxy key is passed in this custom header instead
+  # (sent via ANTHROPIC_CUSTOM_HEADERS).
+  litellm_key_header_name: x-litellm-api-key
+
+litellm_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  num_retries: 0
+  fallbacks:
+    - retinue-claude:
+        - retinue-openrouter
+    - claude-*:
+        - retinue-openrouter
+  model_group_settings:
+    # Only the Claude subscription routes receive Claude Code's OAuth header.
+    forward_client_headers_to_llm_api:
+      - retinue-claude
+      - claude-*

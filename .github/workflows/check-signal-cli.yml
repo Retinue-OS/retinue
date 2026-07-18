@@ -1,0 +1,81 @@
+name: Check signal-cli version
+
+on:
+  schedule:
+    # Every Monday at 08:00 UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get pinned version
+        id: pinned
+        run: |
+          VERSION=$(grep -oP 'ARG SIGNAL_CLI_VERSION=\K\d+(\.\d+)*' signal-gateway/Dockerfile)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Pinned version: $VERSION"
+
+      - name: Get latest release
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh api repos/AsamK/signal-cli/releases/latest --jq '.tag_name' | sed 's/^v//')
+          if ! echo "$LATEST" | grep -qE '^[0-9]+(\.[0-9]+)*$'; then
+            echo "Unexpected version format from API: $LATEST" >&2
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest version: $LATEST"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          PINNED="${{ steps.pinned.outputs.version }}"
+          LATEST="${{ steps.latest.outputs.version }}"
+          if [ "$(printf '%s\n' "$PINNED" "$LATEST" | sort -V | tail -1)" = "$LATEST" ] && [ "$PINNED" != "$LATEST" ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "New version available: $LATEST (pinned: $PINNED)"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date ($PINNED)"
+          fi
+
+      - name: Create bump PR
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINNED: ${{ steps.pinned.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          BRANCH="bump/signal-cli-${LATEST}"
+
+          # Skip if a PR for this version already exists
+          if [ "$(gh pr list --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
+            echo "PR already exists for $BRANCH, skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+          sed -i -E "s/ARG SIGNAL_CLI_VERSION=[0-9]+(\.[0-9]+)*/ARG SIGNAL_CLI_VERSION=${LATEST}/" signal-gateway/Dockerfile
+          git add signal-gateway/Dockerfile
+          git commit -m "chore: bump signal-cli from ${PINNED} to ${LATEST}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: bump signal-cli from ${PINNED} to ${LATEST}" \
+            --body "$(printf 'Automated version bump detected by the weekly signal-cli release check.\n\n- **Previous version:** %s\n- **New version:** %s\n- **Release notes:** https://github.com/AsamK/signal-cli/releases/tag/v%s\n\nAfter merging, run:\n```\ndocker compose up -d --build signal-gateway\n```' "$PINNED" "$LATEST" "$LATEST")" \
+            --base main \
+            --head "$BRANCH"

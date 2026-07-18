@@ -1,0 +1,27 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Local deployment overrides (host-specific mounts, secrets wiring) — never commit
+docker-compose.override.yml
+.env
+
+# Deployment-provided chamber manifest (bind-mounted over the example) — never commit
+/chambers.json
+
+# Client-CA material produced by scripts/gen-client-cert.sh: the CA private key,
+# per-device keys, .p12 bundles and their passphrases — never commit. The CA's
+# *public* certificate is checked in separately at
+# deploy/traefik/dynamic/retinue-client-ca.crt.
+/certs/
+
+# Egress-audit CA material produced by scripts/gen-egress-ca.sh or generated
+# automatically inside the container: the CA private key and mitmproxy confdir
+# files derived from it — never commit.
+/deploy/egress-audit/certs/
+# The live CA also lives on the persistent /root volume; keep any accidental
+# host copy out of git too.
+**/.retinue/egress-audit/certs/
+
+# Marketplace listing generated at runtime from chambers + the identity template
+/.claude-plugin/marketplace.json

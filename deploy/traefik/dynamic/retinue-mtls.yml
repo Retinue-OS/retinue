@@ -1,0 +1,21 @@
+# Traefik dynamic configuration — client-certificate (mTLS) TLS options for the
+# `agents` router. TLS options CANNOT be expressed as Docker labels, so this must
+# be loaded by Traefik's *file provider* (see deploy/traefik/README.md).
+#
+# `VerifyClientCertIfGiven` makes the client certificate OPTIONAL: a browser that
+# presents one must have it signed by our client CA (below), while a browser that
+# presents none is still served and falls back to basic auth at the gateway's
+# /auth endpoint. This is what makes the certificate an *alternative* to the
+# password rather than a hard requirement.
+#
+# The router references this option as `retinue-mtls@file` (see docker-compose.yml).
+tls:
+  options:
+    retinue-mtls:
+      minVersion: VersionTLS12
+      clientAuth:
+        # Path is inside the Traefik container — adjust the mount in
+        # deploy/traefik/README.md if you place the CA elsewhere.
+        caFiles:
+          - /etc/traefik/dynamic/retinue-client-ca.crt
+        clientAuthType: VerifyClientCertIfGiven

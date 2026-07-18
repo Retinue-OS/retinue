@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Project</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- One project's own page (?id=<project URI>): rendered details, in-place
+       editing of the underlying Markdown file, and a command bar that hands
+       quick change requests (typed or dictated) to Ara. -->
+  <script type="module" src="/components/project-page.js"></script>
+</head>
+<body>
+  <main>
+    <retinue-project-page></retinue-project-page>
+  </main>
+
+  <script>
+    // Register the service worker so this page shell is available offline too.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>

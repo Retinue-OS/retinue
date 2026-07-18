@@ -1,0 +1,8 @@
+{
+  "generated": "2026-06-25T19:11:26Z",
+  "items": [
+    { "from": "Mara", "channel": "Signal", "preview": "Does 1 pm still work?", "importance": "high" },
+    { "from": "Bank", "channel": "Mail", "preview": "Invoice due on the 30th.", "importance": "normal" },
+    { "from": "Coach", "channel": "Retinue", "preview": "HRV slightly elevated today.", "importance": "normal" }
+  ]
+}

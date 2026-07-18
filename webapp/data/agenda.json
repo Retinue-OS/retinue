@@ -1,0 +1,8 @@
+{
+  "generated": "2026-06-25T19:11:26Z",
+  "events": [
+    { "time": "09:30", "title": "Retinue stand-up", "location": "Online" },
+    { "time": "13:00", "title": "Lunch with Mara", "location": "Cafe Central" },
+    { "time": "16:00", "title": "Doctor's appointment", "location": "Dr. Meier's practice" }
+  ]
+}

@@ -1,0 +1,160 @@
+# Deployment override (example) — copy to docker-compose.override.yml.
+#
+# The base docker-compose.yml is deployment-neutral. A deployment supplies its
+# own content and edge wiring here: the real chambers.json, the public Traefik
+# router (host rule + client-cert/basic-auth middlewares), the external `web`
+# network, and any published QLever host ports. Compose merges this file
+# automatically; it is git-ignored so each host keeps its own copy.
+#
+# A typical deployment lives in its own repo that pins retinue-os/retinue as a git
+# submodule and contains this override, its chambers.json, and its .env.
+
+services:
+  retinue:
+    volumes:
+      # Bind-mount the deployment's chambers.json. This overrides the example manifest
+      # mounted in the base docker-compose.yml.
+      - ./chambers.json:/workspace/chambers.json:ro
+      # Example: pre-mount a host-managed chamber (e.g. one carrying uncommitted
+      # secrets). The entrypoint uses an already-present chamber as-is. Chambers
+      # cloned from a `url` need no mount — they persist in the shared
+      # `chambers` volume the base compose provides.
+      # - /abs/host/path/to/ari:/workspace/chambers/ari
+      # NOTE: also add the same bind-mount to qlever-life below (as /data/<name>:ro)
+      # so the chamber's RDF files are indexed by the live SPARQL store.
+    environment:
+      # Chamber repository URLs referenced by chambers.json `url_env` entries.
+      # Set the matching variables in .env. Example for "url_env": "MY_CHAMBER_REPO":
+      - MY_CHAMBER_REPO
+      # Advertise deployment-defined SPARQL endpoints to agents: one
+      # SPARQL_ENDPOINT_<NAME> per store, plus an optional _DESC saying what it
+      # contains (see CLAUDE.md "SPARQL endpoints"). Also add the service
+      # hostname to SPARQL_NO_PROXY in .env so queries bypass the egress proxy.
+      # Uncomment when running the optional qlever-genomics service below:
+      # - SPARQL_ENDPOINT_GENOMICS=http://qlever-genomics:7001
+      # - SPARQL_ENDPOINT_GENOMICS_DESC=whole-genome variants (large, static; Sequence Ontology)
+    networks:
+      - agents
+      - web
+    labels:
+      - "traefik.enable=true"
+      # Replace agents.example.com with your deployment's public hostname.
+      - "traefik.http.routers.agents.rule=Host(`agents.example.com`)"
+      - "traefik.http.routers.agents.entrypoints=web,websecure"
+      # Edge auth: accept a TLS client certificate OR basic auth, as alternatives.
+      # `agents-clientcert` (passTLSClientCert) forwards the cert Traefik verified
+      # against our client CA; `agents-auth` (forwardAuth) calls the gateway's
+      # /auth, which authorizes on a valid cert or falls back to a basic-auth
+      # prompt. The two middlewares run in order, so the cert header is present
+      # when forwardAuth forwards the request to /auth.
+      - "traefik.http.routers.agents.middlewares=agents-clientcert,agents-auth"
+      - "traefik.http.middlewares.agents-clientcert.passtlsclientcert.pem=true"
+      - "traefik.http.middlewares.agents-clientcert.passtlsclientcert.info.subject.commonName=true"
+      - "traefik.http.middlewares.agents-auth.forwardauth.address=http://retinue:8080/auth"
+      - "traefik.http.services.agents.loadbalancer.server.port=8080"
+      - "traefik.http.routers.agents.tls.certresolver=myresolver"
+      # Client-CA / optional mTLS lives in a Traefik file-provider config (TLS
+      # options cannot be set via Docker labels). See deploy/traefik/. The option
+      # uses VerifyClientCertIfGiven, so a certificate is optional but, when
+      # presented, must verify against our CA — hence basic auth still works.
+      - "traefik.http.routers.agents.tls.options=retinue-mtls@file"
+
+  # Optional: expose the updater sidecar's POST /update on the same public
+  # host, so a phone can trigger a full rebuild/restart without SSHing into
+  # the VPS. Reuses the same client-cert/basic-auth middlewares as the main
+  # router; the updater's own UPDATER_TOKEN (see .env.example) is a second,
+  # independent layer of auth beneath that, since a fixed rebuild recipe run
+  # with docker-socket access is a high-blast-radius endpoint.
+  # updater:
+  #   networks:
+  #     - agents
+  #     - web
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.updater.rule=Host(`agents.example.com`) && PathPrefix(`/update`)"
+  #     - "traefik.http.routers.updater.entrypoints=web,websecure"
+  #     - "traefik.http.routers.updater.middlewares=agents-clientcert,agents-auth"
+  #     - "traefik.http.services.updater.loadbalancer.server.port=9000"
+  #     - "traefik.http.routers.updater.tls.certresolver=myresolver"
+  #     - "traefik.http.routers.updater.tls.options=retinue-mtls@file"
+
+  # If you pre-mount any host-managed chambers in `retinue` above, add matching
+  # read-only bind-mounts here so qlever-life indexes their RDF files too.
+  # qlever-life:
+  #   volumes:
+  #     - /abs/host/path/to/ari:/data/ari:ro
+
+  # Optional deployment-specific store: a static single-file SPARQL endpoint
+  # (qlever-static/) over one large, rarely-changing N-Triples file in one of
+  # your chambers (e.g. a genome). Advertise it to agents with the
+  # SPARQL_ENDPOINT_* variables on the retinue service above, and add its
+  # hostname to SPARQL_NO_PROXY in .env. Indexed once on first start; to reindex:
+  #   docker compose exec qlever-genomics sh -c 'rm -rf /index/*'
+  #   docker compose restart qlever-genomics
+  # qlever-genomics:
+  #   build: ./qlever-static
+  #   volumes:
+  #     - chambers:/data:ro
+  #     - genomics-index:/index
+  #   environment:
+  #     INPUT_FILE: /data/your-chamber/genetics.nt.gz
+  #     PORT: "7001"
+  #   restart: unless-stopped
+  #   networks:
+  #     - agents
+  #   ports:
+  #     - "7002:7001"
+
+  # Optional: expose the egress-log-viewer on the same public host so you can
+  # review outbound HTTP traffic from a browser. It is read-only and reuses the
+  # same client-cert/basic-auth middlewares as the main gateway.
+  # egress-log-viewer:
+  #   networks:
+  #     - agents
+  #     - web
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.egress-viewer.rule=Host(`agents.example.com`) && PathPrefix(`/egress`)"
+  #     - "traefik.http.routers.egress-viewer.entrypoints=web,websecure"
+  #     - "traefik.http.routers.egress-viewer.middlewares=agents-clientcert,agents-auth"
+  #     - "traefik.http.services.egress-viewer.loadbalancer.server.port=8080"
+  #     - "traefik.http.routers.egress-viewer.tls.certresolver=myresolver"
+  #     - "traefik.http.routers.egress-viewer.tls.options=retinue-mtls@file"
+  #     # Strip the /egress prefix so the viewer sees root paths.
+  #     - "traefik.http.middlewares.egress-stripprefix.stripprefix.prefixes=/egress"
+  #     - "traefik.http.routers.egress-viewer.middlewares=egress-stripprefix,agents-clientcert,agents-auth"
+
+  # Optional: additional messaging accounts. The base signal-gateway service is
+  # account #1 (configured from .env). Add one service per further account, each
+  # reusing the base image via `extends` and overriding only what differs: its
+  # own SIGNAL_ACCOUNT, its SIGNAL_GATEWAY_MODE, and — importantly — its OWN
+  # signal-data volume (never share one between accounts). Link each account once
+  # with signal-cli (see the README "Messaging accounts" section) before use.
+  # To send from a specific account, point scripts/signal-push.py at that
+  # service's endpoint: --url http://signal-gateway-personal:8090/send
+  # signal-gateway-personal:
+  #   extends:
+  #     file: docker-compose.yml
+  #     service: signal-gateway
+  #   environment:
+  #     - SIGNAL_ACCOUNT=+15557654321      # this account's own number (E.164)
+  #     - SIGNAL_GATEWAY_MODE=inbox        # forward to triage, no reply
+  #   volumes:
+  #     - signal-data-personal:/root/.local/share/signal-cli   # its OWN volume
+  #     - piper-data:/models
+  #   networks:
+  #     - agents
+
+# volumes:
+#   genomics-index:
+#   # An extra account (see signal-gateway-personal above) needs its own volume:
+#   # signal-data-personal:
+#   # An existing deployment can keep previously created volumes by pinning
+#   # their names, e.g.:
+#   # retinue-root:
+#   #   name: service-data-health
+
+networks:
+  web:
+    external: true
+    name: web

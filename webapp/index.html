@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- Web components. Each is a standalone custom element that fetches its
+       own data document. Edit this file to add, remove or reorder cards. -->
+  <script type="module" src="/components/conversations.js"></script>
+  <script type="module" src="/components/projects.js"></script>
+  <script type="module" src="/components/app-launcher.js"></script>
+  <!-- Non-functional/static mock cards are intentionally disabled until they
+       are backed by real data flows.
+  <script type="module" src="/components/agenda.js"></script>
+  <script type="module" src="/components/messages.js"></script>
+  <script type="module" src="/components/todo.js"></script>
+  <script type="module" src="/components/briefing.js"></script>
+  -->
+</head>
+<body>
+  <main>
+    <header class="top">
+      <h1 id="greeting">Retinue</h1>
+      <span id="today" class="date"></span>
+    </header>
+
+    <!-- Interactive chat threads with Ara. A thread can be opened by you or by a
+         retinue agent that needs a decision; it talks to the gateway's
+         /conversations API (no static data file). It takes all remaining screen
+         height; when a thread is open the header and app dock hide (see
+         styles.css) so the chat gets the whole display. -->
+    <retinue-conversations heading="Conversations"></retinue-conversations>
+
+    <!-- Running projects, computed live from the life store (GET /projects).
+         Projects where you are on the move are highlighted with an accent bar;
+         "All projects →" opens the full page, including those waiting on a third
+         person. No static data file — the .md frontmatter is the source. -->
+    <retinue-projects heading="Projects"></retinue-projects>
+    <!-- Non-functional/static mock cards are intentionally disabled until they
+         are backed by real data flows.
+    <retinue-agenda   heading="Today"                 src="/data/agenda.json"></retinue-agenda>
+    <retinue-messages heading="Important messages"   src="/data/messages.json"></retinue-messages>
+    <retinue-todo     heading="Top to-do"            src="/data/todo.json"></retinue-todo>
+    <retinue-briefing heading="Briefing"             src="/data/briefing.json"></retinue-briefing>
+    -->
+
+    <!-- App quick-launch dock. Configure the buttons by hand here. Each child is
+         a normal link: tel: / sms: / mailto: / geo: work in every browser;
+         intent:// works in Chromium browsers and can launch arbitrary installed
+         apps (these local OS actions work offline). Plain paths like /sends
+         navigate within the PWA. -->
+    <retinue-app-launcher>
+      <a href="tel:"><span class="ico">&#128222;</span><span class="lbl">Phone</span></a>
+      <a href="sms:"><span class="ico">&#128172;</span><span class="lbl">SMS</span></a>
+      <a href="mailto:"><span class="ico">&#9993;&#65039;</span><span class="lbl">Mail</span></a>
+      <a href="geo:0,0?q="><span class="ico">&#128506;&#65039;</span><span class="lbl">Map</span></a>
+      <a href="/sends"><span class="ico">&#128228;</span><span class="lbl">Sends</span></a>
+    </retinue-app-launcher>
+  </main>
+
+  <script>
+    // Register the service worker so the shell (and the last data) stay
+    // available offline -- the dialer button keeps working without signal.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+
+    // Lightweight, client-side greeting and date. No server rendering.
+    (() => {
+      const now = new Date();
+      const h = now.getHours();
+      const g = h < 5 ? 'Good night' : h < 11 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+      document.getElementById('greeting').textContent = g;
+      document.getElementById('today').textContent =
+        now.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' });
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,520 @@
+# Retinue — containerised runtime (deployment-neutral base)
+#
+# This base compose is content-neutral. Deployment-specific wiring — the public
+# Traefik router/host rule, published QLever ports, the external `web` network,
+# and the real chambers.json — lives in a docker-compose.override.yml (Compose
+# merges it automatically). See docker-compose.override.example.yml.
+#
+# First run (interactive login & folder trust):
+#   docker compose run --rm retinue interactive
+#
+# Headless / remote-control mode:
+#   docker compose up -d
+#
+# Environment variables (set in .env or export before running):
+#   ANTHROPIC_API_KEY  — used by the web gateway for programmatic queries (optional for remote-control)
+#   GITHUB_TOKEN       — required to clone and push the mounted chambers
+# Chamber repository URLs are deployment content: a deployment declares them in
+# its chambers.json (url / url_env) and supplies the matching mounts and env in
+# its docker-compose.override.yml. See docker-compose.override.example.yml.
+
+# A pinned project name keeps `docker compose` calls consistent regardless of
+# the directory name they run from — important because the `updater` sidecar
+# (see below) drives the *same* stack from inside a container whose bind mount
+# is named `/repo`, not whatever the host checkout directory happens to be
+# called. Without this, "docker compose build/up -d" run from the updater
+# would default its project name to "repo" and stand up a second, disconnected
+# stack instead of updating this one.
+name: retinue
+
+services:
+  retinue:
+    build: .
+    depends_on:
+      qlever-life:
+        condition: service_started
+      litellm:
+        condition: service_healthy
+    env_file:
+      - .env
+    volumes:
+      # Persistent storage for /root (Claude login, config, scheduler state).
+      - retinue-root:/root
+      # Shared volume where the egress-audit CA lives. The retinue entrypoint
+      # generates the CA on first start if it is missing.
+      - egress-audit-certs:/etc/egress-audit:rw
+      # Bind-mount the example chambers.json so the container has a manifest out of the box.
+      # Deployments will override this file in their docker-compose.override.yml.
+      - ./chambers.example.json:/workspace/chambers.json:ro
+      # All chambers live side by side in a single shared volume; clones done
+      # by the entrypoint on first start persist here. The same volume is
+      # mounted read-only by qlever-life, so every chamber is indexed equally.
+      - chambers:/workspace/chambers
+      # RW mount of the project tree itself. Agents can branch/commit/push
+      # infra changes (Tier 3 in CLAUDE.md) straight from this live checkout
+      # instead of `git clone … /tmp` — the container already carries the
+      # git/gh credentials needed to push. Discipline: always work on a
+      # feature branch here; never leave `main` dirty on the host checkout,
+      # since that is also what's deployed.
+      - .:/workspace/deployment
+    environment:
+      - ANTHROPIC_API_KEY
+      # Optional Claude-compatible model gateway (for example Ollama). When
+      # unset, Claude Code keeps using its normal Anthropic endpoint.
+      - ANTHROPIC_BASE_URL
+      - ANTHROPIC_AUTH_TOKEN
+      - ANTHROPIC_CUSTOM_HEADERS
+      - ANTHROPIC_MODEL=${RETINUE_CLAUDE_MODEL}
+      - RETINUE_CLAUDE_MODEL
+      - RETINUE_GATEWAY_USES_CLAUDE_OAUTH
+      - GITHUB_TOKEN
+      # SPARQL endpoint advertisement: every SPARQL_ENDPOINT_<NAME> variable
+      # advertises one read-only endpoint to agents; an optional companion
+      # SPARQL_ENDPOINT_<NAME>_DESC says what the store contains. The framework
+      # ships the life store; a deployment adds its own stores the same way in
+      # its override (see docker-compose.override.example.yml) and lists their
+      # hostnames in SPARQL_NO_PROXY so they bypass the egress proxy.
+      - SPARQL_ENDPOINT_LIFE=http://qlever-life:7001
+      - SPARQL_ENDPOINT_LIFE_DESC=general-purpose life store — all RDF and converted files from every mounted chamber, one named graph per file
+      # The web gateway's own SPARQL config (projects card etc.); points at the
+      # same life store the advertisement above announces.
+      - QLEVER_LIFE_URL=http://qlever-life:7001
+      - WEB_GATEWAY_PORT=8080
+      # Outbound Signal: where scripts/signal-push.py reaches the gateway, plus
+      # the shared token (loaded from .env) it authenticates with.
+      - SIGNAL_GATEWAY_SEND_URL=http://signal-gateway:8090/send
+      - SIGNAL_GATEWAY_TOKEN
+      # Internal Signal gateway base URL for pending-send approval (same host,
+      # different path prefix from SIGNAL_GATEWAY_SEND_URL). When set, /sends
+      # aggregates Signal pending sends alongside e-mail ones.
+      - SIGNAL_GATEWAY_BASE_URL=http://signal-gateway:8090
+      # Outbound WhatsApp: where scripts/whatsapp-push.py reaches the gateway,
+      # the internal base URL for pending-send approval, and the shared token.
+      - WHATSAPP_GATEWAY_SEND_URL=http://whatsapp-gateway:8092/send
+      - WHATSAPP_GATEWAY_BASE_URL=http://whatsapp-gateway:8092
+      - WHATSAPP_GATEWAY_TOKEN
+      # Outbound Telegram: where scripts/telegram-push.py reaches the gateway,
+      # the internal base URL for pending-send approval, and the shared token.
+      - TELEGRAM_GATEWAY_SEND_URL=http://telegram-gateway:8093/send
+      - TELEGRAM_GATEWAY_BASE_URL=http://telegram-gateway:8093
+      - TELEGRAM_GATEWAY_TOKEN
+      # Voice input for the dashboard: the web gateway proxies recorded audio to
+      # the shared STT service for transcription. Unset STT_SERVICE_URL to disable
+      # (the dashboard then hides its microphone button).
+      - STT_SERVICE_URL=http://stt:8100/transcribe
+      - STT_TOKEN
+      # Basic-auth users for the gateway's /auth fallback (same htpasswd value
+      # Traefik used before; the gateway now verifies it so a client certificate
+      # can be offered as an alternative). Optional CN restriction for certs.
+      - TRAEFIK_BASIC_AUTH_USERS
+      - GATEWAY_CLIENT_CERT_CN
+      # Dashboard conversation threads (and the per-day transcript log) live
+      # on the persistent /root volume (service-data-health) so they survive
+      # container recreation; without this they would default to ephemeral
+      # /tmp inside the container and be lost on every redeploy.
+      - CONVERSATIONS_DIR=/root/.retinue/conversations
+      - CONVERSATION_DIR=/root/.retinue/conversation-log
+      # scripts/self-update.py pokes the updater sidecar (below) to rebuild
+      # and restart the whole stack; must match the updater's own token.
+      - UPDATER_URL=http://updater:9000/update
+      - UPDATER_TOKEN
+      # Egress audit: route all outbound HTTP/HTTPS through the MITM sidecar.
+      # Internal services are bypassed via NO_PROXY; SPARQL_NO_PROXY (set in the
+      # deployment's .env) appends the hostnames of deployment-defined SPARQL
+      # services, e.g. "qlever-genomics". The CA certificate is generated once
+      # by scripts/gen-egress-ca.sh and trusted by clients.
+      - HTTP_PROXY=http://egress-audit:8080
+      - HTTPS_PROXY=http://egress-audit:8080
+      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,${SPARQL_NO_PROXY:-}
+      - NODE_EXTRA_CA_CERTS=/etc/egress-audit/certs/egress-ca-cert.pem
+      - SSL_CERT_FILE=/etc/egress-audit/certs/egress-ca-cert.pem
+      - REQUESTS_CA_BUNDLE=/etc/egress-audit/certs/egress-ca-cert.pem
+    command: remote-control
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    # Deployment-specific edge wiring — the public Traefik router (host rule,
+    # entrypoints, client-cert/basic-auth middlewares) and the external `web`
+    # network — lives in the deployment's docker-compose.override.yml, not in
+    # this deployment-neutral base. See docker-compose.override.example.yml.
+    networks:
+      - agents
+
+  # Routes Claude Code subscription requests to Anthropic and, on an upstream
+  # failure, retries through OpenRouter. It is internal-only; the model gateway
+  # is reached by the retinue service at http://litellm:4000.
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    depends_on:
+      litellm-db:
+        condition: service_healthy
+    command: --config /app/config.yaml --port 4000
+    # Deliberately no env_file: .env carries Claude-Code-only variables such as
+    # ANTHROPIC_BASE_URL=http://litellm:4000, which would make LiteLLM call
+    # itself as its Anthropic upstream (an infinite auth loop).
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - LITELLM_PRIMARY_MODEL=${LITELLM_PRIMARY_MODEL}
+      - LITELLM_FALLBACK_MODEL=${LITELLM_FALLBACK_MODEL}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DATABASE_URL=${DATABASE_URL}
+      - PROXY_ADMIN_ID=${PROXY_ADMIN_ID}
+      - CHECKPOINT_DISABLE=1
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=5)"
+      interval: 5s
+      timeout: 10s
+      retries: 24
+      start_period: 30s
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # Private persistence for LiteLLM's admin UI, model/key configuration, and
+  # request logs. It is intentionally reachable only from the agents network.
+  litellm-db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=litellm
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=${LITELLM_DB_PASSWORD}
+    volumes:
+      - litellm-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U litellm -d litellm"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    networks:
+      - agents
+
+  signal-gateway:
+    build:
+      context: .
+      # The gateway runs its own process (signal-cli + the HTTP API on :8090),
+      # NOT the main entrypoint's remote-control mode. It therefore builds from
+      # its own Dockerfile (CMD python3 /app/signal-gateway.py). Do not drop this
+      # line: without it the service builds the main image and boots into
+      # remote-control, never opening :8090. (This regressed once before — do not "simplify" it away.)
+      dockerfile: signal-gateway/Dockerfile
+    depends_on:
+      - retinue
+      - stt
+    env_file:
+      - .env
+    environment:
+      - SIGNAL_ACCOUNT
+      # What this account is for: "inbox" (default — the user's own message
+      # source, forwarded to triage, no reply) or "control" (a control channel
+      # that runs messages as prompts to Ara, restricted to accepted requesters).
+      # Run one signal-gateway service per account to mix roles.
+      - SIGNAL_GATEWAY_MODE
+      - RETINUE_GATEWAY_URL=http://retinue:8080/message
+      - RETINUE_GATEWAY_TIMEOUT=600
+      # Voice notes are transcribed by the shared STT service (no ASR model is
+      # loaded in this container).
+      - STT_SERVICE_URL=http://stt:8100/transcribe
+      - STT_TOKEN
+      # Restrict language detection to the languages actually spoken
+      # (comma-separated ISO 639-1 codes), preventing bogus guesses like
+      # Latin/Finnish. Leave unset to allow auto-detection of any language.
+      - SIGNAL_SUPPORTED_LANGUAGES
+      - PIPER_DEFAULT_MODEL=en_US-lessac-medium
+      - PIPER_MODEL_MAP
+      - SIGNAL_POLL_INTERVAL=3
+      # Outbound send-control policy (JSON array, like EMAIL_SEND_POLICY). Keyed by
+      # the SENDING identity (this gateway's own SIGNAL_ACCOUNT number), not the
+      # recipient — the autonomy of a send is a property of the number it goes out
+      # as. Categories: allow (send directly), trust (send with --user-approved,
+      # else verify), verify (requires web-gateway approval at /sends). An account
+      # matching no entry and no "*" wildcard defaults to verify (fail-safe).
+      # [{"number":"+15551234567","category":"verify"},{"number":"+15558888888","category":"allow"}]
+      - SIGNAL_SEND_POLICY
+      # Public base URL for approval links returned by the verify/trust flow.
+      - SEND_APPROVAL_BASE_URL
+      # Outbound push API (internal to the agents network; not published).
+      - SIGNAL_GATEWAY_HTTP_PORT=8090
+      - SIGNAL_DEFAULT_RECIPIENT
+      - SIGNAL_GATEWAY_TOKEN
+    volumes:
+      - signal-data:/root/.local/share/signal-cli
+      - piper-data:/models
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # WhatsApp gateway — the messenger sibling of signal-gateway. Owns the
+  # linked-device WhatsApp Web session (via the neonize/whatsmeow bridge; the
+  # keys live only in this container's whatsapp-data volume) and exposes the same
+  # thin /send + /pending-sends + /contacts API. Outbound is gated by
+  # WHATSAPP_SEND_POLICY (email-style verify/trust/allow, default verify) with
+  # web-gateway approval at /sends. See scripts/whatsapp-gateway.py.
+  #
+  # Link the device once before it can send or receive: start the service, then
+  # read the pairing QR from its logs (`docker compose logs -f whatsapp-gateway`)
+  # and scan it from the phone under Settings -> Linked devices.
+  whatsapp-gateway:
+    build:
+      context: .
+      dockerfile: whatsapp-gateway/Dockerfile
+    depends_on:
+      - retinue
+      - stt
+    env_file:
+      - .env
+    environment:
+      # Optional human-readable label for logs (the identity is the linked device).
+      - WHATSAPP_ACCOUNT
+      # What this account is for: "inbox" (default — the user's own message
+      # source, forwarded to triage, no reply) or "control" (runs messages as
+      # prompts to Ara, restricted to accepted requesters). Run one
+      # whatsapp-gateway service per account to mix roles.
+      - WHATSAPP_GATEWAY_MODE
+      - RETINUE_GATEWAY_URL=http://retinue:8080/message
+      - RETINUE_GATEWAY_TIMEOUT=600
+      # Voice notes are transcribed by the shared STT service (no ASR model is
+      # loaded in this container).
+      - STT_SERVICE_URL=http://stt:8100/transcribe
+      - STT_TOKEN
+      # Restrict answer-language detection (comma-separated ISO 639-1 codes).
+      - WHATSAPP_SUPPORTED_LANGUAGES
+      # Outbound send-control policy (JSON array, like EMAIL_SEND_POLICY). Keyed by
+      # the SENDING identity (this gateway's own WHATSAPP_ACCOUNT number), not the
+      # recipient — the autonomy of a send is a property of the number it goes out
+      # as. Categories: allow (send directly), trust (send with --user-approved,
+      # else verify), verify (requires web-gateway approval at /sends). An account
+      # matching no entry and no "*" wildcard defaults to verify (fail-safe).
+      # [{"number":"+15551234567","category":"verify"},{"number":"+15558888888","category":"allow"}]
+      - WHATSAPP_SEND_POLICY
+      # Public base URL for approval links returned by the verify/trust flow.
+      - SEND_APPROVAL_BASE_URL
+      # Outbound push API (internal to the agents network; not published).
+      - WHATSAPP_GATEWAY_HTTP_PORT=8092
+      - WHATSAPP_DEFAULT_RECIPIENT
+      - WHATSAPP_GATEWAY_TOKEN
+    volumes:
+      # Linked-device session (neonize sqlite) + pending sends + recent chats.
+      - whatsapp-data:/root/.local/share/whatsapp
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # Telegram gateway — the messenger sibling of signal/whatsapp. Logs in as the
+  # user's OWN Telegram account (an MTProto user client via Telethon), so it acts
+  # as the user: it can message the user's contacts as them, read their own DMs
+  # (real inbox-mode triage), and enumerate the contact directory — the same
+  # account access the MCP has, but with the credentials isolated here. Exposes
+  # the same thin /send + /pending-sends API; outbound gated by
+  # TELEGRAM_SEND_POLICY (email-style verify/trust/allow, default verify) keyed by
+  # the sending identity. See scripts/telegram-gateway.py.
+  #
+  # One-time login (creates the session in the telegram-data volume):
+  #   docker compose run --rm -it telegram-gateway \
+  #     python3 /app/telegram-gateway.py login
+  # It prompts for the login code Telegram sends to the phone (and the 2FA
+  # password, if set). api_id/api_hash come from https://my.telegram.org.
+  telegram-gateway:
+    build:
+      context: .
+      dockerfile: telegram-gateway/Dockerfile
+    depends_on:
+      - retinue
+      - stt
+    env_file:
+      - .env
+    environment:
+      # MTProto app credentials (https://my.telegram.org) and the account phone.
+      # These live only in this container.
+      - TELEGRAM_API_ID
+      - TELEGRAM_API_HASH
+      - TELEGRAM_PHONE
+      # Optional explicit sending identity for send-control (defaults to this
+      # account's @username / phone from get_me()).
+      - TELEGRAM_ACCOUNT
+      # What this account is for: "inbox" (default — the user's own message
+      # source, forwarded to triage, no reply) or "control" (runs messages as
+      # prompts to Ara, restricted to accepted requesters).
+      - TELEGRAM_GATEWAY_MODE
+      - RETINUE_GATEWAY_URL=http://retinue:8080/message
+      - RETINUE_GATEWAY_TIMEOUT=600
+      # Voice notes are transcribed by the shared STT service.
+      - STT_SERVICE_URL=http://stt:8100/transcribe
+      - STT_TOKEN
+      - TELEGRAM_SUPPORTED_LANGUAGES
+      # Outbound send-control policy (JSON array, like EMAIL_SEND_POLICY). Keyed by
+      # the SENDING identity (this account, TELEGRAM_ACCOUNT), not the recipient
+      # chat. Categories: allow / trust / verify. An identity matching no entry and
+      # no "*" wildcard defaults to verify (fail-safe).
+      # [{"number":"@me","category":"verify"},{"number":"*","category":"verify"}]
+      - TELEGRAM_SEND_POLICY
+      # Public base URL for approval links returned by the verify/trust flow.
+      - SEND_APPROVAL_BASE_URL
+      # Outbound push API (internal to the agents network; not published).
+      - TELEGRAM_GATEWAY_HTTP_PORT=8093
+      - TELEGRAM_DEFAULT_RECIPIENT
+      - TELEGRAM_GATEWAY_TOKEN
+    volumes:
+      # Login session + pending sends + recent chats.
+      - telegram-data:/root/.local/share/telegram
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # Speech-to-text microservice — owns the Whisper model and exposes
+  # POST /transcribe (see scripts/stt-service.py). Shared by the web gateway
+  # (dashboard voice input) and the Signal gateway (inbound voice notes), so
+  # exactly one ASR model is loaded system-wide. Internal to the agents network;
+  # not published to the host.
+  stt:
+    build:
+      context: .
+      dockerfile: stt/Dockerfile
+    environment:
+      - WHISPER_MODEL=base
+      - STT_HTTP_PORT=8100
+      - STT_TOKEN
+      # Constrain voice-note language detection to the languages actually spoken;
+      # reuses the same deployment setting the Signal gateway uses for text.
+      - STT_SUPPORTED_LANGUAGES=${SIGNAL_SUPPORTED_LANGUAGES:-}
+    volumes:
+      # Persist downloaded Whisper model weights across container recreation.
+      - stt-models:/root/.cache/huggingface
+    restart: unless-stopped
+    networks:
+      - agents
+
+
+  # Updater sidecar — HTTP trigger to rebuild/restart the whole stack
+  # (`git pull && docker compose build && docker compose up -d`), reachable
+  # from the phone (via Traefik, see docker-compose.override.example.yml) and
+  # from inside the retinue container (scripts/self-update.py), without
+  # SSHing into the host. Runs as a *separate* service so it survives the
+  # `retinue` service being recreated mid-update (the container issuing the
+  # command would otherwise be killed by its own `up -d`).
+  #
+  # Uses the docker socket (docker-out-of-docker), not `privileged`: strictly
+  # less blast radius, though a socket mount is still ≈ root on the host —
+  # unavoidable for "rebuild the whole stack". The endpoint only ever runs the
+  # fixed recipe above, never a request-supplied command, and is token-gated
+  # (UPDATER_TOKEN, set in .env — see update-server.py for why this token
+  # cannot be auto-generated like the web gateway's internal backend tokens).
+  updater:
+    build: ./updater
+    env_file:
+      - .env
+    environment:
+      - UPDATER_TOKEN
+      # Deployment-injected update recipe. Empty by default => the updater runs
+      # the framework's built-in `git pull && compose build && compose up -d`.
+      # A nested deployment (e.g. my-retinue) sets this to its own driver, e.g.
+      # UPDATE_COMMAND=/repo/start.sh update — so config flows deployment →
+      # framework, not the other way round. See updater/update-server.py.
+      - UPDATE_COMMAND
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/repo
+    working_dir: /repo
+    restart: unless-stopped
+    networks:
+      - agents
+
+  qlever-life:
+    build: ./qlever-dir
+    volumes:
+      # The shared chambers volume: every chamber's RDF files are indexed
+      # equally — no special data folder.
+      - chambers:/data:ro
+    environment:
+      BASE_URI: "file:"
+      REBUILD_DELAY: "15"
+    # Host port publishing (7001) is deployment-specific — see
+    # docker-compose.override.example.yml. On the agents network the endpoint is
+    # reachable as qlever-life:7001 without publishing a host port.
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # Egress audit sidecar — MITM proxy that logs every outbound HTTP(S) request
+  # from the retinue container. It issues per-host certificates signed by a
+  # deployment-specific CA; the retinue service trusts that CA and routes
+  # through this proxy. Internal hosts are excluded via NO_PROXY so QLever,
+  # Signal gateway, STT, etc. stay direct.
+  egress-audit:
+    build:
+      context: .
+      dockerfile: egress-audit/Dockerfile
+    env_file:
+      - .env
+    environment:
+      - EGRESS_AUDIT_LOG_DIR=/var/log/retinue/egress
+      - EGRESS_AUDIT_BODY_LIMIT=65536
+      - EGRESS_CERT_DIR=/etc/egress-audit/certs
+    volumes:
+      # CA is shared with retinue through this persistent volume. It is
+      # generated automatically by the retinue entrypoint on first start.
+      - egress-audit-certs:/etc/egress-audit:rw
+      - egress-audit-logs:/var/log/retinue/egress
+    networks:
+      - agents
+    restart: unless-stopped
+
+  # Egress log viewer — read-only web dashboard for the human operator.
+  egress-log-viewer:
+    image: python:3.12-slim
+    working_dir: /app
+    command: python3 /app/scripts/egress-log-viewer.py
+    environment:
+      - EGRESS_AUDIT_LOG_DIR=/var/log/retinue/egress
+      - EGRESS_AUDIT_ANOMALY_LOG=/var/log/retinue/egress/anomalies.ndjson
+      - EGRESS_VIEWER_PORT=8080
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - egress-audit-logs:/var/log/retinue/egress:ro
+    networks:
+      - agents
+    restart: unless-stopped
+
+  # Egress anomaly agent — tails the flow log, flags anomalies, and can push
+  # high-severity alerts via the configured command.
+  egress-anomaly-agent:
+    image: python:3.12-slim
+    working_dir: /app
+    command: python3 /app/scripts/egress-anomaly-agent.py
+    env_file:
+      - .env
+    environment:
+      - EGRESS_AUDIT_LOG_DIR=/var/log/retinue/egress
+      - EGRESS_AUDIT_ANOMALY_LOG=/var/log/retinue/egress/anomalies.ndjson
+      - EGRESS_ANOMALY_STATE=/var/lib/egress-anomaly/state.json
+      # Example: alert via Signal for high-severity anomalies.
+      # - EGRESS_ANOMALY_ALERT_COMMAND=python3 /app/scripts/signal-push.py
+      - EGRESS_ANOMALY_ALERT_SEVERITY=high
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - egress-audit-logs:/var/log/retinue/egress:rw
+      - egress-anomaly-state:/var/lib/egress-anomaly
+    networks:
+      - agents
+    restart: unless-stopped
+
+volumes:
+  chambers:
+  retinue-root:
+  signal-data:
+  whatsapp-data:
+  telegram-data:
+  piper-data:
+  stt-models:
+  egress-audit-certs:
+  egress-audit-logs:
+  egress-anomaly-state:
+  litellm-db:
+
+networks:
+  agents:
+    driver: bridge

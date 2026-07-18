@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Conversations</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- The same conversations component the dashboard card uses, but in `full`
+       mode: every thread, an Active/Archived filter, and no five-item cap. This
+       dedicated page keeps the dashboard itself uncluttered. The component's
+       own header carries the title, so the page adds no chrome of its own. -->
+  <script type="module" src="/components/conversations.js"></script>
+</head>
+<body>
+  <main>
+    <retinue-conversations full heading="Conversations"></retinue-conversations>
+  </main>
+
+  <script>
+    // Register the service worker so this page is available offline too.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+{
+  "jobs": [
+    {
+      "id": "deep-thought",
+      "prompt": "Dispatch the marvin subagent: report, in one short paragraph and in character, on the progress of Deep Thought's seven-and-a-half-million-year computation of the Answer to the Ultimate Question of Life, the Universe, and Everything. This is an example scheduled compute job — do not message the user or change any files.",
+      "interval_seconds": 604800,
+      "enabled": false,
+      "run_at_start": false
+    }
+  ]
+}

@@ -1,0 +1,124 @@
+/* Retinue dashboard shell. Minimalist, dark, app-like on small displays.
+ *
+ * Layout model:
+ *  - Dashboard (list mode): main is a flex column with min-height 100dvh. On
+ *    tall screens the conversations region grows to fill the leftover space
+ *    (app-like, dock at the bottom). When the sections outgrow a small or short
+ *    viewport the PAGE scrolls — sections keep their natural height, so the
+ *    conversations region is never squeezed away by the projects card; both are
+ *    always reachable, in the worst case on separate scroll "screens".
+ *  - Thread/composer open: the frame locks to exactly 100dvh and everything
+ *    else hides, so the chat is immersive with an internally scrolled thread
+ *    and a pinned composer.
+ *  - Wide screens (>=1000px and tall enough): two columns — conversations
+ *    left, projects right — both visible, each scrolling internally. */
+:root {
+  --bg: #0b0d12;
+  --card: #151922;
+  --card-2: #1c2230;
+  --fg: #e7ebf2;
+  --muted: #8b93a3;
+  --accent: #6ea8fe;
+  --high: #ff6b6b;
+  --ok: #57c785;
+  --line: rgba(231, 235, 242, .08);
+  --radius: 16px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
+}
+main {
+  max-width: 640px;
+  margin: 0 auto;
+  min-height: 100vh;   /* fallback */
+  min-height: 100dvh;  /* tracks the on-screen keyboard / collapsing URL bar */
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: calc(env(safe-area-inset-top, 0px) + 10px)
+           calc(env(safe-area-inset-right, 0px) + 12px)
+           calc(env(safe-area-inset-bottom, 0px) + 10px)
+           calc(env(safe-area-inset-left, 0px) + 12px);
+}
+.top {
+  flex: none;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 4px 0;
+}
+.top h1 { font-size: 1.3rem; font-weight: 650; letter-spacing: -.01em; margin: 0; }
+.top .date { color: var(--muted); font-size: .8rem; }
+
+/* The conversations region absorbs leftover height on tall screens; on small
+   ones it keeps its natural height and the page scrolls instead (min-height: 0
+   only matters once the immersive thread locks the frame below). */
+retinue-conversations { flex: 1; min-height: 0; }
+retinue-projects { flex: none; }
+
+/* App dock (slotted content lives in the light DOM, so it is styled here). */
+retinue-app-launcher { flex: none; }
+retinue-app-launcher .ico { font-size: 1.35rem; line-height: 1.25; }
+retinue-app-launcher .lbl { font-size: .68rem; color: var(--muted); }
+
+/* Immersive chat: while a thread or the composer is open, lock the frame back
+   to the viewport and hand the whole screen to the conversation (the thread
+   bar carries the title and back button). */
+main:has(retinue-conversations[data-view="thread"]),
+main:has(retinue-conversations[data-view="composer"]) {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+main:has(retinue-conversations[data-view="thread"]) > :not(retinue-conversations),
+main:has(retinue-conversations[data-view="composer"]) > :not(retinue-conversations) {
+  display: none;
+}
+
+/* Project page (project.html): lock the frame to the viewport and let the
+   component scroll its body internally, so the Ara command bar stays pinned
+   within thumb reach — same model as the immersive chat. */
+main:has(retinue-project-page) {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+retinue-project-page { flex: 1; min-height: 0; }
+
+/* Wide-and-tall screens: conversations and projects side by side, both
+   visible, each scrolling internally inside a fixed app frame. Wide-but-short
+   windows keep the single-column scroll layout above instead. */
+@media (min-width: 1000px) and (min-height: 480px) {
+  main {
+    max-width: 1100px;
+    height: 100vh;
+    height: 100dvh;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    gap: 12px 18px;
+  }
+  .top { grid-column: 1 / -1; }
+  retinue-conversations { grid-column: 1; grid-row: 2; min-height: 0; }
+  retinue-projects { grid-column: 2; grid-row: 2; min-height: 0; overflow-y: auto; }
+  retinue-app-launcher { grid-column: 1 / -1; justify-self: center; width: 100%; max-width: 520px; }
+  /* The immersive thread spans the whole frame (its siblings are hidden). */
+  main:has(retinue-conversations[data-view="thread"]) retinue-conversations,
+  main:has(retinue-conversations[data-view="composer"]) retinue-conversations {
+    grid-column: 1 / -1;
+    grid-row: 1 / -1;
+  }
+  /* The project page is a single column at a readable width — the dashboard's
+     two-column grid would leave a hollow second column beside it. */
+  main:has(retinue-project-page) {
+    display: flex;
+    max-width: 760px;
+  }
+}

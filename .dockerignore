@@ -1,0 +1,18 @@
+# QLever index files (large, rebuilt at runtime)
+health.*
+genomics.*
+
+# Git internals
+.git
+
+# Python caches
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.devcontainer/
+
+# Session caches
+.garmin_session
