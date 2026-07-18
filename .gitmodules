@@ -1,0 +1,3 @@
+[submodule "qlever-dir"]
+	path = qlever-dir
+	url = https://github.com/retinue-os/qlever-dir.git

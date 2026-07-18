@@ -1,0 +1,12 @@
+{
+  "chambers": [
+    {
+      "name": "westworld",
+      "path": "examples/chambers/westworld"
+    },
+    {
+      "name": "hitchhiker",
+      "path": "examples/chambers/hitchhiker"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "name": "retinue",
+  "owner": {
+    "name": "Your Name",
+    "email": "you@example.com"
+  },
+  "metadata": {
+    "description": "Plugins provided by the chambers mounted into the Retinue system. This file is generated at startup by the entrypoint: it autodetects each chamber that carries a plugin at ./chambers/<name>/.retinue/.claude-plugin/plugin.json and appends a corresponding entry (name/description read from that plugin.json). Edit chambers.json to change which chambers are mounted; this template only supplies the marketplace identity."
+  },
+  "plugins": []
+}

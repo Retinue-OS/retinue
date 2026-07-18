@@ -1,0 +1,16 @@
+# Placeholder — this file is NOT a usable certificate.
+#
+# Generate your own client CA before enabling mTLS; never ship or reuse someone
+# else's. Whoever holds the CA private key can mint client certificates your
+# gateway will accept, so this must be yours and yours alone.
+#
+#   scripts/gen-client-cert.sh          # see deploy/traefik/README.md
+#
+# Then place the resulting CA certificate here as:
+#   deploy/traefik/dynamic/retinue-client-ca.crt
+#
+# That path is referenced by retinue-mtls.yml (caFiles) and is .gitignore'd, so
+# your CA never lands in git.
+-----BEGIN CERTIFICATE-----
+REPLACE-WITH-YOUR-OWN-CLIENT-CA-CERTIFICATE
+-----END CERTIFICATE-----

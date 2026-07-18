@@ -1,0 +1,40 @@
+{
+  "model": "opus",
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Read(/root/.claude/uploads/**)",
+      "Edit(**)",
+      "Write(**)",
+      "Bash(*)",
+      "WebFetch",
+      "mcp__claude_ai_Zoho__ZohoMail_getMailAccounts",
+      "mcp__claude_ai_Zoho__ZohoMail_getMessageContent",
+      "mcp__claude_ai_Zoho__ZohoMail_listEmails",
+      "mcp__claude_ai_Zoho__ZohoCalendar_getEventsInRange",
+      "mcp__claude_ai_Zoho__ZohoCalendar_searchEvents",
+      "mcp__claude_ai_Zoho__ZohoCalendar_getAllCalendar",
+      "mcp__claude_ai_Zoho__ZohoCalendar_fetchCalendar",
+      "mcp__claude_ai_Zoho__ZohoCalendar_getUserBusySlots",
+      "mcp__claude_ai_Zoho__ZohoCalendar_findTimeSlots",
+      "mcp__claude_ai_whatsapp__list_chats",
+      "mcp__claude_ai_whatsapp__list_messages",
+      "mcp__claude_ai_whatsapp__get_chat",
+      "mcp__claude_ai_whatsapp__get_contact_chats",
+      "mcp__claude_ai_whatsapp__get_direct_chat_by_contact",
+      "mcp__claude_ai_whatsapp__get_last_interaction",
+      "mcp__claude_ai_whatsapp__get_message_context",
+      "mcp__claude_ai_whatsapp__search_contacts",
+      "mcp__claude_ai_whatsapp__download_media",
+      "mcp__claude_ai_Telegram__list_chats",
+      "mcp__claude_ai_Telegram__get_messages",
+      "mcp__claude_ai_Telegram__get_recent_chats",
+      "mcp__claude_ai_Telegram__search_messages",
+      "mcp__claude_ai_Telegram__download_media"
+    ],
+    "deny": [],
+    "additionalDirectories": [
+      "/root/.claude/uploads"
+    ]
+  }
+}
