@@ -37,7 +37,9 @@ Defines these core compose services:
   automatically on filesystem changes. See
   [`docs/triple-stores.md`](docs/triple-stores.md) for what this makes possible
   — querying Markdown frontmatter, sensor CSVs at scale, and why some data gets
-  its own store.
+  its own store. For a worked look at the named-graph half of that design, with
+  queries run against a live store and its limits stated,
+  see [Provenance by path](https://github.com/Retinue-OS/retinue-os-chamber/blob/main/writing/provenance-by-path.md).
 
 A deployment can add further services in its override — for example a
 `qlever-static/`-based endpoint for one large, rarely-changing N-Triples file
