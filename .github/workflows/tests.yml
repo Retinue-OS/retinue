@@ -5,9 +5,15 @@
 # area of the codebase could regress silently.
 #
 # The tests are standalone scripts, not a pytest suite — each is executable on
-# its own and stubs out the heavy runtime imports (langdetect, signal-cli, …) so
-# it can load a gateway module in isolation. Keep them that way: it is why they
-# run here in a couple of seconds with no dependency install.
+# its own and stubs out some heavy runtime imports (langdetect, signal-cli, …)
+# so it can load a gateway module in isolation. Keep them that way.
+#
+# They are NOT dependency-free, though: the gateway modules they import pull in
+# markdown-it-py (web-gateway) and requests (the messaging gateways) at module
+# scope, so those must be installed for the imports to succeed. langdetect is
+# genuinely stubbed and is not needed. This list was determined by running the
+# suite in a clean venv — if you add a module-scope third-party import to a
+# script under test, add it here too.
 name: tests
 
 on:
@@ -24,6 +30,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install markdown-it-py requests
 
       - name: Run test suite
         run: |

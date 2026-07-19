@@ -44,15 +44,19 @@ cp .env.example .env      # then fill it in — see README.md
 docker compose up -d
 ```
 
-Run the tests before opening a PR. They're standalone scripts with no
-dependencies to install:
+Run the tests before opening a PR. They're standalone scripts — no pytest, no
+runner — but the gateway modules they import need two packages:
 
 ```bash
+pip install markdown-it-py requests
 for t in tests/test_*.py; do python3 "$t" || echo "FAILED: $t"; done
 ```
 
 Keep them that way — no pytest, no fixtures requiring the full runtime. A test
-that needs signal-cli installed is a test that won't run in CI.
+that needs signal-cli installed is a test that won't run in CI. If you add a
+module-scope third-party import to a script under test, add it to the install
+line in `.github/workflows/tests.yml` as well, and check the suite still runs
+in a clean virtualenv rather than only on your machine.
 
 ## Conventions
 
