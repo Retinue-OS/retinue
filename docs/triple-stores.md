@@ -136,7 +136,7 @@ else in the store.
 > `.nt`/`.ttl`/`.n3` changes, while the index build *does* process converter
 > extensions like `.md`. So a frontmatter edit is picked up on the next rebuild
 > triggered by some other RDF change, or at container restart — not within the
-> usual ~15 s. Worth knowing before you debug a stale projects card.
+> usual 15–20 s. Worth knowing before you debug a stale projects card.
 
 ### Big CSVs from sensors → a decade of readings, one query away
 
