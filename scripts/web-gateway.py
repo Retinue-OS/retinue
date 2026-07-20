@@ -44,6 +44,12 @@ Projects (dashboard project pages):
                                          attachments) to an existing thread. Same
                                          token gate.
 
+Push notifications (dashboard PWA; see scripts/push_notify.py):
+  GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
+  POST /push/subscribe                -> register a PushSubscription (body is the
+                                         browser's subscription JSON verbatim).
+  POST /push/unsubscribe              -> drop one (body {endpoint}); idempotent.
+
 Session logic:
 - Conversations are keyed by requester identity (the "on-behalf-of" field, e.g.
   the Signal sender). Each key gets its own Claude session, state entry and lock,
@@ -91,6 +97,7 @@ from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
 import email_client as ec
 import gateway_auth
+import push_notify
 
 
 # Claude Code ships as an npm package whose auto-updater briefly swaps the
@@ -182,6 +189,16 @@ _INTERNAL_CONV_MSG_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/mes
 _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
+
+# ── Push notifications ─────────────────────────────────────────────────────────
+# The unread badge only exists while the dashboard is open, which is precisely
+# not the case when Ara opens a thread that needs a decision. Web Push is what
+# reaches an installed PWA with no page running. Keys and device subscriptions
+# live beside the conversations, so they inherit the deployment's persistent
+# volume; see scripts/push_notify.py. Push is optional: with pywebpush absent the
+# endpoints report disabled and the dashboard hides its opt-in button.
+PUSH_DIR = Path(os.environ.get("PUSH_DIR", str(CONVERSATIONS_DIR.parent / "push")))
+push_notify.init(PUSH_DIR)
 
 # ── Dashboard (PWA) static assets ──────────────────────────────────────────────
 # The dashboard front-end is a static PWA served at the site root. Its shell
@@ -1099,6 +1116,23 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     )
 
 
+def _push_conv_notification(conv: dict, text: str) -> None:
+    """Notify the user's devices that a thread needs their attention.
+
+    Called for every agent→user turn that lands unread: a thread Ara opens, a
+    file an agent appends, and Ara's own reply (which arrives after her session
+    ends, long after the user may have closed the app). Best effort — a push
+    failure never affects the conversation itself."""
+    if not push_notify.enabled():
+        return
+    cid = conv.get("id", "")
+    title = conv.get("title") or "Retinue"
+    body = " ".join(str(text or "").split())
+    if len(body) > 160:
+        body = body[:157].rstrip() + "…"
+    push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid)
+
+
 def _conv_worker(cid: str, session_key: str) -> None:
     """Background worker: ask Ara for the next turn in a thread and store it."""
     try:
@@ -1119,7 +1153,9 @@ def _conv_worker(cid: str, session_key: str) -> None:
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
-    _conv_add_message(cid, "assistant", reply, unread=True, pending=False)
+    conv = _conv_add_message(cid, "assistant", reply, unread=True, pending=False)
+    if conv is not None:
+        _push_conv_notification(conv, reply)
 
 
 def _start_conv_turn(cid: str) -> None:
@@ -1926,6 +1962,12 @@ class Handler(BaseHTTPRequestHandler):
         if internal_msg_match:
             self._handle_agent_conversation_message(internal_msg_match.group(1))
             return
+        if self.path.split("?", 1)[0].rstrip("/") == "/push/subscribe":
+            self._handle_push_subscribe()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/push/unsubscribe":
+            self._handle_push_unsubscribe()
+            return
         if self.path.split("?", 1)[0].rstrip("/") == "/conversations/transcribe":
             self._handle_transcribe()
             return
@@ -2286,6 +2328,27 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return payload
 
+    # ── Push notification endpoints ────────────────────────────────────────
+    # These sit behind the dashboard's own auth (Traefik basic auth / forward
+    # auth), same as the conversation endpoints the PWA already calls. They are
+    # deliberately *not* token-gated like /internal/*: the browser calls them.
+
+    def _handle_push_subscribe(self) -> None:
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        if not push_notify.subscribe(payload):
+            self._send_json(400, {"error": "invalid subscription"})
+            return
+        self._send_json(201, {"status": "subscribed"})
+
+    def _handle_push_unsubscribe(self) -> None:
+        payload = self._read_json_body() or {}
+        push_notify.unsubscribe((payload.get("endpoint") or "").strip())
+        # Idempotent: removing an unknown subscription is a success, not a 404.
+        self._send_json(200, {"status": "unsubscribed"})
+
     def _handle_agent_conversation(self) -> None:
         """A retinue agent opens a thread that needs the user's decision.
 
@@ -2302,6 +2365,7 @@ class Handler(BaseHTTPRequestHandler):
         title = (payload.get("title") or "").strip() or None
         conv = _new_conv("agent", owner, title, "agent", message,
                          first_attachments=payload.get("attachments"))
+        _push_conv_notification(conv, message)
         body = {"id": conv["id"], "title": conv["title"]}
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
@@ -2331,6 +2395,7 @@ class Handler(BaseHTTPRequestHandler):
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
+        _push_conv_notification(conv, message or "Sent you a file")
         body = {"id": conv["id"], "title": conv["title"]}
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
@@ -2376,6 +2441,14 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_job_status(job_match.group(1))
             return
         conv_path, _, conv_query = self.path.partition("?")
+        if conv_path in ("/push/config", "/push/config/"):
+            # The PWA reads the application server key from here before it can
+            # subscribe. `enabled: false` makes it hide the opt-in button.
+            self._send_json(200, {
+                "enabled": push_notify.enabled(),
+                "publicKey": push_notify.public_key(),
+            })
+            return
         if conv_path in ("/conversations", "/conversations/"):
             params = urllib.parse.parse_qs(conv_query)
             if "all" in params:

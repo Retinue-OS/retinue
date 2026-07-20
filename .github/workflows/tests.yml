@@ -32,7 +32,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install test dependencies
-        run: pip install markdown-it-py requests
+        run: pip install markdown-it-py requests pywebpush
 
       - name: Run test suite
         run: |

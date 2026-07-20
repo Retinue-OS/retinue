@@ -450,6 +450,27 @@ message, are stored the same way, and their on-disk paths are handed to Ara in
 her engage prompt — so she can actually open a file the user sends (a PDF, a
 CSV) rather than only knowing one exists. A message may be text, files, or both.
 
+**Push notifications.** The unread badge only exists while the dashboard is
+open — which is precisely not the case when you open a thread that needs a
+decision. So every agent→user turn that lands unread (a thread an agent opens
+via `conversation-push.py`, a message it appends, and your own async reply)
+also fans out a **Web Push** notification to the user's registered devices;
+tapping it opens that thread. This is automatic — there is no separate step
+after posting to a conversation.
+
+The plumbing lives in `scripts/push_notify.py` (VAPID keypair, one file per
+device subscription, both persisted under `PUSH_DIR` — by default a sibling of
+`CONVERSATIONS_DIR`, so it inherits the persistent `/root` volume) and three
+gateway endpoints: `GET /push/config`, `POST /push/subscribe`,
+`POST /push/unsubscribe`. The user opts in from the dashboard's bell button
+(`webapp/components/push.js`), which hides itself once enabled. Two caveats
+worth knowing: on **iOS** push only works if the dashboard was added to the
+home screen (in a plain Safari tab the button never appears), and if
+`pywebpush` is unavailable the whole feature reports itself disabled rather
+than failing — conversations still work exactly as before. Set `VAPID_SUBJECT`
+to the operator's contact address; deleting the stored key invalidates every
+existing subscription, so devices would need to re-enable.
+
 The card itself stays compact — the five most recent active threads plus an **All conversations →** link to the dedicated `conversations.html` page, which lists every thread with an Active/Archived/Edits filter. Threads can be archived from inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived threads drop off the active list but stay on that page.
 
 Every project on the projects card also has its **own page**

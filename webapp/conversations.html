@@ -17,10 +17,13 @@
        dedicated page keeps the dashboard itself uncluttered. The component's
        own header carries the title, so the page adds no chrome of its own. -->
   <script type="module" src="/components/conversations.js"></script>
+  <script type="module" src="/components/push.js"></script>
 </head>
 <body>
   <main>
     <retinue-conversations full heading="Conversations"></retinue-conversations>
+    <!-- Hides itself unless push is available and not yet enabled. -->
+    <retinue-push-optin></retinue-push-optin>
   </main>
 
   <script>
