@@ -112,6 +112,10 @@ class RetinueConversations extends HTMLElement {
     else if (cm) { this._composing = true; this._setComposeProject(cm[1]); }
     this._onPop = () => this._syncFromLocation();
     window.addEventListener('popstate', this._onPop);
+    // Also on hashchange: tapping a push notification navigates an
+    // already-open window to #conversation-<id>, and relying on popstate alone
+    // for that fragment change is implementation-dependent.
+    window.addEventListener('hashchange', this._onPop);
     this.render();
     this.refresh();
     this._timer = setInterval(() => this.refresh(), POLL_MS);
@@ -120,7 +124,10 @@ class RetinueConversations extends HTMLElement {
   disconnectedCallback() {
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
-    if (this._onPop) window.removeEventListener('popstate', this._onPop);
+    if (this._onPop) {
+      window.removeEventListener('popstate', this._onPop);
+      window.removeEventListener('hashchange', this._onPop);
+    }
     this._onPop = null;
     this._stopRecording();
     this._stopStream();
