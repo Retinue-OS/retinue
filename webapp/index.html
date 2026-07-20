@@ -17,6 +17,7 @@
   <script type="module" src="/components/conversations.js"></script>
   <script type="module" src="/components/projects.js"></script>
   <script type="module" src="/components/app-launcher.js"></script>
+  <script type="module" src="/components/push.js"></script>
   <!-- Non-functional/static mock cards are intentionally disabled until they
        are backed by real data flows.
   <script type="module" src="/components/agenda.js"></script>
@@ -64,6 +65,9 @@
       <a href="geo:0,0?q="><span class="ico">&#128506;&#65039;</span><span class="lbl">Map</span></a>
       <a href="/sends"><span class="ico">&#128228;</span><span class="lbl">Sends</span></a>
     </retinue-app-launcher>
+
+    <!-- Hides itself unless push is available and not yet enabled. -->
+    <retinue-push-optin></retinue-push-optin>
   </main>
 
   <script>

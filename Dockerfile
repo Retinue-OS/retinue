@@ -45,7 +45,9 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 RUN npm install -g @anthropic-ai/claude-code
 
 # ── Core Python dependencies ────────────────────────────────────────
-RUN python3 -m pip install --break-system-packages --no-cache-dir markdown-it-py
+# pywebpush (with cryptography, http-ece, py-vapid) powers the dashboard's Web
+# Push notifications; see scripts/push_notify.py.
+RUN python3 -m pip install --break-system-packages --no-cache-dir markdown-it-py pywebpush
 
 # ── Agent logic, scripts, and session instructions (baked into image)
 COPY agents/         /workspace/agents/
