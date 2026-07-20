@@ -45,10 +45,10 @@ docker compose up -d
 ```
 
 Run the tests before opening a PR. They're standalone scripts — no pytest, no
-runner — but the gateway modules they import need two packages:
+runner — but the gateway modules they import need a few packages:
 
 ```bash
-pip install markdown-it-py requests
+pip install markdown-it-py requests pywebpush
 for t in tests/test_*.py; do python3 "$t" || echo "FAILED: $t"; done
 ```
 
