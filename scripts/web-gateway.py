@@ -243,8 +243,75 @@ WHATSAPP_GATEWAY_TOKEN = os.environ.get("WHATSAPP_GATEWAY_TOKEN", "").strip()
 TELEGRAM_GATEWAY_BASE_URL = os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "").rstrip("/")
 TELEGRAM_GATEWAY_TOKEN = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
 
+
+def _extra_channel_gateways() -> dict:
+    """Deployment-declared channel gateways beyond the three built-ins.
+
+    A deployment can run more than one gateway per channel — e.g. a second
+    Signal identity (the user's *personal* account, `signal-gateway-personal`)
+    alongside the system account. Those extra gateways can't be hard-coded here:
+    the generic framework must not name a specific deployment's services, and a
+    single `signal` slug can only point at one base URL. So — exactly like
+    `UPDATE_COMMAND` for the updater — the deployment injects them via the
+    environment and config flows deployment → framework.
+
+    `MESSENGER_GATEWAYS` is a JSON array of objects, each with a `base_url` and
+    an optional `token` and `label`. The slug (the `/sends/<slug>/<id>` URL
+    segment) is taken verbatim from an explicit `slug`, else derived from the
+    Docker service name in `base_url` — so enrolling a gateway is "add a row",
+    with no separate slug map to keep in sync. Example:
+
+        MESSENGER_GATEWAYS='[{"base_url":"http://signal-gateway-personal:8090",
+                              "label":"Signal (personal)"}]'
+        # -> slug "signal-personal" (the "-gateway" infix is dropped)
+
+    Malformed entries are skipped with a log line rather than crashing boot.
+    """
+    raw = os.environ.get("MESSENGER_GATEWAYS", "").strip()
+    if not raw:
+        return {}
+    try:
+        entries = json.loads(raw)
+    except ValueError as exc:
+        print(f"[web-gateway] MESSENGER_GATEWAYS is not valid JSON, ignoring: {exc}", flush=True)
+        return {}
+    if not isinstance(entries, list):
+        print("[web-gateway] MESSENGER_GATEWAYS must be a JSON array, ignoring", flush=True)
+        return {}
+    out: dict = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            print(f"[web-gateway] MESSENGER_GATEWAYS entry is not an object, skipping: {entry!r}", flush=True)
+            continue
+        base_url = str(entry.get("base_url", "")).rstrip("/")
+        if not base_url:
+            print(f"[web-gateway] MESSENGER_GATEWAYS entry has no base_url, skipping: {entry!r}", flush=True)
+            continue
+        slug = str(entry.get("slug", "")).strip() or _slug_from_base_url(base_url)
+        if not slug:
+            print(f"[web-gateway] could not derive a slug for {base_url}, skipping", flush=True)
+            continue
+        out[slug] = {
+            "base_url": base_url,
+            "token": str(entry.get("token", "")).strip(),
+            "label": str(entry.get("label", "")).strip() or slug.replace("-", " ").title(),
+        }
+    return out
+
+
+def _slug_from_base_url(base_url: str) -> str:
+    """Derive a URL-safe /sends slug from a gateway's base URL.
+
+    Uses the Docker service hostname (`http://<host>:<port>` -> `<host>`) and
+    drops a redundant `-gateway` infix so `signal-gateway-personal` reads as
+    `signal-personal` in the approval URL, not the raw internal hostname."""
+    host = urllib.parse.urlsplit(base_url).hostname or ""
+    return host.replace("-gateway-", "-").removesuffix("-gateway")
+
+
 # Registry of configured channel gateways, keyed by the slug used in /sends URLs.
-# Only channels with a base URL configured are enrolled.
+# The three built-ins are enrolled when their base URL is set; a deployment adds
+# any further gateways (extra accounts, extra channels) via MESSENGER_GATEWAYS.
 _CHANNEL_GATEWAYS = {
     slug: {"base_url": base_url, "token": token, "label": label}
     for slug, base_url, token, label in (
@@ -254,6 +321,9 @@ _CHANNEL_GATEWAYS = {
     )
     if base_url
 }
+# Deployment-declared extras win on slug collision — a deployment can override a
+# built-in's target if it needs to.
+_CHANNEL_GATEWAYS.update(_extra_channel_gateways())
 
 # Edge authentication (Traefik forward-auth). The public `agents` router is
 # guarded by a forwardAuth middleware that calls GET /auth here. We accept a TLS
