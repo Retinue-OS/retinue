@@ -594,7 +594,7 @@ Claude Code plugin).
 To pick up changes to agents, scripts, or dependencies:
 
 ```bash
-git pull
+git pull --recurse-submodules
 docker compose build
 ```
 
