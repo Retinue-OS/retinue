@@ -179,6 +179,13 @@ SIGNAL_RECENT_CHATS_PATH = Path(
 SIGNAL_RECENT_CHATS_MAX = int(os.environ.get("SIGNAL_RECENT_CHATS_MAX", "100"))
 # Public base URL used to build approval links returned to the caller.
 SEND_APPROVAL_BASE_URL = os.environ.get("SEND_APPROVAL_BASE_URL", "").rstrip("/")
+# The /sends/<slug>/<id> channel slug this gateway's pending sends live under on
+# the web-gateway. Defaults to "signal" (the system account). A deployment that
+# runs a second Signal identity (e.g. signal-gateway-personal) sets this to the
+# slug it registered for that gateway in the web-gateway's MESSENGER_GATEWAYS —
+# e.g. "signal-personal" — so the approval link points at the right account
+# instead of always the system one.
+SEND_APPROVAL_SLUG = os.environ.get("SEND_APPROVAL_SLUG", "signal").strip("/") or "signal"
 
 
 SIGNAL_CLI_TIMEOUT = float(os.environ.get("SIGNAL_CLI_TIMEOUT", "30"))
@@ -1290,7 +1297,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         category = _outbound_policy_category()
         if category == "verify" or (category == "trust" and not user_approved):
             request_id = _new_pending_send(recipient, message, lang, images, voice, category)
-            approval_path = f"/sends/signal/{request_id}"
+            approval_path = f"/sends/{SEND_APPROVAL_SLUG}/{request_id}"
             approval_url = (SEND_APPROVAL_BASE_URL + approval_path) if SEND_APPROVAL_BASE_URL else approval_path
             print(f"[signal-gateway] pending send registered for {recipient} "
                   f"(category={category}, id={request_id})", flush=True)
