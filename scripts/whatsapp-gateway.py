@@ -184,6 +184,11 @@ WHATSAPP_TMP_DIR.mkdir(parents=True, exist_ok=True)
 # so all client calls go through this lock.
 WA_CLIENT_LOCK = threading.Lock()
 
+# JID server parts: phone-number addressing vs. WhatsApp's privacy-preserving
+# LID addressing. Only the former is deliverable — see _lid_to_pn().
+WA_PN_SERVER = "s.whatsapp.net"
+WA_LID_SERVER = "lid"
+
 # The neonize client, populated by _start_bridge(). None until connected; the
 # HTTP /send path reports 503 until then.
 _wa_client = None
@@ -376,17 +381,72 @@ def _jid_is_group(jid) -> bool:
     return str(server).endswith("g.us") or str(jid).endswith("@g.us")
 
 
+def _lid_to_pn(user: str, *, speculative: bool = False) -> str | None:
+    """Resolve a LID user to its phone-number user via the bridge's LID store.
+
+    WhatsApp addresses privacy-preserving contacts by LID (``<user>@lid``), but a
+    message can only be encrypted for a *device* JID, which whatsmeow keys by
+    phone number. whatsmeow keeps the mapping (its ``whatsmeow_lid_map`` table),
+    populated from inbound traffic and contact sync, and neonize exposes it as
+    ``get_pn_from_lid``. Returns None when the store has no mapping — callers
+    must treat that as unreachable rather than falling back to
+    ``<lid>@s.whatsapp.net``, which the bridge accepts and never delivers.
+
+    Pass ``speculative=True`` when probing a bare number that is probably an
+    ordinary phone number: a miss is then the expected outcome, not a fault, and
+    is not logged.
+    """
+    client = _wa_client
+    if client is None:
+        return None
+    from neonize.utils import build_jid  # noqa: PLC0415 - localized bridge dep
+    try:
+        with WA_CLIENT_LOCK:
+            pn = client.get_pn_from_lid(build_jid(user, WA_LID_SERVER))
+    except Exception as exc:  # noqa: BLE001 - any store miss means "unresolved"
+        if not speculative:
+            print(f"[whatsapp-gateway] no phone number stored for LID {user}: {exc}", flush=True)
+        return None
+    resolved = _jid_user(pn)
+    if resolved and resolved != user:
+        print(f"[whatsapp-gateway] resolved LID {user} -> {resolved}", flush=True)
+        return resolved
+    return None
+
+
 def _to_jid(recipient: str):
-    """Build a neonize JID from a bare number or a full ``user@server`` string."""
+    """Build a neonize JID from a bare number or a full ``user@server`` string.
+
+    A ``@lid`` recipient is resolved to its phone-number JID first, since a LID
+    is not directly addressable. A *bare* number is looked up too: contacts can
+    be LID-only (``/contacts`` then reports the LID as their ``number``), and a
+    hit in the LID store is authoritative — a real phone number never appears
+    there, so a miss simply falls through to the normal path.
+    """
     from neonize.utils import build_jid  # noqa: PLC0415 - localized bridge dep
     r = (recipient or "").strip()
-    if "@" in r:
-        user, server = r.split("@", 1)
+    user, _, server = r.partition("@")
+    user = user.lstrip("+")
+    if server == WA_LID_SERVER:
+        resolved = _lid_to_pn(user)
+        if not resolved:
+            raise RuntimeError(
+                f"cannot deliver to {r}: this contact is known only by its LID and the "
+                f"WhatsApp bridge holds no phone number for it. Ask the user to open the "
+                f"chat on their phone and send this contact a message, which populates "
+                f"the mapping; after that, sending from here works."
+            )
+        user, server = resolved, WA_PN_SERVER
+    elif not server:
+        resolved = _lid_to_pn(user, speculative=True)
+        if resolved:
+            user, server = resolved, WA_PN_SERVER
+    if server:
         try:
-            return build_jid(user.lstrip("+"), server)
+            return build_jid(user, server)
         except TypeError:
-            return build_jid(user.lstrip("+"))
-    return build_jid(r.lstrip("+"))
+            return build_jid(user)
+    return build_jid(user)
 
 
 def _extract_message_text(message) -> str:
