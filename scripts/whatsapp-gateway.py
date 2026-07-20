@@ -87,6 +87,12 @@ WHATSAPP_ACCOUNT_LABEL = WHATSAPP_ACCOUNT or "whatsapp"
 # volume so the linked device survives container recreation).
 WHATSAPP_DATA_DIR = Path(os.environ.get("WHATSAPP_DATA_DIR", "/root/.local/share/whatsapp"))
 WHATSAPP_SESSION_NAME = os.environ.get("WHATSAPP_SESSION_NAME", "retinue").strip() or "retinue"
+# Where the pairing QR is dropped as a PNG while unlinked (see _start_bridge).
+# It is removed as soon as the device links — a stale QR on disk is both
+# confusing and a live pairing credential until it expires.
+WHATSAPP_QR_PNG_PATH = Path(
+    os.environ.get("WHATSAPP_QR_PNG_PATH", str(WHATSAPP_DATA_DIR / "pairing-qr.png"))
+)
 
 RETINUE_GATEWAY_URL = os.environ.get("RETINUE_GATEWAY_URL", "http://retinue:8080/message")
 RETINUE_GATEWAY_TIMEOUT = float(os.environ.get("RETINUE_GATEWAY_TIMEOUT", "3600"))
@@ -467,20 +473,48 @@ def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = 
 def _start_bridge() -> None:
     """Connect the neonize client and register the inbound message handler.
 
-    On first run there is no linked session, so neonize prints a pairing QR code
-    to this container's stdout — scan it from the phone's WhatsApp under
-    *Settings → Linked devices* (see README). The session then persists in the
-    whatsapp-data volume. This call blocks (owns the main thread); the outbound
-    HTTP server runs in a daemon thread started by main().
+    On first run there is no linked session, so neonize emits a pairing QR code —
+    scan it from the phone's WhatsApp under *Settings → Linked devices* (see
+    README). The session then persists in the whatsapp-data volume. This call
+    blocks (owns the main thread); the outbound HTTP server runs in a daemon
+    thread started by main().
     """
     global _wa_client
+    import segno
     from neonize.client import NewClient
     from neonize.events import ConnectedEv, MessageEv, PairStatusEv
 
     WHATSAPP_DATA_DIR.mkdir(parents=True, exist_ok=True)
     db_path = str(WHATSAPP_DATA_DIR / f"{WHATSAPP_SESSION_NAME}.sqlite3")
-    client = NewClient(WHATSAPP_SESSION_NAME, database=db_path)
+    # neonize's first positional argument IS the sqlite session path (it is
+    # handed to the Go bridge as the database name); there is no `database=`
+    # keyword. Pin the uuid to the session name so it stays stable even though
+    # the path is what identifies the store.
+    client = NewClient(db_path, uuid=WHATSAPP_SESSION_NAME)
     _wa_client = client
+
+    @client.qr
+    def _on_qr(_client, data_qr: bytes):  # noqa: ANN001
+        """Render the pairing QR to the terminal *and* to a PNG in the volume.
+
+        The terminal rendering is unusable over `docker logs` on some clients
+        (compact block glyphs collapse), so also drop a PNG next to the session
+        store — the operator can `docker cp` it out and open it. segno ships
+        with neonize and writes PNG natively, so this needs no extra dependency.
+        """
+        qr = segno.make_qr(data_qr)
+        qr.terminal(compact=True)
+        try:
+            # border=6: the QR spec's quiet zone is 4 modules, and image
+            # viewers commonly show a PNG on a dark background — with a thin
+            # margin the surrounding UI crowds the finder patterns and phone
+            # scanners fail to lock on. Force an opaque white light module for
+            # the same reason (never transparent, which a dark theme would
+            # render as black-on-black).
+            qr.save(str(WHATSAPP_QR_PNG_PATH), scale=12, border=6, dark="black", light="white")
+            print(f"[whatsapp-gateway] pairing QR written to {WHATSAPP_QR_PNG_PATH}", flush=True)
+        except Exception as exc:  # noqa: BLE001 - a PNG failure must not block pairing
+            print(f"[whatsapp-gateway] could not write QR PNG: {exc}", flush=True)
 
     @client.event(ConnectedEv)
     def _on_connected(_client, _event):  # noqa: ANN001
@@ -490,6 +524,8 @@ def _start_bridge() -> None:
     def _on_pair(_client, event):  # noqa: ANN001
         user = _jid_user(_attr(event, "ID", "id"))
         print(f"[whatsapp-gateway] linked as {user}", flush=True)
+        # The QR is spent — drop it so no live pairing code lingers on the volume.
+        WHATSAPP_QR_PNG_PATH.unlink(missing_ok=True)
 
     @client.event(MessageEv)
     def _on_message(_client, event):  # noqa: ANN001
