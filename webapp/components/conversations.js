@@ -971,9 +971,10 @@ class RetinueConversations extends HTMLElement {
     try {
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(clean);
-      // Prefer the server-provided tag; fall back to detecting from the text so
-      // messages stored before the server attached `lang` still read correctly.
-      const code = lang || this._detectLang(clean);
+      // Use the server-provided language tag. Detection is done server-side and
+      // is language-agnostic — the client privileges no language, so an
+      // untagged message just reads with the browser's default voice.
+      const code = lang;
       if (code) {
         u.lang = code;
         // Setting u.lang alone is not enough in some browsers — they keep the
@@ -987,24 +988,6 @@ class RetinueConversations extends HTMLElement {
       u.addEventListener('error', done);
       window.speechSynthesis.speak(u);
     } catch (_e) { /* ignore */ }
-  }
-
-  // Cheap German-vs-English guess for speech synthesis when the message carries
-  // no server-provided language tag. Returns a BCP-47 code or null.
-  _detectLang(text) {
-    const s = String(text || '').toLowerCase();
-    if (!s.trim()) return null;
-    if (/[äöüß]/.test(s)) return 'de';
-    const words = s.match(/[a-zäöüß]+/g) || [];
-    if (words.length < 3) return null;
-    const de = new Set(['und', 'oder', 'aber', 'nicht', 'ist', 'sind', 'der',
-      'die', 'das', 'den', 'dem', 'ein', 'eine', 'ich', 'du', 'sie', 'wir',
-      'mit', 'auf', 'für', 'auch', 'noch', 'schon', 'kein', 'wenn', 'dann',
-      'weil', 'dass', 'sich', 'hier', 'dein', 'deine', 'habe', 'hat', 'haben',
-      'kann', 'soll', 'muss', 'wie', 'was', 'wo', 'über', 'bitte', 'danke',
-      'gemacht', 'geht', 'mehr', 'gibt']);
-    const hits = words.reduce((n, w) => n + (de.has(w) ? 1 : 0), 0);
-    return (hits >= 2 || hits / words.length >= 0.12) ? 'de' : 'en';
   }
 
   // Pick a speechSynthesis voice whose language matches `code` (e.g. 'de').

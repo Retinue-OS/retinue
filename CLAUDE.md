@@ -509,6 +509,28 @@ the dashboard/webapp, use English by default until localization is implemented.
 Apply this convention going forward; retroactively fixing existing issues or PRs
 is not required.
 
+### No preferred languages except English
+
+The project has **no preferred natural languages other than English**. A feature
+is either **multilingual by design** (treating all languages equally — e.g. a
+language-agnostic library, or logic that carries no per-language assumptions) or
+it is **English-only**. There is no middle tier that privileges one particular
+non-English language.
+
+Concretely, when a feature needs to reason about the language of some content
+(speech-synthesis language tags, locale-aware formatting, detection, …):
+
+- **Do not** hand-code a bias toward one language — e.g. a German word list, an
+  umlaut check, or a `de`-vs-`en` special case. That privileges a single
+  non-English language, which this project does not do.
+- **Do** use a language-agnostic mechanism that treats every language uniformly
+  (a general detector, a proper locale API, per-item language metadata), or keep
+  it English-only if multilingual support isn't warranted yet.
+
+This applies even though the *user* often communicates in German: answering the
+user in their own language (user-facing content, above) is a per-message
+response, not a structural preference baked into the system.
+
 ## Branch policy
 
 Three tiers govern how changes reach `main` in the **health data repository**.
