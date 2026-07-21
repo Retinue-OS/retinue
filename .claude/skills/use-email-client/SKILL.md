@@ -51,7 +51,10 @@ python3 /workspace/scripts/email_client.py fetch-attachment --uid <UID> --part 1
 # Move a message
 python3 /workspace/scripts/email_client.py move --uid <UID> --from INBOX --to "Archive/Folder"
 
-# Send a reply (with correct threading — see below)
+# Reply to a message — threading headers are derived from the source (preferred; see below)
+python3 /workspace/scripts/email_client.py reply --uid <UID> --body "..."
+
+# Send a raw message (no source to thread against; set threading by hand if it's a reply)
 python3 /workspace/scripts/email_client.py send \
   --to <addr> --subject "Re: <original subject>" --body "..." \
   --in-reply-to "<message_id>" --references "<message_id>"
@@ -128,30 +131,37 @@ bypass the send-control policy. The one exception is a mailbox loaded via
 
 ---
 
-## Replies: setting threading headers correctly
+## Replies: use `reply --uid`, don't hand-set threading headers
 
-When replying, `--in-reply-to` and `--references` **must** be set to the
-`message_id` of the original message. The `message_id` is included in the JSON
-output of `read`. Without these headers the reply will not appear in the correct
-thread on the recipient's side.
+**To answer a message you have a UID for, use `reply` — not `send`.** `reply`
+fetches the source message and derives everything a correctly-threaded reply
+needs from it: `In-Reply-To` (the source Message-ID), `References` (the source's
+own chain plus its Message-ID), the recipient (source `Reply-To`/`From`), and the
+subject (`Re: …`). This removes the one manual step that has been silently
+skipped in the past — a reply sent without `In-Reply-To` breaks the thread on the
+recipient's side **and** defeats the already-answered check, which then
+re-proposes the message as unanswered (a duplicate).
 
 ```bash
-# 1. Read the message and note the message_id
-python3 /workspace/scripts/email_client.py read --uid 1234
-# → in the JSON: "message_id": "<abc123@mail.example.com>"
+# The whole reply, threaded automatically:
+python3 /workspace/scripts/email_client.py reply --uid 1234 --body "Hi, ..."
 
-# 2. Send the reply with threading headers
-python3 /workspace/scripts/email_client.py send \
-  --to sender@example.com \
-  --subject "Re: Original subject" \
-  --body "Hi, ..." \
-  --in-reply-to "<abc123@mail.example.com>" \
-  --references "<abc123@mail.example.com>"
+# Override recipient/subject/attachments if needed; otherwise they come from the source:
+python3 /workspace/scripts/email_client.py reply --uid 1234 --body "..." \
+  --to someone-else@example.com --subject "Re: something" --attach /tmp/x.pdf
 ```
 
-When replying to an existing thread where `References` already contains multiple
-message IDs, include all previous IDs in `--references` with the new `message_id`
-last — the client handles the correct formatting.
+`reply` goes through the **same send-control policy** as `send` (verify / trust /
+allow) — a `verify` sender still returns an `approval_url`, `--user-approved`
+still only counts for `trust`. On a direct send it returns `"sent_uid"` (the
+Sent-folder UID) and `"message_id"` of the outgoing mail, so the caller can
+record them (e.g. in the triage status store) and later verify the reply really
+went out.
+
+**Only hand-build a reply with `send --in-reply-to`/`--references`** when there
+is no source UID to reply to — e.g. threading onto a message you know the
+Message-ID of but don't have in a folder. In that case pass all previous IDs in
+`--references` with the new `message_id` last.
 
 ---
 
@@ -171,8 +181,8 @@ this is noticeable and can be handled manually.
 python3 /workspace/scripts/email_client.py read --uid <UID>
 # 2. Mark as read — NOW, before sending
 python3 /workspace/scripts/email_client.py flag --uid <UID> --read
-# 3. Send the reply
-python3 /workspace/scripts/email_client.py send --to ... --in-reply-to ...
+# 3. Send the reply (headers derived from the source UID)
+python3 /workspace/scripts/email_client.py reply --uid <UID> --body "..."
 ```
 
 This order applies to all agents, regardless of whether they send directly,
