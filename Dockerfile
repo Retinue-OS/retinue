@@ -47,7 +47,9 @@ RUN npm install -g @anthropic-ai/claude-code
 # ── Core Python dependencies ────────────────────────────────────────
 # pywebpush (with cryptography, http-ece, py-vapid) powers the dashboard's Web
 # Push notifications; see scripts/push_notify.py.
-RUN python3 -m pip install --break-system-packages --no-cache-dir markdown-it-py pywebpush
+# langdetect gives the dashboard's speech synthesis a language-agnostic tag for
+# stored replies (~55 languages, no per-language bias); see web-gateway.py.
+RUN python3 -m pip install --break-system-packages --no-cache-dir markdown-it-py pywebpush langdetect
 
 # ── Agent logic, scripts, and session instructions (baked into image)
 COPY agents/         /workspace/agents/
