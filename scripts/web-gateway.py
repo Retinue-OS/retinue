@@ -943,40 +943,27 @@ def _new_conv(initiator: str, owner: str, title: str | None,
     return conv
 
 
-# German function words that rarely appear in English text. Used only as a
-# cheap heuristic to tag a reply's language so the dashboard's speech synthesis
-# picks a German voice instead of reading German prose with an English one.
-_DE_HINT_WORDS = frozenset({
-    "und", "oder", "aber", "nicht", "ist", "sind", "war", "wird", "werden",
-    "der", "die", "das", "den", "dem", "des", "ein", "eine", "einen", "einem",
-    "einer", "ich", "du", "sie", "wir", "ihr", "mit", "auf", "für", "auch",
-    "noch", "schon", "kein", "keine", "wenn", "dann", "weil", "dass", "sich",
-    "hier", "dein", "deine", "habe", "hast", "hat", "haben", "kann", "kannst",
-    "soll", "musst", "muss", "wie", "was", "wo", "warum", "über", "bitte",
-    "danke", "gut", "gemacht", "geht", "mehr", "gibt",
-})
-
-
 def _detect_lang(text: str) -> str | None:
-    """Best-effort language tag ('de' or 'en') for speech synthesis.
+    """Best-effort BCP-47 language tag for a reply, so the dashboard's speech
+    synthesis reads it with a matching voice instead of the browser default.
 
-    Returns 'de' when the text looks German (umlaut/ß or a threshold of German
-    function words), 'en' when it clearly does not, and None when there is too
-    little signal to decide (the client then falls back to its own detection).
+    Language-agnostic by design: no language is privileged. Detection is handed
+    to `langdetect` (~55 languages, all treated equally); we return whatever it
+    reports (e.g. 'en', 'de', 'fr', 'it'), or None when there is too little
+    signal or the detector is unavailable — in which case the message carries no
+    `lang` and the client falls back to the browser default voice.
     """
     s = str(text or "")
-    if not s.strip():
+    if len(s.strip()) < 12:  # too little signal to classify reliably
         return None
-    lowered = s.lower()
-    if any(ch in lowered for ch in "äöüß"):
-        return "de"
-    words = re.findall(r"[a-zäöüß]+", lowered)
-    if len(words) < 3:
+    try:
+        from langdetect import detect  # type: ignore
+        from langdetect import DetectorFactory
+        DetectorFactory.seed = 0  # deterministic output
+        code = detect(s)
+    except Exception:
         return None
-    hits = sum(1 for w in words if w in _DE_HINT_WORDS)
-    if hits >= 2 or hits / len(words) >= 0.12:
-        return "de"
-    return "en"
+    return code or None
 
 
 def _conv_add_message(cid: str, role: str, text: str, *,
