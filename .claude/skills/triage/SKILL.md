@@ -62,6 +62,21 @@ status file whose message is **no longer in the INBOX**, mark it `resolved` (the
 user moved/handled it elsewhere) and stop tracking it. This bounds drift and lets
 in-progress office mail legitimately sit in the INBOX without being re-proposed.
 
+**Enforce the inbox-zero invariant on every run — `resolved` ⇔ not in INBOX.**
+The two reconcile directions above are not symmetric in effect: the first leaves
+finished mail physically in the mailbox. So add a third pass that repairs
+`store says done → mailbox still shows it`. For any INBOX message whose status is
+**terminal** — `resolved`, or an `engaged` reply whose only remaining step is an
+owner web-approval already requested at `/sends` — the archive/delete step was
+skipped or deferred and never re-driven. Re-drive it now: `flag --read` then `move`
+it to its disposition folder (`Archive` for `archive`/`reply`-sent/`action`-done,
+delete for `delete`), exactly as Phase 6 would. This is the safety net that makes
+the invariant hold even when an execution earlier missed its move — e.g. the
+already-answered path (which proposes no reply and so never reaches Phase 6's move)
+or a verify-queued send (deferred until approval, then forgotten). Only genuinely
+non-terminal states (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item
+still awaiting *user* input) legitimately stay in the INBOX.
+
 **Messaging** — recent chats, then new messages per chat (Signal / WhatsApp / SMS),
 diffed against the store the same way:
 
@@ -219,6 +234,17 @@ Ara picks up each thread and carries out what was approved, then writes status
 alternative instruction — resolves the underlying e-mail out of the INBOX (archived /
 deleted / filed). When every message is engaged or bulk-resolved, the INBOX is empty.
 This holds without any e-mail client in the loop.
+
+**Writing `resolved` and moving the mail are one atomic step, never two.** A status
+must not reach a terminal value while the message is still in the INBOX. Whenever you
+set `resolved` (or resolve an already-answered thread that needs no reply), issue the
+`flag --read` + `move`-out-of-INBOX in the same step and record the destination folder
+in the status note. If the move fails, keep the status non-terminal and retry next run.
+Phase 1's third reconcile pass is the backstop, but the move belongs here at the moment
+of resolution — the backstop only exists to repair past drift, not to license skipping
+it. The same applies to the already-answered branch (Phase 2) and verify-queued replies
+(above): a reply queued at `/sends` is not resolved until it is sent **and** the source
+mail has left the INBOX.
 
 ---
 
