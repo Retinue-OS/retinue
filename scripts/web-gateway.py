@@ -125,6 +125,53 @@ STATE_FILE = os.environ.get("WEB_GATEWAY_STATE", "/tmp/web-session-state.json")
 PORT = int(os.environ.get("WEB_GATEWAY_PORT", "8080"))
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+
+# ── Per-conversation model selection ───────────────────────────────────────────
+# A dashboard thread runs a fresh `claude -p` per turn (no long-lived in-memory
+# state pinned to a model), so which model answers a thread is a free per-turn
+# choice — pickable at creation and switchable mid-thread, effective from the
+# next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
+# Medic, Archivist, Ari) run on their own hard-wired models regardless.
+#
+# The list of offered models lives in ONE place: the default below, overridable
+# wholesale by the deployment via RETINUE_CONVERSATION_MODELS (a JSON array of
+# {"id","label"} objects). `id` is passed to `claude --model`; `label` is what
+# the dashboard shows. An empty/invalid override falls back to the default. The
+# empty-string id means "use the gateway's configured default" (CLAUDE_MODEL /
+# whatever `claude` resolves) — always offered first so a thread can defer.
+_DEFAULT_CONVERSATION_MODELS = [
+    {"id": "", "label": "Default"},
+    {"id": "opus", "label": "Opus (deepest reasoning)"},
+    {"id": "sonnet", "label": "Sonnet (balanced)"},
+    {"id": "haiku", "label": "Haiku (fastest)"},
+]
+
+
+def _load_conversation_models() -> list[dict]:
+    raw = os.environ.get("RETINUE_CONVERSATION_MODELS", "").strip()
+    if not raw:
+        return list(_DEFAULT_CONVERSATION_MODELS)
+    try:
+        parsed = json.loads(raw)
+        models = []
+        for item in parsed:
+            if not isinstance(item, dict) or "id" not in item:
+                continue
+            mid = str(item["id"]).strip()
+            label = str(item.get("label") or mid or "Default").strip()
+            models.append({"id": mid, "label": label})
+        return models or list(_DEFAULT_CONVERSATION_MODELS)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        print("[web-gateway] invalid RETINUE_CONVERSATION_MODELS; using default list",
+              flush=True)
+        return list(_DEFAULT_CONVERSATION_MODELS)
+
+
+CONVERSATION_MODELS = _load_conversation_models()
+# The set of ids a thread may legitimately request — anything else is ignored so
+# a client can never inject an arbitrary --model argument.
+_CONVERSATION_MODEL_IDS = {m["id"] for m in CONVERSATION_MODELS}
+
 SESSION_MAX_IDLE_SECONDS = 3600  # 1 hour
 REQUESTER_ALLOWLIST_PATH = os.environ.get("ACCEPTED_REQUESTERS_PATH", "")
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR", "/workspace/chambers"))
@@ -189,6 +236,7 @@ _INTERNAL_CONV_MSG_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/mes
 _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
+_CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
 
 # ── Push notifications ─────────────────────────────────────────────────────────
 # The unread badge only exists while the dashboard is open, which is precisely
@@ -798,6 +846,9 @@ def _conv_summary(conv: dict) -> dict:
         "kind": conv.get("kind") or "chat",
         "project": conv.get("project"),
         "project_title": conv.get("project_title"),
+        # The thread's model choice (validated; empty string => gateway default),
+        # so the picker can show the current selection without a second fetch.
+        "model": _conv_model(conv) or "",
         "created": conv.get("created"),
         "updated": conv.get("updated"),
         "unread": bool(conv.get("unread")),
@@ -911,7 +962,8 @@ def _new_conv(initiator: str, owner: str, title: str | None,
               first_role: str, first_text: str,
               first_attachments=None, kind: str = "chat",
               project: str | None = None,
-              project_title: str | None = None) -> dict:
+              project_title: str | None = None,
+              model: str | None = None) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cid = uuid.uuid4().hex
     first_msg = {"role": first_role, "text": first_text, "ts": now}
@@ -938,6 +990,11 @@ def _new_conv(initiator: str, owner: str, title: str | None,
         conv["project"] = project
         if project_title:
             conv["project_title"] = project_title
+    # Persist a validated model choice on the thread; None (the default) is left
+    # unset so existing threads keep behaving exactly as before.
+    valid_model = _valid_model_id(model)
+    if valid_model:
+        conv["model"] = valid_model
     with _conversations_lock:
         _save_conv(conv)
     return conv
@@ -997,6 +1054,25 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                 conv.pop("pending_error", None)
         _save_conv(conv)
         return conv
+
+
+def _valid_model_id(model: str | None) -> str | None:
+    """Return a model id only if it's one the gateway offers, else None.
+
+    None means "use the gateway default" — both the absence of a choice and an
+    id no longer on the offered list collapse to it, so a stale/hostile value can
+    never reach `claude --model`."""
+    if model is None:
+        return None
+    model = str(model).strip()
+    if model in _CONVERSATION_MODEL_IDS and model != "":
+        return model
+    return None
+
+
+def _conv_model(conv: dict) -> str | None:
+    """The validated model a thread should run on, or None for the default."""
+    return _valid_model_id(conv.get("model"))
 
 
 def _conv_set_flags(cid: str, **flags) -> dict | None:
@@ -1131,7 +1207,8 @@ def _conv_worker(cid: str, session_key: str) -> None:
         latest = messages[-1]["text"] if messages else ""
         fresh = _session_is_fresh(_get_session_entry(session_key))
         prompt = _conv_engage_prompt(conv, fresh)
-        result = send_message(prompt, display_question=latest, session_key=session_key)
+        result = send_message(prompt, display_question=latest, session_key=session_key,
+                              model=_conv_model(conv))
         if "error" in result:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
@@ -1376,11 +1453,16 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
 # ── Message dispatch ──────────────────────────────────────────────────────────
 
 def send_message(message: str, display_question: str | None = None,
-                 session_key: str = DEFAULT_SESSION_KEY) -> dict:
+                 session_key: str = DEFAULT_SESSION_KEY,
+                 model: str | None = None) -> dict:
     """Send message to the session for `session_key` (resume or new) and return result.
 
     Serialized per session key so one conversation stays ordered, while different
     keys run in parallel up to the worker-pool bound.
+
+    `model` overrides the model for this turn (a validated per-thread choice);
+    when None the gateway's configured default (CLAUDE_MODEL) applies. Since each
+    turn is a fresh `claude -p`, switching models between turns is free.
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
@@ -1391,8 +1473,11 @@ def send_message(message: str, display_question: str | None = None,
 
             cmd = [CLAUDE_BIN, "-p", "--output-format=json", "--permission-mode", CLAUDE_PERMISSION_MODE,
                    "--add-dir", "/root/.claude/uploads"]
-            if CLAUDE_MODEL:
-                cmd += ["--model", CLAUDE_MODEL]
+            # A per-thread model choice (validated by the caller) wins over the
+            # gateway default. An explicit empty string means "defer to default".
+            effective_model = CLAUDE_MODEL if model is None else model
+            if effective_model:
+                cmd += ["--model", effective_model]
 
             if _session_is_fresh(state):
                 cmd += ["--resume", state["session_id"]]
@@ -1980,6 +2065,10 @@ class Handler(BaseHTTPRequestHandler):
         if unarchive_match:
             self._handle_conversation_archive(unarchive_match.group(1), False)
             return
+        model_match = _CONV_MODEL_RE.match(self.path)
+        if model_match:
+            self._handle_conversation_model(model_match.group(1))
+            return
         action = _SEND_ACTION_RE.match(self.path)
         if action:
             self._handle_send_action(action.group(1), action.group(2), action.group(3))
@@ -2253,9 +2342,13 @@ class Handler(BaseHTTPRequestHandler):
         project_title = (str(payload.get("project_title") or "").strip() or None)
         if project_title:
             project_title = project_title[:120]
+        # An invalid/absent model id is simply dropped (thread runs on the
+        # gateway default) — never an error, so an old client keeps working.
+        model = _valid_model_id(payload.get("model"))
         conv = _new_conv("user", owner, title, "user", message,
                          first_attachments=attachments, kind=kind,
-                         project=project, project_title=project_title)
+                         project=project, project_title=project_title,
+                         model=model)
         _start_conv_turn(conv["id"])
         self._send_json(201, _conv_set_flags(conv["id"], pending=True) or conv)
 
@@ -2284,6 +2377,28 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         self._send_json(200, conv)
+
+    def _handle_conversation_model(self, cid: str) -> None:
+        """Switch a thread's model mid-conversation; takes effect next turn.
+
+        Body {"model": <id>}. An empty string (or an id not on the offered list)
+        resets the thread to the gateway default. Because each turn spawns a
+        fresh `claude -p`, no running state is disturbed — the change simply
+        selects `--model` for the next turn."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        raw = str(payload.get("model") or "").strip()
+        # "" is a legitimate reset to default; any other value must be offered.
+        if raw and raw not in _CONVERSATION_MODEL_IDS:
+            self._send_json(400, {"error": "unknown model"})
+            return
+        conv = _conv_set_flags(cid, model=raw)
+        if conv is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        self._send_json(200, _conv_summary(conv))
 
     def _handle_conversation_archive(self, cid: str, archived: bool) -> None:
         """Archive or unarchive a thread. Archived threads drop out of the
@@ -2435,6 +2550,13 @@ class Handler(BaseHTTPRequestHandler):
                 "enabled": push_notify.enabled(),
                 "publicKey": push_notify.public_key(),
             })
+            return
+        if conv_path in ("/conversation-models", "/conversation-models/"):
+            # The single source of truth for which models the picker offers
+            # (see CONVERSATION_MODELS). The dashboard fetches this to build the
+            # dropdown, so editing the env/default changes the UI with no client
+            # change.
+            self._send_json(200, {"models": CONVERSATION_MODELS})
             return
         if conv_path in ("/conversations", "/conversations/"):
             params = urllib.parse.parse_qs(conv_query)
