@@ -1078,6 +1078,11 @@ def _list_pending_sends_store() -> list:
         for path in sorted(SIGNAL_PENDING_SENDS_DIR.glob("*.json")):
             try:
                 entry = json.loads(path.read_text(encoding="utf-8"))
+                # The dir also holds non-pending-send JSON (e.g. recent-chats.json,
+                # a list). Skip anything that isn't a pending-send dict rather than
+                # letting .get() raise and crash every /pending-sends poll.
+                if not isinstance(entry, dict):
+                    continue
                 if entry.get("status") == "pending":
                     lean = {k: v for k, v in entry.items() if k != "images"}
                     items.append(lean)
