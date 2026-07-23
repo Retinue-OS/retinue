@@ -426,6 +426,29 @@ endpoint is token-gated (`CONVERSATION_BACKEND_TOKEN`, set by the entrypoint)
 so only in-container agents can post on the user's behalf — like the e-mail
 backend and `signal-push.py`. Threads persist under `CONVERSATIONS_DIR`, which the deployment pins to the persistent `/root` volume (`/root/.retinue/conversations`) so threads survive container recreation.
 
+Each thread also carries a **model choice** — which model answers Ara's turns in
+that thread. Because every turn is a fresh `claude -p` (no long-lived state
+pinned to a model), the model is a free per-turn choice: pickable when the thread
+is created and switchable mid-thread from a dropdown in the thread bar, effective
+from the next turn. The picker governs **Ara's own turn only** — dispatched
+subagents (Coach, Medic, Archivist, Ari) always run on their own hard-wired
+models regardless of the selection. The offered list lives in one place — a
+**JSON-LD document**, `config/conversation-models.jsonld` (override the path with
+`RETINUE_CONVERSATION_MODELS_FILE`). JSON-LD is a deliberate compromise: the
+gateway reads the file as **plain JSON** (`json.load`, no RDF dependency on the
+serving path), while the *same file*, being valid JSON-LD, is indexed into the
+life store by any chamber that declares a `jsonld` converter
+(`scripts/jsonld2ttl.py`, a generic rdflib expander) — so the offered models are
+**also queryable over SPARQL** without a second, drift-prone copy. A deployment
+may still override the whole list inline via **`RETINUE_CONVERSATION_MODELS`** (a
+JSON array of `{"id","label"}`, which wins over the file); either way `id` is
+passed to `claude --model` and the empty-string id means "use the gateway
+default". The dashboard reads the list from `GET /conversation-models` and
+persists a thread's choice via `POST /conversations/<id>/model` — an id not on
+the offered list is ignored (the thread falls back to the default), so a client
+can never inject an arbitrary `--model`. The picker hides itself when fewer than
+two models are offered.
+
 A thread can also carry **file attachments** the user downloads straight from
 the dashboard — e.g. an e-mail attachment (a PDF invoice) forwarded into a
 thread, so it's reachable without an e-mail client. Pass `--attach PATH`

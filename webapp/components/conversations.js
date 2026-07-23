@@ -77,6 +77,13 @@ class RetinueConversations extends HTMLElement {
     this._composeProject = null;      // project URI the composer is about, if any
     this._composeProjectTitle = '';   // its display title (for the chip)
     this._pushDepth = 0;     // history entries we pushed and have not unwound
+    // Model picker: which model answers a thread. The offered list comes from
+    // the gateway (single source of truth); '' means the gateway default. The
+    // choice is per-thread — pickable at creation and switchable mid-thread,
+    // effective next turn (each turn is a fresh `claude -p`). _composeModel holds
+    // the pending choice for the new-thread composer.
+    this._models = [];
+    this._composeModel = '';
     // Voice: record a message (server transcribes) and speak replies back.
     this._recState = 'idle'; // idle | recording | transcribing
     this._recChunks = [];
@@ -118,7 +125,27 @@ class RetinueConversations extends HTMLElement {
     window.addEventListener('hashchange', this._onPop);
     this.render();
     this.refresh();
+    this._loadModels();
     this._timer = setInterval(() => this.refresh(), POLL_MS);
+  }
+
+  // Fetch the offered model list once. A failure (or a single-model list) simply
+  // leaves the picker hidden — conversations work exactly as before.
+  async _loadModels() {
+    try {
+      const res = await fetch('/conversation-models', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.models)) {
+        this._models = data.models;
+        this.render();
+      }
+    } catch (_err) { /* picker stays hidden */ }
+  }
+
+  _modelLabel(id) {
+    const m = (this._models || []).find((x) => x.id === (id || ''));
+    return m ? m.label : '';
   }
 
   disconnectedCallback() {
@@ -328,6 +355,9 @@ class RetinueConversations extends HTMLElement {
         body.project = this._composeProject;
         if (this._composeProjectTitle) body.project_title = this._composeProjectTitle;
       }
+      // Carry the composer's model choice onto the new thread ('' = default,
+      // which the server simply leaves unset).
+      if (this._composing && this._composeModel) body.model = this._composeModel;
       if (currentOutFiles.length) {
         body.attachments = currentOutFiles.map((f) => ({
           filename: f.name, content_type: f.type, data: f.data,
@@ -351,6 +381,7 @@ class RetinueConversations extends HTMLElement {
       this._drafts['composer'] = '';
       this._outFiles[conv.id] = [];
       this._outFiles['composer'] = [];
+      this._composeModel = '';  // consumed by this thread; reset for the next one
       this._attachError = '';
     } catch (_err) {
       // surface a soft failure inline by leaving the input; re-render shows state
@@ -560,6 +591,23 @@ class RetinueConversations extends HTMLElement {
       `title="${title}" aria-label="${title}" aria-pressed="${this._autosend}">⚡</button>`;
   }
 
+  // The model dropdown. Governs Ara's own turn only (dispatched subagents keep
+  // their own models) — the title says so. Hidden unless the gateway offers more
+  // than one model, so a single-model deployment sees no clutter. `selected` is
+  // the currently-chosen id ('' = default).
+  _modelPickerHtml(selected) {
+    const models = this._models || [];
+    if (models.length < 2) return '';
+    const opts = models.map((m) =>
+      `<option value="${esc(m.id)}"${m.id === (selected || '') ? ' selected' : ''}>` +
+      `${esc(m.label)}</option>`).join('');
+    const title = 'Model for Ara’s replies in this conversation. ' +
+      'Dispatched subagents (Coach, Medic, …) keep their own models.';
+    return `<label class="model-pick" title="${title}">` +
+      `<span class="mp-ico" aria-hidden="true">⚙</span>` +
+      `<select data-model aria-label="${title}">${opts}</select></label>`;
+  }
+
   _composerView() {
     // Coming from a project page, show what the new thread will be about.
     const projectChip = this._composeProject
@@ -570,7 +618,7 @@ class RetinueConversations extends HTMLElement {
       : `<p>Ask Ara anything &mdash; she picks it up with full context.</p>`;
     return `<div class="thread-bar">${this._backBtnHtml()}` +
       `<span class="bar-title">New conversation</span>` +
-      `<span class="bar-actions">${this._autosendBtnHtml()}</span></div>` +
+      `<span class="bar-actions">${this._modelPickerHtml(this._composeModel)}${this._autosendBtnHtml()}</span></div>` +
       projectChip +
       `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span>` +
       hint + `</div>` +
@@ -593,7 +641,7 @@ class RetinueConversations extends HTMLElement {
       : '';
     return `<div class="thread-bar">${this._backBtnHtml()}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
-      `<span class="bar-actions">${this._autosendBtnHtml()}${autoBtn}${archiveBtn}</span></div>` +
+      `<span class="bar-actions">${this._modelPickerHtml(t.model)}${this._autosendBtnHtml()}${autoBtn}${archiveBtn}</span></div>` +
       `<div class="thread">${this._messagesHtml(t)}</div>` +
       this._inputRow('Reply …');
   }
@@ -932,6 +980,27 @@ class RetinueConversations extends HTMLElement {
     this.render();
   }
 
+  // Model dropdown changed. In the composer it just holds the choice for the
+  // thread we're about to create. In an open thread it's persisted server-side
+  // right away (takes effect on the next turn) so a page reload keeps it.
+  async _onModelChange(value) {
+    const model = value || '';
+    if (this._composing || !this._active) {
+      this._composeModel = model;
+      return;
+    }
+    // Optimistic: reflect it locally, then persist. On failure, re-render
+    // restores the server's value on the next poll.
+    if (this._thread) this._thread.model = model;
+    try {
+      await fetch(`/conversations/${this._active}/model`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+    } catch (_err) { /* next poll re-syncs the real value */ }
+    this.refresh();
+  }
+
   _appendToDraft(text) {
     const draftKey = this._active || (this._composing ? 'composer' : '');
     if (!draftKey) return;
@@ -1066,6 +1135,8 @@ class RetinueConversations extends HTMLElement {
     if (mic) mic.addEventListener('click', () => this._toggleRecord());
     const autosend = root.querySelector('[data-autosend]');
     if (autosend) autosend.addEventListener('click', () => this._toggleAutosend());
+    const modelSel = root.querySelector('[data-model]');
+    if (modelSel) modelSel.addEventListener('change', () => this._onModelChange(modelSel.value));
     const ap = root.querySelector('[data-autoplay]');
     if (ap) ap.addEventListener('click', () => this._toggleAutoplay());
     const fileInput = root.querySelector('[data-file]');
@@ -1213,6 +1284,15 @@ const CSS = `
           border-radius: 999px; color: var(--muted, #8b93a3); cursor: pointer;
           padding: 6px 12px; font-size: .78rem; white-space: nowrap; }
   .pill:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
+  .model-pick { flex: none; display: inline-flex; align-items: center; gap: 3px;
+                color: var(--muted, #8b93a3); }
+  .model-pick .mp-ico { font-size: .9rem; line-height: 1; }
+  .model-pick select { background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
+                       border: 1px solid var(--line, rgba(231, 235, 242, .08));
+                       border-radius: 999px; padding: 5px 8px; font-size: .74rem;
+                       max-width: 9.5rem; cursor: pointer; -webkit-appearance: none;
+                       appearance: none; }
+  .model-pick select:hover { border-color: var(--accent, #6ea8fe); }
   .thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
             display: flex; flex-direction: column; gap: 12px; padding: 12px 2px; }
   .msg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; }
