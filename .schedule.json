@@ -1,0 +1,12 @@
+{
+  "_comment": "Framework-owned base schedule, always loaded by scheduler.py alongside each chamber's .schedule.json. For cross-cutting jobs that belong to the framework itself, not to any single chamber. Chamber manifests cannot shadow these job ids.",
+  "jobs": [
+    {
+      "id": "agent-self-review",
+      "command": "python3 /workspace/scripts/agent-self-review.py",
+      "interval_seconds": 86400,
+      "enabled": true,
+      "run_at_start": false
+    }
+  ]
+}
