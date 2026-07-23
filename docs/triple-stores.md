@@ -78,6 +78,17 @@ executable invoked as `<converter> <input-file>` that emits Turtle on stdout;
 the source file keeps its own path-derived graph IRI. That's the entire
 contract — no plugin API, no registration.
 
+A second reference converter, `scripts/jsonld2ttl.py`, expands **JSON-LD** the
+same way (declare it with `{ "jsonld": "jsonld2ttl.py" }`). This is useful for a
+document a program also needs to read as *plain JSON* without an RDF library —
+the JSON-LD stays a normal JSON file to `json.load`, yet lands in the life store
+too. The framework's own conversation-model list
+(`config/conversation-models.jsonld`, read by `web-gateway.py`) is exactly this
+pattern: one source of truth, reachable both as JSON and over SPARQL. Note that
+`config/` is framework code, not a chamber, so QLever does not index it in the
+base stack — a deployment that wants those triples copies (or symlinks) the file
+into a chamber that declares the `jsonld` converter.
+
 The reference converter turns YAML frontmatter into triples. A project file is
 just a Markdown note a human is happy to open and edit:
 

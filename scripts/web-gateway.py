@@ -133,12 +133,22 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
 # Medic, Archivist, Ari) run on their own hard-wired models regardless.
 #
-# The list of offered models lives in ONE place: the default below, overridable
-# wholesale by the deployment via RETINUE_CONVERSATION_MODELS (a JSON array of
-# {"id","label"} objects). `id` is passed to `claude --model`; `label` is what
-# the dashboard shows. An empty/invalid override falls back to the default. The
-# empty-string id means "use the gateway's configured default" (CLAUDE_MODEL /
-# whatever `claude` resolves) — always offered first so a thread can defer.
+# The list of offered models lives in ONE place: a JSON-LD document,
+# `config/conversation-models.jsonld` (override the path with
+# RETINUE_CONVERSATION_MODELS_FILE). JSON-LD is a deliberate compromise: the
+# gateway reads it here as *plain JSON* (no RDF dependency on the serving path),
+# while the very same file — because it is valid JSON-LD — is indexed into the
+# life store by any chamber that declares a `jsonld` converter
+# (scripts/jsonld2ttl.py), so the offered models are also queryable over SPARQL.
+# One source of truth, two access paths.
+#
+# The document's `models` array holds {"id","label"} objects. `id` is passed to
+# `claude --model`; `label` is what the dashboard shows. The empty-string id
+# means "use the gateway's configured default" (CLAUDE_MODEL / whatever `claude`
+# resolves) — offered first so a thread can defer. A deployment may still
+# override the whole list inline via RETINUE_CONVERSATION_MODELS (a JSON array),
+# which wins over the file; an empty/invalid source falls back to the built-in
+# default below.
 _DEFAULT_CONVERSATION_MODELS = [
     {"id": "", "label": "Default"},
     {"id": "opus", "label": "Opus (deepest reasoning)"},
@@ -146,25 +156,62 @@ _DEFAULT_CONVERSATION_MODELS = [
     {"id": "haiku", "label": "Haiku (fastest)"},
 ]
 
+_DEFAULT_CONVERSATION_MODELS_FILE = str(
+    Path(__file__).resolve().parent.parent / "config" / "conversation-models.jsonld"
+)
+
+
+def _conversation_models_file() -> str:
+    return os.environ.get(
+        "RETINUE_CONVERSATION_MODELS_FILE", _DEFAULT_CONVERSATION_MODELS_FILE
+    )
+
+
+def _coerce_conversation_models(parsed: object) -> list[dict]:
+    """Normalise a parsed models array into validated {"id","label"} dicts.
+
+    Accepts the array itself or a JSON-LD document wrapping it under `models`.
+    Returns [] when nothing usable is present, so callers can fall back."""
+    if isinstance(parsed, dict):
+        parsed = parsed.get("models", [])
+    if not isinstance(parsed, list):
+        return []
+    models = []
+    for item in parsed:
+        if not isinstance(item, dict) or "id" not in item:
+            continue
+        mid = str(item["id"]).strip()
+        label = str(item.get("label") or mid or "Default").strip()
+        models.append({"id": mid, "label": label})
+    return models
+
 
 def _load_conversation_models() -> list[dict]:
+    # An inline env override wins over the file, for deployments that would
+    # rather not ship a file at all.
     raw = os.environ.get("RETINUE_CONVERSATION_MODELS", "").strip()
-    if not raw:
-        return list(_DEFAULT_CONVERSATION_MODELS)
-    try:
-        parsed = json.loads(raw)
-        models = []
-        for item in parsed:
-            if not isinstance(item, dict) or "id" not in item:
-                continue
-            mid = str(item["id"]).strip()
-            label = str(item.get("label") or mid or "Default").strip()
-            models.append({"id": mid, "label": label})
-        return models or list(_DEFAULT_CONVERSATION_MODELS)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        print("[web-gateway] invalid RETINUE_CONVERSATION_MODELS; using default list",
+    if raw:
+        try:
+            models = _coerce_conversation_models(json.loads(raw))
+            if models:
+                return models
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        print("[web-gateway] invalid RETINUE_CONVERSATION_MODELS; falling back to file/default",
               flush=True)
-        return list(_DEFAULT_CONVERSATION_MODELS)
+    # The JSON-LD file, read as plain JSON — the normal path.
+    path = _conversation_models_file()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            models = _coerce_conversation_models(json.load(fh))
+        if models:
+            return models
+        print(f"[web-gateway] no models in {path}; using default list", flush=True)
+    except FileNotFoundError:
+        pass
+    except (json.JSONDecodeError, OSError, ValueError):
+        print(f"[web-gateway] invalid {path}; using default list", flush=True)
+    return list(_DEFAULT_CONVERSATION_MODELS)
 
 
 CONVERSATION_MODELS = _load_conversation_models()
