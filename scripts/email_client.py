@@ -1063,42 +1063,66 @@ def delete_pending_draft(cfg, request_id):
         M.logout()
 
 
-def cmd_send(cfg, args):
+def _dispatch_message(cfg, msg, to, cc=None, bcc=None, attachments=None,
+                      account=None, user_approved=False, extra=None):
+    """Send *msg* through the send-control policy and return a result dict.
+
+    This is the single choke point for outgoing mail: `allow` (and `trust`
+    with --user-approved) send directly; everything else queues a pending
+    request for web approval. `send` and `reply` both go through here so a
+    reply can never bypass the verify/trust/allow gate. The direct-send path
+    captures the Sent-folder UID and echoes the outgoing Message-Id so the
+    caller can record them (e.g. in the triage status store) and later verify
+    the message really went out.
+    """
     policy = load_send_policy()
     category = resolve_category(cfg.user, policy)
-    account = args.account or "default"
-    msg = _build_message(cfg, args.to, args.subject, args.body,
-                         cc=args.cc, bcc=args.bcc, attachments=args.attach,
-                         in_reply_to=args.in_reply_to, references=args.references)
+    account = account or "default"
+    extra = extra or {}
 
-    send_directly = category == "allow" or (category == "trust" and args.user_approved)
+    send_directly = category == "allow" or (category == "trust" and user_approved)
     if send_directly:
-        recipients = list(args.to) + list(args.cc or []) + list(args.bcc or [])
+        recipients = list(to) + list(cc or []) + list(bcc or [])
         _smtp_send(cfg, msg, recipients)
         saved_sent = False
+        sent_uid = None
         if cfg.save_sent:
-            _append(cfg, cfg.sent_folder, msg, seen=True)
+            sent_uid = _append(cfg, cfg.sent_folder, msg, seen=True)
             saved_sent = True
-        print(json.dumps({
+        return {
             "sent": True, "category": category,
-            "approved_by_model": bool(args.user_approved) if category == "trust" else False,
-            "to": args.to, "cc": args.cc or [], "bcc": args.bcc or [],
-            "subject": args.subject, "attachments": args.attach or [],
+            "approved_by_model": bool(user_approved) if category == "trust" else False,
+            "to": to, "cc": cc or [], "bcc": bcc or [],
+            "subject": msg.get("Subject") or "", "attachments": attachments or [],
             "saved_to_sent": saved_sent,
-        }, ensure_ascii=False))
-        return
+            "message_id": msg.get("Message-Id"),
+            "sent_uid": sent_uid,
+            **extra,
+        }
 
     # verify, or trust without --user-approved: register a pending request.
     request_id = register_pending_send(cfg, msg, category)
-    print(json.dumps({
+    return {
         "sent": False, "pending": True, "category": category,
         "request_id": request_id, "account": account,
         "approval_url": approval_url(account, request_id),
-        "to": args.to, "cc": args.cc or [], "bcc": args.bcc or [],
-        "subject": args.subject, "attachments": args.attach or [],
+        "to": to, "cc": cc or [], "bcc": bcc or [],
+        "subject": msg.get("Subject") or "", "attachments": attachments or [],
+        "message_id": msg.get("Message-Id"),
         "note": ("Web approval required before this e-mail is sent. "
                  "Share the approval_url with the user."),
-    }, ensure_ascii=False))
+        **extra,
+    }
+
+
+def cmd_send(cfg, args):
+    msg = _build_message(cfg, args.to, args.subject, args.body,
+                         cc=args.cc, bcc=args.bcc, attachments=args.attach,
+                         in_reply_to=args.in_reply_to, references=args.references)
+    result = _dispatch_message(cfg, msg, args.to, cc=args.cc, bcc=args.bcc,
+                               attachments=args.attach, account=args.account,
+                               user_approved=args.user_approved)
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def cmd_pending(cfg, args):
@@ -1170,6 +1194,67 @@ def cmd_forward(cfg, args):
         "forwarded": str(args.uid), "to": args.to, "subject": subject,
         "attachments": forwarded, "saved_to_sent": cfg.save_sent,
     }, ensure_ascii=False))
+
+
+def _reply_subject(orig_subject):
+    """A reply subject: keep an existing Re:/AW:, otherwise prefix 'Re: '."""
+    s = (orig_subject or "").strip()
+    return s if s.lower().startswith(("re:", "aw:")) else f"Re: {s}"
+
+
+def cmd_reply(cfg, args):
+    """Reply to a message by UID, deriving threading headers from the source.
+
+    The whole point of this verb: In-Reply-To / References are computed from
+    the source message's own Message-ID and References chain, so a reply is
+    always correctly threaded without the caller having to remember to pass
+    --in-reply-to. That threading is what the "already-answered" check relies
+    on; omitting it (as happened once in a free-form dashboard reply) caused a
+    duplicate proposal. Recipient and subject default to the source too, and
+    can be overridden. Goes through the same send-control policy as `send`.
+    """
+    M = imap_connect(cfg)
+    imap_select(M, args.folder, readonly=True)
+    typ, data = M.uid("fetch", str(args.uid), "(RFC822)")
+    if typ != "OK" or not data or data[0] is None:
+        die(f"message uid {args.uid} not found in {args.folder}")
+    raw = next(item[1] for item in data if isinstance(item, tuple))
+    M.logout()
+    orig = _parse_message(raw)
+
+    src_mid = (orig.get("Message-ID") or "").strip()
+    if not src_mid:
+        die(f"source message uid {args.uid} has no Message-ID to thread against; "
+            "use `send` with an explicit subject instead")
+
+    # Reply goes to the source's Reply-To if present, else its From. An explicit
+    # --to overrides (e.g. replying to a list post off-list).
+    if args.to:
+        to = args.to
+    else:
+        reply_target = _decode(orig.get("Reply-To")) or _decode(orig.get("From"))
+        _, addr = parseaddr(reply_target or "")
+        if not addr:
+            die(f"could not determine a reply address from uid {args.uid}; pass --to")
+        to = [addr]
+
+    subject = args.subject or _reply_subject(_decode(orig.get("Subject")))
+
+    # References = the source's own References chain (or its In-Reply-To) plus
+    # the source Message-ID itself; In-Reply-To = the source Message-ID. This is
+    # the RFC 5322 threading contract.
+    prior_refs = (orig.get("References") or orig.get("In-Reply-To") or "").split()
+    references = " ".join(prior_refs + [src_mid])
+
+    msg = _build_message(cfg, to, subject, args.body,
+                         cc=args.cc, bcc=args.bcc, attachments=args.attach,
+                         in_reply_to=src_mid, references=references)
+    result = _dispatch_message(
+        cfg, msg, to, cc=args.cc, bcc=args.bcc, attachments=args.attach,
+        account=args.account, user_approved=args.user_approved,
+        extra={"in_reply_to": src_mid, "replied_to_uid": str(args.uid)},
+    )
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def cmd_folders(cfg, args):
@@ -1295,6 +1380,27 @@ def main():
     sp.add_argument("--subject", help="override subject (default: 'Fwd: ...')")
     sp.add_argument("--prepend", help="intro text added above the forwarded body")
     sp.set_defaults(func=cmd_forward)
+
+    sp = sub.add_parser("reply", help="reply to a message by UID with correct "
+                                      "threading headers derived from the source")
+    sp.add_argument("--uid", required=True,
+                    help="UID of the message being replied to (its Message-ID, "
+                         "subject and sender drive the reply's headers)")
+    sp.add_argument("--folder", default="INBOX",
+                    help="folder the source message is in (default INBOX)")
+    sp.add_argument("--body", default="")
+    sp.add_argument("--to", nargs="+",
+                    help="override recipient(s) (default: source Reply-To/From)")
+    sp.add_argument("--cc", nargs="+")
+    sp.add_argument("--bcc", nargs="+")
+    sp.add_argument("--subject",
+                    help="override subject (default: 'Re: ' + source subject)")
+    sp.add_argument("--attach", nargs="+", help="file path(s)")
+    sp.add_argument("--user-approved", dest="user_approved", action="store_true",
+                    help="assert the user approved this send (only honoured for "
+                         "'trust' addresses; ignored for 'allow', insufficient "
+                         "for 'verify')")
+    sp.set_defaults(func=cmd_reply)
 
     sp = sub.add_parser("folders", help="list available IMAP folders")
     sp.set_defaults(func=cmd_folders)
