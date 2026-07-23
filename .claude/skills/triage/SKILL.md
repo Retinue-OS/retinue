@@ -225,9 +225,16 @@ Ara picks up each thread and carries out what was approved, then writes status
 
 - **Archive / delete** → apply per channel (e-mail `move`/delete; messaging archive),
   honouring named exceptions.
-- **Reply** → for e-mail respect `EMAIL_SEND_POLICY`: `flag --read` **before**
-  sending, set `--in-reply-to`/`--references`, `--user-approved` only for approved
-  `trust` addresses; `verify` always goes through web approval.
+- **Reply** → for e-mail use `email_client.py reply --uid <UID>`, which derives
+  the threading headers (`In-Reply-To`/`References`) from the source so a reply is
+  never sent unthreaded (an unthreaded reply defeats the already-answered check and
+  gets re-proposed as a duplicate). `flag --read` **before** sending; respect
+  `EMAIL_SEND_POLICY` (`--user-approved` only for approved `trust` addresses;
+  `verify` always goes through web approval). On a direct send `reply` returns
+  `sent_uid` + `message_id`: **record them in the status file** (`sent_uid`,
+  `sent_message_id`) so a later run can verify the reply actually went out instead
+  of trusting the `resolved` flag alone. A `verify` reply only becomes `resolved`
+  once its pending send is approved — until then keep it non-terminal.
 - **Action** → do the concrete thing; if it advanced a project, append to its log.
 
 **Inbox-zero:** engaging a conversation — accepting the proposal or giving an
@@ -254,7 +261,9 @@ mail has left the INBOX.
   not a mailbox flag. One file per message; filename = stable id (Message-ID for
   e-mail; `channel:chat:timestamp` for messaging); content = `status` +
   `conversation_id` + `disposition` + timestamps (`proposed`, `omnibus`, `last_nudge`,
-  `resolved`). Write a status only once a message has actually been proposed,
+  `resolved`). For a sent reply also record `sent_uid` + `sent_message_id` (from
+  `reply`'s output) so the send is verifiable against the Sent folder, not merely
+  asserted. Write a status only once a message has actually been proposed,
   bundled, or resolved — never on mere reading.
 - **Reconcile every run** (Phase 1): the INBOX / chat listing is authoritative for
   presence; drop or `resolved`-mark store entries whose message is gone. Treat any
