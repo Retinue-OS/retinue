@@ -136,6 +136,17 @@ generate_marketplace() {
 generate_marketplace
 echo "[plugin] Generated marketplace.json ($(jq '.plugins | length' "$MARKETPLACE") chamber plugin(s))."
 
+# ── Emit the conversation-model list into the life store ────────────
+# The dashboard's per-conversation model picker reads its options from the
+# hand-editable JSON-LD at config/conversation-models.jsonld (the gateway loads
+# it as plain JSON, no RDF on the serving path). This derives the same list into
+# chambers/_generated/conversation-models.nt so QLever indexes it too — no
+# deployment converter or file-copy needed. Deterministic + write-if-changed, so
+# an unchanged list triggers no qlever-dir rebuild. The generated dir is created
+# on demand, so this is independent of any other _generated emitter's presence.
+python3 /workspace/scripts/emit-conversation-models.py || \
+  echo "[plugin] warning: conversation-model registry generation failed (non-fatal)"
+
 # ── Register chamber plugins (marketplace lives at /workspace) ───────
 # Non-fatal: on first-ever start claude may not be configured yet.
 # `claude plugin install` is a no-op once the plugin's version is cached, and the
