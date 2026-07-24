@@ -137,10 +137,11 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # `config/conversation-models.jsonld` (override the path with
 # RETINUE_CONVERSATION_MODELS_FILE). JSON-LD is a deliberate compromise: the
 # gateway reads it here as *plain JSON* (no RDF dependency on the serving path),
-# while the very same file — because it is valid JSON-LD — is indexed into the
-# life store by any chamber that declares a `jsonld` converter
-# (scripts/jsonld2ttl.py), so the offered models are also queryable over SPARQL.
-# One source of truth, two access paths.
+# while the very same list is also queryable over SPARQL. That second path is
+# automatic — a boot emitter (scripts/emit-conversation-models.py, sibling of
+# discover-agents.py) derives the list into chambers/_generated/, which QLever
+# indexes, so no deployment need declare a `jsonld` converter or copy the source
+# into a chamber. One hand-edited source, two access paths, no drift.
 #
 # The document's `models` array holds {"id","label"} objects. `id` is passed to
 # `claude --model`; `label` is what the dashboard shows. The empty-string id

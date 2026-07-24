@@ -436,10 +436,13 @@ models regardless of the selection. The offered list lives in one place — a
 **JSON-LD document**, `config/conversation-models.jsonld` (override the path with
 `RETINUE_CONVERSATION_MODELS_FILE`). JSON-LD is a deliberate compromise: the
 gateway reads the file as **plain JSON** (`json.load`, no RDF dependency on the
-serving path), while the *same file*, being valid JSON-LD, is indexed into the
-life store by any chamber that declares a `jsonld` converter
-(`scripts/jsonld2ttl.py`, a generic rdflib expander) — so the offered models are
-**also queryable over SPARQL** without a second, drift-prone copy. A deployment
+serving path), while the *same list* is **also queryable over SPARQL** without a
+second, drift-prone copy. That second path is automatic: a boot emitter
+(`scripts/emit-conversation-models.py`, the sibling of `discover-agents.py`)
+derives the list into `chambers/_generated/conversation-models.nt`, which QLever
+indexes — no deployment need declare a `jsonld` converter or copy the source into
+a chamber. (`scripts/jsonld2ttl.py`, a generic rdflib expander, remains available
+for the manual converter route.) A deployment
 may still override the whole list inline via **`RETINUE_CONVERSATION_MODELS`** (a
 JSON array of `{"id","label"}`, which wins over the file); either way `id` is
 passed to `claude --model` and the empty-string id means "use the gateway

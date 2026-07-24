@@ -84,10 +84,20 @@ document a program also needs to read as *plain JSON* without an RDF library —
 the JSON-LD stays a normal JSON file to `json.load`, yet lands in the life store
 too. The framework's own conversation-model list
 (`config/conversation-models.jsonld`, read by `web-gateway.py`) is exactly this
-pattern: one source of truth, reachable both as JSON and over SPARQL. Note that
-`config/` is framework code, not a chamber, so QLever does not index it in the
-base stack — a deployment that wants those triples copies (or symlinks) the file
-into a chamber that declares the `jsonld` converter.
+pattern: one source of truth, reachable both as JSON and over SPARQL.
+
+`config/`, though, is framework code, not a chamber, so QLever does not index it
+directly. Rather than make a deployment copy the file into a chamber and declare
+the converter, a **boot emitter** closes the gap automatically — the same
+pattern `discover-agents.py` uses for the agent registry.
+`scripts/emit-conversation-models.py` runs at container start, resolves the
+model list exactly as the gateway does (inline env override → file → built-in
+default), and writes it as deterministic, blank-node-free N-Triples to
+`chambers/_generated/conversation-models.nt`. That directory sits under the
+chambers volume (so QLever indexes it) but in a framework-owned folder in no
+chamber's git repo; it is created on demand and rewritten only when the bytes
+change, so an unchanged list triggers no rebuild. The hand-edited JSON-LD stays
+the single source; the `.nt` is disposable generated output — never edit it.
 
 The reference converter turns YAML frontmatter into triples. A project file is
 just a Markdown note a human is happy to open and edit:
