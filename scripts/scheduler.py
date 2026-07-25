@@ -48,6 +48,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
+# Framework-owned base manifest, always loaded alongside the per-chamber ones.
+# Holds cross-cutting jobs that belong to the framework itself (e.g. agent
+# self-review), not to any single chamber.
+BASE_SCHEDULE = Path(os.environ.get("BASE_SCHEDULE") or "/workspace/.schedule.json")
 TICK = int(os.environ.get("SCHEDULER_TICK_SECONDS", "30"))
 JOB_TIMEOUT = int(os.environ.get("SCHEDULER_JOB_TIMEOUT", "900"))
 STATE_DIR = Path(os.environ.get("SCHEDULER_STATE_DIR", "/root/.retinue/scheduler"))
@@ -114,7 +118,11 @@ def load_jobs() -> list[dict]:
     """Collect and validate jobs from every repo's .schedule.json."""
     jobs: list[dict] = []
     seen: set[str] = set()
-    for manifest in sorted(glob.glob(str(CHAMBERS_DIR / "*" / ".schedule.json"))):
+    # Framework base manifest first, then every chamber's. A chamber cannot
+    # shadow a base job id (first-seen wins, and the duplicate is logged).
+    manifests = [str(BASE_SCHEDULE)] if BASE_SCHEDULE.is_file() else []
+    manifests += sorted(glob.glob(str(CHAMBERS_DIR / "*" / ".schedule.json")))
+    for manifest in manifests:
         try:
             with open(manifest, encoding="utf-8") as fh:
                 data = json.load(fh)

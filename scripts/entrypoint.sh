@@ -147,6 +147,15 @@ echo "[plugin] Generated marketplace.json ($(jq '.plugins | length' "$MARKETPLAC
 python3 /workspace/scripts/emit-conversation-models.py || \
   echo "[plugin] warning: conversation-model registry generation failed (non-fatal)"
 
+# ── Emit the AI-agent registry into the life store ──────────────────
+# Same discovery family as the marketplace, widened to the whole agent roster
+# (core personas are not plugins). Types each agent URI kb:AiAgent so the agent
+# self-review gate can distinguish agents from human/external actors with a
+# store-native join. Deterministic + write-if-changed, so an unchanged roster
+# does not trigger a qlever-dir rebuild.
+python3 /workspace/scripts/discover-agents.py || \
+  echo "[plugin] warning: agent registry generation failed (non-fatal)"
+
 # ── Register chamber plugins (marketplace lives at /workspace) ───────
 # Non-fatal: on first-ever start claude may not be configured yet.
 # `claude plugin install` is a no-op once the plugin's version is cached, and the
