@@ -219,6 +219,48 @@ noise. The manifest is re-read every tick, so adding or editing a
 `.schedule.json` takes effect without a restart. Tunables:
 `SCHEDULER_TICK_SECONDS`, `SCHEDULER_JOB_TIMEOUT`, `SCHEDULER_STATE_DIR`.
 
+Besides the per-chamber manifests, the scheduler always loads a **framework base
+manifest** at `/workspace/.schedule.json` for cross-cutting jobs that belong to
+the framework itself rather than any single chamber. A chamber manifest cannot
+shadow a base job id (first-seen wins).
+
+## Agent self-review (proactivity over own backlog)
+
+Every other scheduled job is **reactive** — it fires on inbound mail, an inbound
+message, or a calendar date. Nothing wakes an agent to work down projects where
+the ball is already in *its* court, so such a project stays invisible until a
+human pokes it. The **`agent-self-review`** base job closes that gap.
+
+It is a scheduler `command` job — so the scheduler spends **no Claude credits**
+to invoke it — that runs `scripts/agent-self-review.py`. The script's gate is a
+plain SPARQL `SELECT` against the life store (also free): unresolved `kb:Project`
+whose `kb:currentActor` is typed `kb:AiAgent`. An **empty result spawns nothing**
+— zero credits when no agent owes work. Only on a non-empty result does it start
+a single `claude -p` session, handed the already-fetched tuples so the agent does
+not re-query; the agent then does each next action or opens a dashboard
+conversation with a concrete proposal, routing each project to its owning agent.
+
+Two facts make this work, both **derived, never hand-maintained**:
+
+- **Who is an AI agent** is store-native. At boot, `scripts/discover-agents.py`
+  walks the same three agent locations the entrypoint knows (core personas in
+  `/workspace/agents/`, the core subagent in `/workspace/.claude/agents/`, and
+  chamber agents in `chambers/*/.retinue/agents/`), plus Ara (the main-session
+  persona, defined here in `CLAUDE.md`, so seeded explicitly), and emits an
+  N-Triples registry typing each `urn:retinue:actor:<name>` as `kb:AiAgent`. It
+  writes to a framework-owned path under the chambers root (`_generated/`) so the
+  life store indexes it. Human/external actors (`reto`, an `iv-stelle`, a
+  correspondent) have no agent definition, so they never match — the AI-vs-human
+  distinction falls out of the join, not a list. The emit is **deterministic**
+  (sorted N-Triples, no blank nodes) and **write-if-changed**, so an unchanged
+  roster never triggers a qlever-dir rebuild.
+- **The actor URI is the agent's basename.** When you park a project on an agent,
+  set `current_actor: <agent-basename>` in its frontmatter (`coach`, `ari`,
+  `ara`, …) — the same string the registry types. This is the one convention the
+  mechanism depends on: a project parked on an agent under any other name is
+  invisible to the sweep. Whenever you leave a project waiting on yourself or a
+  subagent, set `current_actor` accordingly so it is picked up.
+
 ## Outbound messaging (Signal push)
 
 The Signal gateway is bidirectional. Beyond answering inbound messages, it

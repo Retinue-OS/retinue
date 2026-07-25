@@ -62,6 +62,21 @@ status file whose message is **no longer in the INBOX**, mark it `resolved` (the
 user moved/handled it elsewhere) and stop tracking it. This bounds drift and lets
 in-progress office mail legitimately sit in the INBOX without being re-proposed.
 
+**Enforce the inbox-zero invariant on every run — `resolved` ⇔ not in INBOX.**
+The two reconcile directions above are not symmetric in effect: the first leaves
+finished mail physically in the mailbox. So add a third pass that repairs
+`store says done → mailbox still shows it`. For any INBOX message whose status is
+**terminal** — `resolved`, or an `engaged` reply whose only remaining step is an
+owner web-approval already requested at `/sends` — the archive/delete step was
+skipped or deferred and never re-driven. Re-drive it now: `flag --read` then `move`
+it to its disposition folder (`Archive` for `archive`/`reply`-sent/`action`-done,
+delete for `delete`), exactly as Phase 6 would. This is the safety net that makes
+the invariant hold even when an execution earlier missed its move — e.g. the
+already-answered path (which proposes no reply and so never reaches Phase 6's move)
+or a verify-queued send (deferred until approval, then forgotten). Only genuinely
+non-terminal states (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item
+still awaiting *user* input) legitimately stay in the INBOX.
+
 **Messaging** — recent chats, then new messages per chat (Signal / WhatsApp / SMS),
 diffed against the store the same way:
 
@@ -210,15 +225,33 @@ Ara picks up each thread and carries out what was approved, then writes status
 
 - **Archive / delete** → apply per channel (e-mail `move`/delete; messaging archive),
   honouring named exceptions.
-- **Reply** → for e-mail respect `EMAIL_SEND_POLICY`: `flag --read` **before**
-  sending, set `--in-reply-to`/`--references`, `--user-approved` only for approved
-  `trust` addresses; `verify` always goes through web approval.
+- **Reply** → for e-mail use `email_client.py reply --uid <UID>`, which derives
+  the threading headers (`In-Reply-To`/`References`) from the source so a reply is
+  never sent unthreaded (an unthreaded reply defeats the already-answered check and
+  gets re-proposed as a duplicate). `flag --read` **before** sending; respect
+  `EMAIL_SEND_POLICY` (`--user-approved` only for approved `trust` addresses;
+  `verify` always goes through web approval). On a direct send `reply` returns
+  `sent_uid` + `message_id`: **record them in the status file** (`sent_uid`,
+  `sent_message_id`) so a later run can verify the reply actually went out instead
+  of trusting the `resolved` flag alone. A `verify` reply only becomes `resolved`
+  once its pending send is approved — until then keep it non-terminal.
 - **Action** → do the concrete thing; if it advanced a project, append to its log.
 
 **Inbox-zero:** engaging a conversation — accepting the proposal or giving an
 alternative instruction — resolves the underlying e-mail out of the INBOX (archived /
 deleted / filed). When every message is engaged or bulk-resolved, the INBOX is empty.
 This holds without any e-mail client in the loop.
+
+**Writing `resolved` and moving the mail are one atomic step, never two.** A status
+must not reach a terminal value while the message is still in the INBOX. Whenever you
+set `resolved` (or resolve an already-answered thread that needs no reply), issue the
+`flag --read` + `move`-out-of-INBOX in the same step and record the destination folder
+in the status note. If the move fails, keep the status non-terminal and retry next run.
+Phase 1's third reconcile pass is the backstop, but the move belongs here at the moment
+of resolution — the backstop only exists to repair past drift, not to license skipping
+it. The same applies to the already-answered branch (Phase 2) and verify-queued replies
+(above): a reply queued at `/sends` is not resolved until it is sent **and** the source
+mail has left the INBOX.
 
 ---
 
@@ -228,7 +261,9 @@ This holds without any e-mail client in the loop.
   not a mailbox flag. One file per message; filename = stable id (Message-ID for
   e-mail; `channel:chat:timestamp` for messaging); content = `status` +
   `conversation_id` + `disposition` + timestamps (`proposed`, `omnibus`, `last_nudge`,
-  `resolved`). Write a status only once a message has actually been proposed,
+  `resolved`). For a sent reply also record `sent_uid` + `sent_message_id` (from
+  `reply`'s output) so the send is verifiable against the Sent folder, not merely
+  asserted. Write a status only once a message has actually been proposed,
   bundled, or resolved — never on mere reading.
 - **Reconcile every run** (Phase 1): the INBOX / chat listing is authoritative for
   presence; drop or `resolved`-mark store entries whose message is gone. Treat any
