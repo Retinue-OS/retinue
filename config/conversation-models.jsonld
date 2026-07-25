@@ -1,0 +1,17 @@
+{
+  "@context": {
+    "rn": "https://retinue-os.github.io/ns/conversation#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "models": { "@id": "rn:offersModel", "@container": "@set" },
+    "id": "rn:modelId",
+    "label": "rdfs:label"
+  },
+  "@id": "rn:conversationModelList",
+  "@type": "rn:ConversationModelList",
+  "models": [
+    { "@type": "rn:ConversationModel", "id": "", "label": "Default" },
+    { "@type": "rn:ConversationModel", "id": "opus", "label": "Opus (deepest reasoning)" },
+    { "@type": "rn:ConversationModel", "id": "sonnet", "label": "Sonnet (balanced)" },
+    { "@type": "rn:ConversationModel", "id": "haiku", "label": "Haiku (fastest)" }
+  ]
+}
