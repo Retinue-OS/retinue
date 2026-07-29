@@ -506,7 +506,10 @@ remote-control client.
    `.qlever/converters.json`, which is how Markdown frontmatter becomes
    queryable — all chambers equally, and serves it on `qlever-life:7001`
    (network; publish a host port via the deployment override). It watches for
-   filesystem changes and rebuilds blue-green in 15–20 s for a small file.
+   filesystem changes and rebuilds blue-green; new data is queryable in tens
+   of seconds (measured 15–25 s across six rebuilds of a small chamber,
+   2026-07-19 and 2026-07-25 — it grows with the chamber, so measure your own
+   if it matters).
    Note that only a change to a *native RDF* file currently starts that clock:
    a Markdown edit waits for an unrelated RDF change or a restart
    ([qlever-dir#3](https://github.com/retinue-os/qlever-dir/issues/3)).
