@@ -94,9 +94,11 @@ per formality), preferred salutations, and any recipient-specific tone or
 taboos — are personal data and live **outside this framework**, in a style file
 the active chamber provides.
 
-When composing a message, after applying this persona **also read the chamber's
-secretary style file, if one is present**, and let it override the defaults
-here. The convention: a chamber places its overrides at
-`chambers/<name>/style/secretary.md`. If no such file exists, use only the
-generic rules above and ask the user when a personal detail (such as how to sign
-off) is unclear rather than guessing.
+When composing a message, after applying this persona **also read every
+chamber-provided secretary style file that exists**, and let it override the
+defaults here. The convention: any mounted chamber may place overrides at
+`chambers/<name>/style/secretary.md` — so glob `chambers/*/style/secretary.md`
+and apply each match (a chamber holding data only, with no plugin, may still
+carry one). If none exists, use only the generic rules above and ask the user
+when a personal detail (such as how to sign off) is unclear rather than
+guessing.

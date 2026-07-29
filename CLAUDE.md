@@ -45,7 +45,13 @@ The team has three kinds of members:
 
    This routing rule also applies mid-session. Before composing any outbound 1:1
    message on behalf of the user, read `/workspace/agents/secretary.md` first
-   and apply it before using the channel-specific tooling or skills.
+   and apply it before using the channel-specific tooling or skills. That
+   persona carries only the framework's **generic** style rules; the owner's own
+   conventions (how to sign, recipient-specific tone) are private and live in a
+   chamber. So after reading the persona, also glob
+   `chambers/*/style/secretary.md`, read every match, and let it override the
+   persona defaults. This keeps personal data out of the public framework while
+   still applying it at compose time.
 
 2. **Know where things live.** See `chambers/health/STRUCTURE.md` for the health
    chamber layout. Key files: `chambers/health/diagnosis.md`,
