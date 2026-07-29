@@ -37,7 +37,9 @@ Defines these core compose services:
   automatically on filesystem changes. See
   [`docs/triple-stores.md`](docs/triple-stores.md) for what this makes possible
   — querying Markdown frontmatter, sensor CSVs at scale, and why some data gets
-  its own store.
+  its own store. For a worked look at the named-graph half of that design, with
+  queries run against a live store and its limits stated,
+  see [Provenance by path](https://github.com/Retinue-OS/retinue-os-chamber/blob/main/writing/provenance-by-path.md).
 
 A deployment can add further services in its override — for example a
 `qlever-static/`-based endpoint for one large, rarely-changing N-Triples file
@@ -500,9 +502,14 @@ remote-control client.
 3. Python dependencies from every chamber's `requirements.txt` (if present)
    are installed in the `retinue` container.
 4. The `qlever-life` service indexes every `.nt`/`.ttl`/`.n3` file in the shared
-   chambers volume — all chambers equally — and serves it on `qlever-life:7001`
+   chambers volume — plus any extension a chamber declares a converter for in
+   `.qlever/converters.json`, which is how Markdown frontmatter becomes
+   queryable — all chambers equally, and serves it on `qlever-life:7001`
    (network; publish a host port via the deployment override). It watches for
-   filesystem changes and rebuilds blue-green within ~15 s.
+   filesystem changes and rebuilds blue-green in 15–20 s for a small file.
+   Note that only a change to a *native RDF* file currently starts that clock:
+   a Markdown edit waits for an unrelated RDF change or a restart
+   ([qlever-dir#3](https://github.com/retinue-os/qlever-dir/issues/3)).
 5. Git hooks are installed in every chamber that is a git repository.
 6. For every chamber with a `.refresh.json`, the background refresh dispatcher
    is started (see `scripts/refresh.py`).
