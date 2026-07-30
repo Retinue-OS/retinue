@@ -18,6 +18,7 @@ directory ships two runnable example chambers that double as the canonical
     .claude-plugin/plugin.json      ← plugin identity: name + description
     agents/<agent>.md               ← one or more subagents (frontmatter + body)
     skills/                         ← optional skills
+    INSTRUCTIONS.md                 ← optional session-start guidance for Ara
   .schedule.json                    ← optional recurring jobs (scheduler.py)
   .refresh.json                     ← optional external-data refresh (refresh.py)
   ...                               ← the chamber's data (e.g. .nt/.ttl, docs)
@@ -28,6 +29,17 @@ copies only the plugin payload, not the chamber's data. Retinue **autodetects**
 the plugin: if `chambers/<name>/.retinue/.claude-plugin/plugin.json` exists, it
 is registered as a plugin and its `name`/`description` are read from there
 (if `name` is absent, the chamber's directory name is used).
+
+`INSTRUCTIONS.md` is how a chamber hands **orchestrator-level guidance** to Ara
+(the coordinating agent): where its data lives, how to route to its subagents,
+and which of its paths may go straight to `main`. Chamber-specific facts do not
+belong in the framework `CLAUDE.md`; a chamber carries its own instead. At
+container start the entrypoint concatenates every mounted chamber's
+`.retinue/INSTRUCTIONS.md` into `/workspace/.retinue/chamber-instructions.md`,
+which the framework `CLAUDE.md` imports — so a chamber's instructions load into
+every session automatically. It is optional and independent of the plugin: a
+chamber may ship `INSTRUCTIONS.md` with no plugin, or a plugin with no
+`INSTRUCTIONS.md`. Both example chambers ship one as a reference.
 
 ## Declaring a chamber
 
