@@ -11,7 +11,7 @@
  * cached credentials automatically to these same-origin GETs, so both install
  * and runtime fetches work once you have authenticated once.
  */
-const SHELL = 'retinue-shell-v15';
+const SHELL = 'retinue-shell-v16';
 const DATA = 'retinue-data-v1';
 const SHELL_ASSETS = [
   '/',

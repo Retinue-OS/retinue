@@ -46,11 +46,20 @@ const CSS = `
        text-transform: uppercase; color: var(--muted, #8b93a3); margin: 14px 0 8px; }
   .group-label:first-of-type { margin-top: 2px; }
   ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
-  /* Each row links to the project's own page (view, edit, discuss). */
+  /* Each row links to the project's own page (view, edit, discuss). Rows are
+     tap targets, not prose: suppress text selection and the iOS long-press
+     callout so a finger resting on a row while scrolling never starts a
+     selection drag instead of the scroll. */
   li a { display: block; padding: 8px 10px; border-radius: 10px;
          background: var(--card-2, #1c2230); text-decoration: none;
-         -webkit-tap-highlight-color: transparent; }
-  li a:hover { outline: 1px solid var(--accent, #6ea8fe); }
+         -webkit-tap-highlight-color: transparent;
+         user-select: none; -webkit-user-select: none;
+         -webkit-touch-callout: none; touch-action: manipulation; }
+  /* Hover affordance only where a hover pointer exists — on touch screens the
+     sticky :hover outline reads as the row being "selected". */
+  @media (hover: hover) {
+    li a:hover { outline: 1px solid var(--accent, #6ea8fe); }
+  }
   /* "Your move": accent bar on the left, like an unread/active marker. */
   li.mine a { border-left: 3px solid var(--accent, #6ea8fe); }
   li.waiting a { border-left: 3px solid transparent; }

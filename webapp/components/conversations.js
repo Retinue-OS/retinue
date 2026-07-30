@@ -1224,13 +1224,28 @@ const CSS = `
   .muted { color: var(--muted, #8b93a3); margin: 4px 0; }
 
   /* ── List view ─────────────────────────────────────────────────────────── */
-  .tabs { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+  /* On phones the PAGE is the scroller (see styles.css), so .tabs must NOT be
+     a scroll container there: a touch that starts on a row would latch onto it
+     (any subpixel overflow makes it "scrollable") and overscroll-behavior:
+     contain would then swallow the gesture instead of chaining it to the page
+     — leaving only the thin margin outside the card scrollable by finger.
+     Only the wide layout, where the frame is fixed and the list genuinely
+     scrolls internally, makes it a (contained) scroller. */
+  .tabs { flex: 1; min-height: 0;
           display: flex; flex-direction: column; gap: 8px; padding: 2px; }
+  @media (min-width: 1000px) and (min-height: 480px) {
+    .tabs { overflow-y: auto; overscroll-behavior: contain; }
+  }
   .tab { flex: none; text-align: left; background: var(--card-2, #1c2230); border: 0;
          border-radius: 14px; padding: 11px 13px; color: var(--fg, #e7ebf2); cursor: pointer;
          display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline;
-         gap: 2px 10px; -webkit-tap-highlight-color: transparent; }
-  .tab:hover { outline: 1px solid var(--accent, #6ea8fe); }
+         gap: 2px 10px; -webkit-tap-highlight-color: transparent;
+         user-select: none; -webkit-user-select: none; touch-action: manipulation; }
+  /* Hover affordance only where a hover pointer exists — on touch screens the
+     sticky :hover outline reads as the row being "selected" by a scroll touch. */
+  @media (hover: hover) {
+    .tab:hover { outline: 1px solid var(--accent, #6ea8fe); }
+  }
   .tab.unread { box-shadow: inset 3px 0 0 0 var(--accent, #6ea8fe); }
   .t-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-weight: 600; }
   .t-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
