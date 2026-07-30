@@ -42,6 +42,10 @@ general_settings:
   # header, so the proxy key is passed in this custom header instead
   # (sent via ANTHROPIC_CUSTOM_HEADERS).
   litellm_key_header_name: x-litellm-api-key
+  # Persist models added at runtime (admin UI / POST /model/new) to the DB and
+  # load them on start. Without this, runtime-added models are lost on restart
+  # and the "add a pickable model in the admin UI" workflow doesn't work.
+  store_model_in_db: true
 
 litellm_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
