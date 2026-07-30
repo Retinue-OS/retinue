@@ -136,6 +136,45 @@ generate_marketplace() {
 generate_marketplace
 echo "[plugin] Generated marketplace.json ($(jq '.plugins | length' "$MARKETPLACE") chamber plugin(s))."
 
+# ── Aggregate chamber-provided session instructions ─────────────────
+# Chamber-specific facts (where a chamber's data lives, how to route to its
+# agents, which of its paths may go straight to `main`) do not belong in the
+# framework CLAUDE.md. Instead a chamber ships them at
+# chambers/<name>/.retinue/INSTRUCTIONS.md (with or without a plugin). Here we
+# concatenate the INSTRUCTIONS.md of every mounted chamber into a single
+# generated file that the framework CLAUDE.md imports (@ import syntax), so a
+# chamber's guidance is in context in every session — the main remote-control
+# session, scheduled `claude -p` jobs, and dashboard conversation turns, which
+# all run from /workspace. The file lives under /workspace (inside the session
+# working directory) so the import needs no approval prompt. It is always
+# (re)written — present but effectively empty when no chamber ships one — so the
+# import in CLAUDE.md never dangles.
+CHAMBER_INSTRUCTIONS="/workspace/.retinue/chamber-instructions.md"
+generate_chamber_instructions() {
+  local dir cname f
+  mkdir -p "$(dirname "$CHAMBER_INSTRUCTIONS")"
+  {
+    echo "# Chamber instructions (generated)"
+    echo
+    echo "Concatenated at container start from each mounted chamber's"
+    echo "\`.retinue/INSTRUCTIONS.md\`. Do not edit here — edit the chamber source."
+    for dir in "$CHAMBERS_DIR"/*/; do
+      [[ -d "$dir" ]] || continue
+      f="${dir}.retinue/INSTRUCTIONS.md"
+      [[ -f "$f" ]] || continue
+      cname="$(basename "$dir")"
+      echo
+      echo "---"
+      echo
+      echo "<!-- from chambers/$cname/.retinue/INSTRUCTIONS.md -->"
+      echo
+      cat "$f"
+    done
+  } > "$CHAMBER_INSTRUCTIONS"
+}
+generate_chamber_instructions
+echo "[chamber] Generated chamber-instructions.md ($(grep -c '^<!-- from ' "$CHAMBER_INSTRUCTIONS" 2>/dev/null || echo 0) chamber instruction file(s))."
+
 # ── Emit the conversation-model list into the life store ────────────
 # The dashboard's per-conversation model picker reads its options from the
 # hand-editable JSON-LD at config/conversation-models.jsonld (the gateway loads
