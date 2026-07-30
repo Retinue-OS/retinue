@@ -133,23 +133,33 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
 # Medic, Archivist, Ari) run on their own hard-wired models regardless.
 #
-# The list of offered models lives in ONE place: a JSON-LD document,
-# `config/conversation-models.jsonld` (override the path with
-# RETINUE_CONVERSATION_MODELS_FILE). JSON-LD is a deliberate compromise: the
-# gateway reads it here as *plain JSON* (no RDF dependency on the serving path),
-# while the very same list is also queryable over SPARQL. That second path is
-# automatic — a boot emitter (scripts/emit-conversation-models.py, sibling of
-# discover-agents.py) derives the list into chambers/_generated/, which QLever
-# indexes, so no deployment need declare a `jsonld` converter or copy the source
-# into a chamber. One hand-edited source, two access paths, no drift.
+# The list of offered models comes from LiteLLM when the deployment routes
+# through it: the gateway reads GET <RETINUE_LITELLM_URL>/model/info (default:
+# ANTHROPIC_BASE_URL, which already points at the LiteLLM service) and offers
+# every route whose `model_info` carries `retinue_picker: true`, labeled by
+# `retinue_label`. That makes LiteLLM the single place models are managed —
+# a model added there (config or admin UI, flags settable in both) shows up in
+# the picker with no gateway config, and turns route through the same proxy
+# that advertised it, so the picker can never offer a model that isn't served.
+# The list is cached for RETINUE_MODELS_CACHE_SECONDS (default 60); on a failed
+# refresh the last good list keeps serving.
 #
-# The document's `models` array holds {"id","label"} objects. `id` is passed to
-# `claude --model`; `label` is what the dashboard shows. The empty-string id
-# means "use the gateway's configured default" (CLAUDE_MODEL / whatever `claude`
-# resolves) — offered first so a thread can defer. A deployment may still
-# override the whole list inline via RETINUE_CONVERSATION_MODELS (a JSON array),
-# which wins over the file; an empty/invalid source falls back to the built-in
-# default below.
+# Deployments not routing through LiteLLM keep the static sources, which also
+# back the picker whenever LiteLLM is unreachable or advertises no flagged
+# route: RETINUE_CONVERSATION_MODELS (an inline JSON array — an explicit
+# override that also WINS over LiteLLM), else the JSON-LD document
+# `config/conversation-models.jsonld` (path override:
+# RETINUE_CONVERSATION_MODELS_FILE; also derived into the life store by
+# scripts/emit-conversation-models.py), else the built-in default below.
+#
+# Either way the list holds {"id","label"} objects. `id` is passed to
+# `claude --model` (for LiteLLM-sourced entries the id is the route's
+# model_name, which `claude` sends verbatim); `label` is what the dashboard
+# shows. The empty-string id means "use the gateway's configured default"
+# (CLAUDE_MODEL / whatever `claude` resolves) — always offered first so a
+# thread can defer.
+_DEFAULT_MODEL_ENTRY = {"id": "", "label": "Default"}
+
 _DEFAULT_CONVERSATION_MODELS = [
     {"id": "", "label": "Default"},
     {"id": "opus", "label": "Opus (deepest reasoning)"},
@@ -187,20 +197,27 @@ def _coerce_conversation_models(parsed: object) -> list[dict]:
     return models
 
 
-def _load_conversation_models() -> list[dict]:
-    # An inline env override wins over the file, for deployments that would
-    # rather not ship a file at all.
+def _env_conversation_models() -> list[dict] | None:
+    """The RETINUE_CONVERSATION_MODELS inline override, or None if unset/invalid.
+
+    An explicit inline list is the deployment saying "offer exactly this", so it
+    wins over everything — including a reachable LiteLLM."""
     raw = os.environ.get("RETINUE_CONVERSATION_MODELS", "").strip()
-    if raw:
-        try:
-            models = _coerce_conversation_models(json.loads(raw))
-            if models:
-                return models
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-        print("[web-gateway] invalid RETINUE_CONVERSATION_MODELS; falling back to file/default",
-              flush=True)
-    # The JSON-LD file, read as plain JSON — the normal path.
+    if not raw:
+        return None
+    try:
+        models = _coerce_conversation_models(json.loads(raw))
+        if models:
+            return models
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    print("[web-gateway] invalid RETINUE_CONVERSATION_MODELS; falling back to LiteLLM/file/default",
+          flush=True)
+    return None
+
+
+def _load_static_conversation_models() -> list[dict]:
+    # The JSON-LD file, read as plain JSON.
     path = _conversation_models_file()
     try:
         with open(path, encoding="utf-8") as fh:
@@ -215,10 +232,134 @@ def _load_conversation_models() -> list[dict]:
     return list(_DEFAULT_CONVERSATION_MODELS)
 
 
-CONVERSATION_MODELS = _load_conversation_models()
-# The set of ids a thread may legitimately request — anything else is ignored so
-# a client can never inject an arbitrary --model argument.
-_CONVERSATION_MODEL_IDS = {m["id"] for m in CONVERSATION_MODELS}
+_ENV_CONVERSATION_MODELS = _env_conversation_models()
+_STATIC_CONVERSATION_MODELS = _load_static_conversation_models()
+
+# ── LiteLLM-advertised models ──────────────────────────────────────────────────
+# RETINUE_LITELLM_URL points the picker at a LiteLLM proxy; it defaults to
+# ANTHROPIC_BASE_URL, which in a LiteLLM deployment is already the proxy. When
+# the deployment talks straight to Anthropic instead, /model/info simply fails
+# and the static list serves — but skip the known-external API host outright so
+# the cache refresh never phones out of the stack.
+_LITELLM_URL = (
+    os.environ.get("RETINUE_LITELLM_URL", "").strip()
+    or os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+)
+if "api.anthropic.com" in _LITELLM_URL:
+    _LITELLM_URL = ""
+_LITELLM_MODELS_CACHE_SECONDS = float(
+    os.environ.get("RETINUE_MODELS_CACHE_SECONDS", "60")
+)
+_LITELLM_PICKER_FLAG = "retinue_picker"
+_LITELLM_LABEL_KEY = "retinue_label"
+
+
+def _litellm_headers() -> dict[str, str]:
+    """Auth headers for LiteLLM management calls.
+
+    RETINUE_LITELLM_KEY wins when set; otherwise reuse ANTHROPIC_CUSTOM_HEADERS
+    ("Name: Value" per line) — the exact headers Claude Code already sends to
+    the proxy, which carry the key in the proxy's configured key header."""
+    key = os.environ.get("RETINUE_LITELLM_KEY", "").strip()
+    if key:
+        value = key if key.lower().startswith("bearer ") else f"Bearer {key}"
+        return {"x-litellm-api-key": value, "Authorization": value}
+    headers = {}
+    for line in os.environ.get("ANTHROPIC_CUSTOM_HEADERS", "").splitlines():
+        name, sep, value = line.partition(":")
+        if sep and name.strip() and value.strip():
+            headers[name.strip()] = value.strip()
+    return headers
+
+
+def _coerce_litellm_models(parsed: object) -> list[dict]:
+    """Picker entries from a LiteLLM GET /model/info response.
+
+    Only routes flagged `retinue_picker` in their model_info are offered —
+    routing plumbing (wildcards, fallback routes) stays invisible without the
+    flag, and wildcard names are dropped even if flagged since a pattern is not
+    a model id. Duplicate names (config + DB copy of a route) collapse to the
+    first occurrence."""
+    if not isinstance(parsed, dict):
+        return []
+    models, seen = [], set()
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("model_info")
+        if not isinstance(info, dict) or not info.get(_LITELLM_PICKER_FLAG):
+            continue
+        mid = str(item.get("model_name") or "").strip()
+        if not mid or "*" in mid or mid in seen:
+            continue
+        seen.add(mid)
+        label = str(info.get(_LITELLM_LABEL_KEY) or mid).strip()
+        models.append({"id": mid, "label": label})
+    return models
+
+
+def _fetch_litellm_models() -> list[dict]:
+    url = _LITELLM_URL.rstrip("/") + "/model/info"
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/json", **_litellm_headers()}
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return _coerce_litellm_models(json.load(resp))
+
+
+_litellm_models_lock = threading.Lock()
+_litellm_models_cache: dict = {"fetched": None, "models": None, "failed": False}
+
+
+def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
+    """LiteLLM's flagged models, cached; None when there is nothing usable.
+
+    None covers "not configured", "unreachable with no last-good list" and
+    "reachable but zero flagged routes" alike — in each case the caller falls
+    back to the static list. A refresh failure keeps serving the last good
+    list, so a LiteLLM restart doesn't collapse threads to the default model."""
+    if not _LITELLM_URL:
+        return None
+    with _litellm_models_lock:
+        now = time.monotonic()
+        fetched = _litellm_models_cache["fetched"]
+        if (not force and fetched is not None
+                and now - fetched < _LITELLM_MODELS_CACHE_SECONDS):
+            return _litellm_models_cache["models"]
+        try:
+            _litellm_models_cache["models"] = _fetch_litellm_models() or None
+            _litellm_models_cache["failed"] = False
+        except (OSError, ValueError) as exc:
+            # URLError/HTTPError are OSErrors; JSONDecodeError is a ValueError.
+            # Log transitions only, not every quiet minute LiteLLM is absent.
+            if not _litellm_models_cache["failed"]:
+                print(f"[web-gateway] LiteLLM model list unavailable ({exc}); "
+                      "using last good/static list", flush=True)
+            _litellm_models_cache["failed"] = True
+        _litellm_models_cache["fetched"] = now
+        return _litellm_models_cache["models"]
+
+
+def _conversation_models(force: bool = False) -> list[dict]:
+    """The list the picker offers right now, in precedence order:
+    env override > LiteLLM-advertised > file > built-in default."""
+    if _ENV_CONVERSATION_MODELS:
+        return _ENV_CONVERSATION_MODELS
+    dynamic = _litellm_conversation_models(force=force)
+    if dynamic:
+        # LiteLLM knows nothing of "use the gateway default" — synthesize it.
+        return [dict(_DEFAULT_MODEL_ENTRY), *dynamic]
+    return _STATIC_CONVERSATION_MODELS
+
+
+def _model_offered(mid: str) -> bool:
+    """Whether a non-empty model id is currently on the offered list.
+
+    A miss forces one cache refresh before rejecting, so a model just added in
+    LiteLLM is selectable immediately rather than after the cache TTL."""
+    if any(m["id"] == mid for m in _conversation_models()):
+        return True
+    return any(m["id"] == mid for m in _conversation_models(force=True))
 
 SESSION_MAX_IDLE_SECONDS = 3600  # 1 hour
 REQUESTER_ALLOWLIST_PATH = os.environ.get("ACCEPTED_REQUESTERS_PATH", "")
@@ -1113,7 +1254,7 @@ def _valid_model_id(model: str | None) -> str | None:
     if model is None:
         return None
     model = str(model).strip()
-    if model in _CONVERSATION_MODEL_IDS and model != "":
+    if model and _model_offered(model):
         return model
     return None
 
@@ -2439,7 +2580,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw = str(payload.get("model") or "").strip()
         # "" is a legitimate reset to default; any other value must be offered.
-        if raw and raw not in _CONVERSATION_MODEL_IDS:
+        if raw and not _model_offered(raw):
             self._send_json(400, {"error": "unknown model"})
             return
         conv = _conv_set_flags(cid, model=raw)
@@ -2600,11 +2741,11 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
         if conv_path in ("/conversation-models", "/conversation-models/"):
-            # The single source of truth for which models the picker offers
-            # (see CONVERSATION_MODELS). The dashboard fetches this to build the
-            # dropdown, so editing the env/default changes the UI with no client
-            # change.
-            self._send_json(200, {"models": CONVERSATION_MODELS})
+            # The models the picker offers (see _conversation_models — LiteLLM
+            # when it advertises flagged routes, static sources otherwise). The
+            # dashboard fetches this to build the dropdown, so adding a flagged
+            # model in LiteLLM changes the UI with no client change.
+            self._send_json(200, {"models": _conversation_models()})
             return
         if conv_path in ("/conversations", "/conversations/"):
             params = urllib.parse.parse_qs(conv_query)

@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Focused checks for the conversation-model picker sources in the web gateway.
+
+Covers the pure logic without an HTTP server or a live LiteLLM: parsing a
+GET /model/info response (picker flag, labels, wildcard/duplicate filtering),
+the env > LiteLLM > file > default precedence, the cache (TTL, last-good on
+failure, forced refresh on a validation miss), and the auth-header derivation
+from ANTHROPIC_CUSTOM_HEADERS.
+
+    python3 tests/test_web_gateway_models.py
+"""
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import types
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+
+def _load_gateway(tmp: Path, env: dict[str, str]):
+    """Load scripts/web-gateway.py with sandboxed state and a controlled env."""
+    for var in ("RETINUE_CONVERSATION_MODELS", "RETINUE_CONVERSATION_MODELS_FILE",
+                "RETINUE_LITELLM_URL", "RETINUE_LITELLM_KEY",
+                "RETINUE_MODELS_CACHE_SECONDS", "ANTHROPIC_BASE_URL",
+                "ANTHROPIC_CUSTOM_HEADERS"):
+        os.environ.pop(var, None)
+    os.environ["CONVERSATIONS_DIR"] = str(tmp / "convs")
+    os.environ["CONVERSATION_DIR"] = str(tmp / "convlog")
+    os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")
+    os.environ["WEB_GATEWAY_STATE"] = str(tmp / "state.json")
+    (tmp / "chambers").mkdir(parents=True, exist_ok=True)
+    os.environ.update(env)
+    if "markdown_it" not in sys.modules:
+        try:
+            import markdown_it  # noqa: F401
+        except ImportError:
+            stub = types.ModuleType("markdown_it")
+            stub.MarkdownIt = object
+            sys.modules["markdown_it"] = stub
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    spec = importlib.util.spec_from_file_location(
+        "web_gateway_models_under_test", SCRIPTS_DIR / "web-gateway.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _model_info_response(*entries):
+    return {"data": list(entries)}
+
+
+def _route(name, picker=None, label=None, info_extra=None):
+    info = dict(info_extra or {})
+    if picker is not None:
+        info["retinue_picker"] = picker
+    if label is not None:
+        info["retinue_label"] = label
+    return {"model_name": name, "model_info": info}
+
+
+def test_coerce_litellm_models(wg):
+    parsed = _model_info_response(
+        _route("retinue-claude"),                       # unflagged plumbing
+        _route("claude-*", picker=True),                # wildcard, dropped
+        _route("claude-opus-5", picker=True, label="Opus (deepest reasoning)"),
+        _route("claude-opus-5", picker=True, label="DB duplicate"),
+        _route("claude-sonnet-5", picker=True),         # label falls back to id
+        _route("my-gpt", picker=False, label="off"),    # explicitly off
+        {"model_name": "broken"},                       # no model_info at all
+    )
+    models = wg._coerce_litellm_models(parsed)
+    assert models == [
+        {"id": "claude-opus-5", "label": "Opus (deepest reasoning)"},
+        {"id": "claude-sonnet-5", "label": "claude-sonnet-5"},
+    ], models
+    assert wg._coerce_litellm_models({"data": None}) == []
+    assert wg._coerce_litellm_models([]) == []
+
+
+def test_dynamic_list_and_default_entry(wg):
+    wg._fetch_litellm_models = lambda: [
+        {"id": "claude-opus-5", "label": "Opus"}]
+    models = wg._conversation_models()
+    assert models == [{"id": "", "label": "Default"},
+                      {"id": "claude-opus-5", "label": "Opus"}], models
+    # The offered ids drive validation.
+    assert wg._model_offered("claude-opus-5")
+    assert wg._valid_model_id("claude-opus-5") == "claude-opus-5"
+    assert wg._valid_model_id("") is None
+
+
+def test_static_fallback_when_litellm_empty_or_down(wg):
+    # Reachable but nothing flagged -> static list.
+    wg._fetch_litellm_models = lambda: []
+    assert wg._conversation_models(force=True) == wg._STATIC_CONVERSATION_MODELS
+    # Unreachable with no last-good list -> static list.
+    def boom():
+        raise OSError("connection refused")
+    wg._fetch_litellm_models = boom
+    assert wg._conversation_models(force=True) == wg._STATIC_CONVERSATION_MODELS
+    assert not wg._model_offered("claude-opus-5")
+    # Static entries stay selectable while LiteLLM is down.
+    static_id = next(m["id"] for m in wg._STATIC_CONVERSATION_MODELS if m["id"])
+    assert wg._model_offered(static_id)
+
+
+def test_last_good_survives_refresh_failure(wg):
+    wg._fetch_litellm_models = lambda: [{"id": "claude-opus-5", "label": "Opus"}]
+    assert wg._conversation_models(force=True)[1]["id"] == "claude-opus-5"
+    def boom():
+        raise OSError("restarting")
+    wg._fetch_litellm_models = boom
+    models = wg._conversation_models(force=True)
+    assert models[1]["id"] == "claude-opus-5", models
+
+
+def test_cache_ttl_and_forced_refresh(wg):
+    calls = []
+    def fetch():
+        calls.append(1)
+        return [{"id": f"m{len(calls)}", "label": f"m{len(calls)}"}]
+    wg._fetch_litellm_models = fetch
+    wg._conversation_models()
+    wg._conversation_models()
+    assert len(calls) == 1, "second read within TTL must hit the cache"
+    # A validation miss forces one refresh, so a model just added in LiteLLM
+    # is selectable before the TTL expires.
+    assert wg._model_offered("m2")
+    assert len(calls) == 2, calls
+
+
+def test_env_override_wins_over_litellm(wg_env):
+    wg = wg_env
+    wg._fetch_litellm_models = lambda: [{"id": "claude-opus-5", "label": "Opus"}]
+    assert wg._conversation_models() == [
+        {"id": "", "label": "Standard"}, {"id": "opus", "label": "Opus"}]
+    assert wg._model_offered("opus")
+    assert not wg._model_offered("claude-opus-5")
+
+
+def test_litellm_headers(wg):
+    os.environ["ANTHROPIC_CUSTOM_HEADERS"] = "x-litellm-api-key: Bearer sk-abc"
+    assert wg._litellm_headers() == {"x-litellm-api-key": "Bearer sk-abc"}
+    os.environ["RETINUE_LITELLM_KEY"] = "sk-xyz"
+    assert wg._litellm_headers() == {
+        "x-litellm-api-key": "Bearer sk-xyz", "Authorization": "Bearer sk-xyz"}
+    os.environ.pop("RETINUE_LITELLM_KEY")
+    os.environ.pop("ANTHROPIC_CUSTOM_HEADERS")
+    assert wg._litellm_headers() == {}
+
+
+def test_anthropic_api_host_disables_dynamic(tmp: Path):
+    wg = _load_gateway(tmp, {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"})
+    assert wg._LITELLM_URL == ""
+    assert wg._litellm_conversation_models() is None
+    assert wg._conversation_models() == wg._STATIC_CONVERSATION_MODELS
+
+
+def main() -> None:
+    with tempfile.TemporaryDirectory() as tmp_s:
+        tmp = Path(tmp_s)
+        wg = _load_gateway(tmp / "a", {
+            "RETINUE_LITELLM_URL": "http://litellm:4000",
+            # Keep TTL generous so only `force` refreshes within a test run.
+            "RETINUE_MODELS_CACHE_SECONDS": "3600",
+        })
+        test_coerce_litellm_models(wg)
+        test_dynamic_list_and_default_entry(wg)
+        test_static_fallback_when_litellm_empty_or_down(wg)
+        test_last_good_survives_refresh_failure(wg)
+        test_litellm_headers(wg)
+
+        wg = _load_gateway(tmp / "b", {
+            "RETINUE_LITELLM_URL": "http://litellm:4000",
+            "RETINUE_MODELS_CACHE_SECONDS": "3600",
+        })
+        test_cache_ttl_and_forced_refresh(wg)
+
+        wg = _load_gateway(tmp / "c", {
+            "RETINUE_LITELLM_URL": "http://litellm:4000",
+            "RETINUE_MODELS_CACHE_SECONDS": "3600",
+            "RETINUE_CONVERSATION_MODELS": json.dumps([
+                {"id": "", "label": "Standard"}, {"id": "opus", "label": "Opus"}]),
+        })
+        test_env_override_wins_over_litellm(wg)
+
+        test_anthropic_api_host_disables_dynamic(tmp / "d")
+    print("all web-gateway model-picker tests passed")
+
+
+if __name__ == "__main__":
+    main()

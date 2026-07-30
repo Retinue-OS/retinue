@@ -12,6 +12,30 @@ model_list:
   - model_name: retinue-openrouter
     litellm_params:
       model: os.environ/LITELLM_FALLBACK_MODEL
+  # Dashboard picker entries. The web gateway builds the conversation-model
+  # picker from GET /model/info, offering every route whose model_info sets
+  # `retinue_picker: true`, labeled by `retinue_label`. These three seed the
+  # picker with the Claude defaults; models added at runtime through the
+  # LiteLLM admin UI join it the same way — set the same two model_info keys.
+  # Routes without the flag (the plumbing above) never reach the picker.
+  - model_name: claude-opus-5
+    litellm_params:
+      model: anthropic/claude-opus-5
+    model_info:
+      retinue_picker: true
+      retinue_label: Opus (deepest reasoning)
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+    model_info:
+      retinue_picker: true
+      retinue_label: Sonnet (balanced)
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+    model_info:
+      retinue_picker: true
+      retinue_label: Haiku (fastest)
 
 general_settings:
   # Claude Code keeps its subscription OAuth token in the Authorization
@@ -27,8 +51,19 @@ litellm_settings:
         - retinue-openrouter
     - claude-*:
         - retinue-openrouter
+    - claude-opus-5:
+        - retinue-openrouter
+    - claude-sonnet-5:
+        - retinue-openrouter
+    - claude-haiku-4-5:
+        - retinue-openrouter
   model_group_settings:
     # Only the Claude subscription routes receive Claude Code's OAuth header.
+    # The explicitly named picker routes form their own model groups, so they
+    # need their own entries — the claude-* wildcard entry does not cover them.
     forward_client_headers_to_llm_api:
       - retinue-claude
       - claude-*
+      - claude-opus-5
+      - claude-sonnet-5
+      - claude-haiku-4-5
