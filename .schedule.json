@@ -7,6 +7,13 @@
       "interval_seconds": 86400,
       "enabled": true,
       "run_at_start": false
+    },
+    {
+      "id": "daily-status",
+      "command": "python3 /workspace/scripts/daily-status.py --send --verify --once-per-day --at 07:30",
+      "interval_seconds": 1800,
+      "enabled": true,
+      "run_at_start": false
     }
   ]
 }
