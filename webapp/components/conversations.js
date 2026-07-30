@@ -723,6 +723,13 @@ class RetinueConversations extends HTMLElement {
         `<blockquote class="md-quote quote"><div class="q-text">${inner}</div>` +
         `<button class="copy" type="button" data-copy="${esc(raw)}">Copy</button>` +
         `</blockquote>`,
+      // Fenced code blocks get the same copy affordance as blockquotes — Ara
+      // hands out ready-to-paste prompts as code blocks too. The delegated
+      // `.copy` click handler on the thread covers this button as well.
+      code: (raw, _lang, inner) =>
+        `<div class="code-wrap">${inner}` +
+        `<button class="copy code-copy" type="button" data-copy="${esc(raw)}">Copy</button>` +
+        `</div>`,
     });
   }
 
@@ -1351,6 +1358,11 @@ const CSS = `
           border-radius: 8px; padding: 3px 10px; font: inherit; font-size: .74rem; font-weight: 600;
           cursor: pointer; }
   .copy.done { background: var(--ok, #57c785); }
+  .code-wrap { position: relative; }
+  .code-wrap .md-pre { margin: 6px 0; }
+  .code-copy { position: absolute; top: 6px; right: 6px; padding: 2px 8px; font-size: .7rem;
+               opacity: .85; }
+  .code-wrap:hover .code-copy, .code-copy:focus { opacity: 1; }
   .bubble.pending { color: var(--muted, #8b93a3); font-style: italic; }
   .pending-help { display: block; margin-top: 4px; font-size: .72rem; line-height: 1.35; color: var(--muted, #8b93a3); }
   .composer { flex: none; margin-top: 4px; padding-top: 10px;

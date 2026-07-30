@@ -149,10 +149,15 @@ function renderListItems(items) {
  * opts.quote: optional (rawText, innerHtml) => html hook for blockquotes —
  * rawText is the un-prefixed quoted text (for copy-to-clipboard), innerHtml
  * its rendered inline content.
+ * opts.code: optional (rawText, lang, innerHtml) => html hook for fenced code
+ * blocks — rawText is the raw (unescaped) code, lang the fence's language tag
+ * (or ''), innerHtml the default <pre><code>… markup. Lets a host add a
+ * copy-to-clipboard button the same way the quote hook does.
  */
 export function renderMarkdown(text, opts = {}) {
   const quoteHook = opts.quote
     || ((_raw, inner) => `<blockquote class="md-quote">${inner}</blockquote>`);
+  const codeHook = opts.code || ((_raw, _lang, inner) => inner);
   const lines = String(text == null ? '' : text).split('\n');
   const out = [];
   let i = 0;
@@ -167,8 +172,11 @@ export function renderMarkdown(text, opts = {}) {
       i++;
       while (i < lines.length && !FENCE_RE.test(lines[i])) { code.push(lines[i]); i++; }
       i++; // skip the closing fence (or run off the end of an unclosed block)
-      const cls = fence[1] ? ` class="lang-${esc(fence[1])}"` : '';
-      out.push(`<pre class="md-pre"><code${cls}>${esc(code.join('\n'))}</code></pre>`);
+      const lang = fence[1] || '';
+      const cls = lang ? ` class="lang-${esc(lang)}"` : '';
+      const raw = code.join('\n');
+      const inner = `<pre class="md-pre"><code${cls}>${esc(raw)}</code></pre>`;
+      out.push(codeHook(raw, lang, inner));
       continue;
     }
 
