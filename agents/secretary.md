@@ -99,10 +99,18 @@ chamber-provided secretary style file that exists**, and let it override the
 defaults here. The convention: any mounted chamber may place overrides at
 `chambers/<name>/style/secretary.md` — so glob `chambers/*/style/secretary.md`
 and apply each match (a chamber holding data only, with no plugin, may still
-carry one). Overriding is **per rule, last match wins**: merge the matches so a
-chamber that sets a given convention (a sign-off, a recipient's tone) overrides
-only that rule, leaving the framework defaults and other chambers' rules in
-place; when two chambers set the *same* rule, the one later in sorted glob order
-(by path) wins. If no such file exists, use only the generic rules above and ask
-the user when a personal detail (such as how to sign off) is unclear rather than
-guessing.
+carry one).
+
+Each override file states **one convention per heading**, and the heading is the
+rule's identity — what the merge compares. Overriding is **per rule, last match
+wins**: merge the matches so a chamber that sets a given convention (under its
+own heading — a sign-off, a recipient's tone) overrides only that rule, leaving
+the framework defaults and other chambers' rules in place. When two chambers set
+the *same* rule (the same heading), the one later in **byte-wise sorted path
+order** wins — a fixed ordering, independent of locale and case-folding, so two
+deployments with the same chambers always pick the same winner. Note the cost of
+keying on the path: precedence is a function of the chamber's *directory name*,
+so renaming a chamber is the only lever to change which one wins — the
+declaration order in `chambers.json` is not consulted. If no such file exists,
+use only the generic rules above and ask the user when a personal detail (such as
+how to sign off) is unclear rather than guessing.
