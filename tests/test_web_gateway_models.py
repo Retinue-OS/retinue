@@ -127,10 +127,41 @@ def test_cache_ttl_and_forced_refresh(wg):
     wg._conversation_models()
     wg._conversation_models()
     assert len(calls) == 1, "second read within TTL must hit the cache"
-    # A validation miss forces one refresh, so a model just added in LiteLLM
-    # is selectable before the TTL expires.
-    assert wg._model_offered("m2")
+    # Routine lookups (thread summaries, turn dispatch) are cache-only: a miss
+    # must NOT reach upstream, or one list request over N stale threads would
+    # mean N fetches.
+    assert not wg._model_offered("m2")
+    assert wg._valid_model_id("m2") is None
+    assert len(calls) == 1, calls
+    # The human-picked path (thread creation, picker POST) refreshes once on a
+    # miss, so a model just added in LiteLLM is selectable before the TTL.
+    assert wg._model_offered("m2", refresh=True)
     assert len(calls) == 2, calls
+    # An id offered by the fresh cache never refetches, even with refresh.
+    assert wg._model_offered("m2", refresh=True)
+    assert len(calls) == 2, calls
+
+
+def test_fetch_does_not_block_cache_readers(wg):
+    import threading
+    wg._fetch_litellm_models = lambda: [{"id": "base", "label": "base"}]
+    wg._conversation_models(force=True)  # warm the cache
+    entered, release = threading.Event(), threading.Event()
+    def slow_fetch():
+        entered.set()
+        release.wait(5)
+        return [{"id": "slow", "label": "slow"}]
+    wg._fetch_litellm_models = slow_fetch
+    t = threading.Thread(target=lambda: wg._conversation_models(force=True))
+    t.start()
+    assert entered.wait(5)
+    # While the forced refresh is in flight, cache-hit readers must not queue
+    # behind the upstream call.
+    assert wg._conversation_models()[1]["id"] == "base"
+    release.set()
+    t.join(5)
+    assert not t.is_alive()
+    assert wg._conversation_models()[1]["id"] == "slow"
 
 
 def test_env_override_wins_over_litellm(wg_env):
@@ -179,6 +210,7 @@ def main() -> None:
             "RETINUE_MODELS_CACHE_SECONDS": "3600",
         })
         test_cache_ttl_and_forced_refresh(wg)
+        test_fetch_does_not_block_cache_readers(wg)
 
         wg = _load_gateway(tmp / "c", {
             "RETINUE_LITELLM_URL": "http://litellm:4000",

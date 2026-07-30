@@ -317,26 +317,36 @@ def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
     None covers "not configured", "unreachable with no last-good list" and
     "reachable but zero flagged routes" alike — in each case the caller falls
     back to the static list. A refresh failure keeps serving the last good
-    list, so a LiteLLM restart doesn't collapse threads to the default model."""
+    list, so a LiteLLM restart doesn't collapse threads to the default model.
+
+    The lock guards only the cache dict, never the HTTP fetch — a slow
+    upstream must not stall cache-hit readers behind it. Two threads may
+    therefore fetch concurrently after a simultaneous expiry; that duplicate
+    is cheaper than a serialized stall."""
     if not _LITELLM_URL:
         return None
     with _litellm_models_lock:
-        now = time.monotonic()
         fetched = _litellm_models_cache["fetched"]
         if (not force and fetched is not None
-                and now - fetched < _LITELLM_MODELS_CACHE_SECONDS):
+                and time.monotonic() - fetched < _LITELLM_MODELS_CACHE_SECONDS):
             return _litellm_models_cache["models"]
-        try:
-            _litellm_models_cache["models"] = _fetch_litellm_models() or None
+    models = error = None
+    try:
+        models = _fetch_litellm_models() or None
+    except (OSError, ValueError) as exc:
+        # URLError/HTTPError are OSErrors; JSONDecodeError is a ValueError.
+        error = exc
+    with _litellm_models_lock:
+        if error is None:
+            _litellm_models_cache["models"] = models
             _litellm_models_cache["failed"] = False
-        except (OSError, ValueError) as exc:
-            # URLError/HTTPError are OSErrors; JSONDecodeError is a ValueError.
+        else:
             # Log transitions only, not every quiet minute LiteLLM is absent.
             if not _litellm_models_cache["failed"]:
-                print(f"[web-gateway] LiteLLM model list unavailable ({exc}); "
+                print(f"[web-gateway] LiteLLM model list unavailable ({error}); "
                       "using last good/static list", flush=True)
             _litellm_models_cache["failed"] = True
-        _litellm_models_cache["fetched"] = now
+        _litellm_models_cache["fetched"] = time.monotonic()
         return _litellm_models_cache["models"]
 
 
@@ -352,13 +362,20 @@ def _conversation_models(force: bool = False) -> list[dict]:
     return _STATIC_CONVERSATION_MODELS
 
 
-def _model_offered(mid: str) -> bool:
+def _model_offered(mid: str, refresh: bool = False) -> bool:
     """Whether a non-empty model id is currently on the offered list.
 
-    A miss forces one cache refresh before rejecting, so a model just added in
-    LiteLLM is selectable immediately rather than after the cache TTL."""
+    With refresh=True a miss forces one cache refresh before rejecting, so a
+    model just added in LiteLLM is selectable immediately rather than after
+    the cache TTL. Reserve that for the moments a human just picked a model
+    (thread creation, the picker POST): routine lookups — _conv_summary runs
+    one per thread on every list request — must stay cache-only, or each
+    thread pinned to a since-dropped model would turn one GET /conversations
+    into that many upstream fetches, unbounded by the TTL."""
     if any(m["id"] == mid for m in _conversation_models()):
         return True
+    if not refresh:
+        return False
     return any(m["id"] == mid for m in _conversation_models(force=True))
 
 SESSION_MAX_IDLE_SECONDS = 3600  # 1 hour
@@ -1245,7 +1262,7 @@ def _conv_add_message(cid: str, role: str, text: str, *,
         return conv
 
 
-def _valid_model_id(model: str | None) -> str | None:
+def _valid_model_id(model: str | None, refresh: bool = False) -> str | None:
     """Return a model id only if it's one the gateway offers, else None.
 
     None means "use the gateway default" — both the absence of a choice and an
@@ -1254,7 +1271,7 @@ def _valid_model_id(model: str | None) -> str | None:
     if model is None:
         return None
     model = str(model).strip()
-    if model and _model_offered(model):
+    if model and _model_offered(model, refresh=refresh):
         return model
     return None
 
@@ -2533,7 +2550,9 @@ class Handler(BaseHTTPRequestHandler):
             project_title = project_title[:120]
         # An invalid/absent model id is simply dropped (thread runs on the
         # gateway default) — never an error, so an old client keeps working.
-        model = _valid_model_id(payload.get("model"))
+        # refresh: the user just picked this id, so a cache miss warrants one
+        # upstream re-check before dropping it.
+        model = _valid_model_id(payload.get("model"), refresh=True)
         conv = _new_conv("user", owner, title, "user", message,
                          first_attachments=attachments, kind=kind,
                          project=project, project_title=project_title,
@@ -2580,7 +2599,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         raw = str(payload.get("model") or "").strip()
         # "" is a legitimate reset to default; any other value must be offered.
-        if raw and not _model_offered(raw):
+        # refresh: the user just picked this id from the dropdown.
+        if raw and not _model_offered(raw, refresh=True):
             self._send_json(400, {"error": "unknown model"})
             return
         conv = _conv_set_flags(cid, model=raw)
