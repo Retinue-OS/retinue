@@ -18,6 +18,10 @@ model_list:
   # picker with the Claude defaults; models added at runtime through the
   # LiteLLM admin UI join it the same way — set the same two model_info keys.
   # Routes without the flag (the plumbing above) never reach the picker.
+  # Set the flags on CONCRETE routes only, never on a wildcard route:
+  # /model/info expands a wildcard into one entry per known matching model,
+  # each copy carrying the same model_info — so a flagged wildcard floods the
+  # picker with identically-labeled entries.
   - model_name: claude-opus-5
     litellm_params:
       model: anthropic/claude-opus-5
@@ -38,6 +42,12 @@ model_list:
       retinue_label: Haiku (fastest)
 
 general_settings:
+  # The os.environ/ prefix is only resolved for general_settings.master_key;
+  # under litellm_settings the same line stores the unresolved literal on an
+  # attribute the auth path never reads (auth then works only because the env
+  # var itself is set). Keep it here, where it does what it says — this is
+  # also the value _get_salt_key() falls back to for store_model_in_db.
+  master_key: os.environ/LITELLM_MASTER_KEY
   # Claude Code keeps its subscription OAuth token in the Authorization
   # header, so the proxy key is passed in this custom header instead
   # (sent via ANTHROPIC_CUSTOM_HEADERS).
@@ -48,7 +58,6 @@ general_settings:
   store_model_in_db: true
 
 litellm_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
   num_retries: 0
   fallbacks:
     - retinue-claude:

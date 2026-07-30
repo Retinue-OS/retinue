@@ -153,7 +153,19 @@ services:
     # ANTHROPIC_BASE_URL=http://litellm:4000, which would make LiteLLM call
     # itself as its Anthropic upstream (an infinite auth loop).
     environment:
+      # The =${...} form is load-bearing: it defines the variable even when
+      # .env omits it, so a missing key means an empty (fail-closed) master
+      # key — every request rejected — not LiteLLM's unauthenticated dev mode
+      # (which is what master_key=None enables). Do not tidy this to the bare
+      # pass-through form (`- LITELLM_MASTER_KEY`).
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      # Encrypts model credentials stored in the DB (store_model_in_db). Set a
+      # dedicated random value BEFORE adding any model through the admin UI and
+      # never change it afterwards — rotating it makes stored credentials
+      # unreadable. When unset it falls back to the master key, entangling
+      # auth-key rotation with at-rest encryption (pinned explicitly here so an
+      # empty-but-defined salt var can never mean "encrypt with an empty key").
+      - LITELLM_SALT_KEY=${LITELLM_SALT_KEY:-${LITELLM_MASTER_KEY}}
       - LITELLM_PRIMARY_MODEL=${LITELLM_PRIMARY_MODEL}
       - LITELLM_FALLBACK_MODEL=${LITELLM_FALLBACK_MODEL}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
