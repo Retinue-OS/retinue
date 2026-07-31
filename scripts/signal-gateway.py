@@ -1286,6 +1286,15 @@ def _relink_worker() -> None:
         stderr = (proc.stderr.read() or "").strip()
         if proc.returncode == 0:
             print("[signal-gateway] relink completed successfully", flush=True)
+            # The pairing itself is the proof of connectivity: mark the link up
+            # NOW, not when the (parked) receive loop next succeeds. Otherwise
+            # /health stays "down" for one poll round trip after a successful
+            # scan, and a page-driven GET /qr landing in that window would start
+            # a second link attempt — parking the receive loop for another
+            # SIGNAL_RELINK_TIMEOUT and showing a fresh QR to a user who just
+            # scanned. (Telegram's _qr_login_loop records its own success the
+            # same way.)
+            _note_receive_result(True)
             with _RELINK_LOCK:
                 _relink["error"] = None
         else:
