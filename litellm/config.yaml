@@ -12,23 +12,71 @@ model_list:
   - model_name: retinue-openrouter
     litellm_params:
       model: os.environ/LITELLM_FALLBACK_MODEL
+  # Dashboard picker entries. The web gateway builds the conversation-model
+  # picker from GET /model/info, offering every route whose model_info sets
+  # `retinue_picker: true`, labeled by `retinue_label`. These three seed the
+  # picker with the Claude defaults; models added at runtime through the
+  # LiteLLM admin UI join it the same way — set the same two model_info keys.
+  # Routes without the flag (the plumbing above) never reach the picker.
+  # Set the flags on CONCRETE routes only, never on a wildcard route:
+  # /model/info expands a wildcard into one entry per known matching model,
+  # each copy carrying the same model_info — so a flagged wildcard floods the
+  # picker with identically-labeled entries.
+  - model_name: claude-opus-5
+    litellm_params:
+      model: anthropic/claude-opus-5
+    model_info:
+      retinue_picker: true
+      retinue_label: Opus (deepest reasoning)
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+    model_info:
+      retinue_picker: true
+      retinue_label: Sonnet (balanced)
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+    model_info:
+      retinue_picker: true
+      retinue_label: Haiku (fastest)
 
 general_settings:
+  # master_key is read from general_settings (proxy_server.load_config). Under
+  # litellm_settings the same line would only setattr() the (resolved) value
+  # onto the litellm module, where nothing reads it — auth then works only
+  # because the env var itself is set. Keep it here; this is also the value
+  # _get_salt_key() falls back to for store_model_in_db.
+  master_key: os.environ/LITELLM_MASTER_KEY
   # Claude Code keeps its subscription OAuth token in the Authorization
   # header, so the proxy key is passed in this custom header instead
   # (sent via ANTHROPIC_CUSTOM_HEADERS).
   litellm_key_header_name: x-litellm-api-key
+  # Persist models added at runtime (admin UI / POST /model/new) to the DB and
+  # load them on start. Without this, runtime-added models are lost on restart
+  # and the "add a pickable model in the admin UI" workflow doesn't work.
+  store_model_in_db: true
 
 litellm_settings:
-  master_key: os.environ/LITELLM_MASTER_KEY
   num_retries: 0
   fallbacks:
     - retinue-claude:
         - retinue-openrouter
     - claude-*:
         - retinue-openrouter
+    - claude-opus-5:
+        - retinue-openrouter
+    - claude-sonnet-5:
+        - retinue-openrouter
+    - claude-haiku-4-5:
+        - retinue-openrouter
   model_group_settings:
     # Only the Claude subscription routes receive Claude Code's OAuth header.
+    # The explicitly named picker routes form their own model groups, so they
+    # need their own entries — the claude-* wildcard entry does not cover them.
     forward_client_headers_to_llm_api:
       - retinue-claude
       - claude-*
+      - claude-opus-5
+      - claude-sonnet-5
+      - claude-haiku-4-5

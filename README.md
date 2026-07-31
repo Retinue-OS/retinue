@@ -127,6 +127,12 @@ OpenRouter failover. It forwards Claude Code's OAuth token only to Anthropic;
 LiteLLM retains the OpenRouter key and retries there when the subscription
 request fails (for example, due to a burst-rate limit or upstream error).
 
+LiteLLM also feeds the dashboard's conversation-model picker: any route whose
+`model_info` sets `retinue_picker: true` (with a `retinue_label`) is offered in
+the picker — whether declared in `litellm/config.yaml` (which seeds the Claude
+defaults) or added at runtime through the LiteLLM admin UI. No separate model
+list needs configuring.
+
 ```dotenv
 ANTHROPIC_AUTH_TOKEN=
 ANTHROPIC_API_KEY=
@@ -147,7 +153,10 @@ the container. The OAuth token stays in the persistent `retinue-root` volume.
 The LiteLLM Admin UI is available at `https://litellm.<your-domain>/ui` when a
 deployment routes the `litellm` service through Traefik. It uses the same
 client-certificate/basic-auth middleware as the Retinue dashboard. Its
-PostgreSQL database is internal-only and stores LiteLLM configuration and logs.
+PostgreSQL database is internal-only and stores LiteLLM configuration and logs
+— and, with `store_model_in_db` enabled, the models added through the admin UI,
+including any provider API keys they carry (encrypted with `LITELLM_SALT_KEY`,
+falling back to the master key; see `.env.example`).
 
 Any chamber repository URLs your deployment clones are supplied via
 `chambers.json` (a `url`, or a `url_env` naming an environment variable you set

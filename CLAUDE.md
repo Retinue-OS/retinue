@@ -517,21 +517,26 @@ pinned to a model), the model is a free per-turn choice: pickable when the threa
 is created and switchable mid-thread from a dropdown in the thread bar, effective
 from the next turn. The picker governs **Ara's own turn only** — dispatched
 subagents (the Archivist and any chamber-provided subagents) always run on their
-own hard-wired models regardless of the selection. The offered list lives in one
-place — a
-**JSON-LD document**, `config/conversation-models.jsonld` (override the path with
-`RETINUE_CONVERSATION_MODELS_FILE`). JSON-LD is a deliberate compromise: the
-gateway reads the file as **plain JSON** (`json.load`, no RDF dependency on the
-serving path), while the *same list* is **also queryable over SPARQL** without a
-second, drift-prone copy. That second path is automatic: a boot emitter
-(`scripts/emit-conversation-models.py`, the sibling of `discover-agents.py`)
-derives the list into `chambers/_generated/conversation-models.nt`, which QLever
-indexes — no deployment need declare a `jsonld` converter or copy the source into
-a chamber. (`scripts/jsonld2ttl.py`, a generic rdflib expander, remains available
-for the manual converter route.) A deployment
-may still override the whole list inline via **`RETINUE_CONVERSATION_MODELS`** (a
-JSON array of `{"id","label"}`, which wins over the file); either way `id` is
-passed to `claude --model` and the empty-string id means "use the gateway
+own hard-wired models regardless of the selection. In a deployment that routes
+through **LiteLLM** (the shipped default), the offered list is managed **in
+LiteLLM itself**: the gateway reads `GET /model/info` and offers every route
+whose `model_info` sets `retinue_picker: true`, labeled by `retinue_label` —
+set in `litellm/config.yaml` (which seeds the Claude defaults) or on a model
+added at runtime through the LiteLLM admin UI, so adding a pickable model needs
+no gateway config at all. The list is cached briefly
+(`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
+`RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials
+Claude Code already sends (`ANTHROPIC_CUSTOM_HEADERS`, override:
+`RETINUE_LITELLM_KEY`). Static sources remain for deployments without LiteLLM
+and as fallback when it is unreachable or advertises no flagged route: an
+inline **`RETINUE_CONVERSATION_MODELS`** JSON array of `{"id","label"}` (an
+explicit override that also wins over LiteLLM), else the JSON-LD document
+`config/conversation-models.jsonld` (path override:
+`RETINUE_CONVERSATION_MODELS_FILE`; read as plain JSON on the serving path,
+and derived into the life store by the boot emitter
+`scripts/emit-conversation-models.py`, so the fallback list stays queryable
+over SPARQL). Whatever the source, `id` is passed to `claude --model` and the
+empty-string id means "use the gateway
 default". The dashboard reads the list from `GET /conversation-models` and
 persists a thread's choice via `POST /conversations/<id>/model` — an id not on
 the offered list is ignored (the thread falls back to the default), so a client
