@@ -230,6 +230,14 @@ if (( ${#REQ_FILES[@]} > 0 )); then
     python3 -m venv --system-site-packages "$VENV_DIR"
     "$VENV_DIR/bin/python3" -m ensurepip --upgrade || true
     "$VENV_DIR/bin/python3" -m pip install --upgrade pip
+  elif ! grep -qx 'include-system-site-packages = true' "$VENV_DIR/pyvenv.cfg" 2>/dev/null; then
+    # /root is a persistent volume, so an existing venv survives rebuilds with
+    # include-system-site-packages = false and would never pick up the flag
+    # above. Re-running venv without --clear only flips that setting: it keeps
+    # already-installed site-packages and does not reset pip, so this is a safe
+    # one-shot repair of a pre-existing venv on deployments created before this.
+    echo "[pip] Repairing $VENV_DIR to inherit the image's site-packages ..."
+    python3 -m venv --system-site-packages "$VENV_DIR"
   fi
   # Only reinstall when the set of requirement files changed since last install
   REQ_HASH_FILE="$VENV_DIR/.requirements.md5"
