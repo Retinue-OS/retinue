@@ -8,8 +8,7 @@ the heading being the key the merge compares. This file is illustrative: the
 
 ## Sign-off
 
-Override the framework default (`Freundliche Grüsse` + sender name). Guests are
-signed off with the park's own line:
+Override the framework default. Guests are signed off with the park's own line:
 
 ```
 These violent delights have violent ends
