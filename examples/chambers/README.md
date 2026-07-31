@@ -19,6 +19,7 @@ directory ships two runnable example chambers that double as the canonical
     agents/<agent>.md               ← one or more subagents (frontmatter + body)
     skills/                         ← optional skills
     INSTRUCTIONS.md                 ← optional session-start guidance for Ara
+  style/secretary.md                ← optional Secretary style overrides
   .schedule.json                    ← optional recurring jobs (scheduler.py)
   .refresh.json                     ← optional external-data refresh (refresh.py)
   ...                               ← the chamber's data (e.g. .nt/.ttl, docs)
@@ -40,6 +41,16 @@ which the framework `CLAUDE.md` imports — so a chamber's instructions load int
 every session automatically. It is optional and independent of the plugin: a
 chamber may ship `INSTRUCTIONS.md` with no plugin, or a plugin with no
 `INSTRUCTIONS.md`. Both example chambers ship one as a reference.
+
+`style/secretary.md` is how a chamber contributes **Secretary style overrides**:
+the owner's own writing conventions (how to sign off, recipient-specific tone),
+which are personal data and so live in a chamber rather than in the public
+Secretary persona (`agents/secretary.md`). When composing a message the
+Secretary globs `chambers/*/style/secretary.md`, reads every match, and overlays
+it on the generic persona defaults — **one convention per heading**, the heading
+being the key the merge compares; when two chambers set the same heading, the one
+later in byte-wise sorted path order wins. `westworld` ships one as a reference
+(illustrative content — the "owner" is the park).
 
 ## Declaring a chamber
 
