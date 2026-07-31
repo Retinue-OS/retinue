@@ -42,11 +42,11 @@ model_list:
       retinue_label: Haiku (fastest)
 
 general_settings:
-  # The os.environ/ prefix is only resolved for general_settings.master_key;
-  # under litellm_settings the same line stores the unresolved literal on an
-  # attribute the auth path never reads (auth then works only because the env
-  # var itself is set). Keep it here, where it does what it says — this is
-  # also the value _get_salt_key() falls back to for store_model_in_db.
+  # master_key is read from general_settings (proxy_server.load_config). Under
+  # litellm_settings the same line would only setattr() the (resolved) value
+  # onto the litellm module, where nothing reads it — auth then works only
+  # because the env var itself is set. Keep it here; this is also the value
+  # _get_salt_key() falls back to for store_model_in_db.
   master_key: os.environ/LITELLM_MASTER_KEY
   # Claude Code keeps its subscription OAuth token in the Authorization
   # header, so the proxy key is passed in this custom header instead
