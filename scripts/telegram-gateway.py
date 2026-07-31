@@ -168,11 +168,68 @@ WHITELIST_BLOCK_MESSAGE = (
     "Please ask the system owner to add you to the whitelist."
 )
 
+# Optional 2FA password for the QR re-pairing flow: scanning the QR of an
+# account that has a cloud password requires the password to finish the login.
+# When unset, a 2FA-protected account must use the one-time interactive login.
+TELEGRAM_2FA_PASSWORD = os.environ.get("TELEGRAM_2FA_PASSWORD", "").strip()
+# How long to wait between reconnect/authorization re-checks in the client loop.
+TELEGRAM_RECONNECT_SECONDS = float(os.environ.get("TELEGRAM_RECONNECT_SECONDS", "") or "10")
+# How often the watchdog probes the session with get_me() while it looks
+# healthy — this is what catches a session the user revoked from another device
+# (Telethon does not always surface that as a disconnect).
+TELEGRAM_HEALTH_PROBE_SECONDS = float(os.environ.get("TELEGRAM_HEALTH_PROBE_SECONDS", "") or "60")
+
 # The Telethon client and its dedicated asyncio loop, populated by main(). The
 # HTTP server (a separate thread) bridges onto this loop with
 # asyncio.run_coroutine_threadsafe.
 _client = None
 _LOOP: asyncio.AbstractEventLoop | None = None
+
+# ── Link-state tracking ───────────────────────────────────────────────────────
+# Real session state for /health: `connected` means the MTProto client is
+# connected AND the login session is authorised — a revoked session (the user
+# tapped "terminate" on the phone) reports as disconnected, so the
+# gateway-monitor (and the /gateways page) can see it and prompt a re-pair.
+_CONN_LOCK = threading.Lock()
+_conn: dict = {"authorized": False, "error": None, "last_change": None}
+
+
+def _set_conn(**changes) -> None:
+    with _CONN_LOCK:
+        _conn.update(changes)
+        _conn["last_change"] = time.time()
+
+
+def _health_snapshot() -> dict:
+    configured = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
+    client_connected = False
+    try:
+        client_connected = bool(_client is not None and _client.is_connected())
+    except Exception:  # noqa: BLE001 - health must never raise
+        pass
+    with _CONN_LOCK:
+        state = dict(_conn)
+    with _QR_LOCK:
+        qr_pending = _qr_state["url"] is not None
+        qr_error = _qr_state["error"]
+    connected = configured and client_connected and state["authorized"]
+    error = state["error"]
+    if not configured:
+        error = "TELEGRAM_API_ID / TELEGRAM_API_HASH are not set"
+    elif not state["authorized"] and not error:
+        error = ("session is not authorised — re-pair via the QR on the /gateways "
+                 "page or run the one-time interactive login")
+    elif not client_connected and not error:
+        error = "client is not connected to Telegram"
+    return {
+        "status": "ok",
+        "configured": configured,
+        "connected": connected,
+        "authorized": state["authorized"],
+        "qr_pending": qr_pending,
+        "qr_error": qr_error,
+        "error": None if connected else error,
+    }
 
 
 # ── Language helpers ──────────────────────────────────────────────────────────
@@ -458,21 +515,153 @@ async def _on_new_message(event) -> None:
         print(f"[telegram-gateway] error handling message: {exc}\n{traceback.format_exc()}", flush=True)
 
 
-async def _startup() -> None:
-    """Connect the client, verify the login session, and resolve our identity."""
+async def _auth_watchdog() -> None:
+    """Periodically probe the session with get_me().
+
+    A session revoked from another device does not always surface as a
+    disconnect — requests just start failing. get_me() returns None when the
+    client is no longer authorised, which flips /health to disconnected so the
+    gateway-monitor notices within one probe interval.
+    """
+    while True:
+        await asyncio.sleep(TELEGRAM_HEALTH_PROBE_SECONDS)
+        with _CONN_LOCK:
+            authorized = _conn["authorized"]
+        if not authorized or not _client.is_connected():
+            continue
+        try:
+            me = await _client.get_me()
+        except Exception as exc:  # noqa: BLE001 - a failed probe is a health signal
+            _set_conn(error=f"session probe failed: {exc}"[:500])
+            continue
+        if me is None:
+            _set_conn(authorized=False,
+                      error="session is no longer authorised — re-pairing needed")
+            print("[telegram-gateway] session probe: no longer authorised", flush=True)
+
+
+async def _run_client() -> None:
+    """Own the client lifecycle: connect, (re)verify the session, dispatch.
+
+    Deliberately does NOT exit when the session is unauthorised: the HTTP
+    server must stay up so /health reports the state honestly and /qr can run
+    the QR re-pairing flow. Once (re)authorised, normal dispatch resumes.
+    """
     global TELEGRAM_ACCOUNT
-    await _client.connect()
-    if not await _client.is_user_authorized():
-        raise RuntimeError(
-            "Telegram session is not authorised. Run the one-time interactive login "
-            "(see README): docker compose run --rm -it telegram-gateway "
-            "python3 /app/telegram-gateway.py login"
-        )
-    me = await _client.get_me()
-    if not TELEGRAM_ACCOUNT:
-        TELEGRAM_ACCOUNT = (f"@{me.username}" if getattr(me, "username", None)
-                            else (getattr(me, "phone", None) or ""))
-    print(f"[telegram-gateway] logged in as {TELEGRAM_ACCOUNT or me.id}", flush=True)
+    asyncio.ensure_future(_auth_watchdog())
+    announced_unauthorized = False
+    while True:
+        try:
+            if not _client.is_connected():
+                await _client.connect()
+            if await _client.is_user_authorized():
+                me = await _client.get_me()
+                if not TELEGRAM_ACCOUNT and me is not None:
+                    TELEGRAM_ACCOUNT = (f"@{me.username}" if getattr(me, "username", None)
+                                        else (getattr(me, "phone", None) or ""))
+                _set_conn(authorized=True, error=None)
+                announced_unauthorized = False
+                print(f"[telegram-gateway] logged in as {TELEGRAM_ACCOUNT or getattr(me, 'id', 'unknown')} "
+                      f"(mode={TELEGRAM_GATEWAY_MODE})", flush=True)
+                await _client.run_until_disconnected()
+                _set_conn(error="disconnected from Telegram")
+                print("[telegram-gateway] disconnected; rechecking session shortly", flush=True)
+            else:
+                _set_conn(authorized=False)
+                if not announced_unauthorized:
+                    print("[telegram-gateway] session is not authorised — re-pair via the QR on the "
+                          "/gateways page (GET /qr) or run the one-time interactive login (see README)",
+                          flush=True)
+                    announced_unauthorized = True
+        except Exception as exc:  # noqa: BLE001 - keep the lifecycle loop alive
+            _set_conn(error=str(exc)[:500])
+            print(f"[telegram-gateway] client error: {exc}\n{traceback.format_exc()}", flush=True)
+        await asyncio.sleep(TELEGRAM_RECONNECT_SECONDS)
+
+
+# ── QR re-pairing flow ────────────────────────────────────────────────────────
+# Telethon supports logging an existing account in by QR (the phone scans it
+# under Settings → Devices → Link Desktop Device) — the same mechanism the
+# desktop apps use. The login tokens expire after ~30 s, so the loop keeps
+# minting fresh ones until the user scans or the flow errors; GET /qr always
+# serves the current token as a PNG.
+_QR_LOCK = threading.Lock()
+_qr_state: dict = {"url": None, "task_running": False, "error": None}
+
+
+def _qr_png_bytes(url: str) -> bytes:
+    import io
+    import segno  # noqa: PLC0415 - only needed when a re-pair actually runs
+    buf = io.BytesIO()
+    # border=6 / opaque white: generous quiet zone so phone scanners lock on
+    # even when the PNG is shown on a dark page (same settings as the other
+    # gateways' pairing QRs).
+    segno.make_qr(url).save(buf, kind="png", scale=12, border=6, dark="black", light="white")
+    return buf.getvalue()
+
+
+async def _qr_login_loop() -> None:
+    from telethon.errors import SessionPasswordNeededError  # noqa: PLC0415
+    try:
+        while True:
+            if not _client.is_connected():
+                await _client.connect()
+            if await _client.is_user_authorized():
+                break
+            qr = await _client.qr_login()
+            with _QR_LOCK:
+                _qr_state["url"] = qr.url
+            try:
+                await qr.wait(30)
+                break
+            except asyncio.TimeoutError:
+                continue  # token expired unscanned — mint a fresh one
+            except SessionPasswordNeededError:
+                if TELEGRAM_2FA_PASSWORD:
+                    await _client.sign_in(password=TELEGRAM_2FA_PASSWORD)
+                    break
+                with _QR_LOCK:
+                    _qr_state["error"] = (
+                        "the account has a 2FA cloud password; set TELEGRAM_2FA_PASSWORD "
+                        "or run the one-time interactive login (see README)"
+                    )
+                return
+        _set_conn(authorized=True, error=None)
+        print("[telegram-gateway] QR re-pairing complete — session authorised", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        with _QR_LOCK:
+            _qr_state["error"] = str(exc)[:500]
+        print(f"[telegram-gateway] QR login failed: {exc}", flush=True)
+    finally:
+        with _QR_LOCK:
+            _qr_state["url"] = None
+            _qr_state["task_running"] = False
+
+
+def _qr_response() -> tuple[int, bytes | dict, str]:
+    """State machine behind GET /qr (called from the HTTP thread)."""
+    if _client is None or _LOOP is None:
+        return 503, {"error": "client not started (gateway unconfigured?)"}, "application/json"
+    with _CONN_LOCK:
+        authorized = _conn["authorized"]
+    if authorized:
+        return 409, {"status": "connected",
+                     "note": "the Telegram session is authorised; no re-pairing needed"}, "application/json"
+    with _QR_LOCK:
+        if not _qr_state["task_running"]:
+            _qr_state["task_running"] = True
+            _qr_state["error"] = None
+            asyncio.run_coroutine_threadsafe(_qr_login_loop(), _LOOP)
+        url = _qr_state["url"]
+        error = _qr_state["error"]
+    if error:
+        return 502, {"status": "error", "error": error}, "application/json"
+    if not url:
+        return 202, {"status": "starting"}, "application/json"
+    try:
+        return 200, _qr_png_bytes(url), "image/png"
+    except Exception as exc:  # noqa: BLE001
+        return 500, {"status": "error", "error": f"could not render QR: {exc}"}, "application/json"
 
 
 def _build_client():
@@ -844,9 +1033,31 @@ class _PushHandler(BaseHTTPRequestHandler):
         token = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
         return bool(token) and hmac.compare_digest(token, GATEWAY_TOKEN)
 
+    def _reply_raw(self, status: int, payload: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self):
         if self.path.rstrip("/") in ("", "/health"):
-            self._reply(200, {"status": "ok", "connected": _client is not None})
+            self._reply(200, _health_snapshot())
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/qr":
+            # The QR logs the scanner's own account into this bridge — a live
+            # pairing credential — so unlike /health it is token-gated. The
+            # web-gateway proxies it (adding the token) behind the dashboard
+            # auth on the /gateways page.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            status, body, content_type = _qr_response()
+            if isinstance(body, bytes):
+                self._reply_raw(status, body, content_type)
+            else:
+                self._reply(status, body)
             return
         if self.path.rstrip("/") == "/pending-sends":
             if not self._authorized():
@@ -980,13 +1191,22 @@ def main() -> None:
         _run_login()
         return
     global _client, _LOOP
+    if not TELEGRAM_API_ID or not TELEGRAM_API_HASH:
+        # Stay up (with /health reporting configured: false) instead of crash-
+        # looping: an unconfigured channel is a deliberate deployment choice, not
+        # a fault, and the gateway-monitor skips unconfigured gateways.
+        print("[telegram-gateway] TELEGRAM_API_ID / TELEGRAM_API_HASH not set — idling "
+              "(health reports unconfigured)", flush=True)
+        _serve_http()
+        return
     _LOOP = asyncio.new_event_loop()
     asyncio.set_event_loop(_LOOP)
     _client = _build_client()
-    _LOOP.run_until_complete(_startup())
-    print(f"[telegram-gateway] starting (account={TELEGRAM_ACCOUNT or 'unknown'}, mode={TELEGRAM_GATEWAY_MODE})", flush=True)
+    print(f"[telegram-gateway] starting (mode={TELEGRAM_GATEWAY_MODE})", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
-    _LOOP.run_until_complete(_client.run_until_disconnected())
+    # _run_client keeps running through disconnects and unauthorised sessions —
+    # the HTTP API (health, QR re-pairing, pending sends) must outlive both.
+    _LOOP.run_until_complete(_run_client())
 
 
 if __name__ == "__main__":

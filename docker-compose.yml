@@ -256,8 +256,10 @@ services:
   # web-gateway approval at /sends. See scripts/whatsapp-gateway.py.
   #
   # Link the device once before it can send or receive: start the service, then
-  # read the pairing QR from its logs (`docker compose logs -f whatsapp-gateway`)
-  # and scan it from the phone under Settings -> Linked devices.
+  # scan the pairing QR from the phone under Settings -> Linked devices. The QR
+  # shows on the dashboard's /gateways page (proxied from this service's
+  # token-gated GET /qr); the service logs carry it too
+  # (`docker compose logs -f whatsapp-gateway`).
   whatsapp-gateway:
     build:
       context: .

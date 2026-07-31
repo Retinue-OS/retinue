@@ -360,6 +360,13 @@ case "$MODE" in
     python3 /workspace/scripts/web-gateway.py &
     echo "[claude] Starting task scheduler..."
     python3 /workspace/scripts/scheduler.py &
+    # Watches every configured messenger gateway's /health once a minute; when a
+    # link dies (device unlinked, session revoked) it opens a dashboard
+    # conversation — which Web-Pushes the user's devices like any incoming
+    # message — pointing at the /gateways re-pairing page. Needs the
+    # CONVERSATION_BACKEND_TOKEN exported above.
+    echo "[claude] Starting messenger gateway monitor..."
+    python3 /workspace/scripts/gateway-monitor.py &
     # Chambers move under a running container (git pull, agents committing their
     # own files), so a boot-time sync is not enough. Each scheduler job spawns a
     # fresh `claude -p`, which picks up a resynced plugin on its next run.

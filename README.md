@@ -289,9 +289,11 @@ email-style outbound send-control (`WHATSAPP_SEND_POLICY`, keyed — like
 `WHATSAPP_ACCOUNT` number, not the recipient; an undeclared account defaults to
 `verify`), and surfaces its pending sends on the same `/sends` approval page.
 Link the device once: start the
-service and scan the pairing QR it prints to its logs
-(`docker compose logs -f whatsapp-gateway`) from the phone under
-*Settings → Linked devices*. The session persists in the `whatsapp-data` volume.
+service and scan the pairing QR — shown on the dashboard's
+[`/gateways` page](#connection-monitoring--re-pairing-gateways) and printed to
+the service logs (`docker compose logs -f whatsapp-gateway`) — from the phone
+under *Settings → Linked devices*. The session persists in the `whatsapp-data`
+volume.
 Agents send with `scripts/whatsapp-push.py` and resolve contacts with
 `scripts/whatsapp-contacts.py`.
 
@@ -447,6 +449,42 @@ single explicit file instead, set `ACCEPTED_REQUESTERS_PATH` in `.env`.
 **`inbox`** accounts do not use the allowlist: their messages are the user's own
 incoming mail, processed under the owner's session and never run as prompts, so
 the external sender is never treated as an authorised requester.
+
+### Connection monitoring & re-pairing (`/gateways`)
+
+Linked-device sessions die silently: the phone unlinks the device, a Telegram
+session gets revoked — and without monitoring nobody notices until a
+correspondent complains that their messages go unanswered. Three pieces close
+that gap:
+
+- **Honest health.** Every messenger gateway's `GET /health` reports its real
+  link state (`connected`, plus an `error` explaining why not): Signal derives
+  it from the receive poll loop, WhatsApp from the bridge's
+  connected/logged-out events, Telegram from the MTProto connection plus a
+  periodic session probe (which catches a session revoked from another device).
+  An unconfigured channel reports `configured: false` and idles instead of
+  crash-looping.
+- **The monitor.** `scripts/gateway-monitor.py` (forked by the entrypoint in
+  the `retinue` container) polls every configured gateway's `/health` once a
+  minute. After two consecutive failures it notifies the user through the
+  existing inbound-message mechanism — a dashboard conversation, which Web-
+  Pushes the user's devices like any incoming message — linking to the
+  re-pairing page. It reminds every 6 h while the outage lasts and reports the
+  recovery in the same thread. Tunables (all optional):
+  `GATEWAY_MONITOR_INTERVAL`, `GATEWAY_MONITOR_FAILURES`,
+  `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
+  slugs to skip, e.g. a deliberately unlinked channel). It watches the same
+  registry `/sends` uses — the three built-ins plus any `MESSENGER_GATEWAYS`
+  extras.
+- **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the
+  same edge auth as the rest) shows each gateway's live state and, for a
+  disconnected one, the pairing QR code — proxied from the gateway's
+  token-gated `GET /qr` endpoint, so no `docker logs` or `docker cp` is needed.
+  WhatsApp serves the QR its bridge emits when unlinked; Signal starts a
+  `signal-cli link` attempt on demand (device name `SIGNAL_DEVICE_NAME`,
+  default `retinue`); Telegram runs Telethon's QR login (a 2FA-protected
+  account additionally needs `TELEGRAM_2FA_PASSWORD`, or the one-time
+  interactive login above).
 
 ## First start
 

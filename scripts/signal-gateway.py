@@ -195,6 +195,60 @@ SIGNAL_CLI_TIMEOUT = float(os.environ.get("SIGNAL_CLI_TIMEOUT", "30"))
 # concurrently. All signal-cli calls go through this lock.
 SIGNAL_CLI_LOCK = threading.Lock()
 
+# ── Link-state tracking ───────────────────────────────────────────────────────
+# The receive poll loop doubles as the connection probe: every successful
+# `signal-cli receive` proves the account is registered/linked and reachable,
+# every failure carries the reason it is not. /health derives `connected` from
+# the age of the last success, so the gateway-monitor (and the /gateways page)
+# can see a dead link instead of just "process is up".
+#
+# How stale the last successful receive may be before /health reports the link
+# as down. Must comfortably exceed one poll round trip (SIGNAL_POLL_INTERVAL +
+# the receive's own --timeout + SIGNAL_CLI_TIMEOUT worst case).
+SIGNAL_HEALTH_MAX_AGE = float(os.environ.get("SIGNAL_HEALTH_MAX_AGE", "") or "120")
+# Device name shown in the phone's "Linked devices" list when re-linking.
+SIGNAL_DEVICE_NAME = os.environ.get("SIGNAL_DEVICE_NAME", "").strip() or "retinue"
+# How long a re-link attempt (signal-cli link) may wait for the QR to be
+# scanned before it is abandoned. The pairing URI expires server-side anyway.
+SIGNAL_RELINK_TIMEOUT = float(os.environ.get("SIGNAL_RELINK_TIMEOUT", "") or "180")
+
+_LINK_STATE_LOCK = threading.Lock()
+_link_state: dict = {"last_ok": None, "last_error": None, "last_error_at": None}
+# While a re-link runs, the receive loop must stay away from the account data
+# dir (the link subprocess owns it); the loop skips polling while this is set.
+_RELINK_ACTIVE = threading.Event()
+
+
+def _note_receive_result(ok: bool, error: str | None = None) -> None:
+    now = time.time()
+    with _LINK_STATE_LOCK:
+        if ok:
+            _link_state["last_ok"] = now
+            _link_state["last_error"] = None
+            _link_state["last_error_at"] = None
+        else:
+            _link_state["last_error"] = (error or "unknown error")[:500]
+            _link_state["last_error_at"] = now
+
+
+def _health_snapshot() -> dict:
+    now = time.time()
+    with _LINK_STATE_LOCK:
+        last_ok = _link_state["last_ok"]
+        last_error = _link_state["last_error"]
+    connected = last_ok is not None and (now - last_ok) <= SIGNAL_HEALTH_MAX_AGE
+    body = {
+        "status": "ok",
+        "configured": bool(SIGNAL_ACCOUNT),
+        "connected": connected,
+        "last_ok_age": round(now - last_ok, 1) if last_ok is not None else None,
+        "error": None if connected else last_error,
+        "relinking": _RELINK_ACTIVE.is_set(),
+    }
+    if not SIGNAL_ACCOUNT:
+        body["error"] = "SIGNAL_ACCOUNT is not set"
+    return body
+
 
 def _run(cmd: list[str], check: bool = True, timeout: float | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=check, capture_output=True, text=True, timeout=timeout)
@@ -1177,6 +1231,108 @@ def _push(recipient: str, message: str, lang: str | None = None,
             path.unlink(missing_ok=True)
 
 
+# ── Re-link flow ──────────────────────────────────────────────────────────────
+# When the phone unlinks this device (or the session otherwise dies), the
+# account must be paired again by scanning a QR code. `signal-cli link` prints a
+# pairing URI and blocks until it is scanned; we run it in a background thread,
+# render the URI as a PNG, and serve it at GET /qr — which the web-gateway
+# proxies onto the /gateways page so the user can scan it from the phone.
+
+_RELINK_LOCK = threading.Lock()
+_relink: dict = {"qr_png": None, "uri": None, "started": None, "error": None}
+
+
+def _qr_png_bytes(uri: str) -> bytes:
+    """Render a pairing URI as a PNG (same margins as the WhatsApp gateway:
+    generous quiet zone, opaque white background so dark UIs don't defeat the
+    phone's scanner)."""
+    import io
+    import segno  # noqa: PLC0415 - only needed when a relink actually runs
+    buf = io.BytesIO()
+    segno.make_qr(uri).save(buf, kind="png", scale=12, border=6, dark="black", light="white")
+    return buf.getvalue()
+
+
+def _relink_worker() -> None:
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["signal-cli", "link", "-n", SIGNAL_DEVICE_NAME],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        # Abandon the attempt when nobody scans in time — the URI expires
+        # server-side anyway, and a fresh GET /qr starts a new attempt.
+        killer = threading.Timer(SIGNAL_RELINK_TIMEOUT, proc.kill)
+        killer.daemon = True
+        killer.start()
+        uri = None
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith(("sgnl://", "tsdevice:")):
+                uri = line
+                break
+        if uri:
+            try:
+                png = _qr_png_bytes(uri)
+            except Exception as exc:  # noqa: BLE001 - QR render must not kill the link
+                png = None
+                print(f"[signal-gateway] could not render relink QR: {exc}", flush=True)
+            with _RELINK_LOCK:
+                _relink["uri"] = uri
+                _relink["qr_png"] = png
+            print("[signal-gateway] relink pairing URI ready — waiting for scan", flush=True)
+        proc.wait()
+        killer.cancel()
+        stderr = (proc.stderr.read() or "").strip()
+        if proc.returncode == 0:
+            print("[signal-gateway] relink completed successfully", flush=True)
+            with _RELINK_LOCK:
+                _relink["error"] = None
+        else:
+            msg = stderr or ("relink timed out waiting for the QR scan"
+                            if uri else f"signal-cli link failed (exit {proc.returncode})")
+            print(f"[signal-gateway] relink failed: {msg}", flush=True)
+            with _RELINK_LOCK:
+                _relink["error"] = msg[:500]
+    except Exception as exc:  # noqa: BLE001
+        print(f"[signal-gateway] relink error: {exc}\n{traceback.format_exc()}", flush=True)
+        with _RELINK_LOCK:
+            _relink["error"] = str(exc)[:500]
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+        with _RELINK_LOCK:
+            _relink["qr_png"] = None
+            _relink["uri"] = None
+            _relink["started"] = None
+        _RELINK_ACTIVE.clear()
+
+
+def _relink_qr_response() -> tuple[int, bytes | dict, str]:
+    """State machine behind GET /qr: (status, body, content_type).
+
+    Serves the QR PNG when one is ready; otherwise starts a relink attempt (if
+    none is running and the link is actually down) and reports progress as JSON.
+    """
+    if _health_snapshot()["connected"] and not _RELINK_ACTIVE.is_set():
+        return 409, {"status": "connected",
+                     "note": "the Signal link is up; no re-pairing needed"}, "application/json"
+    with _RELINK_LOCK:
+        if _RELINK_ACTIVE.is_set():
+            if _relink["qr_png"]:
+                return 200, _relink["qr_png"], "image/png"
+            return 202, {"status": "starting"}, "application/json"
+        previous_error = _relink["error"]
+        _RELINK_ACTIVE.set()
+        _relink["started"] = time.time()
+        _relink["error"] = None
+    threading.Thread(target=_relink_worker, name="relink", daemon=True).start()
+    body = {"status": "starting"}
+    if previous_error:
+        body["previous_error"] = previous_error
+    return 202, body, "application/json"
+
+
 _PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
 
 
@@ -1199,9 +1355,30 @@ class _PushHandler(BaseHTTPRequestHandler):
         token = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
         return bool(token) and hmac.compare_digest(token, GATEWAY_TOKEN)
 
+    def _reply_raw(self, status: int, payload: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self):
         if self.path.rstrip("/") in ("", "/health"):
-            self._reply(200, {"status": "ok"})
+            self._reply(200, _health_snapshot())
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/qr":
+            # The QR is a live pairing credential — whoever scans it links a new
+            # device to the account — so unlike /health it is token-gated. The
+            # web-gateway proxies it (adding the token) behind the dashboard auth.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            status, body, content_type = _relink_qr_response()
+            if isinstance(body, bytes):
+                self._reply_raw(status, body, content_type)
+            else:
+                self._reply(status, body)
             return
         if self.path.rstrip("/") == "/pending-sends":
             if not self._authorized():
@@ -1340,19 +1517,31 @@ def _serve_http() -> None:
 
 def main() -> None:
     if not SIGNAL_ACCOUNT:
-        raise RuntimeError("SIGNAL_ACCOUNT must be set")
+        # Stay up (with /health reporting configured: false) instead of crash-
+        # looping: an unconfigured channel is a deliberate deployment choice, not
+        # a fault, and the gateway-monitor skips unconfigured gateways.
+        print("[signal-gateway] SIGNAL_ACCOUNT is not set — idling (health reports unconfigured)", flush=True)
+        _serve_http()
+        return
     print(f"[signal-gateway] started (account={SIGNAL_ACCOUNT}, mode={SIGNAL_GATEWAY_MODE}, poll_interval={SIGNAL_POLL_INTERVAL}s)", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
     while True:
+        if _RELINK_ACTIVE.is_set():
+            # The link subprocess owns the account data dir; polling would race it.
+            time.sleep(SIGNAL_POLL_INTERVAL)
+            continue
         try:
             events = _receive_events()
+            _note_receive_result(True)
             if events:
                 print(f"[signal-gateway] received {len(events)} event(s)", flush=True)
             for event in events:
                 _handle_event(event)
         except subprocess.TimeoutExpired:
+            _note_receive_result(False, "signal-cli timed out")
             print("[signal-gateway] warning: signal-cli timed out, retrying", flush=True)
         except Exception as exc:
+            _note_receive_result(False, str(exc))
             print(f"[signal-gateway] error: {exc}", flush=True)
             print(traceback.format_exc(), flush=True)
         time.sleep(SIGNAL_POLL_INTERVAL)

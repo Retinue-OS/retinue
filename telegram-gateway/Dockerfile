@@ -16,7 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # telethon: MTProto user client (pure Python, includes its own crypto).
 # requests: HTTP client to the retinue/STT services.
 # langdetect: answer-language hint for control-mode replies.
-RUN pip install --no-cache-dir telethon requests langdetect
+# segno: renders the QR re-pairing code served at GET /qr (pure Python, no deps).
+RUN pip install --no-cache-dir telethon requests langdetect segno
 
 # Login session + pending sends + recent chats persist on the telegram-data
 # volume (see docker-compose.yml).
