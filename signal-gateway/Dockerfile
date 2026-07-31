@@ -19,7 +19,8 @@ RUN wget -qO /tmp/signal-cli.tar.gz \
        fi \
     && rm /tmp/signal-cli.tar.gz
 
-RUN python3 -m pip install --break-system-packages --no-cache-dir piper-tts requests langdetect
+# segno renders the re-link pairing QR served at GET /qr (pure Python, no deps).
+RUN python3 -m pip install --break-system-packages --no-cache-dir piper-tts requests langdetect segno
 
 RUN mkdir -p /models
 

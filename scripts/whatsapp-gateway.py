@@ -193,6 +193,49 @@ WA_LID_SERVER = "lid"
 # HTTP /send path reports 503 until then.
 _wa_client = None
 
+# ── Link-state tracking ───────────────────────────────────────────────────────
+# Real connection state, driven by bridge events (ConnectedEv / PairStatusEv /
+# DisconnectedEv / LoggedOutEv). /health derives `connected` from this — not
+# from "the client object exists" — so the gateway-monitor (and the /gateways
+# page) can see a dead or unlinked session instead of just "process is up".
+_CONN_LOCK = threading.Lock()
+_conn: dict = {
+    "connected": False,   # live websocket to WhatsApp with a working session
+    "linked": None,       # device pairing known-good (None = not yet known)
+    "logged_out": False,  # the phone unlinked this device — re-pairing needed
+    "pairing": False,     # a pairing QR is currently being offered
+    "error": None,
+    "last_change": None,
+}
+
+
+def _set_conn(**changes) -> None:
+    with _CONN_LOCK:
+        _conn.update(changes)
+        _conn["last_change"] = time.time()
+
+
+def _health_snapshot() -> dict:
+    with _CONN_LOCK:
+        state = dict(_conn)
+    error = state["error"]
+    if state["logged_out"] and not error:
+        error = "device was unlinked from the phone — re-pairing needed"
+    elif state["pairing"] and not error:
+        error = "not linked — waiting for the pairing QR to be scanned"
+    elif not state["connected"] and not error:
+        error = "bridge is not connected"
+    return {
+        "status": "ok",
+        "configured": True,  # linking IS the configuration; nothing else is needed
+        "connected": bool(state["connected"]) and not state["logged_out"],
+        "linked": state["linked"],
+        "logged_out": state["logged_out"],
+        "pairing": state["pairing"],
+        "qr_available": WHATSAPP_QR_PNG_PATH.exists(),
+        "error": None if (state["connected"] and not state["logged_out"]) else error,
+    }
+
 WHITELIST_BLOCK_MESSAGE = (
     "Sorry, this number is not authorised to use the WhatsApp gateway. "
     "Please ask the system owner to add your number to the whitelist."
@@ -559,9 +602,11 @@ def _start_bridge() -> None:
 
         The terminal rendering is unusable over `docker logs` on some clients
         (compact block glyphs collapse), so also drop a PNG next to the session
-        store — the operator can `docker cp` it out and open it. segno ships
-        with neonize and writes PNG natively, so this needs no extra dependency.
+        store — served at GET /qr (and proxied onto the /gateways page), and
+        available to `docker cp` as a fallback. segno ships with neonize and
+        writes PNG natively, so this needs no extra dependency.
         """
+        _set_conn(pairing=True, connected=False, linked=False)
         qr = segno.make_qr(data_qr)
         qr.terminal(compact=True)
         try:
@@ -578,14 +623,49 @@ def _start_bridge() -> None:
 
     @client.event(ConnectedEv)
     def _on_connected(_client, _event):  # noqa: ANN001
+        _set_conn(connected=True, linked=True, logged_out=False, pairing=False, error=None)
         print(f"[whatsapp-gateway] connected (account={WHATSAPP_ACCOUNT_LABEL}, mode={WHATSAPP_GATEWAY_MODE})", flush=True)
 
     @client.event(PairStatusEv)
     def _on_pair(_client, event):  # noqa: ANN001
         user = _jid_user(_attr(event, "ID", "id"))
+        _set_conn(linked=True, logged_out=False, pairing=False, error=None)
         print(f"[whatsapp-gateway] linked as {user}", flush=True)
         # The QR is spent — drop it so no live pairing code lingers on the volume.
         WHATSAPP_QR_PNG_PATH.unlink(missing_ok=True)
+
+    # Disconnect/logout events exist in current neonize but their names have
+    # shifted across versions — register defensively so an older bridge library
+    # degrades to coarser health (no crash on import).
+    try:
+        from neonize.events import DisconnectedEv  # noqa: PLC0415
+
+        @client.event(DisconnectedEv)
+        def _on_disconnected(_client, _event):  # noqa: ANN001
+            _set_conn(connected=False, error="bridge disconnected from WhatsApp")
+            print("[whatsapp-gateway] disconnected from WhatsApp", flush=True)
+    except ImportError:
+        print("[whatsapp-gateway] neonize has no DisconnectedEv; health relies on Connected/LoggedOut only", flush=True)
+
+    try:
+        from neonize.events import LoggedOutEv  # noqa: PLC0415
+
+        @client.event(LoggedOutEv)
+        def _on_logged_out(_client, _event):  # noqa: ANN001
+            _set_conn(connected=False, linked=False, logged_out=True,
+                      error="device was unlinked from the phone — re-pairing needed")
+            print("[whatsapp-gateway] logged out (device unlinked) — reconnecting to offer a new pairing QR", flush=True)
+            # Tear the (now session-less) connection down from a separate thread
+            # so the outer loop in main() reconnects — a fresh connect with no
+            # stored session makes the bridge emit a new pairing QR.
+            def _kick():
+                try:
+                    client.disconnect()
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[whatsapp-gateway] disconnect after logout failed: {exc}", flush=True)
+            threading.Thread(target=_kick, name="logout-kick", daemon=True).start()
+    except ImportError:
+        print("[whatsapp-gateway] neonize has no LoggedOutEv; an unlink is only detected as a disconnect", flush=True)
 
     @client.event(MessageEv)
     def _on_message(_client, event):  # noqa: ANN001
@@ -1028,9 +1108,39 @@ class _PushHandler(BaseHTTPRequestHandler):
         token = auth[len("Bearer "):].strip() if auth.startswith("Bearer ") else ""
         return bool(token) and hmac.compare_digest(token, GATEWAY_TOKEN)
 
+    def _reply_raw(self, status: int, payload: bytes, content_type: str) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self):
         if self.path.rstrip("/") in ("", "/health"):
-            self._reply(200, {"status": "ok", "connected": _wa_client is not None})
+            self._reply(200, _health_snapshot())
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/qr":
+            # The QR is a live pairing credential — whoever scans it links this
+            # bridge to their WhatsApp account — so unlike /health it is
+            # token-gated. The web-gateway proxies it (adding the token) behind
+            # the dashboard auth on the /gateways page.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            try:
+                png = WHATSAPP_QR_PNG_PATH.read_bytes()
+            except OSError:
+                snapshot = _health_snapshot()
+                if snapshot["connected"]:
+                    self._reply(409, {"status": "connected",
+                                      "note": "the WhatsApp link is up; no re-pairing needed"})
+                else:
+                    self._reply(202, {"status": "no_qr_yet",
+                                      "note": "no pairing QR available yet — the bridge emits "
+                                              "one automatically once it reconnects unlinked"})
+                return
+            self._reply_raw(200, png, "image/png")
             return
         if self.path.rstrip("/") == "/pending-sends":
             if not self._authorized():
@@ -1167,8 +1277,10 @@ def main() -> None:
     while True:
         try:
             _start_bridge()
+            _set_conn(connected=False)
             print("[whatsapp-gateway] bridge connection ended; reconnecting in 5s", flush=True)
         except Exception as exc:  # noqa: BLE001
+            _set_conn(connected=False, error=str(exc)[:500])
             print(f"[whatsapp-gateway] bridge error: {exc}\n{traceback.format_exc()}", flush=True)
         time.sleep(5)
 

@@ -97,6 +97,7 @@ from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
 import email_client as ec
 import gateway_auth
+import messenger_gateways
 import push_notify
 
 
@@ -502,99 +503,21 @@ EMAIL_BACKEND_TOKEN = os.environ.get("EMAIL_BACKEND_TOKEN", "")
 EMAIL_CLIENT_PATH = ec.__file__
 
 # Messenger channel gateways (Signal, WhatsApp, …) — each is a sibling service
-# exposing the same pending-send approval API (/pending-sends). When a channel's
-# base URL is set, /sends aggregates its pending sends from that API and proxies
-# /sends/<channel>/{id}/approve|reject actions to it. The channel slug is the
+# exposing the same pending-send approval API (/pending-sends) plus /health and
+# /qr. When a channel's base URL (*_GATEWAY_BASE_URL) is set, /sends aggregates
+# its pending sends from that API and proxies /sends/<channel>/{id}/approve|reject
+# actions to it; /gateways shows its live link state. The channel slug is the
 # `account` segment in the /sends/<account>/<id> URLs.
-SIGNAL_GATEWAY_BASE_URL = os.environ.get("SIGNAL_GATEWAY_BASE_URL", "").rstrip("/")
-# Shared bearer token for signal-gateway's /pending-sends API; mirrors SIGNAL_GATEWAY_TOKEN.
-SIGNAL_GATEWAY_TOKEN = os.environ.get("SIGNAL_GATEWAY_TOKEN", "").strip()
-WHATSAPP_GATEWAY_BASE_URL = os.environ.get("WHATSAPP_GATEWAY_BASE_URL", "").rstrip("/")
-WHATSAPP_GATEWAY_TOKEN = os.environ.get("WHATSAPP_GATEWAY_TOKEN", "").strip()
-TELEGRAM_GATEWAY_BASE_URL = os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "").rstrip("/")
-TELEGRAM_GATEWAY_TOKEN = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
-
-
-def _extra_channel_gateways() -> dict:
-    """Deployment-declared channel gateways beyond the three built-ins.
-
-    A deployment can run more than one gateway per channel — e.g. a second
-    Signal identity (the user's *personal* account, `signal-gateway-personal`)
-    alongside the system account. Those extra gateways can't be hard-coded here:
-    the generic framework must not name a specific deployment's services, and a
-    single `signal` slug can only point at one base URL. So — exactly like
-    `UPDATE_COMMAND` for the updater — the deployment injects them via the
-    environment and config flows deployment → framework.
-
-    `MESSENGER_GATEWAYS` is a JSON array of objects, each with a `base_url` and
-    an optional `token` and `label`. The slug (the `/sends/<slug>/<id>` URL
-    segment) is taken verbatim from an explicit `slug`, else derived from the
-    Docker service name in `base_url` — so enrolling a gateway is "add a row",
-    with no separate slug map to keep in sync. Example:
-
-        MESSENGER_GATEWAYS='[{"base_url":"http://signal-gateway-personal:8090",
-                              "label":"Signal (personal)"}]'
-        # -> slug "signal-personal" (the "-gateway" infix is dropped)
-
-    Malformed entries are skipped with a log line rather than crashing boot.
-    """
-    raw = os.environ.get("MESSENGER_GATEWAYS", "").strip()
-    if not raw:
-        return {}
-    try:
-        entries = json.loads(raw)
-    except ValueError as exc:
-        print(f"[web-gateway] MESSENGER_GATEWAYS is not valid JSON, ignoring: {exc}", flush=True)
-        return {}
-    if not isinstance(entries, list):
-        print("[web-gateway] MESSENGER_GATEWAYS must be a JSON array, ignoring", flush=True)
-        return {}
-    out: dict = {}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            print(f"[web-gateway] MESSENGER_GATEWAYS entry is not an object, skipping: {entry!r}", flush=True)
-            continue
-        base_url = str(entry.get("base_url", "")).rstrip("/")
-        if not base_url:
-            print(f"[web-gateway] MESSENGER_GATEWAYS entry has no base_url, skipping: {entry!r}", flush=True)
-            continue
-        slug = str(entry.get("slug", "")).strip() or _slug_from_base_url(base_url)
-        if not slug:
-            print(f"[web-gateway] could not derive a slug for {base_url}, skipping", flush=True)
-            continue
-        out[slug] = {
-            "base_url": base_url,
-            "token": str(entry.get("token", "")).strip(),
-            "label": str(entry.get("label", "")).strip() or slug.replace("-", " ").title(),
-        }
-    return out
-
-
-def _slug_from_base_url(base_url: str) -> str:
-    """Derive a URL-safe /sends slug from a gateway's base URL.
-
-    Uses the Docker service hostname (`http://<host>:<port>` -> `<host>`) and
-    drops a redundant `-gateway` infix so `signal-gateway-personal` reads as
-    `signal-personal` in the approval URL, not the raw internal hostname."""
-    host = urllib.parse.urlsplit(base_url).hostname or ""
-    return host.replace("-gateway-", "-").removesuffix("-gateway")
-
-
-# Registry of configured channel gateways, keyed by the slug used in /sends URLs.
-# The three built-ins are enrolled when their base URL is set; a deployment adds
-# any further gateways (extra accounts, extra channels) via MESSENGER_GATEWAYS.
-_CHANNEL_GATEWAYS = {
-    slug: {"base_url": base_url, "token": token, "label": label}
-    for slug, base_url, token, label in (
-        ("signal", SIGNAL_GATEWAY_BASE_URL, SIGNAL_GATEWAY_TOKEN, "Signal"),
-        ("whatsapp", WHATSAPP_GATEWAY_BASE_URL, WHATSAPP_GATEWAY_TOKEN, "WhatsApp"),
-        ("telegram", TELEGRAM_GATEWAY_BASE_URL, TELEGRAM_GATEWAY_TOKEN, "Telegram"),
-    )
-    if base_url
-}
-# Deployment-declared extras win on slug collision — a deployment can override a
-# built-in's target if it needs to.
-_CHANNEL_GATEWAYS.update(_extra_channel_gateways())
+#
+# Registry of configured channel gateways, keyed by the slug used in /sends and
+# /gateways URLs. The three built-ins are enrolled when their base URL is set; a
+# deployment adds any further gateways (extra accounts, extra channels — e.g. a
+# second Signal identity like `signal-gateway-personal`) via MESSENGER_GATEWAYS,
+# a JSON array of {base_url, token?, label?, slug?} objects. Deployment-declared
+# extras win on slug collision. The discovery is shared with the
+# gateway-monitor (scripts/messenger_gateways.py) so /sends, /gateways and the
+# connection monitoring all see exactly the same set of gateways.
+_CHANNEL_GATEWAYS = messenger_gateways.channel_gateways("[web-gateway]")
 
 # Edge authentication (Traefik forward-auth). The public `agents` router is
 # guarded by a forwardAuth middleware that calls GET /auth here. We accept a TLS
@@ -1448,6 +1371,8 @@ def _start_conv_turn(cid: str) -> None:
 
 _SEND_SINGLE_RE = re.compile(r"^/sends/([^/]+)/([^/]+?)/?$")
 _SEND_ACTION_RE = re.compile(r"^/sends/([^/]+)/([^/]+)/(approve|reject)/?$")
+_GATEWAY_HEALTH_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/health/?$")
+_GATEWAY_QR_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/qr/?$")
 
 
 def _ec_config(account: str):
@@ -1652,6 +1577,126 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
           "  if(fr){fr.addEventListener('submit',function(){lockButtons('btn-reject');});}\n"
           "})();\n"
           "</script>\n"
+        + "</body>\n</html>\n"
+    )
+
+
+# ── Messenger gateway status & re-pairing (/gateways) ─────────────────────────
+# The page the gateway-monitor's outage notifications point at: live link state
+# of every configured channel gateway, and — for a disconnected one — the
+# pairing QR code, proxied from the gateway service so the user can re-pair
+# straight from the phone. The proxies add the per-gateway token server-side
+# (the QR is a live pairing credential, token-gated on the gateway itself);
+# the page sits behind the same edge auth as the rest of the dashboard.
+
+GATEWAY_HEALTH_TIMEOUT = float(os.environ.get("GATEWAY_HEALTH_TIMEOUT", "") or "8")
+
+# Where the phone's "scan QR" screen lives, per channel family. Keyed by the
+# leading channel name in the slug so extra accounts (signal-personal, …)
+# inherit their family's instructions.
+_PAIRING_HINTS = {
+    "signal": "On the phone: Signal → Settings → Linked devices → Link new device.",
+    "whatsapp": "On the phone: WhatsApp → Settings → Linked devices → Link a device.",
+    "telegram": "On the phone: Telegram → Settings → Devices → Link Desktop Device.",
+}
+
+
+def _gateway_request(gw: dict, path: str, timeout: float):
+    headers = {}
+    if gw.get("token"):
+        headers["Authorization"] = "Bearer " + gw["token"]
+    req = urllib.request.Request(f"{gw['base_url']}{path}", headers=headers)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def _fetch_gateway_health(gw: dict) -> dict:
+    """Fetch a gateway's /health; an unreachable gateway reports as down."""
+    try:
+        with _gateway_request(gw, "/health", GATEWAY_HEALTH_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            if isinstance(body, dict):
+                return body
+            return {"connected": False, "error": "malformed health response"}
+    except Exception as exc:  # noqa: BLE001 - unreachable is a health verdict, not a crash
+        return {"connected": False, "reachable": False, "error": f"gateway unreachable: {exc}"}
+
+
+def _pairing_hint(slug: str) -> str:
+    for family, hint in _PAIRING_HINTS.items():
+        if slug == family or slug.startswith(family + "-"):
+            return hint
+    return "Scan this code from the messenger app on the phone (linked-devices screen)."
+
+
+def _render_gateways_html(statuses: list[dict]) -> str:
+    """Render the /gateways page. `statuses` = [{slug, label, health}, ...]."""
+    cards: list[str] = []
+    any_qr = False
+    for st in statuses:
+        slug = st["slug"]
+        label_e = html.escape(st["label"])
+        h = st["health"]
+        configured = h.get("configured", True)
+        connected = bool(h.get("connected"))
+        if not configured:
+            badge = '<span class="gw-badge gw-off">not configured</span>'
+        elif connected:
+            badge = '<span class="gw-badge gw-up">connected</span>'
+        else:
+            badge = '<span class="gw-badge gw-down">disconnected</span>'
+        rows = [f"<h2>{label_e} {badge}</h2>"]
+        error = h.get("error")
+        if error and configured and not connected:
+            rows.append(f'<p class="meta">{html.escape(str(error))}</p>')
+        if configured and not connected:
+            any_qr = True
+            rows.append(
+                '<div class="qr-wrap">'
+                f'<img class="qr" alt="pairing QR for {label_e}" src="/gateways/{slug}/qr">'
+                '<p class="qr-note meta">If no code shows yet, the gateway is still generating one — '
+                'this page refreshes automatically.</p>'
+                f"<p>{html.escape(_pairing_hint(slug))}</p>"
+                "</div>"
+            )
+        elif connected:
+            age = h.get("last_ok_age")
+            if isinstance(age, (int, float)):
+                rows.append(f'<p class="meta">Last verified {int(age)}s ago.</p>')
+        cards.append('<section class="gw-card">' + "\n".join(rows) + "</section>")
+    if not cards:
+        cards.append("<section><p>No messenger gateways are configured in this deployment.</p></section>")
+    refresh_js = (
+        "<script>\n"
+        "setInterval(function(){\n"
+        "  document.querySelectorAll('img.qr').forEach(function(img){\n"
+        "    var u=new URL(img.getAttribute('src'),location);\n"
+        "    u.searchParams.set('ts',Date.now());\n"
+        "    img.src=u.toString();\n"
+        "  });\n"
+        "}, 20000);\n"
+        "setTimeout(function(){location.reload();}, 60000);\n"
+        "</script>\n"
+    ) if any_qr else '<meta http-equiv="refresh" content="60">\n'
+    return (
+        _HTML_HEAD
+        + "<title>Retinue — Messenger Gateways</title>\n"
+        + "<style>\n"
+          "  .gw-badge{font-size:.75rem;font-weight:600;border-radius:999px;padding:.15rem .6rem;"
+          "vertical-align:middle;margin-left:.4rem}\n"
+          "  .gw-up{background:var(--ok);color:#0b0d12}\n"
+          "  .gw-down{background:var(--high);color:#0b0d12}\n"
+          "  .gw-off{background:var(--card-2);color:var(--muted)}\n"
+          "  .gw-card h2{font-size:1.05rem;margin:.1rem 0 .4rem}\n"
+          "  .qr-wrap{margin-top:.6rem}\n"
+          "  .qr-wrap img.qr{max-width:min(320px,100%);border-radius:8px;background:#fff;display:block}\n"
+        "</style>\n"
+        + "<body>\n"
+        + "<h1>Messenger gateways</h1>\n"
+        + f"<nav>{_NAV_HOME}</nav>\n"
+        + '<p class="meta">Connection state of each messaging channel. A disconnected gateway shows '
+          "its pairing QR code here — scan it from the phone to re-link.</p>\n"
+        + "\n".join(cards) + "\n"
+        + refresh_js
         + "</body>\n</html>\n"
     )
 
@@ -2819,6 +2864,26 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(200, conv)
             return
+        if conv_path.rstrip("/") == "/gateways":
+            statuses = [
+                {"slug": slug, "label": gw.get("label") or slug.title(),
+                 "health": _fetch_gateway_health(gw)}
+                for slug, gw in sorted(_CHANNEL_GATEWAYS.items())
+            ]
+            self._send_html(200, _render_gateways_html(statuses))
+            return
+        gw_health_match = _GATEWAY_HEALTH_RE.match(conv_path)
+        if gw_health_match:
+            gw = _CHANNEL_GATEWAYS.get(gw_health_match.group(1))
+            if not gw:
+                self._send_json(404, {"error": "unknown gateway"})
+            else:
+                self._send_json(200, _fetch_gateway_health(gw))
+            return
+        gw_qr_match = _GATEWAY_QR_RE.match(conv_path)
+        if gw_qr_match:
+            self._handle_gateway_qr(gw_qr_match.group(1))
+            return
         if self.path in ("/sends", "/sends/"):
             self._send_html(200, _render_sends_index_html(_all_pending()))
         elif self.path in ("/sends/next", "/sends/next/"):
@@ -2936,6 +3001,35 @@ class Handler(BaseHTTPRequestHandler):
                     next_url = f"/sends/{nxt['account']}/{nxt['request_id']}"
                 break
         self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url))
+
+    def _handle_gateway_qr(self, slug: str) -> None:
+        """Proxy a gateway's pairing QR (adding the token) to the /gateways page.
+
+        Passes the gateway's own response through verbatim — a PNG when a code
+        is ready, JSON progress/errors otherwise — so the page's <img> either
+        renders the code or falls back to its "not ready yet" note."""
+        gw = _CHANNEL_GATEWAYS.get(slug)
+        if not gw:
+            self._send_json(404, {"error": "unknown gateway"})
+            return
+        try:
+            with _gateway_request(gw, "/qr", GATEWAY_HEALTH_TIMEOUT) as resp:
+                data = resp.read()
+                content_type = resp.headers.get("Content-Type", "application/json")
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            data = exc.read()
+            content_type = exc.headers.get("Content-Type", "application/json")
+            status = exc.code
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(502, {"error": f"gateway unreachable: {exc}"})
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
 
 if __name__ == "__main__":

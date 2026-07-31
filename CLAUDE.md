@@ -442,6 +442,22 @@ the fail-safe default means every send needs approval unless a policy entry gran
 it. Pending Telegram sends appear on `/sends` with the others. Text plus optional
 image attachments only.
 
+### Gateway connection monitoring
+
+Linked-device sessions (Signal, WhatsApp, Telegram) die silently — the phone
+unlinks the device, a session gets revoked. The framework watches for this
+itself: every gateway's `GET /health` reports its real link state, and
+`scripts/gateway-monitor.py` (forked by the entrypoint) polls them once a
+minute. On a sustained failure it opens a dashboard conversation (which
+Web-Pushes the user like any incoming message) pointing at the dashboard's
+**`/gateways`** page, where the user sees each gateway's status and — for a
+disconnected one — the pairing QR code to scan (proxied from the gateway's
+token-gated `GET /qr`). Recovery is reported in the same thread. So: do **not**
+build ad-hoc liveness checks for these channels; if a user reports a channel
+seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
+`SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
+intentional, not broken.
+
 ## Speech-to-text (STT service)
 
 Transcription is a **shared capability**, not the business of any one gateway, so
