@@ -220,7 +220,14 @@ if (( ${#REQ_FILES[@]} > 0 )); then
   VENV_DIR="/root/.venv"
   if [[ ! -d "$VENV_DIR" ]]; then
     echo "[pip] Creating virtual environment at $VENV_DIR ..."
-    python3 -m venv "$VENV_DIR"
+    # Inherit the image's site-packages: the Dockerfile installs the gateway's
+    # own dependencies (markdown-it-py, pywebpush, langdetect) into the system
+    # python, but the gateway runs from this venv. Without --system-site-packages
+    # the venv shadows those, so each import fails silently at runtime (the
+    # dashboard TTS falls back to the English voice when langdetect is missing,
+    # Web Push reports itself disabled when pywebpush is missing, …). Inheriting
+    # them fixes that whole class in one place instead of re-pip'ing per package.
+    python3 -m venv --system-site-packages "$VENV_DIR"
     "$VENV_DIR/bin/python3" -m ensurepip --upgrade || true
     "$VENV_DIR/bin/python3" -m pip install --upgrade pip
   fi
