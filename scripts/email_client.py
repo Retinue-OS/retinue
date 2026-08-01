@@ -34,6 +34,9 @@ SMTP/IMAP access — circumventing the send-control policy.
                       Gmail: "[Gmail]/Drafts")
     SMTP_SAVE_SENT    "true"/"false" — append a Sent copy after sending
                       (default true; set false for Gmail, which saves it itself)
+    SEND_STRIP_HEADERS  comma-separated headers to drop from an approved draft
+                      before submitting it (default "X-ZohoMail-Sender"; set to
+                      an empty string to disable). See DEFAULT_STRIP_HEADERS.
 
 Every command prints JSON to stdout. Errors print {"error": ...} and exit 1.
 
@@ -844,6 +847,25 @@ DEFAULT_SEND_CATEGORY = "verify"
 REQUEST_CATEGORY_HEADER = "X-Send-Request-Category"
 _REQUEST_HEADERS = (REQUEST_CATEGORY_HEADER,)
 
+# Headers the *IMAP server* injects into a stored draft, which must not travel
+# with the message when that draft is later submitted over SMTP.
+#
+# A pending send is parked in the IMAP Drafts folder until the user approves it
+# on /sends, so — unlike a direct send — the message makes a round trip through
+# the provider's IMAP store. Some providers stamp their own headers onto it
+# there. Zoho adds `X-ZohoMail-Sender` carrying the From display name as raw,
+# un-encoded 8-bit bytes; on submission its relay wraps those bytes in an
+# RFC 2047 encoded-word labelled with the placeholder charset token
+# `unknown-8bit`. That token is not a registered charset, so strict receivers
+# (Microsoft Exchange, on-prem and Exchange Online) reject the whole message
+# with `550 5.6.0 CAT.InvalidContent.Exception: InvalidCharsetException`.
+#
+# The header carries no delivery semantics for us — it is the provider's own
+# bookkeeping — so dropping it before submission is lossless and removes the
+# only difference between the (working) direct-send path and the (bouncing)
+# approval path. Override or extend via SEND_STRIP_HEADERS (comma-separated).
+DEFAULT_STRIP_HEADERS = ("X-ZohoMail-Sender",)
+
 
 def load_send_policy():
     """Parse EMAIL_SEND_POLICY (a JSON array) into a list of policy entries."""
@@ -1014,6 +1036,25 @@ def get_pending_send(cfg, request_id):
         M.logout()
 
 
+def strip_provider_headers(msg):
+    """Remove provider-injected headers from a draft fetched back over IMAP.
+
+    Returns the list of header names actually removed, so the caller can report
+    that the workaround fired. See DEFAULT_STRIP_HEADERS for why this exists.
+    """
+    configured = os.environ.get("SEND_STRIP_HEADERS")
+    if configured is not None:
+        names = [n.strip() for n in configured.split(",") if n.strip()]
+    else:
+        names = list(DEFAULT_STRIP_HEADERS)
+    removed = []
+    for name in names:
+        if msg.get(name) is not None:
+            removed.append(name)
+            del msg[name]  # deletes every occurrence
+    return removed
+
+
 def approve_pending_send(cfg, request_id):
     """Send a pending draft (stripping the request metadata) and remove it.
 
@@ -1037,13 +1078,15 @@ def approve_pending_send(cfg, request_id):
         for h in _REQUEST_HEADERS:
             del msg[h]
         del msg["Bcc"]  # never expose Bcc in the dispatched / stored copy
+        stripped = strip_provider_headers(msg)
         _smtp_send(cfg, msg, recipients)
         if cfg.save_sent:
             _append(cfg, cfg.sent_folder, msg, seen=True)
         M.uid("store", uid, "+FLAGS", "(\\Deleted)")
         M.expunge()
         return {"approved": request_id, "sent": True, "to": recipients,
-                "subject": _decode(msg.get("Subject")), "saved_to_sent": cfg.save_sent}
+                "subject": _decode(msg.get("Subject")), "saved_to_sent": cfg.save_sent,
+                "stripped_headers": stripped}
     finally:
         M.logout()
 
