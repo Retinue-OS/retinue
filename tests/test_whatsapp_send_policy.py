@@ -183,7 +183,39 @@ def test_malformed_request_id_rejected():
     print("ok: malformed request id rejected")
 
 
+def test_broadcast_jid_detected():
+    """Status/broadcast chats are recognised by their reserved server part.
+
+    A contact's Status posts arrive as messages whose chat is `status@broadcast`;
+    other broadcast-list posts share the `broadcast` server. Detection is keyed on
+    the server, not message content — so it holds whether the JID is a plain
+    string or a neonize-style object exposing a `.Server` attribute.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway([], tmp)
+
+        class _Jid:
+            def __init__(self, user, server):
+                self.User, self.Server = user, server
+            def __str__(self):
+                return f"{self.User}@{self.Server}"
+
+        # Broadcast / status addresses → True.
+        assert wg._jid_is_broadcast("status@broadcast")
+        assert wg._jid_is_broadcast("1203630...@broadcast")
+        assert wg._jid_is_broadcast(_Jid("status", "broadcast"))
+        # Ordinary 1:1 and group chats → False.
+        assert not wg._jid_is_broadcast("+15551234567@s.whatsapp.net")
+        assert not wg._jid_is_broadcast(_Jid("41791234567", "s.whatsapp.net"))
+        assert not wg._jid_is_broadcast("12345-67890@g.us")
+        assert not wg._jid_is_broadcast(None)
+        # A broadcast address is never mistaken for a group.
+        assert not wg._jid_is_group("status@broadcast")
+    print("ok: status/broadcast jid detected")
+
+
 def main():
+    test_broadcast_jid_detected()
     test_category_resolves_from_sending_account()
     test_category_normalizes_account()
     test_wildcard_applies_to_unlisted_account()

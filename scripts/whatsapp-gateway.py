@@ -188,6 +188,13 @@ WA_CLIENT_LOCK = threading.Lock()
 # LID addressing. Only the former is deliverable — see _lid_to_pn().
 WA_PN_SERVER = "s.whatsapp.net"
 WA_LID_SERVER = "lid"
+# The reserved server part for status/broadcast traffic. A contact's "Status"
+# post (the ephemeral story feed) is delivered to every viewer as a message whose
+# chat is the reserved JID `status@broadcast`, and other broadcast-list posts
+# share the `broadcast` server. This is a protocol address, not a content guess:
+# a message on this server is a broadcast, never a 1:1 message addressed to the
+# user — see _jid_is_broadcast() and its use in _handle_message_event().
+WA_BROADCAST_SERVER = "broadcast"
 
 # The neonize client, populated by _start_bridge(). None until connected; the
 # HTTP /send path reports 503 until then.
@@ -422,6 +429,22 @@ def _jid_user(jid) -> str | None:
 def _jid_is_group(jid) -> bool:
     server = _attr(jid, "Server", "server", default="")
     return str(server).endswith("g.us") or str(jid).endswith("@g.us")
+
+
+def _jid_is_broadcast(jid) -> bool:
+    """True when the chat JID is a status/broadcast address, not a real chat.
+
+    WhatsApp delivers a contact's Status (story) posts and other broadcast-list
+    posts as messages whose *chat* is the reserved ``broadcast`` server (Status
+    specifically is ``status@broadcast``). Keying off the server part is
+    deterministic — a protocol fact, not a content heuristic: such a message is
+    never a 1:1 message to the user, so the gateway drops it rather than mistaking
+    it for incoming mail.
+    """
+    if jid is None:
+        return False
+    server = _attr(jid, "Server", "server", default="")
+    return str(server) == WA_BROADCAST_SERVER or str(jid).endswith("@" + WA_BROADCAST_SERVER)
 
 
 def _lid_to_pn(user: str, *, speculative: bool = False) -> str | None:
@@ -689,6 +712,14 @@ def _handle_message_event(event) -> None:
     chat_jid = _attr(source, "chat", "Chat")
     sender = _jid_user(sender_jid)
     if not sender:
+        return
+    # Status/broadcast posts (a contact's story feed, broadcast lists) arrive as
+    # messages on the reserved `broadcast` server. They are not messages to the
+    # user, so drop them here — before transcription, recording, or forwarding —
+    # rather than surfacing them as incoming mail. Deterministic: keyed on the
+    # chat's server part, not on message content.
+    if _jid_is_broadcast(chat_jid):
+        print(f"[whatsapp-gateway] ignoring status/broadcast post from {sender}", flush=True)
         return
     is_group = bool(_attr(source, "is_group", "IsGroup", default=False)) or _jid_is_group(chat_jid)
     push_name = _attr(info, "push_name", "PushName", "Pushname")
