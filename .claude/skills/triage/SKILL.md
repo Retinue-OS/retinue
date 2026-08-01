@@ -102,6 +102,42 @@ So every push-triggered triage message is the user's own inbound mail, is
 processed under the owner's session, and **is never replied to on the source
 channel** — Ara only proposes via the dashboard.
 
+### Status updates (broadcast posts) — a distinct kind, filed silently by default
+
+Some forwarded items are not messages *to* the user at all but **status updates**:
+a contact's WhatsApp Status (story) post, or another broadcast-list post. The
+gateway marks these deterministically — by their delivery address, not by guessing
+from content — and tags the forwarded prompt with **`kind: status_update`**,
+wrapping the content in `<status_update>` rather than `<external_message>`. Never
+try to re-derive this from the text; trust the tag.
+
+A status update is **not** the user's incoming mail and needs no reply, so it does
+**not** get an individual proposal. Its **default disposition is to file it
+silently**:
+
+1. Derive the stable id and check the status store as usual (idempotent —
+   don't re-file a status already seen).
+2. **Link it as data** only if it clearly belongs to a project or a watched
+   subject; otherwise record it and stop. Store the disposition as
+   `status_filed` (a terminal state, like `resolved` — no INBOX move applies, as
+   messaging has no mailbox).
+3. **Raise NO dashboard conversation and send NO push** — a status update must
+   never open a thread or notify. (This is the whole point: it is background
+   signal, not correspondence.)
+
+**Exceptions — only when a rule opts in:**
+
+- **Watched contact.** If the sender matches a user-configured "notify me when
+  this person posts a status" rule, *then* raise a notification (a dashboard
+  conversation or a Signal push, per the rule) — otherwise stay silent.
+- **News-agent feed.** When a news agent exists and subscribes to status updates,
+  hand the item to it (route as that agent's input) instead of, or in addition to,
+  filing. Until such an agent exists, filing silently is the complete behaviour.
+
+No such rule is configured yet, so today every status update is simply filed
+silently. The marker and this policy are what let that change later without
+touching the gateway.
+
 **Example prompt injected by an inbox-mode `signal-gateway.py`:**
 
 > New message in one of the user's own messaging inboxes (channel: Signal). The
