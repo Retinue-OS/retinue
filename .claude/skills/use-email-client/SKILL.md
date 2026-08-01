@@ -118,6 +118,15 @@ Sent); Deny deletes it; Skip moves to the next request, leaving this one pending
 Approval is **web-only** — there is no CLI `approve` command, so you cannot
 approve a pending send yourself.
 
+Because a pending draft is parked in the provider's IMAP Drafts folder, it makes
+a round trip through that store — and some providers stamp their own headers on
+it there. Approval therefore drops the headers named in `SEND_STRIP_HEADERS`
+(default `X-ZohoMail-Sender`) before submitting; the result reports them in
+`stripped_headers`. This is why an approved send and a direct send now produce
+byte-identical messages. If a **verify** send bounces where an **allow** send of
+the same text goes through, suspect an injected header and compare the two raw
+messages before looking anywhere else.
+
 ### Credential isolation
 
 In remote-control mode you run with **no mailbox credentials**: `email_client.py`
