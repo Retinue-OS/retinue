@@ -1722,8 +1722,15 @@ def send_message(message: str, display_question: str | None = None,
         with _worker_pool:
             state = _get_session_entry(session_key)
 
+            # Grant the session read access both to composer uploads and to
+            # thread attachments. The latter (CONVERSATION_ATTACHMENTS_DIR, under
+            # CONVERSATIONS_DIR) is where files pushed into a thread — including
+            # the user's own — are stored; without it, opening such an attachment
+            # hits a permission prompt while a composer upload works, which looks
+            # like flaky behaviour.
             cmd = [CLAUDE_BIN, "-p", "--output-format=json", "--permission-mode", CLAUDE_PERMISSION_MODE,
-                   "--add-dir", "/root/.claude/uploads"]
+                   "--add-dir", "/root/.claude/uploads",
+                   "--add-dir", str(CONVERSATION_ATTACHMENTS_DIR)]
             # A per-thread model choice (validated by the caller) wins over the
             # gateway default. An explicit empty string means "defer to default".
             effective_model = CLAUDE_MODEL if model is None else model
