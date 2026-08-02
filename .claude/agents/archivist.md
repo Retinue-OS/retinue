@@ -250,7 +250,44 @@ When files appear in `observations/inbox/`:
 - Do not infer or interpolate missing values
 - If a reference range is absent, record only the measured value
 - Duplicate entries (same value, same timestamp, same source): skip silently
-- Out-of-range values: record as-is; do not filter or flag
+- Out-of-range values: record as-is; do not filter or flag — this covers values
+  that are merely surprising given the person's normal range, not values known
+  to come from malfunctioning hardware (see below)
+
+### Flagging known-bad sensor data (device malfunction, confirmed insertion failure, etc.)
+
+Sometimes an analysis (a support case, a manual review) identifies a period
+where a *sensor itself* was defective or not producing valid readings — as
+opposed to an observation that is merely unusual. Never hard-delete the
+affected triples: the raw CSV is the source of truth and observations already
+ingested should stay reversible and auditable. Instead **annotate** each
+affected `sosa:Observation` with three additional triples, appended to the
+same source-adjacent `.nt` file (this is purely additive — none of the
+existing SOSA triples are touched or removed):
+
+| Predicate | Value |
+|---|---|
+| `kb:dataQuality` | `"questionable"` or `"invalid"` (`^^xsd:string`) — `"questionable"` for a partial/likely-bad window, `"invalid"` when the whole wear is unusable (e.g. a sensor that never seated) |
+| `kb:invalidReason` | free-text `^^xsd:string` explaining what was wrong and how it was determined |
+| `kb:qualityProvenance` | a URI identifying the analysis/support case that established the flag (e.g. `urn:health:support-case:{slug}`); give that URI an `rdfs:label` once per file |
+
+`kb:` is `https://w3id.org/retinue/kb#`, the same namespace already used for
+`kb:Project` etc. elsewhere in the system.
+
+Example (appended, not replacing, the observation's existing SOSA triples):
+
+```
+<urn:obs:ckm:LE25047W3C20250910:60> <https://w3id.org/retinue/kb#dataQuality> "invalid"^^<http://www.w3.org/2001/XMLSchema#string> .
+<urn:obs:ckm:LE25047W3C20250910:60> <https://w3id.org/retinue/kb#invalidReason> "Sensor never seated correctly at insertion; no plausible ketone signal for the entire wear."^^<http://www.w3.org/2001/XMLSchema#string> .
+<urn:obs:ckm:LE25047W3C20250910:60> <https://w3id.org/retinue/kb#qualityProvenance> <urn:health:support-case:sibio-app-login-sensor-genauigkeit> .
+<urn:health:support-case:sibio-app-login-sensor-genauigkeit> <http://www.w3.org/2000/01/rdf-schema#label> "SiBio support case ..."^^<http://www.w3.org/2001/XMLSchema#string> .
+```
+
+A consumer that wants only trustworthy readings excludes flagged observations
+with `FILTER NOT EXISTS { ?o kb:dataQuality ?q }`; a consumer auditing sensor
+reliability can query `kb:dataQuality` directly. This convention generalizes
+beyond CKM/CGM — use it for any sensor stream where a defective-device period
+is identified after the fact.
 
 ## Contact list (`lists/care-providers.md`)
 
