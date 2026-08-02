@@ -1,7 +1,7 @@
 {
   "name": "Retinue",
   "short_name": "Retinue",
-  "description": "Kuratiertes, ablenkungsfreies Dashboard",
+  "description": "Curated, distraction-free dashboard",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
