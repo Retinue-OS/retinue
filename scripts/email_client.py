@@ -72,6 +72,7 @@ from datetime import datetime
 from email.message import EmailMessage
 from email.utils import (formataddr, getaddresses, make_msgid, parseaddr,
                          parsedate_to_datetime)
+from html.parser import HTMLParser
 
 # imaplib caps literals at 10 kB by default; raise it for large attachments.
 imaplib._MAXLINE = 100 * 1024 * 1024
@@ -306,8 +307,69 @@ def _iter_attachments(msg):
             yield idx, part
 
 
+class _HTMLTextExtractor(HTMLParser):
+    """Collapse HTML into readable plain text: drop tags, keep text, turn
+    block-level elements and <br> into newlines. Stdlib-only, no dependency."""
+
+    _BLOCK = {
+        "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+        "table", "ul", "ol", "blockquote", "header", "footer", "section",
+        "article", "hr",
+    }
+    _SKIP = {"style", "script", "head", "title"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip_depth += 1
+        elif tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag in self._BLOCK:
+            self._parts.append("\n")
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        self._parts.append(data)
+
+    def get_text(self):
+        text = "".join(self._parts)
+        # collapse runs of blank lines and trailing whitespace per line
+        lines = [ln.strip() for ln in text.splitlines()]
+        out = []
+        blank = False
+        for ln in lines:
+            if ln:
+                out.append(ln)
+                blank = False
+            elif not blank:
+                out.append("")
+                blank = True
+        return "\n".join(out).strip()
+
+
+def _html_to_text(html):
+    """Best-effort readable plain text from an HTML string."""
+    parser = _HTMLTextExtractor()
+    try:
+        parser.feed(html)
+        parser.close()
+    except Exception:
+        return html
+    return parser.get_text()
+
+
 def _body_text(msg):
-    """Best-effort plain-text body."""
+    """Best-effort plain-text body. Prefer a genuine text/plain part; fall back
+    to a *rendered* text version of an HTML-only body rather than raw markup."""
     if msg.is_multipart():
         plain = None
         html = None
@@ -324,12 +386,15 @@ def _body_text(msg):
         if plain is not None:
             return plain
         if html is not None:
-            return html
+            return _html_to_text(html)
         return ""
     try:
-        return msg.get_content()
+        content = msg.get_content()
     except Exception:
-        return msg.get_payload(decode=True).decode("utf-8", errors="replace")
+        content = msg.get_payload(decode=True).decode("utf-8", errors="replace")
+    if (msg.get_content_type() or "").lower() == "text/html":
+        return _html_to_text(content)
+    return content
 
 
 def _summary(M, uid):
@@ -1229,14 +1294,15 @@ def cmd_forward(cfg, args):
         msg.add_attachment(payload, maintype=maintype, subtype=subtype, filename=fname)
         forwarded.append(fname)
 
-    recipients = list(args.to) + list(args.cc or [])
-    _smtp_send(cfg, msg, recipients)
-    if cfg.save_sent:
-        _append(cfg, cfg.sent_folder, msg, seen=True)
-    print(json.dumps({
-        "forwarded": str(args.uid), "to": args.to, "subject": subject,
-        "attachments": forwarded, "saved_to_sent": cfg.save_sent,
-    }, ensure_ascii=False))
+    # Route through the same send-control choke point as send/reply, so a
+    # forward under a `verify` account queues for web approval instead of
+    # going out directly. `allow` (and `trust` + --user-approved) still send.
+    result = _dispatch_message(
+        cfg, msg, args.to, cc=args.cc, attachments=forwarded,
+        account=args.account, user_approved=getattr(args, "user_approved", False),
+        extra={"forwarded": str(args.uid)},
+    )
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def _reply_subject(orig_subject):
@@ -1422,6 +1488,9 @@ def main():
     sp.add_argument("--cc", nargs="+")
     sp.add_argument("--subject", help="override subject (default: 'Fwd: ...')")
     sp.add_argument("--prepend", help="intro text added above the forwarded body")
+    sp.add_argument("--user-approved", dest="user_approved", action="store_true",
+                    help="assert the user approved this send (only honoured for 'trust' "
+                         "addresses; ignored for 'allow', insufficient for 'verify')")
     sp.set_defaults(func=cmd_forward)
 
     sp = sub.add_parser("reply", help="reply to a message by UID with correct "
