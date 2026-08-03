@@ -240,7 +240,10 @@ When files appear in `observations/inbox/`:
 
 1. Identify the data type and appropriate destination subfolder
 2. Move the file to `observations/{subfolder}/`
-3. Extract facts into a sibling `.nt` file (same stem, `.nt` suffix) using the rules above
+3. Extract facts into a sibling `.nt` file (same stem, `.nt` suffix) using the rules above.
+   Treat that file as **regenerable**: it must contain nothing that cannot be rebuilt from
+   the source. Quality annotations therefore go in `<stem>.quality.nt` (see *Data quality
+   rules*), which extraction never writes
 4. If the file type is unrecognised, leave it in `inbox/` and flag to the Medic
 5. Commit the destination files **and** the inbox deletions together in a single commit — stage removals with `git add observations/inbox/` or `git rm`. Never leave the inbox non-empty on the remote after a push.
 
@@ -261,9 +264,20 @@ where a *sensor itself* was defective or not producing valid readings — as
 opposed to an observation that is merely unusual. Never hard-delete the
 affected triples: the raw CSV is the source of truth and observations already
 ingested should stay reversible and auditable. Instead **annotate** each
-affected `sosa:Observation` with three additional triples, appended to the
-same source-adjacent `.nt` file (this is purely additive — none of the
-existing SOSA triples are touched or removed):
+affected `sosa:Observation` with three additional triples. This is purely
+additive — none of the existing SOSA triples are touched or removed.
+
+**Write the annotations to their own sibling, `<stem>.quality.nt`** — not to
+the `<stem>.nt` that inbox processing generates. That file is a derived
+artifact: re-running extraction over a corrected export, or after a bug fix,
+rebuilds it from the CSV, and these three triples are the only ones in it that
+the CSV cannot reproduce. A separate file makes them the one thing extraction
+never overwrites, and it gives the judgement its own named graph
+(`<file:…/<stem>.quality.nt>`) — separating *what the sensor reported* from
+*what a later analysis concluded about it*, which is the distinction the
+convention exists to draw.
+
+The three predicates:
 
 | Predicate | Value |
 |---|---|
@@ -274,20 +288,32 @@ existing SOSA triples are touched or removed):
 `kb:` is `https://w3id.org/retinue/kb#`, the same namespace already used for
 `kb:Project` etc. elsewhere in the system.
 
-Example (appended, not replacing, the observation's existing SOSA triples):
+Example — the whole content of `observations/ckm/2025-09-10-ckm.quality.nt`,
+sitting beside the `2025-09-10-ckm.nt` it annotates (identifiers here are
+synthetic; use the real observation URIs from the file being annotated):
 
 ```
-<urn:obs:ckm:LE25047W3C20250910:60> <https://w3id.org/retinue/kb#dataQuality> "invalid"^^<http://www.w3.org/2001/XMLSchema#string> .
-<urn:obs:ckm:LE25047W3C20250910:60> <https://w3id.org/retinue/kb#invalidReason> "Sensor never seated correctly at insertion; no plausible ketone signal for the entire wear."^^<http://www.w3.org/2001/XMLSchema#string> .
-<urn:obs:ckm:LE25047W3C20250910:60> <https://w3id.org/retinue/kb#qualityProvenance> <urn:health:support-case:sibio-app-login-sensor-genauigkeit> .
-<urn:health:support-case:sibio-app-login-sensor-genauigkeit> <http://www.w3.org/2000/01/rdf-schema#label> "SiBio support case ..."^^<http://www.w3.org/2001/XMLSchema#string> .
+<urn:obs:ckm:SENSOR0001:60> <https://w3id.org/retinue/kb#dataQuality> "invalid"^^<http://www.w3.org/2001/XMLSchema#string> .
+<urn:obs:ckm:SENSOR0001:60> <https://w3id.org/retinue/kb#invalidReason> "Sensor never seated correctly at insertion; no plausible signal for the entire wear."^^<http://www.w3.org/2001/XMLSchema#string> .
+<urn:obs:ckm:SENSOR0001:60> <https://w3id.org/retinue/kb#qualityProvenance> <urn:health:support-case:example-sensor-accuracy> .
+<urn:health:support-case:example-sensor-accuracy> <http://www.w3.org/2000/01/rdf-schema#label> "Vendor support case on sensor accuracy"^^<http://www.w3.org/2001/XMLSchema#string> .
 ```
 
 A consumer that wants only trustworthy readings excludes flagged observations
 with `FILTER NOT EXISTS { ?o kb:dataQuality ?q }`; a consumer auditing sensor
-reliability can query `kb:dataQuality` directly. This convention generalizes
-beyond CKM/CGM — use it for any sensor stream where a defective-device period
-is identified after the fact.
+reliability can query `kb:dataQuality` directly.
+
+Both patterns must be written **outside** a `GRAPH` clause. The observation and
+its flag now live in different named graphs, so the filter sees the flag only
+where the query's default graph is the union of all of them. On the life store
+it is — `SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }` and the same count under
+`GRAPH ?g { ?s ?p ?o }` agree — but a query scoped to one graph, or run against
+a store that keeps the default graph separate from the named ones, returns the
+flagged observations unfiltered. That failure mode is a wrong answer, not an
+error, which is why it is worth stating here rather than leaving to discovery.
+
+This convention generalizes beyond CKM/CGM — use it for any sensor stream where
+a defective-device period is identified after the fact.
 
 ## Contact list (`lists/care-providers.md`)
 
