@@ -1,4 +1,4 @@
-// Push notification opt-in for the Retinue dashboard.
+// Push notification opt-in for the Retinue dashboard PWA.
 //
 // Renders a single bell button that asks for notification permission and
 // registers a Web Push subscription with the gateway. It hides itself whenever
@@ -6,11 +6,18 @@
 // subscription already exists — so the dashboard stays uncluttered once set up.
 //
 // Note on iOS: Safari only exposes the Push API to a PWA that has been added to
-// the home screen. On an in-browser tab `PushManager` is absent and this element
+// the home screen. In an in-browser tab `PushManager` is absent and this element
 // simply never appears; that is expected, not a failure.
 
 const CONFIG_URL = '/push/config';
 const SUBSCRIBE_URL = '/push/subscribe';
+const STORAGE_KEY = 'retinue_notification_mode';
+
+const MODES = [
+  { id: 'all', label: 'All messages' },
+  { id: 'new_only', label: 'New conversations only' },
+  { id: 'new_and_stalled', label: 'New & stalled conversations' },
+];
 
 function urlBase64ToUint8Array(base64) {
   const padded = (base64 + '='.repeat((4 - (base64.length % 4)) % 4))
@@ -33,7 +40,7 @@ async function serverKey() {
 // Register (or re-register) this device with the gateway. Called on every load
 // once permission is granted, so a subscription the browser rotated behind our
 // back — or one lost when the server's store was reset — is restored silently.
-async function ensureSubscription() {
+async function ensureSubscription(mode = 'all') {
   if (!supported() || Notification.permission !== 'granted') return false;
   const key = await serverKey();
   if (!key) return false;
@@ -59,7 +66,7 @@ async function ensureSubscription() {
   const res = await fetch(SUBSCRIBE_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(sub),
+    body: JSON.stringify({ subscription: sub, notification_mode: mode }),
   });
   return res.ok;
 }
@@ -67,28 +74,55 @@ async function ensureSubscription() {
 const CSS = `
   :host { display: none; }
   :host([visible]) { display: block; }
-  button {
+  :host([enabled]) { display: block; }
+  .container {
     display: flex; align-items: center; gap: 8px; width: 100%;
     background: var(--card, #151922); color: var(--fg, #e7ebf2);
     border: 0; border-radius: var(--radius, 16px);
-    padding: 12px 16px; font: inherit; font-size: .85rem; text-align: left;
-    cursor: pointer;
+    padding: 8px 16px; font: inherit; font-size: .85rem;
+    cursor: pointer; position: relative;
+  }
+  .container:hover { background: var(--card-2, #1c2230); }
+  button {
+    background: none; border: 0; padding: 0; font: inherit; color: inherit;
+    cursor: pointer; display: flex; align-items: center; gap: 8px;
   }
   button:disabled { opacity: .6; cursor: default; }
   .ico { font-size: 1.1rem; }
   .muted { color: var(--muted, #8b93a3); font-size: .75rem; }
+  .controls { display: none; align-items: center; gap: 4px; }
+  :host([enabled]) .controls { display: flex; }
+  :host([enabled]) .btn-main { display: none; }
+  select {
+    background: var(--bg, #0b0d12); color: var(--fg, #e7ebf2);
+    border: 1px solid var(--line, rgba(231,235,242,.2));
+    border-radius: 4px; font-size: 0.8rem; padding: 2px 4px;
+    margin-left: auto;
+  }
 `;
 
 class RetinuePushOptIn extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
-    this.shadowRoot.innerHTML =
-      `<style>${CSS}</style>` +
-      `<button type="button"><span class="ico">&#128276;</span>` +
-      `<span class="lbl">Enable notifications</span></button>`;
-    this._btn = this.shadowRoot.querySelector('button');
+    this.shadowRoot.innerHTML = `
+      <style>${CSS}</style>
+      <div class="container">
+        <button type="button" class="btn-main"><span class="ico">&#128276;</span><span class="lbl">Enable notifications</span></button>
+        <div class="controls">
+          <span class="muted">Mode:</span>
+          <select class="mode-select">
+            ${MODES.map(m => `<option value="${m.id}">${m.label}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+    `;
+    this._container = this.shadowRoot.querySelector('.container');
+    this._btn = this.shadowRoot.querySelector('.btn-main');
+    this._select = this.shadowRoot.querySelector('.mode-select');
+    this._label = this.shadowRoot.querySelector('.lbl');
     this._btn.addEventListener('click', () => this._enable());
+    this._select.addEventListener('change', (e) => this._changeMode(e.target.value));
   }
 
   connectedCallback() {
@@ -98,28 +132,33 @@ class RetinuePushOptIn extends HTMLElement {
   async _init() {
     if (!supported()) return;
     if (Notification.permission === 'denied') return;
+    
+    const mode = localStorage.getItem(STORAGE_KEY) || 'all';
+    this._select.value = mode;
+
     if (Notification.permission === 'granted') {
-      // Nothing to ask: just make sure the gateway still knows this device.
-      ensureSubscription().catch(() => {});
+      this.setAttribute('enabled', '');
+      this.setAttribute('visible', '');
+      ensureSubscription(mode).catch(() => {});
       return;
     }
-    // Only offer the button if the server can actually send.
     try {
       if (await serverKey()) this.setAttribute('visible', '');
-    } catch (_) { /* offline: stay hidden */ }
+    } catch (_) {}
   }
 
   async _enable() {
     this._btn.disabled = true;
     this._label('Enabling…');
     try {
-      // requestPermission must run in the click handler's gesture context.
       const perm = await Notification.requestPermission();
       if (perm !== 'granted') {
         this._label('Notifications blocked', true);
         return;
       }
-      if (await ensureSubscription()) {
+      const mode = this._select.value;
+      if (await ensureSubscription(mode)) {
+        this.setAttribute('enabled', '');
         this.removeAttribute('visible');
       } else {
         this._label('Could not enable', true);
@@ -131,8 +170,26 @@ class RetinuePushOptIn extends HTMLElement {
     }
   }
 
+  async _changeMode(mode) {
+    localStorage.setItem(STORAGE_KEY, mode);
+    this._btn.disabled = true;
+    this._label('Updating…');
+    try {
+      if (await ensureSubscription(mode)) {
+        this._label('Updated');
+        setTimeout(() => this._label(''), 2000);
+      } else {
+        this._label('Update failed', true);
+        this._btn.disabled = false;
+      }
+    } catch (err) {
+      this._label('Update failed', true);
+      this._btn.disabled = false;
+    }
+  }
+
   _label(text, muted) {
-    const el = this.shadowRoot.querySelector('.lbl');
+    const el = this._label;
     el.textContent = text;
     el.className = muted ? 'lbl muted' : 'lbl';
   }
