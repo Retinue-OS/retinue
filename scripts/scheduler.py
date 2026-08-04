@@ -28,6 +28,13 @@ Manifest format  (`/workspace/chambers/<chamber>/.schedule.json`):
     ]
   }
 
+A prompt job may pin the model its `claude -p` session runs on with an optional
+`"model"` field. It takes precedence over the global RETINUE_CLAUDE_MODEL and
+supports `${VAR:-default}` shell-style expansion, so a chamber can default a job
+to a model while letting the deployment override it via one env var — without
+naming the chamber in this framework file. Example:
+  {"id": "triage", "prompt": "...", "model": "${RETINUE_TRIAGE_MODEL:-sonnet}"}
+
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
 
@@ -36,11 +43,14 @@ Environment:
   SCHEDULER_JOB_TIMEOUT    per-job timeout in seconds (default 900)
   SCHEDULER_STATE_DIR      state/log dir (default /root/.retinue/scheduler)
   CLAUDE_PERMISSION_MODE   permission mode for `claude -p` (default acceptEdits)
+  RETINUE_CLAUDE_MODEL     global model for all prompt jobs (a job's own "model"
+                           field overrides it)
 """
 
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -58,6 +68,32 @@ STATE_DIR = Path(os.environ.get("SCHEDULER_STATE_DIR", "/root/.retinue/scheduler
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 LOG_FILE = STATE_DIR / "scheduler.log"
+
+
+_VAR_DEFAULT = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def expand_env(value: str) -> str:
+    """Expand `${VAR}` / `${VAR:-default}` against the environment.
+
+    Lets a job manifest carry a self-defaulting model reference like
+    `${RETINUE_TRIAGE_MODEL:-sonnet}` — the deployment can override via the env
+    var, and with nothing set the default applies. Unknown `${VAR}` with no
+    default expands to empty (same as a missing global model: no --model flag).
+    """
+    return _VAR_DEFAULT.sub(
+        lambda m: os.environ.get(m.group(1), m.group(2) if m.group(2) is not None else ""),
+        value,
+    )
+
+
+def job_model(job: dict) -> str:
+    """Model for a prompt job: its own `model` field (env-expanded) wins over the
+    global RETINUE_CLAUDE_MODEL; empty string means 'no --model flag'."""
+    raw = job.get("model")
+    if raw:
+        return expand_env(str(raw)).strip()
+    return CLAUDE_MODEL
 
 
 def job_env() -> dict:
@@ -178,16 +214,19 @@ def run_claude(cmd, **kwargs):
 
 def run_job(job: dict) -> None:
     jid = job["id"]
+    model = ""
     if job.get("prompt"):
         cmd = ["claude", "-p", "--output-format=json",
                "--permission-mode", PERMISSION_MODE, job["prompt"]]
-        if CLAUDE_MODEL:
-            cmd[2:2] = ["--model", CLAUDE_MODEL]
+        model = job_model(job)
+        if model:
+            cmd[2:2] = ["--model", model]
         kind = "prompt"
     else:
         cmd = job["command"]
         kind = "command"
-    log(f"[run] {jid} ({kind}) from {Path(job['_source']).parent.name}")
+    model_note = f", model={model}" if model else ""
+    log(f"[run] {jid} ({kind}{model_note}) from {Path(job['_source']).parent.name}")
     started = now()
     try:
         spawn = run_claude if kind == "prompt" else subprocess.run
