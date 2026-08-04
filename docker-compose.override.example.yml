@@ -132,6 +132,14 @@ services:
   # with signal-cli (see the README "Messaging accounts" section) before use.
   # To send from a specific account, point scripts/signal-push.py at that
   # service's endpoint: --url http://signal-gateway-personal:8090/send
+  #
+  # For the account's `verify` send flow (and /gateways monitoring) to work,
+  # also enrol it with the web-gateway by declaring it in MESSENGER_GATEWAYS on
+  # the retinue service. base_url is enough — the /sends/<slug>/… approval-link
+  # segment is the service name, derived automatically on both sides:
+  # retinue:
+  #   environment:
+  #     - 'MESSENGER_GATEWAYS=[{"base_url":"http://signal-gateway-personal:8090","token":"${SIGNAL_GATEWAY_TOKEN}","label":"Signal (personal)"}]'
   # signal-gateway-personal:
   #   extends:
   #     file: docker-compose.yml

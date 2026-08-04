@@ -37,6 +37,7 @@ def _load_signal_gateway(send_policy, pending_dir, account=""):
         sys.path.insert(0, str(SCRIPTS_DIR))
     os.environ["SIGNAL_SEND_POLICY"] = json.dumps(send_policy)
     os.environ["SIGNAL_ACCOUNT"] = account
+    os.environ.pop("SEND_APPROVAL_SLUG", None)
     os.environ["SIGNAL_PENDING_SENDS_DIR"] = str(pending_dir)
     # Redirect writable dirs the module creates at import time into the sandbox.
     os.environ["PIPER_DATA_DIR"] = str(Path(pending_dir) / "models")
@@ -176,6 +177,34 @@ def test_malformed_request_id_rejected():
     print("ok: malformed request id rejected")
 
 
+def test_approval_slug_derived_from_host_header():
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(_POLICY, tmp)
+        # The slug is the service hostname the caller reached this gateway at,
+        # port stripped — the same name the web-gateway keys the gateway by, so
+        # the approval link resolves for any account with no configuration.
+        assert sg._approval_slug("signal-gateway:8090") == "signal-gateway"
+        assert sg._approval_slug("signal-gateway-personal:8090") == "signal-gateway-personal"
+        # No Host header (exotic client) → the channel-name fallback.
+        assert sg._approval_slug(None) == "signal"
+        assert sg._approval_slug("") == "signal"
+    with tempfile.TemporaryDirectory() as tmp:
+        # An explicit SEND_APPROVAL_SLUG still wins when a deployment sets one.
+        os.environ["SEND_APPROVAL_SLUG"] = "my-signal"
+        try:
+            sg = _load_signal_gateway(_POLICY, tmp)
+            os.environ["SEND_APPROVAL_SLUG"] = "my-signal"  # loader popped it
+            spec = importlib.util.spec_from_file_location(
+                "signal_gateway_slug_override", SCRIPTS_DIR / "signal-gateway.py"
+            )
+            sg = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(sg)
+            assert sg._approval_slug("signal-gateway-personal:8090") == "my-signal"
+        finally:
+            os.environ.pop("SEND_APPROVAL_SLUG", None)
+    print("ok: approval slug derived from Host header")
+
+
 def main():
     test_category_resolves_from_sending_account()
     test_policy_default_verify_without_wildcard()
@@ -183,6 +212,7 @@ def main():
     test_pending_send_reject_does_not_send()
     test_unknown_request_id()
     test_malformed_request_id_rejected()
+    test_approval_slug_derived_from_host_header()
     print("\nAll Signal send-policy checks passed.")
 
 
