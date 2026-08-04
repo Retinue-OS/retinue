@@ -393,14 +393,18 @@ user's own linked number stays `verify`.
 # Recipients matched by a verify/trust policy return a pending-approval notice
 scripts/signal-push.py --recipient +15551112222 "Draft reply to review"
 # → signal-push: send queued for approval (id=…)
-#   signal-push: approve or deny at https://agents.example.com/sends/signal/…
+#   signal-push: approve or deny at https://agents.example.com/sends/signal-gateway/…
 ```
 
 Pending Signal sends appear on `/sends` alongside e-mail approvals; the
 web-gateway fetches them from the signal-gateway's token-gated `/pending-sends`
 API (`SIGNAL_GATEWAY_BASE_URL`) and proxies the allow/deny action back to it.
 `SEND_APPROVAL_BASE_URL` sets the public host used to build the approval link
-returned to the caller.
+returned to the caller. The `/sends/<slug>/…` segment is the gateway's own
+Docker **service name** — derived on the gateway from the request's Host header
+and on the web-gateway from the hostname of the registered base URL, so the two
+always agree and an extra account (e.g. `signal-gateway-personal`, enrolled via
+`MESSENGER_GATEWAYS`) gets working approval links with no slug configuration.
 
 ### Reading the roster (`/recent-chats`, `/contacts`, `/groups`)
 

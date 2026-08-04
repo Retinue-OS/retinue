@@ -165,12 +165,21 @@ def test_channel_gateway_discovery():
         "not-an-object",            # skipped: malformed
     ])
     registry = messenger_gateways.channel_gateways("[test]")
-    assert set(registry) == {"signal", "signal-personal"}
-    assert registry["signal"]["token"] == "s3cret"
-    assert registry["signal-personal"]["label"] == "Signal (personal)"
-    # Slug derivation drops the -gateway infix from the service hostname.
-    assert messenger_gateways.slug_from_base_url("http://whatsapp-gateway:8092") == "whatsapp"
-    assert messenger_gateways.slug_from_base_url("http://signal-gateway-personal:8090") == "signal-personal"
+    assert set(registry) == {"signal-gateway", "signal-gateway-personal"}
+    assert registry["signal-gateway"]["token"] == "s3cret"
+    assert registry["signal-gateway-personal"]["label"] == "Signal (personal)"
+    # The slug is the service hostname, verbatim — the same name a gateway sees
+    # in the Host header of a /send request, so approval links match registry
+    # keys with no slug configuration.
+    assert messenger_gateways.slug_from_base_url("http://whatsapp-gateway:8092") == "whatsapp-gateway"
+    assert messenger_gateways.slug_from_base_url("http://signal-gateway-personal:8090") == "signal-gateway-personal"
+    # resolve(): exact keys win; legacy shortened slugs from pre-upgrade links
+    # ("signal", "signal-personal") still find their gateway; junk resolves to
+    # (None, None) so e-mail account segments fall through untouched.
+    assert messenger_gateways.resolve(registry, "signal-gateway")[0] == "signal-gateway"
+    assert messenger_gateways.resolve(registry, "signal") == ("signal-gateway", registry["signal-gateway"])
+    assert messenger_gateways.resolve(registry, "signal-personal")[0] == "signal-gateway-personal"
+    assert messenger_gateways.resolve(registry, "nope") == (None, None)
     for key in ("SIGNAL_GATEWAY_BASE_URL", "SIGNAL_GATEWAY_TOKEN", "MESSENGER_GATEWAYS"):
         os.environ.pop(key, None)
 

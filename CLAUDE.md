@@ -370,20 +370,22 @@ prints a pending-approval notice with the approval URL instead of confirming
 delivery — the message goes out only once the user allows it at `/sends`.
 
 **Multiple gateways per channel.** The `/sends` page enrols the three built-in
-gateways (`signal`, `whatsapp`, `telegram`) when their `*_GATEWAY_BASE_URL` is
-set, but a deployment often runs *more than one* gateway on a channel — most
-commonly a second Signal identity, the user's **personal** account
-(`signal-gateway-personal`) alongside the system one. Those extra gateways are
-enrolled by the deployment via **`MESSENGER_GATEWAYS`** (read by
-`web-gateway.py`), a JSON array of `{base_url, token?, label?, slug?}` objects;
-each becomes its own `/sends/<slug>/<id>` account on the approval page. The slug
-defaults to the Docker service name with the `-gateway` infix dropped
-(`signal-gateway-personal` → `signal-personal`). The gateway must emit a
-matching link: set **`SEND_APPROVAL_SLUG`** on that gateway service to the same
-slug (default `signal`), so `signal-push.py --url …-personal:8090` prints a
-`/sends/signal-personal/<id>` URL that actually resolves. Without both halves,
-a personal-account send queues correctly but its approval link 404s (config
-flows deployment → framework; the framework names no specific deployment).
+gateways when their `*_GATEWAY_BASE_URL` is set, but a deployment often runs
+*more than one* gateway on a channel — most commonly a second Signal identity,
+the user's **personal** account (`signal-gateway-personal`) alongside the
+system one. Those extra gateways are enrolled by the deployment via
+**`MESSENGER_GATEWAYS`** (read by `web-gateway.py`), a JSON array of
+`{base_url, token?, label?}` objects; each becomes its own `/sends/<slug>/<id>`
+account on the approval page. The slug is the gateway's Docker **service name**
+and needs no configuration on either side: the web-gateway takes the hostname
+of each registered `base_url` verbatim, and the gateway derives the same name
+from the Host header of the `/send` request that queued the message — so
+`signal-push.py --url http://signal-gateway-personal:8090/send` prints a
+`/sends/signal-gateway-personal/<id>` URL that resolves by construction, for
+any account a deployment adds (config flows deployment → framework; the
+framework names no specific deployment). Legacy shortened slugs (`signal`,
+`signal-personal`) from links queued before this scheme still resolve as
+aliases.
 
 ### WhatsApp (the same model)
 

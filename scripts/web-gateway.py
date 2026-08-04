@@ -510,14 +510,24 @@ EMAIL_CLIENT_PATH = ec.__file__
 # `account` segment in the /sends/<account>/<id> URLs.
 #
 # Registry of configured channel gateways, keyed by the slug used in /sends and
-# /gateways URLs. The three built-ins are enrolled when their base URL is set; a
-# deployment adds any further gateways (extra accounts, extra channels — e.g. a
-# second Signal identity like `signal-gateway-personal`) via MESSENGER_GATEWAYS,
-# a JSON array of {base_url, token?, label?, slug?} objects. Deployment-declared
-# extras win on slug collision. The discovery is shared with the
-# gateway-monitor (scripts/messenger_gateways.py) so /sends, /gateways and the
-# connection monitoring all see exactly the same set of gateways.
+# /gateways URLs — the Docker service hostname of each gateway's base URL
+# (`signal-gateway`, `signal-gateway-personal`, …), the same name the gateway
+# derives from the Host header when it emits an approval link, so the two agree
+# with no slug configuration. The three built-ins are enrolled when their base
+# URL is set; a deployment adds any further gateways (extra accounts, extra
+# channels — e.g. a second Signal identity like `signal-gateway-personal`) via
+# MESSENGER_GATEWAYS, a JSON array of {base_url, token?, label?} objects.
+# Deployment-declared extras win on slug collision. The discovery is shared
+# with the gateway-monitor (scripts/messenger_gateways.py) so /sends, /gateways
+# and the connection monitoring all see exactly the same set of gateways.
+# Slug lookups go through _channel_gateway() so legacy shortened slugs
+# ("signal", "signal-personal") in pre-upgrade links still resolve.
 _CHANNEL_GATEWAYS = messenger_gateways.channel_gateways("[web-gateway]")
+
+
+def _channel_gateway(slug: str):
+    """Resolve a URL slug to (canonical_slug, gateway) or (None, None)."""
+    return messenger_gateways.resolve(_CHANNEL_GATEWAYS, slug)
 
 # Edge authentication (Traefik forward-auth). The public `agents` router is
 # guarded by a forwardAuth middleware that calls GET /auth here. We accept a TLS
@@ -1592,8 +1602,8 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
 GATEWAY_HEALTH_TIMEOUT = float(os.environ.get("GATEWAY_HEALTH_TIMEOUT", "") or "8")
 
 # Where the phone's "scan QR" screen lives, per channel family. Keyed by the
-# leading channel name in the slug so extra accounts (signal-personal, …)
-# inherit their family's instructions.
+# leading channel name in the slug so service-name slugs (signal-gateway,
+# signal-gateway-personal, …) inherit their family's instructions.
 _PAIRING_HINTS = {
     "signal": "On the phone: Signal → Settings → Linked devices → Link new device.",
     "whatsapp": "On the phone: WhatsApp → Settings → Linked devices → Link a device.",
@@ -2371,8 +2381,9 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_send_action(self, account: str, request_id: str, verb: str) -> None:
-        if account in _CHANNEL_GATEWAYS:
-            self._handle_channel_send_action(account, request_id, verb)
+        channel, _gw = _channel_gateway(account)
+        if channel:
+            self._handle_channel_send_action(channel, request_id, verb)
             return
         try:
             cfg = _ec_config(account)
@@ -2881,7 +2892,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         gw_health_match = _GATEWAY_HEALTH_RE.match(conv_path)
         if gw_health_match:
-            gw = _CHANNEL_GATEWAYS.get(gw_health_match.group(1))
+            _slug, gw = _channel_gateway(gw_health_match.group(1))
             if not gw:
                 self._send_json(404, {"error": "unknown gateway"})
             else:
@@ -2944,8 +2955,9 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, body)
 
     def _handle_send_single(self, account: str, request_id: str) -> None:
-        if account in _CHANNEL_GATEWAYS:
-            self._handle_channel_send_single(account, request_id)
+        channel, _gw = _channel_gateway(account)
+        if channel:
+            self._handle_channel_send_single(channel, request_id)
             return
         try:
             cfg = _ec_config(account)
@@ -3015,7 +3027,7 @@ class Handler(BaseHTTPRequestHandler):
         Passes the gateway's own response through verbatim — a PNG when a code
         is ready, JSON progress/errors otherwise — so the page's <img> either
         renders the code or falls back to its "not ready yet" note."""
-        gw = _CHANNEL_GATEWAYS.get(slug)
+        _slug, gw = _channel_gateway(slug)
         if not gw:
             self._send_json(404, {"error": "unknown gateway"})
             return
