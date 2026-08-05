@@ -108,6 +108,20 @@ services:
       # can be offered as an alternative). Optional CN restriction for certs.
       - TRAEFIK_BASIC_AUTH_USERS
       - GATEWAY_CLIENT_CERT_CN
+      # Restricts a basic-auth user to named hosts, e.g.
+      #   GATEWAY_BASIC_AUTH_SCOPES=ara-mcp:ara.example.com
+      # A user not named here keeps unrestricted access, so this is opt-in per
+      # credential. Use it for any credential handed to a third party — an MCP
+      # connector token should open the MCP router and nothing else.
+      - GATEWAY_BASIC_AUTH_SCOPES
+      # Ask-Ara MCP connector (scripts/ara-mcp-server.py): lets an outside
+      # Claude client consult Ara instead of interrupting the user. Off unless
+      # ARA_MCP_ENABLED is set, since it is a new external surface; route a host
+      # to port 8110 in the override and scope its basic-auth user above.
+      - ARA_MCP_ENABLED
+      - ARA_MCP_PORT=8110
+      - ARA_MCP_MODEL
+      - ARA_MCP_STATE_DIR=/root/.retinue/ara-mcp
       # Dashboard conversation threads (and the per-day transcript log) live
       # on the persistent /root volume (service-data-health) so they survive
       # container recreation; without this they would default to ephemeral
