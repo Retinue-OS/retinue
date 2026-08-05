@@ -38,11 +38,14 @@ Projects (dashboard project pages):
   POST /internal/conversations        -> a retinue agent opens a thread that needs
                                          the user's decision. Token-gated via
                                          CONVERSATION_BACKEND_TOKEN (header
-                                         X-Conversation-Backend-Token).
+                                         X-Conversation-Backend-Token). Optional
+                                         {kind: "cowork"} for the MCP connector's
+                                         audit trail and {quiet: true} to append
+                                         without an unread badge or Web Push.
   POST /internal/conversations/<id>/messages
                                       -> a retinue agent appends a message (with
                                          attachments) to an existing thread. Same
-                                         token gate.
+                                         token gate; same optional {quiet: true}.
 
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
@@ -1012,10 +1015,11 @@ def _list_convs(scope: str = "active", kind: str = "chat",
       - "all":      every thread regardless of archive state.
 
     `kind` filters by thread kind:
-      - "chat" (default): normal conversations only. Edit-command threads are
-        deliberately absent from every default listing.
+      - "chat" (default): normal conversations only. Edit-command and cowork
+        threads are deliberately absent from every default listing.
       - "edit": only project edit-command threads.
-      - "all":  both.
+      - "cowork": only the audit threads written by the Ask-Ara MCP connector.
+      - "all":  every kind.
 
     `project` (a project URI) restricts the list to threads linked to that
     project — what the project page shows as the project's own activity.
@@ -2737,9 +2741,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         owner = _extract_on_behalf_of(payload) or DEFAULT_SESSION_KEY
         title = (payload.get("title") or "").strip() or None
+        # Agents may open a "cowork" thread — the Ask-Ara MCP connector's audit
+        # trail. Like edit threads it stays out of the default listing; unlike
+        # them it is a record rather than a request, so it is normally quiet
+        # (no unread badge, no Web Push) and the user reads it when curious.
+        kind = (payload.get("kind") or "chat").strip()
+        if kind not in ("chat", "cowork"):
+            self._send_json(400, {"error": "invalid kind"})
+            return
+        quiet = bool(payload.get("quiet"))
         conv = _new_conv("agent", owner, title, "agent", message,
-                         first_attachments=payload.get("attachments"))
-        _push_conv_notification(conv, message)
+                         first_attachments=payload.get("attachments"),
+                         kind=kind)
+        if quiet:
+            _conv_set_flags(conv["id"], unread=False)
+        else:
+            _push_conv_notification(conv, message)
         body = {"id": conv["id"], "title": conv["title"]}
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
@@ -2764,12 +2781,18 @@ class Handler(BaseHTTPRequestHandler):
         if _load_conv(cid) is None:
             self._send_json(404, {"error": "not found"})
             return
-        conv = _conv_add_message(cid, "agent", message, unread=True,
+        # A quiet append is a record, not a request for attention: no unread
+        # badge and no Web Push. Used by the cowork audit trail, which would
+        # otherwise buzz the user's phone on every question the MCP connector
+        # relays.
+        quiet = bool(payload.get("quiet"))
+        conv = _conv_add_message(cid, "agent", message, unread=not quiet,
                                  attachments=attachments)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
-        _push_conv_notification(conv, message or "Sent you a file")
+        if not quiet:
+            _push_conv_notification(conv, message or "Sent you a file")
         body = {"id": conv["id"], "title": conv["title"]}
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
@@ -2777,9 +2800,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.split("?", 1)[0] == "/auth":
-            # Traefik forward-auth endpoint for the public router. Returns 200 to
-            # authorize, 401 (with a Basic challenge) to make the browser prompt
-            # for a password, or 403 for a presented-but-rejected certificate.
+            # Traefik forward-auth endpoint for every public router that points
+            # its forwardAuth middleware here. Returns 200 to authorize, 401
+            # (with a Basic challenge) to make the browser prompt for a password,
+            # or 403 for a presented-but-rejected certificate — or for a valid
+            # basic-auth user that is scoped to other hosts than this one.
             status, extra = gateway_auth.decide(
                 self.headers,
                 AUTH_CONFIG["users"],
@@ -2787,6 +2812,8 @@ class Handler(BaseHTTPRequestHandler):
                 cert_info_header=AUTH_CONFIG["cert_info_header"],
                 allowed_cn=AUTH_CONFIG["allowed_cn"],
                 realm=AUTH_CONFIG["realm"],
+                scopes=AUTH_CONFIG["scopes"],
+                host_header=AUTH_CONFIG["host_header"],
             )
             self.send_response(status)
             for k, v in extra.items():
@@ -2839,7 +2866,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 scope = "active"
             kind = (params.get("kind") or ["chat"])[0]
-            if kind not in ("chat", "edit", "all"):
+            if kind not in ("chat", "edit", "cowork", "all"):
                 kind = "chat"
             project = (params.get("project") or [None])[0]
             self._send_json(200, {"conversations": _list_convs(scope, kind, project)})

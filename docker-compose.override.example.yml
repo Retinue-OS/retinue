@@ -51,6 +51,15 @@ services:
       - "traefik.http.middlewares.agents-clientcert.passtlsclientcert.pem=true"
       - "traefik.http.middlewares.agents-clientcert.passtlsclientcert.info.subject.commonName=true"
       - "traefik.http.middlewares.agents-auth.forwardauth.address=http://retinue:8080/auth"
+      # Do NOT add forwardauth.authRequestHeaders. It is a whitelist, and unset
+      # means "forward everything" — including the X-Forwarded-Host that /auth
+      # needs to tell which router a scoped credential is being offered on (see
+      # GATEWAY_BASIC_AUTH_SCOPES).
+      #
+      # The router names its service explicitly, because enabling the Ask-Ara
+      # connector below defines a second service on this container and Traefik's
+      # name-matching fallback stops applying.
+      - "traefik.http.routers.agents.service=agents"
       - "traefik.http.services.agents.loadbalancer.server.port=8080"
       - "traefik.http.routers.agents.tls.certresolver=myresolver"
       # Client-CA / optional mTLS lives in a Traefik file-provider config (TLS
@@ -58,6 +67,35 @@ services:
       # uses VerifyClientCertIfGiven, so a certificate is optional but, when
       # presented, must verify against our CA — hence basic auth still works.
       - "traefik.http.routers.agents.tls.options=retinue-mtls@file"
+
+      # ── Optional: the Ask-Ara MCP connector ───────────────────────────────
+      # Publishes scripts/ara-mcp-server.py (port 8110, same container) on its
+      # own hostname, so an outside Claude client can consult Ara instead of
+      # interrupting you. Set ARA_MCP_ENABLED=1 in .env to start the process.
+      #
+      # It has NO authentication of its own — these two middlewares are the
+      # boundary, exactly as for the dashboard. Because the connector's password
+      # is handed to a third-party client, give it its OWN htpasswd user and
+      # scope that user to this host only:
+      #
+      #   TRAEFIK_BASIC_AUTH_USERS=owner:$$apr1$$...,ara-mcp:$$apr1$$...
+      #   GATEWAY_BASIC_AUTH_SCOPES=ara-mcp:ara.example.com
+      #
+      # Then the connector credential opens this router and nothing else — on
+      # the dashboard or the model-gateway host it gets a 403. The owner's own
+      # user, being unscoped, still reaches everything including this.
+      #
+      # Add the connector in claude.ai as a remote MCP server with the URL
+      # https://ara.example.com/mcp and those basic-auth credentials.
+      # - "traefik.http.routers.ara-mcp.rule=Host(`ara.example.com`)"
+      # - "traefik.http.routers.ara-mcp.entrypoints=web,websecure"
+      # - "traefik.http.routers.ara-mcp.middlewares=agents-clientcert,agents-auth"
+      # Two services on one container, so each router must name its own
+      # explicitly — Traefik's name-matching fallback is not enough here.
+      # - "traefik.http.routers.ara-mcp.service=ara-mcp"
+      # - "traefik.http.services.ara-mcp.loadbalancer.server.port=8110"
+      # - "traefik.http.routers.ara-mcp.tls.certresolver=myresolver"
+      # - "traefik.http.routers.ara-mcp.tls.options=retinue-mtls@file"
 
   # Optional: expose the updater sidecar's POST /update on the same public
   # host, so a phone can trigger a full rebuild/restart without SSHing into

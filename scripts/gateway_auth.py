@@ -20,6 +20,22 @@ a 401 makes the browser show its password prompt, a 2xx lets the request through
 Internal container-to-container traffic never passes through Traefik, so it is
 unaffected by this — only the public edge is gated.
 
+**Host scoping.** Several routers share this one ``/auth`` endpoint (the
+dashboard, the model-gateway admin UI, the MCP connector, …), so a credential
+that is valid anywhere was, until now, valid *everywhere*. That is wrong for a
+credential handed to a third party — an MCP connector token should open the MCP
+router and nothing else. ``GATEWAY_BASIC_AUTH_SCOPES`` restricts a basic-auth
+user to named hosts::
+
+    GATEWAY_BASIC_AUTH_SCOPES=ara-mcp:ara.example.com
+
+A user **not named** in that variable keeps unrestricted access, so existing
+deployments are unaffected and scoping is strictly opt-in per credential. A user
+that *is* named may authenticate only on a listed host; anywhere else it gets a
+403 rather than a 401, because re-prompting for a password that is correct but
+out of scope only loops the browser. Client certificates are the owner's own
+credential and are never scoped.
+
 Password verification is pure standard library (no third-party dependency): the
 Apache ``$apr1$`` MD5 format produced by ``htpasswd -nb`` is implemented here and
 checked in constant time. ``{SHA}`` and plaintext are also supported, plus
@@ -140,22 +156,73 @@ def load_users(raw: str) -> dict:
     return users
 
 
-def check_basic_auth(authorization: str, users: dict) -> bool:
-    """True if an ``Authorization: Basic`` header matches a configured user."""
+def load_scopes(raw: str) -> dict:
+    """Parse ``user:host`` entries into ``{user: {host, ...}}``.
+
+    Same separators as :func:`load_users` (newlines and/or commas). A user may
+    appear more than once to allow several hosts. Hosts are lowercased and
+    compared without their port. The literal host ``*`` allows any host, which
+    makes an entry explicit-but-unrestricted rather than a silent no-op.
+    """
+    scopes: dict[str, set] = {}
+    if not raw:
+        return scopes
+    for chunk in raw.replace("\r", "\n").replace(",", "\n").split("\n"):
+        entry = chunk.strip()
+        if not entry or entry.startswith("#") or ":" not in entry:
+            continue
+        user, _, host = entry.partition(":")
+        user, host = user.strip(), _normalize_host(host)
+        if user and host:
+            scopes.setdefault(user, set()).add(host)
+    return scopes
+
+
+def _normalize_host(host: str) -> str:
+    """Lowercase a Host/X-Forwarded-Host value and strip its port."""
+    host = (host or "").strip().lower()
+    # Only the first entry of a comma-joined X-Forwarded-Host chain is the
+    # client-facing host; the rest are proxy hops.
+    host = host.split(",")[0].strip()
+    if host.startswith("["):  # bracketed IPv6 literal, optionally :port
+        return host.partition("]")[0] + "]"
+    return host.partition(":")[0]
+
+
+def host_allowed(user: str, host: str, scopes: dict) -> bool:
+    """True if ``user`` may authenticate against ``host``.
+
+    Users absent from ``scopes`` are unrestricted (opt-in scoping).
+    """
+    allowed = scopes.get(user)
+    if not allowed:
+        return True
+    if "*" in allowed:
+        return True
+    return _normalize_host(host) in allowed
+
+
+def check_basic_auth(authorization: str, users: dict):
+    """Verify an ``Authorization: Basic`` header against the configured users.
+
+    Returns the authenticated user name, or ``None`` when the header is absent,
+    malformed, or the password does not match. The name is what lets the caller
+    apply per-user host scoping.
+    """
     if not authorization or not users:
-        return False
+        return None
     try:
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "basic" or not token:
-            return False
+            return None
         decoded = base64.b64decode(token).decode("utf-8")
         user, _, password = decoded.partition(":")
     except Exception:
-        return False
+        return None
     stored = users.get(user)
     if stored is None:
-        return False
-    return verify_password(password, stored)
+        return None
+    return user if verify_password(password, stored) else None
 
 
 def _cn_matches(info_header: str, allowed_cn: str) -> bool:
@@ -170,7 +237,9 @@ def _cn_matches(info_header: str, allowed_cn: str) -> bool:
 
 
 def decide(headers, users, *, cert_header: str, cert_info_header: str,
-           allowed_cn: str = "", realm: str = "Retinue"):
+           allowed_cn: str = "", realm: str = "Retinue",
+           scopes: dict | None = None,
+           host_header: str = "X-Forwarded-Host"):
     """Forward-auth decision.
 
     ``headers`` is a mapping-like object (case-insensitive ``.get``) of the
@@ -179,7 +248,8 @@ def decide(headers, users, *, cert_header: str, cert_info_header: str,
     Returns ``(status, response_headers)``. ``status`` 200 authorizes the
     request; 401 (with a ``WWW-Authenticate`` challenge) makes the browser prompt
     for a password — preserving basic auth as the fallback when no certificate is
-    installed.
+    installed; 403 rejects a credential that is valid but not for this host (see
+    ``scopes``) or a certificate whose CN is not allowed.
     """
     # 1. Client certificate (already CA-verified by Traefik if present).
     #
@@ -199,9 +269,15 @@ def decide(headers, users, *, cert_header: str, cert_info_header: str,
         # rather than fall back to a password prompt.
         return 403, {}
 
-    # 2. Basic auth fallback.
-    if check_basic_auth(headers.get("Authorization", ""), users):
-        return 200, {}
+    # 2. Basic auth fallback, restricted to the user's allowed hosts.
+    user = check_basic_auth(headers.get("Authorization", ""), users)
+    if user is not None:
+        host = headers.get(host_header, "") or headers.get("Host", "") or ""
+        if host_allowed(user, host, scopes or {}):
+            return 200, {}
+        # Correct password, wrong router. A 401 would only make the browser
+        # re-offer the same credential, so refuse outright.
+        return 403, {}
 
     return 401, {"WWW-Authenticate": f'Basic realm="{realm}"'}
 
@@ -215,6 +291,10 @@ def config_from_env() -> dict:
     )
     return {
         "users": load_users(raw_users),
+        "scopes": load_scopes(os.environ.get("GATEWAY_BASIC_AUTH_SCOPES", "")),
+        "host_header": os.environ.get(
+            "GATEWAY_FORWARDED_HOST_HEADER", "X-Forwarded-Host"
+        ),
         "cert_header": os.environ.get(
             "GATEWAY_CLIENT_CERT_HEADER", "X-Forwarded-Tls-Client-Cert"
         ),

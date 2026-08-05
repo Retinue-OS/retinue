@@ -373,6 +373,16 @@ case "$MODE" in
     export CONVERSATION_BACKEND_TOKEN
     echo "[claude] Starting web gateway on port ${WEB_GATEWAY_PORT:-8080}..."
     python3 /workspace/scripts/web-gateway.py &
+    # Ask-Ara MCP connector: lets an outside Claude client consult Ara instead of
+    # interrupting the user. Opt-in, because it is a new external surface — a
+    # deployment enables it only once it has routed a host to this port through
+    # Traefik and scoped a basic-auth user to that host
+    # (GATEWAY_BASIC_AUTH_SCOPES). Nothing reaches it otherwise; it is not
+    # published to the host.
+    if [ "${ARA_MCP_ENABLED:-0}" != "0" ]; then
+      echo "[claude] Starting Ask-Ara MCP server on port ${ARA_MCP_PORT:-8110}..."
+      python3 /workspace/scripts/ara-mcp-server.py &
+    fi
     echo "[claude] Starting task scheduler..."
     python3 /workspace/scripts/scheduler.py &
     # Watches every configured messenger gateway's /health once a minute; when a
