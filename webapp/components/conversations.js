@@ -765,6 +765,19 @@ class RetinueConversations extends HTMLElement {
     }, 1500);
   }
 
+  // Drop a chip's prefill text into the composer for review. Deliberately does
+  // NOT send: the user reads (and can edit) it, then taps Send — same contract
+  // as dictation without auto-send. Persists to the draft so a background-poll
+  // re-render doesn't wipe it, then re-renders to show the text and focus the
+  // field with the caret at the end.
+  _fillComposer(text) {
+    const draftKey = this._active || (this._composing ? 'composer' : '');
+    if (!draftKey) return;
+    this._drafts[draftKey] = text;
+    this._focusNext = true;
+    this.render();
+  }
+
   _pendingStartedAt(t) {
     return t.pending_since || t.updated || t.created || null;
   }
@@ -1134,6 +1147,8 @@ class RetinueConversations extends HTMLElement {
       threadEl.addEventListener('click', (e) => {
         const btn = e.target.closest('.copy');
         if (btn) { this._copyToClipboard(btn); return; }
+        const chip = e.target.closest('.md-chip');
+        if (chip) { this._fillComposer(chip.getAttribute('data-fill') || ''); return; }
         const sbtn = e.target.closest('.speak');
         if (sbtn) this._onSpeakButton(sbtn);
       });
