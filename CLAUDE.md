@@ -606,7 +606,7 @@ than failing — conversations still work exactly as before. Set `VAPID_SUBJECT`
 to the operator's contact address; deleting the stored key invalidates every
 existing subscription, so devices would need to re-enable.
 
-The card itself stays compact — the five most recent active threads plus an **All conversations →** link to the dedicated `conversations.html` page, which lists every thread with an Active/Archived/Edits filter. Threads can be archived from inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived threads drop off the active list but stay on that page.
+The card sizes itself to the layout: on a phone, where every row lengthens the scrolling page, it stays compact at the five most recent active threads; in the wide layout, where it is a scroll box inside its own column, it shows every active thread as tiles that reflow into as many columns as fit (the same rule governs the projects card — see `isWideFrame` in `webapp/components/base.js`). Either way an **All conversations →** link leads to the dedicated `conversations.html` page, which lists every thread with an Active/Archived/Edits filter. Threads can be archived from inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived threads drop off the active list but stay on that page.
 
 Every project on the projects card also has its **own page**
 (`project.html?id=<project URI>`): the gateway maps the URI back to the

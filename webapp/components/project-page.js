@@ -449,6 +449,15 @@ class RetinueProjectPage extends HTMLElement {
     if (form) {
       const input = form.querySelector('input');
       input.addEventListener('input', () => { this._cmd = input.value; });
+      // Cmd/Ctrl+Enter sends, as in the conversation composer. Plain Enter
+      // already submits this single-line field, but the habit comes from there
+      // and must not silently do nothing here.
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+          e.preventDefault();
+          form.requestSubmit();
+        }
+      });
       form.addEventListener('submit', (e) => {
         e.preventDefault();
         this._sendCommand(input.value);
