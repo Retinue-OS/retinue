@@ -25,7 +25,7 @@
 // polls until the answer arrives. Everything degrades gracefully offline (the
 // list/threads just fail to refresh; the last rendered state stays on screen).
 
-import { esc, fmtAge } from './base.js';
+import { esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 
 const LIST_URL = '/conversations';
@@ -38,8 +38,10 @@ const CONV_HASH_RE = /^#conversation-([0-9a-f]{32})$/;
 // with Ara"): #new?project=<encoded uri>&title=<encoded title>.
 const COMPOSER_HASH = '#new';
 const COMPOSER_HASH_RE = /^#new(?:\?(.*))?$/;
-// Most recent threads shown on the compact dashboard card before the user is
-// sent to the dedicated all-conversations page for the rest.
+// Most recent threads shown on the dashboard card before the user is sent to
+// the dedicated all-conversations page for the rest. This cap exists to keep the
+// PAGE short on the phone layout — in the wide layout the list scrolls inside
+// its own column, so it is lifted there (see _shownThreads).
 const MAX_CARD_THREADS = 5;
 const POLL_MS = 4000;
 const PENDING_WARN_SECONDS = 2 * 60;
@@ -123,6 +125,9 @@ class RetinueConversations extends HTMLElement {
     // already-open window to #conversation-<id>, and relying on popstate alone
     // for that fragment change is implementation-dependent.
     window.addEventListener('hashchange', this._onPop);
+    // Crossing the layout breakpoint changes how many threads fit (see
+    // _shownThreads), so re-render when it flips.
+    this._offFrame = onFrameChange(() => { if (!this._full) this.render(); });
     this.render();
     this.refresh();
     this._loadModels();
@@ -156,6 +161,8 @@ class RetinueConversations extends HTMLElement {
       window.removeEventListener('hashchange', this._onPop);
     }
     this._onPop = null;
+    if (this._offFrame) this._offFrame();
+    this._offFrame = null;
     this._stopRecording();
     this._stopStream();
     try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
@@ -207,9 +214,13 @@ class RetinueConversations extends HTMLElement {
     return LIST_URL;
   }
 
-  // The card shows only the most recent threads; the full page shows them all.
+  // How many threads the list shows. The full page shows them all; so does the
+  // dashboard card in the wide layout, where the list is a scroll box of its own
+  // and a cap would only leave the column half empty. Only the phone layout,
+  // where every row lengthens the page, keeps the cap.
   _shownThreads() {
-    return this._full ? this._threads : this._threads.slice(0, MAX_CARD_THREADS);
+    return (this._full || isWideFrame())
+      ? this._threads : this._threads.slice(0, MAX_CARD_THREADS);
   }
 
   async refresh() {
@@ -547,7 +558,9 @@ class RetinueConversations extends HTMLElement {
   }
 
   _allLinkLabel() {
-    const more = this._threads.length > MAX_CARD_THREADS
+    // The count is a "there is more over there" hint, so it only earns its place
+    // while the list is actually truncated.
+    const more = this._threads.length > this._shownThreads().length
       ? ` (${this._threads.length})` : '';
     return `All conversations${more} &rarr;`;
   }
@@ -1252,9 +1265,18 @@ const CSS = `
      contain would then swallow the gesture instead of chaining it to the page
      — leaving only the thin margin outside the card scrollable by finger.
      Only the wide layout, where the frame is fixed and the list genuinely
-     scrolls internally, makes it a (contained) scroller. */
-  .tabs { flex: 1; min-height: 0;
-          display: flex; flex-direction: column; gap: 8px; padding: 2px; }
+     scrolls internally, makes it a (contained) scroller.
+
+     Threads are tiles that reflow into as many columns as fit: one on a phone
+     (min(100%, …) collapses the track to whatever width there is), several once
+     the card is wide — where the list also shows every thread, not five (see
+     _shownThreads). So the room is used in both directions instead of five rows
+     being stretched across a desktop column. align-content: start keeps a short
+     list at its natural height rather than blowing the tiles up. */
+  .tabs { flex: 1; min-height: 0; display: grid; align-content: start;
+          grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
+          gap: 8px; padding: 2px; }
+  .empty { grid-column: 1 / -1; }
   @media (min-width: 1000px) and (min-height: 480px) {
     .tabs { overflow-y: auto; overscroll-behavior: contain; }
   }
@@ -1270,7 +1292,11 @@ const CSS = `
   }
   .tab.unread { box-shadow: inset 3px 0 0 0 var(--accent, #6ea8fe); }
   .t-title { display: flex; align-items: center; gap: 7px; min-width: 0; font-weight: 600; }
-  .t-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Titles are what the list is read for, so give them a second line before
+     cutting: agent-opened threads carry a whole subject line, and one line of
+     ellipsis hid most of it. */
+  .t-name { overflow: hidden; overflow-wrap: anywhere; display: -webkit-box;
+            -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--high, #ff6b6b); }
   .tag-edit { flex: none; font-size: .62rem; font-weight: 700; letter-spacing: .04em;
               text-transform: uppercase; color: var(--accent, #6ea8fe);
@@ -1332,6 +1358,13 @@ const CSS = `
   .model-pick select:hover { border-color: var(--accent, #6ea8fe); }
   .thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
             display: flex; flex-direction: column; gap: 12px; padding: 12px 2px; }
+  /* An open thread takes the whole frame, which on a wide display is far wider
+     than a comfortable line. Centre the messages and the composer in a reading
+     column; the bar keeps its full-width divider. */
+  @media (min-width: 1000px) {
+    .thread, .composer {
+      width: 100%; max-width: 900px; margin-left: auto; margin-right: auto; }
+  }
   .msg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; }
   .msg.me { align-self: flex-end; align-items: flex-end; }
   .who { color: var(--muted, #8b93a3); font-size: .7rem; }

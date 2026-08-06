@@ -25,6 +25,13 @@ import { esc } from './base.js';
 
 const SEP = String.fromCharCode(1); // sentinel absent from escaped text
 
+// Trailing characters an auto-linked URL must hand back to the surrounding text.
+// Sentence punctuation is the obvious part; the asterisks matter just as much,
+// since a URL wrapped in emphasis (**https://example.com**) would otherwise
+// swallow the closing ** into the href — a dead link, and one the bold pass can
+// no longer see either, because the anchor is stashed by then.
+const URL_TAIL_RE = /[.,;:!?)\]*]+$/;
+
 function anchor(url, label) {
   const external = !/^mailto:|^tel:/i.test(url);
   const attrs = external ? ' target="_blank" rel="noopener noreferrer"' : '';
@@ -57,15 +64,15 @@ export function renderInline(text) {
   // [label](url)
   s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|tel:)[^\s)]+)\)/gi,
     (_m, label, url) => stash(anchor(url, label)));
-  // Bare URLs; keep any trailing sentence punctuation outside the link.
+  // Bare URLs; keep any trailing punctuation (URL_TAIL_RE) outside the link.
   s = s.replace(/\bhttps?:\/\/[^\s<]+/gi, (m) => {
-    const t = m.match(/[.,;:!?)\]]+$/);
+    const t = m.match(URL_TAIL_RE);
     const tail = t ? t[0] : '';
     const url = tail ? m.slice(0, -tail.length) : m;
     return stash(anchor(url, url)) + tail;
   });
   s = s.replace(/\bwww\.[^\s<]+/gi, (m) => {
-    const t = m.match(/[.,;:!?)\]]+$/);
+    const t = m.match(URL_TAIL_RE);
     const tail = t ? t[0] : '';
     const host = tail ? m.slice(0, -tail.length) : m;
     return stash(anchor('https://' + host, host)) + tail;

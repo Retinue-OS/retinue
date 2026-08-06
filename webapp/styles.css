@@ -11,7 +11,11 @@
  *    else hides, so the chat is immersive with an internally scrolled thread
  *    and a pinned composer.
  *  - Wide screens (>=1000px and tall enough): two columns — conversations
- *    left, projects right — both visible, each scrolling internally. */
+ *    left, projects right — both visible, each scrolling internally. The frame
+ *    tracks the window up to a generous cap instead of sitting in a narrow
+ *    phone-width strip, and the cards drop their dashboard row caps there (see
+ *    isWideFrame in components/base.js), so the extra room carries more
+ *    conversations and projects rather than empty space. */
 :root {
   --bg: #0b0d12;
   --card: #151922;
@@ -97,11 +101,16 @@ retinue-project-page { flex: 1; min-height: 0; }
    windows keep the single-column scroll layout above instead. */
 @media (min-width: 1000px) and (min-height: 480px) {
   main {
-    max-width: 1100px;
+    /* Fill the window rather than centring a 1100px column with dead margins
+       either side; the cap only stops the conversation tiles from spreading
+       absurdly wide on a very large display. */
+    max-width: min(1600px, 100%);
     height: 100vh;
     height: 100dvh;
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 360px;
+    /* The projects column scales with the window (a fixed 360px looks starved
+       next to a 1200px conversations column) but stays within a readable band. */
+    grid-template-columns: minmax(0, 1fr) clamp(320px, 24vw, 420px);
     grid-template-rows: auto minmax(0, 1fr) auto;
     gap: 12px 18px;
   }
@@ -121,4 +130,18 @@ retinue-project-page { flex: 1; min-height: 0; }
     display: flex;
     max-width: 760px;
   }
+  /* Same for the dedicated list pages: they carry one component, so the grid
+     would either strand it in the narrow right column (projects.html, which the
+     grid rules above place in column 2) or leave that column hollow
+     (conversations.html).
+     Both lists reflow into columns by themselves once they have the width. */
+  main:has(> retinue-conversations[full]),
+  main:has(> retinue-projects[full]) {
+    display: flex;
+  }
+  /* …and the single component takes the frame's height, scrolling internally —
+     the frame itself is fixed and clips, so a natural-height child would put its
+     tail out of reach. */
+  main:has(> retinue-conversations[full]) > retinue-conversations { flex: 1; min-height: 0; }
+  main:has(> retinue-projects[full]) > retinue-projects { flex: 1; min-height: 0; overflow-y: auto; }
 }

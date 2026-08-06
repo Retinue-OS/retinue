@@ -25,6 +25,29 @@ export function fmtAge(iso) {
   return `${Math.round(hrs / 24)} d ago`;
 }
 
+// The dashboard has two layouts (see styles.css — keep this query in sync):
+//  - the phone layout, where the PAGE scrolls and every card contributes its
+//    full height to it, so a card must cap its list or the dashboard becomes an
+//    endless scroll;
+//  - the wide layout, a fixed app frame whose columns scroll internally, where a
+//    card's list is bounded by its own scroll box. There a cap only wastes the
+//    space it was meant to protect, so cards show everything they have.
+export const WIDE_FRAME = '(min-width: 1000px) and (min-height: 480px)';
+
+export function isWideFrame() {
+  return typeof matchMedia === 'function' && matchMedia(WIDE_FRAME).matches;
+}
+
+// Run `fn` whenever the layout flips between the two modes (window resize,
+// device rotation). Returns an unsubscribe function for disconnectedCallback.
+export function onFrameChange(fn) {
+  if (typeof matchMedia !== 'function') return () => {};
+  const mq = matchMedia(WIDE_FRAME);
+  const handler = () => fn(mq.matches);
+  mq.addEventListener('change', handler);
+  return () => mq.removeEventListener('change', handler);
+}
+
 const CARD_CSS = `
   :host { display: block; }
   .card {

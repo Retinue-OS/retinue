@@ -18,9 +18,12 @@
 //
 // Degrades gracefully offline: the fetch fails, the last rendered state stays.
 
-import { esc, fmtAge } from './base.js';
+import { esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
 
 const SRC = '/projects';
+// Caps for the dashboard card in the phone layout, where every row lengthens the
+// scrolling page. In the wide layout the card scrolls inside its own column, so
+// they are lifted there and the column shows the full picture.
 const MAX_CARD_MINE = 6;
 const MAX_CARD_WAITING = 3;
 
@@ -45,7 +48,12 @@ const CSS = `
   .group-label { font-size: .72rem; font-weight: 600; letter-spacing: .04em;
        text-transform: uppercase; color: var(--muted, #8b93a3); margin: 14px 0 8px; }
   .group-label:first-of-type { margin-top: 2px; }
-  ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+  /* Rows reflow into as many columns as fit — one in the dashboard's narrow
+     projects column or on a phone (min(100%, …) collapses the track), several on
+     the full projects page, where a single stretched row per project would leave
+     most of a wide window empty. */
+  ul { list-style: none; margin: 0; padding: 0; display: grid; align-content: start;
+       grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 8px; }
   /* Each row links to the project's own page (view, edit, discuss). Rows are
      tap targets, not prose: suppress text selection and the iOS long-press
      callout so a finger resting on a row while scrolling never starts a
@@ -91,8 +99,17 @@ function projectLi(p, cls, opts = {}) {
 class RetinueProjects extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
-    this.render({ state: 'loading' });
+    this._last = { state: 'loading' };
+    this.render(this._last);
     this.load();
+    // Crossing the layout breakpoint changes how many rows the card shows, so
+    // re-render from the last data when it flips.
+    this._offFrame = onFrameChange(() => { if (!this.full) this.render(this._last); });
+  }
+
+  disconnectedCallback() {
+    if (this._offFrame) this._offFrame();
+    this._offFrame = null;
   }
 
   get full() { return this.hasAttribute('full'); }
@@ -102,9 +119,11 @@ class RetinueProjects extends HTMLElement {
     try {
       const res = await fetch(SRC, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
-      this.render({ state: 'ok', data: await res.json() });
+      this._last = { state: 'ok', data: await res.json() };
+      this.render(this._last);
     } catch (_err) {
-      this.render({ state: 'offline' });
+      this._last = { state: 'offline' };
+      this.render(this._last);
     }
   }
 
@@ -134,15 +153,18 @@ class RetinueProjects extends HTMLElement {
     const mine = Array.isArray(d.mine) ? d.mine : [];
     const waiting = Array.isArray(d.waiting) ? d.waiting : [];
     if (!mine.length && !waiting.length) return '<p class="muted">No running projects.</p>';
+    const wide = isWideFrame();
     const out = [];
     if (mine.length) {
       out.push('<div class="group-label">Your move</div><ul>' +
-        mine.slice(0, MAX_CARD_MINE).map((p) => projectLi(p, 'mine', { next: true })).join('') +
+        mine.slice(0, wide ? mine.length : MAX_CARD_MINE)
+          .map((p) => projectLi(p, 'mine', { next: true })).join('') +
         '</ul>');
     }
     if (waiting.length) {
       out.push('<div class="group-label">Waiting on others</div><ul>' +
-        waiting.slice(0, MAX_CARD_WAITING).map((p) => projectLi(p, 'waiting')).join('') +
+        waiting.slice(0, wide ? waiting.length : MAX_CARD_WAITING)
+          .map((p) => projectLi(p, 'waiting')).join('') +
         '</ul>');
     }
     out.push('<a class="more" href="/projects.html">All projects &rarr;</a>');
