@@ -780,13 +780,15 @@ class RetinueConversations extends HTMLElement {
 
   // Drop a chip's prefill text into the composer for review. Deliberately does
   // NOT send: the user reads (and can edit) it, then taps Send — same contract
-  // as dictation without auto-send. Persists to the draft so a background-poll
-  // re-render doesn't wipe it, then re-renders to show the text and focus the
-  // field with the caret at the end.
+  // as dictation without auto-send. APPENDS to whatever the user has already
+  // typed rather than replacing it (a chip augments the draft, it never wipes
+  // work in progress) — the same append semantics as a dictation. Persists to
+  // the draft so a background-poll re-render doesn't wipe it, then re-renders to
+  // show the text and focus the field with the caret at the end.
   _fillComposer(text) {
     const draftKey = this._active || (this._composing ? 'composer' : '');
     if (!draftKey) return;
-    this._drafts[draftKey] = text;
+    this._appendToDraft(text);
     this._focusNext = true;
     this.render();
   }
