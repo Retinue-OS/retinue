@@ -181,6 +181,8 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None, mode: 
     sent = 0
     for sub in _all_subscriptions():
         user_mode = sub.get("notification_mode", "all")
+        if user_mode == "off":
+            continue
         if mode and mode != "all" and user_mode != "all" and user_mode != mode:
             # Handle complex mapping
             if user_mode == "new_only" and mode != "new":

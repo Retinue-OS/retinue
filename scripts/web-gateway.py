@@ -1315,14 +1315,26 @@ def _push_conv_notification(conv: dict, text: str) -> None:
     file an agent appends, and Ara's own reply (which arrives after her session
     ends, long after the user may have closed the app). Best effort — a push
     failure never affects the conversation itself."""
-    if not push_notify.enabled():
+    if not push_notify.enabled() or conv.get("archived"):
         return
     cid = conv.get("id", "")
     title = conv.get("title") or "Retinue"
     body = " ".join(str(text or "").split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
-    push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid)
+
+    event_mode = "regular"
+    if conv.get("unread"):
+        event_mode = "new"
+    elif conv.get("read_at"):
+        try:
+            last_read = datetime.fromisoformat(conv["read_at"])
+            if (datetime.now(timezone.utc) - last_read).total_seconds() > 600:
+                event_mode = "stalled"
+        except (ValueError, TypeError):
+            pass
+
+    push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid, mode=event_mode)
 
 
 def _conv_worker(cid: str, session_key: str) -> None:
@@ -2632,7 +2644,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, _load_conv(cid) or conv)
 
     def _handle_conversation_read(self, cid: str) -> None:
-        conv = _conv_set_flags(cid, unread=False)
+        conv = _conv_set_flags(cid, unread=False, read_at=datetime.now(timezone.utc).isoformat())
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return

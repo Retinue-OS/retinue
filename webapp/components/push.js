@@ -17,6 +17,7 @@ const MODES = [
   { id: 'all', label: 'All messages' },
   { id: 'new_only', label: 'New conversations only' },
   { id: 'new_and_stalled', label: 'New & stalled conversations' },
+  { id: 'off', label: 'No notifications' },
 ];
 
 function urlBase64ToUint8Array(base64) {
