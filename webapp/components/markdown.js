@@ -41,6 +41,16 @@ export function renderInline(text) {
   // Stash generated <a> HTML behind a placeholder so the later bold/italic
   // passes never mangle a URL, and restore them at the end.
   const stash = (html) => `${SEP}${stashed.push(html) - 1}${SEP}`;
+  // [[chip: Label | prefill text]] — a click-to-fill button. Ara emits these to
+  // offer a reply without the user typing: clicking drops the prefill text into
+  // the composer for review (never auto-sends). The label and prefill are taken
+  // from the already-escaped string `s`, so both are safe as text/attribute.
+  // Stashed like a link so bold/italic passes don't touch the button markup.
+  // A label may not contain "|" (the separator); prefill runs to the closing
+  // "]]". Whitespace around each part is trimmed.
+  s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/gi,
+    (_m, label, fill) => stash(
+      `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`));
   // ![alt](url) — no remote fetches from rendered content; show it as a link.
   s = s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/)[^\s)]+)\)/gi,
     (_m, alt, url) => stash(anchor(url, alt || url)));
@@ -275,6 +285,15 @@ export const MD_CSS = `
   .md hr { border: 0; border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); margin: 12px 0; }
   .md .md-quote { margin: 6px 0 8px; padding: 6px 10px; border-left: 3px solid var(--accent, #6ea8fe);
                   background: rgba(110, 168, 254, .1); border-radius: 8px; }
+  /* Click-to-fill chips: an inline pill that drops a prefilled reply into the
+     composer. Styled as an actionable affordance, distinct from links. */
+  .md .md-chip { display: inline-block; font: inherit; font-size: .9em; line-height: 1.2;
+                 cursor: pointer; margin: 2px 2px; padding: 4px 11px;
+                 color: var(--accent, #6ea8fe); background: rgba(110, 168, 254, .12);
+                 border: 1px solid var(--accent, #6ea8fe); border-radius: 999px;
+                 -webkit-tap-highlight-color: transparent; }
+  .md .md-chip:hover { background: rgba(110, 168, 254, .22); }
+  .md .md-chip:active { transform: translateY(1px); }
   .md .md-tablewrap { overflow-x: auto; margin: 8px 0; }
   .md table { border-collapse: collapse; font-size: .88em; min-width: 60%; }
   .md th, .md td { border: 1px solid var(--line, rgba(231, 235, 242, .12)); padding: 5px 9px;
