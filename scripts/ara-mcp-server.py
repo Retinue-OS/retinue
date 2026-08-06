@@ -37,7 +37,22 @@ so the credential opens the MCP router and nothing else. A second token here
 would be unusable anyway — a client can only send one ``Authorization`` header,
 and Traefik already claims it.
 
+More than one instance
+----------------------
+A client can attach several Retinue deployments at once — a private one and a
+company one, say. They share no data, and the client namespaces the tools by
+connector, so nothing collides technically. What does collide is meaning: two
+servers introducing themselves in identical words leave the model to pick one at
+random, and the wrong instance answers plausibly from its own, unrelated data
+rather than admitting the question is not its own. ``ARA_MCP_IDENTITY`` and
+``ARA_MCP_SCOPE_HINT`` give each instance a name and a remit, in the handshake,
+in the tool descriptions and in the answering prompt, so the choice is made on
+subject matter instead of order.
+
 Configuration (environment):
+    ARA_MCP_IDENTITY          what this instance calls itself (default "Ara")
+    ARA_MCP_SCOPE_HINT        one line on what it covers, for clients with
+                              several instances attached (default: unset)
     ARA_MCP_PORT              listen port (default 8110)
     ARA_MCP_WORKDIR           cwd for the answering session (default /workspace)
     ARA_MCP_MODEL             --model for the answering session (default: unset)
@@ -56,6 +71,7 @@ import json
 import os
 import re
 import subprocess
+import textwrap
 import threading
 import time
 import urllib.error
@@ -67,6 +83,8 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+IDENTITY = os.environ.get("ARA_MCP_IDENTITY", "").strip() or "Ara"
+SCOPE_HINT = os.environ.get("ARA_MCP_SCOPE_HINT", "").strip()
 PORT = int(os.environ.get("ARA_MCP_PORT", "8110"))
 WORKDIR = os.environ.get("ARA_MCP_WORKDIR", "/workspace")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
@@ -87,7 +105,17 @@ CONVERSATION_BASE_URL = os.environ.get("CONVERSATION_BASE_URL", "").rstrip("/")
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = PROTOCOL_VERSIONS[0]
-SERVER_INFO = {"name": "ara", "title": "Ask Ara", "version": "1.0.0"}
+VERSION = "1.1.0"
+
+
+def _slug(name: str) -> str:
+    """A protocol-safe server name derived from the identity."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "ara"
+
+
+def _server_info(identity: str | None = None) -> dict:
+    name = identity or IDENTITY
+    return {"name": _slug(name), "title": f"Ask {name}", "version": VERSION}
 
 # Tools the answering session may never have. Bash is deliberately not on this
 # list — see the module docstring for why, and what the real boundary is.
@@ -96,39 +124,68 @@ FORBIDDEN_TOOLS = ("Write", "Edit", "NotebookEdit")
 # Handed to the client on initialize and, for most clients, injected into its
 # system context. This is the whole point of the connector: it changes the
 # client's default from "interrupt the human" to "ask Ara, then the human".
-SERVER_INSTRUCTIONS = """\
-Ara coordinates Retinue, the user's personal agent system. She has what you do
-not: the user's projects and their current state, their calendar and
-correspondence, the mounted chambers and their data, the life triple store, and
-the history of decisions already taken.
+# Written around the configured identity rather than a fixed name, and without a
+# pronoun for it: a deployment names its own instance, and nothing here should
+# decide what that name should be called.
 
-When something about the user's situation, data, history, or preferences is
-unclear — before you guess, and before you interrupt the user — ask Ara with
-`ask_ara`. Ask in plain prose, the way you would ask a colleague who has been in
-every previous meeting; include what you are trying to do, so she can answer the
-question behind the question. Only put it to the user if Ara answers that she
-does not know, or if the decision is genuinely theirs to make (a preference, an
-approval, a commitment on their behalf).
+def _instructions(identity: str | None = None, scope: str | None = None) -> str:
+    name = identity or IDENTITY
+    scope = SCOPE_HINT if scope is None else scope.strip()
+    remit = f" It covers: {scope}." if scope else ""
+    paragraphs = [
+        f"{name} coordinates Retinue, the user's personal agent system, and has "
+        "what you do not: the user's projects and their current state, their "
+        "calendar and correspondence, the mounted chambers and their data, the "
+        "life triple store, and the history of decisions already taken.",
 
-Ara answers; she does not act. She will not send messages, commit code, or change
-files on your behalf. If something needs doing, she will say so, and you or the
-user carry it out.
+        "When something about the user's situation, data, history, or "
+        "preferences is unclear — before you guess, and before you interrupt "
+        f"the user — ask {name} with `ask_ara`. Ask in plain prose, the way you "
+        "would ask a colleague who has been in every previous meeting; include "
+        "what you are trying to do, so the answer can address the question "
+        f"behind the question. Only put it to the user if {name} answers that "
+        "this is not known here, or if the decision is genuinely theirs to make "
+        "(a preference, an approval, a commitment on their behalf).",
 
-Also available: `list_projects` and `get_project` read the user's project files
-directly — cheaper and more precise than asking when you already know which
-project you mean. `tell_ara` leaves the user a note in their dashboard; use it to
-report something worth their attention rather than to ask a question.
-"""
+        f"{name} answers, and does not act: no message will be sent, no code "
+        "committed, no file changed on your behalf. If something needs doing, "
+        "you will be told what and by whom, and you or the user carry it out.",
+
+        "This client may have several Retinue instances attached at once, each "
+        "holding different data and each presenting these tools under its own "
+        f"connector prefix. This one is {name}.{remit} They share nothing, so a "
+        "question that belongs to another instance has to go to that one: "
+        f"{name} will tell you it is not held here rather than answer from "
+        "unrelated data of its own. Pick the connector whose remit fits the "
+        "question, and if none plainly does, ask the user which.",
+
+        "Also available: `list_projects` and `get_project` read the user's "
+        "project files directly — cheaper and more precise than asking when you "
+        "already know which project you mean. `tell_ara` leaves the user a note "
+        "in their dashboard; use it to report something worth their attention "
+        "rather than to ask a question.",
+    ]
+    # Wrapped on render, not in the source: the identity is substituted in, so
+    # hand-wrapped lines would go ragged for any name but the default.
+    return "\n\n".join(textwrap.fill(p, 79) for p in paragraphs) + "\n"
+
+
+SERVER_INFO = _server_info()
+SERVER_INSTRUCTIONS = _instructions()
 
 TOOLS = [
     {
         "name": "ask_ara",
-        "title": "Ask Ara",
+        "title": f"Ask {IDENTITY}",
         "description": (
-            "Ask Ara — the user's personal agent — a question about the user's "
+            f"Ask {IDENTITY} — the user's personal agent"
+            + (f", covering {SCOPE_HINT}" if SCOPE_HINT else "")
+            + " — a question about the user's "
             "projects, data, correspondence, schedule, preferences, or the state "
             "of their system. Use this instead of asking the user whenever the "
-            "answer is something Ara would already know. Answers can take a "
+            f"answer is something {IDENTITY} would already know. If several "
+            "Retinue connectors are attached, pick the one whose remit fits the "
+            "question. Answers can take a "
             "while: if this returns status \"pending\", poll get_answer with the "
             "returned job_id."
         ),
@@ -195,7 +252,7 @@ TOOLS = [
         "name": "tell_ara",
         "title": "Leave the user a note",
         "description": (
-            "Leave a note for the user in their Retinue dashboard — something "
+            f"Leave a note for the user in the {IDENTITY} dashboard — something "
             "they should know or decide about, arising from the work you are "
             "doing. Not for questions you need answered now; use ask_ara for "
             "those. Returns a link to the thread."
@@ -263,12 +320,30 @@ def _finish_job(job_id: str, status: str, answer: str) -> None:
 
 # ── The answering session ─────────────────────────────────────────────────────
 
-def _build_prompt(question: str, context: str) -> str:
+def _build_prompt(question: str, context: str, identity: str | None = None,
+                  scope: str | None = None) -> str:
+    name = identity or IDENTITY
+    scope = SCOPE_HINT if scope is None else scope.strip()
     parts = [
         "An outside Claude client is working with the user and has consulted "
         "you through the Ask-Ara MCP connector. Answer from what Retinue knows: "
         "the chambers, the life store, the project files, the system's own state.",
         "",
+    ]
+    if scope:
+        # Several instances may be attached to the same client, and the client
+        # can misroute. Saying "not mine" is then the useful answer: it sends
+        # the client to the instance that holds it, where a confident answer
+        # from adjacent local data would send it nowhere.
+        parts += [
+            f"You are {name}, the Retinue instance covering: {scope}. The client "
+            "may have other Retinue instances attached, holding data you do not. "
+            "If this question falls outside your remit, say so plainly in one "
+            "sentence and name what it would belong to — do not answer it from "
+            "adjacent data of your own.",
+            "",
+        ]
+    parts += [
         "This is an advisory, read-only query. Do not send messages, do not "
         "commit, do not modify any file. If something needs doing, say what and "
         "by whom — the client or the user will carry it out.",
@@ -552,7 +627,7 @@ MAX_BODY = 1 << 20
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ara-mcp/1.0"
+    server_version = f"ara-mcp/{VERSION}"
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):  # quieter than the default access log
@@ -574,6 +649,7 @@ class Handler(BaseHTTPRequestHandler):
             with _jobs_lock:
                 pending = sum(1 for j in _jobs.values() if j["status"] == "pending")
             self._send(200, {"status": "ok", "service": "ara-mcp",
+                             "identity": IDENTITY, "scope": SCOPE_HINT,
                              "tools": [t["name"] for t in TOOLS],
                              "pending": pending, "audit": AUDIT})
             return
@@ -620,6 +696,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    log(f"identity={IDENTITY!r} ({SERVER_INFO['name']}) "
+        f"scope={SCOPE_HINT or '(unset)'!r}")
     log(f"workdir={WORKDIR} model={MODEL or '(default)'} audit={AUDIT} "
         f"concurrency={MAX_CONCURRENCY} rate={RATE_LIMIT}/{int(RATE_WINDOW)}s")
     if not CONVERSATION_TOKEN:

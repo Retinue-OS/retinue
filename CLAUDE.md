@@ -672,6 +672,23 @@ and no existing deployment changes behaviour. Client certificates are the owner'
 own credential and are never scoped. Traefik labels: see
 `docker-compose.override.example.yml`.
 
+**More than one instance.** A client may attach several Retinue deployments at
+once — a private one and a work one. Nothing collides technically: the client
+namespaces every tool by connector name, so both `ask_ara` tools stay distinct.
+What collides is meaning. Left at the default, both instances introduce
+themselves with the same name and the same claim to "the user's projects", so
+the model has nothing to route on and picks one — and the wrong instance answers
+plausibly from its own, unrelated data. Two variables fix that, and a
+single-instance deployment needs neither:
+
+- **`ARA_MCP_IDENTITY`** — the name this instance answers under (`Ara (work)`).
+  It flows into `serverInfo`, the `instructions` text, and every tool
+  description. The wire-level server name is slugified from it (`ara-work`).
+- **`ARA_MCP_SCOPE_HINT`** — one line on what this instance covers
+  (`the company: invoices, the board, staff`). It is stated in the handshake
+  *and* handed to the answering session, so an out-of-remit question comes back
+  as "not held here, that belongs to …" rather than as a confident wrong answer.
+
 ## Language convention
 
 All **non-user-facing natural language is written in English**. This keeps the

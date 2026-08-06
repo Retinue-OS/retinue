@@ -64,6 +64,53 @@ def test_initialize_carries_instructions():
     print("ok: initialize returns capabilities and client instructions")
 
 
+def test_identity_defaults_to_ara_and_is_configurable():
+    """A deployment names its own instance; the default is unchanged.
+
+    Two instances attached to one client are namespaced by the client, so the
+    tools never collide — what collides is meaning, and that is fixed here.
+    """
+    assert mcp.IDENTITY == "Ara"
+    assert mcp._server_info() == {"name": "ara", "title": "Ask Ara",
+                                  "version": mcp.VERSION}
+    info = mcp._server_info("Ara (work)")
+    assert info["title"] == "Ask Ara (work)"
+    # The name goes on the wire, so it must survive any identity a deployment
+    # picks — punctuation, spaces, case.
+    assert info["name"] == "ara-work"
+    assert mcp._slug("  !!  ") == "ara"
+    print("ok: the instance identity defaults to Ara and yields a safe slug")
+
+
+def test_instructions_disambiguate_several_instances():
+    """The handshake text has to name this instance and admit to the others."""
+    raw = mcp._instructions("Ara (work)", "invoices, the board, staff")
+    # The text is wrapped on render, so read it as prose, not as lines.
+    text = " ".join(raw.split())
+    assert "Ara (work) coordinates Retinue" in text
+    assert "It covers: invoices, the board, staff." in text
+    # Without this, a misrouted question is answered plausibly and wrongly.
+    assert "several Retinue instances" in text
+    assert "not held here" in text
+    assert "ask_ara" in text and "user" in text.lower()
+    # An instance with no declared remit says nothing about one.
+    assert "It covers:" not in mcp._instructions("Ara", "")
+    print("ok: the instructions name this instance and route questions by remit")
+
+
+def test_the_remit_reaches_the_answering_session():
+    """Saying "not mine" is only possible if the session knows its own remit."""
+    scoped = mcp._build_prompt("Which invoices are open?", "",
+                               identity="Ara (work)", scope="the company")
+    assert "You are Ara (work)" in scoped and "the company" in scoped
+    assert "outside your remit" in scoped
+    # Unscoped deployments — the single-instance case — get the prompt they had.
+    plain = mcp._build_prompt("Which invoices are open?", "", scope="")
+    assert "outside your remit" not in plain
+    assert "read-only" in plain.lower()
+    print("ok: a declared remit reaches the answering prompt, and only then")
+
+
 def test_initialize_negotiates_protocol_version():
     """An older client gets its own version back; an unknown one gets ours."""
     assert call("initialize", {"protocolVersion": "2024-11-05"})["result"][
@@ -288,6 +335,9 @@ def test_job_pruning_keeps_pending_work():
 
 def main():
     test_initialize_carries_instructions()
+    test_identity_defaults_to_ara_and_is_configurable()
+    test_instructions_disambiguate_several_instances()
+    test_the_remit_reaches_the_answering_session()
     test_initialize_negotiates_protocol_version()
     test_notifications_get_no_reply()
     test_ping_and_unknown_method()
