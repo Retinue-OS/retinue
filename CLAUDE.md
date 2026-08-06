@@ -460,6 +460,32 @@ seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
 intentional, not broken.
 
+**A deployment that doesn't use a given channel at all** — never runs its
+container, not even unpaired — must say so explicitly, or the monitor has no
+way to tell that apart from a real outage. The base `docker-compose.yml`
+always points the `retinue` service at all three built-in gateways via
+`SIGNAL_GATEWAY_BASE_URL` / `WHATSAPP_GATEWAY_BASE_URL` /
+`TELEGRAM_GATEWAY_BASE_URL`; if the matching container is never started, the
+monitor's health check fails DNS resolution — indistinguishable, from inside
+this container, from that same container having crashed — and it opens a
+"gateway disconnected" thread on every restart. There are two supported ways
+to silence it, and they mean different things:
+
+- **Leave the container running, just unpaired.** Its own `/health` then
+  reports `configured: false`, which `/sends`, `/gateways` and the monitor all
+  already skip — no config needed, and the channel stays visibly "not set up"
+  on `/gateways` if the user ever wants to pair it later.
+- **Never run the container at all.** Then also blank the matching
+  `*_GATEWAY_BASE_URL` on the `retinue` service in the deployment's
+  `docker-compose.override.yml` (see the example there). An empty base URL
+  drops the channel from the registry entirely — `/sends`, `/gateways` and the
+  monitor stop knowing it exists, same as a chamber that was never mounted.
+
+`GATEWAY_MONITOR_IGNORE` (comma-separated slugs) is the narrower tool: it
+silences the monitor alone while leaving the channel enrolled everywhere else
+— for a gateway the deployment deliberately runs unlinked and doesn't want
+reminders about, not for one it never runs at all.
+
 ## Speech-to-text (STT service)
 
 Transcription is a **shared capability**, not the business of any one gateway, so
