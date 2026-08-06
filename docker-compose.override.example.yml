@@ -87,6 +87,16 @@ services:
       #
       # Add the connector in claude.ai as a remote MCP server with the URL
       # https://ara.example.com/mcp and those basic-auth credentials.
+      #
+      # If the same client attaches MORE than one Retinue instance (a private
+      # one and a work one, say), name each and say what it covers — otherwise
+      # both introduce themselves identically and the client picks one at
+      # random, so the wrong instance answers plausibly from unrelated data:
+      #
+      #   ARA_MCP_IDENTITY=Ara (work)
+      #   ARA_MCP_SCOPE_HINT=the company: invoices, the board, staff
+      #
+      # A single-instance deployment needs neither.
       # - "traefik.http.routers.ara-mcp.rule=Host(`ara.example.com`)"
       # - "traefik.http.routers.ara-mcp.entrypoints=web,websecure"
       # - "traefik.http.routers.ara-mcp.middlewares=agents-clientcert,agents-auth"

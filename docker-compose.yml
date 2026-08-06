@@ -122,6 +122,13 @@ services:
       - ARA_MCP_PORT=8110
       - ARA_MCP_MODEL
       - ARA_MCP_STATE_DIR=/root/.retinue/ara-mcp
+      # Only needed when a client attaches MORE than one Retinue instance: the
+      # name this one answers under, and one line on what it covers, so the
+      # client routes a question by subject instead of by list order.
+      #   ARA_MCP_IDENTITY=Ara (work)
+      #   ARA_MCP_SCOPE_HINT=the company: invoices, the board, staff
+      - ARA_MCP_IDENTITY
+      - ARA_MCP_SCOPE_HINT
       # Dashboard conversation threads (and the per-day transcript log) live
       # on the persistent /root volume (service-data-health) so they survive
       # container recreation; without this they would default to ephemeral
