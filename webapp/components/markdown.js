@@ -292,15 +292,20 @@ export const MD_CSS = `
   .md hr { border: 0; border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); margin: 12px 0; }
   .md .md-quote { margin: 6px 0 8px; padding: 6px 10px; border-left: 3px solid var(--accent, #6ea8fe);
                   background: rgba(110, 168, 254, .1); border-radius: 8px; }
-  /* Click-to-fill chips: an inline pill that drops a prefilled reply into the
-     composer. Styled as an actionable affordance, distinct from links. */
-  .md .md-chip { display: inline-block; font: inherit; font-size: .9em; line-height: 1.2;
-                 cursor: pointer; margin: 2px 2px; padding: 4px 11px;
-                 color: var(--accent, #6ea8fe); background: rgba(110, 168, 254, .12);
-                 border: 1px solid var(--accent, #6ea8fe); border-radius: 999px;
+  /* Click-to-fill chips: styled as a LINK, not a button. Clicking one only drops
+     prefilled text into the composer for review — nothing is sent until the user
+     presses Send — so it must not look like an action button. Real action
+     buttons (immediate effect, no send) are a separate, later affordance with
+     its own syntax; keeping the two visually distinct is deliberate. Reset the
+     native <button> chrome (background/border/padding) so it reads as inline
+     link text. */
+  .md .md-chip { display: inline; font: inherit; cursor: pointer;
+                 padding: 0; margin: 0; border: 0; background: none;
+                 color: var(--accent, #6ea8fe); text-decoration: underline;
+                 text-underline-offset: 2px;
                  -webkit-tap-highlight-color: transparent; }
-  .md .md-chip:hover { background: rgba(110, 168, 254, .22); }
-  .md .md-chip:active { transform: translateY(1px); }
+  .md .md-chip:hover { text-decoration-thickness: 2px; }
+  .md .md-chip:active { opacity: .7; }
   .md .md-tablewrap { overflow-x: auto; margin: 8px 0; }
   .md table { border-collapse: collapse; font-size: .88em; min-width: 60%; }
   .md th, .md td { border: 1px solid var(--line, rgba(231, 235, 242, .12)); padding: 5px 9px;
