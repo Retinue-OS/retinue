@@ -103,23 +103,28 @@ def test_tools_list_is_read_only():
     print("ok: the tool list is the read-only set, tell_ara flagged correctly")
 
 
-def test_forbidden_tools_are_stripped_from_the_session():
-    """File mutation is removed from the answering session outright."""
-    for name in ("Write", "Edit", "NotebookEdit"):
-        assert name in mcp.FORBIDDEN_TOOLS
+def _capture_session(prompt):
+    """Run ``_run_claude`` up to the exec, returning its (argv, kwargs)."""
     captured = {}
 
     def fake_run(cmd, **kw):
-        captured["cmd"] = cmd
+        captured["call"] = (cmd, kw)
         raise RuntimeError("stop before exec")
 
     real = mcp.subprocess.run
     mcp.subprocess.run = fake_run
     try:
-        mcp._run_claude("hello")
+        mcp._run_claude(prompt)
     finally:
         mcp.subprocess.run = real
-    cmd = captured["cmd"]
+    return captured["call"]
+
+
+def test_forbidden_tools_are_stripped_from_the_session():
+    """File mutation is removed from the answering session outright."""
+    for name in ("Write", "Edit", "NotebookEdit"):
+        assert name in mcp.FORBIDDEN_TOOLS
+    cmd, _ = _capture_session("hello")
     for name in mcp.FORBIDDEN_TOOLS:
         assert "--disallowed-tools" in cmd and name in cmd, name
     # No permission-mode override: `claude -p` then auto-denies anything the
@@ -127,6 +132,20 @@ def test_forbidden_tools_are_stripped_from_the_session():
     assert "--permission-mode" not in cmd
     assert "--dangerously-skip-permissions" not in cmd
     print("ok: the answering session cannot write, edit, or skip permissions")
+
+
+def test_the_prompt_is_fed_on_stdin_not_as_an_argument():
+    """--disallowed-tools is variadic, so a trailing prompt is read as a tool.
+
+    A positional prompt after it never reaches the session; the CLI aborts with
+    "Input must be provided either through stdin or as a prompt argument".
+    """
+    cmd, kw = _capture_session("what is the GV date?")
+    assert "what is the GV date?" not in cmd
+    assert kw.get("input") == "what is the GV date?"
+    # Nothing positional at all: every argument is a flag or a flag's value.
+    assert cmd[-1] in mcp.FORBIDDEN_TOOLS or cmd[-1].startswith("-")
+    print("ok: the prompt reaches the session on stdin")
 
 
 def test_ask_ara_returns_the_answer_synchronously():
@@ -274,6 +293,7 @@ def main():
     test_ping_and_unknown_method()
     test_tools_list_is_read_only()
     test_forbidden_tools_are_stripped_from_the_session()
+    test_the_prompt_is_fed_on_stdin_not_as_an_argument()
     test_ask_ara_returns_the_answer_synchronously()
     test_ask_ara_hands_back_a_job_when_slow()
     test_ask_ara_reports_a_failed_session_as_an_error()

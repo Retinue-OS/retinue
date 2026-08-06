@@ -292,9 +292,12 @@ def _run_claude(prompt: str) -> tuple[str, str]:
         cmd += ["--model", MODEL]
     for tool in FORBIDDEN_TOOLS:
         cmd += ["--disallowed-tools", tool]
-    cmd.append(prompt)
+    # The prompt goes on stdin, never as a trailing argument: --disallowed-tools
+    # is variadic, so a positional prompt after it is swallowed as one more tool
+    # name and the session dies with "Input must be provided either through
+    # stdin or as a prompt argument when using --print".
     try:
-        proc = subprocess.run(cmd, cwd=WORKDIR, capture_output=True,
+        proc = subprocess.run(cmd, cwd=WORKDIR, input=prompt, capture_output=True,
                               text=True, timeout=TIMEOUT)
     except subprocess.TimeoutExpired:
         return "error", f"Ara did not answer within {int(TIMEOUT)}s."
