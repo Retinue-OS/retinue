@@ -154,8 +154,12 @@ TELEGRAM_PENDING_SENDS_DIR = Path(
     os.environ.get("TELEGRAM_PENDING_SENDS_DIR", str(TELEGRAM_DATA_DIR / "pending-sends"))
 )
 TELEGRAM_PENDING_SENDS_DIR.mkdir(parents=True, exist_ok=True)
+# Keep recent-chats.json OUT of the pending-sends dir: that directory is read on
+# the "every *.json here IS a pending send" assumption (see _list_pending_sends_store),
+# so a foreign file living there breaks the /sends listing. Store it beside the
+# other top-level data instead, where the pending-sends glob can never reach it.
 TELEGRAM_RECENT_CHATS_PATH = Path(
-    os.environ.get("TELEGRAM_RECENT_CHATS_PATH", str(TELEGRAM_PENDING_SENDS_DIR / "recent-chats.json"))
+    os.environ.get("TELEGRAM_RECENT_CHATS_PATH", str(TELEGRAM_DATA_DIR / "recent-chats.json"))
 )
 TELEGRAM_RECENT_CHATS_MAX = int(os.environ.get("TELEGRAM_RECENT_CHATS_MAX", "100"))
 
@@ -940,7 +944,11 @@ def _list_pending_sends_store() -> list:
         for path in sorted(TELEGRAM_PENDING_SENDS_DIR.glob("*.json")):
             try:
                 entry = json.loads(path.read_text(encoding="utf-8"))
-                if entry.get("status") == "pending":
+                # Defend against any foreign *.json in this dir (e.g. a stray
+                # recent-chats.json from an older deployment, which is a list):
+                # only dict entries are pending sends. A non-dict must not crash
+                # the whole listing with an AttributeError.
+                if isinstance(entry, dict) and entry.get("status") == "pending":
                     lean = {k: v for k, v in entry.items() if k != "images"}
                     items.append(lean)
             except (OSError, json.JSONDecodeError):
