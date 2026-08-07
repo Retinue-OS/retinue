@@ -91,6 +91,7 @@ class RetinueConversations extends HTMLElement {
     this._recChunks = [];
     this._mediaRecorder = null;
     this._recStream = null;
+    this._recTarget = null;  // thread pinned at record-start (dictation target)
     this._autoplay = false;  // speak Ara's replies as they arrive
     try { this._autoplay = localStorage.getItem('retinue-voice-autoplay') === '1'; } catch (_e) { /* ignore */ }
     this._autosend = false;  // send a dictation straight off, without the review step
@@ -352,48 +353,72 @@ class RetinueConversations extends HTMLElement {
     this.refresh();
   }
 
-  async _send(text) {
-    const draftKey = this._active || (this._composing ? 'composer' : '');
+  // `targetOverride` sends to a specific thread ('composer' for a new thread)
+  // regardless of what's open — used by auto-send after dictation, where the
+  // user may have navigated away while transcription ran. Omitted for normal
+  // sends, which go to the open view.
+  async _send(text, targetOverride) {
+    const override = targetOverride != null;
+    const sendToComposer = override ? (targetOverride === 'composer') : this._composing;
+    const sendToThread = override
+      ? (targetOverride && targetOverride !== 'composer' ? targetOverride : null)
+      : this._active;
+    const draftKey = sendToThread || (sendToComposer ? 'composer' : '');
     const currentOutFiles = this._outFiles[draftKey] || [];
     // A message needs text or at least one attachment.
     if (this._busy || (!text.trim() && !currentOutFiles.length)) return;
+    // Whether this send targets the view the user is currently looking at. When
+    // false (auto-send into a thread the user has since navigated away from), we
+    // must not hijack their view with the result.
+    const affectsView = sendToThread ? (this._active === sendToThread)
+      : (sendToComposer && this._composing);
     this._busy = true;
     try {
       const body = { message: text };
       // A composer opened from a project page links the new thread to that
       // project, so Ara starts from the project file's current state.
-      if (this._composing && this._composeProject) {
+      if (sendToComposer && this._composeProject) {
         body.project = this._composeProject;
         if (this._composeProjectTitle) body.project_title = this._composeProjectTitle;
       }
       // Carry the composer's model choice onto the new thread ('' = default,
       // which the server simply leaves unset).
-      if (this._composing && this._composeModel) body.model = this._composeModel;
+      if (sendToComposer && this._composeModel) body.model = this._composeModel;
       if (currentOutFiles.length) {
         body.attachments = currentOutFiles.map((f) => ({
           filename: f.name, content_type: f.type, data: f.data,
         }));
       }
-      const url = this._active ? `/conversations/${this._active}/messages` : LIST_URL;
+      const url = sendToThread ? `/conversations/${sendToThread}/messages` : LIST_URL;
       const res = await fetch(url, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(String(res.status));
       const conv = await res.json();
-      // A thread opened from the composer reuses the composer's history entry,
-      // so back still lands on the list rather than the (now gone) composer.
-      if (this._composing) history.replaceState(null, '', `#conversation-${conv.id}`);
-      this._active = conv.id;
-      this._thread = conv;
-      this._composing = false;
-      this._setComposeProject(undefined); // the link was consumed by this thread
-      this._drafts[conv.id] = '';
-      this._drafts['composer'] = '';
-      this._outFiles[conv.id] = [];
-      this._outFiles['composer'] = [];
-      this._composeModel = '';  // consumed by this thread; reset for the next one
+      // Clear the draft/attachments for whichever target we just sent.
+      this._drafts[draftKey] = '';
+      this._outFiles[draftKey] = [];
       this._attachError = '';
+      if (sendToComposer) {
+        // A brand-new thread. Only bring the user onto it if they were still on
+        // the composer; otherwise leave their current view untouched.
+        this._drafts['composer'] = '';
+        this._outFiles['composer'] = [];
+        this._composeModel = '';  // consumed by this thread; reset for the next one
+        if (affectsView) {
+          // A thread opened from the composer reuses the composer's history
+          // entry, so back still lands on the list rather than the (now gone)
+          // composer.
+          history.replaceState(null, '', `#conversation-${conv.id}`);
+          this._active = conv.id;
+          this._thread = conv;
+          this._composing = false;
+          this._setComposeProject(undefined); // link consumed by this thread
+        }
+      } else if (affectsView) {
+        this._thread = conv;
+      }
     } catch (_err) {
       // surface a soft failure inline by leaving the input; re-render shows state
     } finally {
@@ -970,6 +995,11 @@ class RetinueConversations extends HTMLElement {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       this._recStream = stream;
       this._recChunks = [];
+      // Pin the target thread at record-start: transcription is async, and the
+      // user may open a different thread while it runs. The dictation must land
+      // where the mic was tapped, not wherever happens to be open when the
+      // transcript comes back. '' means the "new thread" composer.
+      this._recTarget = this._active || (this._composing ? 'composer' : '');
       const mr = new MediaRecorder(stream);
       this._mediaRecorder = mr;
       mr.addEventListener('dataavailable', (e) => {
@@ -1012,13 +1042,23 @@ class RetinueConversations extends HTMLElement {
     this._mediaRecorder = null;
     if (!chunks.length) { this._recState = 'idle'; this.render(); return; }
     const blob = new Blob(chunks, { type });
+    // The thread the mic was tapped in — the transcript belongs to it, whatever
+    // is open when transcription finishes. Fall back to the currently-open
+    // target for any recording that started before this field was set.
+    const target = this._recTarget != null
+      ? this._recTarget
+      : (this._active || (this._composing ? 'composer' : ''));
+    this._recTarget = null;
     this._recState = 'transcribing';
     this.render();
     let toSend = '';
+    let sendTarget = '';
     try {
-      // The open thread is context for the cleanup pass: it is what tells the
+      // The pinned thread is context for the cleanup pass: it is what tells the
       // model which names and topics this dictation is likely to be about.
-      const q = this._active ? `?thread=${encodeURIComponent(this._active)}` : '';
+      // 'composer' is a UI key, not a thread id — only a real thread id is sent.
+      const q = (target && target !== 'composer')
+        ? `?thread=${encodeURIComponent(target)}` : '';
       const res = await fetch(`/conversations/transcribe${q}`, {
         method: 'POST',
         headers: { 'Content-Type': blob.type || 'application/octet-stream' },
@@ -1028,10 +1068,9 @@ class RetinueConversations extends HTMLElement {
       const data = await res.json();
       const text = ((data && data.text) || '').trim();
       if (text) {
-        this._appendToDraft(text);
+        this._appendToDraft(text, target);
         // Send the whole draft, so anything typed before dictating comes along.
-        const draftKey = this._active || (this._composing ? 'composer' : '');
-        if (this._autosend && draftKey) toSend = this._drafts[draftKey] || '';
+        if (this._autosend && target) { toSend = this._drafts[target] || ''; sendTarget = target; }
       } else {
         this._attachError = 'No speech was detected in the recording.';
       }
@@ -1043,7 +1082,9 @@ class RetinueConversations extends HTMLElement {
       this.render();
     }
     // _send() re-renders; on failure it leaves the draft in place to retry.
-    if (toSend) await this._send(toSend);
+    // Pass the pinned target so auto-send goes to the thread the mic was tapped
+    // in, not whatever is open now.
+    if (toSend) await this._send(toSend, sendTarget);
   }
 
   _toggleAutosend() {
@@ -1073,8 +1114,13 @@ class RetinueConversations extends HTMLElement {
     this.refresh();
   }
 
-  _appendToDraft(text) {
-    const draftKey = this._active || (this._composing ? 'composer' : '');
+  // `target` (a thread id, or 'composer') pins where the text lands; omitted, it
+  // falls back to the open view. Dictation passes the thread captured at
+  // record-start so the transcript lands there even if the user navigated away.
+  _appendToDraft(text, target) {
+    const draftKey = target != null
+      ? target
+      : (this._active || (this._composing ? 'composer' : ''));
     if (!draftKey) return;
     const cur = this._drafts[draftKey] || '';
     this._drafts[draftKey] = cur ? `${cur.replace(/\s*$/, '')} ${text}` : text;
