@@ -10,8 +10,17 @@
  * Note: the endpoint sits behind HTTP basic auth. The browser attaches the
  * cached credentials automatically to these same-origin GETs, so both install
  * and runtime fetches work once you have authenticated once.
+ *
+ * Cache versioning: the hash placeholder in the SHELL constant below is
+ * substituted by the gateway when it serves /sw.js, with a content hash
+ * computed over the whole shell tree. So the cache name -- and therefore this
+ * service worker's own bytes -- change automatically whenever ANY shell asset
+ * changes, which is exactly what makes the browser fetch a new worker and drop
+ * the stale cache. Nobody has to remember to bump a version by hand. If the
+ * placeholder is served verbatim (e.g. the file opened directly off disk), it
+ * degrades to a fixed but valid cache name.
  */
-const SHELL = 'retinue-shell-v16';
+const SHELL = 'retinue-shell-__SHELL_HASH__';
 const DATA = 'retinue-data-v1';
 const SHELL_ASSETS = [
   '/',

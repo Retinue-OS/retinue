@@ -465,6 +465,50 @@ push_notify.init(PUSH_DIR)
 # can write data without touching the baked-in shell).
 WEBAPP_DIR = Path(os.environ.get("WEBAPP_DIR", "/workspace/webapp"))
 DASHBOARD_DATA_DIR = Path(os.environ.get("DASHBOARD_DATA_DIR", str(WEBAPP_DIR / "data")))
+
+# Content hash of the whole shell tree, used as the service worker's cache name
+# (see _serve_service_worker). Computed over every file under WEBAPP_DIR so ANY
+# webapp change moves the hash automatically — no hand-bumped version to forget.
+# Cached and only recomputed when a file's path/size/mtime changes, so the hot
+# path stays a cheap stat sweep rather than a full re-read on every request.
+# `data/` is excluded: it is curated JSON served no-store, not part of the
+# cached shell, and it changes on its own cadence.
+_SHELL_HASH_CACHE: dict[str, str] = {}
+
+
+def _shell_hash() -> str:
+    """Return a short content hash identifying the current shell-asset set.
+
+    The signature is a stat sweep (relative path + size + mtime_ns of every
+    file under WEBAPP_DIR, excluding data/); when it is unchanged we return the
+    memoised digest, otherwise we hash the signature afresh. Falls back to a
+    fixed but valid token if the tree cannot be walked, so the worker always
+    gets a usable cache name."""
+    try:
+        data_dir = DASHBOARD_DATA_DIR.resolve()
+        entries = []
+        for p in sorted(WEBAPP_DIR.rglob("*")):
+            if not p.is_file():
+                continue
+            try:
+                if p.resolve() == data_dir or data_dir in p.resolve().parents:
+                    continue
+            except OSError:
+                continue
+            st = p.stat()
+            entries.append(f"{p.relative_to(WEBAPP_DIR)}:{st.st_size}:{st.st_mtime_ns}")
+    except OSError:
+        return "static"
+    signature = "\n".join(entries)
+    cached = _SHELL_HASH_CACHE.get(signature)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
+    # Single-signature cache: replace wholesale so a changed tree cannot leak
+    # unbounded entries over the process lifetime.
+    _SHELL_HASH_CACHE.clear()
+    _SHELL_HASH_CACHE[signature] = digest
+    return digest
 # Read-only SPARQL endpoint of the "life" triple store. The projects card
 # (GET /projects) computes its content live from this, so there is no static
 # projects.json and no extractor job: project/goal frontmatter is already
@@ -2366,6 +2410,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             return self._serve_static_file(WEBAPP_DIR / "index.html", WEBAPP_DIR)
+        if path == "/sw.js":
+            return self._serve_service_worker()
         if path.startswith("/data/"):
             rel = path[len("/data/"):]
             return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
@@ -2373,6 +2419,34 @@ class Handler(BaseHTTPRequestHandler):
         if not rel:
             return False
         return self._serve_static_file(WEBAPP_DIR / rel, WEBAPP_DIR)
+
+    def _serve_service_worker(self) -> bool:
+        """Serve sw.js with its cache name stamped from a content hash of the
+        whole shell tree.
+
+        The service worker caches shell assets cache-first, so a changed asset
+        only reaches the browser once the worker's own bytes change. Rather than
+        rely on someone hand-bumping a version constant on every webapp edit
+        (which is easy to forget), we substitute the `__SHELL_HASH__` token with
+        a hash computed over every file under WEBAPP_DIR. Any shell change moves
+        the hash, which moves the worker bytes, which is exactly what triggers
+        the browser to install the new worker and drop the stale cache. The file
+        (baked, read-only) is never mutated on disk — the substitution is done on
+        the response only. Served no-cache so the worker itself is always
+        revalidated."""
+        sw = WEBAPP_DIR / "sw.js"
+        try:
+            text = sw.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        body = text.replace("__SHELL_HASH__", _shell_hash()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/javascript; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
 
     def do_POST(self):
         if self.path == "/message":
