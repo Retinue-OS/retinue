@@ -510,7 +510,8 @@ class RetinueConversations extends HTMLElement {
 
   _threadSignature(t) {
     return JSON.stringify([
-      (t.messages || []).map((m) => [m.role, m.text, m.ts, (m.attachments || []).length]),
+      (t.messages || []).map((m) => [m.role, m.text, m.ts, (m.attachments || []).length,
+        m.model_name || '', m.cost_usd ?? '', m.agent || '']),
       !!t.pending,
       t.pending_since || '',
       t.pending_status || '',
@@ -663,12 +664,17 @@ class RetinueConversations extends HTMLElement {
     const canSpeak = 'speechSynthesis' in window;
     const msgs = (t.messages || []).map((m, idx) => {
       const cls = m.role === 'user' ? 'me' : (m.role === 'agent' ? 'agent' : 'ara');
-      const who = m.role === 'user' ? 'You' : (m.role === 'agent' ? 'Retinue' : 'Ara');
+      // The sender label: the acting agent's own name when a relay set one
+      // (e.g. "Coach"), else the role default. "You" / "Retinue" / "Ara".
+      const defaultWho = m.role === 'user' ? 'You' : (m.role === 'agent' ? 'Retinue' : 'Ara');
+      const who = (m.role !== 'user' && m.agent) ? m.agent : defaultWho;
       const speakBtn = (canSpeak && m.role !== 'user' && (m.text || '').trim())
         ? `<button class="speak" type="button" data-speak-idx="${idx}" ` +
           `title="Play message" aria-label="Play message">\u{1F50A}</button>`
         : '';
-      return `<div class="msg ${cls}"><div class="msg-head"><small class="who">${esc(who)}</small>` +
+      return `<div class="msg ${cls}"><div class="msg-head">` +
+        `<small class="who">${esc(who)}</small>` +
+        this._metaHtml(m) +
         speakBtn + `</div>` +
         `<div class="bubble">${this._renderBubble(m.text)}` +
         this._attachmentsHtml(t.id, m.attachments) +
@@ -681,6 +687,37 @@ class RetinueConversations extends HTMLElement {
         `</div></div>`
       : '';
     return msgs + pending;
+  }
+
+  // The header meta after the sender name: for an answer bubble, the model
+  // short-name and the turn's list-price cost (marked "~$" — a fictional
+  // pay-per-token estimate, not the subscription's actual bill); for every
+  // message, its timestamp. Each piece is optional — older messages predating
+  // this metadata simply omit what they lack. Rendered as middot-separated
+  // muted text so it reads as one quiet line.
+  _metaHtml(m) {
+    const bits = [];
+    if (m.model_name) bits.push(`<span class="m-model">${esc(m.model_name)}</span>`);
+    if (typeof m.cost_usd === 'number' && isFinite(m.cost_usd)) {
+      bits.push(`<span class="m-cost" title="Approximate list-price cost — not the subscription bill">` +
+        `~$${this._fmtCost(m.cost_usd)}</span>`);
+    }
+    if (m.ts) {
+      bits.push(`<time class="m-ts" datetime="${esc(m.ts)}" title="${esc(m.ts)}">` +
+        `${esc(fmtAge(m.ts))}</time>`);
+    }
+    if (!bits.length) return '';
+    return `<small class="msg-meta">${bits.join('<span class="m-sep">·</span>')}</small>`;
+  }
+
+  // Cost with enough precision to stay meaningful for cheap turns: sub-cent
+  // values get more decimals so they don't collapse to "~$0.00".
+  _fmtCost(v) {
+    const c = Math.abs(v);
+    if (c === 0) return '0';
+    if (c < 0.01) return c.toFixed(4);
+    if (c < 1) return c.toFixed(3);
+    return c.toFixed(2);
   }
 
   // Render any files a message carries. Both links hit the gateway's per-thread
@@ -1370,6 +1407,13 @@ const CSS = `
   .msg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; }
   .msg.me { align-self: flex-end; align-items: flex-end; }
   .who { color: var(--muted, #8b93a3); font-size: .7rem; }
+  /* The quiet header meta after the sender name: model · ~$cost · time. All one
+     muted, small line so it never competes with the message body. */
+  .msg-meta { color: var(--muted, #8b93a3); font-size: .7rem;
+              display: inline-flex; align-items: baseline; gap: 5px; flex-wrap: wrap; }
+  .msg-meta .m-sep { opacity: .5; }
+  .msg-meta .m-cost { font-variant-numeric: tabular-nums; }
+  .msg-meta .m-model { font-weight: 600; }
   /* Message text is rendered by the shared Markdown renderer (its .md styles
      are appended after this sheet), so the bubble needs no pre-wrap: block
      structure comes from the renderer. */

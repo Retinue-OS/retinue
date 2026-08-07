@@ -1169,8 +1169,18 @@ def _detect_lang(text: str) -> str | None:
 def _conv_add_message(cid: str, role: str, text: str, *,
                       unread: bool | None = None,
                       pending: bool | None = None,
-                      attachments=None) -> dict | None:
-    """Append a message to a thread and update its flags. Returns the thread."""
+                      attachments=None,
+                      model_name: str | None = None,
+                      cost_usd: float | None = None,
+                      agent: str | None = None) -> dict | None:
+    """Append a message to a thread and update its flags. Returns the thread.
+
+    `model_name`/`cost_usd` carry the answering turn's metadata (short model
+    label and whole-turn list-price cost) so the dashboard can show it in the
+    bubble header; both are byproducts of the answer call and cost nothing extra
+    to surface. `agent` overrides the displayed sender name (e.g. "Coach") when
+    a relay answers on a subagent's behalf.
+    """
     now = datetime.now(timezone.utc).isoformat()
     stored = _store_attachments(cid, attachments or [])
     with _conversations_lock:
@@ -1183,6 +1193,12 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["lang"] = lang
         if stored:
             message["attachments"] = stored
+        if model_name:
+            message["model_name"] = model_name
+        if isinstance(cost_usd, (int, float)):
+            message["cost_usd"] = float(cost_usd)
+        if agent:
+            message["agent"] = agent
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
         if unread is not None:
@@ -1360,7 +1376,11 @@ def _conv_worker(cid: str, session_key: str) -> None:
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
-    conv = _conv_add_message(cid, "assistant", reply, unread=True, pending=False)
+        result = {}
+    # Only a successful turn has cost/model metadata; an error reply carries none.
+    conv = _conv_add_message(cid, "assistant", reply, unread=True, pending=False,
+                             model_name=result.get("model_name"),
+                             cost_usd=result.get("cost_usd"))
     if conv is not None:
         _push_conv_notification(conv, reply)
 
@@ -1717,6 +1737,59 @@ def _render_gateways_html(statuses: list[dict]) -> str:
 
 # ── Message dispatch ──────────────────────────────────────────────────────────
 
+def _short_model_name(canonical: str) -> str:
+    """A one-word label for a model id, for the message header.
+
+    Language-agnostic and provider-agnostic: pick the recognisable family word
+    out of a canonical id like "claude-sonnet-5" or "claude-haiku-4-5" →
+    "Sonnet"/"Haiku". Falls back to a cleaned-up form of whatever is there, so
+    an unfamiliar model still shows *something* rather than nothing.
+    """
+    cid = str(canonical or "").lower()
+    for fam in ("opus", "sonnet", "haiku", "fable"):
+        if fam in cid:
+            return fam.capitalize()
+    # Unknown id: drop a leading vendor token and title-case the rest.
+    tail = cid.split("/")[-1]
+    tail = re.sub(r"^claude[-_]?", "", tail)
+    tail = re.sub(r"[-_]\d.*$", "", tail)  # trim trailing version segments
+    return tail.capitalize() if tail else ""
+
+
+def _envelope_model_name(data: dict) -> str | None:
+    """Short model name for a turn, from the `claude -p` JSON envelope.
+
+    The envelope carries no single top-level model, but `modelUsage` maps each
+    model id used to its own `{costUSD, canonicalModel, …}`. A turn that
+    dispatched a subagent therefore lists more than one model; we attribute the
+    bubble to the model that did the most work by cost (falling back to output
+    tokens, then to the first entry). Returns None when the breakdown is absent.
+    """
+    usage = data.get("modelUsage")
+    if not isinstance(usage, dict) or not usage:
+        return None
+
+    def _weight(entry: dict) -> float:
+        if not isinstance(entry, dict):
+            return 0.0
+        cost = entry.get("costUSD")
+        if isinstance(cost, (int, float)):
+            return float(cost)
+        out = entry.get("outputTokens")
+        return float(out) if isinstance(out, (int, float)) else 0.0
+
+    best_id, best_entry, best_w = None, None, -1.0
+    for mid, entry in usage.items():
+        w = _weight(entry)
+        if w > best_w:
+            best_id, best_entry, best_w = mid, entry, w
+    canonical = ""
+    if isinstance(best_entry, dict):
+        canonical = best_entry.get("canonicalModel") or ""
+    canonical = canonical or best_id or ""
+    return _short_model_name(canonical) or None
+
+
 def send_message(message: str, display_question: str | None = None,
                  session_key: str = DEFAULT_SESSION_KEY,
                  model: str | None = None) -> dict:
@@ -1815,7 +1888,16 @@ def send_message(message: str, display_question: str | None = None,
                 "response": response_text,
                 "session_id": new_state["session_id"],
                 "session_action": session_action,
+                # The whole-turn aggregate cost (already includes any subagent
+                # sidechain the turn spawned). Attributed as-is to the single
+                # bubble this turn produces — the acting agent — so the relay
+                # overhead is folded into that agent's cost rather than shown
+                # separately. It is a list-price estimate, not what the
+                # subscription bills, so the UI marks it "~$".
                 "cost_usd": data.get("total_cost_usd"),
+                # Short model name for the header (e.g. "Sonnet"), derived from
+                # the dominant-cost entry of the per-model usage breakdown.
+                "model_name": _envelope_model_name(data),
             }
 
             if response_text:
