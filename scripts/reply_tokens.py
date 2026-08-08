@@ -1,11 +1,12 @@
-"""Shared reply-token store for the messaging gateways.
+"""Shared reply-token minting for the messaging gateways.
 
 All three linked-device gateways (WhatsApp, Signal, Telegram) share the same
 structural defect when they forward an inbound *inbox* message to Ara's triage:
 the prompt carries only a human-readable ``sender_label`` (a name, maybe a bare
 number), never the exact **origin address** of the conversation the message
 arrived in. The gateway knows that address — the WhatsApp chat JID, the Signal
-source number/UUID, the Telegram ``chat_id`` — but drops it on the floor.
+source number/UUID or group id, the Telegram ``chat_id`` — but drops it on the
+floor.
 
 So when the user then says "reply", the agent has to reconstruct the address by
 resolving the *name*, and name resolution can land on the wrong account entirely
@@ -13,156 +14,180 @@ resolving the *name*, and name resolution can land on the wrong account entirely
 say). The reply goes to the wrong conversation.
 
 This module gives the gateways a generic, channel-agnostic fix: when forwarding
-an inbound message, mint an **opaque reply token** that captures the precise
-origin address, and hand *that* to the agent instead of asking it to guess. To
-reply, the agent passes ``--reply-to <token>`` to the channel's push CLI; the
-gateway resolves the token back to the stored address and sends there. The agent
-never sees or types an address, and — crucially — the token fixes only the
-*destination*: it flows through the very same ``/send`` path as any other push,
-so the ``*_SEND_POLICY`` / ``/sends`` approval gate is untouched. A token cannot
-be used to bypass verification, only to address a reply correctly.
+an inbound message, mint an opaque reply token that captures the precise origin
+address, and hand *that* to the agent instead of asking it to guess. To reply,
+the agent passes ``--reply-to <token>`` to the channel's push CLI; the gateway
+resolves the token back to the address and sends there. The agent never sees or
+types an address, and — crucially — the token fixes only the *destination*: it
+flows through the very same ``/send`` path as any other push, so the
+``*_SEND_POLICY`` / ``/sends`` approval gate is untouched. A token cannot be
+used to bypass verification, only to address a reply correctly.
 
-The token is a server-generated ``secrets.token_urlsafe`` string — unguessable,
-so possession of a valid token is itself the authorization to address that
-conversation (the ``/send`` endpoint is already bearer-token-gated on top). The
-resolved recipient string is whatever the owning gateway's own ``_push`` /
-``_tg_send`` / ``_signal_send`` already accepts as a ``recipient``, so no
-gateway-specific address parsing lives here — each gateway stores the address in
-its own native form and gets it back verbatim.
+**The token is self-contained (stateless).** The origin address travels *inside*
+the token, authenticated by an HMAC-SHA256 signature over the payload. Resolving
+a token means verifying its signature and reading the address back out — there
+is **no per-token storage, no lifetime, and nothing to prune**. This is the
+property the earlier design lacked: it kept one file per minted token and swept
+them on an age cutoff, which meant a token could silently expire and the store
+grew with traffic. A signed self-describing token removes both problems at once.
 
-Entries are persisted one-file-per-token under a caller-supplied directory (on
-the gateway's persistent data volume) so a token stays resolvable across a
-service restart. They are pruned lazily: a token older than ``max_age_seconds``
-(default 30 days) is ignored and swept. This is a convenience-addressing store,
-not a security boundary — an expired token simply means "reply the normal way".
+Why a signature rather than a bare base64 of the address? Two reasons, neither a
+new security boundary (arbitrary addressing is already possible behind the same
+bearer-gated ``/send`` via ``--recipient``; this token is a *convenience*, not a
+gate): it keeps the token **opaque**, so the agent handles an address it can
+neither read nor mistype; and it makes the token **tamper-evident**, so a
+corrupted or hand-edited token resolves to ``None`` (a hard 400 at the gateway)
+rather than to some unintended address. The HMAC uses only the Python standard
+library (``hmac`` + ``hashlib``) — no third-party crypto, which matters because
+the gateway containers ship no ``cryptography`` package.
+
+The one remaining piece of state is a **single signing key per gateway**, not
+per token: it is generated once and persisted to one file on the gateway's data
+volume so tokens stay resolvable across a restart, and it never grows. Rotating
+or deleting that key invalidates all outstanding tokens at once — the only
+"expiry" in the design, and an explicit operator action rather than a timer. A
+key may also be supplied out-of-band via the ``secret=`` constructor argument or
+the ``REPLY_TOKEN_KEY`` environment variable (which, if set, makes all three
+gateways share one key — otherwise each gateway persists its own).
+
+The recipient string is stored and returned verbatim — whatever the owning
+gateway's own ``_push`` / ``_tg_send`` / ``_signal_send`` already accepts as a
+``recipient`` (WhatsApp JID, Signal number/UUID or ``group:<id>``, Telegram
+``chat_id``). No gateway-specific address parsing lives here.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
+import os
 import secrets
-import threading
 import time
 from pathlib import Path
 
-# Token id: url-safe base64 of 24 random bytes → 32 chars, no path separators.
-_TOKEN_NBYTES = 24
-# Default lifetime of a reply token. Long enough that a message the user gets to
-# a day or two later is still directly replyable; short enough that the store
-# does not grow without bound. Overridable per-store.
-DEFAULT_MAX_AGE_SECONDS = 30 * 24 * 3600
+# Token wire format: "<version>.<payload_b64>.<sig_b64>", all url-safe base64
+# without padding, so the whole token is shell- and CLI-argument-safe
+# (characters limited to [A-Za-z0-9_-] plus the two '.' separators).
+_TOKEN_VERSION = "v1"
+# 32-byte HMAC-SHA256 signing key. Long enough that a token cannot be forged
+# without the key; generated with a CSPRNG.
+_KEY_NBYTES = 32
+_KEY_FILENAME = ".signing-key"
+
+
+def _b64e(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64d(text: str) -> bytes:
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + pad)
 
 
 class ReplyTokenStore:
-    """A persistent, self-pruning map of opaque tokens → reply metadata.
+    """Mints and resolves self-contained, signed reply tokens.
 
-    Thread-safe: the gateways call ``mint`` from their receive loop and
-    ``resolve`` from the HTTP ``/send`` handler thread concurrently.
+    Despite the name (kept for drop-in compatibility with the gateways), this
+    holds **no per-token state**: a token carries its own recipient address, and
+    ``resolve`` reconstructs it by verifying the signature. The only persisted
+    state is a single signing key.
+
+    Thread-safe: ``mint`` (called from a gateway's receive loop) and ``resolve``
+    (called from the HTTP ``/send`` handler thread) share no mutable state — the
+    key is read once at construction and never mutated — so no lock is needed.
     """
 
     def __init__(self, directory: str | Path, *,
-                 max_age_seconds: int = DEFAULT_MAX_AGE_SECONDS) -> None:
+                 secret: str | bytes | None = None,
+                 max_age_seconds: int | None = None) -> None:
         self._dir = Path(directory)
-        self._dir.mkdir(parents=True, exist_ok=True)
-        self._max_age = int(max_age_seconds)
-        self._lock = threading.Lock()
-        # In-memory cache mirrors the on-disk files; the disk copy is the source
-        # of truth across restarts, so a cache miss falls back to a disk read.
-        self._cache: dict[str, dict] = {}
+        # ``max_age_seconds`` is accepted for interface compatibility and for
+        # deployments that *want* an age cap; the default is None → tokens do
+        # not expire. The created-at timestamp travels signed inside the token,
+        # so any age check is still stateless.
+        self._max_age = int(max_age_seconds) if max_age_seconds else None
+        self._key = self._load_or_create_key(secret)
+
+    # -- key management -------------------------------------------------------
+
+    def _load_or_create_key(self, secret: str | bytes | None) -> bytes:
+        """Resolve the signing key: an explicit ``secret`` wins, else a
+        persisted key file, else a freshly generated key persisted for reuse."""
+        if secret:
+            return secret.encode("utf-8") if isinstance(secret, str) else secret
+        env = os.environ.get("REPLY_TOKEN_KEY")
+        if env:
+            return env.encode("utf-8")
+        key_path = self._dir / _KEY_FILENAME
+        try:
+            if key_path.is_file():
+                data = key_path.read_bytes().strip()
+                if data:
+                    return data
+        except OSError:
+            pass
+        # Generate and persist. If the volume is unwritable we still return a
+        # usable in-process key — tokens then simply do not survive a restart,
+        # which degrades to "reply the normal way", never to a wrong address.
+        key = secrets.token_bytes(_KEY_NBYTES)
+        try:
+            self._dir.mkdir(parents=True, exist_ok=True)
+            key_path.write_bytes(key)
+            os.chmod(key_path, 0o600)
+        except OSError:
+            pass
+        return key
 
     # -- internals ------------------------------------------------------------
 
-    def _path(self, token: str) -> Path:
-        return self._dir / f"{token}.json"
-
-    @staticmethod
-    def _valid_token(token: str) -> bool:
-        # Server-minted tokens are url-safe base64 (letters, digits, - and _).
-        # Reject anything else up front so a crafted value cannot escape the
-        # store directory via the filename.
-        return bool(token) and all(
-            c.isalnum() or c in "-_" for c in token
-        ) and len(token) <= 128
-
-    def _expired(self, entry: dict) -> bool:
-        created = int(entry.get("created", 0))
-        return (time.time() - created) > self._max_age
+    def _sign(self, signing_input: bytes) -> str:
+        return _b64e(hmac.new(self._key, signing_input, hashlib.sha256).digest())
 
     # -- public API -----------------------------------------------------------
 
     def mint(self, recipient: str, *, channel: str,
              meta: dict | None = None) -> str:
-        """Store ``recipient`` (the gateway's own native address form) and
-        return a fresh opaque token addressing it.
+        """Return a fresh opaque token that encodes ``recipient`` (the gateway's
+        own native address form), authenticated by HMAC.
 
-        ``channel`` and ``meta`` are recorded for observability/debugging only;
-        resolution keys purely on the token.
+        ``channel`` is embedded for observability/debugging; ``meta`` is accepted
+        for call-site compatibility but not embedded — resolution needs only the
+        recipient, and keeping the token small keeps it a comfortable CLI arg.
         """
-        token = secrets.token_urlsafe(_TOKEN_NBYTES)
-        entry = {
-            "token": token,
-            "recipient": recipient,
-            "channel": channel,
-            "meta": meta or {},
-            "created": int(time.time()),
-        }
-        with self._lock:
-            self._cache[token] = entry
-            try:
-                self._path(token).write_text(
-                    json.dumps(entry, ensure_ascii=False), encoding="utf-8"
-                )
-            except OSError:
-                # A store write failure must not break message forwarding: the
-                # token still works for the life of this process via the cache,
-                # and the fallback (reply the normal way) remains available.
-                pass
-        return token
+        payload = {"r": recipient, "c": channel, "t": int(time.time())}
+        payload_b64 = _b64e(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            .encode("utf-8")
+        )
+        signing_input = f"{_TOKEN_VERSION}.{payload_b64}".encode("ascii")
+        return f"{_TOKEN_VERSION}.{payload_b64}.{self._sign(signing_input)}"
 
     def resolve(self, token: str) -> str | None:
-        """Return the stored recipient for ``token``, or ``None`` if the token
-        is unknown, malformed, or expired."""
-        if not self._valid_token(token):
+        """Return the recipient encoded in ``token``, or ``None`` if the token is
+        malformed, has an invalid signature, or (when an age cap is configured)
+        is older than ``max_age_seconds``. Never raises."""
+        if not token:
             return None
-        with self._lock:
-            entry = self._cache.get(token)
-            if entry is None:
-                path = self._path(token)
-                if path.is_file():
-                    try:
-                        entry = json.loads(path.read_text(encoding="utf-8"))
-                        self._cache[token] = entry
-                    except (OSError, ValueError):
-                        entry = None
-            if entry is None:
-                return None
-            if self._expired(entry):
-                self._forget_locked(token)
-                return None
-            recipient = entry.get("recipient")
-            return recipient or None
-
-    def _forget_locked(self, token: str) -> None:
-        self._cache.pop(token, None)
         try:
-            self._path(token).unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    def sweep(self) -> int:
-        """Delete all expired token files. Returns the number removed. Cheap to
-        call opportunistically (e.g. once per receive batch)."""
-        removed = 0
-        with self._lock:
-            for path in list(self._dir.glob("*.json")):
-                try:
-                    entry = json.loads(path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    continue
-                if self._expired(entry):
-                    self._cache.pop(entry.get("token", ""), None)
-                    try:
-                        path.unlink(missing_ok=True)
-                        removed += 1
-                    except OSError:
-                        pass
-        return removed
+            version, payload_b64, sig = token.split(".")
+        except ValueError:
+            return None
+        if version != _TOKEN_VERSION:
+            return None
+        signing_input = f"{version}.{payload_b64}".encode("ascii")
+        expected = self._sign(signing_input)
+        # Constant-time comparison: a signed token is the authorization to
+        # address that conversation, so do not leak validity via timing.
+        if not hmac.compare_digest(sig, expected):
+            return None
+        try:
+            payload = json.loads(_b64d(payload_b64).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if self._max_age is not None:
+            created = int(payload.get("t", 0))
+            if (time.time() - created) > self._max_age:
+                return None
+        recipient = payload.get("r")
+        return recipient or None

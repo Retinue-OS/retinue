@@ -1196,7 +1196,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         if reply_to:
             resolved = REPLY_TOKENS.resolve(reply_to)
             if not resolved:
-                self._reply(400, {"error": "unknown or expired reply_to token; "
+                self._reply(400, {"error": "unknown or invalid reply_to token; "
                                            "address the reply explicitly instead"})
                 return
             recipient = resolved
