@@ -370,7 +370,9 @@ prints a pending-approval notice with the approval URL instead of confirming
 delivery — the message goes out only once the user allows it at `/sends`.
 
 **Multiple gateways per channel.** The `/sends` page enrols the three built-in
-gateways when their `*_GATEWAY_BASE_URL` is set, but a deployment often runs
+gateways when their `*_GATEWAY_BASE_URL` is set and their name is included in
+`MESSENGER_BUILTIN_CHANNELS` (default: all three — see "Gateway connection
+monitoring" below), but a deployment often runs
 *more than one* gateway on a channel — most commonly a second Signal identity,
 the user's **personal** account (`signal-gateway-personal`) alongside the
 system one. Those extra gateways are enrolled by the deployment via
@@ -467,19 +469,26 @@ always points the `retinue` service at all three built-in gateways via
 `SIGNAL_GATEWAY_BASE_URL` / `WHATSAPP_GATEWAY_BASE_URL` /
 `TELEGRAM_GATEWAY_BASE_URL`; if the matching container is never started, the
 monitor's health check fails DNS resolution — indistinguishable, from inside
-this container, from that same container having crashed — and it opens a
+this container, from that same container having crashed — and it would open a
 "gateway disconnected" thread on every restart. There are two supported ways
-to silence it, and they mean different things:
+to avoid that, and they mean different things:
 
 - **Leave the container running, just unpaired.** Its own `/health` then
   reports `configured: false`, which `/sends`, `/gateways` and the monitor all
   already skip — no config needed, and the channel stays visibly "not set up"
-  on `/gateways` if the user ever wants to pair it later.
-- **Never run the container at all.** Then also blank the matching
-  `*_GATEWAY_BASE_URL` on the `retinue` service in the deployment's
-  `docker-compose.override.yml` (see the example there). An empty base URL
-  drops the channel from the registry entirely — `/sends`, `/gateways` and the
-  monitor stop knowing it exists, same as a chamber that was never mounted.
+  on `/gateways` if the user ever wants to pair it later. Preferred when the
+  resource cost of an idle container is a non-issue.
+- **Never run the container at all.** Then set `MESSENGER_BUILTIN_CHANNELS` on
+  the `retinue` service in the deployment's `docker-compose.override.yml` (see
+  `scripts/messenger_gateways.py` and the example there) to the comma-separated
+  subset of `signal`, `whatsapp`, `telegram` this deployment actually runs —
+  e.g. `MESSENGER_BUILTIN_CHANNELS=signal` for a Signal-only deployment, or
+  unset entirely for none. Naming a channel there is what enrols it into the
+  shared registry `/sends`, `/gateways` and the monitor all read from
+  regardless of what `*_GATEWAY_BASE_URL` happens to be wired to; leaving a
+  channel out drops it from all three at once, same as a chamber that was
+  never mounted. One variable states the deployment's whole channel set, so it
+  reads as a deliberate choice rather than three easy-to-forget blanks.
 
 `GATEWAY_MONITOR_IGNORE` (comma-separated slugs) is the narrower tool: it
 silences the monitor alone while leaving the channel enrolled everywhere else
