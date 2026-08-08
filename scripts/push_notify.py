@@ -115,15 +115,26 @@ def _sub_path(endpoint: str) -> Path:
     return _state_dir / "subscriptions" / f"{digest}.json"
 
 
-def subscribe(subscription: dict) -> bool:
-    """Store a PushSubscription as handed over by the browser."""
+def subscribe(payload: dict) -> bool:
+    """Store a PushSubscription and optional preference as handed over by the browser."""
     if not enabled():
+        return False
+    
+    # The client might send the raw subscription or a wrapped {subscription, notification_mode}
+    subscription = payload.get("subscription") if isinstance(payload, dict) and "subscription" in payload else payload
+    if not subscription:
         return False
     endpoint = (subscription or {}).get("endpoint")
     keys = (subscription or {}).get("keys") or {}
     if not endpoint or not keys.get("p256dh") or not keys.get("auth"):
         return False
+    
     record = {"endpoint": endpoint, "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
+    
+    # If it's a wrapped payload, merge the preference
+    if isinstance(payload, dict) and "notification_mode" in payload:
+        record["notification_mode"] = payload["notification_mode"]
+
     with _lock:
         path = _sub_path(endpoint)
         tmp = path.with_suffix(".tmp")
@@ -158,7 +169,7 @@ def subscription_count() -> int:
     return len(_all_subscriptions()) if enabled() else 0
 
 
-def notify(title: str, body: str, url: str = "/", tag: str | None = None) -> int:
+def notify(title: str, body: str, url: str = "/", tag: str | None = None, mode: str | None = None) -> int:
     """Push a notification to every registered device. Returns how many got it.
 
     Best effort by contract: callers invoke this from request handlers and must
@@ -169,6 +180,17 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None) -> int
     payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag or url})
     sent = 0
     for sub in _all_subscriptions():
+        user_mode = sub.get("notification_mode", "all")
+        if user_mode == "off":
+            continue
+        if mode and mode != "all" and user_mode != "all" and user_mode != mode:
+            # Handle complex mapping
+            if user_mode == "new_only" and mode != "new":
+                continue
+            if user_mode == "stalled_only" and mode != "stalled":
+                continue
+            if user_mode == "new_and_stalled" and mode not in ("new", "stalled"):
+                continue
         try:
             webpush(
                 subscription_info=sub,
@@ -192,13 +214,13 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None) -> int
     return sent
 
 
-def notify_async(title: str, body: str, url: str = "/", tag: str | None = None) -> None:
+def notify_async(title: str, body: str, url: str = "/", tag: str | None = None, mode: str | None = None) -> None:
     """Fan out in the background so the triggering HTTP response isn't delayed."""
     if not enabled():
         return
     threading.Thread(
         target=notify,
-        args=(title, body, url, tag),
+        args=(title, body, url, tag, mode),
         name="push-notify",
         daemon=True,
     ).start()
