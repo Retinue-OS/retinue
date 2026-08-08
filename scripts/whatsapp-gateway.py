@@ -830,9 +830,11 @@ def _handle_message_event(event) -> None:
         # the correspondent; passing the exact origin (full user@server, so the
         # office-vs-mobile / PN-vs-LID distinction survives) means a reply goes
         # back to the conversation the message arrived in, never a name-resolved
-        # guess. Groups are excluded — a reply-to-group is a different action the
-        # triage does not take by default, so no reply token is minted for them.
-        origin = None if is_group else (_jid_addr(chat_jid) or _jid_addr(sender_jid))
+        # guess. For a group the chat JID *is* the group address (…@g.us), so the
+        # same origin routes a reply back into the same group — which is what the
+        # user wants when a group message needs an answer. The send still passes
+        # through the normal send-approval policy, so a group send is not silent.
+        origin = _jid_addr(chat_jid) or _jid_addr(sender_jid)
         _forward_to_inbox(text, lang, sender, is_group=is_group,
                           sender_name=push_name, origin=origin)
     else:

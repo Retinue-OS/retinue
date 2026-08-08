@@ -133,9 +133,17 @@ ATTACHMENT_SEARCH_DIRS = [
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 Path(PIPER_DATA_DIR).mkdir(parents=True, exist_ok=True)
 
+# A group reply target is stored as this sentinel prefix + the signal-cli group
+# id. It lets a group flow through the send path as one opaque recipient string
+# (reply token → pending-send store → _signal_send), where it is decoded into the
+# `-g <groupId>` form signal-cli needs. A 1:1 recipient (number/UUID) never
+# carries the prefix, so the two are unambiguous.
+SIGNAL_GROUP_PREFIX = "group:"
+
 # Reply tokens: an inbox message forwarded to triage mints an opaque token for
-# its origin (the sender number/UUID), so a later reply is addressed by token —
-# back to the exact conversation — rather than by re-resolving the sender's name.
+# its origin (the sender number/UUID, or a group id for a group message), so a
+# later reply is addressed by token — back to the exact conversation — rather than
+# by re-resolving the sender's name.
 # Shared implementation across all three gateways (see reply_tokens.py).
 REPLY_TOKENS = ReplyTokenStore(
     os.environ.get("SIGNAL_REPLY_TOKENS_DIR", str(SIGNAL_DATA_DIR / "reply-tokens"))
@@ -313,6 +321,21 @@ def _extract_sender(event: dict) -> str | None:
 def _extract_message_text(event: dict) -> str:
     msg = event.get("envelope", {}).get("dataMessage", {})
     return (msg.get("message") or "").strip()
+
+
+def _extract_group_id(event: dict) -> str | None:
+    """Return the group id when the message arrived in a group, else None.
+
+    signal-cli reports the group under ``dataMessage.groupInfo`` with a base64
+    ``groupId``; that id is exactly what ``send -g`` accepts, so it is the correct
+    reply target for a group message.
+    """
+    group = event.get("envelope", {}).get("dataMessage", {}).get("groupInfo")
+    if isinstance(group, dict):
+        gid = group.get("groupId") or group.get("id")
+        if gid:
+            return str(gid)
+    return None
 
 
 def _normalize_event(event: dict) -> dict | None:
@@ -596,9 +619,19 @@ def _wav_to_ogg(wav_path: Path) -> Path:
 def _signal_send(recipient: str, message: str | None = None, attachments: list[Path] | None = None) -> None:
     """Send a Signal message with an optional body and any number of attachments.
 
+    A ``recipient`` prefixed with :data:`SIGNAL_GROUP_PREFIX` addresses a group:
+    signal-cli takes a group by ``-g <groupId>`` rather than as a positional
+    recipient, so the prefix is stripped and the id passed that way. This keeps
+    group targets a single opaque string end-to-end (reply token → pending-send
+    store → here), so a reply to a group message goes back to that same group.
+
     Serialized via SIGNAL_CLI_LOCK so it never races the receive poll loop.
     """
-    cmd = ["signal-cli", "-a", SIGNAL_ACCOUNT, "send", recipient]
+    if recipient.startswith(SIGNAL_GROUP_PREFIX):
+        group_id = recipient[len(SIGNAL_GROUP_PREFIX):]
+        cmd = ["signal-cli", "-a", SIGNAL_ACCOUNT, "send", "-g", group_id]
+    else:
+        cmd = ["signal-cli", "-a", SIGNAL_ACCOUNT, "send", recipient]
     if message:
         cmd += ["-m", message]
     for attachment in attachments or []:
@@ -922,7 +955,7 @@ def _handle_event(event: dict) -> None:
     # handled. A control account runs it as a prompt and replies; an inbox
     # account hands it to the user's triage and stays silent towards the sender.
     if SIGNAL_GATEWAY_MODE == "inbox":
-        _forward_to_inbox(question, lang, sender)
+        _forward_to_inbox(question, lang, sender, group_id=_extract_group_id(event))
     else:
         _handle_control_message(question, lang, sender)
 
@@ -962,7 +995,8 @@ def _handle_control_message(question: str, lang: str, sender: str) -> None:
             ogg.unlink(missing_ok=True)
 
 
-def _forward_to_inbox(question: str, lang: str, sender: str) -> None:
+def _forward_to_inbox(question: str, lang: str, sender: str,
+                      group_id: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     The account is one of the user's own message sources, so the message is the
@@ -971,14 +1005,23 @@ def _forward_to_inbox(question: str, lang: str, sender: str) -> None:
     external content, with an explicit "do not reply to the sender" directive.
     Triage links it to a project and raises a dashboard conversation, which is
     the user's push notification. No voice/text reply goes back to the sender.
+
+    ``group_id`` is set when the message arrived in a group; the reply target is
+    then the group itself (so a reply goes back to the same group) rather than
+    the individual sender.
     """
+    is_group = bool(group_id)
     sender_label = sender or "unknown"
-    # The Signal reply address is the sender identity itself (number or UUID),
-    # which _signal_send accepts verbatim — so the origin is simply `sender`.
+    if is_group:
+        sender_label += " [group]"
+    # The reply target is the group (via the group-prefixed id) for a group
+    # message, else the sender identity itself (number or UUID) — both forms
+    # _signal_send accepts and routes back to the exact conversation.
+    origin = (SIGNAL_GROUP_PREFIX + group_id) if is_group else sender
     reply_token = None
-    if sender:
+    if origin:
         reply_token = REPLY_TOKENS.mint(
-            sender, channel="signal", meta={"sender_label": sender_label},
+            origin, channel="signal", meta={"sender_label": sender_label},
         )
     reply_line = (
         (f"\nTo reply to this exact conversation, the Secretary passes "

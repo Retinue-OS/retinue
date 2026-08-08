@@ -756,10 +756,12 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     if is_group:
         sender_label += " [group]"
     # The Telegram reply address is the chat_id itself, which _resolve_entity
-    # accepts verbatim. Groups are excluded — a reply-to-group is a different
-    # action the triage does not take by default, so no token is minted for them.
+    # accepts verbatim. For a group the chat_id *is* the group chat, so the same
+    # token routes a reply back into the same group — which is what the user wants
+    # when a group message needs an answer. The send still passes through the
+    # normal send-approval policy, so a group send is not silent.
     reply_token = None
-    if chat_id and not is_group:
+    if chat_id:
         reply_token = REPLY_TOKENS.mint(
             str(chat_id), channel="telegram",
             meta={"sender_label": sender_label, "sender_name": sender_name or ""},
