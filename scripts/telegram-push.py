@@ -46,6 +46,9 @@ def main() -> int:
     parser.add_argument("message", nargs="?", default="", help="message body")
     parser.add_argument("--recipient", help="Telegram chat_id (numeric) or @username. "
                                             "Defaults to the gateway's configured recipient.")
+    parser.add_argument("--reply-to", metavar="TOKEN",
+                        help="reply-token from a forwarded inbox message; addresses the reply "
+                             "back to the exact conversation it arrived in. Overrides --recipient.")
     parser.add_argument("--image", action="append", default=[], metavar="PATH",
                         help="attach an image (repeatable)")
     parser.add_argument("--user-approved", action="store_true",
@@ -59,7 +62,11 @@ def main() -> int:
         parser.error("provide a message and/or at least one --image")
 
     payload: dict = {"message": args.message}
-    if args.recipient:
+    if args.reply_to:
+        # The token carries the origin address; the gateway resolves it and
+        # ignores any recipient, so do not also send a (possibly wrong) --recipient.
+        payload["reply_to"] = args.reply_to
+    elif args.recipient:
         payload["recipient"] = args.recipient
     elif os.environ.get("TELEGRAM_DEFAULT_RECIPIENT", "").strip():
         payload["recipient"] = os.environ["TELEGRAM_DEFAULT_RECIPIENT"].strip()
