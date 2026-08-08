@@ -6,12 +6,23 @@ One registry, two consumers: the web-gateway (which aggregates pending sends on
 polls each gateway's /health). Both must see exactly the same set of gateways,
 so the discovery lives here instead of being duplicated.
 
-The three built-in channels enrol when their ``*_GATEWAY_BASE_URL`` is set; a
-deployment adds any further gateways (extra accounts, extra channels) via
-``MESSENGER_GATEWAYS`` — a JSON array of ``{base_url, token?, label?}``
-objects. The slug (the ``/sends/<slug>/<id>`` URL segment, also used on
-``/gateways``) is the **Docker service hostname** from ``base_url``, verbatim
-(``http://signal-gateway-personal:8090`` → ``signal-gateway-personal``). The
+The three built-in channels enrol when their ``*_GATEWAY_BASE_URL`` is set
+**and** their name is listed in ``MESSENGER_BUILTIN_CHANNELS`` (comma-separated
+subset of ``signal``, ``whatsapp``, ``telegram`` — defaults to all three, i.e.
+today's behaviour, unchanged). ``docker-compose.yml`` wires all three
+``*_GATEWAY_BASE_URL`` vars unconditionally, so a deployment that never runs
+one of the built-in gateway containers at all (not even unpaired) would
+otherwise still enrol a gateway pointed at a host that doesn't exist —
+indistinguishable, by URL alone, from that same container having crashed. Such
+a deployment names only the channels it actually runs, e.g.
+``MESSENGER_BUILTIN_CHANNELS=signal``, and the other two drop out of the
+registry entirely — same as a chamber that was never mounted — with no need to
+separately blank their base URLs. A deployment adds any further gateways
+(extra accounts, extra channels) via ``MESSENGER_GATEWAYS`` — a JSON array of
+``{base_url, token?, label?}`` objects. The slug (the ``/sends/<slug>/<id>``
+URL segment, also used on ``/gateways``) is the **Docker service hostname**
+from ``base_url``, verbatim (``http://signal-gateway-personal:8090`` →
+``signal-gateway-personal``). The
 gateways derive the same slug from the ``Host`` header of the ``/send`` request
 that queued the message, so approval links resolve with no slug configuration
 on either side — any account a deployment adds gets a working ``verify`` flow
@@ -98,29 +109,45 @@ def _extra_channel_gateways(log_prefix: str) -> dict:
     return out
 
 
+# The built-in channels this deployment actually runs. Comma-separated subset
+# of "signal", "whatsapp", "telegram"; unset means all three (today's
+# behaviour). Lets a deployment that never starts one of the built-in gateway
+# containers drop it from the registry with one variable, instead of having to
+# blank that channel's *_GATEWAY_BASE_URL to the same effect.
+_ALL_BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram")
+
+
+def _enabled_builtin_channels() -> set:
+    raw = os.environ.get("MESSENGER_BUILTIN_CHANNELS")
+    if raw is None:
+        return set(_ALL_BUILTIN_CHANNELS)
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
 def channel_gateways(log_prefix: str = "[messenger-gateways]") -> dict:
     """Return the registry of configured channel gateways, keyed by slug.
 
-    Reads the environment at call time (the three built-ins plus any
+    Reads the environment at call time (the enabled built-ins plus any
     MESSENGER_GATEWAYS extras). Every gateway — built-in or extra — is keyed
     by the service hostname of its base URL. Deployment-declared extras win on
     slug collision — a deployment can override a built-in's target if it needs
     to.
     """
+    enabled = _enabled_builtin_channels()
     registry = {
         slug_from_base_url(base_url): {"base_url": base_url, "token": token, "label": label}
-        for base_url, token, label in (
-            (os.environ.get("SIGNAL_GATEWAY_BASE_URL", "").rstrip("/"),
+        for name, base_url, token, label in (
+            ("signal", os.environ.get("SIGNAL_GATEWAY_BASE_URL", "").rstrip("/"),
              os.environ.get("SIGNAL_GATEWAY_TOKEN", "").strip(),
              "Signal"),
-            (os.environ.get("WHATSAPP_GATEWAY_BASE_URL", "").rstrip("/"),
+            ("whatsapp", os.environ.get("WHATSAPP_GATEWAY_BASE_URL", "").rstrip("/"),
              os.environ.get("WHATSAPP_GATEWAY_TOKEN", "").strip(),
              "WhatsApp"),
-            (os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "").rstrip("/"),
+            ("telegram", os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "").rstrip("/"),
              os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip(),
              "Telegram"),
         )
-        if base_url and slug_from_base_url(base_url)
+        if name in enabled and base_url and slug_from_base_url(base_url)
     }
     registry.update(_extra_channel_gateways(log_prefix))
     return registry

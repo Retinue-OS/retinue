@@ -184,6 +184,35 @@ def test_channel_gateway_discovery():
         os.environ.pop(key, None)
 
 
+def test_builtin_channels_filter():
+    import messenger_gateways
+    keys = ("SIGNAL_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_BASE_URL",
+            "TELEGRAM_GATEWAY_BASE_URL", "MESSENGER_GATEWAYS",
+            "MESSENGER_BUILTIN_CHANNELS")
+    for key in keys:
+        os.environ.pop(key, None)
+    os.environ["SIGNAL_GATEWAY_BASE_URL"] = "http://signal-gateway:8090"
+    os.environ["WHATSAPP_GATEWAY_BASE_URL"] = "http://whatsapp-gateway:8092"
+    os.environ["TELEGRAM_GATEWAY_BASE_URL"] = "http://telegram-gateway:8093"
+    try:
+        # Unset: all three base URLs enrol, exactly today's behaviour.
+        assert set(messenger_gateways.channel_gateways("[test]")) == {
+            "signal-gateway", "whatsapp-gateway", "telegram-gateway",
+        }
+        # A deployment naming only the channels it actually runs drops the
+        # rest, even though their *_GATEWAY_BASE_URL is still wired (as
+        # docker-compose.yml always wires all three) — the case of a
+        # container that was never started at all, not merely unpaired.
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal"
+        assert set(messenger_gateways.channel_gateways("[test]")) == {"signal-gateway"}
+        # Empty string: none of the built-ins enrol.
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = ""
+        assert messenger_gateways.channel_gateways("[test]") == {}
+    finally:
+        for key in keys:
+            os.environ.pop(key, None)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

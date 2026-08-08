@@ -489,8 +489,9 @@ that gap:
   `GATEWAY_MONITOR_INTERVAL`, `GATEWAY_MONITOR_FAILURES`,
   `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
   slugs to skip, e.g. a deliberately unlinked channel). It watches the same
-  registry `/sends` uses — the three built-ins plus any `MESSENGER_GATEWAYS`
-  extras.
+  registry `/sends` uses — the built-in channels named in
+  `MESSENGER_BUILTIN_CHANNELS` (default: all three) plus any
+  `MESSENGER_GATEWAYS` extras.
 - **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the
   same edge auth as the rest) shows each gateway's live state and, for a
   disconnected one, the pairing QR code — proxied from the gateway's
