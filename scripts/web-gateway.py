@@ -1315,7 +1315,7 @@ def _push_conv_notification(conv: dict, text: str) -> None:
     file an agent appends, and Ara's own reply (which arrives after her session
     ends, long after the user may have closed the app). Best effort — a push
     failure never affects the conversation itself."""
-    if not push_notify.enabled() or conv.get("archived"):
+    if not push_notify.enabled():
         return
     cid = conv.get("id", "")
     title = conv.get("title") or "Retinue"
@@ -1323,10 +1323,9 @@ def _push_conv_notification(conv: dict, text: str) -> None:
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
 
-    event_mode = "regular"
-    if conv.get("unread"):
-        event_mode = "new"
-    elif conv.get("read_at"):
+    messages = conv.get("messages", [])
+    event_mode = "new"
+    if len(messages) > 1 and conv.get("read_at"):
         try:
             last_read = datetime.fromisoformat(conv["read_at"])
             if (datetime.now(timezone.utc) - last_read).total_seconds() > 600:
