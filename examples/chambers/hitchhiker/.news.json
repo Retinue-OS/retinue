@@ -1,0 +1,21 @@
+{
+  "_comment": "Example news sources for this chamber, read by scripts/news-fetch.py. Each feed becomes news items in the dashboard's news card and page — title, source, the feed's own excerpt and the link, never a copy of the article. Disabled here so the example chamber makes no outbound requests; set enabled: true (and a real URL) in a deployment's own chamber.",
+  "feeds": [
+    {
+      "id": "vogon-notices",
+      "url": "https://example.invalid/vogon-planning/feed.xml",
+      "label": "Vogon Planning Notices",
+      "lang": "en",
+      "half_life_hours": 12,
+      "enabled": false
+    },
+    {
+      "id": "guide-updates",
+      "url": "https://example.invalid/guide/updates.atom",
+      "label": "The Guide — entry updates",
+      "lang": "en",
+      "half_life_hours": 336,
+      "enabled": false
+    }
+  ]
+}

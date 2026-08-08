@@ -135,6 +135,12 @@ services:
       # /tmp inside the container and be lost on every redeploy.
       - CONVERSATIONS_DIR=/root/.retinue/conversations
       - CONVERSATION_DIR=/root/.retinue/conversation-log
+      # The news feed (items, the user's news profile, the feedback log). Same
+      # persistent volume and same reasoning: high-churn, disposable data that
+      # has no business in a chamber's git history or the triple store, but that
+      # must survive a redeploy. Tunables: NEWS_HALF_LIFE_HOURS (how fast an
+      # undated item fades, default 48), NEWS_MAX_AGE_DAYS, NEWS_MAX_ITEMS.
+      - NEWS_DIR=/root/.retinue/news
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
       - UPDATER_URL=http://updater:9000/update

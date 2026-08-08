@@ -15,9 +15,10 @@ Hitchhiker/Marvin) as the canonical "how to author a chamber" reference.
 Defines these core compose services:
 
 - **`retinue`** — the main container: the Claude Code runtime, the core agent
-  definitions (Archivist, Academic, Publisher, Secretary), and the
-  chamber-mounting harness. (Domain content lives in chambers, not in this
-  service.)
+  definitions (Archivist, Herald, Academic, Publisher, Secretary), the dashboard
+  PWA (conversations, projects, and the
+  [news feed](docs/news.md)), and the chamber-mounting harness. (Domain content
+  lives in chambers, not in this service.)
 - **`signal-gateway`** — dedicated Signal bridge (Signal CLI + Piper)
   for one Signal account. Depending on the account's configured mode
   (see [Messaging accounts](#messaging-accounts)) it either runs incoming

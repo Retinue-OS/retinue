@@ -21,10 +21,12 @@ The team has three kinds of members:
   Treat this as a per-action requirement, not just session-start orientation:
   before composing any outbound message on behalf of the user, read the
   relevant persona file and apply its style rules.
-- **Core subagent** (in `/workspace/.claude/agents/`): **Archivist**, a generic
-  ingestion agent that files documents and extracts triples into the life store.
-  It runs isolated on its own model (Sonnet) — dispatch it via the Agent tool
-  with all needed context in the prompt.
+- **Core subagents** (in `/workspace/.claude/agents/`): **Archivist**, a generic
+  ingestion agent that files documents and extracts triples into the life store,
+  and **Herald**, the news agent that scores incoming news items and maintains
+  what the user cares about (see **News feed** below). Both run isolated on their
+  own model (Sonnet) — dispatch them via the Agent tool with all needed context
+  in the prompt.
 - **Domain subagents**, provided as Claude Code plugins by the mounted chambers
   (see below). Which ones exist depends on which chambers are mounted — each
   chamber's own **Chamber instructions** (see below) say what it provides and
@@ -37,6 +39,8 @@ The team has three kinds of members:
 
 1. **Know which role is needed**:
    - Data ingestion → dispatch the `archivist` subagent
+   - News scoring / "more of this, less of that" in the feed → dispatch the
+     `herald` subagent
    - Research → `/workspace/agents/academic.md`
    - Translations → `/workspace/agents/publisher.md`
    - 1:1 communication → `/workspace/agents/secretary.md`
@@ -658,6 +662,45 @@ the Edits filter); "Discuss with Ara" on a project page starts a normal,
 visible thread whose engage prompt points you at the project file.
 
 Changes to `webapp/` and the gateway's serving logic are **Tier 3** (PR).
+
+## News feed
+
+Broadcast-style inbound — a channel announcement, a newsletter blurb, an RSS
+item — needs no reply and fits no project, so triage archives it and it is lost.
+The **news feed** is its home: a dashboard card plus a `/news.html` page of
+**references to sources** (title, source, the source's own excerpt, the link —
+never a copy of the article), ranked by how much each matters *now*.
+
+The whole ranking is one number per item, sampled at read time:
+`importance × 0.5 ^ (age / half_life)`. Two exceptions carry the time-relevance
+idea: an item with an `expires` date (event, deadline) holds full weight until
+that date and then leaves the feed in one step, and an already-opened item is
+damped rather than removed. Nothing is stored sorted and nothing is re-scored as
+time passes — the feed changes because the clock moved.
+
+- **Sources**: any chamber declares RSS/Atom feeds in a **`.news.json`** at its
+  root (same convention as `.refresh.json` / `.schedule.json`), collected by
+  `scripts/news-fetch.py`. Anything that is not a feed — a Telegram channel
+  post, a newsletter you meet during triage, a link worth keeping — you file
+  yourself with `scripts/news-add.py` (use `--expires` for anything dated).
+- **Judgement**: the **`herald`** subagent scores each new item and maintains
+  `preferences.md`, its prose memory of the user's taste. It is invoked by
+  `scripts/news-curate.py`, a scheduler `command` job whose gate is a file read:
+  no unscored items and no new feedback spawns nothing.
+- **The user's loop**: 👍 / 👎 / ✕ on any item, plus a free-text note on the
+  page ("less crypto, more local politics"). Each signal nudges that item
+  immediately and is logged for the Herald to generalize. The learned profile is
+  shown on the news page and is editable by hand.
+- **Read-aloud**: the page speaks the ranked feed through the browser's own
+  speech synthesis, per item in the language the item declares.
+- **Store**: a plain JSON store under `NEWS_DIR` (`/root/.retinue/news`, the
+  persistent volume) — high-churn disposable data belongs neither in a chamber's
+  git history nor in the triple store.
+
+**Before changing how the feed ranks, ingests or learns, read
+`/workspace/docs/news.md`.** It covers the item shape, the manifest format, the
+API, the tunables, and why the keyframe-curve design in issue #25 was replaced
+by this one.
 
 ## Ask Ara (the MCP connector)
 
