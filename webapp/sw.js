@@ -27,6 +27,7 @@ const SHELL_ASSETS = [
   '/conversations.html',
   '/projects.html',
   '/project.html',
+  '/news.html',
   '/styles.css',
   '/manifest.webmanifest',
   '/components/base.js',
@@ -34,6 +35,8 @@ const SHELL_ASSETS = [
   '/components/conversations.js',
   '/components/projects.js',
   '/components/project-page.js',
+  '/components/news.js',
+  '/components/speech.js',
   '/components/push.js',
   '/components/app-launcher.js',
   '/icons/icon-192.png',
@@ -107,6 +110,11 @@ self.addEventListener('fetch', (e) => {
   // views and the editor never work on a stale cached copy. The page shells
   // (/projects.html, /project.html) are separate paths and stay cache-first.
   if (url.pathname === '/projects' || url.pathname.startsWith('/projects/')) return;
+
+  // The news feed is ranked at request time — a cached copy would show
+  // yesterday's order, with lapsed items still in it. The page shell
+  // (/news.html) is a separate path and stays cache-first.
+  if (url.pathname === '/news' || url.pathname.startsWith('/news/')) return;
 
   // Push config carries the server's current VAPID key; a stale cached copy
   // would silently produce subscriptions this server cannot send to.

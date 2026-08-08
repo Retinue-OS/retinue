@@ -22,6 +22,7 @@ directory ships two runnable example chambers that double as the canonical
   style/secretary.md                ← optional Secretary style overrides
   .schedule.json                    ← optional recurring jobs (scheduler.py)
   .refresh.json                     ← optional external-data refresh (refresh.py)
+  .news.json                        ← optional news feeds (news-fetch.py)
   ...                               ← the chamber's data (e.g. .nt/.ttl, docs)
 ```
 
@@ -41,6 +42,11 @@ which the framework `CLAUDE.md` imports — so a chamber's instructions load int
 every session automatically. It is optional and independent of the plugin: a
 chamber may ship `INSTRUCTIONS.md` with no plugin, or a plugin with no
 `INSTRUCTIONS.md`. Both example chambers ship one as a reference.
+
+`.news.json` declares the chamber's **news feeds** (RSS/Atom), collected by
+`scripts/news-fetch.py` into the dashboard's news feed — see `docs/news.md`.
+`hitchhiker` ships one as a reference, with its feeds disabled so the example
+chamber makes no outbound requests.
 
 `style/secretary.md` is how a chamber contributes **Secretary style overrides**:
 the owner's own writing conventions (how to sign off, recipient-specific tone),

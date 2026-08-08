@@ -47,6 +47,18 @@ Projects (dashboard project pages):
                                          attachments) to an existing thread. Same
                                          token gate; same optional {quiet: true}.
 
+News feed (dashboard news page; see scripts/news_store.py):
+  GET  /news                          -> {"generated", "items": [...]} ranked at
+                                         read time. ?scope=feed|read|hidden|all
+                                         (default feed), ?limit=<n>.
+  GET  /news/preferences              -> {"markdown", "updated"} — the Herald's
+                                         memory of what the user cares about.
+  POST /news/preferences              -> replace it (body {markdown}); the user
+                                         may edit their own profile by hand.
+  POST /news/feedback                 -> one user signal (body {id?, signal, note?};
+                                         signal: up|down|read|hide|note). Nudges
+                                         that item now and logs it for the Herald.
+
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
   POST /push/subscribe                -> register a PushSubscription (body is the
@@ -101,6 +113,7 @@ from requester_identity import normalize_requester_identity
 import email_client as ec
 import gateway_auth
 import messenger_gateways
+import news_store
 import push_notify
 
 
@@ -2285,6 +2298,37 @@ def _write_project_file(pid: str, content: str, base_sha: str | None) -> tuple[i
     return 200, {"ok": True, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+# ── News feed ────────────────────────────────────────────────────────────────
+# The feed is ranked here, at read time, from one number per item (see
+# scripts/news_store.py): importance × decay, sampled now. Nothing is
+# pre-sorted and nothing is rewritten as time passes — an item fades because the
+# clock moved, not because a job re-scored it. The store is a plain JSON file on
+# the persistent volume, so this costs a file read.
+
+# The Herald's memory is prose the user can also edit by hand in the dashboard;
+# bound the write so a runaway client cannot fill the volume with it.
+MAX_PREFERENCES_BYTES = 64 * 1024
+
+
+def _news_payload(scope: str, limit: int | None) -> dict:
+    items = news_store.ranked(scope=scope, limit=limit)
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "scope": scope,
+        "items": items,
+    }
+
+
+def _news_preferences_payload() -> dict:
+    path = news_store.preferences_file()
+    try:
+        updated = datetime.fromtimestamp(path.stat().st_mtime,
+                                         timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        updated = None
+    return {"markdown": news_store.load_preferences(), "updated": updated}
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -2474,6 +2518,12 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0].rstrip("/") == "/projects/item":
             self._handle_project_write()
             return
+        if self.path.split("?", 1)[0].rstrip("/") == "/news/feedback":
+            self._handle_news_feedback()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/news/preferences":
+            self._handle_news_preferences_write()
+            return
         if self.path in ("/conversations", "/conversations/"):
             self._handle_conversation_create()
             return
@@ -2657,6 +2707,69 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             return None
         return payload if isinstance(payload, dict) else None
+
+    def _handle_news_feedback(self) -> None:
+        """One user signal on the news feed: 👍/👎, opened, hidden, or a note.
+
+        Two effects, both wanted. The item is nudged immediately, so the feed
+        visibly reacts to the tap instead of waiting for the next curation run;
+        and the signal is appended to the feedback log, which is what the Herald
+        later generalizes into the preferences file. A note with no item id is
+        the user speaking about the feed as a whole ("less crypto") — the most
+        useful signal there is, so it needs no item to attach to."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        signal = (payload.get("signal") or "").strip()
+        item_id = (payload.get("id") or "").strip() or None
+        note = (payload.get("note") or "").strip()[:2000]
+        if signal not in news_store.VALID_SIGNALS:
+            self._send_json(400, {"error": "unknown signal",
+                                  "valid": list(news_store.VALID_SIGNALS)})
+            return
+        if signal == "note" and not note:
+            self._send_json(400, {"error": "a note needs text"})
+            return
+        if signal != "note" and not item_id:
+            self._send_json(400, {"error": "id is required for this signal"})
+            return
+        try:
+            entry = news_store.record_feedback(item_id, signal, note)
+        except KeyError:
+            self._send_json(404, {"error": "unknown item"})
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "could not record feedback",
+                                  "detail": str(exc)})
+            return
+        self._send_json(200, {"ok": True, "feedback": entry})
+
+    def _handle_news_preferences_write(self) -> None:
+        """Replace the Herald's memory with what the user typed.
+
+        The profile is deliberately a plain Markdown file rather than hidden
+        model state: the user can read why their feed looks the way it does, and
+        correct it directly. The Herald is instructed to merge with what it
+        finds here rather than clobber it."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        markdown = payload.get("markdown")
+        if not isinstance(markdown, str):
+            self._send_json(400, {"error": "markdown is required"})
+            return
+        if len(markdown.encode("utf-8")) > MAX_PREFERENCES_BYTES:
+            self._send_json(413, {"error": "preferences too large"})
+            return
+        try:
+            news_store.save_preferences(markdown)
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save preferences",
+                                  "detail": str(exc)})
+            return
+        self._send_json(200, _news_preferences_payload())
 
     def _handle_transcribe(self) -> None:
         """Voice input: proxy uploaded audio to the shared STT service.
@@ -3040,6 +3153,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "unknown project"})
             else:
                 self._send_json(200, item)
+            return
+        if conv_path in ("/news", "/news/"):
+            params = urllib.parse.parse_qs(conv_query)
+            scope = (params.get("scope") or ["feed"])[0]
+            if scope not in ("feed", "read", "hidden", "all"):
+                scope = "feed"
+            try:
+                limit = int((params.get("limit") or ["0"])[0])
+            except ValueError:
+                limit = 0
+            self._send_json(200, _news_payload(scope, limit if limit > 0 else None))
+            return
+        if conv_path in ("/news/preferences", "/news/preferences/"):
+            self._send_json(200, _news_preferences_payload())
             return
         if conv_path in ("/projects", "/projects/"):
             # Live projects view, computed from the life store on demand. No

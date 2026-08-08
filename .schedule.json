@@ -7,6 +7,22 @@
       "interval_seconds": 86400,
       "enabled": true,
       "run_at_start": false
+    },
+    {
+      "_comment": "Pull the feeds each chamber declares in its .news.json. Pure HTTP + parsing, no Claude session; a deployment with no manifest does nothing.",
+      "id": "news-fetch",
+      "command": "python3 /workspace/scripts/news-fetch.py",
+      "interval_seconds": 3600,
+      "enabled": true,
+      "run_at_start": false
+    },
+    {
+      "_comment": "Score what the fetch brought in and fold the user's feedback into the news profile. Gated: spawns a Claude session only when there is unscored news or unconsumed feedback.",
+      "id": "news-curate",
+      "command": "python3 /workspace/scripts/news-curate.py",
+      "interval_seconds": 3600,
+      "enabled": true,
+      "run_at_start": false
     }
   ]
 }
