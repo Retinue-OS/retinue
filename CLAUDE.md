@@ -608,6 +608,30 @@ existing subscription, so devices would need to re-enable.
 
 The card sizes itself to the layout: on a phone, where every row lengthens the scrolling page, it stays compact at the five most recent active threads; in the wide layout, where it is a scroll box inside its own column, it shows every active thread as tiles that reflow into as many columns as fit (the same rule governs the projects card — see `isWideFrame` in `webapp/components/base.js`). Either way an **All conversations →** link leads to the dedicated `conversations.html` page, which lists every thread with an Active/Archived/Edits filter. Threads can be archived from inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived threads drop off the active list but stay on that page.
 
+**Archived + muted.** Archived and unread is a contradiction: the thread claims
+to want attention while being invisible. So when an agent files something new
+into an archived thread (`POST /internal/conversations/<id>/messages`, the
+`--thread` path of `conversation-push.py`), the gateway **un-archives it** — the
+message would otherwise be lost, which is exactly what happened before this
+existed. The opt-out is the separate **`muted`** flag: a muted thread stays
+where it is, however much arrives. `muted` is independent of `archived` (either
+can be set alone) and has no dashboard control on purpose — it is set from an
+agent via `POST /internal/conversations/<id>/flags`:
+
+```bash
+# archive for good — what to run when the user says "archive this conversation"
+python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
+# also: --unarchive, --unmute; flags are their own call, never mixed with a message
+```
+
+The rule for you: **the user clicking Archive is not the same as the user asking
+you to archive.** The button leaves `muted` untouched, so that thread comes back
+when news arrives. When the user *tells* you to archive a thread, they mean it
+should stay archived — set `--archive --mute` together. Mute alone is a valid
+request too (a noisy thread the user keeps active). Never infer a past
+archival's origin by reading the thread: it is not recorded, so `muted` is the
+only decidable signal.
+
 Every project on the projects card also has its **own page**
 (`project.html?id=<project URI>`): the gateway maps the URI back to the
 project's source Markdown file via its named graph in the life store

@@ -46,6 +46,14 @@ Projects (dashboard project pages):
                                       -> a retinue agent appends a message (with
                                          attachments) to an existing thread. Same
                                          token gate; same optional {quiet: true}.
+                                         A non-quiet append un-archives the
+                                         thread unless it is muted.
+  POST /internal/conversations/<id>/flags
+                                      -> a retinue agent sets {archived, muted}
+                                         (either or both). Same token gate. The
+                                         only way to set `muted`, which is what
+                                         keeps a thread archived when new
+                                         messages are filed into it.
 
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
@@ -443,6 +451,7 @@ _CONV_GET_RE = re.compile(r"^/conversations/([0-9a-f]{32})/?$")
 _CONV_ATT_RE = re.compile(r"^/conversations/([0-9a-f]{32})/attachments/([0-9a-f]{32})/?$")
 _CONV_MSG_RE = re.compile(r"^/conversations/([0-9a-f]{32})/messages/?$")
 _INTERNAL_CONV_MSG_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/messages/?$")
+_INTERNAL_CONV_FLAGS_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/flags/?$")
 _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
@@ -995,6 +1004,11 @@ def _conv_summary(conv: dict) -> dict:
         "updated": conv.get("updated"),
         "unread": bool(conv.get("unread")),
         "archived": bool(conv.get("archived")),
+        # A muted thread stays where the user put it: an agent filing news into
+        # it never un-archives it, and (once notification filtering exists) it
+        # is the flag that silences it. Independent of `archived` — either can
+        # be set alone.
+        "muted": bool(conv.get("muted")),
         "pending": bool(conv.get("pending")),
         "pending_since": conv.get("pending_since"),
         "pending_status": conv.get("pending_status"),
@@ -1172,7 +1186,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       attachments=None,
                       model_name: str | None = None,
                       cost_usd: float | None = None,
-                      agent: str | None = None) -> dict | None:
+                      agent: str | None = None,
+                      wake: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
     `model_name`/`cost_usd` carry the answering turn's metadata (short model
@@ -1180,6 +1195,15 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     bubble header; both are byproducts of the answer call and cost nothing extra
     to surface. `agent` overrides the displayed sender name (e.g. "Coach") when
     a relay answers on a subagent's behalf.
+
+    `wake` marks an append that carries something new for the user (an agent
+    filing an inbound message into an existing thread). Such an append
+    un-archives the thread unless it is muted: archived + unread is invisible —
+    it drops out of the active list while claiming to want attention — so a
+    thread that receives news has to come back or the news is lost. Muting is
+    the explicit opt-out, set when the user asks for a thread to be archived for
+    good. Ara's own reply and the user's own reply do not wake a thread: neither
+    is news arriving from outside.
     """
     now = datetime.now(timezone.utc).isoformat()
     stored = _store_attachments(cid, attachments or [])
@@ -1201,6 +1225,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["agent"] = agent
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
+        if wake and conv.get("archived") and not conv.get("muted"):
+            conv["archived"] = False
         if unread is not None:
             conv["unread"] = unread
         if pending is not None:
@@ -2388,6 +2414,10 @@ class Handler(BaseHTTPRequestHandler):
         if internal_msg_match:
             self._handle_agent_conversation_message(internal_msg_match.group(1))
             return
+        internal_flags_match = _INTERNAL_CONV_FLAGS_RE.match(self.path)
+        if internal_flags_match:
+            self._handle_agent_conversation_flags(internal_flags_match.group(1))
+            return
         if self.path.split("?", 1)[0].rstrip("/") == "/push/subscribe":
             self._handle_push_subscribe()
             return
@@ -2761,8 +2791,37 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_conversation_archive(self, cid: str, archived: bool) -> None:
         """Archive or unarchive a thread. Archived threads drop out of the
         dashboard card's active list but stay available in the dedicated
-        all-conversations view (and via GET /conversations?archived=1)."""
+        all-conversations view (and via GET /conversations?archived=1).
+
+        This is the dashboard's own button, i.e. the user archiving a thread
+        by hand — it leaves `muted` untouched, so a thread archived this way
+        comes back when something new is filed into it. Archiving *for good*
+        is the muted variant, which an agent sets via /internal/… when the
+        user asks for the thread to be archived and stay archived."""
         conv = _conv_set_flags(cid, archived=archived)
+        if conv is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        self._send_json(200, _conv_summary(conv))
+
+    def _handle_agent_conversation_flags(self, cid: str) -> None:
+        """A retinue agent sets a thread's `archived`/`muted` flags.
+
+        The agent-side counterpart to the dashboard's archive button, and the
+        only way `muted` can be set today (there is deliberately no UI for it
+        yet): when the user tells Ara to archive a thread, she archives *and*
+        mutes it, so a later inbound message does not resurrect it. Either flag
+        may also be set on its own — muting a thread the user keeps active is
+        a valid request."""
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        flags = {key: bool(payload[key])
+                 for key in ("archived", "muted") if key in payload}
+        if not flags:
+            self._send_json(400, {"error": "no flags given"})
+            return
+        conv = _conv_set_flags(cid, **flags)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
@@ -2868,8 +2927,11 @@ class Handler(BaseHTTPRequestHandler):
         # otherwise buzz the user's phone on every question the MCP connector
         # relays.
         quiet = bool(payload.get("quiet"))
+        # A non-quiet append is news for the user, so it wakes an archived
+        # thread (unless muted): otherwise the message lands unread in a thread
+        # that no longer appears in the active list, and is never seen.
         conv = _conv_add_message(cid, "agent", message, unread=not quiet,
-                                 attachments=attachments)
+                                 attachments=attachments, wake=not quiet)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
