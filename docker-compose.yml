@@ -193,7 +193,15 @@ services:
       # auth-key rotation with at-rest encryption (pinned explicitly here so an
       # empty-but-defined salt var can never mean "encrypt with an empty key").
       - LITELLM_SALT_KEY=${LITELLM_SALT_KEY:-${LITELLM_MASTER_KEY}}
-      - LITELLM_PRIMARY_MODEL=${LITELLM_PRIMARY_MODEL}
+      # The model every agent turn runs on unless a conversation picks another.
+      # Defaulted here so a deployment that never sets it lands on the current
+      # generation rather than on an empty route: `retinue-claude` resolves to
+      # os.environ/LITELLM_PRIMARY_MODEL, so an unset variable is not a
+      # fallback, it is a broken primary. Deployments that want a cheaper or
+      # older default still set it in .env, which wins over this.
+      - LITELLM_PRIMARY_MODEL=${LITELLM_PRIMARY_MODEL:-anthropic/claude-opus-5}
+      # No default: OpenRouter slugs are the operator's to pick, and a wrong
+      # guess here would only surface once the primary is already failing.
       - LITELLM_FALLBACK_MODEL=${LITELLM_FALLBACK_MODEL}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - DATABASE_URL=${DATABASE_URL}
