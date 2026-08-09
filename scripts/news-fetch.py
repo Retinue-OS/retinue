@@ -102,6 +102,53 @@ def read_manifest(path: Path) -> list[dict]:
 
 # ── feed parsing ─────────────────────────────────────────────────────────────
 
+def has_doctype(text: str) -> bool:
+    """True if the document declares a DTD — which a feed has no business doing.
+
+    What comes back from a feed URL is untrusted: the URL is owner-controlled
+    chamber config, but the bytes on any given hour are whatever the remote host
+    (or a hijacked path to it) sends, and this runs unattended once an hour.
+    Every XML amplification attack needs an internal entity declaration, so
+    refusing a DTD outright closes the class before `ET.fromstring` sees it.
+
+    Expat's own billion-laughs guard is not enough on its own. It caps the
+    *running* amplification factor (default 100×) past an 8 MiB output
+    threshold, so the classic nested-entity bomb dies — but a feed that keeps
+    its ratio just under the limit does not: measured against this parser,
+    2 MB of input expands to 101 MB of text in 2 s, and `MAX_FEED_BYTES` allows
+    four times that. It caps what is downloaded, not what expat expands it into.
+
+    Scanning only the prolog matters: a DOCTYPE declaration can appear nowhere
+    else, while the literal string can legitimately turn up inside a feed item
+    (a tech blog quoting HTML), and rejecting those feeds would be a bug. So we
+    walk the XML declaration, processing instructions and comments that may
+    precede the root element, and stop at the first thing that is neither.
+
+    (`defusedxml.ElementTree` would also cover this, and more thoroughly. This
+    file is stdlib-only by design and one text scan closes the vector that is
+    actually reachable here, so the dependency is not worth it yet.)"""
+    n = len(text)
+    i = 1 if text.startswith("﻿") else 0
+    while i < n:
+        while i < n and text[i].isspace():
+            i += 1
+        if text[i:i + 9] == "<!DOCTYPE":
+            return True
+        if text[i:i + 4] == "<!--":
+            end = text.find("-->", i)
+            if end < 0:
+                return False
+            i = end + 3
+        elif text[i:i + 2] == "<?":
+            end = text.find("?>", i)
+            if end < 0:
+                return False
+            i = end + 2
+        else:
+            return False  # the root element (or junk): the prolog is over
+    return False
+
+
 def _local(tag: str) -> str:
     """Element tag without its namespace — RSS 2.0, RSS 1.0/RDF and Atom differ
     only in namespace for the fields we read, so one traversal covers all
@@ -181,6 +228,11 @@ def _entry_time(entry) -> str | None:
 
 def parse_feed(xml_text: str, feed: dict) -> list[dict]:
     """Turn one feed document into news items. Unparseable XML yields nothing."""
+    if has_doctype(xml_text):
+        # Also the friendly answer when a server hands back an HTML error page
+        # instead of the feed: "<!DOCTYPE html>" says so plainly.
+        log(f"feed '{feed['id']}' declares a DTD; refusing to parse it")
+        return []
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError as exc:

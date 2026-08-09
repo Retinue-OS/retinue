@@ -107,6 +107,52 @@ def test_ids_are_stable_per_url(fetch):
     print("ok: item ids derive from the URL, so re-syndication deduplicates")
 
 
+# A feed response is untrusted input: the URL is owner-controlled chamber config,
+# but the bytes it returns on any given hour are the remote host's choice. The
+# four checks below cover the DTD guard — the attack it stops, the false positive
+# it must not cause, and the legitimate prologs it must let through.
+
+
+def test_amplifying_feed_is_refused(fetch):
+    # Measured against this parser: 2 MB of input expands to 101 MB of text
+    # while staying under expat's 100x running-amplification limit, so expat
+    # alone does NOT stop this. Scaled down here to keep the test instant; the
+    # point is that it never reaches ET.fromstring at all.
+    bomb = ('<?xml version="1.0"?>\n<!DOCTYPE rss [<!ENTITY big "%s">]>\n'
+            '<rss><channel><item><title>%s</title>'
+            '<link>https://example.invalid/x</link></item></channel></rss>'
+            % ("x" * 500, ("&big;" + " " * 5) * 2000))
+    assert fetch.has_doctype(bomb)
+    assert fetch.parse_feed(bomb, {"id": "bomb"}) == []
+    print("ok: an entity-amplifying feed is refused before it is parsed")
+
+
+def test_html_error_page_is_refused(fetch):
+    page = "<!DOCTYPE html>\n<html><body>502 Bad Gateway</body></html>"
+    assert fetch.parse_feed(page, {"id": "oops"}) == []
+    print("ok: an HTML error page served instead of a feed is refused")
+
+
+def test_doctype_inside_content_still_parses(fetch):
+    # A tech feed quoting HTML in an item body is not an attack — the guard must
+    # look at the prolog only, or it would reject legitimate feeds.
+    quoting = RSS2.replace("<description>dropped</description>",
+                           "<description>&lt;!DOCTYPE html&gt; is how it starts"
+                           "</description><link>https://example.invalid/doc</link>")
+    assert not fetch.has_doctype(quoting)
+    assert len(fetch.parse_feed(quoting, {"id": "qv"})) == 2
+    print("ok: '<!DOCTYPE' inside an item is content, not a DTD")
+
+
+def test_prolog_variants(fetch):
+    assert not fetch.has_doctype('<?xml version="1.0"?><rss/>')
+    assert not fetch.has_doctype('﻿\n <?xml version="1.0"?>\n<!-- hi --><rss/>')
+    assert not fetch.has_doctype('<rss/>')
+    assert not fetch.has_doctype('')
+    assert fetch.has_doctype('﻿ <?xml version="1.0"?><!-- c --> <!DOCTYPE rss><rss/>')
+    print("ok: the prolog scan walks BOM, XML declaration and comments")
+
+
 def test_broken_xml_yields_nothing(fetch):
     assert fetch.parse_feed("<rss><channel", {"id": "broken"}) == []
     print("ok: a malformed feed yields no items instead of raising")

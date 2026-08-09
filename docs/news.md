@@ -100,6 +100,21 @@ park a feed. See `examples/chambers/hitchhiker/.news.json`.
 RSS 2.0, RSS 1.0/RDF and Atom all parse; the fetcher is stdlib-only
 (`urllib` + `xml.etree`) and one broken feed never stops the others.
 
+**A feed response is untrusted input.** The URL is owner-controlled chamber
+config, but the bytes it returns on any given hour are whatever the remote host
+sends, and the fetcher runs unattended. So a document that declares a **DTD** is
+refused before it is parsed (`has_doctype`, scanning the prolog only). Every XML
+amplification attack needs an internal entity declaration, and expat's own
+billion-laughs guard does not cover this on its own: it caps the *running*
+amplification factor at 100×, which kills the classic nested bomb but lets a
+feed that stays just under the ratio through — measured, 2 MB of input becomes
+101 MB of text in 2 s, and `MAX_FEED_BYTES` (8 MiB) allows four times that. The
+download cap bounds what is fetched, not what expat expands it into. As a side
+effect, an HTML error page served in place of a feed (`<!DOCTYPE html>`) is
+reported as such instead of as a parse error. `defusedxml` would cover the same
+ground more thoroughly, at the cost of the stdlib-only design; one text scan
+closes the vector that is actually reachable here.
+
 **Non-feed sources** — a Telegram channel post, a newsletter the Secretary meets
 during triage, a link someone sent — go in through `scripts/news-add.py`:
 
