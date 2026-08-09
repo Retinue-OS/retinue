@@ -304,10 +304,17 @@ def _coerce_litellm_models(parsed: object) -> list[dict]:
     routing plumbing (wildcards, fallback routes) stays invisible without the
     flag, and wildcard names are dropped even if flagged since a pattern is not
     a model id. Duplicate names (config + DB copy of a route) collapse to the
-    first occurrence."""
+    first occurrence.
+
+    Same-label routes collapse too. A picker route also surfaces under its
+    target id (`claude-opus-5` and `anthropic/claude-opus-5` are two names for
+    one model, both carrying the same model_info), so name-only dedup let every
+    entry appear twice. The label is what the user picks by, so two entries
+    reading "Opus (deepest reasoning)" are a bug whatever their ids; the first
+    occurrence wins, which is the route as the config names it."""
     if not isinstance(parsed, dict):
         return []
-    models, seen = [], set()
+    models, seen, labelled = [], set(), set()
     for item in parsed.get("data") or []:
         if not isinstance(item, dict):
             continue
@@ -317,8 +324,11 @@ def _coerce_litellm_models(parsed: object) -> list[dict]:
         mid = str(item.get("model_name") or "").strip()
         if not mid or "*" in mid or mid in seen:
             continue
-        seen.add(mid)
         label = str(info.get(_LITELLM_LABEL_KEY) or mid).strip()
+        if label in labelled:
+            continue
+        seen.add(mid)
+        labelled.add(label)
         models.append({"id": mid, "label": label})
     return models
 
