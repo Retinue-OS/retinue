@@ -2,7 +2,8 @@
 """Focused checks for the conversation-model picker sources in the web gateway.
 
 Covers the pure logic without an HTTP server or a live LiteLLM: parsing a
-GET /model/info response (picker flag, labels, wildcard/duplicate filtering),
+GET /model/info response (picker flag, labels, wildcard filtering, duplicate
+name and duplicate label collapsing),
 the env > LiteLLM > file > default precedence, the cache (TTL, last-good on
 failure, forced refresh on a validation miss), and the auth-header derivation
 from ANTHROPIC_CUSTOM_HEADERS.
@@ -68,6 +69,9 @@ def test_coerce_litellm_models(wg):
         _route("claude-*", picker=True),                # wildcard, dropped
         _route("claude-opus-5", picker=True, label="Opus (deepest reasoning)"),
         _route("claude-opus-5", picker=True, label="DB duplicate"),
+        # Same route under its target id, same label -> one picker entry.
+        _route("anthropic/claude-opus-5", picker=True,
+               label="Opus (deepest reasoning)"),
         _route("claude-sonnet-5", picker=True),         # label falls back to id
         _route("my-gpt", picker=False, label="off"),    # explicitly off
         {"model_name": "broken"},                       # no model_info at all
