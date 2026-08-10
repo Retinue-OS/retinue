@@ -659,6 +659,7 @@ To pick up changes to agents, scripts, or dependencies:
 ```bash
 git pull --recurse-submodules
 docker compose build
+docker compose up -d
 ```
 
 Your chamber data lives in named volumes and is unaffected by rebuilds.
