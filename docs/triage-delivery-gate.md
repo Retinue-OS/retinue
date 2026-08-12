@@ -124,6 +124,7 @@ only at the instant the gateway receives it. So the messenger backlog is
 **synthesized in the life store**, and the gateway owns it.
 
 **Write path — one volume per gateway, not one across all of them.** Each gateway
+<<<<<<< HEAD
 has its **own** volume; three gateways → three independent volumes, so Signal's
 messages never touch WhatsApp's volume. It has **three mounters**:
 
@@ -141,6 +142,17 @@ under `chambers/_generated/messenger/<channel>/` so qlever-dir picks it up — n
 write endpoint in the `retinue` container. (~15 s reindex lag affects only the
 SPARQL view; the gateway reads `policy/` raw off disk, so its classify hot path
 sees no lag — see below.)
+=======
+has its **own** volume, mounted into exactly two places: that gateway (RW), and
+the retinue side under `chambers/_generated/messenger/<channel>/` (so qlever-dir
+indexes it; RO for qlever). Three gateways → three independent volumes; Signal's
+messages never touch WhatsApp's volume. On the volume the gateway writes **one
+`.nt` file per inbound message**, and retinue writes that channel's policy `.nt`
+(whitelist/blacklist/group-block) that the gateway reads back to classify — the
+two directions share the volume, never a file. No write endpoint in the `retinue`
+container. (~15 s reindex lag affects only the SPARQL view — the gateway reads
+raw files, so its hot path sees no lag; see below.)
+>>>>>>> 08ec41a (docs: per-gateway volumes; policy state as .nt on the same volume)
 
 **The `delivered` flag — not `read`.** Each message carries a boolean
 `delivered`. It means exactly one thing: *the gateway has handed this message to
