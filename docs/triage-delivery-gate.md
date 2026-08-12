@@ -70,24 +70,35 @@ whitelist the sender. On "no", the handle is added to the blacklist.
 
 ## State
 
-Small JSON files on the persistent `/root` volume (like the news store). The
-whitelist is *derived* (Sent-folder scan); the blacklist and group-block are the
-user's own decisions and must persist:
+Whitelist, blacklist and group-block are **emitted as `.nt`** — the same pattern
+as the existing `_generated` registries (`agents.nt`, `conversation-models.nt`).
+That choice does three jobs at once: it indexes natively in qlever (no
+converter), it is trivial for a gateway to parse off disk, and it retires any
+separate per-app JSON.
 
-```
-/root/.retinue/triage/whitelist.json     # {addresses:[...], wildcards:[...], handles:[...]}
-/root/.retinue/triage/blacklist.json     # {handles:[...]}
-/root/.retinue/triage/groupblock.json    # {groups:[...]}
-```
+**Retinue (Ara) is the sole writer of the policy files; the gateways are
+readers** — the reverse direction of the message files, so single-writer-per-file
+still holds and there is no write race. The messenger policy rides on the **same
+per-gateway volume as that channel's messages** (see the volume topology below),
+because the gateway must read it at classify time — see the next point. The
+e-mail whitelist has no gateway, so it lives on the retinue side under
+`_generated` purely so it is queryable over SPARQL.
 
-**The model is the normal editor of these files, not the user with a text
-editor.** Every decision that changes them already flows through Ara: the
-unknown-sender ask-flow writes a whitelist or blacklist entry from the user's
-yes/no, and instructions like "trust everyone at `*@epfl.ch`" or "block that
-group" are conversational — Ara adds the wildcard or the group id and confirms.
-The files are plain JSON so they *can* be read or corrected by hand, but that is
-a fallback, not the intended workflow. Ara reads them to answer "who's
-whitelisted?" and edits them on request.
+**Why the gateway reads a raw file, never SPARQL.** Classification happens on the
+inbound hot path, in-process. If the gateway resolved whitelist/blacklist over
+SPARQL it would inherit the ~15 s reindex lag and a network dependency there —
+exactly what this design avoids. So the gateway reads the policy `.nt` **straight
+off the mounted volume** (fresh, no lag), while qlever indexes the very same file
+for the *query* path. Same file, two readers, different freshness needs, both
+satisfied.
+
+**The model is the normal editor of this state, not the user with a text
+editor.** Every change flows through Ara: the unknown-sender ask-flow writes a
+whitelist or blacklist entry from the user's yes/no, and instructions like "trust
+everyone at `*@epfl.ch`" or "block that group" are conversational — Ara emits the
+wildcard or the group id and confirms. The files stay plain, readable `.nt`, so
+they *can* be corrected by hand, but that is a fallback. Ara also reads them (over
+SPARQL) to answer "who's whitelisted?".
 
 ## The two channels need the gate in different places
 
@@ -112,11 +123,16 @@ Signal / WhatsApp / Telegram have **no queryable backlog** — a message exists
 only at the instant the gateway receives it. So the messenger backlog is
 **synthesized in the life store**, and the gateway owns it.
 
-**Write path — a shared volume, indexed via `_generated/`.** Each gateway gets a
-volume mounted RW where it writes **one `.nt` file per inbound message**. That
-same volume is mounted into the framework's `chambers/_generated/` area, so
-qlever-dir indexes every message as triples automatically — no write endpoint in
-the `retinue` container. (~15 s reindex lag after a write; harmless — see below.)
+**Write path — one volume per gateway, not one across all of them.** Each gateway
+has its **own** volume, mounted into exactly two places: that gateway (RW), and
+the retinue side under `chambers/_generated/messenger/<channel>/` (so qlever-dir
+indexes it; RO for qlever). Three gateways → three independent volumes; Signal's
+messages never touch WhatsApp's volume. On the volume the gateway writes **one
+`.nt` file per inbound message**, and retinue writes that channel's policy `.nt`
+(whitelist/blacklist/group-block) that the gateway reads back to classify — the
+two directions share the volume, never a file. No write endpoint in the `retinue`
+container. (~15 s reindex lag affects only the SPARQL view — the gateway reads
+raw files, so its hot path sees no lag; see below.)
 
 **The `delivered` flag — not `read`.** Each message carries a boolean
 `delivered`. It means exactly one thing: *the gateway has handed this message to
@@ -178,8 +194,8 @@ Tier-3 across both the framework and the gateway services:
 - **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` each
   get the shared volume mounted RW, per-message `.nt` writing, the
   classification gate on inbound, and `GET /undelivered?since=…`.
-- **compose:** the shared volume, mounted into both each gateway and
-  `chambers/_generated/`.
+- **compose:** one volume per gateway, each mounted into its gateway (RW) and
+  into `chambers/_generated/messenger/<channel>/` (RO for qlever).
 
 Takes effect on merge → `scripts/self-update.py` (rebuilds the gateway images).
 
