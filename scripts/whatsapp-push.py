@@ -97,6 +97,15 @@ def main() -> int:
         if body.get("status") == "pending_approval":
             print(f"whatsapp-push: send queued for approval (id={body.get('request_id', '?')})")
             approval_url = body.get("approval_url", "")
+            # The gateway returns an absolute URL only when SEND_APPROVAL_BASE_URL
+            # is set on its side; otherwise it hands back a bare relative path.
+            # Absolutize it here against CONVERSATION_BASE_URL (present in this
+            # container) so the printed link is always complete and never has to
+            # be assembled by hand. Mirrors email_client.approval_url().
+            if approval_url.startswith("/"):
+                base = os.environ.get("CONVERSATION_BASE_URL", "").rstrip("/")
+                if base:
+                    approval_url = base + approval_url
             if approval_url:
                 print(f"whatsapp-push: approve or deny at {approval_url}")
             note = body.get("note", "")
