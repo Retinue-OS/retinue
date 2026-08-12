@@ -7,6 +7,13 @@
       "interval_seconds": 86400,
       "enabled": true,
       "run_at_start": false
+    },
+    {
+      "id": "recurring-projects",
+      "command": "python3 /workspace/scripts/recurring-projects.py",
+      "interval_seconds": 1800,
+      "enabled": true,
+      "run_at_start": false
     }
   ]
 }
