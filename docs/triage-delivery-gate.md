@@ -70,15 +70,24 @@ whitelist the sender. On "no", the handle is added to the blacklist.
 
 ## State
 
-Small, hand-editable JSON on the persistent `/root` volume (like the news
-store) — the whitelist is *derived*, but the blacklist and group-block are the
-user's own decisions and must persist and be editable:
+Small JSON files on the persistent `/root` volume (like the news store). The
+whitelist is *derived* (Sent-folder scan); the blacklist and group-block are the
+user's own decisions and must persist:
 
 ```
 /root/.retinue/triage/whitelist.json     # {addresses:[...], wildcards:[...], handles:[...]}
 /root/.retinue/triage/blacklist.json     # {handles:[...]}
 /root/.retinue/triage/groupblock.json    # {groups:[...]}
 ```
+
+**The model is the normal editor of these files, not the user with a text
+editor.** Every decision that changes them already flows through Ara: the
+unknown-sender ask-flow writes a whitelist or blacklist entry from the user's
+yes/no, and instructions like "trust everyone at `*@epfl.ch`" or "block that
+group" are conversational — Ara adds the wildcard or the group id and confirms.
+The files are plain JSON so they *can* be read or corrected by hand, but that is
+a fallback, not the intended workflow. Ara reads them to answer "who's
+whitelisted?" and edits them on request.
 
 ## The two channels need the gate in different places
 
