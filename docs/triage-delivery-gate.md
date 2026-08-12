@@ -27,7 +27,7 @@ are untouched.
 | **Unknown sender** (messenger) | model runs now, flagged *unknown* → asks user to whitelist/blacklist | — |
 | **Non-whitelisted** (e-mail) | held | model runs for **any** sender |
 | **Blacklisted handle** (messenger) | held, no prompt | model runs |
-| **Group-blocked / no-action-class** | never triggers | never drained (see below) |
+
 
 The tradeoff the user accepts: cold senders wait up to 24 h for a model turn.
 The daily run bounds that latency; nothing is dropped.
