@@ -69,10 +69,17 @@ def messenger_policy_path(channel: str) -> Path:
     This is the retinue writer's view. Each gateway reads the *same file* through
     its own volume mount (env `INBOUND_POLICY_PATH`), so the gateway never needs
     this path.
+
+    The file sits in a ``policy/`` subdirectory of the channel's directory, a
+    sibling of the gateway-written ``messages/``. That folder split is the
+    single-writer-per-file boundary: Ara owns ``policy/``, the gateway owns
+    ``messages/``, and both live in the one per-gateway volume qlever indexes
+    read-only. The gateway's default ``INBOUND_POLICY_PATH`` mirrors this
+    (``<store>/policy/policy.nt``), so writer and reader agree with no config.
     """
     base = os.environ.get("TRIAGE_MESSENGER_DIR")
     root = Path(base) if base else (CHAMBERS_DIR / "_generated" / "messenger")
-    return root / channel / "policy.nt"
+    return root / channel / "policy" / "policy.nt"
 
 
 # --------------------------------------------------------------------------- #
@@ -269,6 +276,56 @@ def handle_status(handle: str, whitelist: set[str], blacklist: set[str]) -> str:
 
 def group_blocked(group: str, blocked_groups: set[str]) -> bool:
     return bool(group) and group.strip() in blocked_groups
+
+
+def gate_decision(
+    channel: str,
+    sender: str,
+    group_id: str | None = None,
+    *,
+    path: Path | None = None,
+    enabled: bool = True,
+) -> dict:
+    """Route one inbound messenger message against the policy.
+
+    This is the single source of truth for the delivery-gate routing table (see
+    docs/triage-delivery-gate.md); all three gateways call it so they can never
+    drift. Returns a dict with:
+
+    - ``forward`` — spend a model turn on this message now.
+    - ``flagged_unknown`` — annotate that turn as an unknown sender (ask the user
+      whether to whitelist/blacklist the handle).
+    - ``delivered_if_held`` — the ``delivered`` flag to persist when NOT
+      forwarding: ``True`` means "accounted for, never drained" (group-blocked),
+      ``False`` means "held, the daily drain picks it up" (blacklisted).
+    - ``reason`` — a short label for the gateway log.
+
+    | class          | forward | flagged | held-flag | drained daily |
+    |----------------|---------|---------|-----------|---------------|
+    | whitelisted    | yes     | no      | —         | —             |
+    | unknown        | yes     | yes     | —         | —             |
+    | blacklisted    | no      | no      | false     | yes           |
+    | group-blocked  | no      | no      | true      | no            |
+
+    ``enabled=False`` forwards everything (the gate turned off). May raise if the
+    policy file is present but unreadable; the caller decides fail-open.
+    """
+    if not enabled:
+        return {"forward": True, "flagged_unknown": False,
+                "delivered_if_held": True, "reason": "gate-disabled"}
+    whitelist, blacklist, groups = load_messenger_policy(channel, path=path)
+    if group_id and group_blocked(group_id, groups):
+        return {"forward": False, "flagged_unknown": False,
+                "delivered_if_held": True, "reason": "group-blocked"}
+    status = handle_status(sender, whitelist, blacklist)
+    if status == "blacklisted":
+        return {"forward": False, "flagged_unknown": False,
+                "delivered_if_held": False, "reason": "blacklisted"}
+    if status == "whitelisted":
+        return {"forward": True, "flagged_unknown": False,
+                "delivered_if_held": True, "reason": "whitelisted"}
+    return {"forward": True, "flagged_unknown": True,
+            "delivered_if_held": True, "reason": "unknown"}
 
 
 # --------------------------------------------------------------------------- #
