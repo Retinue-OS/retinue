@@ -4,90 +4,87 @@ description: >
   Secretary's inbox triage across e-mail, WhatsApp, Signal and SMS. Use whenever
   the user wants to "triage", "go through the inbox", "clear messages", "was ist
   reingekommen", when the scheduled triage job runs, or when an inbound message
-  triggers triage. A credit-free **delivery gate** decides up front whether a
-  message is worth a model turn at all — whitelisted (and first-time unknown)
-  senders are handled live; everything else is held for the once-a-day catch-all.
-  Triage collects the messages in scope, links each to a project, then proposes
-  dispositions in Retinue: replies and actions as individual dashboard
-  conversations (every run), archivals/deletions bundled into one periodic omnibus
-  dashboard conversation. Handled-state lives in a local triage status store for
-  e-mail and in the gateway-owned delivery ledger for messenger — never read/unread
-  and never a mailbox flag, so the user never needs an e-mail client and the
-  mailbox is never mutated for bookkeeping.
+  triggers triage. A credit-free **delivery gate** decides before any model turn
+  whether a message deserves one: whitelisted (and first-time unknown) senders
+  are handled live; everything else waits for the once-a-day catch-all. Triage
+  collects the messages in scope, links each to a project, then proposes
+  dispositions as dashboard conversations — one thread per reply/action (every
+  run), one periodic omnibus for archivals and deletions. Handled-state lives in
+  a local status store (e-mail) and the gateway delivery ledger (messenger) —
+  never read/unread, never a mailbox flag — so the user needs no e-mail client
+  and the mailbox is never mutated for bookkeeping.
 ---
 
 # Inbox Triage (Secretary)
 
-Triage turns incoming messages across **e-mail, WhatsApp, Signal and SMS** into a
-small set of clear decisions inside **Retinue**. It never sends, deletes, or
-archives on its own judgement: it **collects**, **understands**, **links to a
-project**, then **proposes** as dashboard conversations — the user approves, and
-only then does Ara execute. Goal: **inbox-zero, entirely through Retinue**.
+Triage turns inbound messages on **e-mail, WhatsApp, Signal and SMS** into a
+small set of clear decisions in **Retinue**. It never sends, deletes or archives
+on its own judgement: it **collects**, **classifies**, **links to a project**,
+then **proposes** dashboard conversations. The user approves; only then does Ara
+execute. Goal: **inbox-zero, entirely through Retinue**.
 
 ### Principles
 
-- **Retinue is the primary surface; an e-mail client is optional.** Triage is built
-  so the user *never needs* an e-mail client — everything happens in dashboard
-  conversations. Occasional client use must not break it, and it must work with
-  **no** client at all.
-- **Spend model turns only where they earn their keep.** A **delivery gate** (see
-  below) classifies every inbound *before* a model session is spawned. On the
-  frequent runs only whitelisted senders (and first-time unknown ones) cost a
-  turn; everything else is held and swept by a single daily catch-all. The gate is
-  a plain script for e-mail and lives in the gateway inbound handler for messenger
-  — both credit-free — so the biggest cost driver (a model turn per inbound, every
-  30 min) is paid only on messages that actually need attention.
-- **Handled-state lives outside the mailbox — a status store for e-mail, a
-  delivery ledger for messenger.** For e-mail, a directory (`TRIAGE_STATE_DIR`)
-  holds **one file per message** — filename = the message's stable id (the RFC
-  Message-ID), content = its triage status plus bookkeeping (disposition,
-  conversation id, proposed/omnibus/nudge/resolved timestamps). For messenger, the
-  gateway persists **one `kb:InboundMessage` `.nt` per message** on its own volume,
-  carrying a `kb:delivered` flag; "delivered" means *a model turn has already
-  accounted for this message*, and the flag is flipped by exactly one operation —
-  the gateway's `GET /undelivered` drain. Both replace any IMAP flag: reading or
-  replying in a client does not touch them, no custom-keyword tooling is needed,
-  and the mechanism works for **every channel**.
+- **Retinue is the primary surface; an e-mail client is optional.** Everything
+  happens in dashboard conversations. Triage must work with **no** client at all,
+  and occasional client use must not break it.
+- **Spend model turns only where they earn their keep.** The delivery gate
+  (below) classifies every inbound *before* a model session is spawned — a plain
+  script for e-mail, the gateway inbound handler for messenger, both credit-free.
+  On frequent runs only whitelisted senders (plus first-time unknowns) cost a
+  turn; everything else waits for the single daily catch-all.
+- **Handled-state lives outside the mailbox.** E-mail: `TRIAGE_STATE_DIR` holds
+  **one file per message** — filename = the RFC Message-ID, content = triage
+  status plus bookkeeping (disposition, conversation id,
+  proposed/omnibus/nudge/resolved timestamps). Messenger: the gateway persists
+  **one `kb:InboundMessage` `.nt` per message** on its own volume with a
+  `kb:delivered` flag; "delivered" means *a model turn has already accounted for
+  this message*, and only the gateway's `GET /undelivered` drain flips it.
+  Neither is touched by reading or replying in a client, and the mechanism works
+  for **every channel**.
 - **The mailbox / delivery ledger is authoritative for what is present; the store
-  only annotates.** Reconcile each run (below) so the two never drift.
-- **Scope-aware.** Triage may be invoked for **all channels**, a **single channel**,
-  or a **single specific message** (e.g. a push-triggered Signal message). Act only
-  within the requested scope.
-- **Cadence is the scheduler's job.** How often triage runs per channel is external
-  (e.g. the frequent e-mail gate every 30 min, the daily catch-all once a morning,
-  messenger live-on-arrival for whitelisted/unknown senders). Messaging is **more
-  urgent** and normally surfaced immediately on push.
-- **`EMAIL_PROCESSING_INTERVAL` governs only two things:** the minimum interval
-  **between omnibus proposals**, and the **grace period before the first reminder**
-  of an un-engaged conversation. It does **not** set how fast new mail is surfaced —
-  individual proposals go out on the run that first sees the message.
-- **Every conversation carries a decision; a run with nothing to propose ends
-  silently.** The only dashboard conversations triage may open are the two of
-  Phase 4 — an individual proposal, or the omnibus. A run never reports on itself.
-  See **4c. No status-report conversations** below.
+  only annotates.** Reconcile each run (Phase 1) so the two never drift.
+- **Scope-aware.** Triage may cover **all channels**, a **single channel**, or a
+  **single message** (e.g. a push-triggered Signal message). Act only within the
+  requested scope.
+- **Cadence is the scheduler's job** (e.g. frequent e-mail gate every 30 min,
+  daily catch-all each morning, messenger live on push). Messaging is **more
+  urgent** and normally surfaced immediately.
+- **`EMAIL_PROCESSING_INTERVAL` governs only two things:** the minimum gap
+  **between omnibus proposals**, and the **grace period before the first
+  reminder** of an un-engaged conversation. It does **not** delay individual
+  proposals — those go out on the run that first sees the message.
+- **A silent run is the normal outcome.** The only conversations triage may open
+  are Phase 4's two kinds — an individual proposal or the omnibus. A run never
+  reports on itself. See **4c** below.
+- **An archived conversation is a user decision.** Archiving means the user is
+  not pursuing the topic at this stage. Never un-archive a thread — or post into
+  it, which un-archives it as a side effect — just to remind the user. Only
+  genuinely new external content (a new inbound message on the subject) may bring
+  an archived thread back, and that happens through Phases 1–4, never through a
+  reminder.
 
 ### The delivery gate
 
-Before a message reaches a model turn, a credit-free classifier decides whether it
-should — the same "check for free, spend only on a hit" shape as `agent-self-review`.
-It runs in two places, sharing one policy but not one mechanism, because e-mail is
-**pull** and messenger is **push**:
+A credit-free classifier decides whether a message reaches a model turn at all —
+the same "check for free, spend only on a hit" shape as `agent-self-review`. It
+runs in two places, one policy but two mechanisms, because e-mail is **pull** and
+messenger is **push**:
 
-- **E-mail (pull).** `scripts/triage-gate.py` is a scheduler `command` job. On the
-  **frequent** tick it lists new INBOX mail, keeps only senders on the e-mail
-  whitelist, and spawns the model *only* if any survive. On the **daily** tick it
-  first refreshes the whitelist from the Sent folder, then spawns for **any** new
-  sender. The whitelist (`scripts/triage_policy.py`) matches an **exact address**
-  (auto-added from Sent) **or** a hand-added `*@domain` / `*@*.domain` wildcard.
-  Because nothing auto-adds a domain, one reply to `alice@gmail.com` whitelists
-  *only* that address, never all of `gmail.com` — the freemail hole is closed by
-  construction.
+- **E-mail (pull).** `scripts/triage-gate.py`, a scheduler `command` job.
+  **Frequent** tick: list new INBOX mail, keep only whitelisted senders, spawn
+  the model *only* if any survive. **Daily** tick: refresh the whitelist from the
+  Sent folder first, then spawn for **any** new sender. The whitelist
+  (`scripts/triage_policy.py`) matches an **exact address** (auto-added from
+  Sent) **or** a hand-added `*@domain` / `*@*.domain` wildcard. Nothing auto-adds
+  a domain, so one reply to `alice@gmail.com` whitelists *only* that address,
+  never all of `gmail.com` — the freemail hole is closed by construction.
 
 - **Messenger (push).** Each inbox-mode gateway calls
-  `triage_policy.gate_decision(channel, sender, group_id)` in its inbound handler,
-  reading the per-channel policy `.nt` **raw off its mounted volume** (no ~15 s
-  SPARQL reindex lag on the hot path). Every inbound is persisted as one
-  `kb:InboundMessage`; the routing table then decides forward-vs-hold:
+  `triage_policy.gate_decision(channel, sender, group_id)` in its inbound
+  handler, reading the per-channel policy `.nt` **raw off its mounted volume**
+  (no ~15 s SPARQL reindex lag on the hot path). Every inbound is persisted as
+  one `kb:InboundMessage`; the class decides forward-vs-hold:
 
   | class | forwarded live? | held-flag written | swept by daily drain? |
   |---|---|---|---|
@@ -97,18 +94,17 @@ It runs in two places, sharing one policy but not one mechanism, because e-mail 
   | **group-blocked** | no | `delivered:true` | no |
   | **noise-class** (status/echo/news/note-to-self) | no | `delivered:true` | no |
 
-  An **unknown** sender's live turn asks the user whether to whitelist. "Yes" →
-  add the handle to the whitelist; "no" → add it to the blacklist, so it is never
-  asked again and is held-only from then on. A group can be added to the blocked
-  set so it stops triggering unknown-sender prompts. All three lists are edited by
-  **talking to Ara** — the unknown-sender flow writes an entry from the user's
-  yes/no; "trust everyone at `*@epfl.ch`" or "block that group" is an instruction
-  Ara carries out via the `triage_policy.py` CLI and confirms. The plain `.nt`
-  format is only a look-under-the-hood fallback.
+  An **unknown** sender's live turn asks the user whether to whitelist: yes →
+  whitelist; no → blacklist (never asked again, held-only from then on). A group
+  can be added to the blocked set so it stops triggering unknown-sender prompts.
+  All three lists are edited by **talking to Ara** — "trust everyone at
+  `*@epfl.ch`" or "block that group" is an instruction Ara carries out via the
+  `triage_policy.py` CLI and confirms. The raw `.nt` format is only a
+  look-under-the-hood fallback.
 
-Nothing about this changes what triage *does* with a message once it has one — only
-whether a turn is spent now (live) or at the daily drain. Cold senders cost at most
-24 h of latency, bounded by the daily run.
+The gate never changes what triage *does* with a message — only whether the turn
+is spent live or at the daily drain. Cold senders wait at most ~24 h, bounded by
+the daily run.
 
 ---
 
@@ -119,108 +115,103 @@ whether a turn is spent now (live) or at the daily drain. Cold senders cost at m
     python3 /workspace/scripts/email_client.py list --folder INBOX --limit 100
     python3 /workspace/scripts/email_client.py read --uid <UID>   # body + message_id
 
-A message is **to triage** when its id has **no status file**, or a non-terminal
-status (e.g. still awaiting a proposal). Reconcile the other direction too: for any
-status file whose message is **no longer in the INBOX**, mark it `resolved` (the
-user moved/handled it elsewhere) and stop tracking it. This bounds drift and lets
-in-progress office mail legitimately sit in the INBOX without being re-proposed.
+A message is **to triage** when its id has **no status file** or a non-terminal
+status. Reconcile in both directions:
 
-**Enforce the inbox-zero invariant on every run — `resolved` ⇔ not in INBOX.**
-The two reconcile directions above are not symmetric in effect: the first leaves
-finished mail physically in the mailbox. So add a third pass that repairs
-`store says done → mailbox still shows it`. For any INBOX message whose status is
-**terminal** — `resolved`, or an `engaged` reply whose only remaining step is an
-owner web-approval already requested at `/sends` — the archive/delete step was
-skipped or deferred and never re-driven. Re-drive it now: `flag --read` then `move`
-it to its disposition folder (`Archive` for `archive`/`reply`-sent/`action`-done,
-delete for `delete`), exactly as Phase 6 would. This is the safety net that makes
-the invariant hold even when an execution earlier missed its move — e.g. the
-already-answered path (which proposes no reply and so never reaches Phase 6's move)
-or a verify-queued send (deferred until approval, then forgotten). Only genuinely
-non-terminal states (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item
-still awaiting *user* input) legitimately stay in the INBOX.
+1. **INBOX → store:** any present message without a non-terminal status file is
+   to-triage.
+2. **Store → INBOX:** any status file whose message is no longer in the INBOX is
+   marked `resolved` (handled elsewhere) and dropped from tracking. This bounds
+   drift and lets in-progress mail legitimately sit in the INBOX without being
+   re-proposed.
+3. **Repair `done-but-still-there`** — the inbox-zero backstop. For any INBOX
+   message whose status is **terminal** (`resolved`, or an `engaged` reply whose
+   only remaining step is an owner approval already requested at `/sends`), the
+   archive/delete move was skipped or deferred. Re-drive it now: `flag --read`
+   then `move` to its disposition folder (`Archive` for
+   `archive`/`reply`-sent/`action`-done, delete for `delete`), exactly as
+   Phase 6 would. This catches e.g. the already-answered path (which proposes no
+   reply, so never reaches Phase 6's move) and verify-queued sends (deferred
+   until approval, then forgotten). Only genuinely non-terminal states
+   (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item still awaiting
+   *user* input) legitimately stay in the INBOX.
 
 **Messaging** — messenger has **no live listing** (Signal/WhatsApp/Telegram are
-push-only). The held backlog lives in each gateway's delivery ledger, so the daily
-catch-all's messenger collection is a **drain of the gateway**, not a chat listing:
+push-only). The held backlog lives in each gateway's delivery ledger, so the
+daily catch-all **drains the gateway** instead of listing chats:
 
     # ONLY the daily triage skill calls this — it drains AND marks delivered.
     curl -s -H "Authorization: Bearer $INBOUND_GATE_TOKEN" \
       "http://signal-gateway:8090/undelivered?since=<ISO-8601-of-last-drain>"
     # likewise whatsapp-gateway / telegram-gateway for every inbox-mode channel
 
-`GET /undelivered` returns the held messages **and flips each to `delivered:true`
-in the same pass** — it is the *only* operation that mutates the flag, so the drain
-is naturally idempotent (a re-run returns only what arrived since). Process the
-returned messages through Phases 2–4 exactly like e-mail.
+`GET /undelivered` returns the held messages **and flips each to
+`delivered:true` in the same pass**. It is the only operation that mutates the
+flag, so the drain is idempotent — a re-run returns only what arrived since.
+Process the returned messages through Phases 2–4 exactly like e-mail.
 
-**Never call `/undelivered` to browse.** Because it drains as it reads, an ad-hoc
-"what came in on Signal?" or "what did X say last Tuesday?" question must go through
-**plain SPARQL** against the life store (`kb:InboundMessage`), which is a pure read
-and touches no flag. Only the daily drain is allowed to consume the queue.
+**Never call `/undelivered` to browse.** It drains as it reads. Any ad-hoc
+question ("what came in on Signal?", "what did X say last Tuesday?") goes
+through **plain SPARQL** against the life store (`kb:InboundMessage`) — a pure
+read that touches no flag. Only the daily drain may consume the queue.
 
 When invoked for a single channel or a single message, collect only that.
 
 ### Push-triggered triage (single inbound message)
 
 An **inbox-mode** messaging gateway (e.g. `signal-gateway.py` with
-`SIGNAL_GATEWAY_MODE=inbox`) monitors one of the user's own message sources. When
-it receives a message it first runs it through the delivery gate (above); a
-**whitelisted** or **unknown** sender is dispatched straight to Ara via the
-web-gateway rather than waiting for the daily drain, while blacklisted /
+`SIGNAL_GATEWAY_MODE=inbox`) monitors one of the user's own message sources.
+Each inbound first passes the delivery gate: a **whitelisted** or **unknown**
+sender is dispatched straight to Ara via the web-gateway; blacklisted /
 group-blocked / noise-class messages are persisted `delivered` and never pushed.
-The account's mode — not the message content, and not triage — has already decided
-that this is the user's incoming mail; **triage never has to work out whether a
-message is an instruction or user mail.** The prompt already contains the message
-and sender; **Phase 1 collection is skipped** — the item to triage is the message
-in the prompt.
+The account's **mode** — not the content, not triage — already established that
+this is the user's incoming mail; **triage never has to decide whether a message
+is an instruction or user mail.** The prompt contains the message and sender, so
+**Phase 1 is skipped** — the item to triage is the message in the prompt.
 
 Control-mode gateways (`SIGNAL_GATEWAY_MODE=control`) never reach triage this
-way: their messages are run as prompts to Ara and answered on the same channel.
-So every push-triggered triage message is the user's own inbound mail, is
-processed under the owner's session, and **is never replied to on the source
-channel** — Ara only proposes via the dashboard.
+way: their messages run as prompts to Ara and are answered on the same channel.
+So every push-triggered triage message is the user's own inbound mail, processed
+under the owner's session, and **never replied to on the source channel** — Ara
+only proposes via the dashboard.
 
-An **unknown**-sender push is tagged as such: Ara's proposal asks the user whether
-to whitelist the handle (yes → whitelist, no → blacklist so it is never asked
-again), alongside the normal disposition. This is the one path by which a new
-handle enters the policy.
+An **unknown**-sender push is tagged as such: Ara's proposal asks whether to
+whitelist the handle (yes → whitelist, no → blacklist), alongside the normal
+disposition. This is the one path by which a new handle enters the policy.
 
-### Status updates (broadcast posts) — a distinct kind, filed silently by default
+### Status updates (broadcast posts) — filed silently by default
 
-Some forwarded items are not messages *to* the user at all but **status updates**:
-a contact's WhatsApp Status (story) post, or another broadcast-list post. The
-gateway marks these deterministically — by their delivery address, not by guessing
-from content — and treats them as **noise-class** in the gate: persisted straight
-to the ledger with `delivered: true`, so the history stays complete but the daily
-drain never picks them up and no model turn is ever spent. The forwarded prompt (on
-the rare path one is produced) is tagged with **`kind: status_update`**, wrapping
-the content in `<status_update>` rather than `<external_message>`. Never try to
-re-derive this from the text; trust the tag.
+Some forwarded items are not messages *to* the user but **status updates**: a
+contact's WhatsApp Status (story) post, or another broadcast-list post. The
+gateway marks these deterministically — by delivery address, never by guessing
+from content — and treats them as **noise-class**: persisted straight to the
+ledger with `delivered: true`, so history stays complete but no model turn is
+ever spent and the daily drain skips them. On the rare path a prompt is
+produced, it is tagged **`kind: status_update`** and wrapped in
+`<status_update>` rather than `<external_message>`. Trust the tag; never
+re-derive it from the text.
 
-A status update is **not** the user's incoming mail and needs no reply, so it does
-**not** get an individual proposal:
+A status update is **not** the user's mail and needs no reply, so it gets **no**
+individual proposal:
 
-1. It is already `delivered` in the ledger (idempotent — don't re-file a status
+1. It is already `delivered` in the ledger (idempotent — don't re-file one
    already seen).
-2. **Link it as data** only if it clearly belongs to a project or a watched
-   subject; otherwise it stays as filed history and nothing more.
-3. **Raise NO dashboard conversation and send NO push** — a status update must
-   never open a thread or notify. (This is the whole point: it is background
-   signal, not correspondence.)
+2. **Link it as data** only if it clearly belongs to a project or watched
+   subject; otherwise it stays as filed history, nothing more.
+3. **Open NO dashboard conversation, send NO push.** It is background signal,
+   not correspondence.
 
 **Exceptions — only when a rule opts in:**
 
 - **Watched contact.** If the sender matches a user-configured "notify me when
-  this person posts a status" rule, *then* raise a notification (a dashboard
-  conversation or a Signal push, per the rule) — otherwise stay silent.
-- **News-agent feed.** When a news agent exists and subscribes to status updates,
-  hand the item to it (route as that agent's input) instead of, or in addition to,
-  filing. Until such an agent exists, filing silently is the complete behaviour.
+  this person posts a status" rule, raise the notification that rule specifies
+  (dashboard conversation or Signal push) — otherwise stay silent.
+- **News-agent feed.** When a news agent subscribes to status updates, hand the
+  item to it instead of (or in addition to) filing.
 
 No such rule is configured yet, so today every status update is simply filed
-silently. The noise-class marker and this policy are what let that change later
-without touching the gate.
+silently. The noise-class marker and this policy let that change later without
+touching the gate.
 
 **Example prompt injected by an inbox-mode `signal-gateway.py`:**
 
@@ -238,39 +229,39 @@ without touching the gate.
 
 **What Ara does on push-triggered triage:**
 
-1. **Runs Phases 2–4** on this one message: classify the disposition, link to a
-   project, and create a dashboard conversation (quoting the original text, then
-   proposing a draft reply). The dashboard conversation is the user's push
-   notification:
+1. **Runs Phases 2–4** on this one message: classify, link to a project, open a
+   dashboard conversation quoting the original and proposing a draft reply. The
+   conversation is the user's push notification:
 
        python3 /workspace/scripts/conversation-push.py \
          --title "Signal von +41791234567" \
          "Neue Nachricht von +41791234567:\n«Hallo, kannst du mir die Traktanden für das Meeting morgen schicken?»\n\nEntwurf-Antwort:\nHallo,\ndie Traktanden für morgen sind: …\n\nSenden, anpassen oder verwerfen?"
 
-2. **Does not touch the delivered flag.** The gateway already wrote the message
-   `delivered: true` when it forwarded it live, so the daily drain will not
-   re-surface it. Triage bookkeeping for messenger lives in the ledger, not a
-   per-message status file.
+2. **Does not touch the delivered flag.** The gateway already wrote
+   `delivered: true` when it forwarded the message live, so the daily drain will
+   not re-surface it. Messenger bookkeeping lives in the ledger, not a status
+   file.
 3. **Does not reply to the sender.** The source channel is the user's own inbox;
-   any response goes out later through the user's chosen channel once they approve
-   a draft on the dashboard.
+   any response goes out later, through the user's chosen channel, once they
+   approve a draft on the dashboard.
 
 ---
 
 ## Phase 2 — Understand & classify
 
 Resolve the **sender** to a contact note, read the content, assign **one
-disposition**: `archive` (keep, no action) · `delete` (drop, no action) · `reply`
-(needs a response) · `action` (needs something done — calendar, task, forward).
+disposition**: `archive` (keep, no action) · `delete` (drop, no action) ·
+`reply` (needs a response) · `action` (needs something done — calendar, task,
+forward).
 
 ### Already-answered check — before proposing any reply
 
-Inspect the thread first. If there is an **outbound** message *after* the incoming
-one — your reply in Sent / a later `References` entry for e-mail, or `last_is_from_me`
-for messaging — the conversation is **already handled**: write status `resolved`
-(answered elsewhere) and do **not** propose a reply. This is what makes occasional
-e-mail-client use safe. `unread ≠ unhandled`; the status store and thread state, not
-`\Seen`, decide.
+Inspect the thread first. If an **outbound** message follows the incoming one —
+a reply in Sent / a later `References` entry for e-mail, `last_is_from_me` for
+messaging — the conversation is **already handled**: write status `resolved`
+(answered elsewhere) and do **not** propose a reply. This is what makes
+occasional e-mail-client use safe. `unread ≠ unhandled`; the status store and
+thread state decide, never `\Seen`.
 
 ---
 
@@ -295,22 +286,22 @@ Committing link updates is routine operational output — commit and push direct
 
 ### 4a. Individual proposals — every run (not interval-gated)
 
-Each `reply` / `action` item, any channel, becomes its **own dashboard conversation**
-on the run that first sees it — a draft reply or the specific action. Messaging is
-more urgent → propose promptly (or on push). Then write the message's status
-(`proposed`) with the returned conversation id.
+Each `reply` / `action` item, any channel, becomes its **own dashboard
+conversation** on the run that first sees it — a draft reply or the specific
+action. Messaging is more urgent → propose promptly (or on push). Then write
+status `proposed` with the returned conversation id.
 
     python3 /workspace/scripts/conversation-push.py --title "Antwort an <Name>" "...Entwurf...\nSenden, anpassen oder verwerfen?"
 
 Apply the Secretary's language/style rules (Swiss spelling, salutation without
 punctuation, recipient profiles). Never bundle replies.
 
-### 4b. Omnibus proposal — one dashboard conversation, once per `EMAIL_PROCESSING_INTERVAL`
+### 4b. Omnibus proposal — once per `EMAIL_PROCESSING_INTERVAL`
 
 Bundle **all** `archive` + `delete` items in scope into **one** dashboard
-conversation for a single batch approval (`pauschal`). Emit at most once per
-interval; between intervals, accumulate. After emitting, write status `omnibus` for
-those messages and record the last-omnibus timestamp.
+conversation for a single batch approval («pauschal»). Emit at most once per
+interval; between intervals, accumulate. After emitting, write status `omnibus`
+for those messages and record the last-omnibus timestamp.
 
     python3 /workspace/scripts/conversation-push.py --title "Triage: archivieren & löschen" \
     "...grouped ARCHIVIEREN / LÖSCHEN, one line per message...\nOK für alle — oder Ausnahmen nennen."
@@ -319,93 +310,96 @@ those messages and record the last-omnibus timestamp.
 
 A dashboard conversation costs the user an unread badge and a Web Push, so it is
 reserved for something only they can decide. **Never open a conversation to
-narrate a run.** Specifically, none of these is a reason to open a thread:
+narrate a run.** None of these justifies a thread:
 
 - the run finished, and what it classified;
 - there was nothing new to propose;
-- items are pending but the omnibus interval has not elapsed yet;
-- a proposal from an earlier run is still waiting for the user.
+- items are pending but the omnibus interval has not elapsed;
+- an earlier proposal is still waiting for the user.
 
-All of that belongs in the scheduler log (a `prompt` job's output is captured
-there) and in the status store, which already record it. A run whose Phase 4
-produced neither an individual proposal nor an omnibus **ends silently** — that
-is the normal outcome of most runs, not a gap to fill with a report.
+All of that already lives in the scheduler log and the status store. A run whose
+Phase 4 produced neither an individual proposal nor an omnibus **ends silently**
+— the normal outcome of most runs, not a gap to fill. Worse than noise: a status
+thread lands *on top of* the real proposals in the conversation list, pushing
+the actual decisions down.
 
-This matters beyond noise: a status thread lands *on top of* the real proposals
-in the conversation list, pushing the decisions the user actually has to make
-further down — so reporting actively works against the run's own output.
+The one legitimate way to re-surface something already proposed is **Phase 5**:
+a nudge posted **into the existing active conversation** (or a Signal push
+pointing at it), at most once per interval. Never a second thread about the same
+items.
 
-The one legitimate way to draw attention to something already proposed is
-**Phase 5**: a nudge posted **into the existing conversation** (or a Signal push
-pointing at it), interval-gated and at most once per interval. Never a second
-thread about the same items.
-
-**Failures are the exception, and only substantive ones.** If the run could not
-do its job — the mail backend is unreachable, a gateway is down, the store is
-unwritable — open a conversation, because the user has to act. Say what broke
-and what it blocks; do not attach a summary of the run to it.
+**Failures are the exception — substantive ones only.** If the run could not do
+its job (mail backend unreachable, gateway down, store unwritable), open a
+conversation, because the user has to act. Say what broke and what it blocks; do
+not attach a run summary.
 
 ---
 
-## Phase 5 — Bring un-engaged conversations forward (reminders, interval-gated)
+## Phase 5 — Remind on un-engaged conversations (interval-gated)
 
-A message may be tracked (`proposed`/`omnibus`) yet the user has **not engaged** its
-conversation — no user reply; thread still agent-last. Detect via `GET /conversations`
-(last message is the agent's; `created`/`updated` give the age), cross-referenced
-with the status store.
+A message may be tracked (`proposed`/`omnibus`) while the user has **not
+engaged** its conversation — no user reply, thread still agent-last. Detect via
+`GET /conversations` (last message is the agent's; `created`/`updated` give the
+age), cross-referenced with the status store.
 
-Once un-engaged for at least `EMAIL_PROCESSING_INTERVAL` (the grace period), **bring
-it forward**, scaled by urgency & importance:
+Once un-engaged for at least `EMAIL_PROCESSING_INTERVAL` (the grace period),
+remind — scaled by urgency and importance:
 
-- **un-archive** the message (reverse any archival) and post a fresh nudge into the
-  conversation, **and/or**
-- send a **Signal push** (`scripts/signal-push.py`) pointing at the conversation.
+- post a fresh nudge **into the existing active conversation**, **and/or**
+- send a **Signal push** (`scripts/signal-push.py`) pointing at it.
 
-**Urgency scaling:** Signal/WhatsApp/SMS conversations escalate **sooner** and prefer
-the **Signal push**; e-mail escalations default to the in-thread nudge. Record a
-`last_nudge` timestamp in the status file; nudge at most once per interval.
+**Archived conversations are exempt.** If the user archived the thread, they
+have decided not to pursue the topic for now — respect that. Send no nudge and
+no push for it, and never un-archive it as a reminder (posting into it would
+un-archive it as a side effect, so don't post either). Only a **new external
+message on the subject** — arriving through Phases 1–4 — may bring an archived
+thread back.
+
+**Urgency scaling:** Signal/WhatsApp/SMS escalate **sooner** and prefer the
+Signal push; e-mail defaults to the in-thread nudge. Record `last_nudge` in the
+status file; nudge at most once per interval.
 
 ---
 
 ## Phase 6 — Execute on approval & inbox-zero
 
-Ara picks up each thread and carries out what was approved, then writes status
+Ara picks up each thread, carries out what was approved, then writes status
 `resolved`:
 
-- **Archive / delete** → apply per channel (e-mail `move`/delete; messaging archive),
-  honouring named exceptions.
+- **Archive / delete** → apply per channel (e-mail `move`/delete; messaging
+  archive), honouring named exceptions.
 - **Reply** → for e-mail use `email_client.py reply --uid <UID>`, which derives
-  the threading headers (`In-Reply-To`/`References`) from the source so a reply is
-  never sent unthreaded (an unthreaded reply defeats the already-answered check and
-  gets re-proposed as a duplicate). `flag --read` **before** sending; respect
-  `EMAIL_SEND_POLICY` (`--user-approved` only for approved `trust` addresses;
-  `verify` always goes through web approval). On a direct send `reply` returns
-  `sent_uid` + `message_id`: **record them in the status file** (`sent_uid`,
-  `sent_message_id`) so a later run can verify the reply actually went out instead
-  of trusting the `resolved` flag alone. A `verify` reply only becomes `resolved`
-  once its pending send is approved — until then keep it non-terminal.
-- **Action** → do the concrete thing; if it advanced a project, append to its log.
+  the threading headers (`In-Reply-To`/`References`) from the source — an
+  unthreaded reply defeats the already-answered check and gets re-proposed as a
+  duplicate. `flag --read` **before** sending; respect `EMAIL_SEND_POLICY`
+  (`--user-approved` only for approved `trust` addresses; `verify` always goes
+  through web approval). On a direct send `reply` returns `sent_uid` +
+  `message_id`: **record them in the status file** so a later run can verify the
+  send instead of trusting the `resolved` flag. A `verify` reply becomes
+  `resolved` only once its pending send is approved — until then it stays
+  non-terminal.
+- **Action** → do the concrete thing; if it advanced a project, append to its
+  log.
 
-**Inbox-zero:** engaging a conversation — accepting the proposal or giving an
-alternative instruction — resolves the underlying e-mail out of the INBOX (archived /
-deleted / filed). When every message is engaged or bulk-resolved, the INBOX is empty.
-This holds without any e-mail client in the loop.
+**Inbox-zero:** engaging a conversation — approving the proposal or giving an
+alternative instruction — resolves the underlying e-mail out of the INBOX
+(archived / deleted / filed). When every message is engaged or bulk-resolved,
+the INBOX is empty, with no e-mail client in the loop.
 
-**Writing `resolved` and moving the mail are one atomic step, never two.** A status
-must not reach a terminal value while the message is still in the INBOX. Whenever you
-set `resolved` (or resolve an already-answered thread that needs no reply), issue the
-`flag --read` + `move`-out-of-INBOX in the same step and record the destination folder
-in the status note. If the move fails, keep the status non-terminal and retry next run.
-Phase 1's third reconcile pass is the backstop, but the move belongs here at the moment
-of resolution — the backstop only exists to repair past drift, not to license skipping
-it. The same applies to the already-answered branch (Phase 2) and verify-queued replies
-(above): a reply queued at `/sends` is not resolved until it is sent **and** the source
+**Writing `resolved` and moving the mail are one atomic step, never two.** A
+status must not reach a terminal value while the message is still in the INBOX.
+Whenever you set `resolved` (including the already-answered branch of Phase 2),
+issue `flag --read` + `move`-out-of-INBOX in the same step and record the
+destination folder in the status note. If the move fails, keep the status
+non-terminal and retry next run. Phase 1's third reconcile pass is only a
+backstop for past drift — never a licence to skip the move here. Likewise a
+reply queued at `/sends` is not resolved until it is sent **and** the source
 mail has left the INBOX.
 
-For **messenger**, there is no mailbox to empty: a message leaves the backlog when the
-gateway marks it `delivered` (on live forward, or on the daily drain). Approval-side
-execution (sending an approved reply) still runs here; the ledger's flag, not an
-INBOX move, is what closes the loop.
+For **messenger** there is no mailbox to empty: a message leaves the backlog
+when the gateway marks it `delivered` (on live forward or daily drain).
+Approval-side execution (sending an approved reply) still runs here; the
+ledger's flag, not an INBOX move, closes the loop.
 
 ---
 
@@ -413,35 +407,37 @@ INBOX move, is what closes the loop.
 
 ### E-mail — the status store
 
-- **`TRIAGE_STATE_DIR`** is the single source of handled-state, **not `\Seen`** and
+- **`TRIAGE_STATE_DIR`** is the single source of handled-state — **not `\Seen`**,
   not a mailbox flag. One file per message; filename = the Message-ID; content =
-  `status` + `conversation_id` + `disposition` + timestamps (`proposed`, `omnibus`,
-  `last_nudge`, `resolved`). For a sent reply also record `sent_uid` +
-  `sent_message_id` (from `reply`'s output) so the send is verifiable against the
-  Sent folder, not merely asserted. Write a status only once a message has actually
-  been proposed, bundled, or resolved — never on mere reading.
+  `status` + `conversation_id` + `disposition` + timestamps (`proposed`,
+  `omnibus`, `last_nudge`, `resolved`). For a sent reply also record `sent_uid` +
+  `sent_message_id` so the send is verifiable against the Sent folder, not
+  merely asserted. Write a status only once a message has actually been
+  proposed, bundled, or resolved — never on mere reading.
 - **Reconcile every run** (Phase 1): the INBOX listing is authoritative for
-  presence; drop or `resolved`-mark store entries whose message is gone. Treat any
-  present message without a non-terminal status file as to-triage.
-- The **already-answered check** covers mail answered from another client/channel.
-- **Garbage-collect** terminal (`resolved`) entries once their message has left the
-  INBOX (or after a retention window) so the store stays small.
+  presence; `resolved`-mark and drop store entries whose message is gone; treat
+  any present message without a non-terminal status file as to-triage.
+- The **already-answered check** covers mail answered from another
+  client/channel.
+- **Garbage-collect** `resolved` entries once their message has left the INBOX
+  (or after a retention window) so the store stays small.
 
 ### Messenger — the gateway delivery ledger
 
-- Each inbox-mode gateway persists **one `kb:InboundMessage` `.nt` per inbound** on
-  its own volume (`INBOUND_STORE_DIR`), carrying `kb:channel`, `kb:sender`,
-  `kb:group`, the text, a receipt timestamp, and the `kb:delivered` flag. qlever
-  indexes the same files, so the whole stream is queryable over SPARQL.
-- **`delivered` is a single-writer field owned by the gateway.** It is flipped
-  only by `GET /undelivered` (drain), which the **daily triage skill alone** calls.
-  A SPARQL read never mutates it, so browsing messenger history is always safe.
-- A message forwarded live (whitelisted/unknown) is written `delivered:true`; a
-  blacklisted one `delivered:false` (awaits the drain); group-blocked and
-  noise-class ones `delivered:true` (complete history, never drained).
+- Each inbox-mode gateway persists **one `kb:InboundMessage` `.nt` per inbound**
+  on its own volume (`INBOUND_STORE_DIR`): `kb:channel`, `kb:sender`, `kb:group`,
+  the text, a receipt timestamp, and the `kb:delivered` flag. qlever indexes the
+  same files, so the whole stream is queryable over SPARQL.
+- **`delivered` is single-writer, owned by the gateway.** Only `GET /undelivered`
+  (drain) flips it, and only the daily triage skill calls that. A SPARQL read
+  never mutates it, so browsing messenger history is always safe.
+- Live-forwarded (whitelisted/unknown) → `delivered:true`; blacklisted →
+  `delivered:false` (awaits the drain); group-blocked and noise-class →
+  `delivered:true` (complete history, never drained).
 - **Policy** (whitelist/blacklist/group-block) is `.nt` on the same per-gateway
-  volume, in a `policy/` subdirectory Ara writes and the gateway reads raw. Edit it
-  by instructing Ara (the `triage_policy.py` CLI), never by hand-typing identifiers.
+  volume, in a `policy/` subdirectory Ara writes and the gateway reads raw. Edit
+  it by instructing Ara (the `triage_policy.py` CLI), never by hand-typing
+  identifiers.
 
 An interrupted run re-collects still-untracked items and re-proposes only those.
 
