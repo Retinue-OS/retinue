@@ -27,7 +27,7 @@ are untouched.
 | **Unknown sender** (messenger) | model runs now, flagged *unknown* → asks user to whitelist/blacklist | — |
 | **Non-whitelisted** (e-mail) | held | model runs for **any** sender |
 | **Blacklisted handle** (messenger) | held, no prompt | model runs |
-| **Group-blocked / noise-class** | never triggers | never drained (see below) |
+| **Group-blocked / no-action-class** | never triggers | never drained (see below) |
 
 The tradeoff the user accepts: cold senders wait up to 24 h for a model turn.
 The daily run bounds that latency; nothing is dropped.
@@ -59,13 +59,13 @@ wildcards needed there.
 - **Blacklist:** an unknown sender the user declines to whitelist goes here so
   the user is **never asked again**. Permanent until hand-edited.
 - **Group-block:** groups the user marks as never allowed to trigger an
-  unknown-sender prompt (seeded with known-noise groups from day one).
+  unknown-sender prompt (seeded with known no-action groups from day one).
 
 ### Unknown-sender ask-flow (messenger only)
 
 An inbound message from an unknown handle (not whitelisted, not blacklisted, not
-in a blocked group, not noise-class) **does** get a model turn, flagged as coming
-from an unknown sender. The model opens a dashboard thread asking whether to
+in a blocked group, not no-action-class) **does** get a model turn, flagged as
+coming from an unknown sender. The model opens a dashboard thread asking whether to
 whitelist the sender. On "no", the handle is added to the blacklist.
 
 ## State
@@ -167,17 +167,17 @@ store; a read-only query of either changes nothing.
 **Fast loop vs. daily drain:**
 
 - On arrival, the gateway classifies (whitelist / unknown / blacklist /
-  group-block / noise). Whitelisted or unknown-sender → hand to a model turn now,
-  marked delivered. Blacklisted / group-blocked → written `delivered: false`,
+  group-block / no-action). Whitelisted or unknown-sender → hand to a model turn
+  now, marked delivered. Blacklisted / group-blocked → written `delivered: false`,
   no model turn.
 - The daily catch-all calls each inbox-mode gateway's
   `GET /undelivered?since=…`, processes the returned messages; the flag flips as
   a side effect of the fetch, so a re-run is naturally idempotent. It does **not**
   read undelivered over SPARQL (that wouldn't clear the flag).
 
-**Noise-class messages** (status updates, voice-note echoes, the daily-briefing
-self-echo, news channels, note-to-self) are written as triples with
-`delivered: true` already set. History stays complete and queryable; the daily
+**No-action-class messages** (status updates, voice-note echoes, the
+daily-briefing self-echo, news channels, note-to-self) carry signal but demand
+nothing now; they are written as triples with `delivered: true` already set. History stays complete and queryable; the daily
 drain never picks them up; they never prompt.
 
 **Schema.** Align the per-message triple shape with the session-logging

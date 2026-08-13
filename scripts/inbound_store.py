@@ -24,7 +24,7 @@ out of that single act:
    next day instead of being lost.
 
 The delivered flag lets a gateway persist a message it deliberately did **not**
-forward — a blacklisted or noise-class sender is written straight to
+forward — a blacklisted or no-action-class sender is written straight to
 ``delivered: true`` (already accounted for, never drained), while an unknown or
 whitelisted sender that *was* forwarded live is also written ``delivered: true``
 (triage already has it). Only a message that was persisted but **not** handed to
@@ -244,7 +244,7 @@ def write_message(
     Returns ``(subject_uri, path)``. ``delivered=False`` (the default) marks the
     message as still owed to triage; pass ``delivered=True`` for a message the
     gateway is deliberately *not* forwarding (blacklisted, group-blocked or
-    noise-class) so the daily drain never re-surfaces it.
+    no-action-class) so the daily drain never re-surfaces it.
     """
     ts = time.time() if timestamp is None else float(timestamp)
     token = secrets.token_hex(8)

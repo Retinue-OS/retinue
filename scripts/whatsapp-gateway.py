@@ -1027,14 +1027,14 @@ def _forward_status_to_inbox(text: str, lang: str, sender: str,
     if is_group:
         sender_label += " [broadcast-list]"
 
-    # A status post is noise-class: with the delivery gate on it never gets a
-    # model turn, and it is persisted already accounted for (delivered:true) so
+    # A status post is no-action-class: with the delivery gate on it never gets
+    # a model turn, and it is persisted already accounted for (delivered:true) so
     # the daily drain never re-surfaces it. History stays browsable in the store.
     if INBOUND_GATE_ENABLED:
         _persist_inbound(text or "", sender, None, delivered=True)
         print(
             f"[whatsapp-gateway] gate held status update from {sender_label} "
-            f"(noise-class); no model turn",
+            f"(no-action-class); no model turn",
             flush=True,
         )
         return

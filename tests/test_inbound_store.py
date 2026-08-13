@@ -87,7 +87,7 @@ def test_since_filter():
 
 def test_persist_but_not_forward():
     with tempfile.TemporaryDirectory() as tmp:
-        # A blacklisted / noise-class message is stored already delivered.
+        # A blacklisted / no-action-class message is stored already delivered.
         ist.write_message(tmp, channel="tg", sender="spam", text="x",
                           delivered=True, timestamp=5.0)
         assert ist.undelivered(tmp) == [], "delivered=True leaked into the drain"
