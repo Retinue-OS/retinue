@@ -50,6 +50,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Push a Signal message via the signal-gateway.")
     parser.add_argument("message", nargs="?", default="", help="message body (spoken aloud unless --no-voice)")
     parser.add_argument("--recipient", help="Signal recipient (E.164). Defaults to the gateway's configured recipient.")
+    parser.add_argument("--reply-to", metavar="TOKEN",
+                        help="reply-token from a forwarded inbox message; addresses the reply "
+                             "back to the exact conversation it arrived in. Overrides --recipient.")
     parser.add_argument("--image", action="append", default=[], metavar="PATH",
                         help="attach an image (repeatable)")
     parser.add_argument("--lang", help="ISO language code for voice synthesis (auto-detected if omitted)")
@@ -65,7 +68,11 @@ def main() -> int:
         parser.error("provide a message and/or at least one --image")
 
     payload: dict = {"message": args.message, "voice": not args.no_voice}
-    if args.recipient:
+    if args.reply_to:
+        # The token carries the origin address; the gateway resolves it and
+        # ignores any recipient, so do not also send a (possibly wrong) --recipient.
+        payload["reply_to"] = args.reply_to
+    elif args.recipient:
         payload["recipient"] = args.recipient
     elif os.environ.get("SIGNAL_DEFAULT_RECIPIENT", "").strip():
         payload["recipient"] = os.environ["SIGNAL_DEFAULT_RECIPIENT"].strip()

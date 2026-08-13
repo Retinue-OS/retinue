@@ -15,9 +15,10 @@ Hitchhiker/Marvin) as the canonical "how to author a chamber" reference.
 Defines these core compose services:
 
 - **`retinue`** — the main container: the Claude Code runtime, the core agent
-  definitions (Archivist, Academic, Publisher, Secretary), and the
-  chamber-mounting harness. (Domain content lives in chambers, not in this
-  service.)
+  definitions (Archivist, Herald, Academic, Publisher, Secretary), the dashboard
+  PWA (conversations, projects, and the
+  [news feed](docs/news.md)), and the chamber-mounting harness. (Domain content
+  lives in chambers, not in this service.)
 - **`signal-gateway`** — dedicated Signal bridge (Signal CLI + Piper)
   for one Signal account. Depending on the account's configured mode
   (see [Messaging accounts](#messaging-accounts)) it either runs incoming
@@ -489,8 +490,9 @@ that gap:
   `GATEWAY_MONITOR_INTERVAL`, `GATEWAY_MONITOR_FAILURES`,
   `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
   slugs to skip, e.g. a deliberately unlinked channel). It watches the same
-  registry `/sends` uses — the three built-ins plus any `MESSENGER_GATEWAYS`
-  extras.
+  registry `/sends` uses — the built-in channels named in
+  `MESSENGER_BUILTIN_CHANNELS` (default: all three) plus any
+  `MESSENGER_GATEWAYS` extras.
 - **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the
   same edge auth as the rest) shows each gateway's live state and, for a
   disconnected one, the pairing QR code — proxied from the gateway's
@@ -657,6 +659,7 @@ To pick up changes to agents, scripts, or dependencies:
 ```bash
 git pull --recurse-submodules
 docker compose build
+docker compose up -d
 ```
 
 Your chamber data lives in named volumes and is unaffected by rebuilds.

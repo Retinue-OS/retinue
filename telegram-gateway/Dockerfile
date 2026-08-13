@@ -26,5 +26,8 @@ RUN mkdir -p /root/.local/share/telegram
 WORKDIR /app
 COPY scripts/telegram-gateway.py /app/telegram-gateway.py
 COPY scripts/requester_identity.py /app/requester_identity.py
+COPY scripts/reply_tokens.py /app/reply_tokens.py
+COPY scripts/triage_policy.py /app/triage_policy.py
+COPY scripts/inbound_store.py /app/inbound_store.py
 
 CMD ["python3", "/app/telegram-gateway.py"]

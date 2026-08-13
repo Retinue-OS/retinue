@@ -121,6 +121,31 @@ weight:
    project (`#new?project=…&title=…`). The resulting thread is a normal,
    visible conversation whose engage prompt points Ara at the project file.
 
+## News
+
+`components/news.js` is the news card (`index.html`) and, with the `full`
+attribute, the whole `news.html` page. It reads the gateway's live endpoint —
+`GET /news?scope=feed|read|hidden|all&limit=n` — which ranks items at request
+time (importance decayed by age; dated items hold full weight until they lapse,
+then leave the feed). There is no data file and no stored ordering: the feed
+changes because the clock moved. The service worker deliberately does **not**
+cache `/news`, only the `news.html` shell.
+
+Every headline links out to the source (`target=_blank`) — items are references,
+never copies. The three per-item buttons plus the page's free-text note are the
+user's half of the learning loop:
+
+- `POST /news/feedback` — `{id?, signal, note?}` with signal
+  `up|down|read|hide|note`. Each signal nudges that item immediately *and* is
+  logged for the Herald agent, which generalizes it into the profile.
+- `GET /news/preferences` / `POST /news/preferences` — the learned profile as
+  Markdown, shown at the bottom of the page and editable by hand.
+
+Read-aloud (`components/speech.js`) walks the ranked feed with the browser's own
+`speechSynthesis` — ▶ Listen, ⏭ skip, ⏹ stop, current item highlighted, each
+item spoken in the language it declares. See `docs/news.md` for the collector,
+the manifest format and the agent.
+
 ## Voice conversations
 
 Threads can be spoken as well as typed, with no streaming and split by direction:

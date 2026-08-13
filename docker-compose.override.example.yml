@@ -201,6 +201,24 @@ services:
   #   networks:
   #     - agents
 
+  # Opting a built-in gateway channel OUT entirely — a deployment that never
+  # runs signal-gateway/whatsapp-gateway/telegram-gateway at all (not even
+  # unpaired). docker-compose.yml unconditionally points the retinue service
+  # at all three via *_GATEWAY_BASE_URL; if the corresponding container never
+  # starts, gateway-monitor.py sees a DNS failure and reports it as a real
+  # outage forever. Name only the channels you actually run in
+  # MESSENGER_BUILTIN_CHANNELS (see scripts/messenger_gateways.py) so the
+  # rest drop out of /sends, /gateways and the monitor together, same as a
+  # chamber that was never mounted — no need to also blank their base URLs.
+  # (If instead you keep a container running but deliberately unpaired, none
+  # of this is needed — its own /health reports configured: false and every
+  # consumer already skips it.)
+  # retinue:
+  #   environment:
+  #     # Signal-only deployment. Set to an empty string to enrol none of
+  #     # the three built-in channels.
+  #     - MESSENGER_BUILTIN_CHANNELS=signal
+
 # volumes:
 #   genomics-index:
 #   # An extra account (see signal-gateway-personal above) needs its own volume:

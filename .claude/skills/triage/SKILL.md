@@ -46,6 +46,10 @@ only then does Ara execute. Goal: **inbox-zero, entirely through Retinue**.
   **between omnibus proposals**, and the **grace period before the first reminder**
   of an un-engaged conversation. It does **not** set how fast new mail is surfaced —
   individual proposals go out on the run that first sees the message.
+- **Every conversation carries a decision; a run with nothing to propose ends
+  silently.** The only dashboard conversations triage may open are the two of
+  Phase 4 — an individual proposal, or the omnibus. A run never reports on itself.
+  See **4c. No status-report conversations** below.
 
 ---
 
@@ -231,6 +235,36 @@ those messages and record the last-omnibus timestamp.
 
     python3 /workspace/scripts/conversation-push.py --title "Triage: archivieren & löschen" \
     "...grouped ARCHIVIEREN / LÖSCHEN, one line per message...\nOK für alle — oder Ausnahmen nennen."
+
+### 4c. No status-report conversations — a silent run is the normal outcome
+
+A dashboard conversation costs the user an unread badge and a Web Push, so it is
+reserved for something only they can decide. **Never open a conversation to
+narrate a run.** Specifically, none of these is a reason to open a thread:
+
+- the run finished, and what it classified;
+- there was nothing new to propose;
+- items are pending but the omnibus interval has not elapsed yet;
+- a proposal from an earlier run is still waiting for the user.
+
+All of that belongs in the scheduler log (a `prompt` job's output is captured
+there) and in the status store, which already record it. A run whose Phase 4
+produced neither an individual proposal nor an omnibus **ends silently** — that
+is the normal outcome of most runs, not a gap to fill with a report.
+
+This matters beyond noise: a status thread lands *on top of* the real proposals
+in the conversation list, pushing the decisions the user actually has to make
+further down — so reporting actively works against the run's own output.
+
+The one legitimate way to draw attention to something already proposed is
+**Phase 5**: a nudge posted **into the existing conversation** (or a Signal push
+pointing at it), interval-gated and at most once per interval. Never a second
+thread about the same items.
+
+**Failures are the exception, and only substantive ones.** If the run could not
+do its job — the mail backend is unreachable, a gateway is down, the store is
+unwritable — open a conversation, because the user has to act. Say what broke
+and what it blocks; do not attach a summary of the run to it.
 
 ---
 

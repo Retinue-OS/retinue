@@ -50,6 +50,13 @@ services:
       # by the entrypoint on first start persist here. The same volume is
       # mounted read-only by qlever-life, so every chamber is indexed equally.
       - chambers:/workspace/chambers
+      # Triage delivery-gate: Ara writes each messenger channel's policy `.nt`
+      # into the per-gateway volume, mounted here under the chambers tree at the
+      # path triage_policy.messenger_policy_path() targets by default (CHAMBERS_DIR
+      # = /workspace/chambers). Ara owns policy/ only; the gateway owns messages/.
+      - messenger-signal:/workspace/chambers/_generated/messenger/signal
+      - messenger-whatsapp:/workspace/chambers/_generated/messenger/whatsapp
+      - messenger-telegram:/workspace/chambers/_generated/messenger/telegram
       # RW mount of the project tree itself. Agents can branch/commit/push
       # infra changes (Tier 3 in CLAUDE.md) straight from this live checkout
       # instead of `git clone … /tmp` — the container already carries the
@@ -135,6 +142,12 @@ services:
       # /tmp inside the container and be lost on every redeploy.
       - CONVERSATIONS_DIR=/root/.retinue/conversations
       - CONVERSATION_DIR=/root/.retinue/conversation-log
+      # The news feed (items, the user's news profile, the feedback log). Same
+      # persistent volume and same reasoning: high-churn, disposable data that
+      # has no business in a chamber's git history or the triple store, but that
+      # must survive a redeploy. Tunables: NEWS_HALF_LIFE_HOURS (how fast an
+      # undated item fades, default 48), NEWS_MAX_AGE_DAYS, NEWS_MAX_ITEMS.
+      - NEWS_DIR=/root/.retinue/news
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
       - UPDATER_URL=http://updater:9000/update
@@ -274,9 +287,17 @@ services:
       - SIGNAL_GATEWAY_HTTP_PORT=8090
       - SIGNAL_DEFAULT_RECIPIENT
       - SIGNAL_GATEWAY_TOKEN
+      # Triage delivery gate (see docs/triage-delivery-gate.md). Every inbound
+      # inbox message is persisted here as one `.nt` file and routed by the policy
+      # `.nt` Ara maintains in policy/. INBOUND_GATE=0 disables the gate (forward
+      # everything, as before). The store dir is the mounted messenger-signal
+      # volume; INBOUND_POLICY_PATH defaults to <store>/policy/policy.nt.
+      - INBOUND_STORE_DIR=/inbound
+      - INBOUND_GATE
     volumes:
       - signal-data:/root/.local/share/signal-cli
       - piper-data:/models
+      - messenger-signal:/inbound
     restart: unless-stopped
     networks:
       - agents
@@ -332,9 +353,17 @@ services:
       - WHATSAPP_GATEWAY_HTTP_PORT=8092
       - WHATSAPP_DEFAULT_RECIPIENT
       - WHATSAPP_GATEWAY_TOKEN
+      # Triage delivery gate (see docs/triage-delivery-gate.md). Every inbound
+      # inbox message is persisted here as one `.nt` file and routed by the policy
+      # `.nt` Ara maintains in policy/. INBOUND_GATE=0 disables the gate (forward
+      # everything, as before). The store dir is the mounted messenger-whatsapp
+      # volume; INBOUND_POLICY_PATH defaults to <store>/policy/policy.nt.
+      - INBOUND_STORE_DIR=/inbound
+      - INBOUND_GATE
     volumes:
       # Linked-device session (neonize sqlite) + pending sends + recent chats.
       - whatsapp-data:/root/.local/share/whatsapp
+      - messenger-whatsapp:/inbound
     restart: unless-stopped
     networks:
       - agents
@@ -393,9 +422,17 @@ services:
       - TELEGRAM_GATEWAY_HTTP_PORT=8093
       - TELEGRAM_DEFAULT_RECIPIENT
       - TELEGRAM_GATEWAY_TOKEN
+      # Triage delivery gate (see docs/triage-delivery-gate.md). Every inbound
+      # inbox message is persisted here as one `.nt` file and routed by the policy
+      # `.nt` Ara maintains in policy/. INBOUND_GATE=0 disables the gate (forward
+      # everything, as before). The store dir is the mounted messenger-telegram
+      # volume; INBOUND_POLICY_PATH defaults to <store>/policy/policy.nt.
+      - INBOUND_STORE_DIR=/inbound
+      - INBOUND_GATE
     volumes:
       # Login session + pending sends + recent chats.
       - telegram-data:/root/.local/share/telegram
+      - messenger-telegram:/inbound
     restart: unless-stopped
     networks:
       - agents
@@ -464,6 +501,14 @@ services:
       # The shared chambers volume: every chamber's RDF files are indexed
       # equally — no special data folder.
       - chambers:/data:ro
+      # The per-gateway messenger stores, nested under the chambers root so their
+      # message + policy `.nt` files are indexed into the life store exactly like
+      # a chamber's files (named graph = path under /data). Read-only: qlever
+      # never writes; the gateways and Ara are the writers. See
+      # docs/triage-delivery-gate.md.
+      - messenger-signal:/data/_generated/messenger/signal:ro
+      - messenger-whatsapp:/data/_generated/messenger/whatsapp:ro
+      - messenger-telegram:/data/_generated/messenger/telegram:ro
     environment:
       BASE_URI: "file:"
       REBUILD_DELAY: "15"
@@ -543,6 +588,15 @@ volumes:
   signal-data:
   whatsapp-data:
   telegram-data:
+  # Triage delivery-gate stores — one per inbox-mode messenger gateway. Each holds
+  # the gateway-written per-message `.nt` files (messages/) and the Ara-written
+  # policy `.nt` (policy/policy.nt). The owning gateway mounts it RW at /inbound,
+  # the retinue container mounts it RW at chambers/_generated/messenger/<channel>
+  # (to write policy/), and qlever-life mounts it RO under /data so both subtrees
+  # are indexed into the life store. See docs/triage-delivery-gate.md.
+  messenger-signal:
+  messenger-whatsapp:
+  messenger-telegram:
   piper-data:
   stt-models:
   egress-audit-certs:

@@ -46,6 +46,26 @@ Projects (dashboard project pages):
                                       -> a retinue agent appends a message (with
                                          attachments) to an existing thread. Same
                                          token gate; same optional {quiet: true}.
+                                         A non-quiet append un-archives the
+                                         thread unless it is muted.
+  POST /internal/conversations/<id>/flags
+                                      -> a retinue agent sets {archived, muted}
+                                         (either or both). Same token gate. The
+                                         only way to set `muted`, which is what
+                                         keeps a thread archived when new
+                                         messages are filed into it.
+
+News feed (dashboard news page; see scripts/news_store.py):
+  GET  /news                          -> {"generated", "items": [...]} ranked at
+                                         read time. ?scope=feed|read|hidden|all
+                                         (default feed), ?limit=<n>.
+  GET  /news/preferences              -> {"markdown", "updated"} — the Herald's
+                                         memory of what the user cares about.
+  POST /news/preferences              -> replace it (body {markdown}); the user
+                                         may edit their own profile by hand.
+  POST /news/feedback                 -> one user signal (body {id?, signal, note?};
+                                         signal: up|down|read|hide|note). Nudges
+                                         that item now and logs it for the Herald.
 
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
@@ -101,6 +121,7 @@ from requester_identity import normalize_requester_identity
 import email_client as ec
 import gateway_auth
 import messenger_gateways
+import news_store
 import push_notify
 
 
@@ -283,10 +304,17 @@ def _coerce_litellm_models(parsed: object) -> list[dict]:
     routing plumbing (wildcards, fallback routes) stays invisible without the
     flag, and wildcard names are dropped even if flagged since a pattern is not
     a model id. Duplicate names (config + DB copy of a route) collapse to the
-    first occurrence."""
+    first occurrence.
+
+    Same-label routes collapse too. A picker route also surfaces under its
+    target id (`claude-opus-5` and `anthropic/claude-opus-5` are two names for
+    one model, both carrying the same model_info), so name-only dedup let every
+    entry appear twice. The label is what the user picks by, so two entries
+    reading "Opus (deepest reasoning)" are a bug whatever their ids; the first
+    occurrence wins, which is the route as the config names it."""
     if not isinstance(parsed, dict):
         return []
-    models, seen = [], set()
+    models, seen, labelled = [], set(), set()
     for item in parsed.get("data") or []:
         if not isinstance(item, dict):
             continue
@@ -296,8 +324,11 @@ def _coerce_litellm_models(parsed: object) -> list[dict]:
         mid = str(item.get("model_name") or "").strip()
         if not mid or "*" in mid or mid in seen:
             continue
-        seen.add(mid)
         label = str(info.get(_LITELLM_LABEL_KEY) or mid).strip()
+        if label in labelled:
+            continue
+        seen.add(mid)
+        labelled.add(label)
         models.append({"id": mid, "label": label})
     return models
 
@@ -443,6 +474,7 @@ _CONV_GET_RE = re.compile(r"^/conversations/([0-9a-f]{32})/?$")
 _CONV_ATT_RE = re.compile(r"^/conversations/([0-9a-f]{32})/attachments/([0-9a-f]{32})/?$")
 _CONV_MSG_RE = re.compile(r"^/conversations/([0-9a-f]{32})/messages/?$")
 _INTERNAL_CONV_MSG_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/messages/?$")
+_INTERNAL_CONV_FLAGS_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/flags/?$")
 _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
@@ -465,6 +497,50 @@ push_notify.init(PUSH_DIR)
 # can write data without touching the baked-in shell).
 WEBAPP_DIR = Path(os.environ.get("WEBAPP_DIR", "/workspace/webapp"))
 DASHBOARD_DATA_DIR = Path(os.environ.get("DASHBOARD_DATA_DIR", str(WEBAPP_DIR / "data")))
+
+# Content hash of the whole shell tree, used as the service worker's cache name
+# (see _serve_service_worker). Computed over every file under WEBAPP_DIR so ANY
+# webapp change moves the hash automatically — no hand-bumped version to forget.
+# Cached and only recomputed when a file's path/size/mtime changes, so the hot
+# path stays a cheap stat sweep rather than a full re-read on every request.
+# `data/` is excluded: it is curated JSON served no-store, not part of the
+# cached shell, and it changes on its own cadence.
+_SHELL_HASH_CACHE: dict[str, str] = {}
+
+
+def _shell_hash() -> str:
+    """Return a short content hash identifying the current shell-asset set.
+
+    The signature is a stat sweep (relative path + size + mtime_ns of every
+    file under WEBAPP_DIR, excluding data/); when it is unchanged we return the
+    memoised digest, otherwise we hash the signature afresh. Falls back to a
+    fixed but valid token if the tree cannot be walked, so the worker always
+    gets a usable cache name."""
+    try:
+        data_dir = DASHBOARD_DATA_DIR.resolve()
+        entries = []
+        for p in sorted(WEBAPP_DIR.rglob("*")):
+            if not p.is_file():
+                continue
+            try:
+                if p.resolve() == data_dir or data_dir in p.resolve().parents:
+                    continue
+            except OSError:
+                continue
+            st = p.stat()
+            entries.append(f"{p.relative_to(WEBAPP_DIR)}:{st.st_size}:{st.st_mtime_ns}")
+    except OSError:
+        return "static"
+    signature = "\n".join(entries)
+    cached = _SHELL_HASH_CACHE.get(signature)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
+    # Single-signature cache: replace wholesale so a changed tree cannot leak
+    # unbounded entries over the process lifetime.
+    _SHELL_HASH_CACHE.clear()
+    _SHELL_HASH_CACHE[signature] = digest
+    return digest
 # Read-only SPARQL endpoint of the "life" triple store. The projects card
 # (GET /projects) computes its content live from this, so there is no static
 # projects.json and no extractor job: project/goal frontmatter is already
@@ -995,6 +1071,11 @@ def _conv_summary(conv: dict) -> dict:
         "updated": conv.get("updated"),
         "unread": bool(conv.get("unread")),
         "archived": bool(conv.get("archived")),
+        # A muted thread stays where the user put it: an agent filing news into
+        # it never un-archives it, and (once notification filtering exists) it
+        # is the flag that silences it. Independent of `archived` — either can
+        # be set alone.
+        "muted": bool(conv.get("muted")),
         "pending": bool(conv.get("pending")),
         "pending_since": conv.get("pending_since"),
         "pending_status": conv.get("pending_status"),
@@ -1172,7 +1253,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       attachments=None,
                       model_name: str | None = None,
                       cost_usd: float | None = None,
-                      agent: str | None = None) -> dict | None:
+                      agent: str | None = None,
+                      wake: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
     `model_name`/`cost_usd` carry the answering turn's metadata (short model
@@ -1180,6 +1262,15 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     bubble header; both are byproducts of the answer call and cost nothing extra
     to surface. `agent` overrides the displayed sender name (e.g. "Coach") when
     a relay answers on a subagent's behalf.
+
+    `wake` marks an append that carries something new for the user (an agent
+    filing an inbound message into an existing thread). Such an append
+    un-archives the thread unless it is muted: archived + unread is invisible —
+    it drops out of the active list while claiming to want attention — so a
+    thread that receives news has to come back or the news is lost. Muting is
+    the explicit opt-out, set when the user asks for a thread to be archived for
+    good. Ara's own reply and the user's own reply do not wake a thread: neither
+    is news arriving from outside.
     """
     now = datetime.now(timezone.utc).isoformat()
     stored = _store_attachments(cid, attachments or [])
@@ -1201,6 +1292,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["agent"] = agent
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
+        if wake and conv.get("archived") and not conv.get("muted"):
+            conv["archived"] = False
         if unread is not None:
             conv["unread"] = unread
         if pending is not None:
@@ -2241,6 +2334,37 @@ def _write_project_file(pid: str, content: str, base_sha: str | None) -> tuple[i
     return 200, {"ok": True, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+# ── News feed ────────────────────────────────────────────────────────────────
+# The feed is ranked here, at read time, from one number per item (see
+# scripts/news_store.py): importance × decay, sampled now. Nothing is
+# pre-sorted and nothing is rewritten as time passes — an item fades because the
+# clock moved, not because a job re-scored it. The store is a plain JSON file on
+# the persistent volume, so this costs a file read.
+
+# The Herald's memory is prose the user can also edit by hand in the dashboard;
+# bound the write so a runaway client cannot fill the volume with it.
+MAX_PREFERENCES_BYTES = 64 * 1024
+
+
+def _news_payload(scope: str, limit: int | None) -> dict:
+    items = news_store.ranked(scope=scope, limit=limit)
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "scope": scope,
+        "items": items,
+    }
+
+
+def _news_preferences_payload() -> dict:
+    path = news_store.preferences_file()
+    try:
+        updated = datetime.fromtimestamp(path.stat().st_mtime,
+                                         timezone.utc).isoformat(timespec="seconds")
+    except OSError:
+        updated = None
+    return {"markdown": news_store.load_preferences(), "updated": updated}
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -2366,6 +2490,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             return self._serve_static_file(WEBAPP_DIR / "index.html", WEBAPP_DIR)
+        if path == "/sw.js":
+            return self._serve_service_worker()
         if path.startswith("/data/"):
             rel = path[len("/data/"):]
             return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
@@ -2373,6 +2499,34 @@ class Handler(BaseHTTPRequestHandler):
         if not rel:
             return False
         return self._serve_static_file(WEBAPP_DIR / rel, WEBAPP_DIR)
+
+    def _serve_service_worker(self) -> bool:
+        """Serve sw.js with its cache name stamped from a content hash of the
+        whole shell tree.
+
+        The service worker caches shell assets cache-first, so a changed asset
+        only reaches the browser once the worker's own bytes change. Rather than
+        rely on someone hand-bumping a version constant on every webapp edit
+        (which is easy to forget), we substitute the `__SHELL_HASH__` token with
+        a hash computed over every file under WEBAPP_DIR. Any shell change moves
+        the hash, which moves the worker bytes, which is exactly what triggers
+        the browser to install the new worker and drop the stale cache. The file
+        (baked, read-only) is never mutated on disk — the substitution is done on
+        the response only. Served no-cache so the worker itself is always
+        revalidated."""
+        sw = WEBAPP_DIR / "sw.js"
+        try:
+            text = sw.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        body = text.replace("__SHELL_HASH__", _shell_hash()).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/javascript; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+        return True
 
     def do_POST(self):
         if self.path == "/message":
@@ -2388,6 +2542,10 @@ class Handler(BaseHTTPRequestHandler):
         if internal_msg_match:
             self._handle_agent_conversation_message(internal_msg_match.group(1))
             return
+        internal_flags_match = _INTERNAL_CONV_FLAGS_RE.match(self.path)
+        if internal_flags_match:
+            self._handle_agent_conversation_flags(internal_flags_match.group(1))
+            return
         if self.path.split("?", 1)[0].rstrip("/") == "/push/subscribe":
             self._handle_push_subscribe()
             return
@@ -2399,6 +2557,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/projects/item":
             self._handle_project_write()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/news/feedback":
+            self._handle_news_feedback()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/news/preferences":
+            self._handle_news_preferences_write()
             return
         if self.path in ("/conversations", "/conversations/"):
             self._handle_conversation_create()
@@ -2584,6 +2748,69 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return payload if isinstance(payload, dict) else None
 
+    def _handle_news_feedback(self) -> None:
+        """One user signal on the news feed: 👍/👎, opened, hidden, or a note.
+
+        Two effects, both wanted. The item is nudged immediately, so the feed
+        visibly reacts to the tap instead of waiting for the next curation run;
+        and the signal is appended to the feedback log, which is what the Herald
+        later generalizes into the preferences file. A note with no item id is
+        the user speaking about the feed as a whole ("less crypto") — the most
+        useful signal there is, so it needs no item to attach to."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        signal = (payload.get("signal") or "").strip()
+        item_id = (payload.get("id") or "").strip() or None
+        note = (payload.get("note") or "").strip()[:2000]
+        if signal not in news_store.VALID_SIGNALS:
+            self._send_json(400, {"error": "unknown signal",
+                                  "valid": list(news_store.VALID_SIGNALS)})
+            return
+        if signal == "note" and not note:
+            self._send_json(400, {"error": "a note needs text"})
+            return
+        if signal != "note" and not item_id:
+            self._send_json(400, {"error": "id is required for this signal"})
+            return
+        try:
+            entry = news_store.record_feedback(item_id, signal, note)
+        except KeyError:
+            self._send_json(404, {"error": "unknown item"})
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "could not record feedback",
+                                  "detail": str(exc)})
+            return
+        self._send_json(200, {"ok": True, "feedback": entry})
+
+    def _handle_news_preferences_write(self) -> None:
+        """Replace the Herald's memory with what the user typed.
+
+        The profile is deliberately a plain Markdown file rather than hidden
+        model state: the user can read why their feed looks the way it does, and
+        correct it directly. The Herald is instructed to merge with what it
+        finds here rather than clobber it."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        markdown = payload.get("markdown")
+        if not isinstance(markdown, str):
+            self._send_json(400, {"error": "markdown is required"})
+            return
+        if len(markdown.encode("utf-8")) > MAX_PREFERENCES_BYTES:
+            self._send_json(413, {"error": "preferences too large"})
+            return
+        try:
+            news_store.save_preferences(markdown)
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save preferences",
+                                  "detail": str(exc)})
+            return
+        self._send_json(200, _news_preferences_payload())
+
     def _handle_transcribe(self) -> None:
         """Voice input: proxy uploaded audio to the shared STT service.
 
@@ -2761,8 +2988,37 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_conversation_archive(self, cid: str, archived: bool) -> None:
         """Archive or unarchive a thread. Archived threads drop out of the
         dashboard card's active list but stay available in the dedicated
-        all-conversations view (and via GET /conversations?archived=1)."""
+        all-conversations view (and via GET /conversations?archived=1).
+
+        This is the dashboard's own button, i.e. the user archiving a thread
+        by hand — it leaves `muted` untouched, so a thread archived this way
+        comes back when something new is filed into it. Archiving *for good*
+        is the muted variant, which an agent sets via /internal/… when the
+        user asks for the thread to be archived and stay archived."""
         conv = _conv_set_flags(cid, archived=archived)
+        if conv is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        self._send_json(200, _conv_summary(conv))
+
+    def _handle_agent_conversation_flags(self, cid: str) -> None:
+        """A retinue agent sets a thread's `archived`/`muted` flags.
+
+        The agent-side counterpart to the dashboard's archive button, and the
+        only way `muted` can be set today (there is deliberately no UI for it
+        yet): when the user tells Ara to archive a thread, she archives *and*
+        mutes it, so a later inbound message does not resurrect it. Either flag
+        may also be set on its own — muting a thread the user keeps active is
+        a valid request."""
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        flags = {key: bool(payload[key])
+                 for key in ("archived", "muted") if key in payload}
+        if not flags:
+            self._send_json(400, {"error": "no flags given"})
+            return
+        conv = _conv_set_flags(cid, **flags)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
@@ -2868,8 +3124,11 @@ class Handler(BaseHTTPRequestHandler):
         # otherwise buzz the user's phone on every question the MCP connector
         # relays.
         quiet = bool(payload.get("quiet"))
+        # A non-quiet append is news for the user, so it wakes an archived
+        # thread (unless muted): otherwise the message lands unread in a thread
+        # that no longer appears in the active list, and is never seen.
         conv = _conv_add_message(cid, "agent", message, unread=not quiet,
-                                 attachments=attachments)
+                                 attachments=attachments, wake=not quiet)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
@@ -2966,6 +3225,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(404, {"error": "unknown project"})
             else:
                 self._send_json(200, item)
+            return
+        if conv_path in ("/news", "/news/"):
+            params = urllib.parse.parse_qs(conv_query)
+            scope = (params.get("scope") or ["feed"])[0]
+            if scope not in ("feed", "read", "hidden", "all"):
+                scope = "feed"
+            try:
+                limit = int((params.get("limit") or ["0"])[0])
+            except ValueError:
+                limit = 0
+            self._send_json(200, _news_payload(scope, limit if limit > 0 else None))
+            return
+        if conv_path in ("/news/preferences", "/news/preferences/"):
+            self._send_json(200, _news_preferences_payload())
             return
         if conv_path in ("/projects", "/projects/"):
             # Live projects view, computed from the life store on demand. No

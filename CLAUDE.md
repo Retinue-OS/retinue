@@ -21,10 +21,12 @@ The team has three kinds of members:
   Treat this as a per-action requirement, not just session-start orientation:
   before composing any outbound message on behalf of the user, read the
   relevant persona file and apply its style rules.
-- **Core subagent** (in `/workspace/.claude/agents/`): **Archivist**, a generic
-  ingestion agent that files documents and extracts triples into the life store.
-  It runs isolated on its own model (Sonnet) — dispatch it via the Agent tool
-  with all needed context in the prompt.
+- **Core subagents** (in `/workspace/.claude/agents/`): **Archivist**, a generic
+  ingestion agent that files documents and extracts triples into the life store,
+  and **Herald**, the news agent that scores incoming news items and maintains
+  what the user cares about (see **News feed** below). Both run isolated on their
+  own model (Sonnet) — dispatch them via the Agent tool with all needed context
+  in the prompt.
 - **Domain subagents**, provided as Claude Code plugins by the mounted chambers
   (see below). Which ones exist depends on which chambers are mounted — each
   chamber's own **Chamber instructions** (see below) say what it provides and
@@ -37,6 +39,8 @@ The team has three kinds of members:
 
 1. **Know which role is needed**:
    - Data ingestion → dispatch the `archivist` subagent
+   - News scoring / "more of this, less of that" in the feed → dispatch the
+     `herald` subagent
    - Research → `/workspace/agents/academic.md`
    - Translations → `/workspace/agents/publisher.md`
    - 1:1 communication → `/workspace/agents/secretary.md`
@@ -411,7 +415,9 @@ prints a pending-approval notice with the approval URL instead of confirming
 delivery — the message goes out only once the user allows it at `/sends`.
 
 **Multiple gateways per channel.** The `/sends` page enrols the three built-in
-gateways when their `*_GATEWAY_BASE_URL` is set, but a deployment often runs
+gateways when their `*_GATEWAY_BASE_URL` is set and their name is included in
+`MESSENGER_BUILTIN_CHANNELS` (default: all three — see "Gateway connection
+monitoring" below), but a deployment often runs
 *more than one* gateway on a channel — most commonly a second Signal identity,
 the user's **personal** account (`signal-gateway-personal`) alongside the
 system one. Those extra gateways are enrolled by the deployment via
@@ -500,6 +506,39 @@ build ad-hoc liveness checks for these channels; if a user reports a channel
 seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
 intentional, not broken.
+
+**A deployment that doesn't use a given channel at all** — never runs its
+container, not even unpaired — must say so explicitly, or the monitor has no
+way to tell that apart from a real outage. The base `docker-compose.yml`
+always points the `retinue` service at all three built-in gateways via
+`SIGNAL_GATEWAY_BASE_URL` / `WHATSAPP_GATEWAY_BASE_URL` /
+`TELEGRAM_GATEWAY_BASE_URL`; if the matching container is never started, the
+monitor's health check fails DNS resolution — indistinguishable, from inside
+this container, from that same container having crashed — and it would open a
+"gateway disconnected" thread on every restart. There are two supported ways
+to avoid that, and they mean different things:
+
+- **Leave the container running, just unpaired.** Its own `/health` then
+  reports `configured: false`, which `/sends`, `/gateways` and the monitor all
+  already skip — no config needed, and the channel stays visibly "not set up"
+  on `/gateways` if the user ever wants to pair it later. Preferred when the
+  resource cost of an idle container is a non-issue.
+- **Never run the container at all.** Then set `MESSENGER_BUILTIN_CHANNELS` on
+  the `retinue` service in the deployment's `docker-compose.override.yml` (see
+  `scripts/messenger_gateways.py` and the example there) to the comma-separated
+  subset of `signal`, `whatsapp`, `telegram` this deployment actually runs —
+  e.g. `MESSENGER_BUILTIN_CHANNELS=signal` for a Signal-only deployment, or
+  unset entirely for none. Naming a channel there is what enrols it into the
+  shared registry `/sends`, `/gateways` and the monitor all read from
+  regardless of what `*_GATEWAY_BASE_URL` happens to be wired to; leaving a
+  channel out drops it from all three at once, same as a chamber that was
+  never mounted. One variable states the deployment's whole channel set, so it
+  reads as a deliberate choice rather than three easy-to-forget blanks.
+
+`GATEWAY_MONITOR_IGNORE` (comma-separated slugs) is the narrower tool: it
+silences the monitor alone while leaving the channel enrolled everywhere else
+— for a gateway the deployment deliberately runs unlinked and doesn't want
+reminders about, not for one it never runs at all.
 
 ## Speech-to-text (STT service)
 
@@ -649,6 +688,30 @@ existing subscription, so devices would need to re-enable.
 
 The card sizes itself to the layout: on a phone, where every row lengthens the scrolling page, it stays compact at the five most recent active threads; in the wide layout, where it is a scroll box inside its own column, it shows every active thread as tiles that reflow into as many columns as fit (the same rule governs the projects card — see `isWideFrame` in `webapp/components/base.js`). Either way an **All conversations →** link leads to the dedicated `conversations.html` page, which lists every thread with an Active/Archived/Edits filter. Threads can be archived from inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived threads drop off the active list but stay on that page.
 
+**Archived + muted.** Archived and unread is a contradiction: the thread claims
+to want attention while being invisible. So when an agent files something new
+into an archived thread (`POST /internal/conversations/<id>/messages`, the
+`--thread` path of `conversation-push.py`), the gateway **un-archives it** — the
+message would otherwise be lost, which is exactly what happened before this
+existed. The opt-out is the separate **`muted`** flag: a muted thread stays
+where it is, however much arrives. `muted` is independent of `archived` (either
+can be set alone) and has no dashboard control on purpose — it is set from an
+agent via `POST /internal/conversations/<id>/flags`:
+
+```bash
+# archive for good — what to run when the user says "archive this conversation"
+python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
+# also: --unarchive, --unmute; flags are their own call, never mixed with a message
+```
+
+The rule for you: **the user clicking Archive is not the same as the user asking
+you to archive.** The button leaves `muted` untouched, so that thread comes back
+when news arrives. When the user *tells* you to archive a thread, they mean it
+should stay archived — set `--archive --mute` together. Mute alone is a valid
+request too (a noisy thread the user keeps active). Never infer a past
+archival's origin by reading the thread: it is not recorded, so `muted` is the
+only decidable signal.
+
 Every project on the projects card also has its **own page**
 (`project.html?id=<project URI>`): the gateway maps the URI back to the
 project's source Markdown file via its named graph in the life store
@@ -664,6 +727,45 @@ the Edits filter); "Discuss with Ara" on a project page starts a normal,
 visible thread whose engage prompt points you at the project file.
 
 Changes to `webapp/` and the gateway's serving logic are **Tier 3** (PR).
+
+## News feed
+
+Broadcast-style inbound — a channel announcement, a newsletter blurb, an RSS
+item — needs no reply and fits no project, so triage archives it and it is lost.
+The **news feed** is its home: a dashboard card plus a `/news.html` page of
+**references to sources** (title, source, the source's own excerpt, the link —
+never a copy of the article), ranked by how much each matters *now*.
+
+The whole ranking is one number per item, sampled at read time:
+`importance × 0.5 ^ (age / half_life)`. Two exceptions carry the time-relevance
+idea: an item with an `expires` date (event, deadline) holds full weight until
+that date and then leaves the feed in one step, and an already-opened item is
+damped rather than removed. Nothing is stored sorted and nothing is re-scored as
+time passes — the feed changes because the clock moved.
+
+- **Sources**: any chamber declares RSS/Atom feeds in a **`.news.json`** at its
+  root (same convention as `.refresh.json` / `.schedule.json`), collected by
+  `scripts/news-fetch.py`. Anything that is not a feed — a Telegram channel
+  post, a newsletter you meet during triage, a link worth keeping — you file
+  yourself with `scripts/news-add.py` (use `--expires` for anything dated).
+- **Judgement**: the **`herald`** subagent scores each new item and maintains
+  `preferences.md`, its prose memory of the user's taste. It is invoked by
+  `scripts/news-curate.py`, a scheduler `command` job whose gate is a file read:
+  no unscored items and no new feedback spawns nothing.
+- **The user's loop**: 👍 / 👎 / ✕ on any item, plus a free-text note on the
+  page ("less crypto, more local politics"). Each signal nudges that item
+  immediately and is logged for the Herald to generalize. The learned profile is
+  shown on the news page and is editable by hand.
+- **Read-aloud**: the page speaks the ranked feed through the browser's own
+  speech synthesis, per item in the language the item declares.
+- **Store**: a plain JSON store under `NEWS_DIR` (`/root/.retinue/news`, the
+  persistent volume) — high-churn disposable data belongs neither in a chamber's
+  git history nor in the triple store.
+
+**Before changing how the feed ranks, ingests or learns, read
+`/workspace/docs/news.md`.** It covers the item shape, the manifest format, the
+API, the tunables, and why the keyframe-curve design in issue #25 was replaced
+by this one.
 
 ## Ask Ara (the MCP connector)
 

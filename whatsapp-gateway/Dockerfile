@@ -24,5 +24,8 @@ RUN mkdir -p /root/.local/share/whatsapp
 WORKDIR /app
 COPY scripts/whatsapp-gateway.py /app/whatsapp-gateway.py
 COPY scripts/requester_identity.py /app/requester_identity.py
+COPY scripts/reply_tokens.py /app/reply_tokens.py
+COPY scripts/triage_policy.py /app/triage_policy.py
+COPY scripts/inbound_store.py /app/inbound_store.py
 
 CMD ["python3", "/app/whatsapp-gateway.py"]
