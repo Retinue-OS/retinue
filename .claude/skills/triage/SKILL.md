@@ -92,7 +92,7 @@ messenger is **push**:
   | **unknown** | yes, flagged "unknown sender" (`delivered:true`) | — | — |
   | **blacklisted** | no | `delivered:false` | **yes** |
   | **group-blocked** | no | `delivered:true` | no |
-  | **noise-class** (status/echo/news/note-to-self) | no | `delivered:true` | no |
+  | **no-action-class** (status/echo/news/note-to-self) | no | `delivered:true` | no |
 
   An **unknown** sender's live turn asks the user whether to whitelist: yes →
   whitelist; no → blacklist (never asked again, held-only from then on). A group
@@ -163,7 +163,8 @@ An **inbox-mode** messaging gateway (e.g. `signal-gateway.py` with
 `SIGNAL_GATEWAY_MODE=inbox`) monitors one of the user's own message sources.
 Each inbound first passes the delivery gate: a **whitelisted** or **unknown**
 sender is dispatched straight to Ara via the web-gateway; blacklisted /
-group-blocked / noise-class messages are persisted `delivered` and never pushed.
+group-blocked / no-action-class messages are persisted `delivered` and never
+pushed.
 The account's **mode** — not the content, not triage — already established that
 this is the user's incoming mail; **triage never has to decide whether a message
 is an instruction or user mail.** The prompt contains the message and sender, so
@@ -184,9 +185,10 @@ disposition. This is the one path by which a new handle enters the policy.
 Some forwarded items are not messages *to* the user but **status updates**: a
 contact's WhatsApp Status (story) post, or another broadcast-list post. The
 gateway marks these deterministically — by delivery address, never by guessing
-from content — and treats them as **noise-class**: persisted straight to the
-ledger with `delivered: true`, so history stays complete but no model turn is
-ever spent and the daily drain skips them. On the rare path a prompt is
+from content — and treats them as **no-action-class** (signal worth keeping,
+but nothing to do right now): persisted straight to the ledger with
+`delivered: true`, so history stays complete but no model turn is ever spent
+and the daily drain skips them. On the rare path a prompt is
 produced, it is tagged **`kind: status_update`** and wrapped in
 `<status_update>` rather than `<external_message>`. Trust the tag; never
 re-derive it from the text.
@@ -210,8 +212,8 @@ individual proposal:
   item to it instead of (or in addition to) filing.
 
 No such rule is configured yet, so today every status update is simply filed
-silently. The noise-class marker and this policy let that change later without
-touching the gate.
+silently. The no-action-class marker and this policy let that change later
+without touching the gate.
 
 **Example prompt injected by an inbox-mode `signal-gateway.py`:**
 
@@ -432,7 +434,7 @@ ledger's flag, not an INBOX move, closes the loop.
   (drain) flips it, and only the daily triage skill calls that. A SPARQL read
   never mutates it, so browsing messenger history is always safe.
 - Live-forwarded (whitelisted/unknown) → `delivered:true`; blacklisted →
-  `delivered:false` (awaits the drain); group-blocked and noise-class →
+  `delivered:false` (awaits the drain); group-blocked and no-action-class →
   `delivered:true` (complete history, never drained).
 - **Policy** (whitelist/blacklist/group-block) is `.nt` on the same per-gateway
   volume, in a `policy/` subdirectory Ara writes and the gateway reads raw. Edit
