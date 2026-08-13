@@ -9,6 +9,13 @@
       "run_at_start": false
     },
     {
+      "id": "recurring-projects",
+      "command": "python3 /workspace/scripts/recurring-projects.py",
+      "interval_seconds": 1800,
+      "enabled": true,
+      "run_at_start": false
+    },
+    {
       "_comment": "Pull the feeds each chamber declares in its .news.json. Pure HTTP + parsing, no Claude session; a deployment with no manifest does nothing.",
       "id": "news-fetch",
       "command": "python3 /workspace/scripts/news-fetch.py",
