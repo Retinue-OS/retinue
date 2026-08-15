@@ -5,7 +5,12 @@ A "conversation tab" is a chat thread with Ara shown on the dashboard. Besides
 threads the user starts, an agent can *initiate* one when it hits a decision it
 should not make alone — e.g. an RSVP, an ambiguous e-mail, a calendar clash:
 
-    conversation-push.py --title "Party RSVP" "You've got an invitation to Mara's birthday party on Saturday. Shall I confirm you'll attend and add it to your agenda, or politely decline?"
+    conversation-push.py --title "Party RSVP" "You've got an invitation to Mara's birthday party on Saturday. Shall I confirm you'll attend and add it to your agenda, or politely decline? [[chip: Confirm | Yes, confirm and add it to my agenda.]] · [[chip: Decline | Please decline politely.]]"
+
+Message text is rendered as Markdown in the dashboard; compose it per the
+dashboard-composing skill (.claude/skills/dashboard-composing/SKILL.md): a
+click-to-fill [[chip: Label | prefill]] for every offered option, linked
+PR/issue labels, and no bare URLs — always [label](url).
 
 Use --attach to hand the user a file to download from the thread (e.g. an
 e-mail attachment forwarded into the dashboard):
