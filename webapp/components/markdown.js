@@ -58,6 +58,13 @@ export function renderInline(text) {
   s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/gi,
     (_m, label, fill) => stash(
       `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`));
+  // Shorthand: [[chip: Text]] with no "|" — the text is used as BOTH the label
+  // and the prefill. Runs after the two-part form above, so any [[chip: …]] left
+  // here has no separator. This avoids the silent failure where a missing "|"
+  // left the whole marker as raw literal text in the bubble.
+  s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\]\]/gi,
+    (_m, text) => stash(
+      `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`));
   // ![alt](url) — no remote fetches from rendered content; show it as a link.
   s = s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/)[^\s)]+)\)/gi,
     (_m, alt, url) => stash(anchor(url, alt || url)));
