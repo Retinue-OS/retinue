@@ -1308,13 +1308,56 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     )
 
 
+# A conversation counts as stalled once it has seen no activity — no message
+# and no read — for this long (#66's definition: inactive for more than 10 min).
+_STALLED_AFTER_SECONDS = 600
+
+
+def _conv_event_mode(conv: dict) -> str:
+    """Classify the agent turn just appended to a thread for push filtering.
+
+    Returns one of the event kinds `push_notify.notify` matches against each
+    device's notification_mode:
+
+      * "new"     — the first message of a thread the agent opened; the only
+                    event a `new_only` subscriber wants.
+      * "stalled" — a message landing after the thread was inactive for more
+                    than _STALLED_AFTER_SECONDS.
+      * "reply"   — any other turn of an active exchange; delivered only to
+                    "all" subscribers.
+
+    Called after the message was appended, so messages[-1] is the message being
+    pushed; the previous message and the user's last read are the activity
+    anchors. Anything unparseable degrades to "reply", the quietest class.
+    """
+    messages = conv.get("messages", [])
+    if len(messages) <= 1:
+        return "new" if conv.get("initiator") == "agent" else "reply"
+    anchors = []
+    for raw in (messages[-2].get("ts"), conv.get("read_at")):
+        try:
+            ts = datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            continue
+        if ts.tzinfo is not None:
+            anchors.append(ts)
+    if anchors:
+        idle = (datetime.now(timezone.utc) - max(anchors)).total_seconds()
+        if idle > _STALLED_AFTER_SECONDS:
+            return "stalled"
+    return "reply"
+
+
 def _push_conv_notification(conv: dict, text: str) -> None:
     """Notify the user's devices that a thread needs their attention.
 
     Called for every agent→user turn that lands unread: a thread Ara opens, a
     file an agent appends, and Ara's own reply (which arrives after her session
-    ends, long after the user may have closed the app). Best effort — a push
-    failure never affects the conversation itself."""
+    ends, long after the user may have closed the app). Which devices are
+    notified depends on each device's stored preferences: the event kind
+    (see _conv_event_mode) and — for archived threads, which notify by
+    default — an explicit opt-out. Best effort — a push failure never affects
+    the conversation itself."""
     if not push_notify.enabled():
         return
     cid = conv.get("id", "")
@@ -1322,18 +1365,9 @@ def _push_conv_notification(conv: dict, text: str) -> None:
     body = " ".join(str(text or "").split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
-
-    messages = conv.get("messages", [])
-    event_mode = "new"
-    if len(messages) > 1 and conv.get("read_at"):
-        try:
-            last_read = datetime.fromisoformat(conv["read_at"])
-            if (datetime.now(timezone.utc) - last_read).total_seconds() > 600:
-                event_mode = "stalled"
-        except (ValueError, TypeError):
-            pass
-
-    push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid, mode=event_mode)
+    push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
+                             mode=_conv_event_mode(conv),
+                             archived=bool(conv.get("archived")))
 
 
 def _conv_worker(cid: str, session_key: str) -> None:

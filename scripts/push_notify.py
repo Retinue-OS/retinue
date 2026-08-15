@@ -115,25 +115,47 @@ def _sub_path(endpoint: str) -> Path:
     return _state_dir / "subscriptions" / f"{digest}.json"
 
 
+# Per-device notification preferences, stored on the subscription record.
+#
+# `notification_mode` says which event kinds notify this device. Every push is
+# classified by its caller as one of three event kinds — "new" (first message
+# of a thread the agent opened), "stalled" (a message after >10 min of thread
+# inactivity) or "reply" (any other turn of an active exchange) — and
+# `notify()` matches the event against each device's mode. "all" (also the
+# fallback for legacy records without a mode) matches every event; "off"
+# matches none.
+KNOWN_MODES = {"all", "new_only", "stalled_only", "new_and_stalled", "off"}
+_MODE_EVENTS = {
+    "new_only": {"new"},
+    "stalled_only": {"stalled"},
+    "new_and_stalled": {"new", "stalled"},
+}
+
+
 def subscribe(payload: dict) -> bool:
-    """Store a PushSubscription and optional preference as handed over by the browser."""
+    """Store a PushSubscription and optional preferences as handed by the browser."""
     if not enabled():
         return False
-    
-    # The client might send the raw subscription or a wrapped {subscription, notification_mode}
-    subscription = payload.get("subscription") if isinstance(payload, dict) and "subscription" in payload else payload
-    if not subscription:
+
+    # The client sends either a raw subscription (legacy) or a wrapped
+    # {subscription, notification_mode, notify_archived}.
+    wrapped = isinstance(payload, dict) and "subscription" in payload
+    subscription = payload.get("subscription") if wrapped else payload
+    if not isinstance(subscription, dict):
         return False
-    endpoint = (subscription or {}).get("endpoint")
-    keys = (subscription or {}).get("keys") or {}
+    endpoint = subscription.get("endpoint")
+    keys = subscription.get("keys") or {}
     if not endpoint or not keys.get("p256dh") or not keys.get("auth"):
         return False
-    
+
     record = {"endpoint": endpoint, "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
-    
-    # If it's a wrapped payload, merge the preference
-    if isinstance(payload, dict) and "notification_mode" in payload:
-        record["notification_mode"] = payload["notification_mode"]
+
+    if wrapped:
+        # Both values come straight from the client: coerce anything unknown
+        # to the fail-safe defaults rather than storing arbitrary strings.
+        mode = payload.get("notification_mode", "all")
+        record["notification_mode"] = mode if mode in KNOWN_MODES else "all"
+        record["notify_archived"] = bool(payload.get("notify_archived", True))
 
     with _lock:
         path = _sub_path(endpoint)
@@ -169,8 +191,15 @@ def subscription_count() -> int:
     return len(_all_subscriptions()) if enabled() else 0
 
 
-def notify(title: str, body: str, url: str = "/", tag: str | None = None, mode: str | None = None) -> int:
-    """Push a notification to every registered device. Returns how many got it.
+def notify(title: str, body: str, url: str = "/", tag: str | None = None,
+           mode: str | None = None, archived: bool = False) -> int:
+    """Push a notification to every device whose preferences match. Returns how
+    many got it.
+
+    `mode` is the event kind of this push ("new"/"stalled"/"reply", see
+    KNOWN_MODES above); None means unclassified and matches every device not
+    set to "off". `archived` says the triggering conversation is archived, so
+    devices that opted out of archived threads are skipped.
 
     Best effort by contract: callers invoke this from request handlers and must
     not fail because a push service is down.
@@ -183,14 +212,11 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None, mode: 
         user_mode = sub.get("notification_mode", "all")
         if user_mode == "off":
             continue
-        if mode and mode != "all" and user_mode != "all" and user_mode != mode:
-            # Handle complex mapping
-            if user_mode == "new_only" and mode != "new":
-                continue
-            if user_mode == "stalled_only" and mode != "stalled":
-                continue
-            if user_mode == "new_and_stalled" and mode not in ("new", "stalled"):
-                continue
+        if archived and not sub.get("notify_archived", True):
+            continue
+        wanted = _MODE_EVENTS.get(user_mode)  # None: "all" or legacy → everything
+        if wanted is not None and mode is not None and mode not in wanted:
+            continue
         try:
             webpush(
                 subscription_info=sub,
@@ -214,13 +240,14 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None, mode: 
     return sent
 
 
-def notify_async(title: str, body: str, url: str = "/", tag: str | None = None, mode: str | None = None) -> None:
+def notify_async(title: str, body: str, url: str = "/", tag: str | None = None,
+                 mode: str | None = None, archived: bool = False) -> None:
     """Fan out in the background so the triggering HTTP response isn't delayed."""
     if not enabled():
         return
     threading.Thread(
         target=notify,
-        args=(title, body, url, tag, mode),
+        args=(title, body, url, tag, mode, archived),
         name="push-notify",
         daemon=True,
     ).start()

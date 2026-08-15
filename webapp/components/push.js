@@ -1,9 +1,13 @@
 // Push notification opt-in for the Retinue dashboard PWA.
 //
 // Renders a single bell button that asks for notification permission and
-// registers a Web Push subscription with the gateway. It hides itself whenever
-// there is nothing to do — push unsupported, the server has no VAPID key, or a
-// subscription already exists — so the dashboard stays uncluttered once set up.
+// registers a Web Push subscription with the gateway. Once permission is
+// granted it turns into a compact preference row: which events notify this
+// device (the mode select) and whether archived conversations do too. The
+// preferences live on the server-side subscription record; the local copy in
+// localStorage only exists so `_init` can re-register the device with the same
+// preferences on every load (a subscription the browser rotated behind our
+// back — or one lost when the server's store was reset — is restored silently).
 //
 // Note on iOS: Safari only exposes the Push API to a PWA that has been added to
 // the home screen. In an in-browser tab `PushManager` is absent and this element
@@ -12,6 +16,10 @@
 const CONFIG_URL = '/push/config';
 const SUBSCRIBE_URL = '/push/subscribe';
 const STORAGE_KEY = 'retinue_notification_mode';
+const STORAGE_KEY_ARCHIVED = 'retinue_notify_archived';
+
+// #66 names "new & stalled" as the default for devices with no stored choice.
+const DEFAULT_MODE = 'new_and_stalled';
 
 const MODES = [
   { id: 'all', label: 'All messages' },
@@ -19,6 +27,11 @@ const MODES = [
   { id: 'new_and_stalled', label: 'New & stalled conversations' },
   { id: 'off', label: 'No notifications' },
 ];
+
+// Modes that can fire on a message in an existing thread. Only these need the
+// archived-conversations opt-out: a "new" event is a thread being opened,
+// which is never archived, and "off" notifies on nothing.
+const MESSAGE_MODES = ['all', 'new_and_stalled'];
 
 function urlBase64ToUint8Array(base64) {
   const padded = (base64 + '='.repeat((4 - (base64.length % 4)) % 4))
@@ -38,10 +51,9 @@ async function serverKey() {
   return cfg.enabled && cfg.publicKey ? cfg.publicKey : null;
 }
 
-// Register (or re-register) this device with the gateway. Called on every load
-// once permission is granted, so a subscription the browser rotated behind our
-// back — or one lost when the server's store was reset — is restored silently.
-async function ensureSubscription(mode = 'all') {
+// Register (or re-register) this device with the gateway, carrying the
+// device's notification preferences on the subscription record.
+async function ensureSubscription(mode, notifyArchived) {
   if (!supported() || Notification.permission !== 'granted') return false;
   const key = await serverKey();
   if (!key) return false;
@@ -67,7 +79,11 @@ async function ensureSubscription(mode = 'all') {
   const res = await fetch(SUBSCRIBE_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ subscription: sub, notification_mode: mode }),
+    body: JSON.stringify({
+      subscription: sub,
+      notification_mode: mode,
+      notify_archived: notifyArchived,
+    }),
   });
   return res.ok;
 }
@@ -81,7 +97,7 @@ const CSS = `
     background: var(--card, #151922); color: var(--fg, #e7ebf2);
     border: 0; border-radius: var(--radius, 16px);
     padding: 8px 16px; font: inherit; font-size: .85rem;
-    cursor: pointer; position: relative;
+    position: relative;
   }
   .container:hover { background: var(--card-2, #1c2230); }
   button {
@@ -91,15 +107,16 @@ const CSS = `
   button:disabled { opacity: .6; cursor: default; }
   .ico { font-size: 1.1rem; }
   .muted { color: var(--muted, #8b93a3); font-size: .75rem; }
-  .controls { display: none; align-items: center; gap: 4px; }
+  .controls { display: none; align-items: center; gap: 8px; width: 100%; flex-wrap: wrap; }
   :host([enabled]) .controls { display: flex; }
   :host([enabled]) .btn-main { display: none; }
   select {
     background: var(--bg, #0b0d12); color: var(--fg, #e7ebf2);
     border: 1px solid var(--line, rgba(231,235,242,.2));
     border-radius: 4px; font-size: 0.8rem; padding: 2px 4px;
-    margin-left: auto;
   }
+  .archived-opt { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+  .status { margin-left: auto; }
 `;
 
 class RetinuePushOptIn extends HTMLElement {
@@ -115,15 +132,22 @@ class RetinuePushOptIn extends HTMLElement {
           <select class="mode-select">
             ${MODES.map(m => `<option value="${m.id}">${m.label}</option>`).join('')}
           </select>
+          <label class="archived-opt muted" title="Also notify for messages in archived conversations">
+            <input type="checkbox" class="archived-check" checked> Archived
+          </label>
+          <span class="status muted"></span>
         </div>
       </div>
     `;
-    this._container = this.shadowRoot.querySelector('.container');
     this._btn = this.shadowRoot.querySelector('.btn-main');
     this._select = this.shadowRoot.querySelector('.mode-select');
-    this._label = this.shadowRoot.querySelector('.lbl');
+    this._archivedOpt = this.shadowRoot.querySelector('.archived-opt');
+    this._archivedCheck = this.shadowRoot.querySelector('.archived-check');
+    this._status = this.shadowRoot.querySelector('.status');
+    this._lblEl = this.shadowRoot.querySelector('.lbl');
     this._btn.addEventListener('click', () => this._enable());
-    this._select.addEventListener('change', (e) => this._changeMode(e.target.value));
+    this._select.addEventListener('change', () => this._prefsChanged());
+    this._archivedCheck.addEventListener('change', () => this._prefsChanged());
   }
 
   connectedCallback() {
@@ -133,66 +157,82 @@ class RetinuePushOptIn extends HTMLElement {
   async _init() {
     if (!supported()) return;
     if (Notification.permission === 'denied') return;
-    
-    const mode = localStorage.getItem(STORAGE_KEY) || 'all';
-    this._select.value = mode;
+
+    this._select.value = localStorage.getItem(STORAGE_KEY) || DEFAULT_MODE;
+    this._archivedCheck.checked = localStorage.getItem(STORAGE_KEY_ARCHIVED) !== '0';
+    this._syncControls();
 
     if (Notification.permission === 'granted') {
       this.setAttribute('enabled', '');
       this.setAttribute('visible', '');
-      ensureSubscription(mode).catch(() => {});
+      const { mode, notifyArchived } = this._prefs();
+      ensureSubscription(mode, notifyArchived).catch(() => {});
       return;
     }
     try {
       if (await serverKey()) this.setAttribute('visible', '');
-    } catch (_) {}
+    } catch (_) { /* offline: stay hidden */ }
+  }
+
+  _prefs() {
+    return { mode: this._select.value, notifyArchived: this._archivedCheck.checked };
+  }
+
+  // The archived opt-out only applies to modes that notify on messages.
+  _syncControls() {
+    this._archivedOpt.style.display =
+      MESSAGE_MODES.includes(this._select.value) ? '' : 'none';
   }
 
   async _enable() {
     this._btn.disabled = true;
-    this._label('Enabling…');
+    this._setLabel('Enabling…');
     try {
+      // requestPermission must run in the click handler's gesture context.
       const perm = await Notification.requestPermission();
       if (perm !== 'granted') {
-        this._label('Notifications blocked', true);
+        this._setLabel('Notifications blocked', true);
         return;
       }
-      const mode = this._select.value;
-      if (await ensureSubscription(mode)) {
+      const { mode, notifyArchived } = this._prefs();
+      if (await ensureSubscription(mode, notifyArchived)) {
         this.setAttribute('enabled', '');
         this.removeAttribute('visible');
       } else {
-        this._label('Could not enable', true);
+        this._setLabel('Could not enable', true);
         this._btn.disabled = false;
       }
     } catch (err) {
-      this._label('Could not enable', true);
+      this._setLabel('Could not enable', true);
       this._btn.disabled = false;
     }
   }
 
-  async _changeMode(mode) {
+  async _prefsChanged() {
+    const { mode, notifyArchived } = this._prefs();
     localStorage.setItem(STORAGE_KEY, mode);
-    this._btn.disabled = true;
-    this._label('Updating…');
+    localStorage.setItem(STORAGE_KEY_ARCHIVED, notifyArchived ? '1' : '0');
+    this._syncControls();
+    this._setStatus('Updating…');
     try {
-      if (await ensureSubscription(mode)) {
-        this._label('Updated');
-        setTimeout(() => this._label(''), 2000);
-      } else {
-        this._label('Update failed', true);
-        this._btn.disabled = false;
-      }
+      this._setStatus(await ensureSubscription(mode, notifyArchived)
+        ? 'Updated' : 'Update failed');
     } catch (err) {
-      this._label('Update failed', true);
-      this._btn.disabled = false;
+      this._setStatus('Update failed');
     }
   }
 
-  _label(text, muted) {
-    const el = this._label;
-    el.textContent = text;
-    el.className = muted ? 'lbl muted' : 'lbl';
+  _setLabel(text, muted) {
+    this._lblEl.textContent = text;
+    this._lblEl.className = muted ? 'lbl muted' : 'lbl';
+  }
+
+  _setStatus(text) {
+    this._status.textContent = text;
+    clearTimeout(this._statusTimer);
+    if (text === 'Updated') {
+      this._statusTimer = setTimeout(() => { this._status.textContent = ''; }, 2000);
+    }
   }
 }
 
