@@ -92,10 +92,17 @@ class RetinueConversations extends HTMLElement {
     this._mediaRecorder = null;
     this._recStream = null;
     this._recTarget = null;  // thread pinned at record-start (dictation target)
+    this._recIntent = null;  // what to do with the transcript: 'review' | 'send'
+    this._recAborted = false; // recording was discarded via the abort button
+    this._recSending = false; // a send-intent dictation is in flight (transcribe+send)
+    this._recStartMs = 0;    // recording start, for the elapsed-time display
+    // Waveform: analyser over the live mic stream, drawn on a canvas each frame.
+    this._audioCtx = null;
+    this._analyser = null;
+    this._waveRaf = null;
+    this._wavePhase = 0;
     this._autoplay = false;  // speak Ara's replies as they arrive
     try { this._autoplay = localStorage.getItem('retinue-voice-autoplay') === '1'; } catch (_e) { /* ignore */ }
-    this._autosend = false;  // send a dictation straight off, without the review step
-    try { this._autosend = localStorage.getItem('retinue-voice-autosend') === '1'; } catch (_e) { /* ignore */ }
     this._spoken = {};       // per-thread set of message ts already voiced/seen
     this._autoReady = {};    // per-thread: initial history marked, future msgs autoplay
     this._speakingTs = null; // ts of the message currently being spoken, if any
@@ -165,6 +172,7 @@ class RetinueConversations extends HTMLElement {
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
     this._stopRecording();
+    this._stopWave();
     this._stopStream();
     try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
   }
@@ -354,7 +362,7 @@ class RetinueConversations extends HTMLElement {
   }
 
   // `targetOverride` sends to a specific thread ('composer' for a new thread)
-  // regardless of what's open — used by auto-send after dictation, where the
+  // regardless of what's open — used by send-intent dictation, where the
   // user may have navigated away while transcription ran. Omitted for normal
   // sends, which go to the open view.
   async _send(text, targetOverride) {
@@ -368,7 +376,7 @@ class RetinueConversations extends HTMLElement {
     // A message needs text or at least one attachment.
     if (this._busy || (!text.trim() && !currentOutFiles.length)) return;
     // Whether this send targets the view the user is currently looking at. When
-    // false (auto-send into a thread the user has since navigated away from), we
+    // false (a dictation sent into a thread the user has navigated away from), we
     // must not hijack their view with the result.
     const affectsView = sendToThread ? (this._active === sendToThread)
       : (sendToComposer && this._composing);
@@ -616,20 +624,6 @@ class RetinueConversations extends HTMLElement {
     return '<button class="back" data-back aria-label="Back">&#8249;</button>';
   }
 
-  // Dictating and then still having to press Send is a step too many for a
-  // user who dictates everything — this toggle skips the review and sends. It
-  // is a voice *setting*, not a per-message action, so it sits in the top bar
-  // next to the speak toggle rather than eating width in the input row.
-  _autosendBtnHtml() {
-    const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
-    if (!canRecord) return '';
-    const title = this._autosend
-      ? 'Dictation is sent right away — tap to review before sending'
-      : 'Dictation goes to the input field for review — tap to send it right away';
-    return `<button type="button" class="iconbtn${this._autosend ? ' on' : ''}" data-autosend ` +
-      `title="${title}" aria-label="${title}" aria-pressed="${this._autosend}">⚡</button>`;
-  }
-
   // The model dropdown. Governs Ara's own turn only (dispatched subagents keep
   // their own models) — the title says so. Hidden unless the gateway offers more
   // than one model, so a single-model deployment sees no clutter. `selected` is
@@ -657,7 +651,7 @@ class RetinueConversations extends HTMLElement {
       : `<p>Ask Ara anything &mdash; she picks it up with full context.</p>`;
     return `<div class="thread-bar">${this._backBtnHtml()}` +
       `<span class="bar-title">New conversation</span>` +
-      `<span class="bar-actions">${this._modelPickerHtml(this._composeModel)}${this._autosendBtnHtml()}</span></div>` +
+      `<span class="bar-actions">${this._modelPickerHtml(this._composeModel)}</span></div>` +
       projectChip +
       `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span>` +
       hint + `</div>` +
@@ -680,7 +674,7 @@ class RetinueConversations extends HTMLElement {
       : '';
     return `<div class="thread-bar">${this._backBtnHtml()}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
-      `<span class="bar-actions">${this._modelPickerHtml(t.model)}${this._autosendBtnHtml()}${autoBtn}${archiveBtn}</span></div>` +
+      `<span class="bar-actions">${this._modelPickerHtml(t.model)}${autoBtn}${archiveBtn}</span></div>` +
       `<div class="thread">${this._messagesHtml(t)}</div>` +
       this._inputRow('Reply …');
   }
@@ -842,7 +836,7 @@ class RetinueConversations extends HTMLElement {
 
   // Drop a chip's prefill text into the composer for review. Deliberately does
   // NOT send: the user reads (and can edit) it, then taps Send — same contract
-  // as dictation without auto-send. APPENDS to whatever the user has already
+  // as a dictation transcribed for review. APPENDS to whatever the user has already
   // typed rather than replacing it (a chip augments the draft, it never wipes
   // work in progress) — the same append semantics as a dictation. Persists to
   // the draft so a background-poll re-render doesn't wipe it, then re-renders to
@@ -914,18 +908,34 @@ class RetinueConversations extends HTMLElement {
     const errRow = this._attachError ? `<div class="attach-err">${esc(this._attachError)}</div>` : '';
     const currentDraft = draftKey ? (this._drafts[draftKey] || '') : '';
     const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
-    const micLabel = this._recState === 'recording' ? '\u23F9'
-      : (this._recState === 'transcribing' ? '\u2026' : '\u{1F3A4}');
-    const micTitle = this._recState === 'recording' ? 'Stop recording'
-      : (this._recState === 'transcribing' ? 'Transcribing …' : 'Record a voice message');
-    const micDisabled = (this._busy || this._recState === 'transcribing') ? 'disabled' : '';
+    // The voice flow owns the whole input row in the view where the mic was
+    // tapped: a live waveform with its own controls while recording, then a
+    // status line while the recording is transcribed (and, on the send path,
+    // sent). The textarea stays out of the DOM for the entire flow, so the
+    // phone keyboard never pops up mid-dictation.
+    const voiceHere = this._recTarget != null && this._recTarget === draftKey;
+    if (voiceHere && this._recState === 'recording') {
+      return `<div class="composer">` + chipRow + errRow + this._recordingRowHtml() + `</div>`;
+    }
+    if (voiceHere && (this._recState === 'transcribing' || this._recSending)) {
+      const label = this._recState === 'transcribing'
+        ? (this._recSending ? 'Transcribing & sending …' : 'Transcribing …')
+        : 'Sending …';
+      return `<div class="composer">` + chipRow + errRow +
+        `<div class="row rec-row"><div class="wave-wrap rec-status" role="status">` +
+        `<span>${label}</span></div></div></div>`;
+    }
+    // While a dictation is still in flight (possibly for another thread), the
+    // mic stays unavailable — one recording at a time.
+    const micLabel = '\u{1F3A4}';
+    const micTitle = 'Record a voice message';
+    const micDisabled = (this._busy || this._recState !== 'idle' || this._recSending) ? 'disabled' : '';
     const micBtn = canRecord
-      ? `<button type="button" class="mic${this._recState === 'recording' ? ' rec' : ''}" ` +
+      ? `<button type="button" class="mic" ` +
         `data-mic title="${micTitle}" aria-label="${micTitle}" ${micDisabled}>${micLabel}</button>`
       : '';
     // A lean row keeps the width for the text field: mic on the left, the
-    // attach control tucked inside the field, send on the right. The auto-send
-    // toggle lives in the top bar (see _autosendBtnHtml).
+    // attach control tucked inside the field, send on the right.
     return `<div class="composer">` + chipRow + errRow +
       `<form class="row" data-form>` + micBtn +
       `<div class="field">` +
@@ -978,14 +988,17 @@ class RetinueConversations extends HTMLElement {
     this.render();
   }
 
-  // ── Voice input: record → server transcribe → drop into the composer ───────
-  // The server repairs the transcript before returning it, so what lands in the
-  // draft is readable rather than raw Whisper output. It still lands in the
-  // draft, to be read and corrected before Send — unless auto-send is on, in
-  // which case the dictation goes straight to Ara, as it does over Signal.
-  async _toggleRecord() {
-    if (this._recState === 'transcribing') return;
-    if (this._recState === 'recording') { this._stopRecording(); return; }
+  // ── Voice input: record → live waveform → transcribe (review or send) ──────
+  // Tapping the mic swaps the input row for a recording row: a live waveform
+  // (or a simulated one where the Web Audio API is unavailable) with three
+  // controls — abort on the left (discard the recording), and on the right a
+  // green check (transcribe, then drop the text into the composer for review)
+  // and a send button (transcribe and send in one go, with no detour through
+  // the textarea, so the phone keyboard never pops up). The server repairs the
+  // transcript before returning it, so what lands in the draft is readable
+  // rather than raw Whisper output.
+  async _startRecording() {
+    if (this._recState !== 'idle' || this._recSending) return;
     if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder)) {
       this._attachError = 'Voice recording is not supported on this device.';
       this.render();
@@ -995,6 +1008,8 @@ class RetinueConversations extends HTMLElement {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       this._recStream = stream;
       this._recChunks = [];
+      this._recIntent = null;
+      this._recAborted = false;
       // Pin the target thread at record-start: transcription is async, and the
       // user may open a different thread while it runs. The dictation must land
       // where the mic was tapped, not wherever happens to be open when the
@@ -1008,14 +1023,48 @@ class RetinueConversations extends HTMLElement {
       mr.addEventListener('stop', () => this._onRecordingStopped());
       mr.start();
       this._recState = 'recording';
+      this._recStartMs = Date.now();
       this._attachError = '';
       this.render();
+      this._startWave(stream);
     } catch (_err) {
       this._recState = 'idle';
+      this._recTarget = null;
       this._attachError = 'Microphone access was denied.';
       this._stopStream();
       this.render();
     }
+  }
+
+  // The recording row that replaces the textarea while the mic is live:
+  // abort ✕ | red dot + waveform + elapsed time | review ✓ | send ➤.
+  _recordingRowHtml() {
+    return `<div class="row rec-row">` +
+      `<button type="button" class="rec-btn rec-abort" data-rec-abort ` +
+      `title="Discard recording" aria-label="Discard recording">\u2715</button>` +
+      `<div class="wave-wrap"><span class="rec-dot" aria-hidden="true"></span>` +
+      `<canvas class="wave" data-wave aria-hidden="true"></canvas>` +
+      `<span class="rec-time" data-rectime>0:00</span></div>` +
+      `<button type="button" class="rec-btn rec-ok" data-rec-check ` +
+      `title="Stop and transcribe for review" aria-label="Stop and transcribe for review">\u2713</button>` +
+      `<button type="button" class="rec-btn rec-send" data-rec-send ` +
+      `title="Stop, transcribe and send" aria-label="Stop, transcribe and send">\u27A4</button>` +
+      `</div>`;
+  }
+
+  // Abort: throw the recording away and return to the plain input row.
+  _abortRecording() {
+    if (this._recState !== 'recording') return;
+    this._recAborted = true;
+    this._stopRecording();
+  }
+
+  // Check / send buttons: stop the recorder with the chosen intent; the actual
+  // work continues in _onRecordingStopped once the recorder flushes its chunks.
+  _finishRecording(intent) {
+    if (this._recState !== 'recording') return;
+    this._recIntent = intent;
+    this._stopRecording();
   }
 
   _stopRecording() {
@@ -1033,26 +1082,133 @@ class RetinueConversations extends HTMLElement {
     }
   }
 
+  // ── Waveform: analyser-driven bars on the recording row's canvas ───────────
+  // The canvas is re-created by every full render, so each frame looks it up
+  // fresh rather than holding a reference. Where the Web Audio API is missing
+  // (or fails), a simulated wave keeps the "recording is live" signal.
+  _startWave(stream) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    this._analyser = null;
+    if (AC) {
+      try {
+        this._audioCtx = new AC();
+        const srcNode = this._audioCtx.createMediaStreamSource(stream);
+        const an = this._audioCtx.createAnalyser();
+        an.fftSize = 128;
+        an.smoothingTimeConstant = 0.7;
+        srcNode.connect(an);
+        this._analyser = an;
+      } catch (_e) { this._analyser = null; }
+    }
+    this._wavePhase = 0;
+    const tick = () => {
+      if (this._recState !== 'recording') { this._waveRaf = null; return; }
+      this._drawWave();
+      this._waveRaf = requestAnimationFrame(tick);
+    };
+    tick();
+  }
+
+  _stopWave() {
+    if (this._waveRaf) cancelAnimationFrame(this._waveRaf);
+    this._waveRaf = null;
+    this._analyser = null;
+    if (this._audioCtx) {
+      try { this._audioCtx.close(); } catch (_e) { /* ignore */ }
+      this._audioCtx = null;
+    }
+  }
+
+  _drawWave() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const timeEl = root.querySelector('[data-rectime]');
+    if (timeEl) {
+      const s = Math.max(0, Math.floor((Date.now() - this._recStartMs) / 1000));
+      const txt = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+      if (timeEl.textContent !== txt) timeEl.textContent = txt;
+    }
+    const canvas = root.querySelector('[data-wave]');
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (!w || !h) return;
+    if (canvas.width !== Math.round(w * dpr)) canvas.width = Math.round(w * dpr);
+    if (canvas.height !== Math.round(h * dpr)) canvas.height = Math.round(h * dpr);
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    let accent = '#6ea8fe';
+    try {
+      const v = getComputedStyle(this).getPropertyValue('--accent').trim();
+      if (v) accent = v;
+    } catch (_e) { /* keep default */ }
+    ctx.fillStyle = accent;
+    const bars = Math.max(12, Math.min(48, Math.floor(w / 7)));
+    this._wavePhase += 0.22;
+    let levels;
+    if (this._analyser) {
+      const data = new Uint8Array(this._analyser.frequencyBinCount);
+      this._analyser.getByteFrequencyData(data);
+      // Speech lives in the lower bins — spread those across the bars.
+      const usable = Math.max(1, Math.floor(data.length * 0.75));
+      levels = Array.from({ length: bars }, (_, i) =>
+        data[Math.floor((i / bars) * usable)] / 255);
+    } else {
+      // No analyser: a plausible-looking simulated wave.
+      levels = Array.from({ length: bars }, (_, i) => 0.35 +
+        0.25 * Math.sin(i * 0.7 + this._wavePhase) +
+        0.18 * Math.sin(i * 1.3 - this._wavePhase * 1.6) +
+        0.08 * Math.random());
+    }
+    const bw = canvas.width / bars;
+    const mid = canvas.height / 2;
+    for (let i = 0; i < bars; i += 1) {
+      const level = Math.min(1, Math.max(0.06, levels[i]));
+      const bh = Math.max(2 * dpr, level * canvas.height);
+      const x = i * bw + bw * 0.2;
+      const bwid = bw * 0.6;
+      const r = Math.min(bwid / 2, 2 * dpr);
+      const y = mid - bh / 2;
+      if (typeof ctx.roundRect === 'function') {
+        ctx.beginPath();
+        ctx.roundRect(x, y, bwid, bh, r);
+        ctx.fill();
+      } else {
+        ctx.fillRect(x, y, bwid, bh);
+      }
+    }
+  }
+
   async _onRecordingStopped() {
+    this._stopWave();
     this._stopStream();
     const chunks = this._recChunks || [];
     this._recChunks = [];
     const type = (this._mediaRecorder && this._mediaRecorder.mimeType)
       || (chunks[0] && chunks[0].type) || 'audio/webm';
     this._mediaRecorder = null;
-    if (!chunks.length) { this._recState = 'idle'; this.render(); return; }
-    const blob = new Blob(chunks, { type });
+    const intent = this._recIntent || 'review';
+    this._recIntent = null;
+    const aborted = this._recAborted;
+    this._recAborted = false;
     // The thread the mic was tapped in — the transcript belongs to it, whatever
     // is open when transcription finishes. Fall back to the currently-open
     // target for any recording that started before this field was set.
     const target = this._recTarget != null
       ? this._recTarget
       : (this._active || (this._composing ? 'composer' : ''));
-    this._recTarget = null;
+    if (aborted || !chunks.length) {
+      this._recTarget = null;
+      this._recState = 'idle';
+      this.render();
+      return;
+    }
+    const blob = new Blob(chunks, { type });
     this._recState = 'transcribing';
+    this._recSending = intent === 'send';
     this.render();
     let toSend = '';
-    let sendTarget = '';
     try {
       // The pinned thread is context for the cleanup pass: it is what tells the
       // model which names and topics this dictation is likely to be about.
@@ -1070,7 +1226,7 @@ class RetinueConversations extends HTMLElement {
       if (text) {
         this._appendToDraft(text, target);
         // Send the whole draft, so anything typed before dictating comes along.
-        if (this._autosend && target) { toSend = this._drafts[target] || ''; sendTarget = target; }
+        if (intent === 'send' && target) toSend = this._drafts[target] || '';
       } else {
         this._attachError = 'No speech was detected in the recording.';
       }
@@ -1078,19 +1234,25 @@ class RetinueConversations extends HTMLElement {
       this._attachError = "Couldn't transcribe the recording. Please try again.";
     } finally {
       this._recState = 'idle';
-      this._focusNext = true;
+      if (!toSend) {
+        // Review path (or a failed send-dictation): the transcript sits in the
+        // textarea. Only the deliberate review flow pulls up the keyboard.
+        this._recSending = false;
+        this._recTarget = null;
+        this._focusNext = intent === 'review';
+        this.render();
+      }
+    }
+    if (toSend) {
+      // Send path: the status row stays in place of the textarea until the
+      // send completes, so the keyboard never appears. _send() re-renders; on
+      // failure it leaves the draft in place, which then shows up (unfocused)
+      // for a manual retry.
+      await this._send(toSend, target);
+      this._recSending = false;
+      this._recTarget = null;
       this.render();
     }
-    // _send() re-renders; on failure it leaves the draft in place to retry.
-    // Pass the pinned target so auto-send goes to the thread the mic was tapped
-    // in, not whatever is open now.
-    if (toSend) await this._send(toSend, sendTarget);
-  }
-
-  _toggleAutosend() {
-    this._autosend = !this._autosend;
-    try { localStorage.setItem('retinue-voice-autosend', this._autosend ? '1' : '0'); } catch (_e) { /* ignore */ }
-    this.render();
   }
 
   // Model dropdown changed. In the composer it just holds the choice for the
@@ -1252,9 +1414,13 @@ class RetinueConversations extends HTMLElement {
       });
     }
     const mic = root.querySelector('[data-mic]');
-    if (mic) mic.addEventListener('click', () => this._toggleRecord());
-    const autosend = root.querySelector('[data-autosend]');
-    if (autosend) autosend.addEventListener('click', () => this._toggleAutosend());
+    if (mic) mic.addEventListener('click', () => this._startRecording());
+    const recAbort = root.querySelector('[data-rec-abort]');
+    if (recAbort) recAbort.addEventListener('click', () => this._abortRecording());
+    const recCheck = root.querySelector('[data-rec-check]');
+    if (recCheck) recCheck.addEventListener('click', () => this._finishRecording('review'));
+    const recSend = root.querySelector('[data-rec-send]');
+    if (recSend) recSend.addEventListener('click', () => this._finishRecording('send'));
     const modelSel = root.querySelector('[data-model]');
     if (modelSel) modelSel.addEventListener('change', () => this._onModelChange(modelSel.value));
     const ap = root.querySelector('[data-autoplay]');
@@ -1530,9 +1696,27 @@ const CSS = `
          color: var(--fg, #e7ebf2); font-size: 1.05rem; user-select: none;
          -webkit-tap-highlight-color: transparent; }
   .mic:hover { background: rgba(110, 168, 254, .2); }
-  .mic.rec { background: var(--high, #ff6b6b); color: #fff; animation: mic-pulse 1.2s ease-in-out infinite; }
   .mic[disabled] { opacity: .6; cursor: default; }
   @keyframes mic-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  /* ── Recording row: replaces the textarea while the mic is live ─────────── */
+  .rec-row { align-items: center; }
+  .wave-wrap { flex: 1; min-width: 0; height: 40px; display: flex; align-items: center;
+               gap: 8px; background: var(--card-2, #1c2230); border-radius: 20px; padding: 0 12px; }
+  .wave-wrap canvas.wave { flex: 1; min-width: 0; height: 26px; display: block; }
+  .rec-dot { flex: none; width: 8px; height: 8px; border-radius: 50%;
+             background: var(--high, #ff6b6b); animation: mic-pulse 1.2s ease-in-out infinite; }
+  .rec-time { flex: none; color: var(--muted, #8b93a3); font-size: .78rem;
+              font-variant-numeric: tabular-nums; }
+  .rec-btn { flex: none; display: inline-flex; align-items: center; justify-content: center;
+             width: 40px; height: 40px; border-radius: 50%; border: 0; cursor: pointer;
+             font-size: 1.05rem; padding: 0; -webkit-tap-highlight-color: transparent; }
+  .rec-btn:active { filter: brightness(1.12); }
+  .rec-abort { background: var(--card-2, #1c2230); color: var(--high, #ff6b6b); }
+  .rec-abort:hover { background: rgba(255, 107, 107, .18); }
+  .rec-ok { background: var(--ok, #57c785); color: #0b0d12; }
+  .rec-send { background: var(--accent, #6ea8fe); color: #0b0d12; padding-left: 2px; }
+  .rec-status { justify-content: center; color: var(--muted, #8b93a3);
+                font-size: .85rem; font-style: italic; }
   .msg-head { display: flex; align-items: center; gap: 6px; }
   .msg.me .msg-head { flex-direction: row-reverse; }
   .speak { background: transparent; border: 0; cursor: pointer; padding: 0 2px; font-size: .8rem;

@@ -151,11 +151,16 @@ the manifest format and the agent.
 Threads can be spoken as well as typed, with no streaming and split by direction:
 
 - **Input (send as audio).** A microphone button in the composer records with
-  `MediaRecorder`; on stop the audio blob is POSTed to `/conversations/transcribe`.
-  The web gateway proxies it to the shared STT service (`scripts/stt-service.py`),
-  which owns the Whisper model (so this image ships no ASR stack). The transcript
-  is dropped into the composer for the user to review and edit before sending —
-  speech recognition is imperfect. Requires `STT_SERVICE_URL` (set in
+  `MediaRecorder`. While recording, the text field is replaced by a live
+  waveform (Web Audio analyser; a simulated wave where that API is missing)
+  with three controls: **✕** on the left discards the recording, and on the
+  right a green **✓** transcribes it into the composer for review — speech
+  recognition is imperfect — while **➤** transcribes *and* sends in one go,
+  showing only a status line until the send completes (the textarea never
+  reappears mid-flow, so the phone keyboard stays down). Either way the audio
+  blob is POSTed to `/conversations/transcribe`, which the web gateway proxies
+  to the shared STT service (`scripts/stt-service.py`) owning the Whisper model
+  (so this image ships no ASR stack). Requires `STT_SERVICE_URL` (set in
   `docker-compose.yml`); when unset the endpoint returns 503 and the mic button
   is hidden. The mic is also hidden where `MediaRecorder`/`getUserMedia` are
   unavailable.
