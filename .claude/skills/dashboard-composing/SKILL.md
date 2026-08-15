@@ -5,8 +5,8 @@ description: >
   — a conversation reply as Ara, a thread opened or appended via
   conversation-push.py (triage proposals included), and curated card content.
   ALWAYS use before composing such text when it asks the user to choose between
-  options (every option gets a click-to-fill chip), mentions an e-mail (add a
-  chip to ask for details about it), mentions a GitHub pull request or issue
+  options (every option gets a click-to-fill chip), refers to an e-mail without
+  showing it in full (add a details chip), mentions a GitHub pull request or issue
   (the label itself links to it), or contains any URL (never shown bare — always
   a labeled Markdown link).
 ---
@@ -47,20 +47,25 @@ Shall I confirm the party invitation and add it to your agenda, or decline?
 - Place chips on their own line at the end of the message (separated by ` · `),
   so they read as the answer row, not as part of the prose.
 
-## 2. Mentioning an e-mail? Offer a details chip
+## 2. An e-mail referred to but not shown gets a details chip
 
-Whenever a message mentions an e-mail (a triage proposal, a briefing item, a
-thread summary), include a chip whose prefill asks for more details about
-**that specific e-mail** — identified unambiguously by sender and subject, so
-the follow-up works even after the thread has moved on:
+An e-mail that is the **subject** of a thread is shown by default — a triage
+reply proposal quotes the original in full, so a "show me this mail" chip
+there would be pointless. The details chip is for every e-mail a message
+**refers to without including its content**: each line of an archive/delete
+omnibus, an earlier message in the same correspondence, a mail mentioned in a
+briefing or summary. Its prefill asks for more details about **that specific
+e-mail**, identified unambiguously by sender and subject, so the follow-up
+works even after the thread has moved on:
 
 ```
-Mara asked about Saturday ("Re: Party") — I propose the draft below.
-[[chip: Send | Send the draft as proposed.]] · [[chip: Details | Show me the full e-mail from Mara, subject "Re: Party".]]
+Mara's invitation for Saturday is quoted below — I propose the draft reply.
+She already floated the date in two earlier mails not shown here.
+[[chip: Send | Send the draft as proposed.]] · [[chip: Earlier mails | Show me Mara's earlier e-mails about the party date.]]
 ```
 
-When several e-mails appear (e.g. a triage omnibus), give each line its own
-details chip.
+When several unshown e-mails appear in one message (e.g. a triage omnibus),
+give each line its own details chip.
 
 ## 3. PR and issue labels link to GitHub
 

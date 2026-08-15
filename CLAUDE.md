@@ -609,8 +609,9 @@ Ara picks it up with full context and carries out what they approve.
 **Before composing any text for the dashboard** — a conversation reply in your
 own voice, a thread opened or appended via `conversation-push.py` — apply the
 **`dashboard-composing`** skill: every offered option gets a click-to-fill
-`[[chip: …]]`, a mentioned e-mail gets a details chip, PR/issue labels link to
-GitHub, and no URL is ever shown bare (always `[label](url)`).
+`[[chip: …]]`, an e-mail referred to but not shown in full gets a details chip,
+PR/issue labels link to GitHub, and no URL is ever shown bare (always
+`[label](url)`).
 
 The endpoint is token-gated (`CONVERSATION_BACKEND_TOKEN`, set by the entrypoint)
 so only in-container agents can post on the user's behalf — like the e-mail
