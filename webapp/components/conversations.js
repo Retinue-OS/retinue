@@ -94,8 +94,16 @@ class RetinueConversations extends HTMLElement {
     this._recTarget = null;  // thread pinned at record-start (dictation target)
     this._recIntent = null;  // what to do with the transcript: 'review' | 'send'
     this._recAborted = false; // recording was discarded via the abort button
-    this._recSending = false; // a send-intent dictation is in flight (transcribe+send)
     this._recStartMs = 0;    // recording start, for the elapsed-time display
+    // In-flight dictation jobs, keyed like _drafts (a thread id, or 'composer'
+    // for the new-thread composer). Each value is {sending, phase} and owns
+    // that one view's input row until the job completes — every other
+    // conversation keeps its normal row, so text and voice stay usable there
+    // while a transcription runs in the background.
+    this._voiceJobs = {};
+    // Transcription errors per target view, surfaced by that view's composer —
+    // a background job's failure must not pop up in whatever view is open.
+    this._voiceErrors = {};
     // Waveform: analyser over the live mic stream, drawn on a canvas each frame.
     this._audioCtx = null;
     this._analyser = null;
@@ -431,7 +439,11 @@ class RetinueConversations extends HTMLElement {
       // surface a soft failure inline by leaving the input; re-render shows state
     } finally {
       this._busy = false;
-      this.render();
+      // Re-render only when this send concerns the view on screen: a
+      // background dictation-send must not rebuild (and so interrupt) a
+      // conversation the user is meanwhile typing or dictating in — the list
+      // refresh below reconciles previews and badges on its own.
+      if (affectsView) this.render();
       this.refresh();
     }
   }
@@ -448,6 +460,7 @@ class RetinueConversations extends HTMLElement {
   }
 
   _showThread(id) {
+    this._finishRecordingOnLeave();
     this._active = id;
     this._composing = false;
     this._thread = null;
@@ -471,6 +484,7 @@ class RetinueConversations extends HTMLElement {
   }
 
   _showList() {
+    this._finishRecordingOnLeave();
     this._active = null;
     this._composing = false;
     this._thread = null;
@@ -488,6 +502,7 @@ class RetinueConversations extends HTMLElement {
   }
 
   _showComposer() {
+    this._finishRecordingOnLeave();
     this._active = null;
     this._thread = null;
     this._composing = true;
@@ -905,31 +920,33 @@ class RetinueConversations extends HTMLElement {
       `<button type="button" class="c-x" data-rmfile="${i}" aria-label="Remove attachment" ${disabled}>&times;</button></span>`
     ).join('');
     const chipRow = currentOutFiles.length ? `<div class="chips">${chips}</div>` : '';
-    const errRow = this._attachError ? `<div class="attach-err">${esc(this._attachError)}</div>` : '';
+    const voiceErr = draftKey ? (this._voiceErrors[draftKey] || '') : '';
+    const errText = this._attachError || voiceErr;
+    const errRow = errText ? `<div class="attach-err">${esc(errText)}</div>` : '';
     const currentDraft = draftKey ? (this._drafts[draftKey] || '') : '';
     const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
-    // The voice flow owns the whole input row in the view where the mic was
-    // tapped: a live waveform with its own controls while recording, then a
-    // status line while the recording is transcribed (and, on the send path,
-    // sent). The textarea stays out of the DOM for the entire flow, so the
-    // phone keyboard never pops up mid-dictation.
-    const voiceHere = this._recTarget != null && this._recTarget === draftKey;
-    if (voiceHere && this._recState === 'recording') {
+    // The voice flow owns this one view's input row: a live waveform with its
+    // own controls while recording, then a status line while this view's
+    // dictation job is transcribed (and, on the send path, sent). The textarea
+    // stays out of the DOM for the entire flow, so the phone keyboard never
+    // pops up mid-dictation. Other views are untouched — their rows render
+    // normally below, and they can dictate concurrently.
+    if (this._recState === 'recording' && this._recTarget === draftKey) {
       return `<div class="composer">` + chipRow + errRow + this._recordingRowHtml() + `</div>`;
     }
-    if (voiceHere && (this._recState === 'transcribing' || this._recSending)) {
-      const label = this._recState === 'transcribing'
-        ? (this._recSending ? 'Transcribing & sending …' : 'Transcribing …')
-        : 'Sending …';
+    const job = draftKey ? this._voiceJobs[draftKey] : null;
+    if (job) {
+      const label = job.phase === 'sending' ? 'Sending …'
+        : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
       return `<div class="composer">` + chipRow + errRow +
         `<div class="row rec-row"><div class="wave-wrap rec-status" role="status">` +
         `<span>${label}</span></div></div></div>`;
     }
-    // While a dictation is still in flight (possibly for another thread), the
-    // mic stays unavailable — one recording at a time.
+    // Only one live recording at a time — but a mere background transcription
+    // does not lock the mic here.
     const micLabel = '\u{1F3A4}';
     const micTitle = 'Record a voice message';
-    const micDisabled = (this._busy || this._recState !== 'idle' || this._recSending) ? 'disabled' : '';
+    const micDisabled = (this._busy || this._recState !== 'idle') ? 'disabled' : '';
     const micBtn = canRecord
       ? `<button type="button" class="mic" ` +
         `data-mic title="${micTitle}" aria-label="${micTitle}" ${micDisabled}>${micLabel}</button>`
@@ -998,7 +1015,11 @@ class RetinueConversations extends HTMLElement {
   // transcript before returning it, so what lands in the draft is readable
   // rather than raw Whisper output.
   async _startRecording() {
-    if (this._recState !== 'idle' || this._recSending) return;
+    if (this._recState !== 'idle') return;
+    const viewKey = this._viewKey();
+    // The status row hides the mic while this view's own job runs, but guard
+    // anyway: one dictation job per conversation at a time.
+    if (viewKey && this._voiceJobs[viewKey]) return;
     if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder)) {
       this._attachError = 'Voice recording is not supported on this device.';
       this.render();
@@ -1010,11 +1031,14 @@ class RetinueConversations extends HTMLElement {
       this._recChunks = [];
       this._recIntent = null;
       this._recAborted = false;
-      // Pin the target thread at record-start: transcription is async, and the
-      // user may open a different thread while it runs. The dictation must land
-      // where the mic was tapped, not wherever happens to be open when the
-      // transcript comes back. '' means the "new thread" composer.
-      this._recTarget = this._active || (this._composing ? 'composer' : '');
+      // The recording belongs to the view it runs in: that is where its
+      // controls live, and navigating away finishes it like a tap on the green
+      // check (see _finishRecordingOnLeave). So the view noted here is by
+      // construction also the view where the check/send tap — explicit or
+      // implicit — happens, and that is where the transcript lands.
+      // '' means the "new thread" composer.
+      this._recTarget = viewKey;
+      delete this._voiceErrors[viewKey];
       const mr = new MediaRecorder(stream);
       this._mediaRecorder = mr;
       mr.addEventListener('dataavailable', (e) => {
@@ -1052,19 +1076,35 @@ class RetinueConversations extends HTMLElement {
       `</div>`;
   }
 
+  // The view key drafts/jobs are filed under: the open thread id, or
+  // 'composer' for the new-thread composer, or '' on the list.
+  _viewKey() {
+    return this._active || (this._composing ? 'composer' : '');
+  }
+
   // Abort: throw the recording away and return to the plain input row.
   _abortRecording() {
-    if (this._recState !== 'recording') return;
+    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
     this._recAborted = true;
     this._stopRecording();
   }
 
   // Check / send buttons: stop the recorder with the chosen intent; the actual
   // work continues in _onRecordingStopped once the recorder flushes its chunks.
+  // A decision already taken (an earlier tap, or abort) wins over later calls —
+  // this is what keeps a navigation right after a ➤ tap from downgrading the
+  // intent to 'review'.
   _finishRecording(intent) {
-    if (this._recState !== 'recording') return;
+    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
     this._recIntent = intent;
     this._stopRecording();
+  }
+
+  // Leaving the view that hosts a live recording is the same as tapping the
+  // green check: the recording stops, and its transcript lands in the draft of
+  // the conversation the user just left — waiting there, reviewed on return.
+  _finishRecordingOnLeave() {
+    this._finishRecording('review');
   }
 
   _stopRecording() {
@@ -1192,25 +1232,24 @@ class RetinueConversations extends HTMLElement {
     this._recIntent = null;
     const aborted = this._recAborted;
     this._recAborted = false;
-    // The thread the mic was tapped in — the transcript belongs to it, whatever
-    // is open when transcription finishes. Fall back to the currently-open
-    // target for any recording that started before this field was set.
-    const target = this._recTarget != null
-      ? this._recTarget
-      : (this._active || (this._composing ? 'composer' : ''));
+    // The view the recording ran in — where the check/send tap (or the
+    // navigation that acted as one) happened, and where the transcript lands.
+    const target = this._recTarget != null ? this._recTarget : this._viewKey();
+    this._recTarget = null;
+    this._recState = 'idle';
     if (aborted || !chunks.length) {
-      this._recTarget = null;
-      this._recState = 'idle';
       this.render();
       return;
     }
     const blob = new Blob(chunks, { type });
-    this._recState = 'transcribing';
-    this._recSending = intent === 'send';
+    // From here on the dictation is a background job of its target view alone:
+    // the recorder is free again, other conversations keep their normal input
+    // row (text and voice), and only the target's row shows the status line.
+    if (target) this._voiceJobs[target] = { sending: intent === 'send', phase: 'transcribing' };
     this.render();
     let toSend = '';
     try {
-      // The pinned thread is context for the cleanup pass: it is what tells the
+      // The target thread is context for the cleanup pass: it is what tells the
       // model which names and topics this dictation is likely to be about.
       // 'composer' is a UI key, not a thread id — only a real thread id is sent.
       const q = (target && target !== 'composer')
@@ -1228,29 +1267,27 @@ class RetinueConversations extends HTMLElement {
         // Send the whole draft, so anything typed before dictating comes along.
         if (intent === 'send' && target) toSend = this._drafts[target] || '';
       } else {
-        this._attachError = 'No speech was detected in the recording.';
+        this._voiceErrors[target] = 'No speech was detected in the recording.';
       }
     } catch (_err) {
-      this._attachError = "Couldn't transcribe the recording. Please try again.";
-    } finally {
-      this._recState = 'idle';
-      if (!toSend) {
-        // Review path (or a failed send-dictation): the transcript sits in the
-        // textarea. Only the deliberate review flow pulls up the keyboard.
-        this._recSending = false;
-        this._recTarget = null;
-        this._focusNext = intent === 'review';
-        this.render();
-      }
+      this._voiceErrors[target] = "Couldn't transcribe the recording. Please try again.";
     }
     if (toSend) {
       // Send path: the status row stays in place of the textarea until the
-      // send completes, so the keyboard never appears. _send() re-renders; on
-      // failure it leaves the draft in place, which then shows up (unfocused)
-      // for a manual retry.
+      // send completes, so the keyboard never appears. _send() re-renders only
+      // when the user is looking at the target; on failure it leaves the
+      // draft in place, which then shows up (unfocused) for a manual retry.
+      if (target) this._voiceJobs[target].phase = 'sending';
       await this._send(toSend, target);
-      this._recSending = false;
-      this._recTarget = null;
+    }
+    delete this._voiceJobs[target];
+    // Completion must not interrupt whatever the user is doing now: only when
+    // they are still looking at the target view is it re-rendered — and only
+    // the deliberate review flow pulls up the keyboard. A background job's
+    // result just sits in that conversation's draft (or error slot) until the
+    // user returns to it.
+    if (this._viewKey() === target) {
+      this._focusNext = intent === 'review';
       this.render();
     }
   }

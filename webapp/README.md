@@ -157,8 +157,13 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   right a green **✓** transcribes it into the composer for review — speech
   recognition is imperfect — while **➤** transcribes *and* sends in one go,
   showing only a status line until the send completes (the textarea never
-  reappears mid-flow, so the phone keyboard stays down). Either way the audio
-  blob is POSTed to `/conversations/transcribe`, which the web gateway proxies
+  reappears mid-flow, so the phone keyboard stays down). The transcript lands
+  in the conversation where **✓**/**➤** was tapped; navigating away from the
+  conversation acts as **✓**, so the transcript waits in that thread's draft.
+  Transcription is a background job of its one conversation: every other
+  thread keeps a fully usable row (text and voice) meanwhile, and is not
+  re-rendered or refocused when the job — or its reply — arrives. Either way
+  the audio blob is POSTed to `/conversations/transcribe`, which the web gateway proxies
   to the shared STT service (`scripts/stt-service.py`) owning the Whisper model
   (so this image ships no ASR stack). Requires `STT_SERVICE_URL` (set in
   `docker-compose.yml`); when unset the endpoint returns 503 and the mic button
