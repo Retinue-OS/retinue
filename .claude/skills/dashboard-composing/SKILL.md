@@ -39,13 +39,21 @@ Shall I confirm the party invitation and add it to your agenda, or decline?
 [[chip: Confirm | Yes, confirm and add it to my agenda.]] · [[chip: Decline | Please decline politely.]]
 ```
 
-- The prefill is a **complete, self-contained reply** in the language of the
-  thread — it must still make sense as the user's next message after they may
-  have edited it.
+- The prefill is a complete reply in the language of the thread, but it states
+  the **user's intention, not the data**. It is read *in the thread*, so it
+  should lean on the proposal: "Yes, move all 12 to the trash as proposed" —
+  never a restated list of IDs, items or numbers. Sending the reply is signing
+  it, so a prefill that enumerates what the message above already lists forces
+  the user to verify the whole enumeration first — pure burden, no benefit.
+  You resolve "as proposed" from the thread yourself when picking the reply up.
 - An open question ("or something else?") needs no chip; chips cover the
   concrete options.
-- Place chips on their own line at the end of the message (separated by ` · `),
-  so they read as the answer row, not as part of the prose.
+- **Decision chips** — the answers to the question the message poses — go on
+  their own line at the end (separated by ` · `), reading as the answer row.
+- **Details chips go inline**, immediately after the first mention of the item
+  they refer to. A chip beside the item can be labeled just "more"; parked at
+  the end of the message it would have to name the item by number to stay
+  unambiguous, which is exactly the noise to avoid.
 
 ## 2. An e-mail referred to but not shown gets a details chip
 
@@ -60,12 +68,13 @@ works even after the thread has moved on:
 
 ```
 Mara's invitation for Saturday is quoted below — I propose the draft reply.
-She already floated the date in two earlier mails not shown here.
-[[chip: Send | Send the draft as proposed.]] · [[chip: Earlier mails | Show me Mara's earlier e-mails about the party date.]]
+She already floated the date in two earlier mails not shown here [[chip: show them | Show me Mara's earlier e-mails about the party date.]].
+[[chip: Send | Send the draft as proposed.]] · [[chip: Discard | Discard the draft, I'll handle it myself.]]
 ```
 
 When several unshown e-mails appear in one message (e.g. a triage omnibus),
-give each line its own details chip.
+give each line its own inline details chip — right on the line, not collected
+at the end.
 
 ## 3. PR and issue labels link to GitHub
 
