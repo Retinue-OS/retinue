@@ -503,8 +503,31 @@ services:
     networks:
       - agents
 
+  # One-shot init: pre-creates the nested messenger mountpoint directories
+  # inside the shared chambers volume. qlever-life mounts that volume read-only
+  # at /data, so on a fresh volume Docker cannot create the mountpoints for the
+  # messenger-* volumes nested under it ("mkdirat …: read-only file system" at
+  # container create). The retinue service would create them (it mounts chambers
+  # RW), but it starts *after* qlever-life — so this service guarantees the
+  # directories exist first. Idempotent; runs on every `up`.
+  volumes-init:
+    image: python:3.12-slim
+    command:
+      - mkdir
+      - -p
+      - /chambers/_generated/messenger/signal
+      - /chambers/_generated/messenger/whatsapp
+      - /chambers/_generated/messenger/telegram
+    volumes:
+      - chambers:/chambers
+    network_mode: none
+    restart: "no"
+
   qlever-life:
     build: ./qlever-dir
+    depends_on:
+      volumes-init:
+        condition: service_completed_successfully
     volumes:
       # The shared chambers volume: every chamber's RDF files are indexed
       # equally — no special data folder.
