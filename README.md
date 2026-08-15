@@ -24,7 +24,11 @@ Defines these core compose services:
   (see [Messaging accounts](#messaging-accounts)) it either runs incoming
   messages as prompts to `retinue` and replies in audio (**control** mode), or
   hands them to the user's triage as incoming mail (**inbox** mode). Incoming
-  voice notes are transcribed via the `stt` service. It also
+  voice notes are transcribed via the `stt` service, and incoming images are
+  forwarded to the agent alongside the message text (all three messenger
+  gateways do this — the image travels with the `POST /message` forward and is
+  materialized to disk in the `retinue` container so the session can open
+  it). It also
   exposes an outbound `/send` HTTP endpoint so `retinue` can *initiate*
   Signal messages (alerts, escalations, daily briefings) via
   `scripts/signal-push.py`, each with a spoken rendering and optional images.

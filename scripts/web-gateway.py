@@ -3,7 +3,11 @@
 HTTP gateway that routes incoming messages to a named Claude Code session.
 
 POST /message
-  Body (JSON): {"message": "...", "question": "...(optional display text)"}
+  Body (JSON): {"message": "...", "question": "...(optional display text)",
+                "files": [{"filename", "content_type", "data"(base64)}, ...]
+                (optional — e.g. an image a messenger gateway forwards; each
+                file is materialized under MESSAGE_FILES_DIR and its on-disk
+                path appended to the prompt so the session can read it)}
   Body (plain text): the message itself
 
 GET /conversation
@@ -103,6 +107,7 @@ import hashlib
 import html
 import hmac
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -446,6 +451,15 @@ CONVERSATION_ATTACHMENTS_DIR = CONVERSATIONS_DIR / "attachments"
 CONVERSATION_ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 # Cap a single attachment's decoded size to keep memory and disk bounded.
 MAX_ATTACHMENT_BYTES = int(os.environ.get("CONVERSATION_MAX_ATTACHMENT_BYTES", str(25 * 1024 * 1024)))
+# Files forwarded with POST /message (e.g. an image received on a messenger
+# channel — the gateways run in their own containers, so the bytes must travel
+# with the request). They are materialized here so the answering session can
+# read them from disk; deliberately ephemeral working data (default under /tmp,
+# cleared on restart), unlike thread attachments the user downloads later.
+MESSAGE_FILES_DIR = Path(os.environ.get("MESSAGE_FILES_DIR", "/tmp/web-gateway/message-files"))
+# Drop stored message files after this long; swept opportunistically on the next
+# store, so no timer thread is needed for what is best-effort hygiene anyway.
+MESSAGE_FILES_TTL_SECONDS = float(os.environ.get("MESSAGE_FILES_TTL_SECONDS", str(7 * 86400)))
 CONVERSATION_BACKEND_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "")
 # Voice input: the dashboard uploads recorded audio here and we proxy it to the
 # shared STT service (scripts/stt-service.py), which owns the Whisper model — so
@@ -1160,6 +1174,70 @@ def _store_attachments(cid: str, raw_atts) -> list[dict]:
             "size": len(blob),
         })
     return stored
+
+
+def _sweep_message_files() -> None:
+    """Best-effort removal of stored message files older than the TTL."""
+    cutoff = time.time() - MESSAGE_FILES_TTL_SECONDS
+    try:
+        for path in MESSAGE_FILES_DIR.iterdir():
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
+def _store_message_files(raw_files) -> list[dict]:
+    """Materialize files sent with POST /message and return their metadata.
+
+    Each input item is ``{"filename", "content_type", "data"(base64)}`` — the
+    same shape as conversation attachments. Files are written under
+    MESSAGE_FILES_DIR with a server-generated name, so an untrusted filename
+    never becomes a path component; only a plain short extension (derived from
+    the filename, else the content type) survives, since a file extension is
+    what lets the reading session type the file. Malformed or oversized items
+    are skipped. Returns ``[{"path", "content_type", "size"}, ...]``."""
+    stored: list[dict] = []
+    if not isinstance(raw_files, list):
+        return stored
+    for item in raw_files:
+        if not isinstance(item, dict) or not isinstance(item.get("data"), str):
+            continue
+        try:
+            blob = base64.b64decode(item["data"], validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
+            continue
+        content_type = str(item.get("content_type") or "application/octet-stream")
+        suffix = Path(os.path.basename(str(item.get("filename") or ""))).suffix
+        if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
+            suffix = mimetypes.guess_extension(content_type) or ""
+        MESSAGE_FILES_DIR.mkdir(parents=True, exist_ok=True)
+        _sweep_message_files()
+        path = MESSAGE_FILES_DIR / f"{uuid.uuid4().hex}{suffix}"
+        path.write_bytes(blob)
+        stored.append({"path": str(path), "content_type": content_type, "size": len(blob)})
+    return stored
+
+
+def _message_files_note(stored: list[dict]) -> str:
+    """A note listing the files a /message request carried, with their on-disk
+    paths — the counterpart of _conv_attachment_note for gateway-forwarded
+    files. The untrusted original filename is deliberately absent: the reading
+    session needs only the server-named path, type and size."""
+    if not stored:
+        return ""
+    lines = [
+        f"- {f['path']} ({f['content_type']}, {f['size']} bytes)"
+        for f in stored
+    ]
+    return ("\n\nThe message carries the following forwarded file(s); read them "
+            "from disk if relevant (you run in the same container):\n"
+            + "\n".join(lines))
 
 
 # Content types the browser may render in place (``Content-Disposition: inline``)
@@ -2695,13 +2773,22 @@ class Handler(BaseHTTPRequestHandler):
             on_behalf_of = _extract_on_behalf_of(payload)
             display_question = (payload.get("question") or "").strip() or None
             want_async = bool(payload.get("async"))
+            raw_files = payload.get("files")
         else:
             message = raw.strip()
             want_async = False
+            raw_files = None
 
         if not message:
             self._send_json(400, {"error": "empty message"})
             return
+
+        # Files forwarded with the message (e.g. an image received on a
+        # messenger channel) are materialized to disk here, in the container
+        # the answering session runs in, and their paths are appended to the
+        # prompt so the session can actually open them.
+        if raw_files:
+            message += _message_files_note(_store_message_files(raw_files))
 
         if on_behalf_of and not _is_allowed_requester(on_behalf_of):
             self._send_json(403, {
