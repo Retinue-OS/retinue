@@ -565,8 +565,10 @@ composer is already repaired. Signal needs none of this — there the agent read
 the transcript and answers what was meant, while the dashboard is the one place
 that shows the user the raw text. Set `TRANSCRIPT_CLEANUP=0` to disable the pass
 (the endpoint then returns Whisper's output verbatim); the reply always carries
-both `text` and `raw_text`. The dashboard's composer also has an **auto-send**
-toggle that skips the review step and sends a dictation straight to Ara.
+both `text` and `raw_text`. While recording, the dashboard's composer shows a
+live waveform with three controls: discard the recording, transcribe it into
+the text field for review, or transcribe-and-send in one step (no review stop,
+as over Signal).
 
 Language handling (constrain detection to the languages the user speaks, and
 re-decode when a guess falls outside that set) lives entirely in the service via
