@@ -296,7 +296,11 @@ status `proposed` with the returned conversation id.
     python3 /workspace/scripts/conversation-push.py --title "Antwort an <Name>" "...Entwurf...\nSenden, anpassen oder verwerfen?"
 
 Apply the Secretary's language/style rules (Swiss spelling, salutation without
-punctuation, recipient profiles). Never bundle replies.
+punctuation, recipient profiles). Never bundle replies. Compose the
+conversation text per the **dashboard-composing** skill: a `[[chip: …]]` for
+each proposed disposition (send / adjust / discard) and no bare URLs. The
+original is quoted in the thread, so it needs no details chip — those are for
+e-mails referred to but not shown (related earlier mails, omnibus lines).
 
 ### 4b. Omnibus proposal — once per `EMAIL_PROCESSING_INTERVAL`
 
