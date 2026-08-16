@@ -1134,42 +1134,77 @@ def _list_pending_sends_store() -> list:
     return items
 
 
-def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
-    """Approve or reject a pending send; when approved, execute it via _push()."""
-    path = _lookup_existing_path(request_id)
-    if path is None:
-        return None
+def _execute_approved_send(path: Path, entry: dict) -> None:
+    """Run an approved send and record its terminal status (background thread).
+
+    The send happens off the HTTP request that approved it (issue #116): a slow
+    send must not hold the approval response open past the web-gateway's proxy
+    timeout.
+    """
+    request_id = entry["id"]
     try:
-        entry = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if entry.get("status") != "pending":
-        return entry
-    if approved:
-        try:
-            _push(
-                entry["recipient"],
-                entry.get("message", ""),
-                lang=entry.get("lang"),
-                images=entry.get("images") or [],
-                voice=bool(entry.get("voice", True)),
-            )
-            entry["status"] = "approved"
-            print(f"[telegram-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
-        except Exception as exc:
-            print(f"[telegram-gateway] pending send {request_id} execution failed: {exc}", flush=True)
-            entry["status"] = "error"
-            entry["error"] = str(exc)
-    else:
-        entry["status"] = "rejected"
-        print(f"[telegram-gateway] pending send {request_id} rejected", flush=True)
+        _push(
+            entry["recipient"],
+            entry.get("message", ""),
+            lang=entry.get("lang"),
+            images=entry.get("images") or [],
+            voice=bool(entry.get("voice", True)),
+        )
+        entry["status"] = "approved"
+        entry.pop("error", None)
+        print(f"[telegram-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
+    except Exception as exc:
+        print(f"[telegram-gateway] pending send {request_id} execution failed: {exc}", flush=True)
+        entry["status"] = "error"
+        entry["error"] = str(exc)
     try:
         path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
     except OSError as exc:
         print(f"[telegram-gateway] warning: could not update pending send: {exc}", flush=True)
     with _pending_sends_lock:
         _pending_sends.pop(request_id, None)
-    return entry
+
+
+def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
+    """Approve or reject a pending send.
+
+    Approval is asynchronous (issue #116): the entry moves to status "sending"
+    and is returned immediately, while a background thread executes the send
+    and writes the terminal status ("approved", or "error" carrying the real
+    error string) — poll GET /pending-sends/<id> for the outcome. A synchronous
+    send here would hold the approving HTTP request open for the whole transfer
+    (media upload, first-contact device-list lookup, voice synthesis) and trip
+    the web-gateway's proxy timeout, which then misreports the gateway as
+    unreachable. Rejection stays synchronous (no I/O involved).
+    """
+    path = _lookup_existing_path(request_id)
+    if path is None:
+        return None
+    # Serialize the status transition so concurrent approvals cannot both see
+    # "pending" and start two sends.
+    with _pending_sends_lock:
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if entry.get("status") != "pending":
+            return entry
+        entry["status"] = "sending" if approved else "rejected"
+        try:
+            path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        except OSError as exc:
+            print(f"[telegram-gateway] warning: could not update pending send: {exc}", flush=True)
+        _pending_sends.pop(request_id, None)
+        # Snapshot before the worker starts: the thread mutates its own copy,
+        # so the caller always sees the "sending" transition (never a state
+        # the background send has already moved past, or a torn dict).
+        snapshot = dict(entry)
+    if approved:
+        threading.Thread(target=_execute_approved_send, args=(path, dict(entry)),
+                         name=f"send-{request_id[:8]}", daemon=True).start()
+    else:
+        print(f"[telegram-gateway] pending send {request_id} rejected", flush=True)
+    return snapshot
 
 
 # ── Outbound push ─────────────────────────────────────────────────────────────

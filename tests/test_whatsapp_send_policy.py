@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -106,6 +107,18 @@ def test_default_verify_with_no_policy_or_account():
     print("ok: default verify with no policy or account")
 
 
+
+def _wait_terminal(gw_module, rid, timeout=5.0):
+    """Poll the send store until the background send records a terminal status."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        detail = gw_module._get_pending_send_detail(rid)
+        if detail and detail.get("status") not in ("pending", "sending"):
+            return detail
+        time.sleep(0.01)
+    raise AssertionError("send never reached a terminal status")
+
+
 def test_pending_send_store_lifecycle():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_whatsapp_gateway([{"number": "*", "category": "verify"}], tmp)
@@ -127,15 +140,43 @@ def test_pending_send_store_lifecycle():
         assert detail["recipient"] == "+15551234567"
         assert detail["status"] == "pending"
 
+        # Approval is asynchronous (issue #116): the caller gets "sending"
+        # immediately; a background thread executes the send and records the
+        # terminal status.
         entry = wg._complete_pending_send(rid, approved=True)
-        assert entry["status"] == "approved"
+        assert entry["status"] == "sending"
+        assert _wait_terminal(wg, rid)["status"] == "approved"
         assert sent == [("+15551234567", "hello", {"lang": "en", "images": [], "voice": True})]
         assert wg._list_pending_sends_store() == []
-        # Double-completion is a no-op (idempotent), does not resend.
+        # Re-completion after the fact is a no-op (idempotent), does not resend.
         again = wg._complete_pending_send(rid, approved=True)
         assert again["status"] == "approved"
         assert len(sent) == 1
     print("ok: pending send store lifecycle (approve)")
+
+
+def test_pending_send_error_records_error_string():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway([{"number": "*", "category": "verify"}], tmp)
+
+        def _boom(recipient, message, **kw):
+            raise RuntimeError("failed to send usync query: info query timed out")
+
+        wg._push = _boom
+        rid = wg._new_pending_send(
+            "+15551234567", "hello", "en", images=[], voice=True, category="verify"
+        )
+        entry = wg._complete_pending_send(rid, approved=True)
+        assert entry["status"] == "sending"
+        detail = _wait_terminal(wg, rid)
+        # The terminal record carries the gateway's real error string, which the
+        # /sends result page surfaces instead of a generic failure (issue #116).
+        assert detail["status"] == "error"
+        assert "usync" in detail["error"]
+        # A failed send is no longer pending and is not re-approvable.
+        assert wg._list_pending_sends_store() == []
+        assert wg._complete_pending_send(rid, approved=True)["status"] == "error"
+    print("ok: failed send records the real error string")
 
 
 def test_pending_send_reject_does_not_send():
@@ -222,6 +263,7 @@ def main():
     test_default_verify_without_wildcard()
     test_default_verify_with_no_policy_or_account()
     test_pending_send_store_lifecycle()
+    test_pending_send_error_records_error_string()
     test_pending_send_reject_does_not_send()
     test_unknown_request_id()
     test_malformed_request_id_rejected()
