@@ -480,7 +480,14 @@ that gap:
 - **Honest health.** Every messenger gateway's `GET /health` reports its real
   link state (`connected`, plus an `error` explaining why not): Signal derives
   it from the receive poll loop, WhatsApp from the bridge's
-  connected/logged-out events, Telegram from the MTProto connection plus a
+  connected/logged-out events **plus a periodic info-query (usync) probe** —
+  the bridge can hold a live socket while outbound IQ queries are wedged, in
+  which case every send to a recipient without a cached device list fails, so
+  `connected` means "can actually send", not "socket is open"
+  (`WHATSAPP_IQ_PROBE_SECONDS`, default 60; `WHATSAPP_IQ_PROBE_FAILURES`,
+  default 2; on a sustained wedge the gateway also tears its connection down to
+  force a reconnect, at most once per `WHATSAPP_IQ_RECONNECT_BACKOFF` seconds,
+  default 600) — and Telegram from the MTProto connection plus a
   periodic session probe (which catches a session revoked from another device).
   An unconfigured channel reports `configured: false` and idles instead of
   crash-looping.
