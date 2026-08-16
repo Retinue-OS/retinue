@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -88,6 +89,18 @@ def test_default_verify_with_no_policy_or_account():
     print("ok: default verify with no policy or account")
 
 
+
+def _wait_terminal(gw_module, rid, timeout=5.0):
+    """Poll the send store until the background send records a terminal status."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        detail = gw_module._get_pending_send_detail(rid)
+        if detail and detail.get("status") not in ("pending", "sending"):
+            return detail
+        time.sleep(0.01)
+    raise AssertionError("send never reached a terminal status")
+
+
 def test_pending_send_store_lifecycle():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_telegram_gateway([{"number": "*", "category": "verify"}], tmp)
@@ -109,8 +122,12 @@ def test_pending_send_store_lifecycle():
         assert detail["recipient"] == "123456789"
         assert detail["status"] == "pending"
 
+        # Approval is asynchronous (issue #116): the caller gets "sending"
+        # immediately; a background thread executes the send and records the
+        # terminal status.
         entry = wg._complete_pending_send(rid, approved=True)
-        assert entry["status"] == "approved"
+        assert entry["status"] == "sending"
+        assert _wait_terminal(wg, rid)["status"] == "approved"
         assert sent == [("123456789", "hello", {"lang": "en", "images": [], "voice": True})]
         assert wg._list_pending_sends_store() == []
         again = wg._complete_pending_send(rid, approved=True)

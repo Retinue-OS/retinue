@@ -404,6 +404,12 @@ scripts/signal-push.py --recipient +15551112222 "Draft reply to review"
 Pending Signal sends appear on `/sends` alongside e-mail approvals; the
 web-gateway fetches them from the signal-gateway's token-gated `/pending-sends`
 API (`SIGNAL_GATEWAY_BASE_URL`) and proxies the allow/deny action back to it.
+Approval is **asynchronous** on all messenger gateways: the gateway answers
+`status: sending` immediately and delivers in the background, and the approval
+page live-refreshes until the terminal status — so a slow send (a large
+document upload, a first-contact device-list lookup, Signal's voice synthesis)
+shows `sending → sent`, or the gateway's real error string on failure, instead
+of tripping the proxy timeout into a misleading "gateway unreachable".
 `SEND_APPROVAL_BASE_URL` sets the public host used to build the approval link
 returned to the caller. The `/sends/<slug>/…` segment is the gateway's own
 Docker **service name** — derived on the gateway from the request's Host header

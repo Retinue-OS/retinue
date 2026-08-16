@@ -1777,7 +1777,15 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
 
 
 def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None) -> str:
-    """Render the approval page for a channel (Signal/WhatsApp/Telegram) pending send."""
+    """Render the page for a channel (Signal/WhatsApp/Telegram) pending send.
+
+    A "pending" entry gets the Allow/Deny approval UI. Any other status renders
+    as a status page instead: gateways execute an approved send asynchronously
+    (issue #116), so right after approval the entry is "sending" — the page
+    auto-refreshes until the gateway records the terminal status, and an
+    "error" entry shows the gateway's real error string (e.g. a usync timeout)
+    rather than a generic failure.
+    """
     label = _CHANNEL_GATEWAYS.get(channel, {}).get("label", channel.title())
     rid = html.escape(request_id)
     chan = html.escape(channel)
@@ -1791,6 +1799,41 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         f"<tr><th>To</th><td>{recipient}</td></tr>",
         f"<tr><th>Category</th><td>{cat}</td></tr>",
     ]
+    status = detail.get("status") or "pending"
+    if status != "pending":
+        if status == "sending":
+            headline = "Sending…"
+            note = ("The gateway accepted the send and is delivering it in the "
+                    "background. This page refreshes until it completes.")
+            extra_head = '<meta http-equiv="refresh" content="2">\n'
+        elif status == "approved":
+            headline = "Sent ✓"
+            note = "The message was delivered to the channel."
+            extra_head = ""
+        elif status == "rejected":
+            headline = "Rejected"
+            note = "The message was discarded without sending."
+            extra_head = ""
+        else:  # "error"
+            headline = "Send failed"
+            note = ("The gateway could not deliver the message: "
+                    + (detail.get("error") or "unknown error"))
+            extra_head = ""
+        return (
+            _HTML_HEAD
+            + f"<title>Retinue — {label_e} Send {rid}</title>\n"
+            + extra_head
+            + "<body>\n"
+            + f"<h1>{label_e} send: {html.escape(headline)}</h1>\n"
+            + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
+            + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
+            + f'<pre class="msg-body">{msg}</pre>\n'
+            + f'<p class="meta">{html.escape(note)}</p>\n'
+            + '<div class="actions">\n'
+            + '  <a href="/sends/next" class="btn btn-skip">Next pending send</a>\n'
+            + "</div>\n"
+            + "</body>\n</html>\n"
+        )
     return (
         _HTML_HEAD
         + f"<title>Retinue — Approve {label_e} Send {rid}</title>\n"
@@ -2799,7 +2842,15 @@ class Handler(BaseHTTPRequestHandler):
                             + html.escape(str(exc)) + '</p><p><a href="/sends">Back</a></p>'
                             + "</body></html>")
             return
-        self._redirect("/sends/next")
+        if verb == "approve":
+            # Approval is asynchronous on the gateway (issue #116): it answers
+            # "sending" immediately and executes in the background. Land on the
+            # send's own page, which live-refreshes until the terminal status
+            # (sent, or the gateway's real error string) — instead of jumping
+            # straight to the next pending send with no outcome feedback.
+            self._redirect(f"/sends/{channel}/{request_id}")
+        else:
+            self._redirect("/sends/next")
 
     def _handle_message(self):
         length = int(self.headers.get("Content-Length", 0))

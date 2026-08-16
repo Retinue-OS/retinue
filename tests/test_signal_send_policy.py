@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -93,6 +94,18 @@ def test_policy_default_verify_without_wildcard():
     print("ok: default verify without wildcard")
 
 
+
+def _wait_terminal(gw_module, rid, timeout=5.0):
+    """Poll the send store until the background send records a terminal status."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        detail = gw_module._get_pending_send_detail(rid)
+        if detail and detail.get("status") not in ("pending", "sending"):
+            return detail
+        time.sleep(0.01)
+    raise AssertionError("send never reached a terminal status")
+
+
 def test_pending_send_store_lifecycle():
     with tempfile.TemporaryDirectory() as tmp:
         sg = _load_signal_gateway([{"number": "*", "category": "verify"}], tmp)
@@ -117,12 +130,16 @@ def test_pending_send_store_lifecycle():
         assert detail["status"] == "pending"
 
         # Approving executes the send and flips the status.
+        # Approval is asynchronous (issue #116): the caller gets "sending"
+        # immediately; a background thread executes the send and records the
+        # terminal status.
         entry = sg._complete_pending_send(rid, approved=True)
-        assert entry["status"] == "approved"
+        assert entry["status"] == "sending"
+        assert _wait_terminal(sg, rid)["status"] == "approved"
         assert sent == [("+15551234567", "hello", {"lang": "en", "images": [], "voice": True})]
         # No longer pending.
         assert sg._list_pending_sends_store() == []
-        # Double-completion is a no-op (idempotent), does not resend.
+        # Re-completion after the fact is a no-op (idempotent), does not resend.
         again = sg._complete_pending_send(rid, approved=True)
         assert again["status"] == "approved"
         assert len(sent) == 1
