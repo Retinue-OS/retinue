@@ -1941,16 +1941,34 @@ def _render_gateways_html(statuses: list[dict]) -> str:
         error = h.get("error")
         if error and configured and not connected:
             rows.append(f'<p class="meta">{html.escape(str(error))}</p>')
-        if configured and not connected:
+        # Offer the pairing QR only when the gateway says re-pairing is the
+        # remedy. Not every outage is fixed by scanning: a WhatsApp IQ wedge or
+        # a Telegram transport drop keeps the device linked — showing a QR
+        # there (which the gateway cannot even produce) renders as a broken
+        # image and sends the user chasing the wrong fix. Older gateways
+        # without the field keep the previous behaviour (QR whenever down).
+        needs_repair = h.get("needs_repair")
+        if needs_repair is None:
+            needs_repair = configured and not connected
+        if configured and not connected and needs_repair:
             any_qr = True
             rows.append(
                 '<div class="qr-wrap">'
-                f'<img class="qr" alt="pairing QR for {label_e}" src="/gateways/{slug}/qr">'
+                # Hidden until a refresh actually delivers an image: while the
+                # gateway is still generating the code, /qr answers JSON and a
+                # visible <img> would render as a broken-image icon.
+                f'<img class="qr" alt="pairing QR for {label_e}" src="/gateways/{slug}/qr" '
+                'style="display:none" '
+                "onload=\"this.style.display=''\" "
+                'onerror="this.style.display=\'none\'">'
                 '<p class="qr-note meta">If no code shows yet, the gateway is still generating one — '
                 'this page refreshes automatically.</p>'
                 f"<p>{html.escape(_pairing_hint(slug))}</p>"
                 "</div>"
             )
+        elif configured and not connected:
+            rows.append('<p class="meta">The device is still paired — no QR scan needed; '
+                        'the gateway recovers on its own or reports the error above.</p>')
         elif connected:
             age = h.get("last_ok_age")
             if isinstance(age, (int, float)):

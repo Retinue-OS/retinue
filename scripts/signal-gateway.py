@@ -337,6 +337,11 @@ def _health_snapshot() -> dict:
         "last_ok_age": round(now - last_ok, 1) if last_ok is not None else None,
         "error": None if connected else last_error,
         "relinking": _RELINK_ACTIVE.is_set(),
+        # Whether re-pairing (GET /qr, which starts a signal-cli link attempt)
+        # is offered as the remedy. signal-cli gives no way to tell an unlinked
+        # account from a transient receive failure, so any sustained down state
+        # offers the QR — scanning is a deliberate user action either way.
+        "needs_repair": bool(SIGNAL_ACCOUNT) and not connected,
     }
     if not SIGNAL_ACCOUNT:
         body["error"] = "SIGNAL_ACCOUNT is not set"

@@ -366,6 +366,7 @@ def _health_snapshot() -> dict:
                  "recipients without a cached device list fail: "
                  + (state["iq_error"] or "info query timed out"))
     connected = link_up and not iq_wedged
+    qr_available = WHATSAPP_QR_PNG_PATH.exists()
     return {
         "status": "ok",
         "configured": True,  # linking IS the configuration; nothing else is needed
@@ -374,7 +375,11 @@ def _health_snapshot() -> dict:
         "logged_out": state["logged_out"],
         "pairing": state["pairing"],
         "iq_ok": state["iq_ok"],
-        "qr_available": WHATSAPP_QR_PNG_PATH.exists(),
+        "qr_available": qr_available,
+        # Whether scanning a pairing QR is the remedy. False for an IQ wedge —
+        # the device is still linked there, so the /gateways page must show the
+        # error, not a pairing QR that cannot exist.
+        "needs_repair": bool(state["logged_out"] or state["pairing"] or qr_available),
         "error": None if connected else error,
     }
 
@@ -944,6 +949,10 @@ class _IQProbeUnsupported(RuntimeError):
 
 _IQ_RECONNECT_LOCK = threading.Lock()
 _last_iq_reconnect = 0.0
+# The (method, style) call shape that completed a probe, discovered on the
+# first successful round and cached so later failures are never re-classified
+# as API-shape issues.
+_iq_call: tuple | None = None
 
 
 def _iq_probe_once() -> None:
@@ -955,6 +964,7 @@ def _iq_probe_once() -> None:
     underlying query times out); raises _IQProbeUnsupported when the installed
     neonize offers no usable method — the caller then disables the probe.
     """
+    global _iq_call
     client = _wa_client
     if client is None:
         raise RuntimeError("bridge not started")
@@ -964,12 +974,50 @@ def _iq_probe_once() -> None:
         own_jid = _attr(get_me(), "JID", "Jid", "jid")
     if own_jid is None:
         raise _IQProbeUnsupported("neonize exposes no get_me()")
-    for name in ("get_user_info", "get_user_devices"):
-        fn = getattr(client, name, None)
-        if callable(fn):
-            fn([own_jid])
-            return
-    raise _IQProbeUnsupported("neonize exposes neither get_user_info nor get_user_devices")
+    # Calling conventions differ across neonize versions: current ones take the
+    # JID(s) as varargs (`get_user_info(jid)`), older ones a list. Passing the
+    # wrong shape fails inside protobuf ("Parameter to initialize message field
+    # must be dict or instance of same class") — an API-shape error, NOT a
+    # wedge, so while no convention has ever succeeded such errors move on to
+    # the next candidate instead of counting as a failed probe. The first
+    # convention that completes is cached; from then on every exception is a
+    # genuine probe failure (e.g. the usync timeout).
+    if _iq_call is not None:
+        candidates = [_iq_call]
+    else:
+        candidates = [(m, s) for m in ("get_user_info", "get_user_devices")
+                      for s in ("scalar", "list")]
+    last_shape_error = None
+    tried_any = False
+    for method, style in candidates:
+        fn = getattr(client, method, None)
+        if not callable(fn):
+            continue
+        tried_any = True
+        try:
+            if style == "scalar":
+                fn(own_jid)
+            else:
+                fn([own_jid])
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if _iq_call is None and _is_call_shape_error(exc):
+                last_shape_error = exc
+                continue
+            raise
+        _iq_call = (method, style)
+        return
+    if last_shape_error is not None:
+        raise _IQProbeUnsupported(f"no usable info-query call shape: {last_shape_error}")
+    if not tried_any:
+        raise _IQProbeUnsupported("neonize exposes neither get_user_info nor get_user_devices")
+    raise _IQProbeUnsupported("no usable info-query call")
+
+
+def _is_call_shape_error(exc: Exception) -> bool:
+    """True when an exception is a wrong-calling-convention error, not a wedge."""
+    if isinstance(exc, TypeError):
+        return True
+    return "parameter to initialize message field" in str(exc).lower()
 
 
 def _maybe_iq_reconnect() -> None:

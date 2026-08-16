@@ -67,6 +67,9 @@ def test_iq_wedge_flips_health_after_debounce():
         snap = wg._health_snapshot()
         assert snap["connected"] is False and snap["iq_ok"] is False
         assert "usync" in snap["error"] and "info query timed out" in snap["error"]
+        # The device is still linked — re-pairing is NOT the remedy, so the
+        # /gateways page must show the error, not a pairing QR.
+        assert snap["needs_repair"] is False
 
         # Past the threshold every further failure keeps reporting the wedge,
         # so backoff-limited reconnect attempts keep retrying.
@@ -87,6 +90,86 @@ def test_logged_out_wins_over_iq_state():
         snap = wg._health_snapshot()
         assert snap["connected"] is False
         assert "re-pairing" in snap["error"]
+        # Unlinked device: scanning a fresh QR IS the remedy.
+        assert snap["needs_repair"] is True
+
+
+class _ProbeClient:
+    """Fake neonize client for the IQ-probe call-shape discovery.
+
+    `accepts` picks which argument shape get_user_info tolerates; the other
+    shape raises the protobuf error the real binding produces when handed the
+    wrong one ("Parameter to initialize message field …"). `wedge` makes the
+    accepted shape fail like a wedged bridge instead.
+    """
+
+    def __init__(self, accepts="scalar", wedge=None):
+        self.accepts = accepts
+        self.wedge = wedge
+        self.calls = 0
+
+    def get_me(self):
+        import types as _t
+        return _t.SimpleNamespace(JID="15551234567@s.whatsapp.net")
+
+    def get_user_info(self, arg):
+        shape = "list" if isinstance(arg, list) else "scalar"
+        if shape != self.accepts:
+            raise ValueError(
+                "Parameter to initialize message field must be dict or instance "
+                "of same class: expected <class 'Neonize_pb2.JID'> got <class 'list'>."
+            )
+        if self.wedge:
+            raise RuntimeError(self.wedge)
+        self.calls += 1
+
+
+def test_iq_probe_discovers_call_shape():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        # This binding only accepts the list shape; the scalar attempt fails
+        # with the protobuf shape error — which must be treated as "try the
+        # next convention", never as a wedge (the bug behind the false
+        # "disconnected" on a healthy bridge).
+        client = _ProbeClient(accepts="list")
+        wg._wa_client = client
+        wg._iq_probe_once()
+        assert client.calls == 1
+        assert wg._iq_call == ("get_user_info", "list")
+        # The discovered shape is cached and reused.
+        wg._iq_probe_once()
+        assert client.calls == 2
+
+
+def test_iq_probe_shape_error_is_unsupported_not_down():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+
+        class _NoShape(_ProbeClient):
+            def get_user_info(self, arg):
+                raise ValueError("Parameter to initialize message field must be dict")
+            get_user_devices = get_user_info
+
+        wg._wa_client = _NoShape()
+        try:
+            wg._iq_probe_once()
+        except wg._IQProbeUnsupported:
+            pass  # correct: disables the probe instead of flagging a wedge
+        else:
+            raise AssertionError("expected _IQProbeUnsupported")
+
+
+def test_iq_probe_real_failure_still_raises():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        wg._wa_client = _ProbeClient(accepts="scalar",
+                                     wedge="failed to send usync query: info query timed out")
+        try:
+            wg._iq_probe_once()
+        except RuntimeError as exc:
+            assert "usync" in str(exc)
+        else:
+            raise AssertionError("expected the wedge to raise")
 
 
 def test_reconnect_backoff():
@@ -105,6 +188,9 @@ def test_reconnect_backoff():
 def main() -> int:
     tests = [test_iq_wedge_flips_health_after_debounce,
              test_logged_out_wins_over_iq_state,
+             test_iq_probe_discovers_call_shape,
+             test_iq_probe_shape_error_is_unsupported_not_down,
+             test_iq_probe_real_failure_still_raises,
              test_reconnect_backoff]
     failures = 0
     for test in tests:
