@@ -967,7 +967,17 @@ def _iq_probe_once() -> None:
     for name in ("get_user_info", "get_user_devices"):
         fn = getattr(client, name, None)
         if callable(fn):
-            fn([own_jid])
+            # The argument shape has shifted across neonize versions like the
+            # method names: some builds take a single JID, others a list. The
+            # installed build rejects a list ("expected JID got list"), which is
+            # a *type* error the probe would otherwise mistake for a wedge — and
+            # then tear the (healthy) connection down on every cycle. Try the
+            # single-JID form first, fall back to the list form on TypeError,
+            # mirroring the build_jid() adapter above.
+            try:
+                fn(own_jid)
+            except TypeError:
+                fn([own_jid])
             return
     raise _IQProbeUnsupported("neonize exposes neither get_user_info nor get_user_devices")
 
