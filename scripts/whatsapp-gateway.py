@@ -284,6 +284,14 @@ _wa_client = None
 # DisconnectedEv / LoggedOutEv). /health derives `connected` from this — not
 # from "the client object exists" — so the gateway-monitor (and the /gateways
 # page) can see a dead or unlinked session instead of just "process is up".
+#
+# Socket/link events alone are not enough, though: the bridge can hold a live,
+# linked websocket while its outbound info queries (IQ) are wedged — every
+# usync query (device-list lookups, i.e. any send to a recipient whose devices
+# are not yet cached) then times out while /health would still say "connected"
+# (issue #115). So a probe thread periodically completes a lightweight IQ round
+# trip and folds the result in: `connected` means "can actually send", not
+# "socket is open".
 _CONN_LOCK = threading.Lock()
 _conn: dict = {
     "connected": False,   # live websocket to WhatsApp with a working session
@@ -292,7 +300,21 @@ _conn: dict = {
     "pairing": False,     # a pairing QR is currently being offered
     "error": None,
     "last_change": None,
+    "iq_ok": None,        # last IQ probe verdict (None until the first probe)
+    "iq_error": None,
+    "iq_fails": 0,        # consecutive failed probes
+    "iq_checked": None,
 }
+
+# How often the probe thread completes an IQ round trip (0 disables the probe;
+# /health then falls back to socket/link state only).
+WHATSAPP_IQ_PROBE_SECONDS = float(os.environ.get("WHATSAPP_IQ_PROBE_SECONDS", "") or "60")
+# Consecutive failed probes before the gateway reports itself down (debounce —
+# one transient timeout is not a wedge; the gateway-monitor debounces again on
+# top of this).
+WHATSAPP_IQ_PROBE_FAILURES = int(os.environ.get("WHATSAPP_IQ_PROBE_FAILURES", "") or "2")
+# Minimum seconds between automatic reconnect attempts while IQ stays wedged.
+WHATSAPP_IQ_RECONNECT_BACKOFF = float(os.environ.get("WHATSAPP_IQ_RECONNECT_BACKOFF", "") or "600")
 
 
 def _set_conn(**changes) -> None:
@@ -301,9 +323,37 @@ def _set_conn(**changes) -> None:
         _conn["last_change"] = time.time()
 
 
+def _note_iq_result(ok: bool, error: str | None = None) -> bool:
+    """Fold one IQ probe result into the connection state.
+
+    Returns True when the gateway is (still) wedged past the failure threshold —
+    the caller's cue to consider a reconnect (rate-limited separately by
+    WHATSAPP_IQ_RECONNECT_BACKOFF). Deliberately does NOT reset on reconnects:
+    only a successful probe clears the wedge, so a reconnect that doesn't fix
+    the IQ path never produces a flapping healthy/unhealthy cycle.
+    """
+    with _CONN_LOCK:
+        _conn["iq_checked"] = time.time()
+        if ok:
+            _conn["iq_ok"] = True
+            _conn["iq_error"] = None
+            _conn["iq_fails"] = 0
+            return False
+        _conn["iq_fails"] = int(_conn.get("iq_fails", 0)) + 1
+        _conn["iq_error"] = (error or "info query failed")[:500]
+        if _conn["iq_fails"] < WHATSAPP_IQ_PROBE_FAILURES:
+            return False
+        _conn["iq_ok"] = False
+        return True
+
+
 def _health_snapshot() -> dict:
     with _CONN_LOCK:
         state = dict(_conn)
+    link_up = bool(state["connected"]) and not state["logged_out"]
+    # iq_ok is three-valued: None (no verdict yet / probe disabled) must not
+    # count against an otherwise healthy link — only a confirmed wedge does.
+    iq_wedged = state["iq_ok"] is False
     error = state["error"]
     if state["logged_out"] and not error:
         error = "device was unlinked from the phone — re-pairing needed"
@@ -311,15 +361,21 @@ def _health_snapshot() -> dict:
         error = "not linked — waiting for the pairing QR to be scanned"
     elif not state["connected"] and not error:
         error = "bridge is not connected"
+    elif link_up and iq_wedged:
+        error = ("bridge link is up but info queries (usync) are failing — sends to "
+                 "recipients without a cached device list fail: "
+                 + (state["iq_error"] or "info query timed out"))
+    connected = link_up and not iq_wedged
     return {
         "status": "ok",
         "configured": True,  # linking IS the configuration; nothing else is needed
-        "connected": bool(state["connected"]) and not state["logged_out"],
+        "connected": connected,
         "linked": state["linked"],
         "logged_out": state["logged_out"],
         "pairing": state["pairing"],
+        "iq_ok": state["iq_ok"],
         "qr_available": WHATSAPP_QR_PNG_PATH.exists(),
-        "error": None if (state["connected"] and not state["logged_out"]) else error,
+        "error": None if connected else error,
     }
 
 WHITELIST_BLOCK_MESSAGE = (
@@ -872,6 +928,94 @@ def _start_bridge() -> None:
 
     print(f"[whatsapp-gateway] connecting bridge (session={WHATSAPP_SESSION_NAME})…", flush=True)
     client.connect()
+
+
+# ── IQ probe ──────────────────────────────────────────────────────────────────
+# Periodically completes a real info-query (usync) round trip against the
+# bridge — the exact query class that wedges in issue #115 while the socket
+# stays up. Success/failure is folded into _conn via _note_iq_result(), which
+# is what flips /health; on a sustained wedge the connection is torn down (with
+# backoff) so the outer loop in main() reconnects, which in the observed
+# incidents is what lets the bridge recover.
+
+class _IQProbeUnsupported(RuntimeError):
+    """The installed neonize exposes none of the probe methods."""
+
+
+_IQ_RECONNECT_LOCK = threading.Lock()
+_last_iq_reconnect = 0.0
+
+
+def _iq_probe_once() -> None:
+    """One lightweight IQ round trip: resolve our own JID, then usync it.
+
+    neonize method names have shifted across versions, so both the own-JID
+    lookup and the query go through fallback chains, like the rest of the
+    bridge adapter. Raises on failure (including the wedged case, where the
+    underlying query times out); raises _IQProbeUnsupported when the installed
+    neonize offers no usable method — the caller then disables the probe.
+    """
+    client = _wa_client
+    if client is None:
+        raise RuntimeError("bridge not started")
+    own_jid = None
+    get_me = getattr(client, "get_me", None)
+    if callable(get_me):
+        own_jid = _attr(get_me(), "JID", "Jid", "jid")
+    if own_jid is None:
+        raise _IQProbeUnsupported("neonize exposes no get_me()")
+    for name in ("get_user_info", "get_user_devices"):
+        fn = getattr(client, name, None)
+        if callable(fn):
+            fn([own_jid])
+            return
+    raise _IQProbeUnsupported("neonize exposes neither get_user_info nor get_user_devices")
+
+
+def _maybe_iq_reconnect() -> None:
+    """Tear the connection down so main() reconnects — at most once per backoff."""
+    global _last_iq_reconnect
+    with _IQ_RECONNECT_LOCK:
+        now = time.time()
+        if now - _last_iq_reconnect < WHATSAPP_IQ_RECONNECT_BACKOFF:
+            return
+        _last_iq_reconnect = now
+    client = _wa_client
+    if client is None:
+        return
+    print("[whatsapp-gateway] info queries are wedged — tearing the connection down to force a reconnect", flush=True)
+    try:
+        client.disconnect()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[whatsapp-gateway] disconnect for IQ recovery failed: {exc}", flush=True)
+
+
+def _iq_probe_loop() -> None:
+    while True:
+        time.sleep(WHATSAPP_IQ_PROBE_SECONDS)
+        with _CONN_LOCK:
+            link_up = _conn["connected"] and not _conn["logged_out"]
+        if not link_up or _wa_client is None:
+            continue
+        # Take the client lock like every other client call, but give up rather
+        # than queue behind a long transfer: a busy client is not wedge evidence,
+        # and a skipped round just means the next one probes instead.
+        if not WA_CLIENT_LOCK.acquire(timeout=10):
+            continue
+        wedged = False
+        try:
+            _iq_probe_once()
+            _note_iq_result(True)
+        except _IQProbeUnsupported as exc:
+            print(f"[whatsapp-gateway] IQ probe disabled: {exc}; health falls back to link state only", flush=True)
+            return
+        except Exception as exc:  # noqa: BLE001 - a failed probe is the health signal
+            wedged = _note_iq_result(False, str(exc))
+            print(f"[whatsapp-gateway] IQ probe failed: {exc}", flush=True)
+        finally:
+            WA_CLIENT_LOCK.release()
+        if wedged:
+            _maybe_iq_reconnect()
 
 
 def _handle_message_event(event) -> None:
@@ -1668,6 +1812,8 @@ def _serve_http() -> None:
 def main() -> None:
     print(f"[whatsapp-gateway] starting (account={WHATSAPP_ACCOUNT_LABEL}, mode={WHATSAPP_GATEWAY_MODE})", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
+    if WHATSAPP_IQ_PROBE_SECONDS > 0:
+        threading.Thread(target=_iq_probe_loop, name="iq-probe", daemon=True).start()
     # The bridge owns the main thread (its event loop blocks). If it ever returns
     # or raises, exit non-zero so the container is restarted by Compose.
     while True:
