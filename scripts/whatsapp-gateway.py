@@ -752,12 +752,16 @@ def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = 
             data = Path(path).read_bytes()
             mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
             if mime.startswith("image/"):
-                msg = client.build_image_message(data, caption=text or "", mime_type=mime)
+                # build_image_message derives the mime type from the bytes itself
+                # and takes no mime keyword — passing one raises TypeError.
+                msg = client.build_image_message(data, caption=text or "")
                 client.send_message(jid, message=msg)
                 text = ""  # caption already carried the text with the first image
             else:
+                # neonize's document builder spells the parameter `mimetype`
+                # (not `mime_type`); the wrong spelling crashed every PDF send.
                 msg = client.build_document_message(
-                    data, filename=Path(path).name, caption=text or "", mime_type=mime
+                    data, filename=Path(path).name, caption=text or "", mimetype=mime
                 )
                 client.send_message(jid, message=msg)
                 text = ""
