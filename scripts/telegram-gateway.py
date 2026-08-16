@@ -305,6 +305,10 @@ def _health_snapshot() -> dict:
         "authorized": state["authorized"],
         "qr_pending": qr_pending,
         "qr_error": qr_error,
+        # Whether re-pairing (the QR login) is the remedy. Only an unauthorised
+        # session needs it — a mere transport drop of an authorised session
+        # heals by reconnecting, so the /gateways page shows the error, not a QR.
+        "needs_repair": configured and not state["authorized"],
         "error": None if connected else error,
     }
 
