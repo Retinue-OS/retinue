@@ -1970,6 +1970,14 @@ def _render_gateways_html(statuses: list[dict]) -> str:
             rows.append('<p class="meta">The device is still paired — no QR scan needed; '
                         'the gateway recovers on its own or reports the error above.</p>')
         elif connected:
+            # A connected gateway can still be degraded: WhatsApp reports
+            # recipient_lookup_ok: false while outbound sends to uncached
+            # (first-contact) recipients fail their device-list lookup, even
+            # though the link — and the own-JID probe — are fine (issue #120).
+            if h.get("recipient_lookup_ok") is False:
+                rl_err = h.get("recipient_lookup_error") or "device-list resolution is failing"
+                rows.append('<p class="meta">⚠ Outbound sends to new (first-contact) recipients '
+                            'are currently failing: ' + html.escape(str(rl_err)) + '</p>')
             age = h.get("last_ok_age")
             if isinstance(age, (int, float)):
                 rows.append(f'<p class="meta">Last verified {int(age)}s ago.</p>')
