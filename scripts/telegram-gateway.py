@@ -56,6 +56,7 @@ from requester_identity import normalize_requester_identity
 from reply_tokens import ReplyTokenStore
 import inbound_store as _ibstore
 import triage_policy as _triage
+import news_ingest as _news
 
 # What this messaging account is for. Fixed by configuration — never inferred
 # from message content. Mirrors SIGNAL_GATEWAY_MODE / WHATSAPP_GATEWAY_MODE.
@@ -214,6 +215,16 @@ def _persist_inbound(question: str, sender: str, group_id: str | None,
         )
     except Exception as exc:
         print(f"[telegram-gateway] could not persist inbound message: {exc}", flush=True)
+
+
+def _forward_news(question: str, source: str, group_id: str | None, lang: str) -> None:
+    """Best-effort hand-off of a news-flagged group message to the news feed."""
+    ok = _news.forward_news(
+        channel=INBOUND_CHANNEL, source=source or (group_id or "unknown"),
+        text=question, lang=lang, group=group_id,
+    )
+    if ok:
+        print(f"[telegram-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
 SEND_APPROVAL_BASE_URL = os.environ.get("SEND_APPROVAL_BASE_URL", "").rstrip("/")
@@ -871,6 +882,10 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
 
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(handle, group_id)
+    # News rail is independent of the triage decision: a message from a group
+    # flagged `news` goes to the feed whether or not it earns a model turn.
+    if gate.get("news"):
+        _forward_news(question, sender_name or handle, group_id, lang)
     if not gate["forward"]:
         _persist_inbound(question, handle, group_id, delivered=gate["delivered_if_held"])
         print(

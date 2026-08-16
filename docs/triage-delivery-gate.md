@@ -19,18 +19,37 @@ This affects **inbox-mode accounts only** (accounts whose incoming mail/messages
 the system triages on the user's behalf). Control-mode and outbound identities
 are untouched.
 
-## Policy (shared by both channels)
+## Policy — two orthogonal axes (messenger)
+
+Messenger routing is decided on **two independent axes**, so the classes below
+are a *combination* of a sender status and a group's flags, not a single ladder:
+
+- **Sender** — a handle is **whitelisted**, **blacklisted**, or **unknown**.
+- **Group** — three independent flags: **news** (its messages are also forwarded
+  to the news feed / Herald), and at most one of **quieted** or **ignored**
+  (which govern *unknown* senders in that group).
+
+The sender axis wins for a known handle: a **whitelisted** handle is always
+forwarded live and a **blacklisted** handle is never forwarded live, regardless
+of the group. The group's quieted/ignored flag only bites for an **unknown**
+sender — matching the user's model, "new senders in quieted or ignored groups".
+The **news** flag is orthogonal to all of it: a message can go to the news feed
+whether or not it also earns a triage turn.
 
 | Class | Fast loop (frequent) | Daily catch-all |
 |---|---|---|
-| **Whitelisted sender** | model runs now | (already handled) |
-| **Unknown sender** (messenger) | model runs now, flagged *unknown* → asks user to whitelist/blacklist | — |
-| **Non-whitelisted** (e-mail) | held | model runs for **any** sender |
-| **Blacklisted handle** (messenger) | held, no prompt | model runs |
-| **Group-blocked / no-action-class** | never triggers | never drained (see below) |
+| **Whitelisted handle** | model runs now | (already handled) |
+| **Unknown handle**, normal group | model runs now, flagged *unknown* → asks user to whitelist/blacklist | — |
+| **Blacklisted handle** | held, no prompt | model runs |
+| **Unknown handle**, **quieted** group | held, no prompt | model runs (drained) |
+| **Unknown handle**, **ignored** group | never triggers | never drained (see below) |
 
-The tradeoff the user accepts: cold senders wait up to 24 h for a model turn.
-The daily run bounds that latency; nothing is dropped.
+E-mail keeps its simpler single axis: **whitelisted** senders run in the fast
+loop; every other sender is held for the daily catch-all.
+
+The tradeoff the user accepts: cold senders (blacklisted or in a quieted group)
+wait up to 24 h for a model turn. The daily run bounds that latency; nothing is
+dropped. Only an **ignored** group is deliberately never drained.
 
 ### Whitelist — exact addresses by default, wildcards by hand
 
@@ -49,7 +68,7 @@ freemail domain is only ever trusted if the user types the wildcard themselves.
 
 Glob support is deliberately minimal: `*@domain` and `*@*.domain`. No regex.
 
-### Messenger whitelist / blacklist / group-block
+### Messenger sender axis: whitelist / blacklist
 
 Messenger identity is a **handle**, not a domain — no aliasing problem, so no
 wildcards needed there.
@@ -58,19 +77,38 @@ wildcards needed there.
   gateway's contact directory + recent chats, extended by the ask-flow below.
 - **Blacklist:** an unknown sender the user declines to whitelist goes here so
   the user is **never asked again**. Permanent until hand-edited.
-- **Group-block:** groups the user marks as never allowed to trigger an
-  unknown-sender prompt (seeded with known no-action groups from day one).
+
+### Messenger group axis: news / quieted / ignored
+
+A group carries up to three flags, all set through Ara's policy editor:
+
+- **news** — the group is a broadcast source worth keeping in the news feed. Its
+  messages are forwarded to the Herald in addition to (and independently of) any
+  triage decision. See *The news rail* below.
+- **quieted** — an *unknown* sender in this group is not forwarded live, but the
+  message is held for the daily drain, so it still reaches triage within a day.
+- **ignored** — an *unknown* sender in this group never reaches triage at all
+  (accounted for, never drained). This is the strong "don't bother me" flag,
+  seeded with known no-action groups from day one.
+
+`quieted` and `ignored` are mutually exclusive (a group is one or the other, or
+neither); `news` is independent and combines with either. The legacy
+`triageBlockedGroup` predicate is read as `ignored`, so a policy file written
+before this split keeps its old "never reaches triage" behaviour and is migrated
+to the `ignored` predicate on the next write.
 
 ### Unknown-sender ask-flow (messenger only)
 
-An inbound message from an unknown handle (not whitelisted, not blacklisted, not
-in a blocked group, not no-action-class) **does** get a model turn, flagged as
-coming from an unknown sender. The model opens a dashboard thread asking whether to
-whitelist the sender. On "no", the handle is added to the blacklist.
+An inbound message from an unknown handle in a **normal group (or no group)** —
+not whitelisted, not blacklisted, not in a quieted or ignored group — **does**
+get a model turn, flagged as coming from an unknown sender. The model opens a
+dashboard thread asking whether to whitelist the sender. On "no", the handle is
+added to the blacklist. An unknown handle in a **quieted** group is held for the
+daily drain instead; in an **ignored** group it is never asked about.
 
 ## State
 
-Whitelist, blacklist and group-block are **emitted as `.nt`** — the same pattern
+Whitelist, blacklist and the group flags are **emitted as `.nt`** — the same pattern
 as the existing `_generated` registries (`agents.nt`, `conversation-models.nt`).
 That choice does three jobs at once: it indexes natively in qlever (no
 converter), it is trivial for a gateway to parse off disk, and it retires any
@@ -130,7 +168,7 @@ messages never touch WhatsApp's volume. It has **three mounters**:
 | Mounter | Mode | Writes | Reads |
 |---|---|---|---|
 | the gateway | RW | `messages/` (one `.nt` per inbound) | `policy/` (to classify) |
-| the retinue container (Ara) | RW | `policy/` (whitelist/blacklist/group-block `.nt`) | — |
+| the retinue container (Ara) | RW | `policy/` (whitelist/blacklist/group-flags `.nt`) | — |
 | qlever-life | RO | — | both, to index |
 
 Both writing containers mount RW; **separation is by folder-ownership
@@ -164,21 +202,61 @@ This is the IMAP analogy, renamed: "fetch unseen → mark `\Seen`" ≡ "fetch
 undelivered → mark delivered." Both are stateful fetches owned by the message
 store; a read-only query of either changes nothing.
 
-**Fast loop vs. daily drain:**
+**Fast loop vs. daily drain.** On arrival, the gateway classifies on both axes
+(`triage_policy.gate_decision`) and acts on the two flags it returns —
+`forward` (spend a model turn now) and, when not forwarding, `delivered_if_held`
+(the `delivered` flag to persist):
 
-- On arrival, the gateway classifies (whitelist / unknown / blacklist /
-  group-block / no-action). Whitelisted or unknown-sender → hand to a model turn
-  now, marked delivered. Blacklisted / group-blocked → written `delivered: false`,
-  no model turn.
+| Class | forward | held `delivered` | drained daily |
+|---|---|---|---|
+| whitelisted handle | yes (marked delivered) | — | — |
+| unknown, normal group | yes, flagged unknown | — | — |
+| blacklisted handle | no | `false` | yes |
+| unknown, quieted group | no | `false` | yes |
+| unknown, ignored group | no | `true` | **no** |
+
+So the `delivered` flag encodes exactly the drain decision: `false` means "held,
+the daily drain picks it up" (blacklisted handle, quieted group); `true` means
+"accounted for, never drained" (ignored group — the message is on record and
+queryable, but no model ever looks at it unprompted).
+
 - The daily catch-all calls each inbox-mode gateway's
   `GET /undelivered?since=…`, processes the returned messages; the flag flips as
   a side effect of the fetch, so a re-run is naturally idempotent. It does **not**
   read undelivered over SPARQL (that wouldn't clear the flag).
 
 **No-action-class messages** (status updates, voice-note echoes, the
-daily-briefing self-echo, news channels, note-to-self) carry signal but demand
-nothing now; they are written as triples with `delivered: true` already set. History stays complete and queryable; the daily
+daily-briefing self-echo, note-to-self, and unknown senders in an **ignored**
+group) carry signal but demand nothing now; they are written with
+`delivered: true` already set. History stays complete and queryable; the daily
 drain never picks them up; they never prompt.
+
+### The news rail
+
+A group flagged **news** feeds the news page in parallel to triage. The two rails
+are decided by the *same* `gate_decision` call — it returns a `news` boolean
+alongside the triage flags — but they run independently:
+
+- **Deterministic, credit-free, immediate.** When `news` is set, the gateway
+  hands the message to the web-gateway's token-gated `POST /internal/news`
+  (`scripts/news_ingest.py` → `news_store.add_items`), which shapes it into a feed
+  reference with no importance. The Herald scores it on the next curation tick.
+  No model turn is spent on the forward itself, and it happens on arrival — not on
+  the up-to-a-day triage drain.
+- **Cross-container by necessity.** The messenger gateways run in their own
+  containers and cannot touch `NEWS_DIR` (the web-gateway owns it), hence the HTTP
+  hand-off rather than a direct `news-add.py` call. The forward is **env-guarded**
+  (`NEWS_INGEST_URL`): unset → no-op, so a deployment that has not wired the
+  endpoint sees no behaviour change.
+- **Parallel to the agent path.** A triage turn can still file a one-off item with
+  `news-add.py` (an e-mail newsletter met during triage, a linked page). The
+  `news` group flag is the *automatic* rail for a whole broadcast source; that
+  stays open for the ad-hoc case.
+
+The canonical combinations: a pure-noise broadcast channel is **news + ignored**
+(kept in the feed, never bothers triage); a channel whose items occasionally
+warrant a triage turn is **news + quieted** (in the feed, and reaching triage on
+the daily drain).
 
 **Schema.** Align the per-message triple shape with the session-logging
 unification (retinue#85) rather than inventing a parallel vocabulary — one RDF
@@ -201,9 +279,15 @@ Tier-3 across both the framework and the gateway services:
   the shared state files, and this doc.
 - **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` each
   get the shared volume mounted RW, per-message `.nt` writing, the
-  classification gate on inbound, and `GET /undelivered?since=…`.
+  classification gate on inbound, and `GET /undelivered?since=…`. For the news
+  rail they also carry `scripts/news_ingest.py` and forward news-flagged messages
+  to the web-gateway (guarded by `NEWS_INGEST_URL`).
+- **web-gateway:** the token-gated `POST /internal/news` endpoint that shapes a
+  forwarded message into a feed item via `news_store`.
 - **compose:** one volume per gateway, each mounted into its gateway (RW) and
-  into `chambers/_generated/messenger/<channel>/` (RO for qlever).
+  into `chambers/_generated/messenger/<channel>/` (RO for qlever). Each messenger
+  gateway gets `NEWS_INGEST_URL` pointed at the web-gateway's `/internal/news`
+  and shares `CONVERSATION_BACKEND_TOKEN`.
 
 Takes effect on merge → `scripts/self-update.py` (rebuilds the gateway images).
 

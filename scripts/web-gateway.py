@@ -2616,6 +2616,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/internal/conversations", "/internal/conversations/"):
             self._handle_agent_conversation()
             return
+        if self.path in ("/internal/news", "/internal/news/"):
+            self._handle_internal_news()
+            return
         internal_msg_match = _INTERNAL_CONV_MSG_RE.match(self.path)
         if internal_msg_match:
             self._handle_agent_conversation_message(internal_msg_match.group(1))
@@ -2871,6 +2874,70 @@ class Handler(BaseHTTPRequestHandler):
                                   "detail": str(exc)})
             return
         self._send_json(200, {"ok": True, "feedback": entry})
+
+    def _handle_internal_news(self) -> None:
+        """File one news-flagged messenger message into the news feed.
+
+        The deterministic, credit-free half of the news pipeline: a messenger
+        gateway (running in its own container, with no access to NEWS_DIR) forwards
+        a message from a group flagged ``news`` in the triage policy here (see
+        scripts/news_ingest.py). We shape it into a news item — a reference, like
+        every other feed entry — and file it via news_store with no importance, so
+        the Herald scores it on the next curation tick. This rail is independent of
+        triage: a message reaches the feed whether or not it was worth a model turn.
+
+        Token-gated (CONVERSATION_BACKEND_TOKEN) like the other /internal/*
+        endpoints, so only in-container agents can post."""
+        if not CONVERSATION_BACKEND_TOKEN:
+            self._send_json(403, {"error": "news backend disabled"})
+            return
+        token = self.headers.get("X-Conversation-Backend-Token", "")
+        if not hmac.compare_digest(token, CONVERSATION_BACKEND_TOKEN):
+            self._send_json(403, {"error": "forbidden"})
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        text = (payload.get("text") or "").strip()
+        source = (payload.get("source") or "").strip()
+        if not text or not source:
+            self._send_json(400, {"error": "text and source are required"})
+            return
+        url = (payload.get("url") or "").strip()
+        lang = (payload.get("lang") or None)
+        channel = (payload.get("channel") or "").strip() or "messenger"
+        # A broadcast message is not a titled article: derive a short title from
+        # its first line, keep the whole thing as the summary. If it carries no
+        # link, key the id off source+text so re-forwarding the same post dedups.
+        first_line = text.splitlines()[0].strip() if text.splitlines() else text
+        title = (first_line[:117] + "…") if len(first_line) > 118 else first_line
+        summary = (text[:497] + "…") if len(text) > 498 else text
+        id_seed = url or f"{source}\n{text}"
+        now = news_store.now()
+        item = {
+            "id": hashlib.sha1(id_seed.encode("utf-8")).hexdigest()[:16],
+            "title": title or source,
+            "url": url,
+            "summary": summary,
+            "source": source,
+            "source_id": f"messenger:{channel}",
+            "lang": lang,
+            "published": news_store.iso(now),
+            "fetched": news_store.iso(now),
+            "expires": None,
+            "half_life_hours": None,
+            "importance": None,  # unscored → the Herald picks it up next curation
+            "tags": [],
+            "read": False,
+            "hidden": False,
+        }
+        try:
+            added = news_store.add_items([item])
+        except OSError as exc:
+            self._send_json(500, {"error": "could not file item", "detail": str(exc)})
+            return
+        self._send_json(200, {"ok": True, "added": added, "id": item["id"]})
 
     def _handle_news_preferences_write(self) -> None:
         """Replace the Herald's memory with what the user typed.

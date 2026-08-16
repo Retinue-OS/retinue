@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Triage delivery-gate policy: whitelist / blacklist / group-block as N-Triples.
+"""Triage delivery-gate policy: sender whitelist/blacklist + group flags as N-Triples.
 
 This is the single source of truth for *who is worth a model turn* in the triage
 delivery gate (see `docs/triage-delivery-gate.md`). It is deliberately
@@ -14,9 +14,18 @@ Two kinds of policy live here:
     auto-added; a whole domain is trusted only when someone writes the wildcard.
     That is what keeps freemail safe: sending to one `person@gmail.com` whitelists
     that address, never all of `gmail.com`.
-  * **Messenger policy** — per channel: whitelisted handles, blacklisted handles
-    (an unknown sender the user declined, never asked about again), and blocked
-    groups (never trigger an unknown-sender prompt).
+  * **Messenger policy** — per channel, on two orthogonal axes:
+      - **Sender** (a handle): whitelisted / blacklisted / unknown. A whitelisted
+        handle is forwarded to triage immediately regardless of its group; a
+        blacklisted handle is never forwarded live (the daily drain still picks
+        it up); an unknown handle is governed by its group (below).
+      - **Group** (three independent flags): ``news`` — its messages are also
+        forwarded to the news feed (Herald), a rail parallel to triage;
+        ``quieted`` — an *unknown* sender in it is not forwarded live but is
+        drained daily; ``ignored`` — an unknown sender in it never reaches triage
+        at all (accounted for, never drained). ``quieted`` and ``ignored`` bite
+        only for unknown senders; ``news`` is independent of all of it. The
+        legacy ``triageBlockedGroup`` predicate is read as ``ignored``.
 
 Everything is emitted as sorted, deterministic N-Triples with the same
 write-if-changed discipline as `discover-agents.py`, so an unchanged policy never
@@ -34,6 +43,7 @@ import email.utils
 import os
 import re
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 KB = "https://w3id.org/retinue/kb#"
@@ -43,9 +53,21 @@ P_ADDRESS = KB + "triageWhitelistAddress"
 P_WILDCARD = KB + "triageWhitelistWildcard"
 P_HANDLE = KB + "triageWhitelistHandle"
 P_BLOCKED_HANDLE = KB + "triageBlacklistHandle"
+# Group flags — three orthogonal axes (see module docstring).
+P_IGNORED_GROUP = KB + "triageIgnoredGroup"
+P_QUIETED_GROUP = KB + "triageQuietedGroup"
+P_NEWS_GROUP = KB + "triageNewsGroup"
+# Legacy: the original single "blocked group" flag, now read as `ignored`. Still
+# parsed so existing policy files keep working; render migrates it to
+# P_IGNORED_GROUP on the next write.
 P_BLOCKED_GROUP = KB + "triageBlockedGroup"
 
 EMAIL_SUBJECT = "urn:retinue:triage:email-whitelist"
+
+# The loaded messenger policy: two sender sets plus the three group-flag sets.
+MessengerPolicy = namedtuple(
+    "MessengerPolicy", "whitelist blacklist ignored quieted news"
+)
 
 
 def _channel_subject(channel: str) -> str:
@@ -234,12 +256,19 @@ def _norm_handle(handle: str) -> str:
 
 def load_messenger_policy(
     channel: str, path: Path | None = None
-) -> tuple[set[str], set[str], set[str]]:
-    """Return (whitelisted handles, blacklisted handles, blocked groups)."""
+) -> MessengerPolicy:
+    """Return a :class:`MessengerPolicy` for one channel.
+
+    The legacy ``triageBlockedGroup`` predicate is folded into ``ignored`` so a
+    policy file written before the news/quieted/ignored split keeps its old
+    behaviour (blocked == never reaches triage).
+    """
     path = path or messenger_policy_path(channel)
     whitelist: set[str] = set()
     blacklist: set[str] = set()
-    groups: set[str] = set()
+    ignored: set[str] = set()
+    quieted: set[str] = set()
+    news: set[str] = set()
     for _subj, pred, lit in _parse(path):
         val = lit.strip()
         if not val:
@@ -248,18 +277,22 @@ def load_messenger_policy(
             whitelist.add(_norm_handle(val))
         elif pred == P_BLOCKED_HANDLE:
             blacklist.add(_norm_handle(val))
-        elif pred == P_BLOCKED_GROUP:
-            groups.add(val.strip())
-    return whitelist, blacklist, groups
+        elif pred in (P_IGNORED_GROUP, P_BLOCKED_GROUP):
+            ignored.add(val)
+        elif pred == P_QUIETED_GROUP:
+            quieted.add(val)
+        elif pred == P_NEWS_GROUP:
+            news.add(val)
+    return MessengerPolicy(whitelist, blacklist, ignored, quieted, news)
 
 
-def render_messenger_policy(
-    channel: str, whitelist: set[str], blacklist: set[str], groups: set[str]
-) -> str:
+def render_messenger_policy(channel: str, pol: MessengerPolicy) -> str:
     subj = _channel_subject(channel)
-    lines = [_triple(subj, P_HANDLE, h) for h in whitelist]
-    lines += [_triple(subj, P_BLOCKED_HANDLE, h) for h in blacklist]
-    lines += [_triple(subj, P_BLOCKED_GROUP, g) for g in groups]
+    lines = [_triple(subj, P_HANDLE, h) for h in pol.whitelist]
+    lines += [_triple(subj, P_BLOCKED_HANDLE, h) for h in pol.blacklist]
+    lines += [_triple(subj, P_IGNORED_GROUP, g) for g in pol.ignored]
+    lines += [_triple(subj, P_QUIETED_GROUP, g) for g in pol.quieted]
+    lines += [_triple(subj, P_NEWS_GROUP, g) for g in pol.news]
     lines.sort()
     return "".join(line + "\n" for line in lines)
 
@@ -272,10 +305,6 @@ def handle_status(handle: str, whitelist: set[str], blacklist: set[str]) -> str:
     if norm in whitelist:
         return "whitelisted"
     return "unknown"
-
-
-def group_blocked(group: str, blocked_groups: set[str]) -> bool:
-    return bool(group) and group.strip() in blocked_groups
 
 
 def gate_decision(
@@ -292,40 +321,61 @@ def gate_decision(
     docs/triage-delivery-gate.md); all three gateways call it so they can never
     drift. Returns a dict with:
 
-    - ``forward`` — spend a model turn on this message now.
+    - ``forward`` — spend a model turn on this message now (the triage rail).
     - ``flagged_unknown`` — annotate that turn as an unknown sender (ask the user
       whether to whitelist/blacklist the handle).
     - ``delivered_if_held`` — the ``delivered`` flag to persist when NOT
-      forwarding: ``True`` means "accounted for, never drained" (group-blocked),
-      ``False`` means "held, the daily drain picks it up" (blacklisted).
+      forwarding: ``True`` means "accounted for, never drained" (ignored group),
+      ``False`` means "held, the daily drain picks it up" (blacklisted handle or
+      quieted group).
+    - ``news`` — the message's group is a news source: forward it to the news
+      feed (Herald) too. This rail is *independent* of the triage decision above
+      (a message can be both, either, or neither).
     - ``reason`` — a short label for the gateway log.
 
-    | class          | forward | flagged | held-flag | drained daily |
-    |----------------|---------|---------|-----------|---------------|
-    | whitelisted    | yes     | no      | —         | —             |
-    | unknown        | yes     | yes     | —         | —             |
-    | blacklisted    | no      | no      | false     | yes           |
-    | group-blocked  | no      | no      | true      | no            |
+    Triage rail (news rail is orthogonal, driven only by group ∈ news):
+
+    | class                    | forward | flagged | held-flag | drained daily |
+    |--------------------------|---------|---------|-----------|---------------|
+    | whitelisted handle       | yes     | no      | —         | —             |
+    | blacklisted handle       | no      | no      | false     | yes           |
+    | unknown, normal group    | yes     | yes     | —         | —             |
+    | unknown, quieted group   | no      | no      | false     | yes           |
+    | unknown, ignored group   | no      | no      | true      | no            |
+
+    Whitelist/blacklist are sender-level and win over the group's quieted/ignored
+    flag; quieted/ignored bite only for unknown senders — matching the user's
+    model ("new senders in quieted or ignored groups").
 
     ``enabled=False`` forwards everything (the gate turned off). May raise if the
     policy file is present but unreadable; the caller decides fail-open.
     """
     if not enabled:
         return {"forward": True, "flagged_unknown": False,
-                "delivered_if_held": True, "reason": "gate-disabled"}
-    whitelist, blacklist, groups = load_messenger_policy(channel, path=path)
-    if group_id and group_blocked(group_id, groups):
-        return {"forward": False, "flagged_unknown": False,
-                "delivered_if_held": True, "reason": "group-blocked"}
-    status = handle_status(sender, whitelist, blacklist)
-    if status == "blacklisted":
-        return {"forward": False, "flagged_unknown": False,
-                "delivered_if_held": False, "reason": "blacklisted"}
+                "delivered_if_held": True, "news": False, "reason": "gate-disabled"}
+    pol = load_messenger_policy(channel, path=path)
+    grp = group_id.strip() if group_id else None
+    news = bool(grp and grp in pol.news)
+    status = handle_status(sender, pol.whitelist, pol.blacklist)
+
     if status == "whitelisted":
-        return {"forward": True, "flagged_unknown": False,
-                "delivered_if_held": True, "reason": "whitelisted"}
-    return {"forward": True, "flagged_unknown": True,
-            "delivered_if_held": True, "reason": "unknown"}
+        dec = {"forward": True, "flagged_unknown": False,
+               "delivered_if_held": True, "reason": "whitelisted"}
+    elif status == "blacklisted":
+        dec = {"forward": False, "flagged_unknown": False,
+               "delivered_if_held": False, "reason": "blacklisted"}
+    elif grp and grp in pol.ignored:
+        dec = {"forward": False, "flagged_unknown": False,
+               "delivered_if_held": True, "reason": "group-ignored"}
+    elif grp and grp in pol.quieted:
+        dec = {"forward": False, "flagged_unknown": False,
+               "delivered_if_held": False, "reason": "group-quieted"}
+    else:
+        dec = {"forward": True, "flagged_unknown": True,
+               "delivered_if_held": True, "reason": "unknown"}
+
+    dec["news"] = news
+    return dec
 
 
 # --------------------------------------------------------------------------- #
@@ -344,16 +394,32 @@ def _mutate_email(add_addresses=(), add_wildcards=(), remove=()) -> None:
 
 
 def _mutate_messenger(channel, *, wl_add=(), wl_del=(), bl_add=(), bl_del=(),
-                      grp_add=(), grp_del=()) -> None:
-    whitelist, blacklist, groups = load_messenger_policy(channel)
+                      ig_add=(), ig_del=(), q_add=(), q_del=(),
+                      news_add=(), news_del=()) -> None:
+    pol = load_messenger_policy(channel)
+    whitelist = set(pol.whitelist)
+    blacklist = set(pol.blacklist)
+    ignored = set(pol.ignored)
+    quieted = set(pol.quieted)
+    news = set(pol.news)
     whitelist |= {_norm_handle(h) for h in wl_add if h.strip()}
     whitelist -= {_norm_handle(h) for h in wl_del}
     blacklist |= {_norm_handle(h) for h in bl_add if h.strip()}
     blacklist -= {_norm_handle(h) for h in bl_del}
-    groups |= {g.strip() for g in grp_add if g.strip()}
-    groups -= {g.strip() for g in grp_del}
+    ignored |= {g.strip() for g in ig_add if g.strip()}
+    ignored -= {g.strip() for g in ig_del}
+    quieted |= {g.strip() for g in q_add if g.strip()}
+    quieted -= {g.strip() for g in q_del}
+    news |= {g.strip() for g in news_add if g.strip()}
+    news -= {g.strip() for g in news_del}
+    # A group carries at most one of ignored/quieted at a time: adding one clears
+    # the other, so `quiet-add` on an ignored group moves it rather than doubling.
+    ignored -= {g.strip() for g in q_add if g.strip()}
+    quieted -= {g.strip() for g in ig_add if g.strip()}
     write_if_changed(
-        render_messenger_policy(channel, whitelist, blacklist, groups),
+        render_messenger_policy(
+            channel, MessengerPolicy(whitelist, blacklist, ignored, quieted, news)
+        ),
         messenger_policy_path(channel),
     )
 
@@ -368,13 +434,18 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("email-remove"); p.add_argument("entry", nargs="+")
     p = sub.add_parser("check-email"); p.add_argument("address")
 
-    for name in ("show", "whitelist-add", "whitelist-remove", "blacklist-add",
-                 "blacklist-remove", "groupblock-add", "groupblock-remove"):
+    # Handle commands take --handle; group commands take --group. `groupblock-*`
+    # is kept as a legacy alias of `ignore-*`.
+    handle_cmds = ("whitelist-add", "whitelist-remove",
+                   "blacklist-add", "blacklist-remove")
+    group_cmds = ("ignore-add", "ignore-remove", "quiet-add", "quiet-remove",
+                  "news-add", "news-remove", "groupblock-add", "groupblock-remove")
+    for name in ("show",) + handle_cmds + group_cmds:
         p = sub.add_parser(name)
         p.add_argument("--channel", required=True)
-        if name.endswith(("-add", "-remove")) and "group" not in name:
+        if name in handle_cmds:
             p.add_argument("--handle", action="append", default=[])
-        if "group" in name:
+        if name in group_cmds:
             p.add_argument("--group", action="append", default=[])
     p = sub.add_parser("check-handle")
     p.add_argument("--channel", required=True)
@@ -400,13 +471,17 @@ def main(argv: list[str] | None = None) -> int:
         print("whitelisted" if ok else "not-whitelisted")
         return 0 if ok else 3
     elif args.cmd == "show":
-        wl, bl, grp = load_messenger_policy(args.channel)
-        for h in sorted(wl):
+        pol = load_messenger_policy(args.channel)
+        for h in sorted(pol.whitelist):
             print(f"whitelist\t{h}")
-        for h in sorted(bl):
+        for h in sorted(pol.blacklist):
             print(f"blacklist\t{h}")
-        for g in sorted(grp):
-            print(f"groupblock\t{g}")
+        for g in sorted(pol.ignored):
+            print(f"ignore\t{g}")
+        for g in sorted(pol.quieted):
+            print(f"quiet\t{g}")
+        for g in sorted(pol.news):
+            print(f"news\t{g}")
     elif args.cmd == "whitelist-add":
         _mutate_messenger(args.channel, wl_add=args.handle)
     elif args.cmd == "whitelist-remove":
@@ -415,13 +490,21 @@ def main(argv: list[str] | None = None) -> int:
         _mutate_messenger(args.channel, bl_add=args.handle)
     elif args.cmd == "blacklist-remove":
         _mutate_messenger(args.channel, bl_del=args.handle)
-    elif args.cmd == "groupblock-add":
-        _mutate_messenger(args.channel, grp_add=args.group)
-    elif args.cmd == "groupblock-remove":
-        _mutate_messenger(args.channel, grp_del=args.group)
+    elif args.cmd in ("ignore-add", "groupblock-add"):
+        _mutate_messenger(args.channel, ig_add=args.group)
+    elif args.cmd in ("ignore-remove", "groupblock-remove"):
+        _mutate_messenger(args.channel, ig_del=args.group)
+    elif args.cmd == "quiet-add":
+        _mutate_messenger(args.channel, q_add=args.group)
+    elif args.cmd == "quiet-remove":
+        _mutate_messenger(args.channel, q_del=args.group)
+    elif args.cmd == "news-add":
+        _mutate_messenger(args.channel, news_add=args.group)
+    elif args.cmd == "news-remove":
+        _mutate_messenger(args.channel, news_del=args.group)
     elif args.cmd == "check-handle":
-        wl, bl, _grp = load_messenger_policy(args.channel)
-        status = handle_status(args.handle, wl, bl)
+        pol = load_messenger_policy(args.channel)
+        status = handle_status(args.handle, pol.whitelist, pol.blacklist)
         print(status)
         return 0 if status == "whitelisted" else 3
     return 0
