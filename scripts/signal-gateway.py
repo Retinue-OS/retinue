@@ -25,6 +25,7 @@ from requester_identity import normalize_requester_identity
 from reply_tokens import ReplyTokenStore
 import inbound_store as _ibstore
 import triage_policy as _triage
+import news_ingest as _news
 
 SIGNAL_ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "").strip()
 
@@ -210,6 +211,16 @@ def _persist_inbound(question: str, sender: str, group_id: str | None,
         )
     except Exception as exc:
         print(f"[signal-gateway] could not persist inbound message: {exc}", flush=True)
+
+
+def _forward_news(question: str, source: str, group_id: str | None, lang: str) -> None:
+    """Best-effort hand-off of a news-flagged group message to the news feed."""
+    ok = _news.forward_news(
+        channel=INBOUND_CHANNEL, source=source or (group_id or "unknown"),
+        text=question, lang=lang, group=group_id,
+    )
+    if ok:
+        print(f"[signal-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
 # Outbound send-control policy — the messenger analogue of EMAIL_SEND_POLICY.
@@ -1134,6 +1145,10 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # held message is persisted (so the daily drain, or plain SPARQL history,
     # still sees it) and no `claude -p` session is spawned.
     gate = _inbound_gate_decision(sender, group_id)
+    # News rail is independent of the triage decision: a message from a group
+    # flagged `news` goes to the feed whether or not it earns a model turn.
+    if gate.get("news"):
+        _forward_news(question, group_id if is_group else sender, group_id, lang)
     if not gate["forward"]:
         _persist_inbound(question, sender, group_id, delivered=gate["delivered_if_held"])
         print(
