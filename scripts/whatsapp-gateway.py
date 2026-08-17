@@ -304,6 +304,13 @@ _conn: dict = {
     "iq_error": None,
     "iq_fails": 0,        # consecutive failed probes
     "iq_checked": None,
+    # Outcome of the last outbound delivery's recipient resolution (issue
+    # #120). Kept separate from the probe state: the probe usyncs our OWN JID,
+    # which can succeed while an arbitrary recipient's device-list lookup times
+    # out — see _note_recipient_lookup().
+    "recipient_lookup_ok": None,
+    "recipient_lookup_error": None,
+    "recipient_lookup_at": None,
 }
 
 # How often the probe thread completes an IQ round trip (0 disables the probe;
@@ -315,12 +322,42 @@ WHATSAPP_IQ_PROBE_SECONDS = float(os.environ.get("WHATSAPP_IQ_PROBE_SECONDS", ""
 WHATSAPP_IQ_PROBE_FAILURES = int(os.environ.get("WHATSAPP_IQ_PROBE_FAILURES", "") or "2")
 # Minimum seconds between automatic reconnect attempts while IQ stays wedged.
 WHATSAPP_IQ_RECONNECT_BACKOFF = float(os.environ.get("WHATSAPP_IQ_RECONNECT_BACKOFF", "") or "600")
+# Outbound usync/device-list failures (issue #120): how many extra attempts a
+# send gets after the candidate JIDs are exhausted, and the pause before each.
+WHATSAPP_SEND_USYNC_RETRIES = int(os.environ.get("WHATSAPP_SEND_USYNC_RETRIES", "") or "1")
+WHATSAPP_SEND_USYNC_BACKOFF = float(os.environ.get("WHATSAPP_SEND_USYNC_BACKOFF", "") or "15")
+# How long a recorded recipient-lookup failure keeps /health's
+# recipient_lookup_ok at false before the evidence is considered stale (it is
+# tied to whoever was last messaged, so it decays instead of being probed).
+WHATSAPP_RECIPIENT_LOOKUP_TTL = float(os.environ.get("WHATSAPP_RECIPIENT_LOOKUP_TTL", "") or "1800")
 
 
 def _set_conn(**changes) -> None:
     with _CONN_LOCK:
         _conn.update(changes)
         _conn["last_change"] = time.time()
+
+
+def _note_recipient_lookup(ok: bool, error: str | None = None) -> None:
+    """Record the outcome of an outbound delivery's recipient resolution.
+
+    Deliberately separate from the IQ-probe state: the probe usyncs our OWN
+    JID, which can succeed while resolving an arbitrary recipient's device
+    list times out (issue #120) — folding send failures into iq_ok would flap
+    against the green probe. This is an informational health signal (exposed
+    as recipient_lookup_ok in /health and warned about on /gateways); it does
+    not flip `connected`, because a failure is tied to whoever was messaged
+    last and there is no safe way to re-probe it — the evidence decays after
+    WHATSAPP_RECIPIENT_LOOKUP_TTL instead.
+    """
+    with _CONN_LOCK:
+        _conn["recipient_lookup_at"] = time.time()
+        if ok:
+            _conn["recipient_lookup_ok"] = True
+            _conn["recipient_lookup_error"] = None
+        else:
+            _conn["recipient_lookup_ok"] = False
+            _conn["recipient_lookup_error"] = (error or "recipient lookup failed")[:500]
 
 
 def _note_iq_result(ok: bool, error: str | None = None) -> bool:
@@ -367,6 +404,11 @@ def _health_snapshot() -> dict:
                  + (state["iq_error"] or "info query timed out"))
     connected = link_up and not iq_wedged
     qr_available = WHATSAPP_QR_PNG_PATH.exists()
+    rl_ok = state["recipient_lookup_ok"]
+    rl_error = state["recipient_lookup_error"]
+    rl_at = state["recipient_lookup_at"]
+    if rl_ok is False and rl_at and time.time() - rl_at > WHATSAPP_RECIPIENT_LOOKUP_TTL:
+        rl_ok, rl_error = None, None  # the evidence went stale
     return {
         "status": "ok",
         "configured": True,  # linking IS the configuration; nothing else is needed
@@ -380,6 +422,8 @@ def _health_snapshot() -> dict:
         # the device is still linked there, so the /gateways page must show the
         # error, not a pairing QR that cannot exist.
         "needs_repair": bool(state["logged_out"] or state["pairing"] or qr_available),
+        "recipient_lookup_ok": rl_ok,
+        "recipient_lookup_error": rl_error if rl_ok is False else None,
         "error": None if connected else error,
     }
 
@@ -796,38 +840,171 @@ def _download_media(message) -> Path | None:
     return Path(out)
 
 
+def _is_usync_error(exc: Exception) -> bool:
+    """True when a send failure is the usync/device-list resolution class.
+
+    whatsmeow reports a recipient whose device list cannot be resolved (a
+    first-contact / uncached number, issue #120) as "failed to get device
+    list: failed to send usync query: info query timed out". Only this class
+    is retried / LID-falled-back; anything else propagates unchanged.
+    """
+    text = str(exc).lower()
+    return "usync" in text or "device list" in text or "info query timed out" in text
+
+
+def _pn_to_lid(user: str) -> str | None:
+    """Resolve a phone-number user to its LID via the bridge's LID store.
+
+    The reverse of _lid_to_pn: whatsmeow keeps the PN↔LID mapping, populated
+    by inbound traffic and contact sync. A contact who has messaged this
+    account before therefore has a LID here — and per issue #120 a
+    LID-addressed send delivers where the phone-number path stalls in the
+    usync device-list lookup (the LID chat's devices are already cached from
+    the inbound). Returns None when the store holds no mapping (a true first
+    contact) or the installed neonize has no lookup method.
+    """
+    client = _wa_client
+    if client is None or not user:
+        return None
+    fn = getattr(client, "get_lid_from_pn", None)
+    if not callable(fn):
+        return None
+    from neonize.utils import build_jid  # noqa: PLC0415 - localized bridge dep
+    try:
+        with WA_CLIENT_LOCK:
+            lid = fn(build_jid(user, WA_PN_SERVER))
+    except Exception:  # noqa: BLE001 - any store miss means "no mapping"
+        return None
+    resolved = _jid_user(lid)
+    if resolved and resolved != user:
+        return resolved
+    return None
+
+
+def _build_send_ops(text: str | None, media_paths: list[Path] | None) -> list[dict]:
+    """Represent one logical send as an ordered list of per-message operations.
+
+    The first media op carries the text as its caption (WhatsApp's own
+    presentation); a standalone text op is emitted only when no media consumed
+    it. Keeping the parts explicit is what lets the retry engine resume after
+    a partial failure without re-sending the parts that already went out.
+    """
+    text = (text or "").strip()
+    ops: list[dict] = []
+    for path in media_paths or []:
+        ops.append({"kind": "media", "path": Path(path), "caption": text})
+        text = ""
+    if text:
+        ops.append({"kind": "text", "text": text})
+    return ops
+
+
+def _run_send_op(jid, op: dict) -> None:
+    """Execute one send operation against the bridge (serialized via the lock).
+
+    Deliberately per-op locking, not one lock around the whole logical send:
+    the retry engine sleeps between attempts, and holding WA_CLIENT_LOCK
+    through a backoff would block the receive callback and the IQ probe. The
+    accepted trade-off is that two concurrently-approved multi-part sends may
+    interleave their parts in a chat.
+    """
+    client = _wa_client
+    with WA_CLIENT_LOCK:
+        if op["kind"] == "text":
+            client.send_message(jid, op["text"])
+            return
+        path = op["path"]
+        data = path.read_bytes()
+        mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        if mime.startswith("image/"):
+            # build_image_message derives the mime type from the bytes itself
+            # and takes no mime keyword — passing one raises TypeError.
+            msg = client.build_image_message(data, caption=op["caption"] or "")
+        else:
+            # neonize's document builder spells the parameter `mimetype`
+            # (not `mime_type`); the wrong spelling crashed every PDF send.
+            msg = client.build_document_message(
+                data, filename=path.name, caption=op["caption"] or "", mimetype=mime
+            )
+        client.send_message(jid, message=msg)
+
+
+def _send_ops_with_retry(candidates: list, ops: list[dict], runner, label: str,
+                         retries: int | None = None, backoff: float | None = None) -> None:
+    """Run `ops` in order, retrying usync/device-list failures (issue #120).
+
+    `candidates` are the JIDs to try, best first — typically the phone-number
+    JID, then the recipient's LID when the store knows one (the path that
+    delivers where the phone-number lookup stalls). After the candidates are
+    exhausted, the last one gets `retries` further attempts, each preceded by
+    `backoff` seconds. Completed ops are never re-run, so a failure between
+    the parts of a multi-part send cannot duplicate the parts already sent.
+    A non-usync failure propagates immediately. When every attempt fails, the
+    recipient-lookup health signal is recorded and a clear terminal error is
+    raised — this is what the /sends page shows (issue #116).
+    """
+    retries = WHATSAPP_SEND_USYNC_RETRIES if retries is None else retries
+    backoff = WHATSAPP_SEND_USYNC_BACKOFF if backoff is None else backoff
+    plan = [(cand, 0.0) for cand in candidates]
+    plan += [(candidates[-1], backoff)] * max(0, retries)
+    idx = 0
+    last_exc: Exception | None = None
+    for attempt_no, (jid, delay) in enumerate(plan):
+        if delay:
+            time.sleep(delay)
+        try:
+            while idx < len(ops):
+                runner(jid, ops[idx])
+                idx += 1
+            if last_exc is None:
+                _note_recipient_lookup(True)
+            else:
+                # Delivered — but only via the LID fallback / a retry. That is
+                # direct evidence that raw-number (uncached) resolution is
+                # broken right now, so record it as a lookup failure: /health
+                # and /gateways then warn while true first-contact recipients
+                # remain unreachable, instead of the rescue masking the state.
+                _note_recipient_lookup(False, "delivered via fallback/retry; raw-number "
+                                              f"usync lookup failed: {last_exc}")
+            return
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not _is_usync_error(exc):
+                raise
+            last_exc = exc
+            print(f"[whatsapp-gateway] usync/device-list failure sending to {label} "
+                  f"(attempt {attempt_no + 1}/{len(plan)}): {exc}", flush=True)
+    _note_recipient_lookup(False, str(last_exc))
+    raise RuntimeError(
+        f"could not resolve the recipient's device list after {len(plan)} attempt(s): "
+        f"{last_exc}. First-contact (uncached) recipients are currently failing this "
+        f"lookup; a recipient who has messaged this account before stays reachable, "
+        f"and a later retry may succeed."
+    )
+
+
 def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = None) -> None:
     """Send a WhatsApp message: optional text plus any number of media files.
 
-    Serialized via WA_CLIENT_LOCK so it never races the receive callback.
+    Bridge calls are serialized via WA_CLIENT_LOCK (inside _run_send_op) so
+    they never race the receive callback. A usync/device-list failure — the
+    first-contact stall of issue #120 — is retried: first against the
+    recipient's LID when the store knows one, then after a backoff.
     """
     client = _wa_client
     if client is None:
         raise RuntimeError("WhatsApp bridge is not connected yet")
     jid = _to_jid(recipient)
-    text = (text or "").strip()
-    media_paths = media_paths or []
-
-    with WA_CLIENT_LOCK:
-        for path in media_paths:
-            data = Path(path).read_bytes()
-            mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-            if mime.startswith("image/"):
-                # build_image_message derives the mime type from the bytes itself
-                # and takes no mime keyword — passing one raises TypeError.
-                msg = client.build_image_message(data, caption=text or "")
-                client.send_message(jid, message=msg)
-                text = ""  # caption already carried the text with the first image
-            else:
-                # neonize's document builder spells the parameter `mimetype`
-                # (not `mime_type`); the wrong spelling crashed every PDF send.
-                msg = client.build_document_message(
-                    data, filename=Path(path).name, caption=text or "", mimetype=mime
-                )
-                client.send_message(jid, message=msg)
-                text = ""
-        if text:
-            client.send_message(jid, text)
+    ops = _build_send_ops(text, media_paths)
+    if not ops:
+        return
+    candidates = [jid]
+    server = str(_attr(jid, "Server", "server", default="")) or str(jid).rpartition("@")[2]
+    if server == WA_PN_SERVER:
+        lid_user = _pn_to_lid(_jid_user(jid))
+        if lid_user:
+            from neonize.utils import build_jid  # noqa: PLC0415 - localized bridge dep
+            candidates.append(build_jid(lid_user, WA_LID_SERVER))
+    _send_ops_with_retry(candidates, ops, _run_send_op, recipient)
 
 
 def _start_bridge() -> None:

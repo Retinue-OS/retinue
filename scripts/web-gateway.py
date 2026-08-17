@@ -1621,6 +1621,7 @@ def _start_conv_turn(cid: str) -> None:
 
 _SEND_SINGLE_RE = re.compile(r"^/sends/([^/]+)/([^/]+?)/?$")
 _SEND_ACTION_RE = re.compile(r"^/sends/([^/]+)/([^/]+)/(approve|reject)/?$")
+_SEND_STATUS_RE = re.compile(r"^/sends/([^/]+)/([^/]+)/status/?$")
 _GATEWAY_HEALTH_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/health/?$")
 _GATEWAY_QR_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/qr/?$")
 
@@ -1793,7 +1794,10 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
     recipient = html.escape(detail.get("recipient") or detail.get("to") or "")
     cat = html.escape(detail.get("category") or "")
     msg = html.escape(detail.get("message") or "")
-    skip = html.escape(next_url) if next_url else "/sends"
+    # "Skip" jumps to the next pending request — rendered only when one exists
+    # (the nav already links back to /sends and the dashboard).
+    skip_btn = (f'  <a href="{html.escape(next_url)}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
+                if next_url else "")
     meta_rows = [
         f"<tr><th>Channel</th><td>{label_e}</td></tr>",
         f"<tr><th>To</th><td>{recipient}</td></tr>",
@@ -1801,37 +1805,97 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
     ]
     status = detail.get("status") or "pending"
     if status != "pending":
+        # Status page: a "sending" entry shows a spinner and polls the JSON
+        # status endpoint client-side — no full-page refresh flicker. Success
+        # flips the spinner to a green check and auto-advances a moment later:
+        # to the next pending request when one exists, else the page tries to
+        # close itself (falling back to /sends — window.close() only works for
+        # script-opened windows). The next-request button is rendered only when
+        # a next request actually exists; a failure shows the gateway's real
+        # error and stays put so the user can read it.
         if status == "sending":
-            headline = "Sending…"
-            note = ("The gateway accepted the send and is delivering it in the "
-                    "background. This page refreshes until it completes.")
-            extra_head = '<meta http-equiv="refresh" content="2">\n'
+            icon = '<div class="spin" role="status" aria-label="sending"></div>'
+            note = "Delivering in the background…"
         elif status == "approved":
-            headline = "Sent ✓"
-            note = "The message was delivered to the channel."
-            extra_head = ""
+            icon = '<div class="check">✓</div>'
+            note = "Sent."
         elif status == "rejected":
-            headline = "Rejected"
+            icon = '<div class="cross">✕</div>'
             note = "The message was discarded without sending."
-            extra_head = ""
         else:  # "error"
-            headline = "Send failed"
+            icon = '<div class="cross">✕</div>'
             note = ("The gateway could not deliver the message: "
                     + (detail.get("error") or "unknown error"))
-            extra_head = ""
         return (
             _HTML_HEAD
             + f"<title>Retinue — {label_e} Send {rid}</title>\n"
-            + extra_head
+            # No-JS fallback only: with scripting available the page polls
+            # instead of reloading.
+            + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
+               if status == "sending" else "")
+            + "<style>\n"
+              "  .st-row{display:flex;align-items:center;gap:.9rem;margin:1.1rem 0}\n"
+              "  .spin{width:34px;height:34px;border:4px solid var(--line);"
+              "border-top-color:var(--accent);border-radius:50%;animation:st-spin 1s linear infinite}\n"
+              "  @keyframes st-spin{to{transform:rotate(360deg)}}\n"
+              "  .check,.cross{width:38px;height:38px;border-radius:50%;display:flex;"
+              "align-items:center;justify-content:center;font-size:1.35rem;font-weight:700}\n"
+              "  .check{background:var(--ok);color:#0b0d12}\n"
+              "  .cross{background:var(--high);color:#0b0d12}\n"
+              "</style>\n"
             + "<body>\n"
-            + f"<h1>{label_e} send: {html.escape(headline)}</h1>\n"
+            + f"<h1>{label_e} send</h1>\n"
             + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
             + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
             + f'<pre class="msg-body">{msg}</pre>\n'
-            + f'<p class="meta">{html.escape(note)}</p>\n'
+            + f'<div class="st-row"><div id="st-icon">{icon}</div>'
+            + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
             + '<div class="actions">\n'
-            + '  <a href="/sends/next" class="btn btn-skip">Next pending send</a>\n'
+            + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
+            + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
             + "</div>\n"
+            + "<script>\n"
+              "(function(){\n"
+            + f"  var status={json.dumps(status)};\n"
+            + f"  var nextUrl={json.dumps(next_url)};\n"
+            + f"  var pollUrl={json.dumps(f'/sends/{channel}/{request_id}/status')};\n"
+            + "  var icon=document.getElementById('st-icon');\n"
+              "  var note=document.getElementById('st-note');\n"
+              "  var nextBtn=document.getElementById('st-next');\n"
+              "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
+              "  function advance(){\n"
+              "    if(nextUrl){location=nextUrl;return;}\n"
+              "    window.close();\n"
+              "    setTimeout(function(){location='/sends';},400);\n"
+              "  }\n"
+              "  function terminal(st,err){\n"
+              "    if(st==='approved'){\n"
+              "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
+              "      note.textContent='Sent.';\n"
+              "      setTimeout(advance,1500);\n"
+              "    }else if(st==='rejected'){\n"
+              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+              "      note.textContent='The message was discarded without sending.';\n"
+              "      showNext();\n"
+              "    }else{\n"
+              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+              "      note.textContent='The gateway could not deliver the message: '+(err||'unknown error');\n"
+              "      showNext();\n"
+              "    }\n"
+              "  }\n"
+              "  function poll(){\n"
+              "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
+              "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
+              "        if('next' in b){nextUrl=b.next;}\n"
+              "        terminal(b.status,b.error);\n"
+              "      }else{setTimeout(poll,1500);}\n"
+              "    }).catch(function(){setTimeout(poll,3000);});\n"
+              "  }\n"
+              "  if(status==='sending'){setTimeout(poll,1200);}\n"
+              "  else if(status==='approved'){setTimeout(advance,1500);}\n"
+              "  else{showNext();}\n"
+              "})();\n"
+              "</script>\n"
             + "</body>\n</html>\n"
         )
     return (
@@ -1847,7 +1911,7 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
           f'<button type="submit" id="btn-approve" class="btn btn-allow">Allow</button></form>\n'
         + f'  <form method="post" action="/sends/{chan}/{rid}/reject" id="form-reject">'
           f'<button type="submit" id="btn-reject" class="btn btn-deny">Deny</button></form>\n'
-        + f'  <a href="{skip}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
+        + skip_btn
         + "</div>\n"
         + "<script>\n"
           "(function(){\n"
@@ -1970,6 +2034,14 @@ def _render_gateways_html(statuses: list[dict]) -> str:
             rows.append('<p class="meta">The device is still paired — no QR scan needed; '
                         'the gateway recovers on its own or reports the error above.</p>')
         elif connected:
+            # A connected gateway can still be degraded: WhatsApp reports
+            # recipient_lookup_ok: false while outbound sends to uncached
+            # (first-contact) recipients fail their device-list lookup, even
+            # though the link — and the own-JID probe — are fine (issue #120).
+            if h.get("recipient_lookup_ok") is False:
+                rl_err = h.get("recipient_lookup_error") or "device-list resolution is failing"
+                rows.append('<p class="meta">⚠ Outbound sends to new (first-contact) recipients '
+                            'are currently failing: ' + html.escape(str(rl_err)) + '</p>')
             age = h.get("last_ok_age")
             if isinstance(age, (int, float)):
                 rows.append(f'<p class="meta">Last verified {int(age)}s ago.</p>')
@@ -3485,6 +3557,11 @@ class Handler(BaseHTTPRequestHandler):
         if gw_qr_match:
             self._handle_gateway_qr(gw_qr_match.group(1))
             return
+        send_status_match = _SEND_STATUS_RE.match(conv_path)
+        if send_status_match:
+            self._handle_channel_send_status(send_status_match.group(1),
+                                             send_status_match.group(2))
+            return
         if self.path in ("/sends", "/sends/"):
             self._send_html(200, _render_sends_index_html(_all_pending()))
         elif self.path in ("/sends/next", "/sends/next/"):
@@ -3602,7 +3679,48 @@ class Handler(BaseHTTPRequestHandler):
                     nxt = pending[idx + 1]
                     next_url = f"/sends/{nxt['account']}/{nxt['request_id']}"
                 break
+        else:
+            # This request is no longer in the pending list (it is sending or
+            # terminal): the "next request" is simply the first still-pending
+            # one, if any — the status page advances there after success.
+            if pending:
+                next_url = f"/sends/{pending[0]['account']}/{pending[0]['request_id']}"
         self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url))
+
+    def _handle_channel_send_status(self, account: str, request_id: str) -> None:
+        """Lean JSON status for a channel pending send.
+
+        What the send status page polls instead of reloading itself. Once the
+        send is terminal the body also carries `next` — the URL of the next
+        still-pending request, or null — so the page can auto-advance without
+        a second lookup.
+        """
+        channel, gw = _channel_gateway(account)
+        if not gw:
+            self._send_json(404, {"error": "unknown channel"})
+            return
+        url = f"{gw['base_url']}/pending-sends/{request_id}"
+        headers = {}
+        if gw.get("token"):
+            headers["Authorization"] = "Bearer " + gw["token"]
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                detail = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            self._send_json(exc.code, {"error": "not found" if exc.code == 404 else "gateway error"})
+            return
+        except Exception as exc:  # noqa: BLE001 - poller retries on its own
+            self._send_json(502, {"error": f"gateway unreachable: {exc}"})
+            return
+        body = {"status": detail.get("status"), "error": detail.get("error")}
+        if body["status"] not in ("pending", "sending"):
+            pending = _all_pending()
+            nxt = next((p for p in pending
+                        if not (p.get("account") == channel
+                                and p.get("request_id") == request_id)), None)
+            body["next"] = (f"/sends/{nxt['account']}/{nxt['request_id']}" if nxt else None)
+        self._send_json(200, body)
 
     def _handle_gateway_qr(self, slug: str) -> None:
         """Proxy a gateway's pairing QR (adding the token) to the /gateways page.

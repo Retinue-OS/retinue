@@ -313,6 +313,19 @@ volume.
 Agents send with `scripts/whatsapp-push.py` and resolve contacts with
 `scripts/whatsapp-contacts.py`.
 
+Sends to a **first-contact recipient** (a number whose device list the bridge
+has not cached) can stall in the usync device-list lookup while the link — and
+`/health` — stay green. The gateway handles this itself: on a usync failure it
+retries against the recipient's **LID** when the store knows one (any contact
+who has messaged this account before — that path delivers where the raw-number
+lookup stalls), then once more after a backoff (`WHATSAPP_SEND_USYNC_RETRIES`,
+default 1; `WHATSAPP_SEND_USYNC_BACKOFF`, default 15 s), without ever re-sending
+the parts of a multi-part send that already went out. If every attempt fails,
+the pending send terminates with a clear error on `/sends`, and `/health`
+reports `recipient_lookup_ok: false` (shown as a warning on `/gateways`; the
+evidence decays after `WHATSAPP_RECIPIENT_LOOKUP_TTL`, default 30 min, since it
+cannot be re-probed safely).
+
 ### Telegram accounts
 
 Telegram is reached through the sibling `telegram-gateway` service, which logs in

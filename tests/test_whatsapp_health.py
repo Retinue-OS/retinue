@@ -172,6 +172,121 @@ def test_iq_probe_real_failure_still_raises():
             raise AssertionError("expected the wedge to raise")
 
 
+# ── Outbound usync retry / LID fallback (issue #120) ──────────────────────────
+
+class _Runner:
+    """Fake op runner: fails usync-style for the JIDs in `bad`, else records."""
+
+    def __init__(self, bad=()):
+        self.bad = set(bad)
+        self.sent = []  # (jid, op-kind) in execution order
+
+    def __call__(self, jid, op):
+        if jid in self.bad:
+            raise RuntimeError("failed to get device list: failed to send usync query: "
+                               "info query timed out")
+        self.sent.append((jid, op["kind"]))
+
+
+def test_usync_error_classification():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        assert wg._is_usync_error(RuntimeError(
+            "failed to get device list: failed to send usync query: info query timed out"))
+        assert wg._is_usync_error(RuntimeError("usync query rejected"))
+        assert not wg._is_usync_error(ValueError("recipient not on WhatsApp"))
+
+
+def test_send_falls_back_to_lid():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        runner = _Runner(bad={"pn-jid"})
+        ops = wg._build_send_ops("hello", [Path(tmp) / "doc.pdf"])
+        # The first media op carries the text as caption — no separate text op.
+        assert [op["kind"] for op in ops] == ["media"]
+        assert ops[0]["caption"] == "hello"
+        # The phone-number JID stalls in usync; the cached-LID candidate — the
+        # path that delivered in the issue-#120 repro — takes over.
+        wg._send_ops_with_retry(["pn-jid", "lid-jid"], ops, runner, "+15551112222",
+                                retries=1, backoff=0)
+        assert runner.sent == [("lid-jid", "media")]
+        # The rescue itself witnessed the raw-number lookup failing, so the
+        # health signal must record the degradation — not let the fallback
+        # mask it while true first-contact recipients stay unreachable.
+        snap = wg._health_snapshot()
+        assert snap["recipient_lookup_ok"] is False
+        assert "fallback" in snap["recipient_lookup_error"]
+        # A clean first-candidate success records healthy again.
+        wg._send_ops_with_retry(["ok-jid"], wg._build_send_ops("hi", []), runner, "x",
+                                retries=0, backoff=0)
+        assert wg._health_snapshot()["recipient_lookup_ok"] is True
+
+
+def test_send_partial_failure_never_resends():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+
+        sent = []
+        fails = {"n": 0}
+
+        def runner(jid, op):
+            # The first part succeeds on the first candidate; the second part
+            # (caption already consumed → "") stalls in usync once.
+            if op["caption"] == "" and fails["n"] < 1:
+                fails["n"] += 1
+                raise RuntimeError("failed to send usync query: info query timed out")
+            sent.append((jid, op["caption"]))
+
+        ops = wg._build_send_ops("hello", [Path(tmp) / "a.pdf", Path(tmp) / "b.pdf"])
+        assert [op["kind"] for op in ops] == ["media", "media"]
+        wg._send_ops_with_retry(["a", "b"], ops, runner, "x", retries=1, backoff=0)
+        # The first part went out exactly once (on the first candidate); only
+        # the failed second part was re-attempted, on the fallback candidate.
+        assert sent == [("a", "hello"), ("b", "")]
+
+
+def test_send_exhausted_records_lookup_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        runner = _Runner(bad={"pn-jid"})
+        ops = wg._build_send_ops("hello", [])
+        try:
+            wg._send_ops_with_retry(["pn-jid"], ops, runner, "+15551112222",
+                                    retries=1, backoff=0)
+        except RuntimeError as exc:
+            assert "device list" in str(exc) and "First-contact" in str(exc)
+        else:
+            raise AssertionError("expected the exhausted send to raise")
+        snap = wg._health_snapshot()
+        # Informational signal only: the link stays connected (the own-JID
+        # probe is green), but the degradation is visible.
+        assert snap["recipient_lookup_ok"] is False
+        assert "usync" in snap["recipient_lookup_error"]
+        # The evidence decays instead of being cleared by a probe.
+        with wg._CONN_LOCK:
+            wg._conn["recipient_lookup_at"] -= wg.WHATSAPP_RECIPIENT_LOOKUP_TTL + 1
+        assert wg._health_snapshot()["recipient_lookup_ok"] is None
+
+
+def test_send_non_usync_error_propagates():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(tmp)
+        calls = []
+
+        def runner(jid, op):
+            calls.append(jid)
+            raise ValueError("recipient not on WhatsApp")
+
+        ops = wg._build_send_ops("hello", [])
+        try:
+            wg._send_ops_with_retry(["a", "b"], ops, runner, "x", retries=3, backoff=0)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected the non-usync error to propagate")
+        assert calls == ["a"]  # no retry, no fallback
+
+
 def test_reconnect_backoff():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_whatsapp_gateway(tmp)
@@ -191,6 +306,11 @@ def main() -> int:
              test_iq_probe_discovers_call_shape,
              test_iq_probe_shape_error_is_unsupported_not_down,
              test_iq_probe_real_failure_still_raises,
+             test_usync_error_classification,
+             test_send_falls_back_to_lid,
+             test_send_partial_failure_never_resends,
+             test_send_exhausted_records_lookup_failure,
+             test_send_non_usync_error_propagates,
              test_reconnect_backoff]
     failures = 0
     for test in tests:
