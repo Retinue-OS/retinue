@@ -253,10 +253,16 @@ alongside the triage flags — but they run independently:
   `news` group flag is the *automatic* rail for a whole broadcast source; that
   stays open for the ad-hoc case.
 
-The canonical combinations: a pure-noise broadcast channel is **news + ignored**
-(kept in the feed, never bothers triage); a channel whose items occasionally
-warrant a triage turn is **news + quieted** (in the feed, and reaching triage on
-the daily drain).
+The two group flags encode **routing and whether personal interaction is
+possible** — never signal quality. Whether any single item is worth surfacing is
+Herald's per-item judgement, so there is no "noise channel" category. The
+canonical combinations: a **feed-only broadcast source** (subscribed to purely as
+an information source; nobody there addresses the user personally) is
+**news + ignored** (kept in the feed, never bothers triage); a **group channel
+where personal interaction is possible** (an unknown sender there may actually be
+reaching out) is **news + quieted** (in the feed, and reaching triage on the
+daily drain). A source Herald consistently ranks at the bottom is not a channel
+flag at all — it should be unsubscribed (or never marked `news`).
 
 **Schema.** Align the per-message triple shape with the session-logging
 unification (retinue#85) rather than inventing a parallel vocabulary — one RDF

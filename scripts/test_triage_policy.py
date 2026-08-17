@@ -82,8 +82,8 @@ def test_news_flag_is_orthogonal() -> None:
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
 
-        # news + ignored (a pure-noise broadcast channel): held from triage, but
-        # flagged for the news rail.
+        # news + ignored (a feed-only broadcast source, no personal interaction):
+        # held from triage, but flagged for the news rail.
         path = _policy_file(tmp, news=[GROUP], ignored=[GROUP])
         g = _gate(path, "+41795555555", GROUP)
         assert g["news"] is True and not g["forward"], g
