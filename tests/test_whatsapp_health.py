@@ -210,6 +210,15 @@ def test_send_falls_back_to_lid():
         wg._send_ops_with_retry(["pn-jid", "lid-jid"], ops, runner, "+15551112222",
                                 retries=1, backoff=0)
         assert runner.sent == [("lid-jid", "media")]
+        # The rescue itself witnessed the raw-number lookup failing, so the
+        # health signal must record the degradation — not let the fallback
+        # mask it while true first-contact recipients stay unreachable.
+        snap = wg._health_snapshot()
+        assert snap["recipient_lookup_ok"] is False
+        assert "fallback" in snap["recipient_lookup_error"]
+        # A clean first-candidate success records healthy again.
+        wg._send_ops_with_retry(["ok-jid"], wg._build_send_ops("hi", []), runner, "x",
+                                retries=0, backoff=0)
         assert wg._health_snapshot()["recipient_lookup_ok"] is True
 
 

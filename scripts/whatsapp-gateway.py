@@ -900,7 +900,14 @@ def _build_send_ops(text: str | None, media_paths: list[Path] | None) -> list[di
 
 
 def _run_send_op(jid, op: dict) -> None:
-    """Execute one send operation against the bridge (serialized via the lock)."""
+    """Execute one send operation against the bridge (serialized via the lock).
+
+    Deliberately per-op locking, not one lock around the whole logical send:
+    the retry engine sleeps between attempts, and holding WA_CLIENT_LOCK
+    through a backoff would block the receive callback and the IQ probe. The
+    accepted trade-off is that two concurrently-approved multi-part sends may
+    interleave their parts in a chat.
+    """
     client = _wa_client
     with WA_CLIENT_LOCK:
         if op["kind"] == "text":
@@ -949,7 +956,16 @@ def _send_ops_with_retry(candidates: list, ops: list[dict], runner, label: str,
             while idx < len(ops):
                 runner(jid, ops[idx])
                 idx += 1
-            _note_recipient_lookup(True)
+            if last_exc is None:
+                _note_recipient_lookup(True)
+            else:
+                # Delivered — but only via the LID fallback / a retry. That is
+                # direct evidence that raw-number (uncached) resolution is
+                # broken right now, so record it as a lookup failure: /health
+                # and /gateways then warn while true first-contact recipients
+                # remain unreachable, instead of the rescue masking the state.
+                _note_recipient_lookup(False, "delivered via fallback/retry; raw-number "
+                                              f"usync lookup failed: {last_exc}")
             return
         except Exception as exc:  # noqa: BLE001 - classified below
             if not _is_usync_error(exc):
