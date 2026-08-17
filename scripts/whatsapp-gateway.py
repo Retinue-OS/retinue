@@ -221,15 +221,31 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool) -> None:
-    """Best-effort persist of one inbound message to the store; never raises."""
+                     delivered: bool):
+    """Best-effort persist of one inbound message to the store; never raises.
+
+    Returns the store ``Path`` (so the caller can later flip the delivered flag
+    with :func:`_mark_delivered`) or ``None`` if persistence failed.
+    """
     try:
-        _ibstore.write_message(
+        _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered,
         )
+        return path
     except Exception as exc:
         print(f"[whatsapp-gateway] could not persist inbound message: {exc}", flush=True)
+        return None
+
+
+def _mark_delivered(store_path) -> None:
+    """Flip a persisted inbound's delivered flag once triage has it; never raises."""
+    if store_path is None:
+        return
+    try:
+        _ibstore.mark_delivered(store_path)
+    except Exception as exc:
+        print(f"[whatsapp-gateway] could not mark inbound delivered: {exc}", flush=True)
 
 
 # Public base URL used to build approval links returned to the caller.
@@ -1384,10 +1400,23 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # group-block policy matches on. For a 1:1 there is no group.
     group_id = origin if is_group else None
 
+    # Persist FIRST, before any routing decision — the never-drop invariant. The
+    # inbound event has already been consumed from the WhatsApp session, so if it
+    # is lost here it is gone for good. Writing it up front as delivered=False
+    # means any later failure (a throwing gate, a crash mid-forward, a killed
+    # container) leaves the message on disk for the daily drain instead of
+    # silently dropping it. The flag is flipped to true below once the message is
+    # accounted for (forwarded to triage, or held in a fully-resolved class).
+    store_path = _persist_inbound(question, sender, group_id, delivered=False)
+
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(sender, group_id)
     if not gate["forward"]:
-        _persist_inbound(question, sender, group_id, delivered=gate["delivered_if_held"])
+        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
+        # the drain must never re-surface. One held merely for a not-yet-
+        # whitelisted sender stays delivered=False for the daily drain.
+        if gate["delivered_if_held"]:
+            _mark_delivered(store_path)
         print(
             f"[whatsapp-gateway] gate held inbox message from {sender_label} "
             f"({gate['reason']}); no model turn",
@@ -1455,9 +1484,12 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     except requests.exceptions.RequestException as exc:
         print(f"[whatsapp-gateway] connection error forwarding inbox message from {sender_label}: {exc}", flush=True)
 
-    # Persist AFTER forwarding so the delivered flag reflects reality: a failed
-    # forward stays undelivered and the daily drain retries it.
-    _persist_inbound(question, sender, group_id, delivered=forwarded)
+    # Flip the persisted message's delivered flag: a message handed to triage is
+    # delivered; a failed forward stays delivered=False (as written up front) so
+    # the daily drain retries it. At-least-once: a crash between the forward and
+    # this flip may re-surface the message on the next drain — the safe direction.
+    if forwarded:
+        _mark_delivered(store_path)
 
 
 def _forward_status_to_inbox(text: str, lang: str, sender: str,

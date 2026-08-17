@@ -14,10 +14,12 @@ out of that single act:
 
 2. **A delivery ledger.** Each message carries a ``kb:delivered`` flag. This is
    **not** "read" — it records only whether the message has yet been *handed to
-   triage*. The flag is owned solely by the gateway: it is flipped to ``true``
-   by exactly one operation, :func:`undelivered`, which returns the held
-   messages **and marks them delivered as a side effect**. Nothing else — no
-   SPARQL query, no ad-hoc read — ever touches it, so browsing history never
+   triage*. The flag is owned solely by the gateway and flipped ``false → true``
+   by exactly two operations, both here: :func:`undelivered`, which returns the
+   held messages **and marks them delivered as a side effect** (the daily drain),
+   and :func:`mark_delivered`, which flips one already-written message the gateway
+   persisted up front (the persist-before-forward path — see below). Nothing else
+   — no SPARQL query, no ad-hoc read — ever touches it, so browsing history never
    silently "consumes" a message. The daily triage skill drains the backlog by
    calling the gateway's ``/undelivered`` endpoint (which calls this), so a
    message that arrived while its sender was not yet whitelisted is caught the
@@ -25,11 +27,14 @@ out of that single act:
 
 The delivered flag lets a gateway persist a message it deliberately did **not**
 forward — a blacklisted or no-action-class sender is written straight to
-``delivered: true`` (already accounted for, never drained), while an unknown or
-whitelisted sender that *was* forwarded live is also written ``delivered: true``
-(triage already has it). Only a message that was persisted but **not** handed to
-triage — e.g. a gateway that stored first and then found the model unreachable —
-stays ``delivered: false`` and is picked up by the daily drain.
+``delivered: true`` (already accounted for, never drained). A message that *is*
+forwarded takes the never-drop path: the gateway writes it ``delivered: false``
+the instant it arrives (before the gate, before the forward — so a crash or a
+throwing forward cannot lose it), then calls :func:`mark_delivered` once triage
+actually has it. Any message that was persisted but **not** handed to triage —
+a failed forward, a gateway that died mid-dispatch — stays ``delivered: false``
+and is picked up by the daily drain (at-least-once: a rare duplicate surface
+beats a silent loss).
 
 Stdlib only (``hashlib``/``secrets``/``datetime``): this module is copied into
 each gateway image alongside ``triage_policy.py`` and ``reply_tokens.py``, and
@@ -313,3 +318,39 @@ def undelivered(
             "text": fields["text"],
         })
     return out
+
+
+def mark_delivered(path: str | Path) -> bool:
+    """Flip one already-written message's ``delivered`` flag to ``true``.
+
+    This exists for the **persist-before-forward** path: a gateway writes an
+    inbound message ``delivered = false`` the instant it arrives — before the
+    gate, before the forward — so that a later failure (a throwing gate, a crash
+    mid-forward, a killed container) leaves the message on disk for the daily
+    drain instead of silently dropping it. Once triage actually has the message
+    (a live forward succeeded, or it was held in a fully-accounted class), the
+    gateway flips the flag here.
+
+    It performs the same single false→true rewrite as :func:`undelivered`, but
+    for one known file rather than a scan. Best-effort by design: it returns
+    ``True`` on success (or if the flag was already ``true``), ``False`` if the
+    file is missing/unreadable/unparseable, and **never raises** — a bookkeeping
+    failure must not break message handling. A message left ``false`` by a failed
+    flip is simply re-surfaced by the next drain (at-least-once), which is the
+    safe direction.
+    """
+    p = Path(path)
+    try:
+        fields = _parse(p.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    if not fields:
+        return False
+    if fields["delivered"]:
+        return True
+    fields["delivered"] = True
+    try:
+        _atomic_write(_render(fields), p)
+    except OSError:
+        return False
+    return True

@@ -201,15 +201,31 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool) -> None:
-    """Best-effort persist of one inbound message to the store; never raises."""
+                     delivered: bool):
+    """Best-effort persist of one inbound message to the store; never raises.
+
+    Returns the store ``Path`` (so the caller can later flip the delivered flag
+    with :func:`_mark_delivered`) or ``None`` if persistence failed.
+    """
     try:
-        _ibstore.write_message(
+        _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered,
         )
+        return path
     except Exception as exc:
         print(f"[signal-gateway] could not persist inbound message: {exc}", flush=True)
+        return None
+
+
+def _mark_delivered(store_path) -> None:
+    """Flip a persisted inbound's delivered flag once triage has it; never raises."""
+    if store_path is None:
+        return
+    try:
+        _ibstore.mark_delivered(store_path)
+    except Exception as exc:
+        print(f"[signal-gateway] could not mark inbound delivered: {exc}", flush=True)
 
 
 # Outbound send-control policy — the messenger analogue of EMAIL_SEND_POLICY.
@@ -1130,12 +1146,26 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     if is_group:
         sender_label += " [group]"
 
+    # Persist FIRST, before any routing decision — the never-drop invariant.
+    # signal-cli has already drained (acked) this message from the server, so if
+    # it is lost here it is gone for good. Writing it up front as delivered=False
+    # means that any later failure — a throwing gate, a crash mid-forward, a
+    # killed container — leaves the message on disk for the daily drain to catch
+    # instead of silently dropping it. The flag is flipped to true below once the
+    # message is actually accounted for (forwarded to triage, or held in a
+    # fully-resolved class).
+    store_path = _persist_inbound(question, sender, group_id, delivered=False)
+
     # Delivery gate: decide whether this sender is worth a model turn now. A
-    # held message is persisted (so the daily drain, or plain SPARQL history,
-    # still sees it) and no `claude -p` session is spawned.
+    # held message is already persisted above; no `claude -p` session is spawned.
     gate = _inbound_gate_decision(sender, group_id)
     if not gate["forward"]:
-        _persist_inbound(question, sender, group_id, delivered=gate["delivered_if_held"])
+        # Mark delivered only for a message that is fully accounted for (a
+        # blacklisted/no-action class the drain must never re-surface). One held
+        # merely because the sender is not yet whitelisted stays delivered=False
+        # so the daily drain still picks it up.
+        if gate["delivered_if_held"]:
+            _mark_delivered(store_path)
         print(
             f"[signal-gateway] gate held inbox message from {sender_label} "
             f"({gate['reason']}); no model turn",
@@ -1216,10 +1246,13 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     except requests.exceptions.RequestException as exc:
         print(f"[signal-gateway] connection error forwarding inbox message from {sender_label}: {exc}", flush=True)
 
-    # Persist AFTER forwarding so the delivered flag reflects reality: a message
-    # handed to triage is delivered; one whose forward failed stays undelivered
-    # and the daily drain retries it.
-    _persist_inbound(question, sender, group_id, delivered=forwarded)
+    # Flip the persisted message's delivered flag to reflect reality: a message
+    # handed to triage is delivered; one whose forward failed stays delivered=False
+    # (as written up front) so the daily drain retries it. At-least-once: a crash
+    # between the forward and this flip may re-surface the message on the next
+    # drain, which is the safe direction — a rare duplicate beats a silent loss.
+    if forwarded:
+        _mark_delivered(store_path)
 
 
 
@@ -1843,7 +1876,15 @@ def main() -> None:
             if events:
                 print(f"[signal-gateway] received {len(events)} event(s)", flush=True)
             for event in events:
-                _handle_event(event)
+                # Isolate each event: signal-cli has already drained (acked) this
+                # whole batch, so an exception escaping one _handle_event would
+                # abort the loop and permanently lose every remaining event in the
+                # batch. Contain the failure to the one event and keep going.
+                try:
+                    _handle_event(event)
+                except Exception as exc:
+                    print(f"[signal-gateway] error handling event: {exc}", flush=True)
+                    print(traceback.format_exc(), flush=True)
         except subprocess.TimeoutExpired:
             _note_receive_result(False, "signal-cli timed out")
             print("[signal-gateway] warning: signal-cli timed out, retrying", flush=True)
