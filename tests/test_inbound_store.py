@@ -111,6 +111,61 @@ def test_group_and_optional_fields():
     print("PASS test_group_and_optional_fields")
 
 
+def test_media_roundtrip_and_undelivered():
+    with tempfile.TemporaryDirectory() as tmp:
+        # A voice note persisted before transcription: empty text, a media ref.
+        subj, path = ist.write_message(
+            tmp, channel="whatsapp", sender="a", text="",
+            media="/data/media/deadbeef.ogg", timestamp=1.0,
+        )
+        fields = ist._parse(path.read_text(encoding="utf-8"))
+        assert fields["media"] == "/data/media/deadbeef.ogg"
+        assert fields["text"] == ""
+        assert fields["delivered"] is False
+        # media survives the drain and is handed to the caller.
+        got = ist.undelivered(tmp)
+        assert len(got) == 1
+        assert got[0]["media"] == "/data/media/deadbeef.ogg"
+        assert got[0]["text"] == ""
+    print("PASS test_media_roundtrip_and_undelivered")
+
+
+def test_update_message_fills_transcript_and_clears_media():
+    with tempfile.TemporaryDirectory() as tmp:
+        subj, path = ist.write_message(
+            tmp, channel="signal", sender="a", text="",
+            media="/data/media/abc.ogg", timestamp=1.0,
+        )
+        # Transcription succeeded: fill the text, clear the media ref, learn which
+        # file to unlink (the prior media value).
+        prev = ist.update_message(path, text="hallo welt", clear_media=True)
+        assert prev == "/data/media/abc.ogg"
+        fields = ist._parse(path.read_text(encoding="utf-8"))
+        assert fields["text"] == "hallo welt"
+        assert fields["media"] is None
+        # delivered flag is untouched by an update.
+        assert fields["delivered"] is False
+        # A second clear finds nothing left to unlink.
+        assert ist.update_message(path, clear_media=True) is None
+    print("PASS test_update_message_fills_transcript_and_clears_media")
+
+
+def test_update_message_missing_file_returns_none():
+    with tempfile.TemporaryDirectory() as tmp:
+        assert ist.update_message(Path(tmp) / "nope.nt", text="x") is None
+    print("PASS test_update_message_missing_file_returns_none")
+
+
+def test_write_without_media_has_no_media_predicate():
+    with tempfile.TemporaryDirectory() as tmp:
+        _, path = ist.write_message(tmp, channel="tg", sender="a", text="plain",
+                                    timestamp=1.0)
+        text = path.read_text(encoding="utf-8")
+        assert ist.P_MEDIA not in text
+        assert ist._parse(text)["media"] is None
+    print("PASS test_write_without_media_has_no_media_predicate")
+
+
 def test_missing_dir_is_empty():
     with tempfile.TemporaryDirectory() as tmp:
         assert ist.undelivered(Path(tmp) / "nope") == []
@@ -134,6 +189,10 @@ if __name__ == "__main__":
     test_since_filter()
     test_persist_but_not_forward()
     test_group_and_optional_fields()
+    test_media_roundtrip_and_undelivered()
+    test_update_message_fills_transcript_and_clears_media()
+    test_update_message_missing_file_returns_none()
+    test_write_without_media_has_no_media_predicate()
     test_missing_dir_is_empty()
     test_since_epoch_and_iso_equivalent()
     print("all inbound_store tests passed")

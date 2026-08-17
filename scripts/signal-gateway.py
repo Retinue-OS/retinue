@@ -6,6 +6,8 @@ import json
 import mimetypes
 import os
 import re
+import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -201,16 +203,18 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool):
+                     delivered: bool, media: str | None = None):
     """Best-effort persist of one inbound message to the store; never raises.
 
     Returns the store ``Path`` (so the caller can later flip the delivered flag
-    with :func:`_mark_delivered`) or ``None`` if persistence failed.
+    with :func:`_mark_delivered`) or ``None`` if persistence failed. ``media``
+    records a retained raw-audio file for a voice note persisted before
+    transcription (see :func:`_retain_media`).
     """
     try:
         _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
-            text=question, group=group_id or None, delivered=delivered,
+            text=question, group=group_id or None, delivered=delivered, media=media,
         )
         return path
     except Exception as exc:
@@ -226,6 +230,39 @@ def _mark_delivered(store_path) -> None:
         _ibstore.mark_delivered(store_path)
     except Exception as exc:
         print(f"[signal-gateway] could not mark inbound delivered: {exc}", flush=True)
+
+
+def _retain_media(src_path):
+    """Copy a voice-note attachment into the inbound store's durable media dir.
+
+    signal-cli owns the attachment file it wrote; we copy (not move) it under the
+    store volume — *before* STT runs — so a failed or crashed transcription can
+    be retried from a file whose lifetime we control, rather than depending on
+    signal-cli's own retention. Returns the durable ``Path`` or ``None`` on
+    failure (the caller then transcribes the original directly).
+    """
+    try:
+        mdir = _ibstore.media_dir(INBOUND_STORE_DIR)
+        mdir.mkdir(parents=True, exist_ok=True)
+        dest = mdir / f"{secrets.token_hex(8)}{Path(src_path).suffix}"
+        shutil.copy2(str(src_path), str(dest))
+        return dest
+    except Exception as exc:  # noqa: BLE001
+        print(f"[signal-gateway] could not retain voice-note media: {exc}", flush=True)
+        return None
+
+
+def _update_inbound(store_path, *, text: str | None = None,
+                    clear_media: bool = False):
+    """Fill in a pre-persisted message's transcript / drop its media ref; never
+    raises. Returns the media path that was cleared (to unlink), else None."""
+    if store_path is None:
+        return None
+    try:
+        return _ibstore.update_message(store_path, text=text, clear_media=clear_media)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[signal-gateway] could not update inbound message: {exc}", flush=True)
+        return None
 
 
 # Outbound send-control policy — the messenger analogue of EMAIL_SEND_POLICY.
@@ -1059,7 +1096,39 @@ def _handle_event(event: dict) -> None:
         print(f"[signal-gateway] could not record recent sender: {exc}", flush=True)
 
     voice, files = _split_attachments(event)
-    if voice is not None:
+    # A voice note is persisted BEFORE transcription (never-drop): if the pre-
+    # persist happened, this holds its store Path so the forward below reuses the
+    # same record instead of writing a second one.
+    voice_store_path = None
+    if voice is not None and SIGNAL_GATEWAY_MODE == "inbox":
+        print(f"[signal-gateway] processing voice message from {sender}", flush=True)
+        # Never-drop: retain the audio and persist the message up front, THEN
+        # transcribe. A failed or crashed STT run leaves a durable, re-
+        # transcribable record (delivered=False, media set) for the daily drain —
+        # instead of vanishing at the skip-return below, downstream of where
+        # _forward_to_inbox persists. Only in inbox mode: a control account has no
+        # triage drain that would pick a persisted record back up, so the never-
+        # drop ledger is an inbox-mode concept and persisting there would leak.
+        durable = _retain_media(voice) or voice
+        voice_store_path = _persist_inbound(
+            "", sender, _extract_group_id(event), delivered=False, media=str(durable),
+        )
+        try:
+            question, lang = _transcribe(durable)
+        except Exception as exc:  # noqa: BLE001 - keep audio for retry
+            print(f"[signal-gateway] transcription failed for {sender}; "
+                  f"kept for retry: {exc}", flush=True)
+            question, lang = "", DEFAULT_LANGUAGE
+        else:
+            # Transcript in hand: fill it into the record and drop the now-
+            # redundant retained audio (the text supersedes it).
+            prev = _update_inbound(voice_store_path, text=question, clear_media=True)
+            if prev:
+                Path(prev).unlink(missing_ok=True)
+    elif voice is not None:
+        # Control mode: transient handling (no durable spool, no retry) — the
+        # never-drop ledger is inbox-only. Unchanged from the pre-never-drop path:
+        # signal-cli owns the attachment file, so it is not unlinked here.
         print(f"[signal-gateway] processing voice message from {sender}", flush=True)
         question, lang = _transcribe(voice)
     else:
@@ -1072,6 +1141,12 @@ def _handle_event(event: dict) -> None:
         if question:
             print(f"[signal-gateway] processing text message from {sender}", flush=True)
     if not question and not files:
+        if voice_store_path is not None:
+            # A voice note whose transcription failed: not dropped — it is on disk
+            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            print(f"[signal-gateway] voice note from {sender} not transcribed; "
+                  f"retained for retry (not dropped)", flush=True)
+            return
         # Log the raw event structure to help diagnose why content wasn't extracted
         event_sample = json.dumps(event, default=str)
         if len(event_sample) > 500:
@@ -1084,7 +1159,7 @@ def _handle_event(event: dict) -> None:
     # account hands it to the user's triage and stays silent towards the sender.
     if SIGNAL_GATEWAY_MODE == "inbox":
         _forward_to_inbox(question, lang, sender, group_id=_extract_group_id(event),
-                          files=files)
+                          files=files, store_path=voice_store_path)
     else:
         _handle_control_message(question, lang, sender, files=files)
 
@@ -1127,7 +1202,8 @@ def _handle_control_message(question: str, lang: str, sender: str,
 
 def _forward_to_inbox(question: str, lang: str, sender: str,
                       group_id: str | None = None,
-                      files: list[dict] | None = None) -> None:
+                      files: list[dict] | None = None,
+                      store_path=None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     The account is one of the user's own message sources, so the message is the
@@ -1153,8 +1229,10 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # killed container — leaves the message on disk for the daily drain to catch
     # instead of silently dropping it. The flag is flipped to true below once the
     # message is actually accounted for (forwarded to triage, or held in a
-    # fully-resolved class).
-    store_path = _persist_inbound(question, sender, group_id, delivered=False)
+    # fully-resolved class). A voice note was already persisted before
+    # transcription; reuse that record instead of writing a second one.
+    if store_path is None:
+        store_path = _persist_inbound(question, sender, group_id, delivered=False)
 
     # Delivery gate: decide whether this sender is worth a model turn now. A
     # held message is already persisted above; no `claude -p` session is spawned.
