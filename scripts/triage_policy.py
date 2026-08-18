@@ -328,6 +328,35 @@ def gate_decision(
             "delivered_if_held": True, "reason": "unknown"}
 
 
+def auto_whitelist_on_send(channel: str, handles) -> list[str]:
+    """Whitelist recipient handle(s) after an outbound 1:1 messenger send.
+
+    This is the messenger analogue of the e-mail Sent-folder auto-whitelist
+    (see ``load_email_whitelist``): sending to someone is standing proof they
+    are a wanted correspondent, so their reply must count as a *known* sender
+    rather than resurface as an "unknown sender" prompt. Each gateway calls this
+    from its send choke point once a send has actually gone out.
+
+    Idempotent and write-if-changed (an already-known handle is a no-op, so no
+    qlever rebuild churn). A handle currently on the *blacklist* is never
+    re-whitelisted — an explicit block must survive an outbound send. Returns the
+    handles newly added (empty when all were already known or blocked).
+    """
+    norm = {_norm_handle(h) for h in handles if h and str(h).strip()}
+    if not norm:
+        return []
+    whitelist, blacklist, groups = load_messenger_policy(channel)
+    added = sorted(norm - whitelist - blacklist)
+    if not added:
+        return []
+    whitelist |= set(added)
+    write_if_changed(
+        render_messenger_policy(channel, whitelist, blacklist, groups),
+        messenger_policy_path(channel),
+    )
+    return added
+
+
 # --------------------------------------------------------------------------- #
 # CLI — the deterministic editor Ara and the gate use                         #
 # --------------------------------------------------------------------------- #

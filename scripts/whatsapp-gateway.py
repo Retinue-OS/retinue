@@ -1830,6 +1830,55 @@ def _decode_image(image: dict) -> Path:
     return Path(out)
 
 
+def _autowhitelist_recipient(recipient: str) -> None:
+    """After a successful outbound 1:1 send, add the recipient to the inbound
+    whitelist — so a reply from someone the user just messaged is a *known*
+    sender, not an "unknown sender" prompt. The messenger analogue of the
+    e-mail Sent-folder auto-whitelist (see triage_policy.auto_whitelist_on_send).
+
+    Best-effort: it must never break a send, so every failure is swallowed.
+    Group and broadcast recipients are skipped — a group is not a 1:1 handle.
+
+    Identity forms: inbound is gated on the bare user of its sender JID
+    (``_jid_user``), so the handle whitelisted is the recipient *as addressed*
+    — a reply routes back to the inbound's exact origin (LID or PN), which then
+    matches. WhatsApp's LID<->PN split means the two identities differ, so the
+    counterpart is whitelisted too when the bridge's LID store knows it
+    (``_lid_to_pn`` / ``_pn_to_lid``): a later inbound arriving under either
+    identity is then recognised. A true first-contact number the store has no
+    mapping for whitelists only the sent form — the counterpart is learned once
+    that contact's inbound populates the store.
+    """
+    try:
+        r = (recipient or "").strip()
+        if not r:
+            return
+        user, _, server = r.partition("@")
+        user = user.lstrip("+").strip()
+        server = server.split(":", 1)[0]
+        if server.endswith("g.us") or server == WA_BROADCAST_SERVER:
+            return
+        if not user:
+            return
+        handles = {user}
+        # Whitelist the LID<->PN counterpart too, so an inbound under either
+        # identity is recognised. A bare id (no server) is treated as a possible
+        # LID-only contact first (speculative — an ordinary number just misses).
+        if server == WA_LID_SERVER:
+            counterpart = _lid_to_pn(user, speculative=True)
+        elif server == WA_PN_SERVER:
+            counterpart = _pn_to_lid(user)
+        else:
+            counterpart = _lid_to_pn(user, speculative=True) or _pn_to_lid(user)
+        if counterpart:
+            handles.add(counterpart)
+        added = _triage.auto_whitelist_on_send(INBOUND_CHANNEL, handles)
+        if added:
+            print(f"[whatsapp-gateway] auto-whitelisted recipient handle(s): {', '.join(added)}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - auto-whitelist must never break a send
+        print(f"[whatsapp-gateway] auto-whitelist skipped for {recipient!r}: {exc}", flush=True)
+
+
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True) -> None:
     """Send an outbound message: text body plus optional image attachments.
@@ -1848,6 +1897,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
         for image in images:
             temp_paths.append(_decode_image(image))
         _wa_send(recipient, message or None, media_paths=temp_paths)
+        _autowhitelist_recipient(recipient)
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
