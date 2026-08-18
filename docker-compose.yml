@@ -159,7 +159,7 @@ services:
       # by scripts/gen-egress-ca.sh and trusted by clients.
       - HTTP_PROXY=http://egress-audit:8080
       - HTTPS_PROXY=http://egress-audit:8080
-      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,${SPARQL_NO_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,host.docker.internal,${SPARQL_NO_PROXY:-}
       - NODE_EXTRA_CA_CERTS=/etc/egress-audit/certs/egress-ca-cert.pem
       - SSL_CERT_FILE=/etc/egress-audit/certs/egress-ca-cert.pem
       - REQUESTS_CA_BUNDLE=/etc/egress-audit/certs/egress-ca-cert.pem

@@ -165,22 +165,26 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 #
 # The list of offered models comes from LiteLLM when the deployment routes
 # through it: the gateway reads GET <RETINUE_LITELLM_URL>/model/info (default:
-# ANTHROPIC_BASE_URL, which already points at the LiteLLM service) and offers
-# every route whose `model_info` carries `retinue_picker: true`, labeled by
-# `retinue_label`. That makes LiteLLM the single place models are managed —
-# a model added there (config or admin UI, flags settable in both) shows up in
-# the picker with no gateway config, and turns route through the same proxy
-# that advertised it, so the picker can never offer a model that isn't served.
-# The list is cached for RETINUE_MODELS_CACHE_SECONDS (default 60); on a failed
-# refresh the last good list keeps serving.
+# ANTHROPIC_BASE_URL, or http://litellm:4000 when LITELLM_MASTER_KEY is set)
+# and GET /v1/models. Routes whose `model_info` carries `retinue_picker: true`
+# (labeled by `retinue_label`) are an optional allow-list — when any exist,
+# only those are offered. Otherwise the picker shows the concrete models
+# LiteLLM actually advertises, so an Ollama (or other) backend is selectable
+# without leftover Claude aliases. Plumbing aliases (`retinue-claude`,
+# `retinue-openrouter`) and wildcard patterns stay hidden. Turns route
+# through the same proxy that advertised the id, so the picker cannot offer a
+# model that isn't served. The list is cached for RETINUE_MODELS_CACHE_SECONDS
+# (default 60); on a failed refresh the last good list keeps serving.
 #
-# Deployments not routing through LiteLLM keep the static sources, which also
-# back the picker whenever LiteLLM is unreachable or advertises no flagged
-# route: RETINUE_CONVERSATION_MODELS (an inline JSON array — an explicit
-# override that also WINS over LiteLLM), else the JSON-LD document
+# Deployments not routing through LiteLLM keep the static sources:
+# RETINUE_CONVERSATION_MODELS (an inline JSON array — an explicit override
+# that also WINS over LiteLLM), else the JSON-LD document
 # `config/conversation-models.jsonld` (path override:
 # RETINUE_CONVERSATION_MODELS_FILE; also derived into the life store by
 # scripts/emit-conversation-models.py), else the built-in default below.
+# Those static Claude aliases are NOT used when LiteLLM is configured: an
+# empty or failed advertisement then offers only "Default", never a model
+# the proxy does not serve.
 #
 # Either way the list holds {"id","label"} objects. `id` is passed to
 # `claude --model` (for LiteLLM-sourced entries the id is the route's
@@ -267,21 +271,34 @@ _STATIC_CONVERSATION_MODELS = _load_static_conversation_models()
 
 # ── LiteLLM-advertised models ──────────────────────────────────────────────────
 # RETINUE_LITELLM_URL points the picker at a LiteLLM proxy; it defaults to
-# ANTHROPIC_BASE_URL, which in a LiteLLM deployment is already the proxy. When
-# the deployment talks straight to Anthropic instead, /model/info simply fails
-# and the static list serves — but skip the known-external API host outright so
-# the cache refresh never phones out of the stack.
-_LITELLM_URL = (
-    os.environ.get("RETINUE_LITELLM_URL", "").strip()
-    or os.environ.get("ANTHROPIC_BASE_URL", "").strip()
-)
-if "api.anthropic.com" in _LITELLM_URL:
-    _LITELLM_URL = ""
+# ANTHROPIC_BASE_URL, then to the in-stack service when LITELLM_MASTER_KEY is
+# set (so a LiteLLM deployment whose .env left ANTHROPIC_BASE_URL commented
+# still reads the proxy). Skip the known-external Anthropic API host so the
+# cache refresh never phones out of the stack.
+def _resolve_litellm_url() -> str:
+    url = (
+        os.environ.get("RETINUE_LITELLM_URL", "").strip()
+        or os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    )
+    if not url and os.environ.get("LITELLM_MASTER_KEY", "").strip():
+        url = "http://litellm:4000"
+    if "api.anthropic.com" in url:
+        return ""
+    return url
+
+
+_LITELLM_URL = _resolve_litellm_url()
 _LITELLM_MODELS_CACHE_SECONDS = float(
     os.environ.get("RETINUE_MODELS_CACHE_SECONDS", "60")
 )
 _LITELLM_PICKER_FLAG = "retinue_picker"
 _LITELLM_LABEL_KEY = "retinue_label"
+# Routes that exist so Claude Code / failover can address the proxy, not so a
+# human picks them. Never surface these as conversation models.
+_LITELLM_HIDDEN_MODEL_NAMES = frozenset({
+    "retinue-claude",
+    "retinue-openrouter",
+})
 
 
 def _litellm_headers() -> dict[str, str]:
@@ -289,7 +306,8 @@ def _litellm_headers() -> dict[str, str]:
 
     RETINUE_LITELLM_KEY wins when set; otherwise reuse ANTHROPIC_CUSTOM_HEADERS
     ("Name: Value" per line) — the exact headers Claude Code already sends to
-    the proxy, which carry the key in the proxy's configured key header."""
+    the proxy — and fill any gap from LITELLM_MASTER_KEY, which the retinue
+    container already has when the proxy is in the stack."""
     key = os.environ.get("RETINUE_LITELLM_KEY", "").strip()
     if key:
         value = key if key.lower().startswith("bearer ") else f"Bearer {key}"
@@ -299,52 +317,236 @@ def _litellm_headers() -> dict[str, str]:
         name, sep, value = line.partition(":")
         if sep and name.strip() and value.strip():
             headers[name.strip()] = value.strip()
+    master = os.environ.get("LITELLM_MASTER_KEY", "").strip()
+    if master:
+        value = master if master.lower().startswith("bearer ") else f"Bearer {master}"
+        headers.setdefault("x-litellm-api-key", value)
+        headers.setdefault("Authorization", value)
     return headers
 
 
-def _coerce_litellm_models(parsed: object) -> list[dict]:
-    """Picker entries from a LiteLLM GET /model/info response.
+def _pretty_model_label(mid: str) -> str:
+    """Human label for an un-annotated LiteLLM route (e.g. ollama/qwen3.6)."""
+    tail = mid.split("/")[-1].strip()
+    return tail or mid
 
-    Only routes flagged `retinue_picker` in their model_info are offered —
-    routing plumbing (wildcards, fallback routes) stays invisible without the
-    flag, and wildcard names are dropped even if flagged since a pattern is not
-    a model id. Duplicate names (config + DB copy of a route) collapse to the
-    first occurrence.
 
-    Same-label routes collapse too. A picker route also surfaces under its
-    target id (`claude-opus-5` and `anthropic/claude-opus-5` are two names for
-    one model, both carrying the same model_info), so name-only dedup let every
-    entry appear twice. The label is what the user picks by, so two entries
-    reading "Opus (deepest reasoning)" are a bug whatever their ids; the first
-    occurrence wins, which is the route as the config names it."""
+def _is_claude_catalog(mid: str, item: dict | None = None) -> bool:
+    """True for a Claude/Anthropic catalog id (wildcard expansion or leftover seed).
+
+    A `claude-*` wildcard expands to every known Claude id in /model/info.
+    Those are not served by an Ollama (or other) backend."""
+    params = (item or {}).get("litellm_params")
+    upstream = ""
+    if isinstance(params, dict):
+        upstream = str(params.get("model") or "").strip().lower()
+    blob = f"{mid} {upstream}".lower()
+    return "claude" in blob or upstream.startswith("anthropic/")
+
+
+def _ollama_backend_active(models: list[dict], listed_ids: list[str] | None) -> bool:
+    """Whether this deployment is serving Ollama, so leftover Claude seeds hide."""
+    primary = (
+        os.environ.get("LITELLM_PRIMARY_MODEL", "")
+        or os.environ.get("RETINUE_CLAUDE_MODEL", "")
+        or os.environ.get("ANTHROPIC_MODEL", "")
+    ).strip().lower()
+    if primary.startswith("ollama/"):
+        return True
+    if any(str(m.get("id") or "").startswith("ollama/") for m in models):
+        return True
+    return any(str(i).startswith("ollama/") for i in (listed_ids or []))
+
+
+def _litellm_model_id(item: dict) -> str:
+    mid = str(item.get("model_name") or "").strip()
+    if mid:
+        return mid
+    # /v1/models rows use `id`; keep reading them through the same helper.
+    return str(item.get("id") or "").strip()
+
+
+def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) -> list[dict]:
+    """Picker entries from LiteLLM /model/info, optionally intersected with /v1/models.
+
+    Flagged `retinue_picker` routes are preferred labels, not an exclusive
+    list: they join any other concrete advertised route. An explicit
+    `retinue_picker: false` hides a route. That is what an Ollama (or other
+    non-Claude) backend needs — those routes are rarely pre-flagged, and a
+    leftover Claude seed must not hide them. Wildcard names are dropped even
+    if flagged (a pattern is not a model id). Plumbing aliases stay hidden.
+    Duplicate names collapse to the first occurrence. When any Ollama model
+    is advertised, leftover Claude/Anthropic catalog rows are dropped even
+    if they still carry the picker flag.
+
+    Same-label flagged routes collapse too. A picker route also surfaces under
+    its target id (`claude-opus-5` and `anthropic/claude-opus-5` are two names
+    for one model, both carrying the same model_info), so name-only dedup let
+    every entry appear twice. Unflagged rows keep their own id as the label
+    unless `retinue_label` is set, so a wildcard expansion does not collapse
+    to a single shared caption.
+
+    `listed_ids` (from GET /v1/models) further restricts the unflagged list to
+    ids the proxy currently serves, so a `claude-*` catalog expansion cannot
+    flood the picker when the live list is just the pulled Ollama models."""
     if not isinstance(parsed, dict):
-        return []
-    models, seen, labelled = [], set(), set()
+        parsed = {}
+    flagged, advertised, seen = [], [], set()
+    labelled: set[str] = set()
     for item in parsed.get("data") or []:
         if not isinstance(item, dict):
             continue
+        mid = _litellm_model_id(item)
+        if not mid or "*" in mid or mid in seen or mid in _LITELLM_HIDDEN_MODEL_NAMES:
+            continue
         info = item.get("model_info")
-        if not isinstance(info, dict) or not info.get(_LITELLM_PICKER_FLAG):
+        info = info if isinstance(info, dict) else {}
+        custom = str(info.get(_LITELLM_LABEL_KEY) or "").strip()
+        flag_val = info.get(_LITELLM_PICKER_FLAG)
+        if flag_val is False:
             continue
-        mid = str(item.get("model_name") or "").strip()
-        if not mid or "*" in mid or mid in seen:
+        flagged_row = bool(flag_val)
+        if not flagged_row and _is_claude_catalog(mid, item):
             continue
-        label = str(info.get(_LITELLM_LABEL_KEY) or mid).strip()
-        if label in labelled:
-            continue
+        label = custom or (_pretty_model_label(mid) if not flagged_row else mid)
+        if flagged_row:
+            if label in labelled:
+                continue
+            labelled.add(label)
+            flagged.append({"id": mid, "label": label})
+        else:
+            advertised.append({"id": mid, "label": label})
         seen.add(mid)
-        labelled.add(label)
-        models.append({"id": mid, "label": label})
+    if listed_ids is not None:
+        allow = {
+            str(i).strip() for i in listed_ids
+            if str(i).strip() and "*" not in str(i)
+            and str(i).strip() not in _LITELLM_HIDDEN_MODEL_NAMES
+        }
+        if allow:
+            advertised = [m for m in advertised if m["id"] in allow]
+            have = {m["id"] for m in advertised} | {m["id"] for m in flagged}
+            for raw in listed_ids:
+                mid = str(raw).strip()
+                if (not mid or mid in have or "*" in mid
+                        or mid in _LITELLM_HIDDEN_MODEL_NAMES
+                        or _is_claude_catalog(mid)):
+                    continue
+                advertised.append({"id": mid, "label": _pretty_model_label(mid)})
+                have.add(mid)
+    models = flagged + [m for m in advertised if m["id"] not in {x["id"] for x in flagged}]
+    if _ollama_backend_active(models, listed_ids):
+        models = [m for m in models if not _is_claude_catalog(m["id"])]
     return models
 
 
-def _fetch_litellm_models() -> list[dict]:
-    url = _LITELLM_URL.rstrip("/") + "/model/info"
+def _fetch_litellm_json(path: str) -> object:
+    url = _LITELLM_URL.rstrip("/") + path
     req = urllib.request.Request(
         url, headers={"Accept": "application/json", **_litellm_headers()}
     )
     with urllib.request.urlopen(req, timeout=5) as resp:
-        return _coerce_litellm_models(json.load(resp))
+        return json.load(resp)
+
+
+def _listed_model_ids(parsed: object) -> list[str]:
+    if not isinstance(parsed, dict):
+        return []
+    ids = []
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = str(item.get("id") or "").strip()
+        if mid:
+            ids.append(mid)
+    return ids
+
+
+def _resolve_ollama_url() -> str:
+    """Where to list pulled Ollama tags (the models that are actually available).
+
+    LiteLLM's /model/info often keeps a static ollama catalog (or a leftover
+    DB row) instead of the host's /api/tags, so the picker asks Ollama itself
+    when a URL is configured or the primary model is already an ollama/ id."""
+    url = (
+        os.environ.get("RETINUE_OLLAMA_URL", "").strip()
+        or os.environ.get("OLLAMA_API_BASE", "").strip()
+        or os.environ.get("OLLAMA_HOST", "").strip()
+    )
+    if url and "://" not in url:
+        url = "http://" + url
+    if not url:
+        primary = (
+            os.environ.get("LITELLM_PRIMARY_MODEL", "")
+            or os.environ.get("RETINUE_CLAUDE_MODEL", "")
+            or os.environ.get("ANTHROPIC_MODEL", "")
+        ).strip().lower()
+        if primary.startswith("ollama/"):
+            url = "http://host.docker.internal:11434"
+    return url.rstrip("/") if url else ""
+
+
+def _coerce_ollama_tags(parsed: object) -> list[dict]:
+    """Picker entries from an Ollama GET /api/tags body."""
+    if isinstance(parsed, dict):
+        items = parsed.get("models") or []
+    elif isinstance(parsed, list):
+        items = parsed
+    else:
+        return []
+    models, seen = [], set()
+    for item in items:
+        if isinstance(item, dict):
+            name = str(item.get("name") or item.get("model") or "").strip()
+        else:
+            name = str(item or "").strip()
+        if not name:
+            continue
+        mid = name if name.startswith("ollama/") else f"ollama/{name}"
+        if mid in seen:
+            continue
+        seen.add(mid)
+        models.append({"id": mid, "label": _pretty_model_label(mid)})
+    return models
+
+
+def _fetch_ollama_models() -> list[dict] | None:
+    url = _resolve_ollama_url()
+    if not url:
+        return None
+    req = urllib.request.Request(
+        url + "/api/tags", headers={"Accept": "application/json"}
+    )
+    # The retinue container routes outbound HTTP through egress-audit.
+    # A host-side Ollama (host.docker.internal / OLLAMA_API_BASE) is not an
+    # audited destination — ProxyHandler({}) skips HTTP_PROXY for this call.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=5) as resp:
+        return _coerce_ollama_tags(json.load(resp))
+
+
+def _merge_ollama_tags(models: list[dict], tags: list[dict] | None) -> list[dict]:
+    """Replace LiteLLM's ollama catalog with the host's live pulled tags."""
+    if not tags:
+        return models
+    others = [m for m in models if not str(m["id"]).startswith("ollama/")]
+    return others + tags
+
+
+def _fetch_litellm_models() -> list[dict]:
+    info = _fetch_litellm_json("/model/info")
+    listed = None
+    try:
+        listed = _listed_model_ids(_fetch_litellm_json("/v1/models"))
+    except (OSError, ValueError):
+        # /v1/models is enrichment; /model/info alone still yields a list.
+        listed = None
+    models = _coerce_litellm_models(info, listed)
+    try:
+        tags = _fetch_ollama_models()
+    except (OSError, ValueError):
+        tags = None
+    return _merge_ollama_tags(models, tags)
 
 
 _litellm_models_lock = threading.Lock()
@@ -352,12 +554,13 @@ _litellm_models_cache: dict = {"fetched": None, "models": None, "failed": False}
 
 
 def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
-    """LiteLLM's flagged models, cached; None when there is nothing usable.
+    """LiteLLM's advertised models, cached; None when LiteLLM is not the source.
 
-    None covers "not configured", "unreachable with no last-good list" and
-    "reachable but zero flagged routes" alike — in each case the caller falls
-    back to the static list. A refresh failure keeps serving the last good
-    list, so a LiteLLM restart doesn't collapse threads to the default model.
+    None covers "not configured" and "unreachable with no last-good list".
+    An empty list means the proxy answered and offered nothing pickable —
+    the caller must not fall back to the static Claude aliases in that case.
+    A refresh failure keeps serving the last good list, so a LiteLLM restart
+    doesn't collapse threads to the default model.
 
     The lock guards only the cache dict, never the HTTP fetch — a slow
     upstream must not stall cache-hit readers behind it. Two threads may
@@ -372,7 +575,8 @@ def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
             return _litellm_models_cache["models"]
     models = error = None
     try:
-        models = _fetch_litellm_models() or None
+        # Keep [] (reachable, nothing pickable) distinct from None (failure).
+        models = _fetch_litellm_models()
     except (OSError, ValueError) as exc:
         # URLError/HTTPError are OSErrors; JSONDecodeError is a ValueError.
         error = exc
@@ -392,12 +596,17 @@ def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
 
 def _conversation_models(force: bool = False) -> list[dict]:
     """The list the picker offers right now, in precedence order:
-    env override > LiteLLM-advertised > file > built-in default."""
+    env override > LiteLLM-advertised > file > built-in default.
+
+    When LiteLLM is configured, a reachable empty list or a failed fetch with
+    no last-good cache offers only the synthetic Default entry — never the
+    static Claude aliases, which would not be served."""
     if _ENV_CONVERSATION_MODELS:
         return _ENV_CONVERSATION_MODELS
-    dynamic = _litellm_conversation_models(force=force)
-    if dynamic:
-        # LiteLLM knows nothing of "use the gateway default" — synthesize it.
+    if _LITELLM_URL:
+        dynamic = _litellm_conversation_models(force=force)
+        if dynamic is None:
+            return [dict(_DEFAULT_MODEL_ENTRY)]
         return [dict(_DEFAULT_MODEL_ENTRY), *dynamic]
     return _STATIC_CONVERSATION_MODELS
 

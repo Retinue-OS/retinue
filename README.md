@@ -134,11 +134,12 @@ OpenRouter failover. It forwards Claude Code's OAuth token only to Anthropic;
 LiteLLM retains the OpenRouter key and retries there when the subscription
 request fails (for example, due to a burst-rate limit or upstream error).
 
-LiteLLM also feeds the dashboard's conversation-model picker: any route whose
-`model_info` sets `retinue_picker: true` (with a `retinue_label`) is offered in
-the picker — whether declared in `litellm/config.yaml` (which seeds the Claude
-defaults) or added at runtime through the LiteLLM admin UI. No separate model
-list needs configuring.
+LiteLLM also feeds the dashboard's conversation-model picker from the models
+it currently advertises (`GET /model/info` and `GET /v1/models`), including
+Ollama tags reached through an `ollama/*` wildcard. `retinue_picker` /
+`retinue_label` can still name or hide a route; they are not required.
+When the primary model is Ollama, leftover Claude catalog seeds are omitted
+so the picker only offers models the backend can serve.
 
 ```dotenv
 ANTHROPIC_AUTH_TOKEN=
