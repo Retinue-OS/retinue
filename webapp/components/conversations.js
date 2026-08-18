@@ -1016,6 +1016,9 @@ class RetinueConversations extends HTMLElement {
   // rather than raw Whisper output.
   async _startRecording() {
     if (this._recState !== 'idle') return;
+    // Tapping the mic silences any ongoing read-aloud: you are about to speak to
+    // Ara, so a previous reply still talking over you is the wrong behaviour.
+    this._stopSpeaking();
     const viewKey = this._viewKey();
     // The status row hides the mic while this view's own job runs, but guard
     // anyway: one dictation job per conversation at a time.
@@ -1326,13 +1329,16 @@ class RetinueConversations extends HTMLElement {
   }
 
   // ── Voice output: speak Ara's replies via the browser's speech synth ───────
+  // Stop any read-aloud in progress and forget what was being spoken.
+  _stopSpeaking() {
+    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
+    this._speakingTs = null;
+  }
+
   _toggleAutoplay() {
     this._autoplay = !this._autoplay;
     try { localStorage.setItem('retinue-voice-autoplay', this._autoplay ? '1' : '0'); } catch (_e) { /* ignore */ }
-    if (!this._autoplay) {
-      try { window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
-      this._speakingTs = null;
-    }
+    if (!this._autoplay) this._stopSpeaking();
     this.render();
   }
 
@@ -1343,8 +1349,7 @@ class RetinueConversations extends HTMLElement {
     if (!m) return;
     // Second tap on the message being spoken stops it.
     if (this._speakingTs === m.ts && window.speechSynthesis && window.speechSynthesis.speaking) {
-      try { window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
-      this._speakingTs = null;
+      this._stopSpeaking();
       return;
     }
     this._speak(m.text, m.lang, m.ts);
