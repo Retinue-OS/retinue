@@ -30,6 +30,14 @@
       "interval_seconds": 3600,
       "enabled": true,
       "run_at_start": false
+    },
+    {
+      "_comment": "Scan every chamber's declared inboxes (.inbox.json) for waiting files. Filesystem gate, no Claude session; dispatches the Archivist only when something is pending, so empty inboxes cost nothing.",
+      "id": "inbox-scan",
+      "command": "python3 /workspace/scripts/inbox-scan.py",
+      "interval_seconds": 1800,
+      "enabled": true,
+      "run_at_start": false
     }
   ]
 }

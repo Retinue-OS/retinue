@@ -236,6 +236,50 @@ Per-source state (last successful run) is stored in
 all stale sources in the background; its log is appended to
 `chambers/<chamber>/.refresh/startup.log`.
 
+## Document ingestion (chamber inboxes)
+
+Incoming documents are filed by the **Archivist**, a generic ingestion subagent
+that carries **no domain knowledge of its own** (`/workspace/.claude/agents/archivist.md`).
+Which folders are inboxes, where each file moves, and how its facts are
+extracted all live in the **chamber**, declared in an **`.inbox.json`** at its
+root (same convention family as `.refresh.json` / `.schedule.json` /
+`.news.json`):
+
+```json
+{
+  "inboxes": [
+    {
+      "id": "observations",
+      "path": "observations/inbox",
+      "routing": [
+        { "match": "glucose_*.csv", "dest": "observations/clinical/sensors/cgm/",
+          "ingest": "python3 scripts/ingest-sensors.py" },
+        { "match": "*", "dest": null }
+      ],
+      "guide": ".retinue/archivist/extraction.md",
+      "branch_tier": 1
+    }
+  ]
+}
+```
+
+A chamber may declare **several inbox folders** — one entry per folder in
+`inboxes`. Only `path` (relative to the chamber) is required. `routing` gives
+deterministic pattern→destination moves (with an optional per-rule `ingest`
+command); `guide` points at a chamber-local Markdown file holding that chamber's
+ontologies, URI schemes and extraction rules, which the Archivist reads at run
+time; `branch_tier` says which branch-policy tier the outputs commit under. The
+framework carries no chamber-specific inbox knowledge — a deployment with no
+`.inbox.json` anywhere has nothing to ingest.
+
+The **`inbox-scan`** base job (`scripts/inbox-scan.py`, a scheduler `command`
+job — so **no Claude credits**) is the gate: it walks `chambers/*/.inbox.json`,
+counts the files actually waiting in each declared inbox, and only when
+something is pending spawns one `claude -p` session that dispatches the
+Archivist. Empty inboxes cost nothing — the same free-gate shape as
+`news-curate` and `recurring-projects`. You can also dispatch the Archivist
+directly (via the Agent tool) whenever files land in an inbox.
+
 ## Scheduled tasks
 
 Recurring **agent** tasks (as opposed to data freshness) are driven by
