@@ -113,6 +113,13 @@ DEFAULT_LANGUAGE = SUPPORTED_LANGUAGES[0] if SUPPORTED_LANGUAGES else "en"
 HTTP_PORT = int(os.environ.get("TELEGRAM_GATEWAY_HTTP_PORT", "8093"))
 DEFAULT_RECIPIENT = os.environ.get("TELEGRAM_DEFAULT_RECIPIENT", "").strip()
 GATEWAY_TOKEN = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
+# The base URL other services (the life-store emitter, the dashboard) resolve a
+# durable inbound-media reference against — i.e. where this gateway serves its own
+# token-gated GET /media/<id>. Defaults to the in-cluster service name; a
+# deployment overrides it when the gateway is reachable at a different host.
+GATEWAY_SELF_URL = os.environ.get(
+    "TELEGRAM_GATEWAY_SELF_URL", f"http://telegram-gateway:{HTTP_PORT}"
+).rstrip("/")
 MAX_PUSH_BODY_BYTES = int(os.environ.get("TELEGRAM_GATEWAY_MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 # Cap the decoded size of an inbound image forwarded to the agent (it travels
 # base64-encoded inside the POST /message JSON). Matches the retinue gateway's
@@ -206,12 +213,13 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool) -> None:
+                     delivered: bool, attachment_urls: list[str] | None = None) -> None:
     """Best-effort persist of one inbound message to the store; never raises."""
     try:
         _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered,
+            attachment_urls=attachment_urls,
         )
     except Exception as exc:
         print(f"[telegram-gateway] could not persist inbound message: {exc}", flush=True)
@@ -225,6 +233,24 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
     )
     if ok:
         print(f"[telegram-gateway] forwarded news-flagged message from {source}", flush=True)
+
+
+def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+    """Persist one inbound media blob durably and return its HTTP-resolvable URL.
+
+    Best-effort: the durable reference is what keeps the original audio/image out
+    of the graph while still recoverable, so a failure here must never cost the
+    message — it just means this attachment has no reference. The bytes are stored
+    under the gateway's media dir (never inline in RDF) and served back by the
+    token-gated GET /media/<id>."""
+    if not data:
+        return None
+    try:
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+        return f"{GATEWAY_SELF_URL}/media/{media_id}"
+    except Exception as exc:
+        print(f"[telegram-gateway] could not store inbound media: {exc}", flush=True)
+        return None
 
 
 SEND_APPROVAL_BASE_URL = os.environ.get("SEND_APPROVAL_BASE_URL", "").rstrip("/")
@@ -547,40 +573,49 @@ def _list_contacts() -> list:
     return fut.result(timeout=30)
 
 
-def _inbound_image_files(image_path, image_mime: str | None) -> list[dict]:
-    """Read a downloaded inbound image as forward-ready file payloads.
+def _inbound_image_files(image_path, image_mime: str | None) -> tuple[list[dict], list[str]]:
+    """Read a downloaded inbound image as forward-ready files + a durable ref.
 
-    Returns ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape
-    the retinue gateway's POST /message accepts as ``files``. Best-effort: any
-    failure (or an oversized image) forwards the message without its image
-    rather than dropping it. The temp file is always removed."""
+    Returns ``(files, attachment_urls)`` where ``files`` is
+    ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape the
+    retinue gateway's POST /message accepts — and ``attachment_urls`` are
+    HTTP-resolvable references stored on this gateway's volume (never inlined in
+    RDF). Best-effort: any failure forwards the message without its image rather
+    than dropping it. The durable reference is stored regardless of size (it is a
+    plain on-disk blob); only the forwarded ``files`` payload honours the size
+    cap, since that one travels base64-encoded through the triage POST. The temp
+    file is always removed."""
     if not image_path:
-        return []
+        return [], []
     path = Path(image_path)
     try:
         data = path.read_bytes()
     except OSError as exc:
         print(f"[telegram-gateway] could not read inbound image {path}: {exc}", flush=True)
-        return []
+        return [], []
     finally:
         path.unlink(missing_ok=True)
     if not data:
-        return []
+        return [], []
+    mime = image_mime or "image/jpeg"
+    ref = _store_media_ref(data, mime)
+    attachment_urls = [ref] if ref else []
     if len(data) > MAX_INBOUND_FILE_BYTES:
         print(f"[telegram-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
-        return []
-    mime = image_mime or "image/jpeg"
+        return [], attachment_urls
     suffix = path.suffix or mimetypes.guess_extension(mime) or ".jpg"
-    return [{
+    files = [{
         "filename": f"telegram-image{suffix}",
         "content_type": mime,
         "data": base64.b64encode(data).decode("ascii"),
     }]
+    return files, attachment_urls
 
 
 def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
                     is_group: bool, sender_name: str | None,
-                    files: list[dict] | None = None) -> None:
+                    files: list[dict] | None = None,
+                    attachment_urls: list[str] | None = None) -> None:
     """Blocking dispatch — runs in a worker thread, off the asyncio loop."""
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
     if not text and not files:
@@ -590,7 +625,8 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
         lang = _detect_text_language(text)
     if TELEGRAM_GATEWAY_MODE == "inbox":
         _forward_to_inbox(text, lang, str(chat_id), is_group=is_group,
-                          sender_name=sender_name, files=files)
+                          sender_name=sender_name, files=files,
+                          attachment_urls=attachment_urls)
     else:
         _handle_control_message(text, lang, str(chat_id), sender, files=files)
 
@@ -649,17 +685,42 @@ async def _on_new_message(event) -> None:
 
         def _work():
             nonlocal text, lang
+            attachment_urls: list[str] = []
+            voice_files: list[dict] = []
             if media_path:
+                vpath = Path(media_path)
+                # Read the audio once and persist a durable reference BEFORE
+                # transcribing: the recording is the source of truth, so a failed
+                # or garbled transcription must never cost it. The bytes go to an
+                # on-disk blob (any size) plus the forward-ready files payload
+                # (size-capped, since that one travels base64 through triage).
+                try:
+                    audio_bytes = vpath.read_bytes()
+                except OSError:
+                    audio_bytes = b""
+                vmime = mimetypes.guess_type(str(vpath))[0] or "audio/ogg"
+                ref = _store_media_ref(audio_bytes, vmime) if audio_bytes else None
+                if ref:
+                    attachment_urls.append(ref)
+                if audio_bytes and len(audio_bytes) <= MAX_INBOUND_FILE_BYTES:
+                    suffix = vpath.suffix or mimetypes.guess_extension(vmime) or ".ogg"
+                    voice_files.append({
+                        "filename": f"telegram-voice{suffix}",
+                        "content_type": vmime,
+                        "data": base64.b64encode(audio_bytes).decode("ascii"),
+                    })
                 try:
                     print(f"[telegram-gateway] transcribing voice note from {sender}", flush=True)
-                    text, lang = _transcribe(Path(media_path))
+                    text, lang = _transcribe(vpath)
                 except Exception as exc:  # noqa: BLE001 - degrade to placeholder
                     print(f"[telegram-gateway] transcription failed: {exc}", flush=True)
                 finally:
-                    Path(media_path).unlink(missing_ok=True)
-            files = _inbound_image_files(image_path, image_mime)
+                    vpath.unlink(missing_ok=True)
+            image_files, image_urls = _inbound_image_files(image_path, image_mime)
+            attachment_urls.extend(image_urls)
+            files = voice_files + image_files
             _handle_inbound(text, lang, str(chat_id), sender, is_group, sender_name,
-                            files=files)
+                            files=files, attachment_urls=attachment_urls)
 
         _LOOP.run_in_executor(None, _work)
     except Exception as exc:  # noqa: BLE001 - one bad message must not stall the loop
@@ -870,7 +931,8 @@ def _handle_control_message(question: str, lang: str, chat_id: str, sender: str,
 
 def _forward_to_inbox(question: str, lang: str, chat_id: str,
                       is_group: bool = False, sender_name: str | None = None,
-                      files: list[dict] | None = None) -> None:
+                      files: list[dict] | None = None,
+                      attachment_urls: list[str] | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user."""
     sender_label = sender_name or chat_id
     if sender_name:
@@ -891,7 +953,8 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     if gate.get("news"):
         _forward_news(question, sender_name or handle, group_id, lang)
     if not gate["forward"]:
-        _persist_inbound(question, handle, group_id, delivered=gate["delivered_if_held"])
+        _persist_inbound(question, handle, group_id, delivered=gate["delivered_if_held"],
+                         attachment_urls=attachment_urls)
         print(
             f"[telegram-gateway] gate held inbox message from {sender_label} "
             f"({gate['reason']}); no model turn",
@@ -928,8 +991,11 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         if gate["flagged_unknown"] else ""
     )
     attachment_line = (
-        (f"\nThe message includes {len(files)} attached image(s), forwarded "
-         f"with this prompt; their saved on-disk paths are listed at the end.\n")
+        (f"\nThe message includes {len(files)} attachment(s) — a voice note's "
+         f"audio and/or image(s) — forwarded with this prompt; their saved "
+         f"on-disk paths are listed at the end. When you raise the dashboard "
+         f"conversation, include the audio/media itself (not only its "
+         f"transcript), so the user can listen to or view the original.\n")
         if files else ""
     )
     prompt = (
@@ -966,7 +1032,8 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
 
     # Persist AFTER forwarding so the delivered flag reflects reality: a failed
     # forward stays undelivered and the daily drain retries it.
-    _persist_inbound(question, handle, group_id, delivered=forwarded)
+    _persist_inbound(question, handle, group_id, delivered=forwarded,
+                     attachment_urls=attachment_urls)
 
 
 # ── Recent-senders store ──────────────────────────────────────────────────────
@@ -1316,6 +1383,23 @@ class _PushHandler(BaseHTTPRequestHandler):
                 self._reply_raw(status, body, content_type)
             else:
                 self._reply(status, body)
+            return
+        media_match = re.match(r"^/media/([^/?]+)/?$", self.path.split("?", 1)[0])
+        if media_match:
+            # Resolve a durable inbound-media reference (kb:attachment). Token-gated
+            # like /qr — the blob is the user's own inbound audio/image, never
+            # inlined into the graph but served back here on demand. load_media
+            # validates the id (traversal-safe) and returns None for anything that
+            # is not a stored blob.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            got = _ibstore.load_media(INBOUND_STORE_DIR, media_match.group(1))
+            if got is None:
+                self._reply(404, {"error": "not found"})
+                return
+            data, content_type = got
+            self._reply_raw(200, data, content_type)
             return
         if self.path.rstrip("/") == "/pending-sends":
             if not self._authorized():

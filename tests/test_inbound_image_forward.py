@@ -182,20 +182,24 @@ def test_whatsapp_inbound_image_files():
         media = Path(tmp) / "downloaded"
         media.write_bytes(PNG_BYTES)
         wg._download_media = lambda m: media
-        files = wg._inbound_image_files(message)
+        files, urls = wg._inbound_image_files(message)
         assert len(files) == 1, files
         assert files[0]["content_type"] == "image/png"
         assert files[0]["filename"].endswith(".png")
         assert base64.b64decode(files[0]["data"]) == PNG_BYTES
         assert not media.exists()  # temp file cleaned up
+        # The durable HTTP reference is stored and points at GET /media/<id>.
+        assert len(urls) == 1 and "/media/" in urls[0], urls
 
-        # Oversized image → message forwarded without it.
+        # Oversized image → forwarded without the base64 payload, but the durable
+        # reference is stored regardless of size (consistency over data-in-graph).
         media.write_bytes(PNG_BYTES)
         wg.MAX_INBOUND_FILE_BYTES = 4
-        assert wg._inbound_image_files(message) == []
-        # No image in the message → no download attempted.
-        assert wg._inbound_image_files(types.SimpleNamespace()) == []
-    print("ok: whatsapp inbound image becomes a files payload")
+        files, urls = wg._inbound_image_files(message)
+        assert files == [] and len(urls) == 1 and "/media/" in urls[0], (files, urls)
+        # No image in the message → no download attempted, no ref stored.
+        assert wg._inbound_image_files(types.SimpleNamespace()) == ([], [])
+    print("ok: whatsapp inbound image becomes a files payload + durable ref")
 
 
 def test_whatsapp_forward_includes_files():
@@ -208,7 +212,7 @@ def test_whatsapp_forward_includes_files():
         assert len(calls) == 1, calls
         payload = calls[0]["json"]
         assert payload["files"] == files
-        assert "1 attached image(s)" in payload["message"]
+        assert "1 attached file(s)" in payload["message"]
         # A message without images must not carry the key at all.
         wg._forward_to_inbox("plain text", "en", "+15551234567")
         assert "files" not in calls[1]["json"]
@@ -241,30 +245,42 @@ def test_signal_split_attachments():
         voice_file = att_dir / "note.ogg"
         voice_file.write_bytes(b"fake-ogg")
 
-        voice, images = sg._split_attachments(_signal_event([
+        voice, files, urls = sg._split_attachments(_signal_event([
             {"contentType": "image/jpeg", "file": str(image_file)},
             {"contentType": "audio/ogg", "file": str(voice_file)},
             {"contentType": "image/png", "file": str(att_dir / "missing.png")},
         ]))
         assert voice == voice_file
+        images = [f for f in files if f["filename"].startswith("signal-image")]
         assert len(images) == 1, images
         assert images[0]["content_type"] == "image/jpeg"
         assert images[0]["filename"].endswith(".jpg")
         assert base64.b64decode(images[0]["data"]) == PNG_BYTES
+        # The voice note now also rides in `files` as its own audio payload, so
+        # the original recording reaches the conversation alongside its transcript.
+        audio = [f for f in files if f["filename"].startswith("signal-voice")]
+        assert len(audio) == 1 and base64.b64decode(audio[0]["data"]) == b"fake-ogg", audio
+        # Both attachments (image + voice) get a durable HTTP reference.
+        assert len(urls) == 2 and all("/media/" in u for u in urls), urls
 
-        # Legacy: an attachment with no contentType keeps the voice-note path.
-        voice, images = sg._split_attachments(_signal_event([
+        # Legacy: an attachment with no contentType keeps the voice-note path —
+        # still transcribed, still referenced, and now carried as audio too.
+        voice, files, urls = sg._split_attachments(_signal_event([
             {"file": str(voice_file)},
         ]))
-        assert voice == voice_file and images == []
+        assert voice == voice_file
+        assert [f for f in files if f["filename"].startswith("signal-image")] == []
+        assert len(urls) == 1 and "/media/" in urls[0], urls
 
-        # Oversized image → dropped from the payload.
+        # Oversized image → dropped from the forwarded payload, but its durable
+        # reference is stored regardless of size (consistency over data-in-graph).
         sg.MAX_INBOUND_FILE_BYTES = 4
-        voice, images = sg._split_attachments(_signal_event([
+        voice, files, urls = sg._split_attachments(_signal_event([
             {"contentType": "image/jpeg", "file": str(image_file)},
         ]))
-        assert voice is None and images == []
-    print("ok: signal attachments split into voice vs. image payloads")
+        assert voice is None and files == []
+        assert len(urls) == 1 and "/media/" in urls[0], urls
+    print("ok: signal attachments split into voice/image payloads + durable refs")
 
 
 def test_signal_forward_includes_files():
@@ -276,7 +292,7 @@ def test_signal_forward_includes_files():
         assert len(calls) == 1, calls
         payload = calls[0]["json"]
         assert payload["files"] == files
-        assert "1 attached image(s)" in payload["message"]
+        assert "1 attached file(s)" in payload["message"]
         sg._forward_to_inbox("plain", "en", "+15551234567")
         assert "files" not in calls[1]["json"]
     print("ok: signal forward carries files in the POST /message payload")
@@ -299,18 +315,21 @@ def test_telegram_inbound_image_files():
         tg = _load_telegram_gateway(Path(tmp))
         image = Path(tmp) / "tg-img"
         image.write_bytes(PNG_BYTES)
-        files = tg._inbound_image_files(str(image), "image/png")
+        files, urls = tg._inbound_image_files(str(image), "image/png")
         assert len(files) == 1, files
         assert files[0]["content_type"] == "image/png"
         assert files[0]["filename"].endswith(".png")
         assert base64.b64decode(files[0]["data"]) == PNG_BYTES
         assert not image.exists()  # temp file cleaned up
+        assert len(urls) == 1 and "/media/" in urls[0], urls
 
-        assert tg._inbound_image_files(None, None) == []
+        assert tg._inbound_image_files(None, None) == ([], [])
+        # Oversized → no forwarded payload, but the durable reference is kept.
         image.write_bytes(PNG_BYTES)
         tg.MAX_INBOUND_FILE_BYTES = 4
-        assert tg._inbound_image_files(str(image), "image/png") == []
-    print("ok: telegram inbound image becomes a files payload")
+        files, urls = tg._inbound_image_files(str(image), "image/png")
+        assert files == [] and len(urls) == 1 and "/media/" in urls[0], (files, urls)
+    print("ok: telegram inbound image becomes a files payload + durable ref")
 
 
 def test_telegram_forward_includes_files():
@@ -322,7 +341,7 @@ def test_telegram_forward_includes_files():
         assert len(calls) == 1, calls
         payload = calls[0]["json"]
         assert payload["files"] == files
-        assert "1 attached image(s)" in payload["message"]
+        assert "1 attachment(s)" in payload["message"]
         tg._forward_to_inbox("plain", "en", "12345")
         assert "files" not in calls[1]["json"]
     print("ok: telegram forward carries files in the POST /message payload")
