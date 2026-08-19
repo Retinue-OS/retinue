@@ -91,7 +91,7 @@ checkout's `git remote`) rather than emitting an unlinked label. The same rule
 extends to commits and other referenceable items: short label, full URL as the
 link target.
 
-## 4. Never show a URL as text — a relative one least of all
+## 4. Never show a URL as text
 
 A URL is a **link target, never display text**. The renderer auto-links bare
 URLs, but the full address then appears (and gets read aloud) as text — so
@@ -102,27 +102,11 @@ don't rely on that. Always write `[label](url)` with a short human label:
 - Applies everywhere the dashboard renders Markdown: conversation messages,
   pushed threads, project pages, news notes.
 
-A **root-relative URL** — `/gateways`, `/sends`, `/news.html` — is the worse
-case, not the milder one: it is still a URL, only missing its host, and the
-renderer does not auto-link it. So it arrives as inert text the user cannot
-tap and has to translate into a navigation step. Never name a dashboard page
-by its bare address; link it by name, resolving the host from the deployment's
-own setting (`CONVERSATION_BASE_URL`, or the `SEND_APPROVAL_BASE_URL` chain in
-scripts) rather than guessing it:
-
-- `Open [the gateways page](https://…/gateways)`, not `Open /gateways`
-- `approve it on [the sends page](https://…/sends)`, not `see /sends`
-
-This is about **URLs**, not about anything that starts with a slash. A
-filesystem path is not a URL and is not covered: when the user asks where a
-config file, script or chamber lives, `/workspace/scripts/gateway-monitor.py`
-is the answer, written as text (in backticks) — there is nothing to link it to.
-
-The rule binds **generated** text too. Anything a script posts into a
-conversation — `gateway-monitor.py`, `recurring-projects.py`, any
-`conversation-push.py` caller — is dashboard text under it, so a bare address
-leaking into such a notice is fixed in the script that composes it, not by
-hand afterwards.
+**Relative** URLs — `/gateways`, `/sends` — are covered too, and there it
+matters most: the renderer auto-links a bare absolute URL, but not a relative
+one, so it arrives as inert text the user cannot tap at all. Resolve the host
+(`CONVERSATION_BASE_URL`) and link it by name — `Open [the gateways page](…)`,
+not `Open /gateways`.
 
 ## Chip mechanics and limits
 
