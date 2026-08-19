@@ -32,6 +32,7 @@ const SHELL_ASSETS = [
   '/manifest.webmanifest',
   '/components/base.js',
   '/components/markdown.js',
+  '/components/voice.js',
   '/components/conversations.js',
   '/components/projects.js',
   '/components/project-page.js',
