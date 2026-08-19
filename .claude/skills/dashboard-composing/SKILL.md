@@ -98,7 +98,7 @@ URLs, but the full address then appears (and gets read aloud) as text — so
 don't rely on that. Always write `[label](url)` with a short human label:
 
 - `[the invoice PDF](https://…)`, not `https://gateway.example.com/conversations/42ec…/attachments/9f31…`
-- `[a race registration](https://…)`, not the portal's raw URL
+- `[Zimmerberg Trophy](https://…)`, not the registration portal's raw URL
 - Applies everywhere the dashboard renders Markdown: conversation messages,
   pushed threads, project pages, news notes.
 
