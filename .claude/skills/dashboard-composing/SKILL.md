@@ -7,8 +7,8 @@ description: >
   ALWAYS use before composing such text when it asks the user to choose between
   options (every option gets a click-to-fill chip), refers to an e-mail without
   showing it in full (add a details chip), mentions a GitHub pull request or issue
-  (the label itself links to it), or contains any URL (never shown bare — always
-  a labeled Markdown link).
+  (the label itself links to it), or contains any URL, absolute or relative
+  (never shown bare — always a labeled Markdown link).
 ---
 
 # Composing for the dashboard: links and reply chips
@@ -91,7 +91,7 @@ checkout's `git remote`) rather than emitting an unlinked label. The same rule
 extends to commits and other referenceable items: short label, full URL as the
 link target.
 
-## 4. Never show a full URL
+## 4. Never show a URL as text
 
 A URL is a **link target, never display text**. The renderer auto-links bare
 URLs, but the full address then appears (and gets read aloud) as text — so
@@ -101,6 +101,12 @@ don't rely on that. Always write `[label](url)` with a short human label:
 - `[Zimmerberg Trophy](https://…)`, not the registration portal's raw URL
 - Applies everywhere the dashboard renders Markdown: conversation messages,
   pushed threads, project pages, news notes.
+
+**Relative** URLs — `/gateways`, `/sends` — are covered too, and there it
+matters most: the renderer auto-links a bare absolute URL, but not a relative
+one, so it arrives as inert text the user cannot tap at all. Resolve the host
+(`CONVERSATION_BASE_URL`) and link it by name — `Open [the gateways page](…)`,
+not `Open /gateways`.
 
 ## Chip mechanics and limits
 
