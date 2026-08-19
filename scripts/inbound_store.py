@@ -14,10 +14,12 @@ out of that single act:
 
 2. **A delivery ledger.** Each message carries a ``kb:delivered`` flag. This is
    **not** "read" — it records only whether the message has yet been *handed to
-   triage*. The flag is owned solely by the gateway: it is flipped to ``true``
-   by exactly one operation, :func:`undelivered`, which returns the held
-   messages **and marks them delivered as a side effect**. Nothing else — no
-   SPARQL query, no ad-hoc read — ever touches it, so browsing history never
+   triage*. The flag is owned solely by the gateway and flipped ``false → true``
+   by exactly two operations, both here: :func:`undelivered`, which returns the
+   held messages **and marks them delivered as a side effect** (the daily drain),
+   and :func:`mark_delivered`, which flips one already-written message the gateway
+   persisted up front (the persist-before-forward path — see below). Nothing else
+   — no SPARQL query, no ad-hoc read — ever touches it, so browsing history never
    silently "consumes" a message. The daily triage skill drains the backlog by
    calling the gateway's ``/undelivered`` endpoint (which calls this), so a
    message that arrived while its sender was not yet whitelisted is caught the
@@ -25,11 +27,14 @@ out of that single act:
 
 The delivered flag lets a gateway persist a message it deliberately did **not**
 forward — a blacklisted or no-action-class sender is written straight to
-``delivered: true`` (already accounted for, never drained), while an unknown or
-whitelisted sender that *was* forwarded live is also written ``delivered: true``
-(triage already has it). Only a message that was persisted but **not** handed to
-triage — e.g. a gateway that stored first and then found the model unreachable —
-stays ``delivered: false`` and is picked up by the daily drain.
+``delivered: true`` (already accounted for, never drained). A message that *is*
+forwarded takes the never-drop path: the gateway writes it ``delivered: false``
+the instant it arrives (before the gate, before the forward — so a crash or a
+throwing forward cannot lose it), then calls :func:`mark_delivered` once triage
+actually has it. Any message that was persisted but **not** handed to triage —
+a failed forward, a gateway that died mid-dispatch — stays ``delivered: false``
+and is picked up by the daily drain (at-least-once: a rare duplicate surface
+beats a silent loss).
 
 Stdlib only (``hashlib``/``secrets``/``datetime``): this module is copied into
 each gateway image alongside ``triage_policy.py`` and ``reply_tokens.py``, and
@@ -57,10 +62,21 @@ P_RECEIVED_AT = KB + "receivedAt"
 P_TEXT = KB + "text"
 P_MESSAGE_ID = KB + "messageId"
 P_DELIVERED = KB + "delivered"
+# Optional reference to a retained raw-media file (e.g. a voice note's audio),
+# recorded when a message is persisted *before* transcription so a failed or
+# crashed STT run leaves a re-transcribable artifact instead of a silent drop.
+# Cleared once the message is accounted for (transcribed and forwarded).
+P_MEDIA = KB + "media"
 
 # Subdirectory (under the gateway's store dir) that holds the per-message files.
 # The gateway owns this folder read-write; the life store mounts it read-only.
 MESSAGES_SUBDIR = "messages"
+
+# Subdirectory holding raw media (voice-note audio) retained for a message that
+# was persisted before transcription. It lives beside the messages so it shares
+# the gateway's durable data volume; the reference is recorded via P_MEDIA and
+# the file is unlinked once the message is transcribed and accounted for.
+MEDIA_SUBDIR = "media"
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -72,6 +88,10 @@ def _slug(value: str) -> str:
 
 def messages_dir(store_dir: str | Path) -> Path:
     return Path(store_dir) / MESSAGES_SUBDIR
+
+
+def media_dir(store_dir: str | Path) -> Path:
+    return Path(store_dir) / MEDIA_SUBDIR
 
 
 # -- N-Triples serialization --------------------------------------------------
@@ -138,12 +158,15 @@ def _render(fields: dict) -> str:
         lines.append(_lit(subj, P_GROUP, fields["group"]))
     if fields.get("message_id"):
         lines.append(_lit(subj, P_MESSAGE_ID, fields["message_id"]))
+    if fields.get("media"):
+        lines.append(_lit(subj, P_MEDIA, fields["media"]))
     return "".join(l + "\n" for l in sorted(lines))
 
 
 def _parse(text: str) -> dict | None:
     """Read a message file back into a ``fields`` dict, or None if unparseable."""
-    fields: dict = {"delivered": False, "group": None, "message_id": None}
+    fields: dict = {"delivered": False, "group": None, "message_id": None,
+                    "media": None}
     subject = None
     for line in text.splitlines():
         line = line.strip()
@@ -169,6 +192,8 @@ def _parse(text: str) -> dict | None:
             fields["text"] = value
         elif pred == P_MESSAGE_ID:
             fields["message_id"] = value
+        elif pred == P_MEDIA:
+            fields["media"] = value
         elif pred == P_DELIVERED:
             fields["delivered"] = value.strip().lower() == "true"
     if subject is None or "channel" not in fields:
@@ -238,6 +263,7 @@ def write_message(
     message_id: str | None = None,
     timestamp: float | None = None,
     delivered: bool = False,
+    media: str | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
 
@@ -245,6 +271,10 @@ def write_message(
     message as still owed to triage; pass ``delivered=True`` for a message the
     gateway is deliberately *not* forwarding (blacklisted, group-blocked or
     no-action-class) so the daily drain never re-surfaces it.
+
+    ``media`` optionally records a reference (a durable file path) to raw media
+    retained alongside this message — used by the persist-before-transcribe path
+    so a voice note survives a failed or crashed STT run.
     """
     ts = time.time() if timestamp is None else float(timestamp)
     token = secrets.token_hex(8)
@@ -258,6 +288,7 @@ def write_message(
         "message_id": message_id or None,
         "received_at": _iso(ts),
         "delivered": bool(delivered),
+        "media": media or None,
     }
     # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
     fname = f"{int(ts * 1000):016d}-{token}.nt"
@@ -311,5 +342,75 @@ def undelivered(
             "message_id": fields.get("message_id"),
             "received_at": fields["received_at"],
             "text": fields["text"],
+            "media": fields.get("media"),
         })
     return out
+
+
+def mark_delivered(path: str | Path) -> bool:
+    """Flip one already-written message's ``delivered`` flag to ``true``.
+
+    This exists for the **persist-before-forward** path: a gateway writes an
+    inbound message ``delivered = false`` the instant it arrives — before the
+    gate, before the forward — so that a later failure (a throwing gate, a crash
+    mid-forward, a killed container) leaves the message on disk for the daily
+    drain instead of silently dropping it. Once triage actually has the message
+    (a live forward succeeded, or it was held in a fully-accounted class), the
+    gateway flips the flag here.
+
+    It performs the same single false→true rewrite as :func:`undelivered`, but
+    for one known file rather than a scan. Best-effort by design: it returns
+    ``True`` on success (or if the flag was already ``true``), ``False`` if the
+    file is missing/unreadable/unparseable, and **never raises** — a bookkeeping
+    failure must not break message handling. A message left ``false`` by a failed
+    flip is simply re-surfaced by the next drain (at-least-once), which is the
+    safe direction.
+    """
+    p = Path(path)
+    try:
+        fields = _parse(p.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    if not fields:
+        return False
+    if fields["delivered"]:
+        return True
+    fields["delivered"] = True
+    try:
+        _atomic_write(_render(fields), p)
+    except OSError:
+        return False
+    return True
+
+
+def update_message(path: str | Path, *, text: str | None = None,
+                   clear_media: bool = False) -> str | None:
+    """Rewrite a persisted message's mutable fields in place; never raises.
+
+    Used by the **persist-before-transcribe** path: a voice note is written up
+    front with empty text and a ``media`` reference to its retained audio, then
+    once STT succeeds this fills in the transcript (``text=…``) and drops the
+    now-superfluous audio reference (``clear_media=True``).
+
+    Returns the ``media`` value present *before* the call — so a caller clearing
+    it knows which file to unlink — or ``None`` if there was none or the rewrite
+    failed. Only the fields named are touched; ``delivered`` and everything else
+    are preserved.
+    """
+    p = Path(path)
+    try:
+        fields = _parse(p.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    if not fields:
+        return None
+    prev_media = fields.get("media")
+    if text is not None:
+        fields["text"] = text
+    if clear_media:
+        fields["media"] = None
+    try:
+        _atomic_write(_render(fields), p)
+    except OSError:
+        return None
+    return prev_media
