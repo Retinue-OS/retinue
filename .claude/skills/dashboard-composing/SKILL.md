@@ -7,8 +7,8 @@ description: >
   ALWAYS use before composing such text when it asks the user to choose between
   options (every option gets a click-to-fill chip), refers to an e-mail without
   showing it in full (add a details chip), mentions a GitHub pull request or issue
-  (the label itself links to it), or contains any URL or dashboard path (never
-  shown bare — always a labeled Markdown link).
+  (the label itself links to it), or contains any URL, absolute or relative
+  (never shown bare — always a labeled Markdown link).
 ---
 
 # Composing for the dashboard: links and reply chips
@@ -91,7 +91,7 @@ checkout's `git remote`) rather than emitting an unlinked label. The same rule
 extends to commits and other referenceable items: short label, full URL as the
 link target.
 
-## 4. Never show a URL or a path as text
+## 4. Never show a URL as text — a relative one least of all
 
 A URL is a **link target, never display text**. The renderer auto-links bare
 URLs, but the full address then appears (and gets read aloud) as text — so
@@ -102,20 +102,27 @@ don't rely on that. Always write `[label](url)` with a short human label:
 - Applies everywhere the dashboard renders Markdown: conversation messages,
   pushed threads, project pages, news notes.
 
-A **site-root path** — `/gateways`, `/sends`, `/news.html` — is worse than a
-bare URL, not better: the renderer does not auto-link it, so it arrives as
-inert text the user cannot tap and has to translate into a navigation step.
-Never name a dashboard page by its path; link it by name, resolving the host
-from the deployment's own setting (`CONVERSATION_BASE_URL`, or the
-`SEND_APPROVAL_BASE_URL` chain in scripts) rather than guessing it:
+A **root-relative URL** — `/gateways`, `/sends`, `/news.html` — is the worse
+case, not the milder one: it is still a URL, only missing its host, and the
+renderer does not auto-link it. So it arrives as inert text the user cannot
+tap and has to translate into a navigation step. Never name a dashboard page
+by its bare address; link it by name, resolving the host from the deployment's
+own setting (`CONVERSATION_BASE_URL`, or the `SEND_APPROVAL_BASE_URL` chain in
+scripts) rather than guessing it:
 
 - `Open [the gateways page](https://…/gateways)`, not `Open /gateways`
 - `approve it on [the sends page](https://…/sends)`, not `see /sends`
 
-This binds **generated** text too. Anything a script posts into a conversation
-— `gateway-monitor.py`, `recurring-projects.py`, any `conversation-push.py`
-caller — is dashboard text under this rule, so a path leaking into such a
-notice is fixed in the script that composes it, not by hand afterwards.
+This is about **URLs**, not about anything that starts with a slash. A
+filesystem path is not a URL and is not covered: when the user asks where a
+config file, script or chamber lives, `/workspace/scripts/gateway-monitor.py`
+is the answer, written as text (in backticks) — there is nothing to link it to.
+
+The rule binds **generated** text too. Anything a script posts into a
+conversation — `gateway-monitor.py`, `recurring-projects.py`, any
+`conversation-push.py` caller — is dashboard text under it, so a bare address
+leaking into such a notice is fixed in the script that composes it, not by
+hand afterwards.
 
 ## Chip mechanics and limits
 
