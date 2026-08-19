@@ -27,6 +27,7 @@
 
 import { esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
+import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 
 const LIST_URL = '/conversations';
 // Views are addressable by location hash, so opening a thread or the composer
@@ -94,7 +95,6 @@ class RetinueConversations extends HTMLElement {
     this._recTarget = null;  // thread pinned at record-start (dictation target)
     this._recIntent = null;  // what to do with the transcript: 'review' | 'send'
     this._recAborted = false; // recording was discarded via the abort button
-    this._recStartMs = 0;    // recording start, for the elapsed-time display
     // In-flight dictation jobs, keyed like _drafts (a thread id, or 'composer'
     // for the new-thread composer). Each value is {sending, phase} and owns
     // that one view's input row until the job completes — every other
@@ -104,11 +104,8 @@ class RetinueConversations extends HTMLElement {
     // Transcription errors per target view, surfaced by that view's composer —
     // a background job's failure must not pop up in whatever view is open.
     this._voiceErrors = {};
-    // Waveform: analyser over the live mic stream, drawn on a canvas each frame.
-    this._audioCtx = null;
-    this._analyser = null;
-    this._waveRaf = null;
-    this._wavePhase = 0;
+    // Live waveform on the recording row's canvas (shared renderer, voice.js).
+    this._wave = new Waveform(this);
     this._autoplay = false;  // speak Ara's replies as they arrive
     try { this._autoplay = localStorage.getItem('retinue-voice-autoplay') === '1'; } catch (_e) { /* ignore */ }
     this._spoken = {};       // per-thread set of message ts already voiced/seen
@@ -180,7 +177,7 @@ class RetinueConversations extends HTMLElement {
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
     this._stopRecording();
-    this._stopWave();
+    this._wave.stop();
     this._stopStream();
     try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
   }
@@ -531,7 +528,7 @@ class RetinueConversations extends HTMLElement {
       ? `<header><h2>${esc(this.heading)}</h2>` +
         `${this._unreadCount() ? `<span class="badge">${this._unreadCount()}</span>` : ''}</header>`
       : '';
-    this.shadowRoot.innerHTML = `<style>${CSS}${MD_CSS}</style>` +
+    this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>` +
       `<section class="card">${header}<div class="content">${body}</div></section>`;
     this._lastMode = mode;
     this._listSig = this._lastMode === 'list' ? this._listSignature() : '';
@@ -924,7 +921,6 @@ class RetinueConversations extends HTMLElement {
     const errText = this._attachError || voiceErr;
     const errRow = errText ? `<div class="attach-err">${esc(errText)}</div>` : '';
     const currentDraft = draftKey ? (this._drafts[draftKey] || '') : '';
-    const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
     // The voice flow owns this one view's input row: a live waveform with its
     // own controls while recording, then a status line while this view's
     // dictation job is transcribed (and, on the send path, sent). The textarea
@@ -932,22 +928,20 @@ class RetinueConversations extends HTMLElement {
     // pops up mid-dictation. Other views are untouched — their rows render
     // normally below, and they can dictate concurrently.
     if (this._recState === 'recording' && this._recTarget === draftKey) {
-      return `<div class="composer">` + chipRow + errRow + this._recordingRowHtml() + `</div>`;
+      return `<div class="composer">` + chipRow + errRow + recordingRowHtml() + `</div>`;
     }
     const job = draftKey ? this._voiceJobs[draftKey] : null;
     if (job) {
       const label = job.phase === 'sending' ? 'Sending …'
         : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
-      return `<div class="composer">` + chipRow + errRow +
-        `<div class="row rec-row"><div class="wave-wrap rec-status" role="status">` +
-        `<span>${label}</span></div></div></div>`;
+      return `<div class="composer">` + chipRow + errRow + statusRowHtml(label) + `</div>`;
     }
     // Only one live recording at a time — but a mere background transcription
     // does not lock the mic here.
     const micLabel = '\u{1F3A4}';
     const micTitle = 'Record a voice message';
     const micDisabled = (this._busy || this._recState !== 'idle') ? 'disabled' : '';
-    const micBtn = canRecord
+    const micBtn = canRecord()
       ? `<button type="button" class="mic" ` +
         `data-mic title="${micTitle}" aria-label="${micTitle}" ${micDisabled}>${micLabel}</button>`
       : '';
@@ -1020,7 +1014,7 @@ class RetinueConversations extends HTMLElement {
     // The status row hides the mic while this view's own job runs, but guard
     // anyway: one dictation job per conversation at a time.
     if (viewKey && this._voiceJobs[viewKey]) return;
-    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder)) {
+    if (!canRecord()) {
       this._attachError = 'Voice recording is not supported on this device.';
       this.render();
       return;
@@ -1047,10 +1041,9 @@ class RetinueConversations extends HTMLElement {
       mr.addEventListener('stop', () => this._onRecordingStopped());
       mr.start();
       this._recState = 'recording';
-      this._recStartMs = Date.now();
       this._attachError = '';
       this.render();
-      this._startWave(stream);
+      this._wave.start(stream);
     } catch (_err) {
       this._recState = 'idle';
       this._recTarget = null;
@@ -1058,22 +1051,6 @@ class RetinueConversations extends HTMLElement {
       this._stopStream();
       this.render();
     }
-  }
-
-  // The recording row that replaces the textarea while the mic is live:
-  // abort ✕ | red dot + waveform + elapsed time | review ✓ | send ➤.
-  _recordingRowHtml() {
-    return `<div class="row rec-row">` +
-      `<button type="button" class="rec-btn rec-abort" data-rec-abort ` +
-      `title="Discard recording" aria-label="Discard recording">\u2715</button>` +
-      `<div class="wave-wrap"><span class="rec-dot" aria-hidden="true"></span>` +
-      `<canvas class="wave" data-wave aria-hidden="true"></canvas>` +
-      `<span class="rec-time" data-rectime>0:00</span></div>` +
-      `<button type="button" class="rec-btn rec-ok" data-rec-check ` +
-      `title="Stop and transcribe for review" aria-label="Stop and transcribe for review">\u2713</button>` +
-      `<button type="button" class="rec-btn rec-send" data-rec-send ` +
-      `title="Stop, transcribe and send" aria-label="Stop, transcribe and send">\u27A4</button>` +
-      `</div>`;
   }
 
   // The view key drafts/jobs are filed under: the open thread id, or
@@ -1122,106 +1099,8 @@ class RetinueConversations extends HTMLElement {
     }
   }
 
-  // ── Waveform: analyser-driven bars on the recording row's canvas ───────────
-  // The canvas is re-created by every full render, so each frame looks it up
-  // fresh rather than holding a reference. Where the Web Audio API is missing
-  // (or fails), a simulated wave keeps the "recording is live" signal.
-  _startWave(stream) {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    this._analyser = null;
-    if (AC) {
-      try {
-        this._audioCtx = new AC();
-        const srcNode = this._audioCtx.createMediaStreamSource(stream);
-        const an = this._audioCtx.createAnalyser();
-        an.fftSize = 128;
-        an.smoothingTimeConstant = 0.7;
-        srcNode.connect(an);
-        this._analyser = an;
-      } catch (_e) { this._analyser = null; }
-    }
-    this._wavePhase = 0;
-    const tick = () => {
-      if (this._recState !== 'recording') { this._waveRaf = null; return; }
-      this._drawWave();
-      this._waveRaf = requestAnimationFrame(tick);
-    };
-    tick();
-  }
-
-  _stopWave() {
-    if (this._waveRaf) cancelAnimationFrame(this._waveRaf);
-    this._waveRaf = null;
-    this._analyser = null;
-    if (this._audioCtx) {
-      try { this._audioCtx.close(); } catch (_e) { /* ignore */ }
-      this._audioCtx = null;
-    }
-  }
-
-  _drawWave() {
-    const root = this.shadowRoot;
-    if (!root) return;
-    const timeEl = root.querySelector('[data-rectime]');
-    if (timeEl) {
-      const s = Math.max(0, Math.floor((Date.now() - this._recStartMs) / 1000));
-      const txt = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-      if (timeEl.textContent !== txt) timeEl.textContent = txt;
-    }
-    const canvas = root.querySelector('[data-wave]');
-    if (!canvas) return;
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth, h = canvas.clientHeight;
-    if (!w || !h) return;
-    if (canvas.width !== Math.round(w * dpr)) canvas.width = Math.round(w * dpr);
-    if (canvas.height !== Math.round(h * dpr)) canvas.height = Math.round(h * dpr);
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    let accent = '#6ea8fe';
-    try {
-      const v = getComputedStyle(this).getPropertyValue('--accent').trim();
-      if (v) accent = v;
-    } catch (_e) { /* keep default */ }
-    ctx.fillStyle = accent;
-    const bars = Math.max(12, Math.min(48, Math.floor(w / 7)));
-    this._wavePhase += 0.22;
-    let levels;
-    if (this._analyser) {
-      const data = new Uint8Array(this._analyser.frequencyBinCount);
-      this._analyser.getByteFrequencyData(data);
-      // Speech lives in the lower bins — spread those across the bars.
-      const usable = Math.max(1, Math.floor(data.length * 0.75));
-      levels = Array.from({ length: bars }, (_, i) =>
-        data[Math.floor((i / bars) * usable)] / 255);
-    } else {
-      // No analyser: a plausible-looking simulated wave.
-      levels = Array.from({ length: bars }, (_, i) => 0.35 +
-        0.25 * Math.sin(i * 0.7 + this._wavePhase) +
-        0.18 * Math.sin(i * 1.3 - this._wavePhase * 1.6) +
-        0.08 * Math.random());
-    }
-    const bw = canvas.width / bars;
-    const mid = canvas.height / 2;
-    for (let i = 0; i < bars; i += 1) {
-      const level = Math.min(1, Math.max(0.06, levels[i]));
-      const bh = Math.max(2 * dpr, level * canvas.height);
-      const x = i * bw + bw * 0.2;
-      const bwid = bw * 0.6;
-      const r = Math.min(bwid / 2, 2 * dpr);
-      const y = mid - bh / 2;
-      if (typeof ctx.roundRect === 'function') {
-        ctx.beginPath();
-        ctx.roundRect(x, y, bwid, bh, r);
-        ctx.fill();
-      } else {
-        ctx.fillRect(x, y, bwid, bh);
-      }
-    }
-  }
-
   async _onRecordingStopped() {
-    this._stopWave();
+    this._wave.stop();
     this._stopStream();
     const chunks = this._recChunks || [];
     this._recChunks = [];
@@ -1728,32 +1607,8 @@ const CSS = `
           background: transparent; color: var(--muted, #8b93a3); cursor: pointer;
           font-size: 1rem; user-select: none; -webkit-tap-highlight-color: transparent; }
   .clip:hover { background: rgba(110, 168, 254, .2); }
-  .mic { display: inline-flex; align-items: center; justify-content: center; height: 40px; width: 40px;
-         flex: none; border-radius: 50%; background: var(--card-2, #1c2230); border: 0; cursor: pointer;
-         color: var(--fg, #e7ebf2); font-size: 1.05rem; user-select: none;
-         -webkit-tap-highlight-color: transparent; }
-  .mic:hover { background: rgba(110, 168, 254, .2); }
-  .mic[disabled] { opacity: .6; cursor: default; }
-  @keyframes mic-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
-  /* ── Recording row: replaces the textarea while the mic is live ─────────── */
-  .rec-row { align-items: center; }
-  .wave-wrap { flex: 1; min-width: 0; height: 40px; display: flex; align-items: center;
-               gap: 8px; background: var(--card-2, #1c2230); border-radius: 20px; padding: 0 12px; }
-  .wave-wrap canvas.wave { flex: 1; min-width: 0; height: 26px; display: block; }
-  .rec-dot { flex: none; width: 8px; height: 8px; border-radius: 50%;
-             background: var(--high, #ff6b6b); animation: mic-pulse 1.2s ease-in-out infinite; }
-  .rec-time { flex: none; color: var(--muted, #8b93a3); font-size: .78rem;
-              font-variant-numeric: tabular-nums; }
-  .rec-btn { flex: none; display: inline-flex; align-items: center; justify-content: center;
-             width: 40px; height: 40px; border-radius: 50%; border: 0; cursor: pointer;
-             font-size: 1.05rem; padding: 0; -webkit-tap-highlight-color: transparent; }
-  .rec-btn:active { filter: brightness(1.12); }
-  .rec-abort { background: var(--card-2, #1c2230); color: var(--high, #ff6b6b); }
-  .rec-abort:hover { background: rgba(255, 107, 107, .18); }
-  .rec-ok { background: var(--ok, #57c785); color: #0b0d12; }
-  .rec-send { background: var(--accent, #6ea8fe); color: #0b0d12; padding-left: 2px; }
-  .rec-status { justify-content: center; color: var(--muted, #8b93a3);
-                font-size: .85rem; font-style: italic; }
+  /* Mic button, recording row and status row styles come from the shared
+     VOICE_CSS (voice.js), appended to this sheet in render(). */
   .msg-head { display: flex; align-items: center; gap: 6px; }
   .msg.me .msg-head { flex-direction: row-reverse; }
   .speak { background: transparent; border: 0; cursor: pointer; padding: 0 2px; font-size: .8rem;
