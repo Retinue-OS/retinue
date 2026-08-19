@@ -70,6 +70,27 @@ def test_undelivered_drains_once():
     print("PASS test_undelivered_drains_once")
 
 
+def test_mark_delivered_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        # Persist-before-forward: two messages land delivered=false.
+        _, path_a = ist.write_message(tmp, channel="signal", sender="a",
+                                      text="accounted", timestamp=10.0)
+        ist.write_message(tmp, channel="signal", sender="b",
+                          text="failed-forward", timestamp=20.0)
+        # "a" was actually accounted for (forward succeeded) → flip it.
+        assert ist.mark_delivered(path_a) is True
+        # Idempotent: a second flip on an already-true message still reports True
+        # and does not re-write it into the drain.
+        assert ist.mark_delivered(path_a) is True
+        # The drain now surfaces only "b" — "a" is no longer owed, while "b",
+        # left delivered=false (its forward failed), is still surfaced.
+        got = ist.undelivered(tmp)
+        assert [m["text"] for m in got] == ["failed-forward"]
+        # Safe on a missing file: returns False, never raises.
+        assert ist.mark_delivered(ist.messages_dir(tmp) / "nope.nt") is False
+    print("PASS test_mark_delivered_roundtrip")
+
+
 def test_since_filter():
     with tempfile.TemporaryDirectory() as tmp:
         ist.write_message(tmp, channel="wa", sender="a", text="old", timestamp=100.0)
@@ -186,6 +207,7 @@ def test_since_epoch_and_iso_equivalent():
 if __name__ == "__main__":
     test_write_and_roundtrip()
     test_undelivered_drains_once()
+    test_mark_delivered_roundtrip()
     test_since_filter()
     test_persist_but_not_forward()
     test_group_and_optional_fields()
