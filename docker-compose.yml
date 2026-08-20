@@ -270,6 +270,13 @@ services:
       - SIGNAL_GATEWAY_MODE
       - RETINUE_GATEWAY_URL=http://retinue:8080/message
       - RETINUE_GATEWAY_TIMEOUT=600
+      # Broadcast messages from a group flagged `news` in the triage policy are
+      # filed straight into the news feed by the web-gateway — deterministic and
+      # credit-free, no model turn. In-network address like RETINUE_GATEWAY_URL
+      # above, so no deployment configuration is needed; empty it to disable the
+      # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
+      - NEWS_INGEST_URL=http://retinue:8080/internal/news
+      - NEWS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -341,6 +348,13 @@ services:
       - WHATSAPP_GATEWAY_MODE
       - RETINUE_GATEWAY_URL=http://retinue:8080/message
       - RETINUE_GATEWAY_TIMEOUT=600
+      # Broadcast messages from a group flagged `news` in the triage policy are
+      # filed straight into the news feed by the web-gateway — deterministic and
+      # credit-free, no model turn. In-network address like RETINUE_GATEWAY_URL
+      # above, so no deployment configuration is needed; empty it to disable the
+      # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
+      - NEWS_INGEST_URL=http://retinue:8080/internal/news
+      - NEWS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -414,6 +428,13 @@ services:
       - TELEGRAM_GATEWAY_MODE
       - RETINUE_GATEWAY_URL=http://retinue:8080/message
       - RETINUE_GATEWAY_TIMEOUT=600
+      # Broadcast messages from a group flagged `news` in the triage policy are
+      # filed straight into the news feed by the web-gateway — deterministic and
+      # credit-free, no model turn. In-network address like RETINUE_GATEWAY_URL
+      # above, so no deployment configuration is needed; empty it to disable the
+      # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
+      - NEWS_INGEST_URL=http://retinue:8080/internal/news
+      - NEWS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service.
       - STT_SERVICE_URL=http://stt:8100/transcribe
       - STT_TOKEN

@@ -461,6 +461,11 @@ MESSAGE_FILES_DIR = Path(os.environ.get("MESSAGE_FILES_DIR", "/tmp/web-gateway/m
 # store, so no timer thread is needed for what is best-effort hygiene anyway.
 MESSAGE_FILES_TTL_SECONDS = float(os.environ.get("MESSAGE_FILES_TTL_SECONDS", str(7 * 86400)))
 CONVERSATION_BACKEND_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "")
+# The news rail (POST /internal/news) has its own optional token, deliberately
+# NOT the auto-generated CONVERSATION_BACKEND_TOKEN above: unset means "open",
+# and a variable the entrypoint generates when missing can never be unset. See
+# _news_ingest_authorized() for why this one endpoint is open by default.
+NEWS_INGEST_TOKEN = os.environ.get("NEWS_INGEST_TOKEN", "").strip()
 # Voice input: the dashboard uploads recorded audio here and we proxy it to the
 # shared STT service (scripts/stt-service.py), which owns the Whisper model — so
 # this image ships no ASR stack. Empty URL disables the feature (the endpoint
@@ -520,6 +525,36 @@ DASHBOARD_DATA_DIR = Path(os.environ.get("DASHBOARD_DATA_DIR", str(WEBAPP_DIR / 
 # `data/` is excluded: it is curated JSON served no-store, not part of the
 # cached shell, and it changes on its own cadence.
 _SHELL_HASH_CACHE: dict[str, str] = {}
+
+
+def _news_ingest_authorized(provided: str) -> bool:
+    """Authorize a POST /internal/news call. Open when no token is configured.
+
+    The news rail is the one /internal/* endpoint that is **open by default**,
+    and that is a deliberate asymmetry rather than an oversight:
+
+    - Authenticating this transport buys no integrity. The rail exists to carry
+      broadcast content the deployment does not control — a post in an open
+      Telegram channel is written by whoever cares to write it, and reaches the
+      Herald through the legitimate path regardless. Guarding the side door of a
+      room whose front door must stay open is cost without a benefit.
+    - Filing a feed reference is not an outward action. `/internal/conversations`
+      pushes to the user's devices and `/internal/email` sends mail, so those two
+      stay fail-closed; landing a scored reference on the news page does not
+      reach anyone.
+    - Fail-closed here fails *silently*. `news_ingest.forward_news()` is
+      best-effort by design and swallows a 403, so a token mismatch between the
+      gateway containers and this one produces a rail that looks wired and
+      quietly drops every item.
+
+    A deployment that does want the endpoint locked down sets NEWS_INGEST_TOKEN
+    on both sides and it is enforced. Note this is its own variable: reusing
+    CONVERSATION_BACKEND_TOKEN would make "unset" unreachable, since the
+    entrypoint generates that one whenever it is missing.
+    """
+    if not NEWS_INGEST_TOKEN:
+        return True
+    return hmac.compare_digest(provided, NEWS_INGEST_TOKEN)
 
 
 def _shell_hash() -> str:
@@ -3072,13 +3107,11 @@ class Handler(BaseHTTPRequestHandler):
         the Herald scores it on the next curation tick. This rail is independent of
         triage: a message reaches the feed whether or not it was worth a model turn.
 
-        Token-gated (CONVERSATION_BACKEND_TOKEN) like the other /internal/*
-        endpoints, so only in-container agents can post."""
-        if not CONVERSATION_BACKEND_TOKEN:
-            self._send_json(403, {"error": "news backend disabled"})
-            return
+        Open by default, unlike the other /internal/* endpoints: a token is
+        enforced only when NEWS_INGEST_TOKEN is set. See
+        _news_ingest_authorized() for the reasoning."""
         token = self.headers.get("X-Conversation-Backend-Token", "")
-        if not hmac.compare_digest(token, CONVERSATION_BACKEND_TOKEN):
+        if not _news_ingest_authorized(token):
             self._send_json(403, {"error": "forbidden"})
             return
         payload = self._read_json_body()
