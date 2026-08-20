@@ -155,9 +155,10 @@ def test_coerce_ollama_tags(wg):
     ]
 
 
-def test_fetch_ollama_bypasses_http_proxy(wg):
+def _fetch_ollama_with_fake_opener(wg, base_url):
+    """Run _fetch_ollama_models() against base_url, capturing opener handlers."""
     import io
-    os.environ["OLLAMA_API_BASE"] = "http://host.docker.internal:11434"
+    os.environ["OLLAMA_API_BASE"] = base_url
     captured = {}
 
     class FakeOpener:
@@ -172,16 +173,37 @@ def test_fetch_ollama_bypasses_http_proxy(wg):
     orig = wg.urllib.request.build_opener
     wg.urllib.request.build_opener = fake_build_opener
     try:
-        models = wg._fetch_ollama_models()
+        captured["models"] = wg._fetch_ollama_models()
     finally:
         wg.urllib.request.build_opener = orig
         os.environ.pop("OLLAMA_API_BASE", None)
-    assert captured["url"] == "http://host.docker.internal:11434/api/tags"
-    assert any(
+    return captured
+
+
+def _bypasses_proxy(wg, handlers):
+    return any(
         type(h) is wg.urllib.request.ProxyHandler and getattr(h, "proxies", None) == {}
-        for h in captured["handlers"]
-    ), captured["handlers"]
-    assert models == [{"id": "ollama/qwen3.6:latest", "label": "qwen3.6:latest"}]
+        for h in handlers
+    )
+
+
+def test_fetch_ollama_bypasses_http_proxy_for_local_host(wg):
+    for base in ("http://host.docker.internal:11434", "http://localhost:11434",
+                 "http://127.0.0.1:11434"):
+        captured = _fetch_ollama_with_fake_opener(wg, base)
+        assert captured["url"] == base + "/api/tags"
+        assert _bypasses_proxy(wg, captured["handlers"]), (base, captured["handlers"])
+        assert captured["models"] == [
+            {"id": "ollama/qwen3.6:latest", "label": "qwen3.6:latest"}]
+
+
+def test_fetch_ollama_keeps_proxy_for_remote_host(wg):
+    """A non-local Ollama URL is ordinary egress — it must stay auditable."""
+    captured = _fetch_ollama_with_fake_opener(wg, "http://ollama.example.com:11434")
+    assert captured["url"] == "http://ollama.example.com:11434/api/tags"
+    assert not _bypasses_proxy(wg, captured["handlers"]), captured["handlers"]
+    assert captured["models"] == [
+        {"id": "ollama/qwen3.6:latest", "label": "qwen3.6:latest"}]
 
 
 def test_merge_replaces_stale_ollama_catalog(wg):
@@ -329,6 +351,8 @@ def main() -> None:
         test_coerce_intersects_v1_models_when_unflagged(wg)
         test_ollama_backend_hides_leftover_claude_flags(wg)
         test_coerce_ollama_tags(wg)
+        test_fetch_ollama_bypasses_http_proxy_for_local_host(wg)
+        test_fetch_ollama_keeps_proxy_for_remote_host(wg)
         test_merge_replaces_stale_ollama_catalog(wg)
         test_dynamic_list_and_default_entry(wg)
         test_static_fallback_when_litellm_empty_or_down(wg)

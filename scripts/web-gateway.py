@@ -167,10 +167,11 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # through it: the gateway reads GET <RETINUE_LITELLM_URL>/model/info (default:
 # ANTHROPIC_BASE_URL, or http://litellm:4000 when LITELLM_MASTER_KEY is set)
 # and GET /v1/models. Routes whose `model_info` carries `retinue_picker: true`
-# (labeled by `retinue_label`) are an optional allow-list — when any exist,
-# only those are offered. Otherwise the picker shows the concrete models
-# LiteLLM actually advertises, so an Ollama (or other) backend is selectable
-# without leftover Claude aliases. Plumbing aliases (`retinue-claude`,
+# (labeled by `retinue_label`) are named, not exclusive: they join the other
+# concrete models LiteLLM advertises rather than hiding them, so an Ollama (or
+# other) backend stays selectable even when a leftover Claude route is still
+# flagged. `retinue_picker: false` is the one exclusive form — it hides a
+# route. Plumbing aliases (`retinue-claude`,
 # `retinue-openrouter`) and wildcard patterns stay hidden. Turns route
 # through the same proxy that advertised the id, so the picker cannot offer a
 # model that isn't served. The list is cached for RETINUE_MODELS_CACHE_SECONDS
@@ -510,6 +511,21 @@ def _coerce_ollama_tags(parsed: object) -> list[dict]:
     return models
 
 
+_LOCAL_OLLAMA_HOSTS = frozenset({
+    "host.docker.internal",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "[::1]",
+})
+
+
+def _is_local_ollama(url: str) -> bool:
+    """Whether an Ollama URL points at this host rather than out over the wire."""
+    host = (urllib.parse.urlsplit(url).hostname or "").strip().lower()
+    return host in _LOCAL_OLLAMA_HOSTS or host.endswith(".localhost")
+
+
 def _fetch_ollama_models() -> list[dict] | None:
     url = _resolve_ollama_url()
     if not url:
@@ -517,10 +533,15 @@ def _fetch_ollama_models() -> list[dict] | None:
     req = urllib.request.Request(
         url + "/api/tags", headers={"Accept": "application/json"}
     )
-    # The retinue container routes outbound HTTP through egress-audit.
-    # A host-side Ollama (host.docker.internal / OLLAMA_API_BASE) is not an
-    # audited destination — ProxyHandler({}) skips HTTP_PROXY for this call.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    # The retinue container routes outbound HTTP through egress-audit. A
+    # host-side Ollama (host.docker.internal, localhost) is not an audited
+    # destination and a proxy cannot reach it, so ProxyHandler({}) skips
+    # HTTP_PROXY for that case only. A remote RETINUE_OLLAMA_URL is ordinary
+    # egress and keeps the default opener, so the proxy still sees it.
+    if _is_local_ollama(url):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    else:
+        opener = urllib.request.build_opener()
     with opener.open(req, timeout=5) as resp:
         return _coerce_ollama_tags(json.load(resp))
 
