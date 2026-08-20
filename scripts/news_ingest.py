@@ -5,18 +5,20 @@ A group can be flagged ``news`` in the triage policy (see ``triage_policy``): it
 messages are references worth keeping in the news feed, independent of whether
 any of them is worth a triage turn. The messenger gateways run in their own
 containers and cannot touch ``NEWS_DIR`` (the web-gateway owns it), so a
-news-flagged message is handed to the web-gateway's token-gated
-``POST /internal/news``, which shapes it into a news item and files it via
-``news_store``. The Herald scores it on the next curation tick.
+news-flagged message is handed to the web-gateway's ``POST /internal/news``,
+which shapes it into a news item and files it via ``news_store``. The Herald
+scores it on the next curation tick. That endpoint is open unless the deployment
+sets ``NEWS_INGEST_TOKEN`` on both sides.
 
 This is the deterministic, credit-free half of the news pipeline — it spends no
 model turn and runs immediately on arrival, in parallel to the agent-driven
 ``news-add.py`` path a triage turn can still take.
 
-Entirely env-guarded: with ``NEWS_INGEST_URL`` unset the forward is a no-op that
-returns ``False``, so a deployment that has not wired the endpoint sees no change
-in behaviour. Stdlib-only (urllib), so every gateway can import it regardless of
-what else is on its container.
+``NEWS_INGEST_URL`` defaults to the in-network web-gateway address in the base
+compose file, so the rail works with no deployment configuration; with it
+explicitly emptied the forward is a no-op that returns ``False``. Stdlib-only
+(urllib), so every gateway can import it regardless of what else is on its
+container.
 """
 
 from __future__ import annotations
@@ -27,9 +29,13 @@ import sys
 import urllib.request
 
 NEWS_INGEST_URL = os.environ.get("NEWS_INGEST_URL", "").strip()
-# Same shared secret the other in-container agents use for the web-gateway's
-# token-gated /internal/* endpoints (X-Conversation-Backend-Token).
-NEWS_INGEST_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "")
+# Optional shared secret. The endpoint is open when neither side sets one (see
+# _news_ingest_authorized in web-gateway.py); a deployment that wants it locked
+# down sets NEWS_INGEST_TOKEN here and on the web-gateway. CONVERSATION_BACKEND_TOKEN
+# stays accepted as a fallback so a deployment wired before NEWS_INGEST_TOKEN
+# existed keeps working.
+NEWS_INGEST_TOKEN = (os.environ.get("NEWS_INGEST_TOKEN")
+                     or os.environ.get("CONVERSATION_BACKEND_TOKEN", "")).strip()
 
 
 def news_enabled() -> bool:

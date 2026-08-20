@@ -238,16 +238,26 @@ are decided by the *same* `gate_decision` call — it returns a `news` boolean
 alongside the triage flags — but they run independently:
 
 - **Deterministic, credit-free, immediate.** When `news` is set, the gateway
-  hands the message to the web-gateway's token-gated `POST /internal/news`
+  hands the message to the web-gateway's `POST /internal/news`
   (`scripts/news_ingest.py` → `news_store.add_items`), which shapes it into a feed
   reference with no importance. The Herald scores it on the next curation tick.
   No model turn is spent on the forward itself, and it happens on arrival — not on
   the up-to-a-day triage drain.
 - **Cross-container by necessity.** The messenger gateways run in their own
   containers and cannot touch `NEWS_DIR` (the web-gateway owns it), hence the HTTP
-  hand-off rather than a direct `news-add.py` call. The forward is **env-guarded**
-  (`NEWS_INGEST_URL`): unset → no-op, so a deployment that has not wired the
-  endpoint sees no behaviour change.
+  hand-off rather than a direct `news-add.py` call. `NEWS_INGEST_URL` defaults to
+  the in-network web-gateway address in the base compose file, so the rail needs no
+  deployment configuration; emptying it turns the forward into a no-op.
+- **Open by default, lockable.** `POST /internal/news` is the one `/internal/*`
+  endpoint that accepts an untokened call. Authenticating it would buy no
+  integrity — the rail carries broadcast content written by whoever posts in the
+  source channel — while a fail-closed default fails *silently*, since the forward
+  swallows a 403 by design. Filing a feed reference is also not an outward action,
+  unlike `/internal/conversations` (pushes to the user's devices) and
+  `/internal/email` (sends mail), which stay fail-closed. A deployment that wants
+  it locked down sets `NEWS_INGEST_TOKEN` on the gateways and the web-gateway.
+  It is deliberately *not* `CONVERSATION_BACKEND_TOKEN`: the entrypoint generates
+  that one when it is missing, so "unset" would be unreachable.
 - **Parallel to the agent path.** A triage turn can still file a one-off item with
   `news-add.py` (an e-mail newsletter met during triage, a linked page). The
   `news` group flag is the *automatic* rail for a whole broadcast source; that
@@ -288,12 +298,13 @@ Tier-3 across both the framework and the gateway services:
   classification gate on inbound, and `GET /undelivered?since=…`. For the news
   rail they also carry `scripts/news_ingest.py` and forward news-flagged messages
   to the web-gateway (guarded by `NEWS_INGEST_URL`).
-- **web-gateway:** the token-gated `POST /internal/news` endpoint that shapes a
-  forwarded message into a feed item via `news_store`.
+- **web-gateway:** the `POST /internal/news` endpoint that shapes a forwarded
+  message into a feed item via `news_store` — open unless `NEWS_INGEST_TOKEN` is
+  set (`_news_ingest_authorized`).
 - **compose:** one volume per gateway, each mounted into its gateway (RW) and
   into `chambers/_generated/messenger/<channel>/` (RO for qlever). Each messenger
   gateway gets `NEWS_INGEST_URL` pointed at the web-gateway's `/internal/news`
-  and shares `CONVERSATION_BACKEND_TOKEN`.
+  by default, plus an optional `NEWS_INGEST_TOKEN` passthrough.
 
 Takes effect on merge → `scripts/self-update.py` (rebuilds the gateway images).
 
