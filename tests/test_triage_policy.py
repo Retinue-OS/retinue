@@ -398,6 +398,131 @@ def test_auto_whitelist_on_send():
             del os.environ["TRIAGE_MESSENGER_DIR"]
 
 
+# --------------------------------------------------------------------------- #
+# E-mail groups — List-Id normalisation, the two axes, the decision table     #
+# --------------------------------------------------------------------------- #
+
+def test_email_list_id_normalisation():
+    # The RFC shape, bracketed and not, case-folded.
+    assert tp.email_list_id("<sgcarney.substack.com>") == "sgcarney.substack.com"
+    assert tp.email_list_id("Members <members.List.Example.org>") \
+        == "members.list.example.org"
+    assert tp.email_list_id("  plain.list.example.org  ") == "plain.list.example.org"
+    # Real-world junk that must NOT become a group: a display name in the
+    # brackets (seen verbatim in the wild), a bare token with no dot, an empty
+    # header, and an absurdly long value.
+    assert tp.email_list_id("799706515 <Brack News>") == ""
+    assert tp.email_list_id("<newsletter>") == ""
+    assert tp.email_list_id("") == ""
+    assert tp.email_list_id(None) == ""
+    assert tp.email_list_id("<" + "a." * 200 + "com>") == ""
+
+
+def test_email_group_id_falls_back_to_the_sender():
+    # A real list keys on the list, whoever posted to it.
+    assert tp.email_group_id("<members.list.example.org>", "alice@x.com") \
+        == "members.list.example.org"
+    # A listless newsletter is its own group of one — the whole point of the
+    # fallback, so `news`/`quieted`/`ignored` need no second mechanism for it.
+    assert tp.email_group_id("", "News@Bulletin.example") == "news@bulletin.example"
+    # An unusable List-Id is treated as no List-Id at all.
+    assert tp.email_group_id("799706515 <Brack News>", "no-reply@brack.ch") \
+        == "no-reply@brack.ch"
+
+
+def test_group_wildcard_covers_the_lists_beneath_it():
+    wilds = {"*@substack.com"}
+    # The platform's own address, and a per-publication list under it: one
+    # wildcard covers both, because a List-Id is a namespace, not a mailbox.
+    assert tp.email_group_member("no-reply@substack.com", set(), wilds)
+    assert tp.email_group_member("sgcarney.substack.com", set(), wilds)
+    assert tp.email_group_member("substack.com", set(), wilds)
+    # An address *at* a subdomain is still not covered — that stays the strict
+    # `*@*.domain` reading the whitelist relies on.
+    assert not tp.email_group_member("someone@sgcarney.substack.com", set(), wilds)
+    assert tp.email_group_member("someone@sgcarney.substack.com", set(),
+                                 {"*@*.substack.com"})
+    # No accidental suffix matches.
+    assert not tp.email_group_member("notsubstack.com", set(), wilds)
+    assert not tp.email_group_member("", set(), wilds)
+    # An exact entry wins regardless of shape.
+    assert tp.email_group_member("Members.List.Example.org",
+                                 {"members.list.example.org"}, set())
+
+
+def test_email_gate_decision_table():
+    pol = tp.EmailPolicy(
+        addresses={"peer@list.example.org"},
+        wildcards=set(),
+        news={"digest.list.example.org"},
+        news_wildcards={"*@substack.com"},
+        quieted={"digest.list.example.org"},
+        quieted_wildcards=set(),
+        ignored={"noise.list.example.org"},
+        ignored_wildcards={"*@substack.com"},
+    )
+
+    def dec(sender, list_id=""):
+        return tp.email_gate_decision(sender, list_id, pol=pol)
+
+    # Whitelisted sender: triaged now, whatever the list says.
+    d = dec("peer@list.example.org", "<noise.list.example.org>")
+    assert (d["triage_now"], d["daily"], d["reason"]) == (True, True, "whitelisted")
+    # Ignored group: never a model turn.
+    d = dec("stranger@x.com", "<noise.list.example.org>")
+    assert (d["triage_now"], d["daily"]) == (False, False), d
+    # Quieted group: the daily sweep, not the frequent run.
+    d = dec("stranger@x.com", "<digest.list.example.org>")
+    assert (d["triage_now"], d["daily"], d["news"]) == (False, True, True), d
+    # Unknown group: same as quieted on a pull channel — nothing is lost.
+    d = dec("stranger@x.com", "<other.list.example.org>")
+    assert (d["triage_now"], d["daily"], d["news"]) == (False, True, False), d
+    # news + ignored (the read-only newsletter): filed, never triaged.
+    d = dec("no-reply@substack.com", "<sgcarney.substack.com>")
+    assert (d["news"], d["triage_now"], d["daily"]) == (True, False, False), d
+    assert d["group"] == "sgcarney.substack.com", d
+
+
+def test_legacy_address_level_news_still_matches_a_list_mail():
+    """A news entry written before List-Id detection keeps working.
+
+    The entries in the live policy name sender addresses; once the gate started
+    reading `List-Id`, the group for those same mails became the list. Checking
+    news against the sender as well as the group is what stops that migration
+    silently un-filing a newsletter.
+    """
+    pol = tp.EmailPolicy(addresses=set(), wildcards=set(),
+                         news={"bulletin@news.example"}, news_wildcards=set())
+    d = tp.email_gate_decision("bulletin@news.example",
+                               "<letters.news.example>", pol=pol)
+    assert d["news"] is True, d
+    assert d["group"] == "letters.news.example", d
+
+
+def test_quiet_and_ignore_wildcards_roundtrip():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(Path(tmp) / "e.nt")
+        try:
+            tp._mutate_email(news_add=["*@substack.com"],
+                             ignore_add=["*@substack.com", "noise.list.example"],
+                             quiet_add=["digest.list.example"])
+            pol = tp.load_email_policy()
+            assert pol.ignored == {"noise.list.example"}, pol
+            assert pol.ignored_wildcards == {"*@substack.com"}, pol
+            assert pol.quieted == {"digest.list.example"}, pol
+            # The classes are exclusive: quieting an ignored group moves it.
+            tp._mutate_email(quiet_add=["noise.list.example"])
+            pol = tp.load_email_policy()
+            assert pol.ignored == set(), pol
+            assert "noise.list.example" in pol.quieted, pol
+            # And the file still round-trips deterministically.
+            content = tp.render_email_policy(pol)
+            lines = [l for l in content.splitlines() if l]
+            assert lines == sorted(lines), "output not sorted"
+        finally:
+            del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]
+
+
 def _run() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

@@ -52,13 +52,19 @@ class NewsRail:
         return self.ok
 
 
-def _arm_news(gate, tmp, entries, *, ok=True, detail=None, moves=None):
-    """Declare `entries` as news senders and mock the rail's dependencies.
+def _arm_news(gate, tmp, entries, *, ok=True, detail=None, moves=None,
+              ignore=True):
+    """Declare `entries` as a news group and mock the rail's dependencies.
+
+    `ignore` also flags them `ignored`, which is the read-only newsletter case:
+    feed yes, triage never. Pass ignore=False for a list that is read *and*
+    answered, where the feed must not consume the mail.
 
     Returns (rail, calls) where `calls` records every _email_client invocation,
     so a test can assert on the flag/move hygiene as well as the filing.
     """
-    gate.tp._mutate_email(news_add=entries)
+    gate.tp._mutate_email(news_add=entries,
+                          ignore_add=entries if ignore else ())
     rail = NewsRail(ok=ok)
     gate.news_ingest.forward_news = rail
     gate.news_ingest.news_enabled = lambda: True
@@ -327,7 +333,7 @@ def test_news_move_failure_stays_non_terminal():
              "message_id": "<n@news.example>"},
         ]
         gate.spawn = Recorder()
-        gate.divert_news(gate.unread_inbox())
+        gate.route(gate.unread_inbox(), "news")
         assert len(rail.calls) == 1, "item should still reach the feed"
         # Filed but still in the INBOX → not terminal, or Phase 1 would never
         # repair the missing move.
@@ -340,16 +346,112 @@ def test_news_move_failure_stays_non_terminal():
 def test_refresh_from_sent_preserves_news_senders():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
-        gate.tp._mutate_email(news_add=["*@substack.com", "bulletin@news.example"])
+        gate.tp._mutate_email(news_add=["*@substack.com", "bulletin@news.example"],
+                              ignore_add=["*@substack.com"],
+                              quiet_add=["list.example.org"])
         gate._email_client = lambda *a: {"messages": [{"to": "peer@partner.com"}]}
         assert gate.refresh_whitelist_from_sent() == 1
         pol = gate.tp.load_email_policy()
         assert pol.addresses == {"peer@partner.com"}
-        # The whitelist and the news senders share one file: a whitelist write
-        # that rendered only its own half would erase these.
+        # Whitelist, news and group flags share one file: a whitelist write that
+        # rendered only its own half would erase all of these.
         assert pol.news == {"bulletin@news.example"}
         assert pol.news_wildcards == {"*@substack.com"}
+        assert pol.ignored_wildcards == {"*@substack.com"}
+        assert pol.quieted == {"list.example.org"}
     print("PASS test_refresh_from_sent_preserves_news_senders")
+
+
+def test_news_and_quieted_is_filed_but_left_for_triage():
+    """A list one reads *and* answers: feed yes, mailbox untouched."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        rail, calls = _arm_news(
+            gate, tmp, ["discuss.example.org"], ignore=False,
+            detail={"subject": "Re: agenda", "from": "peer@example.org",
+                    "message_id": "<d1@example.org>", "body": "text"},
+        )
+        gate.tp._mutate_email(quiet_add=["discuss.example.org"])
+        inbox = [{"uid": "1", "from": "peer@example.org", "subject": "Re: agenda",
+                  "message_id": "<d1@example.org>",
+                  "list_id": "Discuss <discuss.example.org>"}]
+        gate.unread_inbox = lambda: inbox
+        rec = Recorder()
+        gate.spawn = rec
+
+        # Frequent run: the sender is not whitelisted, so no spawn — but the
+        # feed gets it right away rather than waiting for the daily sweep.
+        assert gate.run_frequent() == 0
+        assert rec.calls == []
+        assert len(rail.calls) == 1
+        # Nothing was consumed: no flag, no move, no status record — triage
+        # still owes this mail a look.
+        assert [c[0] for c in calls] == ["read"], calls
+        assert not (Path(tmp) / "triage").exists()
+
+        # Daily run: now it does reach triage, still exactly once in the feed
+        # per tick (the store dedups by item id, so re-filing is a no-op).
+        gate.refresh_whitelist_from_sent = lambda: 0
+        assert gate.run_daily() == 0
+        assert len(rec.calls) == 1
+        assert {m["message_id"] for m in rec.calls[0][1]} == {"<d1@example.org>"}
+    print("PASS test_news_and_quieted_is_filed_but_left_for_triage")
+
+
+def test_wildcard_covers_the_lists_under_a_platform_domain():
+    """`*@substack.com` has to catch per-publication lists, not just the address."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        rail, calls = _arm_news(
+            gate, tmp, ["*@substack.com"],
+            detail={"subject": "Weekly Letter",
+                    "from": "Author <author@substack.com>",
+                    "message_id": "<s1@substack.com>", "body": "essay"},
+        )
+        gate.unread_inbox = lambda: [
+            # The sender address is the publication's, not the platform's; only
+            # the List-Id ties it to substack.com.
+            {"uid": "1", "from": "Author <author@sgcarney.substack.com>",
+             "subject": "Weekly Letter", "message_id": "<s1@substack.com>",
+             "list_id": "<sgcarney.substack.com>"},
+        ]
+        gate.refresh_whitelist_from_sent = lambda: 0
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_daily() == 0
+        assert len(rail.calls) == 1, "per-publication list missed by the wildcard"
+        assert rec.calls == [], "a read-only newsletter bought a model turn"
+    print("PASS test_wildcard_covers_the_lists_under_a_platform_domain")
+
+
+def test_whitelisted_sender_beats_an_ignored_list():
+    """Sender and list are orthogonal: a colleague writing to a muted list is
+    still correspondence."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.tp._mutate_email(add_addresses=["boss@work.com"],
+                              ignore_add=["announce.example.org"])
+        gate._email_client = lambda *a: {"ok": True}
+        gate.news_ingest.news_enabled = lambda: False
+        gate.unread_inbox = lambda: [
+            {"uid": "1", "from": "Boss <boss@work.com>", "subject": "read this",
+             "message_id": "<b1@work.com>",
+             "list_id": "<announce.example.org>"},
+            {"uid": "2", "from": "someone@else.org", "subject": "fyi",
+             "message_id": "<x1@else.org>",
+             "list_id": "<announce.example.org>"},
+        ]
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert {m["message_id"] for m in rec.calls[0][1]} == {"<b1@work.com>"}
+        # And the unknown sender on that list stays out of triage entirely, even
+        # on the catch-all run.
+        rec.calls.clear()
+        gate.refresh_whitelist_from_sent = lambda: 0
+        assert gate.run_daily() == 0
+        assert {m["message_id"] for m in rec.calls[0][1]} == {"<b1@work.com>"}
+    print("PASS test_whitelisted_sender_beats_an_ignored_list")
 
 
 if __name__ == "__main__":
@@ -365,4 +467,7 @@ if __name__ == "__main__":
     test_news_filing_failure_falls_back_to_triage()
     test_news_move_failure_stays_non_terminal()
     test_refresh_from_sent_preserves_news_senders()
+    test_news_and_quieted_is_filed_but_left_for_triage()
+    test_wildcard_covers_the_lists_under_a_platform_domain()
+    test_whitelisted_sender_beats_an_ignored_list()
     print("all triage-gate tests passed")
