@@ -132,24 +132,51 @@ import push_notify
 
 # Claude Code ships as an npm package whose auto-updater briefly swaps the
 # `claude` symlink; a subprocess spawned in that window fails with ENOENT
-# ([Errno 2] No such file or directory: 'claude'). Retry a few times with a
-# short backoff so a mid-update race is invisible instead of surfacing as an
-# error in the user's conversation.
-CLAUDE_SPAWN_RETRIES = 5
-CLAUDE_SPAWN_BACKOFF_SECONDS = 1.0
+# ([Errno 2] No such file or directory: 'claude'). Poll until the binary is
+# back so a mid-update race is invisible instead of surfacing as an error in
+# the user's conversation.
+#
+# Wait on a deadline rather than a retry count: what has to be outlived is the
+# update, whose length is a property of the npm install, not of how many times
+# we happened to try. The previous 5 x 1 s budget was shorter than a real
+# update — an observed 2.1.235 -> 2.1.240 swap failed a conversation turn after
+# 4 s and only finished 7 s later — so the tolerance was reliably exhausted
+# just before the binary reappeared. An unpacked install is on the order of ten
+# seconds, so 60 s covers it with a wide margin while still failing rather than
+# hanging forever if the binary is genuinely gone (a bad mount, a botched
+# image).
+CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS = float(
+    os.environ.get("CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS", "60"))
+CLAUDE_SPAWN_BACKOFF_SECONDS = 0.5
 CLAUDE_BIN = "/usr/bin/claude"
 
 
 def _run_claude(cmd, **kwargs):
     """subprocess.run for the `claude` binary, tolerant of the transient
     ENOENT window while Claude Code's auto-updater replaces it."""
-    for attempt in range(CLAUDE_SPAWN_RETRIES):
+    deadline = time.monotonic() + CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS
+    waited = False
+    while True:
         try:
-            return subprocess.run(cmd, **kwargs)
+            result = subprocess.run(cmd, **kwargs)
         except FileNotFoundError:
-            if attempt == CLAUDE_SPAWN_RETRIES - 1:
+            if time.monotonic() >= deadline:
+                print(f"[web-gateway] {cmd[0]} still missing after "
+                      f"{CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS:.0f}s — giving up",
+                      flush=True)
                 raise
+            if not waited:
+                # Logged once per spawn: a routine update window is a single
+                # line, while a pathological one is visible in the log.
+                print(f"[web-gateway] {cmd[0]} missing (auto-update?) — "
+                      f"waiting up to {CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS:.0f}s",
+                      flush=True)
+                waited = True
             time.sleep(CLAUDE_SPAWN_BACKOFF_SECONDS)
+            continue
+        if waited:
+            print(f"[web-gateway] {cmd[0]} is back — spawn succeeded", flush=True)
+        return result
 
 STATE_FILE = os.environ.get("WEB_GATEWAY_STATE", "/tmp/web-session-state.json")
 PORT = int(os.environ.get("WEB_GATEWAY_PORT", "8080"))
