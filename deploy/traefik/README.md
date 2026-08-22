@@ -46,9 +46,15 @@ Let's Encrypt resolver `myresolver`). Do this **once** there:
 3. **Restart Traefik.** With `watch: true`, future edits to these files are
    picked up live; the first mount needs a restart.
 
-That's it on the Traefik side. The `retinue` service's labels already reference
-`retinue-mtls@file` and add the `passTLSClientCert` + `forwardAuth` middlewares,
-so rebuilding/restarting the retinue stack completes the wiring.
+That's it on the Traefik side. The `retinue` service's Traefik labels are
+**deployment-specific** and are not in `docker-compose.yml`: copy
+`docker-compose.override.example.yml` to `docker-compose.override.yml` and keep
+its `agents-clientcert` (`passtlsclientcert`) and `agents-auth` (`forwardauth`)
+middlewares plus `traefik.http.routers.agents.tls.options=retinue-mtls@file`.
+Restarting the retinue stack then completes the wiring. If you maintain your
+own override, those three labels are the ones the certificate half depends on
+— without them the gateway never sees a certificate and every device falls
+back to the password prompt.
 
 ## Issuing client certificates
 
@@ -103,10 +109,19 @@ unaffected by any of this.
 The gateway trusts the *presence* of the forwarded client-cert header as proof of
 a valid certificate. Two properties make that safe and **must** hold:
 
-1. **Traefik strips spoofed headers.** `passTLSClientCert` removes any
-   client-supplied `X-Forwarded-Tls-Client-Cert(-Info)` and re-adds it only from
-   the real TLS handshake. Keep this middleware ahead of `forwardAuth` (the
-   labels already do).
+1. **Traefik strips spoofed headers — at the entrypoint, by default.**
+   `X-Forwarded-Tls-Client-Cert(-Info)` are among the `X-Forwarded-*` headers
+   Traefik removes from any request whose remote address it doesn't trust.
+   That is entrypoint behaviour (`forwardedHeaders`), not something the
+   `passTLSClientCert` middleware does — the middleware only *adds* the header
+   when a certificate was actually presented. Keep it that way: never set
+   `forwardedHeaders.insecure` on the entrypoint serving this router, and if
+   you add `forwardedHeaders.trustedIPs` for an upstream proxy, make sure that
+   proxy drops these two headers from client traffic itself. (Middleware order
+   still matters, for a different reason: `passTLSClientCert` must run before
+   `forwardAuth` so the header exists when `/auth` decides. The labels that
+   wire both live in your `docker-compose.override.yml` — see "One-time wiring
+   into your Traefik" above.)
 2. **`/auth` is never published.** It is reachable only via Traefik on the
    internal Docker network. Do not expose port 8080 directly to the internet, or
    a client could inject the header and bypass the certificate check.

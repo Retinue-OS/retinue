@@ -254,12 +254,18 @@ def decide(headers, users, *, cert_header: str, cert_info_header: str,
     # 1. Client certificate (already CA-verified by Traefik if present).
     #
     # SECURITY: we trust the mere presence of this header. That is safe because
-    # (a) Traefik's passTLSClientCert middleware Del()s any client-supplied value
-    # and only re-Set()s it from the real TLS handshake state, so a forged header
-    # cannot survive the edge; and (b) /auth is reachable only through Traefik on
-    # the internal network (never published), so a client cannot inject the header
-    # by calling /auth directly. The gateway cannot re-prove private-key
-    # possession from a forwarded PEM, so this edge guarantee is the boundary.
+    # (a) Traefik's entrypoint strips X-Forwarded-Tls-Client-Cert(-Info) from any
+    # request whose remote address it doesn't trust — by default, for every
+    # client. That is entrypoint behaviour (forwardedHeaders), not something the
+    # passTLSClientCert middleware does: the middleware only *adds* the header
+    # when a certificate was actually presented, it never removes one. Never set
+    # forwardedHeaders.insecure on the entrypoint serving this router, and if
+    # forwardedHeaders.trustedIPs names an upstream proxy, that proxy must itself
+    # drop these two headers from client traffic. (b) /auth is reachable only
+    # through Traefik on the internal network (never published), so a client
+    # cannot inject the header by calling /auth directly. The gateway cannot
+    # re-prove private-key possession from a forwarded PEM, so this edge
+    # guarantee is the boundary.
     cert = headers.get(cert_header, "") or ""
     if cert.strip():
         info = headers.get(cert_info_header, "") or ""
