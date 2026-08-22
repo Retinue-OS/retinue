@@ -1013,6 +1013,21 @@ def _list_groups() -> list[dict]:
     return groups
 
 
+def _resolve_group_name(group_id: str) -> str | None:
+    """Look up a group's display name from the account's groups roster.
+
+    Returns None on a miss (a stale id, or the roster call itself failing) so
+    callers can fall back to the raw id rather than erroring.
+    """
+    try:
+        for group in _list_groups():
+            if group.get("id") == group_id:
+                return group.get("name") or None
+    except Exception as exc:
+        print(f"[signal-gateway] could not resolve group name for {group_id}: {exc}", flush=True)
+    return None
+
+
 # --- Recent-senders store ----------------------------------------------------
 # signal-cli keeps no queryable message history, so the gateway records each
 # inbound sender as messages arrive: identifier(s), the name the envelope carries
@@ -1256,7 +1271,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
     if gate.get("news"):
-        _forward_news(question, group_id if is_group else sender, group_id, lang)
+        source = (_resolve_group_name(group_id) or group_id) if is_group else sender
+        _forward_news(question, source, group_id, lang)
     if not gate["forward"]:
         # Mark delivered only for a message that is fully accounted for (a
         # blacklisted/no-action class the drain must never re-surface). One held
