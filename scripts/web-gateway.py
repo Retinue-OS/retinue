@@ -737,7 +737,13 @@ TRANSCRIBE_TIMEOUT = float(os.environ.get("TRANSCRIBE_TIMEOUT", "120"))
 # user's contact names as context (that is what fixes mangled names). Best
 # effort: any failure returns the raw transcript unchanged.
 TRANSCRIPT_CLEANUP = os.environ.get("TRANSCRIPT_CLEANUP", "1").strip().lower() not in ("0", "false", "no")
-TRANSCRIPT_CLEANUP_MODEL = os.environ.get("TRANSCRIPT_CLEANUP_MODEL", "haiku").strip()
+# An explicit TRANSCRIPT_CLEANUP_MODEL always wins; otherwise fall back to
+# whatever RETINUE_CLAUDE_MODEL selects (so an Ollama/OpenRouter deployment's
+# cleanup pass runs on that backend too, instead of asking it for "haiku" — an
+# Anthropic-only model name); "haiku" remains the last-resort default.
+TRANSCRIPT_CLEANUP_MODEL = (
+    os.environ.get("TRANSCRIPT_CLEANUP_MODEL", "").strip() or CLAUDE_MODEL or "haiku"
+)
 TRANSCRIPT_CLEANUP_TIMEOUT = float(os.environ.get("TRANSCRIPT_CLEANUP_TIMEOUT", "45"))
 # How much of the thread to show the cleanup model, and how far a cleaned
 # transcript may drift in length before we distrust it (a model that starts
