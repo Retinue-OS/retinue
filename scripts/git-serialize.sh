@@ -34,20 +34,41 @@ done
 
 LOCK_DIR="${GIT_SERIALIZE_LOCK_DIR:-/tmp/retinue-git-locks}"
 
+# Git's global options (-C, -c, --git-dir, ...) come *before* the subcommand,
+# so a caller like `git -C /path commit` has to have them peeled off before we
+# can key on the subcommand below -- otherwise $1 is "-C" and the invocation
+# falls through to the unserialized default arm. Collected here and forwarded
+# to every invocation of the real git (including the rev-parse used to find
+# the repo root), so `-C`/`--git-dir` also resolve the *right* repository
+# instead of the wrapper's own cwd.
+GLOBALS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--config-env)
+      GLOBALS+=("$1" "${2:-}"); shift 2 || true ;;
+    --git-dir=*|--work-tree=*|--namespace=*|--exec-path=*|--config-env=*|\
+    --bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|\
+    --noglob-pathspecs|--icase-pathspecs|--no-optional-locks|\
+    -p|--paginate|-P|--no-pager)
+      GLOBALS+=("$1"); shift ;;
+    *) break ;;
+  esac
+done
+
 # Only write operations that can take index.lock or mutate refs/remotes need
 # serialization; read-only commands run unlocked for full parallelism.
 case "${1:-}" in
   commit|push|pull|merge|rebase|am|cherry-pick|revert|add|rm|mv|reset|restore|checkout|switch|stash|tag|fetch)
     mkdir -p "$LOCK_DIR"
     # Lock per repository top level so different repos never block each other.
-    repo_root="$("$REAL_GIT" rev-parse --show-toplevel 2>/dev/null || echo "_global")"
+    repo_root="$("$REAL_GIT" ${GLOBALS[@]+"${GLOBALS[@]}"} rev-parse --show-toplevel 2>/dev/null || echo "_global")"
     lock_name="$(printf '%s' "$repo_root" | tr -c 'A-Za-z0-9._-' '_')"
     exec 9>"$LOCK_DIR/$lock_name.lock"
     flock 9
-    "$REAL_GIT" "$@"
+    "$REAL_GIT" ${GLOBALS[@]+"${GLOBALS[@]}"} "$@"
     exit $?
     ;;
   *)
-    exec "$REAL_GIT" "$@"
+    exec "$REAL_GIT" ${GLOBALS[@]+"${GLOBALS[@]}"} "$@"
     ;;
 esac
