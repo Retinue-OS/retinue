@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Settings</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- Device-level preferences, reached from the dashboard's gear link. The
+       push element runs in `manage` mode here: it always shows this device's
+       notification state, with enable/disable and the delivery preferences. -->
+  <script type="module" src="/components/push.js"></script>
+</head>
+<body>
+  <main class="settings">
+    <header class="top">
+      <h1>Settings</h1>
+      <a class="gear" href="/">&larr; Dashboard</a>
+    </header>
+
+    <section class="scard">
+      <h2>Notifications</h2>
+      <p class="hint">Web Push to this device: Ara notifies you when a
+        conversation needs a decision or an answer arrives while the dashboard
+        is closed. Per device — enable it on each phone or computer you want
+        notified.</p>
+      <retinue-push-optin manage></retinue-push-optin>
+    </section>
+
+    <section class="scard">
+      <h2>Layout</h2>
+      <p class="hint">On a wide screen the dashboard's columns are resizable —
+        drag the dividers, double-click one to reset it. Each card's header
+        switches between list and card view. Both are remembered per device.</p>
+    </section>
+
+    <section class="scard">
+      <h2>System</h2>
+      <ul class="linklist">
+        <li><a href="/gateways">Messenger gateways &mdash; connection status &amp; pairing</a></li>
+        <li><a href="/sends">Pending sends &mdash; messages waiting for approval</a></li>
+      </ul>
+    </section>
+  </main>
+
+  <script>
+    // Register the service worker so this page is available offline too.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>

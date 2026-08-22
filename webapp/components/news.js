@@ -19,7 +19,10 @@
 // Each one nudges that item immediately and is logged for the Herald, which
 // generalizes it into the profile on its next run (scripts/news-curate.py).
 
-import { esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
+import {
+  esc, fmtAge, isWideFrame, onFrameChange,
+  viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
+} from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { Reader, speechAvailable } from './speech.js';
 
@@ -47,6 +50,8 @@ const CSS = `
   .muted { color: var(--muted, #8b93a3); margin: 4px 0; }
   ul { list-style: none; margin: 0; padding: 0; display: grid; align-content: start;
        grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 8px; }
+  /* The header's view toggle (base.js) forces a single full-width column. */
+  ul.as-list { grid-template-columns: minmax(0, 1fr); }
   li { background: var(--card-2, #1c2230); border-radius: 10px; padding: 9px 11px;
        border-left: 3px solid transparent; }
   /* The top of the feed earns the accent bar; everything below is plain, so
@@ -135,6 +140,8 @@ class RetinueNews extends HTMLElement {
     this._scope = 'feed';
     this._prefs = null;
     this._editing = false;
+    // List rows vs reflowing tiles — a per-device choice (see base.js).
+    this._view = viewPref('news');
     this._reader = new Reader((id) => this._markReading(id));
     this.render();
     this.load();
@@ -202,6 +209,13 @@ class RetinueNews extends HTMLElement {
   }
 
   onClick(e) {
+    const vt = e.target.closest('[data-setview]');
+    if (vt) {
+      this._view = vt.getAttribute('data-setview');
+      setViewPref('news', this._view);
+      this.render();
+      return;
+    }
     const el = e.target.closest('[data-act]');
     if (!el) return;
     const act = el.dataset.act;
@@ -301,16 +315,19 @@ class RetinueNews extends HTMLElement {
     const home = this.full
       ? '<a class="more" href="/">&larr; Back to dashboard</a>' : '';
     this.shadowRoot.innerHTML =
-      `<style>${CSS}</style>` +
-      `<section class="card"><header><h2>${esc(this.heading)}</h2>${stamp}</header>` +
+      `<style>${CSS}${VIEW_TOGGLE_CSS}</style>` +
+      `<section class="card"><header><h2>${esc(this.heading)}</h2>` +
+      `${viewToggleHtml(this._view)}${stamp}</header>` +
       `<div class="content">${inner}</div>${home}</section>`;
   }
+
+  get _ulOpen() { return this._view === 'list' ? '<ul class="as-list">' : '<ul>'; }
 
   bodyCard() {
     const items = this.items;
     if (!items.length) return '<p class="muted">Nothing in the feed.</p>';
     const shown = isWideFrame() ? items : items.slice(0, MAX_CARD_ITEMS);
-    return '<ul>' +
+    return this._ulOpen +
       shown.map((it, idx) => itemLi(it, {
         top: idx === 0, summary: false, speech: false,
         reading: this._reader.currentId === it.id,
@@ -339,7 +356,7 @@ class RetinueNews extends HTMLElement {
         '<code>news-add.py</code>.</p>'
       : '<p class="muted">Nothing here.</p>';
     const list = items.length
-      ? '<ul>' + items.map((it, idx) => itemLi(it, {
+      ? this._ulOpen + items.map((it, idx) => itemLi(it, {
           top: idx === 0 && this._scope === 'feed', summary: true, speech,
           reading: this._reader.currentId === it.id,
         })).join('') + '</ul>'

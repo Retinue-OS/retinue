@@ -1,20 +1,28 @@
-// Push notification opt-in for the Retinue dashboard PWA.
+// Push notification management for the Retinue dashboard PWA.
 //
-// Renders a single bell button that asks for notification permission and
-// registers a Web Push subscription with the gateway. Once permission is
-// granted it turns into a compact preference row: which events notify this
-// device (the mode select) and whether archived conversations do too. The
-// preferences live on the server-side subscription record; the local copy in
-// localStorage only exists so `_init` can re-register the device with the same
+// The <retinue-push-optin> element lives on the settings page (settings.html),
+// in `manage` mode: it always shows this device's push state — unsupported,
+// blocked, off, or enabled — with the enable button, the preference row (which
+// events notify this device, whether archived conversations do too) and a
+// disable button. Without the `manage` attribute it keeps its original
+// dashboard-banner behaviour: hidden unless push is available and not yet
+// enabled (no page uses that mode any more, but the contract stays).
+//
+// The preferences live on the server-side subscription record; the local copy
+// in localStorage exists so the device can be re-registered with the same
 // preferences on every load (a subscription the browser rotated behind our
-// back — or one lost when the server's store was reset — is restored silently).
+// back — or one lost when the server's store was reset — is restored
+// silently). That upkeep must not depend on the element being on the page —
+// the dashboard imports this module without one — so it also runs once at
+// module level, below.
 //
 // Note on iOS: Safari only exposes the Push API to a PWA that has been added to
-// the home screen. In an in-browser tab `PushManager` is absent and this element
-// simply never appears; that is expected, not a failure.
+// the home screen. In an in-browser tab `PushManager` is absent; the settings
+// page says so instead of failing silently.
 
 const CONFIG_URL = '/push/config';
 const SUBSCRIBE_URL = '/push/subscribe';
+const UNSUBSCRIBE_URL = '/push/unsubscribe';
 const STORAGE_KEY = 'retinue_notification_mode';
 const STORAGE_KEY_ARCHIVED = 'retinue_notify_archived';
 
@@ -42,6 +50,14 @@ function urlBase64ToUint8Array(base64) {
 
 function supported() {
   return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+}
+
+function storedMode() {
+  return localStorage.getItem(STORAGE_KEY) || DEFAULT_MODE;
+}
+
+function storedArchived() {
+  return localStorage.getItem(STORAGE_KEY_ARCHIVED) !== '0';
 }
 
 async function serverKey() {
@@ -92,13 +108,19 @@ const CSS = `
   :host { display: none; }
   :host([visible]) { display: block; }
   :host([enabled]) { display: block; }
+  /* Settings-page mode: the element always shows this device's state. */
+  :host([manage]) { display: block; }
   .container {
     display: flex; align-items: center; gap: 8px; width: 100%;
+    box-sizing: border-box;
     background: var(--card, #151922); color: var(--fg, #e7ebf2);
     border: 0; border-radius: var(--radius, 16px);
     padding: 8px 16px; font: inherit; font-size: .85rem;
     position: relative;
   }
+  /* The author display:flex above would otherwise outrank the UA [hidden]
+     rule, leaving the row visible when _init hides it. */
+  .container[hidden] { display: none; }
   .container:hover { background: var(--card-2, #1c2230); }
   button {
     background: none; border: 0; padding: 0; font: inherit; color: inherit;
@@ -117,6 +139,20 @@ const CSS = `
   }
   .archived-opt { display: flex; align-items: center; gap: 4px; cursor: pointer; }
   .status { margin-left: auto; }
+  /* State explanation (manage mode only): unsupported browser, blocked
+     permission, or what enabling does. Hidden while empty. */
+  .note { display: none; }
+  :host([manage]) .note:not(:empty) {
+    display: block; color: var(--muted, #8b93a3); font-size: .8rem; margin: 6px 4px 0;
+  }
+  .btn-off {
+    display: none; font: inherit; font-size: .78rem; cursor: pointer;
+    background: transparent; color: var(--muted, #8b93a3);
+    border: 1px solid var(--line, rgba(231,235,242,.2)); border-radius: 8px;
+    padding: 4px 9px;
+  }
+  :host([manage][enabled]) .btn-off { display: inline-block; }
+  .btn-off:hover { color: var(--high, #ff6b6b); border-color: var(--high, #ff6b6b); }
 `;
 
 class RetinuePushOptIn extends HTMLElement {
@@ -136,8 +172,10 @@ class RetinuePushOptIn extends HTMLElement {
             <input type="checkbox" class="archived-check" checked> Archived
           </label>
           <span class="status muted"></span>
+          <button type="button" class="btn-off" title="Stop notifying this device">Disable</button>
         </div>
       </div>
+      <div class="note"></div>
     `;
     this._btn = this.shadowRoot.querySelector('.btn-main');
     this._select = this.shadowRoot.querySelector('.mode-select');
@@ -145,7 +183,10 @@ class RetinuePushOptIn extends HTMLElement {
     this._archivedCheck = this.shadowRoot.querySelector('.archived-check');
     this._status = this.shadowRoot.querySelector('.status');
     this._lblEl = this.shadowRoot.querySelector('.lbl');
+    this._note = this.shadowRoot.querySelector('.note');
+    this._btnOff = this.shadowRoot.querySelector('.btn-off');
     this._btn.addEventListener('click', () => this._enable());
+    this._btnOff.addEventListener('click', () => this._disable());
     this._select.addEventListener('change', () => this._prefsChanged());
     this._archivedCheck.addEventListener('change', () => this._prefsChanged());
   }
@@ -154,12 +195,28 @@ class RetinuePushOptIn extends HTMLElement {
     this._init();
   }
 
-  async _init() {
-    if (!supported()) return;
-    if (Notification.permission === 'denied') return;
+  get manage() { return this.hasAttribute('manage'); }
 
-    this._select.value = localStorage.getItem(STORAGE_KEY) || DEFAULT_MODE;
-    this._archivedCheck.checked = localStorage.getItem(STORAGE_KEY_ARCHIVED) !== '0';
+  async _init() {
+    const container = this.shadowRoot.querySelector('.container');
+    if (!supported()) {
+      // Only the settings page has anything useful to say about this state —
+      // the note explains it, and the enable row would be a dead control.
+      container.hidden = true;
+      this._setNote('Notifications are not available in this browser. On '
+        + 'iPhone/iPad, add the dashboard to the home screen first — Safari '
+        + 'only offers push to an installed app.');
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      container.hidden = true;
+      this._setNote('Notifications are blocked for this site. Allow them in '
+        + 'the browser’s site settings, then come back here.');
+      return;
+    }
+
+    this._select.value = storedMode();
+    this._archivedCheck.checked = storedArchived();
     this._syncControls();
 
     if (Notification.permission === 'granted') {
@@ -169,9 +226,51 @@ class RetinuePushOptIn extends HTMLElement {
       ensureSubscription(mode, notifyArchived).catch(() => {});
       return;
     }
+    if (this.manage) {
+      this._setNote('Notifications are off on this device. Enable them to be '
+        + 'told when Ara needs a decision or answers while the dashboard is '
+        + 'closed.');
+    }
     try {
-      if (await serverKey()) this.setAttribute('visible', '');
-    } catch (_) { /* offline: stay hidden */ }
+      if (await serverKey()) {
+        this.setAttribute('visible', '');
+      } else if (this.manage) {
+        // The gateway reports push disabled (no pywebpush / no key): an
+        // Enable button could only fail, so say why there is none.
+        container.hidden = true;
+        this._setNote('Push notifications are not configured on this server.');
+      }
+    } catch (_) { /* offline: stay hidden (the note still shows in manage mode) */ }
+  }
+
+  _setNote(text) {
+    if (this._note) this._note.textContent = this.manage ? text : '';
+  }
+
+  // Drop this device's subscription: browser-side first (the part that stops
+  // deliveries), then the server record, then back to the opt-in state.
+  async _disable() {
+    this._btnOff.disabled = true;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        const endpoint = sub.endpoint;
+        await sub.unsubscribe();
+        await fetch(UNSUBSCRIBE_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ endpoint }),
+        }).catch(() => {});
+      }
+      this.removeAttribute('enabled');
+      this.setAttribute('visible', '');
+      this._setLabel('Enable notifications');
+      this._btn.disabled = false;
+      this._setNote('Notifications are off on this device.');
+    } finally {
+      this._btnOff.disabled = false;
+    }
   }
 
   _prefs() {
@@ -198,6 +297,7 @@ class RetinuePushOptIn extends HTMLElement {
       if (await ensureSubscription(mode, notifyArchived)) {
         this.setAttribute('enabled', '');
         this.removeAttribute('visible');
+        this._setNote('');
       } else {
         this._setLabel('Could not enable', true);
         this._btn.disabled = false;
@@ -237,3 +337,12 @@ class RetinuePushOptIn extends HTMLElement {
 }
 
 customElements.define('retinue-push-optin', RetinuePushOptIn);
+
+// Subscription upkeep, independent of the element: any page that imports this
+// module (the dashboard does) silently re-registers an already-granted device
+// with its stored preferences, so a browser-rotated or server-reset
+// subscription heals on the pages people actually open — not only when they
+// visit the settings page.
+if (supported() && Notification.permission === 'granted') {
+  ensureSubscription(storedMode(), storedArchived()).catch(() => {});
+}

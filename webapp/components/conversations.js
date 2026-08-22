@@ -25,7 +25,10 @@
 // polls until the answer arrives. Everything degrades gracefully offline (the
 // list/threads just fail to refresh; the last rendered state stays on screen).
 
-import { esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
+import {
+  esc, fmtAge, isWideFrame, onFrameChange,
+  viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
+} from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 
@@ -126,6 +129,8 @@ class RetinueConversations extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._full = this.hasAttribute('full');
+    // List rows vs reflowing tiles — a per-device choice (see base.js).
+    this._view = viewPref('conversations');
     // Deep link: #conversation-<id> opens that thread (used by agent push
     // URLs); #new opens the composer.
     const m = CONV_HASH_RE.exec(location.hash || '');
@@ -282,7 +287,9 @@ class RetinueConversations extends HTMLElement {
       const n = this._unreadCount();
       let badge = hdr.querySelector('.badge');
       if (n && !badge) {
-        hdr.insertAdjacentHTML('beforeend', `<span class="badge">${n}</span>`);
+        // After the heading, not at the end — the view toggle sits at the far
+        // right of the header and the badge belongs beside the title.
+        hdr.querySelector('h2').insertAdjacentHTML('afterend', `<span class="badge">${n}</span>`);
       } else if (n && badge) {
         if (badge.textContent !== String(n)) badge.textContent = String(n);
       } else if (!n && badge) {
@@ -526,9 +533,10 @@ class RetinueConversations extends HTMLElement {
     // so the card header would only repeat it — render it for the list alone.
     const header = mode === 'list'
       ? `<header><h2>${esc(this.heading)}</h2>` +
-        `${this._unreadCount() ? `<span class="badge">${this._unreadCount()}</span>` : ''}</header>`
+        `${this._unreadCount() ? `<span class="badge">${this._unreadCount()}</span>` : ''}` +
+        `${viewToggleHtml(this._view)}</header>`
       : '';
-    this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>` +
+    this.shadowRoot.innerHTML = `<style>${CSS}${VIEW_TOGGLE_CSS}${VOICE_CSS}${MD_CSS}</style>` +
       `<section class="card">${header}<div class="content">${body}</div></section>`;
     this._lastMode = mode;
     this._listSig = this._lastMode === 'list' ? this._listSignature() : '';
@@ -573,7 +581,8 @@ class RetinueConversations extends HTMLElement {
     // The tabs area takes all remaining height and scrolls; the New button and
     // page link stay pinned at the bottom, within thumb reach.
     return this._filterHtml() +
-      `<div class="tabs">${this._tabsHtml()}${this._emptyHtml()}</div>` +
+      `<div class="tabs${this._view === 'list' ? ' as-list' : ''}">` +
+      `${this._tabsHtml()}${this._emptyHtml()}</div>` +
       `<div class="list-foot">${newBtn}${this._footerHtml()}</div>`;
   }
 
@@ -1320,6 +1329,12 @@ class RetinueConversations extends HTMLElement {
     if (unarch) unarch.addEventListener('click', () => this._archive(this._active, false));
     root.querySelectorAll('[data-scope]').forEach((el) =>
       el.addEventListener('click', () => this._setScope(el.getAttribute('data-scope'))));
+    root.querySelectorAll('[data-setview]').forEach((el) =>
+      el.addEventListener('click', () => {
+        this._view = el.getAttribute('data-setview');
+        setViewPref('conversations', this._view);
+        this.render();
+      }));
     // Delegate copy-button clicks on the thread container: it survives the
     // in-place innerHTML swaps of _partialUpdate, so one listener covers the
     // quote-block copy buttons across polls.
@@ -1448,6 +1463,8 @@ const CSS = `
   .tabs { flex: 1; min-height: 0; display: grid; align-content: start;
           grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr));
           gap: 8px; padding: 2px; }
+  /* The header's view toggle (base.js) forces a single full-width column. */
+  .tabs.as-list { grid-template-columns: minmax(0, 1fr); }
   .empty { grid-column: 1 / -1; }
   @media (min-width: 1000px) and (min-height: 480px) {
     .tabs { overflow-y: auto; overscroll-behavior: contain; }

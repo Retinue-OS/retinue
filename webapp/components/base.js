@@ -48,6 +48,47 @@ export function onFrameChange(fn) {
   return () => mq.removeEventListener('change', handler);
 }
 
+// ── List/cards view preference ────────────────────────────────────────────────
+// Each list card (conversations, projects, news) can present its rows either as
+// reflowing tiles ("cards") or as a single full-width column ("list"). The
+// choice is a per-device preference, persisted in localStorage per card key.
+// On phones the tile grid collapses to one column anyway, so the toggle is only
+// rendered in the wide layout (see VIEW_TOGGLE_CSS) — small devices keep the
+// one presentation that makes sense there.
+export function viewPref(key) {
+  try { return localStorage.getItem(`retinue.view.${key}`) || 'cards'; }
+  catch (_e) { return 'cards'; }
+}
+
+export function setViewPref(key, view) {
+  try { localStorage.setItem(`retinue.view.${key}`, view); } catch (_e) { /* private mode */ }
+}
+
+// The header control both list cards share. Clicks carry data-setview; the
+// component wires them (setViewPref + re-render). Glyphs, not words, so the
+// control stays discrete next to the card heading.
+export function viewToggleHtml(view) {
+  const btn = (v, glyph, label) =>
+    `<button type="button" class="vt${view === v ? ' on' : ''}" data-setview="${v}" ` +
+    `title="${label}" aria-label="${label}" aria-pressed="${view === v}">${glyph}</button>`;
+  return `<span class="viewtoggle">${btn('list', '&#9776;', 'Show as list')}` +
+    `${btn('cards', '&#8862;', 'Show as cards')}</span>`;
+}
+
+export const VIEW_TOGGLE_CSS = `
+  .viewtoggle { display: none; margin-left: auto; gap: 2px; }
+  @media ${WIDE_FRAME} {
+    .viewtoggle { display: inline-flex; }
+  }
+  .viewtoggle .vt { font: inherit; font-size: .78rem; line-height: 1; cursor: pointer;
+    background: transparent; color: var(--muted, #8b93a3);
+    border: 1px solid transparent; border-radius: 6px; padding: 3px 6px;
+    -webkit-tap-highlight-color: transparent; }
+  .viewtoggle .vt:hover { color: var(--fg, #e7ebf2); }
+  .viewtoggle .vt.on { color: var(--accent, #6ea8fe);
+    border-color: var(--line, rgba(231, 235, 242, .12)); background: var(--card-2, #1c2230); }
+`;
+
 const CARD_CSS = `
   :host { display: block; }
   .card {

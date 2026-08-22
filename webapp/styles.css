@@ -1,21 +1,22 @@
 /* Retinue dashboard shell. Minimalist, dark, app-like on small displays.
  *
  * Layout model:
- *  - Dashboard (list mode): main is a flex column with min-height 100dvh. On
- *    tall screens the conversations region grows to fill the leftover space
- *    (app-like, dock at the bottom). When the sections outgrow a small or short
- *    viewport the PAGE scrolls — sections keep their natural height, so the
- *    conversations region is never squeezed away by the projects card; both are
- *    always reachable, in the worst case on separate scroll "screens".
+ *  - Dashboard (list mode): main is a flex column with min-height 100dvh. The
+ *    .deck / .col wrappers in index.html are display:contents here, so every
+ *    card stacks and contributes its natural height. On tall screens the
+ *    conversations region grows to fill the leftover space (app-like, dock at
+ *    the bottom); when the sections outgrow a small or short viewport the PAGE
+ *    scrolls, so every section stays reachable.
  *  - Thread/composer open: the frame locks to exactly 100dvh and everything
  *    else hides, so the chat is immersive with an internally scrolled thread
  *    and a pinned composer.
- *  - Wide screens (>=1000px and tall enough): two columns — conversations
- *    left, projects right — both visible, each scrolling internally. The frame
- *    tracks the window up to a generous cap instead of sitting in a narrow
- *    phone-width strip, and the cards drop their dashboard row caps there (see
- *    isWideFrame in components/base.js), so the extra room carries more
- *    conversations and projects rather than empty space. */
+ *  - Wide screens (>=1000px and tall enough): a fixed app frame. The wrappers
+ *    become real columns — conversations above news on the left, projects
+ *    filling the right column top to bottom — each scrolling internally, every
+ *    boundary a draggable splitter (layout.js persists the sizes per device,
+ *    VS Code style; double-click resets). The cards drop their dashboard row
+ *    caps here (see isWideFrame in components/base.js), so the room carries
+ *    content rather than empty space. */
 :root {
   --bg: #0b0d12;
   --card: #151922;
@@ -59,18 +60,48 @@ main {
   padding: 2px 4px 0;
 }
 .top h1 { font-size: 1.3rem; font-weight: 650; letter-spacing: -.01em; margin: 0; }
+.top .top-right { display: inline-flex; align-items: baseline; gap: 12px; }
 .top .date { color: var(--muted); font-size: .8rem; }
+/* Discrete settings link — a quiet glyph, not a button. */
+.top .gear { color: var(--muted); text-decoration: none; font-size: .95rem; }
+.top .gear:hover { color: var(--accent); }
+
+/* Phone layout: the deck wrappers dissolve, cards join main's flex column
+   directly, and the splitters (a wide-layout affordance) do not exist. */
+.deck, .col { display: contents; }
+.splitter { display: none; }
 
 /* The conversations region absorbs leftover height on tall screens; on small
    ones it keeps its natural height and the page scrolls instead (min-height: 0
    only matters once the immersive thread locks the frame below). */
 retinue-conversations { flex: 1; min-height: 0; }
 retinue-projects { flex: none; }
+retinue-news { flex: none; }
+/* Phone stacking priority: projects (actionable) before news (read-mostly).
+   The DOM nests news beside conversations for the wide columns, so flex order
+   restores the stack here; in the wide layout each region is ordered within
+   its own column, where these values reproduce the DOM order anyway. */
+retinue-news { order: 1; }
+retinue-app-launcher { order: 2; }
 
 /* App dock (slotted content lives in the light DOM, so it is styled here). */
 retinue-app-launcher { flex: none; }
 retinue-app-launcher .ico { font-size: 1.35rem; line-height: 1.25; }
 retinue-app-launcher .lbl { font-size: .68rem; color: var(--muted); }
+
+/* Settings page (settings.html): a plain readable column of cards, the same
+   width in every layout — none of the dashboard's frame rules apply to it. */
+main.settings { max-width: 640px; height: auto; }
+.scard { background: var(--card); border: 1px solid var(--line);
+         border-radius: var(--radius); padding: 14px 16px; }
+.scard h2 { font-size: .82rem; font-weight: 600; letter-spacing: .04em;
+            text-transform: uppercase; color: var(--muted); margin: 0 0 10px; }
+.scard .hint { color: var(--muted); font-size: .85rem; margin: 0 0 10px; }
+.linklist { list-style: none; margin: 0; padding: 0;
+            display: flex; flex-direction: column; gap: 8px; }
+.linklist a { display: block; padding: 10px 12px; border-radius: 10px;
+              background: var(--card-2); color: var(--fg); text-decoration: none; }
+.linklist a:hover { outline: 1px solid var(--accent); }
 
 /* Immersive chat: while a thread or the composer is open, lock the frame back
    to the viewport and hand the whole screen to the conversation (the thread
@@ -81,8 +112,10 @@ main:has(retinue-conversations[data-view="composer"]) {
   height: 100dvh;
   overflow: hidden;
 }
-main:has(retinue-conversations[data-view="thread"]) > :not(retinue-conversations),
-main:has(retinue-conversations[data-view="composer"]) > :not(retinue-conversations) {
+main:has(retinue-conversations[data-view="thread"])
+  :is(.top, .splitter, retinue-news, .col-side, retinue-app-launcher),
+main:has(retinue-conversations[data-view="composer"])
+  :is(.top, .splitter, retinue-news, .col-side, retinue-app-launcher) {
   display: none;
 }
 
@@ -96,52 +129,66 @@ main:has(retinue-project-page) {
 }
 retinue-project-page { flex: 1; min-height: 0; }
 
-/* Wide-and-tall screens: conversations and projects side by side, both
-   visible, each scrolling internally inside a fixed app frame. Wide-but-short
-   windows keep the single-column scroll layout above instead. */
+/* Wide-and-tall screens: a fixed app frame whose regions are real, resizable
+   columns. Wide-but-short windows keep the single-column scroll layout above
+   instead. Sizes come from two custom properties layout.js sets and persists —
+   --side-w (projects column width) and --news-h (news region height); with
+   neither set, the CSS defaults below apply. */
 @media (min-width: 1000px) and (min-height: 480px) {
   main {
-    /* Fill the window rather than centring a 1100px column with dead margins
-       either side; the cap only stops the conversation tiles from spreading
-       absurdly wide on a very large display. */
+    /* Fill the window rather than centring a fixed column with dead margins
+       either side; the cap only stops the tiles from spreading absurdly wide
+       on a very large display. */
     max-width: min(1600px, 100%);
     height: 100vh;
     height: 100dvh;
-    display: grid;
-    /* The projects column scales with the window (a fixed 360px looks starved
-       next to a 1200px conversations column) but stays within a readable band. */
-    grid-template-columns: minmax(0, 1fr) clamp(320px, 24vw, 420px);
-    grid-template-rows: auto minmax(0, 1fr) auto;
-    gap: 12px 18px;
   }
-  .top { grid-column: 1 / -1; }
-  retinue-conversations { grid-column: 1; grid-row: 2; min-height: 0; }
-  retinue-projects { grid-column: 2; grid-row: 2; min-height: 0; overflow-y: auto; }
-  retinue-app-launcher { grid-column: 1 / -1; justify-self: center; width: 100%; max-width: 520px; }
-  /* The immersive thread spans the whole frame (its siblings are hidden). */
-  main:has(retinue-conversations[data-view="thread"]) retinue-conversations,
-  main:has(retinue-conversations[data-view="composer"]) retinue-conversations {
-    grid-column: 1 / -1;
-    grid-row: 1 / -1;
-  }
-  /* The project page is a single column at a readable width — the dashboard's
-     two-column grid would leave a hollow second column beside it. */
-  main:has(retinue-project-page) {
-    display: flex;
-    max-width: 760px;
-  }
-  /* Same for the dedicated list pages: they carry one component, so the grid
-     would either strand it in the narrow right column (projects.html, which the
-     grid rules above place in column 2) or leave that column hollow
-     (conversations.html).
-     Both lists reflow into columns by themselves once they have the width. */
-  main:has(> retinue-conversations[full]),
-  main:has(> retinue-projects[full]) {
-    display: flex;
-  }
-  /* …and the single component takes the frame's height, scrolling internally —
-     the frame itself is fixed and clips, so a natural-height child would put its
-     tail out of reach. */
+
+  /* The deck between header and dock: left column (conversations over news),
+     splitter, right column (projects). Visual gaps come from the splitters
+     themselves, so dragging happens exactly where the boundary is seen. */
+  .deck { display: flex; flex: 1; min-height: 0; align-items: stretch; }
+  .col { display: flex; flex-direction: column; min-height: 0; }
+  .col-main { flex: 1 1 0; min-width: 0; }
+  /* Defaults deliberately favor conversations (the interactive surface) over
+     news (read-mostly): roughly two thirds to one third. */
+  .col-main retinue-conversations { flex: 1 1 auto; min-height: 0; }
+  .col-main retinue-news { flex: 0 0 auto; height: var(--news-h, 34%);
+                           min-height: 0; max-height: 75%; overflow-y: auto; }
+  /* The user can drag the news region shut (layout.js snaps small heights to
+     closed); the splitter stays as the handle to pull it open again. */
+  .col-main[data-news="closed"] retinue-news { display: none; }
+  .col-side { flex: 0 0 auto; width: var(--side-w, clamp(320px, 24vw, 420px));
+              min-width: 280px; max-width: 45%; }
+  .col-side retinue-projects { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+
+  /* Splitters: a generous hit area around a hairline, VS Code style. */
+  .splitter { display: block; flex: none; position: relative; z-index: 2;
+              touch-action: none; user-select: none; -webkit-user-select: none; }
+  .splitter-v { width: 14px; cursor: col-resize; }
+  .splitter-h { height: 14px; cursor: row-resize; }
+  .splitter::before { content: ""; position: absolute; background: var(--line); }
+  .splitter-v::before { top: 8px; bottom: 8px; left: 6px; width: 2px; }
+  .splitter-h::before { left: 8px; right: 8px; top: 6px; height: 2px; }
+  .splitter:hover::before, .splitter:focus-visible::before,
+  .splitter.dragging::before { background: var(--accent); }
+  .splitter:focus-visible { outline: none; }
+  /* No news to show (empty feed hides the card): no box holding 34% of the
+     column, and no boundary to drag either. The explicit display:none matters
+     because the element's own :host{display:block} outranks the UA [hidden]
+     rule. */
+  .col-main retinue-news[hidden] { display: none; }
+  .col-main:has(retinue-news[hidden]) .splitter-h { display: none; }
+
+  retinue-app-launcher { align-self: center; width: 100%; max-width: 560px; }
+
+  /* The project page is a single column at a readable width. */
+  main:has(retinue-project-page) { max-width: 760px; }
+  /* The dedicated list pages carry one component, which takes the frame's
+     height and scrolls internally — the frame is fixed and clips, so a
+     natural-height child would put its tail out of reach. The lists reflow
+     into columns by themselves once they have the width. */
   main:has(> retinue-conversations[full]) > retinue-conversations { flex: 1; min-height: 0; }
   main:has(> retinue-projects[full]) > retinue-projects { flex: 1; min-height: 0; overflow-y: auto; }
+  main:has(> retinue-news[full]) > retinue-news { flex: 1; min-height: 0; overflow-y: auto; }
 }

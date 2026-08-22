@@ -687,16 +687,21 @@ The plumbing lives in `scripts/push_notify.py` (VAPID keypair, one file per
 device subscription, both persisted under `PUSH_DIR` — by default a sibling of
 `CONVERSATIONS_DIR`, so it inherits the persistent `/root` volume) and three
 gateway endpoints: `GET /push/config`, `POST /push/subscribe`,
-`POST /push/unsubscribe`. The user opts in from the dashboard's bell button
-(`webapp/components/push.js`), which hides itself once enabled. Two caveats
-worth knowing: on **iOS** push only works if the dashboard was added to the
-home screen (in a plain Safari tab the button never appears), and if
-`pywebpush` is unavailable the whole feature reports itself disabled rather
-than failing — conversations still work exactly as before. Set `VAPID_SUBJECT`
-to the operator's contact address; deleting the stored key invalidates every
-existing subscription, so devices would need to re-enable.
+`POST /push/unsubscribe`. The user manages the opt-in from the **settings
+page** (`settings.html`, reached via the gear in the dashboard header), where
+`webapp/components/push.js` in `manage` mode shows this device's state —
+unsupported, blocked, off, or enabled with the delivery preferences and a
+disable button. The module also runs a silent re-registration on every
+dashboard load, so an already-granted device heals a rotated or server-reset
+subscription without visiting settings. Two caveats worth knowing: on **iOS**
+push only works if the dashboard was added to the home screen (in a plain
+Safari tab the settings page says so), and if `pywebpush` is unavailable the
+whole feature reports itself disabled rather than failing — conversations
+still work exactly as before. Set `VAPID_SUBJECT` to the operator's contact
+address; deleting the stored key invalidates every existing subscription, so
+devices would need to re-enable.
 
-The card sizes itself to the layout: on a phone, where every row lengthens the scrolling page, it stays compact at the five most recent active threads; in the wide layout, where it is a scroll box inside its own column, it shows every active thread as tiles that reflow into as many columns as fit (the same rule governs the projects card — see `isWideFrame` in `webapp/components/base.js`). Either way an **All conversations →** link leads to the dedicated `conversations.html` page, which lists every thread with an Active/Archived/Edits filter. Threads can be archived from inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived threads drop off the active list but stay on that page.
+The dashboard sizes itself to the layout. On a phone the page scrolls: the conversations card stays compact at the five most recent active threads, projects and news keep their own caps, and there is nothing to resize. In the wide layout (`isWideFrame` in `webapp/components/base.js`) the frame is fixed and the cards drop their caps: conversations sit above news on the left, projects fill the right column top to bottom, each region scrolling internally — and every boundary is a draggable splitter (`webapp/layout.js`), VS Code style: drag to resize, double-click to reset, drag news all the way down to close it; sizes persist per device in localStorage. Each list card's header also carries a list/cards toggle (tiles that reflow vs a single column — also per-device, hidden on phones where only one column fits anyway). Either way an **All conversations →** link leads to the dedicated `conversations.html` page, which lists every thread with an Active/Archived/Edits filter. Threads can be archived from inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived threads drop off the active list but stay on that page.
 
 **Archived + muted.** Archived and unread is a contradiction: the thread claims
 to want attention while being invisible. So when an agent files something new
