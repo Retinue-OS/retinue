@@ -58,9 +58,13 @@ STATE_DIR = Path(os.environ.get("GATEWAY_MONITOR_STATE_DIR", "") or "/root/.reti
 STATE_PATH = STATE_DIR / "state.json"
 
 # Where user-facing links point: the public dashboard base URL. Reuses the same
-# deployment setting the send-approval links use, so no new config is needed.
+# deployment settings the send-approval links use, so no new config is needed.
+# CONVERSATION_BASE_URL is the last fallback because it is the one always set in
+# this container (same chain as signal-push.py / email_client.py) — without it
+# the notice would carry a site-root path, which is not clickable in a thread.
 PUBLIC_BASE_URL = os.environ.get("GATEWAY_MONITOR_PUBLIC_BASE_URL", "").rstrip("/") \
-    or os.environ.get("SEND_APPROVAL_BASE_URL", "").rstrip("/")
+    or os.environ.get("SEND_APPROVAL_BASE_URL", "").rstrip("/") \
+    or os.environ.get("CONVERSATION_BASE_URL", "").rstrip("/")
 
 # The dashboard-conversation backend (same endpoint conversation-push.py uses).
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
@@ -96,6 +100,17 @@ def repair_url() -> str:
     return (PUBLIC_BASE_URL + path) if PUBLIC_BASE_URL else path
 
 
+def repair_link(label: str = "the gateways page") -> str:
+    """The repair target as a Markdown link — never a bare URL or path.
+
+    These messages land in a dashboard conversation, which renders Markdown:
+    a bare "/gateways" is plain text there (not clickable, and read aloud as
+    text), so the link target always carries a short human label instead. See
+    the dashboard-composing skill.
+    """
+    return f"[{label}]({repair_url()})"
+
+
 def outage_message(label: str, reason: str | None, since: float | None = None) -> str:
     lines = [
         f"The {label} messenger gateway has lost its connection — incoming messages on "
@@ -104,8 +119,8 @@ def outage_message(label: str, reason: str | None, since: float | None = None) -
     if reason:
         lines.append(f"Reported problem: {reason}")
     lines.append(
-        f"It most likely needs to be re-paired with the phone. Open {repair_url()} "
-        f"to see the gateway status and scan the pairing QR code."
+        f"It most likely needs to be re-paired with the phone. Open "
+        f"{repair_link()} to see the gateway status and scan the pairing QR code."
     )
     if since:
         mins = max(1, int((time.time() - since) // 60))
@@ -118,7 +133,7 @@ def reminder_message(label: str, since: float) -> str:
     return (
         f"Reminder: the {label} messenger gateway is still disconnected "
         f"(for about {hours} hour(s)). Messages on this channel are not flowing. "
-        f"Re-pair it at {repair_url()}."
+        f"Re-pair it on {repair_link()}."
     )
 
 

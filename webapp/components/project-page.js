@@ -21,6 +21,7 @@
 
 import { esc } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
+import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 
 const APPLY_POLL_MS = 3000;
 // Frontmatter keys that are rendered elsewhere (or meaningless to the user)
@@ -81,13 +82,20 @@ class RetinueProjectPage extends HTMLElement {
     this._sending = false;
     this._apply = null;      // {cid, status: 'working'|'done'|'failed', reply}
     this._applyTimer = null;
-    this._recState = 'idle'; // idle | recording | transcribing
+    this._recState = 'idle'; // idle | recording
     this._recChunks = [];
     this._mediaRecorder = null;
     this._recStream = null;
+    this._recIntent = null;  // what to do with the transcript: 'review' | 'send'
+    this._recAborted = false; // recording was discarded via the abort button
+    // The dictation job in flight, or null: {sending, phase} — it owns the
+    // command bar (as a status line) until it completes, so the text field
+    // (and with it the phone keyboard) never has to reappear mid-flow.
+    this._voiceJob = null;
+    this._focusCmdNext = false; // focus the command field after the next render
     this._cmdError = '';
-    this._autosend = false;  // send a dictated command right away (shared flag)
-    try { this._autosend = localStorage.getItem('retinue-voice-autosend') === '1'; } catch (_e) { /* ignore */ }
+    // Live waveform on the recording row's canvas (shared renderer, voice.js).
+    this._wave = new Waveform(this);
   }
 
   connectedCallback() {
@@ -107,6 +115,7 @@ class RetinueProjectPage extends HTMLElement {
     document.removeEventListener('visibilitychange', this._onVisible);
     if (this._applyTimer) clearTimeout(this._applyTimer);
     this._stopRecording();
+    this._wave.stop();
     this._stopStream();
   }
 
@@ -130,6 +139,10 @@ class RetinueProjectPage extends HTMLElement {
 
   _startEdit() {
     if (!this._item) return;
+    // Switching to the raw editor hides the command bar — like navigating away
+    // in the conversations card, it finishes a live recording as if the green
+    // check was tapped; the transcript waits in the command draft.
+    this._finishRecording('review');
     this._mode = 'edit';
     this._draft = this._item.markdown;
     this._editError = '';
@@ -236,11 +249,15 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   // ── Voice input for the command bar ────────────────────────────────────────
+  // Same flow as the conversation composer (see conversations.js): the mic
+  // swaps the bar for a recording row — abort ✕ | live waveform | review ✓ |
+  // send ➤ — then a status line while the dictation is transcribed (and, on
+  // the send path, sent), so the text field and the phone keyboard never
+  // reappear mid-flow.
 
-  async _toggleRecord() {
-    if (this._recState === 'transcribing') return;
-    if (this._recState === 'recording') { this._stopRecording(); return; }
-    if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder)) {
+  async _startRecording() {
+    if (this._recState !== 'idle' || this._voiceJob) return;
+    if (!canRecord()) {
       this._cmdError = 'Voice recording is not supported on this device.';
       this.render();
       return;
@@ -249,6 +266,8 @@ class RetinueProjectPage extends HTMLElement {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       this._recStream = stream;
       this._recChunks = [];
+      this._recIntent = null;
+      this._recAborted = false;
       const mr = new MediaRecorder(stream);
       this._mediaRecorder = mr;
       mr.addEventListener('dataavailable', (e) => {
@@ -259,12 +278,29 @@ class RetinueProjectPage extends HTMLElement {
       this._recState = 'recording';
       this._cmdError = '';
       this.render();
+      this._wave.start(stream);
     } catch (_err) {
       this._recState = 'idle';
       this._cmdError = 'Microphone access was denied.';
       this._stopStream();
       this.render();
     }
+  }
+
+  // Abort: throw the recording away and return to the plain command bar.
+  _abortRecording() {
+    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
+    this._recAborted = true;
+    this._stopRecording();
+  }
+
+  // Check / send buttons: stop the recorder with the chosen intent; the actual
+  // work continues in _onRecordingStopped once the recorder flushes its chunks.
+  // A decision already taken (an earlier tap, or abort) wins over later calls.
+  _finishRecording(intent) {
+    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
+    this._recIntent = intent;
+    this._stopRecording();
   }
 
   _stopRecording() {
@@ -283,14 +319,23 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   async _onRecordingStopped() {
+    this._wave.stop();
     this._stopStream();
     const chunks = this._recChunks || [];
     this._recChunks = [];
     const type = (this._mediaRecorder && this._mediaRecorder.mimeType)
       || (chunks[0] && chunks[0].type) || 'audio/webm';
     this._mediaRecorder = null;
-    if (!chunks.length) { this._recState = 'idle'; this.render(); return; }
-    this._recState = 'transcribing';
+    const intent = this._recIntent || 'review';
+    this._recIntent = null;
+    const aborted = this._recAborted;
+    this._recAborted = false;
+    this._recState = 'idle';
+    if (aborted || !chunks.length) {
+      this.render();
+      return;
+    }
+    this._voiceJob = { sending: intent === 'send', phase: 'transcribing' };
     this.render();
     let toSend = '';
     try {
@@ -303,19 +348,30 @@ class RetinueProjectPage extends HTMLElement {
       const data = await res.json();
       const text = ((data && data.text) || '').trim();
       if (text) {
+        // Append to anything already typed, like a dictation in the composer.
         this._cmd = this._cmd ? `${this._cmd.replace(/\s*$/, '')} ${text}` : text;
-        // Same review-or-send-right-away setting as the conversation composer.
-        if (this._autosend) toSend = this._cmd;
+        if (intent === 'send') toSend = this._cmd;
       } else {
         this._cmdError = 'No speech was detected in the recording.';
       }
     } catch (_err) {
       this._cmdError = "Couldn't transcribe the recording. Please try again.";
-    } finally {
-      this._recState = 'idle';
+    }
+    if (toSend) {
+      // Send path: the status row stays in place of the text field until the
+      // command is handed to Ara, so the keyboard never appears. On failure
+      // _sendCommand leaves _cmd in place for an unfocused manual retry.
+      this._voiceJob.phase = 'sending';
+      await this._sendCommand(toSend);
+    }
+    this._voiceJob = null;
+    // Completion must not yank the user out of the raw editor if they switched
+    // to it meanwhile — the transcript shows in the bar when they return to
+    // the view mode. Only the deliberate review flow raises the keyboard.
+    if (this._mode === 'view') {
+      this._focusCmdNext = intent === 'review';
       this.render();
     }
-    if (toSend) await this._sendCommand(toSend);
   }
 
   // ── Rendering ──────────────────────────────────────────────────────────────
@@ -335,7 +391,7 @@ class RetinueProjectPage extends HTMLElement {
     } else {
       body = this._viewHtml();
     }
-    this.shadowRoot.innerHTML = `<style>${CSS}${MD_CSS}</style>`
+    this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>`
       + `<section class="card">${body}</section>`;
     this._wire();
   }
@@ -344,16 +400,11 @@ class RetinueProjectPage extends HTMLElement {
     return '<a class="back" href="/projects.html" aria-label="All projects">&#8249;</a>';
   }
 
-  _micHtml(cls = 'mic') {
-    const canRecord = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
-    if (!canRecord) return '';
-    const label = this._recState === 'recording' ? '⏹'
-      : (this._recState === 'transcribing' ? '…' : '\u{1F3A4}');
-    const title = this._recState === 'recording' ? 'Stop recording'
-      : (this._recState === 'transcribing' ? 'Transcribing …' : 'Dictate a change');
-    const disabled = (this._sending || this._recState === 'transcribing') ? 'disabled' : '';
-    return `<button type="button" class="${cls}${this._recState === 'recording' ? ' rec' : ''}" `
-      + `data-mic title="${title}" aria-label="${title}" ${disabled}>${label}</button>`;
+  _micHtml() {
+    if (!canRecord()) return '';
+    const disabled = this._sending ? 'disabled' : '';
+    return `<button type="button" class="mic" data-mic title="Dictate a change" `
+      + `aria-label="Dictate a change" ${disabled}>\u{1F3A4}</button>`;
   }
 
   _viewHtml() {
@@ -412,12 +463,27 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   _commandBarHtml() {
-    const disabled = this._sending ? 'disabled' : '';
     const err = this._cmdError ? `<div class="cmd-err">${esc(this._cmdError)}</div>` : '';
+    // The voice flow owns the bar while it runs: the recording row while the
+    // mic is live, then a status line until the dictation is transcribed (and,
+    // on the send path, handed to Ara) — the text field never reappears
+    // mid-flow, so the phone keyboard stays down. See conversations.js.
+    if (this._recState === 'recording') {
+      return `<div class="cmdbar">${err}${recordingRowHtml()}</div>`;
+    }
+    if (this._voiceJob) {
+      const label = this._voiceJob.phase === 'sending' ? 'Sending …'
+        : (this._voiceJob.sending ? 'Transcribing & sending …' : 'Transcribing …');
+      return `<div class="cmdbar">${err}${statusRowHtml(label)}</div>`;
+    }
+    const disabled = this._sending ? 'disabled' : '';
+    // A textarea, not an input: change requests are often multi-sentence, so
+    // the field takes multiple lines and grows with its content (see _wire).
+    // Enter breaks the line; Cmd/Ctrl+Enter or the button sends.
     return `<div class="cmdbar">${err}<form class="row" data-cmd-form>`
       + this._micHtml()
-      + `<input type="text" placeholder="Tell Ara what to change &#8230;" `
-      + `aria-label="Tell Ara what to change" autocomplete="off" ${disabled} value="${esc(this._cmd)}">`
+      + `<textarea rows="1" placeholder="Tell Ara what to change &#8230;" `
+      + `aria-label="Tell Ara what to change" autocomplete="off" ${disabled}>${esc(this._cmd)}</textarea>`
       + `<button type="submit" title="Send" aria-label="Send" ${disabled}>&#10148;</button>`
       + `</form></div>`;
   }
@@ -440,28 +506,48 @@ class RetinueProjectPage extends HTMLElement {
     on('[data-cancel]', () => this._cancelEdit());
     on('[data-save]', () => this._save());
     on('[data-dismiss]', () => this._dismissApply());
-    on('[data-mic]', () => this._toggleRecord());
+    on('[data-mic]', () => this._startRecording());
+    on('[data-rec-abort]', () => this._abortRecording());
+    on('[data-rec-check]', () => this._finishRecording('review'));
+    on('[data-rec-send]', () => this._finishRecording('send'));
     const editor = root.querySelector('.editor');
     if (editor) {
       editor.addEventListener('input', () => { this._draft = editor.value; });
     }
     const form = root.querySelector('[data-cmd-form]');
     if (form) {
-      const input = form.querySelector('input');
-      input.addEventListener('input', () => { this._cmd = input.value; });
-      // Cmd/Ctrl+Enter sends, as in the conversation composer. Plain Enter
-      // already submits this single-line field, but the habit comes from there
-      // and must not silently do nothing here.
+      const input = form.querySelector('textarea');
+      // Grow with the content (a change request is often more than one line),
+      // capped so a long dictation never swallows the page.
+      const grow = () => {
+        input.style.height = 'auto';
+        input.style.height = `${Math.min(input.scrollHeight, Math.round(window.innerHeight * 0.3))}px`;
+      };
+      input.addEventListener('input', () => { this._cmd = input.value; grow(); });
+      // Cmd/Ctrl+Enter sends, as in the conversation composer; plain Enter
+      // breaks the line in this multi-line field.
       input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
           e.preventDefault();
           form.requestSubmit();
         }
       });
+      grow();
       form.addEventListener('submit', (e) => {
         e.preventDefault();
         this._sendCommand(input.value);
       });
+      // The review flow drops the transcript here and opens the keyboard on
+      // purpose; nothing else steals focus.
+      if (this._focusCmdNext) {
+        this._focusCmdNext = false;
+        setTimeout(() => {
+          if (!input.isConnected) return;
+          input.focus();
+          const end = input.value.length;
+          try { input.setSelectionRange(end, end); } catch (_err) { /* ignore */ }
+        }, 0);
+      }
     }
   }
 }
@@ -532,22 +618,18 @@ const CSS = `
   .cmdbar { flex: none; margin-top: 8px; padding-top: 10px;
             border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
   .cmd-err { color: var(--high, #ff6b6b); font-size: .76rem; margin-bottom: 8px; }
-  .row { display: flex; gap: 6px; align-items: center; }
-  .row input { flex: 1; min-width: 0; height: 40px; background: var(--card-2, #1c2230);
-               border: 0; border-radius: 20px; padding: 0 14px; color: var(--fg, #e7ebf2); }
-  .row input::placeholder { color: var(--muted, #8b93a3); }
+  .row { display: flex; gap: 6px; align-items: flex-end; }
+  .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 30vh;
+                  background: var(--card-2, #1c2230); border: 0; border-radius: 20px;
+                  padding: 9px 14px; color: var(--fg, #e7ebf2); font: inherit;
+                  line-height: 1.35; resize: none; overflow-y: auto; }
+  .row textarea::placeholder { color: var(--muted, #8b93a3); }
   .row button[type="submit"] { flex: none; display: inline-flex; align-items: center;
       justify-content: center; width: 40px; height: 40px; border-radius: 50%;
       background: var(--accent, #6ea8fe); color: #0b0d12; border: 0; font-size: 1.05rem;
       cursor: pointer; padding: 0 0 0 2px; -webkit-tap-highlight-color: transparent; }
-  .mic { display: inline-flex; align-items: center; justify-content: center; height: 40px;
-         width: 40px; flex: none; border-radius: 50%; background: var(--card-2, #1c2230);
-         border: 0; cursor: pointer; color: var(--fg, #e7ebf2); font-size: 1.05rem;
-         -webkit-tap-highlight-color: transparent; }
-  .mic.rec { background: var(--high, #ff6b6b); color: #fff;
-             animation: mic-pulse 1.2s ease-in-out infinite; }
-  .mic[disabled] { opacity: .6; cursor: default; }
-  @keyframes mic-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+  /* Mic button, recording row and status row styles come from the shared
+     VOICE_CSS (voice.js), appended to this sheet in render(). */
   button[disabled], input[disabled], textarea[disabled] { opacity: .6; cursor: default; }
 
   .save { flex: none; background: var(--accent, #6ea8fe); color: #0b0d12; border: 0;

@@ -42,6 +42,8 @@ import json
 import mimetypes
 import os
 import re
+import secrets
+import shutil
 import sys
 import tempfile
 import threading
@@ -213,16 +215,69 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool, attachment_urls: list[str] | None = None) -> None:
-    """Best-effort persist of one inbound message to the store; never raises."""
+                     delivered: bool, media: str | None = None,
+                     attachment_urls: list[str] | None = None):
+    """Best-effort persist of one inbound message to the store; never raises.
+
+    Returns the store ``Path`` (so the caller can later flip the delivered flag
+    with :func:`_mark_delivered`) or ``None`` if persistence failed. ``media``
+    records a retained raw-audio file for a voice note persisted before
+    transcription (see :func:`_retain_media`); ``attachment_urls`` are the
+    durable HTTP references to this message's media (see :func:`_store_media_ref`).
+    """
     try:
-        _ibstore.write_message(
+        _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
-            text=question, group=group_id or None, delivered=delivered,
+            text=question, group=group_id or None, delivered=delivered, media=media,
             attachment_urls=attachment_urls,
         )
+        return path
     except Exception as exc:
         print(f"[telegram-gateway] could not persist inbound message: {exc}", flush=True)
+        return None
+
+
+def _mark_delivered(store_path) -> None:
+    """Flip a persisted inbound's delivered flag once triage has it; never raises."""
+    if store_path is None:
+        return
+    try:
+        _ibstore.mark_delivered(store_path)
+    except Exception as exc:
+        print(f"[telegram-gateway] could not mark inbound delivered: {exc}", flush=True)
+
+
+def _retain_media(temp_path):
+    """Move a downloaded media file into the inbound store's durable media dir.
+
+    A voice note is downloaded to a temp file that is otherwise unlinked after
+    transcription. Retaining it under the store volume — *before* STT runs — is
+    what lets a failed or crashed transcription be retried instead of the message
+    vanishing. Returns the durable ``Path`` or ``None`` on failure (the caller
+    then falls back to transcribing the temp file directly).
+    """
+    try:
+        mdir = _ibstore.media_dir(INBOUND_STORE_DIR)
+        mdir.mkdir(parents=True, exist_ok=True)
+        dest = mdir / f"{secrets.token_hex(8)}{Path(temp_path).suffix}"
+        shutil.move(str(temp_path), str(dest))
+        return dest
+    except Exception as exc:  # noqa: BLE001
+        print(f"[telegram-gateway] could not retain voice-note media: {exc}", flush=True)
+        return None
+
+
+def _update_inbound(store_path, *, text: str | None = None,
+                    clear_media: bool = False):
+    """Fill in a pre-persisted message's transcript / drop its media ref; never
+    raises. Returns the media path that was cleared (to unlink), else None."""
+    if store_path is None:
+        return None
+    try:
+        return _ibstore.update_message(store_path, text=text, clear_media=clear_media)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[telegram-gateway] could not update inbound message: {exc}", flush=True)
+        return None
 
 
 def _forward_news(question: str, source: str, group_id: str | None, lang: str) -> None:
@@ -615,18 +670,32 @@ def _inbound_image_files(image_path, image_mime: str | None) -> tuple[list[dict]
 def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
                     is_group: bool, sender_name: str | None,
                     files: list[dict] | None = None,
-                    attachment_urls: list[str] | None = None) -> None:
-    """Blocking dispatch — runs in a worker thread, off the asyncio loop."""
+                    attachment_urls: list[str] | None = None,
+                    store_path=None) -> None:
+    """Blocking dispatch — runs in a worker thread, off the asyncio loop.
+
+    ``store_path`` is set when the caller already persisted this message before
+    transcription (the never-drop voice-note path): it is threaded to
+    :func:`_forward_to_inbox` so the forward reuses that record instead of
+    writing a second one.
+    """
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
     if not text and not files:
-        print(f"[telegram-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
+        if store_path is not None:
+            # A voice note whose transcription failed: not dropped — it is on disk
+            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            print(f"[telegram-gateway] voice note from {sender} not transcribed; "
+                  f"retained for retry (not dropped)", flush=True)
+        else:
+            print(f"[telegram-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
         return
     if text and lang == DEFAULT_LANGUAGE:
         lang = _detect_text_language(text)
     if TELEGRAM_GATEWAY_MODE == "inbox":
         _forward_to_inbox(text, lang, str(chat_id), is_group=is_group,
                           sender_name=sender_name, files=files,
-                          attachment_urls=attachment_urls)
+                          attachment_urls=attachment_urls,
+                          store_path=store_path)
     else:
         _handle_control_message(text, lang, str(chat_id), sender, files=files)
 
@@ -685,8 +754,18 @@ async def _on_new_message(event) -> None:
 
         def _work():
             nonlocal text, lang
-            attachment_urls: list[str] = []
+            # Resolve the image attachment first so its durable reference is
+            # already in attachment_urls by the time the voice-note branch below
+            # pre-persists the message (a Telegram message carries one media, so
+            # in practice only one of the two ever fires — this just makes the
+            # record complete whichever it is).
+            image_files, image_urls = _inbound_image_files(image_path, image_mime)
+            attachment_urls: list[str] = list(image_urls)
             voice_files: list[dict] = []
+            # A voice note is persisted BEFORE transcription (never-drop): if the
+            # pre-persist happened, this holds its store Path so the forward reuses
+            # the same record instead of writing a second one.
+            voice_store_path = None
             if media_path:
                 vpath = Path(media_path)
                 # Read the audio once and persist a durable reference BEFORE
@@ -694,6 +773,8 @@ async def _on_new_message(event) -> None:
                 # or garbled transcription must never cost it. The bytes go to an
                 # on-disk blob (any size) plus the forward-ready files payload
                 # (size-capped, since that one travels base64 through triage).
+                # This read must precede _retain_media below, which *moves* the
+                # temp file away.
                 try:
                     audio_bytes = vpath.read_bytes()
                 except OSError:
@@ -709,18 +790,49 @@ async def _on_new_message(event) -> None:
                         "content_type": vmime,
                         "data": base64.b64encode(audio_bytes).decode("ascii"),
                     })
-                try:
-                    print(f"[telegram-gateway] transcribing voice note from {sender}", flush=True)
-                    text, lang = _transcribe(vpath)
-                except Exception as exc:  # noqa: BLE001 - degrade to placeholder
-                    print(f"[telegram-gateway] transcription failed: {exc}", flush=True)
-                finally:
-                    vpath.unlink(missing_ok=True)
-            image_files, image_urls = _inbound_image_files(image_path, image_mime)
-            attachment_urls.extend(image_urls)
+                if TELEGRAM_GATEWAY_MODE == "inbox":
+                    # Never-drop: retain the audio and persist the message up front,
+                    # THEN transcribe. A failed or crashed STT run leaves a durable,
+                    # re-transcribable record (delivered=False, media set) for the
+                    # daily drain — instead of vanishing at the skip-return in
+                    # _handle_inbound, downstream of where _forward_to_inbox
+                    # persists. Only in inbox mode: a control account has no triage
+                    # drain that would pick a persisted record back up.
+                    #
+                    # The retained copy is the *retry* artifact and is dropped once
+                    # the transcript lands; the kb:attachment blob stored above is
+                    # the message's permanent media and stays.
+                    durable = _retain_media(media_path) or media_path
+                    grp = str(chat_id) if is_group else None
+                    voice_store_path = _persist_inbound(
+                        "", sender, grp, delivered=False, media=str(durable),
+                        attachment_urls=attachment_urls,
+                    )
+                    try:
+                        print(f"[telegram-gateway] transcribing voice note from {sender}", flush=True)
+                        text, lang = _transcribe(Path(durable))
+                    except Exception as exc:  # noqa: BLE001 - keep audio for retry
+                        print(f"[telegram-gateway] transcription failed for {sender}; "
+                              f"kept for retry: {exc}", flush=True)
+                    else:
+                        # Transcript in hand: fill it into the record and drop the
+                        # now-redundant retained audio (the text supersedes it).
+                        prev = _update_inbound(voice_store_path, text=text, clear_media=True)
+                        if prev:
+                            Path(prev).unlink(missing_ok=True)
+                else:
+                    # Control mode: transient handling (no durable spool, no retry).
+                    try:
+                        print(f"[telegram-gateway] transcribing voice note from {sender}", flush=True)
+                        text, lang = _transcribe(vpath)
+                    except Exception as exc:  # noqa: BLE001 - degrade to placeholder
+                        print(f"[telegram-gateway] transcription failed: {exc}", flush=True)
+                    finally:
+                        vpath.unlink(missing_ok=True)
             files = voice_files + image_files
             _handle_inbound(text, lang, str(chat_id), sender, is_group, sender_name,
-                            files=files, attachment_urls=attachment_urls)
+                            files=files, attachment_urls=attachment_urls,
+                            store_path=voice_store_path)
 
         _LOOP.run_in_executor(None, _work)
     except Exception as exc:  # noqa: BLE001 - one bad message must not stall the loop
@@ -932,8 +1044,14 @@ def _handle_control_message(question: str, lang: str, chat_id: str, sender: str,
 def _forward_to_inbox(question: str, lang: str, chat_id: str,
                       is_group: bool = False, sender_name: str | None = None,
                       files: list[dict] | None = None,
-                      attachment_urls: list[str] | None = None) -> None:
-    """Hand an inbox-account message to the user's triage, notifying the user."""
+                      attachment_urls: list[str] | None = None,
+                      store_path=None) -> None:
+    """Hand an inbox-account message to the user's triage, notifying the user.
+
+    ``store_path`` is set when the caller already persisted this message before
+    transcription (the never-drop voice-note path): the persist-first step below
+    is then skipped so the same record is reused instead of a second one written.
+    """
     sender_label = sender_name or chat_id
     if sender_name:
         sender_label = f"{sender_name} ({chat_id})"
@@ -946,6 +1064,17 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     handle = str(chat_id) if chat_id else "unknown"
     group_id = handle if is_group else None
 
+    # Persist FIRST, before any routing decision — the never-drop invariant. The
+    # inbound event has already been consumed from the Telegram session, so if it
+    # is lost here it is gone for good. Writing it up front as delivered=False
+    # means any later failure (a throwing gate, a crash mid-forward, a killed
+    # container) leaves the message on disk for the daily drain instead of
+    # silently dropping it. The flag is flipped to true below once the message is
+    # accounted for (forwarded to triage, or held in a fully-resolved class).
+    if store_path is None:
+        store_path = _persist_inbound(question, handle, group_id, delivered=False,
+                                      attachment_urls=attachment_urls)
+
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(handle, group_id)
     # News rail is independent of the triage decision: a message from a group
@@ -953,8 +1082,11 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     if gate.get("news"):
         _forward_news(question, sender_name or handle, group_id, lang)
     if not gate["forward"]:
-        _persist_inbound(question, handle, group_id, delivered=gate["delivered_if_held"],
-                         attachment_urls=attachment_urls)
+        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
+        # the drain must never re-surface. One held merely for a not-yet-
+        # whitelisted sender stays delivered=False for the daily drain.
+        if gate["delivered_if_held"]:
+            _mark_delivered(store_path)
         print(
             f"[telegram-gateway] gate held inbox message from {sender_label} "
             f"({gate['reason']}); no model turn",
@@ -1030,10 +1162,12 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     except requests.exceptions.RequestException as exc:
         print(f"[telegram-gateway] connection error forwarding inbox message from {sender_label}: {exc}", flush=True)
 
-    # Persist AFTER forwarding so the delivered flag reflects reality: a failed
-    # forward stays undelivered and the daily drain retries it.
-    _persist_inbound(question, handle, group_id, delivered=forwarded,
-                     attachment_urls=attachment_urls)
+    # Flip the persisted message's delivered flag: a message handed to triage is
+    # delivered; a failed forward stays delivered=False (as written up front) so
+    # the daily drain retries it. At-least-once: a crash between the forward and
+    # this flip may re-surface the message on the next drain — the safe direction.
+    if forwarded:
+        _mark_delivered(store_path)
 
 
 # ── Recent-senders store ──────────────────────────────────────────────────────

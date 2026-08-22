@@ -104,8 +104,12 @@ The page renders the frontmatter as meta chips and the body through the shared
 Markdown renderer, and offers three ways to change the project, in increasing
 weight:
 
-1. **Quick command** — the bar at the bottom (typed, or dictated via the same
-   `/conversations/transcribe` pipeline as chat). The request becomes a
+1. **Quick command** — the bar at the bottom: a multi-line field that grows
+   with its content (Enter breaks the line, Cmd/Ctrl+Enter sends), or dictation
+   with the same recording controls as the chat composer (shared UI in
+   `components/voice.js`, same `/conversations/transcribe` pipeline — waveform,
+   ✕ discard, ✓ transcribe for review, ➤ transcribe and send without the
+   keyboard reappearing). The request becomes a
    conversation of **kind `edit`**, linked to the project: Ara applies it to
    the file and the page shows her one-line confirmation, then reloads. Edit
    threads are marked as such and **hidden from the normal conversation

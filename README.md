@@ -97,6 +97,10 @@ scheduled agent jobs. Claude Code can use a Claude-compatible endpoint in place
 of Anthropic. This keeps Retinue's tools, plugins, permissions, and workflows
 unchanged while allowing an Ollama local or cloud model to provide inference.
 
+A longer operator guide — picker, `think:false`, tool drop, output caps,
+and why a tag that answers `pong` can still dump word salad as Ara — is
+[`docs/ollama.md`](docs/ollama.md).
+
 For Ollama, add the following to `.env` and select a model available from your
 Ollama server or Ollama Cloud:
 

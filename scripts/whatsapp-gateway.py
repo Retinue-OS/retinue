@@ -40,6 +40,8 @@ import json
 import mimetypes
 import os
 import re
+import secrets
+import shutil
 import tempfile
 import threading
 import time
@@ -231,16 +233,69 @@ GATEWAY_SELF_URL = os.environ.get(
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool, attachment_urls: list[str] | None = None) -> None:
-    """Best-effort persist of one inbound message to the store; never raises."""
+                     delivered: bool, media: str | None = None,
+                     attachment_urls: list[str] | None = None):
+    """Best-effort persist of one inbound message to the store; never raises.
+
+    Returns the store ``Path`` (so the caller can later flip the delivered flag
+    with :func:`_mark_delivered`) or ``None`` if persistence failed. ``media``
+    records a retained raw-audio file for a voice note persisted before
+    transcription (see :func:`_retain_media`); ``attachment_urls`` are the
+    durable HTTP references to this message's media (see :func:`_store_media_ref`).
+    """
     try:
-        _ibstore.write_message(
+        _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
-            text=question, group=group_id or None, delivered=delivered,
+            text=question, group=group_id or None, delivered=delivered, media=media,
             attachment_urls=attachment_urls or None,
         )
+        return path
     except Exception as exc:
         print(f"[whatsapp-gateway] could not persist inbound message: {exc}", flush=True)
+        return None
+
+
+def _mark_delivered(store_path) -> None:
+    """Flip a persisted inbound's delivered flag once triage has it; never raises."""
+    if store_path is None:
+        return
+    try:
+        _ibstore.mark_delivered(store_path)
+    except Exception as exc:
+        print(f"[whatsapp-gateway] could not mark inbound delivered: {exc}", flush=True)
+
+
+def _retain_media(temp_path):
+    """Move a downloaded media file into the inbound store's durable media dir.
+
+    The bridge downloads a voice note to a temp file that is otherwise unlinked
+    after transcription. Retaining it under the store volume — *before* STT runs
+    — is what lets a failed or crashed transcription be retried instead of the
+    message vanishing. Returns the durable ``Path`` or ``None`` on failure (the
+    caller then falls back to transcribing the temp file directly).
+    """
+    try:
+        mdir = _ibstore.media_dir(INBOUND_STORE_DIR)
+        mdir.mkdir(parents=True, exist_ok=True)
+        dest = mdir / f"{secrets.token_hex(8)}{Path(temp_path).suffix}"
+        shutil.move(str(temp_path), str(dest))
+        return dest
+    except Exception as exc:  # noqa: BLE001
+        print(f"[whatsapp-gateway] could not retain voice-note media: {exc}", flush=True)
+        return None
+
+
+def _update_inbound(store_path, *, text: str | None = None,
+                    clear_media: bool = False):
+    """Fill in a pre-persisted message's transcript / drop its media ref; never
+    raises. Returns the media path that was cleared (to unlink), else None."""
+    if store_path is None:
+        return None
+    try:
+        return _ibstore.update_message(store_path, text=text, clear_media=clear_media)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[whatsapp-gateway] could not update inbound message: {exc}", flush=True)
+        return None
 
 
 def _forward_news(question: str, source: str, group_id: str | None, lang: str) -> None:
@@ -1326,6 +1381,10 @@ def _handle_message_event(event) -> None:
     else:
         files, attachment_urls = _inbound_image_files(message)
 
+    # A voice note is persisted BEFORE transcription (never-drop): if the pre-
+    # persist happened, this holds its store Path so the forward below reuses the
+    # same record instead of writing a second one.
+    voice_store_path = None
     if not text and not files:
         # No text — try a voice note (download + transcribe via the STT service).
         audio = _extract_audio(message)
@@ -1336,7 +1395,8 @@ def _handle_message_event(event) -> None:
                 # files payload (so the original audio rides into the conversation
                 # alongside its transcript), AND transcription. Persist the audio
                 # BEFORE transcribing so a garbled or failed transcript never costs
-                # the recording — the audio is the source of truth here.
+                # the recording — the audio is the source of truth here. This read
+                # must precede _retain_media below, which *moves* the temp file.
                 mime = str(_attr(audio, "mimetype", "Mimetype") or "audio/ogg; codecs=opus")
                 try:
                     audio_bytes = media.read_bytes()
@@ -1354,13 +1414,47 @@ def _handle_message_event(event) -> None:
                             "content_type": mime,
                             "data": base64.b64encode(audio_bytes).decode("ascii"),
                         })
-                try:
-                    print(f"[whatsapp-gateway] transcribing voice note from {sender}", flush=True)
-                    text, lang = _transcribe(media)
-                except Exception as exc:  # noqa: BLE001 - degrade to placeholder
-                    print(f"[whatsapp-gateway] transcription failed: {exc}", flush=True)
-                finally:
-                    media.unlink(missing_ok=True)
+                if is_broadcast or WHATSAPP_GATEWAY_MODE != "inbox":
+                    # Transient handling (no durable spool, no retry): a status
+                    # post is gated to a no-model-turn path anyway, and a
+                    # control-mode account has no triage drain that would ever
+                    # pick a persisted record back up — so persisting here would
+                    # only leak. The never-drop ledger is an inbox-mode concept.
+                    try:
+                        print(f"[whatsapp-gateway] transcribing voice note from {sender}", flush=True)
+                        text, lang = _transcribe(media)
+                    except Exception as exc:  # noqa: BLE001 - degrade to placeholder
+                        print(f"[whatsapp-gateway] transcription failed: {exc}", flush=True)
+                    finally:
+                        media.unlink(missing_ok=True)
+                else:
+                    # Never-drop: retain the audio and persist the message up
+                    # front, THEN transcribe. A failed or crashed STT run leaves a
+                    # durable, re-transcribable record (delivered=False, media set)
+                    # for the daily drain — instead of vanishing at the skip-return
+                    # below, downstream of where _forward_to_inbox persists.
+                    #
+                    # The retained copy is the *retry* artifact and is dropped once
+                    # the transcript lands; the kb:attachment blob stored above is
+                    # the message's permanent media and stays.
+                    durable = _retain_media(media) or media
+                    grp = _jid_addr(chat_jid) if is_group else None
+                    voice_store_path = _persist_inbound(
+                        "", sender, grp, delivered=False, media=str(durable),
+                        attachment_urls=attachment_urls,
+                    )
+                    try:
+                        print(f"[whatsapp-gateway] transcribing voice note from {sender}", flush=True)
+                        text, lang = _transcribe(durable)
+                    except Exception as exc:  # noqa: BLE001 - keep audio for retry
+                        print(f"[whatsapp-gateway] transcription failed for {sender}; "
+                              f"kept for retry: {exc}", flush=True)
+                    else:
+                        # Transcript in hand: fill it into the record and drop the
+                        # now-redundant audio (the text supersedes it).
+                        prev = _update_inbound(voice_store_path, text=text, clear_media=True)
+                        if prev:
+                            Path(prev).unlink(missing_ok=True)
 
     if text and lang == DEFAULT_LANGUAGE:
         lang = _detect_text_language(text)
@@ -1379,7 +1473,13 @@ def _handle_message_event(event) -> None:
     _record_recent_sender(sender_jid, chat_jid, push_name)
 
     if not text and not files:
-        print(f"[whatsapp-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
+        if voice_store_path is not None:
+            # A voice note whose transcription failed: not dropped — it is on disk
+            # (delivered=False, audio retained) for the daily drain / a re-transcribe.
+            print(f"[whatsapp-gateway] voice note from {sender} not transcribed; "
+                  f"retained for retry (not dropped)", flush=True)
+        else:
+            print(f"[whatsapp-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
         return
 
     # The account's mode — not the content — decides handling.
@@ -1395,7 +1495,8 @@ def _handle_message_event(event) -> None:
         origin = _jid_addr(chat_jid) or _jid_addr(sender_jid)
         _forward_to_inbox(text, lang, sender, is_group=is_group,
                           sender_name=push_name, origin=origin, files=files,
-                          attachment_urls=attachment_urls)
+                          attachment_urls=attachment_urls,
+                          store_path=voice_store_path)
     else:
         _handle_control_message(text, lang, sender, files=files)
 
@@ -1434,7 +1535,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
                       is_group: bool = False, sender_name: str | None = None,
                       origin: str | None = None,
                       files: list[dict] | None = None,
-                      attachment_urls: list[str] | None = None) -> None:
+                      attachment_urls: list[str] | None = None,
+                      store_path=None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     The account is one of the user's own message sources, so the message is the
@@ -1447,6 +1549,10 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     embedded in the prompt, so a later reply is addressed by token — back to this
     same conversation — rather than by re-resolving the sender's name, which can
     land on the wrong account.
+
+    ``store_path`` is set when the caller already persisted this message before
+    forwarding (the voice-note persist-before-transcribe path): the record is
+    reused for the delivered flip instead of writing a second one here.
     """
     sender_label = sender or "unknown"
     if sender_name:
@@ -1458,6 +1564,18 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # group-block policy matches on. For a 1:1 there is no group.
     group_id = origin if is_group else None
 
+    # Persist FIRST, before any routing decision — the never-drop invariant. The
+    # inbound event has already been consumed from the WhatsApp session, so if it
+    # is lost here it is gone for good. Writing it up front as delivered=False
+    # means any later failure (a throwing gate, a crash mid-forward, a killed
+    # container) leaves the message on disk for the daily drain instead of
+    # silently dropping it. The flag is flipped to true below once the message is
+    # accounted for (forwarded to triage, or held in a fully-resolved class).
+    # A voice note was already persisted before transcription; reuse that record.
+    if store_path is None:
+        store_path = _persist_inbound(question, sender, group_id, delivered=False,
+                                      attachment_urls=attachment_urls)
+
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(sender, group_id)
     # News rail is independent of the triage decision: a message from a group
@@ -1465,8 +1583,11 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     if gate.get("news"):
         _forward_news(question, sender_name or (group_id if is_group else sender), group_id, lang)
     if not gate["forward"]:
-        _persist_inbound(question, sender, group_id, delivered=gate["delivered_if_held"],
-                         attachment_urls=attachment_urls)
+        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
+        # the drain must never re-surface. One held merely for a not-yet-
+        # whitelisted sender stays delivered=False for the daily drain.
+        if gate["delivered_if_held"]:
+            _mark_delivered(store_path)
         print(
             f"[whatsapp-gateway] gate held inbox message from {sender_label} "
             f"({gate['reason']}); no model turn",
@@ -1537,10 +1658,12 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     except requests.exceptions.RequestException as exc:
         print(f"[whatsapp-gateway] connection error forwarding inbox message from {sender_label}: {exc}", flush=True)
 
-    # Persist AFTER forwarding so the delivered flag reflects reality: a failed
-    # forward stays undelivered and the daily drain retries it.
-    _persist_inbound(question, sender, group_id, delivered=forwarded,
-                     attachment_urls=attachment_urls)
+    # Flip the persisted message's delivered flag: a message handed to triage is
+    # delivered; a failed forward stays delivered=False (as written up front) so
+    # the daily drain retries it. At-least-once: a crash between the forward and
+    # this flip may re-surface the message on the next drain — the safe direction.
+    if forwarded:
+        _mark_delivered(store_path)
 
 
 def _forward_status_to_inbox(text: str, lang: str, sender: str,
@@ -1913,6 +2036,55 @@ def _decode_image(image: dict) -> Path:
     return Path(out)
 
 
+def _autowhitelist_recipient(recipient: str) -> None:
+    """After a successful outbound 1:1 send, add the recipient to the inbound
+    whitelist — so a reply from someone the user just messaged is a *known*
+    sender, not an "unknown sender" prompt. The messenger analogue of the
+    e-mail Sent-folder auto-whitelist (see triage_policy.auto_whitelist_on_send).
+
+    Best-effort: it must never break a send, so every failure is swallowed.
+    Group and broadcast recipients are skipped — a group is not a 1:1 handle.
+
+    Identity forms: inbound is gated on the bare user of its sender JID
+    (``_jid_user``), so the handle whitelisted is the recipient *as addressed*
+    — a reply routes back to the inbound's exact origin (LID or PN), which then
+    matches. WhatsApp's LID<->PN split means the two identities differ, so the
+    counterpart is whitelisted too when the bridge's LID store knows it
+    (``_lid_to_pn`` / ``_pn_to_lid``): a later inbound arriving under either
+    identity is then recognised. A true first-contact number the store has no
+    mapping for whitelists only the sent form — the counterpart is learned once
+    that contact's inbound populates the store.
+    """
+    try:
+        r = (recipient or "").strip()
+        if not r:
+            return
+        user, _, server = r.partition("@")
+        user = user.lstrip("+").strip()
+        server = server.split(":", 1)[0]
+        if server.endswith("g.us") or server == WA_BROADCAST_SERVER:
+            return
+        if not user:
+            return
+        handles = {user}
+        # Whitelist the LID<->PN counterpart too, so an inbound under either
+        # identity is recognised. A bare id (no server) is treated as a possible
+        # LID-only contact first (speculative — an ordinary number just misses).
+        if server == WA_LID_SERVER:
+            counterpart = _lid_to_pn(user, speculative=True)
+        elif server == WA_PN_SERVER:
+            counterpart = _pn_to_lid(user)
+        else:
+            counterpart = _lid_to_pn(user, speculative=True) or _pn_to_lid(user)
+        if counterpart:
+            handles.add(counterpart)
+        added = _triage.auto_whitelist_on_send(INBOUND_CHANNEL, handles)
+        if added:
+            print(f"[whatsapp-gateway] auto-whitelisted recipient handle(s): {', '.join(added)}", flush=True)
+    except Exception as exc:  # noqa: BLE001 - auto-whitelist must never break a send
+        print(f"[whatsapp-gateway] auto-whitelist skipped for {recipient!r}: {exc}", flush=True)
+
+
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True) -> None:
     """Send an outbound message: text body plus optional image attachments.
@@ -1931,6 +2103,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
         for image in images:
             temp_paths.append(_decode_image(image))
         _wa_send(recipient, message or None, media_paths=temp_paths)
+        _autowhitelist_recipient(recipient)
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
