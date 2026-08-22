@@ -128,8 +128,16 @@ them, override without a code change:
 ```dotenv
 CLAUDE_OAUTH_AUTHORIZE_URL=…   CLAUDE_OAUTH_TOKEN_URL=…
 CLAUDE_OAUTH_REDIRECT_URI=…    CLAUDE_OAUTH_CLIENT_ID=…
-CLAUDE_OAUTH_SCOPES=…
+CLAUDE_OAUTH_SCOPES=…          CLAUDE_OAUTH_USER_AGENT=…
 ```
 
 The failure mode is graceful either way: the exchange surfaces the server's
 error on the page, and the console paths keep working.
+
+One such coupling is load-bearing enough to name: Cloudflare fronts the OAuth
+endpoints and rejects generic HTTP clients outright — **"Token endpoint
+returned HTTP 403: error code: 1010"** is Cloudflare's browser-signature ban,
+not an Anthropic error. The exchange therefore identifies itself as the Claude
+Code CLI (`claude-cli/<installed version> (external, cli)` — it is the CLI's
+own sign-in flow being performed). If that signature is ever banned too, set
+`CLAUDE_OAUTH_USER_AGENT` to whatever the then-current CLI sends.

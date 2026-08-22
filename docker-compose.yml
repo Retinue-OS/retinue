@@ -86,6 +86,7 @@ services:
       - CLAUDE_OAUTH_REDIRECT_URI
       - CLAUDE_OAUTH_CLIENT_ID
       - CLAUDE_OAUTH_SCOPES
+      - CLAUDE_OAUTH_USER_AGENT
       - GITHUB_TOKEN
       # SPARQL endpoint advertisement: every SPARQL_ENDPOINT_<NAME> variable
       # advertises one read-only endpoint to agents; an optional companion
