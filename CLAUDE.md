@@ -309,20 +309,22 @@ Two facts make this work, both **derived, never hand-maintained**:
   invisible to the sweep. Whenever you leave a project waiting on yourself or a
   subagent, set `current_actor` accordingly so it is picked up.
 
-## Recurring projects (standing cadences)
+## Waking resting projects (cadences and deadlines)
 
-Some projects are *standing*: they demand an action on a fixed cadence — a day
-each month (an IV assistance-cost filing), a day each quarter (a VAT return) —
-and rest in between. The **`recurring-projects`** base job wakes them on time.
-Like `agent-self-review`, it is a scheduler `command` job (so the scheduler
-spends **no Claude credits**) whose gate is a plain SPARQL `SELECT` against the
-life store (also free) — run by `scripts/recurring-projects.py`. "Which
-recurring project is due today?" is a store question, not a per-chamber
-filesystem scan: every chamber's project frontmatter is already in the store,
-so one query covers notes, operations, and any chamber added later.
+A project that rests until a date is invisible until something wakes it. The
+**`recurring-projects`** base job is that alarm clock. Like `agent-self-review`,
+it is a scheduler `command` job (so the scheduler spends **no Claude credits**)
+whose gate is a plain SPARQL `SELECT` against the life store (also free) — run
+by `scripts/recurring-projects.py`. "Which resting project wants attention
+today?" is a store question, not a per-chamber filesystem scan: every chamber's
+project frontmatter is already in the store, so one query covers notes,
+operations, and any chamber added later.
 
-A standing project declares the cadence in its frontmatter and rests as
-`paused: true`:
+Both kinds of resting project rest as `paused: true` (the dashboard card hides
+them; unlike `status: done` they stay alive and queryable).
+
+**Standing cadences** — an action due a day each month (an IV assistance-cost
+filing) or each quarter (a VAT return):
 
 ```yaml
 recurring: monthly | quarterly
@@ -333,19 +335,45 @@ reminder_title: …          # optional; shown when it wakes
 reminder_message: …        # optional; kept in the file, never in this code
 ```
 
+**One-off deadlines** — a single future date: a follow-up ("check on 29 August
+whether the second weighing happened"), or a statutory deadline years out. No
+new vocabulary is needed, because `expected_by` already means exactly this; it
+just has to be acted on. Such a project declares **no** `recurring` cadence:
+
+```yaml
+expected_by: 2028-10-01    # the date this wants attention
+remind_before: 3m          # optional lead time: 10 / 10d / 2w / 3m
+paused: true
+```
+
+By default a deadline wakes **on** `expected_by`, which is what that field means
+for a follow-up. A deadline that needs acting on *before* it arrives says so
+with `remind_before` (days / weeks / calendar months) — waking early is the
+project's explicit choice, not a default that shifts every follow-up in every
+chamber. A date already in the past wakes on the next run, so nothing is lost
+when the container was down on the day. When a project carries both a cadence
+and an `expected_by`, the cadence wins: the deadline is then the end of the
+whole standing arrangement, not the next occurrence.
+
 For the store to carry these, the chamber's Markdown→triples converter must map
-`recurring`/`due_day`/`next_due` (added to `md2ttl.py`'s scalar table). The
-store is read-only, so the job splits **detect** (the free, chamber-agnostic
-SELECT, which returns each due project with its `file:` named graph) from
-**reactivate** (resolve the graph to the file, flip `paused: false` and set
-`waiting_since`, open one dashboard conversation with the project's own reminder
-text). It leaves the file's existing `current_actor` untouched — a standing
-project already rests with its owner set, so no owner identity is hardcoded in
-this public-repo script. It does **not** advance `next_due` — that happens when the human
-marks the cadence done (via Ara), so an overdue period stays active rather than
-silently skipping. De-dup needs no state file: the gate requires `paused: true`,
-so a reactivated project no longer matches; the file is re-read as the authority
-just before acting, closing any store-lag window.
+`recurring`/`due_day`/`next_due`/`expected_by` (in `md2ttl.py`'s scalar table);
+`remind_before` need not be mapped, since it is read from the file. The store is
+read-only, so the job splits **detect** (the free, chamber-agnostic SELECT,
+which returns each candidate with its `file:` named graph) from **reactivate**
+(resolve the graph to the file, flip `paused: false` and set `waiting_since`,
+open one dashboard conversation with the project's own reminder text). It leaves
+the file's existing `current_actor` untouched — a resting project already has
+its owner set, so no owner identity is hardcoded in this public-repo script. It
+does **not** advance `next_due` — that happens when the human marks the cadence
+done (via Ara), so an overdue period stays active rather than silently skipping.
+
+De-dup needs no state file: the gate requires `paused: true`, so a reactivated
+project no longer matches. **The file, not the store, is the authority** — it is
+re-read just before acting, which closes any store-lag window and, importantly,
+is where `resolved: true` / `status: done` are actually checked: a chamber's
+converter maps only the keys it chose, so a finished project may carry no
+`kb:resolved` in the store at all. The query's own exclusions are an
+optimisation, not the guarantee.
 
 The reminder wording lives in the project frontmatter, not here — this framework
 script (public repo) carries no chamber-specific or personal text.
