@@ -78,13 +78,17 @@ def expand_env(value: str) -> str:
 
     Lets a job manifest carry a self-defaulting model reference like
     `${RETINUE_TRIAGE_MODEL:-sonnet}` — the deployment can override via the env
-    var, and with nothing set the default applies. Unknown `${VAR}` with no
-    default expands to empty (same as a missing global model: no --model flag).
+    var, and with nothing set *or set empty* the default applies, matching real
+    shell `:-` semantics (a plain `dict.get` default only fires when the key is
+    absent, not when it is present-but-empty). Unknown `${VAR}` with no default
+    expands to empty (same as a missing global model: no --model flag).
     """
-    return _VAR_DEFAULT.sub(
-        lambda m: os.environ.get(m.group(1), m.group(2) if m.group(2) is not None else ""),
-        value,
-    )
+    def _sub(m):
+        val = os.environ.get(m.group(1))
+        if val:
+            return val
+        return m.group(2) if m.group(2) is not None else ""
+    return _VAR_DEFAULT.sub(_sub, value)
 
 
 def job_model(job: dict) -> str:
