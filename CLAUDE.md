@@ -85,10 +85,12 @@ plugins — so chamber-provided subagents are available in every session.
 Installing a plugin **copies** it into a version-keyed cache
 (`/root/.claude/plugins/cache/retinue/<name>/<version>/`). Both `claude plugin
 install` and `claude plugin update` are no-ops once that version is present, and
-the version in `plugin.json` rarely changes — so editing a chamber's agent
-definition does **not**, on its own, reach the running subagent. The cache is on
-the persistent `/root` volume, so neither a restart nor an image rebuild clears
-it. `scripts/sync-plugins.py` closes this gap: it compares each cached copy
+the cached copy is keyed by the plugin's version — which, for a manifest that
+declares none (as all chambers here do), is the source repo's commit at
+**install** time. Since install and update are no-ops for an already-installed
+plugin, later commits and uncommitted edits alike stay out of the cache. The
+cache is on the persistent `/root` volume, so neither a restart nor an image
+rebuild clears it. `scripts/sync-plugins.py` closes this gap: it compares each cached copy
 against its chamber source file-by-file and reinstalls (uninstall + install, the
 only way to overwrite an identical version) the ones that drifted. The entrypoint
 runs it once at start and then forks it in `--watch` mode, so a chamber edited at
