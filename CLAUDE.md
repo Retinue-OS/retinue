@@ -569,6 +569,25 @@ silences the monitor alone while leaving the channel enrolled everywhere else
 — for a gateway the deployment deliberately runs unlinked and doesn't want
 reminders about, not for one it never runs at all.
 
+## Claude sign-in monitoring
+
+The OAuth sign-in every Claude Code process shares
+(`/root/.claude/.credentials.json`) is watched the same way the messenger
+links are: `scripts/claude-auth-monitor.py` (forked by the entrypoint, plain
+file reads, no credits) opens a dashboard conversation — Web-Pushing the user
+— days **before** the sign-in's refresh token expires, and immediately when
+the credentials die early (token-rotation clobber with a rejected backup).
+The notice points at the dashboard's **`/claude-auth`** page, where the user
+re-logs in from the browser: open the authorize link, approve, paste the
+displayed code — the gateway writes the credential file and restarts the
+container. So: do **not** build ad-hoc login checks; if the user asks about
+the Claude login or agents failing to authenticate, check
+`python3 /workspace/scripts/claude_auth.py status` and point them at
+`/claude-auth` (that script's `login` subcommand is the console fallback —
+prefer it over running `claude` via `docker exec`, which rotates tokens under
+the live session and is itself a cause of early sign-outs). Details:
+`/workspace/docs/claude-auth.md`.
+
 ## Speech-to-text (STT service)
 
 Transcription is a **shared capability**, not the business of any one gateway, so

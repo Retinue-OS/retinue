@@ -653,6 +653,14 @@ claude
 Follow the prompts to log in and trust the `/workspace` folder. Once done, exit
 the shell (`Ctrl-D`).
 
+This console procedure is only needed **once**. When the sign-in later expires
+(the OAuth refresh token has a fixed lifetime), the system notifies the
+dashboard days in advance and the **`/claude-auth`** page renews it from any
+browser — open the sign-in link, approve, paste the displayed code back; no
+SSH, no container restart by hand. See
+[`docs/claude-auth.md`](docs/claude-auth.md) for the monitoring and the
+recovery paths.
+
 ## Normal start
 
 After the first-time setup, start the system in remote-control mode (detached,

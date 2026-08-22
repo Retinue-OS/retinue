@@ -110,6 +110,7 @@ import json
 import mimetypes
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
@@ -123,6 +124,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
+import claude_auth
 import email_client as ec
 import gateway_auth
 import messenger_gateways
@@ -2401,11 +2403,235 @@ def _render_gateways_html(statuses: list[dict]) -> str:
         "</style>\n"
         + "<body>\n"
         + "<h1>Messenger gateways</h1>\n"
-        + f"<nav>{_NAV_HOME}</nav>\n"
+        + f'<nav>{_NAV_HOME}<a href="/claude-auth">Claude sign-in</a></nav>\n'
         + '<p class="meta">Connection state of each messaging channel. A disconnected gateway shows '
           "its pairing QR code here — scan it from the phone to re-link.</p>\n"
         + "\n".join(cards) + "\n"
         + refresh_js
+        + "</body>\n</html>\n"
+    )
+
+
+# ── Claude sign-in status & browser re-login (/claude-auth) ──────────────────
+# The page the claude-auth-monitor's notifications point at: the state of the
+# OAuth credentials every Claude Code process shares, and a re-login flow that
+# replaces the old console procedure (SSH to the host, stop the stack, run
+# `claude` interactively). The browser performs the same authorization-code +
+# PKCE dance the CLI does: open the authorize URL (on whatever device the user
+# is holding), approve, paste the displayed code back — the gateway exchanges
+# it and writes .credentials.json (see scripts/claude_auth.py). The page sits
+# behind the same edge auth as the rest of the dashboard; what it grants on
+# success is exactly what approving /sends grants — action in the user's name.
+
+# Pending sign-in attempts, keyed by attempt id. In memory on purpose: an
+# attempt holds the PKCE code verifier (which together with a pasted code
+# yields account tokens), so it should live nowhere but this process and die
+# with it. A gateway restart mid-flow just means starting the two-click flow
+# over.
+_CLAUDE_LOGIN_ATTEMPTS: dict[str, dict] = {}
+_CLAUDE_LOGIN_LOCK = threading.Lock()
+_CLAUDE_LOGIN_TTL = 30 * 60
+
+
+def _claude_login_start() -> dict:
+    attempt = claude_auth.new_login_attempt()
+    with _CLAUDE_LOGIN_LOCK:
+        cutoff = time.time() - _CLAUDE_LOGIN_TTL
+        for key in [k for k, v in _CLAUDE_LOGIN_ATTEMPTS.items() if v["created"] < cutoff]:
+            del _CLAUDE_LOGIN_ATTEMPTS[key]
+        _CLAUDE_LOGIN_ATTEMPTS[attempt["id"]] = attempt
+    return {"attempt": attempt["id"], "url": attempt["url"]}
+
+
+def _claude_login_get(attempt_id: str) -> dict | None:
+    with _CLAUDE_LOGIN_LOCK:
+        attempt = _CLAUDE_LOGIN_ATTEMPTS.get(attempt_id or "")
+        if attempt and attempt["created"] >= time.time() - _CLAUDE_LOGIN_TTL:
+            return attempt
+        return None
+
+
+def _claude_login_drop(attempt_id: str) -> None:
+    with _CLAUDE_LOGIN_LOCK:
+        _CLAUDE_LOGIN_ATTEMPTS.pop(attempt_id or "", None)
+
+
+def _pid1_is_claude() -> bool:
+    """Whether PID 1 is the exec'd remote-control `claude` process (as opposed
+    to the gateway-mode `tail` keep-alive, or an interactive shell)."""
+    try:
+        return b"claude" in Path("/proc/1/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
+def _claude_auth_status_payload() -> dict:
+    status = claude_auth.credential_status()
+    status["mode"] = "oauth" if claude_auth.oauth_in_use() else "gateway"
+    status["remote_control_running"] = _pid1_is_claude()
+    return status
+
+
+def _schedule_container_restart(delay: float = 1.5) -> None:
+    """Restart the whole container shortly — after the HTTP reply has flushed.
+
+    SIGTERM to PID 1 ends the container; Docker's restart policy brings it
+    back, and the entrypoint then starts every process on the fresh
+    credentials (and re-runs its backup/restore protocol). This is the same
+    recovery the entrypoint's own credential watcher triggers — deliberately
+    reused rather than trying to hot-swap tokens under a running session,
+    which is exactly the concurrent-rotation scenario that clobbers files.
+    """
+    def _kill():
+        print("[web-gateway] restarting container after Claude re-login "
+              "(SIGTERM to PID 1)", flush=True)
+        try:
+            os.kill(1, signal.SIGTERM)
+        except OSError as exc:
+            print(f"[web-gateway] container restart failed: {exc}", flush=True)
+    timer = threading.Timer(delay, _kill)
+    timer.daemon = True
+    timer.start()
+
+
+_CLAUDE_AUTH_BADGES = {
+    # state → (badge text, badge css class)
+    "ok": ("signed in", "gw-up"),
+    "expiring": ("expires soon", "gw-warn"),
+    "stale": ("needs attention", "gw-warn"),
+    "needs_login": ("signed out", "gw-down"),
+}
+
+
+def _render_claude_auth_html(status: dict) -> str:
+    """Render the /claude-auth page: status card plus the re-login flow."""
+    state = status.get("state", "needs_login")
+    badge_text, badge_cls = _CLAUDE_AUTH_BADGES.get(state, ("unknown", "gw-off"))
+    gateway_mode = status.get("mode") != "oauth"
+    if gateway_mode:
+        badge_text, badge_cls = ("not used", "gw-off")
+
+    def ts(ms) -> str:
+        if not isinstance(ms, (int, float)):
+            return "—"
+        return time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(ms / 1000))
+
+    rows = [f'<h2>Claude account <span class="gw-badge {badge_cls}">'
+            f"{html.escape(badge_text)}</span></h2>"]
+    if gateway_mode:
+        rows.append('<p class="meta">This deployment authenticates Claude Code through a '
+                    "Claude-compatible gateway (ANTHROPIC_BASE_URL), not an OAuth sign-in — "
+                    "there is nothing to sign into here.</p>")
+    else:
+        rows.append(f'<p>{html.escape(str(status.get("reason") or ""))}</p>')
+        detail = []
+        if status.get("subscription"):
+            detail.append(("Subscription", str(status["subscription"])))
+        detail.append(("Sign-in valid until", ts(status.get("refresh_expires_at"))))
+        detail.append(("Access token expires", ts(status.get("access_expires_at"))))
+        detail.append(("Agent session process", "running" if status.get("remote_control_running")
+                       else "not running"))
+        backup = "present" if status.get("backup_present") else "none"
+        if status.get("backup_rejected"):
+            backup = "present, but rejected by the server"
+        detail.append(("Credential backup", backup))
+        rows.append("<dl>" + "".join(
+            f"<dt>{html.escape(k)}</dt><dd>{html.escape(v)}</dd>" for k, v in detail
+        ) + "</dl>")
+        rows.append(
+            '<div class="actions"><button class="btn btn-allow" id="start">Sign in again</button></div>'
+            '<div id="flow" style="display:none">'
+            "<ol class=\"steps\">"
+            '<li><a id="authlink" target="_blank" rel="noopener">Open the Claude sign-in page</a> '
+            "(any device, any browser) and approve access. A code is displayed at the end.</li>"
+            '<li>Paste that code here:<br>'
+            '<input id="code" autocomplete="off" spellcheck="false" '
+            'placeholder="paste the code…"></li>'
+            '<li><label><input type="checkbox" id="restart" checked> Restart the agent session '
+            "afterwards (recommended — running sessions keep using the old sign-in until "
+            "restarted)</label><br>"
+            '<button class="btn btn-allow" id="finish">Complete sign-in</button></li>'
+            "</ol></div>"
+            '<p id="result" class="meta" role="status"></p>'
+        )
+    cards = ['<section class="gw-card">' + "\n".join(rows) + "</section>"]
+    cards.append(
+        "<section><h2>Why sign-ins end</h2>"
+        '<p class="meta">The sign-in\'s refresh token has a fixed lifetime; when it runs out, a '
+        "fresh sign-in is the only fix — this page gets a heads-up notification days before. "
+        "Separately, running a second Claude session against the same credentials (e.g. "
+        "<code>claude</code> via <code>docker exec</code> while remote-control is active) rotates "
+        "the tokens and can log the system out early. Without a browser, "
+        "<code>python3 /workspace/scripts/claude_auth.py login</code> does what this page does, "
+        "from any shell in the container.</p></section>"
+    )
+
+    flow_js = (
+        "<script>\n"
+        "var attempt=null;\n"
+        "function setResult(msg,bad){var el=document.getElementById('result');"
+        "if(!el)return;el.textContent=msg;el.style.color=bad?'var(--high)':'var(--ok)';}\n"
+        # Grace period before polling: the container needs a moment to go
+        # down, or the first poll still reaches the old gateway and reloads
+        # straight into the dying one.
+        "function pollBack(){setTimeout(function(){setInterval(function(){"
+        "fetch('/claude-auth/status',{cache:'no-store'}).then(function(r){"
+        "if(r.ok)location.reload();}).catch(function(){});},3000);},8000);}\n"
+        "var startBtn=document.getElementById('start');\n"
+        "if(startBtn)startBtn.onclick=function(){var b=this;b.disabled=true;"
+        "fetch('/claude-auth/login/start',{method:'POST'})"
+        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
+        ".then(function(x){if(!x.r.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
+        "attempt=x.d.attempt;document.getElementById('authlink').href=x.d.url;"
+        "document.getElementById('flow').style.display='';b.style.display='none';"
+        "setResult('');})"
+        ".catch(function(e){setResult('Could not start the sign-in: '+e.message,true);"
+        "b.disabled=false;});};\n"
+        "var finishBtn=document.getElementById('finish');\n"
+        "if(finishBtn)finishBtn.onclick=function(){var b=this;"
+        "var code=document.getElementById('code').value.trim();"
+        "if(!code){setResult('Paste the code first.',true);return;}\n"
+        "b.disabled=true;"
+        "fetch('/claude-auth/login/finish',{method:'POST',"
+        "headers:{'Content-Type':'application/json'},"
+        "body:JSON.stringify({attempt:attempt,code:code,"
+        "restart:document.getElementById('restart').checked})})"
+        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
+        ".then(function(x){if(!x.r.ok||!x.d.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
+        "if(x.d.restarting){setResult('Signed in. Restarting the agent container — "
+        "this page reconnects automatically…');pollBack();}"
+        "else{setResult('Signed in. Reloading…');"
+        "setTimeout(function(){location.reload();},1200);}})"
+        ".catch(function(e){setResult('Sign-in failed: '+e.message,true);b.disabled=false;});};\n"
+        "</script>\n"
+    )
+
+    return (
+        _HTML_HEAD
+        + "<title>Retinue — Claude sign-in</title>\n"
+        + "<style>\n"
+          "  .gw-badge{font-size:.75rem;font-weight:600;border-radius:999px;padding:.15rem .6rem;"
+          "vertical-align:middle;margin-left:.4rem}\n"
+          "  .gw-up{background:var(--ok);color:#0b0d12}\n"
+          "  .gw-down{background:var(--high);color:#0b0d12}\n"
+          "  .gw-warn{background:#f2c94c;color:#0b0d12}\n"
+          "  .gw-off{background:var(--card-2);color:var(--muted)}\n"
+          "  section h2{font-size:1.05rem;margin:.1rem 0 .4rem}\n"
+          "  dl{display:grid;grid-template-columns:auto 1fr;gap:.15rem .8rem;margin:.6rem 0;"
+          "font-size:.9rem}\n"
+          "  dt{color:var(--muted)}\n  dd{margin:0}\n"
+          "  ol.steps{padding-left:1.2rem}\n  ol.steps li{margin:.6rem 0;line-height:1.5}\n"
+          "  #code{width:100%;max-width:420px;padding:.55rem .7rem;margin-top:.35rem;"
+          "border-radius:8px;border:1px solid var(--line);background:var(--card-2);"
+          "color:var(--fg);font-family:monospace}\n"
+        "</style>\n"
+        + "<body>\n"
+        + "<h1>Claude sign-in</h1>\n"
+        + f'<nav>{_NAV_HOME}<a href="/gateways">Messenger gateways</a></nav>\n'
+        + '<p class="meta">The Claude account every agent in this system runs on. When the '
+          "sign-in expires, renew it here — no console needed.</p>\n"
+        + "\n".join(cards) + "\n"
+        + flow_js
         + "</body>\n</html>\n"
     )
 
@@ -3137,6 +3363,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/push/unsubscribe":
             self._handle_push_unsubscribe()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/claude-auth/login/start":
+            self._handle_claude_login_start()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/claude-auth/login/finish":
+            self._handle_claude_login_finish()
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/conversations/transcribe":
             self._handle_transcribe()
@@ -3949,6 +4181,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(200, conv)
             return
+        if conv_path.rstrip("/") == "/claude-auth":
+            self._send_html(200, _render_claude_auth_html(_claude_auth_status_payload()))
+            return
+        if conv_path.rstrip("/") == "/claude-auth/status":
+            self._send_json(200, _claude_auth_status_payload())
+            return
         if conv_path.rstrip("/") == "/gateways":
             statuses = [
                 {"slug": slug, "label": gw.get("label") or slug.title(),
@@ -4133,6 +4371,59 @@ class Handler(BaseHTTPRequestHandler):
                                 and p.get("request_id") == request_id)), None)
             body["next"] = (f"/sends/{nxt['account']}/{nxt['request_id']}" if nxt else None)
         self._send_json(200, body)
+
+    def _claude_auth_same_origin(self) -> bool:
+        """CSRF guard for the sign-in endpoints. The dashboard's basic-auth
+        credential is ambient — the browser attaches it to cross-site requests
+        too — and these POSTs change authentication state and can restart the
+        container. Every current browser stamps Sec-Fetch-Site; when the
+        header is absent (curl, older engines) we allow, which is the status
+        quo of the other POST routes."""
+        site = self.headers.get("Sec-Fetch-Site", "")
+        return site in ("", "same-origin", "none")
+
+    def _handle_claude_login_start(self) -> None:
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
+        if not claude_auth.oauth_in_use():
+            self._send_json(409, {"error": "this deployment authenticates through a "
+                                           "Claude-compatible gateway, not an OAuth sign-in"})
+            return
+        self._send_json(200, _claude_login_start())
+
+    def _handle_claude_login_finish(self) -> None:
+        if not self._claude_auth_same_origin():
+            self._send_json(403, {"error": "cross-site request rejected"})
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"ok": False, "error": "invalid JSON"})
+            return
+        attempt = _claude_login_get(str(payload.get("attempt") or ""))
+        if attempt is None:
+            self._send_json(400, {"ok": False, "error": "unknown or expired sign-in "
+                                                        "attempt — start the sign-in again"})
+            return
+        try:
+            reply = claude_auth.exchange_code(str(payload.get("code") or ""), attempt)
+            summary = claude_auth.install_tokens(reply)
+        except claude_auth.ClaudeAuthError as exc:
+            # The attempt stays valid: a mis-paste should not force the user
+            # back through the authorize step. A consumed code fails again
+            # with the server's own message.
+            self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        _claude_login_drop(attempt["id"])
+        until = summary.get("refresh_expires_at")
+        print("[web-gateway] Claude re-login completed via /claude-auth"
+              + (f" (sign-in valid until {time.strftime('%Y-%m-%d', time.gmtime(until / 1000))})"
+                 if isinstance(until, (int, float)) else ""), flush=True)
+        restarting = bool(payload.get("restart"))
+        if restarting:
+            _schedule_container_restart()
+        self._send_json(200, {"ok": True, "restarting": restarting,
+                              "status": _claude_auth_status_payload()})
 
     def _handle_gateway_qr(self, slug: str) -> None:
         """Proxy a gateway's pairing QR (adding the token) to the /gateways page.

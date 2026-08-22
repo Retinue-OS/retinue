@@ -74,6 +74,18 @@ services:
       - ANTHROPIC_MODEL=${RETINUE_CLAUDE_MODEL}
       - RETINUE_CLAUDE_MODEL
       - RETINUE_GATEWAY_USES_CLAUDE_OAUTH
+      # Claude sign-in monitoring & browser re-login (docs/claude-auth.md):
+      # tunables for the claude-auth-monitor, and escape hatches for the OAuth
+      # endpoints the /claude-auth re-login flow talks to. All optional.
+      - CLAUDE_AUTH_MONITOR
+      - CLAUDE_AUTH_WARN_DAYS
+      - CLAUDE_AUTH_STALE_HOURS
+      - CLAUDE_AUTH_MONITOR_INTERVAL
+      - CLAUDE_OAUTH_AUTHORIZE_URL
+      - CLAUDE_OAUTH_TOKEN_URL
+      - CLAUDE_OAUTH_REDIRECT_URI
+      - CLAUDE_OAUTH_CLIENT_ID
+      - CLAUDE_OAUTH_SCOPES
       - GITHUB_TOKEN
       # SPARQL endpoint advertisement: every SPARQL_ENDPOINT_<NAME> variable
       # advertises one read-only endpoint to agents; an optional companion
