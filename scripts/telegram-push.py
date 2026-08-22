@@ -3,13 +3,15 @@
 
 The retinue-side client for the gateway's `/send` endpoint — the Telegram sibling
 of signal-push.py / whatsapp-push.py. Agents use it to *initiate* Telegram
-messages (escalations, alerts, briefings). The gateway owns the bot token, so no
-MCP tool schema enters the context and the credential stays isolated.
+messages (escalations, alerts, briefings). The gateway owns the MTProto
+credentials (api_id/api_hash and the login session), so no MCP tool schema
+enters the context and the credential stays isolated.
 
-Outbound is gated by TELEGRAM_SEND_POLICY (keyed by the gateway's own bot
-identity): a `verify` bot queues the message as a pending send that must be
-approved on the web gateway's /sends page; a `trust` bot sends directly only with
---user-approved. On a queued send this prints the approval URL.
+Outbound is gated by TELEGRAM_SEND_POLICY (keyed by the gateway's own sending
+identity — the user's own Telegram account, not a bot): a `verify` account
+queues the message as a pending send that must be approved on the web gateway's
+/sends page; a `trust` account sends directly only with --user-approved. On a
+queued send this prints the approval URL.
 
 Examples:
     telegram-push.py "Ari: reply to Mara failed — check scheduler.log"
@@ -53,7 +55,7 @@ def main() -> int:
                         help="attach an image (repeatable)")
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this send; "
-                             "bypasses the verify flow for 'trust'-category bots")
+                             "bypasses the verify flow for 'trust'-category accounts")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"gateway send URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()
