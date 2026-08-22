@@ -39,18 +39,21 @@ State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
 
 Environment:
-  SCHEDULER_TICK_SECONDS   loop granularity (default 30)
-  SCHEDULER_JOB_TIMEOUT    per-job timeout in seconds (default 900)
-  SCHEDULER_STATE_DIR      state/log dir (default /root/.retinue/scheduler)
-  CLAUDE_PERMISSION_MODE   permission mode for `claude -p` (default acceptEdits)
-  RETINUE_CLAUDE_MODEL     global model for all prompt jobs (a job's own "model"
-                           field overrides it)
+  SCHEDULER_TICK_SECONDS        loop granularity (default 30)
+  SCHEDULER_JOB_TIMEOUT         per-job timeout in seconds (default 900)
+  SCHEDULER_KILL_GRACE_SECONDS  SIGTERM->SIGKILL grace period for a timed-out
+                                 job's process group, in seconds (default 10)
+  SCHEDULER_STATE_DIR           state/log dir (default /root/.retinue/scheduler)
+  CLAUDE_PERMISSION_MODE        permission mode for `claude -p` (default acceptEdits)
+  RETINUE_CLAUDE_MODEL          global model for all prompt jobs (a job's own
+                                 "model" field overrides it)
 """
 
 import glob
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -64,6 +67,9 @@ CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 BASE_SCHEDULE = Path(os.environ.get("BASE_SCHEDULE") or "/workspace/.schedule.json")
 TICK = int(os.environ.get("SCHEDULER_TICK_SECONDS", "30"))
 JOB_TIMEOUT = int(os.environ.get("SCHEDULER_JOB_TIMEOUT", "900"))
+# Grace period between SIGTERM and SIGKILL when a timed-out job's process
+# group has to be killed outright.
+KILL_GRACE_SECONDS = int(os.environ.get("SCHEDULER_KILL_GRACE_SECONDS", "10"))
 STATE_DIR = Path(os.environ.get("SCHEDULER_STATE_DIR", "/root/.retinue/scheduler"))
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
@@ -203,17 +209,28 @@ def is_due(job: dict) -> bool:
     return (now() - last) >= int(job["interval_seconds"])
 
 
-def run_claude(cmd, **kwargs):
-    """subprocess.run tolerant of the brief ENOENT window while Claude Code's
+def spawn_process(cmd, *, retry_enoent, **kwargs):
+    """Popen, tolerant of the brief ENOENT window while Claude Code's
     auto-updater swaps the `claude` symlink (only used for agent prompts, where
     a missing binary is transient rather than a config error)."""
-    for attempt in range(5):
+    attempts = 5 if retry_enoent else 1
+    for attempt in range(attempts):
         try:
-            return subprocess.run(cmd, **kwargs)
+            return subprocess.Popen(cmd, **kwargs)
         except FileNotFoundError:
-            if attempt == 4:
+            if attempt == attempts - 1:
                 raise
             time.sleep(1.0)
+
+
+def _kill_group(pid: int, sig: int) -> None:
+    """Signal a job's whole process group, tolerating a group that is already
+    gone (the job finished in the race between the timeout firing and this
+    call) or was never its own group leader."""
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except (ProcessLookupError, PermissionError):
+        pass
 
 
 def run_job(job: dict) -> None:
@@ -233,27 +250,41 @@ def run_job(job: dict) -> None:
     log(f"[run] {jid} ({kind}{model_note}) from {Path(job['_source']).parent.name}")
     started = now()
     try:
-        spawn = run_claude if kind == "prompt" else subprocess.run
-        result = spawn(
+        proc = spawn_process(
             cmd,
+            retry_enoent=(kind == "prompt"),
             shell=isinstance(cmd, str),
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             cwd="/workspace",
-            timeout=JOB_TIMEOUT,
             env=job_env(),
+            # Own process group, so a timeout can reach descendants too --
+            # subprocess.run's timeout path only ever signalled the direct
+            # child, leaving any grandchildren it spawned running.
+            start_new_session=True,
         )
+        try:
+            out, err = proc.communicate(timeout=JOB_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc.pid, signal.SIGTERM)
+            try:
+                proc.communicate(timeout=KILL_GRACE_SECONDS)
+                log(f"[timeout] {jid} exceeded {JOB_TIMEOUT}s -- group terminated")
+            except subprocess.TimeoutExpired:
+                _kill_group(proc.pid, signal.SIGKILL)
+                proc.communicate()
+                log(f"[timeout] {jid} exceeded {JOB_TIMEOUT}s -- group killed")
+            write_state(jid, "timeout")
+            return
         dur = now() - started
-        if result.returncode == 0:
+        if proc.returncode == 0:
             log(f"[ok] {jid} in {dur:.0f}s")
             write_state(jid, "success")
         else:
-            err = (result.stderr or result.stdout or "").strip().replace("\n", " ")
-            log(f"[fail] {jid} rc={result.returncode} in {dur:.0f}s: {err[:300]}")
+            errtxt = (err or out or "").strip().replace("\n", " ")
+            log(f"[fail] {jid} rc={proc.returncode} in {dur:.0f}s: {errtxt[:300]}")
             write_state(jid, "failed")
-    except subprocess.TimeoutExpired:
-        log(f"[timeout] {jid} exceeded {JOB_TIMEOUT}s")
-        write_state(jid, "timeout")
     except Exception as e:  # never let one job kill the daemon
         log(f"[error] {jid}: {e}")
         write_state(jid, "error")
