@@ -132,8 +132,9 @@ All three cover the big messengers. Differences that matter in practice:
   cleanup. OpenClaw has "Talk" voice mode and device nodes; Hermes has TTS
   via the Nous Portal tool gateway.
 - **A curated home screen**: Retinue's installable PWA dashboard (threaded
-  conversations with attachments both directions, approval queue, data
-  cards) is a differentiator if you want a *place* rather than only chats.
+  conversations with attachments both directions, approval queue, static
+  data cards that ship commented out until a refresh job regenerates them)
+  is a differentiator if you want a *place* rather than only chats.
   OpenClaw's Canvas/Web UI is more of a live surface the agent draws on.
 
 ## 4. Memory and data ownership
