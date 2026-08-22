@@ -34,7 +34,7 @@ If `EXISTING_PID` is empty: proceed to step 2.
 WORKDIR="/workspace"                              # main session cwd — shared memory + CLAUDE.md
 DEBUG_LOG="/tmp/session-${NAME}-debug.log"
 
-cd "$WORKDIR" && setsid env -u ANTHROPIC_API_KEY script -q -c "claude --remote-control '${NAME}' --name '${NAME}' --permission-mode dontAsk --debug-file '${DEBUG_LOG}' --verbose" /dev/null >/dev/null 2>&1 &
+cd "$WORKDIR" && setsid env -u ANTHROPIC_API_KEY script -q -c "claude --remote-control '${NAME}' --name '${NAME}' --permission-mode '${CLAUDE_PERMISSION_MODE:-dontAsk}' --debug-file '${DEBUG_LOG}' --verbose" /dev/null >/dev/null 2>&1 &
 disown
 ```
 
@@ -61,7 +61,7 @@ Report to the user:
 - **`script -q -c "..." /dev/null`**: allocates a pseudo-TTY so the Claude TUI can start. Without a PTY the process detects no terminal and exits immediately after startup. `script` from util-linux provides the PTY; its typescript output goes to `/dev/null`.
 - **`setsid … &` + `disown`**: fully detach so the process survives this Bash invocation.
 - **`env -u ANTHROPIC_API_KEY`**: when set, the CLI uses API-key auth which connects but does not register it with the user's claude.ai account — so the session never appears in the mobile/desktop app. Unsetting forces OAuth.
-- **`--permission-mode dontAsk`**: subsessions run autonomously in the background — permission prompts block the session until answered, which causes hangs in remote-control mode. `dontAsk` silently enforces the `settings.json` allowlist without interrupting the user. The security boundary is the allowlist, not the permission-mode. (`bypassPermissions` was tested but exits silently during startup in remote-control mode.)
+- **`--permission-mode dontAsk`** (default; override via `CLAUDE_PERMISSION_MODE`, same variable used by the entrypoint/scheduler/web-gateway): subsessions run autonomously in the background — permission prompts block the session until answered, which causes hangs in remote-control mode. `dontAsk` applies the `settings.json` allowlist without interrupting the user. Note that the shipped allowlist is permissive by design (`Bash(*)`, `Write(**)`, `Edit(**)`); the containment for a spawned session is the container, the credential sidecars and the send policies, not this file — see `review.md` §3.1. If you override `CLAUDE_PERMISSION_MODE` to a mode that can prompt (e.g. `default`), a spawned session will hang waiting for an answer nobody can give it. (`bypassPermissions` was tested but exits silently during startup in remote-control mode.)
 
 ## On "resume by name"
 
