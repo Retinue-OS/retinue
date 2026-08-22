@@ -395,13 +395,12 @@ def auto_whitelist_on_send(channel: str, handles) -> list[str]:
     norm = {_norm_handle(h) for h in handles if h and str(h).strip()}
     if not norm:
         return []
-    whitelist, blacklist, groups = load_messenger_policy(channel)
-    added = sorted(norm - whitelist - blacklist)
+    pol = load_messenger_policy(channel)
+    added = sorted(norm - pol.whitelist - pol.blacklist)
     if not added:
         return []
-    whitelist |= set(added)
     write_if_changed(
-        render_messenger_policy(channel, whitelist, blacklist, groups),
+        render_messenger_policy(channel, pol._replace(whitelist=pol.whitelist | set(added))),
         messenger_policy_path(channel),
     )
     return added

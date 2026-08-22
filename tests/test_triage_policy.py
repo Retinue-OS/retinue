@@ -299,6 +299,44 @@ def test_mutate_quiet_and_ignore_are_exclusive():
             del os.environ["TRIAGE_MESSENGER_DIR"]
 
 
+def test_auto_whitelist_on_send():
+    """Outbound send promotes the recipient to a known sender — and nothing else.
+
+    Regression guard: this used to unpack `load_messenger_policy()` into three
+    names and call `render_messenger_policy()` with four arguments, both of which
+    raise against the three-axis `MessengerPolicy`. The only caller wraps it in a
+    broad `except`, so every WhatsApp send silently failed to whitelist its
+    recipient. Exercising it end-to-end is what catches that class of drift.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["TRIAGE_MESSENGER_DIR"] = d
+        try:
+            tp._mutate_messenger(CH, wl_add=["41791112233"], bl_add=["41790000000"],
+                                 ig_add=[GROUP], news_add=[GROUP])
+
+            # The gateway hands over bare JID users — a phone number and its LID
+            # counterpart — so both identities of one contact become known.
+            added = tp.auto_whitelist_on_send(CH, ["41791234567", "100000000000001"])
+            assert added == ["100000000000001", "41791234567"], added
+
+            pol = tp.load_messenger_policy(CH)
+            assert {"41791234567", "100000000000001"} <= pol.whitelist, pol
+            # Every other axis survives the write untouched.
+            assert pol.blacklist == {"41790000000"}, pol
+            assert pol.ignored == {GROUP} and pol.news == {GROUP}, pol
+
+            # Idempotent: a known handle adds nothing.
+            assert tp.auto_whitelist_on_send(CH, ["41791234567"]) == []
+            # An explicit block survives an outbound send.
+            assert tp.auto_whitelist_on_send(CH, ["41790000000"]) == []
+            assert "41790000000" not in tp.load_messenger_policy(CH).whitelist
+            # Nothing to do is not an error.
+            assert tp.auto_whitelist_on_send(CH, ["", None]) == []
+        finally:
+            tp.messenger_policy_path(CH).unlink(missing_ok=True)
+            del os.environ["TRIAGE_MESSENGER_DIR"]
+
+
 def _run() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
