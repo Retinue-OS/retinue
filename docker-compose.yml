@@ -148,6 +148,12 @@ services:
       # must survive a redeploy. Tunables: NEWS_HALF_LIFE_HOURS (how fast an
       # undated item fades, default 48), NEWS_MAX_AGE_DAYS, NEWS_MAX_ITEMS.
       - NEWS_DIR=/root/.retinue/news
+      # Where the e-mail news rail posts what it files. The messenger gateways
+      # get this too (they reach the same endpoint over the network); the triage
+      # gate runs *inside* this container, so without it a `news` group is left
+      # to normal triage and never reaches the feed.
+      - NEWS_INGEST_URL=http://retinue:8080/internal/news
+      - NEWS_INGEST_TOKEN
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
       - UPDATER_URL=http://updater:9000/update
