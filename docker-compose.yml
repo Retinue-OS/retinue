@@ -310,6 +310,7 @@ services:
       - INBOUND_STORE_DIR=/inbound
       - INBOUND_GATE
     volumes:
+      # Account data + pending sends + recent chats.
       - signal-data:/root/.local/share/signal-cli
       - piper-data:/models
       - messenger-signal:/inbound

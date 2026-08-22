@@ -305,8 +305,13 @@ if _send_policy_raw:
     except json.JSONDecodeError:
         print("[signal-gateway] warning: invalid SIGNAL_SEND_POLICY JSON; using defaults", flush=True)
 
-# Directory for pending outbound sends awaiting web-gateway approval.
-SIGNAL_PENDING_SENDS_DIR = Path(os.environ.get("SIGNAL_PENDING_SENDS_DIR", "/tmp/signal-pending-sends"))
+# Directory for pending outbound sends awaiting web-gateway approval. On the
+# signal-data volume (not /tmp) so it survives container recreation, not just
+# a restart — the documented update path (`docker compose up -d` after a
+# build) recreates the container, which wipes /tmp.
+SIGNAL_PENDING_SENDS_DIR = Path(
+    os.environ.get("SIGNAL_PENDING_SENDS_DIR", "/root/.local/share/signal-cli/pending-sends")
+)
 SIGNAL_PENDING_SENDS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Recent-senders store — the gateway's equivalent of "recent conversations".

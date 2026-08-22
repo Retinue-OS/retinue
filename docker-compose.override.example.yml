@@ -138,7 +138,7 @@ services:
   # SPARQL_ENDPOINT_* variables on the retinue service above, and add its
   # hostname to SPARQL_NO_PROXY in .env. Indexed once on first start; to reindex:
   #   docker compose exec qlever-genomics sh -c 'rm -rf /index/*'
-  #   docker compose restart qlever-genomics
+  #   docker compose up -d --force-recreate qlever-genomics
   # qlever-genomics:
   #   build: ./qlever-static
   #   volumes:
