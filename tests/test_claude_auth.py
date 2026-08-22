@@ -13,6 +13,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import urllib.parse
@@ -238,6 +239,22 @@ def test_install_tokens_from_scratch():
         # And the file now classifies as signed-in.
         st = ca.credential_status(now=NOW, cred_file=cred)
         assert st["state"] == "ok", st
+
+
+def test_user_agent_shape_and_override():
+    """Cloudflare blocks urllib's default UA (403 / error 1010); the exchange
+    must present as the Claude Code CLI, overridable via env."""
+    old = os.environ.pop("CLAUDE_OAUTH_USER_AGENT", None)
+    try:
+        ua = ca.user_agent()
+        assert re.fullmatch(r"claude-cli/\d[\w.-]* \(external, cli\)", ua), ua
+        assert ca.user_agent() == ua  # cached, no repeated subprocess
+        os.environ["CLAUDE_OAUTH_USER_AGENT"] = "custom/1.0"
+        assert ca.user_agent() == "custom/1.0"
+    finally:
+        os.environ.pop("CLAUDE_OAUTH_USER_AGENT", None)
+        if old is not None:
+            os.environ["CLAUDE_OAUTH_USER_AGENT"] = old
 
 
 def test_oauth_in_use_gate():

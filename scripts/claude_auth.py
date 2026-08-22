@@ -45,7 +45,9 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -77,6 +79,37 @@ SCOPES = os.environ.get("CLAUDE_OAUTH_SCOPES", "") \
     or "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 HTTP_TIMEOUT = float(os.environ.get("CLAUDE_OAUTH_HTTP_TIMEOUT", "") or "30")
+
+# Cloudflare fronts the OAuth endpoints and rejects Python's default
+# User-Agent outright (HTTP 403, Cloudflare error 1010 — "banned based on
+# browser signature"), so the token exchange must present as the client whose
+# sign-in flow this is: the Claude Code CLI. Verified empirically 2026-08-22:
+# urllib's stock UA is blocked, "claude-cli/<version> (external, cli)" passes
+# through to the OAuth app. The version is read from the installed CLI when
+# possible so the UA tracks upgrades; the fallback only matters when `claude`
+# is unavailable, and CLAUDE_OAUTH_USER_AGENT forces any value.
+_FALLBACK_CLI_VERSION = "2.1.240"
+_user_agent_cache: str | None = None
+
+
+def user_agent() -> str:
+    global _user_agent_cache
+    override = os.environ.get("CLAUDE_OAUTH_USER_AGENT", "").strip()
+    if override:
+        return override
+    if _user_agent_cache is None:
+        version = _FALLBACK_CLI_VERSION
+        try:
+            out = subprocess.run(["claude", "--version"], capture_output=True,
+                                 text=True, timeout=10).stdout or ""
+            match = re.match(r"\s*(\d+[\w.-]*)", out)
+            if match:
+                version = match.group(1)
+        except Exception:  # noqa: BLE001 - the fallback version serves fine
+            pass
+        _user_agent_cache = f"claude-cli/{version} (external, cli)"
+    return _user_agent_cache
+
 
 # ── Status thresholds ─────────────────────────────────────────────────────────
 
@@ -305,7 +338,11 @@ def _http_post_json(url: str, payload: dict, timeout: float | None = None) -> di
     """POST JSON, return the parsed JSON reply; HTTP errors raise with the
     server's error body attached so the user sees *why* an exchange failed."""
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(url, data=data, headers={
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": user_agent(),  # see the Cloudflare note above
+    })
     try:
         with urllib.request.urlopen(req, timeout=timeout or HTTP_TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8"))
