@@ -59,7 +59,9 @@ python3 /workspace/scripts/email_client.py send \
   --to <addr> --subject "Re: <original subject>" --body "..." \
   --in-reply-to "<message_id>" --references "<message_id>"
 
-# Forward with original attachments
+# Forward with original attachments — goes through the same send-control gate as
+# send/reply (verify/trust/allow, below), and renders an HTML-only source body as
+# plain text before quoting it.
 python3 /workspace/scripts/email_client.py forward --uid <UID> --to <addr> --prepend "FYI ..."
 
 # Save as draft (without sending)
@@ -86,6 +88,9 @@ category:
 | `allow` | Sends directly, no confirmation (e.g. Ari's own mailbox). |
 | `trust` | Sends directly **only** when you pass `--user-approved` (you assert the user approved this exact send). Without that flag it falls back to the `verify` flow. |
 | `verify` | **Never** sends directly. Saves the message as a pending draft and returns an `approval_url`; the user approves or denies it on the web gateway. |
+
+`reply` and `forward` route through the same choke point as `send`
+(`_dispatch_message`), so the table above governs all three, not just `send`.
 
 Addresses not listed fall back to a `"*"` wildcard entry, or — absent that — to
 `verify` (the fail-safe default).
