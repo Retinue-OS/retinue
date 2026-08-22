@@ -155,8 +155,7 @@ also invoices, events, and other small records). It is built from the
 volume, which QLever mounts read-only at `/data`) by
 [qlever-dir](https://github.com/retinue-os/qlever-dir). Each file's triples are
 placed in a named graph `<file:relative/path.nt>` (relative to the chambers
-root). It rebuilds automatically within ~15 s of any filesystem change
-(blue-green, no downtime).
+root). It rebuilds blue-green with no downtime; new data is queryable in tens of seconds. Only a change to a native RDF file starts that clock — a Markdown edit waits for an unrelated RDF change or a restart ([qlever-dir#3](https://github.com/retinue-os/qlever-dir/issues/3)).
 
 A deployment may run additional, specialist stores as extra compose services in
 its override — for example a static endpoint over one large, rarely-changing

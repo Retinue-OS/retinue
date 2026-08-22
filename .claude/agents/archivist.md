@@ -20,7 +20,7 @@ empty after every push.
 
 The Archivist writes triples as **N-Triples (`.nt`) files alongside the source**.
 The qlever-life service watches the data directory and rebuilds its index
-automatically (within ~15 s of any change); index rebuilds are not the
+automatically in tens of seconds; index rebuilds are not the
 Archivist's concern.
 
 | Source kind | Write to |
