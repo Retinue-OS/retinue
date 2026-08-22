@@ -312,7 +312,23 @@ if _send_policy_raw:
 SIGNAL_PENDING_SENDS_DIR = Path(
     os.environ.get("SIGNAL_PENDING_SENDS_DIR", "/root/.local/share/signal-cli/pending-sends")
 )
-SIGNAL_PENDING_SENDS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_pending_sends_dir() -> None:
+    # Creation must never abort module import: a consumer that only reads
+    # (contact lookup, the tests) works without the directory, and every write
+    # site already degrades with its own warning. Retried before each write.
+    try:
+        SIGNAL_PENDING_SENDS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(
+            f"[signal-gateway] warning: cannot create pending-sends dir "
+            f"{SIGNAL_PENDING_SENDS_DIR}: {exc}",
+            flush=True,
+        )
+
+
+_ensure_pending_sends_dir()
 
 # Recent-senders store — the gateway's equivalent of "recent conversations".
 # signal-cli keeps no queryable message history, so we record each inbound
@@ -1489,6 +1505,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
     # from it here is safe.
     path = SIGNAL_PENDING_SENDS_DIR / f"{request_id}.json"
     try:
+        _ensure_pending_sends_dir()
         path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
     except OSError as exc:
         print(f"[signal-gateway] warning: could not persist pending send: {exc}", flush=True)
