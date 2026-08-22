@@ -5,7 +5,7 @@ A pending send is parked in the IMAP Drafts folder until the user approves it,
 so it makes a round trip through the provider's IMAP store — and Zoho stamps
 `X-ZohoMail-Sender` onto it there, carrying the From display name as raw 8-bit
 bytes. Its relay then labels those bytes with the placeholder charset token
-`unknown-8bit`, which strict Exchange receivers reject (550 InvalidCharsetException).
+`unknown-8bit`, which strict Exchange receivers reject (550 ExchangeDataException).
 The direct-send path never sees the header, which is why only approved sends
 bounced. These tests pin the stripping down to the header level.
 
