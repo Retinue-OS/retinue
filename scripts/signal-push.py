@@ -19,6 +19,13 @@ Examples:
     # Text only, no audio
     signal-push.py --no-voice "Quick note without a voice attachment"
 
+Outbound is gated by SIGNAL_SEND_POLICY, keyed by the gateway's own sending
+identity (SIGNAL_ACCOUNT), not by the recipient: an `allow` account sends
+directly, a `verify` account queues the message as a pending send that must be
+approved on the web gateway's /sends page, and a `trust` account sends directly
+only with --user-approved. An undeclared account defaults to `verify`. On a
+queued send this prints the approval URL instead of confirming delivery.
+
 Configuration (environment):
     SIGNAL_GATEWAY_SEND_URL   default http://signal-gateway:8090/send
     SIGNAL_GATEWAY_TOKEN      optional bearer token (must match the gateway)
@@ -59,7 +66,8 @@ def main() -> int:
     parser.add_argument("--no-voice", action="store_true", help="do not attach a spoken audio rendering")
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this send; "
-                             "bypasses the verify flow for 'trust'-category recipients")
+                             "bypasses the verify flow when this gateway's own "
+                             "sending account is in the 'trust' category")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"gateway send URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()

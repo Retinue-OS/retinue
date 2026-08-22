@@ -7,10 +7,11 @@ WhatsApp messages — error escalations, alerts, briefings — rather than only
 replying to inbound ones. The gateway owns the linked-device session, so no MCP
 tool schema enters the context and the account credentials stay isolated.
 
-Outbound is gated by WHATSAPP_SEND_POLICY (see the gateway): a `verify` recipient
-queues the message as a pending send that must be approved on the web gateway's
-/sends page; a `trust` recipient sends directly only with --user-approved. On a
-queued send this prints the approval URL instead of confirming delivery.
+Outbound is gated by WHATSAPP_SEND_POLICY, keyed by this gateway's own sending
+account (WHATSAPP_ACCOUNT), not by the recipient: a `verify` account queues the
+message as a pending send that must be approved on the web gateway's /sends
+page; a `trust` account sends directly only with --user-approved. On a queued
+send this prints the approval URL instead of confirming delivery.
 
 Examples:
     # Simple text alert to the default recipient
@@ -19,7 +20,7 @@ Examples:
     # With an image attachment, to a specific number
     whatsapp-push.py --recipient +15551234567 --image /tmp/chart.png "Today's summary"
 
-    # Assert the user already approved (bypasses verify for a 'trust' recipient)
+    # Assert the user already approved (bypasses verify for a 'trust' account)
     whatsapp-push.py --user-approved --recipient +15551234567 "Confirmed reply"
 
 Configuration (environment):
@@ -62,7 +63,8 @@ def main() -> int:
                         help="attach an image (repeatable)")
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this send; "
-                             "bypasses the verify flow for 'trust'-category recipients")
+                             "bypasses the verify flow when this gateway's own "
+                             "sending account is in the 'trust' category")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"gateway send URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()
