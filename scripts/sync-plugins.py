@@ -5,10 +5,12 @@ Keep the installed chamber plugins in sync with their sources.
 Claude Code installs a plugin by copying it into a version-keyed cache
 (~/.claude/plugins/cache/<marketplace>/<name>/<version>/).  Both
 `claude plugin install` and `claude plugin update` are no-ops once that version
-is present, and the version string in plugin.json rarely changes -- so an edit
-to a chamber's agent definition never reaches the running subagent.  The cache
-lives on the persistent /root volume, so neither a container restart nor an
-image rebuild clears it.
+is present, and the cached copy is keyed by the plugin's version — which, for a
+manifest that declares none (as all chambers here do), is the source repo's
+commit at install time. Since install and update are no-ops for an
+already-installed plugin, later commits and uncommitted edits alike stay out of
+the cache. The cache lives on the persistent /root volume, so neither a
+container restart nor an image rebuild clears it.
 
 This script compares each installed plugin against its source tree and
 reinstalls the ones that drifted.  Content is compared file by file rather than
