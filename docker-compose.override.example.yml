@@ -201,6 +201,21 @@ services:
   #   networks:
   #     - agents
 
+  # Enrol the CalDAV gateway's pending writes onto /sends the same way. Unlike
+  # signal-gateway-personal above, caldav-gateway ships as a base service
+  # (docker-compose.yml) — only its credentials need setting, in .env (see
+  # .env.example). MESSENGER_GATEWAYS is already channel-agnostic (any
+  # base_url exposing /pending-sends + /health qualifies), so this is the only
+  # wiring needed — no framework code change:
+  # retinue:
+  #   environment:
+  #     - 'MESSENGER_GATEWAYS=[{"base_url":"http://caldav-gateway:8094","token":"${CALDAV_GATEWAY_TOKEN}","label":"Calendar"}]'
+  #
+  # Combining this with another MESSENGER_GATEWAYS extra (e.g. the Signal
+  # account above) needs both objects in the SAME array — Compose environment
+  # values replace rather than merge, so declare all extras together:
+  #     - 'MESSENGER_GATEWAYS=[{"base_url":"http://signal-gateway-personal:8090","token":"${SIGNAL_GATEWAY_TOKEN}","label":"Signal (personal)"},{"base_url":"http://caldav-gateway:8094","token":"${CALDAV_GATEWAY_TOKEN}","label":"Calendar"}]'
+
   # Opting a built-in gateway channel OUT entirely — a deployment that never
   # runs signal-gateway/whatsapp-gateway/telegram-gateway at all (not even
   # unpaired). docker-compose.yml unconditionally points the retinue service

@@ -542,6 +542,99 @@ that gap:
   account additionally needs `TELEGRAM_2FA_PASSWORD`, or the one-time
   interactive login above).
 
+## Calendar (CalDAV)
+
+The `caldav-gateway` service writes calendar events into a real calendar,
+modeled exactly like a messenger channel: it owns the CalDAV credentials in its
+own container (no `mcp__*` tool, nothing in agent context), and outbound writes
+go through the same `allow`/`trust`/`verify` send-control model as e-mail and
+the messenger gateways, with pending events approvable on the same `/sends`
+page. This replaces the old workarounds for "put this on my agenda" — a
+downloaded `.ics` file the phone won't hand to the calendar app, or an
+"add to calendar" web link that only works for Google Calendar.
+
+**Provider-agnostic by design.** The backend is selected purely by
+configuration (`CALDAV_SERVER_URL`/`CALDAV_USERNAME`/`CALDAV_PASSWORD`/
+`CALDAV_CALENDAR_ID`) through a generic RFC 4791 client library
+([`caldav`](https://pypi.org/project/caldav/)) — there is no provider-specific
+code path anywhere in `scripts/caldav-gateway.py`. Zoho (one common choice,
+since it offers CalDAV) is just one configured endpoint among any others; set
+up your account's app password and CalDAV URL per your provider's own docs and
+put them in `.env` (see `.env.example`):
+
+```bash
+CALDAV_SERVER_URL=https://caldav.example.com/dav/you@example.com/
+CALDAV_USERNAME=you@example.com
+CALDAV_PASSWORD=            # an app password, never your normal login password
+CALDAV_CALENDAR_ID=         # optional: id/URL/display name; unset = the default calendar
+CALDAV_ACCOUNT=default      # the sending-identity label CALDAV_SEND_POLICY keys on
+```
+
+Like the messenger gateways, `CALDAV_ACCOUNT` is a property of the *gateway
+instance*, not of any request — one service writes to one calendar. A
+deployment wanting a second calendar (say, a dedicated "agenda reminders"
+calendar the agent may write to without approval) runs a second
+`caldav-gateway-*` service via `extends`, the same
+[Adding more accounts](#adding-more-accounts) pattern used for a second Signal
+number, with its own credentials and its own `CALDAV_ACCOUNT`.
+
+### Outbound send-control (`CALDAV_SEND_POLICY`)
+
+`CALDAV_SEND_POLICY` mirrors `SIGNAL_SEND_POLICY` / `EMAIL_SEND_POLICY`
+exactly, keyed by the **sending identity** (`CALDAV_ACCOUNT`, i.e. which
+configured calendar a write targets) rather than any per-request field:
+
+- `allow` — write directly, no confirmation (e.g. a dedicated reminders calendar).
+- `trust` — write directly only when `caldav-push.py` passes `--user-approved`;
+  otherwise the write falls back to the `verify` flow.
+- `verify` — register the event as a **pending** write; it is created only
+  after explicit approval on the web gateway's `/sends` page.
+
+An account matching no entry and no `"*"` wildcard falls back to `verify`
+(fail-safe, same default as e-mail), so an undeclared calendar can never be
+written to autonomously.
+
+```bash
+scripts/caldav-push.py "Dentist" --start 2026-09-03T14:00:00 --end 2026-09-03T14:30:00
+# → caldav-push: event queued for approval (id=…)
+#   caldav-push: approve or deny at https://agents.example.com/sends/caldav-gateway/…
+
+scripts/caldav-push.py "Conference" --start 2026-09-10 --end 2026-09-12 --all-day \
+    --description "Keynote at 9am"
+```
+
+Approval is **asynchronous**, same as the messenger gateways: the gateway
+answers `status: sending` immediately and writes in the background, so a slow
+CalDAV round trip shows `sending → approved` on the approval page instead of
+tripping the proxy timeout.
+
+### Enrolling with `/sends`
+
+`caldav-gateway` is **not** one of the three hardcoded built-in channels
+(`signal`/`whatsapp`/`telegram`); it enrols the same way an *extra* messenger
+account does — by declaring it in `MESSENGER_GATEWAYS` on the `retinue`
+service (see `docker-compose.override.example.yml`). `MESSENGER_GATEWAYS` is
+already channel-agnostic (any `base_url` exposing `/pending-sends` +
+`/health` qualifies, whatever the underlying channel), so enrolling a calendar
+gateway this way needs **no framework code change**:
+
+```yaml
+retinue:
+  environment:
+    - 'MESSENGER_GATEWAYS=[{"base_url":"http://caldav-gateway:8094","token":"${CALDAV_GATEWAY_TOKEN}","label":"Calendar"}]'
+```
+
+Once enrolled, pending events appear on `/sends` alongside e-mail and messenger
+approvals, and `caldav-gateway`'s `/health` is polled by the same
+[connection monitor](#connection-monitoring--re-pairing-gateways) as the other
+gateways — though unlike a linked-device session there is no persistent link
+state to track, so `/health` only reports whether the gateway is configured;
+a write's own success or failure (visible on `/sends`) is what proves the
+server is reachable.
+
+**Scope.** This first cut is create-only — recurrence, update, and delete are
+out of scope (see issue #13).
+
 ## First start
 
 Builds the image, mounts the chambers into the container, and

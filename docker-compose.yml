@@ -467,6 +467,53 @@ services:
     networks:
       - agents
 
+  # CalDAV gateway — writes calendar events into the user's real calendar (see
+  # scripts/caldav-gateway.py). Provider-agnostic by design (issue #13): the
+  # backend is selected purely by configuration (CALDAV_SERVER_URL/USERNAME/
+  # PASSWORD/CALENDAR_ID) via a generic RFC 4791 client library — no
+  # provider-specific code path, so Zoho (or any other CalDAV server) is just a
+  # configured endpoint.
+  #
+  # Outbound writes are gated by CALDAV_SEND_POLICY, the same allow/trust/verify
+  # model as the messenger gateways, with pending events approvable at /sends.
+  # This gateway is not one of the three hardcoded built-in channels
+  # (signal/whatsapp/telegram); enrol it into /sends the same way an extra
+  # messenger account is enrolled — by declaring it in MESSENGER_GATEWAYS on the
+  # retinue service (see docker-compose.override.example.yml). That mechanism
+  # is already channel-agnostic (any base_url exposing /pending-sends + /health
+  # qualifies), so no further framework code change is needed to wire this up.
+  caldav-gateway:
+    build:
+      context: .
+      dockerfile: caldav-gateway/Dockerfile
+    env_file:
+      - .env
+    environment:
+      - CALDAV_SERVER_URL
+      - CALDAV_USERNAME
+      - CALDAV_PASSWORD
+      # Optional: which calendar to write to (id/URL/display name). Unset =
+      # the account's default calendar.
+      - CALDAV_CALENDAR_ID
+      # The sending-identity label CALDAV_SEND_POLICY keys on — like
+      # SIGNAL_ACCOUNT, one gateway instance = one identity. Defaults to
+      # "default" when unset.
+      - CALDAV_ACCOUNT
+      # Outbound send-control policy (JSON array, like EMAIL_SEND_POLICY). Keyed
+      # by the SENDING identity (CALDAV_ACCOUNT above), not any per-request
+      # field. Categories: allow / trust / verify. An account matching no entry
+      # and no "*" wildcard defaults to verify (fail-safe).
+      # [{"account":"default","category":"verify"},{"account":"agent","category":"allow"}]
+      - CALDAV_SEND_POLICY
+      # Public base URL for approval links returned by the verify/trust flow.
+      - SEND_APPROVAL_BASE_URL
+      # Outbound HTTP API (internal to the agents network; not published).
+      - CALDAV_GATEWAY_HTTP_PORT=8094
+      - CALDAV_GATEWAY_TOKEN
+    restart: unless-stopped
+    networks:
+      - agents
+
   # Speech-to-text microservice — owns the Whisper model and exposes
   # POST /transcribe (see scripts/stt-service.py). Shared by the web gateway
   # (dashboard voice input) and the Signal gateway (inbound voice notes), so
