@@ -929,12 +929,13 @@ _REQUEST_HEADERS = (REQUEST_CATEGORY_HEADER,)
 # RFC 2047 encoded-word labelled with the placeholder charset token
 # `unknown-8bit`. That token is not a registered charset, so strict receivers
 # (Microsoft Exchange, on-prem and Exchange Online) reject the whole message
-# with `550 5.6.0 CAT.InvalidContent.Exception: InvalidCharsetException`.
+# with `550 5.6.0 CAT.InvalidContent.Exception: ExchangeDataException`.
 #
 # The header carries no delivery semantics for us — it is the provider's own
 # bookkeeping — so dropping it before submission is lossless and removes the
 # only difference between the (working) direct-send path and the (bouncing)
-# approval path. Override or extend via SEND_STRIP_HEADERS (comma-separated).
+# approval path. Override via SEND_STRIP_HEADERS (comma-separated; replaces
+# this list rather than adding to it).
 DEFAULT_STRIP_HEADERS = ("X-ZohoMail-Sender",)
 
 

@@ -3218,7 +3218,14 @@ class Handler(BaseHTTPRequestHandler):
         try:
             cfg = _ec_config(account)
             if verb == "approve":
-                ec.approve_pending_send(cfg, request_id)
+                result = ec.approve_pending_send(cfg, request_id)
+                stripped = result.get("stripped_headers")
+                if stripped:
+                    # The workaround for #60's Zoho/Exchange bounce fired —
+                    # report it, so a dropped header is visible somewhere
+                    # rather than only inferred from a message that arrived.
+                    print(f"[web-gateway] {request_id}: stripped provider "
+                          f"header(s) {', '.join(stripped)}", flush=True)
             else:
                 ec.delete_pending_draft(cfg, request_id)
         except ec.EmailError as exc:
