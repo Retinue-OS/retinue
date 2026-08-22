@@ -113,11 +113,12 @@ RETINUE_CLAUDE_MODEL=qwen3.5
 
 `ANTHROPIC_BASE_URL` may instead point at any Claude-compatible gateway. The
 optional `RETINUE_CLAUDE_MODEL` is passed as `--model` to every Claude Code
-process Retinue starts, so dashboard conversations and scheduled jobs use the
-same selected model. Claude Code remote-control sessions are tied to a
-Claude.ai login and are therefore disabled when a gateway is configured. Omit
-all four settings to retain the default Claude Code authentication and
-remote-control session.
+process Retinue starts by default, so dashboard conversations, scheduled jobs,
+and the dashboard's voice-input cleanup pass (`TRANSCRIPT_CLEANUP_MODEL`, which
+falls back to it) all use the same selected model unless a job or thread pins
+its own. Claude Code remote-control sessions are tied to a Claude.ai login and
+are therefore disabled when a gateway is configured. Omit all four settings to
+retain the default Claude Code authentication and remote-control session.
 
 OpenRouter exposes a Claude-compatible Messages API. For example, to use
 OpenAI's GPT-4o through OpenRouter:
