@@ -18,7 +18,12 @@
   <script type="module" src="/components/projects.js"></script>
   <script type="module" src="/components/news.js"></script>
   <script type="module" src="/components/app-launcher.js"></script>
+  <!-- No opt-in element here (that UI lives on /settings.html now), but the
+       module keeps an already-granted subscription healthy on every load. -->
   <script type="module" src="/components/push.js"></script>
+  <!-- Splitter manager for the wide layout: drag-resizable columns, persisted
+       per device. A no-op on phones, where the splitters are hidden. -->
+  <script type="module" src="/layout.js"></script>
   <!-- Non-functional/static mock cards are intentionally disabled until they
        are backed by real data flows.
   <script type="module" src="/components/agenda.js"></script>
@@ -31,28 +36,52 @@
   <main>
     <header class="top">
       <h1 id="greeting">Retinue</h1>
-      <span id="today" class="date"></span>
+      <span class="top-right">
+        <span id="today" class="date"></span>
+        <!-- Discrete way into the settings page (notifications live there). -->
+        <a class="gear" href="/settings.html" title="Settings" aria-label="Settings">&#9881;</a>
+      </span>
     </header>
 
-    <!-- Interactive chat threads with Ara. A thread can be opened by you or by a
-         retinue agent that needs a decision; it talks to the gateway's
-         /conversations API (no static data file). It takes all remaining screen
-         height; when a thread is open the header and app dock hide (see
-         styles.css) so the chat gets the whole display. -->
-    <retinue-conversations heading="Conversations"></retinue-conversations>
+    <!-- The deck: the resizable region between header and dock. On phones the
+         wrappers are display:contents (everything stacks, the page scrolls);
+         in the wide layout they are real flex columns separated by draggable
+         splitters (see layout.js), VS Code style: conversations + news on the
+         left, projects on the right. -->
+    <div class="deck">
+      <section class="col col-main">
+        <!-- Interactive chat threads with Ara. A thread can be opened by you or
+             by a retinue agent that needs a decision; it talks to the gateway's
+             /conversations API (no static data file). It takes all remaining
+             screen height; when a thread is open the header and app dock hide
+             (see styles.css) so the chat gets the whole display. -->
+        <retinue-conversations heading="Conversations"></retinue-conversations>
 
-    <!-- Running projects, computed live from the life store (GET /projects).
-         Projects where you are on the move are highlighted with an accent bar;
-         "All projects →" opens the full page, including those waiting on a third
-         person. No static data file — the .md frontmatter is the source. -->
-    <retinue-projects heading="Projects"></retinue-projects>
+        <div class="splitter splitter-h" data-splitter="news" role="separator"
+             aria-orientation="horizontal" aria-label="Resize news"
+             title="Drag to resize &middot; double-click to reset" tabindex="0"></div>
 
-    <!-- Broadcast-style inbound that needs no reply and fits no project: feed
-         items, newsletter blurbs, channel announcements. Ranked live by
-         GET /news (importance decayed by age; dated items drop out once they
-         lapse), every headline a link to the source. 👍/👎/✕ teach the Herald
-         agent, which keeps the profile behind the ranking. -->
-    <retinue-news heading="News"></retinue-news>
+        <!-- Broadcast-style inbound that needs no reply and fits no project: feed
+             items, newsletter blurbs, channel announcements. Ranked live by
+             GET /news (importance decayed by age; dated items drop out once they
+             lapse), every headline a link to the source. 👍/👎/✕ teach the Herald
+             agent, which keeps the profile behind the ranking. -->
+        <retinue-news heading="News"></retinue-news>
+      </section>
+
+      <div class="splitter splitter-v" data-splitter="side" role="separator"
+           aria-orientation="vertical" aria-label="Resize projects column"
+           title="Drag to resize &middot; double-click to reset" tabindex="0"></div>
+
+      <section class="col col-side">
+        <!-- Running projects, computed live from the life store (GET /projects).
+             Projects where you are on the move are highlighted with an accent
+             bar; "All projects →" opens the full page, including those waiting
+             on a third person. No static data file — the .md frontmatter is the
+             source. -->
+        <retinue-projects heading="Projects"></retinue-projects>
+      </section>
+    </div>
     <!-- Non-functional/static mock cards are intentionally disabled until they
          are backed by real data flows.
     <retinue-agenda   heading="Today"                 src="/data/agenda.json"></retinue-agenda>
@@ -74,9 +103,6 @@
       <a href="/news.html"><span class="ico">&#128240;</span><span class="lbl">News</span></a>
       <a href="/sends"><span class="ico">&#128228;</span><span class="lbl">Sends</span></a>
     </retinue-app-launcher>
-
-    <!-- Hides itself unless push is available and not yet enabled. -->
-    <retinue-push-optin></retinue-push-optin>
   </main>
 
   <script>

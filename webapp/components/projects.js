@@ -18,7 +18,10 @@
 //
 // Degrades gracefully offline: the fetch fails, the last rendered state stays.
 
-import { esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
+import {
+  esc, fmtAge, isWideFrame, onFrameChange,
+  viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
+} from './base.js';
 
 const SRC = '/projects';
 // Caps for the dashboard card in the phone layout, where every row lengthens the
@@ -54,6 +57,8 @@ const CSS = `
      most of a wide window empty. */
   ul { list-style: none; margin: 0; padding: 0; display: grid; align-content: start;
        grid-template-columns: repeat(auto-fill, minmax(min(100%, 320px), 1fr)); gap: 8px; }
+  /* The header's view toggle (base.js) forces a single full-width column. */
+  ul.as-list { grid-template-columns: minmax(0, 1fr); }
   /* Each row links to the project's own page (view, edit, discuss). Rows are
      tap targets, not prose: suppress text selection and the iOS long-press
      callout so a finger resting on a row while scrolling never starts a
@@ -100,6 +105,16 @@ class RetinueProjects extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._last = { state: 'loading' };
+    // List rows vs reflowing tiles — a per-device choice (see base.js). The
+    // listener sits on the shadow root, so it survives every innerHTML swap.
+    this._view = viewPref('projects');
+    this.shadowRoot.addEventListener('click', (e) => {
+      const el = e.target.closest('[data-setview]');
+      if (!el) return;
+      this._view = el.getAttribute('data-setview');
+      setViewPref('projects', this._view);
+      this.render(this._last);
+    });
     this.render(this._last);
     this.load();
     // Crossing the layout breakpoint changes how many rows the card shows, so
@@ -144,10 +159,13 @@ class RetinueProjects extends HTMLElement {
     const home = this.full
       ? '<a class="more" href="/">&larr; Back to dashboard</a>' : '';
     this.shadowRoot.innerHTML =
-      `<style>${CSS}</style>` +
-      `<section class="card"><header><h2>${esc(this.heading)}</h2>${stamp}</header>` +
+      `<style>${CSS}${VIEW_TOGGLE_CSS}</style>` +
+      `<section class="card"><header><h2>${esc(this.heading)}</h2>` +
+      `${viewToggleHtml(this._view)}${stamp}</header>` +
       `<div class="content">${inner}</div>${home}</section>`;
   }
+
+  get _ulOpen() { return this._view === 'list' ? '<ul class="as-list">' : '<ul>'; }
 
   bodyCard(d) {
     const mine = Array.isArray(d.mine) ? d.mine : [];
@@ -156,13 +174,13 @@ class RetinueProjects extends HTMLElement {
     const wide = isWideFrame();
     const out = [];
     if (mine.length) {
-      out.push('<div class="group-label">Your move</div><ul>' +
+      out.push(`<div class="group-label">Your move</div>${this._ulOpen}` +
         mine.slice(0, wide ? mine.length : MAX_CARD_MINE)
           .map((p) => projectLi(p, 'mine', { next: true })).join('') +
         '</ul>');
     }
     if (waiting.length) {
-      out.push('<div class="group-label">Waiting on others</div><ul>' +
+      out.push(`<div class="group-label">Waiting on others</div>${this._ulOpen}` +
         waiting.slice(0, wide ? waiting.length : MAX_CARD_WAITING)
           .map((p) => projectLi(p, 'waiting')).join('') +
         '</ul>');
@@ -177,11 +195,11 @@ class RetinueProjects extends HTMLElement {
     if (!mine.length && !waiting.length) return '<p class="muted">No running projects.</p>';
     const out = [];
     if (mine.length) {
-      out.push('<div class="group-label">Your move</div><ul>' +
+      out.push(`<div class="group-label">Your move</div>${this._ulOpen}` +
         mine.map((p) => projectLi(p, 'mine', { next: true })).join('') + '</ul>');
     }
     if (waiting.length) {
-      out.push('<div class="group-label">Waiting on others</div><ul>' +
+      out.push(`<div class="group-label">Waiting on others</div>${this._ulOpen}` +
         waiting.map((p) => projectLi(p, 'waiting', { next: true })).join('') + '</ul>');
     }
     return out.join('');
