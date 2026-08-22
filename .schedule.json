@@ -9,6 +9,7 @@
       "run_at_start": false
     },
     {
+      "_comment": "Wake resting (paused) projects whose date has come — standing cadences on next_due, one-off deadlines on expected_by minus their remind_before. Gated by a free SPARQL SELECT; the job id predates the deadline half and is kept so scheduler state carries over.",
       "id": "recurring-projects",
       "command": "python3 /workspace/scripts/recurring-projects.py",
       "interval_seconds": 1800,
