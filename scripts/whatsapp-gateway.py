@@ -223,19 +223,31 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
 
 
+# This gateway's own base URL on the internal Docker network, used to build the
+# HTTP references stored for inbound media (GET /media/<id> below). Defaults to
+# the compose service name + HTTP port; a deployment running more than one
+# WhatsApp identity overrides it per container (as it does SEND_APPROVAL_*).
+GATEWAY_SELF_URL = os.environ.get(
+    "WHATSAPP_GATEWAY_SELF_URL", f"http://whatsapp-gateway:{HTTP_PORT}"
+).rstrip("/")
+
+
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool, media: str | None = None):
+                     delivered: bool, media: str | None = None,
+                     attachment_urls: list[str] | None = None):
     """Best-effort persist of one inbound message to the store; never raises.
 
     Returns the store ``Path`` (so the caller can later flip the delivered flag
     with :func:`_mark_delivered`) or ``None`` if persistence failed. ``media``
     records a retained raw-audio file for a voice note persisted before
-    transcription (see :func:`_retain_media`).
+    transcription (see :func:`_retain_media`); ``attachment_urls`` are the
+    durable HTTP references to this message's media (see :func:`_store_media_ref`).
     """
     try:
         _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered, media=media,
+            attachment_urls=attachment_urls or None,
         )
         return path
     except Exception as exc:
@@ -294,6 +306,23 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
     )
     if ok:
         print(f"[whatsapp-gateway] forwarded news-flagged message from {source}", flush=True)
+
+
+def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+    """Persist inbound media durably and return its HTTP-resolvable reference URL.
+
+    Best-effort: any failure returns None so the message still forwards and
+    persists with its transcript — only the audio/image link is skipped, never
+    the message. The bytes go to disk (out of the graph); the returned URL is
+    what lands in the message's ``kb:attachment`` triple."""
+    if not data:
+        return None
+    try:
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+    except Exception as exc:
+        print(f"[whatsapp-gateway] could not store inbound media: {exc}", flush=True)
+        return None
+    return f"{GATEWAY_SELF_URL}/media/{media_id}"
 
 
 # Public base URL used to build approval links returned to the caller.
@@ -853,36 +882,43 @@ def _extract_image(message):
     return None
 
 
-def _inbound_image_files(message) -> list[dict]:
-    """Download this message's image, if any, as forward-ready file payloads.
+def _inbound_image_files(message) -> tuple[list[dict], list[str]]:
+    """Download this message's image, if any, as forward-ready files + a ref.
 
-    Returns ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape
-    the retinue gateway's POST /message accepts as ``files``, where each file is
-    materialized to disk for the answering session. Best-effort: any failure
-    (or an oversized image) forwards the message without its image rather than
-    dropping it."""
+    Returns ``(files, attachment_urls)`` where ``files`` is
+    ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape the
+    retinue gateway's POST /message accepts as ``files``, each materialized to
+    disk for the answering session — and ``attachment_urls`` are the durable
+    HTTP references stored for the same image (its ``kb:attachment`` triple).
+    The durable reference is stored regardless of size (a plain on-disk blob);
+    only the forwarded ``files`` payload honours the size cap, since that one
+    travels base64-encoded through the triage POST. Best-effort: any failure
+    forwards the message without its image rather than dropping it."""
     image = _extract_image(message)
     if image is None:
-        return []
+        return [], []
     media = _download_media(message)
     if media is None:
-        return []
+        return [], []
     try:
         data = media.read_bytes()
     finally:
         media.unlink(missing_ok=True)
     if not data:
-        return []
+        return [], []
+    mime = str(_attr(image, "mimetype", "Mimetype") or "image/jpeg")
+    ref = _store_media_ref(data, mime)
+    attachment_urls = [ref] if ref else []
     if len(data) > MAX_INBOUND_FILE_BYTES:
         print(f"[whatsapp-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
-        return []
-    mime = str(_attr(image, "mimetype", "Mimetype") or "image/jpeg")
+        return [], attachment_urls
     suffix = mimetypes.guess_extension(mime) or ".jpg"
-    return [{
+    files = [{
         "filename": f"whatsapp-image{suffix}",
         "content_type": mime,
         "data": base64.b64encode(data).decode("ascii"),
     }]
+    return files, attachment_urls
 
 
 def _download_media(message) -> Path | None:
@@ -1338,7 +1374,12 @@ def _handle_message_event(event) -> None:
     # An included image is forwarded alongside the text (which, for an image
     # message, is its caption). Status posts are excluded: they are gated to a
     # no-model-turn path anyway, so their media is never downloaded.
-    files = [] if is_broadcast else _inbound_image_files(message)
+    # attachment_urls collect the durable HTTP references (kb:attachment) for
+    # every piece of media on this message — image(s) here, the voice note below.
+    if is_broadcast:
+        files, attachment_urls = [], []
+    else:
+        files, attachment_urls = _inbound_image_files(message)
 
     # A voice note is persisted BEFORE transcription (never-drop): if the pre-
     # persist happened, this holds its store Path so the forward below reuses the
@@ -1350,6 +1391,29 @@ def _handle_message_event(event) -> None:
         if audio is not None:
             media = _download_media(message)
             if media is not None:
+                # Read the bytes once: they feed the durable media reference, the
+                # files payload (so the original audio rides into the conversation
+                # alongside its transcript), AND transcription. Persist the audio
+                # BEFORE transcribing so a garbled or failed transcript never costs
+                # the recording — the audio is the source of truth here. This read
+                # must precede _retain_media below, which *moves* the temp file.
+                mime = str(_attr(audio, "mimetype", "Mimetype") or "audio/ogg; codecs=opus")
+                try:
+                    audio_bytes = media.read_bytes()
+                except OSError as exc:
+                    audio_bytes = b""
+                    print(f"[whatsapp-gateway] could not read voice note: {exc}", flush=True)
+                if audio_bytes:
+                    ref = _store_media_ref(audio_bytes, mime)
+                    if ref:
+                        attachment_urls.append(ref)
+                    if len(audio_bytes) <= MAX_INBOUND_FILE_BYTES:
+                        suffix = mimetypes.guess_extension(mime.split(";", 1)[0].strip()) or ".ogg"
+                        files.append({
+                            "filename": f"whatsapp-voice{suffix}",
+                            "content_type": mime,
+                            "data": base64.b64encode(audio_bytes).decode("ascii"),
+                        })
                 if is_broadcast or WHATSAPP_GATEWAY_MODE != "inbox":
                     # Transient handling (no durable spool, no retry): a status
                     # post is gated to a no-model-turn path anyway, and a
@@ -1369,10 +1433,15 @@ def _handle_message_event(event) -> None:
                     # durable, re-transcribable record (delivered=False, media set)
                     # for the daily drain — instead of vanishing at the skip-return
                     # below, downstream of where _forward_to_inbox persists.
+                    #
+                    # The retained copy is the *retry* artifact and is dropped once
+                    # the transcript lands; the kb:attachment blob stored above is
+                    # the message's permanent media and stays.
                     durable = _retain_media(media) or media
                     grp = _jid_addr(chat_jid) if is_group else None
                     voice_store_path = _persist_inbound(
                         "", sender, grp, delivered=False, media=str(durable),
+                        attachment_urls=attachment_urls,
                     )
                     try:
                         print(f"[whatsapp-gateway] transcribing voice note from {sender}", flush=True)
@@ -1426,6 +1495,7 @@ def _handle_message_event(event) -> None:
         origin = _jid_addr(chat_jid) or _jid_addr(sender_jid)
         _forward_to_inbox(text, lang, sender, is_group=is_group,
                           sender_name=push_name, origin=origin, files=files,
+                          attachment_urls=attachment_urls,
                           store_path=voice_store_path)
     else:
         _handle_control_message(text, lang, sender, files=files)
@@ -1465,6 +1535,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
                       is_group: bool = False, sender_name: str | None = None,
                       origin: str | None = None,
                       files: list[dict] | None = None,
+                      attachment_urls: list[str] | None = None,
                       store_path=None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
@@ -1502,7 +1573,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # accounted for (forwarded to triage, or held in a fully-resolved class).
     # A voice note was already persisted before transcription; reuse that record.
     if store_path is None:
-        store_path = _persist_inbound(question, sender, group_id, delivered=False)
+        store_path = _persist_inbound(question, sender, group_id, delivered=False,
+                                      attachment_urls=attachment_urls)
 
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(sender, group_id)
@@ -1547,8 +1619,11 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         if gate["flagged_unknown"] else ""
     )
     attachment_line = (
-        (f"\nThe message includes {len(files)} attached image(s), forwarded "
-         f"with this prompt; their saved on-disk paths are listed at the end.\n")
+        (f"\nThe message includes {len(files)} attached file(s) (image(s) and/or "
+         f"the original voice note), forwarded with this prompt; their saved "
+         f"on-disk paths are listed at the end. When a voice note is attached, "
+         f"include the audio itself in the dashboard conversation (not only its "
+         f"transcript).\n")
         if files else ""
     )
     prompt = (
@@ -2091,6 +2166,23 @@ class _PushHandler(BaseHTTPRequestHandler):
                                               "one automatically once it reconnects unlinked"})
                 return
             self._reply_raw(200, png, "image/png")
+            return
+        if self.path.split("?", 1)[0].rstrip("/").startswith("/media/"):
+            # Resolve a durable inbound-media reference (kb:attachment). The
+            # bytes live on the store volume, out of the graph; this serves them
+            # back over HTTP. Token-gated like /qr — it is the user's private
+            # inbound content. load_media validates the id, so a crafted path
+            # cannot escape the media dir.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            media_id = self.path.split("?", 1)[0].rstrip("/")[len("/media/"):]
+            loaded = _ibstore.load_media(INBOUND_STORE_DIR, media_id)
+            if loaded is None:
+                self._reply(404, {"error": "not found"})
+                return
+            data, content_type = loaded
+            self._reply_raw(200, data, content_type)
             return
         if self.path.rstrip("/") == "/pending-sends":
             if not self._authorized():

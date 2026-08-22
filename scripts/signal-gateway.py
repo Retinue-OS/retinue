@@ -203,19 +203,31 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
 
 
+# This gateway's own base URL on the internal Docker network, used to build the
+# HTTP references stored for inbound media (GET /media/<id> below). Defaults to
+# the compose service name + HTTP port; a deployment running more than one Signal
+# identity (e.g. the user's personal account) overrides it per container.
+GATEWAY_SELF_URL = os.environ.get(
+    "SIGNAL_GATEWAY_SELF_URL", f"http://signal-gateway:{HTTP_PORT}"
+).rstrip("/")
+
+
 def _persist_inbound(question: str, sender: str, group_id: str | None,
-                     delivered: bool, media: str | None = None):
+                     delivered: bool, media: str | None = None,
+                     attachment_urls: list[str] | None = None):
     """Best-effort persist of one inbound message to the store; never raises.
 
     Returns the store ``Path`` (so the caller can later flip the delivered flag
     with :func:`_mark_delivered`) or ``None`` if persistence failed. ``media``
     records a retained raw-audio file for a voice note persisted before
-    transcription (see :func:`_retain_media`).
+    transcription (see :func:`_retain_media`); ``attachment_urls`` are the
+    durable HTTP references to this message's media (see :func:`_store_media_ref`).
     """
     try:
         _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered, media=media,
+            attachment_urls=attachment_urls or None,
         )
         return path
     except Exception as exc:
@@ -274,6 +286,23 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
     )
     if ok:
         print(f"[signal-gateway] forwarded news-flagged message from {source}", flush=True)
+
+
+def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+    """Persist inbound media durably and return its HTTP-resolvable reference URL.
+
+    Best-effort: any failure returns None so the message still forwards and
+    persists with its transcript — only the media link is skipped. The bytes go
+    to disk (out of the graph); the returned URL is what lands in the message's
+    ``kb:attachment`` triple."""
+    if not data:
+        return None
+    try:
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+    except Exception as exc:
+        print(f"[signal-gateway] could not store inbound media: {exc}", flush=True)
+        return None
+    return f"{GATEWAY_SELF_URL}/media/{media_id}"
 
 
 # Outbound send-control policy — the messenger analogue of EMAIL_SEND_POLICY.
@@ -459,19 +488,27 @@ def _attachment_path(att: dict) -> Path | None:
     return None
 
 
-def _split_attachments(event: dict) -> tuple[Path | None, list[dict]]:
-    """Partition inbound attachments into (voice_note_path, image_files).
+def _split_attachments(event: dict) -> tuple[Path | None, list[dict], list[str]]:
+    """Partition inbound attachments into (voice_note_path, files, attachment_urls).
 
     signal-cli labels each attachment with its contentType: ``audio/*`` is a
     voice note to transcribe, ``image/*`` is forwarded to the agent as a file
     payload (``{"filename", "content_type", "data"(base64)}`` — the shape the
     retinue gateway's POST /message accepts as ``files``). An attachment with
     no contentType keeps the legacy voice-note treatment, since before this
-    split every attachment was handed to the transcriber."""
+    split every attachment was handed to the transcriber.
+
+    Every attachment (image or voice note) is ALSO persisted durably and its
+    HTTP reference collected in ``attachment_urls`` — the ``kb:attachment`` triple
+    on the stored message. The voice note is additionally added to ``files`` so
+    the original audio rides into the conversation alongside its transcript. The
+    durable reference is stored regardless of size (consistency: a reference,
+    never inline); only the transient ``files`` payload honours the size cap."""
     msg = event.get("envelope", {}).get("dataMessage") or {}
     attachments = msg.get("attachments") or []
     voice: Path | None = None
-    images: list[dict] = []
+    files: list[dict] = []
+    attachment_urls: list[str] = []
     for att in attachments:
         if not isinstance(att, dict):
             continue
@@ -480,26 +517,46 @@ def _split_attachments(event: dict) -> tuple[Path | None, list[dict]]:
             print(f"[signal-gateway] attachment metadata present but file not found: {att}", flush=True)
             continue
         content_type = str(att.get("contentType") or "").lower()
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            print(f"[signal-gateway] could not read inbound attachment {path}: {exc}", flush=True)
+            data = b""
         if content_type.startswith("image/"):
-            try:
-                data = path.read_bytes()
-            except OSError as exc:
-                print(f"[signal-gateway] could not read inbound image {path}: {exc}", flush=True)
-                continue
             if not data:
                 continue
+            ref = _store_media_ref(data, content_type)
+            if ref:
+                attachment_urls.append(ref)
             if len(data) > MAX_INBOUND_FILE_BYTES:
                 print(f"[signal-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
                 continue
             suffix = path.suffix or mimetypes.guess_extension(content_type) or ".jpg"
-            images.append({
+            files.append({
                 "filename": f"signal-image{suffix}",
                 "content_type": content_type,
                 "data": base64.b64encode(data).decode("ascii"),
             })
-        elif voice is None:
-            voice = path
-    return voice, images
+        else:
+            # Voice note (audio/*) or an unlabeled attachment: transcribe the
+            # first one. Persist it durably as a reference, and — when it fits —
+            # attach the audio itself so the conversation carries it.
+            mime = content_type or "audio/ogg"
+            if data:
+                ref = _store_media_ref(data, mime)
+                if ref:
+                    attachment_urls.append(ref)
+                if len(data) <= MAX_INBOUND_FILE_BYTES:
+                    suffix = path.suffix or mimetypes.guess_extension(mime) or ".ogg"
+                    label = "voice" if mime.startswith("audio/") else "attachment"
+                    files.append({
+                        "filename": f"signal-{label}{suffix}",
+                        "content_type": mime,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    })
+            if voice is None:
+                voice = path
+    return voice, files, attachment_urls
 
 
 def _extract_sender(event: dict) -> str | None:
@@ -1142,7 +1199,7 @@ def _handle_event(event: dict) -> None:
     except Exception as exc:
         print(f"[signal-gateway] could not record recent sender: {exc}", flush=True)
 
-    voice, files = _split_attachments(event)
+    voice, files, attachment_urls = _split_attachments(event)
     # A voice note is persisted BEFORE transcription (never-drop): if the pre-
     # persist happened, this holds its store Path so the forward below reuses the
     # same record instead of writing a second one.
@@ -1156,9 +1213,14 @@ def _handle_event(event: dict) -> None:
         # _forward_to_inbox persists. Only in inbox mode: a control account has no
         # triage drain that would pick a persisted record back up, so the never-
         # drop ledger is an inbox-mode concept and persisting there would leak.
+        #
+        # The retained copy is the *retry* artifact and is dropped once the
+        # transcript lands; it is distinct from the durable kb:attachment blob
+        # _split_attachments already wrote, which stays for good.
         durable = _retain_media(voice) or voice
         voice_store_path = _persist_inbound(
             "", sender, _extract_group_id(event), delivered=False, media=str(durable),
+            attachment_urls=attachment_urls,
         )
         try:
             question, lang = _transcribe(durable)
@@ -1206,7 +1268,8 @@ def _handle_event(event: dict) -> None:
     # account hands it to the user's triage and stays silent towards the sender.
     if SIGNAL_GATEWAY_MODE == "inbox":
         _forward_to_inbox(question, lang, sender, group_id=_extract_group_id(event),
-                          files=files, store_path=voice_store_path)
+                          files=files, attachment_urls=attachment_urls,
+                          store_path=voice_store_path)
     else:
         _handle_control_message(question, lang, sender, files=files)
 
@@ -1250,6 +1313,7 @@ def _handle_control_message(question: str, lang: str, sender: str,
 def _forward_to_inbox(question: str, lang: str, sender: str,
                       group_id: str | None = None,
                       files: list[dict] | None = None,
+                      attachment_urls: list[str] | None = None,
                       store_path=None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
@@ -1279,7 +1343,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # fully-resolved class). A voice note was already persisted before
     # transcription; reuse that record instead of writing a second one.
     if store_path is None:
-        store_path = _persist_inbound(question, sender, group_id, delivered=False)
+        store_path = _persist_inbound(question, sender, group_id, delivered=False,
+                                      attachment_urls=attachment_urls)
 
     # Delivery gate: decide whether this sender is worth a model turn now. A
     # held message is already persisted above; no `claude -p` session is spawned.
@@ -1333,8 +1398,11 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         if gate["flagged_unknown"] else ""
     )
     attachment_line = (
-        (f"\nThe message includes {len(files)} attached image(s), forwarded "
-         f"with this prompt; their saved on-disk paths are listed at the end.\n")
+        (f"\nThe message includes {len(files)} attached file(s) (image(s) and/or "
+         f"the original voice note), forwarded with this prompt; their saved "
+         f"on-disk paths are listed at the end. When a voice note is attached, "
+         f"include the audio itself in the dashboard conversation (not only its "
+         f"transcript).\n")
         if files else ""
     )
     prompt = (
@@ -1821,6 +1889,23 @@ class _PushHandler(BaseHTTPRequestHandler):
                 self._reply_raw(status, body, content_type)
             else:
                 self._reply(status, body)
+            return
+        if self.path.split("?", 1)[0].rstrip("/").startswith("/media/"):
+            # Resolve a durable inbound-media reference (kb:attachment). The bytes
+            # live on the store volume, out of the graph; this serves them back
+            # over HTTP. Token-gated like /qr — it is the user's private inbound
+            # content. load_media validates the id, so a crafted path cannot
+            # escape the media dir.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            media_id = self.path.split("?", 1)[0].rstrip("/")[len("/media/"):]
+            loaded = _ibstore.load_media(INBOUND_STORE_DIR, media_id)
+            if loaded is None:
+                self._reply(404, {"error": "not found"})
+                return
+            data, content_type = loaded
+            self._reply_raw(200, data, content_type)
             return
         if self.path.rstrip("/") == "/pending-sends":
             if not self._authorized():

@@ -62,23 +62,45 @@ P_RECEIVED_AT = KB + "receivedAt"
 P_TEXT = KB + "text"
 P_MESSAGE_ID = KB + "messageId"
 P_DELIVERED = KB + "delivered"
+# A message's media (voice note, image) is NOT embedded in the graph: consistency
+# over data-in-graph means every attachment — regardless of size — is a *reference*
+# resolved over HTTP, never an inline data-URI literal. This predicate carries that
+# reference as an IRI object (the gateway's own token-gated GET /media/<id> URL);
+# it is multi-valued, so a message with several images gets one triple each. The
+# attachment's media type is not stored here on purpose — it is returned by the
+# HTTP response's Content-Type header when the reference is resolved, which is
+# where a media type belongs once the payload lives behind a URL.
+P_ATTACHMENT = KB + "attachment"
 # Optional reference to a retained raw-media file (e.g. a voice note's audio),
 # recorded when a message is persisted *before* transcription so a failed or
 # crashed STT run leaves a re-transcribable artifact instead of a silent drop.
-# Cleared once the message is accounted for (transcribed and forwarded).
+# Cleared once the message is accounted for (transcribed and forwarded). This is
+# a *local file path*, not a reference for the reader: unlike P_ATTACHMENT (the
+# message's durable, permanent media) it is bookkeeping for the re-transcribe
+# retry and disappears the moment the transcript lands.
 P_MEDIA = KB + "media"
 
 # Subdirectory (under the gateway's store dir) that holds the per-message files.
 # The gateway owns this folder read-write; the life store mounts it read-only.
 MESSAGES_SUBDIR = "messages"
 
-# Subdirectory holding raw media (voice-note audio) retained for a message that
-# was persisted before transcription. It lives beside the messages so it shares
-# the gateway's durable data volume; the reference is recorded via P_MEDIA and
-# the file is unlinked once the message is transcribed and accounted for.
+# Subdirectory holding the durable media blobs referenced by P_ATTACHMENT. Blobs
+# are named by a server-generated hex id (never an untrusted filename) with no
+# RDF extension, so qlever-dir — which indexes only .nt/.ttl/.n3 plus declared
+# converters — ignores them: the binaries sit on the same volume as the message
+# .nt files without ever entering the triple store.
+#
+# It doubles as the spool for raw media (voice-note audio) retained for a message
+# persisted before transcription — same volume, same durability, but referenced
+# via P_MEDIA and unlinked once the message is transcribed and accounted for.
+
 MEDIA_SUBDIR = "media"
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
+# A stored media id is exactly token_hex(16) — 32 lowercase hex chars. Validating
+# against this on read makes the GET /media/<id> path traversal-safe: an id that
+# is not pure hex can never resolve to a file outside the media dir.
+_MEDIA_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 def _slug(value: str) -> str:
@@ -158,6 +180,11 @@ def _render(fields: dict) -> str:
         lines.append(_lit(subj, P_GROUP, fields["group"]))
     if fields.get("message_id"):
         lines.append(_lit(subj, P_MESSAGE_ID, fields["message_id"]))
+    # Multi-valued: one IRI triple per attachment reference (deduped, order-free
+    # since the whole record is sorted before serialization).
+    for url in dict.fromkeys(fields.get("attachments") or []):
+        if url:
+            lines.append(_iri(subj, P_ATTACHMENT, url))
     if fields.get("media"):
         lines.append(_lit(subj, P_MEDIA, fields["media"]))
     return "".join(l + "\n" for l in sorted(lines))
@@ -166,7 +193,7 @@ def _render(fields: dict) -> str:
 def _parse(text: str) -> dict | None:
     """Read a message file back into a ``fields`` dict, or None if unparseable."""
     fields: dict = {"delivered": False, "group": None, "message_id": None,
-                    "media": None}
+                    "attachments": [], "media": None}
     subject = None
     for line in text.splitlines():
         line = line.strip()
@@ -192,6 +219,10 @@ def _parse(text: str) -> dict | None:
             fields["text"] = value
         elif pred == P_MESSAGE_ID:
             fields["message_id"] = value
+        elif pred == P_ATTACHMENT:
+            # IRI object → obj_iri is set; append the reference URL.
+            if value:
+                fields["attachments"].append(value)
         elif pred == P_MEDIA:
             fields["media"] = value
         elif pred == P_DELIVERED:
@@ -263,6 +294,7 @@ def write_message(
     message_id: str | None = None,
     timestamp: float | None = None,
     delivered: bool = False,
+    attachment_urls: list[str] | None = None,
     media: str | None = None,
 ) -> tuple[str, Path]:
     """Persist one inbound message as a deterministic N-Triples file.
@@ -272,9 +304,15 @@ def write_message(
     gateway is deliberately *not* forwarding (blacklisted, group-blocked or
     no-action-class) so the daily drain never re-surfaces it.
 
+    ``attachment_urls`` are HTTP-resolvable references to this message's media
+    (voice note, image), each emitted as a ``kb:attachment`` IRI. The bytes are
+    never inlined into the graph — see :func:`store_media`.
+
     ``media`` optionally records a reference (a durable file path) to raw media
     retained alongside this message — used by the persist-before-transcribe path
-    so a voice note survives a failed or crashed STT run.
+    so a voice note survives a failed or crashed STT run. Unlike
+    ``attachment_urls`` it is transient bookkeeping, cleared by
+    :func:`update_message` once the transcript is in.
     """
     ts = time.time() if timestamp is None else float(timestamp)
     token = secrets.token_hex(8)
@@ -288,6 +326,7 @@ def write_message(
         "message_id": message_id or None,
         "received_at": _iso(ts),
         "delivered": bool(delivered),
+        "attachments": [u for u in (attachment_urls or []) if u],
         "media": media or None,
     }
     # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
@@ -295,6 +334,56 @@ def write_message(
     path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
     return subject, path
+
+
+def store_media(store_dir: str | Path, data: bytes, content_type: str | None) -> str:
+    """Persist one inbound media blob durably and return its server-generated id.
+
+    The blob is keyed by ``token_hex(16)`` — never by an untrusted filename — so
+    the id is path-safe by construction and reveals nothing about the sender. The
+    ``content_type`` is written to a ``<id>.type`` sidecar so the serving endpoint
+    can set the right ``Content-Type`` without trusting anything client-supplied.
+    Neither file carries an RDF extension, so the life store never indexes them.
+
+    The caller builds the HTTP reference (``…/media/<id>``) and passes it to
+    :func:`write_message` as an ``attachment_urls`` entry; the bytes stay on disk
+    and out of the graph.
+    """
+    media_id = secrets.token_hex(16)
+    d = media_dir(store_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    blob = d / media_id
+    tmp = blob.with_suffix(".tmp")
+    tmp.write_bytes(data or b"")
+    os.replace(tmp, blob)
+    ct = (content_type or "application/octet-stream").strip() or "application/octet-stream"
+    _atomic_write(ct + "\n", d / (media_id + ".type"))
+    return media_id
+
+
+def load_media(store_dir: str | Path, media_id: str) -> tuple[bytes, str] | None:
+    """Return ``(bytes, content_type)`` for a stored media id, or None.
+
+    Validates the id against :data:`_MEDIA_ID_RE` before touching the filesystem,
+    so a crafted ``media_id`` can never escape the media dir (path traversal). The
+    content type falls back to ``application/octet-stream`` if the sidecar is
+    missing or unreadable.
+    """
+    if not _MEDIA_ID_RE.match(media_id or ""):
+        return None
+    d = media_dir(store_dir)
+    try:
+        data = (d / media_id).read_bytes()
+    except OSError:
+        return None
+    ct = "application/octet-stream"
+    try:
+        sidecar = (d / (media_id + ".type")).read_text(encoding="utf-8").strip()
+        if sidecar:
+            ct = sidecar
+    except OSError:
+        pass
+    return data, ct
 
 
 def undelivered(
@@ -311,7 +400,9 @@ def undelivered(
     anything; only the daily triage drain does.
 
     Each returned dict has: ``subject``, ``channel``, ``sender``, ``group``,
-    ``message_id``, ``received_at`` (ISO-8601), ``text``.
+    ``message_id``, ``received_at`` (ISO-8601), ``text``, ``attachments`` (a
+    possibly-empty list of HTTP media reference URLs) and ``media`` (the local
+    path of an as-yet-untranscribed voice note, else None).
     """
     mdir = messages_dir(store_dir)
     if not mdir.is_dir():
@@ -342,6 +433,7 @@ def undelivered(
             "message_id": fields.get("message_id"),
             "received_at": fields["received_at"],
             "text": fields["text"],
+            "attachments": fields.get("attachments") or [],
             "media": fields.get("media"),
         })
     return out
