@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Focused checks for the Telegram outbound send-control (TELEGRAM_SEND_POLICY).
 
-The gateway talks to the Telegram Bot API over plain HTTP only inside its bridge
+The gateway talks to Telegram over MTProto (Telethon) only inside its bridge
 adapter, so the policy-category resolution and pending-send file store load and
-run in isolation (no network, no bot token).
+run in isolation (no network, no MTProto session).
 
     python3 tests/test_telegram_send_policy.py
 """
@@ -105,7 +105,7 @@ def test_pending_send_store_lifecycle():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_telegram_gateway([{"number": "*", "category": "verify"}], tmp)
 
-        # Record what _push would have sent instead of touching the Bot API.
+        # Record what _push would have sent instead of touching Telegram.
         sent = []
         wg._push = lambda recipient, message, **kw: sent.append((recipient, message, kw))
 

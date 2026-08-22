@@ -204,8 +204,8 @@ prompt entirely. Mechanics:
 ## Messaging accounts
 
 A messaging account (a Signal number, a linked WhatsApp device, or a Telegram
-bot) has exactly one purpose, fixed by configuration and never inferred from a
-message's content. Set it with `SIGNAL_GATEWAY_MODE` (Signal),
+user account) has exactly one purpose, fixed by configuration and never
+inferred from a message's content. Set it with `SIGNAL_GATEWAY_MODE` (Signal),
 `WHATSAPP_GATEWAY_MODE` (WhatsApp), or `TELEGRAM_GATEWAY_MODE` (Telegram):
 
 | Mode | The account is… | Inbound handling | Reply to sender? |
