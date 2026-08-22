@@ -51,9 +51,17 @@ def forward_news(
     url: str | None = None,
     lang: str | None = None,
     group: str | None = None,
+    title: str | None = None,
+    source_id: str | None = None,
     timeout: float = 8.0,
 ) -> bool:
     """Best-effort hand-off of one news-flagged message to the news feed.
+
+    ``title`` and ``source_id`` are for callers whose message carries a real
+    title and a stable per-source identity — an e-mail newsletter has both (the
+    Subject, the sending address), a messenger post has neither. Omit them and
+    the gateway derives its usual shape (first line as title, the channel as the
+    source id).
 
     Returns ``True`` when the web-gateway accepted the item, ``False`` on any
     miss (endpoint unset, network error, non-2xx) — never raises, so a failing
@@ -68,6 +76,8 @@ def forward_news(
         "url": url or "",
         "lang": lang or None,
         "group": group or None,
+        "title": title or "",
+        "source_id": source_id or "",
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(

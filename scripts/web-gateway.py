@@ -3129,9 +3129,14 @@ class Handler(BaseHTTPRequestHandler):
         # A broadcast message is not a titled article: derive a short title from
         # its first line, keep the whole thing as the summary. If it carries no
         # link, key the id off source+text so re-forwarding the same post dedups.
+        # A caller whose message *does* have a real title and a stable per-source
+        # identity — an e-mail newsletter has both — may supply them instead.
+        supplied_title = (payload.get("title") or "").strip()
         first_line = text.splitlines()[0].strip() if text.splitlines() else text
-        title = (first_line[:117] + "…") if len(first_line) > 118 else first_line
+        raw_title = supplied_title or first_line
+        title = (raw_title[:117] + "…") if len(raw_title) > 118 else raw_title
         summary = (text[:497] + "…") if len(text) > 498 else text
+        source_id = (payload.get("source_id") or "").strip() or f"messenger:{channel}"
         id_seed = url or f"{source}\n{text}"
         now = news_store.now()
         item = {
@@ -3140,7 +3145,7 @@ class Handler(BaseHTTPRequestHandler):
             "url": url,
             "summary": summary,
             "source": source,
-            "source_id": f"messenger:{channel}",
+            "source_id": source_id,
             "lang": lang,
             "published": news_store.iso(now),
             "fetched": news_store.iso(now),
