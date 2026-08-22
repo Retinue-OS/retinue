@@ -85,6 +85,67 @@ def test_email_nt_roundtrip_and_determinism():
         assert got_wild == wildcards
 
 
+def test_email_news_sender_matching():
+    news = {"bulletin@news.example"}
+    wilds = {"*@substack.com", "*@*.ms-society.example"}
+    # Exact, case-insensitive.
+    assert tp.email_news_sender("Bulletin@News.Example", news, wilds)
+    # A wildcard behaves exactly as it does in the whitelist — same matcher.
+    assert tp.email_news_sender("anyone@substack.com", news, wilds)
+    assert tp.email_news_sender("info@sektion.ms-society.example", news, wilds)
+    assert tp.email_news_sender("info@ms-society.example", news, wilds)
+    # A neighbour of a declared sender is not news.
+    assert not tp.email_news_sender("someone@news.example", news, wilds)
+    assert not tp.email_news_sender("x@notsubstack.com", news, wilds)
+    assert not tp.email_news_sender("", news, wilds)
+    assert not tp.email_news_sender("no-at-sign", news, wilds)
+
+
+def test_email_policy_holds_both_classes():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "email-whitelist.nt"
+        pol = tp.EmailPolicy(
+            addresses={"boss@work.com"},
+            wildcards={"*@factsmission.com"},
+            news={"bulletin@news.example"},
+            news_wildcards={"*@substack.com"},
+        )
+        content = tp.render_email_policy(pol)
+        lines = [l for l in content.splitlines() if l]
+        assert lines == sorted(lines), "output not sorted"
+        tp.write_if_changed(content, path)
+        got = tp.load_email_policy(path)
+        assert got == pol, got
+        # The two classes are independent: being a news sender does not
+        # whitelist the address for a triage turn.
+        assert not tp.email_whitelisted("bulletin@news.example",
+                                        got.addresses, got.wildcards)
+        assert not tp.email_news_sender("boss@work.com",
+                                        got.news, got.news_wildcards)
+
+
+def test_mutate_email_sorts_news_by_shape():
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(Path(tmp) / "e.nt")
+        try:
+            tp._mutate_email(add_addresses=["boss@work.com"],
+                             news_add=["*@substack.com", "Bulletin@News.example"])
+            pol = tp.load_email_policy()
+            assert pol.news == {"bulletin@news.example"}, pol
+            assert pol.news_wildcards == {"*@substack.com"}, pol
+            # Adding a whitelist entry later must not drop the news senders:
+            # one file holds both classes.
+            tp._mutate_email(add_addresses=["peer@partner.com"])
+            pol = tp.load_email_policy()
+            assert pol.addresses == {"boss@work.com", "peer@partner.com"}, pol
+            assert pol.news == {"bulletin@news.example"}, pol
+            assert pol.news_wildcards == {"*@substack.com"}, pol
+            tp._mutate_email(news_remove=["*@substack.com"])
+            assert tp.load_email_policy().news_wildcards == set()
+        finally:
+            del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]
+
+
 def test_write_if_changed():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "p.nt"

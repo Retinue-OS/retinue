@@ -45,7 +45,9 @@ whether or not it also earns a triage turn.
 | **Unknown handle**, **ignored** group | never triggers | never drained (see below) |
 
 E-mail keeps its simpler single axis: **whitelisted** senders run in the fast
-loop; every other sender is held for the daily catch-all.
+loop; every other sender is held for the daily catch-all. Its one addition is the
+**news sender** class below — the address-level counterpart of the messenger
+`news` group flag, and likewise orthogonal to the whitelist.
 
 The tradeoff the user accepts: cold senders (blacklisted or in a quieted group)
 wait up to 24 h for a model turn. The daily run bounds that latency; nothing is
@@ -67,6 +69,29 @@ auto-adds a domain. This is what makes freemail safe: emailing one
 freemail domain is only ever trusted if the user types the wildcard themselves.
 
 Glob support is deliberately minimal: `*@domain` and `*@*.domain`. No regex.
+
+### E-mail news senders — the address-level `news` flag
+
+A newsletter is the e-mail shape of a broadcast source: it needs no reply, fits
+no project, and under the plain whitelist logic it would reach the daily
+catch-all and cost a model turn just to be classified `archive`. So an address
+(or a `*@domain` wildcard, same matcher as the whitelist) can be declared a
+**news sender**:
+
+```bash
+python3 scripts/triage_policy.py email-news-add newsletter@example.org '*@substack.com'
+python3 scripts/triage_policy.py show-email        # whitelist … / news …
+python3 scripts/triage_policy.py check-email someone@example.org
+```
+
+The two classes are **independent**: declaring a sender `news` does not
+whitelist it, and a whitelisted correspondent is not turned into a feed source.
+Both live in the **same** `.nt` file, which is why `save_email_policy()` is the
+only supported writer — a caller that rendered just the whitelist would silently
+erase the news senders (the Sent-folder refresh used to be exactly that shape).
+
+Like the messenger flag, this is edited by talking to Ara ("Newsletter X gehört
+in den Feed"); the CLI is what she runs.
 
 ### Messenger sender axis: whitelist / blacklist
 
@@ -149,10 +174,13 @@ IMAP has a queryable backlog. The gate is a scheduler `command` job (zero Claude
 credits):
 
 1. List new INBOX mail since last run.
-2. Dedup by message-id against the existing triage status (same sanitized
+2. **Divert the news rail** (below): mail from a declared news sender is filed to
+   the feed and subtracted from the set — before either mode decides anything, so
+   a newsletter can never buy a model turn.
+3. Dedup by message-id against the existing triage status (same sanitized
    id-scheme triage already uses).
-3. Keep only whitelisted senders → spawn the model for those.
-4. The **daily** job runs for **any** sender (fixed morning hour, before the
+4. Keep only whitelisted senders → spawn the model for those.
+5. The **daily** job runs for **any** sender (fixed morning hour, before the
    briefing).
 
 ### Messenger — gateway-owned store + delivery flag (push)
@@ -263,6 +291,33 @@ alongside the triage flags — but they run independently:
   `news` group flag is the *automatic* rail for a whole broadcast source; that
   stays open for the ad-hoc case.
 
+#### The news rail on e-mail
+
+Same idea, same feed, different plumbing — because e-mail is pull. `triage-gate.py`
+runs the rail itself (`divert_news`), inside the retinue container, at the top of
+both modes:
+
+1. Match the sender against the news class (`tp.email_news_sender`).
+2. `read --uid` the message, build the item — **Subject** as the title, a
+   `TRIAGE_NEWS_EXCERPT_CHARS`-capped body excerpt as the summary, `email:<addr>`
+   as the source id.
+3. The link is the newsletter's **own declared** web version: `Archived-At`
+   (RFC 5064) or `List-Archive` (RFC 2369), surfaced by `email_client.py read`.
+   Nothing is scraped from the body — the first URL in a newsletter is as often a
+   tracking pixel as the article, and the feed item's id is keyed off the URL, so
+   a wrong link is worse than none.
+4. On a successful forward: `flag --read`, then `move` to `TRIAGE_NEWS_FOLDER`
+   (default `Archive`, non-destructive — the feed holds a *reference*, so the mail
+   is archived, never deleted; set it empty to leave the mail in place).
+5. Write the triage **status file** — `disposition: news`, and `resolved` only if
+   the move actually happened. Triage's status store, not `\Seen`, is what stops a
+   message being re-proposed; a terminal status while the mail is still in the
+   INBOX is precisely the drift Phase 1's third pass repairs.
+
+Failure is always backwards-safe: if the feed rejects the item the mail is left
+untouched and falls through to normal triage, so a broken rail degrades to "a
+model turn looks at it", never to a silently swallowed message.
+
 The two group flags encode **routing and whether personal interaction is
 possible** — never signal quality. Whether any single item is worth surfacing is
 Herald's per-item judgement, so there is no "noise channel" category. The
@@ -292,7 +347,10 @@ not through SPARQL, so it is never subject to the lag either.
 Tier-3 across both the framework and the gateway services:
 
 - **framework:** the e-mail gate scheduler job + script, the daily-drain jobs,
-  the shared state files, and this doc.
+  the shared state files, and this doc. The e-mail news rail adds two tunables on
+  the `retinue` service: `TRIAGE_NEWS_FOLDER` (default `Archive`; empty leaves the
+  mail in the INBOX) and `TRIAGE_NEWS_EXCERPT_CHARS` (default 600). It needs
+  `NEWS_INGEST_URL` like the gateways do.
 - **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` each
   get the shared volume mounted RW, per-message `.nt` writing, the
   classification gate on inbound, and `GET /undelivered?since=…`. For the news

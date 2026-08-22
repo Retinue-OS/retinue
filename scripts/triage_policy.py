@@ -14,6 +14,14 @@ Two kinds of policy live here:
     auto-added; a whole domain is trusted only when someone writes the wildcard.
     That is what keeps freemail safe: sending to one `person@gmail.com` whitelists
     that address, never all of `gmail.com`.
+  * **E-mail news senders** — the address-level counterpart of the messenger
+    ``news`` group flag: a sender whose mail is a broadcast (a newsletter, a
+    bulletin) rather than correspondence. Its mail rides the **news rail** —
+    filed into the feed for the Herald to score — and never spends a triage turn
+    of its own. Same two shapes as the whitelist (exact address, `*@domain`
+    wildcard) and the same matcher, so `*@substack.com` works as expected.
+    Orthogonal to the whitelist: a news sender is not "trusted", it is
+    "broadcast", and the classes never need to agree.
   * **Messenger policy** — per channel, on two orthogonal axes:
       - **Sender** (a handle): whitelisted / blacklisted / unknown. A whitelisted
         handle is forwarded to triage immediately regardless of its group; a
@@ -51,6 +59,9 @@ KB = "https://w3id.org/retinue/kb#"
 # Predicates. One flat subject per policy file, repeated predicates for members.
 P_ADDRESS = KB + "triageWhitelistAddress"
 P_WILDCARD = KB + "triageWhitelistWildcard"
+# E-mail news senders — the address-level twin of P_NEWS_GROUP below.
+P_NEWS_ADDRESS = KB + "triageNewsAddress"
+P_NEWS_WILDCARD = KB + "triageNewsWildcard"
 P_HANDLE = KB + "triageWhitelistHandle"
 P_BLOCKED_HANDLE = KB + "triageBlacklistHandle"
 # Group flags — three orthogonal axes (see module docstring).
@@ -63,6 +74,11 @@ P_NEWS_GROUP = KB + "triageNewsGroup"
 P_BLOCKED_GROUP = KB + "triageBlockedGroup"
 
 EMAIL_SUBJECT = "urn:retinue:triage:email-whitelist"
+
+# The loaded e-mail policy: the whitelist pair plus the news-sender pair. One
+# file holds both, so every write goes through save_email_policy() — a writer
+# that renders only the whitelist would erase the news senders (and vice versa).
+EmailPolicy = namedtuple("EmailPolicy", "addresses wildcards news news_wildcards")
 
 # The loaded messenger policy: two sender sets plus the three group-flag sets.
 MessengerPolicy = namedtuple(
@@ -177,11 +193,13 @@ def write_if_changed(content: str, path: Path) -> bool:
 # E-mail whitelist                                                            #
 # --------------------------------------------------------------------------- #
 
-def load_email_whitelist(path: Path | None = None) -> tuple[set[str], set[str]]:
-    """Return (exact addresses, wildcards), both lower-cased."""
+def load_email_policy(path: Path | None = None) -> EmailPolicy:
+    """Return the whole e-mail policy: whitelist pair + news-sender pair."""
     path = path or email_whitelist_path()
     addresses: set[str] = set()
     wildcards: set[str] = set()
+    news: set[str] = set()
+    news_wildcards: set[str] = set()
     for _subj, pred, lit in _parse(path):
         low = lit.strip().lower()
         if not low:
@@ -190,14 +208,54 @@ def load_email_whitelist(path: Path | None = None) -> tuple[set[str], set[str]]:
             addresses.add(low)
         elif pred == P_WILDCARD:
             wildcards.add(low)
-    return addresses, wildcards
+        elif pred == P_NEWS_ADDRESS:
+            news.add(low)
+        elif pred == P_NEWS_WILDCARD:
+            news_wildcards.add(low)
+    return EmailPolicy(addresses, wildcards, news, news_wildcards)
 
 
-def render_email_whitelist(addresses: set[str], wildcards: set[str]) -> str:
-    lines = [_triple(EMAIL_SUBJECT, P_ADDRESS, a) for a in addresses]
-    lines += [_triple(EMAIL_SUBJECT, P_WILDCARD, w) for w in wildcards]
+def load_email_whitelist(path: Path | None = None) -> tuple[set[str], set[str]]:
+    """Return (exact addresses, wildcards), both lower-cased.
+
+    The whitelist half of :func:`load_email_policy`, kept because that is all
+    the frequent gate's hot path needs. **Never pair it with a write** — see
+    :func:`save_email_policy`.
+    """
+    pol = load_email_policy(path)
+    return pol.addresses, pol.wildcards
+
+
+def render_email_policy(pol: EmailPolicy) -> str:
+    lines = [_triple(EMAIL_SUBJECT, P_ADDRESS, a) for a in pol.addresses]
+    lines += [_triple(EMAIL_SUBJECT, P_WILDCARD, w) for w in pol.wildcards]
+    lines += [_triple(EMAIL_SUBJECT, P_NEWS_ADDRESS, a) for a in pol.news]
+    lines += [_triple(EMAIL_SUBJECT, P_NEWS_WILDCARD, w) for w in pol.news_wildcards]
     lines.sort()
     return "".join(line + "\n" for line in lines)
+
+
+def render_email_whitelist(
+    addresses: set[str],
+    wildcards: set[str],
+    news: set[str] = frozenset(),
+    news_wildcards: set[str] = frozenset(),
+) -> str:
+    """Render a policy file from its four parts.
+
+    The news arguments default to empty for callers that predate the news rail,
+    which makes a two-argument call a **silent eraser** of the news senders.
+    Nothing in this repo may call it that way: go through
+    :func:`save_email_policy`, which round-trips every class.
+    """
+    return render_email_policy(
+        EmailPolicy(set(addresses), set(wildcards), set(news), set(news_wildcards))
+    )
+
+
+def save_email_policy(pol: EmailPolicy, path: Path | None = None) -> bool:
+    """Write the whole policy, write-if-changed. The only supported writer."""
+    return write_if_changed(render_email_policy(pol), path or email_whitelist_path())
 
 
 def _domain_matches_wildcard(domain: str, wildcard: str) -> bool:
@@ -224,6 +282,22 @@ def email_whitelisted(addr: str, addresses: set[str], wildcards: set[str]) -> bo
         return True
     domain = low.split("@", 1)[1]
     return any(_domain_matches_wildcard(domain, w) for w in wildcards)
+
+
+def email_news_sender(addr: str, news: set[str], news_wildcards: set[str]) -> bool:
+    """True if `addr` is a declared news sender (exact entry or wildcard).
+
+    Deliberately the same matcher as :func:`email_whitelisted` — a newsletter
+    domain (`*@substack.com`) reads exactly like a trusted domain, and there is
+    no reason for the two classes to spell membership differently.
+    """
+    low = (addr or "").strip().lower()
+    if not low or "@" not in low:
+        return False
+    if low in news:
+        return True
+    domain = low.split("@", 1)[1]
+    return any(_domain_matches_wildcard(domain, w) for w in news_wildcards)
 
 
 def recipients_from_sent(messages: list[dict]) -> set[str]:
@@ -410,15 +484,35 @@ def auto_whitelist_on_send(channel: str, handles) -> list[str]:
 # CLI — the deterministic editor Ara and the gate use                         #
 # --------------------------------------------------------------------------- #
 
-def _mutate_email(add_addresses=(), add_wildcards=(), remove=()) -> None:
-    addresses, wildcards = load_email_whitelist()
+def _mutate_email(add_addresses=(), add_wildcards=(), remove=(),
+                  news_add=(), news_remove=()) -> None:
+    """Add/remove e-mail policy entries, preserving every class not touched.
+
+    `news_add` sorts each entry by shape — a leading `*@` makes it a wildcard,
+    anything else an exact address — so the caller passes what the user said
+    ("*@substack.com", "news@casafair.ch") without picking a subcommand per shape.
+    """
+    pol = load_email_policy()
+    addresses = set(pol.addresses)
+    wildcards = set(pol.wildcards)
+    news = set(pol.news)
+    news_wildcards = set(pol.news_wildcards)
     addresses |= {a.strip().lower() for a in add_addresses if a.strip()}
     wildcards |= {w.strip().lower() for w in add_wildcards if w.strip()}
+    for entry in news_add:
+        e = entry.strip().lower()
+        if not e:
+            continue
+        (news_wildcards if e.startswith("*@") else news).add(e)
     for entry in remove:
         e = entry.strip().lower()
         addresses.discard(e)
         wildcards.discard(e)
-    write_if_changed(render_email_whitelist(addresses, wildcards), email_whitelist_path())
+    for entry in news_remove:
+        e = entry.strip().lower()
+        news.discard(e)
+        news_wildcards.discard(e)
+    save_email_policy(EmailPolicy(addresses, wildcards, news, news_wildcards))
 
 
 def _mutate_messenger(channel, *, wl_add=(), wl_del=(), bl_add=(), bl_del=(),
@@ -460,6 +554,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("email-add-address"); p.add_argument("address", nargs="+")
     p = sub.add_parser("email-add-wildcard"); p.add_argument("wildcard", nargs="+")
     p = sub.add_parser("email-remove"); p.add_argument("entry", nargs="+")
+    p = sub.add_parser("email-news-add"); p.add_argument("entry", nargs="+")
+    p = sub.add_parser("email-news-remove"); p.add_argument("entry", nargs="+")
     p = sub.add_parser("check-email"); p.add_argument("address")
 
     # Handle commands take --handle; group commands take --group. `groupblock-*`
@@ -482,20 +578,27 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.cmd == "show-email":
-        addresses, wildcards = load_email_whitelist()
-        for a in sorted(addresses):
-            print(a)
-        for w in sorted(wildcards):
-            print(w)
+        pol = load_email_policy()
+        for a in sorted(pol.addresses | pol.wildcards):
+            print(f"whitelist\t{a}")
+        for a in sorted(pol.news | pol.news_wildcards):
+            print(f"news\t{a}")
     elif args.cmd == "email-add-address":
         _mutate_email(add_addresses=args.address)
     elif args.cmd == "email-add-wildcard":
         _mutate_email(add_wildcards=args.wildcard)
     elif args.cmd == "email-remove":
         _mutate_email(remove=args.entry)
+    elif args.cmd == "email-news-add":
+        _mutate_email(news_add=args.entry)
+    elif args.cmd == "email-news-remove":
+        _mutate_email(news_remove=args.entry)
     elif args.cmd == "check-email":
-        addresses, wildcards = load_email_whitelist()
-        ok = email_whitelisted(args.address, addresses, wildcards)
+        pol = load_email_policy()
+        if email_news_sender(args.address, pol.news, pol.news_wildcards):
+            print("news")
+            return 0
+        ok = email_whitelisted(args.address, pol.addresses, pol.wildcards)
         print("whitelisted" if ok else "not-whitelisted")
         return 0 if ok else 3
     elif args.cmd == "show":

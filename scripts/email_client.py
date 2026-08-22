@@ -715,6 +715,12 @@ def cmd_read(cfg, args):
         "subject": _decode(msg.get("Subject")),
         "date": iso,
         "message_id": msg.get("Message-ID"),
+        # The bulk-mail headers a newsletter sets on itself. Archived-At
+        # (RFC 5064) and List-Archive (RFC 2369) are the *declared* web version
+        # of this message — the only non-guessed URL an e-mail carries, which is
+        # what the triage gate's news rail files as the item's link.
+        "archived_at": _decode(msg.get("Archived-At")),
+        "list_archive": _decode(msg.get("List-Archive")),
         "flags": [f.decode() if isinstance(f, bytes) else f for f in flags],
         "body": _body_text(msg),
         "attachments": attachments,

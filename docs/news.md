@@ -129,6 +129,20 @@ That keeps the "which channels are news vs. correspondence" question where it
 belongs — with whichever agent already reads that channel — instead of building
 a second inbound pipeline.
 
+**Newsletters (e-mail)** are the automatic version of that ad-hoc path. An
+address or `*@domain` declared a **news sender** in the triage policy is filed by
+the credit-free e-mail gate on arrival — Subject as the title, a body excerpt as
+the summary, the mail's own `Archived-At`/`List-Archive` as the link — and the
+mail is archived out of the INBOX. No model turn is spent, and the item reaches
+the Herald on the next curation tick like any other. The address-level twin of
+the messenger `news` group flag:
+
+```bash
+python3 /workspace/scripts/triage_policy.py email-news-add '*@substack.com'
+```
+
+See `docs/triage-delivery-gate.md` (*The news rail on e-mail*).
+
 ## The Herald: the agent that remembers
 
 `.claude/agents/herald.md` is a core subagent (like the Archivist). It never
