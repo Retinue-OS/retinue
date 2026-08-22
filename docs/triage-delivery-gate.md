@@ -44,10 +44,10 @@ whether or not it also earns a triage turn.
 | **Unknown handle**, **quieted** group | held, no prompt | model runs (drained) |
 | **Unknown handle**, **ignored** group | never triggers | never drained (see below) |
 
-E-mail keeps its simpler single axis: **whitelisted** senders run in the fast
-loop; every other sender is held for the daily catch-all. Its one addition is the
-**news sender** class below — the address-level counterpart of the messenger
-`news` group flag, and likewise orthogonal to the whitelist.
+E-mail has the **same two axes**, with one channel-specific twist: a mail's
+"group" is its **mailing list** (`List-Id`), and a mail that carries no usable
+list header is its own group of one, keyed on the sender address. See *E-mail
+groups* below.
 
 The tradeoff the user accepts: cold senders (blacklisted or in a quieted group)
 wait up to 24 h for a model turn. The daily run bounds that latency; nothing is
@@ -70,28 +70,79 @@ freemail domain is only ever trusted if the user types the wildcard themselves.
 
 Glob support is deliberately minimal: `*@domain` and `*@*.domain`. No regex.
 
-### E-mail news senders — the address-level `news` flag
+### E-mail groups — the list axis, and the same three flags
 
-A newsletter is the e-mail shape of a broadcast source: it needs no reply, fits
-no project, and under the plain whitelist logic it would reach the daily
-catch-all and cost a model turn just to be classified `archive`. So an address
-(or a `*@domain` wildcard, same matcher as the whitelist) can be declared a
-**news sender**:
+A mailing list is not a sender. The people who post to a list change; the list
+does not, and it is the list one has an opinion about ("read-only", "I answer on
+this one"). So e-mail is routed on the same two axes as messenger:
+
+- the **sender** decides *how urgently* a mail is triaged — whitelisted means the
+  frequent run, anything else waits for the daily sweep;
+- the **group** decides *where else it goes* — the same `news` / `quieted` /
+  `ignored` flags PR #114 introduced for messenger groups.
+
+The group id is the message's `List-Id` (RFC 2919), normalised: bracketed part,
+lowercased, and rejected unless it looks like a domain — no whitespace, at least
+one dot, under 200 characters. Real headers are messier than the RFC (opaque
+hashes, and values whose bracketed part is a display name, e.g.
+`799706515 <Brack News>`), and inventing a group nobody can flag is worse than
+having none. A mail with no usable `List-Id` falls back to **its own sender
+address as its group** — a newsletter that carries no list header is a group of
+one, so the three flags apply to it with no second mechanism.
+
+| class | frequent | daily | in the feed |
+|---|---|---|---|
+| whitelisted sender | yes | yes | if the group is `news` |
+| unknown sender, `ignored` group | no | no | if the group is `news` |
+| unknown sender, `quieted` group | no | yes | if the group is `news` |
+| unknown sender, unflagged group | no | yes | no |
+
+The last two triage rows are deliberately identical: on a pull channel the daily
+sweep already *is* the quiet tier. `quieted` earns its keep as the explicit
+opposite of `ignored` — "in the feed **and** in the triage" — which is exactly
+the distinction between a list one only reads and one one also writes to:
+
+- a read-only newsletter → **`news` + `ignored`** (filed to the feed, never a
+  model turn);
+- a list one both reads and answers on → **`news` + `quieted`** (filed to the
+  feed *and* still triaged).
+
+Group entries take the same two shapes as whitelist entries — an exact id, or a
+`*@domain` wildcard. On a group the wildcard also covers ids **beneath** the
+domain, because a `List-Id` is a namespace a platform hands out per publication:
+`*@substack.com` therefore matches both `no-reply@substack.com` and the list
+`sgcarney.substack.com`. It does **not** match a mailbox at a subdomain
+(`someone@sgcarney.substack.com`) — that stays the strict `*@*.domain` reading
+the whitelist relies on, so loosening the group axis never loosens trust.
 
 ```bash
-python3 scripts/triage_policy.py email-news-add newsletter@example.org '*@substack.com'
-python3 scripts/triage_policy.py show-email        # whitelist … / news …
-python3 scripts/triage_policy.py check-email someone@example.org
+python3 scripts/triage_policy.py email-news-add   '*@substack.com'
+python3 scripts/triage_policy.py email-ignore-add '*@substack.com'
+python3 scripts/triage_policy.py email-quiet-add  members.list.example.org
+python3 scripts/triage_policy.py show-email       # whitelist / news / quiet / ignore
+python3 scripts/triage_policy.py check-email stranger@x.com \
+    --list-id '<members.list.example.org>'
+# group   members.list.example.org
+# news    no
+# triage  group-quieted (frequent: no, daily: yes)
 ```
 
-The two classes are **independent**: declaring a sender `news` does not
-whitelist it, and a whitelisted correspondent is not turned into a feed source.
-Both live in the **same** `.nt` file, which is why `save_email_policy()` is the
-only supported writer — a caller that rendered just the whitelist would silently
-erase the news senders (the Sent-folder refresh used to be exactly that shape).
+`quieted` and `ignored` are mutually exclusive, as on messenger; `news` combines
+with either. The axes stay **independent**: declaring a group `news` does not
+whitelist anyone, and a whitelisted correspondent is not turned into a feed
+source — a whitelisted sender writing to an `ignored` list is still triaged now.
 
-Like the messenger flag, this is edited by talking to Ara ("Newsletter X gehört
+Everything lives in the **same** `.nt` file, which is why `save_email_policy()`
+is the only supported writer — a caller that rendered just the whitelist would
+silently erase the group flags (the Sent-folder refresh used to be exactly that
+shape).
+
+Like the messenger flags, this is edited by talking to Ara ("Newsletter X gehört
 in den Feed"); the CLI is what she runs.
+
+Address-level `news` entries written before list detection existed keep working:
+news is matched against the group **and** the bare sender address, so a
+newsletter that turns out to carry a `List-Id` is not silently un-filed.
 
 ### Messenger sender axis: whitelist / blacklist
 
@@ -174,9 +225,11 @@ IMAP has a queryable backlog. The gate is a scheduler `command` job (zero Claude
 credits):
 
 1. List new INBOX mail since last run.
-2. **Divert the news rail** (below): mail from a declared news sender is filed to
-   the feed and subtracted from the set — before either mode decides anything, so
-   a newsletter can never buy a model turn.
+2. **Route both rails in one pass** (`route()`, below): each message is asked for
+   a decision on its sender *and* its group. A `news` group is filed to the feed;
+   whether the mail is *also* left for triage is the group's `ignored`/`quieted`
+   flag, so a read-only newsletter can never buy a model turn while a list one
+   answers on still reaches triage.
 3. Dedup by message-id against the existing triage status (same sanitized
    id-scheme triage already uses).
 4. Keep only whitelisted senders → spawn the model for those.
@@ -294,10 +347,10 @@ alongside the triage flags — but they run independently:
 #### The news rail on e-mail
 
 Same idea, same feed, different plumbing — because e-mail is pull. `triage-gate.py`
-runs the rail itself (`divert_news`), inside the retinue container, at the top of
-both modes:
+runs the rail itself (`route()`), inside the retinue container, in the one pass
+that opens both modes:
 
-1. Match the sender against the news class (`tp.email_news_sender`).
+1. Ask `tp.email_gate_decision(sender, list_id)` — one call answers both axes.
 2. `read --uid` the message, build the item — **Subject** as the title, a
    `TRIAGE_NEWS_EXCERPT_CHARS`-capped body excerpt as the summary, `email:<addr>`
    as the source id.
@@ -314,9 +367,18 @@ both modes:
    message being re-proposed; a terminal status while the mail is still in the
    INBOX is precisely the drift Phase 1's third pass repairs.
 
+Steps 4 and 5 — marking the mail read, moving it, writing a terminal status —
+run only when the decision says triage is **not** owed a look at it, i.e. for a
+`news` + `ignored` group. Otherwise (`news` + `quieted`, or a whitelisted sender
+on a `news` list) the item is filed and **nothing else is touched**: the mail
+stays unread in the INBOX so triage still sees it. Re-filing it on the next
+tick is a no-op — a feed item's id is a hash of its content, and the store skips
+ids it already holds — so no extra dedup marker is needed.
+
 Failure is always backwards-safe: if the feed rejects the item the mail is left
-untouched and falls through to normal triage, so a broken rail degrades to "a
-model turn looks at it", never to a silently swallowed message.
+untouched and falls through to normal triage — even for an `ignored` group — so a
+broken rail degrades to "a model turn looks at it", never to a silently swallowed
+message.
 
 The two group flags encode **routing and whether personal interaction is
 possible** — never signal quality. Whether any single item is worth surfacing is
@@ -328,6 +390,10 @@ where personal interaction is possible** (an unknown sender there may actually b
 reaching out) is **news + quieted** (in the feed, and reaching triage on the
 daily drain). A source Herald consistently ranks at the bottom is not a channel
 flag at all — it should be unsubscribed (or never marked `news`).
+
+The e-mail analogue is exact, with the mailing list in the group's place: a
+read-only newsletter (Substack, a press release list) is **news + ignored**; a
+list one both reads and posts to is **news + quieted**.
 
 **Schema.** Align the per-message triple shape with the session-logging
 unification (retinue#85) rather than inventing a parallel vocabulary — one RDF

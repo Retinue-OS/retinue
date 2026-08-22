@@ -14,14 +14,33 @@ Two kinds of policy live here:
     auto-added; a whole domain is trusted only when someone writes the wildcard.
     That is what keeps freemail safe: sending to one `person@gmail.com` whitelists
     that address, never all of `gmail.com`.
-  * **E-mail news senders** — the address-level counterpart of the messenger
-    ``news`` group flag: a sender whose mail is a broadcast (a newsletter, a
-    bulletin) rather than correspondence. Its mail rides the **news rail** —
-    filed into the feed for the Herald to score — and never spends a triage turn
-    of its own. Same two shapes as the whitelist (exact address, `*@domain`
-    wildcard) and the same matcher, so `*@substack.com` works as expected.
-    Orthogonal to the whitelist: a news sender is not "trusted", it is
-    "broadcast", and the classes never need to agree.
+  * **E-mail groups** — the e-mail counterpart of the messenger *group* flags,
+    on the same three orthogonal axes (``news`` / ``quieted`` / ``ignored``).
+    What plays the part of a messenger group is the **mailing list**: a mail's
+    group id is its ``List-Id`` (RFC 2919) when it carries a usable one, and
+    otherwise its own sender address, so a listless newsletter is simply a group
+    of one. Membership takes the same two shapes as the whitelist (an exact
+    entry, a `*@domain` wildcard) and the same matcher, extended so a wildcard's
+    domain also covers a `List-Id` under it — `*@substack.com` therefore matches
+    both `no-reply@substack.com` and the list `sgcarney.substack.com`.
+
+    The three flags mean:
+
+      - ``news`` — the group is a broadcast source: its mail is filed into the
+        news feed for the Herald to score. Independent of everything below; a
+        mail can be news *and* triaged.
+      - ``ignored`` — a mail from this group never reaches triage at all.
+      - ``quieted`` — a mail from this group is triaged, but only by the daily
+        sweep, never by the frequent run. On a pull channel that is already the
+        default for an unflagged group, so declaring it changes no behaviour; it
+        is the explicit opposite of ``ignored``, worth stating on a ``news``
+        group to record that this list is read *and* answered.
+
+    The whitelist is the sender-level axis and wins over the group flags, exactly
+    as a whitelisted handle wins over its group on the messenger side: mail from
+    a whitelisted address is triaged immediately whatever list it arrived on.
+    ``news`` membership is checked against the group id *and* the sender address,
+    so address-level entries written before list detection keep working.
   * **Messenger policy** — per channel, on two orthogonal axes:
       - **Sender** (a handle): whitelisted / blacklisted / unknown. A whitelisted
         handle is forwarded to triage immediately regardless of its group; a
@@ -59,7 +78,11 @@ KB = "https://w3id.org/retinue/kb#"
 # Predicates. One flat subject per policy file, repeated predicates for members.
 P_ADDRESS = KB + "triageWhitelistAddress"
 P_WILDCARD = KB + "triageWhitelistWildcard"
-# E-mail news senders — the address-level twin of P_NEWS_GROUP below.
+# E-mail group flags. The news pair keeps its original `…Address` names because
+# policy files already carry them; it is a *group* predicate now like the other
+# two, since a listless sender's group id is its own address. The quieted and
+# ignored pairs reuse the messenger group predicates below — same relation, just
+# stated about the e-mail subject — plus a wildcard twin each.
 P_NEWS_ADDRESS = KB + "triageNewsAddress"
 P_NEWS_WILDCARD = KB + "triageNewsWildcard"
 P_HANDLE = KB + "triageWhitelistHandle"
@@ -68,6 +91,11 @@ P_BLOCKED_HANDLE = KB + "triageBlacklistHandle"
 P_IGNORED_GROUP = KB + "triageIgnoredGroup"
 P_QUIETED_GROUP = KB + "triageQuietedGroup"
 P_NEWS_GROUP = KB + "triageNewsGroup"
+# The wildcard twins of the two above, only ever used on the e-mail subject (a
+# messenger group id is an opaque handle, so a domain wildcard is meaningless
+# there).
+P_IGNORED_WILDCARD = KB + "triageIgnoredWildcard"
+P_QUIETED_WILDCARD = KB + "triageQuietedWildcard"
 # Legacy: the original single "blocked group" flag, now read as `ignored`. Still
 # parsed so existing policy files keep working; render migrates it to
 # P_IGNORED_GROUP on the next write.
@@ -75,10 +103,18 @@ P_BLOCKED_GROUP = KB + "triageBlockedGroup"
 
 EMAIL_SUBJECT = "urn:retinue:triage:email-whitelist"
 
-# The loaded e-mail policy: the whitelist pair plus the news-sender pair. One
-# file holds both, so every write goes through save_email_policy() — a writer
-# that renders only the whitelist would erase the news senders (and vice versa).
-EmailPolicy = namedtuple("EmailPolicy", "addresses wildcards news news_wildcards")
+# The loaded e-mail policy: the whitelist pair plus one (exact, wildcard) pair
+# per group flag. One file holds all four classes, so every write goes through
+# save_email_policy() — a writer that renders only some of them erases the rest.
+# The group pairs default to empty for callers written before the group axis
+# landed, which makes a short positional call a silent eraser exactly as the
+# news arguments already were: construct from `_replace` or name every field.
+EmailPolicy = namedtuple(
+    "EmailPolicy",
+    "addresses wildcards news news_wildcards "
+    "quieted quieted_wildcards ignored ignored_wildcards",
+    defaults=(frozenset(),) * 6,
+)
 
 # The loaded messenger policy: two sender sets plus the three group-flag sets.
 MessengerPolicy = namedtuple(
@@ -194,25 +230,32 @@ def write_if_changed(content: str, path: Path) -> bool:
 # --------------------------------------------------------------------------- #
 
 def load_email_policy(path: Path | None = None) -> EmailPolicy:
-    """Return the whole e-mail policy: whitelist pair + news-sender pair."""
+    """Return the whole e-mail policy: whitelist pair + one pair per group flag."""
     path = path or email_whitelist_path()
-    addresses: set[str] = set()
-    wildcards: set[str] = set()
-    news: set[str] = set()
-    news_wildcards: set[str] = set()
+    buckets: dict[str, set[str]] = {
+        key: set() for key in
+        ("addresses", "wildcards", "news", "news_wildcards",
+         "quieted", "quieted_wildcards", "ignored", "ignored_wildcards")
+    }
+    by_predicate = {
+        P_ADDRESS: "addresses",
+        P_WILDCARD: "wildcards",
+        P_NEWS_ADDRESS: "news",
+        P_NEWS_WILDCARD: "news_wildcards",
+        P_QUIETED_GROUP: "quieted",
+        P_QUIETED_WILDCARD: "quieted_wildcards",
+        P_IGNORED_GROUP: "ignored",
+        P_IGNORED_WILDCARD: "ignored_wildcards",
+        # A policy file written before the ignored/quieted split spelled "never
+        # reaches triage" this way; read it as `ignored` so it keeps its meaning.
+        P_BLOCKED_GROUP: "ignored",
+    }
     for _subj, pred, lit in _parse(path):
         low = lit.strip().lower()
-        if not low:
-            continue
-        if pred == P_ADDRESS:
-            addresses.add(low)
-        elif pred == P_WILDCARD:
-            wildcards.add(low)
-        elif pred == P_NEWS_ADDRESS:
-            news.add(low)
-        elif pred == P_NEWS_WILDCARD:
-            news_wildcards.add(low)
-    return EmailPolicy(addresses, wildcards, news, news_wildcards)
+        key = by_predicate.get(pred)
+        if low and key:
+            buckets[key].add(low)
+    return EmailPolicy(**buckets)
 
 
 def load_email_whitelist(path: Path | None = None) -> tuple[set[str], set[str]]:
@@ -227,29 +270,31 @@ def load_email_whitelist(path: Path | None = None) -> tuple[set[str], set[str]]:
 
 
 def render_email_policy(pol: EmailPolicy) -> str:
-    lines = [_triple(EMAIL_SUBJECT, P_ADDRESS, a) for a in pol.addresses]
-    lines += [_triple(EMAIL_SUBJECT, P_WILDCARD, w) for w in pol.wildcards]
-    lines += [_triple(EMAIL_SUBJECT, P_NEWS_ADDRESS, a) for a in pol.news]
-    lines += [_triple(EMAIL_SUBJECT, P_NEWS_WILDCARD, w) for w in pol.news_wildcards]
+    pairs = (
+        (P_ADDRESS, pol.addresses),
+        (P_WILDCARD, pol.wildcards),
+        (P_NEWS_ADDRESS, pol.news),
+        (P_NEWS_WILDCARD, pol.news_wildcards),
+        (P_QUIETED_GROUP, pol.quieted),
+        (P_QUIETED_WILDCARD, pol.quieted_wildcards),
+        (P_IGNORED_GROUP, pol.ignored),
+        (P_IGNORED_WILDCARD, pol.ignored_wildcards),
+    )
+    lines = [_triple(EMAIL_SUBJECT, pred, v) for pred, values in pairs for v in values]
     lines.sort()
     return "".join(line + "\n" for line in lines)
 
 
-def render_email_whitelist(
-    addresses: set[str],
-    wildcards: set[str],
-    news: set[str] = frozenset(),
-    news_wildcards: set[str] = frozenset(),
-) -> str:
-    """Render a policy file from its four parts.
+def render_email_whitelist(addresses: set[str], wildcards: set[str], *rest) -> str:
+    """Render a policy file from its parts, in :class:`EmailPolicy` field order.
 
-    The news arguments default to empty for callers that predate the news rail,
-    which makes a two-argument call a **silent eraser** of the news senders.
-    Nothing in this repo may call it that way: go through
-    :func:`save_email_policy`, which round-trips every class.
+    Every class beyond the two required ones defaults to empty, which makes a
+    short positional call a **silent eraser** of the classes it omits. Nothing in
+    this repo may call it that way: go through :func:`save_email_policy`, which
+    round-trips the whole policy.
     """
     return render_email_policy(
-        EmailPolicy(set(addresses), set(wildcards), set(news), set(news_wildcards))
+        EmailPolicy(set(addresses), set(wildcards), *(set(r) for r in rest))
     )
 
 
@@ -287,17 +332,132 @@ def email_whitelisted(addr: str, addresses: set[str], wildcards: set[str]) -> bo
 def email_news_sender(addr: str, news: set[str], news_wildcards: set[str]) -> bool:
     """True if `addr` is a declared news sender (exact entry or wildcard).
 
-    Deliberately the same matcher as :func:`email_whitelisted` — a newsletter
-    domain (`*@substack.com`) reads exactly like a trusted domain, and there is
-    no reason for the two classes to spell membership differently.
+    The address-keyed special case of :func:`email_group_member`, kept because
+    that is all a caller holding only a sender address needs.
     """
     low = (addr or "").strip().lower()
     if not low or "@" not in low:
         return False
-    if low in news:
+    return email_group_member(low, news, news_wildcards)
+
+
+# RFC 2919 puts the identifier in angle brackets; everything before them is a
+# human-readable label. `Retinue-OS/retinue <retinue.Retinue-OS.github.com>` and
+# a bare `<sgcarney.substack.com>` both yield the bracketed token.
+_LIST_ID_BRACKETED = re.compile(r"<([^<>]+)>\s*$")
+
+
+def email_list_id(raw: str) -> str:
+    """Normalise a ``List-Id`` header to a usable group id, or "" if unusable.
+
+    Real headers are messier than the RFC: alongside well-formed ids we see
+    opaque hashes (Google) and outright malformed values whose bracketed part is
+    a display name with a space in it (`799706515 <Brack News>`). An id has to
+    look like a domain — no whitespace, at least one dot — to be worth keying
+    policy on; anything else is rejected here so the caller falls back to the
+    sender address rather than inventing a group nobody can flag.
+    """
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    match = _LIST_ID_BRACKETED.search(value)
+    candidate = (match.group(1) if match else value).strip().lower()
+    if not candidate or len(candidate) > 200:
+        return ""
+    if any(c.isspace() for c in candidate) or "." not in candidate:
+        return ""
+    return candidate
+
+
+def email_group_id(list_id: str, sender: str) -> str:
+    """The group a message belongs to: its mailing list, else its own sender.
+
+    Making a listless sender its own group is what keeps the two axes uniform —
+    every mail has exactly one group, so ``news``/``quieted``/``ignored`` can be
+    stated about a newsletter that carries no ``List-Id`` just as about a real
+    list, with no second mechanism.
+    """
+    return email_list_id(list_id) or (sender or "").strip().lower()
+
+
+def email_group_member(group: str, entries: set[str], wildcards: set[str]) -> bool:
+    """True if `group` is in a class, by exact entry or by domain wildcard.
+
+    For an address-shaped group the wildcard is matched exactly as in the
+    whitelist, against the part after the `@`. For a `List-Id` group the id
+    *is* the domain, and a wildcard also covers ids **beneath** it: a List-Id is
+    a namespace a platform hands out per publication, so `*@substack.com` reads
+    as "that platform" and has to catch `sgcarney.substack.com` too, without
+    thereby trusting a mailbox at that subdomain.
+    """
+    low = (group or "").strip().lower()
+    if not low:
+        return False
+    if low in entries:
         return True
-    domain = low.split("@", 1)[1]
-    return any(_domain_matches_wildcard(domain, w) for w in news_wildcards)
+    if "@" in low:
+        domain = low.split("@", 1)[1]
+        return any(_domain_matches_wildcard(domain, w) for w in wildcards)
+    return any(
+        _domain_matches_wildcard(low, w) or low.endswith("." + w.split("@", 1)[-1])
+        for w in wildcards
+    )
+
+
+def email_gate_decision(
+    sender: str,
+    list_id: str = "",
+    *,
+    pol: EmailPolicy | None = None,
+    path: Path | None = None,
+) -> dict:
+    """Route one inbound e-mail against the policy — the pull-side twin of
+    :func:`gate_decision`.
+
+    Returns a dict with:
+
+    - ``triage_now`` — worth a model turn on the frequent run.
+    - ``daily`` — reaches triage on the daily sweep.
+    - ``news`` — file it into the news feed for the Herald. Independent of both
+      of the above: a mail can be news-only, news-and-triaged, or neither.
+    - ``group`` / ``reason`` — the group id it was keyed on, and a short label.
+
+    Triage rail (the news rail is orthogonal, driven only by group ∈ news):
+
+    | class                     | triage_now | daily |
+    |---------------------------|------------|-------|
+    | whitelisted sender        | yes        | yes   |
+    | unknown, ignored group    | no         | no    |
+    | unknown, quieted group    | no         | yes   |
+    | unknown, normal group     | no         | yes   |
+
+    The last two rows are deliberately identical: on a pull channel the daily
+    sweep already *is* the quiet tier, so ``quieted`` changes nothing by itself.
+    It earns its keep as the explicit opposite of ``ignored`` — "in the feed
+    **and** in the triage" for a list one both reads and writes to, stated so
+    the intent survives someone later wondering why that list carries no flag.
+    """
+    pol = pol if pol is not None else load_email_policy(path)
+    addr = (sender or "").strip().lower()
+    group = email_group_id(list_id, addr)
+    # News is checked against the group *and* the bare sender address so an
+    # address-level entry written before list detection keeps matching mail that
+    # turns out to carry a List-Id.
+    news = (email_group_member(group, pol.news, pol.news_wildcards)
+            or email_news_sender(addr, pol.news, pol.news_wildcards))
+
+    if email_whitelisted(addr, pol.addresses, pol.wildcards):
+        dec = {"triage_now": True, "daily": True, "reason": "whitelisted"}
+    elif email_group_member(group, pol.ignored, pol.ignored_wildcards):
+        dec = {"triage_now": False, "daily": False, "reason": "group-ignored"}
+    elif email_group_member(group, pol.quieted, pol.quieted_wildcards):
+        dec = {"triage_now": False, "daily": True, "reason": "group-quieted"}
+    else:
+        dec = {"triage_now": False, "daily": True, "reason": "unknown"}
+
+    dec["news"] = news
+    dec["group"] = group
+    return dec
 
 
 def recipients_from_sent(messages: list[dict]) -> set[str]:
@@ -485,34 +645,46 @@ def auto_whitelist_on_send(channel: str, handles) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 def _mutate_email(add_addresses=(), add_wildcards=(), remove=(),
-                  news_add=(), news_remove=()) -> None:
+                  news_add=(), news_remove=(),
+                  quiet_add=(), quiet_remove=(),
+                  ignore_add=(), ignore_remove=()) -> None:
     """Add/remove e-mail policy entries, preserving every class not touched.
 
-    `news_add` sorts each entry by shape — a leading `*@` makes it a wildcard,
-    anything else an exact address — so the caller passes what the user said
-    ("*@substack.com", "news@casafair.ch") without picking a subcommand per shape.
+    Every group-flag argument sorts each entry by shape — a leading `*@` makes it
+    a wildcard, anything else an exact entry (an address or a `List-Id`) — so the
+    caller passes what the user said ("*@substack.com", "sgcarney.substack.com")
+    without picking a subcommand per shape.
     """
     pol = load_email_policy()
-    addresses = set(pol.addresses)
-    wildcards = set(pol.wildcards)
-    news = set(pol.news)
-    news_wildcards = set(pol.news_wildcards)
-    addresses |= {a.strip().lower() for a in add_addresses if a.strip()}
-    wildcards |= {w.strip().lower() for w in add_wildcards if w.strip()}
-    for entry in news_add:
-        e = entry.strip().lower()
-        if not e:
-            continue
-        (news_wildcards if e.startswith("*@") else news).add(e)
-    for entry in remove:
-        e = entry.strip().lower()
-        addresses.discard(e)
-        wildcards.discard(e)
-    for entry in news_remove:
-        e = entry.strip().lower()
-        news.discard(e)
-        news_wildcards.discard(e)
-    save_email_policy(EmailPolicy(addresses, wildcards, news, news_wildcards))
+    sets = {name: set(getattr(pol, name)) for name in EmailPolicy._fields}
+
+    def _add(entries, exact_key, wildcard_key):
+        for entry in entries:
+            e = entry.strip().lower()
+            if e:
+                sets[wildcard_key if e.startswith("*@") else exact_key].add(e)
+
+    def _drop(entries, *keys):
+        for entry in entries:
+            e = entry.strip().lower()
+            for key in keys:
+                sets[key].discard(e)
+
+    sets["addresses"] |= {a.strip().lower() for a in add_addresses if a.strip()}
+    sets["wildcards"] |= {w.strip().lower() for w in add_wildcards if w.strip()}
+    _add(news_add, "news", "news_wildcards")
+    _add(quiet_add, "quieted", "quieted_wildcards")
+    _add(ignore_add, "ignored", "ignored_wildcards")
+    _drop(remove, "addresses", "wildcards")
+    _drop(news_remove, "news", "news_wildcards")
+    _drop(quiet_remove, "quieted", "quieted_wildcards")
+    _drop(ignore_remove, "ignored", "ignored_wildcards")
+    # A group carries at most one of quieted/ignored at a time: adding one clears
+    # the other, so `email-quiet-add` on an ignored group moves it rather than
+    # leaving a contradiction for the decision order to resolve silently.
+    _drop(quiet_add, "ignored", "ignored_wildcards")
+    _drop(ignore_add, "quieted", "quieted_wildcards")
+    save_email_policy(EmailPolicy(**sets))
 
 
 def _mutate_messenger(channel, *, wl_add=(), wl_del=(), bl_add=(), bl_del=(),
@@ -556,7 +728,14 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("email-remove"); p.add_argument("entry", nargs="+")
     p = sub.add_parser("email-news-add"); p.add_argument("entry", nargs="+")
     p = sub.add_parser("email-news-remove"); p.add_argument("entry", nargs="+")
-    p = sub.add_parser("check-email"); p.add_argument("address")
+    p = sub.add_parser("email-quiet-add"); p.add_argument("entry", nargs="+")
+    p = sub.add_parser("email-quiet-remove"); p.add_argument("entry", nargs="+")
+    p = sub.add_parser("email-ignore-add"); p.add_argument("entry", nargs="+")
+    p = sub.add_parser("email-ignore-remove"); p.add_argument("entry", nargs="+")
+    p = sub.add_parser("check-email")
+    p.add_argument("address")
+    p.add_argument("--list-id", default="",
+                   help="the message's List-Id header, if it carries one")
 
     # Handle commands take --handle; group commands take --group. `groupblock-*`
     # is kept as a legacy alias of `ignore-*`.
@@ -583,6 +762,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"whitelist\t{a}")
         for a in sorted(pol.news | pol.news_wildcards):
             print(f"news\t{a}")
+        for a in sorted(pol.quieted | pol.quieted_wildcards):
+            print(f"quiet\t{a}")
+        for a in sorted(pol.ignored | pol.ignored_wildcards):
+            print(f"ignore\t{a}")
     elif args.cmd == "email-add-address":
         _mutate_email(add_addresses=args.address)
     elif args.cmd == "email-add-wildcard":
@@ -593,14 +776,23 @@ def main(argv: list[str] | None = None) -> int:
         _mutate_email(news_add=args.entry)
     elif args.cmd == "email-news-remove":
         _mutate_email(news_remove=args.entry)
+    elif args.cmd == "email-quiet-add":
+        _mutate_email(quiet_add=args.entry)
+    elif args.cmd == "email-quiet-remove":
+        _mutate_email(quiet_remove=args.entry)
+    elif args.cmd == "email-ignore-add":
+        _mutate_email(ignore_add=args.entry)
+    elif args.cmd == "email-ignore-remove":
+        _mutate_email(ignore_remove=args.entry)
     elif args.cmd == "check-email":
-        pol = load_email_policy()
-        if email_news_sender(args.address, pol.news, pol.news_wildcards):
-            print("news")
-            return 0
-        ok = email_whitelisted(args.address, pol.addresses, pol.wildcards)
-        print("whitelisted" if ok else "not-whitelisted")
-        return 0 if ok else 3
+        dec = email_gate_decision(args.address, args.list_id)
+        # One line per rail, so the two axes stay visibly independent.
+        print(f"group\t{dec['group']}")
+        print(f"news\t{'yes' if dec['news'] else 'no'}")
+        print(f"triage\t{dec['reason']}"
+              f" (frequent: {'yes' if dec['triage_now'] else 'no'},"
+              f" daily: {'yes' if dec['daily'] else 'no'})")
+        return 0 if dec["triage_now"] else 3
     elif args.cmd == "show":
         pol = load_messenger_policy(args.channel)
         for h in sorted(pol.whitelist):
