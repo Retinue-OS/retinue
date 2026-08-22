@@ -20,6 +20,8 @@
   <!-- No opt-in element (that UI lives on /settings.html), but the module
        keeps an already-granted subscription healthy on every load. -->
   <script type="module" src="/components/push.js"></script>
+  <!-- Auto-applies shell updates (reload once, guarded against open drafts). -->
+  <script type="module" src="/components/update.js"></script>
 </head>
 <body>
   <main>

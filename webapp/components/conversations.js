@@ -224,6 +224,16 @@ class RetinueConversations extends HTMLElement {
 
   get heading() { return this.getAttribute('heading') || 'Conversations'; }
 
+  // True while a page reload would lose in-memory user input — a composer or
+  // reply draft (kept per thread in _drafts even after leaving the view) or
+  // files picked for upload. components/update.js consults this before
+  // auto-reloading into a freshly activated shell version.
+  get dirty() {
+    const hasDraft = Object.values(this._drafts || {}).some((t) => t && t.trim());
+    const hasFiles = Object.values(this._outFiles || {}).some((fs) => fs && fs.length);
+    return hasDraft || hasFiles;
+  }
+
   // In full mode the filter can request the archived scope or the (normally
   // hidden) project edit-command threads; otherwise we list active chat
   // threads — the default the dashboard card and agents expect.

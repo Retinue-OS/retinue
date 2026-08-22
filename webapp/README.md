@@ -75,8 +75,15 @@ The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
 splitters — double-click resets one, dragging news fully down closes it — and
 each card's header toggles between list and card view. Both preferences
-persist per device in localStorage. Device-level settings (notifications) live
-on `settings.html`, reached via the gear in the dashboard header.
+persist per device in localStorage. Device-level settings (notifications, the
+running shell version with a manual update check) live on `settings.html`,
+reached via the gear in the dashboard header.
+
+Shell updates apply themselves (`components/update.js`): when a new service
+worker activates, controlled pages reload once — never while a thread or the
+composer is open, a draft is unsent, or a text field is focused — and every
+visibility change triggers a `registration.update()`, so an always-open
+window doesn't wait for the browser's daily check.
 
 A retinue agent opens a thread that needs the user's decision with
 `scripts/conversation-push.py` (token-gated `POST /internal/conversations`):
