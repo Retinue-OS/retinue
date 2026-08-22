@@ -392,6 +392,14 @@ case "$MODE" in
     # CONVERSATION_BACKEND_TOKEN exported above.
     echo "[claude] Starting messenger gateway monitor..."
     python3 /workspace/scripts/gateway-monitor.py &
+    # Watches the shared Claude OAuth credentials the same way: warns in a
+    # dashboard conversation days before the sign-in's refresh token expires,
+    # and alerts when the credentials die early (token rotation clobber with a
+    # rejected backup) — pointing at the /claude-auth page where the user can
+    # re-login from the browser instead of a console. Exits by itself in
+    # gateway deployments that use no OAuth sign-in.
+    echo "[claude] Starting Claude sign-in monitor..."
+    python3 /workspace/scripts/claude-auth-monitor.py &
     # Chambers move under a running container (git pull, agents committing their
     # own files), so a boot-time sync is not enough. Each scheduler job spawns a
     # fresh `claude -p`, which picks up a resynced plugin on its next run.
@@ -445,10 +453,14 @@ case "$MODE" in
             tried_expiry=$(cat "$CRED_MARKER" 2>/dev/null || echo "")
             if [[ "$bak_expiry" == "$tried_expiry" ]]; then
               # These exact credentials were already restored and rejected —
-              # stop looping; the user must run: docker compose run --rm retinue interactive
-              echo "[oauth] Backup credentials rejected by server. Log in again:" >&2
-              echo "  docker compose stop retinue" >&2
-              echo "  docker compose run --rm retinue interactive  → then: claude" >&2
+              # stop looping; a fresh sign-in is required. The claude-auth
+              # monitor notifies the user's devices about this state; the
+              # /claude-auth dashboard page performs the re-login from any
+              # browser. Console fallbacks, in order of invasiveness:
+              echo "[oauth] Backup credentials rejected by server. Sign in again:" >&2
+              echo "  → open /claude-auth on the dashboard (browser re-login), or" >&2
+              echo "  → docker exec -it <retinue> python3 /workspace/scripts/claude_auth.py login, or" >&2
+              echo "  → docker compose stop retinue && docker compose run --rm retinue interactive → claude" >&2
               break  # exit watcher loop without restarting
             fi
             cp "$CRED_BAK" "$CRED_FILE"
@@ -466,10 +478,12 @@ case "$MODE" in
     if ! _cred_has_token "$CRED_FILE"; then
       echo "" >&2
       echo "━━━ [oauth] WARNING: No valid OAuth credentials ━━━━━━━━━━━━━━━━━━━━━" >&2
-      echo "  Claude will start but cannot authenticate. To fix:" >&2
+      echo "  Claude will start but cannot authenticate. To fix, either:" >&2
+      echo "    open /claude-auth on the dashboard (browser re-login), or" >&2
+      echo "    docker exec -it <retinue> python3 /workspace/scripts/claude_auth.py login, or" >&2
       echo "    docker compose stop retinue" >&2
       echo "    docker compose run --rm retinue interactive" >&2
-      echo "  Then inside the container: claude" >&2
+      echo "    ... then inside the container: claude" >&2
       echo "  NOTE: Never run 'claude' via 'docker exec' while remote-control" >&2
       echo "  is active — it rotates OAuth tokens and causes this state." >&2
       echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >&2

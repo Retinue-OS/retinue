@@ -40,7 +40,9 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import conversation_notify  # noqa: E402
 import messenger_gateways  # noqa: E402
+from conversation_notify import ConversationNotifier  # noqa: E402
 
 LOG = "[gateway-monitor]"
 
@@ -65,13 +67,6 @@ STATE_PATH = STATE_DIR / "state.json"
 PUBLIC_BASE_URL = os.environ.get("GATEWAY_MONITOR_PUBLIC_BASE_URL", "").rstrip("/") \
     or os.environ.get("SEND_APPROVAL_BASE_URL", "").rstrip("/") \
     or os.environ.get("CONVERSATION_BASE_URL", "").rstrip("/")
-
-# The dashboard-conversation backend (same endpoint conversation-push.py uses).
-_PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
-CONVERSATION_BACKEND_URL = os.environ.get(
-    "CONVERSATION_BACKEND_URL", f"http://localhost:{_PORT}/internal/conversations"
-).rstrip("/")
-CONVERSATION_BACKEND_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "").strip()
 
 
 def classify_health(status: int | None, body: dict | None, error: str | None = None):
@@ -139,37 +134,6 @@ def reminder_message(label: str, since: float) -> str:
 
 def recovery_message(label: str) -> str:
     return f"The {label} messenger gateway is connected again. No further action needed."
-
-
-class ConversationNotifier:
-    """Posts to the dashboard-conversation backend (Web Push fans out there)."""
-
-    def __init__(self, base_url: str = CONVERSATION_BACKEND_URL,
-                 token: str = CONVERSATION_BACKEND_TOKEN, timeout: float = 30.0):
-        self.base_url = base_url
-        self.token = token
-        self.timeout = timeout
-
-    def _post(self, url: str, payload: dict) -> dict | None:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={
-            "Content-Type": "application/json",
-            "X-Conversation-Backend-Token": self.token,
-        })
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001 - callers retry on the next tick
-            print(f"{LOG} conversation post failed: {exc}", flush=True)
-            return None
-
-    def open_thread(self, title: str, message: str) -> str | None:
-        body = self._post(self.base_url, {"title": title, "message": message})
-        return (body or {}).get("id")
-
-    def append(self, thread_id: str, message: str) -> bool:
-        body = self._post(f"{self.base_url}/{thread_id}/messages", {"message": message})
-        return body is not None
 
 
 class MonitorEngine:
@@ -274,7 +238,7 @@ def check_gateway(gw: dict) -> tuple[str, str | None]:
 
 
 def main() -> None:
-    if not CONVERSATION_BACKEND_TOKEN:
+    if not conversation_notify.DEFAULT_BACKEND_TOKEN:
         print(f"{LOG} CONVERSATION_BACKEND_TOKEN is not set — outage notifications "
               f"cannot be delivered; monitoring runs log-only", flush=True)
     gateways = messenger_gateways.channel_gateways(LOG)
@@ -285,7 +249,7 @@ def main() -> None:
     print(f"{LOG} monitoring {', '.join(sorted(watched))} every {INTERVAL:.0f}s "
           f"(threshold {FAIL_THRESHOLD}, remind every {REMIND_SECONDS / 3600:.1f}h)", flush=True)
 
-    engine = MonitorEngine(ConversationNotifier(), state=_load_state())
+    engine = MonitorEngine(ConversationNotifier(log_prefix=LOG), state=_load_state())
     while True:
         for slug, gw in watched.items():
             try:
