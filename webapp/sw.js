@@ -41,6 +41,7 @@ const SHELL_ASSETS = [
   '/components/news.js',
   '/components/speech.js',
   '/components/push.js',
+  '/components/update.js',
   '/components/app-launcher.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
@@ -56,6 +57,15 @@ self.addEventListener('activate', (e) => {
       .then((keys) => Promise.all(keys.filter((k) => k !== SHELL && k !== DATA).map((k) => caches.delete(k))))
       .then(() => self.clients.claim())
   );
+});
+
+// Version introspection for the settings page (components/update.js): a page
+// posts {type:'get-version'} with a MessagePort and gets the shell hash back —
+// the same value that names the cache, i.e. the version actually being served.
+self.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'get-version' && e.ports && e.ports[0]) {
+    e.ports[0].postMessage({ version: SHELL.replace(/^retinue-shell-/, '') });
+  }
 });
 
 // ── Web Push ─────────────────────────────────────────────────────────────────

@@ -16,6 +16,9 @@
        push element runs in `manage` mode here: it always shows this device's
        notification state, with enable/disable and the delivery preferences. -->
   <script type="module" src="/components/push.js"></script>
+  <!-- Shell version + manual update check (and the same auto-update behavior
+       every other page gets from importing the module). -->
+  <script type="module" src="/components/update.js"></script>
 </head>
 <body>
   <main class="settings">
@@ -46,6 +49,10 @@
         <li><a href="/gateways">Messenger gateways &mdash; connection status &amp; pairing</a></li>
         <li><a href="/sends">Pending sends &mdash; messages waiting for approval</a></li>
       </ul>
+      <!-- Updates apply on their own (the app reloads once a new version is
+           installed); this row is the manual fallback and shows which shell
+           version this device is running. -->
+      <retinue-update-check style="margin-top:12px"></retinue-update-check>
     </section>
   </main>
 
