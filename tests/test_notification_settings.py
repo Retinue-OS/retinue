@@ -13,6 +13,7 @@ working cryptography build) is unavailable; `webpush` itself is always mocked.
 """
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -217,6 +218,117 @@ def test_conv_event_mode():
         run_event_mode_tests(wg)
 
 
+# ── #61: the subscriber count an agent-opened thread reports ────────────────
+#
+# _push_conv_notification() used to return nothing, so an agent-opened thread
+# with zero subscribed devices reported success identically to one that
+# actually notified someone. These check the count is now surfaced both from
+# the function itself and from the two /internal/conversations POST handlers'
+# JSON responses (conversation-push.py's warning reads the latter).
+
+def _fake_agent_request(wg, payload: dict, token: str):
+    """A stand-in for the request handler, just enough for
+    _agent_conversation_payload()/_read_json_body() and a captured
+    _send_json() — no real socket I/O involved."""
+    body = json.dumps(payload).encode("utf-8")
+    fake = types.SimpleNamespace(
+        headers={"Content-Length": str(len(body)),
+                 "X-Conversation-Backend-Token": token},
+        rfile=io.BytesIO(body),
+        status=None,
+        response_body=None,
+    )
+
+    def _send_json(status, resp_body):
+        fake.status = status
+        fake.response_body = resp_body
+
+    fake._send_json = _send_json
+    fake._read_json_body = lambda: wg.Handler._read_json_body(fake)
+    fake._agent_conversation_payload = lambda: wg.Handler._agent_conversation_payload(fake)
+    return fake
+
+
+def test_agent_conversation_reports_zero_subscribers():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        os.environ["CONVERSATION_BACKEND_TOKEN"] = "test-token"
+        wg = _load_gateway(tmp_path / "gw")
+        _force_store(tmp_path / "push")  # enabled(), zero subscriptions
+
+        fake = _fake_agent_request(wg, {"message": "decide something"}, "test-token")
+        wg.Handler._handle_agent_conversation(fake)
+        assert fake.status == 201, fake.status
+        assert fake.response_body["push_subscribers"] == 0, fake.response_body
+
+
+def test_agent_conversation_reports_real_subscriber_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        os.environ["CONVERSATION_BACKEND_TOKEN"] = "test-token"
+        wg = _load_gateway(tmp_path / "gw")
+        push_dir = tmp_path / "push"
+        _force_store(push_dir)
+        _write_sub(push_dir, "https://push.example/one")
+        _write_sub(push_dir, "https://push.example/two")
+
+        fake = _fake_agent_request(wg, {"message": "decide something"}, "test-token")
+        # The count is what's under test, not delivery — stand in for the
+        # actual fan-out so the background thread has nothing real to call
+        # (pywebpush is unavailable in this sandbox; see test_push_notify.py).
+        with patch.object(push_notify, "notify_async"):
+            wg.Handler._handle_agent_conversation(fake)
+        assert fake.response_body["push_subscribers"] == 2, fake.response_body
+
+
+def test_agent_conversation_quiet_omits_push_subscribers():
+    """A quiet thread (the cowork audit trail) never calls push_notify, so the
+    field it would report is simply absent — not a misleading zero."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        os.environ["CONVERSATION_BACKEND_TOKEN"] = "test-token"
+        wg = _load_gateway(tmp_path / "gw")
+        _force_store(tmp_path / "push")
+
+        fake = _fake_agent_request(
+            wg, {"message": "logged", "kind": "cowork", "quiet": True}, "test-token")
+        wg.Handler._handle_agent_conversation(fake)
+        assert fake.status == 201, fake.status
+        assert "push_subscribers" not in fake.response_body, fake.response_body
+
+
+def test_agent_conversation_message_reports_subscriber_count():
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        os.environ["CONVERSATION_BACKEND_TOKEN"] = "test-token"
+        wg = _load_gateway(tmp_path / "gw")
+        push_dir = tmp_path / "push"
+        _force_store(push_dir)
+        _write_sub(push_dir, "https://push.example/one")
+
+        opened = wg._new_conv("agent", "Web", None, "agent", "first message")
+        fake = _fake_agent_request(wg, {"message": "a follow-up"}, "test-token")
+        with patch.object(push_notify, "notify_async"):
+            wg.Handler._handle_agent_conversation_message(fake, opened["id"])
+        assert fake.status == 201, fake.status
+        assert fake.response_body["push_subscribers"] == 1, fake.response_body
+
+
+def test_push_conv_notification_return_value():
+    """The function itself: 0 with no subscribers, the real count otherwise —
+    checked directly since it's what both handlers above now report."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        wg = _load_gateway(tmp_path / "gw")
+        push_dir = tmp_path / "push"
+        _force_store(push_dir)
+        conv = {"id": "c" * 32, "title": "T", "initiator": "agent", "messages": []}
+        assert wg._push_conv_notification(conv, "hello") == 0
+        _write_sub(push_dir, "https://push.example/x")
+        with patch.object(push_notify, "notify_async"):
+            assert wg._push_conv_notification(conv, "hello") == 1
+
+
 # ── runner ─────────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -226,6 +338,11 @@ TESTS = [
     test_notify_event_filter_matrix,
     test_notify_archived_optout,
     test_conv_event_mode,
+    test_agent_conversation_reports_zero_subscribers,
+    test_agent_conversation_reports_real_subscriber_count,
+    test_agent_conversation_quiet_omits_push_subscribers,
+    test_agent_conversation_message_reports_subscriber_count,
+    test_push_conv_notification_return_value,
 ]
 
 if __name__ == "__main__":

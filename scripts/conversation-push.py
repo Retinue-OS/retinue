@@ -165,6 +165,10 @@ def main() -> int:
         return 1
 
     print(json.dumps(body, ensure_ascii=False))
+    if body.get("push_subscribers") == 0:
+        print("conversation-push: warning — no device is subscribed to push; "
+              "this thread will only be seen if the dashboard is opened",
+              file=sys.stderr)
     return 0
 
 

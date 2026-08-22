@@ -1853,7 +1853,7 @@ def _conv_event_mode(conv: dict) -> str:
     return "reply"
 
 
-def _push_conv_notification(conv: dict, text: str) -> None:
+def _push_conv_notification(conv: dict, text: str) -> int:
     """Notify the user's devices that a thread needs their attention.
 
     Called for every agent→user turn that lands unread: a thread Ara opens, a
@@ -1862,10 +1862,20 @@ def _push_conv_notification(conv: dict, text: str) -> None:
     notified depends on each device's stored preferences: the event kind
     (see _conv_event_mode) and — for archived threads, which notify by
     default — an explicit opt-out. Best effort — a push failure never affects
-    the conversation itself."""
+    the conversation itself.
+
+    Returns the number of subscribed devices the fan-out targets (not how
+    many were actually reached, which the async fan-out doesn't wait to
+    learn) — zero is the case worth surfacing, since it means the escalation
+    reached no one and looked identical to success everywhere else."""
     if not push_notify.enabled():
-        return
+        return 0
     cid = conv.get("id", "")
+    subscribers = push_notify.subscription_count()
+    if subscribers == 0:
+        print(f"[web-gateway] no device subscribed to push — thread {cid} "
+              "notifies nobody", flush=True)
+        return 0
     title = conv.get("title") or "Retinue"
     body = " ".join(str(text or "").split())
     if len(body) > 160:
@@ -1873,6 +1883,7 @@ def _push_conv_notification(conv: dict, text: str) -> None:
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
                              mode=_conv_event_mode(conv),
                              archived=bool(conv.get("archived")))
+    return subscribers
 
 
 def _conv_worker(cid: str, session_key: str) -> None:
@@ -3739,11 +3750,11 @@ class Handler(BaseHTTPRequestHandler):
         conv = _new_conv("agent", owner, title, "agent", message,
                          first_attachments=payload.get("attachments"),
                          kind=kind)
+        body = {"id": conv["id"], "title": conv["title"]}
         if quiet:
             _conv_set_flags(conv["id"], unread=False)
         else:
-            _push_conv_notification(conv, message)
-        body = {"id": conv["id"], "title": conv["title"]}
+            body["push_subscribers"] = _push_conv_notification(conv, message)
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
         self._send_json(201, body)
@@ -3780,9 +3791,10 @@ class Handler(BaseHTTPRequestHandler):
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
-        if not quiet:
-            _push_conv_notification(conv, message or "Sent you a file")
         body = {"id": conv["id"], "title": conv["title"]}
+        if not quiet:
+            body["push_subscribers"] = _push_conv_notification(
+                conv, message or "Sent you a file")
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
         self._send_json(201, body)
