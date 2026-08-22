@@ -179,7 +179,10 @@ them to the correct subfolder before running ingestion:
 | `ultrahuman*.csv` | `observations/clinical/sensors/wearable/` |
 | `garmin-daily-*.csv` | `observations/clinical/sensors/garmin/` |
 
-After moving sensor files, run `python3 scripts/ingest-sensors.py` to extract
+After moving sensor files, run `python3 scripts/ingest-sensors.py --chamber
+<chamber-root>` (the chamber root is the directory containing the
+`observations/` folder you just wrote into — the script has no usable default
+and exits with an error rather than silently ingesting nothing) to extract
 observations into per-source `.nt` files. Then commit in a single `git add`:
 - the moved CSV files in their destination folder
 - the generated `.nt` files
