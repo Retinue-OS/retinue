@@ -1437,11 +1437,17 @@ def _store_attachments(cid: str, raw_atts) -> list[dict]:
     """Persist agent-provided attachments for thread ``cid`` and return metadata.
 
     Each input item is ``{"filename", "content_type", "data"(base64)}``. Files
-    are written under ``CONVERSATION_ATTACHMENTS_DIR/<cid>/<att_id>`` with a
-    server-generated id, so an untrusted filename never becomes a path
+    are written under ``CONVERSATION_ATTACHMENTS_DIR/<cid>/<att_id><suffix>``
+    with a server-generated id, so an untrusted filename never becomes a path
     component; the original name survives only as metadata (used for the
-    download's Content-Disposition). Malformed or oversized items are skipped.
-    Returns the metadata dicts (without the bytes) to embed in the message."""
+    download's Content-Disposition). ``suffix`` — a plain short extension
+    derived from the filename, else the content type, same as
+    ``_store_message_files`` — is kept on disk and in the returned metadata
+    ("id" itself stays a bare hex string, since it also doubles as the
+    download URL's path segment) so a reading session sees a typed filename
+    instead of guessing from content alone. Malformed or oversized items are
+    skipped. Returns the metadata dicts (without the bytes) to embed in the
+    message."""
     stored: list[dict] = []
     if not isinstance(raw_atts, list):
         return stored
@@ -1455,15 +1461,20 @@ def _store_attachments(cid: str, raw_atts) -> list[dict]:
             continue
         if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
             continue
+        content_type = str(item.get("content_type") or "application/octet-stream")
+        suffix = Path(os.path.basename(str(item.get("filename") or ""))).suffix
+        if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
+            suffix = mimetypes.guess_extension(content_type) or ""
         att_id = uuid.uuid4().hex
         conv_dir.mkdir(parents=True, exist_ok=True)
-        (conv_dir / att_id).write_bytes(blob)
+        (conv_dir / f"{att_id}{suffix}").write_bytes(blob)
         filename = os.path.basename(str(item.get("filename") or "attachment")) or "attachment"
         stored.append({
             "id": att_id,
             "filename": filename,
-            "content_type": str(item.get("content_type") or "application/octet-stream"),
+            "content_type": content_type,
             "size": len(blob),
+            "suffix": suffix,
         })
     return stored
 
@@ -1728,7 +1739,8 @@ def _conv_attachment_note(conv: dict, msg: dict) -> str:
     cid = conv.get("id", "")
     lines = []
     for att in atts:
-        path = CONVERSATION_ATTACHMENTS_DIR / cid / str(att.get("id", ""))
+        stored_name = str(att.get("id", "")) + str(att.get("suffix", ""))
+        path = CONVERSATION_ATTACHMENTS_DIR / cid / stored_name
         lines.append(
             f"- {att.get('filename', 'attachment')} "
             f"({att.get('content_type', 'application/octet-stream')}, "
@@ -3007,8 +3019,9 @@ class Handler(BaseHTTPRequestHandler):
         if meta is None:
             self._send_json(404, {"error": "not found"})
             return
+        suffix = meta.get("suffix") or ""
         base = os.path.realpath(CONVERSATION_ATTACHMENTS_DIR)
-        path = os.path.realpath(os.path.join(base, cid, att_id))
+        path = os.path.realpath(os.path.join(base, cid, f"{att_id}{suffix}"))
         try:
             if os.path.commonpath([base, path]) != base or not os.path.isfile(path):
                 self._send_json(404, {"error": "not found"})
