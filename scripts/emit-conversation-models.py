@@ -34,9 +34,9 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 # Same vocabulary as config/conversation-models.jsonld's @context, so the
 # emitted triples carry the source document's intended semantics.
@@ -117,14 +117,17 @@ def load_models() -> list[dict]:
 
 
 def _slug(model_id: str) -> str:
-    """Stable, blank-node-free IRI local part for a model.
+    """Stable, injective IRI local part for a model.
 
-    The empty id (the "use the gateway default" option) has no model name, so it
-    gets the fixed slug `default`; every other id is used verbatim after
-    replacing any character outside [A-Za-z0-9._-] so the IRI stays well-formed
-    and deterministic."""
-    base = model_id or "default"
-    return re.sub(r"[^A-Za-z0-9._-]", "_", base)
+    Percent-encodes every character outside the IRI-safe set, so distinct ids
+    always produce distinct slugs. Earlier this defaulted the empty id to the
+    literal string "default" before sanitising, which let two *different* ids
+    (`""`, the gateway-default option, and an explicit `"default"`) collapse
+    onto the same node, and let `/` and `:` both fold onto `_`, colliding e.g.
+    `anthropic/claude-opus-4` with `anthropic:claude-opus-4` — a hand-written
+    id never gets a node of its own by accident. The empty id now yields a
+    slug-less node (`#model-`), a legal though minimal IRI."""
+    return quote(model_id, safe="")
 
 
 def _nt_string(value: str) -> str:

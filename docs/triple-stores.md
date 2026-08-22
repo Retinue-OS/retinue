@@ -99,6 +99,21 @@ chamber's git repo; it is created on demand and rewritten only when the bytes
 change, so an unchanged list triggers no rebuild. The hand-edited JSON-LD stays
 the single source; the `.nt` is disposable generated output — never edit it.
 
+> **Caveat, honestly stated:** "created on demand … so QLever indexes it"
+> assumes the watcher is already running by the time `chambers/_generated/`
+> first appears — `discover-agents.py` writes the sibling
+> `chambers/_generated/agents.nt` the same way, and both share the gap. A file
+> written into a directory that did not exist when `inotifywait` established
+> its watches produces no event, so on the boot where the directory is first
+> created the emitted `.nt` is not indexed until an unrelated `.nt`/`.ttl`/`.n3`
+> change triggers a rebuild, or the store restarts
+> ([qlever-dir#10](https://github.com/retinue-os/qlever-dir/issues/10), open).
+> Write-if-changed makes this stickier rather than self-healing: once the
+> content stabilizes the *next* boot writes nothing at all, so there is no
+> second chance at an event. Until that lands upstream, a deployment whose
+> first boot ever created `chambers/_generated/` may need one unrelated store
+> change (or a restart) before these triples show up.
+
 The reference converter turns YAML frontmatter into triples. A project file is
 just a Markdown note a human is happy to open and edit:
 
