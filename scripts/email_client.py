@@ -897,8 +897,7 @@ def _uid_by_message_id(M, folder, message_id):
 #
 #   verify — never sent directly; registered as a pending request (a draft) that
 #            the user approves on the web gateway. Approval happens *only* via
-#            the web interface, never from the CLI (which holds no such command),
-#            so an agent cannot approve its own pending sends.
+#            the web interface — the CLI holds no approve command.
 #   trust  — sent directly only when the model passes --user-approved; otherwise
 #            it falls back to the verify flow.
 #   allow  — sent directly, no confirmation (e.g. Ari's own mailbox).
@@ -1131,7 +1130,8 @@ def approve_pending_send(cfg, request_id):
     """Send a pending draft (stripping the request metadata) and remove it.
 
     Intentionally *not* exposed as a CLI subcommand: approval is performed only
-    by the web gateway, so an agent running the CLI cannot approve a send.
+    by the web gateway. That is friction, not an authorization boundary — this
+    function itself does not check who is calling it.
     """
     M = imap_connect(cfg)
     try:

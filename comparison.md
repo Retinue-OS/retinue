@@ -187,8 +187,8 @@ on the user.
    A prompt-injected session cannot leak keys it cannot read.
 2. *Outbound sends are governed per identity, fail-closed.* Every channel has
    an `allow`/`trust`/`verify` policy keyed by the *sending* account; an
-   undeclared account defaults to `verify` (human approval on the `/sends`
-   page); an agent can never approve its own send. Neither competitor has an
+   undeclared account defaults to `verify` (registered as pending, transmitted
+   only after approval on the `/sends` page). Neither competitor has an
    equivalent for message content.
 3. *Trust is configuration, not inference.* An account is a control channel
    or an inbox by deployment config, never by what a message claims; control
@@ -197,10 +197,12 @@ on the user.
 
 Honest caveats (argued at length in [review.md](review.md)): the egress audit
 is advisory rather than network-enforced; the agent session itself still runs
-with broad shell access over untrusted inbound content; and the hand-rolled
-web gateway is untested. Retinue has had no public security incident — but it
-also has had no public exposure. Its advantage is *design posture*, not a
-proven track record; the other two's disadvantage is a proven track record.
+with broad shell access over untrusted inbound content; and the hand-rolled web
+gateway's request handling and approval authority are still untested, despite a
+test suite that now runs in CI on every PR. Retinue has had no public security
+incident — but it also has had no public exposure. Its advantage is *design
+posture*, not a proven track record; the other two's disadvantage is a proven
+track record.
 
 A structural note that applies to all three: any system that reads untrusted
 messages with a capable model and any outbound path is prompt-injectable.

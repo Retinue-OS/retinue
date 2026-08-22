@@ -10,7 +10,7 @@ whether it is worth pursuing. Written July 2026, against the state of `main`
 
 **The approach is worth pursuing.** Retinue's core architectural bets —
 credential isolation in sidecar gateways, configuration-fixed trust boundaries,
-human-approved outbound sends, and git-as-memory — are genuinely differentiated
+an outbound-send approval queue, and git-as-memory — are genuinely differentiated
 and address exactly the failure modes that have plagued the personal-agent
 scene (exposed gateways, prompt-injection-to-exfiltration, credentials sitting
 in the model's context). No comparable open project combines these properties
@@ -86,9 +86,10 @@ system); control mode additionally requires the sender to be on an explicit
 allowlist. This eliminates an entire class of "the message claimed to be an
 instruction" confusions by construction rather than by prompt engineering. The
 same discipline shows in the send policies: keyed by *sending identity*, with
-undeclared accounts failing safe to `verify`, and the invariant that an agent
-can never approve its own send. These defaults are consistently fail-closed
-(unset `UPDATER_TOKEN` → reject all; no allowlist entry → reject).
+undeclared accounts failing safe to `verify`, and a `verify` send transmitted
+only after approval on the web gateway's `/sends` page. These defaults are
+consistently fail-closed (unset `UPDATER_TOKEN` → reject all; no allowlist
+entry → reject).
 
 ### 2.3 Human-in-the-loop where it actually matters
 
