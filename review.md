@@ -22,9 +22,11 @@ But the assessment comes with three serious caveats:
    does not enforce. The gap between "we log outbound traffic" and "outbound
    traffic is constrained" is where the whole prompt-injection defense either
    holds or doesn't.
-2. **The bespoke, security-critical surface is untested.** The 2,167-line
-   hand-rolled web gateway is the public edge and the approval authority for
-   outbound sends, and it has zero test coverage and no CI.
+2. **The web gateway's HTTP request handling is untested.** The hand-rolled
+   web gateway is the public edge and the approval authority for outbound
+   sends; CI now runs a test suite on every PR, but no test constructs its
+   request handler, so endpoint authorization — including the `/sends`
+   approval path — is exercised by nothing.
 3. **The system is coupled to non-contractual internals of Claude Code.** This
    is simultaneously its superpower and its largest strategic risk.
 
@@ -71,11 +73,11 @@ messaging credentials.** Signal keys, the WhatsApp session, the Telegram MTProto
 session, and SMTP/IMAP passwords live in dedicated containers; the agent talks
 to thin HTTP APIs. The entrypoint even strips `EMAIL_PASS*` from the agent's
 environment and routes `email_client.py` through the gateway
-([entrypoint.sh:483-492](scripts/entrypoint.sh#L483-L492)). Compare this with
-the common pattern — an MCP server whose token sits in the same process tree as
-the model, or worse, credentials pasted into config the model can read — and
-this is a categorical improvement. A prompt-injected agent here cannot steal
-what it never sees.
+([entrypoint.sh:483-492](https://github.com/Retinue-OS/retinue/blob/e2f4e22/scripts/entrypoint.sh#L483-L492)).
+Compare this with the common pattern — an MCP server whose token sits in the
+same process tree as the model, or worse, credentials pasted into config the
+model can read — and this is a categorical improvement. A prompt-injected
+agent here cannot steal what it never sees.
 
 ### 2.2 Trust boundaries are configuration, not content
 
@@ -163,11 +165,11 @@ mounts for chambers a given job has no business writing.
 ### 3.2 Egress audit is observability, not enforcement
 
 The MITM sidecar works via `HTTP_PROXY`/`HTTPS_PROXY` environment variables
-([docker-compose.yml:114-119](docker-compose.yml#L114-L119)). Environment
-variables are advisory: any process — including a bash line the agent writes —
-can unset them, use a raw socket, or speak a non-HTTP protocol, and the
-`agents` bridge network has ordinary outbound internet access. The anomaly
-agent then never sees the flow at all. As built, the layer is valuable
+([docker-compose.yml:155-161](https://github.com/Retinue-OS/retinue/blob/e2f4e22/docker-compose.yml#L155-L161)).
+Environment variables are advisory: any process — including a bash line the
+agent writes — can unset them, use a raw socket, or speak a non-HTTP protocol,
+and the `agents` bridge network has ordinary outbound internet access. The
+anomaly agent then never sees the flow at all. As built, the layer is valuable
 *telemetry* (and the log viewer + anomaly agent are a genuinely rare feature),
 but the README/compose language ("route all outbound HTTP/HTTPS") reads
 stronger than what is enforced.
@@ -177,18 +179,20 @@ whose only route out is the proxy (plus explicit internal services), or add an
 iptables/nftables egress rule in the container. Then the audit log becomes a
 complete record instead of a record of the polite traffic.
 
-### 3.3 The security-critical surface is hand-rolled and untested
+### 3.3 The security-critical surface is hand-rolled and largely untested
 
-- `web-gateway.py` is **2,167 lines** in one file: public edge auth
-  (forward-auth for Traefik), the `/sends` approval authority, attachment
-  storage/serving, conversation state with hand-managed threading locks,
-  transcript cleanup, an email backend proxy, SPARQL dashboards. It is built
-  directly on `BaseHTTPRequestHandler` with string-assembled HTML.
-- Test coverage: **four test files (~730 lines)**, all on send-policy and
-  contact-lookup logic. The web gateway, the entrypoint's credential dance, the
-  scheduler, refresh, and the conversation/attachment layer have none.
-- CI: the only workflow checks the pinned signal-cli version. **No workflow
-  runs the tests.**
+- `web-gateway.py` is a single large file: public edge auth (forward-auth for
+  Traefik), the `/sends` approval authority, attachment storage/serving,
+  conversation state with hand-managed threading locks, transcript cleanup, an
+  email backend proxy, SPARQL dashboards. It is built directly on
+  `BaseHTTPRequestHandler` with string-assembled HTML.
+- Test coverage: a growing set of test files, concentrated on send-policy
+  resolution, the pending-send store, and (more recently) dashboard-project
+  logic. No test constructs the gateway's `BaseHTTPRequestHandler`, so endpoint
+  authorization itself — forward-auth, the internal backend-token checks, the
+  `/sends` approve path — is exercised by nothing.
+- CI: [tests.yml](.github/workflows/tests.yml) runs the test suite on push to
+  `main` and on every pull request.
 
 Hand-implementing `$apr1$` verification in constant time
 ([gateway_auth.py](scripts/gateway_auth.py)) is admirably dependency-free, but
@@ -288,17 +292,17 @@ memory — is a defensible and, so far, uncrowded position.
 The main risks to that position are not conceptual but executional:
 
 - if the egress boundary stays advisory, the security story is a story;
-- if the web gateway stays a 2.2k-line untested monolith, the strongest
-  criticism of the neighbors applies here too;
+- if the web gateway's request handling stays unreviewed and effectively
+  untested, the strongest criticism of the neighbors applies here too;
 - if Claude Code shifts under it, months of workaround shims need rework on
   someone else's schedule.
 
 And one strategic decision is being deferred by the framework/deployment
 split's very tidiness: **is this a personal system or a product?** The
 engineering (content-neutral framework, example chambers, deployment
-overrides) says product; the onboarding cost, single-user assumptions, and
-absent CI say personal tool. Both are legitimate. But the next hundred hours
-are spent very differently depending on the answer — a product needs the
+overrides) says product; the onboarding cost and single-user assumptions say
+personal tool. Both are legitimate. But the next hundred hours are spent very
+differently depending on the answer — a product needs the
 setup wall torn down and the bespoke surface hardened; a personal system
 should stop paying generality tax (e.g. 3.5, 3.7) it never collects on.
 
@@ -307,7 +311,7 @@ should stop paying generality tax (e.g. 3.5, 3.7) it never collects on.
 | # | Action | Effort | Risk retired |
 |---|--------|--------|--------------|
 | 1 | Enforce egress at the network layer (internal-only network; proxy as sole route out) | S | Turns the flagship security feature from telemetry into a boundary |
-| 2 | CI that runs the existing tests on every PR | XS | Stops silent regression of the one tested area (send policies) |
+| 2 | ~~CI that runs the existing tests on every PR~~ — **done**, [tests.yml](.github/workflows/tests.yml) | XS | Stops silent regression of the one tested area (send policies) |
 | 3 | CSRF token + method discipline on `/sends`; path-traversal tests for static/attachment serving | S | Hardens the approval authority — the linchpin of the send-control model |
 | 4 | Run inbox/triage processing in a reduced-privilege subagent (no `Bash(*)`, scoped chamber access); remove `UPDATER_TOKEN` from the default agent env | M | Shrinks the injection blast radius where untrusted content is processed |
 | 5 | Extract the shared gateway core (pending sends, policy, recent-chats, auth) into one module with one test suite | M | Ends the ×3 maintenance and drift |
