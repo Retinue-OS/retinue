@@ -400,7 +400,7 @@ def _body_text(msg):
 def _summary(M, uid):
     typ, data = M.uid(
         "fetch", uid,
-        "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)] FLAGS)")
+        "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID LIST-ID)] FLAGS)")
     if typ != "OK" or not data or data[0] is None:
         return None
     header_bytes = b""
@@ -424,6 +424,11 @@ def _summary(M, uid):
         # Carried in every listing so a caller can key handled-state on the
         # Message-ID without a second round-trip per message.
         "message_id": (hdr.get("Message-ID") or "").strip() or None,
+        # Same reasoning for List-Id (RFC 2919): it is what tells a listing
+        # which mailing list a message came in on, and the triage gate keys its
+        # per-list policy off it — a second fetch per message just for one
+        # header would double the round-trips of every scan.
+        "list_id": _decode(hdr.get("List-Id")) or None,
         "flags": [f.decode() if isinstance(f, bytes) else f for f in flags],
         "unread": b"\\Seen" not in flags,
     }
@@ -721,6 +726,9 @@ def cmd_read(cfg, args):
         # what the triage gate's news rail files as the item's link.
         "archived_at": _decode(msg.get("Archived-At")),
         "list_archive": _decode(msg.get("List-Archive")),
+        # List-Id (RFC 2919) names the list itself, stably across senders — the
+        # identity the triage gate groups a mailing list by.
+        "list_id": _decode(msg.get("List-Id")),
         "flags": [f.decode() if isinstance(f, bytes) else f for f in flags],
         "body": _body_text(msg),
         "attachments": attachments,

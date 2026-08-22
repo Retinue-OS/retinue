@@ -18,18 +18,31 @@ Two modes:
     unread INBOX mail from **any** sender, so nothing a narrow whitelist skipped
     is ever lost.
 
-Both modes first divert the **news rail**: unread mail from a declared news
-sender (a newsletter, a bulletin — see ``triage_policy``) is filed into the news
-feed for the Herald to score, marked read, moved out of the INBOX and recorded
-in the triage status store, all deterministically and with **no model turn**.
-News mail therefore never triggers a spawn on its own; it is subtracted from the
-unread set before either mode decides whether anything is worth one. This is the
-e-mail twin of the messenger ``news`` group flag: same idea, same feed, but a
-pull channel has to do its own fetching and its own inbox hygiene.
+Which of the two a message qualifies for is not the whole story, because a mail
+belongs to two things at once: a **sender** and a **group** (its mailing list,
+or — for a listless newsletter — its own address; see ``triage_policy``). The
+sender decides *how urgently* it is triaged, the group decides *where else it
+goes*, and the gate asks ``triage_policy.email_gate_decision()`` for both in one
+call:
 
-Whitelist policy lives in ``triage_policy.py`` and is persisted as N-Triples the
-life store indexes. The gate reads the whitelist off disk; only the daily run
-writes it. See ``docs/triage-delivery-gate.md``.
+  * ``news`` group — file it into the feed for the Herald to score, credit-free.
+  * ``ignored`` group — never worth a model turn; filing it is all that happens.
+  * ``quieted`` group (or no flag at all) — reaches triage on the daily sweep.
+    On a pull channel those two coincide: the daily sweep *is* the quiet tier.
+    So ``news`` + ``quieted`` is how you say "in the feed **and** in the triage",
+    which is the case for a list one both reads and writes to.
+
+A mail on the news rail alone is marked read, moved out of the INBOX and
+recorded in the triage status store, so it never triggers a spawn. A mail on
+**both** rails is filed to the feed but otherwise left untouched — unread, in
+the INBOX, no status record — because triage still has to see it. Re-filing it
+on the next tick is a no-op: feed item ids are a hash of the content, and the
+store skips ids it already holds.
+
+Sender whitelist and group policy both live in ``triage_policy.py``, persisted as
+N-Triples the life store indexes. The gate reads them off disk; only the daily
+run writes (the whitelist it derives from Sent). See
+``docs/triage-delivery-gate.md``.
 
 Messenger (Signal / WhatsApp / Telegram) is push-driven and gated inside each
 gateway, not here — this script is the e-mail half of the design.
@@ -98,6 +111,12 @@ def _email_client(*args: str) -> dict | None:
 
 def _sender_address(msg: dict) -> str:
     return parseaddr(msg.get("from") or "")[1].strip().lower()
+
+
+def _list_id(msg: dict) -> str:
+    """The raw ``List-Id`` a listing carried, if any (normalising is the policy's
+    job — the gate must not decide what counts as a usable id)."""
+    return (msg.get("list_id") or "").strip()
 
 
 def unread_inbox() -> list[dict]:
@@ -171,13 +190,18 @@ def _excerpt(body: str, limit: int) -> str:
     return text[:limit] + ("…" if len(text) > limit else "")
 
 
-def file_news_message(msg: dict) -> bool:
-    """File one newsletter into the feed, then get it out of the INBOX.
+def file_news_message(msg: dict, *, consume: bool = True) -> bool:
+    """File one newsletter into the feed, and — with `consume` — get it out.
 
     Returns True when the item reached the feed. The mailbox side is best-effort
     and reported separately: a filed item whose move failed is left non-terminal
     so the next run (or triage's Phase-1 backstop) retries the move rather than
     the filing.
+
+    `consume=False` files the item and touches nothing else. That is the case
+    for a group that is both `news` and `quieted`: triage is still owed a look at
+    the mail, so marking it read, moving it or writing a terminal status record
+    would take it away from the very rail the policy asked to keep it on.
     """
     uid = str(msg.get("uid") or "").strip()
     detail = _email_client("read", "--uid", uid) if uid else None
@@ -206,6 +230,10 @@ def file_news_message(msg: dict) -> bool:
         print(f"[triage-gate] news: could not file uid {uid} ({source}); "
               "leaving it unread for the next run", file=sys.stderr)
         return False
+    if not consume:
+        print(f"[triage-gate] news: filed uid {uid} from {source} "
+              "(left unread for triage)", file=sys.stderr)
+        return True
     moved_to = ""
     if uid:
         _email_client("flag", "--uid", uid, "--read")
@@ -266,27 +294,45 @@ def _record_news_status(msg: dict, detail: dict, source: str, moved_to: str) -> 
               file=sys.stderr)
 
 
-def divert_news(unread: list[dict]) -> list[dict]:
-    """File every declared news sender's mail; return what is left to triage."""
+def route(unread: list[dict], mode: str) -> list[dict]:
+    """Run both rails over the unread set; return what `mode` owes a model turn.
+
+    One pass decides everything, because the two rails are not exclusive: the
+    news rail is driven by the message's group, the triage rail by its sender
+    plus the same group, and a mail can ride both (see the module docstring).
+    `mode` is "frequent", "daily", or "news" — the last files the feed and
+    returns nothing, for a run that must never spawn.
+
+    A mail whose filing fails is handed to triage even if the policy would have
+    kept it off that rail: losing it silently is the one outcome worth spending
+    a model turn to avoid.
+    """
     pol = tp.load_email_policy()
-    if not pol.news and not pol.news_wildcards:
-        return unread
-    if not news_ingest.news_enabled():
-        print("[triage-gate] news: NEWS_INGEST_URL unset; news senders left "
-              "to normal triage", file=sys.stderr)
-        return unread
-    rest, filed = [], 0
+    news_ready = news_ingest.news_enabled()
+    warned = False
+    keep, filed, held = [], 0, 0
     for msg in unread:
-        if not tp.email_news_sender(_sender_address(msg), pol.news, pol.news_wildcards):
-            rest.append(msg)
-        elif not file_news_message(msg):
-            rest.append(msg)  # filing failed — let a model turn deal with it
-        else:
-            filed += 1
+        dec = tp.email_gate_decision(_sender_address(msg), _list_id(msg), pol=pol)
+        triaged = dec["daily"]
+        if dec["news"]:
+            if not news_ready:
+                if not warned:
+                    print("[triage-gate] news: NEWS_INGEST_URL unset; news groups "
+                          "left to normal triage", file=sys.stderr)
+                    warned = True
+                triaged = True
+            elif file_news_message(msg, consume=not dec["daily"]):
+                filed += 1
+                held += 1 if dec["daily"] else 0
+            else:
+                triaged = True  # filing failed — let a model turn deal with it
+        if triaged and mode != "news" and (dec["triage_now"] or mode == "daily"):
+            keep.append(msg)
     if filed:
-        print(f"[triage-gate] news: {filed} newsletter(s) filed to the feed",
+        print(f"[triage-gate] news: {filed} item(s) filed to the feed"
+              + (f", {held} of them also kept for triage" if held else ""),
               file=sys.stderr)
-    return rest
+    return keep
 
 
 def build_prompt(mode: str, messages: list[dict]) -> str:
@@ -330,9 +376,8 @@ def spawn(mode: str, messages: list[dict]) -> int:
 
 
 def run_frequent() -> int:
-    addresses, wildcards = tp.load_email_whitelist()
-    unread = divert_news(unread_inbox())
-    hits = [m for m in unread if tp.email_whitelisted(_sender_address(m), addresses, wildcards)]
+    unread = unread_inbox()
+    hits = route(unread, "frequent")
     if not hits:
         print(
             f"[triage-gate] frequent: {len(unread)} unread, none whitelisted; "
@@ -347,12 +392,12 @@ def run_daily() -> int:
     n = refresh_whitelist_from_sent()
     if n >= 0:
         print(f"[triage-gate] daily: whitelist now {n} address(es)", file=sys.stderr)
-    unread = divert_news(unread_inbox())
-    if not unread:
-        print("[triage-gate] daily: inbox has no unread mail; nothing spawned",
-              file=sys.stderr)
+    hits = route(unread_inbox(), "daily")
+    if not hits:
+        print("[triage-gate] daily: nothing unread that triage owes a look; "
+              "nothing spawned", file=sys.stderr)
         return 0
-    return spawn("daily", unread)
+    return spawn("daily", hits)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -361,14 +406,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("frequent", help="spawn only for whitelisted senders")
     sub.add_parser("daily", help="refresh whitelist from Sent, spawn for any sender")
     sub.add_parser("derive-whitelist", help="refresh the whitelist from Sent only")
-    sub.add_parser("news", help="file declared news senders to the feed only")
+    sub.add_parser("news", help="file declared news groups to the feed only")
     args = parser.parse_args(argv)
     if args.mode == "frequent":
         return run_frequent()
     if args.mode == "daily":
         return run_daily()
     if args.mode == "news":
-        divert_news(unread_inbox())
+        route(unread_inbox(), "news")
         return 0
     if args.mode == "derive-whitelist":
         n = refresh_whitelist_from_sent()
