@@ -627,11 +627,13 @@ from the next turn. The picker governs **Ara's own turn only** — dispatched
 subagents (the Archivist and any chamber-provided subagents) always run on their
 own hard-wired models regardless of the selection. In a deployment that routes
 through **LiteLLM** (the shipped default), the offered list is managed **in
-LiteLLM itself**: the gateway reads `GET /model/info` and offers every route
-whose `model_info` sets `retinue_picker: true`, labeled by `retinue_label` —
-set in `litellm/config.yaml` (which seeds the Claude defaults) or on a model
-added at runtime through the LiteLLM admin UI, so adding a pickable model needs
-no gateway config at all. The list is cached briefly
+LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
+and offers the concrete models the proxy currently serves. `retinue_picker: true`
+plus `retinue_label` still names a route; `retinue_picker: false` hides one.
+An Ollama primary (`LITELLM_PRIMARY_MODEL=ollama/…`) drops leftover Claude
+catalog seeds so the picker cannot offer a model the backend does not serve.
+Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
+is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
 `RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials
 Claude Code already sends (`ANTHROPIC_CUSTOM_HEADERS`, override:
