@@ -108,8 +108,10 @@ def test_missing_file_falls_back_to_default():
         # The built-in default list (4 models) is emitted.
         for label in ("Default", "Opus", "Sonnet", "Haiku"):
             assert label in text, f"default label {label} missing"
-        # Empty-id default option gets the fixed `model-default` slug.
-        assert "#model-default>" in text
+        # Empty-id default option gets a slug-less (but legal) node, not the
+        # literal string "default" -- that would collide with an explicit
+        # id of "default" (see #28).
+        assert "#model->" in text
     print("PASS test_missing_file_falls_back_to_default")
 
 
@@ -140,10 +142,42 @@ def test_slug_sanitises_ids():
     with tempfile.TemporaryDirectory() as tmp:
         inline = json.dumps([{"id": "vendor/model:v1", "label": "Weird"}])
         mod, _, text = _run(tmp, env_inline=inline)
-        # IRI-unsafe chars replaced deterministically; id literal kept verbatim.
-        assert "#model-vendor_model_v1>" in text
+        # IRI-unsafe chars percent-encoded deterministically; id literal kept
+        # verbatim in the modelId triple.
+        assert "#model-vendor%2Fmodel%3Av1>" in text
         assert '<https://retinue-os.github.io/ns/conversation#modelId> "vendor/model:v1"' in text
     print("PASS test_slug_sanitises_ids")
+
+
+def test_slug_is_injective_for_former_collisions():
+    """Regression for #28: the old slug (default-fallback + `[^A-Za-z0-9._-]`
+    -> `_`) merged distinct ids onto one node. Both collision shapes from the
+    issue must now stay distinct."""
+    with tempfile.TemporaryDirectory() as tmp:
+        inline = json.dumps([
+            {"id": "", "label": "Gateway default"},
+            {"id": "default", "label": "Explicit default"},
+            {"id": "anthropic/claude-opus-4", "label": "Slash form"},
+            {"id": "anthropic:claude-opus-4", "label": "Colon form"},
+        ])
+        mod, _, text = _run(tmp, env_inline=inline)
+
+        # '' vs 'default': previously both slugged to "model-default".
+        assert "#model->" in text, "empty id lost its slug-less node"
+        assert "#model-default>" in text, "explicit id 'default' lost its own node"
+
+        # '/' vs ':': previously both folded to "model-anthropic_claude-opus-4".
+        assert "#model-anthropic%2Fclaude-opus-4>" in text
+        assert "#model-anthropic%3Aclaude-opus-4>" in text
+
+        # Four distinct ids -> four distinct model subjects, four offersModel
+        # edges (render() sorts but does not dedupe, so a collision would
+        # have shown as a repeated node/edge rather than a missing one).
+        type_suffix = "<https://retinue-os.github.io/ns/conversation#ConversationModel> ."
+        subj_lines = [l for l in text.splitlines() if l.endswith(type_suffix)]
+        assert len(subj_lines) == 4, f"expected 4 distinct model nodes, got {len(subj_lines)}"
+        assert len(set(subj_lines)) == 4, "two ids rendered the identical type triple"
+    print("PASS test_slug_is_injective_for_former_collisions")
 
 
 if __name__ == "__main__":
@@ -153,4 +187,5 @@ if __name__ == "__main__":
     test_invalid_env_then_file()
     test_write_if_changed()
     test_slug_sanitises_ids()
+    test_slug_is_injective_for_former_collisions()
     print("all emit-conversation-models tests passed")
