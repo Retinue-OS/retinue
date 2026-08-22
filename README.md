@@ -409,8 +409,7 @@ sending account (E.164 number, `"*"` as a wildcard default):
   (used when the user explicitly requested the send in a conversation);
   otherwise the send falls back to the `verify` flow.
 - `verify` — register the message as a **pending send**; it is transmitted only
-  after explicit approval on the web gateway's `/sends` page. An agent can never
-  approve its own send.
+  after explicit approval on the web gateway's `/sends` page.
 
 An account matching no entry and no `"*"` wildcard falls back to `verify`
 (fail-safe, same default as e-mail), so an undeclared account can never post

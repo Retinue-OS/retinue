@@ -115,8 +115,9 @@ The user approves/denies pending sends on the gateway: `GET /sends` lists them,
 and each request page (`/sends/<account>/<request-id>`) has **Allow / Deny /
 Skip** buttons. Approval sends the draft and removes it from Drafts (it lands in
 Sent); Deny deletes it; Skip moves to the next request, leaving this one pending.
-Approval is **web-only** — there is no CLI `approve` command, so you cannot
-approve a pending send yourself.
+Approval happens on the web gateway's `/sends` page — there is no CLI
+`approve` command. Don't work around that to approve your own pending send;
+the point of `verify` is that the user takes this step.
 
 Because a pending draft is parked in the provider's IMAP Drafts folder, it makes
 a round trip through that store — and some providers stamp their own headers on

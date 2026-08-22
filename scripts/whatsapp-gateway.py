@@ -17,8 +17,8 @@ and Signal already have:
     default verify), not who receives it. A dedicated agent number can be granted
     ``allow`` while the user's own number stays ``verify``. A ``verify`` send is
     registered as pending and transmitted only after the user approves it on the
-    web gateway's /sends page — an agent can never approve its own send. This is
-    what fixes the concrete dead end from #86/#88: a headless ``claude -p``
+    web gateway's /sends page. This is what fixes the concrete dead end from
+    #86/#88: a headless ``claude -p``
     dashboard session that had the user's explicit approval to send a WhatsApp
     reply could not, because the MCP ``send_message`` needed an interactive
     permission grant a headless session cannot obtain.
