@@ -3928,7 +3928,7 @@ class Handler(BaseHTTPRequestHandler):
         if conv_path in ("/projects", "/projects/"):
             # Live projects view, computed from the life store on demand. No
             # static file, no extractor job — the .md frontmatter is the source
-            # and the triples fall out of the ~15 s qlever-dir rebuild.
+            # and the triples are indexed by qlever-dir's Markdown converter.
             try:
                 self._send_json(200, _fetch_projects())
             except Exception as exc:  # transport/parse — be honest, don't fake data

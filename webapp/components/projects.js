@@ -6,8 +6,8 @@
 //   GET /projects  ->  { generated, mine: [...], waiting: [...] }
 // which the gateway computes on demand with a SPARQL query over the "life"
 // triple store. The project frontmatter (type/currentActor/expectedBy/…) is the
-// single source of truth; qlever-dir's Markdown converter indexes it as triples
-// on the ~15 s rebuild, so there is no second representation to keep in sync.
+// single source of truth; qlever-dir's Markdown converter indexes it as triples,
+// so there is no second representation to keep in sync.
 //
 // Two modes, like conversations.js:
 //  - default: a compact dashboard card. "Your move" projects first, each with an
