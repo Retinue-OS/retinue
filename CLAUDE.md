@@ -946,13 +946,14 @@ Changes that alter how the system itself works. Always use a feature branch and 
 
 **How to PR the retinue repo from inside the container** (no research needed):
 
-The framework checkout is mounted read-write, so no `/tmp` clone is needed —
-branch, commit, and push straight from the live checkout. Always work on a
-feature branch; never leave `main` dirty on this checkout, since it is also
-what's deployed.
+The framework checkout is mounted read-write, so normally no `/tmp` clone is
+needed — branch, commit, and push straight from the live checkout, except in
+the third layout below, where a plain clone is the documented fallback. Always
+work on a feature branch; never leave `main` dirty on this checkout, since it
+is also what's deployed.
 
-**First, find where the framework checkout is.** Two mount layouts are both
-valid, depending on the deployment:
+**First, find where the framework checkout is.** Three mount layouts are
+possible, depending on the deployment:
 
 - **Bare framework** (default `docker-compose.yml`): the framework's own live
   checkout is mounted at `/workspace/deployment`. That directory *is* the
@@ -962,18 +963,33 @@ valid, depending on the deployment:
   **root** at `/workspace/deployment`): then `/workspace/deployment` is the
   private deployment repo, and the framework checkout is one level down at
   `/workspace/deployment/retinue`.
+- **Submodule mount without its parent's `.git`**: the framework is checked
+  out as a git submodule, but only the submodule's own directory is mounted —
+  its `.git` file points at a gitdir under the parent repo's
+  `.git/modules/...`, which isn't reachable inside this container. The files
+  land on disk at one of the two paths above, but neither is a usable git
+  checkout in place. When the detection below reports this, don't work around
+  it — clone into `/tmp` instead
+  (`git clone https://github.com/retinue-os/retinue /tmp/retinue-fix`) and
+  branch/commit/push/PR from there.
 
-Don't assume — detect. The framework dir is the one whose `origin` is
-`retinue-os/retinue`:
+Don't assume — detect by content, not by asking git: a checkout whose gitdir
+isn't mounted makes a git-based check (e.g. reading `origin`) fail silently
+rather than error, which is exactly the third layout above. The framework dir
+is whichever candidate has both `chambers.example.json` and `Dockerfile` at
+its root; fail loudly instead of defaulting if neither does, or if the
+resolved path isn't actually a usable git checkout:
 
 ```bash
-# Resolve the framework checkout regardless of layout:
-if git -C /workspace/deployment remote get-url origin 2>/dev/null | grep -q 'retinue-os/retinue'; then
-  FW=/workspace/deployment              # bare-framework layout
-else
-  FW=/workspace/deployment/retinue      # nested-deployment layout
-fi
-cd "$FW"
+# Resolve the framework checkout regardless of layout, by content — not by asking git:
+FW=
+for cand in /workspace/deployment /workspace/deployment/retinue; do
+  if [ -f "$cand/chambers.example.json" ] && [ -f "$cand/Dockerfile" ]; then FW=$cand; break; fi
+done
+[ -n "$FW" ] || { echo "error: no framework checkout under /workspace/deployment" >&2; exit 1; }
+git -C "$FW" rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "error: $FW is not a usable git checkout (gitdir not mounted?)" >&2; exit 1; }
+cd "$FW" || exit 1
 
 git config user.email "you@example.com" && git config user.name "Ara (Claude)"
 git checkout -b fix/my-change
@@ -992,7 +1008,7 @@ The repositories at a glance:
 
 | Repo | Mounted at | Purpose |
 |------|------------|---------|
-| framework — `retinue-os/retinue` (formerly `health-agents`) | baked into the image as `/workspace`; live checkout also RW-mounted — at `/workspace/deployment` (bare-framework layout) or `/workspace/deployment/retinue` (nested-deployment layout, where the deployment repo owns `/workspace/deployment`) | Infrastructure: core agents, skills, scripts, settings, Dockerfile, repo/plugin manifests |
+| framework — `retinue-os/retinue` (formerly `health-agents`) | baked into the image as `/workspace`; live checkout also RW-mounted — at `/workspace/deployment` (bare-framework layout) or `/workspace/deployment/retinue` (nested-deployment layout, where the deployment repo owns `/workspace/deployment`); if neither gitdir is reachable (submodule mount without its parent's `.git`), fall back to a `/tmp` clone | Infrastructure: core agents, skills, scripts, settings, Dockerfile, repo/plugin manifests |
 | each chamber — its own git repo | cloned or linked at startup as `/workspace/chambers/<name>` | That chamber's data, plus its `.retinue/` plugin (subagents, skills) and its `INSTRUCTIONS.md` |
 
 ## Notes on environment
