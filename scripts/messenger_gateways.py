@@ -97,6 +97,8 @@ def _extra_channel_gateways(log_prefix: str) -> dict:
         if not base_url:
             print(f"{log_prefix} MESSENGER_GATEWAYS entry has no base_url, skipping: {entry!r}", flush=True)
             continue
+        if entry.get("slug"):
+            print(f"{log_prefix} 'slug' is no longer read; ignoring {entry['slug']!r} for {base_url} — the slug is now the service hostname, verbatim", flush=True)
         slug = slug_from_base_url(base_url)
         if not slug:
             print(f"{log_prefix} could not derive a slug for {base_url}, skipping", flush=True)
