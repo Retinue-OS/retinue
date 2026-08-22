@@ -19,7 +19,7 @@ The three systems compared:
 | Memory | Git repositories (markdown + RDF triples), SPARQL queries over life data | Markdown files (`MEMORY.md` + daily notes), optional vector search | Agent-curated memory, SQLite FTS5 recall, Honcho user modeling |
 | Scheduling | Per-chamber `.schedule.json` + refresh dispatchers; each job a fresh session | Cron + heartbeat mechanism | Cron + heartbeat/daily-journal/weekly-review triggers |
 | Outbound message control | **Per-send human approval queue** (`/sends`), policy keyed by sending identity, fail-closed | Tool/exec approval gates; **no per-message approval queue** — sends go out as your real accounts | Approval checks exist but were found disabled in default container config (audit, Apr–May 2026) |
-| Credential placement | **Isolated per-channel gateway containers**; the model's context never holds keys | In the daemon's config/process on your machine (`~/.openclaw/`) | In the framework's config on your machine |
+| Credential placement | **Isolated per-channel gateway containers**; the model's context never holds messaging or mailbox keys | In the daemon's config/process on your machine (`~/.openclaw/`) | In the framework's config on your machine |
 | Setup effort | Highest: Docker Compose, ~30 env vars, Traefik, CA ceremonies, account linking per channel | `npm install -g openclaw` + onboarding wizard; hardening is on you | Install + config; runs on "a $5 VPS," Termux, serverless; six execution backends |
 | Cost | Your Claude subscription/API spend + a small always-on server | Free OSS + your API keys or subscription reuse + an always-on machine | Free OSS + your model spend (Nous Portal $0–200/mo, or open weights on your own GPU) |
 
@@ -181,10 +181,10 @@ on the user.
 
 **Retinue's approach** is architectural rather than reactive, three layers:
 
-1. *The model never holds credentials.* Signal/WhatsApp/Telegram keys and
-   mail passwords live in dedicated containers exposing thin token-gated
-   APIs; the entrypoint strips mail credentials from the agent's environment.
-   A prompt-injected session cannot leak keys it cannot read.
+1. *The model never holds messaging or mailbox credentials.* Signal/WhatsApp/
+   Telegram keys and mail passwords live in dedicated containers exposing thin
+   token-gated APIs; the entrypoint strips mail credentials from the agent's
+   environment. A prompt-injected session cannot leak keys it cannot read.
 2. *Outbound sends are governed per identity, fail-closed.* Every channel has
    an `allow`/`trust`/`verify` policy keyed by the *sending* account; an
    undeclared account defaults to `verify` (registered as pending, transmitted
@@ -257,10 +257,10 @@ features are also the sharpest edges (disable self-written skill trust,
 sandbox execution).
 
 **Choose Retinue if…** you are a self-hosting engineer whose non-negotiables
-are: credentials the model can never see, no message leaving as you without
-your click, and a life record kept as git repositories — and you accept a
-single-maintainer framework, Claude-centric operation, and a weekend (or
-three) of setup. Today that is a narrow audience; it matches the system's
+are: your account credentials the model can never see, no message leaving as
+you without your click, and a life record kept as git repositories — and you
+accept a single-maintainer framework, Claude-centric operation, and a weekend
+(or three) of setup. Today that is a narrow audience; it matches the system's
 actual origin as a personal deployment.
 
 **Consider none of the above if…** you would not run a server at all. A

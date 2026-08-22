@@ -44,9 +44,14 @@ nothing new.
   layer is telemetry. Making it a boundary requires an `internal: true` network
   or in-container firewall rules, and is tracked as a roadmap item.
 - **The main session runs with broad tool permissions while processing
-  untrusted input.** A hostile message cannot steal credentials and cannot
-  silently send messages, but it can induce the agent to read across mounted
-  chambers or write to them. Reduced-privilege triage is a roadmap item.
+  untrusted input.** A hostile message cannot read messaging or mailbox
+  credentials out of the agent's environment (other credentials the container
+  holds, such as a repo token or model-gateway keys, are not scrubbed the same
+  way), and an outbound send still has to clear the sending identity's policy
+  — but nothing authenticates who completes a pending `verify` approval, so
+  treat that as a workflow gate rather than a hard boundary. It can still
+  induce the agent to read across mounted chambers or write to them.
+  Reduced-privilege triage is a roadmap item.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.

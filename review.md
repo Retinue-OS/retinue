@@ -71,7 +71,7 @@ messaging credentials.** Signal keys, the WhatsApp session, the Telegram MTProto
 session, and SMTP/IMAP passwords live in dedicated containers; the agent talks
 to thin HTTP APIs. The entrypoint even strips `EMAIL_PASS*` from the agent's
 environment and routes `email_client.py` through the gateway
-([entrypoint.sh:397-402](scripts/entrypoint.sh#L397-L402)). Compare this with
+([entrypoint.sh:483-492](scripts/entrypoint.sh#L483-L492)). Compare this with
 the common pattern — an MCP server whose token sits in the same process tree as
 the model, or worse, credentials pasted into config the model can read — and
 this is a categorical improvement. A prompt-injected agent here cannot steal
