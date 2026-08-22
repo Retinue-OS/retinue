@@ -588,10 +588,12 @@ lives in `webapp/` (baked into the image):
   the app-launch buttons (`tel:`/`sms:`/`mailto:`/`geo:`/`intent://`).
 - `webapp/components/*.js` are web components that each fetch one JSON document
   and render it, degrading to the last cached state offline.
-- `webapp/data/*.json` is the curated content. **Refreshing these is Ara's job**
-  (a scheduler-driven curation job writes them; currently mock data). The server
-  serves them at `/data/` from `DASHBOARD_DATA_DIR` (default `webapp/data`),
-  kept separate from the baked shell so data can be written without rebuilding.
+- `webapp/data/*.json` is the curated content. The static data cards that
+  consume these files are commented out in `webapp/index.html` until a
+  scheduler-driven refresh job regenerates them. **Refreshing these is Ara's job**
+  (currently mock data). The server serves them at `/data/` from
+  `DASHBOARD_DATA_DIR` (default `webapp/data`), kept separate from the baked
+  shell so data can be written without rebuilding.
 - `webapp/sw.js` caches the shell so the dashboard and its local app-launch
   buttons (notably the dialer) keep working with no connectivity.
 
