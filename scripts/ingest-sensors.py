@@ -7,21 +7,45 @@ name) in the same directory. The graph name is synthesized at index-build time
 by the qlever-life service (qlever-dir), which derives it from the .nt
 file's path relative to the data directory (e.g. `<file:observations/.../foo.nt>`).
 
-Run from repo root:
-    python3 scripts/ingest-sensors.py
+Run pointed at a chamber holding observations/ (the framework checkout itself
+has none, so there is no safe default to fall back to):
+    python3 scripts/ingest-sensors.py --chamber /workspace/chambers/<chamber>
+    # or: CHAMBER_DIR=/workspace/chambers/<chamber> python3 scripts/ingest-sensors.py
 
 Ontology used:
     SOSA  http://www.w3.org/ns/sosa/
     RDF   http://www.w3.org/1999/02/22-rdf-syntax-ns#
     XSD   http://www.w3.org/2001/XMLSchema#
 """
+import argparse
 import csv
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
-REPO_ROOT = Path(os.environ.get("CHAMBER_DIR", Path(__file__).resolve().parent.parent))
+
+def resolve_root() -> Path:
+    """Resolve the chamber root holding observations/, failing loudly instead of
+    silently defaulting to the framework checkout.
+
+    The old default (`CHAMBER_DIR` or the framework root) made a missing
+    chamber indistinguishable from an empty inbox: 0 observations, exit 0.
+    """
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--chamber", help="chamber root holding observations/ (default: $CHAMBER_DIR)")
+    args = ap.parse_args()
+    root = args.chamber or os.environ.get("CHAMBER_DIR")
+    if not root:
+        sys.exit(
+            "ingest-sensors: no chamber given. Pass --chamber DIR or set CHAMBER_DIR.\n"
+            "This script reads <chamber>/observations/clinical/sensors/*; the framework "
+            "checkout has no observations/ directory."
+        )
+    p = Path(root)
+    if not (p / "observations").is_dir():
+        sys.exit(f"ingest-sensors: {p}/observations does not exist -- wrong chamber root?")
+    return p
 
 # --- Namespace shortcuts --------------------------------------------------
 
@@ -45,6 +69,7 @@ PROP_STRESS     = "urn:health:property:stress-level"
 PROP_SPO2       = "urn:health:property:spo2"
 PROP_BODY_BATT  = "urn:health:property:body-battery"
 PROP_SKIN_TEMP  = "urn:health:property:skin-temperature"
+PROP_PUSHES     = "urn:health:property:wheelchair-push-count"
 
 # --- NT helpers -----------------------------------------------------------
 
@@ -145,6 +170,7 @@ GARMIN_COLUMNS = {
     "SpO2":          PROP_SPO2,
     "BodyBattery":   PROP_BODY_BATT,
     "SkinTemp":      PROP_SKIN_TEMP,
+    "Pushes":        PROP_PUSHES,
 }
 
 
@@ -208,8 +234,9 @@ def write_nt(csv_path: Path, triples: list[str]):
 
 def main():
     total_obs = 0
+    root = resolve_root()
 
-    ckm_dir = REPO_ROOT / "observations/clinical/sensors/ckm"
+    ckm_dir = root / "observations/clinical/sensors/ckm"
     for p in sorted(ckm_dir.glob("*.csv")):
         print(f"  CKM  {p.name} ...", end=" ", flush=True)
         triples = extract_ckm(p)
@@ -218,7 +245,7 @@ def main():
         total_obs += n
         print(f"{n} observations")
 
-    cgm_dir = REPO_ROOT / "observations/clinical/sensors/cgm"
+    cgm_dir = root / "observations/clinical/sensors/cgm"
     for p in sorted(cgm_dir.glob("glucose_*.csv")):
         print(f"  CGM  {p.name} ...", end=" ", flush=True)
         triples = extract_cgm(p)
@@ -227,16 +254,16 @@ def main():
         total_obs += n
         print(f"{n} observations")
 
-    wearable_dir = REPO_ROOT / "observations/clinical/sensors/wearable"
+    wearable_dir = root / "observations/clinical/sensors/wearable"
     for p in sorted(wearable_dir.glob("ultrahuman*.csv")):
         print(f"  UH   {p.name} ...", end=" ", flush=True)
         triples = extract_ultrahuman(p)
         write_nt(p, triples)
-        n = len(triples) // 10
+        n = len(triples) // 5
         total_obs += n
         print(f"{n} observations")
 
-    garmin_dir = REPO_ROOT / "observations/clinical/sensors/garmin"
+    garmin_dir = root / "observations/clinical/sensors/garmin"
     if garmin_dir.exists():
         for p in sorted(garmin_dir.glob("garmin-daily-*.csv")):
             print(f"  GAR  {p.name} ...", end=" ", flush=True)
