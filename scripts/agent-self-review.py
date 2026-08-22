@@ -33,9 +33,11 @@ ENDPOINT = os.environ.get("SPARQL_ENDPOINT_LIFE", "http://qlever-life:7001")
 CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 
-# One query answers the whole gate: unresolved projects whose current actor is
-# typed as an AI agent. FILTER NOT EXISTS handles projects with no `resolved`
-# triple at all (the common case) as well as `resolved = false`.
+# One query answers the whole gate: unresolved, unpaused projects whose current
+# actor is typed as an AI agent. FILTER NOT EXISTS handles projects with no
+# `resolved` triple at all (the common case) as well as `resolved = false`, and
+# the same for `paused` -- a project explicitly parked with `paused: true`
+# (recurring-projects.py's resting state) is not the sweep's business either.
 QUERY = f"""
 PREFIX kb: <{KB}>
 SELECT ?project ?actor ?actorName ?title ?nextAction ?waitingSince WHERE {{
@@ -46,6 +48,7 @@ SELECT ?project ?actor ?actorName ?title ?nextAction ?waitingSince WHERE {{
     OPTIONAL {{ ?project kb:currentNextAction ?nextAction }}
     OPTIONAL {{ ?project kb:waitingSince ?waitingSince }}
     FILTER NOT EXISTS {{ ?project kb:resolved true }}
+    FILTER NOT EXISTS {{ ?project kb:paused true }}
   }}
   ?actor a kb:AiAgent .
   OPTIONAL {{ ?actor kb:name ?actorName }}
