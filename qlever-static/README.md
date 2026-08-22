@@ -32,5 +32,5 @@ automatically. To rebuild:
 
 ```bash
 docker compose exec qlever-genomics sh -c 'rm -rf /index/*'
-docker compose restart qlever-genomics
+docker compose up -d --force-recreate qlever-genomics
 ```
