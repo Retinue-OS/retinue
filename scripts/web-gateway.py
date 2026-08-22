@@ -1568,13 +1568,18 @@ def _new_conv(initiator: str, owner: str, title: str | None,
               first_attachments=None, kind: str = "chat",
               project: str | None = None,
               project_title: str | None = None,
-              model: str | None = None) -> dict:
+              model: str | None = None,
+              agent: str | None = None) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cid = uuid.uuid4().hex
     first_msg = {"role": first_role, "text": first_text, "ts": now}
     atts = _store_attachments(cid, first_attachments or [])
     if atts:
         first_msg["attachments"] = atts
+    if agent:
+        # Overrides the displayed sender name (e.g. "Coach") when a relay
+        # opens a thread on a subagent's behalf — see _conv_add_message.
+        first_msg["agent"] = agent
     conv = {
         "id": cid,
         "title": title or _derive_title(first_text),
@@ -3738,6 +3743,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         owner = _extract_on_behalf_of(payload) or DEFAULT_SESSION_KEY
         title = (payload.get("title") or "").strip() or None
+        # Overrides the displayed sender name (e.g. "Coach") when a relay
+        # opens the thread on a subagent's behalf.
+        agent = (payload.get("agent") or "").strip() or None
         # Agents may open a "cowork" thread — the Ask-Ara MCP connector's audit
         # trail. Like edit threads it stays out of the default listing; unlike
         # them it is a record rather than a request, so it is normally quiet
@@ -3749,7 +3757,7 @@ class Handler(BaseHTTPRequestHandler):
         quiet = bool(payload.get("quiet"))
         conv = _new_conv("agent", owner, title, "agent", message,
                          first_attachments=payload.get("attachments"),
-                         kind=kind)
+                         kind=kind, agent=agent)
         body = {"id": conv["id"], "title": conv["title"]}
         if quiet:
             _conv_set_flags(conv["id"], unread=False)
@@ -3786,8 +3794,12 @@ class Handler(BaseHTTPRequestHandler):
         # A non-quiet append is news for the user, so it wakes an archived
         # thread (unless muted): otherwise the message lands unread in a thread
         # that no longer appears in the active list, and is never seen.
+        # `agent` overrides the displayed sender name (e.g. "Coach") when a
+        # relay answers on a subagent's behalf — this is that relay path.
+        agent = (payload.get("agent") or "").strip() or None
         conv = _conv_add_message(cid, "agent", message, unread=not quiet,
-                                 attachments=attachments, wake=not quiet)
+                                 attachments=attachments, wake=not quiet,
+                                 agent=agent)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return

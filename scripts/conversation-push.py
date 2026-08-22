@@ -81,6 +81,9 @@ def main() -> int:
                         help="unmute --thread")
     parser.add_argument("--on-behalf-of", dest="on_behalf_of",
                         help="requester identity that owns the thread (defaults to the dashboard user)")
+    parser.add_argument("--agent",
+                        help="subagent name to show as the message sender (e.g. Coach), "
+                             "when a relay answers on its behalf")
     parser.add_argument("--attach", action="append", default=[], metavar="PATH",
                         help="attach a file the user can download from the thread (repeatable)")
     parser.add_argument("--url", default=None, help=f"endpoint URL (default {DEFAULT_URL})")
@@ -126,6 +129,8 @@ def main() -> int:
             payload["muted"] = args.muted
     else:
         payload["message"] = message
+        if args.agent:
+            payload["agent"] = args.agent
     if args.title:
         payload["title"] = args.title
     if args.on_behalf_of:
