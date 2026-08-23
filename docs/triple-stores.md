@@ -20,10 +20,14 @@ You edit a file, commit it, and the store catches up.
 The `qlever-life` service (built from the [qlever-dir](https://github.com/retinue-os/qlever-dir)
 submodule) mounts the shared chambers volume read-only at `/data` and indexes
 **every** RDF file it finds — `.nt`, `.ttl`, `.n3` — across every mounted
-chamber. It watches the tree with inotify and rebuilds **blue-green**: the new
-index is built into an idle slot, health-checked, and only then does nginx swing
-traffic over. A failed build leaves the previous index serving. There is no
-downtime and no window in which the store is half-updated.
+chamber. It watches the tree with inotify. An ordinary content change to a
+single file is applied **straight to the live index** via SPARQL Update a couple
+of seconds later (`INCREMENTAL_DELAY`, default 2) — a whole-graph replace in one
+request, so the graph never reads empty in between. Only a structural change, or
+enough accumulated deltas to warrant compaction, triggers a full **blue-green**
+rebuild: the new index is built into an idle slot, health-checked, and only then
+does nginx swing traffic over. A failed build leaves the previous index serving.
+There is no downtime and no window in which the store is half-updated.
 
 Each file's triples land in a named graph derived from the file's path:
 
@@ -168,19 +172,21 @@ The same trick generalizes. Contact lists, reading lists, meeting notes, expense
 records — anything with a bit of frontmatter becomes joinable with everything
 else in the store.
 
-> **Caveat, honestly stated:** until 2026-08-20, the inotify watcher fired only
+> **History, honestly stated:** until 2026-08-20 the inotify watcher fired only
 > on `.nt`/`.ttl`/`.n3` changes, while the index build *does* process converter
 > extensions like `.md` — so a frontmatter edit was picked up only on the next
-> rebuild triggered by some other RDF change, or at container restart, not
-> within the usual tens of seconds
-> ([qlever-dir#3](https://github.com/retinue-os/qlever-dir/issues/3)). Fixed
-> upstream by [qlever-dir#13](https://github.com/Retinue-OS/qlever-dir/pull/13):
-> the watcher now triggers directly on a file whose extension has a declared
-> converter, and on a change to the `.qlever/converters.json` that declares it,
-> so a frontmatter edit reaches the tens-of-seconds path like any other change.
-> That depends on running a `qlever-dir` build that includes the fix — worth
-> checking your own deployment's image if a projects card still looks stale
-> longer than that.
+> rebuild triggered by some other RDF change, or at container restart
+> ([qlever-dir#3](https://github.com/retinue-os/qlever-dir/issues/3)). That is
+> fixed: the watcher triggers on any file whose extension has a declared
+> converter, and on a change to the `.qlever/converters.json` (or
+> `.qleverignore`) that decides which files are indexed at all.
+>
+> A converter-extension edit now takes the same fast path as a native RDF one:
+> it is applied incrementally, so an edited project file is queryable a couple
+> of seconds later rather than after a rebuild. Both properties depend on the
+> pinned `qlever-dir` submodule — check `git -C qlever-dir log -1` before
+> trusting either claim about your own deployment, since a stale pin behaves
+> exactly like the paragraph above.
 
 ### Big CSVs from sensors → a decade of readings, one query away
 

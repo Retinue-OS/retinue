@@ -38,8 +38,8 @@ Defines these core compose services:
   input), so exactly one ASR model is loaded system-wide.
 - **`qlever-life`** — a live SPARQL endpoint over the shared chambers volume,
   served by [qlever-dir](https://github.com/retinue-os/qlever-dir) (included as a
-  submodule). Every chamber's RDF files are indexed equally; rebuilds
-  automatically on filesystem changes. See
+  submodule). Every chamber's RDF files are indexed equally; a file change is
+  applied to the live index within seconds. See
   [`docs/triple-stores.md`](docs/triple-stores.md) for what this makes possible
   — querying Markdown frontmatter, sensor CSVs at scale, and why some data gets
   its own store. For a worked look at the named-graph half of that design, with
@@ -699,13 +699,14 @@ remote-control client.
    `.qlever/converters.json`, which is how Markdown frontmatter becomes
    queryable — all chambers equally, and serves it on `qlever-life:7001`
    (network; publish a host port via the deployment override). It watches for
-   filesystem changes and rebuilds blue-green; new data is queryable in tens
-   of seconds (measured 15–25 s across six rebuilds of a small chamber,
-   2026-07-19 and 2026-07-25 — it grows with the chamber, so measure your own
-   if it matters).
-   Note that only a change to a *native RDF* file currently starts that clock:
-   a Markdown edit waits for an unrelated RDF change or a restart
-   ([qlever-dir#3](https://github.com/retinue-os/qlever-dir/issues/3)).
+   filesystem changes: an ordinary edit to one file — native RDF or a declared
+   converter extension alike — is applied to the live index via SPARQL Update
+   about two seconds later, so new data is queryable almost immediately. A
+   structural change, or enough accumulated deltas to warrant compaction,
+   triggers a full blue-green rebuild instead; that takes tens of seconds
+   (measured 15–25 s across six rebuilds of a small chamber, 2026-07-19 and
+   2026-07-25 — it grows with the chamber, so measure your own if it matters)
+   and costs no downtime.
 5. Git hooks are installed in every chamber that is a git repository.
 6. For every chamber with a `.refresh.json`, the background refresh dispatcher
    is started (see `scripts/refresh.py`).
