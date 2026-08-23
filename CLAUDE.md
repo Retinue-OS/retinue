@@ -157,12 +157,9 @@ also invoices, events, and other small records). It is built from the
 volume, which QLever mounts read-only at `/data`) by
 [qlever-dir](https://github.com/retinue-os/qlever-dir). Each file's triples are
 placed in a named graph `<file:relative/path.nt>` (relative to the chambers
-root). A change to one file's **content** — a native RDF file or a file with a
-declared converter, e.g. Markdown frontmatter — is queryable a couple of seconds
-after the write. A *structural* change (a new/removed directory, an edited
-`.qlever/converters.json` or `.qleverignore`) takes tens of seconds instead.
-Neither causes downtime, and no query ever sees a half-updated store; how that
-is achieved is `docs/triple-stores.md`'s business, not yours.
+root). An edited file is queryable seconds later; a structural change (adding or
+removing a directory, editing `.qlever/converters.json` or `.qleverignore`)
+takes tens of seconds. No downtime, and never a half-updated read.
 
 A deployment may run additional, specialist stores as extra compose services in
 its override — for example a static endpoint over one large, rarely-changing
