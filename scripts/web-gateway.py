@@ -1759,8 +1759,43 @@ def _conv_attachment_note(conv: dict, msg: dict) -> str:
             f"({att.get('content_type', 'application/octet-stream')}, "
             f"{att.get('size', 0)} bytes) — saved at {path}"
         )
-    return ("\n\nThe user attached the following file(s); read them from disk if "
+    who = "The user" if msg.get("role") == "user" else "This message"
+    return (f"\n\n{who} attached the following file(s); read them from disk if "
             "relevant (you run in the same container):\n" + "\n".join(lines))
+
+
+# How a message's author is named when a transcript is replayed to Ara.
+_CONV_ROLE_LABEL = {"user": "User", "assistant": "You (Ara)", "agent": "Retinue agent"}
+
+
+def _conv_render_messages(conv: dict, messages: list) -> str:
+    """Render messages as a labelled transcript, each with its attachments."""
+    return "\n".join(
+        f"{_CONV_ROLE_LABEL.get(m.get('role'), m.get('role'))}: "
+        f"{m.get('text', '')}{_conv_attachment_note(conv, m)}"
+        for m in messages
+    )
+
+
+def _conv_unseen_messages(messages: list) -> list:
+    """The tail of the thread a still-running session has not been shown.
+
+    A resumed session holds everything up to and including its own last reply,
+    so anything appended after that last `assistant` message is new to it: the
+    user message that triggers this turn, and — the case this exists for — any
+    message an agent pushed into the thread meanwhile
+    (`conversation-push.py --thread`, triage, a gateway alert). Those used to be
+    dropped: the fresh path sent only the latest user message, so a reply the
+    user based on a pushed message read as a non-sequitur, and only the 1-hour
+    session expiry (which replays the whole transcript) ever surfaced them.
+
+    With no `assistant` message to anchor on we cannot tell what the session
+    saw, so we fall back to the latest message alone rather than risk replaying
+    a whole thread the session already holds."""
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            return messages[i + 1:]
+    return messages[-1:]
 
 
 def _conv_project_note(conv: dict) -> str:
@@ -1800,29 +1835,38 @@ def _conv_project_note(conv: dict) -> str:
 def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     """Build the prompt for Ara's next turn in a thread.
 
-    When the Claude session is still fresh we send just the latest user message
-    (Claude already holds the context, including any project note sent on the
-    first turn). Otherwise — a new or expired session, or an agent-initiated
-    thread Ara has never seen — we replay the transcript so Ara has full
-    context."""
+    When the Claude session is still fresh we send the messages appended since
+    its own last reply (Claude already holds everything before that, including
+    any project note sent on the first turn) — normally just the latest user
+    message, but any message pushed into the thread meanwhile comes with it.
+    Otherwise — a new or expired session, or an agent-initiated thread Ara has
+    never seen — we replay the transcript so Ara has full context."""
     messages = conv.get("messages", [])
     latest_msg = messages[-1] if messages else {}
     latest = latest_msg.get("text", "")
     note = _conv_attachment_note(conv, latest_msg)
     if fresh:
-        return (latest + note) or latest
-    who = {"user": "User", "assistant": "You (Ara)", "agent": "Retinue agent"}
-    transcript = "\n".join(
-        f"{who.get(m.get('role'), m.get('role'))}: {m.get('text', '')}"
-        for m in messages
-    )
+        unseen = _conv_unseen_messages(messages)
+        if len(unseen) <= 1:
+            return (latest + note) or latest
+        return (
+            "These messages arrived in this thread since your last reply, "
+            "oldest first — you have not seen them yet:\n\n"
+            + _conv_render_messages(conv, unseen) + "\n\n"
+            "Reply to the user's latest message in your own voice, taking the "
+            "others into account. If they approve a concrete action, carry it "
+            "out with your tools and confirm what you did."
+        )
+    # The transcript already carries each message's own attachment note, so the
+    # latest message's files need no second mention here.
+    transcript = _conv_render_messages(conv, messages)
     return (
         "You are Ara, continuing a conversation tab in the Retinue dashboard. "
         "Here is the conversation so far:\n\n" + transcript + "\n\n"
         "Reply to the user's latest message in your own voice. If they approve a "
         "concrete action (e.g. updating the agenda, sending a reply, declining an "
         "invitation), carry it out with your tools and confirm what you did."
-        + _conv_project_note(conv) + note
+        + _conv_project_note(conv)
     )
 
 
@@ -2700,8 +2744,10 @@ def send_message(message: str, display_question: str | None = None,
     keys run in parallel up to the worker-pool bound.
 
     `model` overrides the model for this turn (a validated per-thread choice);
-    when None the gateway's configured default (CLAUDE_MODEL) applies. Since each
-    turn is a fresh `claude -p`, switching models between turns is free.
+    when None the gateway's configured default (CLAUDE_MODEL) applies. A turn
+    resumes the thread's existing session when one is still fresh, so switching
+    models between turns is free not because the session is new but because a
+    session transcript is model-independent.
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
