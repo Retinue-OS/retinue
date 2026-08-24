@@ -39,6 +39,17 @@ the INBOX, no status record — because triage still has to see it. Re-filing it
 on the next tick is a no-op: feed item ids are a hash of the content, and the
 store skips ids it already holds.
 
+**What arms the gate is new work, not unread mail.** Triage deliberately never
+touches mailbox flags — ``unread ≠ unhandled``, the status store is the single
+source of handled-state — so a message it has already classified keeps sitting
+unread in the INBOX until its disposition is executed, which for an omnibus
+batch means waiting on the user's approval. Keying the spawn on "is anything
+unread" therefore re-spawns a session on every tick over the same settled stack,
+and each of those sessions is a fresh chance for a stray Phase-5 nudge. So the
+gate honours the rule it writes: only messages with **no status record** arm it.
+Once armed, the payload still carries every routed message, recorded ones
+included, so reconciliation and Phase 5 see the same set as before.
+
 Sender whitelist and group policy both live in ``triage_policy.py``, persisted as
 N-Triples the life store indexes. The gate reads them off disk; only the daily
 run writes (the whitelist it derives from Sent). See
@@ -335,6 +346,25 @@ def route(unread: list[dict], mode: str) -> list[dict]:
     return keep
 
 
+def _already_recorded(msg: dict) -> bool:
+    """True when triage has already written a status record for this message.
+
+    Any record at all counts — `proposed`, `engaged`, `omnibus_pending`,
+    `resolved`. They differ in what is still owed, but none of them is *new*
+    work, and only new work justifies spending a model turn.
+    """
+    path = _status_path(msg.get("message_id") or "")
+    return bool(path and path.exists())
+
+
+def arming(messages: list[dict]) -> list[dict]:
+    """The subset of `messages` that justifies a spawn: the ones triage has
+    never seen. Everything else is settled as far as the gate is concerned and
+    is merely waiting on the user or on an execution step — it must not keep
+    re-spawning a session for as long as it stays in the INBOX."""
+    return [m for m in messages if not _already_recorded(m)]
+
+
 def build_prompt(mode: str, messages: list[dict]) -> str:
     scope = (
         "from a whitelisted sender"
@@ -385,6 +415,14 @@ def run_frequent() -> int:
             file=sys.stderr,
         )
         return 0
+    fresh = arming(hits)
+    if not fresh:
+        print(
+            f"[triage-gate] frequent: {len(hits)} whitelisted, all already in the "
+            "status store; nothing spawned",
+            file=sys.stderr,
+        )
+        return 0
     return spawn("frequent", hits)
 
 
@@ -396,6 +434,11 @@ def run_daily() -> int:
     if not hits:
         print("[triage-gate] daily: nothing unread that triage owes a look; "
               "nothing spawned", file=sys.stderr)
+        return 0
+    fresh = arming(hits)
+    if not fresh:
+        print(f"[triage-gate] daily: {len(hits)} unread, all already in the "
+              "status store; nothing spawned", file=sys.stderr)
         return 0
     return spawn("daily", hits)
 
