@@ -238,8 +238,16 @@ credits):
    flag, so a read-only newsletter can never buy a model turn while a list one
    answers on still reaches triage.
 3. Dedup by message-id against the existing triage status (same sanitized
-   id-scheme triage already uses).
-4. Keep only whitelisted senders → spawn the model for those.
+   id-scheme triage already uses). A message that already has a status record
+   is **not new work** and does not arm the gate — whatever its status. Triage
+   never marks mail read (`unread ≠ unhandled`), so a classified message stays
+   unread in the INBOX until its disposition is executed, which for an omnibus
+   batch means waiting on the user; without this step every tick would re-spawn
+   a session over the same settled stack.
+4. Keep only whitelisted senders → spawn the model for those. The spawn payload
+   still carries every routed message, recorded ones included, so the session
+   reconciles and nudges over the same set as before — only the *decision to
+   spawn* is narrowed.
 5. The **daily** job runs for **any** sender (fixed morning hour, before the
    briefing).
 

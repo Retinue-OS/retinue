@@ -454,6 +454,80 @@ def test_whitelisted_sender_beats_an_ignored_list():
     print("PASS test_whitelisted_sender_beats_an_ignored_list")
 
 
+def _record(gate, message_id, status="omnibus_pending"):
+    """Write a triage status file for `message_id`, as a triage run would."""
+    path = gate._status_path(message_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"status": status, "message_id": message_id}))
+
+
+def test_recorded_mail_does_not_arm_the_gate():
+    # Triage never marks mail read, so everything it classified stays unread in
+    # the INBOX until its disposition is executed. Without this, every tick
+    # re-spawns a session over the same settled stack.
+    for status in ("proposed", "engaged", "omnibus_pending", "resolved"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = _fresh(tmp)
+            gate.tp.write_if_changed(
+                gate.tp.render_email_whitelist(set(), {"*@work.com"}),
+                gate.tp.email_whitelist_path(),
+            )
+            gate.unread_inbox = lambda: [
+                {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+            ]
+            _record(gate, "<a@work.com>", status)
+            rec = Recorder()
+            gate.spawn = rec
+            assert gate.run_frequent() == 0
+            assert rec.calls == [], f"spawned over a message already {status}"
+            gate.refresh_whitelist_from_sent = lambda: 0
+            assert gate.run_daily() == 0
+            assert rec.calls == [], f"daily spawned over a message already {status}"
+    print("PASS test_recorded_mail_does_not_arm_the_gate")
+
+
+def test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones():
+    # Narrowing what *arms* the gate must not narrow what the session sees:
+    # reconciliation and Phase 5 still need the whole routed set.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.tp.write_if_changed(
+            gate.tp.render_email_whitelist(set(), {"*@work.com"}),
+            gate.tp.email_whitelist_path(),
+        )
+        gate.unread_inbox = lambda: [
+            {"from": "boss@work.com", "subject": "old", "message_id": "<a@work.com>"},
+            {"from": "boss@work.com", "subject": "new", "message_id": "<b@work.com>"},
+        ]
+        _record(gate, "<a@work.com>")
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert len(rec.calls) == 1, "one new message should have armed the gate"
+        ids = {m["message_id"] for m in rec.calls[0][1]}
+        assert ids == {"<a@work.com>", "<b@work.com>"}, f"payload narrowed: {ids}"
+    print("PASS test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones")
+
+
+def test_message_without_an_id_always_arms():
+    # No Message-ID means no status file can ever exist for it, so it must fall
+    # on the side of getting a look rather than being silently skipped.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.tp.write_if_changed(
+            gate.tp.render_email_whitelist(set(), {"*@work.com"}),
+            gate.tp.email_whitelist_path(),
+        )
+        gate.unread_inbox = lambda: [
+            {"from": "boss@work.com", "subject": "s", "message_id": ""}
+        ]
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert len(rec.calls) == 1, "an id-less message must still arm the gate"
+    print("PASS test_message_without_an_id_always_arms")
+
+
 if __name__ == "__main__":
     test_frequent_spawns_only_for_whitelisted()
     test_frequent_no_whitelisted_no_spawn()
@@ -470,4 +544,7 @@ if __name__ == "__main__":
     test_news_and_quieted_is_filed_but_left_for_triage()
     test_wildcard_covers_the_lists_under_a_platform_domain()
     test_whitelisted_sender_beats_an_ignored_list()
+    test_recorded_mail_does_not_arm_the_gate()
+    test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones()
+    test_message_without_an_id_always_arms()
     print("all triage-gate tests passed")
