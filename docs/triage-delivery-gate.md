@@ -305,7 +305,7 @@ store; a read-only query of either changes nothing.
 
 | Class | forward | held `delivered` | drained daily |
 |---|---|---|---|
-| whitelisted handle | yes (marked delivered) | — | — |
+| whitelisted handle | yes (delivered once the job succeeds) | — | — |
 | unknown, normal group | yes, flagged unknown | — | — |
 | blacklisted handle | no | `false` | yes |
 | unknown, quieted group | no | `false` | yes |
@@ -320,6 +320,19 @@ queryable, but no model ever looks at it unprompted).
   `GET /undelivered?since=…`, processes the returned messages; the flag flips as
   a side effect of the fetch, so a re-run is naturally idempotent. It does **not**
   read undelivered over SPARQL (that wouldn't clear the flag).
+
+**Forwarded ≠ delivered.** A forward POSTs the message with `async: true`, and
+the retinue gateway answers **202 Accepted** with a `job_url` — acceptance, not
+completion. So the flip waits for that job: `job_delivery.confirm_delivery`
+polls `GET <job_url>` on a daemon thread and calls `mark_delivered` **only** on
+`status: "done"`. `status: "error"`, a 404 (the in-memory job record expired
+before the turn finished), and the poll deadline all leave `delivered: false`,
+so the daily drain re-surfaces the message. Without this, a triage turn that
+died — an upstream model outage, a crashed session — left the message on record
+as delivered and nothing ever looked at it again: a silent loss, exactly what
+the never-drop invariant exists to prevent. A gateway that answers
+synchronously (no `job_url`) is marked delivered at once, since the turn has
+already run by then.
 
 **No-action-class messages** (status updates, voice-note echoes, the
 daily-briefing self-echo, note-to-self, and unknown senders in an **ignored**
