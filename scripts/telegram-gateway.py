@@ -615,7 +615,9 @@ async def _async_recent_dialogs(limit: int) -> list:
             "chat_id": getattr(dialog, "id", None),
             "username": getattr(entity, "username", None),
             "name": dialog.name or None,
-            "is_group": bool(getattr(dialog, "is_group", False)),
+            # Same shared-chat notion as _is_shared_chat: a broadcast channel is
+            # is_channel, not is_group, but it is no more a 1:1 than a group is.
+            "is_group": _is_shared_chat(dialog),
             "last_seen": None,
         })
     return out
@@ -700,13 +702,28 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
         _handle_control_message(text, lang, str(chat_id), sender, files=files)
 
 
+def _is_shared_chat(event) -> bool:
+    """True when the message arrived in a shared chat rather than a 1:1.
+
+    Telethon splits what the delivery gate treats as one thing: a (super)group
+    is ``is_group``, while a **broadcast channel** is ``is_channel`` and *not*
+    ``is_group``. Both are addressed by their chat_id and are never a private
+    conversation, so both must carry a group id — that id is what the policy
+    flags (news / quieted / ignored) match on. Reading ``is_group`` alone made
+    every channel post look like a 1:1: no group id, so a news channel could
+    neither reach the feed nor be quieted, and each post cost an unknown-sender
+    prompt and a model turn.
+    """
+    return bool(getattr(event, "is_group", False)) or bool(getattr(event, "is_channel", False))
+
+
 async def _on_new_message(event) -> None:
     """Telethon NewMessage handler. Extracts fields, then offloads the blocking
     dispatch (retinue call + reply) to a worker thread so the loop stays free."""
     try:
         message = event.message
         chat_id = event.chat_id
-        is_group = bool(getattr(event, "is_group", False))
+        is_group = _is_shared_chat(event)
         try:
             sender_entity = await event.get_sender()
         except Exception:  # noqa: BLE001
