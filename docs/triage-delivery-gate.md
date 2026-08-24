@@ -167,6 +167,13 @@ A group carries up to three flags, all set through Ara's policy editor:
   (accounted for, never drained). This is the strong "don't bother me" flag,
   seeded with known no-action groups from day one.
 
+"Group" here means **any shared chat**, not only a group proper: a Telegram
+broadcast channel is one too, and is the typical `news` source. The gateway has
+to say so explicitly, because Telethon reports a channel as `is_channel` and
+*not* `is_group` — reading `is_group` alone leaves a channel post with no group
+id, so none of these flags can match and every post arrives as if it were a
+private message from an unknown sender.
+
 `quieted` and `ignored` are mutually exclusive (a group is one or the other, or
 neither); `news` is independent and combines with either. The legacy
 `triageBlockedGroup` predicate is read as `ignored`, so a policy file written
