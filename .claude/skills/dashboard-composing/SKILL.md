@@ -26,7 +26,7 @@ principles:
 
 The dashboard is used on a phone: every tap saved matters, and long raw URLs
 wrap over several lines and are unreadable when a thread is skimmed or read
-aloud. Hence the four principles below.
+aloud. Hence the five principles below.
 
 ## 1. Every offered option gets a chip
 
