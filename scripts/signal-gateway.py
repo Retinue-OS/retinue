@@ -28,6 +28,7 @@ from reply_tokens import ReplyTokenStore
 import inbound_store as _ibstore
 import triage_policy as _triage
 import news_ingest as _news
+import job_delivery as _jobs
 
 SIGNAL_ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "").strip()
 
@@ -243,6 +244,26 @@ def _mark_delivered(store_path) -> None:
         _ibstore.mark_delivered(store_path)
     except Exception as exc:
         print(f"[signal-gateway] could not mark inbound delivered: {exc}", flush=True)
+
+
+def _confirm_delivery(job_path: str, store_path, label: str) -> None:
+    """Mark a forwarded inbound delivered once its triage job reports success.
+
+    Polls in the background (see job_delivery): a job that errors, expires or
+    never finishes leaves delivered=False, so the daily drain retries it.
+    """
+    if store_path is None:
+        return
+    _jobs.confirm_delivery(
+        urljoin(RETINUE_GATEWAY_URL, job_path),
+        lambda: _mark_delivered(store_path),
+        log=lambda msg: print(f"[signal-gateway] {label}: {msg}", flush=True),
+        timeout=RETINUE_GATEWAY_TIMEOUT,
+        interval=RETINUE_POLL_INTERVAL,
+        interval_max=RETINUE_POLL_INTERVAL_MAX,
+        backoff=RETINUE_POLL_BACKOFF,
+        http_timeout=RETINUE_POLL_HTTP_TIMEOUT,
+    )
 
 
 def _retain_media(src_path):
@@ -1427,6 +1448,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     if files:
         payload["files"] = files
     forwarded = False
+    job_path = None
     try:
         response = requests.post(
             RETINUE_GATEWAY_URL,
@@ -1435,6 +1457,10 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         )
         response.raise_for_status()
         forwarded = True
+        try:
+            job_path = ((response.json() or {}).get("job_url") or "").strip() or None
+        except ValueError:
+            job_path = None
         print(f"[signal-gateway] forwarded inbox message from {sender_label} to triage ({gate['reason']})", flush=True)
     except requests.exceptions.Timeout:
         print(f"[signal-gateway] timeout forwarding inbox message from {sender_label}", flush=True)
@@ -1444,13 +1470,19 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     except requests.exceptions.RequestException as exc:
         print(f"[signal-gateway] connection error forwarding inbox message from {sender_label}: {exc}", flush=True)
 
-    # Flip the persisted message's delivered flag to reflect reality: a message
-    # handed to triage is delivered; one whose forward failed stays delivered=False
-    # (as written up front) so the daily drain retries it. At-least-once: a crash
-    # between the forward and this flip may re-surface the message on the next
-    # drain, which is the safe direction — a rare duplicate beats a silent loss.
+    # Flip the persisted message's delivered flag only once triage has actually
+    # run. The POST answers 202 (accepted), not "handled": marking delivered on
+    # acceptance would hide a job that later fails from the daily drain, losing
+    # the message. So an async forward waits for `status: done` in the
+    # background; a failed forward, and any job that errors, expires or times
+    # out, stays delivered=False so the drain retries it. At-least-once: a
+    # duplicate triage on the next drain beats a silent loss.
     if forwarded:
-        _mark_delivered(store_path)
+        if job_path:
+            _confirm_delivery(job_path, store_path, sender_label)
+        else:
+            # No job id — the gateway answered synchronously, so the turn ran.
+            _mark_delivered(store_path)
 
 
 

@@ -30,11 +30,14 @@ forward — a blacklisted or no-action-class sender is written straight to
 ``delivered: true`` (already accounted for, never drained). A message that *is*
 forwarded takes the never-drop path: the gateway writes it ``delivered: false``
 the instant it arrives (before the gate, before the forward — so a crash or a
-throwing forward cannot lose it), then calls :func:`mark_delivered` once triage
-actually has it. Any message that was persisted but **not** handed to triage —
-a failed forward, a gateway that died mid-dispatch — stays ``delivered: false``
-and is picked up by the daily drain (at-least-once: a rare duplicate surface
-beats a silent loss).
+throwing forward cannot lose it), then calls :func:`mark_delivered` once the
+triage turn has actually **run**. That last part is the whole point: the forward
+POST answers 202 (accepted), not "handled", so the flip waits on the job's
+``status: done`` (see ``job_delivery.py``). Any message that was persisted but
+never reached a completed turn — a failed forward, a job that errored or
+expired, a gateway that died mid-dispatch — stays ``delivered: false`` and is
+picked up by the daily drain (at-least-once: a rare duplicate surface beats a
+silent loss).
 
 Stdlib only (``hashlib``/``secrets``/``datetime``): this module is copied into
 each gateway image alongside ``triage_policy.py`` and ``reply_tokens.py``, and
