@@ -294,15 +294,34 @@ def _parse_message(raw):
     return email.message_from_bytes(raw, policy=email.policy.default)
 
 
+def _is_attachment(part):
+    """Whether a non-multipart part counts as an attachment.
+
+    `Content-Disposition: attachment` always does, and so does any named part
+    with no disposition at all. The interesting case is `inline`: senders use
+    it both for the images an HTML body references (a logo, a tracking pixel)
+    and — Just Eat, Schubiger — for the actual document the mail is about. The
+    first kind is addressed by the body through a `Content-ID`, the second is
+    not, so that header, not the disposition, is what separates decoration
+    from payload. Requiring a filename as well keeps unnamed body parts out.
+    """
+    disp = (part.get_content_disposition() or "").lower()
+    if disp == "attachment":
+        return True
+    if not part.get_filename():
+        return False
+    if disp != "inline":
+        return True
+    return not part.get("Content-ID")
+
+
 def _iter_attachments(msg):
     """Yield (index, part) for each attachment, numbered from 1."""
     idx = 0
     for part in msg.walk():
         if part.is_multipart():
             continue
-        disp = (part.get_content_disposition() or "").lower()
-        filename = part.get_filename()
-        if disp == "attachment" or (filename and disp != "inline"):
+        if _is_attachment(part):
             idx += 1
             yield idx, part
 
