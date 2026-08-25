@@ -4,12 +4,10 @@ description: >
   Linking and reply-chip principles for any text shown in the Retinue dashboard
   — a conversation reply as Ara, a thread opened or appended via
   conversation-push.py (triage proposals included), and curated card content.
-  ALWAYS use before composing such text when it asks the user to choose between
-  options (every option gets a click-to-fill chip), refers to an e-mail without
-  showing it in full (add a details chip), mentions a GitHub pull request or issue
-  (the label itself links to it), contains any URL, absolute or relative
-  (never shown bare — always a labeled Markdown link), or hands the user a block
-  of text to copy out (always a blockquote).
+  ALWAYS use before composing such text when it asks the user to choose or act
+  on options or a list, refers to an e-mail without showing it in full, mentions
+  a GitHub PR or issue, contains any URL (absolute or relative), or hands the
+  user text to copy out.
 ---
 
 # Composing for the dashboard: links and reply chips
@@ -26,7 +24,7 @@ principles:
 
 The dashboard is used on a phone: every tap saved matters, and long raw URLs
 wrap over several lines and are unreadable when a thread is skimmed or read
-aloud. Hence the five principles below.
+aloud. Hence the principles below.
 
 ## 1. Every offered option gets a chip
 
@@ -58,9 +56,8 @@ Shall I confirm the party invitation and add it to your agenda, or decline?
 - **An enumerated list gets a chip per row _and_ a bulk chip.** In any list the
   message asks the user to act on — a triage omnibus, search results, a set of
   options — every row carries its own short inline details chip, and the bulk
-  answer is itself a chip ("Okay for all") rather than a phrase the user has to
-  type out. After a bulk action, offer the undo the same way. Typing a request
-  per row is exactly the friction chips exist to remove.
+  answer is itself a chip ("Okay for all"), never a phrase to type out. After a
+  bulk action, offer the undo the same way.
 
 ## 2. An e-mail referred to but not shown gets a details chip
 
@@ -106,10 +103,9 @@ don't rely on that. Always write `[label](url)` with a short human label:
 
 - `[the invoice PDF](https://…)`, not `https://gateway.example.com/conversations/42ec…/attachments/9f31…`
 - `[Zimmerberg Trophy](https://…)`, not the registration portal's raw URL
-- A **bare domain** (`example.ch`) is worse than a bare URL: the renderer
-  auto-links `http(s)://…` and `www.…`, but a bare domain is indistinguishable
-  from a filename, so it is not linked at all and arrives as inert text. Wrap
-  it — `[example.ch](https://example.ch)`.
+- A **bare domain** (`example.ch`) is not even auto-linked — the renderer links
+  only `http(s)://…` and `www.…` — so it arrives as inert text. Wrap it:
+  `[example.ch](https://example.ch)`.
 - Applies everywhere the dashboard renders Markdown: conversation messages,
   pushed threads, project pages, news notes.
 
@@ -122,14 +118,13 @@ not `Open /gateways`.
 ## 5. Text the user is meant to copy is a blockquote
 
 Any block the user is expected to lift *out* of the thread — a draft they will
-send themselves because the automated path is blocked, a passage they asked for
-as a quotable citation, text destined for another app — is a **Markdown
-blockquote**: every line prefixed with `> `, an empty quoted line (`>`) between
-paragraphs, inline Markdown inside. The bubble renders a copy button on a
-blockquote, so it is one tap to the clipboard.
+send themselves because the automated path is blocked, a quotable citation,
+text destined for another app — is a **Markdown blockquote**. The bubble
+renders a copy button on it (one tap to the clipboard) while the text still
+renders as prose, inline Markdown included.
 
-A fenced code block is **not** the format for prose, however copyable it looks.
-Reserve fences for actual code or plaintext where the monospace matters.
+A fenced code block also gets a copy button, but it is **not** the format for
+prose: fences render monospace and unrendered. Reserve them for actual code.
 
 ## Chip mechanics and limits
 
@@ -138,11 +133,10 @@ Reserve fences for actual code or plaintext where the monospace matters.
 - The **label** may contain neither `|` nor `]`; the **prefill** must be a
   single line and may not contain `]]`. Keep labels to a word or two.
 - Chips render as inline links (deliberately not as buttons): clicking only
-  fills the composer. There is no chip that acts immediately. The visual form
-  has to signal the consequence — a link says "this fills, you still press
-  Send", a button would say "this acts now". If an immediate-action affordance
-  is ever added, it gets its **own** syntax and sits at the end of the message,
-  so the two can never be mistaken for each other.
+  fills the composer. There is no chip that acts immediately — link-shape
+  signals "fills, you still press Send". An immediate-action affordance, if
+  ever added, gets its own syntax and end-of-message placement, never the
+  chip look.
 - Chips are functional **in conversation bubbles only** — the click-to-fill
   handler lives in the conversations component. Don't emit chips into project
   pages or other non-conversation surfaces; use plain prose or links there.
