@@ -256,6 +256,26 @@ disposition**: `archive` (keep, no action) · `delete` (drop, no action) ·
 `reply` (needs a response) · `action` (needs something done — calendar, task,
 forward).
 
+### `archive` vs `delete` — would the user ever search for this again?
+
+That question is the whole test, and it makes **archive narrow**: genuine
+back-and-forth with regular correspondence partners, and records worth looking
+up later (an order confirmation answers "what did I order, when, for how much,
+what about the warranty"). Everything else defaults to **delete** — newsletters,
+marketing, social and service notifications, cold outreach, and security or
+consent notices, which state a fact already known at read time and re-checkable
+at the source. When in doubt on a non-correspondence notification, propose
+delete.
+
+### Failed-action alerts are neither — they get their own conversation
+
+A failing CI run, a job that reported an error, a delivery that bounced: the
+user may want to act on it, or may have fixed it already. Give it its **own**
+dashboard conversation — one per failing workflow, or grouped per repository or
+run — offering *solved / keep on it / ignore*. Never fold one into the
+archive/delete omnibus: archiving hides both outcomes, the recurring problem and
+the one already dealt with.
+
 ### Already-answered check — before proposing any reply
 
 Inspect the thread first. If an **outbound** message follows the incoming one —
@@ -396,7 +416,10 @@ the INBOX is empty, with no e-mail client in the loop.
 status must not reach a terminal value while the message is still in the INBOX.
 Whenever you set `resolved` (including the already-answered branch of Phase 2),
 issue `flag --read` + `move`-out-of-INBOX in the same step and record the
-destination folder in the status note. If the move fails, keep the status
+destination folder in the status note (marking a message read alone is **not**
+a disposition). Take the destination folder from the account's actual folder
+listing rather than assuming a name — it need not be English, nor match the
+language of the account's other folders. If the move fails, keep the status
 non-terminal and retry next run. Phase 1's third reconcile pass is only a
 backstop for past drift — never a licence to skip the move here. Likewise a
 reply queued at `/sends` is not resolved until it is sent **and** the source
@@ -414,12 +437,22 @@ ledger's flag, not an INBOX move, closes the loop.
 ### E-mail — the status store
 
 - **`TRIAGE_STATE_DIR`** is the single source of handled-state — **not `\Seen`**,
-  not a mailbox flag. One file per message; filename = the Message-ID; content =
+  not a mailbox flag. One file per message; filename = the sanitized Message-ID
+  (below); content =
   `status` + `conversation_id` + `disposition` + timestamps (`proposed`,
   `omnibus`, `last_nudge`, `resolved`). For a sent reply also record `sent_uid` +
   `sent_message_id` so the send is verifiable against the Sent folder, not
   merely asserted. Write a status only once a message has actually been
   proposed, bundled, or resolved — never on mere reading.
+- **Diff on the sanitized id, never the raw Message-ID** — the filename scheme
+  is `message_id.strip('<>')` with `/` → `_`, exactly `triage-gate.py`'s
+  `_status_path()`. An id containing a slash (GitHub notifications) otherwise
+  reports as untracked on *every* run, and re-writing it silently overwrites
+  the earlier `proposed`/`omnibus` record. Messenger proposal records (the
+  `delivered` flag itself stays the gateway's) may still sit under the legacy
+  `whatsapp_<jid>_<epoch>` scheme beside the canonical
+  `whatsapp:<jid>:<ISO-timestamp>` — check both before proposing; drop this
+  check once no legacy entries remain.
 - **Reconcile every run** (Phase 1): the INBOX listing is authoritative for
   presence; `resolved`-mark and drop store entries whose message is gone; treat
   any present message without a non-terminal status file as to-triage.
