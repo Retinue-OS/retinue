@@ -155,6 +155,13 @@ services:
       # /tmp inside the container and be lost on every redeploy.
       - CONVERSATIONS_DIR=/root/.retinue/conversations
       - CONVERSATION_DIR=/root/.retinue/conversation-log
+      # Which Claude session each thread is continuing. Same volume, same
+      # reasoning: the transcripts it points at live on /root and outlive the
+      # container, so keeping this map in /tmp would throw away every resumable
+      # session on each redeploy — the one moment there is most to keep.
+      # Tunable alongside it: CONV_SESSION_MAX_IDLE_SECONDS (how long a
+      # dashboard thread stays resumable, default a week).
+      - WEB_GATEWAY_STATE=/root/.retinue/web-session-state.json
       # The news feed (items, the user's news profile, the feedback log). Same
       # persistent volume and same reasoning: high-churn, disposable data that
       # has no business in a chamber's git history or the triple store, but that

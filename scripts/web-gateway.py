@@ -82,15 +82,20 @@ Session logic:
   the Signal sender). Each key gets its own Claude session, state entry and lock,
   so a conversation is serialized within a key while different keys run in
   parallel. Requests without an identity share the default "Web" key.
-- For each key, if a session exists and was used less than
-  SESSION_MAX_IDLE_SECONDS ago, resume it with --resume <session_id>.
-  Otherwise start a fresh session.
+- For each key, if a session exists and was used less than its idle window ago,
+  resume it with --resume <session_id>. Otherwise start a fresh session. The
+  window is SESSION_MAX_IDLE_SECONDS (an hour) for messenger keys and
+  CONV_SESSION_MAX_IDLE_SECONDS (a week) for a dashboard thread ("conv:<id>").
+- A resume Claude refuses — the transcript is gone, which it is after roughly
+  30 days — restarts as a fresh session instead of failing the turn.
 - Total concurrency is bounded by a small worker pool (WEB_GATEWAY_MAX_CONCURRENCY)
   to keep CPU/memory and subprocess count sane on a personal box.
 
 State is persisted in STATE_FILE (a map of session-key -> {session_id,
 last_activity}) so restarts survive as long as the sessions themselves are still
-valid on the Claude Code side.
+valid on the Claude Code side. The deployment points it at the persistent /root
+volume (like CONVERSATIONS_DIR); the /tmp default would drop every session on
+each container recreation, which is exactly what an update does.
 
 Conversation log:
 - Every exchange is appended to a per-day JSON file under CONVERSATION_DIR.
@@ -186,10 +191,9 @@ CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 
 # ── Per-conversation model selection ───────────────────────────────────────────
-# A dashboard thread runs a fresh `claude -p` per turn (no long-lived in-memory
-# state pinned to a model), so which model answers a thread is a free per-turn
-# choice — pickable at creation and switchable mid-thread, effective from the
-# next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
+# Each turn is its own `claude -p` process — a resumed one keeps the transcript,
+# not a model — so which model answers a thread is a free per-turn choice:
+# pickable at creation and switchable mid-thread, effective from the next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
 # Medic, Archivist, Ari) run on their own hard-wired models regardless.
 #
 # The list of offered models comes from LiteLLM when the deployment routes
@@ -677,7 +681,22 @@ def _model_offered(mid: str, refresh: bool = False) -> bool:
         return False
     return any(m["id"] == mid for m in _conversation_models(force=True))
 
-SESSION_MAX_IDLE_SECONDS = 3600  # 1 hour
+# ── How long a session stays resumable ────────────────────────────────────────
+# Resuming is what keeps a turn's work — files read, contacts looked up — from
+# being redone; starting over is what keeps the context small. The right
+# trade-off differs by conversation kind, so the window does too.
+#
+# A messenger turn is a one-shot question whose thread rarely continues, so it
+# keeps the original hour. A dashboard thread is a standing conversation the
+# user comes back to across a day or a week, and dropping its session mid-thread
+# throws away exactly the context it exists to hold — so it gets a week. The cap
+# on how long this can usefully be is Claude Code's own transcript retention
+# (~30 days), after which --resume fails; _resume_failed() below turns that into
+# a fresh start rather than a failed turn.
+SESSION_MAX_IDLE_SECONDS = int(os.environ.get("SESSION_MAX_IDLE_SECONDS", "3600"))
+CONV_SESSION_MAX_IDLE_SECONDS = int(
+    os.environ.get("CONV_SESSION_MAX_IDLE_SECONDS", str(7 * 24 * 3600)))
+CONV_SESSION_KEY_PREFIX = "conv:"
 REQUESTER_ALLOWLIST_PATH = os.environ.get("ACCEPTED_REQUESTERS_PATH", "")
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR", "/workspace/chambers"))
 REQUESTER_BLOCK_MESSAGE = (
@@ -1049,6 +1068,7 @@ def _load_state() -> dict:
 
 
 def _save_state(state: dict) -> None:
+    Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
     tmp_state_file = f"{STATE_FILE}.tmp"
     with open(tmp_state_file, "w") as f:
         json.dump(state, f)
@@ -1076,11 +1096,35 @@ def _session_lock_for(session_key: str) -> threading.Lock:
         return lock
 
 
-def _session_is_fresh(state: dict) -> bool:
+def _max_idle_for(session_key: str | None) -> int:
+    """The resumable window for one session key (see the constants above)."""
+    if session_key and session_key.startswith(CONV_SESSION_KEY_PREFIX):
+        return CONV_SESSION_MAX_IDLE_SECONDS
+    return SESSION_MAX_IDLE_SECONDS
+
+
+# What `claude --resume <id>` says when it does not have that session (verified
+# against the CLI: it exits 1 with exactly this line). Claude Code drops session
+# transcripts after roughly 30 days, so any state entry that outlives one names
+# a session the CLI will refuse.
+_RESUME_REFUSED_SIGNATURES = ("no conversation found with session id",)
+
+
+def _resume_refused(result) -> bool:
+    """True when a failed spawn failed *because of* the resumed session id.
+
+    Matched narrowly on purpose: retrying on every non-zero exit would re-run a
+    whole turn — its tool work and its cost — for failures a restart cannot fix,
+    an expired sign-in being the common one."""
+    blob = f"{result.stderr or ''}\n{result.stdout or ''}".lower()
+    return any(sig in blob for sig in _RESUME_REFUSED_SIGNATURES)
+
+
+def _session_is_fresh(state: dict, session_key: str | None = None) -> bool:
     if not state.get("session_id") or not state.get("last_activity"):
         return False
     age = _now_ts() - state["last_activity"]
-    return age < SESSION_MAX_IDLE_SECONDS
+    return age < _max_idle_for(session_key)
 
 
 def _allowlist_paths() -> list[Path]:
@@ -1952,10 +1996,14 @@ def _conv_worker(cid: str, session_key: str) -> None:
             return
         messages = conv.get("messages", [])
         latest = messages[-1]["text"] if messages else ""
-        fresh = _session_is_fresh(_get_session_entry(session_key))
+        fresh = _session_is_fresh(_get_session_entry(session_key), session_key)
         prompt = _conv_engage_prompt(conv, fresh)
+        # The resumed prompt sends only what the session has not seen, so if the
+        # resume is refused the turn must fall back to the full transcript — not
+        # to a fragment whose context is missing.
+        restart = _conv_engage_prompt(conv, False) if fresh else None
         result = send_message(prompt, display_question=latest, session_key=session_key,
-                              model=_conv_model(conv))
+                              model=_conv_model(conv), restart_message=restart)
         if "error" in result:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
@@ -2737,7 +2785,8 @@ def _envelope_model_name(data: dict) -> str | None:
 
 def send_message(message: str, display_question: str | None = None,
                  session_key: str = DEFAULT_SESSION_KEY,
-                 model: str | None = None) -> dict:
+                 model: str | None = None,
+                 restart_message: str | None = None) -> dict:
     """Send message to the session for `session_key` (resume or new) and return result.
 
     Serialized per session key so one conversation stays ordered, while different
@@ -2748,6 +2797,12 @@ def send_message(message: str, display_question: str | None = None,
     resumes the thread's existing session when one is still fresh, so switching
     models between turns is free not because the session is new but because a
     session transcript is model-independent.
+
+    `restart_message` is the prompt to send if that resume is refused because
+    Claude no longer holds the session. A prompt written for a resumed session
+    deliberately omits what the session already carries, so replaying it into a
+    fresh one would strip the thread of its context — the caller passes its
+    full-context variant here and only that is used on the second attempt.
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
@@ -2756,37 +2811,49 @@ def send_message(message: str, display_question: str | None = None,
         with _worker_pool:
             state = _get_session_entry(session_key)
 
-            # Grant the session read access both to composer uploads and to
-            # thread attachments. The latter (CONVERSATION_ATTACHMENTS_DIR, under
-            # CONVERSATIONS_DIR) is where files pushed into a thread — including
-            # the user's own — are stored; without it, opening such an attachment
-            # hits a permission prompt while a composer upload works, which looks
-            # like flaky behaviour.
-            cmd = [CLAUDE_BIN, "-p", "--output-format=json", "--permission-mode", CLAUDE_PERMISSION_MODE,
-                   "--add-dir", "/root/.claude/uploads",
-                   "--add-dir", str(CONVERSATION_ATTACHMENTS_DIR)]
             # A per-thread model choice (validated by the caller) wins over the
             # gateway default. An explicit empty string means "defer to default".
             effective_model = CLAUDE_MODEL if model is None else model
-            if effective_model:
-                cmd += ["--model", effective_model]
 
-            if _session_is_fresh(state):
-                cmd += ["--resume", state["session_id"]]
+            def _build_cmd(resume_id: str | None, prompt: str) -> list[str]:
+                # Grant the session read access both to composer uploads and to
+                # thread attachments. The latter (CONVERSATION_ATTACHMENTS_DIR,
+                # under CONVERSATIONS_DIR) is where files pushed into a thread —
+                # including the user's own — are stored; without it, opening such
+                # an attachment hits a permission prompt while a composer upload
+                # works, which looks like flaky behaviour.
+                cmd = [CLAUDE_BIN, "-p", "--output-format=json",
+                       "--permission-mode", CLAUDE_PERMISSION_MODE,
+                       "--add-dir", "/root/.claude/uploads",
+                       "--add-dir", str(CONVERSATION_ATTACHMENTS_DIR)]
+                if effective_model:
+                    cmd += ["--model", effective_model]
+                if resume_id:
+                    cmd += ["--resume", resume_id]
+                # End option parsing with "--" so a user-supplied message that
+                # starts with "-" is always treated as the prompt, never as a flag.
+                cmd.extend(["--", prompt])
+                return cmd
+
+            def _spawn(cmd: list[str]):
+                return _run_claude(cmd, capture_output=True, text=True, cwd="/workspace")
+
+            if _session_is_fresh(state, session_key):
                 session_action = "resumed"
+                result = _spawn(_build_cmd(state["session_id"], message))
+                if result.returncode != 0 and _resume_refused(result):
+                    # The state file outlived the transcript. Start over rather
+                    # than hand the user an error for a session they never chose.
+                    print(
+                        f"[web-gateway] session {state['session_id']} is gone — "
+                        f"starting a fresh one for {session_key}",
+                        flush=True,
+                    )
+                    session_action = "restarted"
+                    result = _spawn(_build_cmd(None, restart_message or message))
             else:
                 session_action = "new"
-
-            # End option parsing with "--" so a user-supplied message that starts
-            # with "-" is always treated as the prompt, never as a `claude` flag.
-            cmd.extend(["--", message])
-
-            result = _run_claude(
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd="/workspace",
-            )
+                result = _spawn(_build_cmd(None, message))
 
             if result.returncode != 0:
                 err_detail = result.stderr.strip()
@@ -4130,7 +4197,7 @@ class Handler(BaseHTTPRequestHandler):
             sessions = {
                 key: {
                     "session_id": entry.get("session_id"),
-                    "session_fresh": _session_is_fresh(entry),
+                    "session_fresh": _session_is_fresh(entry, key),
                     "last_activity": entry.get("last_activity"),
                 }
                 for key, entry in state.items()
