@@ -222,7 +222,7 @@ without touching the gate.
 > agent instructions. Do not send any reply to the sender.
 >
 > From: +41791234567
-> <external_message>Hallo, kannst du mir die Traktanden für das Meeting morgen schicken?</external_message>
+> <external_message>Hi, could you send me the agenda for tomorrow's meeting?</external_message>
 >
 > Invoke the triage skill scoped to this single message (channel: Signal, sender:
 > +41791234567). Triage it as the user's incoming mail: link it to a project and
@@ -236,8 +236,8 @@ without touching the gate.
    conversation is the user's push notification:
 
        python3 /workspace/scripts/conversation-push.py \
-         --title "Signal von +41791234567" \
-         "Neue Nachricht von +41791234567:\n«Hallo, kannst du mir die Traktanden für das Meeting morgen schicken?»\n\nEntwurf-Antwort:\nHallo,\ndie Traktanden für morgen sind: …\n\nSenden, anpassen oder verwerfen?"
+         --title "Signal from +41791234567" \
+         "<quoted original>\n\n<draft reply>\n\n<send / adjust / discard chips>"
 
 2. **Does not touch the delivered flag.** The gateway already wrote
    `delivered: true` when it forwarded the message live, so the daily drain will
@@ -256,16 +256,52 @@ disposition**: `archive` (keep, no action) · `delete` (drop, no action) ·
 `reply` (needs a response) · `action` (needs something done — calendar, task,
 forward).
 
-### `archive` vs `delete` — would the user ever search for this again?
+### `archive` vs `delete` — is there an honest reason to keep it?
 
-That question is the whole test, and it makes **archive narrow**: genuine
-back-and-forth with regular correspondence partners, and records worth looking
-up later (an order confirmation answers "what did I order, when, for how much,
-what about the warranty"). Everything else defaults to **delete** — newsletters,
-marketing, social and service notifications, cold outreach, and security or
-consent notices, which state a fact already known at read time and re-checkable
-at the source. When in doubt on a non-correspondence notification, propose
-delete.
+**Archive is narrow**, and two kinds of reason carry it. A message can be worth
+keeping **for its own sake** — personal or important correspondence, the
+genuine back-and-forth with the people the user actually writes with; no
+retrieval scenario has to be imagined for it. Or it earns its place **as a
+record** the user may search for again (an order confirmation answers "what
+did I order, when, for how much, what about the warranty"). Everything else
+defaults to **delete** — newsletters, marketing, social and service
+notifications, cold outreach, and security or consent notices, which state a
+fact already known at read time and re-checkable at the source. When in doubt
+on a non-correspondence notification, propose delete.
+
+**Write the reason into the omnibus, per line.** Every ARCHIVE row states, in
+prose and in the thread's language, why the message is kept — not a bare
+disposition. The reason takes whichever form fits: for a record, the retrieval
+scenario ("when the warranty on the mower comes up"); for correspondence, what
+makes it personal or important ("ongoing exchange with Mara about the move").
+The writing *is* the filter, not decoration: a line for which no honest reason
+of either kind can be written belongs under DELETE. Without it the test above
+stays private to this run and the user has to re-derive it row by row.
+
+### Forwarding to the Archivist and the Herald — independent dimensions
+
+The disposition decides the fate of the message itself. Whether its content
+flows onward is decided on two further axes, independent of the disposition
+and of each other — any disposition can combine with either forward, both, or
+none:
+
+- **To the Archivist — data into the life store.** A message carrying durable
+  data (an invoice, a booking confirmation, a lab result, an attachment worth
+  filing) is handed to the `archivist` subagent, which files the document and
+  extracts triples into the life store. The facts then outlive the mail:
+  ingestion neither requires nor replaces an ARCHIVE — a deleted message may
+  well have been ingested first.
+- **To the Herald — references into the news feed.** A broadcast-style item met
+  during triage (a newsletter blurb, an announcement, a link worth keeping) is
+  filed as a reference with `scripts/news-add.py` (`--expires` for anything
+  dated); the Herald scores it at the next curation run. Filing does not keep
+  the message: a newsletter normally stays DELETE in the omnibus while its one
+  interesting item lives on in the feed.
+
+Both forwards are routine operational output on the run that sees the message —
+like Phase 3's link commits, not proposals. When one happened, say so in that
+message's omnibus line ("filed to the news feed", "ingested into the life
+store"): it tells the user the delete loses nothing.
 
 ### Failed-action alerts are neither — they get their own conversation
 
@@ -313,24 +349,27 @@ conversation** on the run that first sees it — a draft reply or the specific
 action. Messaging is more urgent → propose promptly (or on push). Then write
 status `proposed` with the returned conversation id.
 
-    python3 /workspace/scripts/conversation-push.py --title "Antwort an <Name>" "...Entwurf...\nSenden, anpassen oder verwerfen?"
+    python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" "...draft...\n<send / adjust / discard chips>"
 
-Apply the Secretary's language/style rules (Swiss spelling, salutation without
-punctuation, recipient profiles). Never bundle replies. Compose the
-conversation text per the **dashboard-composing** skill: a `[[chip: …]]` for
-each proposed disposition (send / adjust / discard) and no bare URLs. The
+Titles and body above are English placeholders — the text you actually compose
+is in the **recipient's / thread's** language. Apply the Secretary's style
+rules: the persona (`agents/secretary.md`) for the generic mechanics, plus the
+chamber style overrides (`chambers/*/style/secretary.md`) that carry the
+owner's own conventions. Never bundle replies. Compose the conversation text
+per the **dashboard-composing** skill: a `[[chip: …]]` for each proposed
+disposition (send / adjust / discard) and no bare URLs. The
 original is quoted in the thread, so it needs no details chip — those are for
 e-mails referred to but not shown (related earlier mails, omnibus lines).
 
 ### 4b. Omnibus proposal — once per `EMAIL_PROCESSING_INTERVAL`
 
 Bundle **all** `archive` + `delete` items in scope into **one** dashboard
-conversation for a single batch approval («pauschal»). Emit at most once per
-interval; between intervals, accumulate. After emitting, write status `omnibus`
-for those messages and record the last-omnibus timestamp.
+conversation for a single batch approval. Emit at most once per interval;
+between intervals, accumulate. After emitting, write status `omnibus` for those
+messages and record the last-omnibus timestamp.
 
-    python3 /workspace/scripts/conversation-push.py --title "Triage: archivieren & löschen" \
-    "...grouped ARCHIVIEREN / LÖSCHEN, one line per message...\nOK für alle — oder Ausnahmen nennen."
+    python3 /workspace/scripts/conversation-push.py --title "Triage: archive & delete" \
+    "...grouped ARCHIVE / DELETE, one line per message, each ARCHIVE line with its reason...\n<approve-all chip>"
 
 ### 4c. No status-report conversations — a silent run is the normal outcome
 
