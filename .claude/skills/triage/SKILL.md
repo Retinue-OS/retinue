@@ -256,23 +256,27 @@ disposition**: `archive` (keep, no action) · `delete` (drop, no action) ·
 `reply` (needs a response) · `action` (needs something done — calendar, task,
 forward).
 
-### `archive` vs `delete` — would the user ever search for this again?
+### `archive` vs `delete` — is there an honest reason to keep it?
 
-That question is the whole test, and it makes **archive narrow**: genuine
-back-and-forth with regular correspondence partners, and records worth looking
-up later (an order confirmation answers "what did I order, when, for how much,
-what about the warranty"). Everything else defaults to **delete** — newsletters,
-marketing, social and service notifications, cold outreach, and security or
-consent notices, which state a fact already known at read time and re-checkable
-at the source. When in doubt on a non-correspondence notification, propose
-delete.
+**Archive is narrow**, and two kinds of reason carry it. A message can be worth
+keeping **for its own sake** — personal or important correspondence, the
+genuine back-and-forth with the people the user actually writes with; no
+retrieval scenario has to be imagined for it. Or it earns its place **as a
+record** the user may search for again (an order confirmation answers "what
+did I order, when, for how much, what about the warranty"). Everything else
+defaults to **delete** — newsletters, marketing, social and service
+notifications, cold outreach, and security or consent notices, which state a
+fact already known at read time and re-checkable at the source. When in doubt
+on a non-correspondence notification, propose delete.
 
-**Write the scenario into the omnibus, per line.** Every ARCHIVE row states, in
-prose, the future situation in which the user would look for that message
-("when the warranty on the mower comes up"), in the thread's language — not a
-bare disposition. The writing *is* the filter, not decoration: a line for which
-no honest scenario can be written belongs under DELETE. Without it the test
-above stays private to this run and the user has to re-derive it row by row.
+**Write the reason into the omnibus, per line.** Every ARCHIVE row states, in
+prose and in the thread's language, why the message is kept — not a bare
+disposition. The reason takes whichever form fits: for a record, the retrieval
+scenario ("when the warranty on the mower comes up"); for correspondence, what
+makes it personal or important ("ongoing exchange with Mara about the move").
+The writing *is* the filter, not decoration: a line for which no honest reason
+of either kind can be written belongs under DELETE. Without it the test above
+stays private to this run and the user has to re-derive it row by row.
 
 ### Failed-action alerts are neither — they get their own conversation
 
@@ -339,7 +343,7 @@ between intervals, accumulate. After emitting, write status `omnibus` for those
 messages and record the last-omnibus timestamp.
 
     python3 /workspace/scripts/conversation-push.py --title "Triage: archive & delete" \
-    "...grouped ARCHIVE / DELETE, one line per message, each ARCHIVE line with its retrieval scenario...\n<approve-all chip>"
+    "...grouped ARCHIVE / DELETE, one line per message, each ARCHIVE line with its reason...\n<approve-all chip>"
 
 ### 4c. No status-report conversations — a silent run is the normal outcome
 
