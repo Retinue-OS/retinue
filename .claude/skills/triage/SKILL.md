@@ -148,7 +148,12 @@ daily catch-all **drains the gateway** instead of listing chats:
 `GET /undelivered` returns the held messages **and flips each to
 `delivered:true` in the same pass**. It is the only operation that mutates the
 flag, so the drain is idempotent — a re-run returns only what arrived since.
-Process the returned messages through Phases 2–4 exactly like e-mail.
+Process the returned messages through Phases 2–4 exactly like e-mail. Each
+drained message carries a **`reply_token`** for its origin conversation — treat
+it exactly like the token of a live-forwarded message: a proposed reply's
+thread gets the channel's reply command (`<channel>-push.py --reply-to
+<token>`) as `--context` (Phase 4a), and the executing session replies by
+token, never by resolving the sender's name.
 
 **Never call `/undelivered` to browse.** It drains as it reads. Any ad-hoc
 question ("what came in on Signal?", "what did X say last Tuesday?") goes
@@ -224,6 +229,13 @@ without touching the gate.
 > From: +41791234567
 > <external_message>Hallo, kannst du mir die Traktanden für das Meeting morgen schicken?</external_message>
 >
+> Reply routing: the reply command for this exact conversation is
+>   python3 /workspace/scripts/signal-push.py --reply-to v1.eyJyIjoi….3q2- "<text>"
+> (no --recipient: the token routes the reply back to the chat the message
+> arrived in …). You do not send the reply — the session that later acts on the
+> user's approval in the dashboard thread does … pass this reply command (token
+> included, verbatim) as --context to conversation-push.py …
+>
 > Invoke the triage skill scoped to this single message (channel: Signal, sender:
 > +41791234567). Triage it as the user's incoming mail: link it to a project and
 > raise a dashboard conversation so the user is notified. Do not reply to the
@@ -233,10 +245,16 @@ without touching the gate.
 
 1. **Runs Phases 2–4** on this one message: classify, link to a project, open a
    dashboard conversation quoting the original and proposing a draft reply. The
-   conversation is the user's push notification:
+   conversation is the user's push notification. **Hand the reply token over**:
+   the prompt's reply command (with its token) goes into the thread as
+   `--context`, verbatim — the session that later executes the approved reply
+   only knows what the thread carries, and without the token it would fall back
+   to name resolution, which can land on the wrong account. The token never
+   appears in the visible proposal text:
 
        python3 /workspace/scripts/conversation-push.py \
          --title "Signal von +41791234567" \
+         --context 'Reply via: python3 /workspace/scripts/signal-push.py --reply-to v1.eyJyIjoi….3q2- "<text>"' \
          "Neue Nachricht von +41791234567:\n«Hallo, kannst du mir die Traktanden für das Meeting morgen schicken?»\n\nEntwurf-Antwort:\nHallo,\ndie Traktanden für morgen sind: …\n\nSenden, anpassen oder verwerfen?"
 
 2. **Does not touch the delivered flag.** The gateway already wrote
@@ -322,6 +340,17 @@ each proposed disposition (send / adjust / discard) and no bare URLs. The
 original is quoted in the thread, so it needs no details chip — those are for
 e-mails referred to but not shown (related earlier mails, omnibus lines).
 
+**A messenger item's proposal thread must carry its reply token.** The item
+came with a reply command (`<channel>-push.py --reply-to <token>` — in the
+gateway's live prompt, or as the drained message's `reply_token`): pass that
+command, token included, as `--context` on the `conversation-push.py` call.
+The context is stored with the message and replayed to every later Ara session
+in the thread, invisible to the user — it is the only way the token reaches
+the session that executes the approved reply. A proposal thread opened without
+it forces that session back onto name resolution, the failure mode reply
+tokens exist to prevent. E-mail needs no context: its reply is addressed by
+`--uid` from the status store (Phase 6).
+
 ### 4b. Omnibus proposal — once per `EMAIL_PROCESSING_INTERVAL`
 
 Bundle **all** `archive` + `delete` items in scope into **one** dashboard
@@ -404,6 +433,17 @@ Ara picks up each thread, carries out what was approved, then writes status
   send instead of trusting the `resolved` flag. A `verify` reply becomes
   `resolved` only once its pending send is approved — until then it stays
   non-terminal.
+
+  For a **messenger** reply, the thread's agent context (replayed in the
+  engage prompt: "Reply via: … --reply-to <token>") carries the exact send
+  command — run it with the approved text. The token addresses the reply back
+  to the conversation the message arrived in; **never resolve the sender's
+  name to an address when a token is present** (the messaging-contact-lookup
+  path is only the fallback for a thread that carries no token). The send
+  still passes the channel's `*_SEND_POLICY`: the user's in-thread approval
+  justifies `--user-approved` for a `trust` account, while `verify` queues at
+  `/sends` and — as with e-mail — the item stays non-terminal until that send
+  is approved.
 - **Action** → do the concrete thing; if it advanced a project, append to its
   log.
 

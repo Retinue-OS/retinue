@@ -286,7 +286,10 @@ the crucial property — it removes any multi-writer race:
 
 - The gateway exposes `GET /undelivered?since=<date>`: returns undelivered
   messages **and flips them to `delivered`** as a side effect. This is the only
-  operation that mutates the flag.
+  operation that mutates the flag. Each returned message also carries a
+  `reply_token` for its origin conversation (minted at drain time; tokens are
+  stateless), so a reply proposed from the drain is addressed by token exactly
+  like one proposed from a live forward — never by resolving the sender's name.
 - Marking delivered = rewriting the message's one small `.nt` file → one reindex.
   One-file-per-message keeps that flip cheap.
 - **A SPARQL query never touches the flag.** Reading the messages over SPARQL is

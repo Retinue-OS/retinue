@@ -160,6 +160,22 @@ REPLY_TOKENS = ReplyTokenStore(
     os.environ.get("SIGNAL_REPLY_TOKENS_DIR", str(SIGNAL_DATA_DIR / "reply-tokens"))
 )
 
+
+def _attach_reply_tokens(messages: list) -> None:
+    """Give each drained /undelivered message a reply token for its origin.
+
+    The drain hands raw ledger rows to the daily triage; without a token those
+    replies fall back to name resolution — the exact failure that by-token
+    routing exists to prevent and that live forwards already avoid. The origin
+    is the group (in the ``group:<id>`` form ``_signal_send`` accepts) when
+    there is one, else the stored sender (number/UUID) — the same forms the
+    live forward mints."""
+    for msg in messages:
+        group = msg.get("group")
+        origin = (SIGNAL_GROUP_PREFIX + str(group)) if group else msg.get("sender")
+        if origin:
+            msg["reply_token"] = REPLY_TOKENS.mint(str(origin), channel="signal")
+
 # ── Inbound triage delivery gate ──────────────────────────────────────────────
 # The gateway spends model credits only on senders that matter (see
 # docs/triage-delivery-gate.md). Every inbound inbox message is persisted as one
@@ -1399,11 +1415,18 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
             origin, channel="signal", meta={"sender_label": sender_label},
         )
     reply_line = (
-        (f"\nTo reply to this exact conversation, the Secretary passes "
-         f"--reply-to {reply_token} to signal-push.py (no --recipient needed): "
-         f"this routes the reply back to the chat the message arrived in, so you "
-         f"never resolve the sender's name to an address. The reply still goes "
-         f"through the normal send-approval policy.\n")
+        (f"\nReply routing: the reply command for this exact conversation is\n"
+         f"  python3 /workspace/scripts/signal-push.py --reply-to {reply_token} \"<text>\"\n"
+         f"(no --recipient: the token routes the reply back to the chat the "
+         f"message arrived in, still through the normal send-approval policy; "
+         f"never resolve the sender's name to an address instead — that can "
+         f"land on the wrong account). You do not send the reply — the session "
+         f"that later acts on the user's approval in the dashboard thread does, "
+         f"and it only knows what that thread carries. So when you open the "
+         f"proposal thread, pass this reply command (token included, verbatim) "
+         f"as --context to conversation-push.py: the context rides with the "
+         f"thread invisibly to the user and is replayed to every later agent "
+         f"session in it.\n")
         if reply_token else ""
     )
     # An unknown sender (not whitelisted, not blacklisted, not in a blocked
@@ -1967,6 +1990,7 @@ class _PushHandler(BaseHTTPRequestHandler):
             since = (qs.get("since") or [None])[0]
             try:
                 messages = _ibstore.undelivered(INBOUND_STORE_DIR, since=since)
+                _attach_reply_tokens(messages)
                 self._reply(200, {"messages": messages, "count": len(messages)})
             except Exception as exc:
                 print(f"[signal-gateway] undelivered drain failed: {exc}", flush=True)
