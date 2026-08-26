@@ -278,6 +278,31 @@ The writing *is* the filter, not decoration: a line for which no honest reason
 of either kind can be written belongs under DELETE. Without it the test above
 stays private to this run and the user has to re-derive it row by row.
 
+### Forwarding to the Archivist and the Herald — independent dimensions
+
+The disposition decides the fate of the message itself. Whether its content
+flows onward is decided on two further axes, independent of the disposition
+and of each other — any disposition can combine with either forward, both, or
+none:
+
+- **To the Archivist — data into the life store.** A message carrying durable
+  data (an invoice, a booking confirmation, a lab result, an attachment worth
+  filing) is handed to the `archivist` subagent, which files the document and
+  extracts triples into the life store. The facts then outlive the mail:
+  ingestion neither requires nor replaces an ARCHIVE — a deleted message may
+  well have been ingested first.
+- **To the Herald — references into the news feed.** A broadcast-style item met
+  during triage (a newsletter blurb, an announcement, a link worth keeping) is
+  filed as a reference with `scripts/news-add.py` (`--expires` for anything
+  dated); the Herald scores it at the next curation run. Filing does not keep
+  the message: a newsletter normally stays DELETE in the omnibus while its one
+  interesting item lives on in the feed.
+
+Both forwards are routine operational output on the run that sees the message —
+like Phase 3's link commits, not proposals. When one happened, say so in that
+message's omnibus line ("filed to the news feed", "ingested into the life
+store"): it tells the user the delete loses nothing.
+
 ### Failed-action alerts are neither — they get their own conversation
 
 A failing CI run, a job that reported an error, a delivery that bounced: the
