@@ -352,11 +352,12 @@ status `proposed` with the returned conversation id.
     python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" "...draft...\n<send / adjust / discard chips>"
 
 Titles and body above are English placeholders — the text you actually compose
-is in the **recipient's / thread's** language. Apply the Secretary's
-language/style rules (Swiss spelling, salutation without punctuation, recipient
-profiles). Never bundle replies. Compose the conversation text per the
-**dashboard-composing** skill: a `[[chip: …]]` for each proposed disposition
-(send / adjust / discard) and no bare URLs. The
+is in the **recipient's / thread's** language. Apply the Secretary's style
+rules: the persona (`agents/secretary.md`) for the generic mechanics, plus the
+chamber style overrides (`chambers/*/style/secretary.md`) that carry the
+owner's own conventions. Never bundle replies. Compose the conversation text
+per the **dashboard-composing** skill: a `[[chip: …]]` for each proposed
+disposition (send / adjust / discard) and no bare URLs. The
 original is quoted in the thread, so it needs no details chip — those are for
 e-mails referred to but not shown (related earlier mails, omnibus lines).
 
