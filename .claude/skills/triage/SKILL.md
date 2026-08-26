@@ -267,6 +267,13 @@ consent notices, which state a fact already known at read time and re-checkable
 at the source. When in doubt on a non-correspondence notification, propose
 delete.
 
+**Write the scenario into the omnibus, per line.** Every ARCHIVE row states, in
+prose, the future situation in which the user would look for that message
+("when the warranty on the mower comes up"), in the thread's language — not a
+bare disposition. The writing *is* the filter, not decoration: a line for which
+no honest scenario can be written belongs under DELETE. Without it the test
+above stays private to this run and the user has to re-derive it row by row.
+
 ### Failed-action alerts are neither — they get their own conversation
 
 A failing CI run, a job that reported an error, a delivery that bounced: the
@@ -330,7 +337,7 @@ interval; between intervals, accumulate. After emitting, write status `omnibus`
 for those messages and record the last-omnibus timestamp.
 
     python3 /workspace/scripts/conversation-push.py --title "Triage: archivieren & löschen" \
-    "...grouped ARCHIVIEREN / LÖSCHEN, one line per message...\nOK für alle — oder Ausnahmen nennen."
+    "...grouped ARCHIVIEREN / LÖSCHEN, one line per message, each ARCHIVIEREN line with its retrieval scenario...\nOK für alle — oder Ausnahmen nennen."
 
 ### 4c. No status-report conversations — a silent run is the normal outcome
 
