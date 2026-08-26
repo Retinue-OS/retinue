@@ -6,8 +6,9 @@ description: >
   conversation-push.py (triage proposals included), and curated card content.
   ALWAYS use before composing such text when it asks the user to choose or act
   on options or a list, refers to an e-mail without showing it in full, mentions
-  a GitHub PR or issue, contains any URL (absolute or relative), or hands the
-  user text to copy out.
+  a GitHub PR or issue, contains any URL (absolute or relative), points the user
+  at another system to act in (a portal, an approval page), or hands the user
+  text to copy out.
 ---
 
 # Composing for the dashboard: links and reply chips
@@ -115,7 +116,37 @@ one, so it arrives as inert text the user cannot tap at all. Resolve the host
 (`CONVERSATION_BASE_URL`) and link it by name — `Open [the gateways page](…)`,
 not `Open /gateways`.
 
-## 5. Text the user is meant to copy is a blockquote
+## 5. Anything you ask the user to do elsewhere carries its link
+
+Rule 4 governs a URL you already decided to show. This one is about the link
+you did not think to include: whenever a message asks the user to act in
+another system — log into a portal to read a message waiting there, review a
+PR, approve a pending send, open a booking or registration page — **name that
+place as a link**. "Please have a look in the portal" on a phone means the user
+now has to go find the portal, sign in and navigate; sparing them exactly that
+was the point of the message.
+
+This is the common shape of a **notification-only** inbound: a mail or push
+carrying no content, only "there is something new for you, sign in to see it".
+Such a message is worth relaying, but relaying it without the way in hands the
+user a chore instead of a link.
+
+- **Take the link from the source, never from memory.** The notification itself
+  almost always carries the sign-in or deep link — pull it out of the message
+  body and use it. Deep-link when the source offers one (straight to the
+  document or thread); otherwise the sign-in page is fine.
+- **If no link is resolvable, say so.** Write "the mail carries no link" rather
+  than reconstructing a plausible address — a guessed portal URL is worse than
+  none.
+- Applies to any destination, in-system ones included: `/sends`, `/gateways`,
+  `/claude-auth`, a project page. Resolve the host per rule 4 and link it.
+
+```
+The portal reports two new entries; the mails carry no content, only a sign-in
+prompt — [open the portal](https://…) to see what they are.
+```
+
+## 6. Text the user is meant to copy is a blockquote
 
 Any block the user is expected to lift *out* of the thread — a draft they will
 send themselves because the automated path is blocked, a quotable citation,
