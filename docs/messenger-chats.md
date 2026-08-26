@@ -58,21 +58,26 @@ messenger messages: the two rails meet only in the shared context
 ## Why a chat is not a conversation
 
 This is the load-bearing decision, so it gets its own section. The dashboard
-conversation concept encodes a thread *with an agent*: every user turn triggers
-a model turn, the thread history is the model's context, and the thread has a
-lifecycle (active → archived). A messenger chat is a thread *with a human*:
-most messages need no model at all, the history is the channel's own record,
-and it never ends. Forcing the second into the first is what produces today's
-pathologies — model turns spent on messages that needed none, approval steps on
-words the user typed themselves, unbounded context, and the scatter of one
-human relationship across many threads.
+conversation concept encodes a thread *with the user's own agent*: every user
+turn triggers a model turn, the thread history is the model's context, and the
+thread has a lifecycle (active → archived). A messenger chat is a thread *with
+an external correspondent* — a person today, just as well someone else's agent
+tomorrow; the design assumes nothing about who or what answers, so
+agent-to-agent correspondence needs no special case anywhere (gate, mirror,
+companion). What defines a chat is that the other side sits *outside* Retinue,
+reached over a channel Retinue does not own: the thread is a record to mirror
+faithfully, not a context to drive; most messages need no model turn on our
+side; and it never ends. Forcing the second into the first is what produces
+today's pathologies — model turns spent on messages that needed none, approval
+steps on words the user typed themselves, unbounded context, and the scatter of
+one relationship across many threads.
 
 So the hybrid is split along its natural seam:
 
 | | **Chat** (new entity) | **Companion thread** (existing entity, new kind) |
 |---|---|---|
-| A thread with | a human correspondent | an agent |
-| Turns driven by | people sending messages | user/agent pane activity |
+| A thread with | an external correspondent (person or agent) | the user's own agent |
+| Turns driven by | correspondents sending messages | user/agent pane activity |
 | Model in the loop | never | every turn (normal conversation) |
 | History | the channel's record, mirrored deterministically | agent discussion about the chat |
 | Lifetime | unbounded | unbounded, but context bounded by the summary |
@@ -133,16 +138,72 @@ owned by the gateway, flipped only by the drain and the forward-confirmation
 path. The chat view is a **pure read** and never touches the flag — the same
 rule the SPARQL browse path already follows.
 
-### Serving — read the volumes, not the network
+### Serving — raw files or the triple store?
 
-The web-gateway runs in the retinue container, which already mounts every
-gateway's message volume read-write at
-`/workspace/chambers/_generated/messenger/<channel>/` (it writes `policy/`
-there today). So the chat API reads the message files **straight off the
-mounted volume** — fresh (no qlever reindex lag), no new gateway read
-endpoints, no HTTP fan-out on the hot path. Folder-ownership convention is
-preserved: gateways own `messages/` (and the new outbound records), retinue
-owns `policy/`; the web-gateway adds no writer to either.
+Two purely local read paths can back the chat API, and the choice deserves
+spelling out. The web-gateway runs in the retinue container, which already
+mounts every gateway's message volume at
+`/workspace/chambers/_generated/messenger/<channel>/` (retinue writes `policy/`
+there today), so it *can* read the message files straight off disk with zero
+lag. The same files are indexed by the life store — and since qlever-dir's
+incremental updates, a new or edited message file is queryable **within
+seconds** (a single-file change is applied straight to the active slot; only
+structural changes — a new directory, converter or ignore config — still take
+tens of seconds). Either local path beats asking the gateways over HTTP:
+history stays browsable while a gateway container is down or unlinked. But
+seconds of lag instead of the old tens changes the calculus between the two,
+because of what the store buys:
+
+- **The merged view is a query, not a program.** The chats list — every chat
+  across every channel with its latest message — is one `GROUP BY`; a thread
+  page is a filter on `kb:chat` with `ORDER BY`/`LIMIT`; an unread badge is a
+  `COUNT` above `last_read`. The raw path re-implements all of that as
+  directory scans over one-file-per-message stores that will grow to tens of
+  thousands of files, on every dashboard poll.
+- **One parser, not two.** `inbound_store`'s deliberately minimal N-Triples
+  round-tripper is a *writer's* parser. A raw-reading chat API would have to
+  learn every schema addition — `kb:chat`, `kb:author`, and especially #130's
+  reactions and quoted replies, which are triples *pointing at other messages*
+  and want a join, not a per-request in-memory index. The store reads whatever
+  shape the gateways learn to write.
+- **Channel-agnostic by construction.** The store unions all graphs: a future
+  gateway that writes the same record shape (SMS, say) appears in the chat API
+  with zero serving-code change and no new mount to know about.
+- **Joins across the life store.** Display names can come from the chambers'
+  own contact graphs instead of gateway roster calls; project links join
+  naturally; and the chat page, the companion's context builder, and the
+  user's ad-hoc "what did X write last week?" all become the *same query* —
+  one implementation of "the thread" instead of three.
+- **Provenance for free.** Named graphs map every mirrored message back to its
+  ledger file — which media references and drain bookkeeping already want.
+
+What the delay costs, and where: precisely at the hottest interactions. A
+message arrives, the deterministic push fires, the user taps through within a
+second — a store-only view might not yet contain the very message the
+notification announced. Likewise one's own send: the bubble must not take
+seconds to appear. And a store-only page makes `qlever-life` a serving
+dependency of the dashboard, not just of ad-hoc queries.
+
+**Resolution: SPARQL-first, with a deterministic live overlay.** The two
+freshness-critical moments are exactly the two paths this design instruments
+anyway: arrivals (and own-device echoes) flow through
+`POST /internal/chats/inbound`, and sends flow through the web-gateway itself.
+Each such event also drops an entry into a small in-memory overlay; the chat
+API serves the store's answer plus whatever overlay entries the store has not
+caught up to, deduplicated on `kb:messageId`. Entries expire after a minute or
+so — by then the store holds them — and the overlay is disposable: a restart
+loses nothing but a few seconds of freshness. The message a push announced is
+*by construction* in the view the tap opens, because the same event produced
+both. Should the store be unreachable, the API degrades to a raw directory
+scan — the LiteLLM-to-static fallback pattern the model picker already uses.
+
+None of this touches the paths that must stay off SPARQL: the gateways'
+classify hot path keeps reading `policy/` raw off their own volumes, and the
+`delivered` flag is still mutated only through the gateway drain — the
+delivery-gate doc's freshness reasoning was always about those, not about
+serving reads. Folder ownership is likewise preserved: gateways own
+`messages/` (and the new outbound records), retinue owns `policy/` and the
+chat state; the chat API adds no writer to any of it.
 
 Media stays where it is: attachment references are the gateways' token-gated
 `GET /media/<id>` URLs, and the web-gateway proxies them behind the dashboard's
@@ -321,8 +382,8 @@ The send policies (`SIGNAL_SEND_POLICY` / `WHATSAPP_SEND_POLICY` /
 `TELEGRAM_SEND_POLICY`, keyed by sending identity) keep their exact meaning;
 the chat surface maps onto them rather than around them:
 
-- **The user's send button is the approval.** `verify` exists to put a human
-  decision between agent-composed content and the wire. Approving a pending
+- **The user's send button is the approval.** `verify` exists to put the
+  user's decision between agent-composed content and the wire. Approving a pending
   send at `/sends` and pressing send on a draft in the authenticated dashboard
   are the *same act* — the second with more context (the whole thread is on
   screen) and fewer steps. The chat send endpoint sits behind the dashboard's
@@ -369,10 +430,11 @@ serving logic, `webapp/`, `scripts/`).
 1. **Complete the ledger** (gateways ×3): `kb:chat` + `kb:messageId` on
    inbound; `kb:OutboundMessage` on every successful send; own-device echo
    capture. Pure plumbing, also unblocks #130.
-2. **Read-only chats:** web-gateway chat API over the mounted stores; Chats
-   card + chat page; `last_read`/unread; `POST /internal/chats/inbound` with
-   deterministic Web Push; media proxy. Triage still runs as today — the value
-   is *seeing whole conversations at last*.
+2. **Read-only chats:** web-gateway chat API (SPARQL-first with the live
+   overlay; raw-scan fallback); Chats card + chat page; `last_read`/unread;
+   `POST /internal/chats/inbound` with deterministic Web Push; media proxy.
+   Triage still runs as today — the value is *seeing whole conversations at
+   last*.
 3. **The composer:** draft store, direct user send (`author: user`), the ✕
    button, voice input. From here the user can answer any message with zero
    model turns.
