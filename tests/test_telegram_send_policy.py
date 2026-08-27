@@ -174,6 +174,23 @@ def test_malformed_request_id_rejected():
     print("ok: malformed request id rejected")
 
 
+def test_user_author_sends_directly():
+    """A user-authored send bypasses the approval queue under every category:
+    verify exists to put the user's decision between agent-composed content and
+    the wire, and the dashboard's send press already is that decision."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_telegram_gateway([{"number": "*", "category": "verify"}], tmp)
+        for category in ("verify", "trust", "allow"):
+            assert wg._send_is_direct(category, False, "user") is True
+        # Agent/device authorship keeps today's rules exactly.
+        assert wg._send_is_direct("verify", False, "agent") is False
+        assert wg._send_is_direct("verify", True, "agent") is False
+        assert wg._send_is_direct("trust", False, "agent") is False
+        assert wg._send_is_direct("trust", True, "agent") is True
+        assert wg._send_is_direct("allow", False, "agent") is True
+    print("ok: user-authored sends are direct; agent rules unchanged")
+
+
 def main():
     test_category_resolves_from_sending_account()
     test_wildcard_applies_to_unlisted_account()
@@ -182,6 +199,7 @@ def main():
     test_pending_send_store_lifecycle()
     test_pending_send_reject_does_not_send()
     test_malformed_request_id_rejected()
+    test_user_author_sends_directly()
     print("\nAll Telegram send-policy checks passed.")
 
 

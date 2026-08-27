@@ -224,6 +224,73 @@ def test_approval_slug_derived_from_host_header():
     print("ok: approval slug derived from Host header")
 
 
+def test_user_author_sends_directly():
+    """A user-authored send bypasses the approval queue under every category:
+    verify exists to put the user's decision between agent-composed content and
+    the wire, and the dashboard's send press already is that decision."""
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(_POLICY, tmp, account="+15551234567")  # verify
+        for category in ("verify", "trust", "allow"):
+            assert sg._send_is_direct(category, False, "user") is True
+        # Agent/device authorship keeps today's rules exactly.
+        assert sg._send_is_direct("verify", False, "agent") is False
+        assert sg._send_is_direct("verify", True, "agent") is False
+        assert sg._send_is_direct("trust", False, "agent") is False
+        assert sg._send_is_direct("trust", True, "agent") is True
+        assert sg._send_is_direct("allow", False, "agent") is True
+    print("ok: user-authored sends are direct; agent rules unchanged")
+
+
+def test_user_author_send_over_http():
+    """End to end through the /send handler: under `verify`, author "user"
+    sends directly (and surfaces the recorded ledger identity) while the
+    default agent authorship still queues for approval."""
+    import http.client
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ.pop("SIGNAL_GATEWAY_TOKEN", None)
+        sg = _load_signal_gateway([{"number": "*", "category": "verify"}], tmp,
+                                  account="+15551234567")
+        pushed = []
+
+        def _fake_push(recipient, message, **kw):
+            pushed.append((recipient, message, kw))
+            return "1724832000123", 1724832000.123
+
+        sg._push = _fake_push
+        server = ThreadingHTTPServer(("127.0.0.1", 0), sg._PushHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+            body = json.dumps({"recipient": "+15551112222", "message": "hi",
+                               "author": "user", "voice": False})
+            conn.request("POST", "/send", body, {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            answer = json.loads(resp.read().decode("utf-8"))
+            assert resp.status == 200, answer
+            assert answer["status"] == "sent"
+            assert answer["message_id"] == "1724832000123"
+            assert pushed and pushed[0][2]["author"] == "user"
+            # The same send without author stays on the approval path.
+            body = json.dumps({"recipient": "+15551112222", "message": "hi"})
+            conn.request("POST", "/send", body, {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            answer = json.loads(resp.read().decode("utf-8"))
+            assert resp.status == 202 and answer["status"] == "pending_approval"
+            # An unknown author is rejected outright, never defaulted.
+            body = json.dumps({"recipient": "+15551112222", "message": "hi",
+                               "author": "assistant"})
+            conn.request("POST", "/send", body, {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            resp.read()
+            assert resp.status == 400
+        finally:
+            server.shutdown()
+    print("ok: /send author=user is direct over HTTP; agent default still queues")
+
+
 def main():
     test_category_resolves_from_sending_account()
     test_policy_default_verify_without_wildcard()
@@ -232,6 +299,8 @@ def main():
     test_unknown_request_id()
     test_malformed_request_id_rejected()
     test_approval_slug_derived_from_host_header()
+    test_user_author_sends_directly()
+    test_user_author_send_over_http()
     print("\nAll Signal send-policy checks passed.")
 
 

@@ -28,6 +28,7 @@ from reply_tokens import ReplyTokenStore
 import inbound_store as _ibstore
 import triage_policy as _triage
 import news_ingest as _news
+import chat_ingest as _chats
 import job_delivery as _jobs
 
 SIGNAL_ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "").strip()
@@ -211,6 +212,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 GATEWAY_SELF_URL = os.environ.get(
     "SIGNAL_GATEWAY_SELF_URL", f"http://signal-gateway:{HTTP_PORT}"
 ).rstrip("/")
+
+# This gateway's registry slug (the service hostname), sent with every chats-
+# rail event so a chat remembers which account it lives on — what routes a
+# dashboard send back through this exact gateway in multi-account deployments.
+_CHATS_GATEWAY_SLUG = _chats.gateway_slug(GATEWAY_SELF_URL)
 
 
 def _chat_key(sender: str | None, group_id: str | None) -> str:
@@ -946,7 +952,7 @@ def _wav_to_ogg(wav_path: Path) -> Path:
 
 def _signal_send(recipient: str, message: str | None = None,
                  attachments: list[Path] | None = None,
-                 author: str = "agent") -> None:
+                 author: str = "agent") -> tuple[str | None, float | None]:
     """Send a Signal message with an optional body and any number of attachments.
 
     A ``recipient`` prefixed with :data:`SIGNAL_GROUP_PREFIX` addresses a group:
@@ -959,7 +965,10 @@ def _signal_send(recipient: str, message: str | None = None,
     record is written once success is known; ``author`` (kb:author) says who
     composed the message and never affects delivery. The ``recipient`` is
     already the chat key — the same number/UUID or ``group:<id>`` form inbound
-    records carry.
+    records carry. Returns ``(message_id, sent_at_epoch)`` — the recorded
+    ledger identity, which the /send response surfaces so the dashboard's chat
+    view can show the sent message under its real id — or ``(None, None)``
+    when signal-cli reported no timestamp.
 
     Serialized via SIGNAL_CLI_LOCK so it never races the receive poll loop.
     """
@@ -988,6 +997,7 @@ def _signal_send(recipient: str, message: str | None = None,
     RECENT_SENDS.note(msg_id, chat=recipient, text=message or "")
     _record_outbound(recipient, message or "", author, message_id=msg_id,
                      timestamp=(ts_ms / 1000.0) if ts_ms else None)
+    return msg_id, (ts_ms / 1000.0) if ts_ms else None
 
 
 def _send_voice_reply(recipient: str, ogg_path: Path, caption: str | None = None) -> None:
@@ -1330,6 +1340,14 @@ def _record_sync_sent(sent: dict) -> None:
         return
     _record_outbound(chat, text, "device", message_id=msg_id,
                      timestamp=(int(ts) / 1000.0) if ts else None)
+    if SIGNAL_GATEWAY_MODE == "inbox":
+        # Chats rail: an own-device send advances the chat's read watermark on
+        # the dashboard (the user was visibly in that chat on their phone).
+        _chats.notify_chat_event_async(
+            direction="out", channel=INBOUND_CHANNEL, chat=chat,
+            gateway=_CHATS_GATEWAY_SLUG, author="device", message_id=msg_id,
+            ts=(int(ts) / 1000.0) if ts else None, text=text,
+        )
     print(f"[signal-gateway] recorded own-device send to {chat}", flush=True)
 
 
@@ -1425,7 +1443,8 @@ def _handle_event(event: dict) -> None:
         _forward_to_inbox(question, lang, sender, group_id=_extract_group_id(event),
                           files=files, attachment_urls=attachment_urls,
                           store_path=voice_store_path,
-                          message_id=_extract_message_id(event))
+                          message_id=_extract_message_id(event),
+                          sender_name=event.get("envelope", {}).get("sourceName"))
     else:
         _handle_control_message(question, lang, sender, files=files)
 
@@ -1471,7 +1490,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
                       files: list[dict] | None = None,
                       attachment_urls: list[str] | None = None,
                       store_path=None,
-                      message_id: str | None = None) -> None:
+                      message_id: str | None = None,
+                      sender_name: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     The account is one of the user's own message sources, so the message is the
@@ -1512,6 +1532,21 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     if gate.get("news"):
         source = (_resolve_group_name(group_id) or group_id) if is_group else sender
         _forward_news(question, source, group_id, lang)
+    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
+    # surface lights up (and the user is Web-Pushed) with no model turn.
+    # Fire-and-forget on its own thread — it must never delay or reorder the
+    # persist → gate → forward path below. Held classes go too (the mirror
+    # updates silently); the gate verdict rides along so they stay quiet.
+    _chats.notify_chat_event_async(
+        direction="in", channel=INBOUND_CHANNEL,
+        chat=_chat_key(sender, group_id), gateway=_CHATS_GATEWAY_SLUG,
+        sender=sender, sender_name=sender_name, group=is_group,
+        message_id=message_id,
+        ts=(int(message_id) / 1000.0) if (message_id or "").isdigit() else None,
+        text=question, attachments=attachment_urls,
+        gate={"forward": bool(gate.get("forward")),
+              "reason": str(gate.get("reason") or "")},
+    )
     if not gate["forward"]:
         # Mark delivered only for a message that is fully accounted for (a
         # blacklisted/no-action class the drain must never re-surface). One held
@@ -1688,6 +1723,22 @@ def _outbound_policy_category() -> str:
         if normalize_requester_identity(number) == normalized:
             return category
     return wildcard if wildcard is not None else DEFAULT_SEND_CATEGORY
+
+
+def _send_is_direct(category: str, user_approved: bool, author: str) -> bool:
+    """Whether a /send executes immediately instead of queueing for approval.
+
+    A user-authored send is direct under EVERY category: verify/trust exist to
+    put the user's decision between agent-composed content and the wire, and a
+    message the user typed and sent in the authenticated dashboard already
+    carries that decision — queueing it would ask the user to approve their own
+    words a second time. The only caller that sets author "user" is the
+    web-gateway's chat-send endpoint, which sits behind the dashboard's edge
+    auth; agents and CLIs default to "agent" and keep today's rules.
+    """
+    if author == "user":
+        return True
+    return category == "allow" or (category == "trust" and user_approved)
 
 
 # ── Pending-send store ────────────────────────────────────────────────────────
@@ -1868,12 +1919,13 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
-          author: str = "agent") -> None:
+          author: str = "agent") -> tuple[str | None, float | None]:
     """Send an outbound message: text body + spoken audio + optional images.
 
     Images precede the voice note. When voice synthesis fails the message is
     still delivered as text (plus any images) rather than lost. ``author`` is
-    carried through to the ledger record (see :func:`_signal_send`).
+    carried through to the ledger record, and the recorded ``(message_id,
+    sent_at)`` is returned (see :func:`_signal_send`).
     """
     images = images or []
     message = (message or "").strip()
@@ -1904,8 +1956,8 @@ def _push(recipient: str, message: str, lang: str | None = None,
             except Exception as voice_exc:
                 print(f"[signal-gateway] push voice synthesis failed, sending without audio: {voice_exc}", flush=True)
 
-        _signal_send(recipient, message=message or None, attachments=attachments,
-                     author=author)
+        return _signal_send(recipient, message=message or None,
+                            attachments=attachments, author=author)
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -2218,8 +2270,10 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
 
         # Check outbound send policy (keyed by this gateway's sending account).
+        # A user-authored send is direct regardless of category — see
+        # _send_is_direct for why the dashboard's send press IS the approval.
         category = _outbound_policy_category()
-        if category == "verify" or (category == "trust" and not user_approved):
+        if not _send_is_direct(category, user_approved, author):
             request_id = _new_pending_send(recipient, message, lang, images, voice,
                                            category, author=author)
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
@@ -2238,8 +2292,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            _push(recipient, message, lang=lang, images=images, voice=voice,
-                  author=author)
+            result = _push(recipient, message, lang=lang, images=images,
+                           voice=voice, author=author)
         except ValueError as exc:
             self._reply(400, {"error": str(exc)})
             return
@@ -2247,9 +2301,20 @@ class _PushHandler(BaseHTTPRequestHandler):
             print(f"[signal-gateway] push failed: {exc}\n{traceback.format_exc()}", flush=True)
             self._reply(502, {"error": f"send failed: {exc}"})
             return
-        print(f"[signal-gateway] push sent to {recipient}"
-              + (f" ({len(images)} image(s))" if images else ""), flush=True)
-        self._reply(200, {"status": "sent", "recipient": recipient})
+        if author == "user":
+            print(f"[signal-gateway] user-authored send to {recipient} "
+                  f"(direct under category {category} — the dashboard send press is the approval)",
+                  flush=True)
+        else:
+            print(f"[signal-gateway] push sent to {recipient}"
+                  + (f" ({len(images)} image(s))" if images else ""), flush=True)
+        body = {"status": "sent", "recipient": recipient}
+        # Surface the recorded ledger identity so the caller (the dashboard's
+        # chat view) can show the sent message under its real id and timestamp.
+        if isinstance(result, tuple) and result[0]:
+            body["message_id"] = result[0]
+            body["ts"] = result[1]
+        self._reply(200, body)
 
 
 def _serve_http() -> None:

@@ -31,5 +31,6 @@ COPY scripts/triage_policy.py /app/triage_policy.py
 COPY scripts/inbound_store.py /app/inbound_store.py
 COPY scripts/job_delivery.py /app/job_delivery.py
 COPY scripts/news_ingest.py /app/news_ingest.py
+COPY scripts/chat_ingest.py /app/chat_ingest.py
 
 CMD ["python3", "/app/telegram-gateway.py"]

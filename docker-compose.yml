@@ -174,6 +174,15 @@ services:
       # to normal triage and never reaches the feed.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Messenger-chat state (read watermarks, shared drafts, archive/mute,
+      # cached display metadata) — one JSON doc per chat, written only by the
+      # web-gateway. Persistent /root volume like CONVERSATIONS_DIR: losing it
+      # would resurrect every read message as unread and drop staged drafts.
+      - CHAT_STATE_DIR=/root/.retinue/chats
+      # Optional shared secret for the gateways' chats notify rail
+      # (POST /internal/chats/inbound). Open when unset — the news-rail model;
+      # set it here and on the gateways to lock the endpoint down.
+      - CHATS_INGEST_TOKEN
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
       - UPDATER_URL=http://updater:9000/update
@@ -303,6 +312,13 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Chats notify rail: on every arrival (and own-device echo) the gateway
+      # POSTs the message's metadata here so the dashboard's chat surface
+      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
+      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
+      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -382,6 +398,13 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Chats notify rail: on every arrival (and own-device echo) the gateway
+      # POSTs the message's metadata here so the dashboard's chat surface
+      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
+      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
+      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -462,6 +485,13 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Chats notify rail: on every arrival (and own-device echo) the gateway
+      # POSTs the message's metadata here so the dashboard's chat surface
+      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
+      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
+      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service.
       - STT_SERVICE_URL=http://stt:8100/transcribe
       - STT_TOKEN
