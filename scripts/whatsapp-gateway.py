@@ -55,6 +55,7 @@ from reply_tokens import ReplyTokenStore
 import inbound_store as _ibstore
 import triage_policy as _triage
 import news_ingest as _news
+import chat_ingest as _chats
 import job_delivery as _jobs
 from requester_identity import normalize_requester_identity
 
@@ -231,6 +232,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 GATEWAY_SELF_URL = os.environ.get(
     "WHATSAPP_GATEWAY_SELF_URL", f"http://whatsapp-gateway:{HTTP_PORT}"
 ).rstrip("/")
+
+# This gateway's registry slug (the service hostname), sent with every chats-
+# rail event so a chat remembers which account it lives on — what routes a
+# dashboard send back through this exact gateway in multi-account deployments.
+_CHATS_GATEWAY_SLUG = _chats.gateway_slug(GATEWAY_SELF_URL)
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
@@ -1175,7 +1181,7 @@ def _wa_chat_key(recipient: str) -> str:
 
 
 def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = None,
-             author: str = "agent") -> None:
+             author: str = "agent") -> tuple[str | None, float | None]:
     """Send a WhatsApp message: optional text plus any number of media files.
 
     Bridge calls are serialized via WA_CLIENT_LOCK (inside _run_send_op) so
@@ -1185,7 +1191,10 @@ def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = 
 
     Every send funnels through here, so this is also where the outbound ledger
     record is written once success is known; ``author`` (kb:author) says who
-    composed the message and never affects delivery.
+    composed the message and never affects delivery. Returns ``(message_id,
+    sent_at_epoch)`` — the recorded ledger identity, surfaced in the /send
+    response so the dashboard's chat view can show the sent message under its
+    real id — or ``(None, None)`` when the bridge reported neither.
     """
     client = _wa_client
     if client is None:
@@ -1194,7 +1203,7 @@ def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = 
     jid = _to_jid(recipient)
     ops = _build_send_ops(text, media_paths)
     if not ops:
-        return
+        return None, None
     candidates = [jid]
     server = str(_attr(jid, "Server", "server", default="")) or str(jid).rpartition("@")[2]
     if server == WA_PN_SERVER:
@@ -1207,9 +1216,11 @@ def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = 
     # here (text + attachments), recorded once; the first part's response
     # carries the StanzaID and send timestamp.
     first = next((r for r in responses if r is not None), None)
+    msg_id = str(_attr(first, "ID", "Id", "id") or "") or None
+    ts = _epoch_seconds(_attr(first, "Timestamp", "timestamp"))
     _record_outbound(chat, (text or "").strip(), author,
-                     message_id=str(_attr(first, "ID", "Id", "id") or "") or None,
-                     timestamp=_epoch_seconds(_attr(first, "Timestamp", "timestamp")))
+                     message_id=msg_id, timestamp=ts)
+    return msg_id, ts
 
 
 def _start_bridge() -> None:
@@ -1650,6 +1661,14 @@ def _record_own_device_send(info, chat_jid, message, msg_id: str | None) -> None
         return
     ts = _epoch_seconds(_attr(info, "Timestamp", "timestamp"))
     _record_outbound(chat, text, "device", message_id=msg_id, timestamp=ts)
+    if WHATSAPP_GATEWAY_MODE == "inbox":
+        # Chats rail: an own-device send advances the chat's read watermark on
+        # the dashboard (the user was visibly in that chat on their phone).
+        _chats.notify_chat_event_async(
+            direction="out", channel=INBOUND_CHANNEL, chat=chat,
+            gateway=_CHATS_GATEWAY_SLUG, author="device", message_id=msg_id,
+            ts=ts, text=text,
+        )
     print(f"[whatsapp-gateway] recorded own-device send to {chat}", flush=True)
 
 
@@ -1736,6 +1755,19 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # flagged `news` goes to the feed whether or not it earns a model turn.
     if gate.get("news"):
         _forward_news(question, sender_name or (group_id if is_group else sender), group_id, lang)
+    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
+    # surface lights up (and the user is Web-Pushed) with no model turn.
+    # Fire-and-forget on its own thread — it must never delay or reorder the
+    # persist → gate → forward path below. Held classes go too (the mirror
+    # updates silently); the gate verdict rides along so they stay quiet.
+    _chats.notify_chat_event_async(
+        direction="in", channel=INBOUND_CHANNEL, chat=origin or sender,
+        gateway=_CHATS_GATEWAY_SLUG, sender=sender, sender_name=sender_name,
+        group=is_group, message_id=message_id, text=question,
+        attachments=attachment_urls,
+        gate={"forward": bool(gate.get("forward")),
+              "reason": str(gate.get("reason") or "")},
+    )
     if not gate["forward"]:
         # Mark delivered only for a fully-accounted class (blacklisted/no-action)
         # the drain must never re-surface. One held merely for a not-yet-
@@ -2016,6 +2048,22 @@ def _outbound_policy_category() -> str:
     return wildcard if wildcard is not None else DEFAULT_SEND_CATEGORY
 
 
+def _send_is_direct(category: str, user_approved: bool, author: str) -> bool:
+    """Whether a /send executes immediately instead of queueing for approval.
+
+    A user-authored send is direct under EVERY category: verify/trust exist to
+    put the user's decision between agent-composed content and the wire, and a
+    message the user typed and sent in the authenticated dashboard already
+    carries that decision — queueing it would ask the user to approve their own
+    words a second time. The only caller that sets author "user" is the
+    web-gateway's chat-send endpoint, which sits behind the dashboard's edge
+    auth; agents and CLIs default to "agent" and keep today's rules.
+    """
+    if author == "user":
+        return True
+    return category == "allow" or (category == "trust" and user_approved)
+
+
 # ── Pending-send store ────────────────────────────────────────────────────────
 # Outbound sends whose policy category is 'verify' (or 'trust' without
 # --user-approved) are registered here and transmitted only after the user
@@ -2258,13 +2306,14 @@ def _autowhitelist_recipient(recipient: str) -> None:
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
-          author: str = "agent") -> None:
+          author: str = "agent") -> tuple[str | None, float | None]:
     """Send an outbound message: text body plus optional image attachments.
 
     `lang`/`voice` are accepted for parity with the Signal gateway's _push
     signature (the pending store persists them) but WhatsApp has no voice
     pipeline, so they are ignored here. ``author`` is carried through to the
-    ledger record (see :func:`_wa_send`).
+    ledger record, and the recorded ``(message_id, sent_at)`` is returned (see
+    :func:`_wa_send`).
     """
     images = images or []
     message = (message or "").strip()
@@ -2275,8 +2324,10 @@ def _push(recipient: str, message: str, lang: str | None = None,
     try:
         for image in images:
             temp_paths.append(_decode_image(image))
-        _wa_send(recipient, message or None, media_paths=temp_paths, author=author)
+        result = _wa_send(recipient, message or None, media_paths=temp_paths,
+                          author=author)
         _autowhitelist_recipient(recipient)
+        return result
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -2483,8 +2534,10 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "'author' must be one of " + "|".join(_ibstore.AUTHORS)})
             return
 
+        # A user-authored send is direct regardless of category — see
+        # _send_is_direct for why the dashboard's send press IS the approval.
         category = _outbound_policy_category()
-        if category == "verify" or (category == "trust" and not user_approved):
+        if not _send_is_direct(category, user_approved, author):
             request_id = _new_pending_send(recipient, message, lang, images, voice,
                                            category, author=author)
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
@@ -2503,8 +2556,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            _push(recipient, message, lang=lang, images=images, voice=voice,
-                  author=author)
+            result = _push(recipient, message, lang=lang, images=images,
+                           voice=voice, author=author)
         except ValueError as exc:
             self._reply(400, {"error": str(exc)})
             return
@@ -2512,9 +2565,20 @@ class _PushHandler(BaseHTTPRequestHandler):
             print(f"[whatsapp-gateway] push failed: {exc}\n{traceback.format_exc()}", flush=True)
             self._reply(502, {"error": f"send failed: {exc}"})
             return
-        print(f"[whatsapp-gateway] push sent to {recipient}"
-              + (f" ({len(images)} image(s))" if images else ""), flush=True)
-        self._reply(200, {"status": "sent", "recipient": recipient})
+        if author == "user":
+            print(f"[whatsapp-gateway] user-authored send to {recipient} "
+                  f"(direct under category {category} — the dashboard send press is the approval)",
+                  flush=True)
+        else:
+            print(f"[whatsapp-gateway] push sent to {recipient}"
+                  + (f" ({len(images)} image(s))" if images else ""), flush=True)
+        body = {"status": "sent", "recipient": recipient}
+        # Surface the recorded ledger identity so the caller (the dashboard's
+        # chat view) can show the sent message under its real id and timestamp.
+        if isinstance(result, tuple) and result[0]:
+            body["message_id"] = result[0]
+            body["ts"] = result[1]
+        self._reply(200, body)
 
 
 def _serve_http() -> None:

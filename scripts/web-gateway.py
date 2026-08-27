@@ -77,6 +77,43 @@ Push notifications (dashboard PWA; see scripts/push_notify.py):
                                          browser's subscription JSON verbatim).
   POST /push/unsubscribe              -> drop one (body {endpoint}); idempotent.
 
+Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
+  GET  /chats                         -> {"generated", "chats": [ChatSummary]}
+                                         — every chat in the message ledgers,
+                                         SPARQL over the life store merged with
+                                         the live overlay and the chat state,
+                                         ordered by last activity.
+  GET  /chats/<id>/messages           -> {"generated", "chat": ChatSummary,
+                                         "messages": [Message]} ascending, the
+                                         last CHAT_PAGE_MESSAGES by default.
+                                         ?before=<ts> pages older history (a
+                                         contract addition over the fixture:
+                                         the fixture documents were unpaged).
+                                         <id> is <channel>:<chat-key>,
+                                         percent-encoded; the key is split off
+                                         at the FIRST colon.
+  POST /chats/<id>/read               -> advance the read watermark (body {ts}).
+  POST /chats/<id>/draft              -> write the shared draft (body {text,
+                                         version}); 409 + current state on a
+                                         stale version; empty text clears it.
+  POST /chats/<id>/send               -> send {text} through the chat's own
+                                         gateway as the user (author "user" —
+                                         direct under every policy category:
+                                         the authenticated send press IS the
+                                         approval `verify` exists for). Returns
+                                         the sent Message.
+  GET  /chats/media/<slug>/<media-id> -> authenticated proxy for ledger media
+                                         (the gateways' token-gated /media/<id>).
+  POST /internal/chats/inbound        -> the gateways' notify rail: one message
+                                         event (arrival or own-device echo).
+                                         Feeds the overlay, keeps chat state,
+                                         Web-Pushes arrivals. Open unless
+                                         CHATS_INGEST_TOKEN is set (news-rail
+                                         model — see the handler).
+  POST /internal/chats/<id>/draft     -> an agent stages the draft (token-gated
+                                         via CONVERSATION_BACKEND_TOKEN; see
+                                         scripts/chat-draft.py).
+
 Session logic:
 - Conversations are keyed by requester identity (the "on-behalf-of" field, e.g.
   the Signal sender). Each key gets its own Claude session, state entry and lock,
@@ -130,6 +167,7 @@ from pathlib import Path
 from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
 import claude_auth
+import chat_state as chat_state_mod
 import email_client as ec
 import gateway_auth
 import messenger_gateways
@@ -744,6 +782,32 @@ CONVERSATION_BACKEND_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "")
 # and a variable the entrypoint generates when missing can never be unset. See
 # _news_ingest_authorized() for why this one endpoint is open by default.
 NEWS_INGEST_TOKEN = os.environ.get("NEWS_INGEST_TOKEN", "").strip()
+
+# ── Messenger chats ────────────────────────────────────────────────────────────
+# Per-chat state (read watermark, shared draft, archive/mute, cached display
+# metadata) — one JSON doc per chat, single-writer = this gateway. The
+# deployment pins it to the persistent /root volume like CONVERSATIONS_DIR.
+CHAT_STATE_DIR = Path(os.environ.get("CHAT_STATE_DIR", "/tmp/web-chat-state"))
+_CHAT_STATE = chat_state_mod.ChatStateStore(CHAT_STATE_DIR)
+# The live overlay bridging the life store's few seconds of indexing lag — fed
+# by the notify rail and the dashboard send path, merged over every SPARQL
+# answer, deduplicated on the channel message id. Entries outlive the store's
+# catch-up window and then expire; a restart loses only that freshness.
+CHAT_OVERLAY_TTL_SECONDS = float(os.environ.get("CHAT_OVERLAY_TTL_SECONDS", "90"))
+_CHAT_OVERLAY = chat_state_mod.ChatOverlay(ttl=CHAT_OVERLAY_TTL_SECONDS)
+# The chats rail's optional token — the NEWS_INGEST_TOKEN model, its own
+# variable for the same reason (an entrypoint-generated token can never be
+# unset, so "open by default" needs a variable nothing generates).
+CHATS_INGEST_TOKEN = os.environ.get("CHATS_INGEST_TOKEN", "").strip()
+# How many messages one GET /chats/<id>/messages page carries (the newest;
+# ?before pages older history).
+CHAT_PAGE_MESSAGES = int(os.environ.get("CHAT_PAGE_MESSAGES", "200"))
+# How long the SPARQL-derived chat-list skeleton is reused between polls; state
+# and overlay are applied fresh on every request, and any write that changes
+# the skeleton's truth (a rail event, a read, a send) invalidates it early.
+CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "3"))
+# Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
+CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
 # Voice input: the dashboard uploads recorded audio here and we proxy it to the
 # shared STT service (scripts/stt-service.py), which owns the Whisper model — so
 # this image ships no ASR stack. Empty URL disables the feature (the endpoint
@@ -3286,6 +3350,564 @@ def _news_preferences_payload() -> dict:
     return {"markdown": news_store.load_preferences(), "updated": updated}
 
 
+# ── Messenger chats (SPARQL over the ledgers + live overlay) ──────────────────
+# The chat surface is a deterministic mirror of the gateways' message ledgers
+# (kb:InboundMessage / kb:OutboundMessage, both stamped with kb:chat), served
+# SPARQL-first: the merged cross-channel view is a query, not a directory scan,
+# and the store's few seconds of indexing lag are bridged by the in-memory
+# overlay fed by the notify rail and the dashboard send path. There is
+# deliberately NO raw-file read path behind it: if the life store is down the
+# chat endpoints answer an honest 502 (the dashboard components keep their last
+# cached state), the same stance /projects takes — a store that is frequently
+# down is an infrastructure defect to fix at the store, not something each
+# consumer papers over.
+
+_CHAT_ID_MAX_LEN = 512
+_CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
+_CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
+_CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
+_CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
+_INTERNAL_CHAT_DRAFT_RE = re.compile(r"^/internal/chats/([^/]+)/draft/?$")
+# The media id is the gateways' token_hex(16) — 32 hex chars, path-safe by
+# construction; the slug charset matches the gateway-registry slugs.
+_CHAT_MEDIA_RE = re.compile(r"^/chats/media/([A-Za-z0-9._-]+)/([0-9a-f]{32})/?$")
+_CHAT_MEDIA_PATH_RE = re.compile(r"^/media/([0-9a-f]{32})/?$")
+_CHAT_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+_T_CHAT_OUTBOUND = _KB + "OutboundMessage"
+
+
+def _chat_id_from_path(raw: str) -> str | None:
+    """Decode and sanity-check the <id> path segment (<channel>:<chat-key>).
+
+    The id travels percent-encoded (keys contain ':', '@', '+', and Signal
+    group ids are base64 with '/' and '='); the split at the FIRST colon is
+    what keeps a key's own colons intact."""
+    chat_id = urllib.parse.unquote(raw or "")
+    if not chat_id or len(chat_id) > _CHAT_ID_MAX_LEN:
+        return None
+    if chat_state_mod.split_chat_id(chat_id) is None:
+        return None
+    return chat_id
+
+
+def _chat_messages_url(chat_id: str) -> str:
+    """The URL the client follows for a chat's messages — served here, but the
+    client never constructs it (the fixture→API contract)."""
+    return "/chats/" + urllib.parse.quote(chat_id, safe="") + "/messages"
+
+
+def _sparql_str(value: str) -> str:
+    """Quote a string as a SPARQL literal. Chat keys come out of the store and
+    go back in as filters, so they are escaped like any untrusted literal."""
+    escaped = (str(value).replace("\\", "\\\\").replace('"', '\\"')
+               .replace("\n", "\\n").replace("\r", "\\r"))
+    return f'"{escaped}"'
+
+
+def _sparql_datetime(iso: str) -> str:
+    return f'"{iso}"^^<http://www.w3.org/2001/XMLSchema#dateTime>'
+
+
+# One row per chat: the per-chat MAX(ts) subquery joins back (on the shared
+# ?chat/?ts variables) to the message that carries it, so the list skeleton —
+# every chat with its latest message — is one query, not a per-chat fan-out.
+# COALESCE-by-UNION: inbound rows carry receivedAt, outbound rows sentAt, and
+# either is the message's timeline instant.
+_CHATS_LIST_SPARQL = """
+PREFIX k: <%s>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?chat ?channel ?ts ?type ?text ?sender ?author ?mid
+       (GROUP_CONCAT(?att; separator=" ") AS ?atts) WHERE {
+  { SELECT ?chat (MAX(?ts0) AS ?ts) WHERE {
+      ?m0 k:chat ?chat .
+      { ?m0 k:receivedAt ?ts0 } UNION { ?m0 k:sentAt ?ts0 }
+    } GROUP BY ?chat }
+  ?m k:chat ?chat ; k:channel ?channel ; k:text ?text ; rdf:type ?type .
+  { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
+  OPTIONAL { ?m k:sender ?sender }
+  OPTIONAL { ?m k:author ?author }
+  OPTIONAL { ?m k:messageId ?mid }
+  OPTIONAL { ?m k:attachment ?att }
+} GROUP BY ?chat ?channel ?ts ?type ?text ?sender ?author ?mid
+""" % _KB
+
+# Unread = COUNT of inbound above each chat's own read watermark. The per-chat
+# cutoffs are injected as a VALUES table, so one bounded query returns one
+# count per chat and no message rows ever cross the wire — chosen over
+# fetching (chat, ts) pairs and counting here, whose payload grows with every
+# never-opened noisy group (a chat with no watermark counts from the epoch).
+_CHATS_UNREAD_SPARQL = """
+PREFIX k: <%s>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?chat (COUNT(?m) AS ?n) WHERE {
+  VALUES (?chat ?cut) { %%s }
+  ?m rdf:type k:InboundMessage ; k:chat ?chat ; k:receivedAt ?ts .
+  FILTER(?ts > ?cut)
+} GROUP BY ?chat
+""" % _KB
+
+_CHAT_MESSAGES_SPARQL = """
+PREFIX k: <%s>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?m ?type ?text ?sender ?author ?mid ?ts
+       (GROUP_CONCAT(?att; separator=" ") AS ?atts) WHERE {
+  ?m k:chat %%(chat)s ; k:channel %%(channel)s ; k:text ?text ; rdf:type ?type .
+  { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
+  OPTIONAL { ?m k:sender ?sender }
+  OPTIONAL { ?m k:author ?author }
+  OPTIONAL { ?m k:messageId ?mid }
+  OPTIONAL { ?m k:attachment ?att }
+  %%(before)s
+} GROUP BY ?m ?type ?text ?sender ?author ?mid ?ts
+ORDER BY DESC(?ts) LIMIT %%(limit)d
+""" % _KB
+
+
+def _bval(binding: dict, key: str) -> str | None:
+    cell = binding.get(key)
+    return cell.get("value") if cell else None
+
+
+def _chat_is_group(channel: str, key: str) -> bool:
+    """Deterministic group heuristic from the key's own channel encoding —
+    exactly how the gateways encode groups into the chat key. The rail's
+    explicit flag (cached in chat state) wins where present; this covers
+    history that predates the rail."""
+    if channel == "signal":
+        return key.startswith("group:")
+    if channel == "whatsapp":
+        return key.endswith("@g.us")
+    if channel == "telegram":
+        return key.startswith("-")
+    return False
+
+
+def _rewrite_media_url(url: str) -> tuple[str, str | None]:
+    """Rewrite a ledger media reference to the authenticated proxy URL.
+
+    The stored references are the gateways' own token-gated /media/<id> URLs on
+    the internal network (http://<service>:<port>/media/<id>) — unreachable and
+    unauthenticated from the browser. They become /chats/media/<slug>/<id>,
+    served below behind the dashboard's edge auth; the slug is the service
+    hostname, i.e. the gateway-registry key, so the proxy knows which gateway
+    (and which token) to fetch from. Returns ``(public_url, media_id)``;
+    anything that is not a gateway media reference passes through unchanged."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url, None
+    m = _CHAT_MEDIA_PATH_RE.match(parts.path or "")
+    if not m or not parts.hostname:
+        return url, None
+    return f"/chats/media/{parts.hostname}/{m.group(1)}", m.group(1)
+
+
+def _chat_media_meta(channel: str, media_id: str) -> tuple[str | None, int | None]:
+    """Best-effort (content_type, size) of a ledger media blob.
+
+    The built-in channels' message volumes are mounted read-only under the
+    chambers root (docker-compose.yml), so the blob's `.type` sidecar is a
+    local read. This is display metadata only — never a message read path; a
+    miss (an extra account's volume, a pruned blob) just omits the fields and
+    the client renders a generic attachment."""
+    if not channel or not media_id:
+        return None, None
+    base = CHAMBERS_DIR / "_generated" / "messenger" / channel / "media"
+    ctype = None
+    size = None
+    try:
+        ctype = (base / (media_id + ".type")).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        pass
+    try:
+        size = (base / media_id).stat().st_size
+    except OSError:
+        pass
+    return ctype, size
+
+
+def _shape_chat_attachments(urls: list[str], channel: str) -> list[dict]:
+    out = []
+    for url in urls:
+        if not url:
+            continue
+        public, media_id = _rewrite_media_url(url)
+        att: dict = {"id": media_id or public, "url": public}
+        ctype, size = _chat_media_meta(channel, media_id or "")
+        if ctype:
+            att["type"] = ctype
+        if size is not None:
+            att["size"] = size
+        out.append(att)
+    return out
+
+
+def _shape_chat_message(chat_id: str, channel: str, *, direction: str,
+                        text: str, ts: str, message_id: str | None,
+                        subject: str | None = None,
+                        sender: str | None = None,
+                        sender_name: str | None = None,
+                        author: str | None = None, agent: str | None = None,
+                        attachment_urls: list[str] | None = None,
+                        roster: dict | None = None) -> dict:
+    """One contract Message: {id, chat, direction, …} (webapp/README.md)."""
+    msg: dict = {
+        "id": message_id or subject or f"{chat_id}#{ts}",
+        "chat": chat_id,
+        "direction": direction,
+        "text": text or "",
+        "ts": ts,
+    }
+    if direction == "out":
+        msg["author"] = author if author in chat_state_mod.AUTHORS else "agent"
+        if agent:
+            msg["agent"] = agent
+    else:
+        if sender:
+            msg["sender"] = sender
+        name = sender_name or (roster or {}).get(sender or "")
+        if name:
+            msg["sender_name"] = name
+    atts = _shape_chat_attachments(attachment_urls or [], channel)
+    if atts:
+        msg["attachments"] = atts
+    return msg
+
+
+def _chat_last_preview(*, direction: str, text: str, ts: str,
+                       sender: str | None, sender_name: str | None,
+                       author: str | None, has_attachments: bool,
+                       roster: dict | None = None) -> dict:
+    last: dict = {
+        "ts": ts,
+        "direction": direction,
+        "kind": "image" if has_attachments and not text else "text",
+        "text": text or "",
+    }
+    if direction == "out":
+        last["author"] = author if author in chat_state_mod.AUTHORS else "agent"
+    else:
+        name = sender_name or (roster or {}).get(sender or "")
+        if name:
+            last["sender_name"] = name
+    return last
+
+
+def _chat_display_name(doc: dict, channel: str, key: str) -> str:
+    """Cached name, else the 1:1 peer's roster name, else the raw key — the
+    honest fallback until a name has passed by on the rail."""
+    if doc.get("name"):
+        return doc["name"]
+    roster = doc.get("roster") or {}
+    if not _chat_is_group(channel, key) and roster.get(key):
+        return roster[key]
+    return key
+
+
+# The SPARQL-derived skeleton (chat list + unread counts) reused between
+# dashboard polls; state and overlay are merged fresh on every request. Any
+# write that changes the skeleton's truth invalidates it early.
+_chats_cache_lock = threading.Lock()
+_chats_cache: dict = {"at": 0.0, "skeleton": None, "unread": None}
+
+
+def _chats_cache_invalidate() -> None:
+    with _chats_cache_lock:
+        _chats_cache["skeleton"] = None
+        _chats_cache["unread"] = None
+
+
+def _fetch_chats_skeleton() -> dict[str, dict]:
+    """One entry per chat from the ledgers: channel + its latest message row."""
+    skeleton: dict[str, dict] = {}
+    for b in _sparql_bindings(_CHATS_LIST_SPARQL):
+        key = _bval(b, "chat")
+        channel = _bval(b, "channel")
+        ts = _bval(b, "ts")
+        if not key or not channel or not ts:
+            continue
+        chat_id = f"{channel}:{key}"
+        # Two messages can share the max timestamp; keep the first row.
+        if chat_id in skeleton:
+            continue
+        atts = [u for u in (_bval(b, "atts") or "").split(" ") if u]
+        skeleton[chat_id] = {
+            "channel": channel,
+            "key": key,
+            "ts": ts,
+            "direction": "out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
+            "text": _bval(b, "text") or "",
+            "sender": _bval(b, "sender"),
+            "author": _bval(b, "author"),
+            "mid": _bval(b, "mid"),
+            "attachments": atts,
+        }
+    return skeleton
+
+
+def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
+    """Per-chat unread counts in one VALUES-bounded query (see the SPARQL)."""
+    if not cutoffs:
+        return {}
+    epoch = "1970-01-01T00:00:00Z"
+    rows = " ".join(
+        f"({_sparql_str(chat_state_mod.split_chat_id(cid)[1])} "
+        f"{_sparql_datetime(cut or epoch)})"
+        for cid, cut in cutoffs.items()
+    )
+    counts: dict[str, int] = {}
+    by_key = {chat_state_mod.split_chat_id(cid)[1]: cid for cid in cutoffs}
+    for b in _sparql_bindings(_CHATS_UNREAD_SPARQL % rows):
+        key = _bval(b, "chat")
+        n = _bval(b, "n")
+        if key in by_key and n is not None:
+            try:
+                counts[by_key[key]] = int(n)
+            except ValueError:
+                continue
+    return counts
+
+
+def _chats_payload() -> dict:
+    """The GET /chats body: store skeleton ∪ overlay, merged with chat state.
+
+    Raises on a store transport/parse error so the caller can answer an honest
+    502 — the overlay alone is seconds of traffic, not a view worth faking."""
+    now = time.time()
+    with _chats_cache_lock:
+        cached = (_chats_cache["skeleton"] is not None
+                  and now - _chats_cache["at"] <= CHAT_LIST_CACHE_SECONDS)
+        skeleton = dict(_chats_cache["skeleton"]) if cached else None
+        unread = dict(_chats_cache["unread"]) if cached else None
+    if skeleton is None:
+        skeleton = _fetch_chats_skeleton()
+        docs_for_cutoffs = _CHAT_STATE.all()
+        unread = _fetch_unread_counts({
+            cid: (docs_for_cutoffs.get(cid) or {}).get("last_read")
+            for cid in skeleton
+        })
+        with _chats_cache_lock:
+            _chats_cache.update({"at": now, "skeleton": dict(skeleton),
+                                 "unread": dict(unread)})
+    docs = _CHAT_STATE.all()
+
+    # Overlay: entries newer than the store's view update each chat's preview
+    # and unread count, and a chat the store has not indexed at all yet still
+    # appears — the message a push announced is in the view the tap opens.
+    overlay_by_chat: dict[str, list[dict]] = {}
+    for entry in _CHAT_OVERLAY.entries():
+        cid = entry.get("chat_id")
+        if cid:
+            overlay_by_chat.setdefault(cid, []).append(entry)
+
+    chats = []
+    for chat_id in set(skeleton) | set(overlay_by_chat):
+        parts = chat_state_mod.split_chat_id(chat_id)
+        if parts is None:
+            continue
+        channel, key = parts
+        doc = docs.get(chat_id) or _CHAT_STATE.get(chat_id)
+        roster = doc.get("roster") or {}
+        row = skeleton.get(chat_id)
+        last = None
+        last_ts = ""
+        if row is not None:
+            last_ts = row["ts"]
+            last = _chat_last_preview(
+                direction=row["direction"], text=row["text"], ts=row["ts"],
+                sender=row.get("sender"), sender_name=None,
+                author=row.get("author"),
+                has_attachments=bool(row.get("attachments")), roster=roster)
+        count = unread.get(chat_id, 0) if row is not None else 0
+        last_read = doc.get("last_read") or ""
+        store_ts = row["ts"] if row is not None else ""
+        store_mid = row.get("mid") if row is not None else None
+        for entry in overlay_by_chat.get(chat_id, []):  # ascending by (ts, id)
+            ts = entry.get("ts") or ""
+            if ts < store_ts:
+                continue  # certainly indexed (and counted) by the store already
+            # Count only overlay inbound the store has not counted. On an exact
+            # timestamp tie with the store's latest row the message ids decide;
+            # an id-less tie is conservatively treated as the same message —
+            # a rare briefly-missing count beats a double one.
+            same_as_store = ts == store_ts and (
+                not entry.get("message_id")
+                or entry.get("message_id") == store_mid)
+            if (entry.get("direction") == "in" and not same_as_store
+                    and ts > last_read):
+                count += 1
+            if ts >= last_ts:
+                last_ts = ts
+                last = _chat_last_preview(
+                    direction=entry.get("direction") or "in",
+                    text=entry.get("text") or "", ts=ts,
+                    sender=entry.get("sender"),
+                    sender_name=entry.get("sender_name"),
+                    author=entry.get("author"),
+                    has_attachments=bool(entry.get("attachments")),
+                    roster=roster)
+        if last is None:
+            continue
+        group = doc.get("group")
+        if group is None:
+            group = _chat_is_group(channel, key)
+        chats.append({
+            "id": chat_id,
+            "channel": channel,
+            "name": _chat_display_name(doc, channel, key),
+            "group": bool(group),
+            "unread": count,
+            "archived": bool(doc.get("archived")),
+            "muted": bool(doc.get("muted")),
+            "last": last,
+            "draft": doc.get("draft"),
+            "messages": _chat_messages_url(chat_id),
+        })
+    chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "chats": chats,
+    }
+
+
+def _chat_summary(chat_id: str) -> dict | None:
+    """One chat's ChatSummary, from the already-merged list view."""
+    for chat in _chats_payload()["chats"]:
+        if chat["id"] == chat_id:
+            return chat
+    return None
+
+
+def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
+    """The GET /chats/<id>/messages body. Raises on store errors (→ 502)."""
+    channel, key = chat_state_mod.split_chat_id(chat_id)
+    doc = _CHAT_STATE.get(chat_id)
+    roster = doc.get("roster") or {}
+    before_clause = f"FILTER(?ts < {_sparql_datetime(before)})" if before else ""
+    query = _CHAT_MESSAGES_SPARQL % {
+        "chat": _sparql_str(key),
+        "channel": _sparql_str(channel),
+        "before": before_clause,
+        "limit": CHAT_PAGE_MESSAGES,
+    }
+    messages = []
+    seen_mids: set[str] = set()
+    seen_fallback: set[tuple] = set()
+    for b in _sparql_bindings(query):
+        ts = _bval(b, "ts")
+        if not ts:
+            continue
+        mid = _bval(b, "mid")
+        text = _bval(b, "text") or ""
+        atts = [u for u in (_bval(b, "atts") or "").split(" ") if u]
+        messages.append(_shape_chat_message(
+            chat_id, channel,
+            direction="out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
+            text=text, ts=ts, message_id=mid, subject=_bval(b, "m"),
+            sender=_bval(b, "sender"), author=_bval(b, "author"),
+            attachment_urls=atts, roster=roster))
+        if mid:
+            seen_mids.add(mid)
+        seen_fallback.add((ts, text))
+    messages.reverse()  # the query pages newest-first; the contract is ascending
+
+    # Merge the live overlay into the NEWEST page only — older pages are
+    # settled history the overlay can no longer be ahead of.
+    if before is None:
+        for entry in _CHAT_OVERLAY.entries(chat_id):
+            mid = entry.get("message_id")
+            ts = entry.get("ts") or ""
+            text = entry.get("text") or ""
+            if (mid and mid in seen_mids) or (not mid and (ts, text) in seen_fallback):
+                continue
+            messages.append(_shape_chat_message(
+                chat_id, channel,
+                direction=entry.get("direction") or "in",
+                text=text, ts=ts, message_id=mid,
+                sender=entry.get("sender"),
+                sender_name=entry.get("sender_name"),
+                author=entry.get("author"), agent=entry.get("agent"),
+                attachment_urls=entry.get("attachments") or [],
+                roster=roster))
+        messages.sort(key=lambda m: m["ts"])
+
+    summary = _chat_summary(chat_id)
+    if summary is None:
+        # A chat paged well into the past (or older than the current list
+        # view) still gets a well-formed summary from its state + this page.
+        newest = messages[-1] if messages else None
+        summary = {
+            "id": chat_id,
+            "channel": channel,
+            "name": _chat_display_name(doc, channel, key),
+            "group": bool(doc.get("group")
+                          if doc.get("group") is not None
+                          else _chat_is_group(channel, key)),
+            "unread": 0,
+            "archived": bool(doc.get("archived")),
+            "muted": bool(doc.get("muted")),
+            "last": None if newest is None else {
+                "ts": newest["ts"],
+                "direction": newest["direction"],
+                "kind": ("image" if newest.get("attachments")
+                         and not newest["text"] else "text"),
+                "text": newest["text"],
+            },
+            "draft": doc.get("draft"),
+            "messages": _chat_messages_url(chat_id),
+        }
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "chat": summary,
+        "messages": messages,
+    }
+
+
+def _chat_gateway(doc: dict, channel: str):
+    """The gateway account a chat's sends route through: the exact gateway the
+    rail saw its messages arrive on when known, else the channel family's
+    registered gateway. Returns (slug, gw) or (None, None)."""
+    slug = doc.get("gateway") or channel
+    canonical, gw = _channel_gateway(slug)
+    if gw is None and slug != channel:
+        canonical, gw = _channel_gateway(channel)
+    return canonical, gw
+
+
+def _chats_ingest_authorized(provided: str) -> bool:
+    """Authorize a POST /internal/chats/inbound call. Open when no token is set.
+
+    The news-rail model, for the news rail's own reason: this rail is fed by
+    gateway forwards that are fire-and-forget and swallow errors by contract,
+    so a fail-closed default would fail *silently* — a token mismatch between
+    containers produces a chat surface that looks wired and quietly never
+    lights up. The events describe messages the ledgers already hold, and the
+    one outward action (a Web Push previewing the user's own inbound mail) is
+    bounded by what the preview shows. A deployment that wants the endpoint
+    locked sets CHATS_INGEST_TOKEN on both sides and it is enforced — its own
+    variable, because the entrypoint-generated CONVERSATION_BACKEND_TOKEN can
+    never be unset."""
+    if not CHATS_INGEST_TOKEN:
+        return True
+    return hmac.compare_digest(provided, CHATS_INGEST_TOKEN)
+
+
+def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
+                            had_unread: bool) -> None:
+    """Web-Push one arrival: title = chat, body = preview, tap-through = the
+    chat page. Deterministic — no model turn is spent on notification."""
+    if not push_notify.enabled():
+        return
+    channel, key = chat_state_mod.split_chat_id(chat_id)
+    title = _chat_display_name(doc, channel, key)
+    body = " ".join(str(entry.get("text") or "").split()) or "(attachment)"
+    if len(body) > 160:
+        body = body[:157].rstrip() + "…"
+    url = "/chat.html?" + urllib.parse.urlencode({"id": chat_id})
+    push_notify.notify_async(title, body, url=url, tag=chat_id,
+                             mode="reply" if had_unread else "new")
+
+
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
@@ -3462,6 +4084,25 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path in ("/internal/news", "/internal/news/"):
             self._handle_internal_news()
+            return
+        if self.path in ("/internal/chats/inbound", "/internal/chats/inbound/"):
+            self._handle_chats_inbound()
+            return
+        internal_chat_draft_match = _INTERNAL_CHAT_DRAFT_RE.match(self.path)
+        if internal_chat_draft_match:
+            self._handle_internal_chat_draft(internal_chat_draft_match.group(1))
+            return
+        chat_read_match = _CHAT_READ_RE.match(self.path)
+        if chat_read_match:
+            self._handle_chat_read(chat_read_match.group(1))
+            return
+        chat_draft_match = _CHAT_DRAFT_RE.match(self.path)
+        if chat_draft_match:
+            self._handle_chat_draft(chat_draft_match.group(1))
+            return
+        chat_send_match = _CHAT_SEND_RE.match(self.path)
+        if chat_send_match:
+            self._handle_chat_send(chat_send_match.group(1))
             return
         internal_msg_match = _INTERNAL_CONV_MSG_RE.match(self.path)
         if internal_msg_match:
@@ -3806,6 +4447,293 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": "could not file item", "detail": str(exc)})
             return
         self._send_json(200, {"ok": True, "added": added, "id": item["id"]})
+
+    # ── Messenger chat endpoints ───────────────────────────────────────────
+    # Dashboard-side routes sit behind the edge auth like /conversations; the
+    # two /internal/chats/* routes are for in-container callers (the gateways'
+    # rail, agent draft staging).
+
+    def _chat_id_or_404(self, raw: str) -> str | None:
+        chat_id = _chat_id_from_path(raw)
+        if chat_id is None:
+            self._send_json(404, {"error": "not a chat id"})
+        return chat_id
+
+    def _handle_chats_list(self) -> None:
+        try:
+            self._send_json(200, _chats_payload())
+        except Exception as exc:  # store down — honest 502, like /projects
+            self._send_json(502, {"error": "life store unreachable",
+                                  "detail": str(exc)})
+
+    def _handle_chat_messages(self, raw_id: str, query: str) -> None:
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        params = urllib.parse.parse_qs(query)
+        before = (params.get("before") or [None])[0]
+        if before is not None and not _CHAT_TS_RE.match(before):
+            self._send_json(400, {"error": "before must be an ISO-8601 timestamp"})
+            return
+        try:
+            self._send_json(200, _chat_messages_payload(chat_id, before=before))
+        except Exception as exc:
+            self._send_json(502, {"error": "life store unreachable",
+                                  "detail": str(exc)})
+
+    def _handle_chat_read(self, raw_id: str) -> None:
+        """Advance one chat's read watermark (body {ts}) — forward only."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        ts = payload.get("ts")
+        if not isinstance(ts, (str, int, float)) or (
+                isinstance(ts, str) and not _CHAT_TS_RE.match(ts)):
+            self._send_json(400, {"error": "ts must be an ISO-8601 timestamp or epoch seconds"})
+            return
+        doc = _CHAT_STATE.advance_last_read(chat_id, ts)
+        _chats_cache_invalidate()
+        self._send_json(200, {"id": chat_id, "last_read": doc["last_read"]})
+
+    def _handle_chat_draft(self, raw_id: str) -> None:
+        """The user writes the shared draft (body {text, version}).
+
+        `version` is the draft version the client based its edit on; a stale
+        one answers 409 with the current state (the project-file sha-guard
+        precedent) so concurrent edits — the user typing while an agent stages
+        — surface instead of clobbering. Empty text is the composer's ✕: the
+        draft (and its author tag) is cleared."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        text = payload.get("text")
+        version = payload.get("version")
+        if not isinstance(text, str) or not isinstance(version, int):
+            self._send_json(400, {"error": "text (string) and version (int) are required"})
+            return
+        ok, doc = _CHAT_STATE.set_draft(chat_id, text, author="user",
+                                        base_version=version)
+        status = 200 if ok else 409
+        self._send_json(status, {"id": chat_id, "draft": doc["draft"],
+                                 "version": doc["draft_version"]})
+
+    def _handle_internal_chat_draft(self, raw_id: str) -> None:
+        """An agent stages the shared draft (author "agent" + its name).
+
+        Token-gated like the other agent write paths. Without an explicit
+        {version}, an existing non-empty *user-authored* draft is never
+        overwritten (409) — an agent must not clobber what the user is typing;
+        re-staging its own earlier draft is fine."""
+        chat_id = _chat_id_from_path(raw_id)
+        if chat_id is None:
+            self._send_json(404, {"error": "not a chat id"})
+            return
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        text = payload.get("text")
+        if not isinstance(text, str):
+            self._send_json(400, {"error": "text (string) is required"})
+            return
+        version = payload.get("version")
+        if version is not None and not isinstance(version, int):
+            self._send_json(400, {"error": "version must be an int"})
+            return
+        agent = (payload.get("agent") or "").strip() or None
+        ok, doc = _CHAT_STATE.set_draft(chat_id, text, author="agent",
+                                        agent=agent, base_version=version,
+                                        require_free=version is None)
+        status = 200 if ok else 409
+        self._send_json(status, {"id": chat_id, "draft": doc["draft"],
+                                 "version": doc["draft_version"]})
+
+    def _handle_chat_send(self, raw_id: str) -> None:
+        """Send {text} through the chat's own gateway as the user.
+
+        The one hop is the gateway's /send with author "user" — direct under
+        every policy category: `verify` exists to put the user's decision
+        between agent-composed content and the wire, and the send press in the
+        authenticated dashboard IS that decision (this endpoint sits behind
+        the edge auth and is the only caller that sets author user). On
+        success the message enters the overlay, the draft is cleared and the
+        watermark advances, and the sent Message is returned so the UI renders
+        it without waiting for the store."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        text = (payload.get("text") or "").strip()
+        if not text:
+            self._send_json(400, {"error": "empty text"})
+            return
+        channel, key = chat_state_mod.split_chat_id(chat_id)
+        doc = _CHAT_STATE.get(chat_id)
+        slug, gw = _chat_gateway(doc, channel)
+        if gw is None:
+            self._send_json(502, {"error": f"no gateway registered for channel {channel!r}"})
+            return
+        body = json.dumps({
+            "recipient": key,
+            "message": text,
+            "author": "user",
+            # A chat send is a text message like the real client's — never the
+            # push CLIs' spoken rendering.
+            "voice": False,
+        }).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if gw.get("token"):
+            headers["Authorization"] = "Bearer " + gw["token"]
+        req = urllib.request.Request(f"{gw['base_url']}/send", data=body,
+                                     headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=CHAT_SEND_TIMEOUT) as resp:
+                answer = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            self._send_json(502, {"error": f"gateway rejected the send (HTTP {exc.code})",
+                                  "detail": detail})
+            return
+        except Exception as exc:  # noqa: BLE001 - unreachable gateway is a 502
+            self._send_json(502, {"error": f"gateway unreachable: {exc}"})
+            return
+        if not isinstance(answer, dict) or answer.get("status") != "sent":
+            # A pre-user-author gateway would queue this for approval — that is
+            # a deployment-version mismatch, not a sent message; say so.
+            self._send_json(502, {"error": "gateway did not send directly",
+                                  "detail": json.dumps(answer)[:500]})
+            return
+        message_id = (str(answer.get("message_id") or "").strip() or None)
+        ts = chat_state_mod.iso_z(answer.get("ts"))
+        msg = _shape_chat_message(chat_id, channel, direction="out", text=text,
+                                  ts=ts, message_id=message_id, author="user")
+        _CHAT_OVERLAY.insert({
+            "chat_id": chat_id, "channel": channel, "direction": "out",
+            "author": "user", "text": text, "ts": ts, "message_id": message_id,
+        })
+        _CHAT_STATE.clear_draft(chat_id)
+        _CHAT_STATE.advance_last_read(chat_id, ts)
+        if not doc.get("gateway") and slug:
+            _CHAT_STATE.note_message(chat_id, gateway=slug)
+        _chats_cache_invalidate()
+        print(f"[web-gateway] chat send to {chat_id} via {slug}", flush=True)
+        self._send_json(200, msg)
+
+    def _handle_chats_inbound(self) -> None:
+        """The gateways' notify rail: one message event, zero model turns.
+
+        The deterministic replacement for notification-by-triage-session: the
+        gateway POSTs the metadata of a message its ledger already holds, and
+        this handler updates the chat's state, feeds the live overlay, and —
+        for an arrival that deserves it — fans out the Web Push whose
+        tap-through opens the chat. Held/no-action gate classes and muted
+        chats stay silent; an arrival un-archives an archived chat unless it
+        is muted (the conversation rule, verbatim). Outbound echoes with
+        author user/device advance the read watermark — the user was visibly
+        in that chat on their phone; an agent-authored outbound advances
+        nothing. Open unless CHATS_INGEST_TOKEN is set — see
+        _chats_ingest_authorized for why fail-open is the fail-safe here."""
+        token = self.headers.get("X-Conversation-Backend-Token", "")
+        if not _chats_ingest_authorized(token):
+            self._send_json(403, {"error": "forbidden"})
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        direction = (payload.get("direction") or "").strip()
+        channel = (payload.get("channel") or "").strip()
+        chat_key = (payload.get("chat") or "").strip()
+        if direction not in ("in", "out") or not channel or not chat_key:
+            self._send_json(400, {"error": "direction (in|out), channel and chat are required"})
+            return
+        chat_id = f"{channel}:{chat_key}"
+        ts = chat_state_mod.iso_z(payload.get("ts"))
+        author = (payload.get("author") or "").strip() or None
+        entry = {
+            "chat_id": chat_id,
+            "channel": channel,
+            "direction": direction,
+            "sender": (payload.get("sender") or "").strip() or None,
+            "sender_name": (payload.get("sender_name") or "").strip() or None,
+            "author": author,
+            "message_id": (str(payload.get("message_id") or "").strip() or None),
+            "ts": ts,
+            "text": str(payload.get("text") or ""),
+            "attachments": [u for u in (payload.get("attachments") or []) if u],
+        }
+        _CHAT_OVERLAY.insert(entry)
+        group = payload.get("group")
+        doc = _CHAT_STATE.note_message(
+            chat_id,
+            name=(payload.get("chat_name") or "").strip()
+                 or (entry["sender_name"] if not group and direction == "in" else None),
+            group=bool(group) if group is not None else None,
+            gateway=(payload.get("gateway") or "").strip() or None,
+            sender=entry["sender"], sender_name=entry["sender_name"])
+        _chats_cache_invalidate()
+        pushed = False
+        if direction == "in":
+            doc, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
+            # A new message in an archived chat would otherwise land invisible;
+            # muted is the explicit "keep it archived" opt-out.
+            if doc.get("archived") and not doc.get("muted"):
+                doc = _CHAT_STATE.set_flags(chat_id, archived=False)
+            gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else None
+            # Held/no-action classes (blacklisted, ignored-group, quieted, …)
+            # update the mirror silently — the gate already decided they are
+            # not worth the user's attention; absent gate info an arrival is
+            # treated as notify-worthy (fail open, like the gate itself).
+            held = gate is not None and not gate.get("forward", True)
+            if not doc.get("muted") and not held:
+                _chat_push_notification(chat_id, doc, entry, had_unread)
+                pushed = True
+        elif author in ("user", "device"):
+            _CHAT_STATE.advance_last_read(chat_id, ts)
+        self._send_json(200, {"ok": True, "id": chat_id, "pushed": pushed})
+
+    def _handle_chat_media(self, slug: str, media_id: str) -> None:
+        """Authenticated proxy for a ledger media blob.
+
+        The gateways serve their media token-gated on the internal network;
+        this passes the registry token and relays bytes and Content-Type (the
+        /gateways/<slug>/qr proxy precedent), so chat bubbles render media
+        with no gateway token in the browser. The route regex already pins the
+        media id to 32 hex chars."""
+        _slug, gw = _channel_gateway(slug)
+        if not gw:
+            self._send_json(404, {"error": "unknown gateway"})
+            return
+        try:
+            with _gateway_request(gw, f"/media/{media_id}", CHAT_SEND_TIMEOUT) as resp:
+                data = resp.read()
+                content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                status = resp.status
+        except urllib.error.HTTPError as exc:
+            data = exc.read()
+            content_type = exc.headers.get("Content-Type", "application/json")
+            status = exc.code
+        except Exception as exc:  # noqa: BLE001
+            self._send_json(502, {"error": f"gateway unreachable: {exc}"})
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        # Ledger media is immutable — cache privately so a re-opened chat does
+        # not refetch every image through the proxy.
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
 
     def _handle_news_preferences_write(self) -> None:
         """Replace the Herald's memory with what the user typed.
@@ -4279,6 +5207,18 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # transport/parse — be honest, don't fake data
                 self._send_json(502, {"error": "life store unreachable",
                                       "detail": str(exc)})
+            return
+        if conv_path in ("/chats", "/chats/"):
+            self._handle_chats_list()
+            return
+        chat_media_match = _CHAT_MEDIA_RE.match(conv_path)
+        if chat_media_match:
+            self._handle_chat_media(chat_media_match.group(1),
+                                    chat_media_match.group(2))
+            return
+        chat_msgs_match = _CHAT_MSGS_RE.match(conv_path)
+        if chat_msgs_match:
+            self._handle_chat_messages(chat_msgs_match.group(1), conv_query)
             return
         att_match = _CONV_ATT_RE.match(conv_path)
         if att_match:
