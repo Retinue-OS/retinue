@@ -194,8 +194,19 @@ caught up to, deduplicated on `kb:messageId`. Entries expire after a minute or
 so — by then the store holds them — and the overlay is disposable: a restart
 loses nothing but a few seconds of freshness. The message a push announced is
 *by construction* in the view the tap opens, because the same event produced
-both. Should the store be unreachable, the API degrades to a raw directory
-scan — the LiteLLM-to-static fallback pattern the model picker already uses.
+both.
+
+There is deliberately **no second read path**. A raw-scan fallback would be a
+second, growing reader of the same records — exactly the duplication choosing
+the store avoids — and it would mask store trouble instead of surfacing it.
+If `qlever-life` is unreachable, the chat API answers with an error, and the
+dashboard components do what they already do offline: show their last cached
+state, which covers a restart or a brief blip with no new code. A store that
+turns out to be frequently down or behind is an infrastructure defect to fix
+at the store (it ships a healthcheck and supervision since the #150 bump),
+not something each consumer works around — the same stance the framework
+takes on messenger link monitoring: one monitor that surfaces the problem,
+no ad-hoc per-consumer liveness workarounds.
 
 None of this touches the paths that must stay off SPARQL: the gateways'
 classify hot path keeps reading `policy/` raw off their own volumes, and the
@@ -430,8 +441,8 @@ serving logic, `webapp/`, `scripts/`).
 1. **Complete the ledger** (gateways ×3): `kb:chat` + `kb:messageId` on
    inbound; `kb:OutboundMessage` on every successful send; own-device echo
    capture. Pure plumbing, also unblocks #130.
-2. **Read-only chats:** web-gateway chat API (SPARQL-first with the live
-   overlay; raw-scan fallback); Chats card + chat page; `last_read`/unread;
+2. **Read-only chats:** web-gateway chat API (SPARQL + live overlay); Chats
+   card + chat page; `last_read`/unread;
    `POST /internal/chats/inbound` with deterministic Web Push; media proxy.
    Triage still runs as today — the value is *seeing whole conversations at
    last*.
