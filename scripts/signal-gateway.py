@@ -213,27 +213,69 @@ GATEWAY_SELF_URL = os.environ.get(
 ).rstrip("/")
 
 
+def _chat_key(sender: str | None, group_id: str | None) -> str:
+    """The chat key (kb:chat) stamped on ledger records, both directions.
+
+    Exactly the recipient string the send path accepts — the group-prefixed id
+    for a group, else the sender identity — so an inbound message and the reply
+    routed back to it carry the same key. Known aliasing limit: signal-cli may
+    surface the same 1:1 peer as a phone number in one envelope and as a UUID
+    in another (see _extract_sender's preference order), and the two forms then
+    key as two chats until merged upstream. What matters here is that both
+    directions derive from the same extraction, so each form is at least
+    self-consistent.
+    """
+    return (SIGNAL_GROUP_PREFIX + group_id) if group_id else (sender or "unknown")
+
+
 def _persist_inbound(question: str, sender: str, group_id: str | None,
                      delivered: bool, media: str | None = None,
-                     attachment_urls: list[str] | None = None):
+                     attachment_urls: list[str] | None = None,
+                     message_id: str | None = None):
     """Best-effort persist of one inbound message to the store; never raises.
 
     Returns the store ``Path`` (so the caller can later flip the delivered flag
     with :func:`_mark_delivered`) or ``None`` if persistence failed. ``media``
     records a retained raw-audio file for a voice note persisted before
     transcription (see :func:`_retain_media`); ``attachment_urls`` are the
-    durable HTTP references to this message's media (see :func:`_store_media_ref`).
+    durable HTTP references to this message's media (see :func:`_store_media_ref`);
+    ``message_id`` is the channel-native id (see :func:`_extract_message_id`).
     """
     try:
         _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered, media=media,
             attachment_urls=attachment_urls or None,
+            chat=_chat_key(sender, group_id), message_id=message_id,
         )
         return path
     except Exception as exc:
         print(f"[signal-gateway] could not persist inbound message: {exc}", flush=True)
         return None
+
+
+# Echo-dedup memory for outbound recording (see inbound_store.RecentSends).
+RECENT_SENDS = _ibstore.RecentSends()
+
+
+def _record_outbound(chat: str, text: str, author: str,
+                     message_id: str | None = None,
+                     timestamp: float | None = None) -> None:
+    """Best-effort ledger record of one successfully sent message; never raises.
+
+    Inbox-mode only, like inbound persistence: the ledger mirrors the user's
+    own conversations, and a control account's traffic (prompts in, Ara's
+    replies out) is persisted on neither direction.
+    """
+    if SIGNAL_GATEWAY_MODE != "inbox":
+        return
+    try:
+        _ibstore.write_outbound(
+            INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, chat=chat, text=text,
+            author=author, message_id=message_id, timestamp=timestamp,
+        )
+    except Exception as exc:
+        print(f"[signal-gateway] could not record outbound message: {exc}", flush=True)
 
 
 def _mark_delivered(store_path) -> None:
@@ -587,6 +629,18 @@ def _extract_sender(event: dict) -> str | None:
     return env.get("sourceNumber") or env.get("sourceUuid") or env.get("sourceServiceId") or env.get("source")
 
 
+def _extract_message_id(event: dict) -> str | None:
+    """The channel-native id of an inbound message: its sent timestamp.
+
+    Signal identifies a message by (source, sent timestamp in epoch millis) —
+    a reaction or quoted reply targets exactly that pair (issue #130) — and the
+    source half is already persisted as kb:sender, so the timestamp alone is
+    stored as kb:messageId.
+    """
+    ts = event.get("envelope", {}).get("timestamp")
+    return str(ts) if ts else None
+
+
 def _extract_message_text(event: dict) -> str:
     msg = event.get("envelope", {}).get("dataMessage", {})
     return (msg.get("message") or "").strip()
@@ -890,7 +944,9 @@ def _wav_to_ogg(wav_path: Path) -> Path:
     return out_path
 
 
-def _signal_send(recipient: str, message: str | None = None, attachments: list[Path] | None = None) -> None:
+def _signal_send(recipient: str, message: str | None = None,
+                 attachments: list[Path] | None = None,
+                 author: str = "agent") -> None:
     """Send a Signal message with an optional body and any number of attachments.
 
     A ``recipient`` prefixed with :data:`SIGNAL_GROUP_PREFIX` addresses a group:
@@ -898,6 +954,12 @@ def _signal_send(recipient: str, message: str | None = None, attachments: list[P
     recipient, so the prefix is stripped and the id passed that way. This keeps
     group targets a single opaque string end-to-end (reply token → pending-send
     store → here), so a reply to a group message goes back to that same group.
+
+    Every send funnels through here, so this is also where the outbound ledger
+    record is written once success is known; ``author`` (kb:author) says who
+    composed the message and never affects delivery. The ``recipient`` is
+    already the chat key — the same number/UUID or ``group:<id>`` form inbound
+    records carry.
 
     Serialized via SIGNAL_CLI_LOCK so it never races the receive poll loop.
     """
@@ -917,6 +979,15 @@ def _signal_send(recipient: str, message: str | None = None, attachments: list[P
         stdout = (proc.stdout or "").strip()
         details = " | ".join(p for p in [f"stderr: {stderr}" if stderr else "", f"stdout: {stdout}" if stdout else ""] if p)
         raise RuntimeError(f"signal-cli send failed (exit {proc.returncode}): {details or '(no output)'}")
+    # Success: complete the ledger. signal-cli prints the sent message's
+    # timestamp (epoch millis) — together with the sending account that is the
+    # message's protocol identity, so it doubles as kb:messageId and kb:sentAt.
+    m = re.search(r"\b(\d{13,})\b", proc.stdout or "")
+    ts_ms = int(m.group(1)) if m else None
+    msg_id = str(ts_ms) if ts_ms else None
+    RECENT_SENDS.note(msg_id, chat=recipient, text=message or "")
+    _record_outbound(recipient, message or "", author, message_id=msg_id,
+                     timestamp=(ts_ms / 1000.0) if ts_ms else None)
 
 
 def _send_voice_reply(recipient: str, ogg_path: Path, caption: str | None = None) -> None:
@@ -1208,7 +1279,70 @@ def _list_recent_chats() -> list[dict]:
     return out
 
 
+def _extract_sync_sent(event: dict) -> dict | None:
+    """The ``syncMessage.sentMessage`` payload of an own-device send, else None.
+
+    When the user sends from their phone (or another linked device), this
+    linked device receives no dataMessage — it receives a sync envelope whose
+    ``sentMessage`` carries the destination (or groupInfo), the text and the
+    sent timestamp. That is the only trace of the outbound half of those
+    conversations this gateway ever sees, so it is captured into the ledger.
+    """
+    sync = event.get("envelope", {}).get("syncMessage")
+    sent = sync.get("sentMessage") if isinstance(sync, dict) else None
+    return sent if isinstance(sent, dict) else None
+
+
+def _record_sync_sent(sent: dict) -> None:
+    """Ledger-record one own-device send (author: device); never a model turn.
+
+    Ledger only: an own send is nobody's inbound mail, so it must not touch the
+    delivery gate, the news rail, triage forwarding, the unknown-sender flow or
+    the recent-senders store — and, being kb:OutboundMessage, it can never
+    surface in the /undelivered drain.
+    """
+    group = sent.get("groupInfo") if isinstance(sent.get("groupInfo"), dict) else None
+    group_id = (group.get("groupId") or group.get("id")) if group else None
+    # Mirror _extract_sender's preference order (number before UUID) so the
+    # outbound key matches the key inbound messages from the same peer get.
+    destination = (sent.get("destinationNumber") or sent.get("destinationUuid")
+                   or sent.get("destination"))
+    if group_id:
+        chat = SIGNAL_GROUP_PREFIX + str(group_id)
+    elif destination:
+        chat = str(destination)
+    else:
+        return  # not attributable to a chat (e.g. a bare read-receipt sync)
+    text = (sent.get("message") or "").strip()
+    ts = sent.get("timestamp")
+    msg_id = str(ts) if ts else None
+    # signal-cli does not sync this device's own sends back to it (sync fan-out
+    # reaches only the account's *other* devices), so in practice everything
+    # here comes from the user's phone/desktop; the seen() check is insurance
+    # against a client-version surprise, not a hot path.
+    if RECENT_SENDS.seen(msg_id, chat=chat, text=text):
+        return
+    if not text:
+        # Attachment-only own-device sends are not captured yet (the media
+        # would have to be fetched just for the mirror); recording nothing
+        # beats recording an empty bubble.
+        print(f"[signal-gateway] own-device send to {chat} has no text; not recorded", flush=True)
+        return
+    _record_outbound(chat, text, "device", message_id=msg_id,
+                     timestamp=(int(ts) / 1000.0) if ts else None)
+    print(f"[signal-gateway] recorded own-device send to {chat}", flush=True)
+
+
 def _handle_event(event: dict) -> None:
+    # An own-device send (the user replying from their phone) arrives as a sync
+    # envelope, not a dataMessage: record it into the ledger and stop — it is
+    # nobody's inbound mail and must not reach the recent-senders store or any
+    # triage path.
+    sync_sent = _extract_sync_sent(event)
+    if sync_sent is not None:
+        _record_sync_sent(sync_sent)
+        return
+
     sender = _extract_sender(event)
     if not sender:
         return
@@ -1241,7 +1375,7 @@ def _handle_event(event: dict) -> None:
         durable = _retain_media(voice) or voice
         voice_store_path = _persist_inbound(
             "", sender, _extract_group_id(event), delivered=False, media=str(durable),
-            attachment_urls=attachment_urls,
+            attachment_urls=attachment_urls, message_id=_extract_message_id(event),
         )
         try:
             question, lang = _transcribe(durable)
@@ -1290,7 +1424,8 @@ def _handle_event(event: dict) -> None:
     if SIGNAL_GATEWAY_MODE == "inbox":
         _forward_to_inbox(question, lang, sender, group_id=_extract_group_id(event),
                           files=files, attachment_urls=attachment_urls,
-                          store_path=voice_store_path)
+                          store_path=voice_store_path,
+                          message_id=_extract_message_id(event))
     else:
         _handle_control_message(question, lang, sender, files=files)
 
@@ -1335,7 +1470,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
                       group_id: str | None = None,
                       files: list[dict] | None = None,
                       attachment_urls: list[str] | None = None,
-                      store_path=None) -> None:
+                      store_path=None,
+                      message_id: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     The account is one of the user's own message sources, so the message is the
@@ -1365,7 +1501,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # transcription; reuse that record instead of writing a second one.
     if store_path is None:
         store_path = _persist_inbound(question, sender, group_id, delivered=False,
-                                      attachment_urls=attachment_urls)
+                                      attachment_urls=attachment_urls,
+                                      message_id=message_id)
 
     # Delivery gate: decide whether this sender is worth a model turn now. A
     # held message is already persisted above; no `claude -p` session is spawned.
@@ -1587,8 +1724,13 @@ def _lookup_existing_path(request_id: str) -> Path | None:
 
 
 def _new_pending_send(recipient: str, message: str, lang: str | None,
-                      images: list, voice: bool, category: str) -> str:
-    """Store a pending outbound send and return its request_id."""
+                      images: list, voice: bool, category: str,
+                      author: str = "agent") -> str:
+    """Store a pending outbound send and return its request_id.
+
+    ``author`` (kb:author) survives the approval round trip so the ledger
+    record written on the eventual send credits the original composer.
+    """
     request_id = uuid.uuid4().hex
     entry = {
         "id": request_id,
@@ -1598,6 +1740,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
         "voice": voice,
         "images": images,
         "category": category,
+        "author": author,
         "created": int(time.time()),
         "status": "pending",
     }
@@ -1664,6 +1807,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
             lang=entry.get("lang"),
             images=entry.get("images") or [],
             voice=bool(entry.get("voice", True)),
+            author=entry.get("author") or "agent",
         )
         entry["status"] = "approved"
         entry.pop("error", None)
@@ -1723,11 +1867,13 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
 
 
 def _push(recipient: str, message: str, lang: str | None = None,
-          images: list[dict] | None = None, voice: bool = True) -> None:
+          images: list[dict] | None = None, voice: bool = True,
+          author: str = "agent") -> None:
     """Send an outbound message: text body + spoken audio + optional images.
 
     Images precede the voice note. When voice synthesis fails the message is
-    still delivered as text (plus any images) rather than lost.
+    still delivered as text (plus any images) rather than lost. ``author`` is
+    carried through to the ledger record (see :func:`_signal_send`).
     """
     images = images or []
     message = (message or "").strip()
@@ -1758,7 +1904,8 @@ def _push(recipient: str, message: str, lang: str | None = None,
             except Exception as voice_exc:
                 print(f"[signal-gateway] push voice synthesis failed, sending without audio: {voice_exc}", flush=True)
 
-        _signal_send(recipient, message=message or None, attachments=attachments)
+        _signal_send(recipient, message=message or None, attachments=attachments,
+                     author=author)
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -2062,11 +2209,19 @@ class _PushHandler(BaseHTTPRequestHandler):
         lang = (payload.get("lang") or "").strip() or None
         voice = bool(payload.get("voice", True))
         user_approved = bool(payload.get("user_approved", False))
+        # Who composed this message — recorded as kb:author on the ledger entry
+        # of a successful send. Callers that say nothing are agents (the push
+        # CLIs); a dashboard composer sends author=user.
+        author = str(payload.get("author") or "agent").strip().lower()
+        if author not in _ibstore.AUTHORS:
+            self._reply(400, {"error": "'author' must be one of " + "|".join(_ibstore.AUTHORS)})
+            return
 
         # Check outbound send policy (keyed by this gateway's sending account).
         category = _outbound_policy_category()
         if category == "verify" or (category == "trust" and not user_approved):
-            request_id = _new_pending_send(recipient, message, lang, images, voice, category)
+            request_id = _new_pending_send(recipient, message, lang, images, voice,
+                                           category, author=author)
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
             approval_url = (SEND_APPROVAL_BASE_URL + approval_path) if SEND_APPROVAL_BASE_URL else approval_path
             print(f"[signal-gateway] pending send registered for {recipient} "
@@ -2083,7 +2238,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            _push(recipient, message, lang=lang, images=images, voice=voice)
+            _push(recipient, message, lang=lang, images=images, voice=voice,
+                  author=author)
         except ValueError as exc:
             self._reply(400, {"error": str(exc)})
             return

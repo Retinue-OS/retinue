@@ -217,7 +217,8 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
                      delivered: bool, media: str | None = None,
-                     attachment_urls: list[str] | None = None):
+                     attachment_urls: list[str] | None = None,
+                     chat: str | None = None, message_id: str | None = None):
     """Best-effort persist of one inbound message to the store; never raises.
 
     Returns the store ``Path`` (so the caller can later flip the delivered flag
@@ -225,17 +226,45 @@ def _persist_inbound(question: str, sender: str, group_id: str | None,
     records a retained raw-audio file for a voice note persisted before
     transcription (see :func:`_retain_media`); ``attachment_urls`` are the
     durable HTTP references to this message's media (see :func:`_store_media_ref`).
+    ``chat`` is the chat key (kb:chat — the marked chat_id as a string, the
+    same value the reply token stores) and ``message_id`` the Telegram message
+    id within that chat.
     """
     try:
         _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered, media=media,
             attachment_urls=attachment_urls,
+            chat=chat, message_id=message_id,
         )
         return path
     except Exception as exc:
         print(f"[telegram-gateway] could not persist inbound message: {exc}", flush=True)
         return None
+
+
+# Echo-dedup memory for outbound recording (see inbound_store.RecentSends).
+RECENT_SENDS = _ibstore.RecentSends()
+
+
+def _record_outbound(chat: str, text: str, author: str,
+                     message_id: str | None = None,
+                     timestamp: float | None = None) -> None:
+    """Best-effort ledger record of one successfully sent message; never raises.
+
+    Inbox-mode only, like inbound persistence: the ledger mirrors the user's
+    own conversations, and a control account's traffic (prompts in, Ara's
+    replies out) is persisted on neither direction.
+    """
+    if TELEGRAM_GATEWAY_MODE != "inbox":
+        return
+    try:
+        _ibstore.write_outbound(
+            INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, chat=chat, text=text,
+            author=author, message_id=message_id, timestamp=timestamp,
+        )
+    except Exception as exc:
+        print(f"[telegram-gateway] could not record outbound message: {exc}", flush=True)
 
 
 def _mark_delivered(store_path) -> None:
@@ -585,30 +614,74 @@ async def _resolve_entity(recipient: str):
         return await _client.get_entity(r)
 
 
-async def _async_send(recipient: str, text: str, media_paths: list) -> None:
-    """Send as the user: optional text plus any number of media files."""
+def _sent_message(obj):
+    """Normalize a Telethon send result: a Message, or a list for some media."""
+    if isinstance(obj, (list, tuple)):
+        return obj[0] if obj else None
+    return obj
+
+
+def _note_own_send(sent, chat_key: str, text: str) -> None:
+    """Note one message this client just sent, so the outgoing-events handler
+    recognizes its echo. Called on the loop, before the echo update can be
+    dispatched (handlers only run at await points), which closes the race."""
+    sent = _sent_message(sent)
+    RECENT_SENDS.note(str(getattr(sent, "id", "") or "") or None,
+                      chat=chat_key, text=text or "")
+
+
+async def _async_send(recipient: str, text: str, media_paths: list):
+    """Send as the user: optional text plus any number of media files.
+
+    Returns ``(chat_key, message_id, sent_at)`` for the ledger: the resolved
+    chat's marked id — the same value inbound events carry as ``event.chat_id``,
+    so both directions of a conversation share one kb:chat key, and the key is
+    itself a valid /send recipient — plus the first sent message's id and date.
+    """
     entity = await _resolve_entity(recipient)
+    try:
+        from telethon import utils as _tg_utils  # noqa: PLC0415 - localized bridge dep
+        chat_key = str(_tg_utils.get_peer_id(entity))
+    except Exception:  # noqa: BLE001 - the ledger key degrades, the send proceeds
+        chat_key = str(recipient).strip()
     text = (text or "").strip()
+    first = None
     for idx, path in enumerate(media_paths or []):
         caption = text if idx == 0 else None
-        await _client.send_file(entity, str(path), caption=caption or None)
+        sent = await _client.send_file(entity, str(path), caption=caption or None)
+        _note_own_send(sent, chat_key, caption or "")
+        first = first if first is not None else _sent_message(sent)
         text = ""  # the caption carried the text with the first attachment
     if text:
-        await _client.send_message(entity, text)
+        sent = await _client.send_message(entity, text)
+        _note_own_send(sent, chat_key, text)
+        first = first if first is not None else _sent_message(sent)
+    msg_id = str(getattr(first, "id", "") or "") or None
+    date = getattr(first, "date", None)
+    sent_at = date.timestamp() if date is not None else None
+    return chat_key, msg_id, sent_at
 
 
-def _tg_send(recipient: str, text: str | None, media_paths: list | None = None) -> None:
+def _tg_send(recipient: str, text: str | None, media_paths: list | None = None,
+             author: str = "agent") -> None:
     """Sync wrapper: schedule the async send on the client loop and wait for it.
 
     Callable from the HTTP thread and from the inbound worker thread; both are
     off the asyncio loop, so this bridges onto it and blocks for the result.
+
+    Every send funnels through here, so this is also where the outbound ledger
+    record is written once success is known; ``author`` (kb:author) says who
+    composed the message and never affects delivery. A multi-part send is one
+    logical message (text + attachments), recorded once.
     """
     if _client is None or _LOOP is None:
         raise RuntimeError("Telegram client is not connected yet")
     fut = asyncio.run_coroutine_threadsafe(
         _async_send(recipient, text or "", media_paths or []), _LOOP
     )
-    fut.result(timeout=TELEGRAM_SEND_TIMEOUT)
+    chat_key, msg_id, sent_at = fut.result(timeout=TELEGRAM_SEND_TIMEOUT)
+    _record_outbound(chat_key, (text or "").strip(), author,
+                     message_id=msg_id, timestamp=sent_at)
 
 
 async def _async_list_contacts() -> list:
@@ -695,7 +768,7 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
                     is_group: bool, sender_name: str | None,
                     files: list[dict] | None = None,
                     attachment_urls: list[str] | None = None,
-                    store_path=None) -> None:
+                    store_path=None, message_id: str | None = None) -> None:
     """Blocking dispatch — runs in a worker thread, off the asyncio loop.
 
     ``store_path`` is set when the caller already persisted this message before
@@ -719,7 +792,7 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
         _forward_to_inbox(text, lang, str(chat_id), is_group=is_group,
                           sender_name=sender_name, files=files,
                           attachment_urls=attachment_urls,
-                          store_path=store_path)
+                          store_path=store_path, message_id=message_id)
     else:
         _handle_control_message(text, lang, str(chat_id), sender, files=files)
 
@@ -745,6 +818,10 @@ async def _on_new_message(event) -> None:
     try:
         message = event.message
         chat_id = event.chat_id
+        # The channel-native message id (unique within the chat), persisted on
+        # both directions so a reaction or quoted reply can later target the
+        # exact message (issue #130).
+        msg_id = str(getattr(message, "id", "") or "") or None
         is_group = _is_shared_chat(event)
         try:
             sender_entity = await event.get_sender()
@@ -846,6 +923,7 @@ async def _on_new_message(event) -> None:
                     voice_store_path = _persist_inbound(
                         "", sender, grp, delivered=False, media=str(durable),
                         attachment_urls=attachment_urls,
+                        chat=str(chat_id), message_id=msg_id,
                     )
                     try:
                         print(f"[telegram-gateway] transcribing voice note from {sender}", flush=True)
@@ -871,11 +949,54 @@ async def _on_new_message(event) -> None:
             files = voice_files + image_files
             _handle_inbound(text, lang, str(chat_id), sender, is_group, sender_name,
                             files=files, attachment_urls=attachment_urls,
-                            store_path=voice_store_path)
+                            store_path=voice_store_path, message_id=msg_id)
 
         _LOOP.run_in_executor(None, _work)
     except Exception as exc:  # noqa: BLE001 - one bad message must not stall the loop
         print(f"[telegram-gateway] error handling message: {exc}\n{traceback.format_exc()}", flush=True)
+
+
+async def _on_outgoing_message(event) -> None:
+    """Ledger-record the user's own sends made from other devices.
+
+    Telethon delivers an outgoing NewMessage event for every send by this
+    account: from the user's phone/desktop AND for this client's own sends
+    (the echo of _async_send). The sends this process performed are noted in
+    RECENT_SENDS before their echo can be dispatched, so a match here is that
+    echo — already recorded at send time — and everything else is a genuine
+    other-device send, recorded as author "device". Ledger only: it never
+    touches the delivery gate, the news rail, triage or the recent-senders
+    store, and as kb:OutboundMessage it can never surface in the /undelivered
+    drain.
+    """
+    try:
+        if TELEGRAM_GATEWAY_MODE != "inbox":
+            return  # the ledger is an inbox-mode concept, as for inbound
+        message = event.message
+        chat_key = str(event.chat_id)
+        msg_id = str(getattr(message, "id", "") or "") or None
+        text = (event.raw_text or "").strip()
+        if RECENT_SENDS.seen(msg_id, chat=chat_key, text=text):
+            return
+        if not text:
+            # Attachment-only own-device sends are not captured yet (the media
+            # would have to be downloaded just for the mirror); recording
+            # nothing beats recording an empty bubble.
+            print(f"[telegram-gateway] own-device send to {chat_key} has no text; not recorded", flush=True)
+            return
+        date = getattr(message, "date", None)
+        sent_at = date.timestamp() if date is not None else None
+
+        # The record is a small file write, but still disk I/O — keep it off
+        # the event loop like the inbound dispatch.
+        def _record():
+            _record_outbound(chat_key, text, "device",
+                             message_id=msg_id, timestamp=sent_at)
+            print(f"[telegram-gateway] recorded own-device send to {chat_key}", flush=True)
+
+        _LOOP.run_in_executor(None, _record)
+    except Exception as exc:  # noqa: BLE001 - one bad event must not stall the loop
+        print(f"[telegram-gateway] error handling outgoing message: {exc}\n{traceback.format_exc()}", flush=True)
 
 
 async def _auth_watchdog() -> None:
@@ -1034,6 +1155,10 @@ def _build_client():
         raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH must be set")
     client = TelegramClient(TELEGRAM_SESSION_PATH, int(TELEGRAM_API_ID), TELEGRAM_API_HASH)
     client.add_event_handler(_on_new_message, events.NewMessage(incoming=True))
+    # Outgoing events complete the ledger: the user's own sends from their
+    # other devices (and the echoes of this client's sends, which the handler
+    # deduplicates) — see _on_outgoing_message.
+    client.add_event_handler(_on_outgoing_message, events.NewMessage(outgoing=True))
     return client
 
 
@@ -1084,7 +1209,8 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
                       is_group: bool = False, sender_name: str | None = None,
                       files: list[dict] | None = None,
                       attachment_urls: list[str] | None = None,
-                      store_path=None) -> None:
+                      store_path=None,
+                      message_id: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     ``store_path`` is set when the caller already persisted this message before
@@ -1112,7 +1238,8 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # accounted for (forwarded to triage, or held in a fully-resolved class).
     if store_path is None:
         store_path = _persist_inbound(question, handle, group_id, delivered=False,
-                                      attachment_urls=attachment_urls)
+                                      attachment_urls=attachment_urls,
+                                      chat=handle, message_id=message_id)
 
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(handle, group_id)
@@ -1345,11 +1472,14 @@ def _lookup_existing_path(request_id: str) -> Path | None:
 
 
 def _new_pending_send(recipient: str, message: str, lang: str | None,
-                      images: list, voice: bool, category: str) -> str:
+                      images: list, voice: bool, category: str,
+                      author: str = "agent") -> str:
     """Store a pending outbound send and return its request_id.
 
     `voice` is accepted for signature parity with the other gateways but is
-    unused for Telegram (no voice pipeline).
+    unused for Telegram (no voice pipeline). ``author`` (kb:author) survives
+    the approval round trip so the ledger record written on the eventual send
+    credits the original composer.
     """
     request_id = uuid.uuid4().hex
     entry = {
@@ -1360,6 +1490,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
         "voice": voice,
         "images": images,
         "category": category,
+        "author": author,
         "created": int(time.time()),
         "status": "pending",
     }
@@ -1420,6 +1551,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
             lang=entry.get("lang"),
             images=entry.get("images") or [],
             voice=bool(entry.get("voice", True)),
+            author=entry.get("author") or "agent",
         )
         entry["status"] = "approved"
         entry.pop("error", None)
@@ -1499,11 +1631,13 @@ def _decode_image(image: dict) -> Path:
 
 
 def _push(recipient: str, message: str, lang: str | None = None,
-          images: list[dict] | None = None, voice: bool = True) -> None:
+          images: list[dict] | None = None, voice: bool = True,
+          author: str = "agent") -> None:
     """Send an outbound message: text body plus optional image attachments.
 
     `lang`/`voice` are accepted for parity with the other gateways' _push
-    signature (persisted in the pending store) but are ignored here.
+    signature (persisted in the pending store) but are ignored here. ``author``
+    is carried through to the ledger record (see :func:`_tg_send`).
     """
     images = images or []
     message = (message or "").strip()
@@ -1513,7 +1647,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
     try:
         for image in images:
             temp_paths.append(_decode_image(image))
-        _tg_send(recipient, message or None, media_paths=temp_paths)
+        _tg_send(recipient, message or None, media_paths=temp_paths, author=author)
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -1702,10 +1836,18 @@ class _PushHandler(BaseHTTPRequestHandler):
         lang = (payload.get("lang") or "").strip() or None
         voice = bool(payload.get("voice", True))
         user_approved = bool(payload.get("user_approved", False))
+        # Who composed this message — recorded as kb:author on the ledger entry
+        # of a successful send. Callers that say nothing are agents (the push
+        # CLIs); a dashboard composer sends author=user.
+        author = str(payload.get("author") or "agent").strip().lower()
+        if author not in _ibstore.AUTHORS:
+            self._reply(400, {"error": "'author' must be one of " + "|".join(_ibstore.AUTHORS)})
+            return
 
         category = _outbound_policy_category()
         if category == "verify" or (category == "trust" and not user_approved):
-            request_id = _new_pending_send(recipient, message, lang, images, voice, category)
+            request_id = _new_pending_send(recipient, message, lang, images, voice,
+                                           category, author=author)
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
             approval_url = (SEND_APPROVAL_BASE_URL + approval_path) if SEND_APPROVAL_BASE_URL else approval_path
             print(f"[telegram-gateway] pending send registered for {recipient} "
@@ -1722,7 +1864,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            _push(recipient, message, lang=lang, images=images, voice=voice)
+            _push(recipient, message, lang=lang, images=images, voice=voice,
+                  author=author)
         except ValueError as exc:
             self._reply(400, {"error": str(exc)})
             return

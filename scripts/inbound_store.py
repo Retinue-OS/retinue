@@ -1,4 +1,4 @@
-"""Per-message inbound store for the messaging gateways (delivery ledger).
+"""Per-message store for the messaging gateways (message ledger).
 
 Every inbound message that reaches an *inbox*-mode gateway (Signal, WhatsApp,
 Telegram) is persisted here as **one N-Triples file per message**, on the
@@ -39,6 +39,16 @@ expired, a gateway that died mid-dispatch — stays ``delivered: false`` and is
 picked up by the daily drain (at-least-once: a rare duplicate surface beats a
 silent loss).
 
+Inbound is only half the ledger. The store also holds **outbound** messages
+(``kb:OutboundMessage``, :func:`write_outbound`) in the same ``messages/``
+directory: every send a gateway completed — an agent push, an approved pending
+send, and the user's own sends from their other devices captured from the
+channel's echo/sync stream. Both directions carry ``kb:chat``, the chat key, so
+one filter yields a whole conversation as a single timeline (filenames sort by
+epoch millis regardless of direction). Outbound records have **no** delivered
+flag and are invisible to :func:`undelivered` — the drain is triage bookkeeping
+for inbound mail only.
+
 Stdlib only (``hashlib``/``secrets``/``datetime``): this module is copied into
 each gateway image alongside ``triage_policy.py`` and ``reply_tokens.py``, and
 those containers ship no third-party RDF library.
@@ -48,7 +58,9 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -58,6 +70,7 @@ RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 XSD_DATETIME = "http://www.w3.org/2001/XMLSchema#dateTime"
 
 T_INBOUND = KB + "InboundMessage"
+T_OUTBOUND = KB + "OutboundMessage"
 P_CHANNEL = KB + "channel"
 P_SENDER = KB + "sender"
 P_GROUP = KB + "group"
@@ -65,6 +78,22 @@ P_RECEIVED_AT = KB + "receivedAt"
 P_TEXT = KB + "text"
 P_MESSAGE_ID = KB + "messageId"
 P_DELIVERED = KB + "delivered"
+# The chat key: the exact recipient string the message's channel accepts on its
+# own send path (Signal number/UUID or "group:<id>", WhatsApp chat JID, Telegram
+# chat_id). Stamped on BOTH directions by the gateways, so one filter yields a
+# whole conversation and a send routes back with the same key.
+P_CHAT = KB + "chat"
+# Outbound only: who composed the message. One of AUTHORS below.
+P_AUTHOR = KB + "author"
+# Outbound only: when the channel accepted the send. A distinct predicate rather
+# than a reuse of kb:receivedAt because the instant means a different thing
+# (nothing was received); readers merging both directions into one timeline
+# COALESCE the two.
+P_SENT_AT = KB + "sentAt"
+# Valid kb:author values: "user" (composed in the dashboard), "agent" (an
+# agent's own send — the push CLIs' default), "device" (the user's own send from
+# another device, captured from the channel's echo/sync stream).
+AUTHORS = ("user", "agent", "device")
 # A message's media (voice note, image) is NOT embedded in the graph: consistency
 # over data-in-graph means every attachment — regardless of size — is a *reference*
 # resolved over HTTP, never an inline data-URI literal. This predicate carries that
@@ -168,17 +197,27 @@ _TRIPLE_RE = re.compile(
 
 
 def _render(fields: dict) -> str:
-    """Deterministic sorted N-Triples for one message. ``fields`` carries the
-    resolved values; only ``group`` and ``message_id`` may be absent."""
+    """Deterministic sorted N-Triples for one message, either direction.
+
+    ``fields`` carries the resolved values; the record's ``type`` selects the
+    direction-specific triples (delivered/receivedAt/sender for inbound,
+    author/sentAt for outbound). Optional fields may be absent."""
     subj = fields["subject"]
+    rtype = fields.get("type") or T_INBOUND
     lines = [
-        _iri(subj, RDF_TYPE, T_INBOUND),
+        _iri(subj, RDF_TYPE, rtype),
         _lit(subj, P_CHANNEL, fields["channel"]),
-        _lit(subj, P_DELIVERED, "true" if fields["delivered"] else "false"),
-        _lit(subj, P_RECEIVED_AT, fields["received_at"], XSD_DATETIME),
-        _lit(subj, P_SENDER, fields["sender"]),
         _lit(subj, P_TEXT, fields["text"]),
     ]
+    if rtype == T_OUTBOUND:
+        lines.append(_lit(subj, P_AUTHOR, fields["author"]))
+        lines.append(_lit(subj, P_SENT_AT, fields["sent_at"], XSD_DATETIME))
+    else:
+        lines.append(_lit(subj, P_DELIVERED, "true" if fields["delivered"] else "false"))
+        lines.append(_lit(subj, P_RECEIVED_AT, fields["received_at"], XSD_DATETIME))
+        lines.append(_lit(subj, P_SENDER, fields["sender"]))
+    if fields.get("chat"):
+        lines.append(_lit(subj, P_CHAT, fields["chat"]))
     if fields.get("group"):
         lines.append(_lit(subj, P_GROUP, fields["group"]))
     if fields.get("message_id"):
@@ -194,9 +233,16 @@ def _render(fields: dict) -> str:
 
 
 def _parse(text: str) -> dict | None:
-    """Read a message file back into a ``fields`` dict, or None if unparseable."""
-    fields: dict = {"delivered": False, "group": None, "message_id": None,
-                    "attachments": [], "media": None}
+    """Read a message file back into a ``fields`` dict, or None if unparseable.
+
+    The record ``type`` defaults to inbound: every file written before
+    ``kb:OutboundMessage`` existed carries an explicit inbound type, so an
+    absent type triple can only be a legacy hand-crafted record — it keeps the
+    pre-outbound contract (drainable) rather than being mistaken for a send.
+    """
+    fields: dict = {"type": T_INBOUND, "delivered": False, "group": None,
+                    "message_id": None, "chat": None, "author": None,
+                    "sent_at": None, "attachments": [], "media": None}
     subject = None
     for line in text.splitlines():
         line = line.strip()
@@ -207,10 +253,10 @@ def _parse(text: str) -> dict | None:
             return None
         subj, pred, obj_iri, lit, _dtype = m.groups()
         subject = subj
-        if pred == RDF_TYPE:
-            continue
         value = obj_iri if obj_iri is not None else _unesc(lit)
-        if pred == P_CHANNEL:
+        if pred == RDF_TYPE:
+            fields["type"] = value
+        elif pred == P_CHANNEL:
             fields["channel"] = value
         elif pred == P_SENDER:
             fields["sender"] = value
@@ -222,6 +268,12 @@ def _parse(text: str) -> dict | None:
             fields["text"] = value
         elif pred == P_MESSAGE_ID:
             fields["message_id"] = value
+        elif pred == P_CHAT:
+            fields["chat"] = value
+        elif pred == P_AUTHOR:
+            fields["author"] = value
+        elif pred == P_SENT_AT:
+            fields["sent_at"] = value
         elif pred == P_ATTACHMENT:
             # IRI object → obj_iri is set; append the reference URL.
             if value:
@@ -294,6 +346,7 @@ def write_message(
     sender: str,
     text: str,
     group: str | None = None,
+    chat: str | None = None,
     message_id: str | None = None,
     timestamp: float | None = None,
     delivered: bool = False,
@@ -306,6 +359,12 @@ def write_message(
     message as still owed to triage; pass ``delivered=True`` for a message the
     gateway is deliberately *not* forwarding (blacklisted, group-blocked or
     no-action-class) so the daily drain never re-surfaces it.
+
+    ``chat`` is the chat key (see :data:`P_CHAT`): the exact recipient string
+    this channel's own send path accepts, computed by the gateway and persisted
+    verbatim, so this message and any reply sent back to it carry the same key.
+    ``message_id`` is the channel-native message identifier, which is what a
+    reaction or quoted reply later targets.
 
     ``attachment_urls`` are HTTP-resolvable references to this message's media
     (voice note, image), each emitted as a ``kb:attachment`` IRI. The bytes are
@@ -321,11 +380,13 @@ def write_message(
     token = secrets.token_hex(8)
     subject = f"urn:retinue:inbound:{_slug(channel)}:{token}"
     fields = {
+        "type": T_INBOUND,
         "subject": subject,
         "channel": channel,
         "sender": sender or "unknown",
         "text": text or "",
         "group": group or None,
+        "chat": chat or None,
         "message_id": message_id or None,
         "received_at": _iso(ts),
         "delivered": bool(delivered),
@@ -333,6 +394,59 @@ def write_message(
         "media": media or None,
     }
     # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
+    fname = f"{int(ts * 1000):016d}-{token}.nt"
+    path = messages_dir(store_dir) / fname
+    _atomic_write(_render(fields), path)
+    return subject, path
+
+
+def write_outbound(
+    store_dir: str | Path,
+    *,
+    channel: str,
+    chat: str,
+    text: str,
+    author: str = "agent",
+    message_id: str | None = None,
+    timestamp: float | None = None,
+    attachment_urls: list[str] | None = None,
+) -> tuple[str, Path]:
+    """Persist one successfully sent outbound message as its own N-Triples file.
+
+    The sibling of :func:`write_message`: one deterministic file per message, in
+    the same ``messages/`` directory, so a chat's two directions form a single
+    timeline (filenames sort by epoch millis regardless of direction). A gateway
+    writes this only once a send has actually gone out — queued pending sends
+    are not messages and never reach the store.
+
+    ``chat`` is the chat key (see :data:`P_CHAT`) — for a send, the resolved
+    recipient. ``author`` must be one of :data:`AUTHORS`; anything else is a
+    programming error and raises ``ValueError``. ``timestamp`` is the sent-at
+    instant (``kb:sentAt`` — see the predicate comment for why it is not
+    ``kb:receivedAt``), defaulting to now; pass the channel-reported send
+    timestamp when the client returns one, along with its ``message_id``.
+
+    There is deliberately **no** delivered flag: the delivery ledger tracks what
+    is owed to *triage*, and an outbound message never is — :func:`undelivered`
+    and :func:`mark_delivered` filter by record type, so these files can never
+    surface in the drain.
+    """
+    if author not in AUTHORS:
+        raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
+    ts = time.time() if timestamp is None else float(timestamp)
+    token = secrets.token_hex(8)
+    subject = f"urn:retinue:outbound:{_slug(channel)}:{token}"
+    fields = {
+        "type": T_OUTBOUND,
+        "subject": subject,
+        "channel": channel,
+        "chat": chat or "unknown",
+        "text": text or "",
+        "author": author,
+        "message_id": message_id or None,
+        "sent_at": _iso(ts),
+        "attachments": [u for u in (attachment_urls or []) if u],
+    }
     fname = f"{int(ts * 1000):016d}-{token}.nt"
     path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
@@ -403,9 +517,9 @@ def undelivered(
     anything; only the daily triage drain does.
 
     Each returned dict has: ``subject``, ``channel``, ``sender``, ``group``,
-    ``message_id``, ``received_at`` (ISO-8601), ``text``, ``attachments`` (a
-    possibly-empty list of HTTP media reference URLs) and ``media`` (the local
-    path of an as-yet-untranscribed voice note, else None).
+    ``chat``, ``message_id``, ``received_at`` (ISO-8601), ``text``,
+    ``attachments`` (a possibly-empty list of HTTP media reference URLs) and
+    ``media`` (the local path of an as-yet-untranscribed voice note, else None).
     """
     mdir = messages_dir(store_dir)
     if not mdir.is_dir():
@@ -417,7 +531,11 @@ def undelivered(
             fields = _parse(path.read_text(encoding="utf-8"))
         except OSError:
             continue
-        if not fields or fields["delivered"]:
+        # Inbound records only: outbound messages share this directory and carry
+        # no delivered flag (which parses as the False default) — without the
+        # type filter every send would be handed to triage as if it were
+        # inbound mail. A file with no type triple is legacy inbound (_parse).
+        if not fields or fields.get("type") != T_INBOUND or fields["delivered"]:
             continue
         if cutoff is not None and _received_epoch(fields) < cutoff:
             continue
@@ -433,6 +551,7 @@ def undelivered(
             "channel": fields["channel"],
             "sender": fields["sender"],
             "group": fields.get("group"),
+            "chat": fields.get("chat"),
             "message_id": fields.get("message_id"),
             "received_at": fields["received_at"],
             "text": fields["text"],
@@ -467,6 +586,10 @@ def mark_delivered(path: str | Path) -> bool:
     except OSError:
         return False
     if not fields:
+        return False
+    # Delivered semantics exist for inbound records only; an outbound file has
+    # no such flag and must never grow one through a stray flip.
+    if fields.get("type") != T_INBOUND:
         return False
     if fields["delivered"]:
         return True
@@ -509,3 +632,69 @@ def update_message(path: str | Path, *, text: str | None = None,
     except OSError:
         return None
     return prev_media
+
+
+# -- echo dedup for outbound recording ----------------------------------------
+
+class RecentSends:
+    """Bounded in-process memory of the sends this gateway itself performed.
+
+    A gateway records each outbound message once, at the moment its send
+    succeeds. Some client libraries then *echo* that same message back through
+    the receive path as an own-account event (Telethon fires an outgoing
+    NewMessage for the client's own sends; whether the WhatsApp bridge replays
+    them varies by whatsmeow version; signal-cli does not sync its own sends
+    back). On the receive path such an echo is indistinguishable from a genuine
+    own-device send from the user's phone — which *must* be recorded. This
+    memory is how the two are told apart: a send noted here is the gateway's
+    own, already in the ledger, and its echo is skipped.
+
+    Keys: the channel-reported message id when the sender captured one, else
+    ``(chat, text)`` as an approximate fallback. Matches expire after
+    ``window`` seconds so that, on the fallback key, an identical later message
+    is never swallowed forever. Deliberately in-process and disposable: a
+    restart forgets it, and the worst outcome of forgetting is one duplicate
+    ledger record — never a lost one.
+    """
+
+    def __init__(self, maxlen: int = 200, window: float = 900.0):
+        self._maxlen = int(maxlen)
+        self._window = float(window)
+        self._lock = threading.Lock()
+        self._entries: OrderedDict = OrderedDict()  # key -> noted-at epoch
+
+    def note(self, message_id: str | None = None, *, chat: str | None = None,
+             text: str | None = None) -> None:
+        """Register one performed send.
+
+        The ``(chat, text)`` fallback key is stored only when no id is known:
+        an id-keyed send must not also suppress a coincidentally identical
+        own-device message sent moments later.
+        """
+        if message_id:
+            key = ("id", str(message_id))
+        elif chat and text:
+            key = ("txt", str(chat), text)
+        else:
+            return
+        with self._lock:
+            self._entries.pop(key, None)
+            self._entries[key] = time.time()
+            while len(self._entries) > self._maxlen:
+                self._entries.popitem(last=False)
+
+    def seen(self, message_id: str | None = None, *, chat: str | None = None,
+             text: str | None = None) -> bool:
+        """True when an echoed event matches a noted send (either key form,
+        within the freshness window)."""
+        keys = []
+        if message_id:
+            keys.append(("id", str(message_id)))
+        if chat and text:
+            keys.append(("txt", str(chat), text))
+        now = time.time()
+        with self._lock:
+            return any(
+                key in self._entries and now - self._entries[key] <= self._window
+                for key in keys
+            )
