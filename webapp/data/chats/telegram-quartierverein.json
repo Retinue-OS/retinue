@@ -6,7 +6,8 @@
   "name": "Quartierverein Unterstrass",
   "group": true,
   "unread": 12,
-  "notify": "none",
+  "archived": false,
+  "muted": true,
   "last": {
    "ts": "2026-08-26T18:00:00+02:00",
    "direction": "in",

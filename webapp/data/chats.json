@@ -7,7 +7,8 @@
    "name": "Mara Meier",
    "group": false,
    "unread": 2,
-   "notify": "all",
+   "archived": false,
+   "muted": false,
    "last": {
     "ts": "2026-08-27T09:12:00+02:00",
     "direction": "in",
@@ -30,7 +31,8 @@
    "name": "Wandergruppe Rigi",
    "group": true,
    "unread": 7,
-   "notify": "all",
+   "archived": false,
+   "muted": false,
    "last": {
     "ts": "2026-08-27T08:47:00+02:00",
     "direction": "in",
@@ -48,7 +50,8 @@
    "name": "Climbing Crew",
    "group": true,
    "unread": 1,
-   "notify": "all",
+   "archived": false,
+   "muted": false,
    "last": {
     "ts": "2026-08-27T07:05:00+02:00",
     "direction": "in",
@@ -66,7 +69,8 @@
    "name": "Luca Bernasconi",
    "group": false,
    "unread": 0,
-   "notify": "all",
+   "archived": false,
+   "muted": false,
    "last": {
     "ts": "2026-08-26T22:40:44+02:00",
     "direction": "in",
@@ -83,7 +87,8 @@
    "name": "Quartierverein Unterstrass",
    "group": true,
    "unread": 12,
-   "notify": "none",
+   "archived": false,
+   "muted": true,
    "last": {
     "ts": "2026-08-26T18:00:00+02:00",
     "direction": "in",
@@ -101,7 +106,8 @@
    "name": "Praxis Dr. Keller",
    "group": false,
    "unread": 0,
-   "notify": "all",
+   "archived": true,
+   "muted": false,
    "last": {
     "ts": "2026-08-25T17:20:00+02:00",
     "direction": "in",

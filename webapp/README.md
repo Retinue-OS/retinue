@@ -107,7 +107,13 @@ it. Pieces:
 
 - `components/chats.js` — the Chats card (dashboard, currently disabled in
   `index.html`) and, with `full`, the whole `chats.html` page: avatar,
-  channel mark, last-message preview, unread badge, ordered by last activity.
+  channel mark, last-message preview, unread badge, non-archived chats
+  ordered by last activity; the full page adds an Active/Archived filter
+  like the conversations page. When enabled on the dashboard, the wide
+  layout gives the card its own fixed-height region above the conversations
+  (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
+  (`data-splitter="chats"`) — the card block and its splitter ship as one
+  commented-out block in `index.html`.
 - `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
   with day separators and an unread waterline, sender labels in groups, the
   author on every outbound bubble (you / Ara / your phone), a composer with a
@@ -121,15 +127,23 @@ will serve, so the swap is a data-source change, not a rewrite:
 
 - `/data/chats.json` — the chat list (future `GET /chats`):
   `{generated, chats: [ChatSummary]}`, ordered by last activity. A
-  `ChatSummary` is `{id, channel, name, group, members?, unread, notify,
-  last, draft, messages}` where `id` is `<channel>:<chat-key>` (the exact
-  recipient string that channel's send path accepts), `unread` derives from
-  the user's `last_read` watermark, `notify` is the per-chat mute
-  (`all|none`), `last` is the preview `{ts, direction, author?, sender_name?,
-  text, kind}`, `draft` is the shared draft `{text, author, agent?, ts,
-  version}` or null, and `messages` is the URL of the chat's message document
-  — the client follows it and never constructs message URLs, which is what
-  makes the fixture→API swap free.
+  `ChatSummary` is `{id, channel, name, group, members?, unread, archived,
+  muted, last, draft, messages}` where `id` is `<channel>:<chat-key>` (the
+  exact recipient string that channel's send path accepts), `unread` derives
+  from the user's `last_read` watermark, `last` is the preview `{ts,
+  direction, author?, sender_name?, text, kind}`, `draft` is the shared
+  draft `{text, author, agent?, ts, version}` or null, and `messages` is the
+  URL of the chat's message document — the client follows it and never
+  constructs message URLs, which is what makes the fixture→API swap free.
+  `archived` and `muted` carry the dashboard-conversation semantics
+  verbatim: an archived chat leaves the card and the Active list (the full
+  page's Archived filter keeps it reachable), and — the server's rule, once
+  the live API exists; the static fixture only carries the flags — a new
+  inbound message **un-archives** an archived chat unless it is muted.
+  `muted` silences that chat's Web Push and keeps an archived chat archived;
+  as with conversations, the Archive button leaves `muted` untouched, while
+  "archive this chat" said to Ara sets both. No pinning yet: favourites-on-top
+  would be a later `pinned` flag, deliberately deferred.
 - `/data/chats/<slug>.json` — one chat's messages (future
   `GET /chats/<id>/messages`): `{generated, chat: ChatSummary, messages:
   [Message], companion: […]}` with `messages` ascending by `ts`. A `Message`

@@ -6,7 +6,8 @@
   "name": "Climbing Crew",
   "group": true,
   "unread": 1,
-  "notify": "all",
+  "archived": false,
+  "muted": false,
   "last": {
    "ts": "2026-08-27T07:05:00+02:00",
    "direction": "in",

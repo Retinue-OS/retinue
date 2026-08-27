@@ -3,7 +3,10 @@
 // last activity, with unread badge, channel mark and last-message preview. Rows
 // link to the chat's own page (chat.html), which renders the full mirror beside
 // its companion thread. With the `full` attribute (chats.html) the list drops
-// the dashboard cap.
+// the dashboard cap and adds an Active/Archived filter, like the conversations
+// page. Archived chats are excluded everywhere else; `muted` only changes the
+// badge treatment here (its real meaning — no Web Push, and no un-archive on a
+// new inbound message — is the server's, once the live chat API exists).
 //
 // FIXTURE DATA for now: the card reads /data/chats.json, a static document
 // shaped exactly like the future `GET /chats` response (the messenger-chats
@@ -84,6 +87,7 @@ export function previewHtml(chat) {
 class RetinueChats extends RetinueCard {
   connectedCallback() {
     this._full = this.hasAttribute('full');
+    this._scope = 'active';  // full-mode filter: active | archived
     // Crossing the layout breakpoint changes how many rows fit (cap vs all).
     this._offFrame = onFrameChange(() => {
       if (this._data) this.renderState({ state: 'ok', data: this._data });
@@ -94,6 +98,19 @@ class RetinueChats extends RetinueCard {
   disconnectedCallback() {
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
+  }
+
+  // RetinueCard renders static content; the full page's scope filter is the
+  // one interactive control, wired after each render.
+  renderState(s) {
+    super.renderState(s);
+    this.shadowRoot.querySelectorAll('[data-scope]').forEach((el) =>
+      el.addEventListener('click', () => {
+        const scope = el.getAttribute('data-scope');
+        if (scope === this._scope) return;
+        this._scope = scope;
+        if (this._data) this.renderState({ state: 'ok', data: this._data });
+      }));
   }
 
   css() {
@@ -131,7 +148,24 @@ class RetinueChats extends RetinueCard {
       .all-link { color: var(--accent, #6ea8fe); text-decoration: none; font-size: .85rem;
                   text-align: center; padding: 2px; }
       .all-link:hover { text-decoration: underline; }
+      /* Active/Archived switch — full page only; same look as the
+         conversations page's filter. */
+      .filter { display: flex; background: var(--card-2, #1c2230); border-radius: 12px;
+                padding: 3px; margin-bottom: 10px; }
+      .filter-tab { flex: 1; background: transparent; border: 0; border-radius: 9px; padding: 7px;
+                    color: var(--muted, #8b93a3); cursor: pointer; }
+      .filter-tab.on { background: var(--accent, #6ea8fe); color: #0b0d12; font-weight: 600; }
     `;
+  }
+
+  // The Active/Archived switch shown on the full page. No pinning and no
+  // unread-only view — deliberately deferred (see the README contract notes).
+  _filterHtml() {
+    if (!this._full) return '';
+    const tab = (scope, label) =>
+      `<button class="filter-tab${this._scope === scope ? ' on' : ''}" ` +
+      `data-scope="${scope}">${label}</button>`;
+    return `<div class="filter">${tab('active', 'Active')}${tab('archived', 'Archived')}</div>`;
   }
 
   body(d) {
@@ -140,13 +174,19 @@ class RetinueChats extends RetinueCard {
     // The API contract returns the list ordered by last activity; keep that
     // guarantee client-side too, so a hand-edited fixture cannot scramble it.
     all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
-    if (!all.length) return '<p class="muted">No chats yet.</p>';
-    const shown = (this._full || isWideFrame()) ? all : all.slice(0, MAX_CARD_CHATS);
+    // Archived chats leave the card and the Active list; the full page's
+    // Archived filter is where they remain reachable.
+    const archived = this._full && this._scope === 'archived';
+    const chats = all.filter((c) => !!c.archived === archived);
+    if (!chats.length) {
+      const msg = archived ? 'No archived chats.' : 'No chats yet.';
+      return `${this._filterHtml()}<p class="muted">${msg}</p>`;
+    }
+    const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
     const rows = shown.map((c) => {
-      const muted = c.notify === 'none';
       const badge = c.unread
-        ? `<span class="unread${muted ? ' muted-chat' : ''}">${c.unread}</span>`
-        : (muted ? '<span class="mute-mark" title="Muted" aria-label="Muted">&#128277;</span>' : '');
+        ? `<span class="unread${c.muted ? ' muted-chat' : ''}">${c.unread}</span>`
+        : (c.muted ? '<span class="mute-mark" title="Muted" aria-label="Muted">&#128277;</span>' : '');
       // A staged draft outranks the last message in the preview — it is what
       // this chat is waiting on.
       const draft = c.draft && c.draft.text;
@@ -165,7 +205,7 @@ class RetinueChats extends RetinueCard {
     }).join('');
     const foot = this._full ? ''
       : `<div class="foot"><a class="all-link" href="/chats.html">All chats &#8594;</a></div>`;
-    return `<ul class="list">${rows}</ul>${foot}`;
+    return `${this._filterHtml()}<ul class="list">${rows}</ul>${foot}`;
   }
 }
 

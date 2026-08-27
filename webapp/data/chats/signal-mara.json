@@ -6,7 +6,8 @@
   "name": "Mara Meier",
   "group": false,
   "unread": 2,
-  "notify": "all",
+  "archived": false,
+  "muted": false,
   "last": {
    "ts": "2026-08-27T09:12:00+02:00",
    "direction": "in",

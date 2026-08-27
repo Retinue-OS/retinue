@@ -6,7 +6,8 @@
   "name": "Wandergruppe Rigi",
   "group": true,
   "unread": 7,
-  "notify": "all",
+  "archived": false,
+  "muted": false,
   "last": {
    "ts": "2026-08-27T08:47:00+02:00",
    "direction": "in",
