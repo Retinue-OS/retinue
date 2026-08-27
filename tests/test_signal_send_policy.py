@@ -136,7 +136,9 @@ def test_pending_send_store_lifecycle():
         entry = sg._complete_pending_send(rid, approved=True)
         assert entry["status"] == "sending"
         assert _wait_terminal(sg, rid)["status"] == "approved"
-        assert sent == [("+15551234567", "hello", {"lang": "en", "images": [], "voice": True})]
+        # The pending entry carries the composer through to the send (kb:author).
+        assert sent == [("+15551234567", "hello",
+                         {"lang": "en", "images": [], "voice": True, "author": "agent"})]
         # No longer pending.
         assert sg._list_pending_sends_store() == []
         # Re-completion after the fact is a no-op (idempotent), does not resend.

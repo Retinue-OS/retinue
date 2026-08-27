@@ -128,7 +128,9 @@ def test_pending_send_store_lifecycle():
         entry = wg._complete_pending_send(rid, approved=True)
         assert entry["status"] == "sending"
         assert _wait_terminal(wg, rid)["status"] == "approved"
-        assert sent == [("123456789", "hello", {"lang": "en", "images": [], "voice": True})]
+        # The pending entry carries the composer through to the send (kb:author).
+        assert sent == [("123456789", "hello",
+                         {"lang": "en", "images": [], "voice": True, "author": "agent"})]
         assert wg._list_pending_sends_store() == []
         again = wg._complete_pending_send(rid, approved=True)
         assert again["status"] == "approved"
