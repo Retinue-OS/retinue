@@ -117,10 +117,12 @@ docstring). Pieces:
   keeps its last rendered state over a failed fetch.
 - `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
   with day separators and an unread waterline, sender labels in groups, the
-  author on every outbound bubble (you / Ara / your phone), a live composer
-  (send, shared draft, one-tap clear ✕, dictation), quick-pattern chips, and
-  the companion pane — swipe between panes on a phone, a draggable splitter
-  on a wide screen. The open chat polls on the conversations cadence,
+  author on every outbound bubble (you / Ara / your phone), inline media
+  (images with a lightbox, voice-note and video players — see the Message
+  contract below), a live composer (send, shared draft, one-tap clear ✕,
+  dictation, image attach with client-side downscale), quick-pattern chips,
+  and the companion pane — swipe between panes on a phone, a draggable
+  splitter on a wide screen. The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
 
@@ -150,19 +152,35 @@ The API, as the components consume it:
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
   sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
-  type?, size?}]}`. Attachment URLs are the web-gateway's authenticated media
-  proxy (`/chats/media/…`); type and size are best-effort, and records carry
-  no image dimensions — the client reserves a fixed placeholder box instead,
-  so a lazy load can never shift the thread's scroll. Reactions and quoted
-  replies (issue #130) will decorate these records later. There is no
-  companion thread in the payload yet: the companion pane runs in a local
-  demo mode until phase 4 wires it to the chat's real companion conversation
-  (kind `companion`) via the `/conversations` API.
-- `POST /chats/<id>/send` `{text}` — sends through the chat's own gateway as
-  the user (direct under every policy category: the authenticated send press
-  IS the approval `verify` exists for) and returns the sent `Message`; the
-  page shows an optimistic bubble and reconciles it with the response, and a
-  failed send puts the words back into the composer.
+  type?, size?, width?, height?}]}`. Attachment URLs are the web-gateway's
+  authenticated media proxy (`/chats/media/…`); type and size are
+  best-effort. `width`/`height` are the medium's real intrinsic size, sniffed
+  at ingest — when present the client reserves the true aspect box before the
+  bytes arrive, when absent (older records) it reserves a fixed placeholder
+  frame; either way a lazy load can never shift the thread's scroll. By type:
+  `image/*` renders inline and opens a full-screen lightbox on tap (same
+  proxied URL — it is the original; tap, Esc or the platform back gesture
+  closes, one history entry deep); `audio/*` is a voice note — the player
+  above the transcript, which is already the message `text`; `video/*` is an
+  inline player (`preload=metadata`, box-reserved the same way); anything
+  else stays a file row. Reactions and quoted replies (issue #130) will
+  decorate these records later. There is no companion thread in the payload
+  yet: the companion pane runs in a local demo mode until phase 4 wires it to
+  the chat's real companion conversation (kind `companion`) via the
+  `/conversations` API.
+- `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
+  gateway as the user (direct under every policy category: the authenticated
+  send press IS the approval `verify` exists for) and returns the sent
+  `Message`; the page shows an optimistic bubble and reconciles it with the
+  response, and a failed send puts the words back into the composer.
+  `images` is `[{content_type, data(base64)}]`, at most 5, each at most
+  ~8 MB decoded (400 on violations); `text` may be absent when images are
+  sent. The returned `Message` (and later polls) carries the sent
+  attachments with proxied URLs and their sniffed dimensions. The client
+  downscales picked photos before upload — longest edge 1600 px, JPEG — as
+  the native clients do; animated GIFs pass through unchanged under the size
+  cap. A failed image send keeps the staged previews (and the text) in the
+  composer for retry.
 - `POST /chats/<id>/draft` `{text, version}` — the shared draft, saved
   ~1 s after the user stops typing and on blur; dictation participates in the
   same debounced save, and the ✕ posts empty text. Writes are
@@ -175,10 +193,12 @@ The API, as the components consume it:
 static documents in the API's response shapes — the contract drafts the API
 was built against, kept as its reference documents and as the Playwright test
 corpus (the validation suite serves them as mocked `/chats*` responses). They
-are no longer a serving source. Two deliberate deltas against the live API:
-they carry image dimensions on attachments (the live records do not — both
-render stably), and a `companion` array seeding the companion pane's demo
-content (the live payload has none).
+are no longer a serving source. The corpus covers the media shapes: image
+attachments with intrinsic dimensions, a voice note (`audio/*` with the
+transcript as the message text) and a video (`video/*` with dimensions), all
+with playable `data:` URLs. One deliberate delta against the live API
+remains: a `companion` array seeding the companion pane's demo content (the
+live payload has none).
 
 ## Markdown rendering
 
