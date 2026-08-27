@@ -32,6 +32,7 @@
 
 import { esc, WIDE_FRAME } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
+import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
 
 const LIST_URL = '/data/chats.json';
@@ -113,6 +114,21 @@ class RetinueChatPage extends HTMLElement {
     this._noteTimer = null;
     this._sizes = this._loadSizes();
     this._wide = matchMedia(WIDE_FRAME);
+    // Voice dictation: this element is a host of voice.js's presentation
+    // contract — the third one, after conversations.js and project-page.js.
+    // The host owns the MediaRecorder state machine and what ✓/➤ mean;
+    // voice.js owns the recording/status rows, the waveform and their styles.
+    // One live recording at a time, targeted at one of the two composers.
+    this._recState = 'idle';   // idle | recording
+    this._recTarget = null;    // 'chat' | 'companion' while recording
+    this._recChunks = [];
+    this._mediaRecorder = null;
+    this._recStream = null;
+    this._recIntent = null;    // 'review' | 'send', decided by the ✓/➤ tap
+    this._recAborted = false;  // recording was discarded via the abort button
+    this._voiceJobs = {};      // per-target {sending, phase} while a dictation runs
+    this._voiceErrors = {};    // per-target error line, shown by that composer
+    this._wave = new Waveform(this);
   }
 
   connectedCallback() {
@@ -129,6 +145,9 @@ class RetinueChatPage extends HTMLElement {
   disconnectedCallback() {
     this._wide.removeEventListener('change', this._onFrame);
     if (this._noteTimer) clearTimeout(this._noteTimer);
+    this._stopRecording();
+    this._wave.stop();
+    this._stopStream();
   }
 
   async _load() {
@@ -158,6 +177,12 @@ class RetinueChatPage extends HTMLElement {
       this._chat = doc.chat || summary;
       this._messages = Array.isArray(doc.messages) ? doc.messages : [];
       this._companion = Array.isArray(doc.companion) ? doc.companion : [];
+      // Pin the unread waterline to where it was when the chat opened —
+      // messages sent from here are appended below it, and a re-render must
+      // not drift the line (messenger convention: it stays put while the
+      // thread is open).
+      this._firstUnread = this._chat.unread
+        ? this._messages.length - this._chat.unread : -1;
       // A staged draft lands in the composer, marked with its author — the
       // agent writes into the draft, the user's send button sends.
       const draft = this._chat.draft;
@@ -213,7 +238,7 @@ class RetinueChatPage extends HTMLElement {
     } else {
       body = this._headHtml() + this._panesHtml();
     }
-    this.shadowRoot.innerHTML = `<style>${CSS}${MD_CSS}</style>` +
+    this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>` +
       `<section class="page">${body}</section>`;
     if (this._state === 'ok') {
       this._applySizes();
@@ -266,7 +291,6 @@ class RetinueChatPage extends HTMLElement {
     const msgs = this._messages;
     if (!msgs.length) return '<div class="center muted">No messages.</div>';
     const unread = this._chat.unread || 0;
-    const firstUnread = unread ? msgs.length - unread : -1;
     let html = '';
     let lastDay = '';
     msgs.forEach((m, i) => {
@@ -275,7 +299,7 @@ class RetinueChatPage extends HTMLElement {
         html += `<div class="day-sep"><span>${esc(fmtDay(m.ts))}</span></div>`;
         lastDay = day;
       }
-      if (i === firstUnread) {
+      if (i === this._firstUnread) {
         html += `<div class="unread-sep"><span>${unread} unread</span></div>`;
       }
       html += this._chatMsgHtml(m);
@@ -322,23 +346,57 @@ class RetinueChatPage extends HTMLElement {
     const chips = QUICK_PATTERNS.map((p) =>
       `<button type="button" class="qchip" data-quick="${p.id}">${esc(p.label)}</button>`
     ).join('');
-    // Row order is deliberate: the clear ✕ sits on the far LEFT, send on the
-    // far right — the ✕ must never be one fat finger away from send (the same
-    // edge the recording row's discard/send split relies on).
     return `<div class="composer">` +
       `<div class="chips" role="toolbar" aria-label="Quick patterns">${chips}</div>` +
       `<div class="note" data-note role="status" hidden></div>` +
       draftTag +
-      `<form class="row" data-chat-form>` +
-      `<button type="button" class="clearbtn" data-clear title="Clear message" ` +
-      `aria-label="Clear message" ${this._draft ? '' : 'disabled'}>&#10005;</button>` +
-      `<textarea rows="1" placeholder="Message &#8230;" aria-label="Message" ` +
-      `autocomplete="off">${esc(this._draft)}</textarea>` +
-      `<button type="button" class="mic" disabled ` +
-      `title="Voice input arrives with the live chat API" ` +
-      `aria-label="Voice input arrives with the live chat API">&#127908;</button>` +
-      `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button>` +
-      `</form></div>`;
+      this._errRowHtml('chat') +
+      this._composerRowHtml('chat', 'Message …', true) +
+      `</div>`;
+  }
+
+  _errRowHtml(target) {
+    const err = this._voiceErrors[target];
+    return err ? `<div class="attach-err" role="status">${esc(err)}</div>` : '';
+  }
+
+  // One composer's input row — or, while this target records or transcribes,
+  // the shared recording/status row from voice.js in its place, so the text
+  // field (and the phone keyboard) never reappears mid-flow: the same
+  // behaviour as the conversation composer and the project command bar.
+  _composerRowHtml(target, placeholder, withClear) {
+    if (this._recState === 'recording' && this._recTarget === target) {
+      return recordingRowHtml();
+    }
+    const job = this._voiceJobs[target];
+    if (job) {
+      const label = job.phase === 'sending' ? 'Sending …'
+        : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
+      return statusRowHtml(label);
+    }
+    const value = target === 'chat' ? this._draft : this._compDraft;
+    const micBtn = canRecord()
+      ? `<button type="button" class="mic" data-mic="${target}" ` +
+        `title="Record a voice message" aria-label="Record a voice message">&#127908;</button>`
+      : '';
+    // The clear ✕ lives INSIDE the field, docked to its top-right corner: on
+    // the send side, as the design asks, but within the field's own boundary,
+    // so it reads — and taps — as part of the text box, visually and
+    // physically distinct from the round send button beside it and never one
+    // fat finger away from it. As a row button it would cost the empty field
+    // width it does not need: it exists only while there is text to clear
+    // (.has-text shows it and pads the text out from under it).
+    const clearBtn = withClear
+      ? `<button type="button" class="clear-inline" data-clear ` +
+        `title="Clear message" aria-label="Clear message">&#10005;</button>`
+      : '';
+    const fieldCls = `field${withClear ? ' has-clear' : ''}${value ? ' has-text' : ''}`;
+    return `<form class="row" data-composer="${target}">` + micBtn +
+      `<div class="${fieldCls}" data-field>` +
+      `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" ` +
+      `autocomplete="off">${esc(value)}</textarea>` + clearBtn +
+      `</div>` +
+      `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button></form>`;
   }
 
   // Companion messages reuse the conversation thread's visual language (same
@@ -363,12 +421,9 @@ class RetinueChatPage extends HTMLElement {
   }
 
   _companionComposerHtml() {
-    return `<div class="composer">` +
-      `<form class="row" data-comp-form>` +
-      `<textarea rows="1" placeholder="Ask Ara &#8230;" aria-label="Ask Ara" ` +
-      `autocomplete="off">${esc(this._compDraft)}</textarea>` +
-      `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button>` +
-      `</form></div>`;
+    // Mirrors the conversation composer: no clear control there, none here.
+    return `<div class="composer">` + this._errRowHtml('companion') +
+      this._composerRowHtml('companion', 'Ask Ara …', false) + `</div>`;
   }
 
   // ── Wiring ─────────────────────────────────────────────────────────────────
@@ -392,84 +447,14 @@ class RetinueChatPage extends HTMLElement {
       }, { passive: true });
     }
 
-    // Chat composer.
-    const form = root.querySelector('[data-chat-form]');
-    if (form) {
-      const input = form.querySelector('textarea');
-      const clearBtn = form.querySelector('[data-clear]');
-      const grow = () => {
-        input.style.height = 'auto';
-        input.style.height =
-          `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
-      };
-      input.addEventListener('input', () => {
-        this._draft = input.value;
-        clearBtn.disabled = !input.value;
-        grow();
-      });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-          e.preventDefault();
-          form.requestSubmit();
-        }
-      });
-      grow();
-      clearBtn.addEventListener('click', () => {
-        // One tap to an empty box — the deliberate divergence from the real
-        // clients. It also dismisses the staged-draft marker: the draft is
-        // rejected, not sent.
-        input.value = '';
-        this._draft = '';
-        this._setDraftByAra(false);
-        clearBtn.disabled = true;
-        grow();
-        input.focus();
-      });
-      form.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const text = input.value;
-        if (!text.trim()) return;
-        this._sendChat(text);
-        input.value = '';
-        this._draft = '';
-        this._setDraftByAra(false);
-        clearBtn.disabled = true;
-        grow();
-      });
-    }
+    // Composers (chat: fixture send; companion: local echo + canned notice).
+    this._wireComposer('chat');
+    this._wireComposer('companion');
 
     // Quick patterns: pre-fill the companion composer with the canned prompt
     // and bring that pane forward — a chip is a companion turn, nothing more.
     root.querySelectorAll('[data-quick]').forEach((el) =>
       el.addEventListener('click', () => this._quickPattern(el.getAttribute('data-quick'))));
-
-    // Companion composer (fixture: echoes locally, then a canned notice).
-    const compForm = root.querySelector('[data-comp-form]');
-    if (compForm) {
-      const input = compForm.querySelector('textarea');
-      const grow = () => {
-        input.style.height = 'auto';
-        input.style.height =
-          `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
-      };
-      input.addEventListener('input', () => { this._compDraft = input.value; grow(); });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-          e.preventDefault();
-          compForm.requestSubmit();
-        }
-      });
-      grow();
-      compForm.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const text = input.value;
-        if (!text.trim()) return;
-        this._sendCompanion(text);
-        input.value = '';
-        this._compDraft = '';
-        grow();
-      });
-    }
 
     // Splitter (wide layout): drag / double-click reset / arrow keys, position
     // persisted per device — the layout.js interaction set, page-local.
@@ -524,6 +509,218 @@ class RetinueChatPage extends HTMLElement {
         this._applySizes();
         this._saveSizes();
       });
+    }
+  }
+
+  // Wire one composer: input tracking + autosize, the inline clear, the mic,
+  // Cmd/Ctrl+Enter, submit — or, while this target records, the recording
+  // row's three controls (voice.js renders them; the host decides what they
+  // mean). A status row (dictation in flight) has nothing to wire.
+  _wireComposer(target) {
+    const root = this.shadowRoot;
+    const isChat = target === 'chat';
+    if (this._recState === 'recording' && this._recTarget === target) {
+      const pane = root.querySelector(isChat ? '.pane-chat' : '.pane-companion');
+      if (!pane) return;
+      const on = (sel, fn) => {
+        const el = pane.querySelector(sel);
+        if (el) el.addEventListener('click', fn);
+      };
+      on('[data-rec-abort]', () => this._abortRecording());
+      on('[data-rec-check]', () => this._finishRecording('review'));
+      on('[data-rec-send]', () => this._finishRecording('send'));
+      return;
+    }
+    const form = root.querySelector(`[data-composer="${target}"]`);
+    if (!form) return;
+    const input = form.querySelector('textarea');
+    const field = form.querySelector('[data-field]');
+    const grow = () => {
+      input.style.height = 'auto';
+      input.style.height =
+        `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+    };
+    input.addEventListener('input', () => {
+      if (isChat) this._draft = input.value; else this._compDraft = input.value;
+      field.classList.toggle('has-text', !!input.value);
+      grow();
+    });
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+        e.preventDefault();
+        form.requestSubmit();
+      }
+    });
+    grow();
+    const clearBtn = form.querySelector('[data-clear]');
+    if (clearBtn) {
+      clearBtn.addEventListener('click', () => {
+        // One tap to an empty box — the deliberate divergence from the real
+        // clients. It also dismisses the staged-draft marker: the draft is
+        // rejected, not sent.
+        input.value = '';
+        this._draft = '';
+        this._setDraftByAra(false);
+        field.classList.remove('has-text');
+        grow();
+        input.focus();
+      });
+    }
+    const mic = form.querySelector('[data-mic]');
+    if (mic) mic.addEventListener('click', () => this._startRecording(target));
+    form.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const text = input.value;
+      if (!text.trim()) return;
+      if (isChat) {
+        this._sendChat(text);
+        this._draft = '';
+        this._setDraftByAra(false);
+      } else {
+        this._sendCompanion(text);
+        this._compDraft = '';
+      }
+      input.value = '';
+      field.classList.remove('has-text');
+      grow();
+    });
+  }
+
+  // ── Voice input: record → live waveform → transcribe (review or send) ──────
+  // The same flow as the conversation composer and the project command bar:
+  // the mic swaps this composer's input row for voice.js's recording row —
+  // abort ✕ | live waveform | review ✓ | send ➤ — then a status line while
+  // the dictation is transcribed (and, on the send path, sent).
+  async _startRecording(target) {
+    if (this._recState !== 'idle' || this._voiceJobs[target]) return;
+    if (!canRecord()) {
+      this._voiceErrors[target] = 'Voice recording is not supported on this device.';
+      this.render();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      this._recStream = stream;
+      this._recChunks = [];
+      this._recIntent = null;
+      this._recAborted = false;
+      this._recTarget = target;
+      delete this._voiceErrors[target];
+      const mr = new MediaRecorder(stream);
+      this._mediaRecorder = mr;
+      mr.addEventListener('dataavailable', (e) => {
+        if (e.data && e.data.size) this._recChunks.push(e.data);
+      });
+      mr.addEventListener('stop', () => this._onRecordingStopped());
+      mr.start();
+      this._recState = 'recording';
+      this.render();
+      this._wave.start(stream);
+    } catch (_err) {
+      this._recState = 'idle';
+      this._recTarget = null;
+      this._voiceErrors[target] = 'Microphone access was denied.';
+      this._stopStream();
+      this.render();
+    }
+  }
+
+  // Abort: throw the recording away and return to the plain input row.
+  _abortRecording() {
+    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
+    this._recAborted = true;
+    this._stopRecording();
+  }
+
+  // Check / send buttons: stop the recorder with the chosen intent; the actual
+  // work continues in _onRecordingStopped once the recorder flushes its
+  // chunks. A decision already taken (an earlier tap, or abort) wins.
+  _finishRecording(intent) {
+    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
+    this._recIntent = intent;
+    this._stopRecording();
+  }
+
+  _stopRecording() {
+    try {
+      if (this._mediaRecorder && this._mediaRecorder.state !== 'inactive') {
+        this._mediaRecorder.stop();
+      }
+    } catch (_e) { /* ignore */ }
+  }
+
+  _stopStream() {
+    if (this._recStream) {
+      try { this._recStream.getTracks().forEach((tr) => tr.stop()); } catch (_e) { /* ignore */ }
+      this._recStream = null;
+    }
+  }
+
+  async _onRecordingStopped() {
+    this._wave.stop();
+    this._stopStream();
+    const chunks = this._recChunks || [];
+    this._recChunks = [];
+    const type = (this._mediaRecorder && this._mediaRecorder.mimeType)
+      || (chunks[0] && chunks[0].type) || 'audio/webm';
+    this._mediaRecorder = null;
+    const intent = this._recIntent || 'review';
+    this._recIntent = null;
+    const aborted = this._recAborted;
+    this._recAborted = false;
+    const target = this._recTarget || 'chat';
+    this._recTarget = null;
+    this._recState = 'idle';
+    if (aborted || !chunks.length) {
+      this.render();
+      return;
+    }
+    this._voiceJobs[target] = { sending: intent === 'send', phase: 'transcribing' };
+    this.render();
+    let toSend = '';
+    try {
+      // Same endpoint and cleanup pass as the conversation composer. No
+      // thread context is sent — chat ids are not conversation ids; the live
+      // chat API can add its own context parameter later.
+      const res = await fetch('/conversations/transcribe', {
+        method: 'POST',
+        headers: { 'Content-Type': type || 'application/octet-stream' },
+        body: new Blob(chunks, { type }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      const text = ((data && data.text) || '').trim();
+      if (text) {
+        // Append to anything already typed — dictating into a staged agent
+        // draft edits it exactly like typing (the marker stays until the
+        // draft is cleared or sent).
+        const cur = target === 'chat' ? this._draft : this._compDraft;
+        const next = cur ? `${cur.replace(/\s*$/, '')} ${text}` : text;
+        if (target === 'chat') this._draft = next; else this._compDraft = next;
+        if (intent === 'send') toSend = next;
+      } else {
+        this._voiceErrors[target] = 'No speech was detected in the recording.';
+      }
+    } catch (_err) {
+      this._voiceErrors[target] = "Couldn't transcribe the recording. Please try again.";
+    }
+    delete this._voiceJobs[target];
+    if (toSend) {
+      if (target === 'chat') { this._draft = ''; this._draftByAra = false; }
+      else this._compDraft = '';
+    }
+    this.render();
+    if (toSend) {
+      // After the render, so the appended bubble (and the chat's fixture
+      // note) lands in the fresh DOM instead of being wiped by it. The sends
+      // are synchronous in fixture mode — the 'sending' status row of the
+      // live composers has nothing to show here.
+      if (target === 'chat') this._sendChat(toSend);
+      else this._sendCompanion(toSend);
+    } else if (intent === 'review') {
+      // The deliberate review flow returns to the field for editing.
+      const input = this.shadowRoot.querySelector(`[data-composer="${target}"] textarea`);
+      if (input) { try { input.focus(); } catch (_e) { /* ignore */ } }
     }
   }
 
@@ -609,14 +806,12 @@ class RetinueChatPage extends HTMLElement {
     const p = QUICK_PATTERNS.find((x) => x.id === id);
     if (!p) return;
     const prompt = p.prompt(this._draft.trim());
-    const compForm = this.shadowRoot.querySelector('[data-comp-form]');
-    const input = compForm && compForm.querySelector('textarea');
+    const input = this.shadowRoot.querySelector('[data-composer="companion"] textarea');
     if (input) {
       input.value = prompt;
-      this._compDraft = prompt;
-      input.style.height = 'auto';
-      input.style.height =
-        `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+      // Through the input pipeline, so state, autosize and the field class
+      // stay in step with a value set by code.
+      input.dispatchEvent(new Event('input'));
     }
     this._setPane('companion', 'smooth');
     if (input) setTimeout(() => { try { input.focus(); } catch (_e) { /* ignore */ } }, 320);
@@ -758,23 +953,34 @@ const CSS = `
                background: rgba(110, 168, 254, .12); color: var(--accent, #6ea8fe);
                font-size: .74rem; font-weight: 600; }
   .row { display: flex; gap: 6px; align-items: flex-end; }
+  .field { flex: 1; min-width: 0; position: relative; display: flex; }
   .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 35vh;
                   background: var(--card-2, #1c2230); border: 0; border-radius: 20px;
                   padding: 9px 14px; color: var(--fg, #e7ebf2); font: inherit; line-height: 1.35;
                   resize: none; overflow-y: auto; }
   .row textarea::placeholder { color: var(--muted, #8b93a3); }
   .row textarea:focus-visible { outline: 1px solid rgba(110, 168, 254, .45); outline-offset: 0; }
-  .row button { flex: none; display: inline-flex; align-items: center; justify-content: center;
-                width: 40px; height: 40px; border-radius: 50%; border: 0; font-size: 1.05rem;
-                cursor: pointer; padding: 0; -webkit-tap-highlight-color: transparent; }
-  .send { background: var(--accent, #6ea8fe); color: #0b0d12; padding-left: 2px; }
+  /* Only the send button is styled here — the mic and the recording/status
+     rows take their look verbatim from the shared VOICE_CSS (voice.js),
+     appended after this sheet, so all three composers in the app stay
+     identical by construction. */
+  .send { flex: none; display: inline-flex; align-items: center; justify-content: center;
+          width: 40px; height: 40px; border-radius: 50%; border: 0; font-size: 1.05rem;
+          cursor: pointer; padding: 0 0 0 2px; background: var(--accent, #6ea8fe);
+          color: #0b0d12; -webkit-tap-highlight-color: transparent; }
   .send:active { filter: brightness(1.12); }
-  .clearbtn { background: var(--card-2, #1c2230); color: var(--high, #ff6b6b); }
-  .clearbtn:hover { background: rgba(255, 107, 107, .18); }
-  .clearbtn[disabled] { opacity: .4; cursor: default; }
-  .clearbtn[disabled]:hover { background: var(--card-2, #1c2230); }
-  .mic { background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
-  .mic[disabled] { opacity: .5; cursor: default; }
+  /* The inline clear: docked in the field's top-right corner, shown only
+     while there is text (see _composerRowHtml for the placement rationale);
+     the .has-text padding keeps text from wrapping under it. */
+  .clear-inline { position: absolute; top: 5px; right: 5px; width: 30px; height: 30px;
+                  display: inline-flex; align-items: center; justify-content: center;
+                  border: 0; border-radius: 50%; padding: 0; cursor: pointer;
+                  background: transparent; color: var(--muted, #8b93a3); font-size: .9rem;
+                  -webkit-tap-highlight-color: transparent; }
+  .clear-inline:hover { color: var(--high, #ff6b6b); background: rgba(255, 107, 107, .14); }
+  .field:not(.has-text) .clear-inline { display: none; }
+  .field.has-clear.has-text textarea { padding-right: 44px; }
+  .attach-err { color: var(--high, #ff6b6b); font-size: .76rem; margin-bottom: 8px; }
 
   /* ── Companion pane (the conversation thread's visual language) ──────────── */
   .cmsg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; align-self: flex-start; }
