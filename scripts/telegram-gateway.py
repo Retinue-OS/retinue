@@ -254,12 +254,15 @@ RECENT_SENDS = _ibstore.RecentSends()
 
 def _record_outbound(chat: str, text: str, author: str,
                      message_id: str | None = None,
-                     timestamp: float | None = None) -> None:
+                     timestamp: float | None = None,
+                     attachment_urls: list[str] | None = None) -> None:
     """Best-effort ledger record of one successfully sent message; never raises.
 
     Inbox-mode only, like inbound persistence: the ledger mirrors the user's
     own conversations, and a control account's traffic (prompts in, Ara's
-    replies out) is persisted on neither direction.
+    replies out) is persisted on neither direction. ``attachment_urls`` are
+    the durable media references stored for this send (see
+    :func:`_store_media_ref`).
     """
     if TELEGRAM_GATEWAY_MODE != "inbox":
         return
@@ -267,9 +270,16 @@ def _record_outbound(chat: str, text: str, author: str,
         _ibstore.write_outbound(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, chat=chat, text=text,
             author=author, message_id=message_id, timestamp=timestamp,
+            attachment_urls=attachment_urls or None,
         )
     except Exception as exc:
         print(f"[telegram-gateway] could not record outbound message: {exc}", flush=True)
+
+
+# Cap on an own-device echo's media: an echo above this records its caption
+# only (or is skipped when it has none), exactly the pre-media behaviour.
+CHAT_ECHO_MEDIA_MAX_BYTES = int(
+    os.environ.get("CHAT_ECHO_MEDIA_MAX_BYTES", str(10 * 1024 * 1024)))
 
 
 def _mark_delivered(store_path) -> None:
@@ -668,7 +678,8 @@ async def _async_send(recipient: str, text: str, media_paths: list):
 
 
 def _tg_send(recipient: str, text: str | None, media_paths: list | None = None,
-             author: str = "agent") -> tuple[str | None, float | None]:
+             author: str = "agent",
+             attachment_urls: list[str] | None = None) -> tuple[str | None, float | None]:
     """Sync wrapper: schedule the async send on the client loop and wait for it.
 
     Callable from the HTTP thread and from the inbound worker thread; both are
@@ -689,7 +700,8 @@ def _tg_send(recipient: str, text: str | None, media_paths: list | None = None,
     )
     chat_key, msg_id, sent_at = fut.result(timeout=TELEGRAM_SEND_TIMEOUT)
     _record_outbound(chat_key, (text or "").strip(), author,
-                     message_id=msg_id, timestamp=sent_at)
+                     message_id=msg_id, timestamp=sent_at,
+                     attachment_urls=attachment_urls)
     return msg_id, sent_at
 
 
@@ -987,27 +999,77 @@ async def _on_outgoing_message(event) -> None:
         text = (event.raw_text or "").strip()
         if RECENT_SENDS.seen(msg_id, chat=chat_key, text=text):
             return
-        if not text:
-            # Attachment-only own-device sends are not captured yet (the media
-            # would have to be downloaded just for the mirror); recording
-            # nothing beats recording an empty bubble.
-            print(f"[telegram-gateway] own-device send to {chat_key} has no text; not recorded", flush=True)
+        # Real media only: a link-preview webpage is not an attachment the
+        # user sent (the inbound path excludes it the same way).
+        media = getattr(message, "media", None)
+        has_media = media is not None and type(media).__name__ != "MessageMediaWebPage"
+        if not text and not has_media:
+            print(f"[telegram-gateway] own-device send to {chat_key} has no text "
+                  f"and no capturable media; not recorded", flush=True)
             return
         date = getattr(message, "date", None)
         sent_at = date.timestamp() if date is not None else None
 
-        # The record is a small file write, but still disk I/O — keep it off
+        # Media echo: download while still on the loop (an await, so the loop
+        # is never blocked), bounded by the declared size up front and by the
+        # real size after — the declaration is sender-controlled. Any failure
+        # degrades to recording the caption; the text is never lost to media.
+        media_path = None
+        mime = None
+        if has_media:
+            file_info = getattr(message, "file", None)
+            size = getattr(file_info, "size", None)
+            mime = getattr(file_info, "mime_type", None)
+            if isinstance(size, int) and size > CHAT_ECHO_MEDIA_MAX_BYTES:
+                print(f"[telegram-gateway] own-device media over "
+                      f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it",
+                      flush=True)
+            else:
+                try:
+                    fd, out = tempfile.mkstemp(prefix="tg-echo-",
+                                               dir=str(TELEGRAM_TMP_DIR))
+                    os.close(fd)
+                    media_path = await message.download_media(file=out)
+                except Exception as exc:  # noqa: BLE001 - degrade to the caption
+                    print(f"[telegram-gateway] own-device media download failed; "
+                          f"recording without it: {exc}", flush=True)
+                    media_path = None
+
+        # The blob read + store + record are plain disk I/O — keep them off
         # the event loop like the inbound dispatch.
         def _record():
+            refs: list[str] = []
+            if media_path:
+                p = Path(media_path)
+                try:
+                    data = p.read_bytes()
+                except OSError:
+                    data = b""
+                finally:
+                    p.unlink(missing_ok=True)
+                if len(data) > CHAT_ECHO_MEDIA_MAX_BYTES:
+                    print(f"[telegram-gateway] own-device media over "
+                          f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it",
+                          flush=True)
+                elif data:
+                    ref = _store_media_ref(
+                        data, mime or mimetypes.guess_type(str(p))[0])
+                    if ref:
+                        refs.append(ref)
+            if not text and not refs:
+                print(f"[telegram-gateway] own-device send to {chat_key} has no "
+                      f"text and no retrievable media; not recorded", flush=True)
+                return
             _record_outbound(chat_key, text, "device",
-                             message_id=msg_id, timestamp=sent_at)
+                             message_id=msg_id, timestamp=sent_at,
+                             attachment_urls=refs)
             # Chats rail: an own-device send advances the chat's read watermark
             # on the dashboard (the user was visibly in that chat on their
             # phone).
             _chats.notify_chat_event_async(
                 direction="out", channel=INBOUND_CHANNEL, chat=chat_key,
                 gateway=_CHATS_GATEWAY_SLUG, author="device",
-                message_id=msg_id, ts=sent_at, text=text,
+                message_id=msg_id, ts=sent_at, text=text, attachments=refs,
             )
             print(f"[telegram-gateway] recorded own-device send to {chat_key}", flush=True)
 
@@ -1678,24 +1740,36 @@ def _decode_image(image: dict) -> Path:
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
-          author: str = "agent") -> tuple[str | None, float | None]:
+          author: str = "agent") -> tuple[str | None, float | None, list[str]]:
     """Send an outbound message: text body plus optional image attachments.
 
     `lang`/`voice` are accepted for parity with the other gateways' _push
     signature (persisted in the pending store) but are ignored here. ``author``
-    is carried through to the ledger record, and the recorded ``(message_id,
-    sent_at)`` is returned (see :func:`_tg_send`).
+    is carried through to the ledger record; each image is also persisted into
+    the ledger media store (inbox mode) so the sent message mirrors with its
+    media. Returns ``(message_id, sent_at, media_refs)``; the /send response
+    surfaces all three (see :func:`_tg_send`).
     """
     images = images or []
     message = (message or "").strip()
     if not message and not images:
         raise ValueError("push requires a non-empty message or at least one image")
     temp_paths: list[Path] = []
+    media_refs: list[str] = []
     try:
         for image in images:
-            temp_paths.append(_decode_image(image))
-        return _tg_send(recipient, message or None, media_paths=temp_paths,
-                        author=author)
+            path = _decode_image(image)
+            temp_paths.append(path)
+            if TELEGRAM_GATEWAY_MODE == "inbox":
+                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
+                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
+                ref = _store_media_ref(path.read_bytes(), ctype)
+                if ref:
+                    media_refs.append(ref)
+        msg_id, sent_at = _tg_send(recipient, message or None,
+                                   media_paths=temp_paths, author=author,
+                                   attachment_urls=media_refs)
+        return msg_id, sent_at, media_refs
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -1931,11 +2005,15 @@ class _PushHandler(BaseHTTPRequestHandler):
             print(f"[telegram-gateway] push sent to {recipient}"
                   + (f" ({len(images)} image(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
-        # Surface the recorded ledger identity so the caller (the dashboard's
-        # chat view) can show the sent message under its real id and timestamp.
-        if isinstance(result, tuple) and result[0]:
-            body["message_id"] = result[0]
-            body["ts"] = result[1]
+        # Surface the recorded ledger identity — id, timestamp and the stored
+        # media references — so the caller (the dashboard's chat view) can show
+        # the sent message exactly as the ledger will.
+        if isinstance(result, tuple):
+            if result[0]:
+                body["message_id"] = result[0]
+                body["ts"] = result[1]
+            if len(result) >= 3 and result[2]:
+                body["attachments"] = result[2]
         self._reply(200, body)
 
 

@@ -48,6 +48,7 @@ CHAT1 = "signal:" + MARA
 WA_KEY = "123456@g.us"
 CHAT2 = "whatsapp:" + WA_KEY
 MID_ATT = "ab" * 16
+MID_ATT2 = "cd" * 16  # the blob the mock gateway "stores" for an images send
 TS0, TS1, TS2, TS3 = ("2026-08-27T06:00:00Z", "2026-08-27T07:00:00Z",
                       "2026-08-27T07:05:00Z", "2026-08-27T07:12:00Z")
 W_TS = "2026-08-26T18:00:00Z"
@@ -155,8 +156,15 @@ class _MockGateway(BaseHTTPRequestHandler):
                                      self.headers.get("Authorization", "")))
         if self.path.rstrip("/") == "/send":
             STATE["sent"].append(payload)
-            self._json(200, {"status": "sent", "recipient": payload.get("recipient"),
-                             "message_id": "777", "ts": time.time()})
+            answer = {"status": "sent", "recipient": payload.get("recipient"),
+                      "message_id": str(776 + len(STATE["sent"])),
+                      "ts": time.time()}
+            if payload.get("images"):
+                # The real gateway persists each image into its ledger media
+                # store and reports the stored references back.
+                answer["attachments"] = [
+                    f"http://127.0.0.1:{STATE['gw_port']}/media/{MID_ATT2}"]
+            self._json(200, answer)
             return
         self._json(404, {"error": "not found"})
 
@@ -447,6 +455,59 @@ def test_send_user_direct(base, wg):
     print("PASS test_send_user_direct")
 
 
+def test_send_images(base, wg):
+    """Images ride the chat send: validated here, persisted by the gateway,
+    and the stored references come back proxied so the sent image renders
+    immediately."""
+    send_path = "/chats/" + _quote(CHAT1) + "/send"
+    png_b64 = "iVBORw0KGgo="  # tiny valid base64; content is the gateway's concern
+
+    # Validation matrix — each rejected before any gateway round trip.
+    n = len(STATE["sent"])
+    status, body = _http(base, "POST", send_path, {"text": "x", "images": "nope"})
+    assert status == 400, body
+    status, body = _http(base, "POST", send_path,
+                         {"text": "x", "images": [{"data": png_b64}] * 6})
+    assert status == 400 and "at most" in body["error"]
+    status, body = _http(base, "POST", send_path,
+                         {"text": "x", "images": [{"data": "not!!base64"}]})
+    assert status == 400 and "base64" in body["error"]
+    status, body = _http(base, "POST", send_path, {"text": "x", "images": ["str"]})
+    assert status == 400
+    old_cap = wg.MAX_ATTACHMENT_BYTES
+    wg.MAX_ATTACHMENT_BYTES = 4
+    try:
+        status, body = _http(base, "POST", send_path,
+                             {"text": "x", "images": [{"data": png_b64}]})
+        assert status == 400 and "too large" in body["error"]
+    finally:
+        wg.MAX_ATTACHMENT_BYTES = old_cap
+    assert len(STATE["sent"]) == n, "rejected sends must never reach the gateway"
+
+    # A valid image send: the gateway payload carries the images verbatim with
+    # the user authorship; the response Message carries the stored reference,
+    # rewritten onto the authenticated proxy.
+    status, msg = _http(base, "POST", send_path,
+                        {"text": "lueg mal",
+                         "images": [{"content_type": "image/png", "data": png_b64}]})
+    assert status == 200, msg
+    sent = STATE["sent"][-1]
+    assert sent["author"] == "user" and sent["message"] == "lueg mal"
+    assert sent["images"] == [{"content_type": "image/png", "data": png_b64}]
+    assert msg["attachments"][0]["url"] == f"/chats/media/127.0.0.1/{MID_ATT2}"
+    assert msg["attachments"][0]["id"] == MID_ATT2
+    # The overlay carries the attachment too: the merged view renders the sent
+    # image before the store indexes it, and the list preview knows the kind.
+    status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
+    mine = next(m for m in body["messages"] if m["id"] == msg["id"])
+    assert mine["attachments"][0]["url"] == f"/chats/media/127.0.0.1/{MID_ATT2}"
+    # An image-only send (no text) is valid.
+    status, only = _http(base, "POST", send_path,
+                         {"images": [{"content_type": "image/png", "data": png_b64}]})
+    assert status == 200 and only["text"] == "" and only["attachments"]
+    print("PASS test_send_images")
+
+
 def test_media_proxy(base, wg):
     req = urllib.request.Request(base + f"/chats/media/127.0.0.1/{MID_ATT}")
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -491,22 +552,26 @@ def main():
         media_dir.mkdir(parents=True)
         (media_dir / MID_ATT).write_bytes(b"x" * 717)
         (media_dir / (MID_ATT + ".type")).write_text("image/jpeg\n")
+        (media_dir / (MID_ATT + ".meta")).write_text('{"width": 320, "height": 420}\n')
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
 
         test_chat_list_contract(base, wg)
-        # The sidecar hints ride on the shaped attachments.
+        # The sidecar hints ride on the shaped attachments — including the
+        # intrinsic size the store sniffed at ingest.
         status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
         att = body["messages"][-1]["attachments"][0]
         assert att.get("type") == "image/jpeg" and att.get("size") == 717
+        assert att.get("width") == 320 and att.get("height") == 420
         test_chat_messages_contract(base, wg)
         test_messages_before_paging(base, wg)
         test_read_watermark(base, wg)
         test_draft_guard(base, wg)
         test_rail_auth_and_notifications(base, wg)
         test_send_user_direct(base, wg)
+        test_send_images(base, wg)
         test_media_proxy(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()

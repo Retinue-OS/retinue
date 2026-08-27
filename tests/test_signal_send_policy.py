@@ -257,7 +257,8 @@ def test_user_author_send_over_http():
 
         def _fake_push(recipient, message, **kw):
             pushed.append((recipient, message, kw))
-            return "1724832000123", 1724832000.123
+            return ("1724832000123", 1724832000.123,
+                    ["http://signal-gateway:8090/media/" + "ee" * 16])
 
         sg._push = _fake_push
         server = ThreadingHTTPServer(("127.0.0.1", 0), sg._PushHandler)
@@ -272,6 +273,9 @@ def test_user_author_send_over_http():
             assert resp.status == 200, answer
             assert answer["status"] == "sent"
             assert answer["message_id"] == "1724832000123"
+            # Stored media references surface too, so the chat view can render
+            # the sent image under its ledger identity.
+            assert answer["attachments"] == ["http://signal-gateway:8090/media/" + "ee" * 16]
             assert pushed and pushed[0][2]["author"] == "user"
             # The same send without author stays on the approval path.
             body = json.dumps({"recipient": "+15551112222", "message": "hi"})
