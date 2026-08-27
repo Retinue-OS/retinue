@@ -1,0 +1,384 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chat": {
+  "id": "whatsapp:120363169876543210@g.us",
+  "channel": "whatsapp",
+  "name": "Wandergruppe Rigi",
+  "group": true,
+  "unread": 7,
+  "archived": false,
+  "muted": false,
+  "last": {
+   "ts": "2026-08-27T08:47:00+02:00",
+   "direction": "in",
+   "kind": "text",
+   "text": "Damit ist das Kulinarische geregelt. Bis Samstag in einer Woche!",
+   "sender_name": "Beat Odermatt"
+  },
+  "draft": null,
+  "messages": "/data/chats/whatsapp-wandergruppe.json",
+  "members": 6
+ },
+ "messages": [
+  {
+   "id": "3EB00001",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Leute, es wird Zeit für die Herbstwanderung. Vorschlag: Rigi, aber diesmal die Route ab Küssnacht.",
+   "ts": "2026-08-10T19:02:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB00002",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41762223344@s.whatsapp.net",
+   "sender_name": "Franziska Kuhn",
+   "text": "Endlich! Ich bin dabei. Welches Wochenende?",
+   "ts": "2026-08-10T19:09:00+02:00"
+  },
+  {
+   "id": "3EB00003",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41795556677@s.whatsapp.net",
+   "sender_name": "Jonas Widmer",
+   "text": "Rigi schon wieder? 🙄 Von mir aus, aber dann mit Einkehr im Bergbeizli.",
+   "ts": "2026-08-10T19:15:00+02:00"
+  },
+  {
+   "id": "3EB00004",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Jonas, die Einkehr ist der Hauptprogrammpunkt, die Wanderung nur Anreise 🍻",
+   "ts": "2026-08-10T19:20:00+02:00"
+  },
+  {
+   "id": "3EB00005",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41787778899@s.whatsapp.net",
+   "sender_name": "Silvia Marchesi",
+   "text": "Io ci sono! Ma niente partenza alle 6 di mattina per favore 😫",
+   "ts": "2026-08-10T20:41:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "3EB00006",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "out",
+   "author": "device",
+   "text": "bin dabei. 5./6. sept oder 12./13.?",
+   "ts": "2026-08-10T21:03:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB00007",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41764445566@s.whatsapp.net",
+   "sender_name": "Tobias Frei",
+   "text": "12./13. bin ich im Militär. Bitte 5./6.",
+   "ts": "2026-08-10T21:30:00+02:00"
+  },
+  {
+   "id": "3EB00008",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41762223344@s.whatsapp.net",
+   "sender_name": "Franziska Kuhn",
+   "text": "Also Samstag 5. September? Wer macht das Doodle?",
+   "ts": "2026-08-12T07:58:00+02:00"
+  },
+  {
+   "id": "3EB00009",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Kein Doodle nötig, hier die Daumen: 5.9. 👍 oder 6.9. ❤️",
+   "ts": "2026-08-12T08:12:00+02:00"
+  },
+  {
+   "id": "3EB00010",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41795556677@s.whatsapp.net",
+   "sender_name": "Jonas Widmer",
+   "text": "👍",
+   "ts": "2026-08-12T08:13:00+02:00"
+  },
+  {
+   "id": "3EB00011",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41787778899@s.whatsapp.net",
+   "sender_name": "Silvia Marchesi",
+   "text": "👍",
+   "ts": "2026-08-12T08:44:00+02:00"
+  },
+  {
+   "id": "3EB00012",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41764445566@s.whatsapp.net",
+   "sender_name": "Tobias Frei",
+   "text": "👍",
+   "ts": "2026-08-12T09:02:00+02:00"
+  },
+  {
+   "id": "3EB00013",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "out",
+   "author": "device",
+   "text": "👍",
+   "ts": "2026-08-12T09:31:00+02:00"
+  },
+  {
+   "id": "3EB00014",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41762223344@s.whatsapp.net",
+   "sender_name": "Franziska Kuhn",
+   "text": "👍 dann ist es fix: Samstag 5. September",
+   "ts": "2026-08-12T10:05:00+02:00"
+  },
+  {
+   "id": "3EB00015",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Route: Küssnacht – Seebodenalp – Rigi Kulm, ca. 4h15, 1300 Hm. Abstieg mit der Bahn nach Vitznau, Schiff zurück.",
+   "ts": "2026-08-18T12:18:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB00016",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "",
+   "ts": "2026-08-18T12:19:00+02:00",
+   "attachments": [
+    {
+     "id": "wa-att-2203",
+     "type": "image/svg+xml",
+     "name": "rigi-route.png",
+     "size": 528,
+     "width": 400,
+     "height": 300,
+     "url": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MDAiIGhlaWdodD0iMzAwIj48cmVjdCB3aWR0aD0iNDAwIiBoZWlnaHQ9IjMwMCIgZmlsbD0iIzJlNGEzNCIvPjxwYXRoIGQ9Ik0wIDIyMCBMOTAgMTQwIEwxNTAgMTkwIEwyMzAgOTAgTDMyMCAxNTAgTDQwMCA2MCBMNDAwIDMwMCBMMCAzMDAgWiIgZmlsbD0iIzNjNWM0MCIvPjxwYXRoIGQ9Ik0wIDI2MCBMMTEwIDIwMCBMMjAwIDI1MCBMMzAwIDE5MCBMNDAwIDIzMCBMNDAwIDMwMCBMMCAzMDAgWiIgZmlsbD0iIzRhNmU0YyIvPjxwYXRoIGQ9Ik0yMCAyODAgQyAxMjAgMjQwLCAxODAgMjYwLCAyNDAgMjAwIFMgMzQwIDEyMCwgMzgwIDkwIiBzdHJva2U9IiNlMDUwM2MiIHN0cm9rZS13aWR0aD0iNCIgc3Ryb2tlLWRhc2hhcnJheT0iMTAgNyIgZmlsbD0ibm9uZSIvPjxjaXJjbGUgY3g9IjM4MCIgY3k9IjkwIiByPSI4IiBmaWxsPSIjZTA1MDNjIi8+PGNpcmNsZSBjeD0iMjAiIGN5PSIyODAiIHI9IjgiIGZpbGw9IiNmMGYwZTgiLz48L3N2Zz4="
+    }
+   ]
+  },
+  {
+   "id": "3EB00017",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41795556677@s.whatsapp.net",
+   "sender_name": "Jonas Widmer",
+   "text": "1300 Höhenmeter?? Beat, wir hatten über «gemütlich» gesprochen",
+   "ts": "2026-08-18T12:26:00+02:00"
+  },
+  {
+   "id": "3EB00018",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Gemütlich ist eine Frage des Tempos, nicht der Höhenmeter 🧗",
+   "ts": "2026-08-18T12:31:00+02:00"
+  },
+  {
+   "id": "3EB00019",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41787778899@s.whatsapp.net",
+   "sender_name": "Silvia Marchesi",
+   "text": "Jonas, puoi sempre prendere il trenino e aspettarci in cima 😂",
+   "ts": "2026-08-18T12:40:00+02:00"
+  },
+  {
+   "id": "3EB00020",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41795556677@s.whatsapp.net",
+   "sender_name": "Jonas Widmer",
+   "text": "Very funny. Ich komme zu Fuss und werde mich NICHT beklagen. Versprochen.",
+   "ts": "2026-08-18T13:02:00+02:00"
+  },
+  {
+   "id": "3EB00021",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41762223344@s.whatsapp.net",
+   "sender_name": "Franziska Kuhn",
+   "text": "Screenshot gemacht, das wird zitiert 📸",
+   "ts": "2026-08-18T13:15:00+02:00"
+  },
+  {
+   "id": "3EB00022",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41764445566@s.whatsapp.net",
+   "sender_name": "Tobias Frei",
+   "text": "Wetter-Langfrist sieht ok aus für den 5. Leicht bewölkt, 18 Grad.",
+   "ts": "2026-08-19T18:30:00+02:00"
+  },
+  {
+   "id": "3EB00023",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Perfektes Wanderwetter. Treffpunkt: 08:40 Küssnacht Bahnhof, Zug ab Zürich HB 07:35 Gleis 6.",
+   "ts": "2026-08-19T18:52:00+02:00"
+  },
+  {
+   "id": "3EB00024",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "out",
+   "author": "user",
+   "text": "Ich nehme den gleichen Zug. Wer will, Abteil ganz vorne.",
+   "ts": "2026-08-19T20:14:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB00025",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41762223344@s.whatsapp.net",
+   "sender_name": "Franziska Kuhn",
+   "text": "👍 ich auch ab HB",
+   "ts": "2026-08-19T20:33:00+02:00"
+  },
+  {
+   "id": "3EB00026",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41787778899@s.whatsapp.net",
+   "sender_name": "Silvia Marchesi",
+   "text": "Domanda: qualcuno ha i bastoni da trekking in prestito? I miei sono rotti.",
+   "ts": "2026-08-24T16:20:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "3EB00027",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41764445566@s.whatsapp.net",
+   "sender_name": "Tobias Frei",
+   "text": "Ich habe ein zweites Paar, bringe ich mit.",
+   "ts": "2026-08-24T16:34:00+02:00"
+  },
+  {
+   "id": "3EB00028",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41787778899@s.whatsapp.net",
+   "sender_name": "Silvia Marchesi",
+   "text": "Grazie Tobias! 🙏",
+   "ts": "2026-08-24T16:35:00+02:00"
+  },
+  {
+   "id": "3EB00029",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Packliste kommt Ende Woche. Wichtigster Punkt vorab: Bargeld fürs Beizli, die nehmen keine Karten.",
+   "ts": "2026-08-24T17:08:00+02:00"
+  },
+  {
+   "id": "3EB00030",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41795556677@s.whatsapp.net",
+   "sender_name": "Jonas Widmer",
+   "text": "DAS ist Planung. Danke Beat.",
+   "ts": "2026-08-24T17:09:00+02:00"
+  },
+  {
+   "id": "3EB00031",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Packliste: gute Schuhe, Regenjacke, 1.5l Wasser, Sonnencreme, Bargeld (!), Ersatzshirt. Wer ein Seilbahn-Halbtax hat: mitnehmen.",
+   "ts": "2026-08-27T08:30:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB00032",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41762223344@s.whatsapp.net",
+   "sender_name": "Franziska Kuhn",
+   "text": "Halbtax-Frage: gilt das GA auf der Rigi-Bahn? Weiss das jemand?",
+   "ts": "2026-08-27T08:36:00+02:00"
+  },
+  {
+   "id": "3EB00033",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41795556677@s.whatsapp.net",
+   "sender_name": "Jonas Widmer",
+   "text": "GA gilt bis Rigi Kulm, ja. Vitznau–Luzern Schiff auch.",
+   "ts": "2026-08-27T08:39:00+02:00"
+  },
+  {
+   "id": "3EB00034",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41762223344@s.whatsapp.net",
+   "sender_name": "Franziska Kuhn",
+   "text": "Merci!",
+   "ts": "2026-08-27T08:40:00+02:00"
+  },
+  {
+   "id": "3EB00035",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41787778899@s.whatsapp.net",
+   "sender_name": "Silvia Marchesi",
+   "text": "Porto la focaccia per tutti 🥖",
+   "ts": "2026-08-27T08:44:00+02:00"
+  },
+  {
+   "id": "3EB00036",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41764445566@s.whatsapp.net",
+   "sender_name": "Tobias Frei",
+   "text": "Silvia du bist die Beste",
+   "ts": "2026-08-27T08:45:00+02:00"
+  },
+  {
+   "id": "3EB00037",
+   "chat": "whatsapp:120363169876543210@g.us",
+   "direction": "in",
+   "sender": "41791234455@s.whatsapp.net",
+   "sender_name": "Beat Odermatt",
+   "text": "Damit ist das Kulinarische geregelt. Bis Samstag in einer Woche!",
+   "ts": "2026-08-27T08:47:00+02:00"
+  }
+ ],
+ "companion": [
+  {
+   "role": "user",
+   "text": "What do I still owe this group?",
+   "ts": "2026-08-24T18:00:00+02:00"
+  },
+  {
+   "role": "ara",
+   "text": "Nothing open on your side: you confirmed the 5 September date and the 07:35 train. Beat posted the packing list this morning — cash for the restaurant is the one thing to remember. I can add the hike to your agenda with a cash reminder the evening before.",
+   "ts": "2026-08-24T18:01:00+02:00"
+  }
+ ]
+}

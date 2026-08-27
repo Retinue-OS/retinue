@@ -1,0 +1,188 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chat": {
+  "id": "signal:+41794456312",
+  "channel": "signal",
+  "name": "Mara Meier",
+  "group": false,
+  "unread": 2,
+  "archived": false,
+  "muted": false,
+  "last": {
+   "ts": "2026-08-27T09:12:00+02:00",
+   "direction": "in",
+   "kind": "text",
+   "text": "Und: chunnsch immer no um halbi sibni?",
+   "sender_name": "Mara Meier"
+  },
+  "draft": {
+   "text": "Samstag passt — ich bin um 18:30 da und bringe Dessert vom Markt mit. Soll ich sonst noch etwas mitnehmen?",
+   "author": "agent",
+   "agent": "Ara",
+   "ts": "2026-08-27T09:21:00+02:00",
+   "version": 3
+  },
+  "messages": "/data/chats/signal-mara.json"
+ },
+ "messages": [
+  {
+   "id": "S1AK0001",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Hoi Reto! Hesch du s Buech vom Peter no bi dir? Er froget wieder 😅",
+   "ts": "2026-08-22T18:04:00+02:00",
+   "lang": "gsw"
+  },
+  {
+   "id": "S1AK0002",
+   "chat": "signal:+41794456312",
+   "direction": "out",
+   "author": "device",
+   "text": "Oh, ja ligt no uf em Stapel... bring is am Samstig verbi, versproche!",
+   "ts": "2026-08-22T18:31:00+02:00",
+   "lang": "gsw"
+  },
+  {
+   "id": "S1AK0003",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "👌 kei Stress",
+   "ts": "2026-08-22T18:33:00+02:00"
+  },
+  {
+   "id": "S1AK0004",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Btw — mir planed es Znacht am Samstig bi eus, so 18:30. Chunnsch au?",
+   "ts": "2026-08-23T12:47:00+02:00",
+   "lang": "gsw"
+  },
+  {
+   "id": "S1AK0005",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "D Sofia bringt ihre berühmti Lasagne 🍝",
+   "ts": "2026-08-23T12:48:00+02:00"
+  },
+  {
+   "id": "S1AK0006",
+   "chat": "signal:+41794456312",
+   "direction": "out",
+   "author": "device",
+   "text": "tönt guet! muess no schnell in kalender luege",
+   "ts": "2026-08-23T13:55:00+02:00",
+   "lang": "gsw"
+  },
+  {
+   "id": "S1AK0007",
+   "chat": "signal:+41794456312",
+   "direction": "out",
+   "author": "agent",
+   "text": "Reto confirms for Saturday 18:30 — he'll check what to bring and get back to you today.",
+   "ts": "2026-08-23T16:02:00+02:00",
+   "agent": "Ara",
+   "lang": "en"
+  },
+  {
+   "id": "S1AK0008",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Haha your assistant answered in English 😂 ok top, bis Samstig!",
+   "ts": "2026-08-23T16:10:00+02:00"
+  },
+  {
+   "id": "S1AK0009",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Lueg mal, de Flyer hängt jetzt im ganze Quartier",
+   "ts": "2026-08-25T09:05:00+02:00",
+   "lang": "gsw",
+   "attachments": [
+    {
+     "id": "sig-att-0117",
+     "type": "image/svg+xml",
+     "name": "flyer.jpg",
+     "size": 717,
+     "width": 320,
+     "height": 420,
+     "url": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzMjAiIGhlaWdodD0iNDIwIj48ZGVmcz48bGluZWFyR3JhZGllbnQgaWQ9ImciIHgxPSIwIiB5MT0iMCIgeDI9IjAiIHkyPSIxIj48c3RvcCBvZmZzZXQ9IjAiIHN0b3AtY29sb3I9IiNlOGIwNGIiLz48c3RvcCBvZmZzZXQ9IjEiIHN0b3AtY29sb3I9IiNiNDU1MmQiLz48L2xpbmVhckdyYWRpZW50PjwvZGVmcz48cmVjdCB3aWR0aD0iMzIwIiBoZWlnaHQ9IjQyMCIgZmlsbD0idXJsKCNnKSIvPjxyZWN0IHg9IjI4IiB5PSIzNiIgd2lkdGg9IjI2NCIgaGVpZ2h0PSI3MiIgcng9IjgiIGZpbGw9IiNmZmY4ZWUiIG9wYWNpdHk9Ii45MiIvPjxyZWN0IHg9IjQ2IiB5PSI1NiIgd2lkdGg9IjE4MCIgaGVpZ2h0PSIxNCIgcng9IjciIGZpbGw9IiM3YTNiMWUiLz48cmVjdCB4PSI0NiIgeT0iNzgiIHdpZHRoPSIxMjAiIGhlaWdodD0iMTAiIHJ4PSI1IiBmaWxsPSIjYTg2MDM4Ii8+PGNpcmNsZSBjeD0iMTYwIiBjeT0iMjUwIiByPSI3NCIgZmlsbD0iI2ZmZjhlZSIgb3BhY2l0eT0iLjg1Ii8+PHJlY3QgeD0iNjAiIHk9IjM1MiIgd2lkdGg9IjIwMCIgaGVpZ2h0PSIxMCIgcng9IjUiIGZpbGw9IiNmZmY4ZWUiIG9wYWNpdHk9Ii44Ii8+PHJlY3QgeD0iOTAiIHk9IjM3MiIgd2lkdGg9IjE0MCIgaGVpZ2h0PSIxMCIgcng9IjUiIGZpbGw9IiNmZmY4ZWUiIG9wYWNpdHk9Ii42Ii8+PC9zdmc+"
+    }
+   ]
+  },
+  {
+   "id": "S1AK0010",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Es isch für s Strassefäscht am 12. September. Du chasch di no als Helfer amelde 😏",
+   "ts": "2026-08-25T09:06:00+02:00"
+  },
+  {
+   "id": "S1AK0011",
+   "chat": "signal:+41794456312",
+   "direction": "out",
+   "author": "user",
+   "text": "Sieht super aus! Für s Fäscht bin ich debii — aber bitte nöd scho wieder Grill-Schicht.",
+   "ts": "2026-08-25T11:22:00+02:00",
+   "lang": "gsw"
+  },
+  {
+   "id": "S1AK0012",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Notiert: kei Grill 🥘❌",
+   "ts": "2026-08-25T11:40:00+02:00"
+  },
+  {
+   "id": "S1AK0013",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Also für morn: bruuchemer no öppis vom Markt? Sofia macht Salat, ich han Wii.",
+   "ts": "2026-08-27T09:11:00+02:00",
+   "lang": "gsw"
+  },
+  {
+   "id": "S1AK0014",
+   "chat": "signal:+41794456312",
+   "direction": "in",
+   "sender": "+41794456312",
+   "sender_name": "Mara Meier",
+   "text": "Und: chunnsch immer no um halbi sibni?",
+   "ts": "2026-08-27T09:12:00+02:00"
+  }
+ ],
+ "companion": [
+  {
+   "role": "ara",
+   "text": "Mara asked two things for tomorrow: whether anything is still needed from the market, and whether 18:30 still stands. Your calendar is free from 17:00.",
+   "ts": "2026-08-27T09:13:00+02:00"
+  },
+  {
+   "role": "user",
+   "text": "18:30 works. Draft a yes — I'll bring dessert from the market.",
+   "ts": "2026-08-27T09:20:00+02:00"
+  },
+  {
+   "role": "ara",
+   "text": "Staged a reply in the draft — adjust the wording and press send when you're happy.\n\n> Samstag passt — ich bin um 18:30 da und bringe Dessert vom Markt mit. Soll ich sonst noch etwas mitnehmen?",
+   "ts": "2026-08-27T09:21:00+02:00"
+  }
+ ]
+}

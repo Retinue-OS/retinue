@@ -1,0 +1,145 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chat": {
+  "id": "telegram:-1001455667788",
+  "channel": "telegram",
+  "name": "Quartierverein Unterstrass",
+  "group": true,
+  "unread": 12,
+  "archived": false,
+  "muted": true,
+  "last": {
+   "ts": "2026-08-26T18:00:00+02:00",
+   "direction": "in",
+   "kind": "text",
+   "text": "Letzter Aufruf: Helferliste Strassenfäscht — es fehlen noch 4 Personen für den Sonntagabend-Abbau.",
+   "sender_name": "Quartierverein Unterstrass"
+  },
+  "draft": null,
+  "messages": "/data/chats/telegram-quartierverein.json",
+  "members": 118
+ },
+ "messages": [
+  {
+   "id": "TGQ0001",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Erinnerung: Am Samstag findet die Quartier-Tauschbörse im Gemeinschaftsraum statt, 10–16 Uhr. Annahme von Gegenständen ab 9 Uhr.",
+   "ts": "2026-08-01T08:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0002",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Die Bauarbeiten an der Winterthurerstrasse beginnen am Montag. Mit Lärm ist jeweils 7–17 Uhr zu rechnen. Infos: https://www.stadt-zuerich.ch",
+   "ts": "2026-08-03T12:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0003",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Protokoll der Vereinsversammlung vom 12. August ist online. Danke an alle 43 Teilnehmenden!",
+   "ts": "2026-08-05T18:30:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0004",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Gesucht: Freiwillige für das Strassenfäscht am 12. September (Auf- und Abbau, Kuchenstand). Melden bei Mara Meier.",
+   "ts": "2026-08-08T09:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0005",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Der Spielplatz Langmauerweg bleibt wegen Reparaturarbeiten diese Woche geschlossen.",
+   "ts": "2026-08-11T14:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0006",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Sammelaktion Alttextilien: Container stehen neu beim Werkhof, nicht mehr an der Schindlerstrasse.",
+   "ts": "2026-08-15T11:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0007",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Vortrag «Biodiversität im Innenhof» am Do 3. September, 19 Uhr, Quartiertreff. Eintritt frei.",
+   "ts": "2026-08-18T17:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0008",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Wasserabstellung am Freitag 4. September 8–11 Uhr im Abschnitt Röslistrasse wegen Leitungsarbeiten.",
+   "ts": "2026-08-20T08:30:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0009",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Das Strassenfäscht-Programm steht: Konzerte ab 15 Uhr, Kinderflohmarkt ab 11 Uhr, Festwirtschaft bis 23 Uhr.",
+   "ts": "2026-08-22T13:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0010",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Fundbüro: Beim Tauschbörsen-Aufräumen wurde ein Schlüsselbund mit rotem Anhänger gefunden. Abholung im Quartierbüro.",
+   "ts": "2026-08-23T10:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0011",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Die Velobörse vom Sonntag ist wegen der Baustelle auf den Schulhausplatz verlegt.",
+   "ts": "2026-08-25T16:00:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "TGQ0012",
+   "chat": "telegram:-1001455667788",
+   "direction": "in",
+   "sender": "-1001455667788",
+   "sender_name": "Quartierverein Unterstrass",
+   "text": "Letzter Aufruf: Helferliste Strassenfäscht — es fehlen noch 4 Personen für den Sonntagabend-Abbau.",
+   "ts": "2026-08-26T18:00:00+02:00",
+   "lang": "de"
+  }
+ ],
+ "companion": []
+}

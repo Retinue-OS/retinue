@@ -97,6 +97,89 @@ The thread shows up with an unread badge; when the user replies, Ara picks it up
 with full context. The endpoint is gated by `CONVERSATION_BACKEND_TOKEN` (set by
 the entrypoint) so only in-container agents can post on the user's behalf.
 
+## Messenger chats
+
+The chat surface of the messenger-chats redesign: each messenger conversation
+(Signal / WhatsApp / Telegram, one peer or group) is a **chat** — a
+deterministic mirror rendered like the messenger client — with its
+**companion pane** (the conversation-with-Ara rail) beside it. It runs against
+the gateway's chat API (SPARQL over the message ledgers plus a live overlay;
+the endpoints and their rationale live in `scripts/web-gateway.py`'s module
+docstring). Pieces:
+
+- `components/chats.js` — the Chats card on the dashboard and, with `full`,
+  the whole `chats.html` page: avatar, channel mark, last-message preview,
+  unread badge, non-archived chats ordered by last activity; the full page
+  adds an Active/Archived filter like the conversations page. In the wide
+  layout the card has its own fixed-height region above the conversations
+  (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
+  (`data-splitter="chats"`). The card refreshes on an ambient cadence and
+  keeps its last rendered state over a failed fetch.
+- `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
+  with day separators and an unread waterline, sender labels in groups, the
+  author on every outbound bubble (you / Ara / your phone), a live composer
+  (send, shared draft, one-tap clear ✕, dictation), quick-pattern chips, and
+  the companion pane — swipe between panes on a phone, a draggable splitter
+  on a wide screen. The open chat polls on the conversations cadence,
+  appending only unseen messages, and posts the read watermark on open, on
+  arrivals while at the bottom, and when the page becomes visible again.
+
+The API, as the components consume it:
+
+- `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
+  activity. A `ChatSummary` is `{id, channel, name, group, members?, unread,
+  archived, muted, last, draft, messages}` where `id` is
+  `<channel>:<chat-key>` (the exact recipient string that channel's send path
+  accepts), `unread` derives from the user's `last_read` watermark, `last` is
+  the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
+  is the shared draft `{text, author, agent?, ts, version}` or null, and
+  `messages` is the URL of the chat's message document — the client follows
+  it and never constructs message URLs. `archived` and `muted` carry the
+  dashboard-conversation semantics verbatim: an archived chat leaves the card
+  and the Active list (the full page's Archived filter keeps it reachable),
+  and a new inbound message **un-archives** an archived chat unless it is
+  muted — the server's rule, applied on the notify rail. `muted` silences
+  that chat's Web Push and keeps an archived chat archived; as with
+  conversations, the Archive button leaves `muted` untouched, while "archive
+  this chat" said to Ara sets both. No pinning yet: favourites-on-top would
+  be a later `pinned` flag, deliberately deferred. A store outage answers an
+  honest 502 (the page shows it; the card keeps its last state).
+- `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
+  [Message]}`, ascending by `ts`, the newest page by default;
+  `?before=<ISO ts>` pages older history (the page renders the newest page —
+  a load-older affordance is future work). A `Message` is `{id, chat,
+  direction, author? (out: user|agent|device, plus agent name),
+  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
+  type?, size?}]}`. Attachment URLs are the web-gateway's authenticated media
+  proxy (`/chats/media/…`); type and size are best-effort, and records carry
+  no image dimensions — the client reserves a fixed placeholder box instead,
+  so a lazy load can never shift the thread's scroll. Reactions and quoted
+  replies (issue #130) will decorate these records later. There is no
+  companion thread in the payload yet: the companion pane runs in a local
+  demo mode until phase 4 wires it to the chat's real companion conversation
+  (kind `companion`) via the `/conversations` API.
+- `POST /chats/<id>/send` `{text}` — sends through the chat's own gateway as
+  the user (direct under every policy category: the authenticated send press
+  IS the approval `verify` exists for) and returns the sent `Message`; the
+  page shows an optimistic bubble and reconciles it with the response, and a
+  failed send puts the words back into the composer.
+- `POST /chats/<id>/draft` `{text, version}` — the shared draft, saved
+  ~1 s after the user stops typing and on blur; dictation participates in the
+  same debounced save, and the ✕ posts empty text. Writes are
+  version-guarded: a stale version answers 409 with the current state, which
+  the page adopts (with a "draft updated elsewhere" note when the words
+  actually differ) rather than clobbering.
+- `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
+
+**Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
+static documents in the API's response shapes — the contract drafts the API
+was built against, kept as its reference documents and as the Playwright test
+corpus (the validation suite serves them as mocked `/chats*` responses). They
+are no longer a serving source. Two deliberate deltas against the live API:
+they carry image dimensions on attachments (the live records do not — both
+render stably), and a `companion` array seeding the companion pane's demo
+content (the live payload has none).
+
 ## Markdown rendering
 
 All Markdown shown by the dashboard — conversation bubbles and project pages —

@@ -1,0 +1,115 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chat": {
+  "id": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+  "channel": "signal",
+  "name": "Climbing Crew",
+  "group": true,
+  "unread": 1,
+  "archived": false,
+  "muted": false,
+  "last": {
+   "ts": "2026-08-27T07:05:00+02:00",
+   "direction": "in",
+   "kind": "text",
+   "text": "Sunday works! 08:30 confirmed. Bringing the new rope 🧵",
+   "sender_name": "Ana Petrova"
+  },
+  "draft": null,
+  "messages": "/data/chats/signal-climbing.json",
+  "members": 4
+ },
+ "messages": [
+  {
+   "id": "S2AK0001",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41791119922",
+   "sender_name": "Nicole Brun",
+   "text": "Halle heute Abend? 18:30?",
+   "ts": "2026-08-23T12:30:00+02:00"
+  },
+  {
+   "id": "S2AK0002",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41762220011",
+   "sender_name": "Sämi Vogt",
+   "text": "in 🧗‍♂️",
+   "ts": "2026-08-23T12:45:00+02:00"
+  },
+  {
+   "id": "S2AK0003",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "out",
+   "author": "device",
+   "text": "dabei",
+   "ts": "2026-08-23T13:10:00+02:00"
+  },
+  {
+   "id": "S2AK0004",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41787334455",
+   "sender_name": "Ana Petrova",
+   "text": "I'll be there at 19:00, meeting runs late",
+   "ts": "2026-08-23T13:30:00+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "S2AK0005",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41791119922",
+   "sender_name": "Nicole Brun",
+   "text": "Wand 4 ist gesperrt heute, Umschraubtag. Treffpunkt beim Boulderbereich.",
+   "ts": "2026-08-23T18:02:00+02:00"
+  },
+  {
+   "id": "S2AK0006",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41762220011",
+   "sender_name": "Sämi Vogt",
+   "text": "Jemand Lust aufs Klettergebiet am Sonntag? Wetter soll top sein.",
+   "ts": "2026-08-26T20:15:00+02:00"
+  },
+  {
+   "id": "S2AK0007",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41791119922",
+   "sender_name": "Nicole Brun",
+   "text": "Sonntag kann ich nicht 😭",
+   "ts": "2026-08-26T20:40:00+02:00"
+  },
+  {
+   "id": "S2AK0008",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "out",
+   "author": "user",
+   "text": "Sonntag bin ich dabei, wenn wir vor 9 starten.",
+   "ts": "2026-08-26T21:05:00+02:00"
+  },
+  {
+   "id": "S2AK0009",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41762220011",
+   "sender_name": "Sämi Vogt",
+   "text": "08:30 ab Bahnhof? Ana?",
+   "ts": "2026-08-26T21:08:00+02:00"
+  },
+  {
+   "id": "S2AK0010",
+   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "direction": "in",
+   "sender": "+41787334455",
+   "sender_name": "Ana Petrova",
+   "text": "Sunday works! 08:30 confirmed. Bringing the new rope 🧵",
+   "ts": "2026-08-27T07:05:00+02:00",
+   "lang": "en"
+  }
+ ],
+ "companion": []
+}

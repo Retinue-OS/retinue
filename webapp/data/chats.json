@@ -1,0 +1,122 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chats": [
+  {
+   "id": "signal:+41794456312",
+   "channel": "signal",
+   "name": "Mara Meier",
+   "group": false,
+   "unread": 2,
+   "archived": false,
+   "muted": false,
+   "last": {
+    "ts": "2026-08-27T09:12:00+02:00",
+    "direction": "in",
+    "kind": "text",
+    "text": "Und: chunnsch immer no um halbi sibni?",
+    "sender_name": "Mara Meier"
+   },
+   "draft": {
+    "text": "Samstag passt — ich bin um 18:30 da und bringe Dessert vom Markt mit. Soll ich sonst noch etwas mitnehmen?",
+    "author": "agent",
+    "agent": "Ara",
+    "ts": "2026-08-27T09:21:00+02:00",
+    "version": 3
+   },
+   "messages": "/data/chats/signal-mara.json"
+  },
+  {
+   "id": "whatsapp:120363169876543210@g.us",
+   "channel": "whatsapp",
+   "name": "Wandergruppe Rigi",
+   "group": true,
+   "unread": 7,
+   "archived": false,
+   "muted": false,
+   "last": {
+    "ts": "2026-08-27T08:47:00+02:00",
+    "direction": "in",
+    "kind": "text",
+    "text": "Damit ist das Kulinarische geregelt. Bis Samstag in einer Woche!",
+    "sender_name": "Beat Odermatt"
+   },
+   "draft": null,
+   "messages": "/data/chats/whatsapp-wandergruppe.json",
+   "members": 6
+  },
+  {
+   "id": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "channel": "signal",
+   "name": "Climbing Crew",
+   "group": true,
+   "unread": 1,
+   "archived": false,
+   "muted": false,
+   "last": {
+    "ts": "2026-08-27T07:05:00+02:00",
+    "direction": "in",
+    "kind": "text",
+    "text": "Sunday works! 08:30 confirmed. Bringing the new rope 🧵",
+    "sender_name": "Ana Petrova"
+   },
+   "draft": null,
+   "messages": "/data/chats/signal-climbing.json",
+   "members": 4
+  },
+  {
+   "id": "telegram:774301992",
+   "channel": "telegram",
+   "name": "Luca Bernasconi",
+   "group": false,
+   "unread": 0,
+   "archived": false,
+   "muted": false,
+   "last": {
+    "ts": "2026-08-26T22:40:44+02:00",
+    "direction": "in",
+    "kind": "text",
+    "text": "Notte 👋",
+    "sender_name": "Luca Bernasconi"
+   },
+   "draft": null,
+   "messages": "/data/chats/telegram-luca.json"
+  },
+  {
+   "id": "telegram:-1001455667788",
+   "channel": "telegram",
+   "name": "Quartierverein Unterstrass",
+   "group": true,
+   "unread": 12,
+   "archived": false,
+   "muted": true,
+   "last": {
+    "ts": "2026-08-26T18:00:00+02:00",
+    "direction": "in",
+    "kind": "text",
+    "text": "Letzter Aufruf: Helferliste Strassenfäscht — es fehlen noch 4 Personen für den Sonntagabend-Abbau.",
+    "sender_name": "Quartierverein Unterstrass"
+   },
+   "draft": null,
+   "messages": "/data/chats/telegram-quartierverein.json",
+   "members": 118
+  },
+  {
+   "id": "whatsapp:41765554433@s.whatsapp.net",
+   "channel": "whatsapp",
+   "name": "Praxis Dr. Keller",
+   "group": false,
+   "unread": 0,
+   "archived": true,
+   "muted": false,
+   "last": {
+    "ts": "2026-08-25T17:20:00+02:00",
+    "direction": "in",
+    "kind": "text",
+    "text": "In Ordnung, bis Donnerstag.",
+    "sender_name": "Praxis Dr. Keller"
+   },
+   "draft": null,
+   "messages": "/data/chats/whatsapp-keller.json"
+  }
+ ]
+}

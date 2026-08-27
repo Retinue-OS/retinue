@@ -28,6 +28,8 @@ const SHELL_ASSETS = [
   '/projects.html',
   '/project.html',
   '/news.html',
+  '/chats.html',
+  '/chat.html',
   '/settings.html',
   '/styles.css',
   '/layout.js',
@@ -38,6 +40,8 @@ const SHELL_ASSETS = [
   '/components/conversations.js',
   '/components/projects.js',
   '/components/project-page.js',
+  '/components/chats.js',
+  '/components/chat-page.js',
   '/components/news.js',
   '/components/speech.js',
   '/components/push.js',
@@ -118,6 +122,11 @@ self.addEventListener('fetch', (e) => {
   // just pass through to the network so threads and replies stay current.
   if (url.pathname === '/conversations' || url.pathname.startsWith('/conversations/')) return;
 
+  // The chat API is the live messenger mirror (messages, unread, the shared
+  // draft): a cached copy would show a stale thread. The page shells
+  // (/chats.html, /chat.html) are separate paths and stay cache-first.
+  if (url.pathname === '/chats' || url.pathname.startsWith('/chats/')) return;
+
   // The projects endpoints are live (SPARQL over the life store, and the
   // editable per-project file at /projects/item); always go to the network so
   // views and the editor never work on a stale cached copy. The page shells
@@ -146,10 +155,10 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // The project page carries its project id in the query string; match the
-  // cached shell regardless so it opens offline too.
-  if (url.pathname === '/project.html') {
-    e.respondWith(caches.match('/project.html').then((res) => res || fetch(e.request)));
+  // The project and chat pages carry their subject id in the query string;
+  // match the cached shell regardless so they open offline too.
+  if (url.pathname === '/project.html' || url.pathname === '/chat.html') {
+    e.respondWith(caches.match(url.pathname).then((res) => res || fetch(e.request)));
     return;
   }
 
