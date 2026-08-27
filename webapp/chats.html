@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Chats</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    /* Full-page list sizing in the wide app frame — the same rule styles.css
+       carries for the other [full] list pages; page-local while the chats
+       surface runs on fixture data. */
+    @media (min-width: 1000px) and (min-height: 480px) {
+      main:has(> retinue-chats[full]) > retinue-chats { flex: 1; min-height: 0; overflow-y: auto; }
+    }
+  </style>
+
+  <!-- The same chats component the dashboard card uses, in `full` mode: every
+       messenger chat (Signal / WhatsApp / Telegram), no cap. Each row opens
+       that chat's own page (chat.html) with the mirror and the companion pane.
+       Runs on the fixture documents under /data/ until the chat API exists. -->
+  <script type="module" src="/components/chats.js"></script>
+</head>
+<body>
+  <main>
+    <retinue-chats full heading="Chats" src="/data/chats.json"></retinue-chats>
+  </main>
+
+  <script>
+    // Register the service worker so this page is available offline too.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>

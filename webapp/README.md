@@ -97,6 +97,57 @@ The thread shows up with an unread badge; when the user replies, Ara picks it up
 with full context. The endpoint is gated by `CONVERSATION_BACKEND_TOKEN` (set by
 the entrypoint) so only in-container agents can post on the user's behalf.
 
+## Messenger chats (fixture)
+
+The chat surface of the messenger-chats redesign, running on **static fixture
+data**: each messenger conversation (Signal / WhatsApp / Telegram, one peer or
+group) is a **chat** — a deterministic mirror rendered like the messenger
+client — with its **companion pane** (the conversation-with-Ara rail) beside
+it. Pieces:
+
+- `components/chats.js` — the Chats card (dashboard, currently disabled in
+  `index.html`) and, with `full`, the whole `chats.html` page: avatar,
+  channel mark, last-message preview, unread badge, ordered by last activity.
+- `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
+  with day separators and an unread waterline, sender labels in groups, the
+  author on every outbound bubble (you / Ara / your phone), a composer with a
+  one-tap clear ✕ and the staged agent draft pre-filled, quick-pattern chips,
+  and the companion pane — swipe between panes on a phone, a draggable
+  splitter on a wide screen.
+
+**The fixture documents are the draft of the chat API contract.** The
+components consume exactly the response shapes the future gateway endpoints
+will serve, so the swap is a data-source change, not a rewrite:
+
+- `/data/chats.json` — the chat list (future `GET /chats`):
+  `{generated, chats: [ChatSummary]}`, ordered by last activity. A
+  `ChatSummary` is `{id, channel, name, group, members?, unread, notify,
+  last, draft, messages}` where `id` is `<channel>:<chat-key>` (the exact
+  recipient string that channel's send path accepts), `unread` derives from
+  the user's `last_read` watermark, `notify` is the per-chat mute
+  (`all|none`), `last` is the preview `{ts, direction, author?, sender_name?,
+  text, kind}`, `draft` is the shared draft `{text, author, agent?, ts,
+  version}` or null, and `messages` is the URL of the chat's message document
+  — the client follows it and never constructs message URLs, which is what
+  makes the fixture→API swap free.
+- `/data/chats/<slug>.json` — one chat's messages (future
+  `GET /chats/<id>/messages`): `{generated, chat: ChatSummary, messages:
+  [Message], companion: […]}` with `messages` ascending by `ts`. A `Message`
+  anticipates the completed ledger records: `{id, chat, direction, author?
+  (out: user|agent|device, plus agent name), sender?/sender_name? (in),
+  text, lang?, ts, attachments?: [{id, type, name, size, width?, height?,
+  url}]}` — image dimensions are in the contract so the client reserves the
+  box before the bytes arrive (no scroll shift on lazy load). Reactions
+  and quoted replies (issue #130) will decorate these records; the fixture
+  does not fabricate them. Attachment `url`s are inline data URIs in the
+  fixture; the real API serves the web-gateway's authenticated media proxy
+  instead. `companion` is fixture-only: a stand-in for the chat's companion
+  thread, which phase 4 replaces with the real conversation (kind
+  `companion`) via the `/conversations` API.
+
+Sending is fixture-mode: the composer appends locally and says so; nothing
+leaves the browser until the send path (phase 3) exists.
+
 ## Markdown rendering
 
 All Markdown shown by the dashboard — conversation bubbles and project pages —

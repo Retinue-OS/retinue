@@ -1,0 +1,86 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chat": {
+  "id": "whatsapp:41765554433@s.whatsapp.net",
+  "channel": "whatsapp",
+  "name": "Praxis Dr. Keller",
+  "group": false,
+  "unread": 0,
+  "notify": "all",
+  "last": {
+   "ts": "2026-08-25T17:20:00+02:00",
+   "direction": "in",
+   "kind": "text",
+   "text": "In Ordnung, bis Donnerstag.",
+   "sender_name": "Praxis Dr. Keller"
+  },
+  "draft": null,
+  "messages": "/data/chats/whatsapp-keller.json"
+ },
+ "messages": [
+  {
+   "id": "3EB10001",
+   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "direction": "in",
+   "sender": "41765554433@s.whatsapp.net",
+   "sender_name": "Praxis Dr. Keller",
+   "text": "Guten Tag Herr Baumann, dies ist eine Erinnerung an Ihren Termin am Di 25.08. um 14:30 bei Dr. Keller. Bitte bestätigen Sie mit JA oder melden Sie sich zum Verschieben.",
+   "ts": "2026-08-21T09:30:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB10002",
+   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "direction": "out",
+   "author": "agent",
+   "text": "JA — der Termin am 25.08. um 14:30 ist bestätigt. Freundliche Grüsse, Reto Baumann",
+   "ts": "2026-08-21T10:02:00+02:00",
+   "agent": "Ara",
+   "lang": "de"
+  },
+  {
+   "id": "3EB10003",
+   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "direction": "in",
+   "sender": "41765554433@s.whatsapp.net",
+   "sender_name": "Praxis Dr. Keller",
+   "text": "Vielen Dank für Ihre Bestätigung. Bis Dienstag!",
+   "ts": "2026-08-21T10:03:00+02:00"
+  },
+  {
+   "id": "3EB10004",
+   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "direction": "in",
+   "sender": "41765554433@s.whatsapp.net",
+   "sender_name": "Praxis Dr. Keller",
+   "text": "Guten Tag Herr Baumann, die besprochene Überweisung an die Physiotherapie ist bereit und liegt am Empfang für Sie bereit. Abholung Mo–Fr 8–17 Uhr.",
+   "ts": "2026-08-25T15:40:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB10005",
+   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "direction": "out",
+   "author": "user",
+   "text": "Danke, ich hole sie am Donnerstag ab.",
+   "ts": "2026-08-25T17:12:00+02:00",
+   "lang": "de"
+  },
+  {
+   "id": "3EB10006",
+   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "direction": "in",
+   "sender": "41765554433@s.whatsapp.net",
+   "sender_name": "Praxis Dr. Keller",
+   "text": "In Ordnung, bis Donnerstag.",
+   "ts": "2026-08-25T17:20:00+02:00"
+  }
+ ],
+ "companion": [
+  {
+   "role": "ara",
+   "text": "The practice confirmed the physio referral is ready at the front desk (Mon–Fri 8–17). You said Thursday — that's today. I've put it on today's agenda.",
+   "ts": "2026-08-27T07:40:00+02:00"
+  }
+ ]
+}

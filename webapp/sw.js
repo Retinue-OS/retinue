@@ -28,6 +28,8 @@ const SHELL_ASSETS = [
   '/projects.html',
   '/project.html',
   '/news.html',
+  '/chats.html',
+  '/chat.html',
   '/settings.html',
   '/styles.css',
   '/layout.js',
@@ -38,6 +40,8 @@ const SHELL_ASSETS = [
   '/components/conversations.js',
   '/components/projects.js',
   '/components/project-page.js',
+  '/components/chats.js',
+  '/components/chat-page.js',
   '/components/news.js',
   '/components/speech.js',
   '/components/push.js',
@@ -146,10 +150,10 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // The project page carries its project id in the query string; match the
-  // cached shell regardless so it opens offline too.
-  if (url.pathname === '/project.html') {
-    e.respondWith(caches.match('/project.html').then((res) => res || fetch(e.request)));
+  // The project and chat pages carry their subject id in the query string;
+  // match the cached shell regardless so they open offline too.
+  if (url.pathname === '/project.html' || url.pathname === '/chat.html') {
+    e.respondWith(caches.match(url.pathname).then((res) => res || fetch(e.request)));
     return;
   }
 

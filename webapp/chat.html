@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Chat</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+  <style>
+    /* Lock the frame to the viewport and let the component scroll internally,
+       so the composer stays pinned within thumb reach — the same model as the
+       project page (see the retinue-project-page rules in styles.css); kept
+       page-local while the chats surface runs on fixture data. */
+    main:has(retinue-chat-page) {
+      height: 100vh;
+      height: 100dvh;
+      overflow: hidden;
+    }
+    retinue-chat-page { flex: 1; min-height: 0; }
+  </style>
+
+  <!-- One chat's page (?id=<chat id>): the deterministic mirror of a messenger
+       conversation, rendered like the client itself, beside its companion pane
+       (Ara). Swipe between the panes on a phone; side by side behind a
+       splitter on a wide screen. Fixture data until the chat API exists. -->
+  <script type="module" src="/components/chat-page.js"></script>
+</head>
+<body>
+  <main>
+    <retinue-chat-page></retinue-chat-page>
+  </main>
+
+  <script>
+    // Register the service worker so this page shell is available offline too.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>

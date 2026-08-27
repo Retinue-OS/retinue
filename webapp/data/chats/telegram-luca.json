@@ -1,0 +1,1782 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chat": {
+  "id": "telegram:774301992",
+  "channel": "telegram",
+  "name": "Luca Bernasconi",
+  "group": false,
+  "unread": 0,
+  "notify": "all",
+  "last": {
+   "ts": "2026-08-26T22:40:44+02:00",
+   "direction": "in",
+   "kind": "text",
+   "text": "Notte 👋",
+   "sender_name": "Luca Bernasconi"
+  },
+  "draft": null,
+  "messages": "/data/chats/telegram-luca.json"
+ },
+ "messages": [
+  {
+   "id": "TG0001",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ehi! Allora, facciamo sul serio con il tuo sito portfolio o resta un progetto da bar?",
+   "ts": "2026-07-10T17:40:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0002",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "Facciamo sul serio 😄 ho già comprato il dominio",
+   "ts": "2026-07-10T17:42:36+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0003",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Quale?",
+   "ts": "2026-07-10T17:45:02+02:00"
+  },
+  {
+   "id": "TG0004",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "reto-baumann.ch — original, lo so",
+   "ts": "2026-07-10T17:46:34+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0005",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Meglio di portfolio-final-v2-NEW.ch 😂",
+   "ts": "2026-07-10T17:50:36+02:00"
+  },
+  {
+   "id": "TG0006",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ok. Static site, niente CMS. Astro o plain HTML?",
+   "ts": "2026-07-10T17:55:09+02:00"
+  },
+  {
+   "id": "TG0007",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "Astro. voglio imparare qualcosa di nuovo",
+   "ts": "2026-07-10T17:58:20+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0008",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Bravo. Ti mando lo starter che uso io stasera.",
+   "ts": "2026-07-10T18:00:31+02:00"
+  },
+  {
+   "id": "TG0009",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "https://github.com/withastro/astro — parti dal template minimal, non dal blog",
+   "ts": "2026-07-11T21:12:00+02:00"
+  },
+  {
+   "id": "TG0010",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "grazie! ci guardo nel weekend",
+   "ts": "2026-07-11T21:14:03+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0011",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Il weekend = mai. Blocca due ore in agenda 😏",
+   "ts": "2026-07-11T21:15:32+02:00"
+  },
+  {
+   "id": "TG0012",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ok ok, sabato mattina. fissato",
+   "ts": "2026-07-11T21:18:31+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0013",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "sabato mattina come promesso: repo creato, build funziona",
+   "ts": "2026-07-14T10:03:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0014",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Miracolo 🙌 mandami il link",
+   "ts": "2026-07-14T10:07:02+02:00"
+  },
+  {
+   "id": "TG0015",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "https://github.com/rbaumann/portfolio — è ancora vuoto eh",
+   "ts": "2026-07-14T10:10:42+02:00"
+  },
+  {
+   "id": "TG0016",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Struttura prima, contenuti dopo. Fai: home, projects, about, contact. Basta.",
+   "ts": "2026-07-14T10:15:39+02:00"
+  },
+  {
+   "id": "TG0017",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "E NIENTE dark mode toggle finché non c'è contenuto. Ti conosco.",
+   "ts": "2026-07-14T10:18:49+02:00"
+  },
+  {
+   "id": "TG0018",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "😤 va bene",
+   "ts": "2026-07-14T10:20:43+02:00"
+  },
+  {
+   "id": "TG0019",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Padel giovedì 19:00? Marco ha dato forfait, ci serve un quarto",
+   "ts": "2026-07-16T12:30:00+02:00"
+  },
+  {
+   "id": "TG0020",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ci sono. chi è il quarto?",
+   "ts": "2026-07-16T12:34:50+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0021",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Tu SEI il quarto 😂 gli altri siamo io, Dani e Pascal",
+   "ts": "2026-07-16T12:37:38+02:00"
+  },
+  {
+   "id": "TG0022",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ah ecco. ok, prenoto io il campo?",
+   "ts": "2026-07-16T12:41:25+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0023",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Già fatto, corte 2 al Vitis. Porta palline nuove se le hai",
+   "ts": "2026-07-16T12:43:12+02:00"
+  },
+  {
+   "id": "TG0024",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "👍",
+   "ts": "2026-07-16T12:47:36+02:00"
+  },
+  {
+   "id": "TG0025",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "6-2 6-3. Pascal is still complaining about that lob 😂",
+   "ts": "2026-07-17T22:15:00+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0026",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "the lob was legal and beautiful",
+   "ts": "2026-07-17T22:16:31+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0027",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "It was pure luck and you know it",
+   "ts": "2026-07-17T22:20:43+02:00"
+  },
+  {
+   "id": "TG0028",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "skill. buonanotte luca 😴",
+   "ts": "2026-07-17T22:25:08+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0029",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Come va il sito? Hai fatto la struttura?",
+   "ts": "2026-07-20T09:20:00+02:00"
+  },
+  {
+   "id": "TG0030",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "home e projects ci sono. about è difficile, odio scrivere di me stesso",
+   "ts": "2026-07-20T09:22:46+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0031",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Classico. Scrivi in terza persona, poi converti. Oppure chiedi al tuo agente 🤖",
+   "ts": "2026-07-20T09:24:46+02:00"
+  },
+  {
+   "id": "TG0032",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ahah in effetti... Ara scrive meglio di me",
+   "ts": "2026-07-20T09:28:01+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0033",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Tutti scrivono meglio di te ❤️",
+   "ts": "2026-07-20T09:31:38+02:00"
+  },
+  {
+   "id": "TG0034",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ti giro una cosa: il museo cerca qualcuno per il redesign del sito. Piccolo budget ma bel progetto. Interessa?",
+   "ts": "2026-07-22T15:44:00+02:00"
+  },
+  {
+   "id": "TG0035",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "quanto piccolo?",
+   "ts": "2026-07-22T15:47:36+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0036",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Tipo 8k. Ma portfolio piece vera.",
+   "ts": "2026-07-22T15:50:16+02:00"
+  },
+  {
+   "id": "TG0037",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Interessante. Mandami il contatto, scrivo una proposta la settimana prossima.",
+   "ts": "2026-07-22T15:55:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0038",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "elena.ferrari@museo-arte.ch — dille che ti mando io",
+   "ts": "2026-07-22T15:57:58+02:00"
+  },
+  {
+   "id": "TG0039",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Fatto segnare. Grazie Luca!",
+   "ts": "2026-07-22T16:02:04+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0040",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Weekend in Ticino confermato? Nonna chiede quante persone a pranzo domenica 🍝",
+   "ts": "2026-07-25T19:05:00+02:00"
+  },
+  {
+   "id": "TG0041",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "confermato! arriviamo sabato verso le 11",
+   "ts": "2026-07-25T19:09:52+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0042",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Perfetto. Treno o macchina?",
+   "ts": "2026-07-25T19:14:26+02:00"
+  },
+  {
+   "id": "TG0043",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "treno, così dormo nel gottardo",
+   "ts": "2026-07-25T19:16:42+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0044",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ti prendo a Bellinzona allora. Manda l'orario quando lo sai",
+   "ts": "2026-07-25T19:18:10+02:00"
+  },
+  {
+   "id": "TG0045",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "IC 10:07 da Zurigo, arrivo 12:24",
+   "ts": "2026-07-25T19:22:27+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0046",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "👍 segnato",
+   "ts": "2026-07-25T19:24:19+02:00"
+  },
+  {
+   "id": "TG0047",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Font question: Inter or something with more character for the portfolio?",
+   "ts": "2026-07-28T13:02:00+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0048",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "why are YOU asking ME, you're the designer",
+   "ts": "2026-07-28T13:05:11+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0049",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "It's YOUR portfolio 😂 ok: I'd go Fraunces for headings, Inter for body",
+   "ts": "2026-07-28T13:08:06+02:00"
+  },
+  {
+   "id": "TG0050",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "fraunces looks great. doing that",
+   "ts": "2026-07-28T13:10:30+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0051",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Send a screenshot when it's in",
+   "ts": "2026-07-28T13:11:39+02:00"
+  },
+  {
+   "id": "TG0052",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "",
+   "ts": "2026-07-28T13:15:26+02:00",
+   "attachments": [
+    {
+     "id": "tg-att-0731",
+     "type": "image/svg+xml",
+     "name": "screenshot.png",
+     "size": 720,
+     "width": 360,
+     "height": 240,
+     "url": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIzNjAiIGhlaWdodD0iMjQwIj48cmVjdCB3aWR0aD0iMzYwIiBoZWlnaHQ9IjI0MCIgZmlsbD0iIzE0MTgxZiIvPjxyZWN0IHg9IjAiIHk9IjAiIHdpZHRoPSIzNjAiIGhlaWdodD0iMzQiIGZpbGw9IiMxZTI1MzAiLz48Y2lyY2xlIGN4PSIxOCIgY3k9IjE3IiByPSI2IiBmaWxsPSIjZmY2YjZiIi8+PGNpcmNsZSBjeD0iMzgiIGN5PSIxNyIgcj0iNiIgZmlsbD0iI2U4YjA0YiIvPjxjaXJjbGUgY3g9IjU4IiBjeT0iMTciIHI9IjYiIGZpbGw9IiM1N2M3ODUiLz48cmVjdCB4PSIyMCIgeT0iNTYiIHdpZHRoPSIyMDAiIGhlaWdodD0iMTIiIHJ4PSI2IiBmaWxsPSIjNmVhOGZlIi8+PHJlY3QgeD0iMjAiIHk9IjgyIiB3aWR0aD0iMzIwIiBoZWlnaHQ9IjgiIHJ4PSI0IiBmaWxsPSIjMzk0MDRkIi8+PHJlY3QgeD0iMjAiIHk9IjEwMCIgd2lkdGg9IjI4MCIgaGVpZ2h0PSI4IiByeD0iNCIgZmlsbD0iIzM5NDA0ZCIvPjxyZWN0IHg9IjIwIiB5PSIxMTgiIHdpZHRoPSIzMDAiIGhlaWdodD0iOCIgcng9IjQiIGZpbGw9IiMyYzMzM2YiLz48cmVjdCB4PSIyMCIgeT0iMTUwIiB3aWR0aD0iMTUwIiBoZWlnaHQ9IjYwIiByeD0iOCIgZmlsbD0iIzIzMmIzOCIvPjxyZWN0IHg9IjE5MCIgeT0iMTUwIiB3aWR0aD0iMTUwIiBoZWlnaHQ9IjYwIiByeD0iOCIgZmlsbD0iIzIzMmIzOCIvPjwvc3ZnPg=="
+    }
+   ]
+  },
+  {
+   "id": "TG0053",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "first draft of the hero. rough but direction is there",
+   "ts": "2026-07-28T13:19:40+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0054",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Oh nice. Kill the second card row, too busy. Otherwise 👌",
+   "ts": "2026-07-28T13:24:27+02:00"
+  },
+  {
+   "id": "TG0055",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ancora sveglio ieri? Ho visto commit alle 01:30 🥱",
+   "ts": "2026-07-29T08:50:00+02:00"
+  },
+  {
+   "id": "TG0056",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "la deploy pipeline mi ha fatto impazzire. netlify voleva node 20, io avevo 22",
+   "ts": "2026-07-29T08:53:52+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0057",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Pin it in .nvmrc e basta",
+   "ts": "2026-07-29T08:55:27+02:00"
+  },
+  {
+   "id": "TG0058",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "fatto, adesso builda. comunque ODIO i build tool",
+   "ts": "2026-07-29T08:57:22+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0059",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Benvenuto nel web development 🎉",
+   "ts": "2026-07-29T09:00:28+02:00"
+  },
+  {
+   "id": "TG0060",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Guardi la partita? Svizzera-Italia amichevole",
+   "ts": "2026-07-30T20:31:00+02:00"
+  },
+  {
+   "id": "TG0061",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "davanti alla tv, forza svizzera 🇨🇭",
+   "ts": "2026-07-30T20:35:50+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0062",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Traditore 😂 io tifo Italia ovviamente",
+   "ts": "2026-07-30T20:38:45+02:00"
+  },
+  {
+   "id": "TG0063",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "GOL!!! 1-0",
+   "ts": "2026-07-30T20:40:43+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0064",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Fuorigioco netto, vedrai",
+   "ts": "2026-07-30T20:45:31+02:00"
+  },
+  {
+   "id": "TG0065",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "il VAR dice gol 😏",
+   "ts": "2026-07-30T20:47:16+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0066",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Il VAR è svizzero",
+   "ts": "2026-07-30T20:52:00+02:00"
+  },
+  {
+   "id": "TG0067",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ahahah",
+   "ts": "2026-07-30T20:53:20+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0068",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ok 1-1. Giustizia.",
+   "ts": "2026-07-30T20:56:36+02:00"
+  },
+  {
+   "id": "TG0069",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "rigore inventato ma vabbè",
+   "ts": "2026-07-30T20:59:35+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0070",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "INVENTATO?? C'era tutto",
+   "ts": "2026-07-30T21:02:34+02:00"
+  },
+  {
+   "id": "TG0071",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "2-1!!! embolo 🚀",
+   "ts": "2026-07-30T21:07:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0072",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Non ti scrivo più",
+   "ts": "2026-07-30T21:09:37+02:00"
+  },
+  {
+   "id": "TG0073",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "dai era bello, birra di consolazione giovedì?",
+   "ts": "2026-07-30T21:11:53+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0074",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Solo se offri tu",
+   "ts": "2026-07-30T21:14:12+02:00"
+  },
+  {
+   "id": "TG0075",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "affare fatto 🍻",
+   "ts": "2026-07-30T21:15:43+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0076",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Giovedì padel di nuovo? Stessa ora",
+   "ts": "2026-07-31T18:22:00+02:00"
+  },
+  {
+   "id": "TG0077",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "questa settimana non posso, ho la serata genitori... cioè no aspetta, quella è mercoledì. giovedì ok",
+   "ts": "2026-07-31T18:25:43+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0078",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "😂 organizzatissimo. Corte 2, 19:00",
+   "ts": "2026-07-31T18:27:02+02:00"
+  },
+  {
+   "id": "TG0079",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ci sono. stavolta niente lob, prometto",
+   "ts": "2026-07-31T18:28:33+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0080",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Bugiardo",
+   "ts": "2026-07-31T18:31:08+02:00"
+  },
+  {
+   "id": "TG0081",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Domanda seria: per il museo, CMS o no? Elena vuole aggiornare gli eventi da sola",
+   "ts": "2026-08-02T14:12:00+02:00"
+  },
+  {
+   "id": "TG0082",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Allora serve un CMS. Headless? Decap è gratis e sta su git.",
+   "ts": "2026-08-02T14:13:38+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0083",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Decap con Astro l'hai mai fatto?",
+   "ts": "2026-08-02T14:17:28+02:00"
+  },
+  {
+   "id": "TG0084",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "No, ma c'è documentazione. L'alternativa è Storyblok, ma costa.",
+   "ts": "2026-08-02T14:19:23+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0085",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Proviamo Decap. Se Elena non lo capisce, cambiamo",
+   "ts": "2026-08-02T14:24:17+02:00"
+  },
+  {
+   "id": "TG0086",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Ok. Prototipo del flusso eventi entro la review dei wireframe.",
+   "ts": "2026-08-02T14:26:19+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0087",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Segnato 📝",
+   "ts": "2026-08-02T14:29:57+02:00"
+  },
+  {
+   "id": "TG0088",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "https://www.frontendmentor.io/challenges — guarda il secondo, è identico al layout che volevi",
+   "ts": "2026-08-03T19:03:00+02:00"
+  },
+  {
+   "id": "TG0089",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ah sì! praticamente uguale. lo studio",
+   "ts": "2026-08-03T19:04:54+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0090",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Rubare con gli occhi è metà del mestiere",
+   "ts": "2026-08-03T19:06:27+02:00"
+  },
+  {
+   "id": "TG0091",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "l'altra metà?",
+   "ts": "2026-08-03T19:09:18+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0092",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Fatturare 💸",
+   "ts": "2026-08-03T19:10:30+02:00"
+  },
+  {
+   "id": "TG0093",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "😂😂",
+   "ts": "2026-08-03T19:11:52+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0094",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Proposta per il museo mandata? Elena mi ha chiesto",
+   "ts": "2026-08-04T11:30:00+02:00"
+  },
+  {
+   "id": "TG0095",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Mandata ieri sera — scope, timeline, 7'800 CHF. Copia in allegato alla mail che ti ho inoltrato.",
+   "ts": "2026-08-04T11:32:54+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0096",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Visto, solida. Forse troppo onesta sulla timeline 😂",
+   "ts": "2026-08-04T11:35:06+02:00"
+  },
+  {
+   "id": "TG0097",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Meglio onesti adesso che in ritardo dopo 🤷",
+   "ts": "2026-08-04T11:37:02+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0098",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Saggio. Ti faccio sapere cosa dice",
+   "ts": "2026-08-04T11:40:02+02:00"
+  },
+  {
+   "id": "TG0099",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "ELENA HA DETTO SÌ 🎉🎉",
+   "ts": "2026-08-06T20:40:00+02:00"
+  },
+  {
+   "id": "TG0100",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "NOOO dai! fantastico",
+   "ts": "2026-08-06T20:42:19+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0101",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Kickoff la settimana prossima. Ti mando l'invito",
+   "ts": "2026-08-06T20:44:20+02:00"
+  },
+  {
+   "id": "TG0102",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "grande luca, ti devo una cena",
+   "ts": "2026-08-06T20:45:34+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0103",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Due cene. Una per il contatto, una per la pazienza 😏",
+   "ts": "2026-08-06T20:47:57+02:00"
+  },
+  {
+   "id": "TG0104",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Treno per il Ticino sabato: confermi IC 10:07? Nonna vuole sapere DEFINITIVAMENTE quanti siamo 😂",
+   "ts": "2026-08-07T07:45:00+02:00"
+  },
+  {
+   "id": "TG0105",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "confermo, siamo in 2, io e la Nina",
+   "ts": "2026-08-07T07:46:02+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0106",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Perfetto. Lei è vegetariana giusto?",
+   "ts": "2026-08-07T07:49:16+02:00"
+  },
+  {
+   "id": "TG0107",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "sì, ma mangia pesce",
+   "ts": "2026-08-07T07:53:56+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0108",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Quindi pescetariana. Nonna farà comunque il brasato per 12 persone",
+   "ts": "2026-08-07T07:55:14+02:00"
+  },
+  {
+   "id": "TG0109",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ovviamente 😂 portiamo il vino noi",
+   "ts": "2026-08-07T07:58:03+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0110",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Il merlot del Mendrisiotto che avevi portato l'altra volta?",
+   "ts": "2026-08-07T08:01:22+02:00"
+  },
+  {
+   "id": "TG0111",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "quello. ne prendo due bottiglie",
+   "ts": "2026-08-07T08:03:30+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0112",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Sei ufficialmente il nipote acquisito preferito",
+   "ts": "2026-08-07T08:08:20+02:00"
+  },
+  {
+   "id": "TG0113",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Sabato ci vediamo alle 12:24 a Bellinzona. Domenica pranzo dalla nonna alle 12:30 SPACCATE",
+   "ts": "2026-08-08T16:20:00+02:00"
+  },
+  {
+   "id": "TG0114",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "puntualissimi promesso",
+   "ts": "2026-08-08T16:22:59+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0115",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "L'ultima volta siete arrivati alle 13 😑",
+   "ts": "2026-08-08T16:25:43+02:00"
+  },
+  {
+   "id": "TG0116",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "colpa dello sciopero dei treni!!",
+   "ts": "2026-08-08T16:30:18+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0117",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Scuse. A sabato 👋",
+   "ts": "2026-08-08T16:34:23+02:00"
+  },
+  {
+   "id": "TG0118",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "agent",
+   "text": "Reto is stuck in a delayed train and will join the museum kickoff call ~10 minutes late — he asks to start with Elena's part.",
+   "ts": "2026-08-10T09:15:00+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0119",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "👍 grazie Ara. Elena lo sa, iniziamo noi",
+   "ts": "2026-08-10T09:16:00+02:00"
+  },
+  {
+   "id": "TG0120",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "arrivato, sto entrando nella call",
+   "ts": "2026-08-10T09:17:35+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0121",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Buon kickoff direi. Elena vuole il moodboard entro due settimane, ce la fai?",
+   "ts": "2026-08-10T11:05:00+02:00"
+  },
+  {
+   "id": "TG0122",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Ce la faccio se tu fai la direzione artistica e io smetto di litigare con i build tool.",
+   "ts": "2026-08-10T11:09:25+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0123",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Deal. Domenica pomeriggio sessione di lavoro da me?",
+   "ts": "2026-08-10T11:12:06+02:00"
+  },
+  {
+   "id": "TG0124",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Domenica va bene, dalle 14.",
+   "ts": "2026-08-10T11:14:57+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0125",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Weekend bellissimo, grazie di essere venuti. Nonna ha già chiesto quando tornate",
+   "ts": "2026-08-11T21:10:00+02:00"
+  },
+  {
+   "id": "TG0126",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "grazie a voi!! il brasato era incredibile. salutamela tanto",
+   "ts": "2026-08-11T21:14:28+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0127",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Fatto. Ti ha messo da parte un vasetto di ragù, te lo porto giovedì",
+   "ts": "2026-08-11T21:16:14+02:00"
+  },
+  {
+   "id": "TG0128",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "tua nonna è un tesoro nazionale",
+   "ts": "2026-08-11T21:17:53+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0129",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Lo so 🥹",
+   "ts": "2026-08-11T21:22:36+02:00"
+  },
+  {
+   "id": "TG0130",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Manda i tuoi tre progetti migliori per il moodboard, con una riga di contesto ciascuno",
+   "ts": "2026-08-13T16:33:00+02:00"
+  },
+  {
+   "id": "TG0131",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "stasera li metto insieme",
+   "ts": "2026-08-13T16:34:14+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0132",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Stasera = stanotte alle 01:30?",
+   "ts": "2026-08-13T16:39:07+02:00"
+  },
+  {
+   "id": "TG0133",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "...possibile",
+   "ts": "2026-08-13T16:43:19+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0134",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "🥱🥱🥱",
+   "ts": "2026-08-13T16:44:35+02:00"
+  },
+  {
+   "id": "TG0135",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "eccoli. tre progetti, tre righe. vado a dormire",
+   "ts": "2026-08-14T00:47:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0136",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "01:30 spaccato. Sei un orologio 😂 Buonanotte",
+   "ts": "2026-08-14T00:51:51+02:00"
+  },
+  {
+   "id": "TG0137",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "luca aiuto, il form di contatto manda mail vuote",
+   "ts": "2026-08-15T22:05:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0138",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Screenshot del codice del form",
+   "ts": "2026-08-15T22:06:42+02:00"
+  },
+  {
+   "id": "TG0139",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "un attimo",
+   "ts": "2026-08-15T22:09:18+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0140",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Scommetto che manca il name= sugli input",
+   "ts": "2026-08-15T22:10:40+02:00"
+  },
+  {
+   "id": "TG0141",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "...come lo sapevi",
+   "ts": "2026-08-15T22:14:35+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0142",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Succede a TUTTI la prima volta con Netlify forms 😂",
+   "ts": "2026-08-15T22:17:18+02:00"
+  },
+  {
+   "id": "TG0143",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "aggiunto, funziona. sei un mago",
+   "ts": "2026-08-15T22:20:02+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0144",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Sono solo vecchio. Vai a dormire",
+   "ts": "2026-08-15T22:21:10+02:00"
+  },
+  {
+   "id": "TG0145",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "notte 😴",
+   "ts": "2026-08-15T22:24:41+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0146",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Pranzo veloce domani? Sono in centro per una consegna",
+   "ts": "2026-08-16T12:40:00+02:00"
+  },
+  {
+   "id": "TG0147",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "sì! 12:15 al solito posto?",
+   "ts": "2026-08-16T12:42:38+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0148",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Il vietnamita?",
+   "ts": "2026-08-16T12:46:10+02:00"
+  },
+  {
+   "id": "TG0149",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "quello. prenoto io",
+   "ts": "2026-08-16T12:47:59+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0150",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "👍 a domani",
+   "ts": "2026-08-16T12:52:00+02:00"
+  },
+  {
+   "id": "TG0151",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Moodboard v1 nel drive. Guarda la direzione B, secondo me è quella giusta",
+   "ts": "2026-08-17T12:10:00+02:00"
+  },
+  {
+   "id": "TG0152",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "B è bellissima. la A è troppo museo-polveroso",
+   "ts": "2026-08-17T12:12:39+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0153",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Esatto. B con la palette della C?",
+   "ts": "2026-08-17T12:17:29+02:00"
+  },
+  {
+   "id": "TG0154",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "sì! esattamente",
+   "ts": "2026-08-17T12:18:51+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0155",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ok la preparo per Elena",
+   "ts": "2026-08-17T12:21:47+02:00"
+  },
+  {
+   "id": "TG0156",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ti ricordi il nome del tipo del hosting che avevamo usato per il progetto di Dani? Quello svizzero",
+   "ts": "2026-08-18T14:20:00+02:00"
+  },
+  {
+   "id": "TG0157",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "cyon? o infomaniak?",
+   "ts": "2026-08-18T14:22:17+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0158",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Infomaniak! Grazie",
+   "ts": "2026-08-18T14:27:08+02:00"
+  },
+  {
+   "id": "TG0159",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ho pensato una cosa per il museo: timeline interattiva delle mostre passate. Troppo?",
+   "ts": "2026-08-19T09:55:00+02:00"
+  },
+  {
+   "id": "TG0160",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Non troppo — ma fase 2. Prima la base che Elena può aggiornare da sola.",
+   "ts": "2026-08-19T09:56:36+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0161",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Hai ragione. Lo metto nel backlog «idee belle ma dopo»",
+   "ts": "2026-08-19T09:58:50+02:00"
+  },
+  {
+   "id": "TG0162",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Il backlog più affollato del mondo 😂",
+   "ts": "2026-08-19T10:01:26+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0163",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Una carriera intera là dentro",
+   "ts": "2026-08-19T10:03:16+02:00"
+  },
+  {
+   "id": "TG0164",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Padel giovedì? Dani porta un collega nuovo, dice che è forte",
+   "ts": "2026-08-20T19:55:00+02:00"
+  },
+  {
+   "id": "TG0165",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "\"dice che è forte\" = ci massacra",
+   "ts": "2026-08-20T19:57:55+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0166",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Probabile 😂 vieni lo stesso?",
+   "ts": "2026-08-20T20:01:40+02:00"
+  },
+  {
+   "id": "TG0167",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "ovvio. 19:00?",
+   "ts": "2026-08-20T20:04:22+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0168",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "👍",
+   "ts": "2026-08-20T20:09:20+02:00"
+  },
+  {
+   "id": "TG0169",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Ok il collega di Dani gioca in serie B praticamente",
+   "ts": "2026-08-21T21:48:00+02:00"
+  },
+  {
+   "id": "TG0170",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "il mio ego è distrutto ma è stato divertente",
+   "ts": "2026-08-21T21:52:30+02:00",
+   "lang": "en"
+  },
+  {
+   "id": "TG0171",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "6-0 6-1 💀 la prossima volta chiediamo l'handicap",
+   "ts": "2026-08-21T21:56:49+02:00"
+  },
+  {
+   "id": "TG0172",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "la prossima volta giochiamo a carte",
+   "ts": "2026-08-21T21:59:15+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0173",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Dani chiede se giochiamo anche martedì prossimo, torneo interno del club",
+   "ts": "2026-08-22T17:30:00+02:00"
+  },
+  {
+   "id": "TG0174",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "torneo?? livello?",
+   "ts": "2026-08-22T17:33:12+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0175",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Amatori. Premio: una fondue per la coppia vincente 🧀",
+   "ts": "2026-08-22T17:36:03+02:00"
+  },
+  {
+   "id": "TG0176",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "per la fondue mi alleno anche di notte. ci sono",
+   "ts": "2026-08-22T17:37:21+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0177",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Iscritti. Categoria «entusiasti con lob fortunati»",
+   "ts": "2026-08-22T17:38:36+02:00"
+  },
+  {
+   "id": "TG0178",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "RISPETTA IL LOB",
+   "ts": "2026-08-22T17:41:27+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0179",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Elena approves the moodboard. Direction B, palette C — esattamente come avevi detto tu",
+   "ts": "2026-08-24T10:05:00+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0180",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Perfetto! Allora parto con i wireframe questa settimana.",
+   "ts": "2026-08-24T10:09:23+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0181",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Wireframe entro venerdì prossimo? Poi review insieme",
+   "ts": "2026-08-24T10:13:27+02:00"
+  },
+  {
+   "id": "TG0182",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Venerdì è realistico. Ci sentiamo prima per il Ticino comunque?",
+   "ts": "2026-08-24T10:15:57+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0183",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Sì — nonna ha già chiesto di nuovo quante persone 😂",
+   "ts": "2026-08-24T10:20:44+02:00"
+  },
+  {
+   "id": "TG0184",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Wireframe come procedono? Non per pressare eh. (Per pressare)",
+   "ts": "2026-08-25T13:18:00+02:00"
+  },
+  {
+   "id": "TG0185",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Home e pagina mostra fatte, eventi a metà. Venerdì ce la faccio.",
+   "ts": "2026-08-25T13:20:52+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0186",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Bravo. Venerdì sera review con birra?",
+   "ts": "2026-08-25T13:24:29+02:00"
+  },
+  {
+   "id": "TG0187",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "user",
+   "text": "Review con birra approvata 🍻 da te alle 18?",
+   "ts": "2026-08-25T13:25:48+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0188",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Alle 18 👍 porto io le birre, tu il laptop",
+   "ts": "2026-08-25T13:30:42+02:00"
+  },
+  {
+   "id": "TG0189",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Stasera ho guardato il tuo sito live. È BELLO. Fiero di te 🥹",
+   "ts": "2026-08-26T22:25:00+02:00"
+  },
+  {
+   "id": "TG0190",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "grazie 🙏 senza di te sarebbe ancora un template",
+   "ts": "2026-08-26T22:29:53+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0191",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Vero 😏 Scherzo. Manda il link a Elena, fa buona impressione",
+   "ts": "2026-08-26T22:32:59+02:00"
+  },
+  {
+   "id": "TG0192",
+   "chat": "telegram:774301992",
+   "direction": "out",
+   "author": "device",
+   "text": "buona idea, lo metto in firma. notte!",
+   "ts": "2026-08-26T22:36:53+02:00",
+   "lang": "it"
+  },
+  {
+   "id": "TG0193",
+   "chat": "telegram:774301992",
+   "direction": "in",
+   "sender": "774301992",
+   "sender_name": "Luca Bernasconi",
+   "text": "Notte 👋",
+   "ts": "2026-08-26T22:40:44+02:00"
+  }
+ ],
+ "companion": [
+  {
+   "role": "user",
+   "text": "When is the museum wireframe review due?",
+   "ts": "2026-08-26T08:30:00+02:00"
+  },
+  {
+   "role": "ara",
+   "text": "You promised Luca the wireframes by **Friday 4 September**, review together afterwards. The moodboard (direction B, palette C) was approved by Elena on Monday. Related project: *Museo redesign* — I keep the deadline there.",
+   "ts": "2026-08-26T08:31:00+02:00"
+  }
+ ]
+}
