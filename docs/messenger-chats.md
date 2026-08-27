@@ -230,8 +230,18 @@ persistent volume — high-churn disposable data, the news-store precedent):
 - `draft` + a version counter (sha-guard style, like project-file writes) — the
   shared text area;
 - `last_read` — the user's read watermark, from which unread badges derive;
-- `notify` — per-chat notification setting (`all` | `none`), the chat-level
-  mute (groups want this);
+- `archived`, `muted` — the conversation model's pair, adopted verbatim so
+  both rails share one mental model. A chat never *ends*, but the semantics
+  transfer exactly: `archived` drops the chat from the card and the default
+  list, and a new inbound message **un-archives** it (the message would
+  otherwise be invisible — the same contradiction the conversation flags
+  already resolve); `muted` silences Web Push and keeps an archived chat
+  archived (the noisy group one keeps visible is muted alone; a done-with
+  contact is archived + muted). The standing rule carries over too: the user
+  *clicking* Archive leaves `muted` untouched, the user *telling* Ara to
+  archive sets both. Deliberately retinue-side only — the phone client's own
+  archive state is not mirrored (only Telegram even exposes it, and coupling
+  to it would make the three channels behave differently);
 - `summary`, `summary_watermark` — the rolling summary and the timestamp up to
   which it has folded both rails;
 - `companion` — the companion thread's conversation id, once created;
@@ -243,9 +253,19 @@ token-gated agent endpoints both go through it).
 ## The chat surface (UI)
 
 - A **Chats card** on the dashboard (finally replacing the static
-  `messages.js` mock): the messenger home screen — chats ordered by last
-  activity, unread badges, last-message preview, channel glyph. A dedicated
-  `chats.html` lists all chats; each chat has its own page/panel.
+  `messages.js` mock): the messenger home screen — every **non-archived**
+  chat, ordered by last activity, with unread badge, last-message preview
+  (a staged draft outranks it) and channel glyph. Deliberately not filtered
+  to unread: the card is also the launchpad for *writing*, and with archive
+  in place the list self-curates. The phone caps it (five rows plus an
+  "All chats →" link); on the wide frame the card sits in **its own region
+  above the Conversations card, behind a draggable splitter** (the
+  `layout.js` set: drag, double-click reset, snap closed, per-device
+  persistence), scrolling internally. A `pinned` flag (pin-to-top, as the
+  clients have) is a possible later addition to the chat state; deferred
+  until recency-plus-archive proves insufficient. A dedicated `chats.html`
+  lists every chat behind an Active/Archived filter; each chat has its own
+  page/panel.
 - The **chat pane** renders like a messenger client: bubbles left/right, day
   separators, sender labels in groups, media inline. Outbound bubbles carry
   their author — the user, *Ara* (agent-sent), or *phone* (own-device echo) — a
@@ -320,7 +340,7 @@ and what a model turn is *for*:
    a new `POST /internal/chats/inbound` on the web-gateway (the news-rail
    shape: fail-safe, `*_INGEST`-style token optional). The web-gateway updates
    the chat's index entry and fans out a Web Push — title = chat name, body =
-   preview, tap-through = the chat — honouring the per-chat `notify` setting
+   preview, tap-through = the chat — honouring the per-chat `muted` flag
    and the gate class (an `ignored`-group or no-action-class message updates
    the mirror silently). **Notification no longer costs a model turn.**
 4. **Forward — as a companion turn.** Where the gate says `forward`, the same
@@ -455,8 +475,9 @@ serving logic, `webapp/`, `scripts/`).
    Per-message conversation spam ends here.
 5. **Summaries & forking:** the summarizer job, summary on the chat page,
    fork actions on both sides, `--origin-chat`.
-6. **Polish:** reactions & quoted replies in the UI (#130), per-chat `notify`
-   and assist settings surfaced, group niceties.
+6. **Polish:** reactions & quoted replies in the UI (#130), archive/mute
+   controls on the chat page, a per-chat assist setting, optional `pinned`,
+   group niceties.
 
 ## Open questions
 
