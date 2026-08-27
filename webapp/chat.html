@@ -14,8 +14,8 @@
   <style>
     /* Lock the frame to the viewport and let the component scroll internally,
        so the composer stays pinned within thumb reach — the same model as the
-       project page (see the retinue-project-page rules in styles.css); kept
-       page-local while the chats surface runs on fixture data. */
+       project page (see the retinue-project-page rules in styles.css), kept
+       page-local with the rest of the chat surface's page styles. */
     main:has(retinue-chat-page) {
       height: 100vh;
       height: 100dvh;
@@ -27,7 +27,7 @@
   <!-- One chat's page (?id=<chat id>): the deterministic mirror of a messenger
        conversation, rendered like the client itself, beside its companion pane
        (Ara). Swipe between the panes on a phone; side by side behind a
-       splitter on a wide screen. Fixture data until the chat API exists. -->
+       splitter on a wide screen. Live against the gateway's chat API. -->
   <script type="module" src="/components/chat-page.js"></script>
 </head>
 <body>

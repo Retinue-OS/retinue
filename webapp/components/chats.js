@@ -8,18 +8,25 @@
 // badge treatment here (its real meaning — no Web Push, and no un-archive on a
 // new inbound message — is the server's, once the live chat API exists).
 //
-// FIXTURE DATA for now: the card reads /data/chats.json, a static document
-// shaped exactly like the future `GET /chats` response (the messenger-chats
-// design, phase 2). The document shape is the API contract draft — see
-// webapp/README.md, "Messenger chats (fixture)". Swapping fixture for live API
-// is a `src` change only; nothing in here knows it is reading a file.
+// The list comes from the gateway's GET /chats (the default `src`, still
+// overridable by attribute) — SPARQL over the message ledgers merged with the
+// live overlay and the chat state. The response shape is documented in
+// webapp/README.md, "Messenger chats"; the reference documents under
+// webapp/data/chats* mirror it for tests. The card refreshes on an ambient
+// cadence and keeps its last rendered state over a failed fetch (a store blip
+// must not blank the list).
 
 import { RetinueCard, esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
 
+const LIST_URL = '/chats';
 // Rows shown on the dashboard card before "All chats →" takes over — the same
 // cap logic as the conversations card: only the phone layout, where each row
 // lengthens the page, caps the list.
 const MAX_CARD_CHATS = 5;
+// Ambient refresh: the card carries summaries, not the open thread — a gentler
+// cadence than the conversations card's 4s poll is enough (the server caches
+// the SPARQL skeleton between polls anyway).
+const REFRESH_MS = 15000;
 
 // Channel marks: no brand assets in the shell, so a lettered dot in the
 // channel's recognisable colour does the telling.
@@ -93,11 +100,36 @@ class RetinueChats extends RetinueCard {
       if (this._data) this.renderState({ state: 'ok', data: this._data });
     });
     super.connectedCallback();
+    this._timer = setInterval(() => this.load(), REFRESH_MS);
   }
 
   disconnectedCallback() {
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
+    if (this._timer) clearInterval(this._timer);
+    this._timer = null;
+  }
+
+  get dataUrl() { return this.getAttribute('src') || LIST_URL; }
+
+  // Unlike the one-shot base loader, a refreshing card must not blank itself
+  // over one failed fetch: keep the last rendered list and let the next tick
+  // reconcile. Only a failure with nothing rendered yet shows the offline
+  // state.
+  async load() {
+    try {
+      const res = await fetch(this.dataUrl, { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      // Re-render only when the list actually changed — a rebuild would reset
+      // the region's scroll and the filter wiring for nothing.
+      const sig = JSON.stringify(data.chats || []);
+      if (sig === this._sig) { this._data = data; return; }
+      this._sig = sig;
+      this.renderState({ state: 'ok', data });
+    } catch (_err) {
+      if (!this._data) this.renderState({ state: 'offline' });
+    }
   }
 
   // RetinueCard renders static content; the full page's scope filter is the

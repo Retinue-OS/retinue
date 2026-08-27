@@ -12,12 +12,17 @@
 //    third page grows one of these, the pointer/persist logic should be lifted
 //    into a shared module rather than copied again.
 //
-// FIXTURE MODE: everything renders from the static documents under
-// /data/chats/ (shape = the chat API contract draft, see webapp/README.md,
-// "Messenger chats (fixture)"). Sending appends locally and says so; nothing
-// leaves the browser. The later phases swap the data source for the live chat
-// API and wire the composer to the real send path — the rendering below is the
-// part meant to survive that swap.
+// Data comes from the chat API (webapp/README.md, "Messenger chats"):
+// GET /chats names each chat's message document in `messages`, and this page
+// follows that URL verbatim — it never constructs message URLs. The composer
+// is live: sends POST /chats/<id>/send (the user's send press is direct under
+// every policy category), the shared draft is saved through the
+// version-guarded POST /chats/<id>/draft, and the read watermark advances via
+// POST /chats/<id>/read. The open chat is polled on the conversations cadence,
+// appending only unseen messages — the composer and the scroll position are
+// never rebuilt by a poll. The messages endpoint also pages older history
+// (?before=<ts>); this page renders the newest page and leaves a load-older
+// affordance for later.
 //
 // The companion pane deliberately does NOT embed components/conversations.js:
 // that element owns location.hash routing (#conversation-…), polls the
@@ -25,17 +30,18 @@
 // the rest of the page — none of which can host a side-by-side pane without
 // refactoring it. Instead this pane replicates the conversation thread's
 // visual language (same bubble classes and styles, the shared Markdown
-// renderer, so both render identically) over fixture messages; phase 4 points
-// it at the chat's real companion thread (conversation kind `companion`)
-// through the /conversations API — or at a thread view extracted from
-// conversations.js by then.
+// renderer, so both render identically) in a demo mode: the chat API carries
+// no companion thread yet, so the pane echoes locally and says so. Phase 4
+// points it at the chat's real companion thread (conversation kind
+// `companion`) through the /conversations API — or at a thread view extracted
+// from conversations.js by then.
 
 import { esc, WIDE_FRAME } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
 
-const LIST_URL = '/data/chats.json';
+const LIST_URL = '/chats';
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
 const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
@@ -43,6 +49,12 @@ const MAX_COMP_FRACTION = 0.6;
 const KEY_STEP_PX = 32;
 const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
 const NOTE_MS = 2600;
+// The conversations cadence: how often the open chat re-fetches its messages.
+const POLL_MS = 4000;
+// Idle time after the last keystroke before the draft is saved server-side.
+const DRAFT_SAVE_MS = 1000;
+// Sticking distance: within this many px of the bottom counts as "at bottom".
+const NEAR_BOTTOM_PX = 40;
 
 // Quick patterns: canned companion prompts over the current draft/thread.
 // A chip is nothing but a pre-filled companion turn (see the design doc) —
@@ -85,6 +97,16 @@ function dayKey(iso) {
   return Number.isNaN(t.getTime()) ? '' : t.toDateString();
 }
 
+// Strictly-after for ISO timestamps. The ledgers mix offsets (+02:00, Z), so
+// epoch comparison is the truth; the string fallback only covers unparsable
+// values.
+function tsAfter(a, b) {
+  const ta = Date.parse(a);
+  const tb = Date.parse(b);
+  if (!Number.isNaN(ta) && !Number.isNaN(tb)) return ta > tb;
+  return String(a) > String(b);
+}
+
 function fmtDay(iso) {
   const t = new Date(iso);
   if (Number.isNaN(t.getTime())) return '';
@@ -110,10 +132,23 @@ class RetinueChatPage extends HTMLElement {
     this._draft = '';          // chat composer text
     this._draftByAra = false;  // composer holds the staged agent draft
     this._compDraft = '';      // companion composer text
-    this._localSeq = 0;        // ids for locally appended fixture messages
+    this._localSeq = 0;        // ids for optimistic (not yet confirmed) bubbles
     this._noteTimer = null;
     this._sizes = this._loadSizes();
     this._wide = matchMedia(WIDE_FRAME);
+    // Live-API state: the chat's own messages URL (followed verbatim from the
+    // summary), the ids already rendered (poll de-dup), the version the next
+    // draft write is based on, the draft text the server last accepted, and
+    // the newest ts already posted to the read watermark.
+    this._msgUrl = '';
+    this._seen = new Set();
+    this._draftVersion = 0;
+    this._draftSaved = '';
+    this._draftTimer = null;
+    this._draftInflight = null;
+    this._pollTimer = null;
+    this._lastReadPosted = '';
+    this._onVis = null;
     // Voice dictation: this element is a host of voice.js's presentation
     // contract — the third one, after conversations.js and project-page.js.
     // The host owns the MediaRecorder state machine and what ✓/➤ mean;
@@ -145,6 +180,10 @@ class RetinueChatPage extends HTMLElement {
   disconnectedCallback() {
     this._wide.removeEventListener('change', this._onFrame);
     if (this._noteTimer) clearTimeout(this._noteTimer);
+    if (this._draftTimer) clearTimeout(this._draftTimer);
+    if (this._pollTimer) clearInterval(this._pollTimer);
+    if (this._onVis) document.removeEventListener('visibilitychange', this._onVis);
+    this._onVis = null;
     this._stopRecording();
     this._wave.stop();
     this._stopStream();
@@ -158,25 +197,32 @@ class RetinueChatPage extends HTMLElement {
       return;
     }
     try {
-      // Two hops, both part of the contract: the list document names each
-      // chat's message document in `messages`, so the client never builds a
-      // message URL itself — the fixture→API swap changes only these payloads.
+      // Two hops, both part of the contract: the list names each chat's
+      // message document in `messages`, so the client never builds a message
+      // URL itself. A 502 is the store's honest "unreachable" answer — show
+      // it as such rather than a generic failure.
       const listRes = await fetch(LIST_URL, { cache: 'no-store' });
+      if (listRes.status === 502) throw new Error('store');
       if (!listRes.ok) throw new Error(String(listRes.status));
       const list = await listRes.json();
       const summary = (list.chats || []).find((c) => c.id === this._id);
       if (!summary || !summary.messages) {
         this._state = 'error';
-        this._error = 'This chat is not in the fixture data.';
+        this._error = 'This chat is not in the chat list.';
         this.render();
         return;
       }
-      const msgRes = await fetch(summary.messages, { cache: 'no-store' });
+      this._msgUrl = summary.messages;
+      const msgRes = await fetch(this._msgUrl, { cache: 'no-store' });
+      if (msgRes.status === 502) throw new Error('store');
       if (!msgRes.ok) throw new Error(String(msgRes.status));
       const doc = await msgRes.json();
       this._chat = doc.chat || summary;
       this._messages = Array.isArray(doc.messages) ? doc.messages : [];
+      // The companion thread does not exist in the chat API yet — absent (or
+      // empty), the pane runs in its local demo mode.
       this._companion = Array.isArray(doc.companion) ? doc.companion : [];
+      this._seen = new Set(this._messages.map((m) => m.id));
       // Pin the unread waterline to where it was when the chat opened —
       // messages sent from here are appended below it, and a re-render must
       // not drift the line (messenger convention: it stays put while the
@@ -184,8 +230,11 @@ class RetinueChatPage extends HTMLElement {
       this._firstUnread = this._chat.unread
         ? this._messages.length - this._chat.unread : -1;
       // A staged draft lands in the composer, marked with its author — the
-      // agent writes into the draft, the user's send button sends.
+      // agent writes into the draft, the user's send button sends. The draft
+      // version anchors all later version-guarded saves.
       const draft = this._chat.draft;
+      this._draftVersion = (draft && draft.version) || 0;
+      this._draftSaved = (draft && draft.text) || '';
       if (draft && draft.text && !this._draft) {
         this._draft = draft.text;
         this._draftByAra = draft.author === 'agent';
@@ -193,10 +242,155 @@ class RetinueChatPage extends HTMLElement {
       this._state = 'ok';
       try { document.title = `Retinue — ${this._chat.name}`; } catch (_e) { /* ignore */ }
       this.render();
-    } catch (_err) {
+      // Opening the chat reads it: advance the watermark to the newest
+      // message, then keep the mirror fresh on the conversations cadence.
+      this._postRead(this._newestTs());
+      this._startPolling();
+    } catch (err) {
       this._state = 'error';
-      this._error = 'Could not load this chat. Offline?';
+      this._error = err && err.message === 'store'
+        ? 'The message store is unreachable right now — try again in a moment.'
+        : 'Could not load this chat. Offline?';
       this.render();
+    }
+  }
+
+  _newestTs() {
+    const m = this._messages[this._messages.length - 1];
+    return m ? m.ts : '';
+  }
+
+  _atBottom() {
+    const t = this.shadowRoot.querySelector('[data-chat-thread]');
+    return !!t && t.scrollHeight - t.scrollTop - t.clientHeight < NEAR_BOTTOM_PX;
+  }
+
+  // ── Live mirror: poll, read watermark ──────────────────────────────────────
+  _startPolling() {
+    if (this._pollTimer) return;
+    this._pollTimer = setInterval(() => this._poll(), POLL_MS);
+    this._onVis = () => {
+      if (document.hidden) return;
+      // Coming back to a visible page: catch up at once, and mark the newest
+      // message read if the user is looking at the bottom of the thread.
+      this._poll();
+      if (this._atBottom()) this._postRead(this._newestTs());
+    };
+    document.addEventListener('visibilitychange', this._onVis);
+  }
+
+  async _poll() {
+    if (this._state !== 'ok' || !this._msgUrl || document.hidden) return;
+    try {
+      const res = await fetch(this._msgUrl, { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const doc = await res.json();
+      const msgs = Array.isArray(doc.messages) ? doc.messages : [];
+      const stick = this._atBottom();
+      let newest = '';
+      // Append only unseen messages — never a full re-render, which would
+      // fight the composer (focus, IME, dictation) and the scroll position.
+      // Chat streams are monotonic enough that appending in payload order is
+      // right; anything older is history this page already shows.
+      for (const m of msgs) {
+        if (!m || this._seen.has(m.id)) continue;
+        this._seen.add(m.id);
+        this._messages.push(m);
+        this._appendMessage('[data-chat-thread]', m, true, stick);
+        if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
+      }
+      if (newest && stick) this._postRead(newest);
+      // An agent may stage a draft while the page is open. Adopt it only into
+      // an EMPTY composer — never over what the user is typing.
+      const d = doc.chat && doc.chat.draft;
+      if (d && d.text && !this._draft && d.version !== this._draftVersion) {
+        this._draftVersion = d.version;
+        this._draftSaved = d.text;
+        this._draft = d.text;
+        this._draftByAra = d.author === 'agent';
+        this.render();
+      }
+    } catch (_err) {
+      // Offline or store blip: keep the last rendered state; the next poll
+      // reconciles.
+    }
+  }
+
+  // Advance the server-side read watermark, monotonically: the newest ts is
+  // posted once, and a failure returns it to the pool for the next occasion.
+  async _postRead(ts) {
+    if (!ts || (this._lastReadPosted && !tsAfter(ts, this._lastReadPosted))) return;
+    const prev = this._lastReadPosted;
+    this._lastReadPosted = ts;
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/read`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ts }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+    } catch (_err) {
+      this._lastReadPosted = prev;
+    }
+  }
+
+  // ── Shared draft: debounced, version-guarded saves ─────────────────────────
+  _scheduleDraftSave() {
+    if (this._draftTimer) clearTimeout(this._draftTimer);
+    this._draftTimer = setTimeout(() => this._saveDraft(), DRAFT_SAVE_MS);
+  }
+
+  // The in-flight save is tracked so a send can wait for it: tapping Send
+  // blurs the field, which fires an immediate save — un-ordered, that write
+  // could land after the send's server-side draft clear and resurrect the
+  // just-sent text as a draft.
+  _saveDraft(retried) {
+    const p = this._saveDraftNow(retried);
+    this._draftInflight = p;
+    p.finally(() => { if (this._draftInflight === p) this._draftInflight = null; });
+    return p;
+  }
+
+  async _saveDraftNow(retried) {
+    if (this._draftTimer) clearTimeout(this._draftTimer);
+    this._draftTimer = null;
+    const text = this._draft;
+    if (text === this._draftSaved) return;
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/draft`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, version: this._draftVersion }),
+      });
+      const data = await res.json();
+      if (res.status === 409) {
+        // Someone else moved the draft. Adopt the server's version — and its
+        // text, when it actually has different words — instead of clobbering.
+        this._draftVersion = data.version || 0;
+        const server = (data.draft && data.draft.text) || '';
+        if (!server && text.trim() && !retried) {
+          // A bare version bump (e.g. the counter advanced past a cleared
+          // draft): our words are not in conflict with anything — retry once
+          // on the adopted version.
+          await this._saveDraft(true);
+          return;
+        }
+        if (server !== this._draft) {
+          this._draft = server;
+          this._draftSaved = server;
+          this._draftByAra = !!(data.draft && data.draft.author === 'agent');
+          this.render();
+          this._showNote('Draft updated elsewhere.');
+        } else {
+          this._draftSaved = server;
+        }
+        return;
+      }
+      if (!res.ok) throw new Error(String(res.status));
+      this._draftVersion = data.version || this._draftVersion;
+      this._draftSaved = text;
+    } catch (_err) {
+      // Offline: the draft stays local; the next edit (or blur) retries.
     }
   }
 
@@ -322,18 +516,21 @@ class RetinueChatPage extends HTMLElement {
     }
     const media = (m.attachments || []).map((a) => {
       if (!String(a.type || '').startsWith('image/')) {
-        return `<span class="att-file">&#128206; ${esc(a.name || 'attachment')}</span>`;
+        // Type and name are best-effort in the live records; a bare reference
+        // still renders as a recognisable attachment row.
+        return `<span class="att-file">&#128206; ${esc(a.name || 'Attachment')}</span>`;
       }
-      // The contract carries the image's intrinsic size so the box is reserved
-      // before the bytes arrive — a lazily loading image must never shift the
-      // thread's scroll position.
+      // A lazily loading image must never shift the thread's scroll position:
+      // reserve the box up front — from the intrinsic size when the record
+      // carries one, else as a fixed placeholder frame (the live ledger
+      // records carry no dimensions).
       const dims = (a.width > 0 && a.height > 0)
         ? ` width="${Number(a.width)}" height="${Number(a.height)}"` : '';
-      return `<img class="att-img" src="${esc(a.url)}" alt="${esc(a.name || 'image')}"` +
-        `${dims} loading="lazy">`;
+      return `<img class="att-img${dims ? '' : ' no-dims'}" src="${esc(a.url)}" ` +
+        `alt="${esc(a.name || 'image')}"${dims} loading="lazy">`;
     }).join('');
     const text = m.text ? `<span class="txt">${linkify(m.text)}</span>` : '';
-    return `<div class="${cls}">${head}<div class="bubble">${media}${text}` +
+    return `<div class="${cls}" data-mid="${esc(m.id)}">${head}<div class="bubble">${media}${text}` +
       `<span class="stamp">${esc(fmtTime(m.ts))}</span></div></div>`;
   }
 
@@ -541,10 +738,20 @@ class RetinueChatPage extends HTMLElement {
         `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
     };
     input.addEventListener('input', () => {
-      if (isChat) this._draft = input.value; else this._compDraft = input.value;
+      if (isChat) {
+        this._draft = input.value;
+        // The shared draft follows the keystrokes, debounced — an agent (and
+        // another device) reads it from the chat state.
+        this._scheduleDraftSave();
+      } else {
+        this._compDraft = input.value;
+      }
       field.classList.toggle('has-text', !!input.value);
       grow();
     });
+    if (isChat) {
+      input.addEventListener('blur', () => this._saveDraft());
+    }
     input.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
@@ -556,14 +763,15 @@ class RetinueChatPage extends HTMLElement {
     if (clearBtn) {
       clearBtn.addEventListener('click', () => {
         // One tap to an empty box — the deliberate divergence from the real
-        // clients. It also dismisses the staged-draft marker: the draft is
-        // rejected, not sent.
+        // clients. It also dismisses the staged-draft marker (the draft is
+        // rejected, not sent) and clears the server-side draft with it.
         input.value = '';
         this._draft = '';
         this._setDraftByAra(false);
         field.classList.remove('has-text');
         grow();
         input.focus();
+        this._saveDraft();
       });
     }
     const mic = form.querySelector('[data-mic]');
@@ -711,13 +919,14 @@ class RetinueChatPage extends HTMLElement {
     }
     this.render();
     if (toSend) {
-      // After the render, so the appended bubble (and the chat's fixture
-      // note) lands in the fresh DOM instead of being wiped by it. The sends
-      // are synchronous in fixture mode — the 'sending' status row of the
-      // live composers has nothing to show here.
+      // After the render, so the appended bubble (and any note) lands in the
+      // fresh DOM instead of being wiped by it. The chat send goes through
+      // the live send path; the companion pane stays a local demo.
       if (target === 'chat') this._sendChat(toSend);
       else this._sendCompanion(toSend);
     } else if (intent === 'review') {
+      // Dictating into the field edits the shared draft like typing does.
+      if (target === 'chat') this._scheduleDraftSave();
       // The deliberate review flow returns to the field for editing.
       const input = this.shadowRoot.querySelector(`[data-composer="${target}"] textarea`);
       if (input) { try { input.focus(); } catch (_e) { /* ignore */ } }
@@ -754,12 +963,19 @@ class RetinueChatPage extends HTMLElement {
     if (el) el.scrollTop = el.scrollHeight;
   }
 
-  // Fixture send: optimistic local echo only. The real path (phase 3) POSTs to
-  // the chat send endpoint, the gateway records author `user`, and no policy
-  // category queues it — the user's send button IS the approval.
-  _sendChat(text) {
+  // Live send: an optimistic bubble goes up at once, then is reconciled with
+  // the Message the server returns (POST /chats/<id>/send — the gateway
+  // records author `user`, and no policy category queues it: the user's send
+  // press IS the approval `verify` exists for). On failure the bubble comes
+  // back down and the words return to the composer.
+  async _sendChat(text) {
+    if (this._draftTimer) clearTimeout(this._draftTimer);
+    this._draftTimer = null;
+    // Order matters server-side: let a save fired by the pre-tap blur settle
+    // before the send clears the draft.
+    if (this._draftInflight) { try { await this._draftInflight; } catch (_e) { /* ignore */ } }
     this._localSeq += 1;
-    const m = {
+    const local = {
       id: `local-${this._localSeq}`,
       chat: this._chat.id,
       direction: 'out',
@@ -767,12 +983,60 @@ class RetinueChatPage extends HTMLElement {
       text,
       ts: new Date().toISOString(),
     };
-    this._messages.push(m);
-    this._appendMessage('[data-chat-thread]', m, true);
-    this._showNote('Fixture mode &mdash; message not sent anywhere.');
+    this._messages.push(local);
+    this._appendMessage('[data-chat-thread]', local, true);
+    const node = this.shadowRoot.querySelector(
+      `[data-chat-thread] [data-mid="${local.id}"]`);
+    if (node) node.classList.add('sending');
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/send`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const msg = await res.json();
+      // Reconcile in place: the server's id, timestamp and shape replace the
+      // optimistic guess, and the poll's de-dup knows the message.
+      const idx = this._messages.indexOf(local);
+      if (idx >= 0) this._messages[idx] = msg;
+      this._seen.add(msg.id);
+      if (node) {
+        node.classList.remove('sending');
+        node.setAttribute('data-mid', msg.id);
+        const stamp = node.querySelector('.stamp');
+        if (stamp) stamp.textContent = fmtTime(msg.ts);
+      }
+      // The server cleared the shared draft and advanced the watermark with
+      // this send; mirror both (the next draft save re-anchors its version
+      // through the guard's one-shot retry).
+      this._draftSaved = '';
+      this._postRead(msg.ts);
+    } catch (_err) {
+      // Not sent: take the bubble down, give the words back to the composer.
+      const idx = this._messages.indexOf(local);
+      if (idx >= 0) this._messages.splice(idx, 1);
+      if (node) {
+        const sep = node.previousElementSibling;
+        node.remove();
+        // A day separator introduced just for this bubble goes with it.
+        if (sep && sep.classList.contains('day-sep') && sep.nextElementSibling === null) sep.remove();
+      }
+      this._restoreComposer(text);
+      this._showNote("Couldn't send &mdash; check the connection and try again.");
+    }
   }
 
-  _appendMessage(sel, m, isChat) {
+  _restoreComposer(text) {
+    this._draft = text;
+    const form = this.shadowRoot.querySelector('[data-composer="chat"]');
+    const input = form && form.querySelector('textarea');
+    if (!input) return;
+    input.value = text;
+    input.dispatchEvent(new Event('input'));
+  }
+
+  _appendMessage(sel, m, isChat, stick = true) {
     const thread = this.shadowRoot.querySelector(sel);
     if (!thread) return;
     const prev = isChat
@@ -783,8 +1047,11 @@ class RetinueChatPage extends HTMLElement {
       html += `<div class="day-sep"><span>${esc(fmtDay(m.ts))}</span></div>`;
     }
     html += isChat ? this._chatMsgHtml(m) : this._companionMsgHtml(m);
+    // A message arriving while the user reads old history must not yank the
+    // view to the bottom; only stick when they were already there.
+    const keep = thread.scrollTop;
     thread.insertAdjacentHTML('beforeend', html);
-    thread.scrollTop = thread.scrollHeight;
+    thread.scrollTop = stick ? thread.scrollHeight : keep;
   }
 
   _showNote(html) {
@@ -832,8 +1099,9 @@ class RetinueChatPage extends HTMLElement {
     setTimeout(() => {
       const reply = {
         role: 'ara',
-        text: 'Fixture mode: this pane is not wired to an agent yet. Once the chat API exists, ' +
-          'this turn reaches Ara with the chat context and the shared draft.',
+        text: 'Demo mode: this pane is not wired to an agent yet. Once the chat’s ' +
+          'companion thread exists, this turn reaches Ara with the chat context and ' +
+          'the shared draft.',
         ts: new Date().toISOString(),
       };
       this._companion.push(reply);
@@ -936,7 +1204,13 @@ const CSS = `
            font-size: .66rem; opacity: .6; }
   .att-img { display: block; max-width: min(280px, 100%); height: auto;
              border-radius: 10px; margin: 2px 0 6px; }
+  /* No intrinsic dimensions in the record: a fixed frame keeps the box stable
+     through the lazy load (object-fit crops rather than reflows). */
+  .att-img.no-dims { width: min(220px, 100%); height: 160px; object-fit: cover;
+                     background: rgba(0, 0, 0, .2); }
   .att-file { display: block; font-size: .82rem; margin: 2px 0 4px; }
+  /* Optimistic bubble awaiting the server's send confirmation. */
+  .msg.sending .bubble { opacity: .7; }
 
   /* ── Composer ────────────────────────────────────────────────────────────── */
   .composer { flex: none; margin-top: 4px; padding: 10px 2px 2px;

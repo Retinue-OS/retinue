@@ -122,6 +122,11 @@ self.addEventListener('fetch', (e) => {
   // just pass through to the network so threads and replies stay current.
   if (url.pathname === '/conversations' || url.pathname.startsWith('/conversations/')) return;
 
+  // The chat API is the live messenger mirror (messages, unread, the shared
+  // draft): a cached copy would show a stale thread. The page shells
+  // (/chats.html, /chat.html) are separate paths and stay cache-first.
+  if (url.pathname === '/chats' || url.pathname.startsWith('/chats/')) return;
+
   // The projects endpoints are live (SPARQL over the life store, and the
   // editable per-project file at /projects/item); always go to the network so
   // views and the editor never work on a stale cached copy. The page shells

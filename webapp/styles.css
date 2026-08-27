@@ -77,8 +77,7 @@ main {
 retinue-conversations { flex: 1; min-height: 0; }
 retinue-projects { flex: none; }
 retinue-news { flex: none; }
-/* Chats card (ships commented out in index.html): natural height in the phone
-   stack, like the other list cards. Inert while the card is absent. */
+/* Chats card: natural height in the phone stack, like the other list cards. */
 retinue-chats { flex: none; }
 /* Phone stacking priority: projects (actionable) before news (read-mostly).
    The DOM nests news beside conversations for the wide columns, so flex order
@@ -153,11 +152,10 @@ retinue-project-page { flex: 1; min-height: 0; }
   .deck { display: flex; flex: 1; min-height: 0; align-items: stretch; }
   .col { display: flex; flex-direction: column; min-height: 0; }
   .col-main { flex: 1 1 0; min-width: 0; }
-  /* Chats (when its block is enabled in index.html): a fixed-height region
-     above the conversations, scrolling internally — without a height of its
-     own the card would squeeze the flexible conversations region to nothing.
-     --chats-h comes from the chats splitter (layout.js); inert while the card
-     ships commented out. */
+  /* Chats: a fixed-height region above the conversations, scrolling
+     internally — without a height of its own the card would squeeze the
+     flexible conversations region to nothing. --chats-h comes from the chats
+     splitter (layout.js). */
   .col-main retinue-chats { flex: 0 0 auto; height: var(--chats-h, clamp(160px, 30%, 380px));
                             min-height: 0; overflow-y: auto; }
   /* The user can drag the chats region shut (layout.js snaps small heights to

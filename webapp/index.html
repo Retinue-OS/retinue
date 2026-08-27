@@ -35,9 +35,8 @@
   <script type="module" src="/components/todo.js"></script>
   <script type="module" src="/components/briefing.js"></script>
   -->
-  <!-- Chats (messenger mirror) — runs on fixture data until the chat API exists.
+  <!-- Chats (messenger mirror): the home-screen list over GET /chats. -->
   <script type="module" src="/components/chats.js"></script>
-  -->
 </head>
 <body>
   <main>
@@ -57,19 +56,17 @@
          left, projects on the right. -->
     <div class="deck">
       <section class="col col-main">
-        <!-- Chats (messenger mirror): the card plus the splitter that resizes
-             its region — disabled until the chat API exists (the card runs on
-             fixture data). Enable by uncommenting the next block, plus the
-             components/chats.js script tag in <head>; the card then takes a
-             draggable fixed-height region above the conversations (styles.css
-             --chats-h, managed by layout.js like the news boundary). -->
-        <!--
-        <retinue-chats heading="Chats" src="/data/chats.json"></retinue-chats>
+        <!-- Chats (messenger mirror): every channel conversation as one row,
+             from the gateway's GET /chats; rows open the chat's own page. In
+             the wide layout the card takes a draggable fixed-height region
+             above the conversations (styles.css --chats-h, managed by
+             layout.js like the news boundary — the splitter below is its
+             handle). -->
+        <retinue-chats heading="Chats"></retinue-chats>
 
         <div class="splitter splitter-h" data-splitter="chats" role="separator"
              aria-orientation="horizontal" aria-label="Resize chats"
              title="Drag to resize &middot; double-click to reset" tabindex="0"></div>
-        -->
 
         <!-- Interactive chat threads with Ara. A thread can be opened by you or
              by a retinue agent that needs a decision; it talks to the gateway's
