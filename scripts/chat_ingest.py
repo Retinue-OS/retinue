@@ -10,6 +10,13 @@ metadata to the web-gateway's ``POST /internal/chats/inbound``, which updates
 the chat's state and the in-memory live overlay — the deterministic,
 credit-free notification path (no model turn).
 
+An event asserts *which account* sent it and nothing about where that account
+lives: a gateway's address is configured on the reader's side (the
+web-gateway's messenger registry) and is authoritative there. A gateway that
+also declared its own address would be a second source of truth free to drift
+from the first — which is exactly what once attributed one account's chats to
+another.
+
 Fire-and-forget by contract: :func:`notify_chat_event_async` runs the POST on
 a daemon thread with a short timeout, never raises, and never blocks or
 reorders the gateway's own hot path (persist → gate → triage forward). A lost
@@ -30,7 +37,6 @@ import json
 import os
 import sys
 import threading
-import urllib.parse
 import urllib.request
 
 CHATS_INGEST_URL = os.environ.get("CHATS_INGEST_URL", "").strip()
@@ -46,22 +52,12 @@ def chats_enabled() -> bool:
     return bool(CHATS_INGEST_URL)
 
 
-def gateway_slug(self_url: str) -> str:
-    """This gateway's registry slug: the service hostname of its own base URL.
-
-    The web-gateway keys its messenger-gateway registry by service hostname, so
-    sending it with each event lets a chat remember which *account* it lives on
-    — the difference between the system Signal number and the user's personal
-    one — and route a later send back through that exact gateway."""
-    return urllib.parse.urlsplit(self_url or "").hostname or ""
-
-
 def notify_chat_event(
     *,
     direction: str,
     channel: str,
     chat: str,
-    gateway: str | None = None,
+    account: str | None = None,
     sender: str | None = None,
     sender_name: str | None = None,
     chat_name: str | None = None,
@@ -77,7 +73,10 @@ def notify_chat_event(
     """Synchronous rail POST; returns True when the web-gateway accepted it.
 
     ``direction`` is ``in`` for an arrival, ``out`` for an outbound echo (the
-    user's own send from another device). ``gate`` carries the delivery-gate
+    user's own send from another device). ``account`` is this gateway's own
+    ``*_ACCOUNT`` — how the web-gateway identifies which registry gateway sent
+    the event, matched against the accounts the gateways it already knows
+    report for themselves. ``gate`` carries the delivery-gate
     verdict for inbound events (``{"forward": bool, "reason": str}``) so the
     web-gateway can keep held/no-action classes silent. Never raises.
     """
@@ -87,7 +86,11 @@ def notify_chat_event(
         "direction": direction,
         "channel": channel,
         "chat": chat,
-        "gateway": gateway or None,
+        # The sending gateway's own account identity — the routing key, and
+        # the only identity a gateway asserts about itself. Where that account
+        # can be reached is the reader's business: the address lives in the
+        # web-gateway's messenger registry, which is authoritative.
+        "account": account or None,
         "sender": sender or None,
         "sender_name": sender_name or None,
         "chat_name": chat_name or None,

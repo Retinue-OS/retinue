@@ -225,20 +225,6 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
 
 
-# This gateway's own base URL on the internal Docker network, used to build the
-# HTTP references stored for inbound media (GET /media/<id> below). Defaults to
-# the compose service name + HTTP port; a deployment running more than one
-# WhatsApp identity overrides it per container (as it does SEND_APPROVAL_*).
-GATEWAY_SELF_URL = os.environ.get(
-    "WHATSAPP_GATEWAY_SELF_URL", f"http://whatsapp-gateway:{HTTP_PORT}"
-).rstrip("/")
-
-# This gateway's registry slug (the service hostname), sent with every chats-
-# rail event so a chat remembers which account it lives on — what routes a
-# dashboard send back through this exact gateway in multi-account deployments.
-_CHATS_GATEWAY_SLUG = _chats.gateway_slug(GATEWAY_SELF_URL)
-
-
 def _persist_inbound(question: str, sender: str, group_id: str | None,
                      delivered: bool, media: str | None = None,
                      attachment_urls: list[str] | None = None,
@@ -374,12 +360,22 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
 
 
 def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
-    """Persist inbound media durably and return its HTTP-resolvable reference URL.
+    """Persist inbound media durably and return its store reference.
+
+    The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
+    and deliberately not a URL: where the blob can be fetched is a property of
+    the gateway's *address*, which the reader already holds in its registry
+    (``MESSENGER_GATEWAYS`` / ``*_GATEWAY_BASE_URL``). A container writing its
+    own address into the record duplicates that as a second source of truth,
+    and a wrong one for every extra account of a channel. The reference carries
+    only what identifies the blob; the reader resolves it through the account
+    that owns the chat. It is also a valid N-Triples IRI and matches the
+    ``urn:retinue:…`` shape the ledger's own subjects use.
 
     Best-effort: any failure returns None so the message still forwards and
-    persists with its transcript — only the audio/image link is skipped, never
-    the message. The bytes go to disk (out of the graph); the returned URL is
-    what lands in the message's ``kb:attachment`` triple."""
+    persists with its transcript — only the media link is skipped. The bytes go
+    to disk (out of the graph); the returned reference is what lands in the
+    message's ``kb:attachment`` triple."""
     if not data:
         return None
     try:
@@ -387,7 +383,7 @@ def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
     except Exception as exc:
         print(f"[whatsapp-gateway] could not store inbound media: {exc}", flush=True)
         return None
-    return f"{GATEWAY_SELF_URL}/media/{media_id}"
+    return f"urn:retinue:media:{INBOUND_CHANNEL}:{media_id}"
 
 
 # Public base URL used to build approval links returned to the caller.
@@ -570,6 +566,15 @@ def _health_snapshot() -> dict:
     return {
         "status": "ok",
         "configured": True,  # linking IS the configuration; nothing else is needed
+        # Routing identity for the chat surface. `mode` says whether this
+        # account may own a chat at all (only "inbox" may: a control account's
+        # traffic is prompts to Ara, never the user's correspondence), and
+        # `account` is what the web-gateway matches a rail event against to
+        # find this gateway's registry slug. A container deliberately never
+        # names its own address or slug: the reader's registry already holds
+        # that, and a second source of truth is what mis-routed sends here.
+        "mode": WHATSAPP_GATEWAY_MODE,
+        "account": WHATSAPP_ACCOUNT or None,
         "connected": connected,
         "linked": state["linked"],
         "logged_out": state["logged_out"],
@@ -1666,7 +1671,7 @@ def _record_own_device_send(info, chat_jid, message, msg_id: str | None) -> None
         # the dashboard (the user was visibly in that chat on their phone).
         _chats.notify_chat_event_async(
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
-            gateway=_CHATS_GATEWAY_SLUG, author="device", message_id=msg_id,
+            account=WHATSAPP_ACCOUNT, author="device", message_id=msg_id,
             ts=ts, text=text,
         )
     print(f"[whatsapp-gateway] recorded own-device send to {chat}", flush=True)
@@ -1762,7 +1767,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # updates silently); the gate verdict rides along so they stay quiet.
     _chats.notify_chat_event_async(
         direction="in", channel=INBOUND_CHANNEL, chat=origin or sender,
-        gateway=_CHATS_GATEWAY_SLUG, sender=sender, sender_name=sender_name,
+        account=WHATSAPP_ACCOUNT, sender=sender, sender_name=sender_name,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
