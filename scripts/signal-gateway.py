@@ -252,12 +252,15 @@ RECENT_SENDS = _ibstore.RecentSends()
 
 def _record_outbound(chat: str, text: str, author: str,
                      message_id: str | None = None,
-                     timestamp: float | None = None) -> None:
+                     timestamp: float | None = None,
+                     attachment_urls: list[str] | None = None) -> None:
     """Best-effort ledger record of one successfully sent message; never raises.
 
     Inbox-mode only, like inbound persistence: the ledger mirrors the user's
     own conversations, and a control account's traffic (prompts in, Ara's
-    replies out) is persisted on neither direction.
+    replies out) is persisted on neither direction. ``attachment_urls`` are
+    the durable media references stored for this send (see
+    :func:`_store_media_ref`).
     """
     if SIGNAL_GATEWAY_MODE != "inbox":
         return
@@ -265,9 +268,16 @@ def _record_outbound(chat: str, text: str, author: str,
         _ibstore.write_outbound(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, chat=chat, text=text,
             author=author, message_id=message_id, timestamp=timestamp,
+            attachment_urls=attachment_urls or None,
         )
     except Exception as exc:
         print(f"[signal-gateway] could not record outbound message: {exc}", flush=True)
+
+
+# Cap on an own-device echo's media: an echo above this records its caption
+# only (or is skipped when it has none), exactly the pre-media behaviour.
+CHAT_ECHO_MEDIA_MAX_BYTES = int(
+    os.environ.get("CHAT_ECHO_MEDIA_MAX_BYTES", str(10 * 1024 * 1024)))
 
 
 def _mark_delivered(store_path) -> None:
@@ -957,7 +967,8 @@ def _wav_to_ogg(wav_path: Path) -> Path:
 
 def _signal_send(recipient: str, message: str | None = None,
                  attachments: list[Path] | None = None,
-                 author: str = "agent") -> tuple[str | None, float | None]:
+                 author: str = "agent",
+                 attachment_urls: list[str] | None = None) -> tuple[str | None, float | None]:
     """Send a Signal message with an optional body and any number of attachments.
 
     A ``recipient`` prefixed with :data:`SIGNAL_GROUP_PREFIX` addresses a group:
@@ -1001,7 +1012,8 @@ def _signal_send(recipient: str, message: str | None = None,
     msg_id = str(ts_ms) if ts_ms else None
     RECENT_SENDS.note(msg_id, chat=recipient, text=message or "")
     _record_outbound(recipient, message or "", author, message_id=msg_id,
-                     timestamp=(ts_ms / 1000.0) if ts_ms else None)
+                     timestamp=(ts_ms / 1000.0) if ts_ms else None,
+                     attachment_urls=attachment_urls)
     return msg_id, (ts_ms / 1000.0) if ts_ms else None
 
 
@@ -1308,6 +1320,42 @@ def _extract_sync_sent(event: dict) -> dict | None:
     return sent if isinstance(sent, dict) else None
 
 
+def _sync_attachment_refs(sent: dict) -> list[str]:
+    """Durable media references for an own-device send's attachments.
+
+    signal-cli's receive downloads sync-transcript attachments exactly like
+    inbound ones: the JSON carries the same attachment records (contentType,
+    id, filename) and the blobs land in its attachments dir — so capturing
+    them is a local file read, not a network fetch, the same cost the inbound
+    path already pays on this thread. Best-effort per attachment: a file that
+    is not on disk (an older signal-cli that keeps sync attachments only in
+    memory, or already-pruned retention) or over CHAT_ECHO_MEDIA_MAX_BYTES is
+    skipped with a log line and the echo degrades to its caption.
+    """
+    refs: list[str] = []
+    for att in sent.get("attachments") or []:
+        if not isinstance(att, dict):
+            continue
+        path = _attachment_path(att)
+        if path is None:
+            print(f"[signal-gateway] own-device attachment not on disk; "
+                  f"recording without it: {att.get('id') or att.get('filename')}", flush=True)
+            continue
+        try:
+            if path.stat().st_size > CHAT_ECHO_MEDIA_MAX_BYTES:
+                print(f"[signal-gateway] own-device attachment over "
+                      f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it", flush=True)
+                continue
+            data = path.read_bytes()
+        except OSError as exc:
+            print(f"[signal-gateway] could not read own-device attachment: {exc}", flush=True)
+            continue
+        ref = _store_media_ref(data, str(att.get("contentType") or "") or None)
+        if ref:
+            refs.append(ref)
+    return refs
+
+
 def _record_sync_sent(sent: dict) -> None:
     """Ledger-record one own-device send (author: device); never a model turn.
 
@@ -1316,6 +1364,10 @@ def _record_sync_sent(sent: dict) -> None:
     the recent-senders store — and, being kb:OutboundMessage, it can never
     surface in the /undelivered drain.
     """
+    # The ledger is inbox-only (as for every persist); returning up front also
+    # keeps control mode from storing media blobs no record would reference.
+    if SIGNAL_GATEWAY_MODE != "inbox":
+        return
     group = sent.get("groupInfo") if isinstance(sent.get("groupInfo"), dict) else None
     group_id = (group.get("groupId") or group.get("id")) if group else None
     # Mirror _extract_sender's preference order (number before UUID) so the
@@ -1337,14 +1389,16 @@ def _record_sync_sent(sent: dict) -> None:
     # against a client-version surprise, not a hot path.
     if RECENT_SENDS.seen(msg_id, chat=chat, text=text):
         return
-    if not text:
-        # Attachment-only own-device sends are not captured yet (the media
-        # would have to be fetched just for the mirror); recording nothing
-        # beats recording an empty bubble.
-        print(f"[signal-gateway] own-device send to {chat} has no text; not recorded", flush=True)
+    attachment_urls = _sync_attachment_refs(sent)
+    if not text and not attachment_urls:
+        # Nothing retrievable to mirror (no caption, no on-disk media):
+        # recording nothing beats recording an empty bubble.
+        print(f"[signal-gateway] own-device send to {chat} has no text and no "
+              f"retrievable media; not recorded", flush=True)
         return
     _record_outbound(chat, text, "device", message_id=msg_id,
-                     timestamp=(int(ts) / 1000.0) if ts else None)
+                     timestamp=(int(ts) / 1000.0) if ts else None,
+                     attachment_urls=attachment_urls)
     if SIGNAL_GATEWAY_MODE == "inbox":
         # Chats rail: an own-device send advances the chat's read watermark on
         # the dashboard (the user was visibly in that chat on their phone).
@@ -1352,6 +1406,7 @@ def _record_sync_sent(sent: dict) -> None:
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
             account=SIGNAL_ACCOUNT, author="device", message_id=msg_id,
             ts=(int(ts) / 1000.0) if ts else None, text=text,
+            attachments=attachment_urls,
         )
     print(f"[signal-gateway] recorded own-device send to {chat}", flush=True)
 
@@ -1921,13 +1976,16 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
-          author: str = "agent") -> tuple[str | None, float | None]:
+          author: str = "agent") -> tuple[str | None, float | None, list[str]]:
     """Send an outbound message: text body + spoken audio + optional images.
 
     Images precede the voice note. When voice synthesis fails the message is
     still delivered as text (plus any images) rather than lost. ``author`` is
-    carried through to the ledger record, and the recorded ``(message_id,
-    sent_at)`` is returned (see :func:`_signal_send`).
+    carried through to the ledger record; each image is also persisted into
+    the ledger media store (inbox mode) so the sent message mirrors with its
+    media — the spoken rendering is deliberately not stored, since the text it
+    reads out already is. Returns ``(message_id, sent_at, media_refs)``; the
+    /send response surfaces all three (see :func:`_signal_send`).
     """
     images = images or []
     message = (message or "").strip()
@@ -1936,11 +1994,18 @@ def _push(recipient: str, message: str, lang: str | None = None,
 
     attachments: list[Path] = []
     temp_paths: list[Path] = []
+    media_refs: list[str] = []
     try:
         for image in images:
             path = _decode_image(image)
             temp_paths.append(path)
             attachments.append(path)
+            if SIGNAL_GATEWAY_MODE == "inbox":
+                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
+                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
+                ref = _store_media_ref(path.read_bytes(), ctype)
+                if ref:
+                    media_refs.append(ref)
 
         if voice and message:
             spoken = _strip_markdown(message)
@@ -1958,8 +2023,10 @@ def _push(recipient: str, message: str, lang: str | None = None,
             except Exception as voice_exc:
                 print(f"[signal-gateway] push voice synthesis failed, sending without audio: {voice_exc}", flush=True)
 
-        return _signal_send(recipient, message=message or None,
-                            attachments=attachments, author=author)
+        msg_id, ts = _signal_send(recipient, message=message or None,
+                                  attachments=attachments, author=author,
+                                  attachment_urls=media_refs)
+        return msg_id, ts, media_refs
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -2311,11 +2378,15 @@ class _PushHandler(BaseHTTPRequestHandler):
             print(f"[signal-gateway] push sent to {recipient}"
                   + (f" ({len(images)} image(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
-        # Surface the recorded ledger identity so the caller (the dashboard's
-        # chat view) can show the sent message under its real id and timestamp.
-        if isinstance(result, tuple) and result[0]:
-            body["message_id"] = result[0]
-            body["ts"] = result[1]
+        # Surface the recorded ledger identity — id, timestamp and the stored
+        # media references — so the caller (the dashboard's chat view) can show
+        # the sent message exactly as the ledger will.
+        if isinstance(result, tuple):
+            if result[0]:
+                body["message_id"] = result[0]
+                body["ts"] = result[1]
+            if len(result) >= 3 and result[2]:
+                body["attachments"] = result[2]
         self._reply(200, body)
 
 

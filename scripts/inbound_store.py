@@ -55,6 +55,7 @@ those containers ship no third-party RDF library.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -456,6 +457,68 @@ def write_outbound(
     return subject, path
 
 
+def _image_dimensions(data: bytes) -> tuple[int, int] | None:
+    """Best-effort (width, height) from an image blob's header, else None.
+
+    A deliberately tiny magic-number parser — PNG (IHDR), GIF (logical screen
+    descriptor), JPEG (the first SOF segment), WebP (VP8 / VP8L / VP8X) — so
+    the chat surface can tell the client an image's intrinsic size and the
+    bubble reserves its box before the bytes arrive. Detection is by magic, not
+    by declared content type, so non-images (voice notes) simply miss. Never
+    raises: any malformed or truncated header is an honest None.
+    """
+    try:
+        if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
+            w = int.from_bytes(data[16:20], "big")
+            h = int.from_bytes(data[20:24], "big")
+            return (w, h) if w and h else None
+        if len(data) >= 10 and data[:6] in (b"GIF87a", b"GIF89a"):
+            w = int.from_bytes(data[6:8], "little")
+            h = int.from_bytes(data[8:10], "little")
+            return (w, h) if w and h else None
+        if len(data) >= 4 and data[:2] == b"\xff\xd8":
+            # Walk the JPEG segments to the first start-of-frame. SOF markers
+            # are 0xC0–0xCF minus DHT (C4), JPG (C8) and DAC (CC); its payload
+            # is precision(1), height(2 BE), width(2 BE).
+            i = 2
+            while i + 9 < len(data):
+                if data[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = data[i + 1]
+                if marker == 0xFF:
+                    i += 1  # fill byte
+                    continue
+                if marker in (0x00, 0x01) or 0xD0 <= marker <= 0xD9:
+                    i += 2  # standalone marker, no length field
+                    continue
+                seg_len = int.from_bytes(data[i + 2:i + 4], "big")
+                if seg_len < 2:
+                    return None
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    h = int.from_bytes(data[i + 5:i + 7], "big")
+                    w = int.from_bytes(data[i + 7:i + 9], "big")
+                    return (w, h) if w and h else None
+                i += 2 + seg_len
+            return None
+        if len(data) >= 30 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            fourcc = data[12:16]
+            if fourcc == b"VP8X":  # extended: 24-bit canvas size minus one
+                w = int.from_bytes(data[24:27], "little") + 1
+                h = int.from_bytes(data[27:30], "little") + 1
+                return w, h
+            if fourcc == b"VP8 " and data[23:26] == b"\x9d\x01\x2a":  # lossy
+                w = int.from_bytes(data[26:28], "little") & 0x3FFF
+                h = int.from_bytes(data[28:30], "little") & 0x3FFF
+                return (w, h) if w and h else None
+            if fourcc == b"VP8L" and data[20] == 0x2F:  # lossless: 14+14 bits
+                bits = int.from_bytes(data[21:25], "little")
+                return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        return None
+    except Exception:  # noqa: BLE001 - sniffing must never cost the blob
+        return None
+
+
 def store_media(store_dir: str | Path, data: bytes, content_type: str | None) -> str:
     """Persist one inbound media blob durably and return its server-generated id.
 
@@ -463,11 +526,18 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     the id is path-safe by construction and reveals nothing about the sender. The
     ``content_type`` is written to a ``<id>.type`` sidecar so the serving endpoint
     can set the right ``Content-Type`` without trusting anything client-supplied.
-    Neither file carries an RDF extension, so the life store never indexes them.
+    For an image blob (detected by magic — see :func:`_image_dimensions`) the
+    intrinsic size is written to a ``<id>.meta`` JSON sidecar
+    (``{"width", "height"}``) so the chat surface can reserve the image box
+    before the bytes arrive; an absent sidecar means unknown, exactly the
+    pre-sidecar behaviour. None of these files carries an RDF extension, so the
+    life store never indexes them.
 
-    The caller builds the HTTP reference (``…/media/<id>``) and passes it to
-    :func:`write_message` as an ``attachment_urls`` entry; the bytes stay on disk
-    and out of the graph.
+    The caller builds the reference — a host-free
+    ``urn:retinue:media:<channel>:<id>``, see :data:`P_ATTACHMENT` — and passes
+    it to :func:`write_message` as an ``attachment_urls`` entry; the bytes stay
+    on disk and out of the graph, and the reader resolves the reference through
+    the account that owns the chat.
     """
     media_id = secrets.token_hex(16)
     d = media_dir(store_dir)
@@ -478,6 +548,10 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     os.replace(tmp, blob)
     ct = (content_type or "application/octet-stream").strip() or "application/octet-stream"
     _atomic_write(ct + "\n", d / (media_id + ".type"))
+    dims = _image_dimensions(data or b"")
+    if dims:
+        _atomic_write(json.dumps({"width": dims[0], "height": dims[1]}) + "\n",
+                      d / (media_id + ".meta"))
     return media_id
 
 

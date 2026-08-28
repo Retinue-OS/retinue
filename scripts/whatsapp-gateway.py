@@ -258,12 +258,15 @@ RECENT_SENDS = _ibstore.RecentSends()
 
 def _record_outbound(chat: str, text: str, author: str,
                      message_id: str | None = None,
-                     timestamp: float | None = None) -> None:
+                     timestamp: float | None = None,
+                     attachment_urls: list[str] | None = None) -> None:
     """Best-effort ledger record of one successfully sent message; never raises.
 
     Inbox-mode only, like inbound persistence: the ledger mirrors the user's
     own conversations, and a control account's traffic (prompts in, Ara's
-    replies out) is persisted on neither direction.
+    replies out) is persisted on neither direction. ``attachment_urls`` are
+    the durable media references stored for this send (see
+    :func:`_store_media_ref`).
     """
     if WHATSAPP_GATEWAY_MODE != "inbox":
         return
@@ -271,9 +274,16 @@ def _record_outbound(chat: str, text: str, author: str,
         _ibstore.write_outbound(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, chat=chat, text=text,
             author=author, message_id=message_id, timestamp=timestamp,
+            attachment_urls=attachment_urls or None,
         )
     except Exception as exc:
         print(f"[whatsapp-gateway] could not record outbound message: {exc}", flush=True)
+
+
+# Cap on an own-device echo's media: an echo above this records its caption
+# only (or is skipped when it has none), exactly the pre-media behaviour.
+CHAT_ECHO_MEDIA_MAX_BYTES = int(
+    os.environ.get("CHAT_ECHO_MEDIA_MAX_BYTES", str(10 * 1024 * 1024)))
 
 
 def _epoch_seconds(value) -> float | None:
@@ -1186,7 +1196,8 @@ def _wa_chat_key(recipient: str) -> str:
 
 
 def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = None,
-             author: str = "agent") -> tuple[str | None, float | None]:
+             author: str = "agent",
+             attachment_urls: list[str] | None = None) -> tuple[str | None, float | None]:
     """Send a WhatsApp message: optional text plus any number of media files.
 
     Bridge calls are serialized via WA_CLIENT_LOCK (inside _run_send_op) so
@@ -1224,7 +1235,8 @@ def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = 
     msg_id = str(_attr(first, "ID", "Id", "id") or "") or None
     ts = _epoch_seconds(_attr(first, "Timestamp", "timestamp"))
     _record_outbound(chat, (text or "").strip(), author,
-                     message_id=msg_id, timestamp=ts)
+                     message_id=msg_id, timestamp=ts,
+                     attachment_urls=attachment_urls)
     return msg_id, ts
 
 
@@ -1652,27 +1664,93 @@ def _record_own_device_send(info, chat_jid, message, msg_id: str | None) -> None
     """
     if _jid_is_broadcast(chat_jid):
         return  # the user's own status posts are broadcasts, not chat traffic
+    if WHATSAPP_GATEWAY_MODE != "inbox":
+        return  # the ledger is inbox-only; control mode must not store blobs either
     chat = _jid_addr(chat_jid)
     text = _extract_message_text(message)
     if RECENT_SENDS.seen(msg_id, chat=chat, text=text):
         return
     if not chat:
         return
-    if not text:
-        # Attachment-only own-device sends are not captured yet (the media
-        # would have to be downloaded just for the mirror); recording nothing
-        # beats recording an empty bubble.
-        print(f"[whatsapp-gateway] own-device send to {chat} has no text; not recorded", flush=True)
-        return
     ts = _epoch_seconds(_attr(info, "Timestamp", "timestamp"))
-    _record_outbound(chat, text, "device", message_id=msg_id, timestamp=ts)
+    media_sub = _extract_image(message) or _extract_audio(message)
+    if media_sub is not None:
+        # The media echo needs a bridge download; hand it to a worker thread so
+        # the event callback — the receive path — is never held behind it.
+        threading.Thread(
+            target=_record_own_device_media,
+            args=(chat, text, msg_id, ts, message, media_sub),
+            name="echo-media", daemon=True,
+        ).start()
+        return
+    if not text:
+        # Neither text nor a capturable media kind (image/audio; videos and
+        # documents stay out of the mirror for now): recording nothing beats
+        # recording an empty bubble.
+        print(f"[whatsapp-gateway] own-device send to {chat} has no text and no "
+              f"capturable media; not recorded", flush=True)
+        return
+    _finish_own_device_record(chat, text, msg_id, ts, [])
+
+
+def _record_own_device_media(chat: str, text: str, msg_id: str | None,
+                             ts: float | None, message, media_sub) -> None:
+    """Worker half of a media echo: download, store, record; never raises.
+
+    Bounded by CHAT_ECHO_MEDIA_MAX_BYTES — checked against the declared
+    fileLength before downloading and against the real size after, since the
+    declaration is sender-controlled. Every failure degrades to recording the
+    caption (or the skip log when there is none): the text is never lost to a
+    media problem."""
+    try:
+        ref = None
+        declared = _attr(media_sub, "file_length", "fileLength", "FileLength")
+        try:
+            declared = int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > CHAT_ECHO_MEDIA_MAX_BYTES:
+            print(f"[whatsapp-gateway] own-device media over "
+                  f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it", flush=True)
+        else:
+            media = _download_media(message)  # best-effort; None on failure
+            if media is None:
+                print(f"[whatsapp-gateway] own-device media download failed; "
+                      f"recording without it", flush=True)
+            else:
+                try:
+                    data = media.read_bytes()
+                finally:
+                    media.unlink(missing_ok=True)
+                if len(data) > CHAT_ECHO_MEDIA_MAX_BYTES:
+                    print(f"[whatsapp-gateway] own-device media over "
+                          f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it",
+                          flush=True)
+                elif data:
+                    mime = str(_attr(media_sub, "mimetype", "Mimetype") or "") or None
+                    ref = _store_media_ref(data, mime)
+        refs = [ref] if ref else []
+        if not text and not refs:
+            print(f"[whatsapp-gateway] own-device send to {chat} has no text and no "
+                  f"retrievable media; not recorded", flush=True)
+            return
+        _finish_own_device_record(chat, text, msg_id, ts, refs)
+    except Exception as exc:  # noqa: BLE001 - a media echo must never crash a thread
+        print(f"[whatsapp-gateway] own-device media echo failed: {exc}", flush=True)
+
+
+def _finish_own_device_record(chat: str, text: str, msg_id: str | None,
+                              ts: float | None, refs: list[str]) -> None:
+    """Shared tail of both echo paths: the ledger record and the rail event."""
+    _record_outbound(chat, text, "device", message_id=msg_id, timestamp=ts,
+                     attachment_urls=refs)
     if WHATSAPP_GATEWAY_MODE == "inbox":
         # Chats rail: an own-device send advances the chat's read watermark on
         # the dashboard (the user was visibly in that chat on their phone).
         _chats.notify_chat_event_async(
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
             account=WHATSAPP_ACCOUNT, author="device", message_id=msg_id,
-            ts=ts, text=text,
+            ts=ts, text=text, attachments=refs,
         )
     print(f"[whatsapp-gateway] recorded own-device send to {chat}", flush=True)
 
@@ -2311,14 +2389,16 @@ def _autowhitelist_recipient(recipient: str) -> None:
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
-          author: str = "agent") -> tuple[str | None, float | None]:
+          author: str = "agent") -> tuple[str | None, float | None, list[str]]:
     """Send an outbound message: text body plus optional image attachments.
 
     `lang`/`voice` are accepted for parity with the Signal gateway's _push
     signature (the pending store persists them) but WhatsApp has no voice
     pipeline, so they are ignored here. ``author`` is carried through to the
-    ledger record, and the recorded ``(message_id, sent_at)`` is returned (see
-    :func:`_wa_send`).
+    ledger record; each image is also persisted into the ledger media store
+    (inbox mode) so the sent message mirrors with its media. Returns
+    ``(message_id, sent_at, media_refs)``; the /send response surfaces all
+    three (see :func:`_wa_send`).
     """
     images = images or []
     message = (message or "").strip()
@@ -2326,13 +2406,21 @@ def _push(recipient: str, message: str, lang: str | None = None,
         raise ValueError("push requires a non-empty message or at least one image")
 
     temp_paths: list[Path] = []
+    media_refs: list[str] = []
     try:
         for image in images:
-            temp_paths.append(_decode_image(image))
-        result = _wa_send(recipient, message or None, media_paths=temp_paths,
-                          author=author)
+            path = _decode_image(image)
+            temp_paths.append(path)
+            if WHATSAPP_GATEWAY_MODE == "inbox":
+                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
+                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
+                ref = _store_media_ref(path.read_bytes(), ctype)
+                if ref:
+                    media_refs.append(ref)
+        msg_id, ts = _wa_send(recipient, message or None, media_paths=temp_paths,
+                              author=author, attachment_urls=media_refs)
         _autowhitelist_recipient(recipient)
-        return result
+        return msg_id, ts, media_refs
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -2578,11 +2666,15 @@ class _PushHandler(BaseHTTPRequestHandler):
             print(f"[whatsapp-gateway] push sent to {recipient}"
                   + (f" ({len(images)} image(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
-        # Surface the recorded ledger identity so the caller (the dashboard's
-        # chat view) can show the sent message under its real id and timestamp.
-        if isinstance(result, tuple) and result[0]:
-            body["message_id"] = result[0]
-            body["ts"] = result[1]
+        # Surface the recorded ledger identity — id, timestamp and the stored
+        # media references — so the caller (the dashboard's chat view) can show
+        # the sent message exactly as the ledger will.
+        if isinstance(result, tuple):
+            if result[0]:
+                body["message_id"] = result[0]
+                body["ts"] = result[1]
+            if len(result) >= 3 and result[2]:
+                body["attachments"] = result[2]
         self._reply(200, body)
 
 

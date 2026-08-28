@@ -808,6 +808,9 @@ CHAT_PAGE_MESSAGES = int(os.environ.get("CHAT_PAGE_MESSAGES", "200"))
 CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "3"))
 # Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
 CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
+# How many images one chat send may carry; each is size-capped by
+# MAX_ATTACHMENT_BYTES like every other upload through this gateway.
+CHAT_SEND_MAX_IMAGES = int(os.environ.get("CHAT_SEND_MAX_IMAGES", "5"))
 # How long a gateway's identity (mode + account, read from its /health) is
 # reused. Long on success — an account's mode and number do not change under a
 # running container — and short after a failed probe, so a gateway that was
@@ -3518,19 +3521,23 @@ def _parse_media_reference(url: str) -> tuple[str | None, str | None]:
     return m.group(1), parts.hostname
 
 
-def _chat_media_meta(channel: str, media_id: str) -> tuple[str | None, int | None]:
-    """Best-effort (content_type, size) of a ledger media blob.
+def _chat_media_meta(channel: str, media_id: str) -> tuple[str | None, int | None,
+                                                           int | None, int | None]:
+    """Best-effort (content_type, size, width, height) of a ledger media blob.
 
     The built-in channels' message volumes are mounted read-only under the
-    chambers root (docker-compose.yml), so the blob's `.type` sidecar is a
-    local read. This is display metadata only — never a message read path; a
-    miss (an extra account's volume, a pruned blob) just omits the fields and
-    the client renders a generic attachment."""
+    chambers root (docker-compose.yml), so the blob's `.type` and `.meta`
+    sidecars (the latter carries the image dimensions the store sniffed at
+    ingest) are local reads. This is display metadata only — never a message
+    read path; a miss (an extra account's volume, a pruned blob, a pre-meta
+    blob) just omits the fields and the client renders without them."""
     if not channel or not media_id:
-        return None, None
+        return None, None, None, None
     base = CHAMBERS_DIR / "_generated" / "messenger" / channel / "media"
     ctype = None
     size = None
+    width = None
+    height = None
     try:
         ctype = (base / (media_id + ".type")).read_text(encoding="utf-8").strip() or None
     except OSError:
@@ -3539,7 +3546,15 @@ def _chat_media_meta(channel: str, media_id: str) -> tuple[str | None, int | Non
         size = (base / media_id).stat().st_size
     except OSError:
         pass
-    return ctype, size
+    try:
+        meta = json.loads((base / (media_id + ".meta")).read_text(encoding="utf-8"))
+        if isinstance(meta, dict):
+            w, h = meta.get("width"), meta.get("height")
+            if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+                width, height = w, h
+    except (OSError, ValueError):
+        pass
+    return ctype, size, width, height
 
 
 def _shape_chat_attachments(urls: list[str], channel: str,
@@ -3568,11 +3583,16 @@ def _shape_chat_attachments(urls: list[str], channel: str,
         slug = serving_slug or legacy_slug
         public = f"/chats/media/{slug}/{media_id}" if (media_id and slug) else url
         att: dict = {"id": media_id or public, "url": public}
-        ctype, size = _chat_media_meta(channel, media_id or "")
+        ctype, size, width, height = _chat_media_meta(channel, media_id or "")
         if ctype:
             att["type"] = ctype
         if size is not None:
             att["size"] = size
+        # Intrinsic size, when the store sniffed it at ingest — the client
+        # reserves the image box with it, so lazy loads never shift the scroll.
+        if width is not None and height is not None:
+            att["width"] = width
+            att["height"] = height
         out.append(att)
     return out
 
@@ -4780,7 +4800,36 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON"})
             return
         text = (payload.get("text") or "").strip()
-        if not text:
+        # Optional images, in the gateways' own /send shape. Validated here —
+        # count, base64, decoded size — so a bad upload fails fast with a 400
+        # instead of a gateway round trip; the gateway persists the bytes into
+        # its ledger media store and reports the stored references back.
+        raw_images = payload.get("images") or []
+        if not isinstance(raw_images, list):
+            self._send_json(400, {"error": "'images' must be a list"})
+            return
+        if len(raw_images) > CHAT_SEND_MAX_IMAGES:
+            self._send_json(400, {"error": f"at most {CHAT_SEND_MAX_IMAGES} images per send"})
+            return
+        images = []
+        for img in raw_images:
+            if not isinstance(img, dict) or not isinstance(img.get("data"), str):
+                self._send_json(400, {"error": "each image needs base64 'data'"})
+                return
+            ctype = img.get("content_type")
+            if ctype is not None and not isinstance(ctype, str):
+                self._send_json(400, {"error": "image content_type must be a string"})
+                return
+            try:
+                raw = base64.b64decode(img["data"], validate=True)
+            except (ValueError, binascii.Error):
+                self._send_json(400, {"error": "invalid base64 image data"})
+                return
+            if len(raw) > MAX_ATTACHMENT_BYTES:
+                self._send_json(400, {"error": "image too large"})
+                return
+            images.append({"content_type": (ctype or "").strip(), "data": img["data"]})
+        if not text and not images:
             self._send_json(400, {"error": "empty text"})
             return
         channel, key = chat_state_mod.split_chat_id(chat_id)
@@ -4793,14 +4842,17 @@ class Handler(BaseHTTPRequestHandler):
                   flush=True)
             self._send_json(409, {"error": route_error})
             return
-        body = json.dumps({
+        send_payload = {
             "recipient": key,
             "message": text,
             "author": "user",
             # A chat send is a text message like the real client's — never the
             # push CLIs' spoken rendering.
             "voice": False,
-        }).encode("utf-8")
+        }
+        if images:
+            send_payload["images"] = images
+        body = json.dumps(send_payload).encode("utf-8")
         headers = {"Content-Type": "application/json"}
         if gw.get("token"):
             headers["Authorization"] = "Bearer " + gw["token"]
@@ -4825,11 +4877,22 @@ class Handler(BaseHTTPRequestHandler):
             return
         message_id = (str(answer.get("message_id") or "").strip() or None)
         ts = chat_state_mod.iso_z(answer.get("ts"))
+        # The stored ledger media references the gateway reports back — the
+        # same host-free urn:retinue:media:… form it writes into the record.
+        # Shaping resolves them onto the authenticated proxy through the very
+        # account this send just used, so the returned Message (and the merged
+        # view, via the overlay) renders the sent image immediately. Passing
+        # that slug is what makes a URN resolvable at all: it names the blob,
+        # not a host.
+        gw_atts = [u for u in (answer.get("attachments") or [])
+                   if isinstance(u, str) and u]
         msg = _shape_chat_message(chat_id, channel, direction="out", text=text,
-                                  ts=ts, message_id=message_id, author="user")
+                                  ts=ts, message_id=message_id, author="user",
+                                  attachment_urls=gw_atts, serving_slug=slug)
         _CHAT_OVERLAY.insert({
             "chat_id": chat_id, "channel": channel, "direction": "out",
             "author": "user", "text": text, "ts": ts, "message_id": message_id,
+            "attachments": gw_atts,
         })
         _CHAT_STATE.clear_draft(chat_id)
         _CHAT_STATE.advance_last_read(chat_id, ts)
