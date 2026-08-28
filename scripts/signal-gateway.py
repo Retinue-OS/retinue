@@ -1399,14 +1399,15 @@ def _record_sync_sent(sent: dict) -> None:
     _record_outbound(chat, text, "device", message_id=msg_id,
                      timestamp=(int(ts) / 1000.0) if ts else None,
                      attachment_urls=attachment_urls)
-    # Chats rail: an own-device send advances the chat's read watermark on
-    # the dashboard (the user was visibly in that chat on their phone).
-    _chats.notify_chat_event_async(
-        direction="out", channel=INBOUND_CHANNEL, chat=chat,
-        account=SIGNAL_ACCOUNT, author="device", message_id=msg_id,
-        ts=(int(ts) / 1000.0) if ts else None, text=text,
-        attachments=attachment_urls,
-    )
+    if SIGNAL_GATEWAY_MODE == "inbox":
+        # Chats rail: an own-device send advances the chat's read watermark on
+        # the dashboard (the user was visibly in that chat on their phone).
+        _chats.notify_chat_event_async(
+            direction="out", channel=INBOUND_CHANNEL, chat=chat,
+            account=SIGNAL_ACCOUNT, author="device", message_id=msg_id,
+            ts=(int(ts) / 1000.0) if ts else None, text=text,
+            attachments=attachment_urls,
+        )
     print(f"[signal-gateway] recorded own-device send to {chat}", flush=True)
 
 

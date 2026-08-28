@@ -1744,13 +1744,14 @@ def _finish_own_device_record(chat: str, text: str, msg_id: str | None,
     """Shared tail of both echo paths: the ledger record and the rail event."""
     _record_outbound(chat, text, "device", message_id=msg_id, timestamp=ts,
                      attachment_urls=refs)
-    # Chats rail: an own-device send advances the chat's read watermark on
-    # the dashboard (the user was visibly in that chat on their phone).
-    _chats.notify_chat_event_async(
-        direction="out", channel=INBOUND_CHANNEL, chat=chat,
-        account=WHATSAPP_ACCOUNT, author="device", message_id=msg_id,
-        ts=ts, text=text, attachments=refs,
-    )
+    if WHATSAPP_GATEWAY_MODE == "inbox":
+        # Chats rail: an own-device send advances the chat's read watermark on
+        # the dashboard (the user was visibly in that chat on their phone).
+        _chats.notify_chat_event_async(
+            direction="out", channel=INBOUND_CHANNEL, chat=chat,
+            account=WHATSAPP_ACCOUNT, author="device", message_id=msg_id,
+            ts=ts, text=text, attachments=refs,
+        )
     print(f"[whatsapp-gateway] recorded own-device send to {chat}", flush=True)
 
 
