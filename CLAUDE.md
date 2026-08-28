@@ -664,8 +664,9 @@ Ara picks it up with full context and carries out what they approve.
 own voice, a thread opened or appended via `conversation-push.py` — apply the
 **`dashboard-composing`** skill: every offered option gets a click-to-fill
 `[[chip: …]]`, an e-mail referred to but not shown in full gets a details chip,
-PR/issue labels link to GitHub, and no URL is ever shown bare (always
-`[label](url)`).
+PR/issue labels link to GitHub, no URL is ever shown bare (always
+`[label](url)`), and anything the user is asked to do elsewhere — a portal to
+sign into, a page to approve on — is named as a link.
 
 The endpoint is token-gated (`CONVERSATION_BACKEND_TOKEN`, set by the entrypoint)
 so only in-container agents can post on the user's behalf — like the e-mail
