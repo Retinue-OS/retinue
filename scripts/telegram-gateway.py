@@ -117,17 +117,6 @@ DEFAULT_LANGUAGE = SUPPORTED_LANGUAGES[0] if SUPPORTED_LANGUAGES else "en"
 HTTP_PORT = int(os.environ.get("TELEGRAM_GATEWAY_HTTP_PORT", "8093"))
 DEFAULT_RECIPIENT = os.environ.get("TELEGRAM_DEFAULT_RECIPIENT", "").strip()
 GATEWAY_TOKEN = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
-# The base URL other services (the life-store emitter, the dashboard) resolve a
-# durable inbound-media reference against — i.e. where this gateway serves its own
-# token-gated GET /media/<id>. Defaults to the in-cluster service name; a
-# deployment overrides it when the gateway is reachable at a different host.
-GATEWAY_SELF_URL = os.environ.get(
-    "TELEGRAM_GATEWAY_SELF_URL", f"http://telegram-gateway:{HTTP_PORT}"
-).rstrip("/")
-# This gateway's registry slug (the service hostname), sent with every chats-
-# rail event so a chat remembers which account it lives on — what routes a
-# dashboard send back through this exact gateway in multi-account deployments.
-_CHATS_GATEWAY_SLUG = _chats.gateway_slug(GATEWAY_SELF_URL)
 MAX_PUSH_BODY_BYTES = int(os.environ.get("TELEGRAM_GATEWAY_MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 # Cap the decoded size of an inbound image forwarded to the agent (it travels
 # base64-encoded inside the POST /message JSON). Matches the retinue gateway's
@@ -357,18 +346,27 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
 
 
 def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
-    """Persist one inbound media blob durably and return its HTTP-resolvable URL.
+    """Persist inbound media durably and return its store reference.
 
-    Best-effort: the durable reference is what keeps the original audio/image out
-    of the graph while still recoverable, so a failure here must never cost the
-    message — it just means this attachment has no reference. The bytes are stored
-    under the gateway's media dir (never inline in RDF) and served back by the
-    token-gated GET /media/<id>."""
+    The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
+    and deliberately not a URL: where the blob can be fetched is a property of
+    the gateway's *address*, which the reader already holds in its registry
+    (``MESSENGER_GATEWAYS`` / ``*_GATEWAY_BASE_URL``). A container writing its
+    own address into the record duplicates that as a second source of truth,
+    and a wrong one for every extra account of a channel. The reference carries
+    only what identifies the blob; the reader resolves it through the account
+    that owns the chat. It is also a valid N-Triples IRI and matches the
+    ``urn:retinue:…`` shape the ledger's own subjects use.
+
+    Best-effort: any failure returns None so the message still forwards and
+    persists with its transcript — only the media link is skipped. The bytes go
+    to disk (out of the graph); the returned reference is what lands in the
+    message's ``kb:attachment`` triple."""
     if not data:
         return None
     try:
         media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
-        return f"{GATEWAY_SELF_URL}/media/{media_id}"
+        return f"urn:retinue:media:{INBOUND_CHANNEL}:{media_id}"
     except Exception as exc:
         print(f"[telegram-gateway] could not store inbound media: {exc}", flush=True)
         return None
@@ -459,6 +457,15 @@ def _health_snapshot() -> dict:
     return {
         "status": "ok",
         "configured": configured,
+        # Routing identity for the chat surface. `mode` says whether this
+        # account may own a chat at all (only "inbox" may: a control account's
+        # traffic is prompts to Ara, never the user's correspondence), and
+        # `account` is what the web-gateway matches a rail event against to
+        # find this gateway's registry slug. A container deliberately never
+        # names its own address or slug: the reader's registry already holds
+        # that, and a second source of truth is what mis-routed sends here.
+        "mode": TELEGRAM_GATEWAY_MODE,
+        "account": TELEGRAM_ACCOUNT or None,
         "connected": connected,
         "authorized": state["authorized"],
         "qr_pending": qr_pending,
@@ -1068,7 +1075,7 @@ async def _on_outgoing_message(event) -> None:
             # phone).
             _chats.notify_chat_event_async(
                 direction="out", channel=INBOUND_CHANNEL, chat=chat_key,
-                gateway=_CHATS_GATEWAY_SLUG, author="device",
+                account=TELEGRAM_ACCOUNT, author="device",
                 message_id=msg_id, ts=sent_at, text=text, attachments=refs,
             )
             print(f"[telegram-gateway] recorded own-device send to {chat_key}", flush=True)
@@ -1333,7 +1340,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # updates silently); the gate verdict rides along so they stay quiet.
     _chats.notify_chat_event_async(
         direction="in", channel=INBOUND_CHANNEL, chat=handle,
-        gateway=_CHATS_GATEWAY_SLUG, sender=handle, sender_name=sender_name,
+        account=TELEGRAM_ACCOUNT, sender=handle, sender_name=sender_name,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),

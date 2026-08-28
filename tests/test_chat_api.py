@@ -47,14 +47,18 @@ MARA = "+41794456312"
 CHAT1 = "signal:" + MARA
 WA_KEY = "123456@g.us"
 CHAT2 = "whatsapp:" + WA_KEY
-MID_ATT = "ab" * 16
+MID_ATT = "ab" * 16   # recorded as a host-free urn:retinue:media:… (today's shape)
 MID_ATT2 = "cd" * 16  # the blob the mock gateway "stores" for an images send
+MID_ATT3 = "ef" * 16  # a legacy http://<service>/media/<id> record on disk
 TS0, TS1, TS2, TS3 = ("2026-08-27T06:00:00Z", "2026-08-27T07:00:00Z",
                       "2026-08-27T07:05:00Z", "2026-08-27T07:12:00Z")
 W_TS = "2026-08-26T18:00:00Z"
 
 # Mutable canned state the mock servers consult.
-STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": []}
+STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
+               # The mock gateway's reported identity: chat routing sends only
+               # through an inbox-mode account (see test_control_gateway_refused).
+               "gw_mode": "inbox", "gw_account": "+41791112233"}
 
 
 def _cell(value):
@@ -93,7 +97,7 @@ class _MockSparql(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _chat_list(self):
-        att_url = f"http://127.0.0.1:{STATE['gw_port']}/media/{MID_ATT}"
+        att_url = f"urn:retinue:media:signal:{MID_ATT}"
         return [
             _lit_row(chat=MARA, channel="signal", ts=TS3, type=T_IN,
                      text="Und: chunnsch immer no?", sender=MARA, atts=att_url),
@@ -117,7 +121,10 @@ class _MockSparql(BaseHTTPRequestHandler):
         if "FILTER(?ts <" in query:  # the ?before page
             return [_lit_row(m="urn:retinue:inbound:signal:000", type=T_IN,
                              text="older message", sender=MARA, mid="900", ts=TS0)]
-        att_url = f"http://127.0.0.1:{STATE['gw_port']}/media/{MID_ATT}"
+        # Both shapes on one message: the URN a gateway records today and a
+        # legacy URL written when gateways still declared their own host.
+        att_url = (f"urn:retinue:media:signal:{MID_ATT} "
+                   f"http://signal-gateway:8090/media/{MID_ATT3}")
         return [  # newest first, as ORDER BY DESC would
             _lit_row(m="urn:retinue:inbound:signal:003", type=T_IN,
                      text="Und: chunnsch immer no?", sender=MARA, mid="903",
@@ -136,6 +143,11 @@ class _MockGateway(BaseHTTPRequestHandler):
     def do_GET(self):
         STATE["gw_requests"].append(("GET", self.path,
                                      self.headers.get("Authorization", "")))
+        if self.path.rstrip("/") in ("", "/health"):
+            self._json(200, {"status": "ok", "configured": True,
+                             "connected": True, "mode": STATE["gw_mode"],
+                             "account": STATE["gw_account"]})
+            return
         if self.path.startswith("/media/"):
             if self.headers.get("Authorization", "") != "Bearer gw-secret":
                 self._json(401, {"error": "unauthorized"})
@@ -162,8 +174,7 @@ class _MockGateway(BaseHTTPRequestHandler):
             if payload.get("images"):
                 # The real gateway persists each image into its ledger media
                 # store and reports the stored references back.
-                answer["attachments"] = [
-                    f"http://127.0.0.1:{STATE['gw_port']}/media/{MID_ATT2}"]
+                answer["attachments"] = [f"urn:retinue:media:signal:{MID_ATT2}"]
             self._json(200, answer)
             return
         self._json(404, {"error": "not found"})
@@ -283,9 +294,16 @@ def test_chat_messages_contract(base, wg):
     assert "sender" not in m_out
     # The attachment reference is rewritten to the authenticated proxy — never
     # the gateway's internal token-gated URL.
-    att = m_att["attachments"][0]
-    assert att["url"] == f"/chats/media/127.0.0.1/{MID_ATT}"
-    assert att["id"] == MID_ATT
+    atts = {a["id"]: a for a in m_att["attachments"]}
+    assert set(atts) == {MID_ATT, MID_ATT3}
+    # A host-free URN and a legacy URL alike are served through the chat's own
+    # account — the legacy record's recorded host ("signal-gateway", the value
+    # that was wrong for every extra account) is deliberately overridden.
+    assert atts[MID_ATT]["url"] == f"/chats/media/127.0.0.1/{MID_ATT}"
+    assert atts[MID_ATT3]["url"] == f"/chats/media/127.0.0.1/{MID_ATT3}"
+    # The sniffed intrinsic size rides on the blob that has a .meta sidecar.
+    assert atts[MID_ATT]["width"] == 320 and atts[MID_ATT]["height"] == 420
+    assert "width" not in atts[MID_ATT3], "no sidecar, no guessed dimensions"
     print("PASS test_chat_messages_contract")
 
 
@@ -419,8 +437,9 @@ def test_rail_auth_and_notifications(base, wg):
 
 
 def test_send_user_direct(base, wg):
-    # The rail taught the chat its gateway account (slug 127.0.0.1 — the mock);
-    # a 1:1 signal chat would normally learn "signal-gateway" the same way.
+    # This rail event reports no account, so it deliberately stamps nothing:
+    # routing rests on the channel having exactly one inbox account, which is
+    # the unambiguous case a single-account deployment always hits.
     rail_event = {"direction": "in", "channel": "signal", "chat": MARA,
                   "sender": MARA, "sender_name": "Mara Meier", "group": False,
                   "message_id": "m-in", "text": "hoi", "gateway": "127.0.0.1",
@@ -440,9 +459,12 @@ def test_send_user_direct(base, wg):
     # recorded ledger identity.
     assert msg["direction"] == "out" and msg["author"] == "user"
     assert msg["chat"] == CHAT1 and msg["id"] == "777"
-    # Draft cleared, watermark advanced to the send.
+    # Draft cleared, watermark advanced to the send. The send writes no
+    # gateway stamp: it has no account evidence of its own, and a stamp that is
+    # merely "what we resolved last time" is what made the incident sticky.
     doc = wg._CHAT_STATE.get(CHAT1)
     assert doc["draft"] is None
+    assert doc.get("gateway") is None, "a send must not stamp an account"
     assert doc["last_read"] == msg["ts"]
     # The sent message is in the merged view before the store indexes it: the
     # list preview flips to the outbound, and the messages page contains it.
@@ -507,6 +529,69 @@ def test_send_images(base, wg):
     assert status == 200 and only["text"] == "" and only["attachments"]
     print("PASS test_send_images")
 
+def test_control_gateway_refused(base, wg):
+    """A control account is never a chat identity: refuse, never mis-send.
+
+    This is the incident in miniature — the chat is stamped with an account
+    that turns out to be the system bot. The send must not go out as it."""
+    STATE["sent"].clear()
+    STATE["gw_mode"] = "control"
+    wg._gw_identity.clear()
+    try:
+        status, body = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/send",
+                             {"text": "must not go out as the bot"})
+        assert status == 409, (status, body)
+        assert "no inbox-mode gateway for channel signal" == body["error"], body
+        assert STATE["sent"] == [], "a refused send must never reach a gateway"
+    finally:
+        STATE["gw_mode"] = "inbox"
+        wg._gw_identity.clear()
+    # With the account back in inbox mode the same send goes through.
+    status, msg = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/send",
+                        {"text": "now it may"})
+    assert status == 200 and len(STATE["sent"]) == 1
+    assert STATE["sent"][0]["author"] == "user"
+    print("PASS test_control_gateway_refused")
+
+
+def test_rail_attributes_by_account(base, wg):
+    """A rail event whose self-reported slug is wrong is still attributed to
+    the account that actually sent it — the root cause of the incident."""
+    cid = "signal:+41790008888"
+    status, body = _http(base, "POST", "/internal/chats/inbound",
+                         {"direction": "in", "channel": "signal",
+                          "chat": "+41790008888", "sender": "+41790008888",
+                          "sender_name": "Nina", "message_id": "acct-1",
+                          "text": "hoi",
+                          # What the mis-defaulted gateway reports: its own
+                          # account, but the BUILT-IN's slug.
+                          "account": STATE["gw_account"],
+                          "gateway": "signal-gateway",
+                          "gate": {"forward": True, "reason": "whitelisted"}})
+    assert status == 200, body
+    # The registry entry for this account is the mock's slug, not the slug the
+    # event claimed — and the stamp is marked as account-derived, which is what
+    # makes it authoritative later.
+    doc = wg._CHAT_STATE.get(cid)
+    assert doc["gateway"] == "127.0.0.1"
+    assert doc["gateway_source"] == "account"
+    # That marked stamp routes even where the channel has several candidates,
+    # and survives the repair pass.
+    assert wg._chat_gateway(doc, "signal")[0] == "127.0.0.1"
+    assert wg.repair_chat_gateway_stamps() == 0
+    # An account the registry does not serve leaves the stamp alone rather
+    # than writing a wrong one.
+    status, _ = _http(base, "POST", "/internal/chats/inbound",
+                      {"direction": "in", "channel": "signal",
+                       "chat": "+41790007777", "sender": "+41790007777",
+                       "message_id": "acct-2", "text": "hi",
+                       "account": "+15559990000", "gateway": "signal-gateway",
+                       "gate": {"forward": True, "reason": "whitelisted"}})
+    assert status == 200
+    unknown = wg._CHAT_STATE.get("signal:+41790007777")
+    assert unknown["gateway"] is None and unknown["gateway_source"] is None
+    print("PASS test_rail_attributes_by_account")
+
 
 def test_media_proxy(base, wg):
     req = urllib.request.Request(base + f"/chats/media/127.0.0.1/{MID_ATT}")
@@ -562,7 +647,8 @@ def main():
         # The sidecar hints ride on the shaped attachments — including the
         # intrinsic size the store sniffed at ingest.
         status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
-        att = body["messages"][-1]["attachments"][0]
+        att = next(a for a in body["messages"][-1]["attachments"]
+                   if a["id"] == MID_ATT)
         assert att.get("type") == "image/jpeg" and att.get("size") == 717
         assert att.get("width") == 320 and att.get("height") == 420
         test_chat_messages_contract(base, wg)
@@ -572,6 +658,9 @@ def main():
         test_rail_auth_and_notifications(base, wg)
         test_send_user_direct(base, wg)
         test_send_images(base, wg)
+
+        test_control_gateway_refused(base, wg)
+        test_rail_attributes_by_account(base, wg)
         test_media_proxy(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()

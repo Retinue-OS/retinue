@@ -24,6 +24,16 @@
 // (?before=<ts>); this page renders the newest page and leaves a load-older
 // affordance for later.
 //
+// Media: image attachments render inline at their true aspect ratio when the
+// record carries intrinsic dimensions (a fixed placeholder frame otherwise —
+// either way the box is reserved before the bytes arrive, so a lazy load can
+// never shift the thread) and open full screen in a lightbox; audio renders
+// as a player above the transcript text (voice notes), video as an inline
+// player under the same box-reserve rules. The composer stages images too:
+// picked (or, on capable devices, camera-captured) photos are downscaled
+// client-side, previewed above the input row, and sent as the `images` part
+// of POST /chats/<id>/send.
+//
 // The companion pane deliberately does NOT embed components/conversations.js:
 // that element owns location.hash routing (#conversation-…), polls the
 // /conversations endpoints, and flags itself via data-view so styles.css hides
@@ -55,6 +65,14 @@ const POLL_MS = 4000;
 const DRAFT_SAVE_MS = 1000;
 // Sticking distance: within this many px of the bottom counts as "at bottom".
 const NEAR_BOTTOM_PX = 40;
+// Outgoing images — the caps mirror the send endpoint (which answers 400 on
+// violations), so a doomed selection fails here instead of after the upload.
+const MAX_IMAGES_PER_SEND = 5;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+// Client-side downscale before upload, as the native clients do: longest edge
+// to IMAGE_MAX_EDGE, re-encoded as JPEG at IMAGE_JPEG_QUALITY.
+const IMAGE_MAX_EDGE = 1600;
+const IMAGE_JPEG_QUALITY = 0.85;
 
 // Quick patterns: canned companion prompts over the current draft/thread.
 // A chip is nothing but a pre-filled companion turn (see the design doc) —
@@ -133,6 +151,12 @@ class RetinueChatPage extends HTMLElement {
     this._draftByAra = false;  // composer holds the staged agent draft
     this._compDraft = '';      // companion composer text
     this._localSeq = 0;        // ids for optimistic (not yet confirmed) bubbles
+    this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
+    this._imgError = '';       // staged-image error line (limit hit, unreadable file)
+    this._lightbox = null;     // {url, alt} while the image overlay is open
+    this._lbKeydown = null;    // window keydown handler while the lightbox is open
+    this._lbPrevFocus = null;  // element to restore focus to on lightbox close
+    this._onPop = null;
     this._noteTimer = null;
     this._sizes = this._loadSizes();
     this._wide = matchMedia(WIDE_FRAME);
@@ -173,12 +197,20 @@ class RetinueChatPage extends HTMLElement {
     // (drafts survive — they live in fields, mirrored on every input event).
     this._onFrame = () => this.render();
     this._wide.addEventListener('change', this._onFrame);
+    // The lightbox holds one history entry while open, so the platform back
+    // gesture closes it instead of leaving the page; popstate is where the
+    // actual dismissal happens, whichever way the entry is unwound.
+    this._onPop = () => { if (this._lightbox) this._dismissLightbox(); };
+    window.addEventListener('popstate', this._onPop);
     this.render();
     this._load();
   }
 
   disconnectedCallback() {
     this._wide.removeEventListener('change', this._onFrame);
+    if (this._onPop) window.removeEventListener('popstate', this._onPop);
+    this._onPop = null;
+    if (this._lightbox) this._dismissLightbox();
     if (this._noteTimer) clearTimeout(this._noteTimer);
     if (this._draftTimer) clearTimeout(this._draftTimer);
     if (this._pollTimer) clearInterval(this._pollTimer);
@@ -441,6 +473,9 @@ class RetinueChatPage extends HTMLElement {
       this._scrollThread('[data-comp-thread]');
       this._setPane(this._pane, 'instant');
     }
+    // A full render replaces the shadow DOM wholesale; an open lightbox (its
+    // node lives beside .page) survives by being re-appended.
+    if (this._lightbox) this._renderLightbox();
   }
 
   _headHtml() {
@@ -514,24 +549,110 @@ class RetinueChatPage extends HTMLElement {
       head = `<div class="msg-head"><small class="who sender" ` +
         `style="color:${colorFor(m.sender)}">${esc(m.sender_name)}</small></div>`;
     }
-    const media = (m.attachments || []).map((a) => {
-      if (!String(a.type || '').startsWith('image/')) {
-        // Type and name are best-effort in the live records; a bare reference
-        // still renders as a recognisable attachment row.
-        return `<span class="att-file">&#128206; ${esc(a.name || 'Attachment')}</span>`;
-      }
-      // A lazily loading image must never shift the thread's scroll position:
-      // reserve the box up front — from the intrinsic size when the record
-      // carries one, else as a fixed placeholder frame (the live ledger
-      // records carry no dimensions).
-      const dims = (a.width > 0 && a.height > 0)
-        ? ` width="${Number(a.width)}" height="${Number(a.height)}"` : '';
-      return `<img class="att-img${dims ? '' : ' no-dims'}" src="${esc(a.url)}" ` +
-        `alt="${esc(a.name || 'image')}"${dims} loading="lazy">`;
-    }).join('');
+    const media = (m.attachments || []).map((a) => this._attachmentHtml(a)).join('');
     const text = m.text ? `<span class="txt">${linkify(m.text)}</span>` : '';
     return `<div class="${cls}" data-mid="${esc(m.id)}">${head}<div class="bubble">${media}${text}` +
       `<span class="stamp">${esc(fmtTime(m.ts))}</span></div></div>`;
+  }
+
+  // One attachment inside a bubble, by type. Loading media must never shift
+  // the thread's scroll position: when the record carries the intrinsic size
+  // (sniffed at ingest; older records may lack it) the true box is reserved
+  // up front — the inline aspect-ratio/width below — otherwise a fixed
+  // placeholder frame holds the space. Images open the lightbox; a voice
+  // note's player sits above the transcript, which is already the message
+  // text; anything that is neither image, audio nor video stays a
+  // recognisable file row (type and name are best-effort in live records).
+  _attachmentHtml(a) {
+    const type = String(a.type || '');
+    const w = Number(a.width);
+    const h = Number(a.height);
+    const hasDims = w > 0 && h > 0;
+    const dims = hasDims ? ` width="${w}" height="${h}"` : '';
+    // The inline size pins BOTH the reserved box and the element's intrinsic
+    // contribution: with bare width/height attributes, a shrink-to-fit bubble
+    // measures the full attribute width during intrinsic sizing (a
+    // percentage-bearing max-width is ignored there), stretching the bubble
+    // far past the rendered medium. Fixed lengths only, so nothing is
+    // cyclic: the box is min(cap, natural) — never an upscale — the ratio is
+    // held by aspect-ratio through the load, and a narrower bubble clamps
+    // via max-width:100% with the height following the ratio.
+    const sized = (cap) => (hasDims
+      ? ` style="aspect-ratio: ${w} / ${h}; width: min(${cap}px, ${w}px)"` : '');
+    if (type.startsWith('image/')) {
+      return `<button type="button" class="att-imgbtn" data-lightbox="${esc(a.url)}" ` +
+        `data-alt="${esc(a.name || 'Image')}" aria-label="View image full screen">` +
+        `<img class="att-img${hasDims ? '' : ' no-dims'}" src="${esc(a.url)}" ` +
+        `alt="${esc(a.name || 'image')}"${dims}${sized(280)} loading="lazy"></button>`;
+    }
+    if (type.startsWith('audio/')) {
+      return `<audio class="att-audio" controls preload="none" src="${esc(a.url)}" ` +
+        `title="${esc(a.name || 'Voice message')}"></audio>`;
+    }
+    if (type.startsWith('video/')) {
+      return `<video class="att-video${hasDims ? '' : ' no-dims'}" controls preload="metadata" ` +
+        `playsinline src="${esc(a.url)}"${dims}${sized(280)}></video>`;
+    }
+    return `<span class="att-file">&#128206; ${esc(a.name || 'Attachment')}</span>`;
+  }
+
+  // ── Lightbox ───────────────────────────────────────────────────────────────
+  // A tapped image opens full screen on a dark scrim at natural fit, over the
+  // same proxied URL (it is the original). Closing: tap, Esc, or the platform
+  // back gesture/button — opening pushes one history entry, so back closes
+  // the overlay instead of leaving the page (the conversations hash-view
+  // precedent for view state on the history stack).
+  _openLightbox(url, alt) {
+    if (this._lightbox || !url) return;
+    this._lightbox = { url, alt: alt || 'Image' };
+    this._lbPrevFocus = this.shadowRoot.activeElement || null;
+    history.pushState({ lightbox: true }, '', location.href);
+    this._renderLightbox();
+  }
+
+  // User intent to close: unwind our history entry; the popstate handler does
+  // the actual dismissal — the same path the back gesture takes.
+  _closeLightbox() {
+    if (!this._lightbox) return;
+    history.back();
+  }
+
+  _renderLightbox() {
+    const root = this.shadowRoot;
+    if (root.querySelector('.lightbox')) return;
+    const { url, alt } = this._lightbox;
+    const node = document.createElement('div');
+    node.className = 'lightbox';
+    node.setAttribute('role', 'dialog');
+    node.setAttribute('aria-modal', 'true');
+    node.setAttribute('aria-label', alt);
+    node.tabIndex = -1;
+    node.innerHTML = `<img class="lb-img" src="${esc(url)}" alt="${esc(alt)}">` +
+      `<button type="button" class="lb-close" aria-label="Close">&#10005;</button>`;
+    // One tap anywhere — scrim, image or the ✕ — closes.
+    node.addEventListener('click', () => this._closeLightbox());
+    root.appendChild(node);
+    if (!this._lbKeydown) {
+      this._lbKeydown = (e) => {
+        if (e.key === 'Escape') { e.preventDefault(); this._closeLightbox(); }
+      };
+      window.addEventListener('keydown', this._lbKeydown);
+    }
+    try { node.focus(); } catch (_e) { /* ignore */ }
+  }
+
+  _dismissLightbox() {
+    this._lightbox = null;
+    if (this._lbKeydown) {
+      window.removeEventListener('keydown', this._lbKeydown);
+      this._lbKeydown = null;
+    }
+    const node = this.shadowRoot && this.shadowRoot.querySelector('.lightbox');
+    if (node) node.remove();
+    if (this._lbPrevFocus && this._lbPrevFocus.isConnected) {
+      try { this._lbPrevFocus.focus(); } catch (_e) { /* ignore */ }
+    }
+    this._lbPrevFocus = null;
   }
 
   _chatComposerHtml() {
@@ -547,14 +668,43 @@ class RetinueChatPage extends HTMLElement {
       `<div class="chips" role="toolbar" aria-label="Quick patterns">${chips}</div>` +
       `<div class="note" data-note role="status" hidden></div>` +
       draftTag +
+      this._imgPreviewsHtml() +
       this._errRowHtml('chat') +
       this._composerRowHtml('chat', 'Message …', true) +
       `</div>`;
   }
 
   _errRowHtml(target) {
-    const err = this._voiceErrors[target];
+    const err = this._voiceErrors[target] || (target === 'chat' ? this._imgError : '');
     return err ? `<div class="attach-err" role="status">${esc(err)}</div>` : '';
+  }
+
+  // Staged outgoing images: small thumbnails above the input row, each with
+  // its own remove — they ride along until the send (or their ✕) takes them.
+  _imgPreviewsHtml() {
+    if (!this._outImages.length) return '';
+    const items = this._outImages.map((im, i) =>
+      `<span class="imgp"><img src="${esc(im.url)}" alt="${esc(im.name || 'image')}">` +
+      `<button type="button" class="imgp-x" data-rmimg="${i}" ` +
+      `aria-label="Remove image">&#10005;</button></span>`).join('');
+    return `<div class="img-previews" data-previews>${items}</div>`;
+  }
+
+  // The paperclip mirrors the conversations composer's affordance (a label
+  // over a hidden file input) as a row button — images only, since that is
+  // what the send endpoint carries. Where the file input supports capture
+  // (phones), a camera button beside it opens the camera directly, as the
+  // native clients offer.
+  _attachBtnsHtml() {
+    const clip = `<label class="attach-btn" title="Attach images" aria-label="Attach images">` +
+      `<input type="file" hidden multiple accept="image/*" data-attach>` +
+      `<span aria-hidden="true">&#128206;</span></label>`;
+    const cam = ('capture' in document.createElement('input'))
+      ? `<label class="attach-btn" title="Take a photo" aria-label="Take a photo">` +
+        `<input type="file" hidden accept="image/*" capture="environment" data-attach>` +
+        `<span aria-hidden="true">&#128247;</span></label>`
+      : '';
+    return clip + cam;
   }
 
   // One composer's input row — or, while this target records or transcribes,
@@ -588,7 +738,8 @@ class RetinueChatPage extends HTMLElement {
         `title="Clear message" aria-label="Clear message">&#10005;</button>`
       : '';
     const fieldCls = `field${withClear ? ' has-clear' : ''}${value ? ' has-text' : ''}`;
-    return `<form class="row" data-composer="${target}">` + micBtn +
+    const attachBtns = target === 'chat' ? this._attachBtnsHtml() : '';
+    return `<form class="row" data-composer="${target}">` + micBtn + attachBtns +
       `<div class="${fieldCls}" data-field>` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" ` +
       `autocomplete="off">${esc(value)}</textarea>` + clearBtn +
@@ -644,14 +795,22 @@ class RetinueChatPage extends HTMLElement {
       }, { passive: true });
     }
 
-    // Composers (chat: fixture send; companion: local echo + canned notice).
-    this._wireComposer('chat');
+    // Composers (chat: live send; companion: local echo + canned notice).
+    this._wireChatComposer();
     this._wireComposer('companion');
 
-    // Quick patterns: pre-fill the companion composer with the canned prompt
-    // and bring that pane forward — a chip is a companion turn, nothing more.
-    root.querySelectorAll('[data-quick]').forEach((el) =>
-      el.addEventListener('click', () => this._quickPattern(el.getAttribute('data-quick'))));
+    // Image lightbox: delegated on the thread container, so bubbles appended
+    // by polls and sends are covered without per-message wiring.
+    const chatThread = root.querySelector('[data-chat-thread]');
+    if (chatThread) {
+      chatThread.addEventListener('click', (e) => {
+        const btn = e.target && e.target.closest && e.target.closest('[data-lightbox]');
+        if (btn) {
+          this._openLightbox(btn.getAttribute('data-lightbox'),
+            btn.getAttribute('data-alt') || 'Image');
+        }
+      });
+    }
 
     // Splitter (wide layout): drag / double-click reset / arrow keys, position
     // persisted per device — the layout.js interaction set, page-local.
@@ -709,10 +868,39 @@ class RetinueChatPage extends HTMLElement {
     }
   }
 
+  // The chat composer plus what only it has: the quick-pattern chips and the
+  // staged-image previews — everything _refreshChatComposer must re-wire
+  // after replacing the composer block in place.
+  _wireChatComposer() {
+    const root = this.shadowRoot;
+    // Quick patterns: pre-fill the companion composer with the canned prompt
+    // and bring that pane forward — a chip is a companion turn, nothing more.
+    root.querySelectorAll('[data-quick]').forEach((el) =>
+      el.addEventListener('click', () => this._quickPattern(el.getAttribute('data-quick'))));
+    // Preview removes live outside the input row, so they stay tappable even
+    // while a recording or dictation job holds the row.
+    root.querySelectorAll('[data-rmimg]').forEach((el) =>
+      el.addEventListener('click', () => this._removeImage(Number(el.getAttribute('data-rmimg')))));
+    this._wireComposer('chat');
+  }
+
+  // Rebuild only the chat composer block (chips, previews, error line, input
+  // row) in place — never the thread, whose scroll position and playing media
+  // a full render would reset.
+  _refreshChatComposer() {
+    const el = this.shadowRoot.querySelector('.pane-chat .composer');
+    if (!el) { this.render(); return; }
+    const tpl = document.createElement('template');
+    tpl.innerHTML = this._chatComposerHtml();
+    el.replaceWith(tpl.content.firstElementChild);
+    this._wireChatComposer();
+  }
+
   // Wire one composer: input tracking + autosize, the inline clear, the mic,
-  // Cmd/Ctrl+Enter, submit — or, while this target records, the recording
-  // row's three controls (voice.js renders them; the host decides what they
-  // mean). A status row (dictation in flight) has nothing to wire.
+  // the image attach inputs, Cmd/Ctrl+Enter, submit — or, while this target
+  // records, the recording row's three controls (voice.js renders them; the
+  // host decides what they mean). A status row (dictation in flight) has
+  // nothing to wire.
   _wireComposer(target) {
     const root = this.shadowRoot;
     const isChat = target === 'chat';
@@ -730,6 +918,16 @@ class RetinueChatPage extends HTMLElement {
     }
     const form = root.querySelector(`[data-composer="${target}"]`);
     if (!form) return;
+    if (isChat) {
+      // The picked files are read before the input resets — resetting first
+      // would hand _addImages an empty list.
+      form.querySelectorAll('[data-attach]').forEach((inp) =>
+        inp.addEventListener('change', () => {
+          const files = Array.from(inp.files || []);
+          inp.value = '';
+          this._addImages(files);
+        }));
+    }
     const input = form.querySelector('textarea');
     const field = form.querySelector('[data-field]');
     const grow = () => {
@@ -779,18 +977,22 @@ class RetinueChatPage extends HTMLElement {
     form.addEventListener('submit', (e) => {
       e.preventDefault();
       const text = input.value;
-      if (!text.trim()) return;
+      // A chat message needs text or at least one staged image; a companion
+      // turn is text-only.
+      if (!text.trim() && !(isChat && this._outImages.length)) return;
       if (isChat) {
-        this._sendChat(text);
         this._draft = '';
         this._setDraftByAra(false);
       } else {
-        this._sendCompanion(text);
         this._compDraft = '';
       }
       input.value = '';
       field.classList.remove('has-text');
       grow();
+      // After the field reset: _sendChat consumes the staged images and
+      // replaces the composer block to drop their previews.
+      if (isChat) this._sendChat(text);
+      else this._sendCompanion(text);
     });
   }
 
@@ -963,14 +1165,138 @@ class RetinueChatPage extends HTMLElement {
     if (el) el.scrollTop = el.scrollHeight;
   }
 
-  // Live send: an optimistic bubble goes up at once, then is reconciled with
-  // the Message the server returns (POST /chats/<id>/send — the gateway
-  // records author `user`, and no policy category queues it: the user's send
-  // press IS the approval `verify` exists for). On failure the bubble comes
-  // back down and the words return to the composer.
+  // ── Staged outgoing images ─────────────────────────────────────────────────
+  async _addImages(files) {
+    this._imgError = '';
+    for (const file of files) {
+      if (!String(file.type || '').startsWith('image/')) {
+        this._imgError = `"${file.name}" is not an image.`;
+        continue;
+      }
+      if (this._outImages.length >= MAX_IMAGES_PER_SEND) {
+        this._imgError = `Up to ${MAX_IMAGES_PER_SEND} images per message.`;
+        break;
+      }
+      try {
+        const im = await this._prepareImage(file);
+        if (im.blob.size > MAX_IMAGE_BYTES) {
+          this._imgError = `"${file.name}" is too large.`;
+          continue;
+        }
+        im.url = URL.createObjectURL(im.blob);
+        im.name = file.name;
+        this._outImages.push(im);
+      } catch (_err) {
+        this._imgError = `Couldn't read "${file.name}".`;
+      }
+    }
+    this._refreshChatComposer();
+    // Back to the field to type the caption (the conversations composer's
+    // behaviour after attaching).
+    const ta = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+    if (ta) { try { ta.focus(); } catch (_e) { /* ignore */ } }
+  }
+
+  _removeImage(index) {
+    const [im] = this._outImages.splice(index, 1);
+    if (im) { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } }
+    this._imgError = '';
+    this._refreshChatComposer();
+  }
+
+  // Downscale/recompress one picked image the way the native clients do:
+  // longest edge to IMAGE_MAX_EDGE, JPEG at IMAGE_JPEG_QUALITY — except
+  // animated GIFs, which a canvas pass would freeze to one frame, so they
+  // pass through unchanged (still under the size cap). Returns {blob,
+  // content_type, width, height} — the real intrinsic size of what will be
+  // sent, so the optimistic bubble reserves the same box the server's
+  // ingest-sniffed dimensions will confirm.
+  async _prepareImage(file) {
+    if (file.type === 'image/gif' && await this._gifAnimated(file)) {
+      const bmp = await this._decodeImage(file);
+      return { blob: file, content_type: 'image/gif', width: bmp.width, height: bmp.height };
+    }
+    const bmp = await this._decodeImage(file);
+    const scale = Math.min(1, IMAGE_MAX_EDGE / Math.max(bmp.width, bmp.height));
+    const w = Math.max(1, Math.round(bmp.width * scale));
+    const h = Math.max(1, Math.round(bmp.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    canvas.getContext('2d').drawImage(bmp, 0, 0, w, h);
+    if (typeof bmp.close === 'function') { try { bmp.close(); } catch (_e) { /* ignore */ } }
+    const blob = await new Promise((res, rej) => canvas.toBlob(
+      (b) => (b ? res(b) : rej(new Error('encode'))), 'image/jpeg', IMAGE_JPEG_QUALITY));
+    return { blob, content_type: 'image/jpeg', width: w, height: h };
+  }
+
+  // createImageBitmap honours EXIF orientation; the Image fallback covers
+  // engines without it (a detached image's width/height are its intrinsic
+  // size, so both paths read uniformly).
+  async _decodeImage(file) {
+    if (typeof createImageBitmap === 'function') {
+      try { return await createImageBitmap(file, { imageOrientation: 'from-image' }); }
+      catch (_e) { /* fall through — option unsupported or decode failed */ }
+    }
+    return new Promise((res, rej) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => { URL.revokeObjectURL(url); res(img); };
+      img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('decode')); };
+      img.src = url;
+    });
+  }
+
+  // Animated = more than one Graphic Control Extension block (0x21 0xF9) in
+  // the stream — cheap, and exact enough for real-world GIFs.
+  async _gifAnimated(file) {
+    const buf = new Uint8Array(await file.arrayBuffer());
+    let count = 0;
+    for (let i = 0; i + 1 < buf.length; i += 1) {
+      if (buf[i] === 0x21 && buf[i + 1] === 0xf9) {
+        count += 1;
+        if (count > 1) return true;
+      }
+    }
+    return false;
+  }
+
+  // {content_type, data}: the payload item the send endpoint accepts. Base64
+  // via FileReader, so a large blob never hits a string-building loop.
+  _imagePayload(im) {
+    return new Promise((res, rej) => {
+      const r = new FileReader();
+      r.onload = () => res({
+        content_type: im.content_type,
+        data: String(r.result).split(',')[1] || '',
+      });
+      r.onerror = () => rej(new Error('read'));
+      r.readAsDataURL(im.blob);
+    });
+  }
+
+  // Live send: an optimistic bubble goes up at once — staged images showing
+  // their local previews in the same reserved boxes the server's dimensions
+  // will confirm — then is reconciled with the Message the server returns
+  // (POST /chats/<id>/send — the gateway records author `user`, and no policy
+  // category queues it: the user's send press IS the approval `verify` exists
+  // for). On failure the bubble comes back down and the words AND the staged
+  // images return to the composer for retry.
   async _sendChat(text) {
     if (this._draftTimer) clearTimeout(this._draftTimer);
     this._draftTimer = null;
+    const images = this._outImages;
+    this._outImages = [];
+    this._imgError = '';
+    if (images.length) {
+      const ta = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+      const hadFocus = !!ta && this.shadowRoot.activeElement === ta;
+      this._refreshChatComposer();
+      if (hadFocus) {
+        const next = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+        if (next) { try { next.focus(); } catch (_e) { /* ignore */ } }
+      }
+    }
     // Order matters server-side: let a save fired by the pre-tap blur settle
     // before the send clears the draft.
     if (this._draftInflight) { try { await this._draftInflight; } catch (_e) { /* ignore */ } }
@@ -983,46 +1309,74 @@ class RetinueChatPage extends HTMLElement {
       text,
       ts: new Date().toISOString(),
     };
+    if (images.length) {
+      local.attachments = images.map((im, i) => ({
+        id: `local-att-${this._localSeq}-${i}`,
+        url: im.url,
+        type: im.content_type,
+        width: im.width,
+        height: im.height,
+        name: im.name,
+      }));
+    }
     this._messages.push(local);
     this._appendMessage('[data-chat-thread]', local, true);
-    const node = this.shadowRoot.querySelector(
+    const findLocal = () => this.shadowRoot.querySelector(
       `[data-chat-thread] [data-mid="${local.id}"]`);
+    const node = findLocal();
     if (node) node.classList.add('sending');
     try {
+      const body = {};
+      if (!images.length || text.trim()) body.text = text;
+      if (images.length) {
+        body.images = await Promise.all(images.map((im) => this._imagePayload(im)));
+      }
       const res = await fetch(`/chats/${encodeURIComponent(this._id)}/send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) throw new Error(String(res.status));
       const msg = await res.json();
-      // Reconcile in place: the server's id, timestamp and shape replace the
-      // optimistic guess, and the poll's de-dup knows the message.
+      // Reconcile: the server's message replaces the optimistic bubble
+      // wholesale — same renderer, so nothing moves except the media sources,
+      // now the proxied URLs (the reserved boxes match by construction), and
+      // the poll's de-dup knows the message.
       const idx = this._messages.indexOf(local);
       if (idx >= 0) this._messages[idx] = msg;
       this._seen.add(msg.id);
-      if (node) {
-        node.classList.remove('sending');
-        node.setAttribute('data-mid', msg.id);
-        const stamp = node.querySelector('.stamp');
-        if (stamp) stamp.textContent = fmtTime(msg.ts);
+      const cur = findLocal();
+      if (cur) {
+        const tpl = document.createElement('template');
+        tpl.innerHTML = this._chatMsgHtml(msg);
+        cur.replaceWith(tpl.content.firstElementChild);
       }
+      images.forEach((im) => { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } });
       // The server cleared the shared draft and advanced the watermark with
       // this send; mirror both (the next draft save re-anchors its version
       // through the guard's one-shot retry).
       this._draftSaved = '';
       this._postRead(msg.ts);
     } catch (_err) {
-      // Not sent: take the bubble down, give the words back to the composer.
+      // Not sent: take the bubble down, give words and images back to the
+      // composer. The preview object URLs were never revoked, so the staged
+      // images are intact for the retry.
       const idx = this._messages.indexOf(local);
       if (idx >= 0) this._messages.splice(idx, 1);
-      if (node) {
-        const sep = node.previousElementSibling;
-        node.remove();
+      const cur = findLocal();
+      if (cur) {
+        const sep = cur.previousElementSibling;
+        cur.remove();
         // A day separator introduced just for this bubble goes with it.
         if (sep && sep.classList.contains('day-sep') && sep.nextElementSibling === null) sep.remove();
       }
-      this._restoreComposer(text);
+      if (images.length) {
+        this._outImages = images.concat(this._outImages);
+        this._draft = text;
+        this._refreshChatComposer();
+      } else {
+        this._restoreComposer(text);
+      }
       this._showNote("Couldn't send &mdash; check the connection and try again.");
     }
   }
@@ -1202,15 +1556,48 @@ const CSS = `
   .msg.by-agent .bubble a { color: var(--accent, #6ea8fe); }
   .stamp { display: inline-block; float: right; margin: 8px 0 0 8px;
            font-size: .66rem; opacity: .6; }
-  .att-img { display: block; max-width: min(280px, 100%); height: auto;
+  /* With intrinsic dimensions the true aspect box is reserved before the
+     bytes arrive: the inline aspect-ratio + fixed-length width from
+     _attachmentHtml size the element, height:auto follows the ratio, and
+     max-width:100% clamps inside a narrower bubble. */
+  .att-imgbtn { display: block; padding: 0; border: 0; background: transparent;
+                cursor: zoom-in; border-radius: 10px;
+                -webkit-tap-highlight-color: transparent; }
+  .att-imgbtn:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 1px; }
+  .att-img { display: block; max-width: 100%; height: auto;
              border-radius: 10px; margin: 2px 0 6px; }
-  /* No intrinsic dimensions in the record: a fixed frame keeps the box stable
-     through the lazy load (object-fit crops rather than reflows). */
-  .att-img.no-dims { width: min(220px, 100%); height: 160px; object-fit: cover;
+  /* No intrinsic dimensions in the record (older ledger entries): a fixed
+     frame keeps the box stable through the lazy load (object-fit crops
+     rather than reflows). The width is a fixed length on purpose — a
+     percentage re-resolves against the shrink-to-fit bubble once the
+     intrinsic ratio arrives, which would narrow the frame mid-load. */
+  .att-img.no-dims { width: 220px; max-width: 100%; height: 160px; object-fit: cover;
                      background: rgba(0, 0, 0, .2); }
+  /* A voice note's player sits above the transcript (the message text). Fixed
+     length + clamp, not a percentage — see .att-img.no-dims. */
+  .att-audio { display: block; width: 250px; max-width: 100%; height: 40px; margin: 2px 0 6px; }
+  .att-video { display: block; max-width: 100%; height: auto;
+               border-radius: 10px; margin: 2px 0 6px; background: rgba(0, 0, 0, .25); }
+  /* Dimension-less video: the same fixed-frame reservation as images (fixed
+     length, not a percentage — see .att-img.no-dims); the element letterboxes
+     the frames inside the held box once metadata lands. */
+  .att-video.no-dims { width: 280px; max-width: 100%; height: 180px; }
   .att-file { display: block; font-size: .82rem; margin: 2px 0 4px; }
   /* Optimistic bubble awaiting the server's send confirmation. */
   .msg.sending .bubble { opacity: .7; }
+
+  /* ── Lightbox ────────────────────────────────────────────────────────────── */
+  .lightbox { position: fixed; inset: 0; z-index: 60; background: rgba(4, 6, 10, .93);
+              display: flex; align-items: center; justify-content: center; outline: none; }
+  .lightbox .lb-img { max-width: 100vw; max-height: 100vh; max-height: 100dvh;
+                      object-fit: contain; }
+  .lightbox .lb-close { position: fixed; top: calc(env(safe-area-inset-top, 0px) + 10px);
+                        right: calc(env(safe-area-inset-right, 0px) + 10px);
+                        width: 40px; height: 40px; border-radius: 50%; border: 0;
+                        display: inline-flex; align-items: center; justify-content: center;
+                        background: rgba(255, 255, 255, .14); color: #fff; font-size: 1rem;
+                        cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .lightbox .lb-close:hover { background: rgba(255, 255, 255, .28); }
 
   /* ── Composer ────────────────────────────────────────────────────────────── */
   .composer { flex: none; margin-top: 4px; padding: 10px 2px 2px;
@@ -1227,6 +1614,25 @@ const CSS = `
                background: rgba(110, 168, 254, .12); color: var(--accent, #6ea8fe);
                font-size: .74rem; font-weight: 600; }
   .row { display: flex; gap: 6px; align-items: flex-end; }
+  /* Image attach controls: the paperclip (and, on capture-capable devices,
+     the camera) — labels over hidden file inputs, in the mic button's round
+     dress so the row reads as one family. */
+  .attach-btn { display: inline-flex; align-items: center; justify-content: center;
+                width: 40px; height: 40px; flex: none; border-radius: 50%;
+                background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
+                font-size: 1.05rem; cursor: pointer; user-select: none;
+                -webkit-tap-highlight-color: transparent; }
+  .attach-btn:hover { background: rgba(110, 168, 254, .2); }
+  /* Staged images: removable thumbnails riding above the input row. */
+  .img-previews { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 10px; }
+  .imgp { position: relative; }
+  .imgp img { display: block; width: 56px; height: 56px; object-fit: cover;
+              border-radius: 10px; background: var(--card-2, #1c2230); }
+  .imgp-x { position: absolute; top: -6px; right: -6px; width: 22px; height: 22px;
+            display: inline-flex; align-items: center; justify-content: center;
+            border: 0; border-radius: 50%; padding: 0; cursor: pointer;
+            background: var(--high, #ff6b6b); color: #fff; font-size: .66rem;
+            -webkit-tap-highlight-color: transparent; }
   .field { flex: 1; min-width: 0; position: relative; display: flex; }
   .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 35vh;
                   background: var(--card-2, #1c2230); border: 0; border-radius: 20px;

@@ -79,7 +79,7 @@ class RetinueConversations extends HTMLElement {
     this._listSig = '';
     this._threadSig = '';
     this._full = false;      // full mode: dedicated all-conversations page
-    this._scope = 'active';  // full-mode thread filter: active|archived|edits
+    this._scope = 'active';  // full-mode thread filter: active|archived|edits|cowork
     this._composeProject = null;      // project URI the composer is about, if any
     this._composeProjectTitle = '';   // its display title (for the chip)
     this._pushDepth = 0;     // history entries we pushed and have not unwound
@@ -234,12 +234,14 @@ class RetinueConversations extends HTMLElement {
     return hasDraft || hasFiles;
   }
 
-  // In full mode the filter can request the archived scope or the (normally
-  // hidden) project edit-command threads; otherwise we list active chat
-  // threads — the default the dashboard card and agents expect.
+  // In full mode the filter can request the archived scope or either of the
+  // normally hidden kinds — project edit-command threads and the Ask-Ara MCP
+  // connector's cowork audit threads; otherwise we list active chat threads —
+  // the default the dashboard card and agents expect.
   _listUrl() {
     if (this._full && this._scope === 'archived') return `${LIST_URL}?archived=1`;
     if (this._full && this._scope === 'edits') return `${LIST_URL}?all=1&kind=edit`;
+    if (this._full && this._scope === 'cowork') return `${LIST_URL}?all=1&kind=cowork`;
     return LIST_URL;
   }
 
@@ -374,7 +376,7 @@ class RetinueConversations extends HTMLElement {
     }
   }
 
-  // Switch the full-page Active/Archived filter and reload that scope.
+  // Switch the full-page thread filter and reload that scope.
   _setScope(scope) {
     if (this._scope === scope) return;
     this._scope = scope;
@@ -596,14 +598,16 @@ class RetinueConversations extends HTMLElement {
       `<div class="list-foot">${newBtn}${this._footerHtml()}</div>`;
   }
 
-  // Active/Archived/Edits switch — only in the dedicated full-page view. The
-  // Edits filter is where the normally hidden project edit-command threads
-  // remain reachable.
+  // Active/Archived/Edits/Cowork switch — only in the dedicated full-page view.
+  // The last two filters are where the normally hidden kinds remain reachable:
+  // project edit-command threads, and the audit threads the Ask-Ara MCP
+  // connector writes for every exchange with an outside Claude session.
   _filterHtml() {
     if (!this._full) return '';
     const tab = (scope, label) =>
       `<button class="filter-tab${this._scope === scope ? ' on' : ''}" data-scope="${scope}">${label}</button>`;
-    return `<div class="filter">${tab('active', 'Active')}${tab('archived', 'Archived')}${tab('edits', 'Edits')}</div>`;
+    return `<div class="filter">${tab('active', 'Active')}${tab('archived', 'Archived')}` +
+      `${tab('edits', 'Edits')}${tab('cowork', 'Cowork')}</div>`;
   }
 
   _emptyHtml() {
@@ -612,7 +616,9 @@ class RetinueConversations extends HTMLElement {
       ? 'No archived conversations.'
       : (this._full && this._scope === 'edits')
         ? 'No edit commands yet. Dictate or type one on a project page.'
-        : 'No conversations yet.';
+        : (this._full && this._scope === 'cowork')
+          ? 'No cowork sessions yet. These appear when an outside Claude session asks Ara something.'
+          : 'No conversations yet.';
     return `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span><p>${msg}</p></div>`;
   }
 

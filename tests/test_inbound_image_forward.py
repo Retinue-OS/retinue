@@ -188,15 +188,16 @@ def test_whatsapp_inbound_image_files():
         assert files[0]["filename"].endswith(".png")
         assert base64.b64decode(files[0]["data"]) == PNG_BYTES
         assert not media.exists()  # temp file cleaned up
-        # The durable HTTP reference is stored and points at GET /media/<id>.
-        assert len(urls) == 1 and "/media/" in urls[0], urls
+        # The durable reference is stored: a host-free urn:retinue:media:<channel>:<id>
+        # naming the blob, which the reader resolves through the chat's account.
+        assert len(urls) == 1 and "urn:retinue:media:" in urls[0], urls
 
         # Oversized image → forwarded without the base64 payload, but the durable
         # reference is stored regardless of size (consistency over data-in-graph).
         media.write_bytes(PNG_BYTES)
         wg.MAX_INBOUND_FILE_BYTES = 4
         files, urls = wg._inbound_image_files(message)
-        assert files == [] and len(urls) == 1 and "/media/" in urls[0], (files, urls)
+        assert files == [] and len(urls) == 1 and "urn:retinue:media:" in urls[0], (files, urls)
         # No image in the message → no download attempted, no ref stored.
         assert wg._inbound_image_files(types.SimpleNamespace()) == ([], [])
     print("ok: whatsapp inbound image becomes a files payload + durable ref")
@@ -261,7 +262,7 @@ def test_signal_split_attachments():
         audio = [f for f in files if f["filename"].startswith("signal-voice")]
         assert len(audio) == 1 and base64.b64decode(audio[0]["data"]) == b"fake-ogg", audio
         # Both attachments (image + voice) get a durable HTTP reference.
-        assert len(urls) == 2 and all("/media/" in u for u in urls), urls
+        assert len(urls) == 2 and all("urn:retinue:media:" in u for u in urls), urls
 
         # Legacy: an attachment with no contentType keeps the voice-note path —
         # still transcribed, still referenced, and now carried as audio too.
@@ -270,7 +271,7 @@ def test_signal_split_attachments():
         ]))
         assert voice == voice_file
         assert [f for f in files if f["filename"].startswith("signal-image")] == []
-        assert len(urls) == 1 and "/media/" in urls[0], urls
+        assert len(urls) == 1 and "urn:retinue:media:" in urls[0], urls
 
         # Oversized image → dropped from the forwarded payload, but its durable
         # reference is stored regardless of size (consistency over data-in-graph).
@@ -279,7 +280,7 @@ def test_signal_split_attachments():
             {"contentType": "image/jpeg", "file": str(image_file)},
         ]))
         assert voice is None and files == []
-        assert len(urls) == 1 and "/media/" in urls[0], urls
+        assert len(urls) == 1 and "urn:retinue:media:" in urls[0], urls
     print("ok: signal attachments split into voice/image payloads + durable refs")
 
 
@@ -321,14 +322,14 @@ def test_telegram_inbound_image_files():
         assert files[0]["filename"].endswith(".png")
         assert base64.b64decode(files[0]["data"]) == PNG_BYTES
         assert not image.exists()  # temp file cleaned up
-        assert len(urls) == 1 and "/media/" in urls[0], urls
+        assert len(urls) == 1 and "urn:retinue:media:" in urls[0], urls
 
         assert tg._inbound_image_files(None, None) == ([], [])
         # Oversized → no forwarded payload, but the durable reference is kept.
         image.write_bytes(PNG_BYTES)
         tg.MAX_INBOUND_FILE_BYTES = 4
         files, urls = tg._inbound_image_files(str(image), "image/png")
-        assert files == [] and len(urls) == 1 and "/media/" in urls[0], (files, urls)
+        assert files == [] and len(urls) == 1 and "urn:retinue:media:" in urls[0], (files, urls)
     print("ok: telegram inbound image becomes a files payload + durable ref")
 
 

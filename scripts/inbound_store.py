@@ -96,13 +96,15 @@ P_SENT_AT = KB + "sentAt"
 # another device, captured from the channel's echo/sync stream).
 AUTHORS = ("user", "agent", "device")
 # A message's media (voice note, image) is NOT embedded in the graph: consistency
-# over data-in-graph means every attachment — regardless of size — is a *reference*
-# resolved over HTTP, never an inline data-URI literal. This predicate carries that
-# reference as an IRI object (the gateway's own token-gated GET /media/<id> URL);
-# it is multi-valued, so a message with several images gets one triple each. The
-# attachment's media type is not stored here on purpose — it is returned by the
-# HTTP response's Content-Type header when the reference is resolved, which is
-# where a media type belongs once the payload lives behind a URL.
+# over data-in-graph means every attachment — regardless of size — is a *reference*,
+# never an inline data-URI literal. This predicate carries that reference as an IRI
+# object: a host-free ``urn:retinue:media:<channel>:<id>`` naming the blob, which
+# the gateway serves from its own token-gated GET /media/<id>. The reference states
+# *which* blob and deliberately not where to fetch it — a gateway's address is the
+# reader's configuration (its messenger registry), and a record that also carried
+# one would be a second source of truth free to drift from it. Multi-valued, so a
+# message with several images gets one triple each. The media type is not stored
+# here on purpose — it comes back in the serving response's Content-Type header.
 P_ATTACHMENT = KB + "attachment"
 # Optional reference to a retained raw-media file (e.g. a voice note's audio),
 # recorded when a message is persisted *before* transcription so a failed or
@@ -367,9 +369,10 @@ def write_message(
     ``message_id`` is the channel-native message identifier, which is what a
     reaction or quoted reply later targets.
 
-    ``attachment_urls`` are HTTP-resolvable references to this message's media
-    (voice note, image), each emitted as a ``kb:attachment`` IRI. The bytes are
-    never inlined into the graph — see :func:`store_media`.
+    ``attachment_urls`` are references to this message's media (voice note,
+    image), each emitted as a ``kb:attachment`` IRI — see :data:`P_ATTACHMENT`
+    for the shape. The bytes are never inlined into the graph; see
+    :func:`store_media`.
 
     ``media`` optionally records a reference (a durable file path) to raw media
     retained alongside this message — used by the persist-before-transcribe path
@@ -530,9 +533,11 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     pre-sidecar behaviour. None of these files carries an RDF extension, so the
     life store never indexes them.
 
-    The caller builds the HTTP reference (``…/media/<id>``) and passes it to
-    :func:`write_message` as an ``attachment_urls`` entry; the bytes stay on disk
-    and out of the graph.
+    The caller builds the reference — a host-free
+    ``urn:retinue:media:<channel>:<id>``, see :data:`P_ATTACHMENT` — and passes
+    it to :func:`write_message` as an ``attachment_urls`` entry; the bytes stay
+    on disk and out of the graph, and the reader resolves the reference through
+    the account that owns the chat.
     """
     media_id = secrets.token_hex(16)
     d = media_dir(store_dir)
