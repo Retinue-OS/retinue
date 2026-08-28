@@ -30,6 +30,18 @@ keep it archived" is expressed. Set the flags (no message) with:
 
     conversation-push.py --thread 42ecb0113a3d48ac87be514cfaf99a7c --archive --mute
 
+Use --context to hand machine-usable context to the Ara sessions that will
+later serve this thread, without showing it to the user — canonically the
+exact reply command (reply token included) for a proposed messenger reply:
+
+    conversation-push.py --title "WhatsApp von Mara" \
+        --context 'Reply via: python3 /workspace/scripts/whatsapp-push.py --reply-to <token> "<text>"' \
+        "Neue Nachricht von Mara: … Entwurf-Antwort: … Senden, anpassen oder verwerfen?"
+
+The context is stored on the message and replayed in every later engage of the
+thread, so the session acting on the user's approval replies by token instead
+of re-resolving the sender's name (which can land on the wrong account).
+
 The thread appears on the dashboard with an unread badge; when the user replies,
 Ara picks up the thread (with full context) and carries out what they approve.
 
@@ -84,6 +96,13 @@ def main() -> int:
     parser.add_argument("--agent",
                         help="subagent name to show as the message sender (e.g. Coach), "
                              "when a relay answers on its behalf")
+    parser.add_argument("--context", metavar="TEXT",
+                        help="agent-only context stored with the message: replayed to every "
+                             "later Ara session in this thread but never rendered to the "
+                             "user. Canonical use: the exact reply command (reply token "
+                             "included) for a proposed messenger reply, so the session "
+                             "acting on the user's approval replies by token instead of "
+                             "resolving the sender's name")
     parser.add_argument("--attach", action="append", default=[], metavar="PATH",
                         help="attach a file the user can download from the thread (repeatable)")
     parser.add_argument("--url", default=None, help=f"endpoint URL (default {DEFAULT_URL})")
@@ -115,6 +134,12 @@ def main() -> int:
         print("conversation-push: --archive/--mute cannot be combined with a message",
               file=sys.stderr)
         return 2
+    # Context rides with a message; on a flags-only call there is no message
+    # to carry it.
+    if flags_only and args.context:
+        print("conversation-push: --context cannot be combined with --archive/--mute",
+              file=sys.stderr)
+        return 2
 
     url = args.url or DEFAULT_URL
     if args.thread and not args.url:
@@ -131,6 +156,8 @@ def main() -> int:
         payload["message"] = message
         if args.agent:
             payload["agent"] = args.agent
+        if args.context:
+            payload["context"] = args.context
     if args.title:
         payload["title"] = args.title
     if args.on_behalf_of:

@@ -44,14 +44,21 @@ Projects (dashboard project pages):
                                          CONVERSATION_BACKEND_TOKEN (header
                                          X-Conversation-Backend-Token). Optional
                                          {kind: "cowork"} for the MCP connector's
-                                         audit trail and {quiet: true} to append
-                                         without an unread badge or Web Push.
+                                         audit trail, {quiet: true} to append
+                                         without an unread badge or Web Push, and
+                                         {context: "..."} — agent-only context
+                                         stored on the message and replayed to
+                                         every later Ara session in the thread,
+                                         never rendered to the user (e.g. the
+                                         exact reply command, with reply token,
+                                         for a proposed messenger reply).
   POST /internal/conversations/<id>/messages
                                       -> a retinue agent appends a message (with
                                          attachments) to an existing thread. Same
-                                         token gate; same optional {quiet: true}.
-                                         A non-quiet append un-archives the
-                                         thread unless it is muted.
+                                         token gate; same optional {quiet: true}
+                                         and {context: "..."}. A non-quiet append
+                                         un-archives the thread unless it is
+                                         muted.
   POST /internal/conversations/<id>/flags
                                       -> a retinue agent sets {archived, muted}
                                          (either or both). Same token gate. The
@@ -1695,7 +1702,8 @@ def _new_conv(initiator: str, owner: str, title: str | None,
               project: str | None = None,
               project_title: str | None = None,
               model: str | None = None,
-              agent: str | None = None) -> dict:
+              agent: str | None = None,
+              context: str | None = None) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cid = uuid.uuid4().hex
     first_msg = {"role": first_role, "text": first_text, "ts": now}
@@ -1706,6 +1714,10 @@ def _new_conv(initiator: str, owner: str, title: str | None,
         # Overrides the displayed sender name (e.g. "Coach") when a relay
         # opens a thread on a subagent's behalf — see _conv_add_message.
         first_msg["agent"] = agent
+    if context:
+        # Agent-only context replayed to Ara's sessions, never rendered to the
+        # user — see _conv_context_note.
+        first_msg["context"] = context
     conv = {
         "id": cid,
         "title": title or _derive_title(first_text),
@@ -1766,6 +1778,7 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       model_name: str | None = None,
                       cost_usd: float | None = None,
                       agent: str | None = None,
+                      context: str | None = None,
                       wake: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
@@ -1773,7 +1786,9 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     label and whole-turn list-price cost) so the dashboard can show it in the
     bubble header; both are byproducts of the answer call and cost nothing extra
     to surface. `agent` overrides the displayed sender name (e.g. "Coach") when
-    a relay answers on a subagent's behalf.
+    a relay answers on a subagent's behalf. `context` is agent-only context
+    stored with the message and replayed to Ara's sessions, never rendered to
+    the user — see _conv_context_note.
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -1802,6 +1817,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["cost_usd"] = float(cost_usd)
         if agent:
             message["agent"] = agent
+        if context:
+            message["context"] = context
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
         if wake and conv.get("archived") and not conv.get("muted"):
@@ -1882,15 +1899,33 @@ def _conv_attachment_note(conv: dict, msg: dict) -> str:
             "relevant (you run in the same container):\n" + "\n".join(lines))
 
 
+def _conv_context_note(msg: dict) -> str:
+    """Agent-only context carried by a message, framed for Ara's transcript.
+
+    An agent posting into a thread may attach machine-usable context the user
+    should never see — canonically the exact reply command (with its reply
+    token) for a proposed messenger reply, so the session that later acts on
+    the user's approval addresses the reply by token instead of re-resolving
+    the sender's name. The dashboard renders only a message's `text`, so the
+    context is invisible there; this note is how it reaches every later Ara
+    session in the thread."""
+    ctx = str(msg.get("context") or "").strip()
+    if not ctx:
+        return ""
+    return ("\n\n[Agent context carried with this message — for you, "
+            "not shown to the user:\n" + ctx + "]")
+
+
 # How a message's author is named when a transcript is replayed to Ara.
 _CONV_ROLE_LABEL = {"user": "User", "assistant": "You (Ara)", "agent": "Retinue agent"}
 
 
 def _conv_render_messages(conv: dict, messages: list) -> str:
-    """Render messages as a labelled transcript, each with its attachments."""
+    """Render messages as a labelled transcript, each with its attachments
+    and any agent-only context."""
     return "\n".join(
         f"{_CONV_ROLE_LABEL.get(m.get('role'), m.get('role'))}: "
-        f"{m.get('text', '')}{_conv_attachment_note(conv, m)}"
+        f"{m.get('text', '')}{_conv_attachment_note(conv, m)}{_conv_context_note(m)}"
         for m in messages
     )
 
@@ -1966,7 +2001,7 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     if fresh:
         unseen = _conv_unseen_messages(messages)
         if len(unseen) <= 1:
-            return (latest + note) or latest
+            return (latest + note + _conv_context_note(latest_msg)) or latest
         return (
             "These messages arrived in this thread since your last reply, "
             "oldest first — you have not seen them yet:\n\n"
@@ -5337,9 +5372,13 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid kind"})
             return
         quiet = bool(payload.get("quiet"))
+        # Agent-only context (e.g. the reply command for a proposed messenger
+        # reply, reply token included) — replayed to Ara's sessions in this
+        # thread, never rendered to the user.
+        context = str(payload.get("context") or "").strip() or None
         conv = _new_conv("agent", owner, title, "agent", message,
                          first_attachments=payload.get("attachments"),
-                         kind=kind, agent=agent)
+                         kind=kind, agent=agent, context=context)
         body = {"id": conv["id"], "title": conv["title"]}
         if quiet:
             _conv_set_flags(conv["id"], unread=False)
@@ -5379,9 +5418,10 @@ class Handler(BaseHTTPRequestHandler):
         # `agent` overrides the displayed sender name (e.g. "Coach") when a
         # relay answers on a subagent's behalf — this is that relay path.
         agent = (payload.get("agent") or "").strip() or None
+        context = str(payload.get("context") or "").strip() or None
         conv = _conv_add_message(cid, "agent", message, unread=not quiet,
                                  attachments=attachments, wake=not quiet,
-                                 agent=agent)
+                                 agent=agent, context=context)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
