@@ -115,9 +115,17 @@ main:has(retinue-conversations[data-view="composer"]) {
   overflow: hidden;
 }
 main:has(retinue-conversations[data-view="thread"])
-  :is(.top, .splitter, retinue-news, .col-side, retinue-app-launcher),
+  :is(.top, .splitter, .col-side, retinue-app-launcher),
 main:has(retinue-conversations[data-view="composer"])
-  :is(.top, .splitter, retinue-news, .col-side, retinue-app-launcher) {
+  :is(.top, .splitter, .col-side, retinue-app-launcher),
+/* …and every other card sharing the main column. Matched by position rather
+   than named one by one: the enumeration silently stopped covering the column
+   the moment a card was added to it, which is how the chats list stayed on
+   screen above an open thread. */
+main:has(retinue-conversations[data-view="thread"])
+  .col-main > :not(retinue-conversations),
+main:has(retinue-conversations[data-view="composer"])
+  .col-main > :not(retinue-conversations) {
   display: none;
 }
 

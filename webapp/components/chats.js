@@ -212,7 +212,7 @@ class RetinueChats extends RetinueCard {
     const chats = all.filter((c) => !!c.archived === archived);
     if (!chats.length) {
       const msg = archived ? 'No archived chats.' : 'No chats yet.';
-      return `${this._filterHtml()}<p class="muted">${msg}</p>`;
+      return `${this._filterHtml()}<p class="muted">${msg}</p>${this._footHtml()}`;
     }
     const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
     const rows = shown.map((c) => {
@@ -235,9 +235,20 @@ class RetinueChats extends RetinueCard {
         badge +
         `</a></li>`;
     }).join('');
-    const foot = this._full ? ''
-      : `<div class="foot"><a class="all-link" href="/chats.html">All chats &#8594;</a></div>`;
-    return `${this._filterHtml()}<ul class="list">${rows}</ul>${foot}`;
+    return `${this._filterHtml()}<ul class="list">${rows}</ul>${this._footHtml()}`;
+  }
+
+  // The card leads deeper (the full list); the full page leads back out. The
+  // way back matters more than it looks: chats.html carries no chrome of its
+  // own, so without this link the only exit is the browser's back gesture —
+  // and there is none at all once the page is opened from the home screen as
+  // an installed PWA. Every other full list page (conversations, projects,
+  // news) offers the same return, in the same place.
+  _footHtml() {
+    const link = this._full
+      ? '<a class="all-link" href="/">&larr; Back to dashboard</a>'
+      : '<a class="all-link" href="/chats.html">All chats &#8594;</a>';
+    return `<div class="foot">${link}</div>`;
   }
 }
 
