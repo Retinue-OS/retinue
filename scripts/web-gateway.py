@@ -808,6 +808,13 @@ CHAT_PAGE_MESSAGES = int(os.environ.get("CHAT_PAGE_MESSAGES", "200"))
 CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "3"))
 # Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
 CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
+# How long a gateway's identity (mode + account, read from its /health) is
+# reused. Long on success — an account's mode and number do not change under a
+# running container — and short after a failed probe, so a gateway that was
+# unreachable or still starting is re-checked promptly.
+CHAT_GATEWAY_IDENTITY_TTL = float(os.environ.get("CHAT_GATEWAY_IDENTITY_TTL", "300"))
+CHAT_GATEWAY_IDENTITY_TTL_FAIL = float(
+    os.environ.get("CHAT_GATEWAY_IDENTITY_TTL_FAIL", "15"))
 # Voice input: the dashboard uploads recorded audio here and we proxy it to the
 # shared STT service (scripts/stt-service.py), which owns the Whisper model — so
 # this image ships no ASR stack. Empty URL disables the feature (the endpoint
@@ -3372,6 +3379,8 @@ _INTERNAL_CHAT_DRAFT_RE = re.compile(r"^/internal/chats/([^/]+)/draft/?$")
 # construction; the slug charset matches the gateway-registry slugs.
 _CHAT_MEDIA_RE = re.compile(r"^/chats/media/([A-Za-z0-9._-]+)/([0-9a-f]{32})/?$")
 _CHAT_MEDIA_PATH_RE = re.compile(r"^/media/([0-9a-f]{32})/?$")
+# The host-free reference a gateway records today: urn:retinue:media:<channel>:<id>.
+_CHAT_MEDIA_URN_RE = re.compile(r"^urn:retinue:media:([a-z0-9_]+):([0-9a-f]{32})$")
 _CHAT_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 _T_CHAT_OUTBOUND = _KB + "OutboundMessage"
 
@@ -3482,24 +3491,31 @@ def _chat_is_group(channel: str, key: str) -> bool:
     return False
 
 
-def _rewrite_media_url(url: str) -> tuple[str, str | None]:
-    """Rewrite a ledger media reference to the authenticated proxy URL.
+def _parse_media_reference(url: str) -> tuple[str | None, str | None]:
+    """Read a ledger media reference: ``(media_id, legacy_slug)``.
 
-    The stored references are the gateways' own token-gated /media/<id> URLs on
-    the internal network (http://<service>:<port>/media/<id>) — unreachable and
-    unauthenticated from the browser. They become /chats/media/<slug>/<id>,
-    served below behind the dashboard's edge auth; the slug is the service
-    hostname, i.e. the gateway-registry key, so the proxy knows which gateway
-    (and which token) to fetch from. Returns ``(public_url, media_id)``;
-    anything that is not a gateway media reference passes through unchanged."""
+    Two shapes exist. Current records are host-free URNs,
+    ``urn:retinue:media:<channel>:<id>`` — a gateway states which blob, never
+    where to fetch it, because the address of an account is the reader's own
+    registry entry. Records written before that carry the gateway's self-
+    declared URL, ``http://<service>:<port>/media/<id>``; those still render,
+    with the recorded service name kept as a last-resort serving slug.
+
+    Either way the id identifies the blob; who serves it is decided by the
+    caller from the chat's account. Returns ``(None, None)`` for anything that
+    is not a media reference."""
+    text = (url or "").strip()
+    m = _CHAT_MEDIA_URN_RE.match(text)
+    if m:
+        return m.group(2), None
     try:
-        parts = urllib.parse.urlsplit(url)
+        parts = urllib.parse.urlsplit(text)
     except ValueError:
-        return url, None
+        return None, None
     m = _CHAT_MEDIA_PATH_RE.match(parts.path or "")
     if not m or not parts.hostname:
-        return url, None
-    return f"/chats/media/{parts.hostname}/{m.group(1)}", m.group(1)
+        return None, None
+    return m.group(1), parts.hostname
 
 
 def _chat_media_meta(channel: str, media_id: str) -> tuple[str | None, int | None]:
@@ -3526,12 +3542,31 @@ def _chat_media_meta(channel: str, media_id: str) -> tuple[str | None, int | Non
     return ctype, size
 
 
-def _shape_chat_attachments(urls: list[str], channel: str) -> list[dict]:
+def _shape_chat_attachments(urls: list[str], channel: str,
+                            serving_slug: str | None = None) -> list[dict]:
+    """Shape ledger attachment references for the client.
+
+    Blobs live on the gateway that received them and are served through this
+    gateway's authenticated proxy, ``/chats/media/<slug>/<id>``. Which gateway
+    that is comes from ``serving_slug``, the chat's resolved account: a
+    reference names the blob, not a host (see :func:`_parse_media_reference`).
+
+    ``serving_slug`` is only ever the answer of :func:`_chat_gateway`, which is
+    either an account-derived stamp or the channel's single inbox account —
+    never an untrusted stamp and never a pick among several. So a redirect can
+    never reach an account that may not own the chat. Where ownership is
+    unproven the caller passes None: a legacy record then falls back to the
+    service name it recorded (which may 404), and a host-free one is passed
+    through verbatim and plainly fails to load. Both are honest failures in a
+    chat whose account is ambiguous — where sending is refused anyway — and
+    both beat silently reading another account's media."""
     out = []
     for url in urls:
         if not url:
             continue
-        public, media_id = _rewrite_media_url(url)
+        media_id, legacy_slug = _parse_media_reference(url)
+        slug = serving_slug or legacy_slug
+        public = f"/chats/media/{slug}/{media_id}" if (media_id and slug) else url
         att: dict = {"id": media_id or public, "url": public}
         ctype, size = _chat_media_meta(channel, media_id or "")
         if ctype:
@@ -3549,7 +3584,8 @@ def _shape_chat_message(chat_id: str, channel: str, *, direction: str,
                         sender_name: str | None = None,
                         author: str | None = None, agent: str | None = None,
                         attachment_urls: list[str] | None = None,
-                        roster: dict | None = None) -> dict:
+                        roster: dict | None = None,
+                        serving_slug: str | None = None) -> dict:
     """One contract Message: {id, chat, direction, …} (webapp/README.md)."""
     msg: dict = {
         "id": message_id or subject or f"{chat_id}#{ts}",
@@ -3568,7 +3604,8 @@ def _shape_chat_message(chat_id: str, channel: str, *, direction: str,
         name = sender_name or (roster or {}).get(sender or "")
         if name:
             msg["sender_name"] = name
-    atts = _shape_chat_attachments(attachment_urls or [], channel)
+    atts = _shape_chat_attachments(attachment_urls or [], channel,
+                                   serving_slug=serving_slug)
     if atts:
         msg["attachments"] = atts
     return msg
@@ -3783,6 +3820,11 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     channel, key = chat_state_mod.split_chat_id(chat_id)
     doc = _CHAT_STATE.get(chat_id)
     roster = doc.get("roster") or {}
+    # The account this chat belongs to, when it can be told: media is served
+    # through it rather than through the host recorded in each reference (see
+    # _shape_chat_attachments). A chat whose account is ambiguous still lists
+    # its messages — only sending refuses — so this stays best-effort.
+    serving_slug, _gw, _err = _chat_gateway(doc, channel)
     before_clause = f"FILTER(?ts < {_sparql_datetime(before)})" if before else ""
     query = _CHAT_MESSAGES_SPARQL % {
         "chat": _sparql_str(key),
@@ -3805,7 +3847,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
             direction="out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
             text=text, ts=ts, message_id=mid, subject=_bval(b, "m"),
             sender=_bval(b, "sender"), author=_bval(b, "author"),
-            attachment_urls=atts, roster=roster))
+            attachment_urls=atts, roster=roster, serving_slug=serving_slug))
         if mid:
             seen_mids.add(mid)
         seen_fallback.add((ts, text))
@@ -3828,7 +3870,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
                 sender_name=entry.get("sender_name"),
                 author=entry.get("author"), agent=entry.get("agent"),
                 attachment_urls=entry.get("attachments") or [],
-                roster=roster))
+                roster=roster, serving_slug=serving_slug))
         messages.sort(key=lambda m: m["ts"])
 
     summary = _chat_summary(chat_id)
@@ -3863,15 +3905,179 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     }
 
 
+# -- Which account a chat belongs to ------------------------------------------
+# Sending as the wrong identity is worse than not sending: the message goes out
+# over a conversation the user cannot see, and the reply lands somewhere they
+# will never look. So chat routing is identity-first and fail-closed:
+#
+#   * only an **inbox**-mode account may own a chat (a control account's traffic
+#     is prompts to Ara, and ledger persistence is inbox-gated, so a control
+#     account can never legitimately hold one);
+#   * a gateway's identity comes from its own /health — its mode and the account
+#     it sends as — and never from a slug or address a container states about
+#     itself. Where a gateway lives is this side's configuration (the messenger
+#     registry); a gateway that also declared it was a second source of truth,
+#     and its drift is what stamped one account's chats with another's slug;
+#   * when the correct account cannot be determined, the send is REFUSED with
+#     the real reason rather than routed by guess.
+
+_gw_identity_lock = threading.Lock()
+# slug -> {"mode": str|None, "account": str|None, "at": float, "ok": bool}
+_gw_identity: dict[str, dict] = {}
+
+
+def _gateway_identity(slug: str, gw: dict, refresh: bool = False) -> dict:
+    """One gateway's ``{"mode", "account"}``, cached; never raises.
+
+    A failed probe keeps the last known-good identity and merely re-probes
+    sooner: a health blip must degrade gracefully — an account known to be
+    inbox a minute ago still routes — rather than lock the user out of sending.
+    A gateway that has never answered, or one too old to report a mode, has
+    mode None, which is eligible for nothing."""
+    now = time.time()
+    with _gw_identity_lock:
+        entry = _gw_identity.get(slug)
+    if entry is not None and not refresh:
+        ttl = CHAT_GATEWAY_IDENTITY_TTL if entry["ok"] else CHAT_GATEWAY_IDENTITY_TTL_FAIL
+        if now - entry["at"] <= ttl:
+            return entry
+    health = _fetch_gateway_health(gw)  # unreachable is a verdict, not a raise
+    mode = health.get("mode")
+    if isinstance(mode, str) and mode:
+        fresh = {"mode": mode, "account": (health.get("account") or None),
+                 "at": now, "ok": True}
+    else:
+        fresh = ({"mode": entry["mode"], "account": entry["account"]}
+                 if entry is not None else {"mode": None, "account": None})
+        fresh.update({"at": now, "ok": False})
+    with _gw_identity_lock:
+        _gw_identity[slug] = fresh
+    return fresh
+
+
+def _gateway_is_inbox(slug: str, gw: dict) -> bool:
+    return _gateway_identity(slug, gw).get("mode") == "inbox"
+
+
+def _gateway_in_channel(slug: str, gw: dict, channel: str) -> bool:
+    """Whether a registry gateway serves this channel.
+
+    The registry keys by service hostname and keeps no channel field, so this
+    reads the two things that do carry it: the slug (``signal-gateway``,
+    ``signal-gateway-personal`` — the /gateways pairing hints match the same
+    way) and the label the built-ins set to the channel name. A gateway named
+    after neither is not considered for an unstamped chat: refusing beats
+    guessing an identity."""
+    channel = (channel or "").lower()
+    if not channel:
+        return False
+    if slug == channel or slug.startswith(channel + "-"):
+        return True
+    return str(gw.get("label") or "").strip().lower().startswith(channel)
+
+
+def _inbox_gateways(channel: str) -> list:
+    """Every inbox-mode gateway serving this channel, slug-sorted."""
+    return [(slug, gw) for slug, gw in sorted(_CHANNEL_GATEWAYS.items())
+            if _gateway_in_channel(slug, gw, channel) and _gateway_is_inbox(slug, gw)]
+
+
+def _slug_for_account(channel: str, account: str) -> str | None:
+    """The registry slug of the gateway sending as ``account``, or None.
+
+    This is the rail's routing key: an account is unambiguous per container, a
+    self-derived slug is not. Identities are compared normalized, so the same
+    number formatted differently on either side still matches."""
+    wanted = normalize_requester_identity(account or "")
+    if not wanted:
+        return None
+    for slug, gw in sorted(_CHANNEL_GATEWAYS.items()):
+        if not _gateway_in_channel(slug, gw, channel):
+            continue
+        known = _gateway_identity(slug, gw).get("account")
+        if known and normalize_requester_identity(known) == wanted:
+            return slug
+    return None
+
+
+def _rail_gateway_slug(channel: str, account: str | None) -> str | None:
+    """Attribute one rail event to a registry gateway by account, or None.
+
+    The account is the only identity an event asserts, and the only one worth
+    trusting: it is matched against what the registry's gateways report for
+    themselves. An event states nothing about where it came from — a gateway
+    that named its own address or slug would be a second source of truth, and
+    its drift is what mis-routed sends to the wrong identity. An unrecognised
+    (or absent) account leaves the chat unstamped, and routing falls back to
+    the unambiguous single-inbox-account case or refuses."""
+    return _slug_for_account(channel, (account or "").strip())
+
+
 def _chat_gateway(doc: dict, channel: str):
-    """The gateway account a chat's sends route through: the exact gateway the
-    rail saw its messages arrive on when known, else the channel family's
-    registered gateway. Returns (slug, gw) or (None, None)."""
-    slug = doc.get("gateway") or channel
-    canonical, gw = _channel_gateway(slug)
-    if gw is None and slug != channel:
-        canonical, gw = _channel_gateway(channel)
-    return canonical, gw
+    """Resolve the account a chat's sends go out as.
+
+    Returns ``(slug, gateway, error)`` — exactly one of ``gateway`` / ``error``
+    is set. A stamped slug is authoritative only when its provenance says it
+    was established from the account a gateway reported (``gateway_source``)
+    *and* it still resolves to an inbox-mode gateway. Mode alone is not
+    enough: the stamps that caused the incident named the built-in service,
+    which may itself be inbox-mode, so trusting any inbox-resolving stamp
+    would have left every poisoned chat sending as the wrong account. An
+    untrusted stamp is discarded and re-derived here — not only by the repair
+    pass — so correctness never depends on that sweep having run. With no
+    usable stamp, exactly one inbox account for the channel is unambiguous and
+    used; zero or several are refused."""
+    stamped = (doc.get("gateway") or "").strip()
+    if stamped:
+        trusted = doc.get("gateway_source") == chat_state_mod.GATEWAY_SOURCE_ACCOUNT
+        canonical, gw = _channel_gateway(stamped)
+        if trusted and gw is not None and _gateway_is_inbox(canonical, gw):
+            return canonical, gw, None
+        why = ("not established from a reported account" if not trusted
+               else "no longer an inbox-mode account")
+        print(f"[web-gateway] discarding chat gateway stamp {stamped!r} for channel "
+              f"{channel!r}: {why}", flush=True)
+    candidates = _inbox_gateways(channel)
+    if len(candidates) == 1:
+        slug, gw = candidates[0]
+        return slug, gw, None
+    if not candidates:
+        return None, None, f"no inbox-mode gateway for channel {channel}"
+    return None, None, ("cannot tell which account this chat belongs to - "
+                        + ", ".join(slug for slug, _ in candidates))
+
+
+def repair_chat_gateway_stamps() -> int:
+    """Drop chat-state gateway stamps not provably established by account.
+
+    One-time repair for docs stamped before rail events carried an account:
+    every additional account of a channel reported the *built-in's* slug, so
+    chats belonging to the user's own number were stamped with — and their
+    sends routed to — another account. The test is provenance, not mode: the
+    built-in may itself be inbox-mode, in which case a mode-only check would
+    pass every poisoned stamp and change nothing.
+
+    Idempotent, and it never clobbers a genuinely account-derived stamp: a
+    repaired doc has no stamp to re-clear, and a re-stamped one carries the
+    marker. A cleared stamp is re-established by that chat's next
+    account-attributed rail event. Returns how many docs were repaired."""
+    repaired = 0
+    for chat_id, doc in _CHAT_STATE.all().items():
+        stamped = (doc.get("gateway") or "").strip()
+        if not stamped:
+            continue
+        if doc.get("gateway_source") == chat_state_mod.GATEWAY_SOURCE_ACCOUNT:
+            canonical, gw = _channel_gateway(stamped)
+            if gw is not None and _gateway_is_inbox(canonical, gw):
+                continue
+            why = "no longer an inbox-mode account"
+        else:
+            why = "not established from a reported account"
+        _CHAT_STATE.set_gateway(chat_id, None)
+        repaired += 1
+        print(f"[web-gateway] repaired chat {chat_id}: dropped gateway stamp "
+              f"{stamped!r} ({why})", flush=True)
+    return repaired
 
 
 def _chats_ingest_authorized(provided: str) -> bool:
@@ -4579,9 +4785,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         channel, key = chat_state_mod.split_chat_id(chat_id)
         doc = _CHAT_STATE.get(chat_id)
-        slug, gw = _chat_gateway(doc, channel)
+        slug, gw, route_error = _chat_gateway(doc, channel)
         if gw is None:
-            self._send_json(502, {"error": f"no gateway registered for channel {channel!r}"})
+            # Refuse, naming the real reason. Sending as the wrong identity is
+            # worse than not sending at all — see _chat_gateway.
+            print(f"[web-gateway] refusing chat send to {chat_id}: {route_error}",
+                  flush=True)
+            self._send_json(409, {"error": route_error})
             return
         body = json.dumps({
             "recipient": key,
@@ -4623,8 +4833,11 @@ class Handler(BaseHTTPRequestHandler):
         })
         _CHAT_STATE.clear_draft(chat_id)
         _CHAT_STATE.advance_last_read(chat_id, ts)
-        if not doc.get("gateway") and slug:
-            _CHAT_STATE.note_message(chat_id, gateway=slug)
+        # Deliberately no stamping here. A send either used an already
+        # account-derived stamp (nothing to add) or the unambiguous
+        # single-inbox-account rule, which re-derives identically next time and
+        # is not evidence of *this chat's* account — writing it would recreate
+        # the sticky-wrong-stamp failure this incident was.
         _chats_cache_invalidate()
         print(f"[web-gateway] chat send to {chat_id} via {slug}", flush=True)
         self._send_json(200, msg)
@@ -4674,12 +4887,18 @@ class Handler(BaseHTTPRequestHandler):
         }
         _CHAT_OVERLAY.insert(entry)
         group = payload.get("group")
+        # Which account this arrived on, resolved from the account the gateway
+        # reports (see _rail_gateway_slug). This is the ONLY writer of a chat's gateway
+        # stamp, and every stamp it writes is marked as account-derived; an
+        # unresolvable account leaves the existing stamp alone.
+        rail_slug = _rail_gateway_slug(channel, payload.get("account"))
         doc = _CHAT_STATE.note_message(
             chat_id,
             name=(payload.get("chat_name") or "").strip()
                  or (entry["sender_name"] if not group and direction == "in" else None),
             group=bool(group) if group is not None else None,
-            gateway=(payload.get("gateway") or "").strip() or None,
+            gateway=rail_slug,
+            gateway_source=chat_state_mod.GATEWAY_SOURCE_ACCOUNT if rail_slug else None,
             sender=entry["sender"], sender_name=entry["sender_name"])
         _chats_cache_invalidate()
         pushed = False
@@ -4709,10 +4928,24 @@ class Handler(BaseHTTPRequestHandler):
         this passes the registry token and relays bytes and Content-Type (the
         /gateways/<slug>/qr proxy precedent), so chat bubbles render media
         with no gateway token in the browser. The route regex already pins the
-        media id to 32 hex chars."""
+        media id to 32 hex chars.
+
+        The slug reaching here is inbox by construction — it comes from a
+        ledger attachment reference (or the chat's resolved account), and
+        ledger persistence is inbox-gated on all three gateways — but that is
+        an invariant of another file, so it is verified rather than assumed:
+        an account positively known to be control-mode is refused. An unknown
+        mode (an unreachable gateway) still serves, since this is a read of
+        the user's own media behind the dashboard's own auth and blocking it
+        would only break image rendering during a health blip."""
         _slug, gw = _channel_gateway(slug)
         if not gw:
             self._send_json(404, {"error": "unknown gateway"})
+            return
+        if _gateway_identity(_slug, gw).get("mode") == "control":
+            print(f"[web-gateway] refusing chat media from control-mode gateway "
+                  f"{_slug!r}", flush=True)
+            self._send_json(404, {"error": "not found"})
             return
         try:
             with _gateway_request(gw, f"/media/{media_id}", CHAT_SEND_TIMEOUT) as resp:
@@ -5254,7 +5487,13 @@ class Handler(BaseHTTPRequestHandler):
             if not gw:
                 self._send_json(404, {"error": "unknown gateway"})
             else:
-                self._send_json(200, _fetch_gateway_health(gw))
+                # `account` is the routing key this gateway matches rail events
+                # against — a phone number. It stays server-side: the page
+                # needs the link state, not the user's own number in a JSON
+                # body the browser caches.
+                health = {k: v for k, v in _fetch_gateway_health(gw).items()
+                          if k != "account"}
+                self._send_json(200, health)
             return
         gw_qr_match = _GATEWAY_QR_RE.match(conv_path)
         if gw_qr_match:
@@ -5509,6 +5748,16 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Repair chat-state gateway stamps written before rail events carried an
+    # account (they named the built-in service for every additional account of
+    # a channel, so sends routed to the wrong identity). Idempotent, and
+    # best-effort: a probe failure must never keep the gateway from starting.
+    try:
+        repaired = repair_chat_gateway_stamps()
+        if repaired:
+            print(f"[web-gateway] repaired {repaired} chat gateway stamp(s)", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] chat gateway repair skipped: {exc}", flush=True)
     # ThreadingHTTPServer so quick requests (job polls, /health) are never
     # blocked head-of-line behind a long-running job. Actual `claude` concurrency
     # is still bounded by the worker pool inside send_message().

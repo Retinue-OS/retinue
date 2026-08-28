@@ -205,20 +205,6 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
 
 
-# This gateway's own base URL on the internal Docker network, used to build the
-# HTTP references stored for inbound media (GET /media/<id> below). Defaults to
-# the compose service name + HTTP port; a deployment running more than one Signal
-# identity (e.g. the user's personal account) overrides it per container.
-GATEWAY_SELF_URL = os.environ.get(
-    "SIGNAL_GATEWAY_SELF_URL", f"http://signal-gateway:{HTTP_PORT}"
-).rstrip("/")
-
-# This gateway's registry slug (the service hostname), sent with every chats-
-# rail event so a chat remembers which account it lives on — what routes a
-# dashboard send back through this exact gateway in multi-account deployments.
-_CHATS_GATEWAY_SLUG = _chats.gateway_slug(GATEWAY_SELF_URL)
-
-
 def _chat_key(sender: str | None, group_id: str | None) -> str:
     """The chat key (kb:chat) stamped on ledger records, both directions.
 
@@ -358,12 +344,22 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
 
 
 def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
-    """Persist inbound media durably and return its HTTP-resolvable reference URL.
+    """Persist inbound media durably and return its store reference.
+
+    The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
+    and deliberately not a URL: where the blob can be fetched is a property of
+    the gateway's *address*, which the reader already holds in its registry
+    (``MESSENGER_GATEWAYS`` / ``*_GATEWAY_BASE_URL``). A container writing its
+    own address into the record duplicates that as a second source of truth,
+    and a wrong one for every extra account of a channel. The reference carries
+    only what identifies the blob; the reader resolves it through the account
+    that owns the chat. It is also a valid N-Triples IRI and matches the
+    ``urn:retinue:…`` shape the ledger's own subjects use.
 
     Best-effort: any failure returns None so the message still forwards and
     persists with its transcript — only the media link is skipped. The bytes go
-    to disk (out of the graph); the returned URL is what lands in the message's
-    ``kb:attachment`` triple."""
+    to disk (out of the graph); the returned reference is what lands in the
+    message's ``kb:attachment`` triple."""
     if not data:
         return None
     try:
@@ -371,7 +367,7 @@ def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
     except Exception as exc:
         print(f"[signal-gateway] could not store inbound media: {exc}", flush=True)
         return None
-    return f"{GATEWAY_SELF_URL}/media/{media_id}"
+    return f"urn:retinue:media:{INBOUND_CHANNEL}:{media_id}"
 
 
 # Outbound send-control policy — the messenger analogue of EMAIL_SEND_POLICY.
@@ -516,6 +512,15 @@ def _health_snapshot() -> dict:
     body = {
         "status": "ok",
         "configured": bool(SIGNAL_ACCOUNT),
+        # Routing identity for the chat surface. `mode` says whether this
+        # account may own a chat at all (only "inbox" may: a control account's
+        # traffic is prompts to Ara, never the user's correspondence), and
+        # `account` is what the web-gateway matches a rail event against to
+        # find this gateway's registry slug. A container deliberately never
+        # names its own address or slug: the reader's registry already holds
+        # that, and a second source of truth is what mis-routed sends here.
+        "mode": SIGNAL_GATEWAY_MODE,
+        "account": SIGNAL_ACCOUNT or None,
         "connected": connected,
         "last_ok_age": round(now - last_ok, 1) if last_ok is not None else None,
         "error": None if connected else last_error,
@@ -1345,7 +1350,7 @@ def _record_sync_sent(sent: dict) -> None:
         # the dashboard (the user was visibly in that chat on their phone).
         _chats.notify_chat_event_async(
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
-            gateway=_CHATS_GATEWAY_SLUG, author="device", message_id=msg_id,
+            account=SIGNAL_ACCOUNT, author="device", message_id=msg_id,
             ts=(int(ts) / 1000.0) if ts else None, text=text,
         )
     print(f"[signal-gateway] recorded own-device send to {chat}", flush=True)
@@ -1539,7 +1544,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # updates silently); the gate verdict rides along so they stay quiet.
     _chats.notify_chat_event_async(
         direction="in", channel=INBOUND_CHANNEL,
-        chat=_chat_key(sender, group_id), gateway=_CHATS_GATEWAY_SLUG,
+        chat=_chat_key(sender, group_id), account=SIGNAL_ACCOUNT,
         sender=sender, sender_name=sender_name, group=is_group,
         message_id=message_id,
         ts=(int(message_id) / 1000.0) if (message_id or "").isdigit() else None,
@@ -1655,9 +1660,6 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         else:
             # No job id — the gateway answered synchronously, so the turn ran.
             _mark_delivered(store_path)
-
-
-
 
 
 def _strip_markdown(text: str) -> str:

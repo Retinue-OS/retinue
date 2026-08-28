@@ -53,7 +53,10 @@ TS0, TS1, TS2, TS3 = ("2026-08-27T06:00:00Z", "2026-08-27T07:00:00Z",
 W_TS = "2026-08-26T18:00:00Z"
 
 # Mutable canned state the mock servers consult.
-STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": []}
+STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
+               # The mock gateway's reported identity: chat routing sends only
+               # through an inbox-mode account (see test_control_gateway_refused).
+               "gw_mode": "inbox", "gw_account": "+41791112233"}
 
 
 def _cell(value):
@@ -135,6 +138,11 @@ class _MockGateway(BaseHTTPRequestHandler):
     def do_GET(self):
         STATE["gw_requests"].append(("GET", self.path,
                                      self.headers.get("Authorization", "")))
+        if self.path.rstrip("/") in ("", "/health"):
+            self._json(200, {"status": "ok", "configured": True,
+                             "connected": True, "mode": STATE["gw_mode"],
+                             "account": STATE["gw_account"]})
+            return
         if self.path.startswith("/media/"):
             if self.headers.get("Authorization", "") != "Bearer gw-secret":
                 self._json(401, {"error": "unauthorized"})
@@ -411,8 +419,9 @@ def test_rail_auth_and_notifications(base, wg):
 
 
 def test_send_user_direct(base, wg):
-    # The rail taught the chat its gateway account (slug 127.0.0.1 — the mock);
-    # a 1:1 signal chat would normally learn "signal-gateway" the same way.
+    # This rail event reports no account, so it deliberately stamps nothing:
+    # routing rests on the channel having exactly one inbox account, which is
+    # the unambiguous case a single-account deployment always hits.
     rail_event = {"direction": "in", "channel": "signal", "chat": MARA,
                   "sender": MARA, "sender_name": "Mara Meier", "group": False,
                   "message_id": "m-in", "text": "hoi", "gateway": "127.0.0.1",
@@ -432,9 +441,12 @@ def test_send_user_direct(base, wg):
     # recorded ledger identity.
     assert msg["direction"] == "out" and msg["author"] == "user"
     assert msg["chat"] == CHAT1 and msg["id"] == "777"
-    # Draft cleared, watermark advanced to the send.
+    # Draft cleared, watermark advanced to the send. The send writes no
+    # gateway stamp: it has no account evidence of its own, and a stamp that is
+    # merely "what we resolved last time" is what made the incident sticky.
     doc = wg._CHAT_STATE.get(CHAT1)
     assert doc["draft"] is None
+    assert doc.get("gateway") is None, "a send must not stamp an account"
     assert doc["last_read"] == msg["ts"]
     # The sent message is in the merged view before the store indexes it: the
     # list preview flips to the outbound, and the messages page contains it.
@@ -445,6 +457,70 @@ def test_send_user_direct(base, wg):
     assert any(m["id"] == "777" and m["text"] == "bis Samstag!"
                for m in body["messages"])
     print("PASS test_send_user_direct")
+
+
+def test_control_gateway_refused(base, wg):
+    """A control account is never a chat identity: refuse, never mis-send.
+
+    This is the incident in miniature — the chat is stamped with an account
+    that turns out to be the system bot. The send must not go out as it."""
+    STATE["sent"].clear()
+    STATE["gw_mode"] = "control"
+    wg._gw_identity.clear()
+    try:
+        status, body = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/send",
+                             {"text": "must not go out as the bot"})
+        assert status == 409, (status, body)
+        assert "no inbox-mode gateway for channel signal" == body["error"], body
+        assert STATE["sent"] == [], "a refused send must never reach a gateway"
+    finally:
+        STATE["gw_mode"] = "inbox"
+        wg._gw_identity.clear()
+    # With the account back in inbox mode the same send goes through.
+    status, msg = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/send",
+                        {"text": "now it may"})
+    assert status == 200 and len(STATE["sent"]) == 1
+    assert STATE["sent"][0]["author"] == "user"
+    print("PASS test_control_gateway_refused")
+
+
+def test_rail_attributes_by_account(base, wg):
+    """A rail event whose self-reported slug is wrong is still attributed to
+    the account that actually sent it — the root cause of the incident."""
+    cid = "signal:+41790008888"
+    status, body = _http(base, "POST", "/internal/chats/inbound",
+                         {"direction": "in", "channel": "signal",
+                          "chat": "+41790008888", "sender": "+41790008888",
+                          "sender_name": "Nina", "message_id": "acct-1",
+                          "text": "hoi",
+                          # What the mis-defaulted gateway reports: its own
+                          # account, but the BUILT-IN's slug.
+                          "account": STATE["gw_account"],
+                          "gateway": "signal-gateway",
+                          "gate": {"forward": True, "reason": "whitelisted"}})
+    assert status == 200, body
+    # The registry entry for this account is the mock's slug, not the slug the
+    # event claimed — and the stamp is marked as account-derived, which is what
+    # makes it authoritative later.
+    doc = wg._CHAT_STATE.get(cid)
+    assert doc["gateway"] == "127.0.0.1"
+    assert doc["gateway_source"] == "account"
+    # That marked stamp routes even where the channel has several candidates,
+    # and survives the repair pass.
+    assert wg._chat_gateway(doc, "signal")[0] == "127.0.0.1"
+    assert wg.repair_chat_gateway_stamps() == 0
+    # An account the registry does not serve leaves the stamp alone rather
+    # than writing a wrong one.
+    status, _ = _http(base, "POST", "/internal/chats/inbound",
+                      {"direction": "in", "channel": "signal",
+                       "chat": "+41790007777", "sender": "+41790007777",
+                       "message_id": "acct-2", "text": "hi",
+                       "account": "+15559990000", "gateway": "signal-gateway",
+                       "gate": {"forward": True, "reason": "whitelisted"}})
+    assert status == 200
+    unknown = wg._CHAT_STATE.get("signal:+41790007777")
+    assert unknown["gateway"] is None and unknown["gateway_source"] is None
+    print("PASS test_rail_attributes_by_account")
 
 
 def test_media_proxy(base, wg):
@@ -507,6 +583,8 @@ def main():
         test_draft_guard(base, wg)
         test_rail_auth_and_notifications(base, wg)
         test_send_user_direct(base, wg)
+        test_control_gateway_refused(base, wg)
+        test_rail_attributes_by_account(base, wg)
         test_media_proxy(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()

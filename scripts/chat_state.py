@@ -20,9 +20,18 @@ is *not* a channel message lives here, in one JSON document per chat under
   unless it is muted, and ``muted`` also silences that chat's Web Push.
 - cached display metadata — the chat's ``name``, its ``group`` flag, the
   originating ``gateway`` service slug (which is what routes a send back
-  through the right account), and a per-chat ``roster`` of sender handle →
-  display name (the ledger stores handles only; names arrive on the notify
-  rail and are remembered here).
+  through the right account) together with ``gateway_source``, how that slug
+  was established, and a per-chat ``roster`` of sender handle → display name
+  (the ledger stores handles only; names arrive on the notify rail and are
+  remembered here).
+
+``gateway_source`` exists because a slug alone says nothing about how much it
+can be trusted. Stamps written before the gateways reported their account were
+derived by each container *about itself*, from a value that defaults to the
+built-in service name — so an extra account of a channel stamped its chats with
+the built-in's slug. Only ``GATEWAY_SOURCE_ACCOUNT`` marks a stamp established
+from the account a gateway reports; anything else, including a doc written
+before this field existed (which simply lacks it), is untrusted and re-derived.
 
 **Single-writer: the web-gateway.** User edits and the token-gated agent
 endpoints both go through it, so this store needs no cross-process locking —
@@ -53,6 +62,13 @@ from pathlib import Path
 # gateway images; keeping both stdlib-and-self-contained is the shared-module
 # convention).
 AUTHORS = ("user", "agent", "device")
+
+# The one provenance that makes a chat's gateway stamp authoritative: it was
+# established from the account the sending gateway reports for itself. An
+# absent or any other value means "derived some other way" — untrusted, because
+# the only other way that ever existed was a container guessing its own
+# registry identity, which is what mis-routed sends to the wrong account.
+GATEWAY_SOURCE_ACCOUNT = "account"
 
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
@@ -128,6 +144,10 @@ class ChatStateStore:
             "name": None,
             "group": None,
             "gateway": None,
+            # How `gateway` was established; see GATEWAY_SOURCE_ACCOUNT. A doc
+            # written before this field existed lacks it and so is untrusted by
+            # construction — the marker cannot be forged by an old stamp.
+            "gateway_source": None,
             "roster": {},
             "roster_refreshed": None,
             # First-unread watermark: set when an inbound lands on a fully-read
@@ -184,6 +204,7 @@ class ChatStateStore:
 
     def note_message(self, chat_id: str, *, name: str | None = None,
                      group: bool | None = None, gateway: str | None = None,
+                     gateway_source: str | None = None,
                      sender: str | None = None,
                      sender_name: str | None = None) -> dict:
         """Cache display metadata learned from a message event (the rail).
@@ -198,13 +219,33 @@ class ChatStateStore:
             if group is not None:
                 doc["group"] = bool(group)
             if gateway:
+                # Slug and provenance are written as one: a stamp can never end
+                # up marked trusted by a path that did not establish it.
                 doc["gateway"] = gateway
+                doc["gateway_source"] = gateway_source or None
             if sender and sender_name:
                 roster = doc.get("roster") or {}
                 if roster.get(sender) != sender_name:
                     roster[sender] = sender_name
                     doc["roster"] = roster
                     doc["roster_refreshed"] = time.time()
+            self._write(doc)
+            return doc
+
+    def set_gateway(self, chat_id: str, slug: str | None,
+                    source: str | None = None) -> dict:
+        """Set — or clear, with None — which gateway account owns this chat.
+
+        Separate from :meth:`note_message`, which only ever fills metadata in
+        and so cannot undo a wrong stamp. Clearing is what the web-gateway's
+        repair pass needs: a stamp that cannot be shown to be this chat's
+        account is dropped, and the next account-attributed rail event
+        establishes the right one. Provenance is written with the slug and
+        cleared with it, so the two can never disagree."""
+        with self._lock:
+            doc = self._read(chat_id)
+            doc["gateway"] = slug or None
+            doc["gateway_source"] = (source or None) if slug else None
             self._write(doc)
             return doc
 
