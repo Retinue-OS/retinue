@@ -262,19 +262,19 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # RETINUE_CONVERSATION_MODELS_FILE; also derived into the life store by
 # scripts/emit-conversation-models.py), else the built-in default below.
 # Those static Claude aliases are NOT used when LiteLLM is configured: an
-# empty or failed advertisement then offers only "Default", never a model
-# the proxy does not serve.
+# empty or failed advertisement then offers nothing (the picker hides
+# itself), never a model the proxy does not serve.
 #
 # Either way the list holds {"id","label"} objects. `id` is passed to
 # `claude --model` (for LiteLLM-sourced entries the id is the route's
 # model_name, which `claude` sends verbatim); `label` is what the dashboard
-# shows. The empty-string id means "use the gateway's configured default"
-# (CLAUDE_MODEL / whatever `claude` resolves) — always offered first so a
-# thread can defer.
-_DEFAULT_MODEL_ENTRY = {"id": "", "label": "Default"}
-
+# shows. The list carries only concrete models — no synthetic "Default" row.
+# Instead, the entry the gateway's configured default (CLAUDE_MODEL, resolved
+# through LiteLLM's route aliases when it is one) actually runs on is flagged
+# `default: true` and says so in its label; a thread without a stored choice
+# runs that default, stored as the empty string internally. Empty-id entries
+# in a static source are dropped for the same reason.
 _DEFAULT_CONVERSATION_MODELS = [
-    {"id": "", "label": "Default"},
     {"id": "opus", "label": "Opus (deepest reasoning)"},
     {"id": "sonnet", "label": "Sonnet (balanced)"},
     {"id": "haiku", "label": "Haiku (fastest)"},
@@ -295,6 +295,8 @@ def _coerce_conversation_models(parsed: object) -> list[dict]:
     """Normalise a parsed models array into validated {"id","label"} dicts.
 
     Accepts the array itself or a JSON-LD document wrapping it under `models`.
+    Empty-id rows (the legacy synthetic "Default" option) are dropped — the
+    default is flagged on its concrete entry instead (see _mark_default).
     Returns [] when nothing usable is present, so callers can fall back."""
     if isinstance(parsed, dict):
         parsed = parsed.get("models", [])
@@ -305,7 +307,9 @@ def _coerce_conversation_models(parsed: object) -> list[dict]:
         if not isinstance(item, dict) or "id" not in item:
             continue
         mid = str(item["id"]).strip()
-        label = str(item.get("label") or mid or "Default").strip()
+        if not mid:
+            continue
+        label = str(item.get("label") or mid).strip()
         models.append({"id": mid, "label": label})
     return models
 
@@ -443,6 +447,53 @@ def _litellm_model_id(item: dict) -> str:
         return mid
     # /v1/models rows use `id`; keep reading them through the same helper.
     return str(item.get("id") or "").strip()
+
+
+# route name -> upstream model (litellm_params.model), from the last good
+# GET /model/info. This is what lets a plumbing alias like `retinue-claude`
+# resolve to the concrete model it serves — both to flag the picker's default
+# entry and to name the answering model in a message header instead of the
+# route label.
+_litellm_route_upstreams: dict[str, str] = {}
+
+
+def _record_route_upstreams(parsed: object) -> None:
+    """Remember each concrete route's upstream model from a /model/info body."""
+    global _litellm_route_upstreams
+    if not isinstance(parsed, dict):
+        return
+    routes: dict[str, str] = {}
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = _litellm_model_id(item)
+        params = item.get("litellm_params")
+        upstream = (
+            str(params.get("model") or "").strip()
+            if isinstance(params, dict) else ""
+        )
+        if mid and upstream and "*" not in mid and upstream != mid:
+            routes.setdefault(mid, upstream)
+    _litellm_route_upstreams = routes
+
+
+def _resolve_route_model(mid: str) -> str:
+    """Follow LiteLLM route aliases to the concrete model a name serves.
+
+    Also resolves `os.environ/VAR` upstream values (LiteLLM echoes those
+    verbatim when it has not substituted them). Returns the input unchanged
+    when nothing maps it further, so callers can use it unconditionally."""
+    mid = str(mid or "").strip()
+    seen: set[str] = set()
+    while mid and mid not in seen:
+        seen.add(mid)
+        nxt = _litellm_route_upstreams.get(mid, "")
+        if nxt.startswith("os.environ/"):
+            nxt = os.environ.get(nxt[len("os.environ/"):], "").strip()
+        if not nxt or nxt == mid:
+            break
+        mid = nxt
+    return mid
 
 
 def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) -> list[dict]:
@@ -634,6 +685,7 @@ def _merge_ollama_tags(models: list[dict], tags: list[dict] | None) -> list[dict
 
 def _fetch_litellm_models() -> list[dict]:
     info = _fetch_litellm_json("/model/info")
+    _record_route_upstreams(info)
     listed = None
     try:
         listed = _listed_model_ids(_fetch_litellm_json("/v1/models"))
@@ -693,21 +745,46 @@ def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
         return _litellm_models_cache["models"]
 
 
+def _mark_default(models: list[dict]) -> list[dict]:
+    """Return a copy with the entry the gateway default runs on flagged.
+
+    The picker offers no synthetic "Default" row; instead the concrete entry
+    that default turns actually run on carries `default: true` and says so in
+    its label — so the dropdown always names a real model. CLAUDE_MODEL is
+    resolved through LiteLLM's route aliases (retinue-claude → its upstream)
+    and matched against each entry the same way, tail-insensitively to the
+    provider prefix (`anthropic/claude-opus-5` names `claude-opus-5`). When
+    the default resolves to no offered entry, nothing is flagged."""
+    out = [dict(m) for m in models]
+    target = _resolve_route_model(CLAUDE_MODEL)
+    if not target:
+        return out
+    target_tail = target.split("/")[-1]
+    for m in out:
+        resolved = _resolve_route_model(m["id"])
+        if target in (m["id"], resolved) or target_tail in (
+                m["id"], resolved.split("/")[-1]):
+            m["default"] = True
+            label = str(m.get("label") or m["id"])
+            m["label"] = (label[:-1] + ", default)" if label.endswith(")")
+                          else label + " (default)")
+            break
+    return out
+
+
 def _conversation_models(force: bool = False) -> list[dict]:
     """The list the picker offers right now, in precedence order:
     env override > LiteLLM-advertised > file > built-in default.
 
     When LiteLLM is configured, a reachable empty list or a failed fetch with
-    no last-good cache offers only the synthetic Default entry — never the
+    no last-good cache offers nothing (the picker hides itself) — never the
     static Claude aliases, which would not be served."""
     if _ENV_CONVERSATION_MODELS:
-        return _ENV_CONVERSATION_MODELS
+        return _mark_default(_ENV_CONVERSATION_MODELS)
     if _LITELLM_URL:
         dynamic = _litellm_conversation_models(force=force)
-        if dynamic is None:
-            return [dict(_DEFAULT_MODEL_ENTRY)]
-        return [dict(_DEFAULT_MODEL_ENTRY), *dynamic]
-    return _STATIC_CONVERSATION_MODELS
+        return _mark_default(dynamic or [])
+    return _mark_default(_STATIC_CONVERSATION_MODELS)
 
 
 def _model_offered(mid: str, refresh: bool = False) -> bool:
@@ -2853,7 +2930,7 @@ def _short_model_name(canonical: str) -> str:
             return fam.capitalize()
     # Unknown id: drop a leading vendor token and title-case the rest.
     tail = cid.split("/")[-1]
-    tail = re.sub(r"^claude[-_]?", "", tail)
+    tail = re.sub(r"^(retinue|claude)[-_]?", "", tail)
     tail = re.sub(r"[-_]\d.*$", "", tail)  # trim trailing version segments
     return tail.capitalize() if tail else ""
 
@@ -2889,7 +2966,16 @@ def _envelope_model_name(data: dict) -> str | None:
     if isinstance(best_entry, dict):
         canonical = best_entry.get("canonicalModel") or ""
     canonical = canonical or best_id or ""
-    return _short_model_name(canonical) or None
+    # Behind LiteLLM the envelope reports the route name it was called with
+    # (e.g. `retinue-claude`), not the model that answered. Resolve it through
+    # the route map so the header names a concrete model, warming the cached
+    # model-list fetch once when the map has not seen this name yet.
+    resolved = _resolve_route_model(canonical)
+    if (resolved == canonical and _LITELLM_URL
+            and canonical not in _litellm_route_upstreams):
+        _litellm_conversation_models()  # cached; refreshes the route map
+        resolved = _resolve_route_model(canonical)
+    return _short_model_name(resolved) or None
 
 
 def send_message(message: str, display_question: str | None = None,
