@@ -249,7 +249,20 @@ python3 /workspace/scripts/memory.py store \
 
 # Recall: by tag / time range / actor / minimum relevance.
 python3 /workspace/scripts/memory.py recall --tag insurance --since 2026-06-01 --limit 10
+
+# Reinforce: the user restated something already on record — strengthen it
+# instead of storing a duplicate (recall prints each entry's [id]).
+python3 /workspace/scripts/memory.py reinforce 20260829T193141Z-575748
 ```
+
+**Reinforce, don't duplicate.** When the user restates a rule or preference
+that memory already holds, a second copy would fragment the signal. Recall
+first, then `reinforce` the existing entry by its id: this appends a
+`kb:reiteratedAt` timestamp to the same resource (into the current session's
+file — RDF merges by subject across files, so the original is never touched).
+Alongside the creation-time relevance, recall then shows how often and how
+recently an entry was repeated — the "user keeps saying this" signal, and the
+strongest reason to include a memory in a dispatch prompt.
 
 What belongs in memory is the session-level residue that no chamber file
 carries: decisions and their reasons, outcomes of dispatched work, discovered
