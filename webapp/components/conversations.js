@@ -670,7 +670,9 @@ class RetinueConversations extends HTMLElement {
   // when the gateway could not name its default (no flagged entry) does a
   // hidden, unpickable placeholder keep the select from claiming a concrete
   // model it is not running.
-  _modelPickerHtml(selected) {
+  // `wide` renders the roomy composer form: a visible "Model" caption and an
+  // untruncated select, instead of the bar's compact gear + capped-width one.
+  _modelPickerHtml(selected, { wide = false } = {}) {
     const models = this._models || [];
     if (models.length < 2) return '';
     let sel = selected || '';
@@ -685,8 +687,11 @@ class RetinueConversations extends HTMLElement {
       `${esc(m.label)}</option>`).join('');
     const title = 'Model for Ara’s replies in this conversation. ' +
       'Dispatched subagents (Coach, Medic, …) keep their own models.';
-    return `<label class="model-pick" title="${title}">` +
-      `<span class="mp-ico" aria-hidden="true">⚙</span>` +
+    const caption = wide
+      ? '<span class="mp-label">Model</span>'
+      : '<span class="mp-ico" aria-hidden="true">⚙</span>';
+    return `<label class="model-pick${wide ? ' wide' : ''}" title="${title}">` +
+      caption +
       `<select data-model aria-label="${title}">${opts}</select></label>`;
   }
 
@@ -698,12 +703,16 @@ class RetinueConversations extends HTMLElement {
     const hint = this._composeProject
       ? `<p>Ask Ara about this project &mdash; she reads its current state first.</p>`
       : `<p>Ask Ara anything &mdash; she picks it up with full context.</p>`;
+    // The picker sits in the body as a labeled, full-width row — cramped into
+    // the top bar it truncated its labels and was easy to miss, and picking
+    // the model is exactly the choice to make before the first message goes
+    // out (it can still be switched later from the thread bar).
     return `<div class="thread-bar">${this._backBtnHtml()}` +
-      `<span class="bar-title">New conversation</span>` +
-      `<span class="bar-actions">${this._modelPickerHtml(this._composeModel)}</span></div>` +
+      `<span class="bar-title">New conversation</span></div>` +
       projectChip +
       `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span>` +
-      hint + `</div>` +
+      hint +
+      this._modelPickerHtml(this._composeModel, { wide: true }) + `</div>` +
       this._inputRow('Ask Ara something …');
   }
 
@@ -1573,6 +1582,12 @@ const CSS = `
                        max-width: 9.5rem; cursor: pointer; -webkit-appearance: none;
                        appearance: none; }
   .model-pick select:hover { border-color: var(--accent, #6ea8fe); }
+  /* The composer's roomy form: a captioned, untruncated picker centered under
+     the "Ask Ara anything" hint, so the model choice is plainly offered before
+     the conversation starts. */
+  .model-pick.wide { gap: 8px; margin-top: 14px; }
+  .model-pick.wide .mp-label { font-size: .8rem; }
+  .model-pick.wide select { max-width: none; font-size: .85rem; padding: 7px 12px; }
   .thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
             display: flex; flex-direction: column; gap: 12px; padding: 12px 2px; }
   /* An open thread takes the whole frame, which on a wide display is far wider
