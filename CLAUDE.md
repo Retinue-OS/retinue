@@ -225,6 +225,49 @@ the store, or deciding whether something needs its own endpoint, read
 trick, the frontmatter-to-triples converter contract, the SOSA vocabulary used
 for all sensor observations, and when a separate store is warranted.
 
+## Memory (the session log in the life store)
+
+Every turn is a fresh `claude -p`, so whatever a session learned dies with it
+unless written down. The memory log closes that gap: sessions store durable
+entries as N-Triples files in the framework-owned `_generated` pseudo-chamber
+(`chambers/_generated/memory/`), which the life store indexes like any chamber
+data. A memory entry is a **resource, not a bare fact** — the memory text plus
+topic tags, the recording actor, a timestamp, and an optional relevance
+indicator (0–1) — so memories are recallable by time range, tag, actor, or
+importance. Both directions go through `scripts/memory.py`:
+
+```bash
+# Store: whenever a session learns or decides something a later session will
+# need — a decision taken, an outcome, a user preference, a system quirk.
+python3 /workspace/scripts/memory.py store \
+  --actor ara --tag insurance --tag deadline --relevance 0.7 \
+  "IV assistance-cost filing for August submitted; response expected mid-September."
+
+# Recall: by tag / time range / actor / minimum relevance.
+python3 /workspace/scripts/memory.py recall --tag insurance --since 2026-06-01 --limit 10
+```
+
+What belongs in memory is the session-level residue that no chamber file
+carries: decisions and their reasons, outcomes of dispatched work, discovered
+quirks, user preferences stated in passing. What does **not**: data that
+already enters the store through a chamber (observations, projects, contacts)
+— never duplicate it — and never secrets (tokens, passwords), since the store
+is readable by every agent. Store memories as they arise, and always before a
+session ends with something learned. Recall at the start of non-trivial work —
+and **when dispatching a subagent**: subagents start cold and may not query
+the store themselves, so recall the relevant memories (the tags are the join
+key) and include them in the dispatch prompt. `recall` output is formatted for
+direct inclusion; `--json` gives raw rows, and the entries are ordinary
+`kb:Memory` triples if you prefer SPARQL. Passing `--session <label>` groups a
+session's entries into one file (one file per session is the intended shape;
+scheduled jobs can set `RETINUE_MEMORY_SESSION` instead).
+
+Memory is on by default; a deployment sets `RETINUE_MEMORY=0` to disable it —
+`store` then no-ops successfully, and sessions should not attempt to log.
+Memory files live on the chambers volume but in no git repository: persistent
+across restarts, deployment-local, disposable by deleting files — like the
+news store, not like chamber data.
+
 ## Data refresh
 
 External data sources (e.g. Garmin) are kept up to date by the generic refresh

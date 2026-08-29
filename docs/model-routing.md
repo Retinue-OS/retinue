@@ -148,17 +148,20 @@ this codebase chose structural enforcement over prompt discipline twice —
 transcript cleanup (`TRANSCRIPT_CLEANUP_MODEL`) and the send policies — and
 both held; this is the same move.
 
-### Later — memory as triples
+### Memory as triples (first slice shipped with phase 1)
 
 Per-turn statelessness makes context the whole game, and the tier split raises
 the stakes: briefing workers and Ara senior cheaply is what keeps the
-architecture affordable. The complement is an event log in the life store —
-each turn appends what happened as triples (timestamp, actor, tag, one-line
-summary) into a chamber-indexed path, so briefing becomes a SPARQL query by
-time range and tag instead of hand-carried context. Named-graph provenance
-comes free; the store stays read-only because writes are file appends, which is
-already how everything enters it. Needs its own design pass (retention, what
-junior may log vs. what senior curates) and is deliberately out of scope here.
+architecture affordable. The complement is a session log in the life store,
+and its first slice ships alongside phase 1: `scripts/memory.py` stores
+entries as N-Triples files under `chambers/_generated/memory/` (indexed like
+any chamber data) and recalls them by tag, time range, actor, or minimum
+relevance. An entry is a resource, not a bare fact — content, tags, actor,
+timestamp, optional relevance — and `recall`'s output is prompt-ready, so a
+dispatched agent that cannot query the store itself still gets the memories
+joined into its briefing. `RETINUE_MEMORY=0` disables the mechanism
+deployment-wide. Still open for a later pass: retention/compaction, and what
+junior may log versus what senior curates.
 
 ## Non-goals
 
