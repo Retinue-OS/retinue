@@ -1,0 +1,170 @@
+# Model routing: Ara junior, Ara senior, and the tiered household
+
+Ara has two very different job profiles rolled into one name: the errand-runner
+who receives whatever comes in and routes it to the right agent, and the
+supervisor who notices when something is broken and steps in as system
+administrator and developer. The first profile is high-frequency and cheap in
+judgement; the second is rare and demanding. Running both on the same model
+means either paying frontier prices for mail-room work or trusting routine
+traffic to a model that cannot supervise.
+
+This document is the design for splitting the two — which model runs which kind
+of session, who is allowed to say what to the user, and how the pieces land in
+phases. Phase 1 is implemented; the later phases are recorded here so they can
+be built without re-deriving the reasoning.
+
+## The enabling fact: every Ara turn is a fresh session
+
+There is no long-lived Ara process. Every entry point spawns a fresh
+`claude -p`: each scheduler prompt job, each dashboard conversation turn, each
+triage run, each `ask_ara` question from the MCP connector. "Switching models"
+is therefore not an agent handoff but a launch parameter — the same persona
+(`CLAUDE.md`), started on a different model. Nothing needs to be summarised
+across a tier boundary, because no Ara turn carries hidden state: escalating a
+turn means re-running it on a bigger model against the same engage prompt and
+thread file it was going to read anyway.
+
+Most of the plumbing predates this design:
+
+- Scheduler prompt jobs take a per-job `"model"` field with `${VAR:-default}`
+  expansion (`scheduler.py`).
+- Dashboard threads carry a per-thread model choice, switchable mid-thread
+  (`web-gateway.py`, `POST /conversations/<id>/model`).
+- Subagents pin their model in frontmatter (`.claude/agents/*.md`).
+- Triage has its own `RETINUE_TRIAGE_MODEL`; transcript cleanup already runs on
+  a cheap model by default.
+
+## The two tiers
+
+Two environment variables declare the tiers; both are optional and both fall
+back to the existing `RETINUE_CLAUDE_MODEL`, so a deployment that sets neither
+behaves exactly as before:
+
+- **`RETINUE_ROUTER_MODEL`** — the cheap, fast model for routing-shaped turns
+  (Ara junior).
+- **`RETINUE_FRONTIER_MODEL`** — the strong model for supervision, escalation,
+  and system work (Ara senior).
+
+Difficulty is decided by **entry point first**, because most sessions know
+their difficulty before any model runs:
+
+| Entry point | Tier | Why |
+|---|---|---|
+| Scheduler prompt jobs (mailbox checks, dispatch turns) | router | Routine by construction; the real work is done by the dispatched subagent on its own pinned model. |
+| `news-curate.py` spawn | router | The turn only dispatches the Herald. |
+| `agent-self-review.py` spawn | frontier | Supervision by construction, and rare — the free SPARQL gate means it usually spawns nothing. |
+| Main remote-control session | frontier | Interactive system administration and development — Ara senior's desk. |
+| Dashboard turns, `ask_ara` | phase 2 | Difficulty unknown before a model reads the message; needs the escalation flow below. |
+
+A job manifest can still pin any prompt job explicitly
+(`"model": "${RETINUE_TRIAGE_MODEL:-sonnet}"`); the per-job field always wins
+over the tier defaults.
+
+## The door: who speaks, and under which name
+
+The persona rules (in `CLAUDE.md`) follow one metaphor: **one household, one
+door**. The user always just writes into the thread; they never choose whom to
+address. Behind the door:
+
+- **Ara junior** (router tier) answers the door. She may tell you where the key
+  is — relay a fact, a lookup, a status — route the matter to the right worker,
+  or fetch Ara senior. She **never composes content and never answers
+  substantively**. This is a whitelist, not a judgement call: cheap models are
+  worst at knowing what they don't know, so junior's permission to finish a
+  turn herself is enumerated (route, relay labeled worker output, acknowledge,
+  file, set flags) and everything else escalates by default.
+- **Workers** (Secretary, Academic, Archivist, Herald, chamber agents) do the
+  actual work and are quoted under their own names, as today.
+- **Ara senior** (frontier tier) handles escalations, supervision, Tier-2/3
+  decisions, and anything touching the system itself.
+
+Signatures are honest: anything signed *Ara jr.* is logistics and never
+load-bearing; anything signed *Ara* (senior) came from the frontier tier;
+worker output carries the worker's label. Opacity of *form* (lint, plumbing,
+routing metadata) is fine; opacity of *judgement* is not — the user must always
+be able to tell whose judgement they are consuming. "Take this to Ara senior"
+is a phrase (and, in phase 2, a reply chip) the user can always use — explicit,
+user-triggered escalation is the backstop for the router model's weak
+self-assessment.
+
+**One actor URI, two signatures.** The agent registry
+(`discover-agents.py`) keeps a single `urn:retinue:actor:ara`. A project parked
+on `current_actor: ara` belongs to the household; which tier picks it up is a
+runtime routing decision, not workflow state. Registering junior/senior as
+separate actors would let a project parked on a misspelled variant silently
+drop out of the self-review sweep. Signature is presentation; the actor URI is
+workflow; the model stamp (phase 2) is the ground truth beneath both.
+
+## Phases
+
+### Phase 1 — tier variables and identity (this document's PR)
+
+- `RETINUE_ROUTER_MODEL` / `RETINUE_FRONTIER_MODEL`, with the entry-point
+  mapping above wired into `scheduler.py`, `news-curate.py`,
+  `agent-self-review.py`, and the entrypoint's main session. Strictly
+  behavior-preserving when the new variables are unset.
+- The junior/senior identity, whitelist, and signature rules in `CLAUDE.md`.
+
+### Phase 2 — escalation and attribution
+
+- **Escalation flow** for the unknown-difficulty entry points (dashboard turns,
+  `ask_ara`): the turn starts on the router tier; when junior hits anything
+  outside her whitelist she escalates, and the gateway re-runs the same engage
+  prompt on `RETINUE_FRONTIER_MODEL`, discarding the cheap transcript. The
+  existing per-thread model API doubles as "this thread stays escalated"; the
+  thread-bar picker is the user-visible tier control. `ask_ara`'s slow-answer
+  job-id mechanism already absorbs the extra latency of an escalated answer.
+- **Model stamps**: the gateway knows which model ran each turn (it builds the
+  `--model` flag); persist it in the message record and surface it subtly in
+  the bubble. Attribution becomes ground truth in the data rather than a
+  convention agents might violate — names can drift, stamps cannot.
+- The "[[chip: Take this to Ara senior]]" escalation chip.
+
+### Phase 3 — personas become agents
+
+The persona/subagent split is historical: personas were free while Ara always
+ran on a strong model. A router-tier Ara must not compose in-role, so the
+composing roles become proper agents with pinned models — Secretary first
+(outbound composing has the most rules and the highest cost of sloppiness),
+Academic and Publisher after, on the same template.
+
+The persona files survive as a **style layer**, not an identity: the secretary
+agent's definition instructs it to read `/workspace/agents/secretary.md`, then
+glob `chambers/*/style/secretary.md` and let the chamber's private conventions
+override — preserving the public-framework/private-chamber split exactly as
+the persona mechanism does today. Workers cannot pause to ask the user
+mid-task; they return "I need a decision on X" and Ara opens a decision thread
+with chips — which is the interaction model the dashboard already uses.
+
+### Phase 4 — presentation enforcement at the choke point
+
+Mediation splits into two components with different homes. Mediation of
+*meaning* (what reaches the user, which thread, who is labeled as speaking)
+stays with Ara junior — it is routing-shaped. Mediation of *form* moves to the
+gateway: a cheap-model presentation lint applied to everything that lands in a
+dashboard thread, enforcing the `dashboard-composing` rules (no bare URLs,
+labeled links, option chips, details chips) regardless of author. Precedents in
+this codebase chose structural enforcement over prompt discipline twice —
+transcript cleanup (`TRANSCRIPT_CLEANUP_MODEL`) and the send policies — and
+both held; this is the same move.
+
+### Later — memory as triples
+
+Per-turn statelessness makes context the whole game, and the tier split raises
+the stakes: briefing workers and Ara senior cheaply is what keeps the
+architecture affordable. The complement is an event log in the life store —
+each turn appends what happened as triples (timestamp, actor, tag, one-line
+summary) into a chamber-indexed path, so briefing becomes a SPARQL query by
+time range and tag instead of hand-carried context. Named-graph provenance
+comes free; the store stays read-only because writes are file appends, which is
+already how everything enters it. Needs its own design pass (retention, what
+junior may log vs. what senior curates) and is deliberately out of scope here.
+
+## Non-goals
+
+- No change to subagent models: workers keep pinning their own model in
+  frontmatter; the tier variables govern Ara's own turns only.
+- No pre-classifier: a gate model that reads every message to pick a tier costs
+  an extra call on all traffic. Escalation-by-re-run is cheaper and simpler.
+- No second door: transparency is about who signed the answer, never about
+  making the user route their own requests.

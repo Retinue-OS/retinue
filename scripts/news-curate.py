@@ -31,7 +31,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import news_store as store  # noqa: E402
 
-CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# This turn only dispatches the Herald (which pins its own model), so it is a
+# router-tier Ara junior turn (docs/model-routing.md).
+CLAUDE_MODEL = (
+    os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
+    or os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+)
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 # Scoring a whole backlog in one session is slower and no better than scoring
 # the freshest slice; the rest comes round on the next run an hour later.

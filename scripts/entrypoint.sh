@@ -347,9 +347,12 @@ case "$MODE" in
     SESSION_NAME="$(date +%Y%m%d-%H%M%S)-${HOSTNAME}"
     DEBUG_LOG="/tmp/session-main-debug.log"
     CLAUDE_MODEL_ARGS=()
-    if [[ -n "${RETINUE_CLAUDE_MODEL:-}" ]]; then
-      CLAUDE_MODEL_ARGS=(--model "$RETINUE_CLAUDE_MODEL")
-      echo "[claude] Using configured model: $RETINUE_CLAUDE_MODEL"
+    # The interactive main session is Ara senior's desk, so the frontier tier
+    # wins when the deployment declares one (docs/model-routing.md).
+    MAIN_SESSION_MODEL="${RETINUE_FRONTIER_MODEL:-${RETINUE_CLAUDE_MODEL:-}}"
+    if [[ -n "$MAIN_SESSION_MODEL" ]]; then
+      CLAUDE_MODEL_ARGS=(--model "$MAIN_SESSION_MODEL")
+      echo "[claude] Using configured model: $MAIN_SESSION_MODEL"
     fi
     if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then
       echo "[claude] Using Claude-compatible gateway: $ANTHROPIC_BASE_URL"

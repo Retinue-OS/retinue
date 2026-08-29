@@ -30,7 +30,12 @@ import urllib.request
 
 KB = "https://w3id.org/retinue/kb#"
 ENDPOINT = os.environ.get("SPARQL_ENDPOINT_LIFE", "http://qlever-life:7001")
-CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# Self-review is supervision — an Ara senior job — so the frontier tier wins
+# when the deployment declares one (docs/model-routing.md).
+CLAUDE_MODEL = (
+    os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
+    or os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+)
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 
 # One query answers the whole gate: unresolved, unpaused projects whose current

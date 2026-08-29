@@ -45,8 +45,11 @@ Environment:
                                  job's process group, in seconds (default 10)
   SCHEDULER_STATE_DIR           state/log dir (default /root/.retinue/scheduler)
   CLAUDE_PERMISSION_MODE        permission mode for `claude -p` (default acceptEdits)
-  RETINUE_CLAUDE_MODEL          global model for all prompt jobs (a job's own
-                                 "model" field overrides it)
+  RETINUE_ROUTER_MODEL          router-tier model for prompt jobs (Ara junior
+                                 turns — see docs/model-routing.md); falls back
+                                 to RETINUE_CLAUDE_MODEL when unset
+  RETINUE_CLAUDE_MODEL          global fallback model (a job's own "model"
+                                 field overrides both)
 """
 
 import glob
@@ -72,7 +75,13 @@ JOB_TIMEOUT = int(os.environ.get("SCHEDULER_JOB_TIMEOUT", "900"))
 KILL_GRACE_SECONDS = int(os.environ.get("SCHEDULER_KILL_GRACE_SECONDS", "10"))
 STATE_DIR = Path(os.environ.get("SCHEDULER_STATE_DIR", "/root/.retinue/scheduler"))
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
-CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# Prompt jobs are routing-shaped Ara turns (dispatch, relay), so the router
+# tier wins when the deployment declares one; a job's own "model" field still
+# overrides either (docs/model-routing.md).
+CLAUDE_MODEL = (
+    os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
+    or os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+)
 LOG_FILE = STATE_DIR / "scheduler.log"
 
 
