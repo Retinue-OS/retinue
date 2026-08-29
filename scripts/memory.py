@@ -19,9 +19,18 @@ A memory entry is a resource, not a bare fact:
     <urn:retinue:memory:ID> kb:actor        <urn:retinue:actor:ara> .
     <urn:retinue:memory:ID> kb:relevance    "0.7"^^xsd:decimal .   # optional
     <urn:retinue:memory:ID> kb:session      "…" .                  # optional
+    <urn:retinue:memory:ID> kb:model        "…" .                  # optional
 
 The actor URI is the same convention the agent registry types
 (`discover-agents.py`), so memories join with the `kb:AiAgent` roster.
+
+`kb:model` records which model wrote the memory — the judgement-attribution
+stamp (docs/model-routing.md): the actor stays the household (`ara`), while
+the model tells a reader how much to trust a recorded decision. A session
+cannot introspect its own `--model` flag, so the spawner advertises it via
+RETINUE_SESSION_MODEL (set by the scheduler, the gate scripts, and the
+entrypoint alongside the flag they build); `--model` overrides, and with
+neither the stamp is simply absent.
 
 File layout: one flat directory. Entries from the same session share a file
 when a session label is known (`--session` or RETINUE_MEMORY_SESSION —
@@ -46,6 +55,8 @@ Environment:
                            (default $CHAMBERS_DIR/_generated/memory)
   RETINUE_MEMORY_SESSION   default session label for `store`
   RETINUE_MEMORY_ACTOR     default actor name (default: ara)
+  RETINUE_SESSION_MODEL    the model this session runs on, advertised by the
+                           spawner; stamped as kb:model on stored entries
   SPARQL_ENDPOINT_LIFE     the life store endpoint for `recall`
 """
 
@@ -155,6 +166,9 @@ def store(args: argparse.Namespace) -> int:
         )
     if session:
         lines.append(f"{subj} <{KB}session> {_nt_string(session)} .")
+    model = (args.model or os.environ.get("RETINUE_SESSION_MODEL", "")).strip()
+    if model:
+        lines.append(f"{subj} <{KB}model> {_nt_string(model)} .")
 
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
@@ -209,7 +223,7 @@ def recall(args: argparse.Namespace) -> int:
     sparql = f"""
 PREFIX kb: <{KB}>
 PREFIX xsd: <{XSD}>
-SELECT ?m ?content ?t ?actor ?relevance
+SELECT ?m ?content ?t ?actor ?relevance ?model
        (GROUP_CONCAT(DISTINCT ?tag; SEPARATOR=", ") AS ?tags) WHERE {{
   ?m a kb:Memory ;
      kb:content ?content ;
@@ -217,9 +231,10 @@ SELECT ?m ?content ?t ?actor ?relevance
   OPTIONAL {{ ?m kb:tag ?tag }}
   OPTIONAL {{ ?m kb:actor ?actor }}
   OPTIONAL {{ ?m kb:relevance ?relevance }}
+  OPTIONAL {{ ?m kb:model ?model }}
   {chr(10).join('  ' + p for p in patterns)}
 }}
-GROUP BY ?m ?content ?t ?actor ?relevance
+GROUP BY ?m ?content ?t ?actor ?relevance ?model
 ORDER BY DESC(?t)
 LIMIT {args.limit}
 """
@@ -240,6 +255,7 @@ LIMIT {args.limit}
                 "recorded_at": val(r, "t"),
                 "actor": val(r, "actor").removeprefix(ACTOR_PREFIX),
                 "relevance": val(r, "relevance") or None,
+                "model": val(r, "model") or None,
                 "tags": [t for t in val(r, "tags").split(", ") if t],
             }
             for r in rows
@@ -257,6 +273,9 @@ LIMIT {args.limit}
         rel = val(r, "relevance")
         if rel:
             meta.append(f"relevance {rel}")
+        model = val(r, "model")
+        if model:
+            meta.append(f"via {model}")
         print(f"- {when} ({'; '.join(meta)})")
         print(f"  {val(r, 'content')}")
     return 0
@@ -279,6 +298,9 @@ def main(argv: list[str]) -> int:
                          help="importance indicator, 0..1")
     p_store.add_argument("--session", default="",
                          help="session label — entries sharing it share a file")
+    p_store.add_argument("--model", default="",
+                         help="model that wrote this memory "
+                              "(default: RETINUE_SESSION_MODEL)")
     p_store.set_defaults(func=store)
 
     p_recall = sub.add_parser("recall", help="query memories from the life store")

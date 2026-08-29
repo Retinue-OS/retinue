@@ -115,15 +115,24 @@ def job_model(job: dict) -> str:
     return CLAUDE_MODEL
 
 
-def job_env() -> dict:
+def job_env(model: str = "") -> dict:
     """Environment for spawned jobs.
 
     Scheduled jobs run agents (`claude -p`) or scripts that must not hold mailbox
     credentials. When EMAIL_BACKEND_TOKEN is set, strip EMAIL_PASS* and point
     email_client.py at the web gateway so it proxies instead (mirrors the
     entrypoint's remote-control setup, since the scheduler is forked before it).
+
+    `model` advertises the model the spawned session runs on (a session cannot
+    introspect its own --model flag), so memory entries can be stamped with it
+    (scripts/memory.py). Cleared rather than inherited when this job passes no
+    --model, so a stale value can never mislabel a session.
     """
     env = dict(os.environ)
+    if model:
+        env["RETINUE_SESSION_MODEL"] = model
+    else:
+        env.pop("RETINUE_SESSION_MODEL", None)
     if env.get("EMAIL_BACKEND_TOKEN"):
         port = env.get("WEB_GATEWAY_PORT", "8080")
         env["EMAIL_BACKEND_URL"] = f"http://localhost:{port}/internal/email"
@@ -267,7 +276,7 @@ def run_job(job: dict) -> None:
             stderr=subprocess.PIPE,
             text=True,
             cwd="/workspace",
-            env=job_env(),
+            env=job_env(model),
             # Own process group, so a timeout can reach descendants too --
             # subprocess.run's timeout path only ever signalled the direct
             # child, leaving any grandchildren it spawned running.

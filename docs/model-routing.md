@@ -117,7 +117,11 @@ workflow; the model stamp (phase 2) is the ground truth beneath both.
 - **Model stamps**: the gateway knows which model ran each turn (it builds the
   `--model` flag); persist it in the message record and surface it subtly in
   the bubble. Attribution becomes ground truth in the data rather than a
-  convention agents might violate — names can drift, stamps cannot.
+  convention agents might violate — names can drift, stamps cannot. Memory
+  entries already carry this stamp (`kb:model`, fed by
+  `RETINUE_SESSION_MODEL`, which every spawner that builds a `--model` flag
+  exports into the session — shipped with phase 1); phase 2 extends the same
+  mechanism to dashboard message records.
 - The "[[chip: Take this to Ara senior]]" escalation chip.
 
 ### Phase 3 — personas become agents

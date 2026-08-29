@@ -232,9 +232,13 @@ unless written down. The memory log closes that gap: sessions store durable
 entries as N-Triples files in the framework-owned `_generated` pseudo-chamber
 (`chambers/_generated/memory/`), which the life store indexes like any chamber
 data. A memory entry is a **resource, not a bare fact** — the memory text plus
-topic tags, the recording actor, a timestamp, and an optional relevance
-indicator (0–1) — so memories are recallable by time range, tag, actor, or
-importance. Both directions go through `scripts/memory.py`:
+topic tags, the recording actor, a timestamp, an optional relevance indicator
+(0–1), and the model that wrote it (stamped automatically from
+`RETINUE_SESSION_MODEL`, which the spawner sets alongside the `--model` flag it
+builds; the actor stays the household `ara`, while the model stamp tells a
+later reader how much to trust a recorded judgement) — so memories are
+recallable by time range, tag, actor, or importance. Both directions go
+through `scripts/memory.py`:
 
 ```bash
 # Store: whenever a session learns or decides something a later session will

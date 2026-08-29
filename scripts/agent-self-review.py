@@ -135,9 +135,14 @@ def main() -> int:
           "spawning session", file=sys.stderr)
     cmd = ["claude", "-p", "--output-format=json",
            "--permission-mode", PERMISSION_MODE, build_prompt(rows)]
+    # Advertise the session's model so memory entries can be stamped with it
+    # (scripts/memory.py); cleared when no --model is passed, never inherited.
+    env = dict(os.environ)
+    env.pop("RETINUE_SESSION_MODEL", None)
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
-    result = subprocess.run(cmd, cwd="/workspace")
+        env["RETINUE_SESSION_MODEL"] = CLAUDE_MODEL
+    result = subprocess.run(cmd, cwd="/workspace", env=env)
     return result.returncode
 
 
