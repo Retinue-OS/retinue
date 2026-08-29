@@ -664,12 +664,24 @@ class RetinueConversations extends HTMLElement {
   // The model dropdown. Governs Ara's own turn only (dispatched subagents keep
   // their own models) — the title says so. Hidden unless the gateway offers more
   // than one model, so a single-model deployment sees no clutter. `selected` is
-  // the currently-chosen id ('' = default).
+  // the currently-chosen id; '' means the thread rides the gateway default,
+  // which the list carries not as its own row but as a `default: true` flag on
+  // the concrete entry that default runs on — show that entry as selected. Only
+  // when the gateway could not name its default (no flagged entry) does a
+  // hidden, unpickable placeholder keep the select from claiming a concrete
+  // model it is not running.
   _modelPickerHtml(selected) {
     const models = this._models || [];
     if (models.length < 2) return '';
-    const opts = models.map((m) =>
-      `<option value="${esc(m.id)}"${m.id === (selected || '') ? ' selected' : ''}>` +
+    let sel = selected || '';
+    if (!models.some((m) => m.id === sel)) {
+      const def = models.find((m) => m.default);
+      sel = def ? def.id : '';
+    }
+    const placeholder = models.some((m) => m.id === sel) ? ''
+      : '<option value="" hidden selected>Default</option>';
+    const opts = placeholder + models.map((m) =>
+      `<option value="${esc(m.id)}"${m.id === sel ? ' selected' : ''}>` +
       `${esc(m.label)}</option>`).join('');
     const title = 'Model for Ara’s replies in this conversation. ' +
       'Dispatched subagents (Coach, Medic, …) keep their own models.';

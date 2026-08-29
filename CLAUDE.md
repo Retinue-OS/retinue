@@ -698,9 +698,12 @@ explicit override that also wins over LiteLLM), else the JSON-LD document
 `RETINUE_CONVERSATION_MODELS_FILE`; read as plain JSON on the serving path,
 and derived into the life store by the boot emitter
 `scripts/emit-conversation-models.py`, so the fallback list stays queryable
-over SPARQL). Whatever the source, `id` is passed to `claude --model` and the
-empty-string id means "use the gateway
-default". The dashboard reads the list from `GET /conversation-models` and
+over SPARQL). Whatever the source, `id` is passed to `claude --model`. The
+list carries only concrete models — no synthetic "Default" row: the entry the
+gateway's configured default resolves to (through LiteLLM's route aliases)
+is flagged `default: true` and labeled as the default, and a thread without a
+stored choice runs that default (stored as the empty string internally).
+The dashboard reads the list from `GET /conversation-models` and
 persists a thread's choice via `POST /conversations/<id>/model` — an id not on
 the offered list is ignored (the thread falls back to the default), so a client
 can never inject an arbitrary `--model`. The picker hides itself when fewer than
