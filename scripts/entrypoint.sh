@@ -514,6 +514,9 @@ case "$MODE" in
     # here, after every daemon fork, so scheduler jobs never inherit it.
     if [[ -n "$MAIN_SESSION_MODEL" ]]; then
       export RETINUE_SESSION_MODEL="$MAIN_SESSION_MODEL"
+    else
+      # Never inherit a stale stamp: an un-pinned session must carry none.
+      unset RETINUE_SESSION_MODEL
     fi
     # Use --remote-control flag (not the subcommand) so that an interactive
     # session is created immediately and appears in the Claude app sidebar

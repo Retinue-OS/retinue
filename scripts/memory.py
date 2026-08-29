@@ -91,6 +91,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fcntl
 import json
 import os
 import re
@@ -151,14 +152,27 @@ def _xsd_datetime(dt: datetime.datetime) -> str:
 
 
 def _target_file(fallback_stem: str, session: str) -> Path:
-    """Entries sharing a session label share a file; otherwise one per entry."""
-    return MEMORY_DIR / f"{_slug(session) if session else fallback_stem}.nt"
+    """Entries sharing a session label share a file; otherwise one per entry.
+    A label that slugs to nothing falls back to the per-entry stem — never a
+    hidden ".nt" that would silently pool unrelated writes."""
+    stem = _slug(session)
+    if session and not stem:
+        print(f"[memory] unusable session label {session!r}; "
+              "using a per-entry file", file=sys.stderr)
+    return MEMORY_DIR / f"{stem or fallback_stem}.nt"
 
 
 def _append(path: Path, lines: list[str]) -> None:
+    """Append under an exclusive lock: session files are shared between
+    concurrent sessions, and interleaved writes would corrupt N-Triples."""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
-        fh.write("".join(line + "\n" for line in lines))
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            fh.write("".join(line + "\n" for line in lines))
+            fh.flush()
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 ENTRY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
@@ -330,9 +344,12 @@ def _date_bound(value: str, end_of_day: bool) -> str:
 def recall(args: argparse.Namespace) -> int:
     patterns: list[str] = []
     if args.tag:
-        wanted = " ".join(
-            _sparql_string(_slug(t)) for t in args.tag if _slug(t)
-        )
+        slugged = [s for s in (_slug(t) for t in args.tag) if s]
+        if not slugged:
+            print(f"[memory] no usable --tag values in {args.tag!r}",
+                  file=sys.stderr)
+            return 1
+        wanted = " ".join(_sparql_string(s) for s in slugged)
         patterns.append(f"?m kb:tag ?want . VALUES ?want {{ {wanted} }}")
     if args.actor:
         patterns.append(f"?m kb:actor <{ACTOR_PREFIX}{_slug(args.actor)}> .")
