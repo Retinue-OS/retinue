@@ -253,6 +253,12 @@ python3 /workspace/scripts/memory.py recall --tag insurance --since 2026-06-01 -
 # Reinforce: the user restated something already on record — strengthen it
 # instead of storing a duplicate (recall prints each entry's [id]).
 python3 /workspace/scripts/memory.py reinforce 20260829T193141Z-575748
+
+# Challenge: an entry turned out false / was overtaken / is now in doubt —
+# store what is known NOW and link the old entry to it.
+python3 /workspace/scripts/memory.py store --tag insurance \
+  --supersedes 20260829T193141Z-575748 \
+  "Filing deadline moved to the 15th; the August arrangement is void."
 ```
 
 **Reinforce, don't duplicate.** When the user restates a rule or preference
@@ -263,6 +269,17 @@ file — RDF merges by subject across files, so the original is never touched).
 Alongside the creation-time relevance, recall then shows how often and how
 recently an entry was repeated — the "user keeps saying this" signal, and the
 strongest reason to include a memory in a dispatch prompt.
+
+**Challenge, don't edit.** The inverse of reinforcing: a memory can turn out
+plainly false, be overtaken by events, or become doubtful on new evidence.
+Never edit or delete the old entry — store the **new** memory carrying what is
+known now, linked via `--corrects <id>` (was false), `--supersedes <id>` (the
+world changed), or `--questions <id>` (veracity in doubt). The link's object
+is the new entry, written into the current session's file like a reiteration.
+Corrected and superseded entries drop out of recall by default
+(`--include-superseded` shows them, labeled), while questioned ones stay,
+flagged — so no stale fact leaks into a dispatch prompt, yet the history of
+what was once believed remains queryable.
 
 What belongs in memory is the session-level residue that no chamber file
 carries: decisions and their reasons, outcomes of dispatched work, discovered
