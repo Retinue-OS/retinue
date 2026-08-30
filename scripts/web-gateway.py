@@ -234,6 +234,12 @@ STATE_FILE = os.environ.get("WEB_GATEWAY_STATE", "/tmp/web-session-state.json")
 PORT = int(os.environ.get("WEB_GATEWAY_PORT", "8080"))
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# Model tiers (docs/model-routing.md): a turn with no pinned model starts on
+# the router tier — Ara junior answers the door — and a turn junior escalates
+# is re-run on the frontier tier as Ara senior. Both optional: with neither
+# set the deployment runs untiered and nothing below changes behaviour.
+ROUTER_MODEL = os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
+FRONTIER_MODEL = os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
 
 # ── Per-conversation model selection ───────────────────────────────────────────
 # Each turn is its own `claude -p` process — a resumed one keeps the transcript,
@@ -2188,8 +2194,16 @@ def _conv_worker(cid: str, session_key: str) -> None:
         # resume is refused the turn must fall back to the full transcript — not
         # to a fragment whose context is missing.
         restart = _conv_engage_prompt(conv, False) if fresh else None
+        # An explicit per-thread choice wins; an escalated thread without one
+        # stays with Ara senior (the frontier tier) rather than re-paying a
+        # junior turn plus an escalation on every message.
+        chosen = _conv_model(conv)
+        if chosen is None and conv.get("escalated") and FRONTIER_MODEL:
+            chosen = FRONTIER_MODEL
         result = send_message(prompt, display_question=latest, session_key=session_key,
-                              model=_conv_model(conv), restart_message=restart)
+                              model=chosen, restart_message=restart)
+        if result.get("escalated"):
+            _conv_set_flags(cid, escalated=True)
         if "error" in result:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
@@ -2988,16 +3002,27 @@ def send_message(message: str, display_question: str | None = None,
     keys run in parallel up to the worker-pool bound.
 
     `model` overrides the model for this turn (a validated per-thread choice);
-    when None the gateway's configured default (CLAUDE_MODEL) applies. A turn
-    resumes the thread's existing session when one is still fresh, so switching
-    models between turns is free not because the session is new but because a
-    session transcript is model-independent.
+    when None the router tier applies (Ara junior at the door), falling back
+    to the gateway default (CLAUDE_MODEL). A turn resumes the thread's
+    existing session when one is still fresh, so switching models between
+    turns is free not because the session is new but because a session
+    transcript is model-independent.
 
     `restart_message` is the prompt to send if that resume is refused because
     Claude no longer holds the session. A prompt written for a resumed session
     deliberately omits what the session already carries, so replaying it into a
     fresh one would strip the thread of its context — the caller passes its
     full-context variant here and only that is used on the second attempt.
+
+    Escalation (docs/model-routing.md, phase 2): when a frontier tier is
+    configured and this turn runs below it, the session is handed
+    RETINUE_ESCALATE_FILE; creating that file is Ara junior's signal that the
+    turn is outside her whitelist. The junior reply is then discarded and the
+    same prompt is re-run on the frontier tier against the same pre-turn
+    resume point — the abandoned junior fork never enters the thread's
+    session lineage. The result carries "escalated": True so the caller can
+    keep the thread escalated. Every spawned session also gets
+    RETINUE_SESSION_MODEL, the stamp scripts/memory.py records on memories.
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
@@ -3006,11 +3031,20 @@ def send_message(message: str, display_question: str | None = None,
         with _worker_pool:
             state = _get_session_entry(session_key)
 
-            # A per-thread model choice (validated by the caller) wins over the
-            # gateway default. An explicit empty string means "defer to default".
-            effective_model = CLAUDE_MODEL if model is None else model
+            # A per-thread model choice (validated by the caller) wins over
+            # the tier default. An explicit empty string means "defer".
+            effective_model = (ROUTER_MODEL or CLAUDE_MODEL) if model is None else model
 
-            def _build_cmd(resume_id: str | None, prompt: str) -> list[str]:
+            # A turn below the frontier tier may be escalated by the session
+            # itself: it creates the file named in RETINUE_ESCALATE_FILE.
+            escalatable = bool(FRONTIER_MODEL) and effective_model != FRONTIER_MODEL
+            escalate_flag = (
+                Path(tempfile.gettempdir()) / f"retinue-escalate-{uuid.uuid4().hex}"
+                if escalatable else None
+            )
+
+            def _build_cmd(resume_id: str | None, prompt: str,
+                           run_model: str) -> list[str]:
                 # Grant the session read access both to composer uploads and to
                 # thread attachments. The latter (CONVERSATION_ATTACHMENTS_DIR,
                 # under CONVERSATIONS_DIR) is where files pushed into a thread —
@@ -3021,8 +3055,8 @@ def send_message(message: str, display_question: str | None = None,
                        "--permission-mode", CLAUDE_PERMISSION_MODE,
                        "--add-dir", "/root/.claude/uploads",
                        "--add-dir", str(CONVERSATION_ATTACHMENTS_DIR)]
-                if effective_model:
-                    cmd += ["--model", effective_model]
+                if run_model:
+                    cmd += ["--model", run_model]
                 if resume_id:
                     cmd += ["--resume", resume_id]
                 # End option parsing with "--" so a user-supplied message that
@@ -3030,12 +3064,30 @@ def send_message(message: str, display_question: str | None = None,
                 cmd.extend(["--", prompt])
                 return cmd
 
-            def _spawn(cmd: list[str]):
-                return _run_claude(cmd, capture_output=True, text=True, cwd="/workspace")
+            def _spawn(cmd: list[str], run_model: str):
+                # RETINUE_SESSION_MODEL advertises the model this session runs
+                # on (sessions cannot introspect their --model flag); cleared
+                # rather than inherited so a stale value never mislabels a
+                # session. The escalate flag is only offered below the
+                # frontier tier — senior has nobody to escalate to.
+                env = dict(os.environ)
+                env.pop("RETINUE_SESSION_MODEL", None)
+                env.pop("RETINUE_ESCALATE_FILE", None)
+                if run_model:
+                    env["RETINUE_SESSION_MODEL"] = run_model
+                if escalate_flag is not None and run_model != FRONTIER_MODEL:
+                    env["RETINUE_ESCALATE_FILE"] = str(escalate_flag)
+                return _run_claude(cmd, capture_output=True, text=True,
+                                   cwd="/workspace", env=env)
 
+            # Remember the resume point and prompt the final first-pass run
+            # used, so an escalated re-run replays exactly that turn on the
+            # frontier tier — abandoning junior's fork, never stacking on it.
             if _session_is_fresh(state, session_key):
                 session_action = "resumed"
-                result = _spawn(_build_cmd(state["session_id"], message))
+                run_resume, run_prompt = state["session_id"], message
+                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                effective_model)
                 if result.returncode != 0 and _resume_refused(result):
                     # The state file outlived the transcript. Start over rather
                     # than hand the user an error for a session they never chose.
@@ -3045,10 +3097,25 @@ def send_message(message: str, display_question: str | None = None,
                         flush=True,
                     )
                     session_action = "restarted"
-                    result = _spawn(_build_cmd(None, restart_message or message))
+                    run_resume, run_prompt = None, restart_message or message
+                    result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                    effective_model)
             else:
                 session_action = "new"
-                result = _spawn(_build_cmd(None, message))
+                run_resume, run_prompt = None, message
+                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                effective_model)
+
+            escalated = False
+            if escalate_flag is not None and escalate_flag.exists():
+                escalate_flag.unlink(missing_ok=True)
+                if result.returncode == 0:
+                    escalated = True
+                    print(f"[web-gateway] {session_key}: junior escalated — "
+                          f"re-running on {FRONTIER_MODEL}", flush=True)
+                    result = _spawn(
+                        _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
+                        FRONTIER_MODEL)
 
             if result.returncode != 0:
                 err_detail = result.stderr.strip()
@@ -3108,6 +3175,8 @@ def send_message(message: str, display_question: str | None = None,
                 # the dominant-cost entry of the per-model usage breakdown.
                 "model_name": _envelope_model_name(data),
             }
+            if escalated:
+                out["escalated"] = True
 
             if response_text:
                 shown_question = display_question or message
@@ -5346,7 +5415,9 @@ class Handler(BaseHTTPRequestHandler):
         if raw and not _model_offered(raw, refresh=True):
             self._send_json(400, {"error": "unknown model"})
             return
-        conv = _conv_set_flags(cid, model=raw)
+        # Touching the picker is the user taking manual control of the
+        # thread's tier, so it also clears a standing escalation.
+        conv = _conv_set_flags(cid, model=raw, escalated=False)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return

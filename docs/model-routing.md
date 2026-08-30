@@ -105,24 +105,38 @@ workflow; the model stamp (phase 2) is the ground truth beneath both.
   behavior-preserving when the new variables are unset.
 - The junior/senior identity, whitelist, and signature rules in `CLAUDE.md`.
 
-### Phase 2 — escalation and attribution
+### Phase 2 — escalation and attribution (shipped)
 
-- **Escalation flow** for the unknown-difficulty entry points (dashboard turns,
-  `ask_ara`): the turn starts on the router tier; when junior hits anything
-  outside her whitelist she escalates, and the gateway re-runs the same engage
-  prompt on `RETINUE_FRONTIER_MODEL`, discarding the cheap transcript. The
-  existing per-thread model API doubles as "this thread stays escalated"; the
-  thread-bar picker is the user-visible tier control. `ask_ara`'s slow-answer
-  job-id mechanism already absorbs the extra latency of an escalated answer.
-- **Model stamps**: the gateway knows which model ran each turn (it builds the
-  `--model` flag); persist it in the message record and surface it subtly in
-  the bubble. Attribution becomes ground truth in the data rather than a
-  convention agents might violate — names can drift, stamps cannot. Memory
-  entries already carry this stamp (`kb:model`, fed by
-  `RETINUE_SESSION_MODEL`, which every spawner that builds a `--model` flag
-  exports into the session — shipped with phase 1); phase 2 extends the same
-  mechanism to dashboard message records.
-- The "[[chip: Take this to Ara senior]]" escalation chip.
+- **Escalation flow** for the unknown-difficulty entry points. A gateway turn
+  with no per-thread model choice now runs on the router tier
+  (`RETINUE_ROUTER_MODEL`, falling back to the gateway default). When a
+  frontier tier is configured and the turn runs below it, the session is
+  handed **`RETINUE_ESCALATE_FILE`**: creating that file is junior's signal
+  (CLAUDE.md tells her how and when), the junior reply is discarded, and
+  `send_message` re-runs the same prompt on `RETINUE_FRONTIER_MODEL` against
+  the same pre-turn resume point — the abandoned junior fork never enters the
+  thread's session lineage. A thread that escalated carries an `escalated`
+  flag and stays with senior on later turns; the user touching the model
+  picker takes manual control and clears it. `ask_ara` follows the same
+  contract (`ARA_MCP_MODEL` wins, else router with escalation to frontier),
+  with the existing slow-answer job-id flow absorbing the extra latency.
+- **Model stamps**: dashboard bubbles already carried the answering model
+  (`model_name` in each message record, derived from the turn's own usage
+  envelope — ground truth from the API response, not the flag). What phase 2
+  added is the other half: the gateway and the MCP server now export
+  `RETINUE_SESSION_MODEL` into every session they spawn (and clear an
+  inherited value), so memories written from dashboard and `ask_ara` turns
+  are `kb:model`-stamped like every other session's.
+- The **"[[chip: Take this to Ara senior]]"** chip: CLAUDE.md instructs junior
+  to offer it whenever she answers a borderline point herself; the user
+  clicking it sends the explicit escalation phrase, which junior honors via
+  the flag file.
+- **Claude Code's built-in auto memory is disabled** deployment-wide
+  (`autoMemoryEnabled: false` in `.claude/settings.json`, plus
+  `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` exported by the entrypoint): the life
+  store is the system's one memory, and a second, opaque memory beside it
+  would be invisible to SPARQL and to the reinforce/challenge lifecycle.
+  CLAUDE.md project instructions are unaffected.
 
 ### Phase 3 — personas become agents
 

@@ -12,6 +12,15 @@ CHAMBERS_DIR="${CHAMBERS_DIR:-/workspace/chambers}"
 CHAMBERS_MANIFEST="${CHAMBERS_MANIFEST:-/workspace/chambers.json}"
 export CHAMBERS_DIR CHAMBERS_MANIFEST
 
+# Retinue keeps its own session memory in the life store (scripts/memory.py,
+# CLAUDE.md "Memory"); Claude Code's built-in auto memory would be a second,
+# opaque memory beside it, invisible to SPARQL and to the reinforce/challenge
+# lifecycle. Disable it for every session this container spawns — CLAUDE.md
+# project instructions are unaffected. (.claude/settings.json sets
+# autoMemoryEnabled=false too; the env var covers sessions that run outside
+# that settings scope.)
+export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+
 # ── Ensure egress-audit CA exists (auto-generate if missing) ────────
 # The MITM proxy needs a CA. Generating it at container start means a
 # deployment can update to a version that includes egress auditing without
