@@ -665,6 +665,14 @@ services:
       - messenger-signal:/data/_generated/messenger/signal:ro
       - messenger-whatsapp:/data/_generated/messenger/whatsapp:ro
       - messenger-telegram:/data/_generated/messenger/telegram:ro
+      # Persist both blue-green index slots so a restart resumes serving the
+      # last completed build immediately instead of 502ing for the whole
+      # duration of a fresh rebuild (qlever-dir still always rebuilds on
+      # startup to catch up on anything that changed while the container was
+      # down — this only avoids the gap in service while it does). See
+      # qlever-dir's "Resuming across a restart" README section.
+      - life-index-a:/index-a
+      - life-index-b:/index-b
     environment:
       BASE_URI: "file:"
       REBUILD_DELAY: "15"
@@ -753,6 +761,10 @@ volumes:
   messenger-signal:
   messenger-whatsapp:
   messenger-telegram:
+  # qlever-life's two blue-green index slots — see the qlever-life service
+  # above for why these are persisted.
+  life-index-a:
+  life-index-b:
   piper-data:
   stt-models:
   egress-audit-certs:
