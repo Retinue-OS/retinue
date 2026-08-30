@@ -502,6 +502,27 @@ def _resolve_route_model(mid: str) -> str:
     return mid
 
 
+def _same_model(a: str, b: str) -> bool:
+    """Whether two model names denote the same concrete model.
+
+    Model names reach the gateway from two namespaces that never had to agree
+    until the tiers arrived: the picker offers LiteLLM route ids
+    (`anthropic/claude-opus-5`) while RETINUE_ROUTER_MODEL/_FRONTIER_MODEL name
+    bare models (`claude-opus-5`). Comparing those as strings makes the
+    frontier model look unequal to itself — so a thread pinned to the frontier
+    tier via the picker would be handed junior's escalation hatch and could
+    escalate Opus to Opus. Both sides are resolved through LiteLLM's route
+    aliases and compared tail-insensitively to the provider prefix, which is
+    how _mark_default has always matched the default entry."""
+    a, b = str(a or "").strip(), str(b or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    ra, rb = _resolve_route_model(a), _resolve_route_model(b)
+    return ra == rb or ra.split("/")[-1] == rb.split("/")[-1]
+
+
 def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) -> list[dict]:
     """Picker entries from LiteLLM /model/info, optionally intersected with /v1/models.
 
@@ -765,11 +786,8 @@ def _mark_default(models: list[dict]) -> list[dict]:
     target = _resolve_route_model(CLAUDE_MODEL)
     if not target:
         return out
-    target_tail = target.split("/")[-1]
     for m in out:
-        resolved = _resolve_route_model(m["id"])
-        if target in (m["id"], resolved) or target_tail in (
-                m["id"], resolved.split("/")[-1]):
+        if _same_model(target, m["id"]):
             m["default"] = True
             label = str(m.get("label") or m["id"])
             m["label"] = (label[:-1] + ", default)" if label.endswith(")")
@@ -808,6 +826,35 @@ def _model_offered(mid: str, refresh: bool = False) -> bool:
     if not refresh:
         return False
     return any(m["id"] == mid for m in _conversation_models(force=True))
+
+
+def _default_offered_model_id() -> str | None:
+    """The offered id that default turns actually run on, or None.
+
+    This is the picker's own `default: true` entry — a concrete, offered model
+    — not CLAUDE_MODEL, which is typically a hidden plumbing route
+    (`retinue-claude`) that _valid_model_id rejects."""
+    for m in _conversation_models():
+        if m.get("default"):
+            return m["id"]
+    return None
+
+
+def _offered_equivalent(mid: str | None) -> str | None:
+    """The offered id naming the same model as `mid`, or None.
+
+    A pin stored before the picker moved to LiteLLM route ids holds a bare name
+    (`claude-haiku-4-5`) that is no longer on the offered list, so
+    _valid_model_id rejects it and the thread behaves as if unpinned. This
+    recovers the choice the user actually made instead of flattening it to the
+    default."""
+    mid = str(mid or "").strip()
+    if not mid:
+        return None
+    for m in _conversation_models():
+        if _same_model(mid, m["id"]):
+            return m["id"]
+    return None
 
 # ── How long a session stays resumable ────────────────────────────────────────
 # Resuming is what keeps a turn's work — files read, contacts looked up — from
@@ -1939,6 +1986,54 @@ def _conv_model(conv: dict) -> str | None:
     return _valid_model_id(conv.get("model"))
 
 
+# Threads that predate the model tiers carry no pin, because back then they
+# did not need one: an unpinned thread ran the gateway default. Introducing
+# RETINUE_ROUTER_MODEL redefined that same absent value as "the router tier",
+# so those threads silently dropped to the cheap model mid-conversation while
+# the picker still showed the default. Stored state must never change meaning
+# under a deploy — so the old implicit default is written in explicitly, once.
+_MODEL_PIN_MIGRATION_MARKER = ".model-pin-migration-done"
+
+
+def materialise_pre_tier_model_pins() -> int:
+    """Pin threads that predate the tiers to the gateway default. Returns the
+    number of threads rewritten.
+
+    Runs at most once, guarded by a marker file: at that moment every existing
+    thread predates the migration by definition, so no timestamp has to be
+    guessed. Threads created afterwards genuinely mean "defer to the tier
+    default" and are never touched — nor is any thread that carries a real
+    explicit choice.
+
+    A thread holding a legacy pin the current list no longer offers (a bare
+    `claude-haiku-4-5` from before the picker moved to route ids) is repaired
+    to the offered id naming that same model, not flattened to the default:
+    it lost its pin to a format change, and the user did choose it."""
+    marker = CONVERSATIONS_DIR / _MODEL_PIN_MIGRATION_MARKER
+    if marker.exists():
+        return 0
+    target = _default_offered_model_id()
+    if not target:
+        # Model list unreachable at boot. Leave the marker unwritten so the
+        # next start retries, rather than recording the migration as done.
+        print("[web-gateway] model-pin migration deferred: no default model "
+              "offered yet", flush=True)
+        return 0
+    migrated = 0
+    with _conversations_lock:
+        for path in sorted(CONVERSATIONS_DIR.glob("*.json")):
+            if not _CONV_ID_RE.match(path.stem):
+                continue
+            conv = _load_conv(path.stem)
+            if conv is None or _valid_model_id(conv.get("model")):
+                continue
+            conv["model"] = _offered_equivalent(conv.get("model")) or target
+            _save_conv(conv)
+            migrated += 1
+    marker.write_text(target + "\n", encoding="utf-8")
+    return migrated
+
+
 def _conv_set_flags(cid: str, **flags) -> dict | None:
     with _conversations_lock:
         conv = _load_conv(cid)
@@ -3033,11 +3128,20 @@ def send_message(message: str, display_question: str | None = None,
 
             # A per-thread model choice (validated by the caller) wins over
             # the tier default. An explicit empty string means "defer".
+            #
+            # INVARIANT: what "defer" resolves to is stored state's meaning,
+            # not its value — so any future change to this line changes the
+            # model of every unpinned thread retroactively, mid-conversation.
+            # Ship such a change together with a one-shot migration that
+            # materialises the previous default into an explicit pin (see
+            # materialise_pre_tier_model_pins), or existing threads silently
+            # move to a model nobody chose for them.
             effective_model = (ROUTER_MODEL or CLAUDE_MODEL) if model is None else model
 
             # A turn below the frontier tier may be escalated by the session
             # itself: it creates the file named in RETINUE_ESCALATE_FILE.
-            escalatable = bool(FRONTIER_MODEL) and effective_model != FRONTIER_MODEL
+            escalatable = bool(FRONTIER_MODEL) and not _same_model(
+                effective_model, FRONTIER_MODEL)
             escalate_flag = (
                 Path(tempfile.gettempdir()) / f"retinue-escalate-{uuid.uuid4().hex}"
                 if escalatable else None
@@ -3075,7 +3179,8 @@ def send_message(message: str, display_question: str | None = None,
                 env.pop("RETINUE_ESCALATE_FILE", None)
                 if run_model:
                     env["RETINUE_SESSION_MODEL"] = run_model
-                if escalate_flag is not None and run_model != FRONTIER_MODEL:
+                if escalate_flag is not None and not _same_model(
+                        run_model, FRONTIER_MODEL):
                     env["RETINUE_ESCALATE_FILE"] = str(escalate_flag)
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
@@ -6018,6 +6123,16 @@ if __name__ == "__main__":
             print(f"[web-gateway] repaired {repaired} chat gateway stamp(s)", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"[web-gateway] chat gateway repair skipped: {exc}", flush=True)
+    # Pin threads that predate the model tiers to the gateway default, so the
+    # introduction of RETINUE_ROUTER_MODEL does not retroactively move them to
+    # the router tier. Idempotent (marker-guarded) and best-effort.
+    try:
+        pinned = materialise_pre_tier_model_pins()
+        if pinned:
+            print(f"[web-gateway] pinned {pinned} pre-tier thread(s) to the "
+                  "gateway default", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] model-pin migration skipped: {exc}", flush=True)
     # ThreadingHTTPServer so quick requests (job polls, /health) are never
     # blocked head-of-line behind a long-running job. Actual `claude` concurrency
     # is still bounded by the worker pool inside send_message().
