@@ -347,9 +347,12 @@ case "$MODE" in
     SESSION_NAME="$(date +%Y%m%d-%H%M%S)-${HOSTNAME}"
     DEBUG_LOG="/tmp/session-main-debug.log"
     CLAUDE_MODEL_ARGS=()
-    if [[ -n "${RETINUE_CLAUDE_MODEL:-}" ]]; then
-      CLAUDE_MODEL_ARGS=(--model "$RETINUE_CLAUDE_MODEL")
-      echo "[claude] Using configured model: $RETINUE_CLAUDE_MODEL"
+    # The interactive main session is Ara senior's desk, so the frontier tier
+    # wins when the deployment declares one (docs/model-routing.md).
+    MAIN_SESSION_MODEL="${RETINUE_FRONTIER_MODEL:-${RETINUE_CLAUDE_MODEL:-}}"
+    if [[ -n "$MAIN_SESSION_MODEL" ]]; then
+      CLAUDE_MODEL_ARGS=(--model "$MAIN_SESSION_MODEL")
+      echo "[claude] Using configured model: $MAIN_SESSION_MODEL"
     fi
     if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then
       echo "[claude] Using Claude-compatible gateway: $ANTHROPIC_BASE_URL"
@@ -505,6 +508,16 @@ case "$MODE" in
     for var in $(env | sed -n 's/^\(EMAIL_PASS[^=]*\)=.*/\1/p'); do
       unset "$var"
     done
+    # Advertise the model this session runs on, so memory entries can be
+    # stamped with it (scripts/memory.py). Sessions cannot introspect their
+    # own --model flag; the spawner is the source of truth. Exported only
+    # here, after every daemon fork, so scheduler jobs never inherit it.
+    if [[ -n "$MAIN_SESSION_MODEL" ]]; then
+      export RETINUE_SESSION_MODEL="$MAIN_SESSION_MODEL"
+    else
+      # Never inherit a stale stamp: an un-pinned session must carry none.
+      unset RETINUE_SESSION_MODEL
+    fi
     # Use --remote-control flag (not the subcommand) so that an interactive
     # session is created immediately and appears in the Claude app sidebar
     # without the user needing to connect via a URL first.

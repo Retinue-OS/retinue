@@ -30,7 +30,12 @@ import urllib.request
 
 KB = "https://w3id.org/retinue/kb#"
 ENDPOINT = os.environ.get("SPARQL_ENDPOINT_LIFE", "http://qlever-life:7001")
-CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# Self-review is supervision — an Ara senior job — so the frontier tier wins
+# when the deployment declares one (docs/model-routing.md).
+CLAUDE_MODEL = (
+    os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
+    or os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+)
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 
 # One query answers the whole gate: unresolved, unpaused projects whose current
@@ -130,9 +135,14 @@ def main() -> int:
           "spawning session", file=sys.stderr)
     cmd = ["claude", "-p", "--output-format=json",
            "--permission-mode", PERMISSION_MODE, build_prompt(rows)]
+    # Advertise the session's model so memory entries can be stamped with it
+    # (scripts/memory.py); cleared when no --model is passed, never inherited.
+    env = dict(os.environ)
+    env.pop("RETINUE_SESSION_MODEL", None)
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
-    result = subprocess.run(cmd, cwd="/workspace")
+        env["RETINUE_SESSION_MODEL"] = CLAUDE_MODEL
+    result = subprocess.run(cmd, cwd="/workspace", env=env)
     return result.returncode
 
 
