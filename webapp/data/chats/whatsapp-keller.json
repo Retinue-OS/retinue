@@ -8,6 +8,7 @@
   "unread": 0,
   "archived": true,
   "muted": false,
+  "companion": null,
   "last": {
    "ts": "2026-08-25T17:20:00+02:00",
    "direction": "in",
@@ -75,13 +76,6 @@
    "sender_name": "Praxis Dr. Keller",
    "text": "In Ordnung, bis Donnerstag.",
    "ts": "2026-08-25T17:20:00+02:00"
-  }
- ],
- "companion": [
-  {
-   "role": "ara",
-   "text": "The practice confirmed the physio referral is ready at the front desk (Mon–Fri 8–17). You said Thursday — that's today. I've put it on today's agenda.",
-   "ts": "2026-08-27T07:40:00+02:00"
   }
  ]
 }

@@ -8,6 +8,7 @@
   "unread": 7,
   "archived": false,
   "muted": false,
+  "companion": "a7f3c21d94b84e0fa1c65d2e8b309f47",
   "last": {
    "ts": "2026-08-27T08:47:00+02:00",
    "direction": "in",
@@ -407,18 +408,6 @@
    "sender_name": "Beat Odermatt",
    "text": "Damit ist das Kulinarische geregelt. Bis Samstag in einer Woche!",
    "ts": "2026-08-27T08:47:00+02:00"
-  }
- ],
- "companion": [
-  {
-   "role": "user",
-   "text": "What do I still owe this group?",
-   "ts": "2026-08-24T18:00:00+02:00"
-  },
-  {
-   "role": "ara",
-   "text": "Nothing open on your side: you confirmed the 5 September date and the 07:35 train. Beat posted the packing list this morning — cash for the restaurant is the one thing to remember. I can add the hike to your agenda with a cash reminder the evening before.",
-   "ts": "2026-08-24T18:01:00+02:00"
   }
  ]
 }

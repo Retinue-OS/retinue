@@ -125,16 +125,24 @@ docstring). Pieces:
   splitter on a wide screen. The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
+  The companion pane is the chat's own conversation with Ara (see the
+  `companion` field below): her turns render in the conversation thread's
+  visual language, `pending` shows as her writing, and a chip is that same
+  turn with a canned prompt. The two rails meet in the shared draft — Ara
+  stages a reply, the chat poll adopts it into an empty composer marked as
+  hers, and the send press stays the user's.
 
 The API, as the components consume it:
 
 - `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
   activity. A `ChatSummary` is `{id, channel, name, group, members?, unread,
-  archived, muted, last, draft, messages}` where `id` is
+  archived, muted, companion, last, draft, messages}` where `id` is
   `<channel>:<chat-key>` (the exact recipient string that channel's send path
   accepts), `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
-  is the shared draft `{text, author, agent?, ts, version}` or null, and
+  is the shared draft `{text, author, agent?, ts, version}` or null,
+  `companion` is the conversation id of this chat's companion thread (null
+  until one exists), and
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
   dashboard-conversation semantics verbatim: an archived chat leaves the card
@@ -164,10 +172,9 @@ The API, as the components consume it:
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
   else stays a file row. Reactions and quoted replies (issue #130) will
-  decorate these records later. There is no companion thread in the payload
-  yet: the companion pane runs in a local demo mode until phase 4 wires it to
-  the chat's real companion conversation (kind `companion`) via the
-  `/conversations` API.
+  decorate these records later. The companion thread is not in this payload:
+  it is an ordinary conversation, named by the summary's `companion` id and
+  read through `/conversations`.
 - `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
   gateway as the user (direct under every policy category: the authenticated
   send press IS the approval `verify` exists for) and returns the sent
@@ -188,6 +195,13 @@ The API, as the components consume it:
   the page adopts (with a "draft updated elsewhere" note when the words
   actually differ) rather than clobbering.
 - `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
+- `POST /chats/<id>/companion` — `{id}`, the chat's companion conversation.
+  Idempotent: it creates the thread on the first call and returns the same id
+  afterwards. The page calls it lazily — on the user's first turn or chip, so
+  that a chat merely opened leaves no empty thread behind. From that id on,
+  the pane is a plain conversation client: `GET /conversations/<id>` for the
+  thread (`pending` is Ara writing), the reply POST for a turn, the read POST
+  when the pane shows it.
 
 **Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
 static documents in the API's response shapes — the contract drafts the API
@@ -196,9 +210,10 @@ corpus (the validation suite serves them as mocked `/chats*` responses). They
 are no longer a serving source. The corpus covers the media shapes: image
 attachments with intrinsic dimensions, a voice note (`audio/*` with the
 transcript as the message text) and a video (`video/*` with dimensions), all
-with playable `data:` URLs. One deliberate delta against the live API
-remains: a `companion` array seeding the companion pane's demo content (the
-live payload has none).
+with playable `data:` URLs, and both companion states: one chat names an
+existing thread, the rest carry `companion: null`. Companion messages
+themselves are conversation documents, not chat ones, so the corpus holds
+none — the suite mocks `/conversations/<id>` for those.
 
 ## Markdown rendering
 

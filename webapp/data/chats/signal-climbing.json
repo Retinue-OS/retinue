@@ -8,6 +8,7 @@
   "unread": 1,
   "archived": false,
   "muted": false,
+  "companion": null,
   "last": {
    "ts": "2026-08-27T07:05:00+02:00",
    "direction": "in",
@@ -110,6 +111,5 @@
    "ts": "2026-08-27T07:05:00+02:00",
    "lang": "en"
   }
- ],
- "companion": []
+ ]
 }
