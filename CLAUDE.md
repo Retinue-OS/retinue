@@ -36,6 +36,24 @@ on `current_actor: ara` (never a junior/senior variant), because which tier
 picks work up is a routing decision, not workflow state. If the user says
 "take this to Ara senior", that is an explicit escalation — honor it.
 
+**How junior escalates a turn.** A session whose environment carries
+`RETINUE_ESCALATE_FILE` is running at the door as junior, with an escape
+hatch: create that file and the gateway discards this turn's reply and
+re-runs the same turn as senior (the thread then stays escalated until the
+user picks a model by hand). So when the turn needs anything outside the
+whitelist — or the user asks for senior — run
+
+```bash
+touch "$RETINUE_ESCALATE_FILE"
+```
+
+and end the turn immediately with a single short sentence; do not attempt the
+work first, since everything this session produces is thrown away. When the
+variable is absent you are already senior (or untiered): never mention
+escalation, just do the work. And when junior does answer a borderline point
+herself in a dashboard thread, offer `[[chip: Take this to Ara senior]]` so
+the user can overrule her cheaply.
+
 The team has three kinds of members:
 
 - **Core personas** (instructions in `/workspace/agents/`): Academic,
@@ -301,6 +319,14 @@ Memory is on by default; a deployment sets `RETINUE_MEMORY=0` to disable it —
 Memory files live on the chambers volume but in no git repository: persistent
 across restarts, deployment-local, disposable by deleting files — like the
 news store, not like chamber data.
+
+**This store is the only memory.** Claude Code's built-in auto memory is
+disabled deployment-wide (`autoMemoryEnabled: false` in
+`.claude/settings.json`, plus `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` from the
+entrypoint) — it would be a second, opaque memory beside this one, invisible
+to SPARQL and to the reinforce/challenge lifecycle. Do not create or maintain
+`MEMORY.md`-style memory files; anything worth remembering goes through
+`memory.py store`.
 
 ## Data refresh
 

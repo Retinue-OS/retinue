@@ -1,5 +1,6 @@
 {
   "model": "opus",
+  "autoMemoryEnabled": false,
   "disableClaudeAiConnectors": true,
   "permissions": {
     "allow": [
