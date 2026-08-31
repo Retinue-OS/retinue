@@ -794,6 +794,15 @@ PR/issue labels link to GitHub, no URL is ever shown bare (always
 `[label](url)`), and anything the user is asked to do elsewhere — a portal to
 sign into, a page to approve on — is named as a link.
 
+The gateway additionally runs a **presentation lint** over every agent→user
+message that lands in a thread (Ara's replies and `conversation-push.py`
+posts alike; quiet `cowork` audit threads excepted): a cheap-model pass that
+enforces the chips-and-links form regardless of which model composed the
+text. It is a net, not a license — it fixes form only, never adds content
+(details chips, GitHub links and portal URLs it cannot know), so keep
+composing per the skill. `PRESENTATION_LINT=0` disables it;
+`PRESENTATION_LINT_MODEL` overrides its model (default: the router tier).
+
 The endpoint is token-gated (`CONVERSATION_BACKEND_TOKEN`, set by the entrypoint)
 so only in-container agents can post on the user's behalf — like the e-mail
 backend and `signal-push.py`. Threads persist under `CONVERSATIONS_DIR`, which the deployment pins to the persistent `/root` volume (`/root/.retinue/conversations`) so threads survive container recreation.
