@@ -982,6 +982,28 @@ TRANSCRIPT_CLEANUP_TIMEOUT = float(os.environ.get("TRANSCRIPT_CLEANUP_TIMEOUT", 
 # answering instead of correcting returns something much longer).
 TRANSCRIPT_CLEANUP_CONTEXT_MESSAGES = 6
 TRANSCRIPT_CLEANUP_MAX_GROWTH = 1.6
+# Presentation lint (docs/model-routing.md, phase 4). Everything that lands in
+# a dashboard thread as an agent→user message passes through a cheap-model
+# lint that enforces the dashboard-composing form rules — reply chips for
+# offered options, no bare or relative URLs — regardless of which agent or
+# model wrote the text. Structural enforcement at the choke point, same move
+# as the transcript cleanup and the send policies: the rules hold even when a
+# small model forgot them while composing. Form only, fail-open: the lint
+# never adds content, and any failure delivers the original text.
+PRESENTATION_LINT = os.environ.get("PRESENTATION_LINT", "1").strip().lower() not in ("0", "false", "no")
+# An explicit PRESENTATION_LINT_MODEL wins; else the router tier (the lint is
+# a routing-priced job), else the gateway default — so a non-Anthropic
+# deployment lints on its own backend; "haiku" is the last-resort default.
+PRESENTATION_LINT_MODEL = (
+    os.environ.get("PRESENTATION_LINT_MODEL", "").strip()
+    or ROUTER_MODEL or CLAUDE_MODEL or "haiku"
+)
+PRESENTATION_LINT_TIMEOUT = float(os.environ.get("PRESENTATION_LINT_TIMEOUT", "45"))
+# Chips and link labels legitimately grow a message, so the allowance is wider
+# than the cleanup pass's; a model that starts answering instead of linting
+# still blows past it. A shrunken result dropped content — equally distrusted.
+PRESENTATION_LINT_MAX_GROWTH = 2.5
+PRESENTATION_LINT_MIN_KEEP = 0.6
 _CONV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _ATT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONV_GET_RE = re.compile(r"^/conversations/([0-9a-f]{32})/?$")
@@ -2303,7 +2325,12 @@ def _conv_worker(cid: str, session_key: str) -> None:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
         else:
-            reply = result.get("response") or "(no reply)"
+            # The lint enforces the dashboard-composing form (chips for
+            # options, no bare URLs) on the way out — the net under whichever
+            # model composed the reply. Error replies above skip it: they are
+            # gateway-authored and already plain.
+            reply = _lint_presentation(result.get("response") or "(no reply)",
+                                       kind=conv.get("kind") or "chat")
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
@@ -3406,6 +3433,94 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     if not cleaned or len(cleaned) > max(80, len(raw) * TRANSCRIPT_CLEANUP_MAX_GROWTH):
         return raw
     return cleaned
+
+
+# ── Presentation lint ─────────────────────────────────────────────────────────
+
+_LINT_SYSTEM_PROMPT = (
+    "You are a formatting lint for messages an assistant sends to its user's "
+    "phone dashboard. The dashboard renders Markdown plus one extra "
+    "affordance, the reply chip: [[chip: Label | prefill text]] — an inline "
+    "click-to-fill button; clicking it drops the prefill into the composer "
+    "for the user to review and send themselves, it never auto-sends.\n\n"
+    "Return the message below with ONLY these presentation rules enforced, "
+    "changing nothing else:\n\n"
+    "1. Options get chips. When the message asks the user to choose, confirm "
+    "or decide (send/adjust/discard a draft, yes/no, pick one of several), "
+    "add one chip per offered option on a final line, separated by \" · \". "
+    "The Label is one or two words; the prefill is a complete one-line reply "
+    "in the thread's language stating the user's intention (\"Yes, send it "
+    "as proposed.\") — it leans on the message above and never restates its "
+    "data. An open \"or something else?\" needs no chip. If the message "
+    "already carries chips for its options, leave them exactly as they are.\n"
+    "2. No bare URLs. Every URL becomes [short label](url) with a meaningful "
+    "label. A bare domain (example.ch) becomes [example.ch](https://example.ch). "
+    "A relative path (/sends, /gateways) becomes an absolute link using the "
+    "base URL given above, linked by name.\n"
+    "3. Never invent a URL or a fact. If the message tells the user to act "
+    "somewhere but carries no URL for it, leave that sentence unchanged.\n\n"
+    "Keep the message's language, wording, structure and content exactly — do "
+    "not translate, summarise, rephrase, shorten, answer, or comment. If "
+    "nothing violates the rules, return the message unchanged.\n\n"
+    "Output only the final message text, nothing else."
+)
+
+
+def _lint_presentation(text: str, *, kind: str = "chat") -> str:
+    """Enforce the dashboard-composing form on an agent→user message.
+
+    Runs on everything that lands in a dashboard thread — Ara's replies and
+    the token-gated agent posts alike — so the chips/links conventions hold
+    regardless of which agent or model composed the text. Form only, never
+    content; returns `text` unchanged on any failure, oversized drift, or for
+    the quiet cowork audit threads (a record, not a UI surface)."""
+    if not PRESENTATION_LINT or kind == "cowork":
+        return text
+    raw = (text or "").strip()
+    if not raw:
+        return text
+    # Credit-free gate: a very short message with no URL has nothing to lint.
+    if len(raw) < 40 and "http" not in raw and "www." not in raw:
+        return text
+    parts = []
+    if CONVERSATION_BASE_URL:
+        parts.append("Dashboard base URL for relative paths: "
+                     + CONVERSATION_BASE_URL)
+    parts.append("Message to lint:\n" + raw)
+    cmd = [
+        "claude", "-p", "--output-format=json",
+        "--model", PRESENTATION_LINT_MODEL,
+        # A lint pass needs no tools, no MCP servers and no project context —
+        # excluding them is what keeps it cheap and fast.
+        "--allowed-tools", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", _LINT_SYSTEM_PROMPT,
+        "--", "\n\n".join(parts),
+    ]
+    try:
+        with _worker_pool:
+            result = _run_claude(
+                cmd, capture_output=True, text=True,
+                timeout=PRESENTATION_LINT_TIMEOUT,
+                cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
+            )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"[web-gateway] presentation lint failed: {exc}", flush=True)
+        return text
+    if result.returncode != 0:
+        print(f"[web-gateway] presentation lint exited {result.returncode}",
+              flush=True)
+        return text
+    try:
+        linted = (json.loads(result.stdout).get("result") or "").strip()
+    except (json.JSONDecodeError, AttributeError):
+        return text
+    if (not linted
+            or len(linted) < len(raw) * PRESENTATION_LINT_MIN_KEEP
+            or len(linted) > len(raw) * PRESENTATION_LINT_MAX_GROWTH + 200):
+        return text
+    return linted
 
 
 # ── Projects (live SPARQL over the life store) ────────────────────────────────
@@ -5611,8 +5726,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_agent_conversation(self) -> None:
         """A retinue agent opens a thread that needs the user's decision.
 
-        The message is stored verbatim (the agent has already composed it); Ara
-        only engages once the user replies."""
+        The agent has already composed the message; the presentation lint
+        below enforces only its form (chips, labeled links), never its
+        content. Ara only engages once the user replies."""
         payload = self._agent_conversation_payload()
         if payload is None:
             return
@@ -5638,6 +5754,7 @@ class Handler(BaseHTTPRequestHandler):
         # reply, reply token included) — replayed to Ara's sessions in this
         # thread, never rendered to the user.
         context = str(payload.get("context") or "").strip() or None
+        message = _lint_presentation(message, kind=kind)
         conv = _new_conv("agent", owner, title, "agent", message,
                          first_attachments=payload.get("attachments"),
                          kind=kind, agent=agent, context=context)
@@ -5666,9 +5783,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Check the thread up front: _conv_add_message persists attachments
         # before it loads the thread, so an unknown id would leave orphan files.
-        if _load_conv(cid) is None:
+        # The load also supplies the thread's kind for the presentation lint.
+        target = _load_conv(cid)
+        if target is None:
             self._send_json(404, {"error": "not found"})
             return
+        if message:
+            message = _lint_presentation(message,
+                                         kind=target.get("kind") or "chat")
         # A quiet append is a record, not a request for attention: no unread
         # badge and no Web Push. Used by the cowork audit trail, which would
         # otherwise buzz the user's phone on every question the MCP connector
