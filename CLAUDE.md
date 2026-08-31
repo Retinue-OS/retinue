@@ -237,7 +237,9 @@ auth scoping, multi-instance identity: `docs/ask-ara.md`.
 
 All **non-user-facing** natural language — code comments, commit messages,
 issues, PR titles/bodies, mechanics documentation — is English. User-facing
-content follows its context (e.g. answer the user in their language). The
+content follows its context (e.g. answer the user in their language); agent
+persona and style instructions count as user-facing, while static webapp UI
+copy stays English until localization is implemented. The
 project has **no preferred natural languages except English**: a feature is
 either multilingual by design (language-agnostic mechanisms, per-item language
 metadata) or English-only — never a hand-coded bias toward one non-English

@@ -188,7 +188,8 @@ to avoid that, and they mean different things:
   `scripts/messenger_gateways.py` and the example there) to the comma-separated
   subset of `signal`, `whatsapp`, `telegram` this deployment actually runs —
   e.g. `MESSENGER_BUILTIN_CHANNELS=signal` for a Signal-only deployment, or
-  unset entirely for none. Naming a channel there is what enrols it into the
+  set it explicitly **empty** for none — *unset* means all three, today's
+  default. Naming a channel there is what enrols it into the
   shared registry `/sends`, `/gateways` and the monitor all read from
   regardless of what `*_GATEWAY_BASE_URL` happens to be wired to; leaving a
   channel out drops it from all three at once, same as a chamber that was

@@ -98,10 +98,13 @@ is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
 `RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials
 Claude Code already sends (`ANTHROPIC_CUSTOM_HEADERS`, override:
-`RETINUE_LITELLM_KEY`). Static sources remain for deployments without LiteLLM
-and as fallback when it is unreachable or advertises no flagged route: an
+`RETINUE_LITELLM_KEY`). When LiteLLM is configured, a reachable-but-empty
+list or a failed fetch with no last-good cache offers **nothing** (the picker
+hides itself) — never the static aliases, which the proxy would not serve.
+Static sources apply only when LiteLLM is *not* configured: an
 inline **`RETINUE_CONVERSATION_MODELS`** JSON array of `{"id","label"}` (an
-explicit override that also wins over LiteLLM), else the JSON-LD document
+explicit override that wins over everything, LiteLLM included), else the
+JSON-LD document
 `config/conversation-models.jsonld` (path override:
 `RETINUE_CONVERSATION_MODELS_FILE`; read as plain JSON on the serving path,
 and derived into the life store by the boot emitter
@@ -221,16 +224,19 @@ POST http://stt:8100/transcribe   (raw audio body; optional ?lang=<iso>)
   -> {"text": "...", "lang": "<iso>"}
 ```
 
-Both gateways are **clients** of it, so no ASR model is loaded anywhere else:
+The gateways are **clients** of it, so no ASR model is loaded anywhere else:
 
-- the **signal-gateway** posts inbound voice notes to it (`STT_SERVICE_URL`);
+- the **signal-gateway**, **whatsapp-gateway** and **telegram-gateway** post
+  inbound voice notes to it (`STT_SERVICE_URL`);
 - the **web-gateway** proxies dashboard voice input to it, exposing
   `POST /conversations/transcribe` to the PWA.
 
 Dashboard voice input adds a **cleanup pass** on top: the raw transcript is run
-through a small model (`TRANSCRIPT_CLEANUP_MODEL`, default `haiku`) with the
+through a small model (`TRANSCRIPT_CLEANUP_MODEL`; unset it falls back to
+`RETINUE_CLAUDE_MODEL` — so a non-Anthropic deployment cleans up on its own
+backend — with `haiku` as the last resort) with the
 thread so far and the chambers' contact names as context, so what lands in the
-composer is already repaired. Signal needs none of this — there the agent reads
+composer is already repaired. The messengers need none of this — there the agent reads
 the transcript and answers what was meant, while the dashboard is the one place
 that shows the user the raw text. Set `TRANSCRIPT_CLEANUP=0` to disable the pass
 (the endpoint then returns Whisper's output verbatim); the reply always carries
