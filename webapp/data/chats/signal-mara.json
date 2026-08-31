@@ -8,6 +8,7 @@
   "unread": 2,
   "archived": false,
   "muted": false,
+  "companion": null,
   "last": {
    "ts": "2026-08-27T09:12:00+02:00",
    "direction": "in",
@@ -166,23 +167,6 @@
    "sender_name": "Mara Meier",
    "text": "Und: chunnsch immer no um halbi sibni?",
    "ts": "2026-08-27T09:12:00+02:00"
-  }
- ],
- "companion": [
-  {
-   "role": "ara",
-   "text": "Mara asked two things for tomorrow: whether anything is still needed from the market, and whether 18:30 still stands. Your calendar is free from 17:00.",
-   "ts": "2026-08-27T09:13:00+02:00"
-  },
-  {
-   "role": "user",
-   "text": "18:30 works. Draft a yes — I'll bring dessert from the market.",
-   "ts": "2026-08-27T09:20:00+02:00"
-  },
-  {
-   "role": "ara",
-   "text": "Staged a reply in the draft — adjust the wording and press send when you're happy.\n\n> Samstag passt — ich bin um 18:30 da und bringe Dessert vom Markt mit. Soll ich sonst noch etwas mitnehmen?",
-   "ts": "2026-08-27T09:21:00+02:00"
   }
  ]
 }

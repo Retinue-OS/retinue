@@ -8,6 +8,7 @@
   "unread": 0,
   "archived": false,
   "muted": false,
+  "companion": null,
   "last": {
    "ts": "2026-08-26T22:40:44+02:00",
    "direction": "in",
@@ -1766,18 +1767,6 @@
    "sender_name": "Luca Bernasconi",
    "text": "Notte 👋",
    "ts": "2026-08-26T22:40:44+02:00"
-  }
- ],
- "companion": [
-  {
-   "role": "user",
-   "text": "When is the museum wireframe review due?",
-   "ts": "2026-08-26T08:30:00+02:00"
-  },
-  {
-   "role": "ara",
-   "text": "You promised Luca the wireframes by **Friday 4 September**, review together afterwards. The moodboard (direction B, palette C) was approved by Elena on Monday. Related project: *Museo redesign* — I keep the deadline there.",
-   "ts": "2026-08-26T08:31:00+02:00"
   }
  ]
 }
