@@ -142,6 +142,21 @@ def test_flags_and_note_message():
         print("PASS test_flags_and_note_message")
 
 
+def test_companion_link():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "whatsapp:123456@g.us"
+        assert store.get(cid)["companion"] is None, "no companion by default"
+        doc = store.set_companion(cid, "deadbeef")
+        assert doc["companion"] == "deadbeef"
+        # Survives an unrelated write, and round-trips through all().
+        store.set_flags(cid, archived=True)
+        assert store.get(cid)["companion"] == "deadbeef"
+        assert store.all()[cid]["companion"] == "deadbeef"
+        assert store.set_companion(cid, None)["companion"] is None
+        print("PASS test_companion_link")
+
+
 def test_overlay_merge_dedup_expiry():
     ov = cs.ChatOverlay(ttl=60.0)
     cid = "signal:+41790001122"
@@ -186,6 +201,7 @@ if __name__ == "__main__":
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()
     test_flags_and_note_message()
+    test_companion_link()
     test_overlay_merge_dedup_expiry()
     test_iso_z_normalizes()
     print("all chat-state tests passed")

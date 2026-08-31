@@ -13,6 +13,8 @@ direct user-send contract and serving token-gated media). Covers:
   un-archive-unless-muted rule, held-gate and muted silence, push mode
   new-vs-reply, and echoes advancing the read watermark;
 - the read watermark, the version-guarded draft (409), agent staging;
+- POST /chats/<id>/companion: idempotent create-or-get, the id surfacing on the
+  ChatSummary, and the thread staying out of the default conversation list;
 - POST /chats/<id>/send: author "user" reaches the gateway, the draft clears,
   the watermark advances, and the sent message is returned and visible in the
   merged view before the store knows it (the overlay);
@@ -260,7 +262,8 @@ def test_chat_list_contract(base, wg):
     # ChatSummary contract fields, exactly the fixture's shape.
     for c in (c1, c2):
         assert {"id", "channel", "name", "group", "unread", "archived",
-                "muted", "last", "draft", "messages"} <= set(c)
+                "muted", "last", "draft", "companion", "messages"} <= set(c)
+        assert c["companion"] is None, "no companion thread until one is asked for"
     assert c1["channel"] == "signal" and c1["group"] is False
     assert c2["channel"] == "whatsapp" and c2["group"] is True
     assert c1["unread"] == 2 and c2["unread"] == 1
@@ -593,6 +596,46 @@ def test_rail_attributes_by_account(base, wg):
     print("PASS test_rail_attributes_by_account")
 
 
+def test_companion_endpoint(base, wg):
+    """The chat's linked conversation: created once, returned forever after."""
+    path = "/chats/" + _quote(CHAT2) + "/companion"
+    status, body = _http(base, "POST", path, {})
+    assert status == 201, body
+    cid = body["id"]
+    assert cid
+
+    # Idempotent: a second open returns the same thread, not a new one.
+    status, again = _http(base, "POST", path, {})
+    assert status == 200 and again["id"] == cid, again
+
+    # And it is recorded on the chat, so a client can find it without posting.
+    status, chats = _http(base, "GET", "/chats")
+    summary = next(c for c in chats["chats"] if c["id"] == CHAT2)
+    assert summary["companion"] == cid
+    # Every other chat is unaffected.
+    other = next(c for c in chats["chats"] if c["id"] == CHAT1)
+    assert other["companion"] is None
+
+    # It is an ordinary conversation the dashboard drives through
+    # /conversations — no second read API for companion threads.
+    status, conv = _http(base, "GET", f"/conversations/{cid}")
+    assert status == 200, conv
+    assert conv["kind"] == "companion" and conv["chat"] == CHAT2
+    assert conv["messages"], "the pane would open on an empty thread"
+
+    # But it never shows up where the user browses their own threads.
+    status, listing = _http(base, "GET", "/conversations?all=1")
+    assert cid not in {c["id"] for c in listing["conversations"]}
+    status, listing = _http(base, "GET", "/conversations?all=1&kind=edit")
+    assert cid not in {c["id"] for c in listing["conversations"]}
+    status, listing = _http(base, "GET", "/conversations?all=1&kind=companion")
+    assert cid in {c["id"] for c in listing["conversations"]}
+
+    status, body = _http(base, "POST", "/chats/nothing/companion", {})
+    assert status == 404, body
+    print("PASS test_companion_endpoint")
+
+
 def test_media_proxy(base, wg):
     req = urllib.request.Request(base + f"/chats/media/127.0.0.1/{MID_ATT}")
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -658,6 +701,8 @@ def main():
         test_rail_auth_and_notifications(base, wg)
         test_send_user_direct(base, wg)
         test_send_images(base, wg)
+
+        test_companion_endpoint(base, wg)
 
         test_control_gateway_refused(base, wg)
         test_rail_attributes_by_account(base, wg)

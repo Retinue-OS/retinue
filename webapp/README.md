@@ -130,16 +130,17 @@ The API, as the components consume it:
 
 - `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
   activity. A `ChatSummary` is `{id, channel, name, group, members?, unread,
-  archived, muted, last, draft, messages}` where `id` is
+  archived, muted, last, draft, companion, messages}` where `id` is
   `<channel>:<chat-key>` (the exact recipient string that channel's send path
   accepts), `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
-  is the shared draft `{text, author, agent?, ts, version}` or null, and
-  `messages` is the URL of the chat's message document — the client follows
-  it and never constructs message URLs. `archived` and `muted` carry the
-  dashboard-conversation semantics verbatim: an archived chat leaves the card
-  and the Active list (the full page's Archived filter keeps it reachable),
-  and a new inbound message **un-archives** an archived chat unless it is
+  is the shared draft `{text, author, agent?, ts, version}` or null,
+  `companion` is the id of this chat's companion conversation or null while
+  none exists, and `messages` is the URL of the chat's message document — the
+  client follows it and never constructs message URLs. `archived` and `muted`
+  carry the dashboard-conversation semantics verbatim: an archived chat leaves
+  the card and the Active list (the full page's Archived filter keeps it
+  reachable), and a new inbound message **un-archives** it unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
   that chat's Web Push and keeps an archived chat archived; as with
   conversations, the Archive button leaves `muted` untouched, while "archive
@@ -164,10 +165,7 @@ The API, as the components consume it:
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
   else stays a file row. Reactions and quoted replies (issue #130) will
-  decorate these records later. There is no companion thread in the payload
-  yet: the companion pane runs in a local demo mode until phase 4 wires it to
-  the chat's real companion conversation (kind `companion`) via the
-  `/conversations` API.
+  decorate these records later.
 - `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
   gateway as the user (direct under every policy category: the authenticated
   send press IS the approval `verify` exists for) and returns the sent
@@ -188,6 +186,18 @@ The API, as the components consume it:
   the page adopts (with a "draft updated elsewhere" note when the words
   actually differ) rather than clobbering.
 - `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
+- `POST /chats/<id>/companion` — `{id}`, the chat's companion conversation:
+  the thread where the user works out a reply with Ara. Idempotent — 201 the
+  first time, 200 with the same id afterwards — so the pane may call it
+  unconditionally on open instead of branching on the summary's `companion`.
+  The thread is an ordinary conversation of kind `companion`, linked back to
+  the chat by a `chat` field, so the pane drives it entirely through the
+  existing `/conversations/<id>` endpoints (read, reply, model picker,
+  `pending`). Its turns reach Ara with the chat's newest messages and current
+  draft attached, and she answers by staging a draft into that chat's
+  composer rather than sending — the user's send press is what sends. No
+  conversation-list filter surfaces companion threads: one belongs to its
+  chat and is reached from the chat page.
 
 **Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
 static documents in the API's response shapes — the contract drafts the API
@@ -197,8 +207,9 @@ are no longer a serving source. The corpus covers the media shapes: image
 attachments with intrinsic dimensions, a voice note (`audio/*` with the
 transcript as the message text) and a video (`video/*` with dimensions), all
 with playable `data:` URLs. One deliberate delta against the live API
-remains: a `companion` array seeding the companion pane's demo content (the
-live payload has none).
+remains: a `companion` array of seeded demo messages, where the live payload
+carries only the companion conversation's id and the pane fetches the thread
+itself from `/conversations/<id>`.
 
 ## Markdown rendering
 

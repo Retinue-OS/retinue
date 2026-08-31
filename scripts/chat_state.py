@@ -154,6 +154,10 @@ class ChatStateStore:
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
             "unread_since": None,
+            # Id of this chat's companion conversation — the dashboard thread
+            # where the user works out a reply with Ara. None until one is
+            # first asked for; see `set_companion`.
+            "companion": None,
         }
 
     def _read(self, chat_id: str) -> dict:
@@ -246,6 +250,19 @@ class ChatStateStore:
             doc = self._read(chat_id)
             doc["gateway"] = slug or None
             doc["gateway_source"] = (source or None) if slug else None
+            self._write(doc)
+            return doc
+
+    def set_companion(self, chat_id: str, conv_id: str | None) -> dict:
+        """Record — or clear, with None — this chat's companion conversation.
+
+        A plain setter, as the caller is the web-gateway, which is the only
+        writer of this store and serializes create-or-get itself; making the
+        store arbitrate instead would still leave the losing caller holding an
+        already-created conversation."""
+        with self._lock:
+            doc = self._read(chat_id)
+            doc["companion"] = conv_id or None
             self._write(doc)
             return doc
 
