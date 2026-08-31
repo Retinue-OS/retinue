@@ -138,7 +138,7 @@ workflow; the model stamp (phase 2) is the ground truth beneath both.
   would be invisible to SPARQL and to the reinforce/challenge lifecycle.
   CLAUDE.md project instructions are unaffected.
 
-### Phase 3 — personas become agents
+### Phase 3 — personas become agents (first slice shipped: Secretary)
 
 The persona/subagent split is historical: personas were free while Ara always
 ran on a strong model. A router-tier Ara must not compose in-role, so the
@@ -153,6 +153,18 @@ override — preserving the public-framework/private-chamber split exactly as
 the persona mechanism does today. Workers cannot pause to ask the user
 mid-task; they return "I need a decision on X" and Ara opens a decision thread
 with chips — which is the interaction model the dashboard already uses.
+
+As shipped (Secretary only; Academic and Publisher remain personas for now):
+`.claude/agents/secretary.md` defines a compose-only subagent (Read, Glob,
+Grep — deliberately no Bash and no send tooling, so the "what to say" /
+"whether it goes out" boundary is structural). CLAUDE.md makes dispatch
+mandatory: every outbound message addressed to a human is composed by the
+subagent and sent verbatim by the dispatcher, on every tier — exempting only
+the system's own voice (alerts and briefings to the owner, dashboard thread
+replies). Contact lookup and sending stay with the dispatching session, where
+the send policies already apply. The persona file gained a usage note marking
+which of its sections address the composing subagent (style) and which the
+dispatcher (tooling, triage, send control).
 
 ### Phase 4 — presentation enforcement at the choke point (shipped)
 

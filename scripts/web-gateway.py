@@ -772,26 +772,42 @@ def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
         return _litellm_models_cache["models"]
 
 
+def _offered_entry_for(model_name: str, models: list[dict]) -> dict | None:
+    """The entry in `models` naming the same concrete model as `model_name`.
+
+    The name is resolved through LiteLLM's route aliases (retinue-claude →
+    its upstream) and matched tail-insensitively to the provider prefix
+    (`anthropic/claude-opus-5` names `claude-opus-5`)."""
+    target = _resolve_route_model(model_name) if model_name else ""
+    if not target:
+        return None
+    for m in models:
+        if _same_model(target, m["id"]):
+            return m
+    return None
+
+
 def _mark_default(models: list[dict]) -> list[dict]:
-    """Return a copy with the entry the gateway default runs on flagged.
+    """Return a copy with the entry un-pinned threads actually run flagged.
 
     The picker offers no synthetic "Default" row; instead the concrete entry
     that default turns actually run on carries `default: true` and says so in
-    its label — so the dropdown always names a real model. CLAUDE_MODEL is
-    resolved through LiteLLM's route aliases (retinue-claude → its upstream)
-    and matched against each entry the same way, tail-insensitively to the
-    provider prefix (`anthropic/claude-opus-5` names `claude-opus-5`). When
-    the default resolves to no offered entry, nothing is flagged."""
+    its label — so the dropdown always names a real model. Since the tiers,
+    an un-pinned thread runs the ROUTER tier when one is set (Ara junior at
+    the door — docs/model-routing.md), else the gateway default — so that is
+    the row to flag, or the picker lies about new threads (observed live: the
+    header showed the gateway default while the turns ran the router model).
+    A router model the list does not offer falls back to flagging the gateway
+    default, so the picker keeps its default row. When neither candidate
+    resolves to an offered entry, nothing is flagged."""
     out = [dict(m) for m in models]
-    target = _resolve_route_model(CLAUDE_MODEL)
-    if not target:
-        return out
-    for m in out:
-        if _same_model(target, m["id"]):
-            m["default"] = True
-            label = str(m.get("label") or m["id"])
-            m["label"] = (label[:-1] + ", default)" if label.endswith(")")
-                          else label + " (default)")
+    for candidate in (ROUTER_MODEL, CLAUDE_MODEL):
+        entry = _offered_entry_for(candidate, out)
+        if entry is not None:
+            entry["default"] = True
+            label = str(entry.get("label") or entry["id"])
+            entry["label"] = (label[:-1] + ", default)" if label.endswith(")")
+                              else label + " (default)")
             break
     return out
 
@@ -826,18 +842,6 @@ def _model_offered(mid: str, refresh: bool = False) -> bool:
     if not refresh:
         return False
     return any(m["id"] == mid for m in _conversation_models(force=True))
-
-
-def _default_offered_model_id() -> str | None:
-    """The offered id that default turns actually run on, or None.
-
-    This is the picker's own `default: true` entry — a concrete, offered model
-    — not CLAUDE_MODEL, which is typically a hidden plumbing route
-    (`retinue-claude`) that _valid_model_id rejects."""
-    for m in _conversation_models():
-        if m.get("default"):
-            return m["id"]
-    return None
 
 
 def _offered_equivalent(mid: str | None) -> str | None:
@@ -2034,7 +2038,13 @@ def materialise_pre_tier_model_pins() -> int:
     marker = CONVERSATIONS_DIR / _MODEL_PIN_MIGRATION_MARKER
     if marker.exists():
         return 0
-    target = _default_offered_model_id()
+    # Pre-tier threads ran the GATEWAY default, so the pin target deliberately
+    # bypasses the picker's `default` flag — which, since the tiers, names the
+    # router model an un-pinned thread runs today. Pinning those threads to
+    # the router would repeat the very downgrade this migration exists to
+    # prevent.
+    entry = _offered_entry_for(CLAUDE_MODEL, _conversation_models())
+    target = entry["id"] if entry else None
     if not target:
         # Model list unreachable at boot. Leave the marker unwritten so the
         # next start retries, rather than recording the migration as done.
