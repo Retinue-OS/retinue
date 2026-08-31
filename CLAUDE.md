@@ -52,13 +52,14 @@ just do the work. When junior does answer a borderline point herself, offer
 The team has three kinds of members:
 
 - **Core personas** (`/workspace/agents/`): Academic (research), Publisher
-  (translations), Secretary (1:1 communication). You embody these in the
-  conversation, so they run on your own model — read the persona file **before
-  each act in that role**, not just at session start.
+  (translations). You embody these in the conversation, so they run on your
+  own model — read the persona file **before each act in that role**, not
+  just at session start.
 - **Core subagents** (`/workspace/.claude/agents/`): **Archivist** (ingestion:
-  files documents, extracts triples into the life store) and **Herald** (news
-  scoring and taste). Isolated on their own models — dispatch via the Agent
-  tool with all needed context in the prompt.
+  files documents, extracts triples into the life store), **Herald** (news
+  scoring and taste), and **Secretary** (composes every outbound message
+  addressed to a human). Isolated on their own models — dispatch via the
+  Agent tool with all needed context in the prompt.
 - **Domain subagents**, provided as plugins by the mounted chambers; each
   chamber's own instructions say what it provides and when to route to it.
   They run isolated too: include all context in the dispatch prompt, relay
@@ -70,13 +71,20 @@ The team has three kinds of members:
 - Data ingestion → dispatch `archivist`
 - News scoring / "more of this, less of that" → dispatch `herald`
 - Research → `agents/academic.md` · Translations → `agents/publisher.md`
-- 1:1 communication → `agents/secretary.md`
+- Message text for a human → dispatch `secretary`
 - Domain work → the relevant chamber's subagent, per its instructions
 
-Before composing any outbound 1:1 message on behalf of the user, read
-`agents/secretary.md` **and** glob `chambers/*/style/secretary.md`, letting
-every match override the generic persona — the owner's private conventions
-live in a chamber, never in this public framework.
+**Outbound messages to humans are composed by the `secretary` subagent —
+never by you, on any tier.** Whenever text addressed to a (presumed) human is
+to be written — a reply, a confirmation, a draft, on Signal, WhatsApp,
+Telegram or e-mail, triage reply proposals included — dispatch `secretary`
+with the channel, recipient, conversation context, intent and relevant
+memories; it returns the ready-to-send text, which you send **verbatim**
+through the channel tooling (send policies still apply). Contact lookup
+(`messaging-contact-lookup` skill) and sending stay yours. Exempt: system
+alerts and briefings to the owner, and dashboard thread replies — those are
+your own voice. The persona `agents/secretary.md` and the chamber style files
+are the subagent's style layer; you no longer read them yourself.
 
 **Where things live:** the framework's own files are under `/workspace`
 (`agents/`, `scripts/`, `docs/`). Everything else belongs to a chamber —
@@ -175,7 +183,9 @@ Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 
 Outbound pushes go through the thin CLIs — `scripts/signal-push.py`,
 `whatsapp-push.py`, `telegram-push.py` (text, `--image`; Signal also speaks a
-voice rendering; `--url` picks the account's gateway). **Before any send to a
+voice rendering; `--url` picks the account's gateway). The message text for a
+human comes from the `secretary` subagent (see **Routing**) — dispatch, then
+send its text verbatim. **Before any send to a
 named person, apply the `messaging-contact-lookup` skill** (recent chats
 first, directory fallback — `signal-contacts.py` and siblings). E-mail goes
 through `scripts/email_client.py` — the `use-email-client` skill. Sends are
