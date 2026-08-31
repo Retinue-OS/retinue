@@ -21,10 +21,12 @@ GET /conversation/YYYY-MM-DD
 
 Conversation tabs (dashboard chat threads, distinct from the per-day log):
   GET  /conversations                 -> {"conversations": [summary, ...]}
-                                         Optional filters: ?kind=chat|edit|all
-                                         (default chat — project edit-command
-                                         threads are hidden from normal lists)
-                                         and ?project=<uri>.
+                                         Optional filters:
+                                         ?kind=chat|edit|cowork|companion|all
+                                         (default chat — edit-command, cowork
+                                         and messenger-companion threads are
+                                         hidden from normal lists) and
+                                         ?project=<uri>.
   GET  /conversations/<id>            -> full thread {id,title,messages,...}
   POST /conversations                 -> open a new thread (body {message};
                                          optional kind: "chat"|"edit", project:
@@ -109,6 +111,15 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          the authenticated send press IS the
                                          approval `verify` exists for). Returns
                                          the sent Message.
+  POST /chats/<id>/companion          -> {"id"} the chat's companion thread —
+                                         the conversation where the user works
+                                         out a reply with Ara. Creates it on
+                                         the first call (201) and returns the
+                                         same one afterwards (200); the id is
+                                         also the ChatSummary's `companion`.
+                                         An ordinary conversation of kind
+                                         "companion", so the client drives it
+                                         entirely through /conversations/<id>.
   GET  /chats/media/<slug>/<media-id> -> authenticated proxy for ledger media
                                          (the gateways' token-gated /media/<id>).
   POST /internal/chats/inbound        -> the gateways' notify rail: one message
@@ -159,6 +170,7 @@ import json
 import mimetypes
 import os
 import re
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -772,26 +784,42 @@ def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
         return _litellm_models_cache["models"]
 
 
+def _offered_entry_for(model_name: str, models: list[dict]) -> dict | None:
+    """The entry in `models` naming the same concrete model as `model_name`.
+
+    The name is resolved through LiteLLM's route aliases (retinue-claude →
+    its upstream) and matched tail-insensitively to the provider prefix
+    (`anthropic/claude-opus-5` names `claude-opus-5`)."""
+    target = _resolve_route_model(model_name) if model_name else ""
+    if not target:
+        return None
+    for m in models:
+        if _same_model(target, m["id"]):
+            return m
+    return None
+
+
 def _mark_default(models: list[dict]) -> list[dict]:
-    """Return a copy with the entry the gateway default runs on flagged.
+    """Return a copy with the entry un-pinned threads actually run flagged.
 
     The picker offers no synthetic "Default" row; instead the concrete entry
     that default turns actually run on carries `default: true` and says so in
-    its label — so the dropdown always names a real model. CLAUDE_MODEL is
-    resolved through LiteLLM's route aliases (retinue-claude → its upstream)
-    and matched against each entry the same way, tail-insensitively to the
-    provider prefix (`anthropic/claude-opus-5` names `claude-opus-5`). When
-    the default resolves to no offered entry, nothing is flagged."""
+    its label — so the dropdown always names a real model. Since the tiers,
+    an un-pinned thread runs the ROUTER tier when one is set (Ara junior at
+    the door — docs/model-routing.md), else the gateway default — so that is
+    the row to flag, or the picker lies about new threads (observed live: the
+    header showed the gateway default while the turns ran the router model).
+    A router model the list does not offer falls back to flagging the gateway
+    default, so the picker keeps its default row. When neither candidate
+    resolves to an offered entry, nothing is flagged."""
     out = [dict(m) for m in models]
-    target = _resolve_route_model(CLAUDE_MODEL)
-    if not target:
-        return out
-    for m in out:
-        if _same_model(target, m["id"]):
-            m["default"] = True
-            label = str(m.get("label") or m["id"])
-            m["label"] = (label[:-1] + ", default)" if label.endswith(")")
-                          else label + " (default)")
+    for candidate in (ROUTER_MODEL, CLAUDE_MODEL):
+        entry = _offered_entry_for(candidate, out)
+        if entry is not None:
+            entry["default"] = True
+            label = str(entry.get("label") or entry["id"])
+            entry["label"] = (label[:-1] + ", default)" if label.endswith(")")
+                              else label + " (default)")
             break
     return out
 
@@ -826,18 +854,6 @@ def _model_offered(mid: str, refresh: bool = False) -> bool:
     if not refresh:
         return False
     return any(m["id"] == mid for m in _conversation_models(force=True))
-
-
-def _default_offered_model_id() -> str | None:
-    """The offered id that default turns actually run on, or None.
-
-    This is the picker's own `default: true` entry — a concrete, offered model
-    — not CLAUDE_MODEL, which is typically a hidden plumbing route
-    (`retinue-claude`) that _valid_model_id rejects."""
-    for m in _conversation_models():
-        if m.get("default"):
-            return m["id"]
-    return None
 
 
 def _offered_equivalent(mid: str | None) -> str | None:
@@ -955,6 +971,13 @@ CHAT_SEND_MAX_IMAGES = int(os.environ.get("CHAT_SEND_MAX_IMAGES", "5"))
 CHAT_GATEWAY_IDENTITY_TTL = float(os.environ.get("CHAT_GATEWAY_IDENTITY_TTL", "300"))
 CHAT_GATEWAY_IDENTITY_TTL_FAIL = float(
     os.environ.get("CHAT_GATEWAY_IDENTITY_TTL_FAIL", "15"))
+# How many of a chat's newest messages a companion turn is shown. A hard cap,
+# not a summary: everything older is simply absent from the prompt, so a long
+# correspondence reaches Ara truncated rather than compressed. Enough for the
+# current exchange, small enough that the note stays bounded however long the
+# chat is; a rolling summary replaces the truncation later.
+CHAT_COMPANION_CONTEXT_MESSAGES = int(
+    os.environ.get("CHAT_COMPANION_CONTEXT_MESSAGES", "20"))
 # Voice input: the dashboard uploads recorded audio here and we proxy it to the
 # shared STT service (scripts/stt-service.py), which owns the Whisper model — so
 # this image ships no ASR stack. Empty URL disables the feature (the endpoint
@@ -982,6 +1005,28 @@ TRANSCRIPT_CLEANUP_TIMEOUT = float(os.environ.get("TRANSCRIPT_CLEANUP_TIMEOUT", 
 # answering instead of correcting returns something much longer).
 TRANSCRIPT_CLEANUP_CONTEXT_MESSAGES = 6
 TRANSCRIPT_CLEANUP_MAX_GROWTH = 1.6
+# Presentation lint (docs/model-routing.md, phase 4). Everything that lands in
+# a dashboard thread as an agent→user message passes through a cheap-model
+# lint that enforces the dashboard-composing form rules — reply chips for
+# offered options, no bare or relative URLs — regardless of which agent or
+# model wrote the text. Structural enforcement at the choke point, same move
+# as the transcript cleanup and the send policies: the rules hold even when a
+# small model forgot them while composing. Form only, fail-open: the lint
+# never adds content, and any failure delivers the original text.
+PRESENTATION_LINT = os.environ.get("PRESENTATION_LINT", "1").strip().lower() not in ("0", "false", "no")
+# An explicit PRESENTATION_LINT_MODEL wins; else the router tier (the lint is
+# a routing-priced job), else the gateway default — so a non-Anthropic
+# deployment lints on its own backend; "haiku" is the last-resort default.
+PRESENTATION_LINT_MODEL = (
+    os.environ.get("PRESENTATION_LINT_MODEL", "").strip()
+    or ROUTER_MODEL or CLAUDE_MODEL or "haiku"
+)
+PRESENTATION_LINT_TIMEOUT = float(os.environ.get("PRESENTATION_LINT_TIMEOUT", "45"))
+# Chips and link labels legitimately grow a message, so the allowance is wider
+# than the cleanup pass's; a model that starts answering instead of linting
+# still blows past it. A shrunken result dropped content — equally distrusted.
+PRESENTATION_LINT_MAX_GROWTH = 2.5
+PRESENTATION_LINT_MIN_KEEP = 0.6
 _CONV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _ATT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONV_GET_RE = re.compile(r"^/conversations/([0-9a-f]{32})/?$")
@@ -1628,11 +1673,15 @@ def _conv_summary(conv: dict) -> dict:
         "title": conv.get("title", ""),
         "initiator": conv.get("initiator", "user"),
         # "chat" is the default and what every pre-existing thread means; "edit"
-        # marks quick edit commands issued from a project page, which the
-        # dashboard hides from the normal conversation list.
+        # marks quick edit commands issued from a project page and "companion"
+        # a messenger chat's linked thread, both of which the dashboard hides
+        # from the normal conversation list.
         "kind": conv.get("kind") or "chat",
         "project": conv.get("project"),
         "project_title": conv.get("project_title"),
+        # The chat a companion thread belongs to, as `project` is for an edit
+        # thread: the id the /chats API uses, <channel>:<chat-key>.
+        "chat": conv.get("chat"),
         # The thread's model choice (validated; empty string => gateway default),
         # so the picker can show the current selection without a second fetch.
         "model": _conv_model(conv) or "",
@@ -1665,10 +1714,13 @@ def _list_convs(scope: str = "active", kind: str = "chat",
       - "all":      every thread regardless of archive state.
 
     `kind` filters by thread kind:
-      - "chat" (default): normal conversations only. Edit-command and cowork
-        threads are deliberately absent from every default listing.
+      - "chat" (default): normal conversations only. Edit-command, cowork and
+        companion threads are deliberately absent from every default listing.
       - "edit": only project edit-command threads.
       - "cowork": only the audit threads written by the Ask-Ara MCP connector.
+      - "companion": only messenger chats' companion threads. No dashboard
+        filter asks for these — a companion belongs to its chat and is reached
+        from the chat page — so this exists for inspection, not for browsing.
       - "all":  every kind.
 
     `project` (a project URI) restricts the list to threads linked to that
@@ -1833,7 +1885,8 @@ def _new_conv(initiator: str, owner: str, title: str | None,
               project_title: str | None = None,
               model: str | None = None,
               agent: str | None = None,
-              context: str | None = None) -> dict:
+              context: str | None = None,
+              chat: str | None = None) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cid = uuid.uuid4().hex
     first_msg = {"role": first_role, "text": first_text, "ts": now}
@@ -1856,7 +1909,8 @@ def _new_conv(initiator: str, owner: str, title: str | None,
         "initiator": initiator,
         "owner": owner,
         # "chat" is a normal conversation; "edit" is a quick edit command from a
-        # project page — marked so default listings can leave it out.
+        # project page and "companion" a messenger chat's linked thread — both
+        # marked so default listings can leave them out.
         "kind": kind,
         # An agent-initiated thread arrives unread (it needs the user's
         # attention); a user starting their own thread has already seen it.
@@ -1868,6 +1922,8 @@ def _new_conv(initiator: str, owner: str, title: str | None,
         conv["project"] = project
         if project_title:
             conv["project_title"] = project_title
+    if chat:
+        conv["chat"] = chat
     # Persist a validated model choice on the thread; None (the default) is left
     # unset so existing threads keep behaving exactly as before.
     valid_model = _valid_model_id(model)
@@ -2012,7 +2068,13 @@ def materialise_pre_tier_model_pins() -> int:
     marker = CONVERSATIONS_DIR / _MODEL_PIN_MIGRATION_MARKER
     if marker.exists():
         return 0
-    target = _default_offered_model_id()
+    # Pre-tier threads ran the GATEWAY default, so the pin target deliberately
+    # bypasses the picker's `default` flag — which, since the tiers, names the
+    # router model an un-pinned thread runs today. Pinning those threads to
+    # the router would repeat the very downgrade this migration exists to
+    # prevent.
+    entry = _offered_entry_for(CLAUDE_MODEL, _conversation_models())
+    target = entry["id"] if entry else None
     if not target:
         # Model list unreachable at boot. Leave the marker unwritten so the
         # next start retries, rather than recording the migration as done.
@@ -2163,6 +2225,117 @@ def _conv_project_note(conv: dict) -> str:
     return "\n\n[Context: " + "\n".join(lines) + "]"
 
 
+# How one chat message is labelled when a companion thread replays it. The
+# ledger's own axes (direction, and for outbound the author) already say who
+# spoke; this only puts a name to each.
+def _companion_speaker(msg: dict, chat_name: str) -> str:
+    if msg.get("direction") != "out":
+        return msg.get("sender_name") or msg.get("sender") or chat_name
+    author = msg.get("author")
+    if author == "device":
+        return "The user (sent from their own phone)"
+    if author == "agent":
+        return msg.get("agent") or "You (Ara)"
+    return "The user (sent from the dashboard)"
+
+
+def _conv_chat_note(conv: dict) -> str:
+    """Context block for a messenger chat's companion thread.
+
+    Gives Ara what the thread itself never says: which chat this is about, how
+    the conversation has been going, what is currently staged in the shared
+    draft, and that her output belongs in that draft rather than on the wire.
+
+    The chat excerpt is a **hard cap, not a summary**: the newest
+    CHAT_COMPANION_CONTEXT_MESSAGES messages are replayed verbatim and
+    everything older is simply absent, so a long correspondence arrives
+    truncated rather than compressed. The cap is stated in the note so Ara can
+    ask instead of assuming she has seen the beginning. A rolling per-chat
+    summary — maintained as the chat grows, and carrying the older history
+    the cap drops — replaces the truncation later.
+
+    Unlike the project note, which points at a file Ara re-reads, this carries
+    live values that go stale, so it is appended to *every* companion turn
+    rather than only the first."""
+    chat_id = conv.get("chat")
+    if not chat_id:
+        return ""
+    parts = chat_state_mod.split_chat_id(chat_id)
+    channel, key = parts if parts else ("", chat_id)
+    doc = _CHAT_STATE.get(chat_id)
+    name = _chat_display_name(doc, channel, key)
+    where = f'the {channel} chat "{name}"' if channel else f'the chat "{name}"'
+    group = doc.get("group")
+    if group is None:
+        group = _chat_is_group(channel, key)
+    if group:
+        where += " (a group)"
+    lines = [
+        f"This thread is the companion to {where} — chat id {chat_id}. It is "
+        "where you and the user work out what to say; it is not the chat "
+        "itself, and nothing you write here reaches the correspondent.",
+    ]
+    try:
+        messages = _chat_messages_payload(chat_id)["messages"]
+    except Exception as exc:  # store down — the thread still works, with less
+        print(f"[web-gateway] companion context lookup failed for {chat_id}: "
+              f"{exc}", flush=True)
+        messages = None
+    if messages is None:
+        lines.append("The chat's messages could not be read just now (the "
+                     "life store did not answer), so this note carries none. "
+                     "Say so rather than answering as if you had seen them.")
+    elif not messages:
+        lines.append("The chat has no messages yet.")
+    else:
+        shown = messages[-CHAT_COMPANION_CONTEXT_MESSAGES:]
+        rendered = []
+        for m in shown:
+            text = " ".join(str(m.get("text") or "").split())
+            atts = m.get("attachments") or []
+            if atts:
+                kinds = sorted({a.get("type") for a in atts if a.get("type")})
+                label = f"{len(atts)} attachment" + ("s" if len(atts) > 1 else "")
+                if kinds:
+                    label += ": " + ", ".join(kinds)
+                text = (text + " " if text else "") + f"[{label}]"
+            rendered.append(f"  {m.get('ts')} {_companion_speaker(m, name)}: "
+                            + (text or "(empty)"))
+        head = f"The {len(shown)} most recent messages, oldest first"
+        if len(messages) > len(shown):
+            head += (" — a cap, not a summary: older messages exist and are "
+                     "not shown here")
+        lines.append(head + ":\n" + "\n".join(rendered))
+    draft = doc.get("draft") or {}
+    draft_text = " ".join(str(draft.get("text") or "").split())
+    if draft_text:
+        by = draft.get("author") or "user"
+        who = ("the user" if by == "user"
+               else (draft.get("agent") or "an agent"))
+        lines.append("The chat's shared draft currently holds, written by "
+                     f"{who}: " + json.dumps(draft_text, ensure_ascii=False))
+    else:
+        lines.append("The chat's shared draft is empty.")
+    lines.append(
+        "Before you compose anything for the correspondent, read "
+        "agents/secretary.md for the framework's generic style rules, then "
+        "glob chambers/*/style/secretary.md and read every match — the "
+        "owner's own conventions (how to sign, tone per recipient) live "
+        "there and override the persona's defaults."
+    )
+    lines.append(
+        "When you have a reply to propose, do not send it: stage it as the "
+        "chat's shared draft with\n"
+        "  python3 /workspace/scripts/chat-draft.py --chat "
+        f"{shlex.quote(chat_id)} '<the message>'\n"
+        "The user sees it in the chat's composer, edits it if they like, and "
+        "their send press is what puts it on the wire in their name. Then say "
+        "here, in one or two sentences, what you staged and why — the draft "
+        "carries the message, so do not repeat it in full."
+    )
+    return "\n\n[Context: " + "\n\n".join(lines) + "]"
+
+
 def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     """Build the prompt for Ara's next turn in a thread.
 
@@ -2171,15 +2344,22 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     any project note sent on the first turn) — normally just the latest user
     message, but any message pushed into the thread meanwhile comes with it.
     Otherwise — a new or expired session, or an agent-initiated thread Ara has
-    never seen — we replay the transcript so Ara has full context."""
+    never seen — we replay the transcript so Ara has full context.
+
+    A companion thread's chat note rides on every turn, fresh session or not:
+    it carries live values (the chat's newest messages, the shared draft) that
+    a session sent them once would go on answering from after they changed."""
     messages = conv.get("messages", [])
     latest_msg = messages[-1] if messages else {}
     latest = latest_msg.get("text", "")
     note = _conv_attachment_note(conv, latest_msg)
+    chat_note = (_conv_chat_note(conv)
+                 if (conv.get("kind") or "chat") == "companion" else "")
     if fresh:
         unseen = _conv_unseen_messages(messages)
         if len(unseen) <= 1:
-            return (latest + note + _conv_context_note(latest_msg)) or latest
+            return ((latest + note + _conv_context_note(latest_msg) + chat_note)
+                    or latest)
         return (
             "These messages arrived in this thread since your last reply, "
             "oldest first — you have not seen them yet:\n\n"
@@ -2187,6 +2367,7 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
             "Reply to the user's latest message in your own voice, taking the "
             "others into account. If they approve a concrete action, carry it "
             "out with your tools and confirm what you did."
+            + chat_note
         )
     # The transcript already carries each message's own attachment note, so the
     # latest message's files need no second mention here.
@@ -2197,7 +2378,7 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
         "Reply to the user's latest message in your own voice. If they approve a "
         "concrete action (e.g. updating the agenda, sending a reply, declining an "
         "invitation), carry it out with your tools and confirm what you did."
-        + _conv_project_note(conv)
+        + _conv_project_note(conv) + chat_note
     )
 
 
@@ -2303,7 +2484,12 @@ def _conv_worker(cid: str, session_key: str) -> None:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
         else:
-            reply = result.get("response") or "(no reply)"
+            # The lint enforces the dashboard-composing form (chips for
+            # options, no bare URLs) on the way out — the net under whichever
+            # model composed the reply. Error replies above skip it: they are
+            # gateway-authored and already plain.
+            reply = _lint_presentation(result.get("response") or "(no reply)",
+                                       kind=conv.get("kind") or "chat")
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
@@ -3408,6 +3594,102 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     return cleaned
 
 
+# ── Presentation lint ─────────────────────────────────────────────────────────
+
+_LINT_SYSTEM_PROMPT = (
+    "You are a formatting lint for messages an assistant sends to its user's "
+    "phone dashboard. The dashboard renders Markdown plus one extra "
+    "affordance, the reply chip: [[chip: Label | prefill text]] — an inline "
+    "click-to-fill button; clicking it drops the prefill into the composer "
+    "for the user to review and send themselves, it never auto-sends.\n\n"
+    "Return the message below with ONLY these presentation rules enforced, "
+    "changing nothing else:\n\n"
+    "1. Options get chips. When the message asks the user to choose, confirm "
+    "or decide (send/adjust/discard a draft, yes/no, pick one of several), "
+    "add one chip per offered option on a final line, separated by \" · \". "
+    "The Label is one or two words; the prefill is a complete one-line reply "
+    "in the thread's language stating the user's intention (\"Yes, send it "
+    "as proposed.\") — it leans on the message above and never restates its "
+    "data. An open \"or something else?\" needs no chip. If the message "
+    "already carries chips for its options, leave them exactly as they are.\n"
+    "2. No bare URLs. Every URL becomes [short label](url) with a meaningful "
+    "label. A bare domain (example.ch) becomes [example.ch](https://example.ch). "
+    "A relative path (/sends, /gateways) becomes an absolute link using the "
+    "base URL given above, linked by name.\n"
+    "3. Never invent a URL or a fact. If the message tells the user to act "
+    "somewhere but carries no URL for it, leave that sentence unchanged.\n\n"
+    "Keep the message's language, wording, structure and content exactly — do "
+    "not translate, summarise, rephrase, shorten, answer, or comment. If "
+    "nothing violates the rules, return the message unchanged.\n\n"
+    "Output only the final message text, nothing else."
+)
+
+
+# Anything URL-shaped, for the lint's credit-free skip gate: a scheme, a
+# `word.word` token (bare domains like example.ch — also matches filenames,
+# which merely over-lints, and the lint returns a compliant message
+# unchanged), or a `/path` token (relative URLs like /sends).
+_LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
+
+
+def _lint_presentation(text: str, *, kind: str = "chat") -> str:
+    """Enforce the dashboard-composing form on an agent→user message.
+
+    Runs on everything that lands in a dashboard thread — Ara's replies and
+    the token-gated agent posts alike — so the chips/links conventions hold
+    regardless of which agent or model composed the text. Form only, never
+    content; returns `text` unchanged on any failure, oversized drift, or for
+    the quiet cowork audit threads (a record, not a UI surface)."""
+    if not PRESENTATION_LINT or kind == "cowork":
+        return text
+    raw = (text or "").strip()
+    if not raw:
+        return text
+    # Credit-free gate: a very short message with nothing URL-shaped in it —
+    # no scheme, no bare domain, no relative path — has nothing to lint.
+    if len(raw) < 40 and not _LINT_URLISH_RE.search(raw):
+        return text
+    parts = []
+    if CONVERSATION_BASE_URL:
+        parts.append("Dashboard base URL for relative paths: "
+                     + CONVERSATION_BASE_URL)
+    parts.append("Message to lint:\n" + raw)
+    cmd = [
+        "claude", "-p", "--output-format=json",
+        "--model", PRESENTATION_LINT_MODEL,
+        # A lint pass needs no tools, no MCP servers and no project context —
+        # excluding them is what keeps it cheap and fast.
+        "--allowed-tools", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", _LINT_SYSTEM_PROMPT,
+        "--", "\n\n".join(parts),
+    ]
+    try:
+        with _worker_pool:
+            result = _run_claude(
+                cmd, capture_output=True, text=True,
+                timeout=PRESENTATION_LINT_TIMEOUT,
+                cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
+            )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"[web-gateway] presentation lint failed: {exc}", flush=True)
+        return text
+    if result.returncode != 0:
+        print(f"[web-gateway] presentation lint exited {result.returncode}",
+              flush=True)
+        return text
+    try:
+        linted = (json.loads(result.stdout).get("result") or "").strip()
+    except (json.JSONDecodeError, AttributeError):
+        return text
+    if (not linted
+            or len(linted) < len(raw) * PRESENTATION_LINT_MIN_KEEP
+            or len(linted) > len(raw) * PRESENTATION_LINT_MAX_GROWTH + 200):
+        return text
+    return linted
+
+
 # ── Projects (live SPARQL over the life store) ────────────────────────────────
 
 # The retinue knowledge-base namespace the qlever-dir Markdown converter emits
@@ -3672,6 +3954,7 @@ _CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
 _CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
 _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
+_CHAT_COMPANION_RE = re.compile(r"^/chats/([^/]+)/companion/?$")
 _INTERNAL_CHAT_DRAFT_RE = re.compile(r"^/internal/chats/([^/]+)/draft/?$")
 # The media id is the gateways' token_hex(16) — 32 hex chars, path-safe by
 # construction; the slug charset matches the gateway-registry slugs.
@@ -4113,6 +4396,9 @@ def _chats_payload() -> dict:
             "muted": bool(doc.get("muted")),
             "last": last,
             "draft": doc.get("draft"),
+            # This chat's companion conversation, or null until one is asked
+            # for — see POST /chats/<id>/companion.
+            "companion": doc.get("companion"),
             "messages": _chat_messages_url(chat_id),
         })
     chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
@@ -4128,6 +4414,48 @@ def _chat_summary(chat_id: str) -> dict | None:
         if chat["id"] == chat_id:
             return chat
     return None
+
+
+# Serializes create-or-get for companion threads. The web-gateway is the only
+# writer of chat state, so one process-wide lock is all that keeps two
+# simultaneous opens from each creating a thread and one of them winning.
+_companion_lock = threading.Lock()
+
+
+def _chat_companion(chat_id: str) -> tuple[str, bool]:
+    """This chat's companion conversation id, creating it on first ask.
+
+    Returns ``(conversation_id, created)``. Idempotent through the chat's state
+    doc, which is where the id lives, so every later call — from any device —
+    gets the same thread. A recorded id whose conversation is gone (a thread
+    the user deleted) is replaced rather than handed back, so the endpoint
+    never returns an id that cannot then be read.
+
+    The thread is an ordinary conversation in every respect but its `kind` and
+    its link back here: the dashboard drives it through /conversations, Ara
+    answers in it as she does anywhere, and her reply lands unread and pushed.
+    Its opening message is written here rather than by a model turn — it costs
+    nothing, always says the same thing, and is what tells the user that Ara
+    drafts into the chat's composer instead of sending."""
+    with _companion_lock:
+        doc = _CHAT_STATE.get(chat_id)
+        existing = doc.get("companion")
+        if existing and _load_conv(str(existing)) is not None:
+            return str(existing), False
+        parts = chat_state_mod.split_chat_id(chat_id)
+        channel, key = parts if parts else ("", chat_id)
+        name = _chat_display_name(doc, channel, key)
+        where = (f'the {channel} chat "{name}"' if channel
+                 else f'the chat "{name}"')
+        conv = _new_conv(
+            "user", DEFAULT_SESSION_KEY, f"Companion: {name}", "agent",
+            f"This thread is where we work out what to say in {where}. "
+            "Tell me what you want to get across and I'll put a draft in that "
+            "chat's composer — you read it, change what you like, and your "
+            "send press is what sends it.",
+            kind="companion", chat=chat_id)
+        _CHAT_STATE.set_companion(chat_id, conv["id"])
+        return conv["id"], True
 
 
 def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
@@ -4211,6 +4539,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
                 "text": newest["text"],
             },
             "draft": doc.get("draft"),
+            "companion": doc.get("companion"),
             "messages": _chat_messages_url(chat_id),
         }
     return {
@@ -4624,6 +4953,10 @@ class Handler(BaseHTTPRequestHandler):
         chat_send_match = _CHAT_SEND_RE.match(self.path)
         if chat_send_match:
             self._handle_chat_send(chat_send_match.group(1))
+            return
+        chat_companion_match = _CHAT_COMPANION_RE.match(self.path)
+        if chat_companion_match:
+            self._handle_chat_companion(chat_companion_match.group(1))
             return
         internal_msg_match = _INTERNAL_CONV_MSG_RE.match(self.path)
         if internal_msg_match:
@@ -5075,6 +5408,24 @@ class Handler(BaseHTTPRequestHandler):
         status = 200 if ok else 409
         self._send_json(status, {"id": chat_id, "draft": doc["draft"],
                                  "version": doc["draft_version"]})
+
+    def _handle_chat_companion(self, raw_id: str) -> None:
+        """Open (or re-open) this chat's companion conversation.
+
+        Idempotent: the first call creates the thread and records it on the
+        chat, every later one returns the same id — so the client may call it
+        unconditionally when the companion pane opens, without first reading
+        the chat's `companion` field."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        try:
+            cid, created = _chat_companion(chat_id)
+        except OSError as exc:
+            self._send_json(500, {"error": "could not open the companion thread",
+                                  "detail": str(exc)})
+            return
+        self._send_json(201 if created else 200, {"id": cid})
 
     def _handle_chat_send(self, raw_id: str) -> None:
         """Send {text} through the chat's own gateway as the user.
@@ -5611,8 +5962,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_agent_conversation(self) -> None:
         """A retinue agent opens a thread that needs the user's decision.
 
-        The message is stored verbatim (the agent has already composed it); Ara
-        only engages once the user replies."""
+        The agent has already composed the message; the presentation lint
+        below enforces only its form (chips, labeled links), never its
+        content. Ara only engages once the user replies."""
         payload = self._agent_conversation_payload()
         if payload is None:
             return
@@ -5638,6 +5990,7 @@ class Handler(BaseHTTPRequestHandler):
         # reply, reply token included) — replayed to Ara's sessions in this
         # thread, never rendered to the user.
         context = str(payload.get("context") or "").strip() or None
+        message = _lint_presentation(message, kind=kind)
         conv = _new_conv("agent", owner, title, "agent", message,
                          first_attachments=payload.get("attachments"),
                          kind=kind, agent=agent, context=context)
@@ -5666,9 +6019,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Check the thread up front: _conv_add_message persists attachments
         # before it loads the thread, so an unknown id would leave orphan files.
-        if _load_conv(cid) is None:
+        # The load also supplies the thread's kind for the presentation lint.
+        target = _load_conv(cid)
+        if target is None:
             self._send_json(404, {"error": "not found"})
             return
+        if message:
+            message = _lint_presentation(message,
+                                         kind=target.get("kind") or "chat")
         # A quiet append is a record, not a request for attention: no unread
         # badge and no Web Push. Used by the cowork audit trail, which would
         # otherwise buzz the user's phone on every question the MCP connector
@@ -5763,7 +6121,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 scope = "active"
             kind = (params.get("kind") or ["chat"])[0]
-            if kind not in ("chat", "edit", "cowork", "all"):
+            if kind not in ("chat", "edit", "cowork", "companion", "all"):
                 kind = "chat"
             project = (params.get("project") or [None])[0]
             self._send_json(200, {"conversations": _list_convs(scope, kind, project)})

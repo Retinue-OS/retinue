@@ -138,7 +138,7 @@ workflow; the model stamp (phase 2) is the ground truth beneath both.
   would be invisible to SPARQL and to the reinforce/challenge lifecycle.
   CLAUDE.md project instructions are unaffected.
 
-### Phase 3 — personas become agents
+### Phase 3 — personas become agents (first slice shipped: Secretary)
 
 The persona/subagent split is historical: personas were free while Ara always
 ran on a strong model. A router-tier Ara must not compose in-role, so the
@@ -154,7 +154,19 @@ the persona mechanism does today. Workers cannot pause to ask the user
 mid-task; they return "I need a decision on X" and Ara opens a decision thread
 with chips — which is the interaction model the dashboard already uses.
 
-### Phase 4 — presentation enforcement at the choke point
+As shipped (Secretary only; Academic and Publisher remain personas for now):
+`.claude/agents/secretary.md` defines a compose-only subagent (Read, Glob,
+Grep — deliberately no Bash and no send tooling, so the "what to say" /
+"whether it goes out" boundary is structural). CLAUDE.md makes dispatch
+mandatory: every outbound message addressed to a human is composed by the
+subagent and sent verbatim by the dispatcher, on every tier — exempting only
+the system's own voice (alerts and briefings to the owner, dashboard thread
+replies). Contact lookup and sending stay with the dispatching session, where
+the send policies already apply. The persona file gained a usage note marking
+which of its sections address the composing subagent (style) and which the
+dispatcher (tooling, triage, send control).
+
+### Phase 4 — presentation enforcement at the choke point (shipped)
 
 Mediation splits into two components with different homes. Mediation of
 *meaning* (what reaches the user, which thread, who is labeled as speaking)
@@ -165,6 +177,32 @@ labeled links, option chips, details chips) regardless of author. Precedents in
 this codebase chose structural enforcement over prompt discipline twice —
 transcript cleanup (`TRANSCRIPT_CLEANUP_MODEL`) and the send policies — and
 both held; this is the same move.
+
+As shipped: `_lint_presentation()` in `web-gateway.py` runs on Ara's own
+replies (`_conv_worker`) and on the token-gated agent posts (`POST
+/internal/conversations` and `…/<id>/messages` — the `conversation-push.py`
+paths, triage proposals included), skipping the quiet `cowork` audit threads
+and gateway-authored error replies. It mirrors the transcript-cleanup
+mechanics: a one-shot `claude -p` with no tools, no MCP servers and no
+project context, run outside `/workspace` so no CLAUDE.md is loaded, on
+`PRESENTATION_LINT_MODEL` (default: the router tier, else the gateway
+default, else `haiku`). The lint is form-only and fail-open — a timeout, a
+non-zero exit, or a result that shrinks or balloons beyond the drift guards
+delivers the original text unchanged. `PRESENTATION_LINT=0` disables it. The
+first live tier deployment is what motivated shipping this early: a
+router-tier model reliably forgot chips and composed bullet lists, which no
+amount of prompt discipline fixed.
+
+The field test also showed the flag-file escalation failing on the weakest
+models — junior *echoed* `touch "$RETINUE_ESCALATE_FILE"` into her reply
+instead of executing it, so the turn was never re-run. Open hardening ideas,
+deliberately not yet shipped: treat the marker string appearing in junior's
+reply text as the escalation signal too (echoing is what weak models do
+reliably), and match the explicit "take this to Ara senior" phrase in the
+*user's* message at the gateway to skip junior outright. Until then, a
+router tier below Sonnet-class is not recommended for conversational entry
+points; scheduler dispatch jobs tolerate weaker routers via their per-job
+`model` field.
 
 ### Memory as triples (first slice shipped with phase 1)
 
