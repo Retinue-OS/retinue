@@ -3466,6 +3466,13 @@ _LINT_SYSTEM_PROMPT = (
 )
 
 
+# Anything URL-shaped, for the lint's credit-free skip gate: a scheme, a
+# `word.word` token (bare domains like example.ch — also matches filenames,
+# which merely over-lints, and the lint returns a compliant message
+# unchanged), or a `/path` token (relative URLs like /sends).
+_LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
+
+
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     """Enforce the dashboard-composing form on an agent→user message.
 
@@ -3479,8 +3486,9 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     raw = (text or "").strip()
     if not raw:
         return text
-    # Credit-free gate: a very short message with no URL has nothing to lint.
-    if len(raw) < 40 and "http" not in raw and "www." not in raw:
+    # Credit-free gate: a very short message with nothing URL-shaped in it —
+    # no scheme, no bare domain, no relative path — has nothing to lint.
+    if len(raw) < 40 and not _LINT_URLISH_RE.search(raw):
         return text
     parts = []
     if CONVERSATION_BASE_URL:
