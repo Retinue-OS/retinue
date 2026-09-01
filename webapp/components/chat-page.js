@@ -173,6 +173,7 @@ class RetinueChatPage extends HTMLElement {
     this._pane = 'chat';       // chat | companion (phone pane indicator)
     this._draft = '';          // chat composer text
     this._draftByAra = false;  // composer holds the staged agent draft
+    this._unconfirmed = [];    // sends the gateway never confirmed; see _sendChat
     this._undoing = false;     // a clear is being restored; hold draft saves
     this._undo = null;         // {text, byAra} a cleared draft, still recoverable
     this._undoTimer = null;
@@ -373,6 +374,10 @@ class RetinueChatPage extends HTMLElement {
       for (const m of msgs) {
         if (!m || this._seen.has(m.id)) continue;
         this._seen.add(m.id);
+        if (this._reconcileUnconfirmed(m)) {
+          if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
+          continue;
+        }
         this._messages.push(m);
         this._appendChatMessage(m, stick);
         if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
@@ -397,6 +402,47 @@ class RetinueChatPage extends HTMLElement {
       // Offline or store blip: keep the last rendered state; the next poll
       // reconciles.
     }
+  }
+
+  // One arriving message against the sends whose identity we never learned.
+  //
+  // A send the gateway did not confirm in time came back without a message id
+  // and with a timestamp of the server's own making, so nothing about it will
+  // match the record the channel eventually writes. Left alone, the poll would
+  // append that record beside the bubble already on screen and the user would
+  // see their own message twice — for as long as the page stayed open, since
+  // the client's dedup is by id and both ids are real to it.
+  //
+  // So an unconfirmed send is reconciled by its words: the first outbound
+  // record carrying the same text, at or after the moment we stopped waiting,
+  // is that send, and it replaces the bubble in place rather than joining it.
+  // Oldest record first, so two identical sends resolve to two bubbles in the
+  // order they were made. Returns true when the message was absorbed.
+  _reconcileUnconfirmed(m) {
+    if (!this._unconfirmed.length || !m || m.direction !== 'out') return false;
+    const text = m.text || '';
+    const i = this._unconfirmed.findIndex(
+      (u) => u.text === text && (!u.since || !tsAfter(u.since, m.ts)));
+    if (i < 0) return false;
+    const [pending] = this._unconfirmed.splice(i, 1);
+    const idx = this._messages.findIndex((x) => x && x.id === pending.id);
+    if (idx >= 0) this._messages[idx] = m;
+    // Found by walking rather than by selector: a synthesised id carries the
+    // chat id, so it holds ':', '#' and '+', and building a selector out of it
+    // would need escaping this has no reason to get wrong.
+    const thread = this.shadowRoot.querySelector('[data-chat-thread]');
+    const node = thread && [...thread.querySelectorAll('[data-mid]')]
+      .find((n) => n.getAttribute('data-mid') === pending.id);
+    if (node) {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = this._chatMsgHtml(m);
+      node.replaceWith(tpl.content.firstElementChild);
+    } else if (idx < 0) {
+      // The bubble is gone (a re-render dropped it) and nothing holds the
+      // message: let the caller append it normally rather than losing it.
+      return false;
+    }
+    return true;
   }
 
   // Advance the server-side read watermark, monotonically: the newest ts is
@@ -865,9 +911,43 @@ class RetinueChatPage extends HTMLElement {
     const who = me ? 'You' : (m.agent || (m.role === 'agent' ? 'Retinue' : 'Ara'));
     return `<div class="cmsg${me ? ' me' : ''}">` +
       `<div class="cmsg-head"><small class="who">${esc(who)}</small>` +
-      `<small class="cmeta">${esc(fmtTime(m.ts))}</small></div>` +
+      this._compMetaHtml(m) + `</div>` +
       `<div class="cbubble">${renderMarkdown(m.text)}` +
       this._compAttachHtml(m) + `</div></div>`;
+  }
+
+  // The header meta after the sender name. The companion thread is an ordinary
+  // dashboard conversation, so its answers carry the same two byproducts the
+  // conversations card already shows — which model answered, and that turn's
+  // list-price cost — and a pane that hides them makes the model choice in this
+  // very page unverifiable. Same vocabulary and same order as
+  // conversations.js's _metaHtml (model · ~$cost · time); the time stays this
+  // pane's clock time rather than that card's relative age, because the mirror
+  // beside it is stamped in clock time and the two are read together. Each
+  // piece is optional: a user turn has no model, and messages predating the
+  // metadata simply omit what they lack.
+  _compMetaHtml(m) {
+    const bits = [];
+    if (m.model_name) bits.push(`<span class="m-model">${esc(m.model_name)}</span>`);
+    if (typeof m.cost_usd === 'number' && isFinite(m.cost_usd)) {
+      bits.push(`<span class="m-cost" title="Approximate list-price cost — not the subscription bill">` +
+        `~$${this._fmtCost(m.cost_usd)}</span>`);
+    }
+    const t = fmtTime(m.ts);
+    if (t) bits.push(`<time datetime="${esc(m.ts || '')}">${esc(t)}</time>`);
+    if (!bits.length) return '';
+    return `<small class="cmeta">${bits.join('<span class="m-sep">·</span>')}</small>`;
+  }
+
+  // Cost with enough precision to stay meaningful for cheap turns: sub-cent
+  // values get more decimals so they don't collapse to "~$0.00". Mirrors
+  // conversations.js so the same turn reads identically in both surfaces.
+  _fmtCost(v) {
+    const c = Math.abs(v);
+    if (c === 0) return '0';
+    if (c < 0.01) return c.toFixed(4);
+    if (c < 1) return c.toFixed(3);
+    return c.toFixed(2);
   }
 
   // A companion message can carry files like any conversation message; they
@@ -1614,7 +1694,17 @@ class RetinueChatPage extends HTMLElement {
       // the poll's de-dup knows the message.
       const idx = this._messages.indexOf(local);
       if (idx >= 0) this._messages[idx] = msg;
-      this._seen.add(msg.id);
+      // An unconfirmed send has no identity to remember: its id is synthesised
+      // from a timestamp of ours, so registering it as seen would not stop the
+      // real record — which carries the channel's own id and instant — from
+      // being appended as a second copy of the user's own message. It is
+      // reconciled by its words instead, in _reconcileUnconfirmed.
+      if (msg.unconfirmed) {
+        this._unconfirmed.push({ id: msg.id, text: msg.text || '',
+                                 since: msg.since || '' });
+      } else {
+        this._seen.add(msg.id);
+      }
       const cur = findLocal();
       if (cur) {
         const tpl = document.createElement('template');
@@ -2069,9 +2159,17 @@ const CSS = `
   /* ── Companion pane (the conversation thread's visual language) ──────────── */
   .cmsg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; align-self: flex-start; }
   .cmsg.me { align-self: flex-end; align-items: flex-end; }
-  .cmsg-head { display: flex; align-items: center; gap: 6px; }
+  .cmsg-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
   .cmsg.me .cmsg-head { flex-direction: row-reverse; }
-  .cmeta { color: var(--muted, #8b93a3); font-size: .7rem; }
+  /* model · ~$cost · time, one muted line — the conversations card's meta in a
+     narrower pane, so it is allowed to wrap rather than push the head wider
+     than the bubble. */
+  .cmeta { color: var(--muted, #8b93a3); font-size: .7rem;
+           display: inline-flex; align-items: baseline; gap: 5px; flex-wrap: wrap;
+           min-width: 0; }
+  .cmeta .m-sep { opacity: .5; }
+  .cmeta .m-cost { font-variant-numeric: tabular-nums; }
+  .cmeta .m-model { font-weight: 600; }
   .cbubble { background: var(--card-2, #1c2230); border-radius: 16px;
              border-bottom-left-radius: 6px; padding: 9px 13px; line-height: 1.4; }
   .cmsg.me .cbubble { background: var(--accent, #6ea8fe); color: #0b0d12;

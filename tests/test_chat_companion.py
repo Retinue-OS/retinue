@@ -14,8 +14,12 @@ the chat's name, its recent messages with who spoke, the shared draft, the
 draft-don't-send instruction and the persona rule; the message excerpt is
 capped and says so; a store outage degrades honestly; a non-companion thread is
 untouched; a group chat is named as one; companion threads stay out of the
-default conversation listing; and
-Ara's reply in one lands like any other — unread, with a Web Push.
+default conversation listing; and Ara's reply in one lands like any other —
+unread, with a Web Push.
+
+The staging rule gets its own assertions: a message went out under a `verify`
+policy after the user asked Ara, in this pane, to send it, so the note has to
+be categorical rather than guidance she can weigh against a direct request.
 
     python3 tests/test_chat_companion.py
 """
@@ -138,9 +142,15 @@ def test_engage_prompt_carries_chat_context(wg):
     # How to act: stage, don't send — with the runnable command.
     assert "chat-draft.py" in prompt and "--chat" in prompt
     assert "send press" in prompt
-    # The persona rule from CLAUDE.md, both halves.
-    assert "agents/secretary.md" in prompt
-    assert "chambers/*/style/secretary.md" in prompt
+    # Composing goes to the secretary subagent, per CLAUDE.md's routing rule —
+    # Ara does not write a human's message herself on any tier.
+    assert "`secretary` subagent" in prompt and "verbatim" in prompt
+    # …and the staging rule is categorical, naming the case that broke it: the
+    # user asking, in this pane, for the message to be sent.
+    assert "You do not send, under any circumstances" in prompt
+    assert "not a preference to weigh against what the user asks" in prompt
+    assert "and then send it" in prompt
+    assert "ready for their send press" in prompt
 
     # A live-value note must ride on the fresh-session turn too, or Ara keeps
     # answering from a chat state that has since moved on.
