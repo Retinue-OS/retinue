@@ -122,7 +122,22 @@ docstring). Pieces:
   contract below), a live composer (send, shared draft, one-tap clear ✕,
   dictation, image attach with client-side downscale), quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
-  splitter on a wide screen. The open chat polls on the conversations cadence,
+  splitter on a wide screen. The composer row is the conversation composer's
+  row: mic on the left, send on the right, both always there, and the paperclip
+  inside the text field (whose chooser is also the camera on a phone) — one
+  layout across both surfaces, and one place to reach for each affordance.
+  Keeping only two round controls is what buys the field its width, since each
+  one costs 46px of a phone's; the chat field additionally carries the clear ✕,
+  beside the clip and only while there is something to clear. A clear is
+  **undoable**: the ✕'s slot becomes an undo that restores the draft through
+  `POST /chats/<id>/draft/undo` — verbatim, its "drafted by Ara" marker
+  included — and lapses after 12s or as soon as the user has moved on (typing,
+  dictating, sending, or Ara staging a new draft). One tap emptying the box is
+  only safe if the tap can be taken back, and a staged draft is not something
+  the user can retype.
+  Back goes back where the chat was opened from within the
+  app, and to the chats list for a chat opened cold (a notification, a
+  bookmark). The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the
@@ -227,6 +242,15 @@ The API, as the components consume it:
   version-guarded: a stale version answers 409 with the current state, which
   the page adopts (with a "draft updated elsewhere" note when the words
   actually differ) rather than clobbering.
+- `POST /chats/<id>/draft/undo` (no body) — restores the draft the ✕ last
+  cleared, with its original `author`/`agent`, and answers the new
+  `{id, draft, version}`. 409 with the current state when there is nothing to
+  put back: nothing was cleared, a draft has been written since, or the stash
+  has aged out. Server-side on purpose — the draft endpoint stamps every write
+  `user`, so a client resubmitting the text would quietly reattribute Ara's
+  words to the user about to send them in their own name — and one guarded
+  step, so it cannot race the clear that produced it whichever order the two
+  requests arrive in.
 - `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
 - `POST /chats/<id>/companion` — `{id}`, the chat's companion conversation.
   Idempotent: it creates the thread on the first call and returns the same id

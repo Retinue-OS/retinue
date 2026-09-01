@@ -443,6 +443,51 @@ def test_draft_guard(base, wg):
     print("PASS test_draft_guard")
 
 
+def test_draft_undo_endpoint(base, wg):
+    """POST /chats/<id>/draft/undo puts back what the ✕ removed, author and all.
+
+    The endpoint exists because the draft POST can only ever stamp "user": a
+    client resubmitting the text would silently reattribute a draft Ara staged
+    to the user about to send it in their own name.
+    """
+    draft_path = "/chats/" + _quote(CHAT1) + "/draft"
+    undo_path = draft_path + "/undo"
+    internal = "/internal/chats/" + _quote(CHAT1) + "/draft"
+    tok = {"X-Conversation-Backend-Token": "agent-token"}
+
+    # Nothing cleared yet → nothing to give back, and the current state is
+    # returned so the client can settle on the truth rather than guess.
+    status, body = _http(base, "POST", undo_path, {})
+    assert status == 409 and "draft" in body and "version" in body, body
+
+    # Ara stages a draft; the user's ✕ clears it; the undo restores it.
+    status, staged = _http(base, "POST", internal,
+                           {"text": "Samstag passt.", "agent": "Ara"}, headers=tok)
+    assert status == 200 and staged["draft"]["author"] == "agent"
+    status, cleared = _http(base, "POST", draft_path,
+                            {"text": "", "version": staged["version"]})
+    assert status == 200 and cleared["draft"] is None
+
+    status, back = _http(base, "POST", undo_path, {})
+    assert status == 200, back
+    assert back["draft"]["text"] == "Samstag passt."
+    # The whole point: it is still Ara's, so a reload still says so.
+    assert back["draft"]["author"] == "agent", back["draft"]
+    assert back["draft"]["agent"] == "Ara", back["draft"]
+    assert back["version"] > cleared["version"]
+    # And it is on the chat summary, where the list reads it.
+    summary = wg._chat_summary(CHAT1)
+    assert summary["draft"]["author"] == "agent", summary["draft"]
+
+    # Spent: a second undo refuses and leaves the restored draft alone.
+    status, again = _http(base, "POST", undo_path, {})
+    assert status == 409 and again["draft"]["text"] == "Samstag passt."
+
+    # Tidy up for the tests that follow.
+    _http(base, "POST", draft_path, {"text": "", "version": back["version"]})
+    print("PASS test_draft_undo_endpoint")
+
+
 def test_rail_auth_and_notifications(base, wg):
     rail = "/internal/chats/inbound"
     cid = "telegram:555001"
@@ -877,6 +922,7 @@ def main():
         test_messages_before_paging(base, wg)
         test_read_watermark(base, wg)
         test_draft_guard(base, wg)
+        test_draft_undo_endpoint(base, wg)
         test_rail_auth_and_notifications(base, wg)
         test_send_user_direct(base, wg)
         test_send_images(base, wg)
