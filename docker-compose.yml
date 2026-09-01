@@ -183,6 +183,15 @@ services:
       # (POST /internal/chats/inbound). Open when unset — the news-rail model;
       # set it here and on the gateways to lock the endpoint down.
       - CHATS_INGEST_TOKEN
+      # Which TCP peers count as "arrived through the reverse proxy" for the
+      # endpoints that act with the user's own authority: the chat send press
+      # and approving a pending send. Defence in depth only — no send skips an
+      # account's policy any more, whoever calls. Unset (the default) means anything that
+      # is neither loopback nor this container's own address — which is what
+      # Traefik in its own container looks like. Set it (addresses or CIDRs)
+      # to pin the proxy explicitly, and set it to include loopback only in a
+      # host-networking topology, where the distinction is unavailable.
+      - EDGE_PROXY_PEERS
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
       - UPDATER_URL=http://updater:9000/update

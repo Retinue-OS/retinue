@@ -157,6 +157,61 @@ def test_pending_send_store_lifecycle():
     print("ok: pending send store lifecycle (approve)")
 
 
+def test_approved_entry_carries_the_send_outcome():
+    """What a completed send produced is read back off the approved entry.
+
+    Approval executes off the request, so the id, the instant and the stored
+    media references would otherwise be discarded — and the chat surface reads
+    exactly these three back to render a just-sent message (its bubble, its
+    dedup against the ledger, and its images). The lifecycle test above stubs
+    ``_push`` with a plain append, which returns None and so only ever exercises
+    the unreadable-result fallback; this pins the branch that matters.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway([{"number": "*", "category": "verify"}], tmp)
+        media = ["urn:retinue:media:whatsapp:" + "aa" * 16]
+        pushed = []
+
+        def _fake_push(recipient, message, **kw):
+            pushed.append((recipient, message, kw))
+            return ("1724832000123", 1724832000.123, media)
+
+        wg._push = _fake_push
+        rid = wg._new_pending_send(
+            "+15551234567", "hoi", "de", images=[], voice=False, category="verify"
+        )
+        assert wg._complete_pending_send(rid, approved=True)["status"] == "sending"
+        entry = _wait_terminal(wg, rid)
+        assert entry["status"] == "approved", entry
+        assert pushed, "approval did not reach the send path"
+        # The three fields the chat surface depends on, survived intact.
+        assert entry["message_id"] == "1724832000123", entry
+        assert entry["sent_at"] == 1724832000.123, entry
+        assert entry["attachments"] == media, entry
+    print("ok: approved entry carries the send outcome")
+
+
+def test_send_outcome_falls_back_when_unreadable():
+    """A send that returns something unreadable is still a send.
+
+    The gateway returned without raising, so the message went out; losing the
+    id must never turn that into a reported failure. Pinned separately because
+    it is the branch the other tests reach by accident.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway([{"number": "*", "category": "verify"}], tmp)
+        wg._push = lambda recipient, message, **kw: None
+        rid = wg._new_pending_send(
+            "+15551234567", "hoi", None, images=[], voice=False, category="verify"
+        )
+        wg._complete_pending_send(rid, approved=True)
+        entry = _wait_terminal(wg, rid)
+        assert entry["status"] == "approved", entry
+        assert entry["message_id"] is None and entry["sent_at"] is None
+        assert entry["attachments"] == []
+    print("ok: send outcome falls back when unreadable")
+
+
 def test_pending_send_error_records_error_string():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_whatsapp_gateway([{"number": "*", "category": "verify"}], tmp)
@@ -257,21 +312,28 @@ def test_broadcast_jid_detected():
     print("ok: status/broadcast jid detected")
 
 
-def test_user_author_sends_directly():
-    """A user-authored send bypasses the approval queue under every category:
-    verify exists to put the user's decision between agent-composed content and
-    the wire, and the dashboard's send press already is that decision."""
+def test_policy_alone_decides_directness():
+    """`author` decides nothing, and there is no caller-supplied bypass at all.
+
+    author "user" used to be direct under every category, on the reasoning that
+    only the dashboard ever sets it. It is a JSON field any caller can set — so
+    a message went out under `verify` that the user never pressed send on.
+    Authorship is ledger provenance again, and the dashboard's own press is not
+    an exception either: it is queued here like everything else and released
+    through /pending-sends/<id>/approve."""
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_whatsapp_gateway([{"number": "*", "category": "verify"}], tmp)
-        for category in ("verify", "trust", "allow"):
-            assert wg._send_is_direct(category, False, "user") is True
-        # Agent/device authorship keeps today's rules exactly.
-        assert wg._send_is_direct("verify", False, "agent") is False
-        assert wg._send_is_direct("verify", True, "agent") is False
-        assert wg._send_is_direct("trust", False, "agent") is False
-        assert wg._send_is_direct("trust", True, "agent") is True
-        assert wg._send_is_direct("allow", False, "agent") is True
-    print("ok: user-authored sends are direct; agent rules unchanged")
+        assert wg._send_is_direct("verify", False) is False
+        assert wg._send_is_direct("verify", True) is False
+        assert wg._send_is_direct("trust", False) is False
+        assert wg._send_is_direct("trust", True) is True
+        assert wg._send_is_direct("allow", False) is True
+        # The signature carries no author and no bypass flag, so no caller can
+        # reintroduce one by passing a field.
+        import inspect
+        params = list(inspect.signature(wg._send_is_direct).parameters)
+        assert params == ["category", "user_approved"], params
+    print("ok: the account's policy alone decides; no caller-supplied bypass")
 
 
 def main():
@@ -282,11 +344,13 @@ def main():
     test_default_verify_without_wildcard()
     test_default_verify_with_no_policy_or_account()
     test_pending_send_store_lifecycle()
+    test_approved_entry_carries_the_send_outcome()
+    test_send_outcome_falls_back_when_unreadable()
     test_pending_send_error_records_error_string()
     test_pending_send_reject_does_not_send()
     test_unknown_request_id()
     test_malformed_request_id_rejected()
-    test_user_author_sends_directly()
+    test_policy_alone_decides_directness()
     print("\nAll WhatsApp send-policy checks passed.")
 
 

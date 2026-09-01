@@ -178,10 +178,16 @@ The API, as the components consume it:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
 - `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
-  gateway as the user (direct under every policy category: the authenticated
-  send press IS the approval `verify` exists for) and returns the sent
-  `Message`; the page shows an optimistic bubble and reconciles it with the
-  response, and a failed send puts the words back into the composer.
+  gateway and returns the sent `Message`. It does not skip the account's send
+  policy: under `allow` the gateway sends outright, and otherwise the send is
+  **queued and then released** through that gateway's own approve endpoint in
+  the same request — the press IS the approval `verify` exists for, but it is
+  spent on the mechanism rather than around it, so the send is recorded in the
+  pending store with its approval. (What that does and does not prevent is in
+  `_chat_send_via_gateway`: an agent calling `/send` gets a queued message; an
+  agent that also calls approve has simulated the press, which nothing inside a
+  shared container can stop.) The page shows an optimistic bubble and reconciles
+  it with the response, and a failed send puts the words back into the composer.
   `images` is `[{content_type, data(base64)}]`, at most 5, each at most
   ~8 MB decoded (400 on violations); `text` may be absent when images are
   sent. The returned `Message` (and later polls) carries the sent
@@ -190,6 +196,31 @@ The API, as the components consume it:
   the native clients do; animated GIFs pass through unchanged under the size
   cap. A failed image send keeps the staged previews (and the text) in the
   composer for retry.
+
+  **The send honours the account's send policy rather than skipping it.** The
+  message goes to the gateway as author `user` — provenance, nothing more —
+  and carries no field that asks it to bypass anything. Under `allow` it goes
+  out on that hop; under `verify` (or `trust`) the gateway queues it as a
+  pending send and the web-gateway releases it through the gateway's own
+  `/pending-sends/<id>/approve` in the same request, so the press still
+  completes in one action while the send is recorded in the pending store with
+  its approval. This is what makes an accidental send impossible: an agent that
+  POSTs a gateway's `/send` gets a queued message somebody still has to
+  release, whatever it writes in the body. `author: "user"` used to bypass the
+  policy outright, which is how a message once went out that nobody pressed
+  send on.
+
+  As a second, lesser layer, this endpoint (and the `/sends` approve action)
+  also refuses a request that did not arrive through the reverse proxy — the
+  TCP peer address decides, since the edge auth is a forward-auth Traefik
+  consults and so never sees an in-container caller. Refusals answer 403 naming
+  the reason and are logged loudly. Pin the proxy's peers with
+  `EDGE_PROXY_PEERS` (addresses or CIDRs); a deployment whose proxy arrives on
+  loopback must set it. Neither layer is a boundary against a determined agent:
+  the web-gateway shares a container with the agents and they hold the
+  gateways' tokens, so an agent can make the approve call itself — a deliberate
+  simulation of the button press, not an accident. An agent proposes a message
+  by staging the shared draft; the user's press is what sends.
 - `POST /chats/<id>/draft` `{text, version}` — the shared draft, saved
   ~1 s after the user stops typing and on blur; dictation participates in the
   same debounced save, and the ✕ posts empty text. Writes are

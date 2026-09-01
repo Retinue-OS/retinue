@@ -165,6 +165,7 @@ class RetinueChatPage extends HTMLElement {
     this._pane = 'chat';       // chat | companion (phone pane indicator)
     this._draft = '';          // chat composer text
     this._draftByAra = false;  // composer holds the staged agent draft
+    this._unconfirmed = [];    // sends the gateway never confirmed; see _sendChat
     this._compDraft = '';      // companion composer text
     this._localSeq = 0;        // ids for optimistic (not yet confirmed) bubbles
     this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
@@ -354,6 +355,10 @@ class RetinueChatPage extends HTMLElement {
       for (const m of msgs) {
         if (!m || this._seen.has(m.id)) continue;
         this._seen.add(m.id);
+        if (this._reconcileUnconfirmed(m)) {
+          if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
+          continue;
+        }
         this._messages.push(m);
         this._appendChatMessage(m, stick);
         if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
@@ -375,6 +380,47 @@ class RetinueChatPage extends HTMLElement {
       // Offline or store blip: keep the last rendered state; the next poll
       // reconciles.
     }
+  }
+
+  // One arriving message against the sends whose identity we never learned.
+  //
+  // A send the gateway did not confirm in time came back without a message id
+  // and with a timestamp of the server's own making, so nothing about it will
+  // match the record the channel eventually writes. Left alone, the poll would
+  // append that record beside the bubble already on screen and the user would
+  // see their own message twice — for as long as the page stayed open, since
+  // the client's dedup is by id and both ids are real to it.
+  //
+  // So an unconfirmed send is reconciled by its words: the first outbound
+  // record carrying the same text, at or after the moment we stopped waiting,
+  // is that send, and it replaces the bubble in place rather than joining it.
+  // Oldest record first, so two identical sends resolve to two bubbles in the
+  // order they were made. Returns true when the message was absorbed.
+  _reconcileUnconfirmed(m) {
+    if (!this._unconfirmed.length || !m || m.direction !== 'out') return false;
+    const text = m.text || '';
+    const i = this._unconfirmed.findIndex(
+      (u) => u.text === text && (!u.since || !tsAfter(u.since, m.ts)));
+    if (i < 0) return false;
+    const [pending] = this._unconfirmed.splice(i, 1);
+    const idx = this._messages.findIndex((x) => x && x.id === pending.id);
+    if (idx >= 0) this._messages[idx] = m;
+    // Found by walking rather than by selector: a synthesised id carries the
+    // chat id, so it holds ':', '#' and '+', and building a selector out of it
+    // would need escaping this has no reason to get wrong.
+    const thread = this.shadowRoot.querySelector('[data-chat-thread]');
+    const node = thread && [...thread.querySelectorAll('[data-mid]')]
+      .find((n) => n.getAttribute('data-mid') === pending.id);
+    if (node) {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = this._chatMsgHtml(m);
+      node.replaceWith(tpl.content.firstElementChild);
+    } else if (idx < 0) {
+      // The bubble is gone (a re-render dropped it) and nothing holds the
+      // message: let the caller append it normally rather than losing it.
+      return false;
+    }
+    return true;
   }
 
   // Advance the server-side read watermark, monotonically: the newest ts is
@@ -1442,7 +1488,17 @@ class RetinueChatPage extends HTMLElement {
       // the poll's de-dup knows the message.
       const idx = this._messages.indexOf(local);
       if (idx >= 0) this._messages[idx] = msg;
-      this._seen.add(msg.id);
+      // An unconfirmed send has no identity to remember: its id is synthesised
+      // from a timestamp of ours, so registering it as seen would not stop the
+      // real record — which carries the channel's own id and instant — from
+      // being appended as a second copy of the user's own message. It is
+      // reconciled by its words instead, in _reconcileUnconfirmed.
+      if (msg.unconfirmed) {
+        this._unconfirmed.push({ id: msg.id, text: msg.text || '',
+                                 since: msg.since || '' });
+      } else {
+        this._seen.add(msg.id);
+      }
       const cur = findLocal();
       if (cur) {
         const tpl = document.createElement('template');
