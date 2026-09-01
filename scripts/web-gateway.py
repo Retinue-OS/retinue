@@ -3953,6 +3953,7 @@ _CHAT_ID_MAX_LEN = 512
 _CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
 _CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
 _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
+_CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
 _CHAT_COMPANION_RE = re.compile(r"^/chats/([^/]+)/companion/?$")
 _INTERNAL_CHAT_DRAFT_RE = re.compile(r"^/internal/chats/([^/]+)/draft/?$")
@@ -4946,6 +4947,10 @@ class Handler(BaseHTTPRequestHandler):
         if chat_read_match:
             self._handle_chat_read(chat_read_match.group(1))
             return
+        chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
+        if chat_draft_undo_match:
+            self._handle_chat_draft_undo(chat_draft_undo_match.group(1))
+            return
         chat_draft_match = _CHAT_DRAFT_RE.match(self.path)
         if chat_draft_match:
             self._handle_chat_draft(chat_draft_match.group(1))
@@ -5378,6 +5383,28 @@ class Handler(BaseHTTPRequestHandler):
         status = 200 if ok else 409
         self._send_json(status, {"id": chat_id, "draft": doc["draft"],
                                  "version": doc["draft_version"]})
+
+    def _handle_chat_draft_undo(self, raw_id: str) -> None:
+        """Put back the draft the composer's ✕ just cleared (no body).
+
+        The restore is a server-side step rather than the client resubmitting
+        the text, and that is the whole point of the endpoint: the draft comes
+        back with the **author** it had, so one an agent staged is still marked
+        as the agent's. A client rewriting it could only claim it as the user's
+        own, and that marker is what tells the user whose words they are about
+        to send in their name. It also cannot race the clear that produced it —
+        one guarded step, either order of arrival, coherent state.
+
+        409 when there is nothing to put back (nothing was cleared, something
+        was written since, or the stash has aged out), with the current draft
+        state so the client can settle on the truth."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        restored, doc = _CHAT_STATE.undo_clear(chat_id)
+        self._send_json(200 if restored else 409,
+                        {"id": chat_id, "draft": doc["draft"],
+                         "version": doc["draft_version"]})
 
     def _handle_internal_chat_draft(self, raw_id: str) -> None:
         """An agent stages the shared draft (author "agent" + its name).

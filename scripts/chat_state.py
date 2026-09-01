@@ -70,6 +70,12 @@ AUTHORS = ("user", "agent", "device")
 # registry identity, which is what mis-routed sends to the wrong account.
 GATEWAY_SOURCE_ACCOUNT = "account"
 
+# How long a cleared draft stays restorable server-side. The client only offers
+# the undo for a few seconds; this is the outer bound behind it, generous enough
+# that a slow round trip never loses the offer and short enough that a stash
+# cannot resurface long after the user has moved on.
+UNDO_CLEAR_MAX_AGE = 300.0
+
 _ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
 
 
@@ -136,6 +142,9 @@ class ChatStateStore:
             "key": parts[1],
             "last_read": None,
             "draft": None,
+            # What the newest clear removed, kept so it can be put back exactly
+            # — see set_draft and undo_clear. None when nothing is recoverable.
+            "cleared": None,
             # Monotonic counter surviving draft clears, so a version can never
             # repeat and a stale writer is always detectable.
             "draft_version": 0,
@@ -321,7 +330,11 @@ class ChatStateStore:
 
         Empty ``text`` clears the draft (the composer's ✕), dropping the
         author tag with it; the version counter still advances so the clear is
-        itself guarded against.
+        itself guarded against. What was cleared is kept aside as ``cleared``
+        so :meth:`undo_clear` can put it back exactly — text, author and agent
+        name — because a draft an agent staged is not something the user can
+        retype, and re-sending it as their own words would lose the one marker
+        that says whose words they are.
         """
         if author not in AUTHORS:
             raise ValueError(f"author must be one of {'|'.join(AUTHORS)}, got {author!r}")
@@ -337,6 +350,12 @@ class ChatStateStore:
                     return False, doc
             doc["draft_version"] = current + 1
             if not text:
+                previous = doc.get("draft") or None
+                # Only a clear that actually removed something is undoable, and
+                # only the newest one: an older stash would offer to restore
+                # text the user has long since moved past.
+                doc["cleared"] = ({**previous, "at": iso_z(None)}
+                                  if previous and previous.get("text") else None)
                 doc["draft"] = None
             else:
                 draft = {
@@ -348,13 +367,68 @@ class ChatStateStore:
                 if agent:
                     draft["agent"] = agent
                 doc["draft"] = draft
+                # Writing a draft settles the question of what the composer
+                # holds; whatever was cleared before it is no longer the thing
+                # to go back to.
+                doc["cleared"] = None
             self._write(doc)
             return True, doc
 
     def clear_draft(self, chat_id: str) -> dict:
-        """Unconditional clear — the send path, where the draft just went out."""
+        """Unconditional clear — the send path, where the draft just went out.
+
+        A draft that has just been sent is not something to offer back, so this
+        leaves nothing to undo."""
         _, doc = self.set_draft(chat_id, "", author="user")
-        return doc
+        with self._lock:
+            doc = self._read(chat_id)
+            if doc.get("cleared"):
+                doc["cleared"] = None
+                self._write(doc)
+            return doc
+
+    def undo_clear(self, chat_id: str, *,
+                   max_age_seconds: float = UNDO_CLEAR_MAX_AGE) -> tuple[bool, dict]:
+        """Put the newest cleared draft back, verbatim; ``(restored, doc)``.
+
+        The restore happens here rather than by the client re-submitting the
+        text, for two reasons. It keeps the draft's **author** — a draft an
+        agent staged comes back marked as the agent's, where a client re-write
+        could only claim it as the user's, and that marker is the one thing
+        saying whose words these are about to be sent as. And it is a single
+        guarded step, so it cannot race the clear that produced it: whichever
+        order the two requests arrive in, the state they leave is coherent.
+
+        Refused when there is nothing to restore, or when the stash is older
+        than ``max_age_seconds`` — an undo offered long after the fact would be
+        putting back text the user has moved on from."""
+        with self._lock:
+            doc = self._read(chat_id)
+            stash = doc.get("cleared") or None
+            if not stash or not stash.get("text"):
+                return False, doc
+            try:
+                age = time.time() - datetime.fromisoformat(
+                    str(stash.get("at") or "").replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                age = None
+            if age is None or age > max_age_seconds:
+                doc["cleared"] = None
+                self._write(doc)
+                return False, doc
+            doc["draft_version"] = int(doc.get("draft_version") or 0) + 1
+            draft = {
+                "text": stash["text"],
+                "author": stash.get("author") if stash.get("author") in AUTHORS else "user",
+                "ts": iso_z(None),
+                "version": doc["draft_version"],
+            }
+            if stash.get("agent"):
+                draft["agent"] = stash["agent"]
+            doc["draft"] = draft
+            doc["cleared"] = None
+            self._write(doc)
+            return True, doc
 
 
 # ── Live overlay ──────────────────────────────────────────────────────────────

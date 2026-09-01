@@ -173,6 +173,7 @@ class RetinueChatPage extends HTMLElement {
     this._pane = 'chat';       // chat | companion (phone pane indicator)
     this._draft = '';          // chat composer text
     this._draftByAra = false;  // composer holds the staged agent draft
+    this._undoing = false;     // a clear is being restored; hold draft saves
     this._undo = null;         // {text, byAra} a cleared draft, still recoverable
     this._undoTimer = null;
     this._compDraft = '';      // companion composer text
@@ -436,6 +437,10 @@ class RetinueChatPage extends HTMLElement {
   async _saveDraftNow(retried) {
     if (this._draftTimer) clearTimeout(this._draftTimer);
     this._draftTimer = null;
+    // A restore is in flight: the server is about to say what the draft is,
+    // author included. Writing here would race it, and would write the wrong
+    // author besides — this endpoint can only ever stamp "user".
+    if (this._undoing) return;
     const text = this._draft;
     if (text === this._draftSaved) return;
     try {
@@ -840,12 +845,6 @@ class RetinueChatPage extends HTMLElement {
       micBtn + field + sendBtn + `</form>`;
   }
 
-  // What makes the chat's send button the right control to show: words, or a
-  // staged image on its own (an image needs no caption).
-  _hasSendable(text) {
-    return !!text || this._outImages.length > 0;
-  }
-
   // Companion messages reuse the conversation thread's visual language (same
   // bubble geometry and styles as conversations.js, Markdown via the shared
   // renderer) so this pane and real dashboard conversations render identically
@@ -1121,7 +1120,10 @@ class RetinueChatPage extends HTMLElement {
         grow();
         input.focus();
         this._saveDraft();
-        this._setUndo(prev ? { text: prev, byAra: wasAra } : null);
+        // Offered only for something the server actually held: it stores a
+        // draft stripped, so whitespace alone was never a draft and there
+        // would be nothing to put back — an undo that could only ever fail.
+        this._setUndo(prev.trim() ? { text: prev, byAra: wasAra } : null);
       });
     }
     const undoBtn = form.querySelector('[data-undo]');
@@ -1342,25 +1344,84 @@ class RetinueChatPage extends HTMLElement {
     if (field) field.classList.toggle('has-undo', !!this._undo);
   }
 
-  // Put the cleared text back exactly as it was, its "drafted by Ara" marker
-  // included — which is why this goes through a composer refresh rather than
-  // just writing the textarea: the marker is part of the composer block.
-  _undoClear() {
+  // Put the cleared draft back — the SERVER's copy of it, not a rewrite of the
+  // text from here. Two things follow from that, and both are the reason the
+  // endpoint exists.
+  //
+  // The draft comes back with the author it had, so one Ara staged is still
+  // marked as hers. Rewriting it from the client could only save it as the
+  // user's own (the draft endpoint stamps author "user", as it must), and that
+  // marker is what tells the user whose words they are about to send in their
+  // name — precisely the thing worth not losing when the ✕ was a mis-tap.
+  //
+  // And it cannot lose a race with the clear's own save. The clear's write may
+  // still be in flight; awaiting it first means the restore is applied to
+  // settled state, and the restore is one guarded server-side step rather than
+  // a second write that the in-flight one could overtake or the equality guard
+  // swallow.
+  //
+  // The composer is refreshed rather than written directly because the "Draft
+  // by Ara" marker is part of that block.
+  async _undoClear() {
     const entry = this._undo;
     if (!entry) return;
     this._setUndo(null);
+    // Held for the round trip. Any draft save landing in between would write
+    // these words back as the USER's — the blur that replacing a focused
+    // textarea fires, or the user simply tapping away — and that would both
+    // lose the author and consume the server's stash before the restore asks
+    // for it.
+    this._undoing = true;
+    // Optimistic, but written into the existing field rather than through a
+    // composer rebuild: rebuilding blurs the focused textarea, and that blur
+    // is itself one of the saves being guarded against. The "Draft by Ara"
+    // marker arrives with the refresh below, one round trip later.
     this._draft = entry.text;
-    this._draftByAra = entry.byAra;
-    this._refreshChatComposer();
     const input = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
     if (input) {
-      try {
-        input.focus();
-        // Caret at the end, where the user left off, not at the start.
-        input.setSelectionRange(input.value.length, input.value.length);
-      } catch (_e) { /* a browser that dislikes selection on a hidden field */ }
+      input.value = entry.text;
+      const field = input.closest('[data-field]');
+      if (field) field.classList.add('has-text');
     }
-    this._saveDraft();
+    this._focusComposerEnd();
+    if (this._draftInflight) {
+      try { await this._draftInflight; } catch (_e) { /* its failure is its own */ }
+    }
+    try {
+      const res = await fetch(
+        `/chats/${encodeURIComponent(this._id)}/draft/undo`, { method: 'POST' });
+      const data = await res.json();
+      // Settle on what the server actually holds, whether it restored or
+      // refused — a refusal means something else has since claimed the draft,
+      // and showing our optimistic copy over it would be the stale view.
+      const draft = (data && data.draft) || null;
+      this._draftVersion = (data && data.version) || this._draftVersion;
+      this._draft = (draft && draft.text) || '';
+      this._draftSaved = this._draft;
+      this._draftByAra = !!(draft && draft.author === 'agent');
+      this._refreshChatComposer();
+      if (this._draft) this._focusComposerEnd();
+      if (!res.ok) this._showNote('That draft could not be restored.');
+    } catch (_err) {
+      // Offline: the words are on screen and the next edit saves them as the
+      // user's own, which is the honest outcome when the restore never landed.
+      this._draftSaved = '';
+      this._undoing = false;
+      this._scheduleDraftSave();
+      return;
+    } finally {
+      this._undoing = false;
+    }
+  }
+
+  _focusComposerEnd() {
+    const input = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+    if (!input) return;
+    try {
+      input.focus();
+      // Caret at the end, where the user left off, not at the start.
+      input.setSelectionRange(input.value.length, input.value.length);
+    } catch (_e) { /* a browser that dislikes selection on a hidden field */ }
   }
 
   _setDraftByAra(on) {

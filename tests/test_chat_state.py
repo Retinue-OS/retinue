@@ -65,6 +65,70 @@ def test_draft_version_guard():
         print("PASS test_draft_version_guard")
 
 
+def test_undo_clear_restores_the_draft_with_its_author():
+    """A cleared draft comes back exactly, author included.
+
+    The restore lives here rather than in the client because a client can only
+    resubmit text, and the user-facing draft endpoint stamps every write
+    "user" — so a draft Ara staged would come back as the user's own words.
+    That marker is the one thing saying whose words are about to be sent in
+    the user's name, which is precisely what a mis-tapped ✕ must not cost.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "signal:+41790001122"
+        store.set_draft(cid, "Samstag passt.", author="agent", agent="Ara",
+                        base_version=0)
+        ok, doc = store.set_draft(cid, "", author="user", base_version=1)
+        assert ok and doc["draft"] is None
+        assert doc["cleared"]["text"] == "Samstag passt."
+
+        restored, doc = store.undo_clear(cid)
+        assert restored, doc
+        assert doc["draft"]["text"] == "Samstag passt."
+        assert doc["draft"]["author"] == "agent", doc["draft"]
+        assert doc["draft"]["agent"] == "Ara", doc["draft"]
+        # The version moves on, so a writer holding the pre-undo version is
+        # stale — the restore is guarded like any other write.
+        assert doc["draft_version"] == 3
+        assert doc["cleared"] is None, "the stash outlived its use"
+
+        # Nothing left to undo: a second attempt refuses rather than repeating.
+        again, doc = store.undo_clear(cid)
+        assert not again and doc["draft"]["text"] == "Samstag passt."
+    print("PASS test_undo_clear_restores_the_draft_with_its_author")
+
+
+def test_undo_clear_is_refused_once_it_is_stale_or_moot():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "signal:+41790001122"
+        # Nothing was ever cleared.
+        assert store.undo_clear(cid)[0] is False
+
+        # Writing a draft settles what the composer holds: whatever was cleared
+        # before it is no longer the thing to go back to.
+        store.set_draft(cid, "erste", author="user", base_version=0)
+        store.set_draft(cid, "", author="user", base_version=1)
+        store.set_draft(cid, "zweite", author="user", base_version=2)
+        assert store.undo_clear(cid)[0] is False
+        assert store.get(cid)["draft"]["text"] == "zweite"
+
+        # A send is not a clear to offer back — those words are gone on purpose.
+        store.clear_draft(cid)
+        assert store.get(cid)["draft"] is None
+        assert store.undo_clear(cid)[0] is False
+
+        # And a stash that has aged out is dropped rather than restored.
+        store.set_draft(cid, "alt", author="user")
+        store.set_draft(cid, "", author="user")
+        assert store.get(cid)["cleared"]["text"] == "alt"
+        restored, doc = store.undo_clear(cid, max_age_seconds=-1)
+        assert not restored and doc["draft"] is None
+        assert doc["cleared"] is None, "an aged-out stash should not linger"
+    print("PASS test_undo_clear_is_refused_once_it_is_stale_or_moot")
+
+
 def test_agent_staging_never_clobbers_user_text():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -198,6 +262,8 @@ def test_iso_z_normalizes():
 if __name__ == "__main__":
     test_split_and_filename_safety()
     test_draft_version_guard()
+    test_undo_clear_restores_the_draft_with_its_author()
+    test_undo_clear_is_refused_once_it_is_stale_or_moot()
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()
     test_flags_and_note_message()

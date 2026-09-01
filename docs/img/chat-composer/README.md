@@ -3,9 +3,9 @@
 Illustrations for the composer change in PR #185, referenced from that PR and
 kept here so the images stay reachable after the branch is gone.
 
-Both are rendered from the real component by Playwright/Chromium at 390×844
-(a phone), against the repo's own chat fixtures. The pixel figures are measured
-off the live elements, not estimates.
+All three are rendered from the real component by Playwright/Chromium at
+390×844 (a phone), against the repo's own chat fixtures. The pixel figures are
+measured off the live elements, not estimates.
 
 - **`composer-width.png`** — the same message in the same chat before and after.
   Four round controls (mic, paperclip, camera, send) left the field 178px and
@@ -16,7 +16,8 @@ off the live elements, not estimates.
   only control that comes and goes, and only when there is text to clear.
 - **`composer-undo.png`** — clearing a draft Ara staged, and taking it back:
   the ✕'s slot becomes an undo, and the restored draft carries its marker
-  again. Shot as the three taps it actually is.
+  again (the restore goes through the server, which is what keeps the author).
+  Shot as the three taps it actually is.
 
 Two things worth knowing before reshooting these:
 
