@@ -15,7 +15,10 @@ direct user-send contract and serving token-gated media). Covers:
 - the read watermark, the version-guarded draft (409), agent staging;
 - POST /chats/<id>/companion: idempotent create-or-get, the id surfacing on the
   ChatSummary, and the thread staying out of the default conversation list;
-- POST /chats/<id>/send: author "user" reaches the gateway, the draft clears,
+- POST /chats/<id>/send: the message reaches the gateway as author "user"
+  with nothing that skips its send policy — under `verify` it is queued and
+  released through the gateway's own approve call in the same request — the
+  draft clears,
   the watermark advances, and the sent message is returned and visible in the
   merged view before the store knows it (the overlay);
 - honest 502 when the life store is down — no raw fallback.
@@ -60,7 +63,10 @@ W_TS = "2026-08-26T18:00:00Z"
 STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
                # The mock gateway's reported identity: chat routing sends only
                # through an inbox-mode account (see test_control_gateway_refused).
-               "gw_mode": "inbox", "gw_account": "+41791112233"}
+               "gw_mode": "inbox", "gw_account": "+41791112233",
+               # The mock account's send policy: "allow" sends on the first
+               # hop, anything else queues and must be approved.
+               "gw_policy": "allow", "pending": {}, "approved": []}
 
 
 def _cell(value):
@@ -138,6 +144,10 @@ class _MockSparql(BaseHTTPRequestHandler):
         ]
 
 
+_PENDING_RE = __import__("re").compile(
+    r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
+
+
 class _MockGateway(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -149,6 +159,14 @@ class _MockGateway(BaseHTTPRequestHandler):
             self._json(200, {"status": "ok", "configured": True,
                              "connected": True, "mode": STATE["gw_mode"],
                              "account": STATE["gw_account"]})
+            return
+        m = _PENDING_RE.match(self.path)
+        if m and not m.group(2):
+            entry = STATE["pending"].get(m.group(1))
+            if entry is None:
+                self._json(404, {"error": "not found"})
+                return
+            self._json(200, dict(entry))
             return
         if self.path.startswith("/media/"):
             if self.headers.get("Authorization", "") != "Bearer gw-secret":
@@ -165,19 +183,44 @@ class _MockGateway(BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
-        payload = json.loads(self.rfile.read(length).decode("utf-8"))
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        payload = json.loads(raw) if raw else {}
         STATE["gw_requests"].append(("POST", self.path,
                                      self.headers.get("Authorization", "")))
         if self.path.rstrip("/") == "/send":
             STATE["sent"].append(payload)
-            answer = {"status": "sent", "recipient": payload.get("recipient"),
-                      "message_id": str(776 + len(STATE["sent"])),
-                      "ts": time.time()}
+            outcome = {"message_id": str(776 + len(STATE["sent"])),
+                       "sent_at": time.time()}
             if payload.get("images"):
                 # The real gateway persists each image into its ledger media
                 # store and reports the stored references back.
-                answer["attachments"] = [f"urn:retinue:media:signal:{MID_ATT2}"]
-            self._json(200, answer)
+                outcome["attachments"] = [f"urn:retinue:media:signal:{MID_ATT2}"]
+            if STATE["gw_policy"] == "allow":
+                self._json(200, {"status": "sent",
+                                 "recipient": payload.get("recipient"),
+                                 "message_id": outcome["message_id"],
+                                 "ts": outcome["sent_at"],
+                                 "attachments": outcome.get("attachments", [])})
+                return
+            # Anything stricter queues, exactly as the real gateway does under
+            # `verify`: nothing the caller can put in the body skips this.
+            rid = f"{len(STATE['pending']) + 1:032x}"
+            STATE["pending"][rid] = {"id": rid, "status": "pending", **outcome}
+            self._json(202, {"status": "pending_approval", "request_id": rid,
+                             "approval_url": f"/sends/signal/{rid}"})
+            return
+        m = _PENDING_RE.match(self.path)
+        if m and m.group(2) == "approve":
+            entry = STATE["pending"].get(m.group(1))
+            if entry is None:
+                self._json(404, {"error": "pending send not found"})
+                return
+            # Approval executes off the request at the real gateway, so the
+            # caller sees "sending" and reads the outcome back afterwards.
+            entry["status"] = "sending"
+            STATE["approved"].append(m.group(1))
+            self._json(200, dict(entry))
+            entry["status"] = "approved"
             return
         self._json(404, {"error": "not found"})
 
@@ -204,6 +247,12 @@ def _load_gateway(tmp: Path, sparql_port: int, gw_port: int):
     os.environ.pop("TELEGRAM_GATEWAY_BASE_URL", None)
     os.environ.pop("MESSENGER_GATEWAYS", None)
     os.environ.pop("CHATS_INGEST_TOKEN", None)
+    # These tests drive the handler directly over loopback, which the
+    # user-authority gate refuses (see tests/test_chat_send_authority.py).
+    # Pinning the harness's own peer is the same knob a deployment uses to name
+    # its reverse proxy, so the send paths run exactly as the dashboard reaches
+    # them; the gate itself is covered in its own file.
+    os.environ["EDGE_PROXY_PEERS"] = "127.0.0.1"
     os.environ["CHAT_STATE_DIR"] = str(tmp / "chat-state")
     os.environ["CHAT_LIST_CACHE_SECONDS"] = "0"
     os.environ["CONVERSATION_BACKEND_TOKEN"] = "agent-token"
@@ -457,6 +506,9 @@ def test_send_user_direct(base, wg):
     assert len(STATE["sent"]) == 1
     sent = STATE["sent"][0]
     assert sent["author"] == "user" and sent["recipient"] == MARA
+    # Authorship is all it carries: no field in this body asks the gateway to
+    # skip its policy, because no such field exists any more.
+    assert "edge_verified" not in sent and "user_approved" not in sent
     assert sent["voice"] is False and sent["message"] == "bis Samstag!"
     # The returned Message is contract-shaped and carries the gateway's
     # recorded ledger identity.
@@ -596,6 +648,44 @@ def test_rail_attributes_by_account(base, wg):
     print("PASS test_rail_attributes_by_account")
 
 
+def test_send_under_verify_is_queued_then_approved(base, wg):
+    """The dashboard press under `verify`: one action, but through the queue.
+
+    The gateway's policy is not skipped — the send is registered as a pending
+    send and released with the gateway's own approve call, in this same
+    request. So an agent that merely POSTs a gateway's /send is left with a
+    queued message somebody still has to release, while the user's press still
+    completes in one go and comes back with the sent Message.
+    """
+    STATE["sent"].clear()
+    STATE["pending"].clear()
+    STATE["approved"].clear()
+    STATE["gw_requests"].clear()
+    STATE["gw_policy"] = "verify"
+    try:
+        status, msg = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/send",
+                            {"text": "unter verify"})
+        assert status == 200, msg
+    finally:
+        STATE["gw_policy"] = "allow"
+    # One send registered, and released through the gateway's own endpoint.
+    assert len(STATE["sent"]) == 1, STATE["sent"]
+    assert len(STATE["approved"]) == 1, STATE["approved"]
+    rid = STATE["approved"][0]
+    assert STATE["pending"][rid]["status"] == "approved"
+    approve_calls = [pth for verb, pth, _ in STATE["gw_requests"]
+                     if verb == "POST" and pth.endswith("/approve")]
+    assert approve_calls == [f"/pending-sends/{rid}/approve"], approve_calls
+    # The outcome survives the queue: the returned Message carries the id the
+    # gateway recorded on the approved entry, not a synthetic one.
+    assert msg["id"] == STATE["pending"][rid]["message_id"]
+    assert msg["text"] == "unter verify" and msg["author"] == "user"
+    # And it is in the merged view, exactly as a direct send would be.
+    status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
+    assert any(m["id"] == msg["id"] for m in body["messages"])
+    print("PASS test_send_under_verify_is_queued_then_approved")
+
+
 def test_companion_endpoint(base, wg):
     """The chat's linked conversation: created once, returned forever after."""
     path = "/chats/" + _quote(CHAT2) + "/companion"
@@ -701,6 +791,7 @@ def main():
         test_rail_auth_and_notifications(base, wg)
         test_send_user_direct(base, wg)
         test_send_images(base, wg)
+        test_send_under_verify_is_queued_then_approved(base, wg)
 
         test_companion_endpoint(base, wg)
 

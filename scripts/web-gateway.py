@@ -166,6 +166,7 @@ import binascii
 import hashlib
 import html
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
@@ -1204,6 +1205,109 @@ def _channel_gateway(slug: str):
 # htpasswd users. Internal container-to-container calls never hit Traefik and so
 # are never gated by this. See scripts/gateway_auth.py for the decision logic.
 AUTH_CONFIG = gateway_auth.config_from_env()
+
+# ── Which requests carry the user's own authority ─────────────────────────────
+# Two endpoints act *as the user* rather than on their behalf: the chat send
+# press, and approving a pending send on /sends. Both are where `verify` is
+# satisfied and a message reaches the wire.
+#
+# THIS IS THE SECOND LAYER, NOT THE GUARANTEE. What actually keeps a message
+# from going out unbidden lives at the messenger gateways: no caller-supplied
+# field skips an account's send policy any more, so under `verify` every send
+# is queued — the dashboard's own press included, which satisfies the policy by
+# releasing the queued send rather than by stepping around it (see
+# _chat_send_via_gateway). An agent that calls a gateway's /send is left with a
+# message somebody still has to release, whatever it puts in the body.
+#
+# The check here is worth keeping anyway, because these endpoints used to be
+# justified by "they sit behind the edge auth" and that was false. The edge
+# auth is a Traefik forward-auth: the proxy asks GET /auth and then forwards
+# the request, so it only ever sees traffic that reached Traefik, and an
+# in-container caller talking straight to this port is never asked (see the
+# AUTH_CONFIG comment). Any agent in this container can curl them.
+#
+# What distinguishes the two callers is the TCP peer address, which they cannot
+# choose: Traefik connects from another container's address, while an
+# in-container caller connects either from loopback or, having dialled this
+# container's own address, from the very address this socket is bound to. That
+# is the discriminator; it fails closed on anything it cannot classify.
+#
+# BE CLEAR ABOUT WHAT THIS IS. The web-gateway and the agents share one
+# container, and the channel gateways' tokens are in that container's
+# environment. Anything this process can reach, an agent can reach too, and an
+# agent that obtains the edge credentials can come through Traefik like a
+# browser. This closes the easy, obvious path — the one a helpful agent takes
+# without meaning any harm — and makes any attempt visible in the log. It is
+# defence in depth, in the same spirit as the Ask-Ara boundary being "the
+# allowlist plus the prompt, not a sandbox". It is not a hard boundary, and no
+# arrangement inside a shared container could make it one.
+#
+# EDGE_PROXY_PEERS pins it explicitly: comma-separated addresses or CIDRs the
+# reverse proxy connects from. When set it is the whole rule — which is also
+# how a deployment whose proxy legitimately arrives on loopback (host
+# networking) states that, accepting that the distinction is then unavailable.
+EDGE_PROXY_PEERS = os.environ.get("EDGE_PROXY_PEERS", "").strip()
+
+
+def _parse_edge_peers(raw: str) -> list:
+    nets = []
+    for part in (raw or "").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            print(f"[web-gateway] EDGE_PROXY_PEERS: ignoring unparseable "
+                  f"entry {part!r}", flush=True)
+    return nets
+
+
+_EDGE_PEER_NETS = _parse_edge_peers(EDGE_PROXY_PEERS)
+if any(n.is_loopback for n in _EDGE_PEER_NETS):
+    print("[web-gateway] EDGE_PROXY_PEERS includes loopback: user-authority "
+          "endpoints accept in-container callers on this deployment", flush=True)
+
+
+def _normalize_peer(value: str | None):
+    """An ip_address for a socket peer, unmapping ::ffff:1.2.3.4 — which is how
+    a v4 client reaches a dual-stack listener, and which reports itself as
+    neither loopback nor private until unmapped. None when unparseable."""
+    try:
+        addr = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return None
+    return getattr(addr, "ipv4_mapped", None) or addr
+
+
+def _classify_request_origin(peer: str | None,
+                             local: str | None) -> tuple[bool, str]:
+    """Whether a request arrived through the reverse proxy; (ok, reason).
+
+    `peer` is the connection's remote address and `local` the address this
+    socket is bound to for that same connection — read per connection rather
+    than resolved from the hostname, so it cannot go stale and needs no name
+    lookup. A peer equal to `local` is this host talking to itself over a
+    non-loopback address, which is an in-container caller just as much as
+    loopback is.
+
+    Unclassifiable input is refused: a missing or unparseable peer address
+    means we cannot tell, and "cannot tell" must not read as "allowed"."""
+    addr = _normalize_peer(peer)
+    if addr is None:
+        return False, f"unclassifiable peer address {peer!r}"
+    if _EDGE_PEER_NETS:
+        if any(addr in net for net in _EDGE_PEER_NETS):
+            return True, ""
+        return False, (f"peer {addr} is not in EDGE_PROXY_PEERS "
+                       f"({EDGE_PROXY_PEERS})")
+    if addr.is_loopback:
+        return False, f"peer {addr} is loopback — an in-container caller"
+    local_addr = _normalize_peer(local)
+    if local_addr is not None and addr == local_addr:
+        return False, (f"peer {addr} is this container's own address — an "
+                       f"in-container caller")
+    return True, ""
 
 # Concurrency model:
 # - `_session_locks` holds one lock per session key, so a single conversation is
@@ -2317,21 +2421,39 @@ def _conv_chat_note(conv: dict) -> str:
     else:
         lines.append("The chat's shared draft is empty.")
     lines.append(
-        "Before you compose anything for the correspondent, read "
-        "agents/secretary.md for the framework's generic style rules, then "
-        "glob chambers/*/style/secretary.md and read every match — the "
-        "owner's own conventions (how to sign, tone per recipient) live "
-        "there and override the persona's defaults."
+        "The words for the correspondent are written by the `secretary` "
+        "subagent, not by you: dispatch it with the channel, the "
+        "correspondent, the exchange above and what the user wants to get "
+        "across, and use the text it returns verbatim."
     )
     lines.append(
-        "When you have a reply to propose, do not send it: stage it as the "
-        "chat's shared draft with\n"
+        "There is exactly one thing you do with that text — you put it in "
+        "this chat's shared draft:\n"
         "  python3 /workspace/scripts/chat-draft.py --chat "
         f"{shlex.quote(chat_id)} '<the message>'\n"
-        "The user sees it in the chat's composer, edits it if they like, and "
-        "their send press is what puts it on the wire in their name. Then say "
-        "here, in one or two sentences, what you staged and why — the draft "
-        "carries the message, so do not repeat it in full."
+        "Then say here, in one or two sentences, what you staged and why. The "
+        "draft carries the message, so do not repeat it in full."
+    )
+    lines.append(
+        "You do not send, under any circumstances, and this is not a "
+        "preference to weigh against what the user asks. If they tell you "
+        "here to send it — \"and then send it\", \"schick das ab\", "
+        "\"just send it\" — that does not make sending allowed: stage the "
+        "text and answer that it is in the composer, ready for their send "
+        "press. The press is what puts a message on the wire in their name, "
+        "and a message that went out any other way is one they never "
+        "approved, however plainly they seemed to ask for it. If they insist, "
+        "say plainly that you cannot and that the send button is the only way."
+    )
+    lines.append(
+        "In particular, never answer a correspondent with signal-push.py, "
+        "whatsapp-push.py, telegram-push.py or any other send tool. Those go "
+        "out over the system's own account, not the user's: the correspondent "
+        "receives a message from a number they do not know, as a message "
+        "request, signed by nobody they recognise — which has happened, and "
+        "is worse than not answering at all. They exist for alerts and "
+        "briefings to the owner. This chat has exactly one correct outbound "
+        "path and it is the user's press on the draft you staged."
     )
     return "\n\n[Context: " + "\n\n".join(lines) + "]"
 
@@ -4458,6 +4580,99 @@ def _chat_companion(chat_id: str) -> tuple[str, bool]:
         return conv["id"], True
 
 
+# How long to wait for a gateway to report back what an approved send actually
+# did. Approval executes asynchronously there (a slow send must not hold the
+# approving request open), so the outcome is read by polling the pending entry.
+CHAT_SEND_CONFIRM_TIMEOUT = float(
+    os.environ.get("CHAT_SEND_CONFIRM_TIMEOUT", "30"))
+CHAT_SEND_CONFIRM_INTERVAL = 0.2
+
+
+def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
+                 method: str = "POST") -> tuple[int, dict]:
+    """One authenticated request to a channel gateway; (status, parsed body).
+
+    Raises on a transport failure, which the caller turns into a 502."""
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    if gw.get("token"):
+        headers["Authorization"] = "Bearer " + gw["token"]
+    req = urllib.request.Request(gw["base_url"] + path, data=data,
+                                 headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=CHAT_SEND_TIMEOUT) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            return exc.code, json.loads(raw)
+        except ValueError:
+            return exc.code, {"error": raw}
+
+
+def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
+    """Put one chat message on the wire; ({message_id, ts, attachments}, error).
+
+    The gateway's send policy decides, and nothing here asks it to skip that.
+    An `allow` account sends on the first hop. Anything stricter answers 202
+    with a pending send, and this releases it through the gateway's own
+    /pending-sends/<id>/approve in the same request — so the message is
+    recorded in the pending store *with* its approval rather than going around
+    the mechanism, and the dashboard press still completes in one action.
+
+    That is the whole difference between the user's press and an agent: an
+    agent that calls /send gets a queued message somebody still has to release.
+    An agent that also calls approve has deliberately simulated the button
+    press, which no arrangement inside a shared container can prevent — the
+    agents hold this gateway's token. What it can no longer do is send by
+    accident, which is what happened when `author: "user"` was a bypass.
+
+    Approval executes asynchronously at the gateway, so the outcome is polled
+    off the pending entry. A confirmation that does not arrive in time is not
+    a failed send — the message is very likely on the wire — so the send is
+    reported without an id and the caller's dedup falls back to (ts, text).
+    """
+    status, answer = _gateway_hop(gw, "/send", send_payload)
+    if not isinstance(answer, dict):
+        return {}, f"gateway returned a non-object body (HTTP {status})"
+    if status == 200 and answer.get("status") == "sent":
+        return {"message_id": answer.get("message_id"),
+                "ts": answer.get("ts"),
+                "attachments": answer.get("attachments") or []}, ""
+    if answer.get("status") != "pending_approval":
+        return {}, (f"gateway rejected the send (HTTP {status}): "
+                    + json.dumps(answer)[:300])
+
+    request_id = str(answer.get("request_id") or "").strip()
+    if not request_id:
+        return {}, "gateway queued the send but named no request id"
+    status, approved = _gateway_hop(
+        gw, f"/pending-sends/{request_id}/approve")
+    if status != 200:
+        return {}, (f"gateway refused to approve the queued send "
+                    f"(HTTP {status}): {json.dumps(approved)[:300]}")
+
+    deadline = time.time() + CHAT_SEND_CONFIRM_TIMEOUT
+    entry = approved if isinstance(approved, dict) else {}
+    while entry.get("status") == "sending" and time.time() < deadline:
+        time.sleep(CHAT_SEND_CONFIRM_INTERVAL)
+        status, entry = _gateway_hop(
+            gw, f"/pending-sends/{request_id}", method="GET")
+        if status != 200 or not isinstance(entry, dict):
+            entry = {"status": "sending"}
+            break
+    state = entry.get("status")
+    if state == "error":
+        return {}, f"the send failed at the gateway: {entry.get('error')}"
+    if state == "sending":
+        print(f"[web-gateway] send {request_id} not confirmed within "
+              f"{CHAT_SEND_CONFIRM_TIMEOUT}s; reporting it without an id",
+              flush=True)
+    return {"message_id": entry.get("message_id"),
+            "ts": entry.get("sent_at"),
+            "attachments": entry.get("attachments") or []}, ""
+
+
 def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     """The GET /chats/<id>/messages body. Raises on store errors (→ 502)."""
     channel, key = chat_state_mod.split_chat_id(chat_id)
@@ -5057,6 +5272,23 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_send_action(self, account: str, request_id: str, verb: str) -> None:
+        """Approve or reject one pending send — the user's decision, and the
+        other place `verify` is satisfied.
+
+        Gated like the chat send, and for the same reason: an agent that could
+        POST .../approve here would simply queue its own send and then approve
+        it, which would leave the send gate closing nothing at all. Reject is
+        gated too — it cannot cause a send, but suppressing a message the user
+        meant to allow is equally not an agent's call."""
+        ok, reason = self._request_from_edge(
+            f"{verb} of pending send {account}/{request_id}")
+        if not ok:
+            self._send_html(403, _HTML_HEAD + "<body><h1>Not allowed</h1><p>"
+                            "Approving or rejecting a pending send is the "
+                            "user's own decision and is accepted only from the "
+                            "dashboard through the reverse proxy.</p><p>"
+                            + html.escape(reason) + "</p></body></html>")
+            return
         channel, _gw = _channel_gateway(account)
         if channel:
             self._handle_channel_send_action(channel, request_id, verb)
@@ -5307,6 +5539,29 @@ class Handler(BaseHTTPRequestHandler):
     # two /internal/chats/* routes are for in-container callers (the gateways'
     # rail, agent draft staging).
 
+    def _request_from_edge(self, what: str) -> tuple[bool, str]:
+        """Gate for the endpoints that act with the user's own authority.
+
+        Returns ``(ok, reason)``; a refusal is printed loudly, because the whole
+        value of this check is that an attempt to act as the user is visible
+        rather than silent. See the EDGE_PROXY_PEERS block for what it does and
+        does not prevent."""
+        try:
+            peer = self.client_address[0]
+        except Exception:  # noqa: BLE001 - no address is itself unclassifiable
+            peer = None
+        try:
+            local = self.connection.getsockname()[0]
+        except Exception:  # noqa: BLE001 - fall through to the peer checks
+            local = None
+        ok, reason = _classify_request_origin(peer, local)
+        if not ok:
+            print(f"[web-gateway] REFUSED {what}: {reason}. This endpoint acts "
+                  f"with the user's own authority and is accepted only through "
+                  f"the reverse proxy — an agent must stage a draft and let the "
+                  f"user press send.", flush=True)
+        return ok, reason
+
     def _chat_id_or_404(self, raw: str) -> str | None:
         chat_id = _chat_id_from_path(raw)
         if chat_id is None:
@@ -5430,16 +5685,37 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_chat_send(self, raw_id: str) -> None:
         """Send {text} through the chat's own gateway as the user.
 
-        The one hop is the gateway's /send with author "user" — direct under
-        every policy category: `verify` exists to put the user's decision
-        between agent-composed content and the wire, and the send press in the
-        authenticated dashboard IS that decision (this endpoint sits behind
-        the edge auth and is the only caller that sets author user). On
-        success the message enters the overlay, the draft is cleared and the
+        `verify` exists to put the user's decision between agent-composed
+        content and the wire, and the send press in the dashboard IS that
+        decision. It satisfies the policy rather than skipping it: the send is
+        queued at the gateway like any other and released through the
+        gateway's own approve endpoint in this same request (see
+        _chat_send_via_gateway). Nothing sends because a field said "user",
+        which is how a message once went out that nobody pressed send on.
+
+        The request must also have arrived through the reverse proxy (see
+        EDGE_PROXY_PEERS). That is defence in depth rather than the guarantee:
+        the guarantee is that no send skips the queue at all. It is worth
+        keeping because the endpoint used to be justified by "this sits behind
+        the edge auth", which was false — that auth is a forward-auth the proxy
+        consults, so an in-container caller is never asked for it.
+
+        On success the message enters the overlay, the draft is cleared and the
         watermark advances, and the sent Message is returned so the UI renders
         it without waiting for the store."""
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
+            return
+        ok, reason = self._request_from_edge(f"chat send to {chat_id}")
+        if not ok:
+            self._send_json(403, {
+                "error": "a chat send is the user's own action and is accepted "
+                         "only from the dashboard through the reverse proxy",
+                "detail": reason,
+                "remedy": "To propose a message, stage it as the chat's shared "
+                          "draft (scripts/chat-draft.py) and let the user press "
+                          "send.",
+            })
             return
         payload = self._read_json_body()
         if payload is None:
@@ -5491,6 +5767,9 @@ class Handler(BaseHTTPRequestHandler):
         send_payload = {
             "recipient": key,
             "message": text,
+            # Ledger provenance only: who composed the words. It carries no
+            # authority at the gateway — that conflation is what let a message
+            # go out under `verify` that nobody pressed send on.
             "author": "user",
             # A chat send is a text message like the real client's — never the
             # push CLIs' spoken rendering.
@@ -5498,31 +5777,16 @@ class Handler(BaseHTTPRequestHandler):
         }
         if images:
             send_payload["images"] = images
-        body = json.dumps(send_payload).encode("utf-8")
-        headers = {"Content-Type": "application/json"}
-        if gw.get("token"):
-            headers["Authorization"] = "Bearer " + gw["token"]
-        req = urllib.request.Request(f"{gw['base_url']}/send", data=body,
-                                     headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=CHAT_SEND_TIMEOUT) as resp:
-                answer = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:500]
-            self._send_json(502, {"error": f"gateway rejected the send (HTTP {exc.code})",
-                                  "detail": detail})
-            return
+            result, send_error = _chat_send_via_gateway(gw, send_payload)
         except Exception as exc:  # noqa: BLE001 - unreachable gateway is a 502
             self._send_json(502, {"error": f"gateway unreachable: {exc}"})
             return
-        if not isinstance(answer, dict) or answer.get("status") != "sent":
-            # A pre-user-author gateway would queue this for approval — that is
-            # a deployment-version mismatch, not a sent message; say so.
-            self._send_json(502, {"error": "gateway did not send directly",
-                                  "detail": json.dumps(answer)[:500]})
+        if send_error:
+            self._send_json(502, {"error": send_error})
             return
-        message_id = (str(answer.get("message_id") or "").strip() or None)
-        ts = chat_state_mod.iso_z(answer.get("ts"))
+        message_id = (str(result.get("message_id") or "").strip() or None)
+        ts = chat_state_mod.iso_z(result.get("ts"))
         # The stored ledger media references the gateway reports back — the
         # same host-free urn:retinue:media:… form it writes into the record.
         # Shaping resolves them onto the authenticated proxy through the very
@@ -5530,7 +5794,7 @@ class Handler(BaseHTTPRequestHandler):
         # view, via the overlay) renders the sent image immediately. Passing
         # that slug is what makes a URN resolvable at all: it names the blob,
         # not a host.
-        gw_atts = [u for u in (answer.get("attachments") or [])
+        gw_atts = [u for u in (result.get("attachments") or [])
                    if isinstance(u, str) and u]
         msg = _shape_chat_message(chat_id, channel, direction="out", text=text,
                                   ts=ts, message_id=message_id, author="user",
