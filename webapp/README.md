@@ -127,7 +127,9 @@ docstring). Pieces:
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the
   `companion` field below): her turns render in the conversation thread's
-  visual language, `pending` shows as her writing, and a chip is that same
+  visual language — including its `model_name` / `cost_usd` meta, so which
+  model answered and what that turn cost are as visible here as on the
+  conversations card — `pending` shows as her writing, and a chip is that same
   turn with a canned prompt. The two rails meet in the shared draft — Ara
   stages a reply, the chat poll adopts it into an empty composer marked as
   hers, and the send press stays the user's.

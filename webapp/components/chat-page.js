@@ -796,9 +796,43 @@ class RetinueChatPage extends HTMLElement {
     const who = me ? 'You' : (m.agent || (m.role === 'agent' ? 'Retinue' : 'Ara'));
     return `<div class="cmsg${me ? ' me' : ''}">` +
       `<div class="cmsg-head"><small class="who">${esc(who)}</small>` +
-      `<small class="cmeta">${esc(fmtTime(m.ts))}</small></div>` +
+      this._compMetaHtml(m) + `</div>` +
       `<div class="cbubble">${renderMarkdown(m.text)}` +
       this._compAttachHtml(m) + `</div></div>`;
+  }
+
+  // The header meta after the sender name. The companion thread is an ordinary
+  // dashboard conversation, so its answers carry the same two byproducts the
+  // conversations card already shows — which model answered, and that turn's
+  // list-price cost — and a pane that hides them makes the model choice in this
+  // very page unverifiable. Same vocabulary and same order as
+  // conversations.js's _metaHtml (model · ~$cost · time); the time stays this
+  // pane's clock time rather than that card's relative age, because the mirror
+  // beside it is stamped in clock time and the two are read together. Each
+  // piece is optional: a user turn has no model, and messages predating the
+  // metadata simply omit what they lack.
+  _compMetaHtml(m) {
+    const bits = [];
+    if (m.model_name) bits.push(`<span class="m-model">${esc(m.model_name)}</span>`);
+    if (typeof m.cost_usd === 'number' && isFinite(m.cost_usd)) {
+      bits.push(`<span class="m-cost" title="Approximate list-price cost — not the subscription bill">` +
+        `~$${this._fmtCost(m.cost_usd)}</span>`);
+    }
+    const t = fmtTime(m.ts);
+    if (t) bits.push(`<time datetime="${esc(m.ts || '')}">${esc(t)}</time>`);
+    if (!bits.length) return '';
+    return `<small class="cmeta">${bits.join('<span class="m-sep">·</span>')}</small>`;
+  }
+
+  // Cost with enough precision to stay meaningful for cheap turns: sub-cent
+  // values get more decimals so they don't collapse to "~$0.00". Mirrors
+  // conversations.js so the same turn reads identically in both surfaces.
+  _fmtCost(v) {
+    const c = Math.abs(v);
+    if (c === 0) return '0';
+    if (c < 0.01) return c.toFixed(4);
+    if (c < 1) return c.toFixed(3);
+    return c.toFixed(2);
   }
 
   // A companion message can carry files like any conversation message; they
@@ -1833,9 +1867,17 @@ const CSS = `
   /* ── Companion pane (the conversation thread's visual language) ──────────── */
   .cmsg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; align-self: flex-start; }
   .cmsg.me { align-self: flex-end; align-items: flex-end; }
-  .cmsg-head { display: flex; align-items: center; gap: 6px; }
+  .cmsg-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
   .cmsg.me .cmsg-head { flex-direction: row-reverse; }
-  .cmeta { color: var(--muted, #8b93a3); font-size: .7rem; }
+  /* model · ~$cost · time, one muted line — the conversations card's meta in a
+     narrower pane, so it is allowed to wrap rather than push the head wider
+     than the bubble. */
+  .cmeta { color: var(--muted, #8b93a3); font-size: .7rem;
+           display: inline-flex; align-items: baseline; gap: 5px; flex-wrap: wrap;
+           min-width: 0; }
+  .cmeta .m-sep { opacity: .5; }
+  .cmeta .m-cost { font-variant-numeric: tabular-nums; }
+  .cmeta .m-model { font-weight: 600; }
   .cbubble { background: var(--card-2, #1c2230); border-radius: 16px;
              border-bottom-left-radius: 6px; padding: 9px 13px; line-height: 1.4; }
   .cmsg.me .cbubble { background: var(--accent, #6ea8fe); color: #0b0d12;
