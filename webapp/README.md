@@ -122,11 +122,13 @@ docstring). Pieces:
   contract below), a live composer (send, shared draft, one-tap clear ✕,
   dictation, image attach with client-side downscale), quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
-  splitter on a wide screen. The composer row keeps at most two round
-  controls, since each costs the text field 46px of a phone's width: the
-  paperclip (whose chooser is also the camera on a phone), and one right-hand
-  button that is the mic while there is nothing to send and the send button as
-  soon as there is. Back goes back where the chat was opened from within the
+  splitter on a wide screen. The composer row is the conversation composer's
+  row: mic on the left, send on the right, both always there, and the paperclip
+  inside the text field (whose chooser is also the camera on a phone) — one
+  layout across both surfaces, and one place to reach for each affordance.
+  Keeping only two round controls is what buys the field its width, since each
+  one costs 46px of a phone's; the chat field additionally carries the clear ✕,
+  beside the clip and only while there is something to clear. Back goes back where the chat was opened from within the
   app, and to the chats list for a chat opened cold (a notification, a
   bookmark). The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on

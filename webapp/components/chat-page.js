@@ -756,14 +756,18 @@ class RetinueChatPage extends HTMLElement {
     return `<div class="img-previews" data-previews>${items}</div>`;
   }
 
-  // The paperclip mirrors the conversations composer's affordance (a label
-  // over a hidden file input) as a row button — images only, since that is
-  // what the send endpoint carries. One control, not two: the phone's own
-  // file chooser already offers the camera among its sources, and on a narrow
-  // screen every round button in the row is width taken from the text field,
-  // which is what the user is actually looking at while writing.
-  _attachBtnHtml() {
-    return `<label class="attach-btn" title="Attach images" aria-label="Attach images">` +
+  // The paperclip, tucked INSIDE the text field exactly as the conversations
+  // composer tucks its own: a label over a hidden file input, images only since
+  // that is what the send endpoint carries. Inside rather than beside, because
+  // a round control in the row costs the field 46px of a phone's width while
+  // one inside costs only padding — and because the two composers should not
+  // teach two different places to look for the same affordance.
+  //
+  // One control, not two: the phone's file chooser already offers the camera
+  // among its sources, so a separate camera button buys a shortcut at the price
+  // of a whole control's width.
+  _clipHtml() {
+    return `<label class="clip" title="Attach images" aria-label="Attach images">` +
       `<input type="file" hidden multiple accept="image/*" data-attach>` +
       `<span aria-hidden="true">&#128206;</span></label>`;
   }
@@ -800,43 +804,27 @@ class RetinueChatPage extends HTMLElement {
       ? `<button type="button" class="clear-inline" data-clear ` +
         `title="Clear message" aria-label="Clear message">&#10005;</button>`
       : '';
-    const fieldCls = `field${withClear ? ' has-clear' : ''}${value ? ' has-text' : ''}`;
+    // Both composers are the dashboard conversation composer's row: mic on the
+    // left, send on the right, and what belongs inside the field lives inside
+    // it. Keeping the two round controls in their fixed places is the point —
+    // the mic is where the mic always is, whatever the field holds, so
+    // dictating into an existing draft is just pressing it. The chat field
+    // additionally carries the clear ✕ and the paperclip; the companion's
+    // carries neither (it is Ara's own thread, and it never fights for width).
+    const inField = isChat ? clearBtn + this._clipHtml() : clearBtn;
+    const fieldCls = `field${withClear ? ' has-clear' : ''}` +
+      `${isChat ? ' has-clip' : ''}${value ? ' has-text' : ''}`;
     const field = `<div class="${fieldCls}" data-field>` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" ` +
-      `autocomplete="off">${esc(value)}</textarea>` + clearBtn + `</div>`;
-    // The companion row is the dashboard conversation composer's row, verbatim:
-    // mic left, field, send right — it carries no attach control and its pane
-    // is never the one fighting for width.
-    if (!isChat) {
-      return `<form class="row" data-composer="${target}">` + micBtn + field + sendBtn + `</form>`;
-    }
-    // The chat row keeps at most two round controls, because each one costs the
-    // text field 46px of a phone's width: the paperclip on the left, and on the
-    // right ONE button that is the mic while there is nothing to send and the
-    // send button as soon as there is (the messenger idiom — dictation is
-    // offered exactly when the field is empty, which is when one dictates).
-    // Both are rendered and swapped by class, so the switch never rebuilds the
-    // row and can never cost the field its focus or the phone its keyboard.
-    // Without a usable recorder there is nothing to swap and send stands alone.
-    const swap = micBtn ? ' swap' : '';
-    const content = this._hasSendable(value) ? ' has-content' : '';
-    return `<form class="row${swap}${content}" data-composer="${target}">` +
-      this._attachBtnHtml() + field + micBtn + sendBtn + `</form>`;
+      `autocomplete="off">${esc(value)}</textarea>` + inField + `</div>`;
+    return `<form class="row" data-composer="${target}">` +
+      micBtn + field + sendBtn + `</form>`;
   }
 
   // What makes the chat's send button the right control to show: words, or a
   // staged image on its own (an image needs no caption).
   _hasSendable(text) {
     return !!text || this._outImages.length > 0;
-  }
-
-  // Keep the swap in step with the field after any change to either input —
-  // typing, the clear ✕, a send, an adopted draft, staged or removed images.
-  _syncSendSwap() {
-    const form = this.shadowRoot.querySelector('[data-composer="chat"]');
-    if (!form) return; // a recording or status row holds the composer
-    const input = form.querySelector('textarea');
-    form.classList.toggle('has-content', this._hasSendable(input ? input.value : ''));
   }
 
   // Companion messages reuse the conversation thread's visual language (same
@@ -1083,7 +1071,6 @@ class RetinueChatPage extends HTMLElement {
         this._compDraft = input.value;
       }
       field.classList.toggle('has-text', !!input.value);
-      if (isChat) this._syncSendSwap();
       grow();
     });
     if (isChat) {
@@ -1106,7 +1093,6 @@ class RetinueChatPage extends HTMLElement {
         this._draft = '';
         this._setDraftByAra(false);
         field.classList.remove('has-text');
-        this._syncSendSwap();
         grow();
         input.focus();
         this._saveDraft();
@@ -1436,9 +1422,6 @@ class RetinueChatPage extends HTMLElement {
         const next = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
         if (next) { try { next.focus(); } catch (_e) { /* ignore */ } }
       }
-    } else {
-      // Nothing left to send: the row's one right-hand button is the mic again.
-      this._syncSendSwap();
     }
     // Order matters server-side: let a save fired by the pre-tap blur settle
     // before the send clears the draft.
@@ -1861,20 +1844,15 @@ const CSS = `
                background: rgba(110, 168, 254, .12); color: var(--accent, #6ea8fe);
                font-size: .74rem; font-weight: 600; }
   .row { display: flex; gap: 6px; align-items: flex-end; }
-  /* Mic and send share the row's right-hand slot, one shown at a time: every
-     round control here costs the text field 46px, and on a phone that is the
-     difference between a readable draft and three words a line. Display, not
-     visibility — a hidden control must give its width back. */
-  .row.swap:not(.has-content) .send { display: none; }
-  .row.swap.has-content .mic { display: none; }
-  /* The image attach control: a label over a hidden file input, in the mic
-     button's round dress so the row reads as one family. */
-  .attach-btn { display: inline-flex; align-items: center; justify-content: center;
-                width: 40px; height: 40px; flex: none; border-radius: 50%;
-                background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
-                font-size: 1.05rem; cursor: pointer; user-select: none;
-                -webkit-tap-highlight-color: transparent; }
-  .attach-btn:hover { background: rgba(110, 168, 254, .2); }
+  /* The attach control, inside the field and dressed exactly as the
+     conversations composer's clip — same size, same corner, same hover. Two
+     composers, one place to reach for a paperclip. */
+  .clip { position: absolute; right: 3px; bottom: 3px; display: inline-flex;
+          align-items: center; justify-content: center; height: 34px; width: 34px;
+          border-radius: 50%; background: transparent; color: var(--muted, #8b93a3);
+          cursor: pointer; font-size: 1rem; user-select: none;
+          -webkit-tap-highlight-color: transparent; }
+  .clip:hover { background: rgba(110, 168, 254, .2); }
   /* Staged images: removable thumbnails riding above the input row. */
   .img-previews { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 10px; }
   .imgp { position: relative; }
@@ -1904,14 +1882,28 @@ const CSS = `
   /* The inline clear: docked in the field's top-right corner, shown only
      while there is text (see _composerRowHtml for the placement rationale);
      the .has-text padding keeps text from wrapping under it. */
-  .clear-inline { position: absolute; top: 5px; right: 5px; width: 30px; height: 30px;
+  /* The clear ✕ sits at the field's bottom-right too, immediately left of the
+     clip — both anchored to the same edge and the same baseline, so a one-line
+     field cannot stack them on top of each other. It is only there while there
+     is something to clear, and the textarea's right padding tracks whichever
+     of the two is actually present. */
+  .clear-inline { position: absolute; bottom: 5px; right: 5px; width: 30px; height: 30px;
                   display: inline-flex; align-items: center; justify-content: center;
                   border: 0; border-radius: 50%; padding: 0; cursor: pointer;
                   background: transparent; color: var(--muted, #8b93a3); font-size: .9rem;
                   -webkit-tap-highlight-color: transparent; }
+  /* Beside the clip, not above it: both are anchored to the field's bottom
+     edge, so stacking them would put one on top of the other in a one-line
+     field. The ✕ takes the inner position — it acts on the text, so it sits
+     nearer to it. */
+  .field.has-clip .clear-inline { right: 39px; }
   .clear-inline:hover { color: var(--high, #ff6b6b); background: rgba(255, 107, 107, .14); }
   .field:not(.has-text) .clear-inline { display: none; }
+  /* Right padding tracks what is actually shown, so an empty field is not
+     holding room for a ✕ that is not there. */
+  .field.has-clip textarea { padding-right: 42px; }
   .field.has-clear.has-text textarea { padding-right: 44px; }
+  .field.has-clip.has-clear.has-text textarea { padding-right: 74px; }
   .attach-err { color: var(--high, #ff6b6b); font-size: .76rem; margin-bottom: 8px; }
 
   /* ── Companion pane (the conversation thread's visual language) ──────────── */
