@@ -55,6 +55,48 @@ def test_write_and_roundtrip():
     print("PASS test_write_and_roundtrip")
 
 
+def test_account_marks_who_received_it():
+    """kb:account: the identity the record belongs to, on inbound.
+
+    A chat key names a peer only within one account, and a channel's message
+    volume is shared by every account on it — so without this, two accounts
+    writing to the same peer are indistinguishable in the store, which is what
+    merged their conversations. Optional, because records written before the
+    predicate existed carry none and a gateway that does not know its own
+    account yet (Telegram before the session authorizes) writes none.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _s, path = ist.write_message(
+            tmp, channel="signal", sender="+41790000000", text="hoi",
+            chat="+41790000000", account="+41766029556", timestamp=1000.0)
+        text = path.read_text(encoding="utf-8")
+        assert ist.P_ACCOUNT in text
+        fields = ist._parse(text)
+        assert fields["account"] == "+41766029556"
+        assert fields["chat"] == "+41790000000"
+        # Nothing is invented: re-rendering reproduces the file byte for byte.
+        assert ist._render(fields) == text
+
+        # Same peer, other account: two records that a reader can tell apart
+        # even though their chat key is identical.
+        _s2, path2 = ist.write_message(
+            tmp, channel="signal", sender="+41790000000", text="hoi",
+            chat="+41790000000", account="+41765761976", timestamp=1001.0)
+        f2 = ist._parse(path2.read_text(encoding="utf-8"))
+        assert f2["chat"] == fields["chat"]
+        assert f2["account"] != fields["account"]
+
+        # Unset: the predicate is absent rather than written empty, so the
+        # record is honestly unattributed instead of claiming an empty account.
+        _s3, path3 = ist.write_message(
+            tmp, channel="signal", sender="x", text="hoi", chat="x",
+            timestamp=1002.0)
+        text3 = path3.read_text(encoding="utf-8")
+        assert ist.P_ACCOUNT not in text3
+        assert ist._parse(text3)["account"] is None
+    print("PASS test_account_marks_who_received_it")
+
+
 def test_undelivered_drains_once():
     with tempfile.TemporaryDirectory() as tmp:
         ist.write_message(tmp, channel="signal", sender="a", text="one", timestamp=10.0)
@@ -206,6 +248,7 @@ def test_since_epoch_and_iso_equivalent():
 
 if __name__ == "__main__":
     test_write_and_roundtrip()
+    test_account_marks_who_received_it()
     test_undelivered_drains_once()
     test_mark_delivered_roundtrip()
     test_since_filter()

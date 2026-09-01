@@ -68,8 +68,16 @@ export function initials(name) {
 
 // Avatar disc (deterministic colour, initials) with the channel mark docked to
 // its corner — one glance answers both "who" and "over which channel".
+// The avatar's colour identifies the PEER, not the chat: it is keyed on the
+// channel and chat key, so the same person keeps one colour across every
+// account that talks to them — including the unattributed history beside an
+// account-named chat. Keying it on the chat id instead would paint one person
+// in as many colours as there are chats with them, in exactly the list where
+// telling those chats apart is already the difficulty. The key rather than the
+// name, because a roster update renames a contact and must not repaint them.
 export function avatarHtml(chat) {
-  return `<span class="av" style="background:${colorFor(chat.id)}" aria-hidden="true">` +
+  const peer = `${chat.channel || ''}\u0000${chat.key || chat.id || ''}`;
+  return `<span class="av" style="background:${colorFor(peer)}" aria-hidden="true">` +
     `${esc(initials(chat.name))}${channelMarkHtml(chat.channel)}</span>`;
 }
 
@@ -163,6 +171,10 @@ class RetinueChats extends RetinueCard {
             border: 2px solid var(--card, #151922); box-sizing: content-box; }
       .name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis;
               white-space: nowrap; }
+      /* Which account this row is, shown only when a name repeats within a
+         channel. Quiet and inline: it disambiguates, it is not a second name. */
+      .name .acct { margin-left: 6px; font-weight: 400; font-size: .72rem;
+                    color: var(--muted, #8b93a3); }
       .when { grid-column: 3; color: var(--muted, #8b93a3); font-size: .72rem; white-space: nowrap; }
       .row.has-unread .when { color: var(--accent, #6ea8fe); }
       .prev { grid-column: 2; color: var(--muted, #8b93a3); font-size: .8rem; line-height: 1.35;
@@ -215,6 +227,17 @@ class RetinueChats extends RetinueCard {
       return `${this._filterHtml()}<p class="muted">${msg}</p>${this._footHtml()}`;
     }
     const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
+    // Two accounts of one channel talking to the same peer are two chats with
+    // the same name (and so is a peer's unattributed history beside its
+    // account-named chat). The name alone cannot tell them apart, so where —
+    // and only where — a name repeats within a channel, each row also says
+    // which account it is. Computed over the rows actually shown, so an
+    // unambiguous list carries no such label at all.
+    const nameCount = {};
+    for (const c of shown) {
+      const k = `${c.channel}\u0000${c.name}`;
+      nameCount[k] = (nameCount[k] || 0) + 1;
+    }
     const rows = shown.map((c) => {
       const badge = c.unread
         ? `<span class="unread${c.muted ? ' muted-chat' : ''}">${c.unread}</span>`
@@ -229,7 +252,14 @@ class RetinueChats extends RetinueCard {
       return `<li><a class="row${c.unread ? ' has-unread' : ''}" ` +
         `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
         `${avatarHtml(c)}` +
-        `<span class="name">${esc(c.name)}</span>` +
+        `<span class="name">${esc(c.name)}` +
+        (nameCount[`${c.channel}\u0000${c.name}`] > 1
+          ? `<span class="acct" title="${c.account
+              ? `On the account ${esc(c.account)}`
+              : 'Older messages, from before the account was recorded'}">${
+              c.account ? esc(c.account) : 'earlier'}</span>`
+          : '') +
+        `</span>` +
         `<span class="when">${esc(fmtAge((c.last || {}).ts))}</span>` +
         `<span class="prev">${prev}</span>` +
         badge +

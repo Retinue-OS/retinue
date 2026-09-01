@@ -243,7 +243,7 @@ def _persist_inbound(question: str, sender: str, group_id: str | None,
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered, media=media,
             attachment_urls=attachment_urls,
-            chat=chat, message_id=message_id,
+            chat=chat, account=TELEGRAM_ACCOUNT, message_id=message_id,
         )
         return path
     except Exception as exc:
@@ -272,7 +272,8 @@ def _record_outbound(chat: str, text: str, author: str,
     try:
         _ibstore.write_outbound(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, chat=chat, text=text,
-            author=author, message_id=message_id, timestamp=timestamp,
+            author=author, account=TELEGRAM_ACCOUNT, message_id=message_id,
+            timestamp=timestamp,
             attachment_urls=attachment_urls or None,
         )
     except Exception as exc:

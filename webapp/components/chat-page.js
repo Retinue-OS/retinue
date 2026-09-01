@@ -510,10 +510,28 @@ class RetinueChatPage extends HTMLElement {
   _headHtml() {
     const c = this._chat;
     const ch = esc((CHANNELS[c.channel] || { label: c.channel }).label);
-    const key = c.id.slice(c.id.indexOf(':') + 1);
-    const sub = c.group
-      ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
-      : `${ch} &middot; ${esc(key)}`;
+    // The peer as the summary names them. Not sliced out of the id any more:
+    // an id can carry an account segment ahead of the key, and slicing at the
+    // first colon would put that in the header as the correspondent.
+    const key = c.key || c.id.slice(c.id.indexOf(':') + 1);
+    // Which account this conversation is on, where the chat says. The header is
+    // where it belongs: two accounts talking to one peer are two chats with the
+    // same name, and this is the line that says which one is open.
+    // This line has room for one fact, and where the chat knows its account
+    // that fact is the account: two accounts talking to one peer are two chats
+    // with the same title and the same avatar, and nothing else on the page
+    // says which of them is open. So it displaces the peer's handle (the title
+    // already names the peer), the group marker and member count, and even the
+    // channel — which the avatar's own badge carries anyway. The header gives
+    // this line about 140px next to the back button, avatar and pane tabs, and
+    // any pairing of those facts overflows it; what a truncated subtitle drops
+    // is the tail, which is exactly the half that disambiguates. Hence one
+    // rule for both group and 1:1, short enough to always fit.
+    const sub = c.account
+      ? `via ${esc(c.account)}`
+      : (c.group
+        ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
+        : `${ch} &middot; ${esc(key)}`);
     return `<header class="chat-head">` +
       `<a class="back" href="/chats.html" aria-label="All chats">&#8249;</a>` +
       avatarHtml(c) +

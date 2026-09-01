@@ -3,6 +3,8 @@
  "chat": {
   "id": "telegram:-1001455667788",
   "channel": "telegram",
+  "account": null,
+  "key": "-1001455667788",
   "name": "Quartierverein Unterstrass",
   "group": true,
   "unread": 12,

@@ -1,8 +1,10 @@
 {
  "generated": "2026-08-27T09:45:00+02:00",
  "chat": {
-  "id": "signal:+41794456312",
+  "id": "signal:~+41765761976:+41794456312",
   "channel": "signal",
+  "account": "+41765761976",
+  "key": "+41794456312",
   "name": "Mara Meier",
   "group": false,
   "unread": 2,
@@ -28,7 +30,7 @@
  "messages": [
   {
    "id": "S1AK0001",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -38,7 +40,7 @@
   },
   {
    "id": "S1AK0002",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "out",
    "author": "device",
    "text": "Oh, ja ligt no uf em Stapel... bring is am Samstig verbi, versproche!",
@@ -47,7 +49,7 @@
   },
   {
    "id": "S1AK0003",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -56,7 +58,7 @@
   },
   {
    "id": "S1AK0004",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -66,7 +68,7 @@
   },
   {
    "id": "S1AK0005",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -75,7 +77,7 @@
   },
   {
    "id": "S1AK0006",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "out",
    "author": "device",
    "text": "tönt guet! muess no schnell in kalender luege",
@@ -84,7 +86,7 @@
   },
   {
    "id": "S1AK0007",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "out",
    "author": "agent",
    "text": "Reto confirms for Saturday 18:30 — he'll check what to bring and get back to you today.",
@@ -94,7 +96,7 @@
   },
   {
    "id": "S1AK0008",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -103,7 +105,7 @@
   },
   {
    "id": "S1AK0009",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -124,7 +126,7 @@
   },
   {
    "id": "S1AK0010",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -133,7 +135,7 @@
   },
   {
    "id": "S1AK0011",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "out",
    "author": "user",
    "text": "Sieht super aus! Für s Fäscht bin ich debii — aber bitte nöd scho wieder Grill-Schicht.",
@@ -142,7 +144,7 @@
   },
   {
    "id": "S1AK0012",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -151,7 +153,7 @@
   },
   {
    "id": "S1AK0013",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",
@@ -161,7 +163,7 @@
   },
   {
    "id": "S1AK0014",
-   "chat": "signal:+41794456312",
+   "chat": "signal:~+41765761976:+41794456312",
    "direction": "in",
    "sender": "+41794456312",
    "sender_name": "Mara Meier",

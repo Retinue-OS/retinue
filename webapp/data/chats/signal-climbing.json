@@ -1,8 +1,10 @@
 {
  "generated": "2026-08-27T09:45:00+02:00",
  "chat": {
-  "id": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+  "id": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
   "channel": "signal",
+  "account": "+41765761976",
+  "key": "group:R2xhcnVzQWxwaW5pc3Q=",
   "name": "Climbing Crew",
   "group": true,
   "unread": 1,
@@ -23,7 +25,7 @@
  "messages": [
   {
    "id": "S2AK0001",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41791119922",
    "sender_name": "Nicole Brun",
@@ -32,7 +34,7 @@
   },
   {
    "id": "S2AK0002",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41762220011",
    "sender_name": "Sämi Vogt",
@@ -41,7 +43,7 @@
   },
   {
    "id": "S2AK0003",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "out",
    "author": "device",
    "text": "dabei",
@@ -49,7 +51,7 @@
   },
   {
    "id": "S2AK0004",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41787334455",
    "sender_name": "Ana Petrova",
@@ -59,7 +61,7 @@
   },
   {
    "id": "S2AK0005",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41791119922",
    "sender_name": "Nicole Brun",
@@ -68,7 +70,7 @@
   },
   {
    "id": "S2AK0006",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41762220011",
    "sender_name": "Sämi Vogt",
@@ -77,7 +79,7 @@
   },
   {
    "id": "S2AK0007",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41791119922",
    "sender_name": "Nicole Brun",
@@ -86,7 +88,7 @@
   },
   {
    "id": "S2AK0008",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "out",
    "author": "user",
    "text": "Sonntag bin ich dabei, wenn wir vor 9 starten.",
@@ -94,7 +96,7 @@
   },
   {
    "id": "S2AK0009",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41762220011",
    "sender_name": "Sämi Vogt",
@@ -103,7 +105,7 @@
   },
   {
    "id": "S2AK0010",
-   "chat": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "chat": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "direction": "in",
    "sender": "+41787334455",
    "sender_name": "Ana Petrova",

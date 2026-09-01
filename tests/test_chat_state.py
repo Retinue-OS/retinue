@@ -39,12 +39,68 @@ def test_split_and_filename_safety():
     assert cs.split_chat_id("telegram:-1001455667788") == ("telegram", "-1001455667788")
     assert cs.split_chat_id("nochannel") is None
     assert cs.split_chat_id("signal:") is None
+    # An id that names an account splits the same way for callers that only
+    # want the key — the key means the same thing either way.
+    assert cs.split_chat_id("signal:~+41766029556:group:R2xh=") == (
+        "signal", "group:R2xh=")
     # Filenames are digests: path-hostile key characters never touch the fs,
     # and distinct ids never collide on a file.
     a = cs.state_filename("signal:group:R2xh/../../etc=")
     b = cs.state_filename("signal:group:R2xh/other=")
     assert a != b and "/" not in a and a.endswith(".json")
     print("PASS test_split_and_filename_safety")
+
+
+def test_account_is_half_the_identity():
+    """A chat is (channel, account, key), and the three round-trip.
+
+    Two accounts of one channel writing to the same peer produce the same chat
+    key — that is what merged their conversations — so the account has to be
+    part of the id. Ids for records that carry no account keep the exact shape
+    they have always had, which is why nothing already on disk moves.
+    """
+    mk, ref = cs.make_chat_id, cs.split_chat_ref
+    # Unattributed: byte-identical to the historical form.
+    assert mk("signal", "+41790000000") == "signal:+41790000000"
+    assert ref("signal:+41790000000") == ("signal", None, "+41790000000")
+    assert ref("signal:group:R2xh=") == ("signal", None, "group:R2xh=")
+
+    # Attributed: the account is a segment of its own, and a key's own colons
+    # stay inside the key.
+    cid = mk("signal", "group:R2xh=", "+41766029556")
+    assert cid == "signal:~+41766029556:group:R2xh="
+    assert ref(cid) == ("signal", "+41766029556", "group:R2xh=")
+
+    # Same peer, two accounts: two ids, and two state documents.
+    a = mk("signal", "+41790000000", "+41766029556")
+    b = mk("signal", "+41790000000", "+41765761976")
+    assert a != b
+    assert cs.state_filename(a) != cs.state_filename(b)
+    assert ref(a)[2] == ref(b)[2], "the peer is the same; the account is not"
+
+    # The shape survives values no channel emits today. The key is the
+    # channel's string, so the encoding may not rest on a claim about what
+    # channels produce: a key opening with the marker, an account carrying the
+    # separator, the marker or a percent sign all round-trip.
+    for channel, key, account in [
+        ("signal", "~looks-like-a-marker", None),
+        ("signal", "~~doubled", None),
+        ("signal", "+4179", "acct:with:colons"),
+        ("signal", "+4179", "~leading-marker"),
+        ("signal", "+4179", "100%"),
+        ("telegram", "-1001455667788", "@ara_bot"),
+        ("whatsapp", "4179@s.whatsapp.net", "41765761976"),
+    ]:
+        cid = mk(channel, key, account)
+        assert ref(cid) == (channel, account, key), (cid, ref(cid))
+        assert cs.split_chat_id(cid) == (channel, key)
+
+    # Malformed ids are refused, never half-read: a bare marker, an empty
+    # account or an empty key is not something make_chat_id ever composed.
+    for bad in ["", "signal", "signal:", ":key", "signal:~", "signal:~acct",
+                "signal:~:key", "signal:~acct:"]:
+        assert ref(bad) is None, bad
+    print("PASS test_account_is_half_the_identity")
 
 
 def test_draft_version_guard():
@@ -197,6 +253,7 @@ def test_iso_z_normalizes():
 
 if __name__ == "__main__":
     test_split_and_filename_safety()
+    test_account_is_half_the_identity()
     test_draft_version_guard()
     test_agent_staging_never_clobbers_user_text()
     test_last_read_forward_only_and_unread_modes()

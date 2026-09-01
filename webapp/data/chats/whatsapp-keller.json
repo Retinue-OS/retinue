@@ -1,8 +1,10 @@
 {
  "generated": "2026-08-27T09:45:00+02:00",
  "chat": {
-  "id": "whatsapp:41765554433@s.whatsapp.net",
+  "id": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
   "channel": "whatsapp",
+  "account": "+41765761976",
+  "key": "41765554433@s.whatsapp.net",
   "name": "Praxis Dr. Keller",
   "group": false,
   "unread": 0,
@@ -22,7 +24,7 @@
  "messages": [
   {
    "id": "3EB10001",
-   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "chat": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
    "direction": "in",
    "sender": "41765554433@s.whatsapp.net",
    "sender_name": "Praxis Dr. Keller",
@@ -32,7 +34,7 @@
   },
   {
    "id": "3EB10002",
-   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "chat": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
    "direction": "out",
    "author": "agent",
    "text": "JA — der Termin am 25.08. um 14:30 ist bestätigt. Freundliche Grüsse, Reto Baumann",
@@ -42,7 +44,7 @@
   },
   {
    "id": "3EB10003",
-   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "chat": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
    "direction": "in",
    "sender": "41765554433@s.whatsapp.net",
    "sender_name": "Praxis Dr. Keller",
@@ -51,7 +53,7 @@
   },
   {
    "id": "3EB10004",
-   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "chat": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
    "direction": "in",
    "sender": "41765554433@s.whatsapp.net",
    "sender_name": "Praxis Dr. Keller",
@@ -61,7 +63,7 @@
   },
   {
    "id": "3EB10005",
-   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "chat": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
    "direction": "out",
    "author": "user",
    "text": "Danke, ich hole sie am Donnerstag ab.",
@@ -70,7 +72,7 @@
   },
   {
    "id": "3EB10006",
-   "chat": "whatsapp:41765554433@s.whatsapp.net",
+   "chat": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
    "direction": "in",
    "sender": "41765554433@s.whatsapp.net",
    "sender_name": "Praxis Dr. Keller",

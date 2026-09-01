@@ -183,6 +183,82 @@ def test_two_inbox_accounts_refuse():
     print("PASS test_two_inbox_accounts_refuse")
 
 
+def test_chat_account_outranks_every_stamp():
+    """A chat whose id names its account routes by that, not by state.
+
+    The account in the id came from the kb:account the writing gateway stamped
+    on this chat's own ledger records — a fact carried by the messages
+    themselves. The gateway stamp is a cache this process maintains, and the
+    incident was a poisoned one. So where both exist the id wins, and a wrong
+    stamp cannot reach the send path at all.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        _registry(wg, **{"signal-gateway": _inbox(SYSTEM),
+                         "signal-gateway-personal": _inbox(PERSONAL)})
+        # The stamp names the system bot; the chat belongs to the user's own
+        # number. Without the account this send went out as the bot.
+        doc = _stamp(source="account", slug="signal-gateway")
+        slug, gw, err = wg._chat_gateway(doc, "signal", PERSONAL)
+        assert err is None and slug == "signal-gateway-personal", (slug, err)
+        # And the other way round, so the id is doing the work rather than a
+        # coincidence of ordering.
+        slug, _gw, err = wg._chat_gateway(
+            _stamp(source="account", slug="signal-gateway-personal"),
+            "signal", SYSTEM)
+        assert err is None and slug == "signal-gateway"
+    print("PASS test_chat_account_outranks_every_stamp")
+
+
+def test_two_inbox_accounts_route_when_the_chat_names_one():
+    """The ambiguity that refuses a send is resolved by the id, not by a guess.
+
+    With two inbox accounts on a channel an unattributed chat must refuse — the
+    reader genuinely cannot tell whose it is. A chat that names its account is
+    not ambiguous at all, and refusing it would leave the user unable to answer
+    their own correspondence.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        _registry(wg, **{"signal-gateway": _inbox(SYSTEM),
+                         "signal-gateway-personal": _inbox(PERSONAL)})
+        # Unattributed: still refused, exactly as before.
+        _slug, gw, err = wg._chat_gateway({}, "signal")
+        assert gw is None and "cannot tell which account" in err
+        # Named: routed, each to its own.
+        for account, want in ((SYSTEM, "signal-gateway"),
+                              (PERSONAL, "signal-gateway-personal")):
+            slug, gw, err = wg._chat_gateway({}, "signal", account)
+            assert err is None and slug == want, (account, slug, err)
+    print("PASS test_two_inbox_accounts_route_when_the_chat_names_one")
+
+
+def test_named_account_never_falls_back():
+    """An id naming an account the registry cannot serve refuses outright.
+
+    Falling through to the single-inbox rule would answer a known account's
+    conversation as a different identity — the exact failure this file exists
+    for, reintroduced through the back door.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        _registry(wg, **{"signal-gateway": _inbox(PERSONAL)})
+        # Unknown account, and exactly one inbox gateway that would otherwise
+        # have been picked without hesitation.
+        slug, gw, err = wg._chat_gateway({}, "signal", "+15559990000")
+        assert gw is None and slug is None
+        assert "+15559990000" in err and "not a configured gateway" in err, err
+        # The same account in control mode: the deployment has said this
+        # identity is not for chats, so its history stays readable and
+        # unsendable rather than being answered from somewhere else.
+        _registry(wg, **{"signal-gateway": _control(SYSTEM),
+                         "signal-gateway-personal": _inbox(PERSONAL)})
+        slug, gw, err = wg._chat_gateway({}, "signal", SYSTEM)
+        assert gw is None and slug is None
+        assert "no longer an inbox-mode account" in err, err
+    print("PASS test_named_account_never_falls_back")
+
+
 def test_no_inbox_account_refuses():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp))
@@ -310,6 +386,9 @@ if __name__ == "__main__":
     test_stamped_control_is_discarded_and_rerouted()
     test_single_inbox_needs_no_stamp()
     test_two_inbox_accounts_refuse()
+    test_chat_account_outranks_every_stamp()
+    test_two_inbox_accounts_route_when_the_chat_names_one()
+    test_named_account_never_falls_back()
     test_no_inbox_account_refuses()
     test_health_blip_keeps_last_known_good()
     test_unknown_mode_is_never_eligible()

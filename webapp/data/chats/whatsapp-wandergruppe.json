@@ -1,8 +1,10 @@
 {
  "generated": "2026-08-27T09:45:00+02:00",
  "chat": {
-  "id": "whatsapp:120363169876543210@g.us",
+  "id": "whatsapp:~+41765761976:120363169876543210@g.us",
   "channel": "whatsapp",
+  "account": "+41765761976",
+  "key": "120363169876543210@g.us",
   "name": "Wandergruppe Rigi",
   "group": true,
   "unread": 7,
@@ -23,7 +25,7 @@
  "messages": [
   {
    "id": "3EB00001",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -33,7 +35,7 @@
   },
   {
    "id": "3EB00002",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41762223344@s.whatsapp.net",
    "sender_name": "Franziska Kuhn",
@@ -42,7 +44,7 @@
   },
   {
    "id": "3EB00003",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41795556677@s.whatsapp.net",
    "sender_name": "Jonas Widmer",
@@ -51,7 +53,7 @@
   },
   {
    "id": "3EB00004",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -60,7 +62,7 @@
   },
   {
    "id": "3EB00005",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41787778899@s.whatsapp.net",
    "sender_name": "Silvia Marchesi",
@@ -70,7 +72,7 @@
   },
   {
    "id": "3EB00006",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "out",
    "author": "device",
    "text": "bin dabei. 5./6. sept oder 12./13.?",
@@ -79,7 +81,7 @@
   },
   {
    "id": "3EB00007",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41764445566@s.whatsapp.net",
    "sender_name": "Tobias Frei",
@@ -88,7 +90,7 @@
   },
   {
    "id": "3EB00008",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41762223344@s.whatsapp.net",
    "sender_name": "Franziska Kuhn",
@@ -97,7 +99,7 @@
   },
   {
    "id": "3EB00009",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -106,7 +108,7 @@
   },
   {
    "id": "3EB00010",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41795556677@s.whatsapp.net",
    "sender_name": "Jonas Widmer",
@@ -115,7 +117,7 @@
   },
   {
    "id": "3EB00011",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41787778899@s.whatsapp.net",
    "sender_name": "Silvia Marchesi",
@@ -124,7 +126,7 @@
   },
   {
    "id": "3EB00012",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41764445566@s.whatsapp.net",
    "sender_name": "Tobias Frei",
@@ -133,7 +135,7 @@
   },
   {
    "id": "3EB00013",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "out",
    "author": "device",
    "text": "👍",
@@ -141,7 +143,7 @@
   },
   {
    "id": "3EB00014",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41762223344@s.whatsapp.net",
    "sender_name": "Franziska Kuhn",
@@ -150,7 +152,7 @@
   },
   {
    "id": "3EB00015",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -160,7 +162,7 @@
   },
   {
    "id": "3EB00016",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -180,7 +182,7 @@
   },
   {
    "id": "3EB00017",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41795556677@s.whatsapp.net",
    "sender_name": "Jonas Widmer",
@@ -189,7 +191,7 @@
   },
   {
    "id": "3EB00018",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -198,7 +200,7 @@
   },
   {
    "id": "3EB00019",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41787778899@s.whatsapp.net",
    "sender_name": "Silvia Marchesi",
@@ -207,7 +209,7 @@
   },
   {
    "id": "3EB00020",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41795556677@s.whatsapp.net",
    "sender_name": "Jonas Widmer",
@@ -216,7 +218,7 @@
   },
   {
    "id": "3EB00021",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41762223344@s.whatsapp.net",
    "sender_name": "Franziska Kuhn",
@@ -225,7 +227,7 @@
   },
   {
    "id": "3EB00022",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41764445566@s.whatsapp.net",
    "sender_name": "Tobias Frei",
@@ -234,7 +236,7 @@
   },
   {
    "id": "3EB00023",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -243,7 +245,7 @@
   },
   {
    "id": "3EB00024",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "out",
    "author": "user",
    "text": "Ich nehme den gleichen Zug. Wer will, Abteil ganz vorne.",
@@ -252,7 +254,7 @@
   },
   {
    "id": "3EB00025",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41762223344@s.whatsapp.net",
    "sender_name": "Franziska Kuhn",
@@ -261,7 +263,7 @@
   },
   {
    "id": "3EB00026",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41787778899@s.whatsapp.net",
    "sender_name": "Silvia Marchesi",
@@ -271,7 +273,7 @@
   },
   {
    "id": "3EB00027",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41764445566@s.whatsapp.net",
    "sender_name": "Tobias Frei",
@@ -280,7 +282,7 @@
   },
   {
    "id": "3EB00028",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41787778899@s.whatsapp.net",
    "sender_name": "Silvia Marchesi",
@@ -289,7 +291,7 @@
   },
   {
    "id": "3EB00029",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -298,7 +300,7 @@
   },
   {
    "id": "3EB00030",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41795556677@s.whatsapp.net",
    "sender_name": "Jonas Widmer",
@@ -307,7 +309,7 @@
   },
   {
    "id": "3EB00030A1",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41787778899@s.whatsapp.net",
    "sender_name": "Silvia Marchesi",
@@ -326,7 +328,7 @@
   },
   {
    "id": "3EB00030A2",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41764445566@s.whatsapp.net",
    "sender_name": "Tobias Frei",
@@ -347,7 +349,7 @@
   },
   {
    "id": "3EB00031",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
@@ -357,7 +359,7 @@
   },
   {
    "id": "3EB00032",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41762223344@s.whatsapp.net",
    "sender_name": "Franziska Kuhn",
@@ -366,7 +368,7 @@
   },
   {
    "id": "3EB00033",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41795556677@s.whatsapp.net",
    "sender_name": "Jonas Widmer",
@@ -375,7 +377,7 @@
   },
   {
    "id": "3EB00034",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41762223344@s.whatsapp.net",
    "sender_name": "Franziska Kuhn",
@@ -384,7 +386,7 @@
   },
   {
    "id": "3EB00035",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41787778899@s.whatsapp.net",
    "sender_name": "Silvia Marchesi",
@@ -393,7 +395,7 @@
   },
   {
    "id": "3EB00036",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41764445566@s.whatsapp.net",
    "sender_name": "Tobias Frei",
@@ -402,7 +404,7 @@
   },
   {
    "id": "3EB00037",
-   "chat": "whatsapp:120363169876543210@g.us",
+   "chat": "whatsapp:~+41765761976:120363169876543210@g.us",
    "direction": "in",
    "sender": "41791234455@s.whatsapp.net",
    "sender_name": "Beat Odermatt",
