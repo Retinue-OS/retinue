@@ -243,9 +243,11 @@ without touching the gate.
 
 **What Ara does on push-triggered triage:**
 
-1. **Runs Phases 2–4** on this one message: resolve the sender, gather what the
-   reply depends on, dispatch the `secretary` for the decision, link to a
-   project, and open the dashboard conversation that carries it. The
+1. **Runs Phases 2–4** on this one message, in that order: classify, resolve
+   the sender, link it to a project (Phase 3), then gather what the reply
+   depends on — the project's state included, which is why the link comes
+   first — dispatch the `secretary` for the decision, and open the dashboard
+   conversation that carries it. The
    conversation is the user's push notification. **Hand the reply token over**:
    the prompt's reply command (with its token) goes into the thread as
    `--context`, verbatim — the session that later executes the approved reply
@@ -402,11 +404,15 @@ facts settle it) **or** a `DECISION NEEDED` question with `OPTIONS` (the answer
 is the user's to give) — the contract in `.claude/agents/secretary.md`. Its
 `BASIS` line says which facts decided, and names any that were missing.
 
-**3. Open the thread around what came back.** A `REPLY` becomes a proposal
-with send / adjust / discard chips. A `DECISION NEEDED` becomes a question
-with one chip per returned option — and **no draft at all**: the user answers
-by chip, and the reply is composed on a second dispatch once they have. Either
-way the original is quoted above it.
+**3. Open the thread around what came back**, one of three shapes. A `REPLY`
+becomes a proposal with send / adjust / discard chips. A `DECISION NEEDED`
+becomes a question with one chip per returned option — and **no draft at
+all**: the user answers by chip, and the reply is composed on a second
+dispatch once they have. A `NO MESSAGE` owes the sender nothing: propose the
+work it names (the calendar entry, the forward) with its own chips, or — when
+it corrects the disposition to `archive`/`delete` — drop the item into the
+omnibus instead of opening a thread at all. Whichever shape, the original is
+quoted above it, and nothing is sent.
 
     # facts settled it — propose the reply
     python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" \
@@ -516,9 +522,20 @@ Ara picks up each thread, carries out what was approved, then writes status
 **A chip the user picked is an answer, not a reply.** When the thread asked a
 `DECISION NEEDED` question, their choice is the fact that was missing — feed it
 back to the `secretary` (message, sender, context, and now the user's answer)
-and send the text it returns, verbatim. The same holds for a proposal the user
-adjusted rather than approved: their instruction goes to the secretary, whose
-text goes out. No session composes the outgoing words itself, on any tier.
+and post the text it returns into the thread as a proposal, with the same
+send / adjust / discard chips. **Only `send` sends.** An answer to a question
+and an adjustment are both instructions about what the reply should say, not
+approval of words the user has not yet seen; the same holds for a proposal the
+user adjusted rather than approved — their instruction goes to the secretary,
+whose text comes back for approval like any other. No session composes the
+outgoing words itself, on any tier, and no text reaches a recipient that the
+user has not seen and approved.
+
+**A `CANNOT COMPOSE:` line is never sendable text.** When the secretary
+returns one — a missing convention, an unreadable style layer — post what is
+missing into the thread so the user can repair it, and leave the item
+non-terminal. Never send that line, and never re-dispatch for the same text
+until the cause is fixed; a second dispatch would only return it again.
 
 Then carry out the disposition:
 
