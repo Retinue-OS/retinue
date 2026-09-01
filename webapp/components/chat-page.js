@@ -30,9 +30,9 @@
 // never shift the thread) and open full screen in a lightbox; audio renders
 // as a player above the transcript text (voice notes), video as an inline
 // player under the same box-reserve rules. The composer stages images too:
-// picked (or, on capable devices, camera-captured) photos are downscaled
-// client-side, previewed above the input row, and sent as the `images` part
-// of POST /chats/<id>/send.
+// picked photos (the phone's own chooser offers the camera among the sources)
+// are downscaled client-side, previewed above the input row, and sent as the
+// `images` part of POST /chats/<id>/send.
 //
 // The companion pane is the chat's own conversation with Ara: an ordinary
 // dashboard conversation (kind `companion`), named by `companion` on the chat
@@ -60,6 +60,8 @@ import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from 
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
 
 const LIST_URL = '/chats';
+// Where the back control lands a visitor who has no app history behind them.
+const CHATS_URL = '/chats.html';
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
 const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
@@ -170,6 +172,7 @@ class RetinueChatPage extends HTMLElement {
     this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
     this._imgError = '';       // staged-image error line (limit hit, unreadable file)
     this._lightbox = null;     // {url, alt} while the image overlay is open
+    this._lbClosing = false;   // its history entry is being unwound
     this._lbKeydown = null;    // window keydown handler while the lightbox is open
     this._lbPrevFocus = null;  // element to restore focus to on lightbox close
     this._onPop = null;
@@ -209,6 +212,13 @@ class RetinueChatPage extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = new URLSearchParams(location.search).get('id') || '';
+    // Where "back" leads. A same-origin referrer means the chat was opened
+    // from inside the app (the dashboard card, the chats list, another chat),
+    // so there is an entry to return to and the user expects the place they
+    // came from — not a list they then have to scroll to escape. Opened cold
+    // (a push notification, a bookmark, the home-screen icon) there is no such
+    // entry, and the chats list is the honest landing place.
+    this._fromApp = this._openedFromApp();
     // Pane arrangement differs across the breakpoint; re-render on a flip
     // (drafts survive — they live in fields, mirrored on every input event).
     this._onFrame = () => this.render();
@@ -489,7 +499,7 @@ class RetinueChatPage extends HTMLElement {
       body = '<div class="center muted">&#8230;</div>';
     } else if (this._state === 'error') {
       body = `<div class="center muted"><p>${esc(this._error)}</p>` +
-        '<p><a class="backlink" href="/chats.html">&#8249; All chats</a></p></div>';
+        `<p><a class="backlink" href="${CHATS_URL}">&#8249; All chats</a></p></div>`;
     } else {
       body = this._headHtml() + this._panesHtml();
     }
@@ -515,7 +525,7 @@ class RetinueChatPage extends HTMLElement {
       ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
       : `${ch} &middot; ${esc(key)}`;
     return `<header class="chat-head">` +
-      `<a class="back" href="/chats.html" aria-label="All chats">&#8249;</a>` +
+      `<a class="back" href="${CHATS_URL}" data-back title="Back" aria-label="Back">&#8249;</a>` +
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
@@ -625,6 +635,28 @@ class RetinueChatPage extends HTMLElement {
     return `<span class="att-file">&#128206; ${esc(a.name || 'Attachment')}</span>`;
   }
 
+  // ── Leaving the chat ───────────────────────────────────────────────────────
+  _openedFromApp() {
+    try {
+      const ref = document.referrer;
+      return !!ref && new URL(ref, location.href).origin === location.origin;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  // An installed PWA has no browser chrome and no back gesture on every
+  // platform, so this control is the way out of a chat, not a convenience.
+  // The lightbox parks one history entry while it is open and unwinds it on
+  // close, so by the time this runs the top of the stack is the chat's own
+  // entry again and one step back leaves the chat — but a press while the
+  // overlay is still up closes that first, never two views at once.
+  _goBack() {
+    if (this._lightbox) { this._closeLightbox(); return; }
+    if (this._fromApp && history.length > 1) { history.back(); return; }
+    location.href = CHATS_URL;
+  }
+
   // ── Lightbox ───────────────────────────────────────────────────────────────
   // A tapped image opens full screen on a dark scrim at natural fit, over the
   // same proxied URL (it is the original). Closing: tap, Esc, or the platform
@@ -640,9 +672,13 @@ class RetinueChatPage extends HTMLElement {
   }
 
   // User intent to close: unwind our history entry; the popstate handler does
-  // the actual dismissal — the same path the back gesture takes.
+  // the actual dismissal — the same path the back gesture takes. The unwind is
+  // asynchronous, so the in-flight flag keeps a second press (the ✕ then the
+  // header's back, in quick succession) from popping a second entry and
+  // dropping the user out of the chat with it.
   _closeLightbox() {
-    if (!this._lightbox) return;
+    if (!this._lightbox || this._lbClosing) return;
+    this._lbClosing = true;
     history.back();
   }
 
@@ -672,6 +708,7 @@ class RetinueChatPage extends HTMLElement {
 
   _dismissLightbox() {
     this._lightbox = null;
+    this._lbClosing = false;
     if (this._lbKeydown) {
       window.removeEventListener('keydown', this._lbKeydown);
       this._lbKeydown = null;
@@ -721,19 +758,14 @@ class RetinueChatPage extends HTMLElement {
 
   // The paperclip mirrors the conversations composer's affordance (a label
   // over a hidden file input) as a row button — images only, since that is
-  // what the send endpoint carries. Where the file input supports capture
-  // (phones), a camera button beside it opens the camera directly, as the
-  // native clients offer.
-  _attachBtnsHtml() {
-    const clip = `<label class="attach-btn" title="Attach images" aria-label="Attach images">` +
+  // what the send endpoint carries. One control, not two: the phone's own
+  // file chooser already offers the camera among its sources, and on a narrow
+  // screen every round button in the row is width taken from the text field,
+  // which is what the user is actually looking at while writing.
+  _attachBtnHtml() {
+    return `<label class="attach-btn" title="Attach images" aria-label="Attach images">` +
       `<input type="file" hidden multiple accept="image/*" data-attach>` +
       `<span aria-hidden="true">&#128206;</span></label>`;
-    const cam = ('capture' in document.createElement('input'))
-      ? `<label class="attach-btn" title="Take a photo" aria-label="Take a photo">` +
-        `<input type="file" hidden accept="image/*" capture="environment" data-attach>` +
-        `<span aria-hidden="true">&#128247;</span></label>`
-      : '';
-    return clip + cam;
   }
 
   // One composer's input row — or, while this target records or transcribes,
@@ -750,11 +782,13 @@ class RetinueChatPage extends HTMLElement {
         : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
       return statusRowHtml(label);
     }
-    const value = target === 'chat' ? this._draft : this._compDraft;
+    const isChat = target === 'chat';
+    const value = isChat ? this._draft : this._compDraft;
     const micBtn = canRecord()
       ? `<button type="button" class="mic" data-mic="${target}" ` +
         `title="Record a voice message" aria-label="Record a voice message">&#127908;</button>`
       : '';
+    const sendBtn = `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button>`;
     // The clear ✕ lives INSIDE the field, docked to its top-right corner: on
     // the send side, as the design asks, but within the field's own boundary,
     // so it reads — and taps — as part of the text box, visually and
@@ -767,13 +801,42 @@ class RetinueChatPage extends HTMLElement {
         `title="Clear message" aria-label="Clear message">&#10005;</button>`
       : '';
     const fieldCls = `field${withClear ? ' has-clear' : ''}${value ? ' has-text' : ''}`;
-    const attachBtns = target === 'chat' ? this._attachBtnsHtml() : '';
-    return `<form class="row" data-composer="${target}">` + micBtn + attachBtns +
-      `<div class="${fieldCls}" data-field>` +
+    const field = `<div class="${fieldCls}" data-field>` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" ` +
-      `autocomplete="off">${esc(value)}</textarea>` + clearBtn +
-      `</div>` +
-      `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button></form>`;
+      `autocomplete="off">${esc(value)}</textarea>` + clearBtn + `</div>`;
+    // The companion row is the dashboard conversation composer's row, verbatim:
+    // mic left, field, send right — it carries no attach control and its pane
+    // is never the one fighting for width.
+    if (!isChat) {
+      return `<form class="row" data-composer="${target}">` + micBtn + field + sendBtn + `</form>`;
+    }
+    // The chat row keeps at most two round controls, because each one costs the
+    // text field 46px of a phone's width: the paperclip on the left, and on the
+    // right ONE button that is the mic while there is nothing to send and the
+    // send button as soon as there is (the messenger idiom — dictation is
+    // offered exactly when the field is empty, which is when one dictates).
+    // Both are rendered and swapped by class, so the switch never rebuilds the
+    // row and can never cost the field its focus or the phone its keyboard.
+    // Without a usable recorder there is nothing to swap and send stands alone.
+    const swap = micBtn ? ' swap' : '';
+    const content = this._hasSendable(value) ? ' has-content' : '';
+    return `<form class="row${swap}${content}" data-composer="${target}">` +
+      this._attachBtnHtml() + field + micBtn + sendBtn + `</form>`;
+  }
+
+  // What makes the chat's send button the right control to show: words, or a
+  // staged image on its own (an image needs no caption).
+  _hasSendable(text) {
+    return !!text || this._outImages.length > 0;
+  }
+
+  // Keep the swap in step with the field after any change to either input —
+  // typing, the clear ✕, a send, an adopted draft, staged or removed images.
+  _syncSendSwap() {
+    const form = this.shadowRoot.querySelector('[data-composer="chat"]');
+    if (!form) return; // a recording or status row holds the composer
+    const input = form.querySelector('textarea');
+    form.classList.toggle('has-content', this._hasSendable(input ? input.value : ''));
   }
 
   // Companion messages reuse the conversation thread's visual language (same
@@ -841,6 +904,17 @@ class RetinueChatPage extends HTMLElement {
   // ── Wiring ─────────────────────────────────────────────────────────────────
   _wire() {
     const root = this.shadowRoot;
+    // Back: a real link (its href is the fallback destination, and it still
+    // opens the chats list in a new tab on a modified click) whose plain press
+    // honours where the user actually came from — see _goBack.
+    const back = root.querySelector('[data-back]');
+    if (back) {
+      back.addEventListener('click', (e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
+        e.preventDefault();
+        this._goBack();
+      });
+    }
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
     // the indicator honest whichever way the pane was reached (tab or swipe).
     root.querySelectorAll('[data-pane-tab]').forEach((el) =>
@@ -1009,6 +1083,7 @@ class RetinueChatPage extends HTMLElement {
         this._compDraft = input.value;
       }
       field.classList.toggle('has-text', !!input.value);
+      if (isChat) this._syncSendSwap();
       grow();
     });
     if (isChat) {
@@ -1031,6 +1106,7 @@ class RetinueChatPage extends HTMLElement {
         this._draft = '';
         this._setDraftByAra(false);
         field.classList.remove('has-text');
+        this._syncSendSwap();
         grow();
         input.focus();
         this._saveDraft();
@@ -1360,6 +1436,9 @@ class RetinueChatPage extends HTMLElement {
         const next = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
         if (next) { try { next.focus(); } catch (_e) { /* ignore */ } }
       }
+    } else {
+      // Nothing left to send: the row's one right-hand button is the mic again.
+      this._syncSendSwap();
     }
     // Order matters server-side: let a save fired by the pre-tap blur settle
     // before the send clears the draft.
@@ -1782,9 +1861,14 @@ const CSS = `
                background: rgba(110, 168, 254, .12); color: var(--accent, #6ea8fe);
                font-size: .74rem; font-weight: 600; }
   .row { display: flex; gap: 6px; align-items: flex-end; }
-  /* Image attach controls: the paperclip (and, on capture-capable devices,
-     the camera) — labels over hidden file inputs, in the mic button's round
-     dress so the row reads as one family. */
+  /* Mic and send share the row's right-hand slot, one shown at a time: every
+     round control here costs the text field 46px, and on a phone that is the
+     difference between a readable draft and three words a line. Display, not
+     visibility — a hidden control must give its width back. */
+  .row.swap:not(.has-content) .send { display: none; }
+  .row.swap.has-content .mic { display: none; }
+  /* The image attach control: a label over a hidden file input, in the mic
+     button's round dress so the row reads as one family. */
   .attach-btn { display: inline-flex; align-items: center; justify-content: center;
                 width: 40px; height: 40px; flex: none; border-radius: 50%;
                 background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
