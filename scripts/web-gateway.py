@@ -1264,6 +1264,16 @@ def _parse_edge_peers(raw: str) -> list:
 
 
 _EDGE_PEER_NETS = _parse_edge_peers(EDGE_PROXY_PEERS)
+# Set but yielding nothing usable is a typo, not a decision to go back to the
+# heuristic. Both cases produce an empty list, so without this flag a
+# mistyped value would silently buy the permissive fallback — the opposite of
+# what a deployment that bothered to pin its proxy asked for, and it would do
+# so quietly, which is the worst way for a security control to fail.
+_EDGE_PEERS_INVALID = bool(EDGE_PROXY_PEERS) and not _EDGE_PEER_NETS
+if _EDGE_PEERS_INVALID:
+    print(f"[web-gateway] EDGE_PROXY_PEERS is set to {EDGE_PROXY_PEERS!r} but "
+          "names no usable address or CIDR: refusing every request to a "
+          "user-authority endpoint until it is corrected", flush=True)
 if any(n.is_loopback for n in _EDGE_PEER_NETS):
     print("[web-gateway] EDGE_PROXY_PEERS includes loopback: user-authority "
           "endpoints accept in-container callers on this deployment", flush=True)
@@ -1292,7 +1302,13 @@ def _classify_request_origin(peer: str | None,
     loopback is.
 
     Unclassifiable input is refused: a missing or unparseable peer address
-    means we cannot tell, and "cannot tell" must not read as "allowed"."""
+    means we cannot tell, and "cannot tell" must not read as "allowed". A
+    misconfigured EDGE_PROXY_PEERS is refused for the same reason — a value
+    that parses to nothing is a typo, and reading it as "unset" would hand the
+    deployment the permissive heuristic it was trying to replace."""
+    if _EDGE_PEERS_INVALID:
+        return False, (f"EDGE_PROXY_PEERS is set to {EDGE_PROXY_PEERS!r} but "
+                       f"names no usable address or CIDR")
     addr = _normalize_peer(peer)
     if addr is None:
         return False, f"unclassifiable peer address {peer!r}"
@@ -4586,6 +4602,12 @@ def _chat_companion(chat_id: str) -> tuple[str, bool]:
 CHAT_SEND_CONFIRM_TIMEOUT = float(
     os.environ.get("CHAT_SEND_CONFIRM_TIMEOUT", "30"))
 CHAT_SEND_CONFIRM_INTERVAL = 0.2
+# Slack when matching an unconfirmed send against its ledger row by time. The
+# row carries the instant the CHANNEL accepted the message, stamped by another
+# machine's clock, so it can read a little earlier than the moment this process
+# asked for the send. Generous on purpose: over-matching briefly hides one of
+# two identical messages, under-matching shows the user their own message twice.
+CHAT_UNCONFIRMED_SKEW_SECONDS = 60.0
 
 
 def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
@@ -4629,8 +4651,16 @@ def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
 
     Approval executes asynchronously at the gateway, so the outcome is polled
     off the pending entry. A confirmation that does not arrive in time is not
-    a failed send — the message is very likely on the wire — so the send is
-    reported without an id and the caller's dedup falls back to (ts, text).
+    a failed send — the message is very likely on the wire, and reporting it as
+    failed would put the words back in the composer for the user to send a
+    second time, which is a worse error than a display artifact. So the send is
+    reported, and reported honestly: `unconfirmed` says the identity is not
+    known, because there is none to give. Every timestamp available at that
+    point is this process's own clock rather than the instant the channel
+    accepted the message, so a caller must not match such a send on (ts, text)
+    — the ledger row will carry the gateway's own instant and its message id,
+    and neither will agree. It is matched on text and direction instead; see
+    the merge in _chat_messages_payload.
     """
     status, answer = _gateway_hop(gw, "/send", send_payload)
     if not isinstance(answer, dict):
@@ -4666,10 +4696,11 @@ def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
         return {}, f"the send failed at the gateway: {entry.get('error')}"
     if state == "sending":
         print(f"[web-gateway] send {request_id} not confirmed within "
-              f"{CHAT_SEND_CONFIRM_TIMEOUT}s; reporting it without an id",
+              f"{CHAT_SEND_CONFIRM_TIMEOUT}s; reporting it unconfirmed",
               flush=True)
     return {"message_id": entry.get("message_id"),
             "ts": entry.get("sent_at"),
+            "unconfirmed": state == "sending",
             "attachments": entry.get("attachments") or []}, ""
 
 
@@ -4693,6 +4724,9 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     messages = []
     seen_mids: set[str] = set()
     seen_fallback: set[tuple] = set()
+    # Outbound rows as (ts, text), for matching sends whose identity we never
+    # learned — see the unconfirmed branch in the overlay merge below.
+    store_out: list[tuple] = []
     for b in _sparql_bindings(query):
         ts = _bval(b, "ts")
         if not ts:
@@ -4709,6 +4743,8 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
         if mid:
             seen_mids.add(mid)
         seen_fallback.add((ts, text))
+        if _bval(b, "type") == _T_CHAT_OUTBOUND:
+            store_out.append((ts, text))
     messages.reverse()  # the query pages newest-first; the contract is ascending
 
     # Merge the live overlay into the NEWEST page only — older pages are
@@ -4719,6 +4755,19 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
             ts = entry.get("ts") or ""
             text = entry.get("text") or ""
             if (mid and mid in seen_mids) or (not mid and (ts, text) in seen_fallback):
+                continue
+            # A send the gateway never confirmed carries neither its message id
+            # nor the instant the channel accepted it, so neither of the tests
+            # above can ever match its ledger row — which is how the user's own
+            # message came to be rendered twice. Such an entry is by
+            # construction one specific send, so an outbound row with the same
+            # words, recorded at or after the moment we gave up waiting, is
+            # that send. Matching two genuinely identical messages as one costs
+            # a bubble for the seconds until the overlay expires; not matching
+            # them showed a duplicate for as long as the page stayed open.
+            if entry.get("unconfirmed") and any(
+                    otext == text and ots >= (entry.get("since") or ts)
+                    for ots, otext in store_out):
                 continue
             messages.append(_shape_chat_message(
                 chat_id, channel,
@@ -5777,6 +5826,10 @@ class Handler(BaseHTTPRequestHandler):
         }
         if images:
             send_payload["images"] = images
+        # The instant the send was asked for. A record the channel writes for it
+        # cannot predate this by more than clock skew, which is what makes it a
+        # sound lower bound when the send comes back without an identity.
+        asked_at = time.time()
         try:
             result, send_error = _chat_send_via_gateway(gw, send_payload)
         except Exception as exc:  # noqa: BLE001 - unreachable gateway is a 502
@@ -5786,6 +5839,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(502, {"error": send_error})
             return
         message_id = (str(result.get("message_id") or "").strip() or None)
+        unconfirmed = bool(result.get("unconfirmed"))
+        # With no confirmation there is no channel instant either, so this is
+        # our own clock — good enough to order the bubble, and explicitly not
+        # something to match the ledger row on later.
         ts = chat_state_mod.iso_z(result.get("ts"))
         # The stored ledger media references the gateway reports back — the
         # same host-free urn:retinue:media:… form it writes into the record.
@@ -5799,9 +5856,18 @@ class Handler(BaseHTTPRequestHandler):
         msg = _shape_chat_message(chat_id, channel, direction="out", text=text,
                                   ts=ts, message_id=message_id, author="user",
                                   attachment_urls=gw_atts, serving_slug=slug)
+        since = chat_state_mod.iso_z(asked_at - CHAT_UNCONFIRMED_SKEW_SECONDS)
+        if unconfirmed:
+            # The client keeps its optimistic bubble rather than trusting this
+            # id, and reconciles it against the first outbound record from
+            # `since` onwards carrying these words.
+            msg["unconfirmed"] = True
+            msg["since"] = since
         _CHAT_OVERLAY.insert({
             "chat_id": chat_id, "channel": channel, "direction": "out",
             "author": "user", "text": text, "ts": ts, "message_id": message_id,
+            "unconfirmed": unconfirmed,
+            "since": since if unconfirmed else None,
             "attachments": gw_atts,
         })
         _CHAT_STATE.clear_draft(chat_id)

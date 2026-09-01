@@ -176,10 +176,16 @@ The API, as the components consume it:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
 - `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
-  gateway as the user (direct under every policy category: the send press IS
-  the approval `verify` exists for) and returns the sent
-  `Message`; the page shows an optimistic bubble and reconciles it with the
-  response, and a failed send puts the words back into the composer.
+  gateway and returns the sent `Message`. It does not skip the account's send
+  policy: under `allow` the gateway sends outright, and otherwise the send is
+  **queued and then released** through that gateway's own approve endpoint in
+  the same request — the press IS the approval `verify` exists for, but it is
+  spent on the mechanism rather than around it, so the send is recorded in the
+  pending store with its approval. (What that does and does not prevent is in
+  `_chat_send_via_gateway`: an agent calling `/send` gets a queued message; an
+  agent that also calls approve has simulated the press, which nothing inside a
+  shared container can stop.) The page shows an optimistic bubble and reconciles
+  it with the response, and a failed send puts the words back into the composer.
   `images` is `[{content_type, data(base64)}]`, at most 5, each at most
   ~8 MB decoded (400 on violations); `text` may be absent when images are
   sent. The returned `Message` (and later polls) carries the sent

@@ -66,7 +66,20 @@ STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
                "gw_mode": "inbox", "gw_account": "+41791112233",
                # The mock account's send policy: "allow" sends on the first
                # hop, anything else queues and must be approved.
-               "gw_policy": "allow", "pending": {}, "approved": []}
+               "gw_policy": "allow", "pending": {}, "approved": [],
+               # When set, an approved send never leaves "sending" — the
+               # gateway that does not confirm in time.
+               "gw_never_confirms": False,
+               # When set, replaces the canned per-chat message rows.
+               "msg_rows": None,
+               # What each queued send will produce once it completes.
+               "outcomes": {}}
+
+
+def _iso_now(offset=0.0):
+    from datetime import datetime, timedelta, timezone
+    return ((datetime.now(timezone.utc) + timedelta(seconds=offset))
+            .isoformat(timespec="seconds").replace("+00:00", "Z"))
 
 
 def _cell(value):
@@ -124,6 +137,8 @@ class _MockSparql(BaseHTTPRequestHandler):
                 if key in counts and cut.startswith("1970-")]
 
     def _messages(self, query):
+        if STATE.get("msg_rows") is not None:
+            return STATE["msg_rows"]
         if f'"{MARA}"' not in query:
             return []
         if "FILTER(?ts <" in query:  # the ?before page
@@ -205,7 +220,13 @@ class _MockGateway(BaseHTTPRequestHandler):
             # Anything stricter queues, exactly as the real gateway does under
             # `verify`: nothing the caller can put in the body skips this.
             rid = f"{len(STATE['pending']) + 1:032x}"
-            STATE["pending"][rid] = {"id": rid, "status": "pending", **outcome}
+            # The outcome is NOT on the entry yet: the real gateway records the
+            # message id and the sent-at instant only once the send has
+            # actually gone out (an approval executes off the request). An
+            # entry that carried them from the start would hide exactly the
+            # case where a caller has to cope without them.
+            STATE["pending"][rid] = {"id": rid, "status": "pending"}
+            STATE["outcomes"][rid] = outcome
             self._json(202, {"status": "pending_approval", "request_id": rid,
                              "approval_url": f"/sends/signal/{rid}"})
             return
@@ -220,7 +241,12 @@ class _MockGateway(BaseHTTPRequestHandler):
             entry["status"] = "sending"
             STATE["approved"].append(m.group(1))
             self._json(200, dict(entry))
-            entry["status"] = "approved"
+            # A gateway still sending when the caller gives up waiting is the
+            # unconfirmed path: it stays "sending" for as long as the test
+            # wants, and its ledger row turns up later with its own identity.
+            if not STATE.get("gw_never_confirms"):
+                entry.update(STATE["outcomes"].get(m.group(1)) or {})
+                entry["status"] = "approved"
             return
         self._json(404, {"error": "not found"})
 
@@ -686,6 +712,69 @@ def test_send_under_verify_is_queued_then_approved(base, wg):
     print("PASS test_send_under_verify_is_queued_then_approved")
 
 
+def test_unconfirmed_send_is_not_rendered_twice(base, wg):
+    """A send the gateway never confirms is reported, and reported honestly.
+
+    Waiting forever is not an option and reporting a failure is the worse
+    error — the words would go back into the composer and the user would send
+    them a second time, for real. So the send is reported without an identity,
+    marked `unconfirmed`.
+
+    The bug that marking closes: such a send has neither the channel's message
+    id nor the instant it accepted the message, so neither of the merge's two
+    dedup tests can ever match the ledger row that eventually appears, and the
+    user saw their own message twice.
+    """
+    STATE["sent"].clear()
+    STATE["pending"].clear()
+    STATE["approved"].clear()
+    STATE["gw_policy"] = "verify"
+    STATE["gw_never_confirms"] = True
+    prev_timeout = wg.CHAT_SEND_CONFIRM_TIMEOUT
+    wg.CHAT_SEND_CONFIRM_TIMEOUT = 0.3   # don't sit out the real 30s
+    try:
+        status, msg = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/send",
+                            {"text": "im Flug"})
+        assert status == 200, msg
+        # Reported as sent — the message is very likely on the wire — but the
+        # response says plainly that its identity is not known.
+        assert msg["unconfirmed"] is True, msg
+        assert msg["text"] == "im Flug" and msg["author"] == "user"
+        rid = STATE["approved"][0]
+        assert STATE["pending"][rid]["status"] == "sending"
+
+        # The store now indexes the record the gateway did write, with the
+        # channel's own id and instant — neither of which the response carried.
+        # Stamped a few seconds back, as the real one is: the channel accepted
+        # the message while this caller was still waiting, so the record
+        # predates the moment it gave up — by roughly the confirm timeout. That
+        # gap is the whole point: it is why the (ts, text) fallback cannot match
+        # these two, and why the unconfirmed rule has to.
+        ledger_ts = _iso_now(-5)
+        STATE["msg_rows"] = [
+            _lit_row(m="urn:retinue:outbound:signal:777", type=T_OUT,
+                     text="im Flug", author="user", mid="7770", ts=ledger_ts),
+        ]
+        try:
+            status, body = _http(base, "GET",
+                                 "/chats/" + _quote(CHAT1) + "/messages")
+            assert status == 200
+            mine = [m for m in body["messages"] if m["text"] == "im Flug"]
+            assert len(mine) == 1, [m["id"] for m in mine]
+            # And the one that survives is the real record, not the placeholder.
+            assert mine[0]["id"] == "7770", mine[0]
+        finally:
+            STATE["msg_rows"] = None
+    finally:
+        wg.CHAT_SEND_CONFIRM_TIMEOUT = prev_timeout
+        STATE["gw_never_confirms"] = False
+        STATE["gw_policy"] = "allow"
+        STATE["pending"].clear()
+        STATE["approved"].clear()
+        wg._CHAT_OVERLAY.clear() if hasattr(wg._CHAT_OVERLAY, "clear") else None
+    print("PASS test_unconfirmed_send_is_not_rendered_twice")
+
+
 def test_companion_endpoint(base, wg):
     """The chat's linked conversation: created once, returned forever after."""
     path = "/chats/" + _quote(CHAT2) + "/companion"
@@ -793,6 +882,7 @@ def main():
         test_send_images(base, wg)
         test_send_under_verify_is_queued_then_approved(base, wg)
 
+        test_unconfirmed_send_is_not_rendered_twice(base, wg)
         test_companion_endpoint(base, wg)
 
         test_control_gateway_refused(base, wg)

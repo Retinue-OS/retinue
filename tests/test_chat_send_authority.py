@@ -183,6 +183,40 @@ def test_configured_peers_are_the_whole_rule(wg):
     print("PASS test_configured_peers_are_the_whole_rule")
 
 
+def test_a_mistyped_peer_list_fails_closed(wg):
+    """A peer list that parses to nothing is a typo, not a decision.
+
+    Both an unset value and a wholly unparseable one leave _EDGE_PEER_NETS
+    empty, so without a separate flag the second would silently buy the
+    permissive heuristic — the exact fallback a deployment that pinned its
+    proxy was trying to replace, and it would do so quietly.
+    """
+    saved_nets, saved_bad = wg._EDGE_PEER_NETS, wg._EDGE_PEERS_INVALID
+    saved_raw = wg.EDGE_PROXY_PEERS
+    try:
+        wg.EDGE_PROXY_PEERS = "not-an-address, also-bad"
+        wg._EDGE_PEER_NETS = wg._parse_edge_peers(wg.EDGE_PROXY_PEERS)
+        assert wg._EDGE_PEER_NETS == [], wg._EDGE_PEER_NETS
+        wg._EDGE_PEERS_INVALID = True
+        # The peer an unset list would have accepted is now refused, and the
+        # reason names the configuration rather than the caller.
+        ok, why = wg._classify_request_origin("203.0.113.9", "172.19.0.9")
+        assert ok is False, "a mistyped peer list still accepted a peer"
+        assert "EDGE_PROXY_PEERS" in why and "no usable" in why, why
+        # Nothing gets through, not even what the heuristic would have refused
+        # anyway — the state is "cannot tell", and that never reads as allowed.
+        assert wg._classify_request_origin("127.0.0.1", "127.0.0.1")[0] is False
+        # Correcting it restores normal service without a restart of the logic.
+        wg.EDGE_PROXY_PEERS = "10.0.0.0/8"
+        wg._EDGE_PEER_NETS = wg._parse_edge_peers(wg.EDGE_PROXY_PEERS)
+        wg._EDGE_PEERS_INVALID = False
+        assert wg._classify_request_origin("10.1.2.3", "172.19.0.9")[0] is True
+    finally:
+        wg.EDGE_PROXY_PEERS = saved_raw
+        wg._EDGE_PEER_NETS, wg._EDGE_PEERS_INVALID = saved_nets, saved_bad
+    print("PASS test_a_mistyped_peer_list_fails_closed")
+
+
 def test_send_from_inside_the_container_is_refused(base, wg):
     """The incident, end to end: an in-container caller asking for a send."""
     GW_SEEN.clear()
@@ -241,6 +275,7 @@ def main():
         wg.push_notify.enabled = lambda: False
         test_peer_classification(wg)
         test_configured_peers_are_the_whole_rule(wg)
+        test_a_mistyped_peer_list_fails_closed(wg)
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
