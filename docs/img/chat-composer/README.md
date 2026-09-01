@@ -14,6 +14,9 @@ off the live elements, not estimates.
   composer, which is the row it now matches: mic left, send right, paperclip
   inside the field. Then the states, to show that nothing swaps — the ✕ is the
   only control that comes and goes, and only when there is text to clear.
+- **`composer-undo.png`** — clearing a draft Ara staged, and taking it back:
+  the ✕'s slot becomes an undo, and the restored draft carries its marker
+  again. Shot as the three taps it actually is.
 
 Two things worth knowing before reshooting these:
 

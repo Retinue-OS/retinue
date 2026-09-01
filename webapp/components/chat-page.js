@@ -87,6 +87,12 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const IMAGE_MAX_EDGE = 1600;
 const IMAGE_JPEG_QUALITY = 0.85;
 
+// How long a cleared draft stays recoverable. Long enough to notice the box is
+// empty and reach for the undo, short enough that the control is not still
+// sitting there when the user comes back to a chat they left minutes ago —
+// where it would offer to restore text they have long since abandoned.
+const UNDO_CLEAR_MS = 12000;
+
 // Quick patterns: canned companion prompts over the current draft/thread.
 // A chip is nothing but a pre-filled companion turn (see the design doc) —
 // the user still reads and sends it.
@@ -167,6 +173,8 @@ class RetinueChatPage extends HTMLElement {
     this._pane = 'chat';       // chat | companion (phone pane indicator)
     this._draft = '';          // chat composer text
     this._draftByAra = false;  // composer holds the staged agent draft
+    this._undo = null;         // {text, byAra} a cleared draft, still recoverable
+    this._undoTimer = null;
     this._compDraft = '';      // companion composer text
     this._localSeq = 0;        // ids for optimistic (not yet confirmed) bubbles
     this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
@@ -379,6 +387,9 @@ class RetinueChatPage extends HTMLElement {
         this._draftSaved = d.text;
         this._draft = d.text;
         this._draftByAra = d.author === 'agent';
+        // A draft arriving is a better offer than the one the user just threw
+        // away; restoring the old text over it would be the wrong undo.
+        this._setUndo(null);
         this._refreshChatComposer();
       }
     } catch (_err) {
@@ -800,9 +811,16 @@ class RetinueChatPage extends HTMLElement {
     // fat finger away from it. As a row button it would cost the empty field
     // width it does not need: it exists only while there is text to clear
     // (.has-text shows it and pads the text out from under it).
+    // The ✕ and its undo share one slot in the field, and CSS picks between
+    // them: the ✕ while there is text, the undo for a short while after a
+    // clear. Both are rendered up front so the swap is a class toggle rather
+    // than a rebuild — a rebuild here would cost the field its focus and the
+    // phone its keyboard.
     const clearBtn = withClear
       ? `<button type="button" class="clear-inline" data-clear ` +
-        `title="Clear message" aria-label="Clear message">&#10005;</button>`
+        `title="Clear message" aria-label="Clear message">&#10005;</button>` +
+        `<button type="button" class="undo-inline" data-undo ` +
+        `title="Undo clear" aria-label="Undo clear">&#8630;</button>`
       : '';
     // Both composers are the dashboard conversation composer's row: mic on the
     // left, send on the right, and what belongs inside the field lives inside
@@ -813,7 +831,8 @@ class RetinueChatPage extends HTMLElement {
     // carries neither (it is Ara's own thread, and it never fights for width).
     const inField = isChat ? clearBtn + this._clipHtml() : clearBtn;
     const fieldCls = `field${withClear ? ' has-clear' : ''}` +
-      `${isChat ? ' has-clip' : ''}${value ? ' has-text' : ''}`;
+      `${isChat ? ' has-clip' : ''}${value ? ' has-text' : ''}` +
+      `${this._undo ? ' has-undo' : ''}`;
     const field = `<div class="${fieldCls}" data-field>` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" ` +
       `autocomplete="off">${esc(value)}</textarea>` + inField + `</div>`;
@@ -1071,6 +1090,9 @@ class RetinueChatPage extends HTMLElement {
         this._compDraft = input.value;
       }
       field.classList.toggle('has-text', !!input.value);
+      // Anything typed (or dictated in) means the user has moved on; the offer
+      // does not come back if they then delete it again.
+      if (isChat && this._undo) this._setUndo(null);
       grow();
     });
     if (isChat) {
@@ -1088,7 +1110,10 @@ class RetinueChatPage extends HTMLElement {
       clearBtn.addEventListener('click', () => {
         // One tap to an empty box — the deliberate divergence from the real
         // clients. It also dismisses the staged-draft marker (the draft is
-        // rejected, not sent) and clears the server-side draft with it.
+        // rejected, not sent) and clears the server-side draft with it. All of
+        // which is why the tap is offered back: see _setUndo.
+        const prev = input.value;
+        const wasAra = this._draftByAra;
         input.value = '';
         this._draft = '';
         this._setDraftByAra(false);
@@ -1096,10 +1121,20 @@ class RetinueChatPage extends HTMLElement {
         grow();
         input.focus();
         this._saveDraft();
+        this._setUndo(prev ? { text: prev, byAra: wasAra } : null);
       });
     }
+    const undoBtn = form.querySelector('[data-undo]');
+    if (undoBtn) undoBtn.addEventListener('click', () => this._undoClear());
     const mic = form.querySelector('[data-mic]');
-    if (mic) mic.addEventListener('click', () => this._startRecording(target));
+    if (mic) {
+      mic.addEventListener('click', () => {
+        // The recording row replaces this one and the transcript lands in the
+        // field, so the offer is spent either way.
+        if (isChat) this._setUndo(null);
+        this._startRecording(target);
+      });
+    }
     form.addEventListener('submit', (e) => {
       e.preventDefault();
       const text = input.value;
@@ -1109,6 +1144,10 @@ class RetinueChatPage extends HTMLElement {
       if (isChat) {
         this._draft = '';
         this._setDraftByAra(false);
+        // Sending is moving on: an offer left over from an earlier clear must
+        // not put that text back into a composer the user has just emptied on
+        // purpose.
+        this._setUndo(null);
       } else {
         this._compDraft = '';
       }
@@ -1278,6 +1317,50 @@ class RetinueChatPage extends HTMLElement {
       el.classList.toggle('on', on);
       el.setAttribute('aria-selected', on ? 'true' : 'false');
     });
+  }
+
+  // ── Undoing a clear ────────────────────────────────────────────────────────
+  // The ✕ empties the box in one tap, which is what makes it useful and also
+  // what makes a mis-tap expensive: the text is gone from the field AND from
+  // the server-side draft, and a draft Ara staged is not something the user
+  // can retype. So a clear is offered back for a short while — as an undo in
+  // the ✕'s own slot, costing no width, and gone again the moment it stops
+  // being what the user wants.
+  //
+  // It ends on whichever comes first: the timeout, or anything that means the
+  // user has moved on — typing, dictating, sending, or Ara staging a new
+  // draft over it. Only a non-empty clear offers one; clearing an already
+  // empty box has nothing to give back.
+  _setUndo(entry) {
+    if (this._undoTimer) clearTimeout(this._undoTimer);
+    this._undoTimer = null;
+    this._undo = entry || null;
+    if (this._undo) {
+      this._undoTimer = setTimeout(() => this._setUndo(null), UNDO_CLEAR_MS);
+    }
+    const field = this.shadowRoot.querySelector('[data-composer="chat"] [data-field]');
+    if (field) field.classList.toggle('has-undo', !!this._undo);
+  }
+
+  // Put the cleared text back exactly as it was, its "drafted by Ara" marker
+  // included — which is why this goes through a composer refresh rather than
+  // just writing the textarea: the marker is part of the composer block.
+  _undoClear() {
+    const entry = this._undo;
+    if (!entry) return;
+    this._setUndo(null);
+    this._draft = entry.text;
+    this._draftByAra = entry.byAra;
+    this._refreshChatComposer();
+    const input = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+    if (input) {
+      try {
+        input.focus();
+        // Caret at the end, where the user left off, not at the start.
+        input.setSelectionRange(input.value.length, input.value.length);
+      } catch (_e) { /* a browser that dislikes selection on a hidden field */ }
+    }
+    this._saveDraft();
   }
 
   _setDraftByAra(on) {
@@ -1898,12 +1981,28 @@ const CSS = `
      nearer to it. */
   .field.has-clip .clear-inline { right: 39px; }
   .clear-inline:hover { color: var(--high, #ff6b6b); background: rgba(255, 107, 107, .14); }
+  /* The undo occupies the ✕'s slot, in the accent colour — it offers something
+     back rather than taking it away, and it should read as the one thing worth
+     tapping in an unexpectedly empty box. */
+  .undo-inline { position: absolute; bottom: 5px; right: 5px; width: 30px; height: 30px;
+                 display: inline-flex; align-items: center; justify-content: center;
+                 border: 0; border-radius: 50%; padding: 0; cursor: pointer;
+                 background: transparent; color: var(--accent, #6ea8fe); font-size: 1rem;
+                 -webkit-tap-highlight-color: transparent; }
+  .field.has-clip .undo-inline { right: 39px; }
+  .undo-inline:hover { background: rgba(110, 168, 254, .2); }
+  /* One slot, two controls: the ✕ while there is text to clear, the undo while
+     a clear is still recoverable and the box is empty. Text always wins — once
+     the user is writing again there is nothing to undo. */
   .field:not(.has-text) .clear-inline { display: none; }
+  .field:not(.has-undo) .undo-inline,
+  .field.has-text .undo-inline { display: none; }
   /* Right padding tracks what is actually shown, so an empty field is not
-     holding room for a ✕ that is not there. */
+     holding room for a control that is not there. */
   .field.has-clip textarea { padding-right: 42px; }
   .field.has-clear.has-text textarea { padding-right: 44px; }
-  .field.has-clip.has-clear.has-text textarea { padding-right: 74px; }
+  .field.has-clip.has-clear.has-text textarea,
+  .field.has-clip.has-undo:not(.has-text) textarea { padding-right: 74px; }
   .attach-err { color: var(--high, #ff6b6b); font-size: .76rem; margin-bottom: 8px; }
 
   /* ── Companion pane (the conversation thread's visual language) ──────────── */

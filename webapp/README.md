@@ -128,7 +128,13 @@ docstring). Pieces:
   layout across both surfaces, and one place to reach for each affordance.
   Keeping only two round controls is what buys the field its width, since each
   one costs 46px of a phone's; the chat field additionally carries the clear ✕,
-  beside the clip and only while there is something to clear. Back goes back where the chat was opened from within the
+  beside the clip and only while there is something to clear. A clear is
+  **undoable**: the ✕'s slot becomes an undo that puts the text back verbatim,
+  its "drafted by Ara" marker included, and lapses after 12s or as soon as the
+  user has moved on (typing, dictating, sending, or Ara staging a new draft) —
+  one tap emptying the box is only safe if the tap can be taken back, and a
+  staged draft is not something the user can retype.
+  Back goes back where the chat was opened from within the
   app, and to the chats list for a chat opened cold (a notification, a
   bookmark). The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
