@@ -224,29 +224,42 @@ def test_approval_slug_derived_from_host_header():
     print("ok: approval slug derived from Host header")
 
 
-def test_user_author_sends_directly():
-    """A user-authored send bypasses the approval queue under every category:
-    verify exists to put the user's decision between agent-composed content and
-    the wire, and the dashboard's send press already is that decision."""
+def test_policy_alone_decides_directness():
+    """`author` decides nothing, and there is no caller-supplied bypass at all.
+
+    author "user" used to be direct under every category, on the reasoning that
+    only the dashboard ever sets it. It is a JSON field any caller can set — so
+    a message went out under `verify` that the user never pressed send on.
+    Authorship is ledger provenance again, and the dashboard's own press is not
+    an exception either: it is queued here like everything else and released
+    through /pending-sends/<id>/approve."""
     with tempfile.TemporaryDirectory() as tmp:
         sg = _load_signal_gateway(_POLICY, tmp, account="+15551234567")  # verify
-        for category in ("verify", "trust", "allow"):
-            assert sg._send_is_direct(category, False, "user") is True
-        # Agent/device authorship keeps today's rules exactly.
-        assert sg._send_is_direct("verify", False, "agent") is False
-        assert sg._send_is_direct("verify", True, "agent") is False
-        assert sg._send_is_direct("trust", False, "agent") is False
-        assert sg._send_is_direct("trust", True, "agent") is True
-        assert sg._send_is_direct("allow", False, "agent") is True
-    print("ok: user-authored sends are direct; agent rules unchanged")
+        assert sg._send_is_direct("verify", False) is False
+        assert sg._send_is_direct("verify", True) is False
+        assert sg._send_is_direct("trust", False) is False
+        assert sg._send_is_direct("trust", True) is True
+        assert sg._send_is_direct("allow", False) is True
+        # The signature carries no author and no bypass flag, so no caller can
+        # reintroduce one by passing a field.
+        import inspect
+        params = list(inspect.signature(sg._send_is_direct).parameters)
+        assert params == ["category", "user_approved"], params
+    print("ok: the account's policy alone decides; no caller-supplied bypass")
 
 
-def test_user_author_send_over_http():
-    """End to end through the /send handler: under `verify`, author "user"
-    sends directly (and surfaces the recorded ledger identity) while the
-    default agent authorship still queues for approval."""
+def test_send_over_http_always_queues_under_verify():
+    """End to end through the /send handler, under `verify`.
+
+    Every caller queues — including a POST claiming author "user", which is the
+    shape an agent can produce and the shape that once put a message on the
+    wire. Releasing it is a second, separate call to the gateway's own approve
+    endpoint, which is what the dashboard's send press does; the send then
+    records the authorship it was given, and its outcome is readable back off
+    the pending entry."""
     import http.client
     import threading
+    import time
     from http.server import ThreadingHTTPServer
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -265,19 +278,41 @@ def test_user_author_send_over_http():
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+            # Claiming user authorship is not authority: this is exactly the
+            # request an agent can issue, and it queues.
             body = json.dumps({"recipient": "+15551112222", "message": "hi",
                                "author": "user", "voice": False})
             conn.request("POST", "/send", body, {"Content-Type": "application/json"})
             resp = conn.getresponse()
             answer = json.loads(resp.read().decode("utf-8"))
+            assert resp.status == 202, answer
+            assert answer["status"] == "pending_approval", answer
+            assert not pushed, "author alone put a message on the wire"
+            request_id = answer["request_id"]
+
+            # Releasing it is the separate call the dashboard's press makes.
+            conn.request("POST", f"/pending-sends/{request_id}/approve", "",
+                         {"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            answer = json.loads(resp.read().decode("utf-8"))
             assert resp.status == 200, answer
-            assert answer["status"] == "sent"
-            assert answer["message_id"] == "1724832000123"
-            # Stored media references surface too, so the chat view can render
-            # the sent image under its ledger identity.
-            assert answer["attachments"] == ["http://signal-gateway:8090/media/" + "ee" * 16]
+            # Approval executes off the request, so the terminal state and the
+            # outcome are read back from the entry.
+            for _ in range(200):
+                conn.request("GET", f"/pending-sends/{request_id}")
+                resp = conn.getresponse()
+                entry = json.loads(resp.read().decode("utf-8"))
+                if entry.get("status") != "sending":
+                    break
+                time.sleep(0.01)
+            assert entry["status"] == "approved", entry
             assert pushed and pushed[0][2]["author"] == "user"
-            # The same send without author stays on the approval path.
+            # The send's identity survives the approval — the chat surface
+            # reads its message id and stored media back from here.
+            assert entry["message_id"] == "1724832000123"
+            assert entry["attachments"] == ["http://signal-gateway:8090/media/" + "ee" * 16]
+
+            # A send with no author at all is treated identically.
             body = json.dumps({"recipient": "+15551112222", "message": "hi"})
             conn.request("POST", "/send", body, {"Content-Type": "application/json"})
             resp = conn.getresponse()
@@ -292,7 +327,7 @@ def test_user_author_send_over_http():
             assert resp.status == 400
         finally:
             server.shutdown()
-    print("ok: /send author=user is direct over HTTP; agent default still queues")
+    print("ok: /send queues every caller under verify; approve releases it")
 
 
 def main():
@@ -303,8 +338,8 @@ def main():
     test_unknown_request_id()
     test_malformed_request_id_rejected()
     test_approval_slug_derived_from_host_header()
-    test_user_author_sends_directly()
-    test_user_author_send_over_http()
+    test_policy_alone_decides_directness()
+    test_send_over_http_always_queues_under_verify()
     print("\nAll Signal send-policy checks passed.")
 
 

@@ -1807,19 +1807,31 @@ def _outbound_policy_category() -> str:
     return wildcard if wildcard is not None else DEFAULT_SEND_CATEGORY
 
 
-def _send_is_direct(category: str, user_approved: bool, author: str) -> bool:
+def _send_is_direct(category: str, user_approved: bool) -> bool:
     """Whether a /send executes immediately instead of queueing for approval.
 
-    A user-authored send is direct under EVERY category: verify/trust exist to
-    put the user's decision between agent-composed content and the wire, and a
-    message the user typed and sent in the authenticated dashboard already
-    carries that decision — queueing it would ask the user to approve their own
-    words a second time. The only caller that sets author "user" is the
-    web-gateway's chat-send endpoint, which sits behind the dashboard's edge
-    auth; agents and CLIs default to "agent" and keep today's rules.
+    Only the policy decides. There is deliberately no caller-supplied bypass:
+    `author` used to be one — author "user" was direct under every category, on
+    the reasoning that only the dashboard ever sets it — and that is how a
+    message once went out under `verify` that the user never pressed send on.
+    `author` is a JSON field any caller can set, and it describes who composed
+    a message; a description must not also decide whether policy applies.
+
+    So every caller of /send is subject to the account's category, and under
+    `verify` every send lands in the pending store. The dashboard's own send
+    press is not an exception to that: the web-gateway queues it here like
+    anything else and then approves it in the same request, through
+    /pending-sends/<id>/approve. That keeps the mechanism honest — the send is
+    recorded with its approval and nothing skips the queue — while still
+    putting the user's message on the wire in one action.
+
+    An agent could make both calls too. That is a deliberate simulation of the
+    user's button press, not something it can do by accident, and it is out of
+    scope here: no arrangement inside a shared container can prevent it, since
+    the agents hold this gateway's token. What is now impossible by accident is
+    the thing that actually happened — a send going out because a field
+    happened to say "user".
     """
-    if author == "user":
-        return True
     return category == "allow" or (category == "trust" and user_approved)
 
 
@@ -1926,15 +1938,22 @@ def _list_pending_sends_store() -> list:
 
 
 def _execute_approved_send(path: Path, entry: dict) -> None:
-    """Run an approved send and record its terminal status (background thread).
+    """Run an approved send and record its outcome (background thread).
 
     The send happens off the HTTP request that approved it (issue #116): a slow
     send must not hold the approval response open past the web-gateway's proxy
     timeout.
+
+    What the send produced — the channel's message id, the send time, and the
+    ledger media references for any images — is written onto the entry beside
+    the status. The status alone used to be all that survived, so an approved
+    send's identity was simply lost; the chat surface needs it, because a chat
+    send is now queued and approved rather than skipping the queue, and it
+    reads the outcome back from here (GET /pending-sends/<id>).
     """
     request_id = entry["id"]
     try:
-        _push(
+        result = _push(
             entry["recipient"],
             entry.get("message", ""),
             lang=entry.get("lang"),
@@ -1942,13 +1961,25 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
             voice=bool(entry.get("voice", True)),
             author=entry.get("author") or "agent",
         )
-        entry["status"] = "approved"
-        entry.pop("error", None)
-        print(f"[signal-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     except Exception as exc:
         print(f"[signal-gateway] pending send {request_id} execution failed: {exc}", flush=True)
         entry["status"] = "error"
         entry["error"] = str(exc)
+    else:
+        # It returned without raising, so the message went out: the status is
+        # "approved" whatever the identity turns out to be. An unreadable
+        # result costs the id, never the truth about delivery — reporting a
+        # sent message as failed would be the worse error of the two.
+        entry["status"] = "approved"
+        try:
+            message_id, sent_at, media_refs = result
+        except (TypeError, ValueError):
+            message_id, sent_at, media_refs = None, None, []
+        entry["message_id"] = message_id
+        entry["sent_at"] = sent_at
+        entry["attachments"] = list(media_refs or [])
+        entry.pop("error", None)
+        print(f"[signal-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     try:
         path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
     except OSError as exc:
@@ -2365,10 +2396,11 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
 
         # Check outbound send policy (keyed by this gateway's sending account).
-        # A user-authored send is direct regardless of category — see
-        # _send_is_direct for why the dashboard's send press IS the approval.
+        # Every caller is subject to it, the dashboard included: `author`
+        # decides nothing, and there is no bypass flag. A queued send is
+        # released through /pending-sends/<id>/approve.
         category = _outbound_policy_category()
-        if not _send_is_direct(category, user_approved, author):
+        if not _send_is_direct(category, user_approved):
             request_id = _new_pending_send(recipient, message, lang, images, voice,
                                            category, author=author)
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
@@ -2396,13 +2428,11 @@ class _PushHandler(BaseHTTPRequestHandler):
             print(f"[signal-gateway] push failed: {exc}\n{traceback.format_exc()}", flush=True)
             self._reply(502, {"error": f"send failed: {exc}"})
             return
-        if author == "user":
-            print(f"[signal-gateway] user-authored send to {recipient} "
-                  f"(direct under category {category} — the dashboard send press is the approval)",
-                  flush=True)
-        else:
-            print(f"[signal-gateway] push sent to {recipient}"
-                  + (f" ({len(images)} image(s))" if images else ""), flush=True)
+        # One line for every send that reached this point — i.e. one the
+        # account's policy allows directly. Authorship is provenance, so it is
+        # reported rather than branched on.
+        print(f"[signal-gateway] sent to {recipient} (author={author})"
+              + (f" ({len(images)} image(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
         # Surface the recorded ledger identity — id, timestamp and the stored
         # media references — so the caller (the dashboard's chat view) can show

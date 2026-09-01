@@ -122,12 +122,29 @@ docstring). Pieces:
   contract below), a live composer (send, shared draft, one-tap clear ✕,
   dictation, image attach with client-side downscale), quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
-  splitter on a wide screen. The open chat polls on the conversations cadence,
+  splitter on a wide screen. The composer row is the conversation composer's
+  row: mic on the left, send on the right, both always there, and the paperclip
+  inside the text field (whose chooser is also the camera on a phone) — one
+  layout across both surfaces, and one place to reach for each affordance.
+  Keeping only two round controls is what buys the field its width, since each
+  one costs 46px of a phone's; the chat field additionally carries the clear ✕,
+  beside the clip and only while there is something to clear. A clear is
+  **undoable**: the ✕'s slot becomes an undo that restores the draft through
+  `POST /chats/<id>/draft/undo` — verbatim, its "drafted by Ara" marker
+  included — and lapses after 12s or as soon as the user has moved on (typing,
+  dictating, sending, or Ara staging a new draft). One tap emptying the box is
+  only safe if the tap can be taken back, and a staged draft is not something
+  the user can retype.
+  Back goes back where the chat was opened from within the
+  app, and to the chats list for a chat opened cold (a notification, a
+  bookmark). The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the
   `companion` field below): her turns render in the conversation thread's
-  visual language, `pending` shows as her writing, and a chip is that same
+  visual language — including its `model_name` / `cost_usd` meta, so which
+  model answered and what that turn cost are as visible here as on the
+  conversations card — `pending` shows as her writing, and a chip is that same
   turn with a canned prompt. The two rails meet in the shared draft — Ara
   stages a reply, the chat poll adopts it into an empty composer marked as
   hers, and the send press stays the user's.
@@ -187,10 +204,16 @@ The API, as the components consume it:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
 - `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
-  gateway as the user (direct under every policy category: the authenticated
-  send press IS the approval `verify` exists for) and returns the sent
-  `Message`; the page shows an optimistic bubble and reconciles it with the
-  response, and a failed send puts the words back into the composer.
+  gateway and returns the sent `Message`. It does not skip the account's send
+  policy: under `allow` the gateway sends outright, and otherwise the send is
+  **queued and then released** through that gateway's own approve endpoint in
+  the same request — the press IS the approval `verify` exists for, but it is
+  spent on the mechanism rather than around it, so the send is recorded in the
+  pending store with its approval. (What that does and does not prevent is in
+  `_chat_send_via_gateway`: an agent calling `/send` gets a queued message; an
+  agent that also calls approve has simulated the press, which nothing inside a
+  shared container can stop.) The page shows an optimistic bubble and reconciles
+  it with the response, and a failed send puts the words back into the composer.
   `images` is `[{content_type, data(base64)}]`, at most 5, each at most
   ~8 MB decoded (400 on violations); `text` may be absent when images are
   sent. The returned `Message` (and later polls) carries the sent
@@ -199,12 +222,46 @@ The API, as the components consume it:
   the native clients do; animated GIFs pass through unchanged under the size
   cap. A failed image send keeps the staged previews (and the text) in the
   composer for retry.
+
+  **The send honours the account's send policy rather than skipping it.** The
+  message goes to the gateway as author `user` — provenance, nothing more —
+  and carries no field that asks it to bypass anything. Under `allow` it goes
+  out on that hop; under `verify` (or `trust`) the gateway queues it as a
+  pending send and the web-gateway releases it through the gateway's own
+  `/pending-sends/<id>/approve` in the same request, so the press still
+  completes in one action while the send is recorded in the pending store with
+  its approval. This is what makes an accidental send impossible: an agent that
+  POSTs a gateway's `/send` gets a queued message somebody still has to
+  release, whatever it writes in the body. `author: "user"` used to bypass the
+  policy outright, which is how a message once went out that nobody pressed
+  send on.
+
+  As a second, lesser layer, this endpoint (and the `/sends` approve action)
+  also refuses a request that did not arrive through the reverse proxy — the
+  TCP peer address decides, since the edge auth is a forward-auth Traefik
+  consults and so never sees an in-container caller. Refusals answer 403 naming
+  the reason and are logged loudly. Pin the proxy's peers with
+  `EDGE_PROXY_PEERS` (addresses or CIDRs); a deployment whose proxy arrives on
+  loopback must set it. Neither layer is a boundary against a determined agent:
+  the web-gateway shares a container with the agents and they hold the
+  gateways' tokens, so an agent can make the approve call itself — a deliberate
+  simulation of the button press, not an accident. An agent proposes a message
+  by staging the shared draft; the user's press is what sends.
 - `POST /chats/<id>/draft` `{text, version}` — the shared draft, saved
   ~1 s after the user stops typing and on blur; dictation participates in the
   same debounced save, and the ✕ posts empty text. Writes are
   version-guarded: a stale version answers 409 with the current state, which
   the page adopts (with a "draft updated elsewhere" note when the words
   actually differ) rather than clobbering.
+- `POST /chats/<id>/draft/undo` (no body) — restores the draft the ✕ last
+  cleared, with its original `author`/`agent`, and answers the new
+  `{id, draft, version}`. 409 with the current state when there is nothing to
+  put back: nothing was cleared, a draft has been written since, or the stash
+  has aged out. Server-side on purpose — the draft endpoint stamps every write
+  `user`, so a client resubmitting the text would quietly reattribute Ara's
+  words to the user about to send them in their own name — and one guarded
+  step, so it cannot race the clear that produced it whichever order the two
+  requests arrive in.
 - `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
 - `POST /chats/<id>/companion` — `{id}`, the chat's companion conversation.
   Idempotent: it creates the thread on the first call and returns the same id

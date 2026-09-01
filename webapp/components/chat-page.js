@@ -30,9 +30,9 @@
 // never shift the thread) and open full screen in a lightbox; audio renders
 // as a player above the transcript text (voice notes), video as an inline
 // player under the same box-reserve rules. The composer stages images too:
-// picked (or, on capable devices, camera-captured) photos are downscaled
-// client-side, previewed above the input row, and sent as the `images` part
-// of POST /chats/<id>/send.
+// picked photos (the phone's own chooser offers the camera among the sources)
+// are downscaled client-side, previewed above the input row, and sent as the
+// `images` part of POST /chats/<id>/send.
 //
 // The companion pane is the chat's own conversation with Ara: an ordinary
 // dashboard conversation (kind `companion`), named by `companion` on the chat
@@ -60,6 +60,8 @@ import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from 
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
 
 const LIST_URL = '/chats';
+// Where the back control lands a visitor who has no app history behind them.
+const CHATS_URL = '/chats.html';
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
 const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
@@ -84,6 +86,12 @@ const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 // to IMAGE_MAX_EDGE, re-encoded as JPEG at IMAGE_JPEG_QUALITY.
 const IMAGE_MAX_EDGE = 1600;
 const IMAGE_JPEG_QUALITY = 0.85;
+
+// How long a cleared draft stays recoverable. Long enough to notice the box is
+// empty and reach for the undo, short enough that the control is not still
+// sitting there when the user comes back to a chat they left minutes ago —
+// where it would offer to restore text they have long since abandoned.
+const UNDO_CLEAR_MS = 12000;
 
 // Quick patterns: canned companion prompts over the current draft/thread.
 // A chip is nothing but a pre-filled companion turn (see the design doc) —
@@ -165,11 +173,16 @@ class RetinueChatPage extends HTMLElement {
     this._pane = 'chat';       // chat | companion (phone pane indicator)
     this._draft = '';          // chat composer text
     this._draftByAra = false;  // composer holds the staged agent draft
+    this._unconfirmed = [];    // sends the gateway never confirmed; see _sendChat
+    this._undoing = false;     // a clear is being restored; hold draft saves
+    this._undo = null;         // {text, byAra} a cleared draft, still recoverable
+    this._undoTimer = null;
     this._compDraft = '';      // companion composer text
     this._localSeq = 0;        // ids for optimistic (not yet confirmed) bubbles
     this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
     this._imgError = '';       // staged-image error line (limit hit, unreadable file)
     this._lightbox = null;     // {url, alt} while the image overlay is open
+    this._lbClosing = false;   // its history entry is being unwound
     this._lbKeydown = null;    // window keydown handler while the lightbox is open
     this._lbPrevFocus = null;  // element to restore focus to on lightbox close
     this._onPop = null;
@@ -209,6 +222,13 @@ class RetinueChatPage extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = new URLSearchParams(location.search).get('id') || '';
+    // Where "back" leads. A same-origin referrer means the chat was opened
+    // from inside the app (the dashboard card, the chats list, another chat),
+    // so there is an entry to return to and the user expects the place they
+    // came from — not a list they then have to scroll to escape. Opened cold
+    // (a push notification, a bookmark, the home-screen icon) there is no such
+    // entry, and the chats list is the honest landing place.
+    this._fromApp = this._openedFromApp();
     // Pane arrangement differs across the breakpoint; re-render on a flip
     // (drafts survive — they live in fields, mirrored on every input event).
     this._onFrame = () => this.render();
@@ -354,6 +374,10 @@ class RetinueChatPage extends HTMLElement {
       for (const m of msgs) {
         if (!m || this._seen.has(m.id)) continue;
         this._seen.add(m.id);
+        if (this._reconcileUnconfirmed(m)) {
+          if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
+          continue;
+        }
         this._messages.push(m);
         this._appendChatMessage(m, stick);
         if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
@@ -369,12 +393,56 @@ class RetinueChatPage extends HTMLElement {
         this._draftSaved = d.text;
         this._draft = d.text;
         this._draftByAra = d.author === 'agent';
+        // A draft arriving is a better offer than the one the user just threw
+        // away; restoring the old text over it would be the wrong undo.
+        this._setUndo(null);
         this._refreshChatComposer();
       }
     } catch (_err) {
       // Offline or store blip: keep the last rendered state; the next poll
       // reconciles.
     }
+  }
+
+  // One arriving message against the sends whose identity we never learned.
+  //
+  // A send the gateway did not confirm in time came back without a message id
+  // and with a timestamp of the server's own making, so nothing about it will
+  // match the record the channel eventually writes. Left alone, the poll would
+  // append that record beside the bubble already on screen and the user would
+  // see their own message twice — for as long as the page stayed open, since
+  // the client's dedup is by id and both ids are real to it.
+  //
+  // So an unconfirmed send is reconciled by its words: the first outbound
+  // record carrying the same text, at or after the moment we stopped waiting,
+  // is that send, and it replaces the bubble in place rather than joining it.
+  // Oldest record first, so two identical sends resolve to two bubbles in the
+  // order they were made. Returns true when the message was absorbed.
+  _reconcileUnconfirmed(m) {
+    if (!this._unconfirmed.length || !m || m.direction !== 'out') return false;
+    const text = m.text || '';
+    const i = this._unconfirmed.findIndex(
+      (u) => u.text === text && (!u.since || !tsAfter(u.since, m.ts)));
+    if (i < 0) return false;
+    const [pending] = this._unconfirmed.splice(i, 1);
+    const idx = this._messages.findIndex((x) => x && x.id === pending.id);
+    if (idx >= 0) this._messages[idx] = m;
+    // Found by walking rather than by selector: a synthesised id carries the
+    // chat id, so it holds ':', '#' and '+', and building a selector out of it
+    // would need escaping this has no reason to get wrong.
+    const thread = this.shadowRoot.querySelector('[data-chat-thread]');
+    const node = thread && [...thread.querySelectorAll('[data-mid]')]
+      .find((n) => n.getAttribute('data-mid') === pending.id);
+    if (node) {
+      const tpl = document.createElement('template');
+      tpl.innerHTML = this._chatMsgHtml(m);
+      node.replaceWith(tpl.content.firstElementChild);
+    } else if (idx < 0) {
+      // The bubble is gone (a re-render dropped it) and nothing holds the
+      // message: let the caller append it normally rather than losing it.
+      return false;
+    }
+    return true;
   }
 
   // Advance the server-side read watermark, monotonically: the newest ts is
@@ -415,6 +483,10 @@ class RetinueChatPage extends HTMLElement {
   async _saveDraftNow(retried) {
     if (this._draftTimer) clearTimeout(this._draftTimer);
     this._draftTimer = null;
+    // A restore is in flight: the server is about to say what the draft is,
+    // author included. Writing here would race it, and would write the wrong
+    // author besides — this endpoint can only ever stamp "user".
+    if (this._undoing) return;
     const text = this._draft;
     if (text === this._draftSaved) return;
     try {
@@ -489,7 +561,7 @@ class RetinueChatPage extends HTMLElement {
       body = '<div class="center muted">&#8230;</div>';
     } else if (this._state === 'error') {
       body = `<div class="center muted"><p>${esc(this._error)}</p>` +
-        '<p><a class="backlink" href="/chats.html">&#8249; All chats</a></p></div>';
+        `<p><a class="backlink" href="${CHATS_URL}">&#8249; All chats</a></p></div>`;
     } else {
       body = this._headHtml() + this._panesHtml();
     }
@@ -533,7 +605,7 @@ class RetinueChatPage extends HTMLElement {
         ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
         : `${ch} &middot; ${esc(key)}`);
     return `<header class="chat-head">` +
-      `<a class="back" href="/chats.html" aria-label="All chats">&#8249;</a>` +
+      `<a class="back" href="${CHATS_URL}" data-back title="Back" aria-label="Back">&#8249;</a>` +
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
@@ -643,6 +715,28 @@ class RetinueChatPage extends HTMLElement {
     return `<span class="att-file">&#128206; ${esc(a.name || 'Attachment')}</span>`;
   }
 
+  // ── Leaving the chat ───────────────────────────────────────────────────────
+  _openedFromApp() {
+    try {
+      const ref = document.referrer;
+      return !!ref && new URL(ref, location.href).origin === location.origin;
+    } catch (_e) {
+      return false;
+    }
+  }
+
+  // An installed PWA has no browser chrome and no back gesture on every
+  // platform, so this control is the way out of a chat, not a convenience.
+  // The lightbox parks one history entry while it is open and unwinds it on
+  // close, so by the time this runs the top of the stack is the chat's own
+  // entry again and one step back leaves the chat — but a press while the
+  // overlay is still up closes that first, never two views at once.
+  _goBack() {
+    if (this._lightbox) { this._closeLightbox(); return; }
+    if (this._fromApp && history.length > 1) { history.back(); return; }
+    location.href = CHATS_URL;
+  }
+
   // ── Lightbox ───────────────────────────────────────────────────────────────
   // A tapped image opens full screen on a dark scrim at natural fit, over the
   // same proxied URL (it is the original). Closing: tap, Esc, or the platform
@@ -658,9 +752,13 @@ class RetinueChatPage extends HTMLElement {
   }
 
   // User intent to close: unwind our history entry; the popstate handler does
-  // the actual dismissal — the same path the back gesture takes.
+  // the actual dismissal — the same path the back gesture takes. The unwind is
+  // asynchronous, so the in-flight flag keeps a second press (the ✕ then the
+  // header's back, in quick succession) from popping a second entry and
+  // dropping the user out of the chat with it.
   _closeLightbox() {
-    if (!this._lightbox) return;
+    if (!this._lightbox || this._lbClosing) return;
+    this._lbClosing = true;
     history.back();
   }
 
@@ -690,6 +788,7 @@ class RetinueChatPage extends HTMLElement {
 
   _dismissLightbox() {
     this._lightbox = null;
+    this._lbClosing = false;
     if (this._lbKeydown) {
       window.removeEventListener('keydown', this._lbKeydown);
       this._lbKeydown = null;
@@ -737,21 +836,20 @@ class RetinueChatPage extends HTMLElement {
     return `<div class="img-previews" data-previews>${items}</div>`;
   }
 
-  // The paperclip mirrors the conversations composer's affordance (a label
-  // over a hidden file input) as a row button — images only, since that is
-  // what the send endpoint carries. Where the file input supports capture
-  // (phones), a camera button beside it opens the camera directly, as the
-  // native clients offer.
-  _attachBtnsHtml() {
-    const clip = `<label class="attach-btn" title="Attach images" aria-label="Attach images">` +
+  // The paperclip, tucked INSIDE the text field exactly as the conversations
+  // composer tucks its own: a label over a hidden file input, images only since
+  // that is what the send endpoint carries. Inside rather than beside, because
+  // a round control in the row costs the field 46px of a phone's width while
+  // one inside costs only padding — and because the two composers should not
+  // teach two different places to look for the same affordance.
+  //
+  // One control, not two: the phone's file chooser already offers the camera
+  // among its sources, so a separate camera button buys a shortcut at the price
+  // of a whole control's width.
+  _clipHtml() {
+    return `<label class="clip" title="Attach images" aria-label="Attach images">` +
       `<input type="file" hidden multiple accept="image/*" data-attach>` +
       `<span aria-hidden="true">&#128206;</span></label>`;
-    const cam = ('capture' in document.createElement('input'))
-      ? `<label class="attach-btn" title="Take a photo" aria-label="Take a photo">` +
-        `<input type="file" hidden accept="image/*" capture="environment" data-attach>` +
-        `<span aria-hidden="true">&#128247;</span></label>`
-      : '';
-    return clip + cam;
   }
 
   // One composer's input row — or, while this target records or transcribes,
@@ -768,11 +866,13 @@ class RetinueChatPage extends HTMLElement {
         : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
       return statusRowHtml(label);
     }
-    const value = target === 'chat' ? this._draft : this._compDraft;
+    const isChat = target === 'chat';
+    const value = isChat ? this._draft : this._compDraft;
     const micBtn = canRecord()
       ? `<button type="button" class="mic" data-mic="${target}" ` +
         `title="Record a voice message" aria-label="Record a voice message">&#127908;</button>`
       : '';
+    const sendBtn = `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button>`;
     // The clear ✕ lives INSIDE the field, docked to its top-right corner: on
     // the send side, as the design asks, but within the field's own boundary,
     // so it reads — and taps — as part of the text box, visually and
@@ -780,18 +880,33 @@ class RetinueChatPage extends HTMLElement {
     // fat finger away from it. As a row button it would cost the empty field
     // width it does not need: it exists only while there is text to clear
     // (.has-text shows it and pads the text out from under it).
+    // The ✕ and its undo share one slot in the field, and CSS picks between
+    // them: the ✕ while there is text, the undo for a short while after a
+    // clear. Both are rendered up front so the swap is a class toggle rather
+    // than a rebuild — a rebuild here would cost the field its focus and the
+    // phone its keyboard.
     const clearBtn = withClear
       ? `<button type="button" class="clear-inline" data-clear ` +
-        `title="Clear message" aria-label="Clear message">&#10005;</button>`
+        `title="Clear message" aria-label="Clear message">&#10005;</button>` +
+        `<button type="button" class="undo-inline" data-undo ` +
+        `title="Undo clear" aria-label="Undo clear">&#8630;</button>`
       : '';
-    const fieldCls = `field${withClear ? ' has-clear' : ''}${value ? ' has-text' : ''}`;
-    const attachBtns = target === 'chat' ? this._attachBtnsHtml() : '';
-    return `<form class="row" data-composer="${target}">` + micBtn + attachBtns +
-      `<div class="${fieldCls}" data-field>` +
+    // Both composers are the dashboard conversation composer's row: mic on the
+    // left, send on the right, and what belongs inside the field lives inside
+    // it. Keeping the two round controls in their fixed places is the point —
+    // the mic is where the mic always is, whatever the field holds, so
+    // dictating into an existing draft is just pressing it. The chat field
+    // additionally carries the clear ✕ and the paperclip; the companion's
+    // carries neither (it is Ara's own thread, and it never fights for width).
+    const inField = isChat ? clearBtn + this._clipHtml() : clearBtn;
+    const fieldCls = `field${withClear ? ' has-clear' : ''}` +
+      `${isChat ? ' has-clip' : ''}${value ? ' has-text' : ''}` +
+      `${this._undo ? ' has-undo' : ''}`;
+    const field = `<div class="${fieldCls}" data-field>` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" ` +
-      `autocomplete="off">${esc(value)}</textarea>` + clearBtn +
-      `</div>` +
-      `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button></form>`;
+      `autocomplete="off">${esc(value)}</textarea>` + inField + `</div>`;
+    return `<form class="row" data-composer="${target}">` +
+      micBtn + field + sendBtn + `</form>`;
   }
 
   // Companion messages reuse the conversation thread's visual language (same
@@ -814,9 +929,43 @@ class RetinueChatPage extends HTMLElement {
     const who = me ? 'You' : (m.agent || (m.role === 'agent' ? 'Retinue' : 'Ara'));
     return `<div class="cmsg${me ? ' me' : ''}">` +
       `<div class="cmsg-head"><small class="who">${esc(who)}</small>` +
-      `<small class="cmeta">${esc(fmtTime(m.ts))}</small></div>` +
+      this._compMetaHtml(m) + `</div>` +
       `<div class="cbubble">${renderMarkdown(m.text)}` +
       this._compAttachHtml(m) + `</div></div>`;
+  }
+
+  // The header meta after the sender name. The companion thread is an ordinary
+  // dashboard conversation, so its answers carry the same two byproducts the
+  // conversations card already shows — which model answered, and that turn's
+  // list-price cost — and a pane that hides them makes the model choice in this
+  // very page unverifiable. Same vocabulary and same order as
+  // conversations.js's _metaHtml (model · ~$cost · time); the time stays this
+  // pane's clock time rather than that card's relative age, because the mirror
+  // beside it is stamped in clock time and the two are read together. Each
+  // piece is optional: a user turn has no model, and messages predating the
+  // metadata simply omit what they lack.
+  _compMetaHtml(m) {
+    const bits = [];
+    if (m.model_name) bits.push(`<span class="m-model">${esc(m.model_name)}</span>`);
+    if (typeof m.cost_usd === 'number' && isFinite(m.cost_usd)) {
+      bits.push(`<span class="m-cost" title="Approximate list-price cost — not the subscription bill">` +
+        `~$${this._fmtCost(m.cost_usd)}</span>`);
+    }
+    const t = fmtTime(m.ts);
+    if (t) bits.push(`<time datetime="${esc(m.ts || '')}">${esc(t)}</time>`);
+    if (!bits.length) return '';
+    return `<small class="cmeta">${bits.join('<span class="m-sep">·</span>')}</small>`;
+  }
+
+  // Cost with enough precision to stay meaningful for cheap turns: sub-cent
+  // values get more decimals so they don't collapse to "~$0.00". Mirrors
+  // conversations.js so the same turn reads identically in both surfaces.
+  _fmtCost(v) {
+    const c = Math.abs(v);
+    if (c === 0) return '0';
+    if (c < 0.01) return c.toFixed(4);
+    if (c < 1) return c.toFixed(3);
+    return c.toFixed(2);
   }
 
   // A companion message can carry files like any conversation message; they
@@ -859,6 +1008,17 @@ class RetinueChatPage extends HTMLElement {
   // ── Wiring ─────────────────────────────────────────────────────────────────
   _wire() {
     const root = this.shadowRoot;
+    // Back: a real link (its href is the fallback destination, and it still
+    // opens the chats list in a new tab on a modified click) whose plain press
+    // honours where the user actually came from — see _goBack.
+    const back = root.querySelector('[data-back]');
+    if (back) {
+      back.addEventListener('click', (e) => {
+        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
+        e.preventDefault();
+        this._goBack();
+      });
+    }
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
     // the indicator honest whichever way the pane was reached (tab or swipe).
     root.querySelectorAll('[data-pane-tab]').forEach((el) =>
@@ -1027,6 +1187,9 @@ class RetinueChatPage extends HTMLElement {
         this._compDraft = input.value;
       }
       field.classList.toggle('has-text', !!input.value);
+      // Anything typed (or dictated in) means the user has moved on; the offer
+      // does not come back if they then delete it again.
+      if (isChat && this._undo) this._setUndo(null);
       grow();
     });
     if (isChat) {
@@ -1044,7 +1207,10 @@ class RetinueChatPage extends HTMLElement {
       clearBtn.addEventListener('click', () => {
         // One tap to an empty box — the deliberate divergence from the real
         // clients. It also dismisses the staged-draft marker (the draft is
-        // rejected, not sent) and clears the server-side draft with it.
+        // rejected, not sent) and clears the server-side draft with it. All of
+        // which is why the tap is offered back: see _setUndo.
+        const prev = input.value;
+        const wasAra = this._draftByAra;
         input.value = '';
         this._draft = '';
         this._setDraftByAra(false);
@@ -1052,10 +1218,23 @@ class RetinueChatPage extends HTMLElement {
         grow();
         input.focus();
         this._saveDraft();
+        // Offered only for something the server actually held: it stores a
+        // draft stripped, so whitespace alone was never a draft and there
+        // would be nothing to put back — an undo that could only ever fail.
+        this._setUndo(prev.trim() ? { text: prev, byAra: wasAra } : null);
       });
     }
+    const undoBtn = form.querySelector('[data-undo]');
+    if (undoBtn) undoBtn.addEventListener('click', () => this._undoClear());
     const mic = form.querySelector('[data-mic]');
-    if (mic) mic.addEventListener('click', () => this._startRecording(target));
+    if (mic) {
+      mic.addEventListener('click', () => {
+        // The recording row replaces this one and the transcript lands in the
+        // field, so the offer is spent either way.
+        if (isChat) this._setUndo(null);
+        this._startRecording(target);
+      });
+    }
     form.addEventListener('submit', (e) => {
       e.preventDefault();
       const text = input.value;
@@ -1065,6 +1244,10 @@ class RetinueChatPage extends HTMLElement {
       if (isChat) {
         this._draft = '';
         this._setDraftByAra(false);
+        // Sending is moving on: an offer left over from an earlier clear must
+        // not put that text back into a composer the user has just emptied on
+        // purpose.
+        this._setUndo(null);
       } else {
         this._compDraft = '';
       }
@@ -1234,6 +1417,109 @@ class RetinueChatPage extends HTMLElement {
       el.classList.toggle('on', on);
       el.setAttribute('aria-selected', on ? 'true' : 'false');
     });
+  }
+
+  // ── Undoing a clear ────────────────────────────────────────────────────────
+  // The ✕ empties the box in one tap, which is what makes it useful and also
+  // what makes a mis-tap expensive: the text is gone from the field AND from
+  // the server-side draft, and a draft Ara staged is not something the user
+  // can retype. So a clear is offered back for a short while — as an undo in
+  // the ✕'s own slot, costing no width, and gone again the moment it stops
+  // being what the user wants.
+  //
+  // It ends on whichever comes first: the timeout, or anything that means the
+  // user has moved on — typing, dictating, sending, or Ara staging a new
+  // draft over it. Only a non-empty clear offers one; clearing an already
+  // empty box has nothing to give back.
+  _setUndo(entry) {
+    if (this._undoTimer) clearTimeout(this._undoTimer);
+    this._undoTimer = null;
+    this._undo = entry || null;
+    if (this._undo) {
+      this._undoTimer = setTimeout(() => this._setUndo(null), UNDO_CLEAR_MS);
+    }
+    const field = this.shadowRoot.querySelector('[data-composer="chat"] [data-field]');
+    if (field) field.classList.toggle('has-undo', !!this._undo);
+  }
+
+  // Put the cleared draft back — the SERVER's copy of it, not a rewrite of the
+  // text from here. Two things follow from that, and both are the reason the
+  // endpoint exists.
+  //
+  // The draft comes back with the author it had, so one Ara staged is still
+  // marked as hers. Rewriting it from the client could only save it as the
+  // user's own (the draft endpoint stamps author "user", as it must), and that
+  // marker is what tells the user whose words they are about to send in their
+  // name — precisely the thing worth not losing when the ✕ was a mis-tap.
+  //
+  // And it cannot lose a race with the clear's own save. The clear's write may
+  // still be in flight; awaiting it first means the restore is applied to
+  // settled state, and the restore is one guarded server-side step rather than
+  // a second write that the in-flight one could overtake or the equality guard
+  // swallow.
+  //
+  // The composer is refreshed rather than written directly because the "Draft
+  // by Ara" marker is part of that block.
+  async _undoClear() {
+    const entry = this._undo;
+    if (!entry) return;
+    this._setUndo(null);
+    // Held for the round trip. Any draft save landing in between would write
+    // these words back as the USER's — the blur that replacing a focused
+    // textarea fires, or the user simply tapping away — and that would both
+    // lose the author and consume the server's stash before the restore asks
+    // for it.
+    this._undoing = true;
+    // Optimistic, but written into the existing field rather than through a
+    // composer rebuild: rebuilding blurs the focused textarea, and that blur
+    // is itself one of the saves being guarded against. The "Draft by Ara"
+    // marker arrives with the refresh below, one round trip later.
+    this._draft = entry.text;
+    const input = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+    if (input) {
+      input.value = entry.text;
+      const field = input.closest('[data-field]');
+      if (field) field.classList.add('has-text');
+    }
+    this._focusComposerEnd();
+    if (this._draftInflight) {
+      try { await this._draftInflight; } catch (_e) { /* its failure is its own */ }
+    }
+    try {
+      const res = await fetch(
+        `/chats/${encodeURIComponent(this._id)}/draft/undo`, { method: 'POST' });
+      const data = await res.json();
+      // Settle on what the server actually holds, whether it restored or
+      // refused — a refusal means something else has since claimed the draft,
+      // and showing our optimistic copy over it would be the stale view.
+      const draft = (data && data.draft) || null;
+      this._draftVersion = (data && data.version) || this._draftVersion;
+      this._draft = (draft && draft.text) || '';
+      this._draftSaved = this._draft;
+      this._draftByAra = !!(draft && draft.author === 'agent');
+      this._refreshChatComposer();
+      if (this._draft) this._focusComposerEnd();
+      if (!res.ok) this._showNote('That draft could not be restored.');
+    } catch (_err) {
+      // Offline: the words are on screen and the next edit saves them as the
+      // user's own, which is the honest outcome when the restore never landed.
+      this._draftSaved = '';
+      this._undoing = false;
+      this._scheduleDraftSave();
+      return;
+    } finally {
+      this._undoing = false;
+    }
+  }
+
+  _focusComposerEnd() {
+    const input = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
+    if (!input) return;
+    try {
+      input.focus();
+      // Caret at the end, where the user left off, not at the start.
+      input.setSelectionRange(input.value.length, input.value.length);
+    } catch (_e) { /* a browser that dislikes selection on a hidden field */ }
   }
 
   _setDraftByAra(on) {
@@ -1426,7 +1712,17 @@ class RetinueChatPage extends HTMLElement {
       // the poll's de-dup knows the message.
       const idx = this._messages.indexOf(local);
       if (idx >= 0) this._messages[idx] = msg;
-      this._seen.add(msg.id);
+      // An unconfirmed send has no identity to remember: its id is synthesised
+      // from a timestamp of ours, so registering it as seen would not stop the
+      // real record — which carries the channel's own id and instant — from
+      // being appended as a second copy of the user's own message. It is
+      // reconciled by its words instead, in _reconcileUnconfirmed.
+      if (msg.unconfirmed) {
+        this._unconfirmed.push({ id: msg.id, text: msg.text || '',
+                                 since: msg.since || '' });
+      } else {
+        this._seen.add(msg.id);
+      }
       const cur = findLocal();
       if (cur) {
         const tpl = document.createElement('template');
@@ -1800,15 +2096,15 @@ const CSS = `
                background: rgba(110, 168, 254, .12); color: var(--accent, #6ea8fe);
                font-size: .74rem; font-weight: 600; }
   .row { display: flex; gap: 6px; align-items: flex-end; }
-  /* Image attach controls: the paperclip (and, on capture-capable devices,
-     the camera) — labels over hidden file inputs, in the mic button's round
-     dress so the row reads as one family. */
-  .attach-btn { display: inline-flex; align-items: center; justify-content: center;
-                width: 40px; height: 40px; flex: none; border-radius: 50%;
-                background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
-                font-size: 1.05rem; cursor: pointer; user-select: none;
-                -webkit-tap-highlight-color: transparent; }
-  .attach-btn:hover { background: rgba(110, 168, 254, .2); }
+  /* The attach control, inside the field and dressed exactly as the
+     conversations composer's clip — same size, same corner, same hover. Two
+     composers, one place to reach for a paperclip. */
+  .clip { position: absolute; right: 3px; bottom: 3px; display: inline-flex;
+          align-items: center; justify-content: center; height: 34px; width: 34px;
+          border-radius: 50%; background: transparent; color: var(--muted, #8b93a3);
+          cursor: pointer; font-size: 1rem; user-select: none;
+          -webkit-tap-highlight-color: transparent; }
+  .clip:hover { background: rgba(110, 168, 254, .2); }
   /* Staged images: removable thumbnails riding above the input row. */
   .img-previews { display: flex; flex-wrap: wrap; gap: 8px; margin: 2px 0 10px; }
   .imgp { position: relative; }
@@ -1838,22 +2134,60 @@ const CSS = `
   /* The inline clear: docked in the field's top-right corner, shown only
      while there is text (see _composerRowHtml for the placement rationale);
      the .has-text padding keeps text from wrapping under it. */
-  .clear-inline { position: absolute; top: 5px; right: 5px; width: 30px; height: 30px;
+  /* The clear ✕ sits at the field's bottom-right too, immediately left of the
+     clip — both anchored to the same edge and the same baseline, so a one-line
+     field cannot stack them on top of each other. It is only there while there
+     is something to clear, and the textarea's right padding tracks whichever
+     of the two is actually present. */
+  .clear-inline { position: absolute; bottom: 5px; right: 5px; width: 30px; height: 30px;
                   display: inline-flex; align-items: center; justify-content: center;
                   border: 0; border-radius: 50%; padding: 0; cursor: pointer;
                   background: transparent; color: var(--muted, #8b93a3); font-size: .9rem;
                   -webkit-tap-highlight-color: transparent; }
+  /* Beside the clip, not above it: both are anchored to the field's bottom
+     edge, so stacking them would put one on top of the other in a one-line
+     field. The ✕ takes the inner position — it acts on the text, so it sits
+     nearer to it. */
+  .field.has-clip .clear-inline { right: 39px; }
   .clear-inline:hover { color: var(--high, #ff6b6b); background: rgba(255, 107, 107, .14); }
+  /* The undo occupies the ✕'s slot, in the accent colour — it offers something
+     back rather than taking it away, and it should read as the one thing worth
+     tapping in an unexpectedly empty box. */
+  .undo-inline { position: absolute; bottom: 5px; right: 5px; width: 30px; height: 30px;
+                 display: inline-flex; align-items: center; justify-content: center;
+                 border: 0; border-radius: 50%; padding: 0; cursor: pointer;
+                 background: transparent; color: var(--accent, #6ea8fe); font-size: 1rem;
+                 -webkit-tap-highlight-color: transparent; }
+  .field.has-clip .undo-inline { right: 39px; }
+  .undo-inline:hover { background: rgba(110, 168, 254, .2); }
+  /* One slot, two controls: the ✕ while there is text to clear, the undo while
+     a clear is still recoverable and the box is empty. Text always wins — once
+     the user is writing again there is nothing to undo. */
   .field:not(.has-text) .clear-inline { display: none; }
+  .field:not(.has-undo) .undo-inline,
+  .field.has-text .undo-inline { display: none; }
+  /* Right padding tracks what is actually shown, so an empty field is not
+     holding room for a control that is not there. */
+  .field.has-clip textarea { padding-right: 42px; }
   .field.has-clear.has-text textarea { padding-right: 44px; }
+  .field.has-clip.has-clear.has-text textarea,
+  .field.has-clip.has-undo:not(.has-text) textarea { padding-right: 74px; }
   .attach-err { color: var(--high, #ff6b6b); font-size: .76rem; margin-bottom: 8px; }
 
   /* ── Companion pane (the conversation thread's visual language) ──────────── */
   .cmsg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; align-self: flex-start; }
   .cmsg.me { align-self: flex-end; align-items: flex-end; }
-  .cmsg-head { display: flex; align-items: center; gap: 6px; }
+  .cmsg-head { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
   .cmsg.me .cmsg-head { flex-direction: row-reverse; }
-  .cmeta { color: var(--muted, #8b93a3); font-size: .7rem; }
+  /* model · ~$cost · time, one muted line — the conversations card's meta in a
+     narrower pane, so it is allowed to wrap rather than push the head wider
+     than the bubble. */
+  .cmeta { color: var(--muted, #8b93a3); font-size: .7rem;
+           display: inline-flex; align-items: baseline; gap: 5px; flex-wrap: wrap;
+           min-width: 0; }
+  .cmeta .m-sep { opacity: .5; }
+  .cmeta .m-cost { font-variant-numeric: tabular-nums; }
+  .cmeta .m-model { font-weight: 600; }
   .cbubble { background: var(--card-2, #1c2230); border-radius: 16px;
              border-bottom-left-radius: 6px; padding: 9px 13px; line-height: 1.4; }
   .cmsg.me .cbubble { background: var(--accent, #6ea8fe); color: #0b0d12;
