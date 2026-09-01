@@ -243,8 +243,11 @@ without touching the gate.
 
 **What Ara does on push-triggered triage:**
 
-1. **Runs Phases 2–4** on this one message: classify, link to a project, open a
-   dashboard conversation quoting the original and proposing a draft reply. The
+1. **Runs Phases 2–4** on this one message, in that order: classify, resolve
+   the sender, link it to a project (Phase 3), then gather what the reply
+   depends on — the project's state included, which is why the link comes
+   first — dispatch the `secretary` for the decision, and open the dashboard
+   conversation that carries it. The
    conversation is the user's push notification. **Hand the reply token over**:
    the prompt's reply command (with its token) goes into the thread as
    `--context`, verbatim — the session that later executes the approved reply
@@ -253,17 +256,23 @@ without touching the gate.
    appears in the visible proposal text:
 
        python3 /workspace/scripts/conversation-push.py \
-         --title "Signal from +41791234567" \
+         --title "Signal from <resolved name>" \
          --context 'Reply via: python3 /workspace/scripts/signal-push.py --reply-to v1.eyJyIjoi….3q2- "<text>"' \
-         "<quoted original>\n\n<draft reply>\n\n<send / adjust / discard chips>"
+         "<quoted original>\n\n<the secretary's reply, or the question and its chips>"
 
-2. **Does not touch the delivered flag.** The gateway already wrote
+2. **Resolves the sender to a name first** — the **messaging-contact-lookup**
+   skill, before the thread is opened. A bare handle in the title makes the
+   user do the identification the system was supposed to do, and the secretary
+   cannot pitch a register without knowing who is writing. When lookup finds
+   nothing, say so in the thread ("unknown number") rather than showing the
+   handle alone as if it were an identity.
+3. **Does not touch the delivered flag.** The gateway already wrote
    `delivered: true` when it forwarded the message live, so the daily drain will
    not re-surface it. Messenger bookkeeping lives in the ledger, not a status
    file.
-3. **Does not reply to the sender.** The source channel is the user's own inbox;
+4. **Does not reply to the sender.** The source channel is the user's own inbox;
    any response goes out later, through the user's chosen channel, once they
-   approve a draft on the dashboard.
+   have approved a reply — or chosen the answer — on the dashboard.
 
 ---
 
@@ -273,6 +282,13 @@ Resolve the **sender** to a contact note, read the content, assign **one
 disposition**: `archive` (keep, no action) · `delete` (drop, no action) ·
 `reply` (needs a response) · `action` (needs something done — calendar, task,
 forward).
+
+This first cut is yours and it is final for `archive` and `delete`: bulk mail
+that needs no answer goes straight to the omnibus, and dispatching a subagent
+per newsletter would spend turns where they earn nothing. For `reply` and
+`action` the cut only decides that the item deserves a proposal — the
+`secretary` confirms or corrects the disposition as part of the decision it
+returns in Phase 4a, and its verdict wins.
 
 ### `archive` vs `delete` — is there an honest reason to keep it?
 
@@ -363,21 +379,64 @@ Committing link updates is routine operational output — commit and push direct
 ### 4a. Individual proposals — every run (not interval-gated)
 
 Each `reply` / `action` item, any channel, becomes its **own dashboard
-conversation** on the run that first sees it — a draft reply or the specific
-action. Messaging is more urgent → propose promptly (or on push). Then write
-status `proposed` with the returned conversation id.
+conversation** on the run that first sees it. Messaging is more urgent →
+propose promptly (or on push). Then write status `proposed` with the returned
+conversation id.
 
-    python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" "...draft...\n<send / adjust / discard chips>"
+A proposal is built in three steps, in this order. **You do not decide the
+substance and you do not write the words** — steps 1 and 3 are yours, step 2
+belongs to the `secretary` subagent, whose model is the one this system trusts
+with correspondence.
 
-Titles and body above are English placeholders — the text you actually compose
-is in the **recipient's / thread's** language. Apply the Secretary's style
-rules: the persona (`agents/secretary.md`) for the generic mechanics, plus the
-chamber style overrides (`chambers/*/style/secretary.md`) that carry the
-owner's own conventions. Never bundle replies. Compose the conversation text
-per the **dashboard-composing** skill: a `[[chip: …]]` for each proposed
-disposition (send / adjust / discard) and no bare URLs. The
-original is quoted in the thread, so it needs no details chip — those are for
-e-mails referred to but not shown (related earlier mails, omnibus lines).
+**1. Gather what the reply depends on.** Before dispatching, collect the facts
+that could settle the answer, from whatever sources this deployment actually
+has: the sender resolved to a contact (the **messaging-contact-lookup** skill
+for messenger; the contact note for e-mail), the linked project's state,
+`memory.py recall` for the standing preferences and past decisions on this
+person or topic, the life store, and — where the deployment provides one — the
+calendar for any date or slot the message proposes. A source this deployment
+does not have is simply a fact you lack; note it and move on, never guess it.
+
+**2. Dispatch `secretary` for the decision.** Hand over the message, the
+sender as resolved, the channel, the thread so far, and every fact from step 1.
+It returns the disposition plus **either** ready-to-send `REPLY` text (the
+facts settle it) **or** a `DECISION NEEDED` question with `OPTIONS` (the answer
+is the user's to give) — the contract in `.claude/agents/secretary.md`. Its
+`BASIS` line says which facts decided, and names any that were missing.
+
+**3. Open the thread around what came back**, one of three shapes. A `REPLY`
+becomes a proposal with send / adjust / discard chips. A `DECISION NEEDED`
+becomes a question with one chip per returned option — and **no draft at
+all**: the user answers by chip, and the reply is composed on a second
+dispatch once they have. A `NO MESSAGE` owes the sender nothing: propose the
+work it names (the calendar entry, the forward) with its own chips, or — when
+it corrects the disposition to `archive`/`delete` — drop the item into the
+omnibus instead of opening a thread at all. Whichever shape, the original is
+quoted above it, and nothing is sent.
+
+    # facts settled it — propose the reply
+    python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" \
+      "<quoted original>\n\n<the secretary's reply>\n<send / adjust / discard chips>"
+
+    # the user owns the answer — ask, do not draft
+    python3 /workspace/scripts/conversation-push.py --title "<name> asks about <subject>" \
+      "<quoted original>\n\n<the question>\n[[chip: This morning]] [[chip: Friday morning]] [[chip: Neither works]]"
+
+**Never post a draft that defers the substance.** "Thanks for your message,
+let me check and get back to you" is not a reply: it spends a round trip to
+say nothing, and leaves the user the same decision plus a second message to
+approve. If the substance is not settled by the facts, ask — that is what the
+`DECISION NEEDED` branch is for.
+
+Titles and chip labels above are English placeholders — the text that reaches
+the recipient is the secretary's, in the **recipient's / thread's** language,
+and the thread text you write around it follows the user's. You no longer read
+the style files yourself: the persona and the chamber overrides are the
+secretary's layer. Never bundle replies. Compose the conversation text per the
+**dashboard-composing** skill: a `[[chip: …]]` for every option offered and no
+bare URLs. The original is quoted in the thread, so it needs no details chip —
+those are for e-mails referred to but not shown (related earlier mails,
+omnibus lines).
 
 **A messenger item's proposal thread must carry its reply token.** The item
 came with a reply command (`<channel>-push.py --reply-to <token>` — in the
@@ -458,7 +517,27 @@ status file; nudge at most once per interval.
 ## Phase 6 — Execute on approval & inbox-zero
 
 Ara picks up each thread, carries out what was approved, then writes status
-`resolved`:
+`resolved`.
+
+**A chip the user picked is an answer, not a reply.** When the thread asked a
+`DECISION NEEDED` question, their choice is the fact that was missing — feed it
+back to the `secretary` (message, sender, context, and now the user's answer)
+and post the text it returns into the thread as a proposal, with the same
+send / adjust / discard chips. **Only `send` sends.** An answer to a question
+and an adjustment are both instructions about what the reply should say, not
+approval of words the user has not yet seen; the same holds for a proposal the
+user adjusted rather than approved — their instruction goes to the secretary,
+whose text comes back for approval like any other. No session composes the
+outgoing words itself, on any tier, and no text reaches a recipient that the
+user has not seen and approved.
+
+**A `CANNOT COMPOSE:` line is never sendable text.** When the secretary
+returns one — a missing convention, an unreadable style layer — post what is
+missing into the thread so the user can repair it, and leave the item
+non-terminal. Never send that line, and never re-dispatch for the same text
+until the cause is fixed; a second dispatch would only return it again.
+
+Then carry out the disposition:
 
 - **Archive / delete** → apply per channel (e-mail `move`/delete; messaging
   archive), honouring named exceptions.

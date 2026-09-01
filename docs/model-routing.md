@@ -154,6 +154,17 @@ the persona mechanism does today. Workers cannot pause to ask the user
 mid-task; they return "I need a decision on X" and Ara opens a decision thread
 with chips — which is the interaction model the dashboard already uses.
 
+The dispatch is also how a role's model reaches work that is not composing.
+Inbox triage is the Secretary's own job (the skill is titled for her), and its
+weakest step is judgement: deciding whether the gathered facts settle a reply
+or the user must. That decision now goes to the `secretary` subagent, so it
+runs at the Secretary's weight without any model plumbing — no tier variable
+for triage, no reading a model out of an agent definition to re-use elsewhere.
+The dispatching session keeps the mechanical half (drains, contact lookup,
+status files, threads), which is exactly what a router-tier Ara is for, and
+the compose-only boundary stays intact because the subagent never gains the
+tools that send.
+
 As shipped (Secretary only; Academic and Publisher remain personas for now):
 `.claude/agents/secretary.md` defines a compose-only subagent (Read, Glob,
 Grep — deliberately no Bash and no send tooling, so the "what to say" /
