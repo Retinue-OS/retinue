@@ -1109,16 +1109,31 @@ class RetinueChatPage extends HTMLElement {
     const ok = await this._pinModel(this._companionId, model);
     if (ok) {
       this._compModelConfirmed = model;
-    } else {
-      // Fall back locally first — unless the user has since picked again,
-      // whose own pin is queued and will report for itself — then reconcile
-      // with the thread; the reload is a check, not what the rollback rests on.
-      if (this._compModel === model) this._compModel = this._compModelConfirmed;
+    } else if (this._compModel === model) {
+      // Fall back locally first, then reconcile with the thread; the reload
+      // is a check, not what the rollback rests on. A refusal for a choice
+      // the user has since replaced is not reported at all: the newer pin is
+      // queued and reports for itself.
+      this._compModel = this._compModelConfirmed;
       this._syncPicker(true);
       this._showNote("Couldn't switch the model &mdash; the thread keeps the one it had.",
         'companion');
     }
     await this._loadCompanion();
+  }
+
+  // Wait until no pin is queued or in flight, and say how the last one went
+  // (true when there was none). A pin that starts while waiting is waited
+  // for too, and a refusal counts only if nothing newer replaced it — so a
+  // turn behind a refused pin is aborted, while one behind a refused pick
+  // that the user already corrected goes out on the corrected model.
+  async _settledPins() {
+    for (;;) {
+      const gen = this._pinGen;
+      const ok = await this._pinQueue;
+      if (this._pinGen !== gen) continue;
+      return ok;
+    }
   }
 
   // Persist a model choice; resolves true when the gateway stored it, false
@@ -2009,10 +2024,13 @@ class RetinueChatPage extends HTMLElement {
         // not choose: the picker drops back to the default the thread really
         // has, and the caller reports the failure.
         const held = this._compModel;
-        if (held && !(await this._pinModel(id, held))) {
-          if (this._compModel === held) this._compModel = '';
-          this._syncPicker(true);
-          throw new Error('model');
+        if (held) {
+          if (!(await this._pinModel(id, held))) {
+            if (this._compModel === held) this._compModel = '';
+            this._syncPicker(true);
+            throw new Error('model');
+          }
+          this._compModelConfirmed = held;
         }
         return id;
       })().finally(() => { this._compCreate = null; });
@@ -2023,6 +2041,10 @@ class RetinueChatPage extends HTMLElement {
   async _loadCompanion() {
     if (!this._companionId || document.hidden) return;
     try {
+      // Read only once no pin is in flight: a GET that overlaps a pin can
+      // carry the previous model under the newest generation, and would be
+      // adopted as current.
+      await this._settledPins();
       const gen = this._pinGen;
       const res = await fetch(`/conversations/${encodeURIComponent(this._companionId)}`,
         { cache: 'no-store' });
@@ -2112,7 +2134,7 @@ class RetinueChatPage extends HTMLElement {
       // gateway may run it on the model the picker no longer shows — and a
       // pin the gateway refused means this turn does not go out at all
       // (_onModelChange has already put the picker back and said so).
-      if (!(await this._pinQueue)) throw new Error('model');
+      if (!(await this._settledPins())) throw new Error('model');
       const gen = this._pinGen;
       const res = await fetch(`/conversations/${encodeURIComponent(cid)}/messages`, {
         method: 'POST',
