@@ -74,6 +74,22 @@ the e-mail backend and `signal-push.py`. Threads persist under
 volume (`/root/.retinue/conversations`) so threads survive container
 recreation.
 
+**Opening a thread is a side effect, so it takes an idempotency key.** The
+same turn can legitimately run twice — the escalation re-run replays a junior
+turn's prompt on the frontier model (its reply is discarded, but a thread it
+already opened is not), and a messenger gateway can redeliver a message after
+a reconnect — and each run would otherwise raise its own thread for one
+message. A caller that can name what it is reacting to passes that name as
+`--key` (`{key: "..."}` on the endpoint); the first thread opened under a key
+is the only one, and a repeat is answered with that thread
+(`"deduplicated": true`, HTTP 200) having posted nothing. The inbox gateways
+mint one per inbound (`Thread key: <channel>:<message-id>`, carried in the
+triage prompt), so the key is the channel's own message identity rather than
+anything the session invents. Bindings live in `CONVERSATIONS_DIR/.keys`, one
+file per key; a binding whose thread was deleted counts as unbound, so a
+removed thread never swallows the next message about the same item. Keys are
+for *opening* a thread — appending already addresses one by id.
+
 The gateway runs a **presentation lint** over every agent→user message that
 lands in a thread — see `docs/model-routing.md` (phase 4) for the mechanism
 and its configuration.

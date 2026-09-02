@@ -53,7 +53,12 @@ Projects (dashboard project pages):
                                          every later Ara session in the thread,
                                          never rendered to the user (e.g. the
                                          exact reply command, with reply token,
-                                         for a proposed messenger reply).
+                                         for a proposed messenger reply), and
+                                         {key: "..."} — an idempotency key: a
+                                         second create under a key already used
+                                         returns that thread (200, with
+                                         "deduplicated": true) instead of
+                                         opening a duplicate.
   POST /internal/conversations/<id>/messages
                                       -> a retinue agent appends a message (with
                                          attachments) to an existing thread. Same
@@ -2157,6 +2162,51 @@ def _valid_model_id(model: str | None, refresh: bool = False) -> str | None:
     return None
 
 
+# ── Idempotent thread creation ────────────────────────────────────────────────
+# A dashboard thread is a side effect, and the same turn can legitimately run
+# twice. The escalation re-run replays a junior turn's prompt on the frontier
+# model — its reply is discarded, but a thread it already opened is not — and a
+# messenger gateway can redeliver a stanza after a reconnect. Either way the
+# user gets two identical threads for one message. A caller that can name what
+# it is reacting to (an inbound message id) passes that name as `key`: the
+# first thread opened under a key is the only one, and a repeat is handed the
+# same thread back instead of opening another.
+_CONV_KEYS_DIR = CONVERSATIONS_DIR / ".keys"
+_CONV_KEY_MAX = 200
+_conv_keys_lock = threading.Lock()
+
+
+def _conv_key_path(key: str) -> Path:
+    # Hashed, so any channel's id scheme is a safe filename.
+    return _CONV_KEYS_DIR / hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _conv_for_key(key: str) -> str | None:
+    """The live thread already opened under `key`, or None.
+
+    A binding whose thread has since been deleted counts as unbound: a removed
+    thread must not silently swallow the next message about the same item."""
+    try:
+        cid = _conv_key_path(key).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not _CONV_ID_RE.match(cid) or _load_conv(cid) is None:
+        return None
+    return cid
+
+
+def _bind_conv_key(key: str, cid: str) -> None:
+    """Record that `key` opened thread `cid`. Best-effort: a failure here costs
+    idempotency on a later repeat, never the thread the user is waiting for."""
+    try:
+        _CONV_KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _conv_key_path(key).with_suffix(".tmp")
+        tmp.write_text(cid, encoding="utf-8")
+        tmp.replace(_conv_key_path(key))
+    except OSError as exc:  # noqa: BLE001
+        print(f"[web-gateway] could not bind conversation key: {exc}", flush=True)
+
+
 def _conv_model(conv: dict) -> str | None:
     """The validated model a thread should run on, or None for the default."""
     return _valid_model_id(conv.get("model"))
@@ -3768,7 +3818,6 @@ _LINT_SYSTEM_PROMPT = (
 # which merely over-lints, and the lint returns a compliant message
 # unchanged), or a `/path` token (relative URLs like /sends).
 _LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
-
 
 def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     """Enforce the dashboard-composing form on an agent→user message.
@@ -6320,10 +6369,36 @@ class Handler(BaseHTTPRequestHandler):
         # reply, reply token included) — replayed to Ara's sessions in this
         # thread, never rendered to the user.
         context = str(payload.get("context") or "").strip() or None
+        # Idempotency: a repeat of the turn that opened this thread — an
+        # escalation re-run, a redelivered inbound — must reuse it, not open a
+        # second one. Checked before the lint so a duplicate costs no model
+        # call, and again under the lock below, which is what actually makes
+        # create-and-bind atomic.
+        key = str(payload.get("key") or "").strip()
+        if len(key) > _CONV_KEY_MAX:
+            self._send_json(400, {"error": "key too long"})
+            return
+        if key:
+            with _conv_keys_lock:
+                existing = _conv_for_key(key)
+            if existing is not None:
+                self._send_json(200, self._dedup_body(existing, key))
+                return
         message = _lint_presentation(message, kind=kind)
-        conv = _new_conv("agent", owner, title, "agent", message,
-                         first_attachments=payload.get("attachments"),
-                         kind=kind, agent=agent, context=context)
+        if key:
+            with _conv_keys_lock:
+                existing = _conv_for_key(key)
+                if existing is not None:
+                    self._send_json(200, self._dedup_body(existing, key))
+                    return
+                conv = _new_conv("agent", owner, title, "agent", message,
+                                 first_attachments=payload.get("attachments"),
+                                 kind=kind, agent=agent, context=context)
+                _bind_conv_key(key, conv["id"])
+        else:
+            conv = _new_conv("agent", owner, title, "agent", message,
+                             first_attachments=payload.get("attachments"),
+                             kind=kind, agent=agent, context=context)
         body = {"id": conv["id"], "title": conv["title"]}
         if quiet:
             _conv_set_flags(conv["id"], unread=False)
@@ -6332,6 +6407,17 @@ class Handler(BaseHTTPRequestHandler):
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
         self._send_json(201, body)
+
+    def _dedup_body(self, cid: str, key: str) -> dict:
+        """The answer to a repeat: the thread that key already opened. No
+        message is appended and no push is sent — the user has this already."""
+        print(f"[web-gateway] conversation key already open; reusing {cid}",
+              flush=True)
+        conv = _load_conv(cid) or {}
+        body = {"id": cid, "title": conv.get("title") or "", "deduplicated": True}
+        if CONVERSATION_BASE_URL:
+            body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{cid}"
+        return body
 
     def _handle_agent_conversation_message(self, cid: str) -> None:
         """A retinue agent appends a message to an existing thread.

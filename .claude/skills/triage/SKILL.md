@@ -257,6 +257,7 @@ without touching the gate.
 
        python3 /workspace/scripts/conversation-push.py \
          --title "Signal from <resolved name>" \
+         --key <the prompt's thread key, verbatim> \
          --context 'Reply via: python3 /workspace/scripts/signal-push.py --reply-to v1.eyJyIjoi….3q2- "<text>"' \
          "<quoted original>\n\n<the secretary's reply, or the question and its chips>"
 
@@ -437,6 +438,16 @@ secretary's layer. Never bundle replies. Compose the conversation text per the
 bare URLs. The original is quoted in the thread, so it needs no details chip —
 those are for e-mails referred to but not shown (related earlier mails,
 omnibus lines).
+
+**A messenger item's proposal thread carries its thread key.** The gateway
+prompt names one (`Thread key: <channel>:<id>`) — pass it verbatim as `--key`
+on the `conversation-push.py` call that opens the thread. It makes the thread
+idempotent: the same turn can legitimately run twice (an escalation re-runs
+the prompt after a junior turn already opened a thread; a gateway can
+redeliver a message after a reconnect), and without the key each run raises
+its own thread, so the user gets the same item twice. With it, the second run
+is handed the first thread and posts nothing. A key belongs only on the call
+that *opens* a thread — appending to one already addresses it by id.
 
 **A messenger item's proposal thread must carry its reply token.** The item
 came with a reply command (`<channel>-push.py --reply-to <token>` — in the
