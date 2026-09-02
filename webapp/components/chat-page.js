@@ -179,12 +179,17 @@ class RetinueChatPage extends HTMLElement {
     // thread exists the choice is held here and pinned right after creation.
     this._models = [];
     this._compModel = '';
+    // The last model the gateway confirmed for the thread (stored, or read
+    // back from it). A refused pin falls back to this locally, so the picker
+    // is honest even when the reconciling reload fails as well.
+    this._compModelConfirmed = '';
     // Pins are serialized through this promise chain, and a turn waits for
     // it: the gateway runs requests concurrently, so a model POST that is
     // merely in flight when the message POST arrives may not govern that
-    // turn. The chain never rejects (a failed pin is reported where it was
-    // made, not to whoever waits behind it).
-    this._pinQueue = Promise.resolve();
+    // turn. It resolves to the latest pin's outcome — false aborts the turn
+    // queued behind a refused pin — and is reset to true once that failure
+    // has been handled, so one refusal does not block every later send.
+    this._pinQueue = Promise.resolve(true);
     this._compTimer = null;
     this._pane = 'chat';       // chat | companion (phone pane indicator)
     this._draft = '';          // chat composer text
@@ -1085,18 +1090,26 @@ class RetinueChatPage extends HTMLElement {
     this._compModel = model;
     if (!this._companionId) return;
     const ok = await this._pinModel(this._companionId, model);
-    if (!ok) {
+    if (ok) {
+      this._compModelConfirmed = model;
+    } else {
+      // Fall back locally first — unless the user has since picked again,
+      // whose own pin is queued and will report for itself — then reconcile
+      // with the thread; the reload is a check, not what the rollback rests on.
+      if (this._compModel === model) this._compModel = this._compModelConfirmed;
+      this._syncPicker(true);
       this._showNote("Couldn't switch the model &mdash; the thread keeps the one it had.",
         'companion');
     }
     await this._loadCompanion();
-    if (!ok) this._syncPicker(true);
   }
 
   // Persist a model choice; resolves true when the gateway stored it, false
   // on an HTTP error or a dropped connection — never throws. Queued behind
   // any earlier pin (rapid re-selections land in order) and ahead of the
-  // next companion turn (see _pinQueue).
+  // next companion turn: _pinQueue resolves to this pin's outcome while it
+  // is the latest, and a refusal is cleared from it once reported here so
+  // only the turn already waiting on it is aborted.
   _pinModel(cid, model) {
     const run = this._pinQueue.then(async () => {
       try {
@@ -1109,8 +1122,16 @@ class RetinueChatPage extends HTMLElement {
         return false;
       }
     });
-    this._pinQueue = run.then(() => undefined, () => undefined);
-    return run;
+    // One promise for both the caller and the queue, so their continuations
+    // run in registration order: the picker's own report (registered at
+    // selection time) first, a turn queued behind it after — its note is the
+    // one left standing.
+    const queued = run.catch(() => false).then((ok) => {
+      if (!ok && this._pinQueue === queued) this._pinQueue = Promise.resolve(true);
+      return ok;
+    });
+    this._pinQueue = queued;
+    return queued;
   }
 
   _companionComposerHtml() {
@@ -1967,9 +1988,10 @@ class RetinueChatPage extends HTMLElement {
         // refuses the pin, that turn does not go out on a model the user did
         // not choose: the picker drops back to the default the thread really
         // has, and the caller reports the failure.
-        if (this._compModel && !(await this._pinModel(id, this._compModel))) {
-          this._compModel = '';
-          this._syncPicker();
+        const held = this._compModel;
+        if (held && !(await this._pinModel(id, held))) {
+          if (this._compModel === held) this._compModel = '';
+          this._syncPicker(true);
           throw new Error('model');
         }
         return id;
@@ -2003,6 +2025,7 @@ class RetinueChatPage extends HTMLElement {
     // carries the field only once a choice was ever made; absent means the
     // gateway default, exactly like ''.
     this._compModel = typeof conv.model === 'string' ? conv.model : '';
+    this._compModelConfirmed = this._compModel;
     this._renderCompanion();
     this._syncPicker();
     // Reading the pane is reading the thread: the dashboard must not badge a
@@ -2059,8 +2082,10 @@ class RetinueChatPage extends HTMLElement {
     try {
       const cid = await this._ensureCompanion();
       // A pin still in flight must be stored before this turn starts, or the
-      // gateway may run it on the model the picker no longer shows.
-      await this._pinQueue;
+      // gateway may run it on the model the picker no longer shows — and a
+      // pin the gateway refused means this turn does not go out at all
+      // (_onModelChange has already put the picker back and said so).
+      if (!(await this._pinQueue)) throw new Error('model');
       const res = await fetch(`/conversations/${encodeURIComponent(cid)}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2075,7 +2100,7 @@ class RetinueChatPage extends HTMLElement {
       this._renderCompanion();
       this._restoreCompanionComposer(text);
       this._showNote(err && err.message === 'model'
-        ? "Couldn't set the model for this thread &mdash; it stays on the default, " +
+        ? "Couldn't set the model for this thread &mdash; it keeps the one it had, " +
           'and your message is back in the box.'
         : "Couldn't reach Ara &mdash; your message is back in the box.",
         'companion');
