@@ -42,7 +42,13 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Claude Code CLI ─────────────────────────────────────────────────
-RUN npm install -g @anthropic-ai/claude-code
+# Pinned so that image rebuilds are reproducible. The daily
+# .github/workflows/check-claude-code.yml opens a PR whenever npm publishes a
+# newer `latest` and keeps at most one such PR open; bump the ARG only through
+# that PR (or by hand in the same format — the workflow greps for it).
+ARG CLAUDE_CODE_VERSION=2.1.258
+RUN npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+    && claude --version
 
 # ── Core Python dependencies ────────────────────────────────────────
 # pywebpush (with cryptography, http-ece, py-vapid) powers the dashboard's Web
