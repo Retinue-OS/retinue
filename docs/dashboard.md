@@ -84,7 +84,9 @@ Each thread carries a **model choice** — which model answers Ara's turns in
 that thread. Because every turn is a fresh `claude -p` (no long-lived state
 pinned to a model), the model is a free per-turn choice: pickable when the thread
 is created and switchable mid-thread from a dropdown in the thread bar, effective
-from the next turn. The picker governs **Ara's own turn only** — dispatched
+from the next turn. A messenger chat's companion thread (the chat page's Ara
+pane) offers the same dropdown in its bar, so the tier answering there is as
+visible and as switchable as anywhere else. The picker governs **Ara's own turn only** — dispatched
 subagents (the Archivist and any chamber-provided subagents) always run on their
 own hard-wired models regardless of the selection. In a deployment that routes
 through **LiteLLM** (the shipped default), the offered list is managed **in

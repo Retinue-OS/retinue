@@ -39,7 +39,10 @@
 // summary and driven through the same /conversations endpoints the
 // conversations card uses. It is created lazily — POST /chats/<id>/companion
 // on the user's first turn or chip, never on merely opening a chat, so
-// glancing at chats leaves no empty threads behind.
+// glancing at chats leaves no empty threads behind. Its bar carries the same
+// per-thread model picker as the conversation thread bar (GET
+// /conversation-models, POST /conversations/<id>/model), so which tier
+// answers here is visible and switchable without leaving the chat.
 //
 // The pane deliberately does NOT embed components/conversations.js: that
 // element owns location.hash routing (#conversation-…), polls the list
@@ -169,6 +172,13 @@ class RetinueChatPage extends HTMLElement {
     this._compPending = false; // Ara's turn is running in the companion
     this._compStatus = '';     // the pending line the conversation reports
     this._compCreate = null;   // in-flight lazy creation, shared by callers
+    // The companion's model picker, the same choice the conversations card
+    // offers: the list comes from the gateway (single source of truth), ''
+    // means the gateway default, and the choice is stored on the thread —
+    // effective next turn, since each turn is a fresh `claude -p`. Before the
+    // thread exists the choice is held here and pinned right after creation.
+    this._models = [];
+    this._compModel = '';
     this._compTimer = null;
     this._pane = 'chat';       // chat | companion (phone pane indicator)
     this._draft = '';          // chat composer text
@@ -267,6 +277,9 @@ class RetinueChatPage extends HTMLElement {
       this.render();
       return;
     }
+    // The offered model list is independent of the chat and never blocks it:
+    // it lands whenever it lands and the picker appears then (or not at all).
+    this._loadModels();
     try {
       // Two hops, both part of the contract: the list names each chat's
       // message document in `messages`, so the client never builds a message
@@ -625,8 +638,9 @@ class RetinueChatPage extends HTMLElement {
       `aria-label="Resize companion pane" tabindex="0" ` +
       `title="Drag to resize &middot; double-click to reset"></div>` +
       `<section class="pane pane-companion" aria-label="Ara">` +
-      `<div class="comp-bar"><span class="comp-who">Ara</span>` +
-      `<span class="comp-hint">reads this chat, writes into your draft</span></div>` +
+      `<div class="comp-bar" data-comp-bar><span class="comp-who">Ara</span>` +
+      `<span class="comp-hint">reads this chat, writes into your draft</span>` +
+      `<span class="comp-actions" data-comp-picker>${this._modelPickerHtml()}</span></div>` +
       `<div class="thread" data-comp-thread>${this._companionThreadHtml()}</div>` +
       this._companionComposerHtml() +
       `</section></div>`;
@@ -997,6 +1011,82 @@ class RetinueChatPage extends HTMLElement {
       `<span>${esc(label)} &#8230;</span></div></div>`;
   }
 
+  // The model dropdown, the compact form of the conversations card's (gear +
+  // select; see _modelPickerHtml there for the rules it follows). Governs
+  // Ara's own turn in the companion thread only — dispatched subagents keep
+  // their own models. Hidden unless the gateway offers more than one model.
+  // '' (the gateway default) shows as the entry the list flags `default`;
+  // only when no entry is flagged does a hidden placeholder keep the select
+  // from claiming a concrete model the thread is not running.
+  _modelPickerHtml() {
+    const models = this._models || [];
+    if (models.length < 2) return '';
+    let sel = this._compModel || '';
+    if (!models.some((m) => m.id === sel)) {
+      const def = models.find((m) => m.default);
+      sel = def ? def.id : '';
+    }
+    const placeholder = models.some((m) => m.id === sel) ? ''
+      : '<option value="" hidden selected>Default</option>';
+    const opts = placeholder + models.map((m) =>
+      `<option value="${esc(m.id)}"${m.id === sel ? ' selected' : ''}>` +
+      `${esc(m.label)}</option>`).join('');
+    const title = 'Model for Ara’s replies in this chat’s thread. ' +
+      'Dispatched subagents (Secretary, …) keep their own models.';
+    return `<label class="model-pick" title="${title}">` +
+      `<span class="mp-ico" aria-hidden="true">⚙</span>` +
+      `<select data-model aria-label="${title}">${opts}</select></label>`;
+  }
+
+  // Fetch the offered model list once. A failure (or a single-model list)
+  // simply leaves the picker hidden — the pane works exactly as before.
+  async _loadModels() {
+    try {
+      const res = await fetch('/conversation-models', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.models)) {
+        this._models = data.models;
+        this._syncPicker();
+      }
+    } catch (_err) { /* picker stays hidden */ }
+  }
+
+  // Bring the picker in line with the state — in place, never a full render
+  // (which would rebuild the mirror and the chat composer). Rebuilt wholesale
+  // when the list or the choice changed under it; left alone while the user
+  // has it open, so a poll cannot snap a half-made choice away.
+  _syncPicker() {
+    const host = this.shadowRoot.querySelector('[data-comp-picker]');
+    if (!host) return;
+    const sel = host.querySelector('[data-model]');
+    if (sel && this.shadowRoot.activeElement === sel) return;
+    const html = this._modelPickerHtml();
+    if (host.innerHTML !== html) host.innerHTML = html;
+  }
+
+  // The dropdown changed. An existing thread has it persisted server-side
+  // right away (effective next turn, and a reload keeps it); a thread not yet
+  // created holds the choice until _ensureCompanion pins it. The gateway
+  // treats a picker touch as the user taking manual control of the tier, so
+  // it also ends a standing escalation to Ara senior.
+  async _onModelChange(value) {
+    const model = value || '';
+    this._compModel = model;
+    if (!this._companionId) return;
+    await this._pinModel(this._companionId, model);
+    this._loadCompanion();
+  }
+
+  async _pinModel(cid, model) {
+    try {
+      await fetch(`/conversations/${encodeURIComponent(cid)}/model`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+    } catch (_err) { /* the next poll re-syncs the real value */ }
+  }
+
   _companionComposerHtml() {
     // Mirrors the conversation composer: no clear control there, none here.
     return `<div class="composer">` +
@@ -1017,6 +1107,15 @@ class RetinueChatPage extends HTMLElement {
         if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
         e.preventDefault();
         this._goBack();
+      });
+    }
+    // The model picker is re-rendered in place (see _syncPicker), so the
+    // listener sits on the bar that survives, not on the select.
+    const compBar = root.querySelector('[data-comp-bar]');
+    if (compBar) {
+      compBar.addEventListener('change', (e) => {
+        const sel = e.target;
+        if (sel && sel.matches && sel.matches('[data-model]')) this._onModelChange(sel.value);
       });
     }
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
@@ -1837,6 +1936,9 @@ class RetinueChatPage extends HTMLElement {
         const id = (data && data.id) || '';
         if (!id) throw new Error('no companion id');
         this._companionId = id;
+        // A choice made before the thread existed is pinned now, ahead of
+        // the first turn that is about to be posted into it.
+        if (this._compModel) await this._pinModel(id, this._compModel);
         return id;
       })().finally(() => { this._compCreate = null; });
     }
@@ -1864,7 +1966,10 @@ class RetinueChatPage extends HTMLElement {
     this._companion = Array.isArray(conv.messages) ? conv.messages : [];
     this._compPending = !!conv.pending;
     this._compStatus = conv.pending_status || '';
+    // The thread's stored choice is the truth once it exists ('' = default).
+    if (typeof conv.model === 'string') this._compModel = conv.model;
     this._renderCompanion();
+    this._syncPicker();
     // Reading the pane is reading the thread: the dashboard must not badge a
     // companion turn the user has already seen here.
     if (conv.unread) this._markCompanionRead();
@@ -1993,6 +2098,18 @@ const CSS = `
   .comp-who { font-weight: 650; font-size: .85rem; }
   .comp-hint { color: var(--muted, #8b93a3); font-size: .72rem; overflow: hidden;
                text-overflow: ellipsis; white-space: nowrap; }
+  .comp-actions { flex: none; margin-left: auto; display: inline-flex; align-items: center;
+                  align-self: center; }
+  /* The picker, as the conversations card styles it. */
+  .model-pick { flex: none; display: inline-flex; align-items: center; gap: 3px;
+                color: var(--muted, #8b93a3); }
+  .model-pick .mp-ico { font-size: .9rem; line-height: 1; }
+  .model-pick select { background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
+                       border: 1px solid var(--line, rgba(231, 235, 242, .08));
+                       border-radius: 999px; padding: 5px 8px; font-size: .74rem;
+                       max-width: 9.5rem; cursor: pointer; -webkit-appearance: none;
+                       appearance: none; }
+  .model-pick select:hover { border-color: var(--accent, #6ea8fe); }
   @media ${WIDE_FRAME} {
     .panes { overflow-x: visible; scroll-snap-type: none; }
     .pane-chat { flex: 1 1 auto; }

@@ -145,7 +145,11 @@ docstring). Pieces:
   visual language — including its `model_name` / `cost_usd` meta, so which
   model answered and what that turn cost are as visible here as on the
   conversations card — `pending` shows as her writing, and a chip is that same
-  turn with a canned prompt. The two rails meet in the shared draft — Ara
+  turn with a canned prompt. The pane's bar carries the same per-thread model
+  picker as the conversation thread bar (`GET /conversation-models` for the
+  list, `POST /conversations/<id>/model` to switch; hidden below two offered
+  models): a choice made before the thread exists is pinned right after the
+  lazy creation, ahead of the first turn. The two rails meet in the shared draft — Ara
   stages a reply, the chat poll adopts it into an empty composer marked as
   hers, and the send press stays the user's.
 
