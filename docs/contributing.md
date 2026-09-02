@@ -116,6 +116,29 @@ updates via its own `start.sh update`) injects its recipe by setting
 `UPDATE_COMMAND` in its override/`.env`; config flows deployment → framework.
 The HTTP caller can never supply the command — only the operator's environment.
 
+### Upgrading the Claude Code CLI
+
+A deployment may disable Claude Code's in-container auto-updater
+(`DISABLE_AUTOUPDATER=1`) — it unpacks the new release beside the old one and
+swaps it in, and a restart landing mid-swap leaves neither, with the damage in
+the container's writable layer so every subsequent restart replays it. Where
+it is disabled, the image is the only place the version moves.
+
+That makes the Dockerfile's pin load-bearing: `ARG CLAUDE_CODE_VERSION`, used
+by the `npm install -g @anthropic-ai/claude-code@${…}` line. **Do not drop the
+version and let npm resolve `latest`** — it looks like it tracks upstream and
+does the opposite. That layer depends on no file in the repo, so
+`docker compose build` reuses the cache forever and the version silently
+freezes at whatever was current the day the layer was first built (this is how
+the runtime ended up months behind, on a version too old for a newly released
+model). Naming the version changes the `RUN` command, which invalidates the
+layer, which is what makes `self-update.py` actually deliver the upgrade.
+
+`.github/workflows/check-claude-code.yml` polls the npm registry daily and
+opens a bump PR against that ARG, closing any older still-open bump PR so a
+late merge cannot pin the version backwards. Merging one is a normal Tier 3
+merge followed by `python3 /workspace/scripts/self-update.py`.
+
 ## Claude sign-in monitoring
 
 The OAuth sign-in every Claude Code process shares
