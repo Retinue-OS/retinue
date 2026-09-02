@@ -189,6 +189,11 @@ class RetinueChatPage extends HTMLElement {
     // a distinct "escalated" state instead, from which any choice — the
     // default included — is a change that clears the escalation.
     this._compEscalated = false;
+    // Whether an existing thread's document has been read at least once.
+    // Until then its model and escalation are unknown, and the picker stays
+    // hidden rather than show the default for a thread that may be pinned
+    // or escalated. A thread that does not exist yet needs no read.
+    this._compLoaded = false;
     // Model fields are adopted only from responses that began after the
     // latest pin started: a poll that was already in flight when the user
     // switched carries the old model and must not overwrite the new one.
@@ -328,6 +333,7 @@ class RetinueChatPage extends HTMLElement {
       // that has not carries null, and nothing is created until the user
       // actually says something (see _ensureCompanion).
       this._companionId = this._chat.companion || '';
+      this._compLoaded = !this._companionId;
       this._seen = new Set(this._messages.map((m) => m.id));
       // Pin the unread waterline to where it was when the chat opened —
       // messages sent from here are appended below it, and a re-render must
@@ -1041,7 +1047,7 @@ class RetinueChatPage extends HTMLElement {
   // from claiming a concrete model the thread is not running.
   _modelPickerHtml() {
     const models = this._models || [];
-    if (models.length < 2) return '';
+    if (models.length < 2 || !this._compLoaded) return '';
     let sel = this._compModel || '';
     const escalated = !sel && this._compEscalated;
     if (!escalated && !models.some((m) => m.id === sel)) {
@@ -1106,20 +1112,26 @@ class RetinueChatPage extends HTMLElement {
     const model = value || '';
     this._compModel = model;
     if (!this._companionId) return;
-    const ok = await this._pinModel(this._companionId, model);
+    await this._pinAndReport(this._companionId, model);
+    await this._loadCompanion();
+  }
+
+  // Pin, record the outcome, and report a refusal: on success the model is
+  // the confirmed one; on refusal the picker falls back to the confirmed
+  // model locally and says so — but only while the refused value is still
+  // the current choice. A refusal for a choice the user has since replaced
+  // is not reported at all: the newer pin is queued and reports for itself.
+  async _pinAndReport(cid, model) {
+    const ok = await this._pinModel(cid, model);
     if (ok) {
       this._compModelConfirmed = model;
     } else if (this._compModel === model) {
-      // Fall back locally first, then reconcile with the thread; the reload
-      // is a check, not what the rollback rests on. A refusal for a choice
-      // the user has since replaced is not reported at all: the newer pin is
-      // queued and reports for itself.
       this._compModel = this._compModelConfirmed;
       this._syncPicker(true);
       this._showNote("Couldn't switch the model &mdash; the thread keeps the one it had.",
         'companion');
     }
-    await this._loadCompanion();
+    return ok;
   }
 
   // Wait until no pin is queued or in flight, and say how the last one went
@@ -2018,19 +2030,20 @@ class RetinueChatPage extends HTMLElement {
         const id = (data && data.id) || '';
         if (!id) throw new Error('no companion id');
         this._companionId = id;
+        // A fresh thread has nothing to read: it runs the default until
+        // pinned, and its picker is live at once.
+        this._compLoaded = true;
         // A choice made before the thread existed is pinned now, ahead of
         // the first turn that is about to be posted into it. If the gateway
         // refuses the pin, that turn does not go out on a model the user did
         // not choose: the picker drops back to the default the thread really
-        // has, and the caller reports the failure.
+        // has, and the caller reports the failure. A pick the user replaced
+        // while this one was in flight is not what decides: the queue is
+        // settled, and only a refusal of the latest choice aborts the turn.
         const held = this._compModel;
         if (held) {
-          if (!(await this._pinModel(id, held))) {
-            if (this._compModel === held) this._compModel = '';
-            this._syncPicker(true);
-            throw new Error('model');
-          }
-          this._compModelConfirmed = held;
+          this._pinAndReport(id, held);
+          if (!(await this._settledPins())) throw new Error('model');
         }
         return id;
       })().finally(() => { this._compCreate = null; });
@@ -2066,6 +2079,7 @@ class RetinueChatPage extends HTMLElement {
     this._companion = Array.isArray(conv.messages) ? conv.messages : [];
     this._compPending = !!conv.pending;
     this._compStatus = conv.pending_status || '';
+    this._compLoaded = true;
     if (gen === this._pinGen) {
       // The thread's stored choice is the truth once it exists. The document
       // carries the field only once a choice was ever made; absent means the

@@ -148,8 +148,10 @@ docstring). Pieces:
   turn with a canned prompt. The pane's bar carries the same per-thread model
   picker as the conversation thread bar (`GET /conversation-models` for the
   list, `POST /conversations/<id>/model` to switch; hidden below two offered
-  models): a choice made before the thread exists is pinned right after the
-  lazy creation, ahead of the first turn. An unpinned thread that Ara junior
+  models, and until an existing thread's document has been read once, so a
+  pinned or escalated thread is never shown as the default): a choice made
+  before the thread exists is pinned right after the lazy creation, ahead
+  of the first turn. An unpinned thread that Ara junior
   escalated (`escalated` on the document; the gateway keeps it with Ara
   senior) shows as "Ara senior (escalated)" rather than as the default, and
   any pick — the default included — is the change that clears it. The two rails meet in the shared draft — Ara
