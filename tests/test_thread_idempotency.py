@@ -165,6 +165,33 @@ def test_gateway_dedupe():
               len(get_conv(b1["id"])["messages"]) == 1)
         check("the repeat pushed no notification", "push_subscribers" not in b2)
 
+        # The escalation case, which is the reason the key exists. Junior
+        # opened this thread with an incomplete proposal before escalating;
+        # senior replays the turn and pushes the real answer under the same
+        # key. Dedup must not swallow it — discarding it would leave the user
+        # with only junior's attempt, which is the very failure this mechanism
+        # is meant to prevent, arriving by the other door.
+        ESC = KEY + "-escalated"
+        s6, b6 = create("I'm not sure what she's asking.", key=ESC, title="WhatsApp")
+        s7, b7 = create("Stefanie asks whether Saturday still works.",
+                        key=ESC, title="WhatsApp")
+        check("the re-run returns 200", s7 == 200, str(s7))
+        check("the re-run reuses the thread rather than opening a second",
+              s6 == 201 and b7.get("id") == b6["id"])
+        esc_msgs = get_conv(b6["id"])["messages"]
+        check("senior's answer was kept, not discarded", len(esc_msgs) == 2,
+              str([m["text"] for m in esc_msgs]))
+        check("and it is the newest thing in the thread",
+              esc_msgs[-1]["text"] == "Stefanie asks whether Saturday still works.")
+        check("the user is told about it", b7.get("appended") is True
+              and "push_subscribers" in b7)
+        # …while a redelivery of that same corrected message stays silent.
+        _, b8 = create("Stefanie asks whether Saturday still works.",
+                       key=ESC, title="WhatsApp")
+        check("a true redelivery is still absorbed silently",
+              b8.get("appended") is None and "push_subscribers" not in b8)
+        check("and appends nothing", len(get_conv(b6["id"])["messages"]) == 2)
+
         s3, b3 = create("Another message", key=KEY + "-other")
         check("a different key opens its own thread",
               s3 == 201 and b3["id"] != b1["id"])

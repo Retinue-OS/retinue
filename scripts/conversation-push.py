@@ -96,14 +96,20 @@ def main() -> int:
     parser.add_argument("--agent",
                         help="subagent name to show as the message sender (e.g. Coach), "
                              "when a relay answers on its behalf")
-    parser.add_argument("--key", metavar="ID",
+    parser.add_argument("--key", metavar="KEY",
                         help="idempotency key: opening a thread twice under the "
                              "same key reuses the first one instead of creating "
-                             "a duplicate. Pass the id of whatever you are "
-                             "reacting to (an inbound message id), so a re-run "
-                             "of this turn — an escalation, a redelivered "
-                             "message — cannot open a second thread. New "
-                             "threads only; ignored with --thread.")
+                             "a duplicate, so a re-run of this turn — an "
+                             "escalation, a redelivered message — cannot open a "
+                             "second thread. For a messenger message, pass the "
+                             "thread_key the gateway handed you (in the forwarded "
+                             "prompt, or on the drained record) VERBATIM; never "
+                             "build one from the channel's own message id, which "
+                             "is unique only within a chat and would collide "
+                             "across chats and accounts. Otherwise pass any "
+                             "identity that names this subject globally and the "
+                             "same way every time. New threads only; ignored "
+                             "with --thread.")
     parser.add_argument("--context", metavar="TEXT",
                         help="agent-only context stored with the message: replayed to every "
                              "later Ara session in this thread but never rendered to the "

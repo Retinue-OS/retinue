@@ -82,7 +82,19 @@ a reconnect — and each run would otherwise raise its own thread for one
 message. A caller that can name what it is reacting to passes that name as
 `--key` (`{key: "..."}` on the endpoint); the first thread opened under a key
 is the only one, and a repeat is answered with that thread
-(`"deduplicated": true`, HTTP 200) having posted nothing. The inbox gateways
+(`"deduplicated": true`, HTTP 200).
+
+Whether the repeat also posts depends on what it has to say, because the two
+runs a key exists for differ exactly there. A **redelivery** repeats words the
+thread already carries: absorbed silently, no message, no push, no badge. An
+**escalation re-run** is the same turn done properly — junior's reply was
+discarded and the prompt replayed on the frontier tier, but a thread junior
+opened before escalating survived and holds its incomplete attempt. Dropping
+senior's answer there would leave the user with only that, so a repeat carrying
+something the thread does not already say is **appended and pushed**
+(`"appended": true`). Appended rather than substituted: junior's words may
+already have reached the user's phone, and rewriting what someone has read is
+worse than showing them the correction after it. The inbox gateways
 mint one per inbound and carry it in the triage prompt (`Thread key: …`), so
 the key is the channel's own message identity rather than anything the session
 invents. That identity is `<channel>:<receiving account>:<chat>:<message id>`,

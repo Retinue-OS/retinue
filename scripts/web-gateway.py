@@ -2168,9 +2168,19 @@ def _valid_model_id(model: str | None, refresh: bool = False) -> str | None:
 # model — its reply is discarded, but a thread it already opened is not — and a
 # messenger gateway can redeliver a stanza after a reconnect. Either way the
 # user gets two identical threads for one message. A caller that can name what
-# it is reacting to (an inbound message id) passes that name as `key`: the
-# first thread opened under a key is the only one, and a repeat is handed the
-# same thread back instead of opening another.
+# it is reacting to passes that name as `key`: the first thread opened under a
+# key is the only one, and a repeat is handed the same thread back instead of
+# opening another.
+#
+# The key namespace is global, so the name has to be globally unique. A
+# channel's own message id is NOT: Telegram numbers messages per chat, Signal
+# identifies one by (source, sent timestamp), and a deployment may run several
+# gateways on one channel — so two different messages can share an id and would
+# collapse onto one thread, reply context included. Messenger callers therefore
+# use the key `inbound_store.thread_key()` builds, which carries the receiving
+# account and the chat alongside the native id; the gateways hand it to the
+# agent both on the live forward and on a drained record, and it is passed
+# verbatim rather than reconstructed.
 _CONV_KEYS_DIR = CONVERSATIONS_DIR / ".keys"
 _CONV_KEY_MAX = 200
 _conv_keys_lock = threading.Lock()
@@ -2179,6 +2189,30 @@ _conv_keys_lock = threading.Lock()
 def _conv_key_path(key: str) -> Path:
     # Hashed, so any channel's id scheme is a safe filename.
     return _CONV_KEYS_DIR / hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _conv_already_says(cid: str, message: str, payload: dict,
+                       context: str | None) -> bool:
+    """Whether this thread already carries exactly what a repeat wants to say.
+
+    The test for "redelivery, not correction". It looks at every message in the
+    thread, not just the one the key opened it with: once an escalation has
+    appended a corrected answer, a later redelivery of *that* answer is the
+    thing most likely to arrive, and matching only the opening message would
+    append it a second time. Anything already in the thread has been said, and
+    saying it again adds nothing — which is the whole promise of the key.
+
+    Attachments count as new by their presence: they are stored per message, so
+    a repeat carrying files is not word-for-word the same as one that did not.
+    Context is compared too — a repeat whose agent-only context has changed
+    (a fresher reply token, say) is carrying something the thread lacks.
+    """
+    if payload.get("attachments"):
+        return False
+    conv = _load_conv(cid) or {}
+    return any(str(m.get("text") or "") == message
+               and str(m.get("context") or "") == (context or "")
+               for m in (conv.get("messages") or []))
 
 
 def _conv_for_key(key: str) -> str | None:
@@ -6382,14 +6416,23 @@ class Handler(BaseHTTPRequestHandler):
             with _conv_keys_lock:
                 existing = _conv_for_key(key)
             if existing is not None:
-                self._send_json(200, self._dedup_body(existing, key))
+                # Word-for-word what the thread already holds: a redelivery,
+                # absorbed here without a model call. Anything else has to be
+                # linted before it can be compared at all — the stored text
+                # went through the lint, so raw text would look "different"
+                # even when it is the same message.
+                if not _conv_already_says(existing, message, payload, context):
+                    message = _lint_presentation(message, kind=kind)
+                self._send_json(200, self._reuse_thread(
+                    existing, key, message, payload, context, agent, quiet))
                 return
         message = _lint_presentation(message, kind=kind)
         if key:
             with _conv_keys_lock:
                 existing = _conv_for_key(key)
                 if existing is not None:
-                    self._send_json(200, self._dedup_body(existing, key))
+                    self._send_json(200, self._reuse_thread(
+                        existing, key, message, payload, context, agent, quiet))
                     return
                 conv = _new_conv("agent", owner, title, "agent", message,
                                  first_attachments=payload.get("attachments"),
@@ -6408,15 +6451,51 @@ class Handler(BaseHTTPRequestHandler):
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
         self._send_json(201, body)
 
-    def _dedup_body(self, cid: str, key: str) -> dict:
-        """The answer to a repeat: the thread that key already opened. No
-        message is appended and no push is sent — the user has this already."""
-        print(f"[web-gateway] conversation key already open; reusing {cid}",
-              flush=True)
+    def _reuse_thread(self, cid: str, key: str, message: str,
+                      payload: dict, context: str | None,
+                      agent: str | None = None, quiet: bool = False) -> dict:
+        """The answer to a second open under one key: never a second thread.
+
+        Whether it is also a second *message* depends on what the writer has to
+        say, and the two cases this key exists for differ exactly there.
+
+        A **redelivery** replays a stanza the channel already delivered: same
+        words, nothing new. It is absorbed silently — no message, no push, no
+        unread badge — because the user has this already.
+
+        An **escalation re-run** is the same turn done properly. Junior's reply
+        was discarded and the prompt replayed on the frontier tier, but a thread
+        junior opened before escalating is a side effect that survived, and it
+        holds junior's incomplete attempt. Discarding senior's message here
+        would leave the user with only that — the failure this whole mechanism
+        was meant to prevent, arriving by the other door. So a writer with
+        something different to say is appended to the thread and pushed.
+
+        Appended rather than substituted on purpose: junior's words may already
+        have reached the user's phone, and silently rewriting what someone has
+        read is worse than showing them the correction after it. The thread then
+        reads as what actually happened.
+        """
         conv = _load_conv(cid) or {}
+        attachments = payload.get("attachments")
+        same = _conv_already_says(cid, message, payload, context)
         body = {"id": cid, "title": conv.get("title") or "", "deduplicated": True}
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{cid}"
+        if same:
+            print(f"[web-gateway] conversation key already open; reusing {cid}",
+                  flush=True)
+            return body
+        print(f"[web-gateway] conversation key already open with different "
+              f"words; appending to {cid} rather than dropping them", flush=True)
+        conv = _conv_add_message(cid, "agent", message, agent=agent,
+                                 attachments=attachments, context=context,
+                                 unread=not quiet, wake=not quiet) or conv
+        body["appended"] = True
+        # A quiet writer stays quiet on this path too — a cowork audit trail
+        # does not start badging the dashboard just because it was reopened.
+        if not quiet:
+            body["push_subscribers"] = _push_conv_notification(conv, message)
         return body
 
     def _handle_agent_conversation_message(self, cid: str) -> None:
