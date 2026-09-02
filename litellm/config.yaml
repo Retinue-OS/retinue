@@ -59,24 +59,31 @@ general_settings:
 
 litellm_settings:
   num_retries: 0
-  fallbacks:
-    - retinue-claude:
-        - retinue-openrouter
-    - claude-*:
-        - retinue-openrouter
-    - claude-opus-5:
-        - retinue-openrouter
-    - claude-sonnet-5:
-        - retinue-openrouter
-    - claude-haiku-4-5:
-        - retinue-openrouter
+  # Fallbacks are resolved by the model_group the caller ASKED for. An agent
+  # file may pin any concrete model ID — including one released after this
+  # file was last edited — and Claude Code sends it verbatim, so the set of
+  # model groups arriving here is open-ended and cannot be enumerated. A
+  # per-model `fallbacks` list therefore silently leaves every model it does
+  # not name without a fallback (LiteLLM reports "No fallback model group
+  # found for original model_group=…" and gives up), and the wildcard route
+  # above does not stand in: `claude-*` is a deployment pattern, not a
+  # fallback key, and LiteLLM does not expand it during fallback lookup.
+  # `default_fallbacks` applies to every model group instead, including ones
+  # that do not exist yet — the only form that survives a new model release.
+  # (It nominally applies to retinue-openrouter too; a fallback from that
+  # group to itself is a no-op retry, not a loop.)
+  default_fallbacks:
+    - retinue-openrouter
   model_group_settings:
-    # Only the Claude subscription routes receive Claude Code's OAuth header.
-    # The explicitly named picker routes form their own model groups, so they
-    # need their own entries — the claude-* wildcard entry does not cover them.
+    # Only Anthropic-backed routes may receive Claude Code's forwarded client
+    # headers (`x-*` and `anthropic-beta`) — the OpenRouter route must not, or
+    # the proxy key in x-litellm-api-key travels to a third party. That rules
+    # out the global general_settings boolean, which forwards for everything.
+    #
+    # Entries here match the DEPLOYMENT rather than the name the caller
+    # requested, and the documented wildcard shape is a provider prefix
+    # (`anthropic/*`). One such entry covers every Claude model this proxy can
+    # serve, current and future, so no individual model ever needs naming.
+    # LITELLM_FALLBACK_MODEL resolves to `openrouter/…` and is not matched.
     forward_client_headers_to_llm_api:
-      - retinue-claude
-      - claude-*
-      - claude-opus-5
-      - claude-sonnet-5
-      - claude-haiku-4-5
+      - anthropic/*
