@@ -12,6 +12,19 @@ model_list:
   - model_name: retinue-openrouter
     litellm_params:
       model: os.environ/LITELLM_FALLBACK_MODEL
+  # Named route for an agent-pinned model that is not a picker entry. The
+  # health chamber's `medic` subagent pins `model: claude-fable-5-1`, which
+  # Claude Code sends verbatim. The claude-* wildcard above would route it,
+  # but fallbacks and forward_client_headers_to_llm_api are keyed by the
+  # requested model_group, and LiteLLM does not expand the wildcard when it
+  # looks those up — a wildcard-routed request reports
+  # "No fallback model group found for original model_group=claude-fable-5-1"
+  # and drops to no fallback at all. Naming the route restores both.
+  # No model_info/retinue_picker here on purpose: this is a subagent model,
+  # not an offer for the dashboard's conversation-model picker.
+  - model_name: claude-fable-5-1
+    litellm_params:
+      model: anthropic/claude-fable-5-1
   # Dashboard picker entries. The web gateway builds the conversation-model
   # picker from GET /model/info, offering every route whose model_info sets
   # `retinue_picker: true`, labeled by `retinue_label`. These three seed the
@@ -70,6 +83,8 @@ litellm_settings:
         - retinue-openrouter
     - claude-haiku-4-5:
         - retinue-openrouter
+    - claude-fable-5-1:
+        - retinue-openrouter
   model_group_settings:
     # Only the Claude subscription routes receive Claude Code's OAuth header.
     # The explicitly named picker routes form their own model groups, so they
@@ -80,3 +95,4 @@ litellm_settings:
       - claude-opus-5
       - claude-sonnet-5
       - claude-haiku-4-5
+      - claude-fable-5-1
