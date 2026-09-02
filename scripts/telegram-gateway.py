@@ -195,6 +195,13 @@ def _attach_reply_tokens(messages: list) -> None:
         origin = msg.get("group") or msg.get("sender")
         if origin:
             msg["reply_token"] = REPLY_TOKENS.mint(str(origin), channel="telegram")
+        # …and the same thread key the live forward would mint, so a record
+        # that was already forwarded (a live turn that died before finishing,
+        # say) reuses its thread instead of opening a second one. The record's
+        # own subject is the fallback when the channel gave no message id.
+        msg["thread_key"] = _ibstore.thread_key(
+            "telegram", TELEGRAM_ACCOUNT, msg.get("chat"), msg.get("message_id"),
+            subject=msg.get("subject"))
 
 # ── Inbound triage delivery gate ──────────────────────────────────────────────
 # Spend model credits only on senders that matter (see
@@ -1416,14 +1423,13 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
          f"transcript), so the user can listen to or view the original.\n")
         if files else ""
     )
-    # A stable name for this inbound, handed to triage as the dashboard
-    # thread's idempotency key: if this same turn runs twice — the escalation
-    # re-run replays the prompt after a junior turn already opened a thread, or
-    # the gateway redelivers a stanza after a reconnect — the second run reuses
-    # the first thread instead of opening a duplicate. Falls back to the
-    # arrival time when the channel gave us no message id, which still pins a
-    # replayed prompt to one key (only a genuine redelivery could then differ).
-    thread_key = "telegram:" + (message_id or f"t{int(time.time())}")
+    # The canonical idempotency key for this message's dashboard thread —
+    # account and chat included, because a channel-native id alone is not
+    # unique (see inbound_store.thread_key). The drain decorates its rows with
+    # the same key, so a record handled live and then drained lands on one
+    # thread rather than two.
+    thread_key = _ibstore.thread_key(
+        "telegram", TELEGRAM_ACCOUNT, handle, message_id)
     key_line = (
         f"\nThread key: {thread_key}\n"
         f"Pass it verbatim as --key to conversation-push.py when you open the "

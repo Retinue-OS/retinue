@@ -149,8 +149,15 @@ daily catch-all **drains the gateway** instead of listing chats:
 `delivered:true` in the same pass**. It is the only operation that mutates the
 flag, so the drain is idempotent — a re-run returns only what arrived since.
 Process the returned messages through Phases 2–4 exactly like e-mail. Each
-drained message carries a **`reply_token`** for its origin conversation — treat
-it exactly like the token of a live-forwarded message: a proposed reply's
+drained message carries a **`thread_key`** as well: pass it as `--key` when you
+open its dashboard conversation, exactly as you would the live prompt's
+`Thread key:`. It is the same value the live forward mints, which is what makes
+the drain safe — a message that was forwarded live but whose turn died before
+it finished still sits in the ledger as undelivered, so the drain sees it
+again; with the key, it reuses the thread that turn opened instead of raising a
+second one. Each drained message also carries a **`reply_token`** for its
+origin conversation — treat it exactly like the token of a live-forwarded
+message: a proposed reply's
 thread gets the channel's reply command (`<channel>-push.py --reply-to
 <token>`) as `--context` (Phase 4a), and the executing session replies by
 token, never by resolving the sender's name.
@@ -439,9 +446,12 @@ bare URLs. The original is quoted in the thread, so it needs no details chip —
 those are for e-mails referred to but not shown (related earlier mails,
 omnibus lines).
 
-**A messenger item's proposal thread carries its thread key.** The gateway
-prompt names one (`Thread key: <channel>:<id>`) — pass it verbatim as `--key`
-on the `conversation-push.py` call that opens the thread. It makes the thread
+**A messenger item's proposal thread carries its thread key.** A live forward
+names one in the prompt (`Thread key: …`) and a drained record carries one in
+its `thread_key` field — pass it verbatim as `--key` on the
+`conversation-push.py` call that opens the thread. Never build the key
+yourself: it names the receiving account and chat as well as the message id,
+because a channel-native id alone is not unique across chats or accounts. It makes the thread
 idempotent: the same turn can legitimately run twice (an escalation re-runs
 the prompt after a junior turn already opened a thread; a gateway can
 redeliver a message after a reconnect), and without the key each run raises
