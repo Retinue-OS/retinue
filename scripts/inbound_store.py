@@ -138,6 +138,23 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _MEDIA_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def subject_for(path) -> str | None:
+    """The stored record's own subject URN, or None if it cannot be read.
+
+    Used to give an id-less message the same :func:`thread_key` on the live
+    path as it will get at the drain: the live forward has only the store path
+    it just wrote, while the drain carries the parsed subject. Best-effort —
+    an unreadable record simply falls back to a fresh random key.
+    """
+    if not path:
+        return None
+    try:
+        fields = _parse(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return (fields or {}).get("subject")
+
+
 def thread_key(channel: str, account: str, chat: str | None,
                message_id: str | None, subject: str | None = None) -> str:
     """The canonical idempotency key for one inbound message's dashboard thread.

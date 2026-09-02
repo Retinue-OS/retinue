@@ -189,10 +189,17 @@ def test_gateway_dedupe():
         threads = [threading.Thread(target=worker) for _ in range(6)]
         [t.start() for t in threads]
         [t.join() for t in threads]
+        # Every worker must have come back: five of them silently erroring
+        # would leave one 201 in `results` and satisfy the checks below while
+        # proving nothing.
+        check("all six concurrent requests returned", len(results) == 6, str(len(results)))
         ids = {b["id"] for _, b in results}
         check("concurrent duplicates collapse to one thread", len(ids) == 1, str(ids))
         check("exactly one of them created it",
               sum(1 for s, _ in results if s == 201) == 1)
+        check("the other five were served the existing thread",
+              sum(1 for s, _ in results if s == 200) == 5,
+              str(sorted(s for s, _ in results)))
     finally:
         srv.shutdown()
 

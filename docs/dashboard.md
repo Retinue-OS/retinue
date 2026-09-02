@@ -83,9 +83,17 @@ message. A caller that can name what it is reacting to passes that name as
 `--key` (`{key: "..."}` on the endpoint); the first thread opened under a key
 is the only one, and a repeat is answered with that thread
 (`"deduplicated": true`, HTTP 200) having posted nothing. The inbox gateways
-mint one per inbound (`Thread key: <channel>:<message-id>`, carried in the
-triage prompt), so the key is the channel's own message identity rather than
-anything the session invents. Bindings live in `CONVERSATIONS_DIR/.keys`, one
+mint one per inbound and carry it in the triage prompt (`Thread key: …`), so
+the key is the channel's own message identity rather than anything the session
+invents. That identity is `<channel>:<receiving account>:<chat>:<message id>`,
+built only by `inbound_store.thread_key()` — the account and chat are part of
+it because a native message id is not unique on its own: Telegram numbers
+messages per chat, Signal identifies one by (source, sent timestamp), and a
+deployment may run two gateways on one channel. An inbound with no native id
+falls back to the stored record's own URN, and to a random value when there is
+not even that, so distinct arrivals never merge. The drain decorates its rows
+with the same key, so a message forwarded live and later drained — a live turn
+that died before finishing — lands on the thread it already opened. Bindings live in `CONVERSATIONS_DIR/.keys`, one
 file per key; a binding whose thread was deleted counts as unbound, so a
 removed thread never swallows the next message about the same item. Keys are
 for *opening* a thread — appending already addresses one by id.

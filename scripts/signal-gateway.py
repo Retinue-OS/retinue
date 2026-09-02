@@ -1694,7 +1694,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # the same key, so a record handled live and then drained lands on one
     # thread rather than two.
     thread_key = _ibstore.thread_key(
-        "signal", SIGNAL_ACCOUNT, origin, message_id)
+        "signal", SIGNAL_ACCOUNT, origin, message_id,
+        subject=None if message_id else _ibstore.subject_for(store_path))
     key_line = (
         f"\nThread key: {thread_key}\n"
         f"Pass it verbatim as --key to conversation-push.py when you open the "
