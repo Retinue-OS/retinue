@@ -43,11 +43,21 @@ Inbound is only half the ledger. The store also holds **outbound** messages
 (``kb:OutboundMessage``, :func:`write_outbound`) in the same ``messages/``
 directory: every send a gateway completed — an agent push, an approved pending
 send, and the user's own sends from their other devices captured from the
-channel's echo/sync stream. Both directions carry ``kb:chat``, the chat key, so
-one filter yields a whole conversation as a single timeline (filenames sort by
-epoch millis regardless of direction). Outbound records have **no** delivered
-flag and are invisible to :func:`undelivered` — the drain is triage bookkeeping
-for inbound mail only.
+channel's echo/sync stream. Both directions carry ``kb:chat``, the chat key, and
+``kb:account``, the gateway account that wrote the record, so one filter yields a
+whole conversation as a single timeline (filenames sort by epoch millis
+regardless of direction). It takes **both**: a chat key identifies a peer within
+one account, and a channel's message volume is shared by every account on it, so
+the pair is the conversation's real identity. Outbound records have **no**
+delivered flag and are invisible to :func:`undelivered` — the drain is triage
+bookkeeping for inbound mail only.
+
+Only **inbox**-mode gateways write here at all, in either direction: a control
+account's traffic (prompts in, an agent's replies out) is not the user's
+correspondence and is persisted on neither. So every record on a channel's
+volume was written by one of that channel's inbox accounts — which is what lets
+a reader attribute a record written before ``kb:account`` existed, when the
+channel has exactly one such account, without guessing.
 
 Stdlib only (``hashlib``/``secrets``/``datetime``): this module is copied into
 each gateway image alongside ``triage_policy.py`` and ``reply_tokens.py``, and
@@ -84,6 +94,20 @@ P_DELIVERED = KB + "delivered"
 # chat_id). Stamped on BOTH directions by the gateways, so one filter yields a
 # whole conversation and a send routes back with the same key.
 P_CHAT = KB + "chat"
+# The gateway account this record belongs to: the *_ACCOUNT value of the
+# container that wrote it, stamped verbatim on BOTH directions. A chat key is
+# only unique *within* an account — two accounts of one channel talking to the
+# same peer produce the same key — so without this predicate their messages
+# merge into one timeline and one unread count, and a reply cannot know which
+# identity it should go out as. The account is the only identity a gateway
+# asserts about itself (its address and registry slug are the reader's
+# configuration; a gateway declaring those would be a second source of truth
+# free to drift), so it is what the record carries. Absent on records written
+# before this predicate existed, and on a gateway whose account is not yet
+# known — Telegram discovers its own only once the session authorizes — so
+# readers must treat it as optional and say what they do with an unattributed
+# record rather than guessing one.
+P_ACCOUNT = KB + "account"
 # Outbound only: who composed the message. One of AUTHORS below.
 P_AUTHOR = KB + "author"
 # Outbound only: when the channel accepted the send. A distinct predicate rather
@@ -221,6 +245,10 @@ def _render(fields: dict) -> str:
         lines.append(_lit(subj, P_SENDER, fields["sender"]))
     if fields.get("chat"):
         lines.append(_lit(subj, P_CHAT, fields["chat"]))
+    # Both directions: the chat key alone does not identify a conversation
+    # across accounts (see P_ACCOUNT).
+    if fields.get("account"):
+        lines.append(_lit(subj, P_ACCOUNT, fields["account"]))
     if fields.get("group"):
         lines.append(_lit(subj, P_GROUP, fields["group"]))
     if fields.get("message_id"):
@@ -244,8 +272,9 @@ def _parse(text: str) -> dict | None:
     pre-outbound contract (drainable) rather than being mistaken for a send.
     """
     fields: dict = {"type": T_INBOUND, "delivered": False, "group": None,
-                    "message_id": None, "chat": None, "author": None,
-                    "sent_at": None, "attachments": [], "media": None}
+                    "message_id": None, "chat": None, "account": None,
+                    "author": None, "sent_at": None, "attachments": [],
+                    "media": None}
     subject = None
     for line in text.splitlines():
         line = line.strip()
@@ -273,6 +302,8 @@ def _parse(text: str) -> dict | None:
             fields["message_id"] = value
         elif pred == P_CHAT:
             fields["chat"] = value
+        elif pred == P_ACCOUNT:
+            fields["account"] = value
         elif pred == P_AUTHOR:
             fields["author"] = value
         elif pred == P_SENT_AT:
@@ -350,6 +381,7 @@ def write_message(
     text: str,
     group: str | None = None,
     chat: str | None = None,
+    account: str | None = None,
     message_id: str | None = None,
     timestamp: float | None = None,
     delivered: bool = False,
@@ -366,8 +398,10 @@ def write_message(
     ``chat`` is the chat key (see :data:`P_CHAT`): the exact recipient string
     this channel's own send path accepts, computed by the gateway and persisted
     verbatim, so this message and any reply sent back to it carry the same key.
-    ``message_id`` is the channel-native message identifier, which is what a
-    reaction or quoted reply later targets.
+    ``account`` is the gateway's own ``*_ACCOUNT`` (see :data:`P_ACCOUNT`) — the
+    other half of the identity, because a chat key is unique only within one
+    account. ``message_id`` is the channel-native message identifier, which is
+    what a reaction or quoted reply later targets.
 
     ``attachment_urls`` are references to this message's media (voice note,
     image), each emitted as a ``kb:attachment`` IRI — see :data:`P_ATTACHMENT`
@@ -391,6 +425,7 @@ def write_message(
         "text": text or "",
         "group": group or None,
         "chat": chat or None,
+        "account": account or None,
         "message_id": message_id or None,
         "received_at": _iso(ts),
         "delivered": bool(delivered),
@@ -411,6 +446,7 @@ def write_outbound(
     chat: str,
     text: str,
     author: str = "agent",
+    account: str | None = None,
     message_id: str | None = None,
     timestamp: float | None = None,
     attachment_urls: list[str] | None = None,
@@ -424,8 +460,11 @@ def write_outbound(
     are not messages and never reach the store.
 
     ``chat`` is the chat key (see :data:`P_CHAT`) — for a send, the resolved
-    recipient. ``author`` must be one of :data:`AUTHORS`; anything else is a
-    programming error and raises ``ValueError``. ``timestamp`` is the sent-at
+    recipient — and ``account`` the identity it went out as (see
+    :data:`P_ACCOUNT`), which for a send is not bookkeeping but the record of
+    *who the recipient saw*: the same text to the same peer from two accounts
+    are two different events. ``author`` must be one of :data:`AUTHORS`;
+    anything else is a programming error and raises ``ValueError``. ``timestamp`` is the sent-at
     instant (``kb:sentAt`` — see the predicate comment for why it is not
     ``kb:receivedAt``), defaulting to now; pass the channel-reported send
     timestamp when the client returns one, along with its ``message_id``.
@@ -445,6 +484,7 @@ def write_outbound(
         "subject": subject,
         "channel": channel,
         "chat": chat or "unknown",
+        "account": account or None,
         "text": text or "",
         "author": author,
         "message_id": message_id or None,

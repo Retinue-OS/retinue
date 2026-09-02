@@ -188,6 +188,43 @@ def test_recent_sends_dedup():
     print("PASS test_recent_sends_dedup")
 
 
+def test_outbound_account_separates_identical_sends():
+    """Two accounts sending the same words to the same peer are two events.
+
+    For a send the account is not bookkeeping but the record of *who the
+    recipient saw*: a message from the control account arrives as a stranger's
+    contact request, one from the user's own account arrives in their thread.
+    The ledger has to be able to say which happened.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        _s, p1 = ist.write_outbound(tmp, channel="signal", chat="+41790000000",
+                                    text="bis bald", author="agent",
+                                    account="+41766029556", timestamp=100.0)
+        _s, p2 = ist.write_outbound(tmp, channel="signal", chat="+41790000000",
+                                    text="bis bald", author="user",
+                                    account="+41765761976", timestamp=200.0)
+        f1 = ist._parse(p1.read_text(encoding="utf-8"))
+        f2 = ist._parse(p2.read_text(encoding="utf-8"))
+        assert ist.P_ACCOUNT in p1.read_text(encoding="utf-8")
+        assert f1["account"] == "+41766029556"
+        assert f2["account"] == "+41765761976"
+        assert f1["chat"] == f2["chat"] == "+41790000000"
+        assert f1["text"] == f2["text"]
+        # Round-trips byte for byte, like every other field.
+        assert ist._render(f1) == p1.read_text(encoding="utf-8")
+
+        # An outbound record still never reaches the triage drain, account or
+        # not — the delivered ledger is inbound bookkeeping only.
+        assert ist.undelivered(tmp) == []
+
+        # Unset stays absent rather than empty (see the inbound sibling).
+        _s, p3 = ist.write_outbound(tmp, channel="signal", chat="x", text="y",
+                                    timestamp=300.0)
+        assert ist.P_ACCOUNT not in p3.read_text(encoding="utf-8")
+        assert ist._parse(p3.read_text(encoding="utf-8"))["account"] is None
+    print("PASS test_outbound_account_separates_identical_sends")
+
+
 def test_both_directions_share_one_timeline():
     with tempfile.TemporaryDirectory() as tmp:
         ist.write_message(tmp, channel="signal", sender="a", text="first",
@@ -213,5 +250,6 @@ if __name__ == "__main__":
     test_inbound_chat_key_roundtrip()
     test_file_without_type_is_legacy_inbound()
     test_recent_sends_dedup()
+    test_outbound_account_separates_identical_sends()
     test_both_directions_share_one_timeline()
     print("all outbound-store tests passed")

@@ -52,6 +52,12 @@ MARA = "+41794456312"
 CHAT1 = "signal:" + MARA
 WA_KEY = "123456@g.us"
 CHAT2 = "whatsapp:" + WA_KEY
+# Two accounts of one channel, for the merge cases: the same chat key under
+# each must stay two chats (see test_accounts_do_not_merge).
+ACCT_A = "+41791112233"   # the mock gateway's own account
+ACCT_B = "+41764445566"   # a second, unregistered account of the same channel
+# Its own peer, untouched by the other tests' sends and overlay entries.
+MERGE_PEER = "+41791230000"
 MID_ATT = "ab" * 16   # recorded as a host-free urn:retinue:media:… (today's shape)
 MID_ATT2 = "cd" * 16  # the blob the mock gateway "stores" for an images send
 MID_ATT3 = "ef" * 16  # a legacy http://<service>/media/<id> record on disk
@@ -70,6 +76,8 @@ STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
                # When set, an approved send never leaves "sending" — the
                # gateway that does not confirm in time.
                "gw_never_confirms": False,
+               # When set, replaces the canned chat-list rows for one test.
+               "list_rows": None,
                # When set, replaces the canned per-chat message rows.
                "msg_rows": None,
                # What each queued send will produce once it completes.
@@ -104,7 +112,7 @@ class _MockSparql(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"boom")
             return
-        if "VALUES (?chat ?cut)" in query:
+        if "VALUES (?chat ?account ?cut)" in query:
             bindings = self._unread(query)
         elif "MAX(?ts0)" in query:
             bindings = self._chat_list()
@@ -118,6 +126,8 @@ class _MockSparql(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _chat_list(self):
+        if STATE.get("list_rows") is not None:
+            return STATE["list_rows"]
         att_url = f"urn:retinue:media:signal:{MID_ATT}"
         return [
             _lit_row(chat=MARA, channel="signal", ts=TS3, type=T_IN,
@@ -129,12 +139,16 @@ class _MockSparql(BaseHTTPRequestHandler):
     def _unread(self, query):
         # Canned semantics: a chat whose injected cutoff is still the epoch has
         # never been read (full count); a real cutoff means it was caught up.
+        # Rows are (key, account, cutoff) — the account is part of the row key,
+        # so a count comes back tagged with the account it was asked for.
         import re
-        pairs = dict(re.findall(r'\("((?:[^"\\]|\\.)*)"\s+"([^"]+)"\^\^', query))
-        counts = {MARA: "2", WA_KEY: "1"}
-        return [_lit_row(chat=key, n=counts[key])
-                for key, cut in pairs.items()
-                if key in counts and cut.startswith("1970-")]
+        rows = re.findall(
+            r'\("((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"\s+"([^"]+)"\^\^', query)
+        counts = {(MARA, ""): "2", (WA_KEY, ""): "1",
+                  (MERGE_PEER, ACCT_A): "2", (MERGE_PEER, ACCT_B): "1"}
+        return [_lit_row(chat=key, account=acct, n=counts[(key, acct)])
+                for key, acct, cut in rows
+                if (key, acct) in counts and cut.startswith("1970-")]
 
     def _messages(self, query):
         if STATE.get("msg_rows") is not None:
@@ -336,9 +350,15 @@ def test_chat_list_contract(base, wg):
     c1, c2 = chats[CHAT1], chats[CHAT2]
     # ChatSummary contract fields, exactly the fixture's shape.
     for c in (c1, c2):
-        assert {"id", "channel", "name", "group", "unread", "archived",
-                "muted", "last", "draft", "companion", "messages"} <= set(c)
+        assert {"id", "channel", "account", "key", "name", "group", "unread",
+                "archived", "muted", "last", "draft", "companion",
+                "messages"} <= set(c)
         assert c["companion"] is None, "no companion thread until one is asked for"
+    # The two halves of a chat's identity, both surfaced: the peer (stable
+    # across accounts, so the client can colour one person one way) and the
+    # account, null while the records carry none.
+    assert c1["key"] == MARA and c1["account"] is None
+    assert c2["key"] == WA_KEY and c2["account"] is None
     assert c1["channel"] == "signal" and c1["group"] is False
     assert c2["channel"] == "whatsapp" and c2["group"] is True
     assert c1["unread"] == 2 and c2["unread"] == 1
@@ -352,7 +372,7 @@ def test_chat_list_contract(base, wg):
     status, doc = _http(base, "GET", c1["messages"])
     assert status == 200
     # The unread query injected the epoch cutoff for never-read chats.
-    unread_qs = [q for q in STATE["queries"] if "VALUES (?chat ?cut)" in q]
+    unread_qs = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q]
     assert unread_qs and MARA in unread_qs[-1] and "1970-01-01" in unread_qs[-1]
     print("PASS test_chat_list_contract")
 
@@ -409,7 +429,7 @@ def test_read_watermark(base, wg):
     # The mock store answers 0 once a real cutoff is injected — and the query
     # carried exactly the new watermark.
     assert c1["unread"] == 0
-    unread_q = [q for q in STATE["queries"] if "VALUES (?chat ?cut)" in q][-1]
+    unread_q = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q][-1]
     assert TS3 in unread_q
     print("PASS test_read_watermark")
 
@@ -683,7 +703,12 @@ def test_control_gateway_refused(base, wg):
 def test_rail_attributes_by_account(base, wg):
     """A rail event whose self-reported slug is wrong is still attributed to
     the account that actually sent it — the root cause of the incident."""
-    cid = "signal:+41790008888"
+    # The event carries an account, so the chat it lands in is that account's:
+    # the id is composed from the same value the gateway stamps as kb:account
+    # on this very message's ledger record.
+    cid = wg.chat_state_mod.make_chat_id("signal", "+41790008888",
+                                         STATE["gw_account"])
+    assert cid == "signal:~+41791112233:+41790008888", cid
     status, body = _http(base, "POST", "/internal/chats/inbound",
                          {"direction": "in", "channel": "signal",
                           "chat": "+41790008888", "sender": "+41790008888",
@@ -714,8 +739,18 @@ def test_rail_attributes_by_account(base, wg):
                        "account": "+15559990000", "gateway": "signal-gateway",
                        "gate": {"forward": True, "reason": "whitelisted"}})
     assert status == 200
-    unknown = wg._CHAT_STATE.get("signal:+41790007777")
+    # …but the chat is still that account's own: an id is composed from the
+    # account the event asserts, which is a fact about the sender, while the
+    # gateway stamp is a lookup in the reader's registry that can simply miss.
+    unknown_id = wg.chat_state_mod.make_chat_id("signal", "+41790007777",
+                                                "+15559990000")
+    unknown = wg._CHAT_STATE.get(unknown_id)
     assert unknown["gateway"] is None and unknown["gateway_source"] is None
+    # And it cannot be sent: an account the registry does not serve is refused
+    # outright rather than falling back to the channel's other identity.
+    slug, gw, err = wg._chat_gateway(unknown, "signal", "+15559990000")
+    assert gw is None and slug is None
+    assert "+15559990000" in err and "not a configured gateway" in err, err
     print("PASS test_rail_attributes_by_account")
 
 
@@ -889,6 +924,72 @@ def test_store_down_is_502(base, wg):
     print("PASS test_store_down_is_502")
 
 
+def test_accounts_do_not_merge(base, wg):
+    """Two accounts of one channel writing to the SAME peer are two chats.
+
+    The defect this closes: a chat key identifies a peer only within an
+    account, and one channel's message volume is shared by every account on it,
+    so grouping by the key alone put a second account's messages into the first
+    account's conversation — timeline, unread badge and all.
+    """
+    STATE["list_rows"] = [
+        # One peer (MARA), two accounts, plus the same peer's unattributed
+        # history from before kb:account existed. Three chats, not one.
+        _lit_row(chat=MERGE_PEER, account=ACCT_A, channel="signal", ts=TS3,
+                 type=T_IN, text="von A", sender=MERGE_PEER, atts=""),
+        _lit_row(chat=MERGE_PEER, account=ACCT_B, channel="signal", ts=TS2,
+                 type=T_OUT, text="von B", author="agent", atts=""),
+        _lit_row(chat=MERGE_PEER, account="", channel="signal", ts=TS1,
+                 type=T_IN, text="ohne Konto", sender=MERGE_PEER, atts=""),
+    ]
+    try:
+        wg._chats_cache_invalidate()
+        _, body = _http(base, "GET", "/chats")
+        rows = {c["id"]: c for c in body["chats"]}
+        id_a = wg.chat_state_mod.make_chat_id("signal", MERGE_PEER, ACCT_A)
+        id_b = wg.chat_state_mod.make_chat_id("signal", MERGE_PEER, ACCT_B)
+        id_legacy = "signal:" + MERGE_PEER
+        assert set(rows) >= {id_a, id_b, id_legacy}, sorted(rows)
+        # Each shows only its own account's last message …
+        assert rows[id_a]["last"]["text"] == "von A"
+        assert rows[id_b]["last"]["text"] == "von B"
+        assert rows[id_legacy]["last"]["text"] == "ohne Konto"
+        # … carries the account so the UI can tell same-named rows apart …
+        assert rows[id_a]["account"] == ACCT_A
+        assert rows[id_b]["account"] == ACCT_B
+        assert rows[id_legacy]["account"] is None
+        # … and counts unread apart: the canned store gives A two and B one,
+        # so a merged count would show three on either row.
+        assert rows[id_a]["unread"] == 2, rows[id_a]["unread"]
+        assert rows[id_b]["unread"] == 1, rows[id_b]["unread"]
+
+        # The messages query asks for one account's records, never the key's.
+        # Serving a page also refreshes the chat summary, so pick the messages
+        # query by its own shape rather than taking whatever ran last.
+        def _last_messages_query():
+            return [q for q in STATE["queries"] if "ORDER BY DESC(?ts)" in q][-1]
+
+        _http(base, "GET", "/chats/" + _quote(id_a) + "/messages")
+        q = _last_messages_query()
+        assert f'"{ACCT_A}"' in q and f'k:chat "{MERGE_PEER}"' in q, q
+        # An unattributed chat asks for exactly the records carrying no
+        # account — the empty literal — not for every record of that key.
+        _http(base, "GET", "/chats/" + _quote(id_legacy) + "/messages")
+        q = _last_messages_query()
+        assert 'COALESCE(?acc0, "") = ""' in q, q
+
+        # Sending goes out as the chat's own account. A's is the mock gateway's;
+        # B's is not in the registry, so it is refused rather than sent as A.
+        doc_a = wg._CHAT_STATE.get(id_a)
+        assert wg._chat_gateway(doc_a, "signal", ACCT_A)[0] == "127.0.0.1"
+        slug, gw_, err = wg._chat_gateway(wg._CHAT_STATE.get(id_b), "signal", ACCT_B)
+        assert gw_ is None and slug is None and ACCT_B in err, err
+    finally:
+        STATE["list_rows"] = None
+        wg._chats_cache_invalidate()
+    print("PASS test_accounts_do_not_merge")
+
+
 def main():
     sparql = _serve(_MockSparql)
     gw = _serve(_MockGateway)
@@ -933,6 +1034,7 @@ def main():
 
         test_control_gateway_refused(base, wg)
         test_rail_attributes_by_account(base, wg)
+        test_accounts_do_not_merge(base, wg)
         test_media_proxy(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()

@@ -4138,26 +4138,41 @@ def _sparql_datetime(iso: str) -> str:
 
 
 # One row per chat: the per-chat MAX(ts) subquery joins back (on the shared
-# ?chat/?ts variables) to the message that carries it, so the list skeleton —
-# every chat with its latest message — is one query, not a per-chat fan-out.
-# COALESCE-by-UNION: inbound rows carry receivedAt, outbound rows sentAt, and
-# either is the message's timeline instant.
+# ?chat/?account/?ts variables) to the message that carries it, so the list
+# skeleton — every chat with its latest message — is one query, not a per-chat
+# fan-out. COALESCE-by-UNION: inbound rows carry receivedAt, outbound rows
+# sentAt, and either is the message's timeline instant.
+#
+# A chat is (chat key, account), not the key alone: one channel's message volume
+# is shared by every account on it, and a key identifies a peer only within an
+# account (see inbound_store.P_ACCOUNT). Grouping by the key alone is what let a
+# second account's traffic land in another account's conversation.
+#
+# kb:account is OPTIONAL — records written before the predicate existed have
+# none — so it is folded to the empty string, giving those records a group of
+# their own rather than letting them join every account's. The subquery may BIND
+# ?account because nothing binds it there yet; the outer pattern must FILTER on
+# it instead, since binding an in-scope variable is a SPARQL error.
 _CHATS_LIST_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-SELECT ?chat ?channel ?ts ?type ?text ?sender ?author ?mid
+SELECT ?chat ?account ?channel ?ts ?type ?text ?sender ?author ?mid
        (GROUP_CONCAT(?att; separator=" ") AS ?atts) WHERE {
-  { SELECT ?chat (MAX(?ts0) AS ?ts) WHERE {
+  { SELECT ?chat ?account (MAX(?ts0) AS ?ts) WHERE {
       ?m0 k:chat ?chat .
       { ?m0 k:receivedAt ?ts0 } UNION { ?m0 k:sentAt ?ts0 }
-    } GROUP BY ?chat }
+      OPTIONAL { ?m0 k:account ?acc0 }
+      BIND(COALESCE(?acc0, "") AS ?account)
+    } GROUP BY ?chat ?account }
   ?m k:chat ?chat ; k:channel ?channel ; k:text ?text ; rdf:type ?type .
   { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
+  OPTIONAL { ?m k:account ?acc1 }
+  FILTER(COALESCE(?acc1, "") = ?account)
   OPTIONAL { ?m k:sender ?sender }
   OPTIONAL { ?m k:author ?author }
   OPTIONAL { ?m k:messageId ?mid }
   OPTIONAL { ?m k:attachment ?att }
-} GROUP BY ?chat ?channel ?ts ?type ?text ?sender ?author ?mid
+} GROUP BY ?chat ?account ?channel ?ts ?type ?text ?sender ?author ?mid
 """ % _KB
 
 # Unread = COUNT of inbound above each chat's own read watermark. The per-chat
@@ -4165,16 +4180,26 @@ SELECT ?chat ?channel ?ts ?type ?text ?sender ?author ?mid
 # count per chat and no message rows ever cross the wire — chosen over
 # fetching (chat, ts) pairs and counting here, whose payload grows with every
 # never-opened noisy group (a chat with no watermark counts from the epoch).
+# The row key is (chat key, account) for the same reason the list query groups
+# by both: counting a key across accounts would badge one account's chat with
+# another's arrivals. ?account arrives bound from VALUES, so the account test is
+# a FILTER — a BIND on an in-scope variable is a SPARQL error.
 _CHATS_UNREAD_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-SELECT ?chat (COUNT(?m) AS ?n) WHERE {
-  VALUES (?chat ?cut) { %%s }
+SELECT ?chat ?account (COUNT(?m) AS ?n) WHERE {
+  VALUES (?chat ?account ?cut) { %%s }
   ?m rdf:type k:InboundMessage ; k:chat ?chat ; k:receivedAt ?ts .
+  OPTIONAL { ?m k:account ?acc0 }
+  FILTER(COALESCE(?acc0, "") = ?account)
   FILTER(?ts > ?cut)
-} GROUP BY ?chat
+} GROUP BY ?chat ?account
 """ % _KB
 
+# One chat's messages. Both halves of the identity are injected as literals —
+# the key and the account — so a chat never shows another account's messages to
+# the same peer. An empty account literal selects exactly the records that carry
+# no kb:account, which is the pre-predicate history and nothing else.
 _CHAT_MESSAGES_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
@@ -4182,6 +4207,8 @@ SELECT ?m ?type ?text ?sender ?author ?mid ?ts
        (GROUP_CONCAT(?att; separator=" ") AS ?atts) WHERE {
   ?m k:chat %%(chat)s ; k:channel %%(channel)s ; k:text ?text ; rdf:type ?type .
   { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
+  OPTIONAL { ?m k:account ?acc0 }
+  FILTER(COALESCE(?acc0, "") = %%(account)s)
   OPTIONAL { ?m k:sender ?sender }
   OPTIONAL { ?m k:author ?author }
   OPTIONAL { ?m k:messageId ?mid }
@@ -4284,14 +4311,14 @@ def _shape_chat_attachments(urls: list[str], channel: str,
     reference names the blob, not a host (see :func:`_parse_media_reference`).
 
     ``serving_slug`` is only ever the answer of :func:`_chat_gateway`, which is
-    either an account-derived stamp or the channel's single inbox account —
-    never an untrusted stamp and never a pick among several. So a redirect can
-    never reach an account that may not own the chat. Where ownership is
-    unproven the caller passes None: a legacy record then falls back to the
-    service name it recorded (which may 404), and a host-free one is passed
-    through verbatim and plainly fails to load. Both are honest failures in a
-    chat whose account is ambiguous — where sending is refused anyway — and
-    both beat silently reading another account's media."""
+    the account named by the chat's own id, else an account-derived stamp, else
+    the channel's single inbox account — never an untrusted stamp and never a
+    pick among several. So a redirect can never reach an account that may not
+    own the chat. Where ownership is unproven the caller passes None: a legacy
+    record then falls back to the service name it recorded (which may 404), and
+    a host-free one is passed through verbatim and plainly fails to load. Both
+    are honest failures in a chat whose account is ambiguous — where sending is
+    refused anyway — and both beat silently reading another account's media."""
     out = []
     for url in urls:
         if not url:
@@ -4392,7 +4419,13 @@ def _chats_cache_invalidate() -> None:
 
 
 def _fetch_chats_skeleton() -> dict[str, dict]:
-    """One entry per chat from the ledgers: channel + its latest message row."""
+    """One entry per chat from the ledgers: channel + its latest message row.
+
+    Keyed by the composed chat id, so two accounts talking to the same peer are
+    two entries. A row whose ``?account`` is the empty string carries no
+    ``kb:account`` at all — history from before the predicate — and composes to
+    the plain ``<channel>:<key>`` id it has always had, which is why nothing
+    that already exists moves, is renamed, or loses its state document."""
     skeleton: dict[str, dict] = {}
     for b in _sparql_bindings(_CHATS_LIST_SPARQL):
         key = _bval(b, "chat")
@@ -4400,7 +4433,8 @@ def _fetch_chats_skeleton() -> dict[str, dict]:
         ts = _bval(b, "ts")
         if not key or not channel or not ts:
             continue
-        chat_id = f"{channel}:{key}"
+        account = _bval(b, "account") or None
+        chat_id = chat_state_mod.make_chat_id(channel, key, account)
         # Two messages can share the max timestamp; keep the first row.
         if chat_id in skeleton:
             continue
@@ -4408,6 +4442,7 @@ def _fetch_chats_skeleton() -> dict[str, dict]:
         skeleton[chat_id] = {
             "channel": channel,
             "key": key,
+            "account": account,
             "ts": ts,
             "direction": "out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
             "text": _bval(b, "text") or "",
@@ -4420,23 +4455,35 @@ def _fetch_chats_skeleton() -> dict[str, dict]:
 
 
 def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
-    """Per-chat unread counts in one VALUES-bounded query (see the SPARQL)."""
+    """Per-chat unread counts in one VALUES-bounded query (see the SPARQL).
+
+    The VALUES row is (chat key, account, cutoff) and results map back on the
+    same pair, so two accounts' chats with one peer are counted apart. Ids the
+    module never composed are skipped rather than sent as a half-formed row."""
     if not cutoffs:
         return {}
     epoch = "1970-01-01T00:00:00Z"
+    refs = {}
+    for cid, cut in cutoffs.items():
+        parts = chat_state_mod.split_chat_ref(cid)
+        if parts is None:
+            continue
+        refs[cid] = (parts[2], parts[1] or "", cut)
+    if not refs:
+        return {}
     rows = " ".join(
-        f"({_sparql_str(chat_state_mod.split_chat_id(cid)[1])} "
+        f"({_sparql_str(key)} {_sparql_str(account)} "
         f"{_sparql_datetime(cut or epoch)})"
-        for cid, cut in cutoffs.items()
+        for key, account, cut in refs.values()
     )
     counts: dict[str, int] = {}
-    by_key = {chat_state_mod.split_chat_id(cid)[1]: cid for cid in cutoffs}
+    by_pair = {(key, account): cid for cid, (key, account, _c) in refs.items()}
     for b in _sparql_bindings(_CHATS_UNREAD_SPARQL % rows):
-        key = _bval(b, "chat")
+        pair = (_bval(b, "chat"), _bval(b, "account") or "")
         n = _bval(b, "n")
-        if key in by_key and n is not None:
+        if pair in by_pair and n is not None:
             try:
-                counts[by_key[key]] = int(n)
+                counts[by_pair[pair]] = int(n)
             except ValueError:
                 continue
     return counts
@@ -4528,6 +4575,15 @@ def _chats_payload() -> dict:
         chats.append({
             "id": chat_id,
             "channel": channel,
+            # Which of the channel's accounts this conversation belongs to, or
+            # null for history written before the ledger recorded it. Exposed
+            # because two accounts talking to one peer are two chats with the
+            # same name, and the name alone cannot tell them apart.
+            "account": (chat_state_mod.split_chat_ref(chat_id) or (None, None, None))[1],
+            # The peer, as the ledger and the send path name them. Stable across
+            # the accounts that talk to them, which is what lets the client give
+            # one person one avatar colour however many chats they appear in.
+            "key": key,
             "name": _chat_display_name(doc, channel, key),
             "group": bool(group),
             "unread": count,
@@ -4707,18 +4763,21 @@ def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
 
 def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     """The GET /chats/<id>/messages body. Raises on store errors (→ 502)."""
-    channel, key = chat_state_mod.split_chat_id(chat_id)
+    channel, account, key = chat_state_mod.split_chat_ref(chat_id)
     doc = _CHAT_STATE.get(chat_id)
     roster = doc.get("roster") or {}
     # The account this chat belongs to, when it can be told: media is served
     # through it rather than through the host recorded in each reference (see
     # _shape_chat_attachments). A chat whose account is ambiguous still lists
     # its messages — only sending refuses — so this stays best-effort.
-    serving_slug, _gw, _err = _chat_gateway(doc, channel)
+    serving_slug, _gw, _err = _chat_gateway(doc, channel, account)
     before_clause = f"FILTER(?ts < {_sparql_datetime(before)})" if before else ""
     query = _CHAT_MESSAGES_SPARQL % {
         "chat": _sparql_str(key),
         "channel": _sparql_str(channel),
+        # The empty literal selects the records carrying no kb:account, which
+        # is exactly the history an unqualified id names.
+        "account": _sparql_str(account or ""),
         "before": before_clause,
         "limit": CHAT_PAGE_MESSAGES,
     }
@@ -4922,20 +4981,48 @@ def _rail_gateway_slug(channel: str, account: str | None) -> str | None:
     return _slug_for_account(channel, (account or "").strip())
 
 
-def _chat_gateway(doc: dict, channel: str):
+def _chat_gateway(doc: dict, channel: str, account: str | None = None):
     """Resolve the account a chat's sends go out as.
 
     Returns ``(slug, gateway, error)`` — exactly one of ``gateway`` / ``error``
-    is set. A stamped slug is authoritative only when its provenance says it
-    was established from the account a gateway reported (``gateway_source``)
-    *and* it still resolves to an inbox-mode gateway. Mode alone is not
-    enough: the stamps that caused the incident named the built-in service,
-    which may itself be inbox-mode, so trusting any inbox-resolving stamp
-    would have left every poisoned chat sending as the wrong account. An
-    untrusted stamp is discarded and re-derived here — not only by the repair
-    pass — so correctness never depends on that sweep having run. With no
-    usable stamp, exactly one inbox account for the channel is unambiguous and
-    used; zero or several are refused."""
+    is set.
+
+    ``account`` is the chat id's own account segment, and where it is present it
+    settles the question outright: the id was composed from the ``kb:account``
+    the writing gateway stamped on this chat's records, so it names the identity
+    that actually holds this conversation. That is a stronger fact than any
+    cached stamp — it comes from the messages themselves rather than from state
+    this process maintains — so it is tried first, and an account naming no
+    registry gateway is an error rather than a licence to fall through: falling
+    back would send a known account's chat out as a different identity, which is
+    the failure this whole mechanism exists to prevent.
+
+    Without one — a chat whose records predate ``kb:account`` — the old ladder
+    stands. A stamped slug is authoritative only when its provenance says it was
+    established from the account a gateway reported (``gateway_source``) *and* it
+    still resolves to an inbox-mode gateway. Mode alone is not enough: the stamps
+    that caused the incident named the built-in service, which may itself be
+    inbox-mode, so trusting any inbox-resolving stamp would have left every
+    poisoned chat sending as the wrong account. An untrusted stamp is discarded
+    and re-derived here — not only by the repair pass — so correctness never
+    depends on that sweep having run. With no usable stamp, exactly one inbox
+    account for the channel is unambiguous and used; zero or several are
+    refused."""
+    if account:
+        slug = _slug_for_account(channel, account)
+        canonical, gw = _channel_gateway(slug) if slug else (None, None)
+        if gw is not None and _gateway_is_inbox(canonical, gw):
+            return canonical, gw, None
+        # Two distinct refusals, and neither may fall through to the ladder
+        # below: sending a chat whose owning account is known out as some other
+        # identity is precisely the failure this mechanism exists to prevent.
+        # An account that is no longer inbox-mode is the deployment saying this
+        # identity is not for chats, so its history stays readable and unsendable
+        # rather than being answered from elsewhere.
+        why = ("is no longer an inbox-mode account" if gw is not None
+               else "is not a configured gateway")
+        return None, None, (f"the account this chat belongs to ({account}) "
+                            f"{why} on channel {channel}")
     stamped = (doc.get("gateway") or "").strip()
     if stamped:
         trusted = doc.get("gateway_source") == chat_state_mod.GATEWAY_SOURCE_ACCOUNT
@@ -5830,9 +5917,9 @@ class Handler(BaseHTTPRequestHandler):
         if not text and not images:
             self._send_json(400, {"error": "empty text"})
             return
-        channel, key = chat_state_mod.split_chat_id(chat_id)
+        channel, account, key = chat_state_mod.split_chat_ref(chat_id)
         doc = _CHAT_STATE.get(chat_id)
-        slug, gw, route_error = _chat_gateway(doc, channel)
+        slug, gw, route_error = _chat_gateway(doc, channel, account)
         if gw is None:
             # Refuse, naming the real reason. Sending as the wrong identity is
             # worse than not sending at all — see _chat_gateway.
@@ -5890,6 +5977,16 @@ class Handler(BaseHTTPRequestHandler):
             # `since` onwards carrying these words.
             msg["unconfirmed"] = True
             msg["since"] = since
+        # The overlay entry goes under the id the user sent FROM, which is where
+        # they are looking. For a chat whose records predate kb:account that is
+        # the unattributed id, while the gateway stamps its own account on the
+        # record it writes — so once the store indexes it, this message is the
+        # first of that peer's conversation *on this account*, and the reply to
+        # it lands there too. The overlay is not made to point at that new id
+        # instead: a sent message has to appear in the chat it was sent from.
+        # The visible effect is the one-time hand-over described in chat_state —
+        # the unattributed history stays readable, and the conversation carries
+        # on under the account that actually holds it.
         _CHAT_OVERLAY.insert({
             "chat_id": chat_id, "channel": channel, "direction": "out",
             "author": "user", "text": text, "ts": ts, "message_id": message_id,
@@ -5936,7 +6033,15 @@ class Handler(BaseHTTPRequestHandler):
         if direction not in ("in", "out") or not channel or not chat_key:
             self._send_json(400, {"error": "direction (in|out), channel and chat are required"})
             return
-        chat_id = f"{channel}:{chat_key}"
+        # The account rides on the event and is half the chat's identity — the
+        # same value the writing gateway stamped as kb:account on the ledger
+        # record for this very message, so the overlay entry and the row the
+        # store indexes seconds later compose to the same id. A gateway that
+        # does not know its own account yet (Telegram before the session
+        # authorizes) sends none, and its events compose the unqualified id its
+        # records will also produce.
+        account = (payload.get("account") or "").strip() or None
+        chat_id = chat_state_mod.make_chat_id(channel, chat_key, account)
         ts = chat_state_mod.iso_z(payload.get("ts"))
         author = (payload.get("author") or "").strip() or None
         entry = {
@@ -5957,7 +6062,7 @@ class Handler(BaseHTTPRequestHandler):
         # reports (see _rail_gateway_slug). This is the ONLY writer of a chat's gateway
         # stamp, and every stamp it writes is marked as account-derived; an
         # unresolvable account leaves the existing stamp alone.
-        rail_slug = _rail_gateway_slug(channel, payload.get("account"))
+        rail_slug = _rail_gateway_slug(channel, account)
         doc = _CHAT_STATE.note_message(
             chat_id,
             name=(payload.get("chat_name") or "").strip()

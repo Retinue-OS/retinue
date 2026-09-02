@@ -152,10 +152,21 @@ docstring). Pieces:
 The API, as the components consume it:
 
 - `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
-  activity. A `ChatSummary` is `{id, channel, name, group, members?, unread,
-  archived, muted, companion, last, draft, messages}` where `id` is
-  `<channel>:<chat-key>` (the exact recipient string that channel's send path
-  accepts), `unread` derives from the user's `last_read` watermark, `last` is
+  activity. A `ChatSummary` is `{id, channel, account, key, name, group,
+  members?, unread, archived, muted, companion, last, draft, messages}`.
+
+  A chat is one peer **on one account**, and `id` names both:
+  `<channel>:~<account>:<chat-key>`, or `<channel>:<chat-key>` for history
+  written before the ledger recorded the account. `key` is the chat key on its
+  own — the exact recipient string that channel's send path accepts — and
+  `account` the gateway account, or null for that older history. Both are
+  surfaced because the name identifies neither: two accounts talking to the
+  same person are two chats called the same thing, so the client labels a
+  repeated name with its account, and keys the avatar colour on the *peer* so
+  one person keeps one colour across all of them. Clients must treat the id as
+  opaque and read `key`/`account` rather than splitting it.
+
+  `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
   is the shared draft `{text, author, agent?, ts, version}` or null,
   `companion` is the conversation id of this chat's companion thread (null

@@ -2,8 +2,10 @@
  "generated": "2026-08-27T09:45:00+02:00",
  "chats": [
   {
-   "id": "signal:+41794456312",
+   "id": "signal:~+41765761976:+41794456312",
    "channel": "signal",
+   "account": "+41765761976",
+   "key": "+41794456312",
    "name": "Mara Meier",
    "group": false,
    "unread": 2,
@@ -27,8 +29,31 @@
    "messages": "/data/chats/signal-mara.json"
   },
   {
-   "id": "whatsapp:120363169876543210@g.us",
+   "id": "signal:~+41766029556:+41794456312",
+   "channel": "signal",
+   "account": "+41766029556",
+   "key": "+41794456312",
+   "name": "Mara Meier",
+   "group": false,
+   "unread": 0,
+   "archived": false,
+   "muted": false,
+   "companion": null,
+   "last": {
+    "ts": "2026-08-26T08:04:00+02:00",
+    "direction": "out",
+    "kind": "text",
+    "author": "agent",
+    "text": "Systemhinweis: Backup gestern Nacht ok."
+   },
+   "draft": null,
+   "messages": "/data/chats/signal-mara-bot.json"
+  },
+  {
+   "id": "whatsapp:~+41765761976:120363169876543210@g.us",
    "channel": "whatsapp",
+   "account": "+41765761976",
+   "key": "120363169876543210@g.us",
    "name": "Wandergruppe Rigi",
    "group": true,
    "unread": 7,
@@ -47,8 +72,10 @@
    "members": 6
   },
   {
-   "id": "signal:group:R2xhcnVzQWxwaW5pc3Q=",
+   "id": "signal:~+41765761976:group:R2xhcnVzQWxwaW5pc3Q=",
    "channel": "signal",
+   "account": "+41765761976",
+   "key": "group:R2xhcnVzQWxwaW5pc3Q=",
    "name": "Climbing Crew",
    "group": true,
    "unread": 1,
@@ -67,8 +94,10 @@
    "members": 4
   },
   {
-   "id": "telegram:774301992",
+   "id": "telegram:~@reto:774301992",
    "channel": "telegram",
+   "account": "@reto",
+   "key": "774301992",
    "name": "Luca Bernasconi",
    "group": false,
    "unread": 0,
@@ -88,6 +117,8 @@
   {
    "id": "telegram:-1001455667788",
    "channel": "telegram",
+   "account": null,
+   "key": "-1001455667788",
    "name": "Quartierverein Unterstrass",
    "group": true,
    "unread": 12,
@@ -106,8 +137,10 @@
    "members": 118
   },
   {
-   "id": "whatsapp:41765554433@s.whatsapp.net",
+   "id": "whatsapp:~+41765761976:41765554433@s.whatsapp.net",
    "channel": "whatsapp",
+   "account": "+41765761976",
+   "key": "41765554433@s.whatsapp.net",
    "name": "Praxis Dr. Keller",
    "group": false,
    "unread": 0,

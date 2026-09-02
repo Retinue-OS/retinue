@@ -1,12 +1,26 @@
 """Retinue-side chat state and the live message overlay (messenger chats).
 
-A **chat** is one messenger conversation (one peer or group, on one gateway
-account), identified as ``<channel>:<chat-key>`` — the chat key being the exact
-recipient string that channel's send path accepts, the same ``kb:chat`` value
-the gateways stamp on every ledger record. The message history itself lives in
-the gateways' ledgers and is served over SPARQL; everything about a chat that
-is *not* a channel message lives here, in one JSON document per chat under
-``CHAT_STATE_DIR``:
+A **chat** is one messenger conversation — one peer or group, on one gateway
+account — and it takes both halves to name it: the **chat key** is the exact
+recipient string that channel's send path accepts (the ``kb:chat`` the gateways
+stamp on every ledger record), and the **account** is the identity that holds
+the conversation (their ``kb:account``). A key is unique only within an account,
+because one channel's message volume is shared by every account on it, so two
+accounts writing to the same peer produce the same key.
+
+The id is therefore ``<channel>:~<account>:<chat-key>``, and
+``<channel>:<chat-key>`` for records written before ``kb:account`` existed — see
+:func:`make_chat_id` for the shape and why the two can always be told apart.
+Those older ids are left exactly as they were rather than being guessed at: a
+record that does not say which account wrote it cannot be attributed by this
+process, and inventing an attribution would put one account's history under
+another's name. The practical effect of that honesty is a one-time split — an
+ongoing conversation shows as its unattributed history plus the account-named
+chat that carries everything from now on — which heals as the new chat fills.
+
+The message history itself lives in the gateways' ledgers and is served over
+SPARQL; everything about a chat that is *not* a channel message lives here, in
+one JSON document per chat under ``CHAT_STATE_DIR``:
 
 - ``last_read`` — the user's read watermark (ISO-8601), from which unread
   badges derive; only ever advances.
@@ -99,16 +113,103 @@ def iso_z(ts: float | str | None = None) -> str:
         return iso_z(None)
 
 
-def split_chat_id(chat_id: str) -> tuple[str, str] | None:
-    """Split ``<channel>:<chat-key>`` at the FIRST colon.
+# Marker opening an id's optional account segment. A chat id is
+# ``<channel>:<key>`` when the account is unknown and
+# ``<channel>:~<account>:<key>`` when it is known, and this character is what
+# tells the two apart in one pass: no chat key any channel produces begins with
+# it (Signal groups begin ``group:``, WhatsApp JIDs and Telegram chat ids with a
+# digit or ``-``, phone numbers with ``+``), so a middle segment opening with
+# ``~`` can only be an account. The alternative — counting colons — cannot work:
+# ``signal:group:abc`` is a legacy two-segment id whose key merely contains one.
+# ``~`` is unreserved in RFC 3986, so an id stays readable percent-encoded in a
+# URL.
+_ACCOUNT_MARK = "~"
 
-    Chat keys themselves contain ``:`` (Signal ``group:<id>``), ``@`` and
-    ``+``, so only the first separator is structural. Returns None when the id
-    has no channel or no key."""
-    channel, sep, key = (chat_id or "").partition(":")
-    if not sep or not channel or not key:
+# Inside the account segment three characters need hiding: ``:`` would forge a
+# segment boundary, a leading ``~`` would look like the doubled marker that
+# escapes a key (see :func:`make_chat_id`), and ``%`` must be escaped for the
+# encoding to be reversible at all. Everything else — ``+``, ``@``, digits,
+# letters — is left as it is so an id reads as the account it names. ``%`` is
+# listed first so encoding never re-escapes its own output, and decoding walks
+# the list backwards so ``%253A`` comes back as the literal ``%3A``.
+_ACCOUNT_ESCAPES = (("%", "%25"), (":", "%3A"), ("~", "%7E"))
+
+
+def encode_account(account: str) -> str:
+    """The account as it appears inside a chat id (see :data:`_ACCOUNT_ESCAPES`)."""
+    out = account or ""
+    for raw, enc in _ACCOUNT_ESCAPES:
+        out = out.replace(raw, enc)
+    return out
+
+
+def decode_account(segment: str) -> str:
+    """Inverse of :func:`encode_account`. ``%`` last, so ``%253A`` round-trips."""
+    out = segment or ""
+    for raw, enc in reversed(_ACCOUNT_ESCAPES):
+        out = out.replace(enc, raw)
+    return out
+
+
+def make_chat_id(channel: str, key: str, account: str | None = None) -> str:
+    """Compose a chat id from its parts — the one place the shape is written.
+
+    With no account this is the historical ``<channel>:<key>``, which is also
+    what a ledger record written before ``kb:account`` existed still yields; with
+    one it is ``<channel>:~<account>:<key>``.
+
+    Composing and splitting are inverses for **every** channel-supplied value,
+    not merely the ones today's channels produce. No current channel emits a key
+    beginning with the marker, but the key is the channel's string and this
+    module does not get to assume what a future one will hand it: an accountless
+    key that opens with ``~`` gets the marker doubled, which is a form the
+    account branch can never produce (an account's own leading ``~`` is
+    percent-escaped). So the ambiguity is closed by construction rather than by
+    a claim about the channels."""
+    if account:
+        return f"{channel}:{_ACCOUNT_MARK}{encode_account(account)}:{key}"
+    if key.startswith(_ACCOUNT_MARK):
+        return f"{channel}:{_ACCOUNT_MARK}{key}"
+    return f"{channel}:{key}"
+
+
+def split_chat_id(chat_id: str) -> tuple[str, str] | None:
+    """Split a chat id into ``(channel, key)``, ignoring any account segment.
+
+    The two-value form every caller that only routes or displays a message
+    wants: the key is what a send path accepts and what ``kb:chat`` holds, and
+    it means the same thing whether or not the id names an account. Callers that
+    must distinguish two accounts' chats use :func:`split_chat_ref` instead.
+    Returns None when the id has no channel or no key."""
+    ref = split_chat_ref(chat_id)
+    return None if ref is None else (ref[0], ref[2])
+
+
+def split_chat_ref(chat_id: str) -> tuple[str, str | None, str] | None:
+    """Split a chat id into ``(channel, account, key)``; None if malformed.
+
+    ``account`` is None for an id that names none — a chat whose records predate
+    ``kb:account``, or one on a gateway that did not know its own account yet.
+    Chat keys contain ``:`` themselves (Signal ``group:<id>``), so the split is
+    positional, never a count: the first colon ends the channel, and only a
+    second segment opening with :data:`_ACCOUNT_MARK` is an account — everything
+    after it is the key, colons and all. A *doubled* marker is the escape
+    :func:`make_chat_id` writes for an accountless key that begins with one, and
+    is stripped back to that key here."""
+    channel, sep, rest = (chat_id or "").partition(":")
+    if not sep or not channel or not rest:
         return None
-    return channel, key
+    if rest.startswith(_ACCOUNT_MARK * 2):
+        return channel, None, rest[len(_ACCOUNT_MARK):]
+    if rest.startswith(_ACCOUNT_MARK):
+        account, sep2, key = rest[len(_ACCOUNT_MARK):].partition(":")
+        # A marker with no closing colon, or with an empty account or key, is
+        # not an id this module ever composed — refuse it rather than silently
+        # reading it as a key that happens to start with "~".
+        if not sep2 or not account or not key:
+            return None
+        return channel, decode_account(account), key
+    return channel, None, rest
 
 
 def state_filename(chat_id: str) -> str:
@@ -135,11 +236,15 @@ class ChatStateStore:
 
     @staticmethod
     def _default(chat_id: str) -> dict:
-        parts = split_chat_id(chat_id) or ("", chat_id)
+        parts = split_chat_ref(chat_id) or ("", None, chat_id)
         return {
             "id": chat_id,
             "channel": parts[0],
-            "key": parts[1],
+            # The gateway account this chat belongs to, or None for one whose
+            # records predate kb:account. Denormalized from the id purely so a
+            # state document is readable on its own; the id stays the truth.
+            "account": parts[1],
+            "key": parts[2],
             "last_read": None,
             "draft": None,
             # What the newest clear removed, kept so it can be put back exactly
@@ -178,7 +283,15 @@ class ChatStateStore:
             return self._default(chat_id)
         doc = self._default(chat_id)
         doc.update(data)
-        doc["id"] = chat_id  # the digest filename is not invertible; trust the caller's id
+        # The id is the truth about a chat's identity, and channel/account/key
+        # are only ever denormalized from it for readability — so they are
+        # re-derived here rather than taken from the file. The digest filename
+        # is not invertible, so the caller's id is what we have; a stored copy
+        # that ever disagreed with it would silently route or filter by the
+        # wrong half.
+        doc["id"] = chat_id
+        channel, account, key = split_chat_ref(chat_id) or ("", None, chat_id)
+        doc["channel"], doc["account"], doc["key"] = channel, account, key
         return doc
 
     def _write(self, doc: dict) -> None:
