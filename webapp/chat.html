@@ -19,6 +19,10 @@
     main:has(retinue-chat-page) {
       height: 100vh;
       height: 100dvh;
+      /* The visible height (viewport.js), which can be less than 100dvh — so
+         the base min-height must not hold the frame at the taller value. */
+      height: var(--frame-h, 100dvh);
+      min-height: 0;
       overflow: hidden;
     }
     retinue-chat-page { flex: 1; min-height: 0; }
@@ -29,6 +33,8 @@
        (Ara). Swipe between the panes on a phone; side by side behind a
        splitter on a wide screen. Live against the gateway's chat API. -->
   <script type="module" src="/components/chat-page.js"></script>
+  <!-- Keeps the locked frame the height that is actually visible. -->
+  <script type="module" src="/viewport.js"></script>
 </head>
 <body>
   <main>

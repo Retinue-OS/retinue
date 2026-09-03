@@ -112,6 +112,10 @@ main:has(retinue-conversations[data-view="thread"]),
 main:has(retinue-conversations[data-view="composer"]) {
   height: 100vh;
   height: 100dvh;
+  /* The visible height (viewport.js), which can be less than 100dvh — so the
+     base min-height must not hold the frame at the taller value. */
+  height: var(--frame-h, 100dvh);
+  min-height: 0;
   overflow: hidden;
 }
 main:has(retinue-conversations[data-view="thread"])
@@ -135,6 +139,10 @@ main:has(retinue-conversations[data-view="composer"])
 main:has(retinue-project-page) {
   height: 100vh;
   height: 100dvh;
+  /* The visible height (viewport.js), which can be less than 100dvh — so the
+     base min-height must not hold the frame at the taller value. */
+  height: var(--frame-h, 100dvh);
+  min-height: 0;
   overflow: hidden;
 }
 retinue-project-page { flex: 1; min-height: 0; }
@@ -152,6 +160,7 @@ retinue-project-page { flex: 1; min-height: 0; }
     max-width: min(1600px, 100%);
     height: 100vh;
     height: 100dvh;
+    height: var(--frame-h, 100dvh);
   }
 
   /* The deck between header and dock: left column (conversations over news),

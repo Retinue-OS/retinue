@@ -33,6 +33,7 @@ const SHELL_ASSETS = [
   '/settings.html',
   '/styles.css',
   '/layout.js',
+  '/viewport.js',
   '/manifest.webmanifest',
   '/components/base.js',
   '/components/markdown.js',
