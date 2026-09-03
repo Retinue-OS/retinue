@@ -191,7 +191,10 @@ first, directory fallback — `signal-contacts.py` and siblings). E-mail goes
 through `scripts/email_client.py` — the `use-email-client` skill. Sends are
 gated by per-identity send policies (`allow`/`trust`/`verify`; undeclared
 defaults to `verify`, queued for approval on the dashboard's `/sends` page) —
-a queued send is not a failure. **An autonomous agent that hits a blocking
+a queued send is not a failure, but it is **not done either**: the push script
+prints that send's own approval URL, and your reply relays it as a labeled
+link, so the user can approve without hunting for the page. Reporting a queue
+without the link leaves the message stuck. **An autonomous agent that hits a blocking
 error must push an alert to the user**, not just log. Channel liveness is
 monitored by the framework — never build ad-hoc checks; a dead-seeming channel
 is checked on `/gateways`, and `configured: false` is intentional, not broken.

@@ -96,6 +96,20 @@ def main() -> int:
     parser.add_argument("--agent",
                         help="subagent name to show as the message sender (e.g. Coach), "
                              "when a relay answers on its behalf")
+    parser.add_argument("--key", metavar="KEY",
+                        help="idempotency key: opening a thread twice under the "
+                             "same key reuses the first one instead of creating "
+                             "a duplicate, so a re-run of this turn — an "
+                             "escalation, a redelivered message — cannot open a "
+                             "second thread. For a messenger message, pass the "
+                             "thread_key the gateway handed you (in the forwarded "
+                             "prompt, or on the drained record) VERBATIM; never "
+                             "build one from the channel's own message id, which "
+                             "is unique only within a chat and would collide "
+                             "across chats and accounts. Otherwise pass any "
+                             "identity that names this subject globally and the "
+                             "same way every time. New threads only; ignored "
+                             "with --thread.")
     parser.add_argument("--context", metavar="TEXT",
                         help="agent-only context stored with the message: replayed to every "
                              "later Ara session in this thread but never rendered to the "
@@ -158,6 +172,10 @@ def main() -> int:
             payload["agent"] = args.agent
         if args.context:
             payload["context"] = args.context
+        # Only a new thread can be deduplicated; appending to a named thread is
+        # already addressed by its id.
+        if args.key and not args.thread:
+            payload["key"] = args.key
     if args.title:
         payload["title"] = args.title
     if args.on_behalf_of:
@@ -197,6 +215,9 @@ def main() -> int:
         return 1
 
     print(json.dumps(body, ensure_ascii=False))
+    if body.get("deduplicated"):
+        print("conversation-push: this key already opened a thread — reusing it, "
+              "nothing was posted", file=sys.stderr)
     if body.get("push_subscribers") == 0:
         print("conversation-push: warning — no device is subscribed to push; "
               "this thread will only be seen if the dashboard is opened",

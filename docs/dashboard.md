@@ -74,6 +74,42 @@ the e-mail backend and `signal-push.py`. Threads persist under
 volume (`/root/.retinue/conversations`) so threads survive container
 recreation.
 
+**Opening a thread is a side effect, so it takes an idempotency key.** The
+same turn can legitimately run twice — the escalation re-run replays a junior
+turn's prompt on the frontier model (its reply is discarded, but a thread it
+already opened is not), and a messenger gateway can redeliver a message after
+a reconnect — and each run would otherwise raise its own thread for one
+message. A caller that can name what it is reacting to passes that name as
+`--key` (`{key: "..."}` on the endpoint); the first thread opened under a key
+is the only one, and a repeat is answered with that thread
+(`"deduplicated": true`, HTTP 200).
+
+Whether the repeat also posts depends on what it has to say, because the two
+runs a key exists for differ exactly there. A **redelivery** repeats words the
+thread already carries: absorbed silently, no message, no push, no badge. An
+**escalation re-run** is the same turn done properly — junior's reply was
+discarded and the prompt replayed on the frontier tier, but a thread junior
+opened before escalating survived and holds its incomplete attempt. Dropping
+senior's answer there would leave the user with only that, so a repeat carrying
+something the thread does not already say is **appended and pushed**
+(`"appended": true`). Appended rather than substituted: junior's words may
+already have reached the user's phone, and rewriting what someone has read is
+worse than showing them the correction after it. The inbox gateways
+mint one per inbound and carry it in the triage prompt (`Thread key: …`), so
+the key is the channel's own message identity rather than anything the session
+invents. That identity is `<channel>:<receiving account>:<chat>:<message id>`,
+built only by `inbound_store.thread_key()` — the account and chat are part of
+it because a native message id is not unique on its own: Telegram numbers
+messages per chat, Signal identifies one by (source, sent timestamp), and a
+deployment may run two gateways on one channel. An inbound with no native id
+falls back to the stored record's own URN, and to a random value when there is
+not even that, so distinct arrivals never merge. The drain decorates its rows
+with the same key, so a message forwarded live and later drained — a live turn
+that died before finishing — lands on the thread it already opened. Bindings live in `CONVERSATIONS_DIR/.keys`, one
+file per key; a binding whose thread was deleted counts as unbound, so a
+removed thread never swallows the next message about the same item. Keys are
+for *opening* a thread — appending already addresses one by id.
+
 The gateway runs a **presentation lint** over every agent→user message that
 lands in a thread — see `docs/model-routing.md` (phase 4) for the mechanism
 and its configuration.

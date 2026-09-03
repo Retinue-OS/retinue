@@ -162,6 +162,54 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 _MEDIA_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def subject_for(path) -> str | None:
+    """The stored record's own subject URN, or None if it cannot be read.
+
+    Used to give an id-less message the same :func:`thread_key` on the live
+    path as it will get at the drain: the live forward has only the store path
+    it just wrote, while the drain carries the parsed subject. Best-effort —
+    an unreadable record simply falls back to a fresh random key.
+    """
+    if not path:
+        return None
+    try:
+        fields = _parse(Path(path).read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return (fields or {}).get("subject")
+
+
+def thread_key(channel: str, account: str, chat: str | None,
+               message_id: str | None, subject: str | None = None) -> str:
+    """The canonical idempotency key for one inbound message's dashboard thread.
+
+    Opening a thread is a side effect, and the same inbound can legitimately be
+    handled twice — an escalation re-runs the turn's prompt, a channel
+    redelivers a stanza after a reconnect, a live turn dies before finishing and
+    the daily drain picks the record up again. All of those must land on one
+    thread, so the key has to name the *message*, identically on the live path
+    and at the drain.
+
+    A channel-native message id alone will not do that. Telegram numbers
+    messages per chat, Signal identifies one by (source, sent timestamp), and a
+    deployment may run several gateways on the same channel (a system account
+    and the owner's personal one), so two different messages can share an id.
+    The key therefore carries the receiving account and the chat as well —
+    together those are unique wherever the native id is.
+
+    Without a native id there is nothing stable to recognise a redelivery by,
+    and merging on anything coarser (an arrival second, say) would collapse
+    genuinely distinct messages. `subject` — the record's own URN, unique per
+    persisted message — is used when available, which keeps the drain's key
+    stable for a record it has already seen; otherwise a fresh random value is
+    minted, so distinct arrivals never collide even though a redelivery of an
+    id-less message cannot be recognised as one.
+    """
+    if message_id:
+        return ":".join((channel, account or "-", str(chat or "-"), str(message_id)))
+    return subject or f"{channel}:{account or '-'}:{secrets.token_hex(8)}"
+
+
 def _slug(value: str) -> str:
     """Lowercase IRI-safe token for a channel name (``signal``, ``whatsapp``…)."""
     return _SLUG_RE.sub("_", (value or "").strip().lower()).strip("_") or "unknown"

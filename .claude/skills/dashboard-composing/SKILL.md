@@ -140,6 +140,11 @@ user a chore instead of a link.
   none.
 - Applies to any destination, in-system ones included: `/sends`, `/gateways`,
   `/claude-auth`, a project page. Resolve the host per rule 4 and link it.
+- **A queued send carries its own deep link** — the push script prints
+  `approve or deny at <url>` for that one message (`/sends/<gateway>/<id>`).
+  Relay *that* URL, not the bare `/sends` page: it opens on the very message
+  awaiting approval. Telling the user a send is "waiting on /sends" without it
+  is the chore this rule exists to spare them.
 
 ```
 The portal reports two new entries; the mails carry no content, only a sign-in

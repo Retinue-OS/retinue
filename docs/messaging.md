@@ -72,6 +72,14 @@ undeclared account defaults to `verify`. When a send is queued, `signal-push.py`
 prints a pending-approval notice with the approval URL instead of confirming
 delivery — the message goes out only once the user allows it at `/sends`.
 
+That printed URL (`approve or deny at …`, of the form `/sends/<gateway>/<id>`,
+absolute where a base URL is configured) addresses **that one pending send**,
+not the page as a whole, and it is the only place it appears: nothing else
+surfaces it later. So an agent reporting a queued send relays it as a labeled
+link in the same message (the `dashboard-composing` skill, rule 5). A report
+that names `/sends` without the link makes the user find the page and the entry
+themselves — and a queued send nobody approves is a message never sent.
+
 ## Multiple gateways per channel
 
 The `/sends` page enrols the three built-in
