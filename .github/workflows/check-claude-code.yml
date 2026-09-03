@@ -1,0 +1,124 @@
+# Watches the npm registry for new Claude Code releases and opens a bump PR
+# against the ARG in the Dockerfile.
+#
+# Why this exists: the in-container auto-updater is disabled in the deployment
+# (DISABLE_AUTOUPDATER=1 — it can leave the container with no working `claude`
+# binary at all after an ill-timed restart), so the version only ever moves
+# when the image is rebuilt. Before the ARG was introduced the install line was
+# unpinned, which sounds like it would track upstream but does the opposite:
+# the layer depends on no file in the repo, so the build cache never expires
+# and the version froze at whatever was latest the day the layer was built.
+# Pinning plus this workflow makes upgrades explicit, reviewable and dated.
+#
+# Modelled on check-signal-cli.yml; keep the two in step when either changes.
+name: Check Claude Code version
+
+on:
+  schedule:
+    # Daily at 07:23 UTC. Off the hour on purpose — scheduled jobs at :00 queue
+    # behind everyone else's and start late.
+    - cron: "23 7 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get pinned version
+        id: pinned
+        run: |
+          VERSION=$(grep -oP 'ARG CLAUDE_CODE_VERSION=\K\d+(\.\d+)*' Dockerfile)
+          if [ -z "$VERSION" ]; then
+            echo "No ARG CLAUDE_CODE_VERSION found in Dockerfile" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Pinned version: $VERSION"
+
+      - name: Get latest release
+        id: latest
+        run: |
+          # The `latest` dist-tag, so prereleases published under another tag
+          # are not picked up.
+          LATEST=$(curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest | jq -r '.version')
+          if ! echo "$LATEST" | grep -qE '^[0-9]+(\.[0-9]+)*$'; then
+            echo "Unexpected version format from the registry: $LATEST" >&2
+            exit 1
+          fi
+          echo "version=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest version: $LATEST"
+
+      - name: Compare versions
+        id: compare
+        run: |
+          PINNED="${{ steps.pinned.outputs.version }}"
+          LATEST="${{ steps.latest.outputs.version }}"
+          if [ "$(printf '%s\n' "$PINNED" "$LATEST" | sort -V | tail -1)" = "$LATEST" ] && [ "$PINNED" != "$LATEST" ]; then
+            echo "needs_update=true" >> "$GITHUB_OUTPUT"
+            echo "New version available: $LATEST (pinned: $PINNED)"
+          else
+            echo "needs_update=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date ($PINNED)"
+          fi
+
+      - name: Create bump PR
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINNED: ${{ steps.pinned.outputs.version }}
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          BRANCH="bump/claude-code-${LATEST}"
+
+          # Skip if a PR for this exact version already exists
+          if [ "$(gh pr list --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
+            echo "PR already exists for $BRANCH, skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+          sed -i -E "s/ARG CLAUDE_CODE_VERSION=[0-9]+(\.[0-9]+)*/ARG CLAUDE_CODE_VERSION=${LATEST}/" Dockerfile
+          git add Dockerfile
+          git commit -m "chore: bump Claude Code from ${PINNED} to ${LATEST}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: bump Claude Code from ${PINNED} to ${LATEST}" \
+            --body "$(printf 'Automated version bump detected by the daily Claude Code release check.\n\n- **Previous version:** %s\n- **New version:** %s\n- **Package:** https://www.npmjs.com/package/@anthropic-ai/claude-code/v/%s\n\nThe in-container auto-updater is disabled, so the running stack keeps the old version until the image is rebuilt. After merging:\n\n```\npython3 scripts/self-update.py\n```\n' "$PINNED" "$LATEST" "$LATEST")" \
+            --base main \
+            --head "$BRANCH"
+
+      - name: Close superseded bump PRs
+        if: steps.compare.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LATEST: ${{ steps.latest.outputs.version }}
+        run: |
+          # Releases can outpace review. Any still-open bump PR for an older
+          # version would, if merged after this one, pin the image BACKWARDS —
+          # so close them rather than leave that trap lying around. Only
+          # branches this workflow itself created are touched.
+          gh pr list --state open --json number,headRefName \
+            --jq '.[] | select(.headRefName | startswith("bump/claude-code-")) | "\(.number) \(.headRefName)"' \
+          | while read -r NUMBER BRANCH; do
+              VERSION="${BRANCH#bump/claude-code-}"
+              [ "$VERSION" = "$LATEST" ] && continue
+              # Keep anything that is somehow newer than what we just found.
+              if [ "$(printf '%s\n' "$VERSION" "$LATEST" | sort -V | tail -1)" != "$LATEST" ]; then
+                echo "PR #$NUMBER is for $VERSION, newer than $LATEST — leaving it open"
+                continue
+              fi
+              echo "Closing superseded PR #$NUMBER ($VERSION)"
+              gh pr close "$NUMBER" --delete-branch \
+                --comment "Superseded by the bump to ${LATEST}. Merging this now would pin Claude Code to an older version than the one already proposed, so it is closed as obsolete."
+            done

@@ -42,7 +42,22 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Claude Code CLI ─────────────────────────────────────────────────
-RUN npm install -g @anthropic-ai/claude-code
+# Pinned, and deliberately so. The in-container auto-updater is disabled in
+# the deployment (DISABLE_AUTOUPDATER=1) because a restart landing mid-swap
+# leaves neither the old nor the new install and every subsequent restart
+# replays the damage — so the image is the only place the version moves.
+#
+# Unpinned (`npm install -g @anthropic-ai/claude-code`) that did not work:
+# the layer depends on no file in the repo, so `docker compose build` reuses
+# the cache indefinitely and the version silently freezes at whatever was
+# latest on the day the layer was first built. Naming the version makes the
+# RUN command change, which invalidates the layer, which is what makes an
+# upgrade actually take effect on rebuild.
+#
+# .github/workflows/check-claude-code.yml watches the npm registry and opens
+# a bump PR against this ARG when a newer version appears.
+ARG CLAUDE_CODE_VERSION=2.1.258
+RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # ── Core Python dependencies ────────────────────────────────────────
 # pywebpush (with cryptography, http-ece, py-vapid) powers the dashboard's Web
