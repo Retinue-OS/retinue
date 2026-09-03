@@ -24,6 +24,9 @@
   <!-- Splitter manager for the wide layout: drag-resizable columns, persisted
        per device. A no-op on phones, where the splitters are hidden. -->
   <script type="module" src="/layout.js"></script>
+  <!-- Keeps an open thread's locked frame the height that is actually
+       visible on the phone (styles.css reads --frame-h). -->
+  <script type="module" src="/viewport.js"></script>
   <!-- Applies a freshly activated shell version by reloading once (guarded
        against open drafts), and re-checks for one whenever the window becomes
        visible — so an always-open dashboard doesn't stay stale for a day. -->

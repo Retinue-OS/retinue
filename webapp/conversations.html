@@ -17,6 +17,9 @@
        dedicated page keeps the dashboard itself uncluttered. The component's
        own header carries the title, so the page adds no chrome of its own. -->
   <script type="module" src="/components/conversations.js"></script>
+  <!-- Keeps an open thread's locked frame the height that is actually
+       visible on the phone (styles.css reads --frame-h). -->
+  <script type="module" src="/viewport.js"></script>
   <!-- No opt-in element (that UI lives on /settings.html), but the module
        keeps an already-granted subscription healthy on every load. -->
   <script type="module" src="/components/push.js"></script>
