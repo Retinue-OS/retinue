@@ -11,17 +11,51 @@
   const LEAD_PRESETS = [[60, '1 h'], [120, '2 h'], [360, '6 h'], [1440, '1 day'], [2880, '2 days'], [4320, '3 days'], [10080, '1 week'], [20160, '2 weeks'], [40320, '4 weeks']];
   const SPEEDS = [[2, '×1 — the day in 12 min'], [4.8, '×2 — 5 min'], [12, '×5 — 2 min'], [24, '×10 — 1 min']];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024; // in step with the gateway's cap
+  const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
+  const attachmentsHtml = (atts) => (atts && atts.length ? `<div class="attachments">${atts.map((a) => `<span class="att">📎 ${esc(a.name)}<small>${esc(fmtSize(a.size))}</small></span>`).join('')}</div>` : '');
+
+  // Live waveform on the recording row's canvas, driven by a Web Audio analyser over
+  // the mic stream — with a simulated wave where that is unavailable (after voice.js).
+  class Waveform {
+    constructor(hostFn) { this.hostFn = hostFn; this.ctx = null; this.analyser = null; this.raf = null; this.phase = 0; this.startMs = 0; }
+    start(stream, startMs) {
+      this.stop(); this.startMs = startMs || Date.now();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC && stream) { try { this.ctx = new AC(); const src = this.ctx.createMediaStreamSource(stream); const an = this.ctx.createAnalyser(); an.fftSize = 128; an.smoothingTimeConstant = 0.7; src.connect(an); this.analyser = an; } catch (_e) { this.analyser = null; } }
+      const tick = () => { this.draw(); this.raf = requestAnimationFrame(tick); }; tick();
+    }
+    stop() { if (this.raf) cancelAnimationFrame(this.raf); this.raf = null; this.analyser = null; if (this.ctx) { try { this.ctx.close(); } catch (_e) { /* ignore */ } this.ctx = null; } }
+    draw() {
+      const host = this.hostFn(); if (!host) return;
+      const timeEl = host.querySelector('[data-rectime]');
+      if (timeEl) { const s = Math.max(0, Math.floor((Date.now() - this.startMs) / 1000)); const txt = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; if (timeEl.textContent !== txt) timeEl.textContent = txt; }
+      const canvas = host.querySelector('[data-wave]'); if (!canvas) return;
+      const dpr = window.devicePixelRatio || 1; const w = canvas.clientWidth, h = canvas.clientHeight; if (!w || !h) return;
+      if (canvas.width !== Math.round(w * dpr)) canvas.width = Math.round(w * dpr);
+      if (canvas.height !== Math.round(h * dpr)) canvas.height = Math.round(h * dpr);
+      const ctx = canvas.getContext('2d'); if (!ctx) return;
+      ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.fillStyle = '#6ea8fe';
+      const bars = Math.max(12, Math.min(48, Math.floor(w / 7))); this.phase += 0.22;
+      let levels;
+      if (this.analyser) { const data = new Uint8Array(this.analyser.frequencyBinCount); this.analyser.getByteFrequencyData(data); const usable = Math.max(1, Math.floor(data.length * 0.75)); levels = Array.from({ length: bars }, (_, i) => data[Math.floor((i / bars) * usable)] / 255); }
+      else levels = Array.from({ length: bars }, (_, i) => 0.35 + 0.25 * Math.sin(i * 0.7 + this.phase) + 0.18 * Math.sin(i * 1.3 - this.phase * 1.6) + 0.08 * Math.random());
+      const bw = canvas.width / bars, mid = canvas.height / 2;
+      for (let i = 0; i < bars; i++) { const level = Math.min(1, Math.max(0.06, levels[i])); const bh = Math.max(2 * dpr, level * canvas.height); const x = i * bw + bw * 0.2, bwid = bw * 0.6, r = Math.min(bwid / 2, 2 * dpr), y = mid - bh / 2; if (typeof ctx.roundRect === 'function') { ctx.beginPath(); ctx.roundRect(x, y, bwid, bh, r); ctx.fill(); } else ctx.fillRect(x, y, bwid, bh); }
+    }
+  }
 
   class App {
     constructor(rootEl) {
       this.root = rootEl; this.engine = new root.AttentionEngine();
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll() });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.heldOpen = false; this.waitingOpen = false;
+      this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
       this.banner = null; this.bannerTimer = null; this.toastTimer = null; this.seenPushes = 0; this.feedLen = -1;
       this.phoneEl = rootEl.querySelector('#phone'); this.deckEl = rootEl.querySelector('#deck');
       this.buildDeck();
       rootEl.addEventListener('click', (e) => this.onClick(e));
-      rootEl.addEventListener('change', (e) => this.onInput(e));
+      rootEl.addEventListener('change', (e) => { if (e.target.matches('[data-file]')) { this.addFiles(e.target.dataset.id, e.target.files); return; } this.onInput(e); });
       rootEl.addEventListener('input', (e) => { if (e.target.id === 'composer') this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, byAra: false }; });
       rootEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'composer') { e.preventDefault(); this.send(e.target.dataset.id, e.target.dataset.tab); } });
       const params = new URLSearchParams(location.search);
@@ -30,6 +64,7 @@
       const open = params.get('open'); if (open && this.engine.byId.has(open)) { this.openView(open, params.get('tab')); if (params.get('details') === '1') this.sheet = open; }
       this.renderAll();
       if (params.get('play') === '1') this.sim.play();
+      if (params.get('rec') === '1' && this.view) this.startRecording(this.view.id, this.view.tab);
       this.clockLoop();
     }
 
@@ -142,17 +177,77 @@
       const sub = isChat ? `${item.channel} · ${item.count > 1 ? `${item.count} messages` : item.sender}` : item.kind === 'thread' ? `Thread opened by ${item.agent}` : `Project · ${item.actor === 'you' ? 'your move' : `parked on ${item.actor}`}`;
       const status = item.state === 'done' ? `${item.doneHow === 'replied' ? 'replied' : 'done'} ${hhmm(item.doneAt)}` : item.actor !== 'you' ? `waiting on ${item.actor}` : `${lvl} · ${e.urgencyShort(item)}`;
       const bubbles = tab === 'chat'
-        ? item.chat.map((m) => `<div class="bub ${m.dir}">${m.dir === 'in' && m.from ? `<div class="bub-from">${esc(m.from)}</div>` : ''}<div class="bub-text">${esc(m.text)}</div><div class="bub-t">${m.dir === 'in' ? esc(m.from || item.sender) : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('')
-        : item.thread.map((m) => `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out'}"><div class="bub-text">${esc(m.text)}</div><div class="bub-t">${m.who === 'ara' ? 'Ara' : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('');
+        ? item.chat.map((m) => `<div class="bub ${m.dir}">${m.dir === 'in' && m.from ? `<div class="bub-from">${esc(m.from)}</div>` : ''}${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.dir === 'in' ? esc(m.from || item.sender) : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('')
+        : item.thread.map((m) => `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out'}">${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'ara' ? 'Ara' : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('');
       const chips = tab === 'ara' && item.chips && item.chips.length && item.state === 'open' ? `<div class="chips">${item.chips.map((c) => `<button class="chipbtn" data-act="chip" data-id="${esc(item.id)}" data-label="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';
-      const draft = this.draft && this.draft.id === item.id && this.draft.tab === tab ? this.draft : null;
-      const composer = `<div class="composer">${draft && draft.byAra ? '<div class="draft-note">Ara’s draft — edit it or send it</div>' : ''}<div class="composer-row"><input id="composer" type="text" autocomplete="off" placeholder="${tab === 'chat' ? `Reply to ${esc(item.sender)}…` : 'Ask Ara…'}" value="${esc(draft ? draft.text : '')}" data-tab="${tab}" data-id="${esc(item.id)}"><button class="btn primary" data-act="send" data-id="${esc(item.id)}" data-tab="${tab}">${tab === 'chat' ? 'Send' : 'Ask'}</button></div></div>`;
+      const composer = this.composerHtml(item, tab);
       const foot = item.state === 'open' && item.actor === 'you' ? `<div class="v-foot"><button class="btn" data-act="later" data-when="next" data-id="${esc(item.id)}">Later · ${esc(e.nextBreakpointText())}</button><button class="btn" data-act="do" data-id="${esc(item.id)}">${isChat ? 'Mark handled' : 'Mark done'}</button></div>` : '';
       return `<div class="view">
         <div class="v-head"><button class="back" data-act="back" aria-label="Back">‹</button><div class="v-titles"><div class="v-title">${esc(item.title)}</div><div class="v-sub">${esc(sub)} · <span style="color:${LEVEL_COLORS[lvl]}">${esc(status)}</span></div></div><button class="info" data-act="open" data-id="${esc(item.id)}" title="Importance, urgency, delivery — and their corrections">ⓘ</button></div>
         ${isChat ? `<div class="segs"><button class="seg${tab === 'chat' ? ' on' : ''}" data-act="tab" data-tab="chat">Chat</button><button class="seg${tab === 'ara' ? ' on' : ''}" data-act="tab" data-tab="ara">Ara</button></div>` : ''}
         <div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
         ${chips}${composer}${foot}</div>`;
+    }
+    composerHtml(item, tab) {
+      const id = item.id; const draft = this.draft && this.draft.id === id && this.draft.tab === tab ? this.draft : null;
+      const files = this.files[id] || [];
+      const chips = files.length ? `<div class="file-chips">${files.map((f, i) => `<span class="fchip"><span class="c-name">${esc(f.name)}</span><span class="c-size">${esc(fmtSize(f.size))}</span><button type="button" class="c-x" data-act="rmfile" data-id="${esc(id)}" data-index="${i}" aria-label="Remove attachment">×</button></span>`).join('')}</div>` : '';
+      const err = this.attachError ? `<div class="attach-err">${esc(this.attachError)}</div>` : '';
+      let row;
+      if (this.rec && this.rec.id === id && this.rec.tab === tab) {
+        row = `<div class="composer-row rec-row"><button type="button" class="rec-btn rec-abort" data-act="rec-abort" title="Discard recording" aria-label="Discard recording">✕</button><div class="wave-wrap"><span class="rec-dot" aria-hidden="true"></span><canvas class="wave" data-wave aria-hidden="true"></canvas><span class="rec-time" data-rectime>0:00</span></div><button type="button" class="rec-btn rec-ok" data-act="rec-check" title="Stop and transcribe for review" aria-label="Stop and transcribe for review">✓</button><button type="button" class="rec-btn rec-send" data-act="rec-send" title="Stop, transcribe and send" aria-label="Stop, transcribe and send">➤</button></div>`;
+      } else if (this.job && this.job.id === id && this.job.tab === tab) {
+        row = `<div class="composer-row rec-row"><div class="wave-wrap rec-status" role="status"><span>${esc(this.job.label)}</span></div></div>`;
+      } else {
+        const placeholder = tab === 'chat' ? `Reply to ${item.sender}…` : 'Ask Ara…';
+        row = `<div class="composer-row"><button type="button" class="mic" data-act="mic" data-id="${esc(id)}" data-tab="${tab}" title="Record a voice message" aria-label="Record a voice message">🎤</button><div class="field"><input id="composer" type="text" autocomplete="off" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" value="${esc(draft ? draft.text : '')}" data-tab="${tab}" data-id="${esc(id)}"><label class="clip" title="Attach a file" aria-label="Attach a file"><input type="file" multiple hidden data-file data-id="${esc(id)}"><span aria-hidden="true">📎</span></label></div><button type="button" class="send" data-act="send" data-id="${esc(id)}" data-tab="${tab}" title="${tab === 'chat' ? 'Send' : 'Ask Ara'}" aria-label="${tab === 'chat' ? 'Send' : 'Ask Ara'}">➤</button></div>`;
+      }
+      return `<div class="composer">${draft && draft.byAra ? '<div class="draft-note">Ara’s draft — edit it or send it</div>' : ''}${chips}${err}${row}</div>`;
+    }
+    // ---- attachments ------------------------------------------------------------------
+    addFiles(id, list) {
+      this.sim.viewerActed(); this.attachError = '';
+      const files = this.files[id] || (this.files[id] = []);
+      for (const f of Array.from(list || [])) { if (f.size > MAX_ATTACHMENT_BYTES) { this.attachError = `${f.name} is larger than 25 MB.`; continue; } files.push({ name: f.name, size: f.size }); }
+      this.renderAll();
+    }
+    // ---- voice -----------------------------------------------------------------------------
+    async startRecording(id, tab) {
+      if (this.rec) return; this.sim.viewerActed(); this.attachError = '';
+      const rec = { id, tab, startMs: Date.now(), stream: null, recognition: null, transcript: '', interim: '', real: false };
+      this.rec = rec; this.renderAll();
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        try { rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); rec.real = true; } catch (_e) { rec.stream = null; }
+      }
+      if (this.rec !== rec) { if (rec.stream) rec.stream.getTracks().forEach((t) => t.stop()); return; }
+      if (!rec.stream) this.showToast('No microphone here — the waveform is simulated; the real dashboard records and transcribes on the server.');
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SR && rec.stream) {
+        try {
+          const r = new SR(); r.continuous = true; r.interimResults = true; r.lang = navigator.language || 'en';
+          r.onresult = (ev) => { let fin = '', interim = ''; for (let i = 0; i < ev.results.length; i++) { const t = ev.results[i][0].transcript; if (ev.results[i].isFinal) fin += t + ' '; else interim += t; } rec.transcript = fin.trim(); rec.interim = interim.trim(); };
+          r.onerror = () => {}; r.start(); rec.recognition = r;
+        } catch (_e) { rec.recognition = null; }
+      }
+      this.wave.start(rec.stream, rec.startMs);
+    }
+    stopRecording(mode) {
+      const rec = this.rec; if (!rec) return; this.rec = null; this.wave.stop();
+      const seconds = Math.max(1, Math.round((Date.now() - rec.startMs) / 1000));
+      if (rec.recognition) { try { rec.recognition.stop(); } catch (_e) { /* ignore */ } }
+      if (rec.stream) rec.stream.getTracks().forEach((t) => t.stop());
+      if (mode === 'abort') { this.renderAll(); return; }
+      const { id, tab } = rec;
+      this.job = { id, tab, label: mode === 'send' ? 'Transcribing & sending …' : 'Transcribing …' }; this.renderAll();
+      setTimeout(() => {
+        this.job = null;
+        const spoken = [rec.transcript, rec.interim].filter(Boolean).join(' ').trim();
+        const text = spoken || `🎙 voice note, ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} (transcription needs the stt service)`;
+        if (!spoken) this.showToast(rec.real ? 'No speech recognition in this browser — a placeholder stands in for the transcript.' : 'Simulated recording — a placeholder stands in for the transcript.');
+        if (mode === 'send') { this.draft = { id, tab, text, byAra: false }; this.send(id, tab); return; }
+        const prev = this.draft && this.draft.id === id && this.draft.tab === tab ? this.draft.text : '';
+        this.draft = { id, tab, text: prev ? `${prev} ${text}` : text, byAra: false }; this.renderAll();
+      }, 700);
     }
     modeMenu() {
       const e = this.engine; const cur = e.mode(); const sched = e.scheduledMode();
@@ -229,14 +324,15 @@
 
     // ---- interaction ---------------------------------------------------------------
     send(id, tab) {
-      const input = this.phoneEl.querySelector('#composer'); const text = (input ? input.value : (this.draft ? this.draft.text : '')).trim(); if (!text) return;
-      this.sim.viewerActed(); this.draft = null;
-      if (tab === 'chat') this.engine.sendChat(id, text);
-      else this.converse(id, text);
+      const input = this.phoneEl.querySelector('#composer'); const text = (input ? input.value : (this.draft ? this.draft.text : '')).trim();
+      const files = (this.files[id] || []).slice(); if (!text && !files.length) return;
+      this.sim.viewerActed(); this.draft = null; this.files[id] = []; this.attachError = '';
+      if (tab === 'chat') this.engine.sendChat(id, text, files);
+      else this.converse(id, text, files);
       this.renderAll();
     }
-    converse(id, text) {
-      const r = this.engine.say(id, text); if (!r) return;
+    converse(id, text, files = []) {
+      const r = this.engine.say(id, text, files); if (!r) return;
       if (r.draft) { this.draft = { id, tab: 'chat', text: r.draft, byAra: true }; if (this.view && this.view.id === id) this.view.tab = 'chat'; }
       const d = this.engine._dialogue(this.engine.byId.get(id)); const rec = d && d.replies && d.replies[text]; if (rec && rec.note) this.showToast(rec.note);
     }
@@ -256,10 +352,15 @@
         case 'close-menu': this.menu = false; break;
         case 'set-mode': this.sim.viewerActed(); e.setManualMode(el.dataset.mode || null); this.menu = false; break;
         case 'view': this.sim.viewerActed(); this.openView(id); break;
-        case 'back': this.view = null; this.draft = null; break;
+        case 'back': this.view = null; this.draft = null; if (this.rec) this.stopRecording('abort'); break;
         case 'tab': this.sim.viewerActed(); if (this.view) this.view.tab = el.dataset.tab; break;
         case 'chip': this.sim.viewerActed(); this.converse(id, el.dataset.label); break;
         case 'send': this.send(id, el.dataset.tab); return;
+        case 'mic': this.startRecording(id, el.dataset.tab); return;
+        case 'rec-abort': this.stopRecording('abort'); return;
+        case 'rec-check': this.stopRecording('review'); return;
+        case 'rec-send': this.stopRecording('send'); return;
+        case 'rmfile': this.sim.viewerActed(); (this.files[id] || []).splice(Number(el.dataset.index), 1); break;
         case 'open': this.sim.viewerActed(); this.sheet = id; break;
         case 'close-sheet': this.sheet = null; break;
         case 'toggle-held': this.sim.viewerActed(); this.heldOpen = !this.heldOpen; break;

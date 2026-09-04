@@ -232,14 +232,16 @@
       return item;
     }
     // The user's turn in the thread: a chip label or free text. Returns Ara's reply record.
-    say(id, text) {
+    say(id, text, attachments = []) {
       const item = this.ensureThread(id); if (!item) return null;
-      item.thread.push({ who: 'you', text, t: this.now });
-      const d = this._dialogue(item); const r = (d && d.replies && d.replies[text]) || (d && d.free) || { text: 'Noted. I keep this with the item.' };
-      const reply = { who: 'ara', text: this._fill(r.text, item), t: this.now };
+      item.thread.push({ who: 'you', text, t: this.now, attachments });
+      const d = this._dialogue(item);
+      const filed = attachments.length ? `Filed ${attachments.map((a) => a.name).join(', ')} with this item.` : '';
+      const r = (d && d.replies && d.replies[text]) || (text ? (d && d.free) || { text: 'Noted. I keep this with the item.' } : { text: filed || 'Noted.' });
+      const reply = { who: 'ara', text: (text && filed ? filed + ' ' : '') + this._fill(r.text, item), t: this.now };
       item.thread.push(reply); item.chips = r.chips ? r.chips.slice() : (r.done || r.later || r.waitOn ? [] : item.chips);
       const short = (x) => (x.length > 70 ? x.slice(0, 67) + '…' : x);
-      this.emit({ kind: 'action', item, text: `${item.kind === 'chat' ? 'Ara pane' : 'Thread'} “${item.title}” — you: “${short(text)}” · Ara: “${short(reply.text)}”` });
+      this.emit({ kind: 'action', item, text: `${item.kind === 'chat' ? 'Ara pane' : 'Thread'} “${item.title}” — you: “${short(text)}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} · Ara: “${short(reply.text)}”` });
       if (r.note) this.emit({ kind: 'system', item, text: `(${r.note})` });
       if (r.waitOn) { item.actor = r.waitOn; item.waiting_since = this.now; item.released = true; item.snoozedUntil = null; this.emit({ kind: 'action', item, text: `${item.title} is parked on ${r.waitOn}.` }); }
       if (r.later) this.later(id, r.later);
@@ -247,11 +249,11 @@
       return { reply, draft: r.draft ? this._fill(r.draft, item) : null };
     }
     // Send a reply in a messenger chat; the chat counts as handled.
-    sendChat(id, text) {
+    sendChat(id, text, attachments = []) {
       const item = this.byId.get(id); if (!item || item.kind !== 'chat') return false;
-      item.chat.push({ dir: 'out', text, t: this.now });
+      item.chat.push({ dir: 'out', text, t: this.now, attachments });
       if (item.state === 'open') { item.state = 'done'; item.doneAt = this.now; item.doneHow = 'replied'; this.doneToday += 1; }
-      this.emit({ kind: 'action', item, text: `Replied to ${item.sender} on ${item.channel}: “${text}” — handled.` });
+      this.emit({ kind: 'action', item, text: `Replied to ${item.sender} on ${item.channel}: “${text}”${attachments.length ? ` + ${attachments.length} file${attachments.length === 1 ? '' : 's'}` : ''} — handled.` });
       return true;
     }
 

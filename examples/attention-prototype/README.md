@@ -25,7 +25,8 @@ choose the checkpoints (`node replay.mjs 480 725`).
 
 Deep links: `index.html?at=13:35` opens the day at that time, `&play=1` starts
 playing, `&open=<item id>` opens an item (`&tab=chat` for a chat's message history),
-`&details=1` opens its details sheet as well, `&held=1` expands Held.
+`&details=1` opens its details sheet as well, `&rec=1` starts a recording in
+the opened view, `&held=1` expands Held.
 
 ## What is in it
 
@@ -44,7 +45,16 @@ checkbox. A messenger chat opens on its **Ara** tab, the chat's own conversation
 Ara: her opening restates the one-line description the dashboard row shows,
 she answers questions, and she can stage a reply as a draft in the composer —
 the send press stays yours, and a sent reply counts as handled. The **Chat**
-tab beside it holds the full message history with a composer. A thread or a
+tab beside it holds the full message history with a composer.
+
+The composer is the real dashboard's: mic on the left, the text field with the
+paperclip inside it, send on the right. Files attach as chips above the field
+and travel with the message (25 MB cap, as on the gateway). The mic swaps the
+row for a recording bar — discard ✕, a live waveform with the elapsed time,
+transcribe for review ✓, transcribe and send ➤ — driven by the microphone
+where the browser allows it and simulated otherwise; browsers with speech
+recognition supply the transcript, others get a placeholder in its place, since
+the real dashboard transcribes on the server. A thread or a
 project opens the conversation with Ara about it; her chips are canned prompts,
 and she says what she can do and what needs you: the VAT return, for instance,
 is prepared but goes through the tax administration's portal with your login,
