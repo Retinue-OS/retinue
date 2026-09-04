@@ -248,6 +248,14 @@
       if (r.done) this.doIt(id);
       return { reply, draft: r.draft ? this._fill(r.draft, item) : null };
     }
+    // A plain exchange in the thread that needs no dialogue lookup (draft rewrites).
+    exchange(id, youText, araText) {
+      const item = this.ensureThread(id); if (!item) return null;
+      item.thread.push({ who: 'you', text: youText, t: this.now }); const reply = { who: 'ara', text: araText, t: this.now }; item.thread.push(reply);
+      const short = (x) => (x.length > 70 ? x.slice(0, 67) + '…' : x);
+      this.emit({ kind: 'action', item, text: `${item.kind === 'chat' ? 'Ara pane' : 'Thread'} “${item.title}” — you: “${short(youText)}” · Ara: “${short(araText)}”` });
+      return reply;
+    }
     // Send a reply in a messenger chat; the chat counts as handled.
     sendChat(id, text, attachments = []) {
       const item = this.byId.get(id); if (!item || item.kind !== 'chat') return false;

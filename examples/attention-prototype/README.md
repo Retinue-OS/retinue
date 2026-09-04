@@ -26,7 +26,8 @@ choose the checkpoints (`node replay.mjs 480 725`).
 Deep links: `index.html?at=13:35` opens the day at that time, `&play=1` starts
 playing, `&open=<item id>` opens an item (`&tab=chat` for a chat's message history),
 `&details=1` opens its details sheet as well, `&rec=1` starts a recording in
-the opened view, `&held=1` expands Held.
+the opened view, `&chip=<label>` taps a chip in the Ara pane on load (`&rewrite=Warmer` then rewrites the draft), `&held=1`
+expands Held.
 
 ## What is in it
 
@@ -53,8 +54,14 @@ and travel with the message (25 MB cap, as on the gateway). The mic swaps the
 row for a recording bar — discard ✕, a live waveform with the elapsed time,
 transcribe for review ✓, transcribe and send ➤ — driven by the microphone
 where the browser allows it and simulated otherwise; browsers with speech
-recognition supply the transcript, others get a placeholder in its place, since
-the real dashboard transcribes on the server. A thread or a
+recognition (Chrome, Edge, Safari) supply the transcript, others get a
+placeholder in its place, since the real dashboard transcribes on the server.
+
+A draft that came from Ara or from a transcription carries a bar with *Send
+now* and *Discard*; the text stays editable by hand, and the Ara pane shows
+the same draft with *Shorter*, *Warmer* and *More formal* chips (rule-based
+here, a model turn in a deployment), plus the same two buttons. Asking Ara for
+a shorter, warmer or more formal version in words does the same. A thread or a
 project opens the conversation with Ara about it; her chips are canned prompts,
 and she says what she can do and what needs you: the VAT return, for instance,
 is prepared but goes through the tax administration's portal with your login,

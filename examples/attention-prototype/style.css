@@ -142,7 +142,15 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .chipbtn{font:inherit;font-size:12.5px;color:#e7ebf2;background:#1b2536;border:1px solid #6ea8fe;border-radius:14px;padding:5px 11px;cursor:pointer}
 .chipbtn:hover{background:#243350}
 .composer{padding:8px 12px 4px}
-.draft-note{font-size:11px;color:#4fb3b9;margin:0 0 4px 4px}
+.draft-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap;background:#12343a;border:1px solid #1f5a60;border-radius:12px;padding:6px 8px 6px 10px;margin:0 0 6px}
+.draft-label{flex:1;min-width:120px;font-size:11.5px;color:#a8dfe2}
+.draft-bar .btn{background:#1f2a3a;color:#e7ebf2;border-color:#2a323b}
+.draft-bar .btn.primary{background:#6ea8fe;color:#0b0d12;border-color:#6ea8fe}
+.draft-card{margin:6px 12px 0;background:#0f131a;border:1px dashed #2a323b;border-radius:12px;padding:8px 10px}
+.dc-label{font-size:10.5px;letter-spacing:1.2px;color:#8b93a3;text-transform:uppercase}
+.dc-text{font-size:13px;color:#cbd3dd;margin:4px 0 2px}
+.draft-card .chips{padding:4px 0 0}
+.chipbtn.primary{background:#6ea8fe;color:#0b0d12}
 .composer-row{display:flex;gap:6px;align-items:center}
 .composer-row .field{flex:1;min-width:0;position:relative;display:flex}
 .composer-row input{flex:1;min-width:0;font:inherit;font-size:14px;color:#e7ebf2;background:#151922;border:1px solid #2a323b;border-radius:20px;padding:9px 38px 9px 12px;outline:none}

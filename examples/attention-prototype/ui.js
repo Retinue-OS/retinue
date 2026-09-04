@@ -15,6 +15,17 @@
   const fmtSize = (n) => (n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${Math.round(n / 1024)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`);
   const attachmentsHtml = (atts) => (atts && atts.length ? `<div class="attachments">${atts.map((a) => `<span class="att">📎 ${esc(a.name)}<small>${esc(fmtSize(a.size))}</small></span>`).join('')}</div>` : '');
 
+  // Draft rewrites, rule-based: what a model turn does in a deployment.
+  const CONTRACTIONS = [[/\bI’ll\b|\bI'll\b/g, 'I will'], [/\bI’m\b|\bI'm\b/g, 'I am'], [/\bdon’t\b|\bdon't\b/gi, 'do not'], [/\bcan’t\b|\bcan't\b/gi, 'cannot'], [/\bwon’t\b|\bwon't\b/gi, 'will not'], [/\bit’s\b|\bit's\b/gi, 'it is'], [/\bwe’re\b|\bwe're\b/gi, 'we are'], [/\bthat’s\b|\bthat's\b/gi, 'that is'], [/\bdoesn’t\b|\bdoesn't\b/gi, 'does not']];
+  const EMOJI = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]\uFE0F?/gu;
+  function rewrite(text, style, first) {
+    let t = text.trim();
+    if (style === 'Shorter') { const parts = t.split(/(?<=[.!?])\s+/); t = parts[0]; if (parts.length === 1 && t.includes(' — ')) t = t.split(' — ')[0]; if (!/[.!?]$/.test(t)) t += '.'; return t; }
+    if (style === 'More formal') { for (const [re, to] of CONTRACTIONS) t = t.replace(re, to); t = t.replace(EMOJI, '').replace(/\s+/g, ' ').trim(); if (!/[.!?]$/.test(t)) t += '.'; if (!/^(dear|hello|good)/i.test(t)) t = `${first ? `Dear ${first}, ` : ''}${t.charAt(0).toLowerCase()}${t.slice(1)}`; return `${t} Kind regards.`; }
+    if (style === 'Warmer') { t = t.replace(/^(dear|hello|hi)\s+\w+,?\s*/i, ''); t = t.replace(/\s*kind regards\.?$/i, ''); if (!/[.!?]$/.test(t)) t += '.'; return `${first ? `Hi ${first}! ` : 'Hi! '}${t} Looking forward to it 🙂`; }
+    return t;
+  }
+
   // Live waveform on the recording row's canvas, driven by a Web Audio analyser over
   // the mic stream — with a simulated wave where that is unavailable (after voice.js).
   class Waveform {
@@ -56,12 +67,12 @@
       this.buildDeck();
       rootEl.addEventListener('click', (e) => this.onClick(e));
       rootEl.addEventListener('change', (e) => { if (e.target.matches('[data-file]')) { this.addFiles(e.target.dataset.id, e.target.files); return; } this.onInput(e); });
-      rootEl.addEventListener('input', (e) => { if (e.target.id === 'composer') this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, byAra: false }; });
+      rootEl.addEventListener('input', (e) => { if (e.target.id === 'composer') { const src = this.draft && this.draft.id === e.target.dataset.id && this.draft.tab === e.target.dataset.tab ? this.draft.source : 'typed'; this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, source: src === 'typed' ? 'typed' : src }; } });
       rootEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'composer') { e.preventDefault(); this.send(e.target.dataset.id, e.target.dataset.tab); } });
       const params = new URLSearchParams(location.search);
       const at = params.get('at'); if (at) { const [h, m] = at.split(':').map(Number); this.sim.seek(h * 60 + (m || 0)); this.seenPushes = this.engine.pushes.length; }
       if (params.get('held') === '1') this.heldOpen = true;
-      const open = params.get('open'); if (open && this.engine.byId.has(open)) { this.openView(open, params.get('tab')); if (params.get('details') === '1') this.sheet = open; }
+      const open = params.get('open'); if (open && this.engine.byId.has(open)) { this.openView(open, params.get('tab')); const chip = params.get('chip'); if (chip) { this.converse(open, chip); const rw = params.get('rewrite'); if (rw) this.rewriteDraft(open, rw); if (params.get('tab')) this.view.tab = params.get('tab'); } if (params.get('details') === '1') this.sheet = open; }
       this.renderAll();
       if (params.get('play') === '1') this.sim.play();
       if (params.get('rec') === '1' && this.view) this.startRecording(this.view.id, this.view.tab);
@@ -179,6 +190,8 @@
       const bubbles = tab === 'chat'
         ? item.chat.map((m) => `<div class="bub ${m.dir}">${m.dir === 'in' && m.from ? `<div class="bub-from">${esc(m.from)}</div>` : ''}${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.dir === 'in' ? esc(m.from || item.sender) : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('')
         : item.thread.map((m) => `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out'}">${m.text ? `<div class="bub-text">${esc(m.text)}</div>` : ''}${attachmentsHtml(m.attachments)}<div class="bub-t">${m.who === 'ara' ? 'Ara' : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('');
+      const chatDraft = isChat && this.draft && this.draft.id === item.id && this.draft.tab === 'chat' && this.draft.text ? this.draft : null;
+      const draftCard = tab === 'ara' && chatDraft ? `<div class="draft-card"><div class="dc-label">Draft in the chat composer</div><div class="dc-text">“${esc(chatDraft.text)}”</div><div class="chips">${['Shorter', 'Warmer', 'More formal'].map((s) => `<button class="chipbtn" data-act="rewrite" data-id="${esc(item.id)}" data-style="${s}">${s}</button>`).join('')}<button class="chipbtn primary" data-act="send-now" data-id="${esc(item.id)}" data-tab="chat">Send now</button><button class="chipbtn" data-act="discard-draft" data-id="${esc(item.id)}" data-tab="chat">Discard</button></div></div>` : '';
       const chips = tab === 'ara' && item.chips && item.chips.length && item.state === 'open' ? `<div class="chips">${item.chips.map((c) => `<button class="chipbtn" data-act="chip" data-id="${esc(item.id)}" data-label="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';
       const composer = this.composerHtml(item, tab);
       const foot = item.state === 'open' && item.actor === 'you' ? `<div class="v-foot"><button class="btn" data-act="later" data-when="next" data-id="${esc(item.id)}">Later · ${esc(e.nextBreakpointText())}</button><button class="btn" data-act="do" data-id="${esc(item.id)}">${isChat ? 'Mark handled' : 'Mark done'}</button></div>` : '';
@@ -186,7 +199,16 @@
         <div class="v-head"><button class="back" data-act="back" aria-label="Back">‹</button><div class="v-titles"><div class="v-title">${esc(item.title)}</div><div class="v-sub">${esc(sub)} · <span style="color:${LEVEL_COLORS[lvl]}">${esc(status)}</span></div></div><button class="info" data-act="open" data-id="${esc(item.id)}" title="Importance, urgency, delivery — and their corrections">ⓘ</button></div>
         ${isChat ? `<div class="segs"><button class="seg${tab === 'chat' ? ' on' : ''}" data-act="tab" data-tab="chat">Chat</button><button class="seg${tab === 'ara' ? ' on' : ''}" data-act="tab" data-tab="ara">Ara</button></div>` : ''}
         <div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
-        ${chips}${composer}${foot}</div>`;
+        ${draftCard}${chips}${composer}${foot}</div>`;
+    }
+    // Ara rewrites the chat draft: rule-based here, a model turn in a deployment.
+    rewriteDraft(id, style, asked) {
+      const d = this.draft && this.draft.id === id && this.draft.tab === 'chat' ? this.draft : null; if (!d || !d.text) return false;
+      const item = this.engine.byId.get(id); const first = item && item.sender && !item.sender.includes(' group') ? item.sender.split(' ')[0] : '';
+      const text = rewrite(d.text, style, first);
+      this.draft = { id, tab: 'chat', text, source: 'ara' };
+      this.engine.exchange(id, asked || style, `Rewritten (${style.toLowerCase()}): “${text}” — it is in the composer; send it, edit it, or ask for another take.`);
+      return true;
     }
     composerHtml(item, tab) {
       const id = item.id; const draft = this.draft && this.draft.id === id && this.draft.tab === tab ? this.draft : null;
@@ -202,7 +224,8 @@
         const placeholder = tab === 'chat' ? `Reply to ${item.sender}…` : 'Ask Ara…';
         row = `<div class="composer-row"><button type="button" class="mic" data-act="mic" data-id="${esc(id)}" data-tab="${tab}" title="Record a voice message" aria-label="Record a voice message">🎤</button><div class="field"><input id="composer" type="text" autocomplete="off" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" value="${esc(draft ? draft.text : '')}" data-tab="${tab}" data-id="${esc(id)}"><label class="clip" title="Attach a file" aria-label="Attach a file"><input type="file" multiple hidden data-file data-id="${esc(id)}"><span aria-hidden="true">📎</span></label></div><button type="button" class="send" data-act="send" data-id="${esc(id)}" data-tab="${tab}" title="${tab === 'chat' ? 'Send' : 'Ask Ara'}" aria-label="${tab === 'chat' ? 'Send' : 'Ask Ara'}">➤</button></div>`;
       }
-      return `<div class="composer">${draft && draft.byAra ? '<div class="draft-note">Ara’s draft — edit it or send it</div>' : ''}${chips}${err}${row}</div>`;
+      const bar = draft && draft.text && draft.source !== 'typed' && !this.rec && !this.job ? `<div class="draft-bar"><span class="draft-label">${draft.source === 'ara' ? 'Ara’s draft' : 'Transcribed'} — edit it here or in the Ara pane</span><button type="button" class="btn tiny primary" data-act="send-now" data-id="${esc(id)}" data-tab="${tab}">${tab === 'chat' ? 'Send now' : 'Ask now'}</button><button type="button" class="btn tiny" data-act="discard-draft" data-id="${esc(id)}" data-tab="${tab}">Discard</button></div>` : '';
+      return `<div class="composer">${bar}${chips}${err}${row}</div>`;
     }
     // ---- attachments ------------------------------------------------------------------
     addFiles(id, list) {
@@ -220,15 +243,17 @@
         try { rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); rec.real = true; } catch (_e) { rec.stream = null; }
       }
       if (this.rec !== rec) { if (rec.stream) rec.stream.getTracks().forEach((t) => t.stop()); return; }
-      if (!rec.stream) this.showToast('No microphone here — the waveform is simulated; the real dashboard records and transcribes on the server.');
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SR && rec.stream) {
+      if (SR) {
         try {
           const r = new SR(); r.continuous = true; r.interimResults = true; r.lang = navigator.language || 'en';
           r.onresult = (ev) => { let fin = '', interim = ''; for (let i = 0; i < ev.results.length; i++) { const t = ev.results[i][0].transcript; if (ev.results[i].isFinal) fin += t + ' '; else interim += t; } rec.transcript = fin.trim(); rec.interim = interim.trim(); };
-          r.onerror = () => {}; r.start(); rec.recognition = r;
-        } catch (_e) { rec.recognition = null; }
-      }
+          r.onerror = (ev) => { rec.error = ev.error || 'error'; };
+          r.onend = () => { rec.ended = true; if (rec.onended) rec.onended(); };
+          r.start(); rec.recognition = r;
+        } catch (_e) { rec.recognition = null; rec.error = 'unavailable'; }
+      } else rec.error = 'unsupported';
+      if (!rec.stream && !rec.recognition) this.showToast('No microphone here — the waveform is simulated.');
       this.wave.start(rec.stream, rec.startMs);
     }
     stopRecording(mode) {
@@ -239,15 +264,20 @@
       if (mode === 'abort') { this.renderAll(); return; }
       const { id, tab } = rec;
       this.job = { id, tab, label: mode === 'send' ? 'Transcribing & sending …' : 'Transcribing …' }; this.renderAll();
-      setTimeout(() => {
+      // Final results can still arrive after stop(): wait for the recogniser to end, briefly.
+      const settled = new Promise((resolve) => { if (!rec.recognition || rec.ended) return resolve(); rec.onended = resolve; setTimeout(resolve, 1500); });
+      settled.then(() => {
         this.job = null;
         const spoken = [rec.transcript, rec.interim].filter(Boolean).join(' ').trim();
-        const text = spoken || `🎙 voice note, ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')} (transcription needs the stt service)`;
-        if (!spoken) this.showToast(rec.real ? 'No speech recognition in this browser — a placeholder stands in for the transcript.' : 'Simulated recording — a placeholder stands in for the transcript.');
-        if (mode === 'send') { this.draft = { id, tab, text, byAra: false }; this.send(id, tab); return; }
+        if (!spoken) {
+          const why = rec.error === 'unsupported' ? 'This browser has no speech recognition (Chrome, Edge and Safari do).' : rec.error === 'not-allowed' || rec.error === 'service-not-allowed' ? 'Microphone access was refused for this page.' : rec.error === 'audio-capture' ? 'No microphone was found.' : rec.error === 'network' ? 'The browser’s speech service is unreachable.' : 'Nothing was recognised.';
+          this.showToast(`${why} A placeholder stands in for the transcript; the real dashboard transcribes on the server.`);
+        }
+        const text = spoken || `🎙 voice note, ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+        if (mode === 'send') { this.send(id, tab, text); return; }
         const prev = this.draft && this.draft.id === id && this.draft.tab === tab ? this.draft.text : '';
-        this.draft = { id, tab, text: prev ? `${prev} ${text}` : text, byAra: false }; this.renderAll();
-      }, 700);
+        this.draft = { id, tab, text: prev ? `${prev} ${text}` : text, source: 'voice' }; this.renderAll();
+      });
     }
     modeMenu() {
       const e = this.engine; const cur = e.mode(); const sched = e.scheduledMode();
@@ -323,8 +353,9 @@
     }
 
     // ---- interaction ---------------------------------------------------------------
-    send(id, tab) {
-      const input = this.phoneEl.querySelector('#composer'); const text = (input ? input.value : (this.draft ? this.draft.text : '')).trim();
+    send(id, tab, explicit) {
+      const input = this.phoneEl.querySelector('#composer'); const fromDom = input && input.dataset.id === id && input.dataset.tab === tab ? input.value : null;
+      const text = (explicit != null ? explicit : fromDom != null ? fromDom : (this.draft && this.draft.id === id && this.draft.tab === tab ? this.draft.text : '')).trim();
       const files = (this.files[id] || []).slice(); if (!text && !files.length) return;
       this.sim.viewerActed(); this.draft = null; this.files[id] = []; this.attachError = '';
       if (tab === 'chat') this.engine.sendChat(id, text, files);
@@ -332,8 +363,11 @@
       this.renderAll();
     }
     converse(id, text, files = []) {
+      const intent = /short|brief|concise/i.test(text) ? 'Shorter' : /formal|polite|business/i.test(text) ? 'More formal' : /warm|friendl|nicer|kinder/i.test(text) ? 'Warmer' : null;
+      const dlg = this.engine._dialogue(this.engine.byId.get(id));
+      if (intent && !files.length && this.draft && this.draft.id === id && this.draft.tab === 'chat' && this.draft.text && !(dlg && dlg.replies && dlg.replies[text])) { this.rewriteDraft(id, intent, text); return; }
       const r = this.engine.say(id, text, files); if (!r) return;
-      if (r.draft) { this.draft = { id, tab: 'chat', text: r.draft, byAra: true }; if (this.view && this.view.id === id) this.view.tab = 'chat'; }
+      if (r.draft) { this.draft = { id, tab: 'chat', text: r.draft, source: 'ara' }; if (this.view && this.view.id === id) this.view.tab = 'chat'; }
       const d = this.engine._dialogue(this.engine.byId.get(id)); const rec = d && d.replies && d.replies[text]; if (rec && rec.note) this.showToast(rec.note);
     }
     onClick(ev) {
@@ -361,6 +395,9 @@
         case 'rec-check': this.stopRecording('review'); return;
         case 'rec-send': this.stopRecording('send'); return;
         case 'rmfile': this.sim.viewerActed(); (this.files[id] || []).splice(Number(el.dataset.index), 1); break;
+        case 'send-now': this.send(id, el.dataset.tab, this.draft && this.draft.id === id && this.draft.tab === el.dataset.tab && this.view && this.view.tab !== el.dataset.tab ? this.draft.text : undefined); return;
+        case 'discard-draft': this.sim.viewerActed(); if (this.draft && this.draft.id === id) this.draft = null; break;
+        case 'rewrite': this.sim.viewerActed(); this.rewriteDraft(id, el.dataset.style); break;
         case 'open': this.sim.viewerActed(); this.sheet = id; break;
         case 'close-sheet': this.sheet = null; break;
         case 'toggle-held': this.sim.viewerActed(); this.heldOpen = !this.heldOpen; break;
