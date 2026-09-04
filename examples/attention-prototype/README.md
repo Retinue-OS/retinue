@@ -25,7 +25,7 @@ choose the checkpoints (`node replay.mjs 480 725`).
 
 Deep links: `index.html?at=13:35` opens the day at that time, `&play=1` starts
 playing, `&open=<item id>` opens an item (`&tab=chat` for a chat's message history),
-`&held=1` expands Held.
+`&details=1` opens its details sheet as well, `&held=1` expands Held.
 
 ## What is in it
 

@@ -107,6 +107,8 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .f-value{font-size:13.5px;margin:3px 0 6px}
 .f-ctl{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px}
 .f-note{color:#8b93a3;font-size:11px}
+.f-k{color:#8b93a3;font-size:11px;text-transform:uppercase;letter-spacing:.8px}
+.f-break{flex-basis:100%;height:0}
 .sheet .btn,.menu .btn{background:#1f2a3a;color:#e7ebf2;border-color:#2a323b}
 .sheet .btn.primary{background:#6ea8fe;color:#0b0d12;border-color:#6ea8fe}
 .sheet .btn.on{border-color:#6ea8fe;color:#6ea8fe}

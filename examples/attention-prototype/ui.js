@@ -27,7 +27,7 @@
       const params = new URLSearchParams(location.search);
       const at = params.get('at'); if (at) { const [h, m] = at.split(':').map(Number); this.sim.seek(h * 60 + (m || 0)); this.seenPushes = this.engine.pushes.length; }
       if (params.get('held') === '1') this.heldOpen = true;
-      const open = params.get('open'); if (open && this.engine.byId.has(open)) this.openView(open, params.get('tab'));
+      const open = params.get('open'); if (open && this.engine.byId.has(open)) { this.openView(open, params.get('tab')); if (params.get('details') === '1') this.sheet = open; }
       this.renderAll();
       if (params.get('play') === '1') this.sim.play();
       this.clockLoop();
@@ -165,6 +165,10 @@
       const src = item.kind === 'chat' ? `${item.channel} · ${item.sender}${item.count > 1 ? ` · ${item.count} messages` : ''}` : item.kind === 'thread' ? `Thread opened by ${item.agent}` : `Project · ${item.actor === 'you' ? 'your move' : `parked on ${item.actor}`}`;
       const hasPermit = item.sender && e.profile.permits[mode.id].includes(item.sender);
       const admitsSphere = mode.admits.includes(item.sphere);
+      const day = Math.floor(e.now / DAY) * DAY; const at = (d, h) => day + d * DAY + h * 60;
+      const dueOpts = [[null, 'no deadline'], [at(0, 17), 'today 17:00'], [at(1, 12), 'tomorrow 12:00'], [at(1, 17), 'tomorrow 17:00'], [at(3, 17), 'in 3 days'], [at(7, 17), 'in a week'], [at(14, 17), 'in two weeks'], [at(28, 17), 'in four weeks']].filter(([v]) => v == null || v > e.now);
+      if (item.due != null && !dueOpts.some(([v]) => v === item.due)) dueOpts.splice(1, 0, [item.due, whenText(item.due, e.now)]);
+      const dueSel = `<select class="select small" data-act="due-set" data-id="${esc(item.id)}">${dueOpts.map(([v, l]) => `<option value="${v == null ? 'none' : v}"${(v == null ? item.due == null : v === item.due) ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
       const leadSel = `<select class="select small" data-act="lead" data-id="${esc(item.id)}">${LEAD_PRESETS.map(([v, l]) => `<option value="${v}"${v === item.lead ? ' selected' : ''}>${l}</option>`).join('')}${LEAD_PRESETS.some(([v]) => v === item.lead) ? '' : `<option value="${item.lead}" selected>${dur(item.lead)}</option>`}</select>`;
       const actions = item.state !== 'open' ? `<div class="done-note">${item.doneHow === 'replied' ? 'Replied' : 'Done'} at ${hhmm(item.doneAt)}.</div><div class="actions"><button class="btn" data-act="view" data-id="${esc(item.id)}">${item.kind === 'chat' ? 'Open the chat' : 'Open the thread'}</button></div>` : item.actor !== 'you' ? `<div class="done-note">Parked on ${esc(item.actor)}${item.waiting_since != null ? ` for ${dur(e.now - item.waiting_since)}` : ''}.</div><div class="actions"><button class="btn primary" data-act="view" data-id="${esc(item.id)}">Discuss with Ara</button><button class="btn" data-act="do" data-id="${esc(item.id)}">Mark resolved</button></div>` : `<div class="actions">
           <button class="btn primary" data-act="view" data-id="${esc(item.id)}">${item.kind === 'chat' ? 'Open the chat' : 'Work on it with Ara'}</button>
@@ -176,7 +180,7 @@
         ${item.body ? `<div class="sheet-body">${esc(item.body)}</div>` : ''}
         <div class="fields">
           <div class="field"><div class="f-label">Importance</div><div class="f-value">${esc(x.importance)}</div><div class="f-ctl"><button class="btn tiny" data-act="imp" data-delta="-1" data-id="${esc(item.id)}">−</button><button class="btn tiny" data-act="imp" data-delta="1" data-id="${esc(item.id)}">+</button><span class="f-note">corrects the prior for ${esc(item.sender || item.kindLabel)}</span></div></div>
-          <div class="field"><div class="f-label">Urgency</div><div class="f-value">${esc(x.urgency)}</div><div class="f-ctl">${item.critical ? '<span class="f-note">critical is declared, not derived</span>' : `lead ${leadSel}<button class="btn tiny" data-act="due" data-delta="-1440" data-id="${esc(item.id)}">−1 day</button><button class="btn tiny" data-act="due" data-delta="1440" data-id="${esc(item.id)}">+1 day</button>${item.due != null ? `<button class="btn tiny" data-act="due" data-delta="none" data-id="${esc(item.id)}">no deadline</button>` : ''}<span class="f-note">lead corrects every “${esc(item.kindLabel)}”</span>`}</div></div>
+          <div class="field"><div class="f-label">Urgency</div><div class="f-value">${esc(x.urgency)}</div><div class="f-ctl">${item.critical ? '<span class="f-note">critical is declared, not derived</span>' : `<span class="f-k">deadline</span> ${dueSel}${item.due != null ? `<button class="btn tiny" data-act="due" data-delta="-1440" data-id="${esc(item.id)}">−1 day</button><button class="btn tiny" data-act="due" data-delta="1440" data-id="${esc(item.id)}">+1 day</button>` : ''}<span class="f-break"></span><span class="f-k">lead</span> ${leadSel}<span class="f-note">the lead corrects every “${esc(item.kindLabel)}”</span>`}</div></div>
           <div class="field"><div class="f-label">Delivery</div><div class="f-value">level <b style="color:${LEVEL_COLORS[lvl]}">${esc(lvl)}</b> · ${esc(x.delivery)}</div><div class="f-ctl">${item.sender ? `<button class="btn tiny${hasPermit ? ' on' : ''}" data-act="permit" data-id="${esc(item.id)}">${hasPermit ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit` : `Let ${esc(item.sender)} interrupt in ${esc(mode.name)}`}</button>` : ''}<button class="btn tiny${admitsSphere ? ' on' : ''}" data-act="admit" data-id="${esc(item.id)}">${admitsSphere ? `Stop admitting ${esc(item.sphere)} in ${esc(mode.name)}` : `Admit ${esc(item.sphere)} in ${esc(mode.name)}`}</button><span class="f-note">a Focus rule, importance untouched</span></div></div>
         </div>
         ${actions}
@@ -275,6 +279,7 @@
       const el = ev.target.closest('[data-act]'); if (!el) return;
       if (el.dataset.act === 'speed') { this.sim.speed = Number(el.value); return; }
       if (el.dataset.act === 'lead') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { lead: Number(el.value) }); this.renderAll(); }
+      if (el.dataset.act === 'due-set') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { due: el.value === 'none' ? null : Number(el.value) }); this.renderAll(); }
     }
   }
 
