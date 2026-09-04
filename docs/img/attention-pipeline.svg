@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 312" role="img" aria-label="From arrival to delivery: every source sets the same four properties, the level is arithmetic, the focus mode filters, and the dashboard's chips feed an attention profile" font-family="'Source Sans 3','Liberation Sans',Arial,sans-serif" font-size="11.5" fill="#1c2530">
+  <defs>
+    <marker id="f3-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2530"/></marker>
+  </defs>
+  <rect x="0.5" y="0.5" width="759" height="311" rx="6" fill="#ffffff" stroke="#d5dbe1"/>
+  <g>
+    <rect x="16" y="28" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
+    <text x="24" y="41" font-weight="700">Messenger chats</text>
+    <text x="24" y="54" font-size="10.2" fill="#5d6b7a">delivery gate, sender prior</text>
+    <rect x="16" y="68" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
+    <text x="24" y="81" font-weight="700">E-mail triage</text>
+    <text x="24" y="94" font-size="10.2" fill="#5d6b7a">the Secretary’s judgement</text>
+    <rect x="16" y="108" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
+    <text x="24" y="121" font-weight="700">Agent threads</text>
+    <text x="24" y="134" font-size="10.2" fill="#5d6b7a">conversation-push flags</text>
+    <rect x="16" y="148" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
+    <text x="24" y="161" font-weight="700">Project wake-ups</text>
+    <text x="24" y="174" font-size="10.2" fill="#5d6b7a">frontmatter: importance, due</text>
+    <rect x="16" y="188" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
+    <text x="24" y="201" font-weight="700">News</text>
+    <text x="24" y="214" font-size="10.2" fill="#5d6b7a">already scored by the Herald</text>
+  </g>
+  <g stroke="#1c2530" stroke-width="1.2">
+    <line x1="192" y1="44" x2="208" y2="44"/><line x1="192" y1="84" x2="208" y2="84"/><line x1="192" y1="124" x2="208" y2="124"/><line x1="192" y1="164" x2="208" y2="164"/><line x1="192" y1="204" x2="208" y2="204"/>
+    <line x1="208" y1="44" x2="208" y2="204"/>
+    <line x1="208" y1="130" x2="226" y2="130" marker-end="url(#f3-ah)"/>
+  </g>
+  <rect x="228" y="70" width="176" height="120" rx="5" fill="#e2f0ef" stroke="#176a6d" stroke-width="1.2"/>
+  <text x="240" y="90" font-weight="700" font-size="13">Attention item</text>
+  <text x="240" y="108">importance 0–5</text>
+  <text x="240" y="124">due → urgency at read time</text>
+  <text x="240" y="140">sphere</text>
+  <text x="240" y="156">waits on: current actor</text>
+  <text x="240" y="178" font-size="10" fill="#5d6b7a">on chat, thread and project</text>
+  <line x1="404" y1="130" x2="456" y2="130" stroke="#1c2530" stroke-width="1.2" marker-end="url(#f3-ah)"/>
+  <text x="430" y="122" font-size="11" font-weight="700" text-anchor="middle">level</text>
+  <text x="430" y="144" font-size="10" fill="#5d6b7a" text-anchor="middle">arithmetic</text>
+  <rect x="458" y="70" width="152" height="120" rx="5" fill="#ffffff" stroke="#1c2530" stroke-width="1.2"/>
+  <text x="470" y="90" font-weight="700" font-size="13">Focus mode</text>
+  <text x="470" y="108">allowed spheres</text>
+  <text x="470" y="124">lowest level that</text>
+  <text x="470" y="140">breaks through</text>
+  <text x="470" y="156">schedule · calendar</text>
+  <text x="470" y="178" font-size="10" fill="#5d6b7a">chip · sentence · schedule</text>
+  <g stroke="#1c2530" stroke-width="1.2" fill="none">
+    <line x1="610" y1="130" x2="620" y2="68" marker-end="url(#f3-ah)"/>
+    <line x1="610" y1="130" x2="620" y2="132" marker-end="url(#f3-ah)"/>
+    <line x1="610" y1="130" x2="620" y2="196" marker-end="url(#f3-ah)"/>
+  </g>
+  <rect x="622" y="40" width="130" height="56" rx="5" fill="#fbeedd" stroke="#d4670f" stroke-width="1.2"/>
+  <text x="630" y="55" font-weight="700" fill="#b4560b">Push now</text>
+  <text x="630" y="68" font-size="9.8">above the threshold</text>
+  <text x="630" y="80" font-size="9.8">in an admitted sphere</text>
+  <text x="630" y="92" font-size="9.8">Urgency: high</text>
+  <rect x="622" y="104" width="130" height="56" rx="5" fill="#e2f0ef" stroke="#176a6d" stroke-width="1.2"/>
+  <text x="630" y="119" font-weight="700" fill="#176a6d">Hold → digest</text>
+  <text x="630" y="132" font-size="9.8">to the next breakpoint</text>
+  <text x="630" y="144" font-size="9.8">Topic-collapsed push</text>
+  <text x="630" y="156" font-size="9.8">+1 level at its bound</text>
+  <rect x="622" y="168" width="130" height="56" rx="5" fill="#eef1f4" stroke="#8a94a0" stroke-width="1.2"/>
+  <text x="630" y="183" font-weight="700" fill="#5d6b7a">Silent</text>
+  <text x="630" y="196" font-size="9.8">passive: badge and</text>
+  <text x="630" y="208" font-size="9.8">list only, no push</text>
+  <g stroke="#1c2530" stroke-width="1.2" fill="none">
+    <polyline points="687,224 687,276 612,276" marker-end="url(#f3-ah)"/>
+    <line x1="458" y1="276" x2="406" y2="276" marker-end="url(#f3-ah)"/>
+    <line x1="316" y1="252" x2="316" y2="192" marker-end="url(#f3-ah)"/>
+  </g>
+  <text x="693" y="250" font-size="10" fill="#5d6b7a">the user taps</text>
+  <text x="322" y="226" font-size="10" fill="#5d6b7a">defaults</text>
+  <rect x="458" y="252" width="152" height="48" rx="5" fill="#f3f5f7" stroke="#cfd6dd"/>
+  <text x="470" y="270" font-weight="700">Dashboard chips</text>
+  <text x="470" y="284" font-size="9.8" fill="#5d6b7a">Later · Not important ·</text>
+  <text x="470" y="296" font-size="9.8" fill="#5d6b7a">Always interrupt</text>
+  <rect x="228" y="252" width="176" height="48" rx="5" fill="#f3f5f7" stroke="#cfd6dd"/>
+  <text x="240" y="270" font-weight="700">Attention profile</text>
+  <text x="240" y="284" font-size="9.8" fill="#5d6b7a">priors per sender, kind, sphere;</text>
+  <text x="240" y="296" font-size="9.8" fill="#5d6b7a">prose the user can read and edit</text>
+</svg>

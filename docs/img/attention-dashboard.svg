@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 540" role="img" aria-label="The dashboard home as one attention list: Now, Next, Held until the next breakpoint, Waiting on others, with a mode chip in the header" font-family="'Source Sans 3','Liberation Sans',Arial,sans-serif" font-size="11" fill="#e7ebf2">
+  <rect x="6" y="6" width="308" height="528" rx="26" fill="#0b0d12" stroke="#2a323b" stroke-width="2"/>
+  <text x="26" y="48" font-size="19" font-weight="700">Attention</text>
+  <rect x="176" y="30" width="118" height="26" rx="13" fill="#1b2536" stroke="#6ea8fe"/>
+  <text x="235" y="47" text-anchor="middle" font-size="11">Work · until 17:00 ▾</text>
+  <text x="26" y="82" font-size="10.5" letter-spacing="1.2" fill="#8b93a3">NOW · 2</text>
+  <rect x="24" y="90" width="272" height="76" rx="10" fill="#151922"/>
+  <rect x="32" y="100" width="3" height="56" rx="1.5" fill="#e08a2e"/>
+  <rect x="42" y="100" width="70" height="16" rx="8" fill="#1f2a3a"/>
+  <circle cx="51" cy="108" r="3" fill="#6ea8fe"/>
+  <text x="58" y="112" font-size="10.5" fill="#cbd3dd">customers</text>
+  <text x="288" y="112" text-anchor="end" font-size="11" fill="#8b93a3">due 17:00 · thread</text>
+  <text x="42" y="136" font-size="13" font-weight="600">Quote for Müller AG</text>
+  <rect x="42" y="146" width="48" height="18" rx="9" fill="#6ea8fe"/>
+  <text x="66" y="159" text-anchor="middle" font-size="10.5" font-weight="700" fill="#0b0d12">Do it</text>
+  <rect x="96" y="146" width="46" height="18" rx="9" fill="#1f2a3a" stroke="#2a323b"/>
+  <text x="119" y="159" text-anchor="middle" font-size="10.5">Later</text>
+  <rect x="148" y="146" width="92" height="18" rx="9" fill="#1f2a3a" stroke="#2a323b"/>
+  <text x="194" y="159" text-anchor="middle" font-size="10.5">Not important</text>
+  <rect x="24" y="172" width="272" height="56" rx="10" fill="#151922"/>
+  <rect x="32" y="182" width="3" height="36" rx="1.5" fill="#e08a2e"/>
+  <rect x="42" y="182" width="70" height="16" rx="8" fill="#1f2a3a"/>
+  <circle cx="51" cy="190" r="3" fill="#6ea8fe"/>
+  <text x="58" y="194" font-size="10.5" fill="#cbd3dd">customers</text>
+  <text x="288" y="194" text-anchor="end" font-size="11" fill="#8b93a3">2 messages · 14:20</text>
+  <text x="42" y="218" font-size="13" font-weight="600">WhatsApp · Anna Keller</text>
+  <text x="26" y="254" font-size="10.5" letter-spacing="1.2" fill="#8b93a3">NEXT · 3</text>
+  <rect x="24" y="262" width="272" height="56" rx="10" fill="#151922"/>
+  <rect x="32" y="272" width="3" height="36" rx="1.5" fill="#4fb3b9"/>
+  <rect x="42" y="272" width="52" height="16" rx="8" fill="#1f2a3a"/>
+  <circle cx="51" cy="280" r="3" fill="#c9a0ff"/>
+  <text x="58" y="284" font-size="10.5" fill="#cbd3dd">admin</text>
+  <text x="288" y="284" text-anchor="end" font-size="11" fill="#8b93a3">due 25 Sept · project</text>
+  <text x="42" y="308" font-size="13" font-weight="600">Quarterly VAT return</text>
+  <rect x="24" y="324" width="272" height="56" rx="10" fill="#151922"/>
+  <rect x="32" y="334" width="3" height="36" rx="1.5" fill="#4fb3b9"/>
+  <rect x="42" y="334" width="70" height="16" rx="8" fill="#1f2a3a"/>
+  <circle cx="51" cy="342" r="3" fill="#6ea8fe"/>
+  <text x="58" y="346" font-size="10.5" fill="#cbd3dd">customers</text>
+  <text x="288" y="346" text-anchor="end" font-size="11" fill="#8b93a3">chat · 10:05</text>
+  <text x="42" y="370" font-size="13" font-weight="600">Contract clause question</text>
+  <rect x="24" y="386" width="272" height="56" rx="10" fill="#151922"/>
+  <rect x="32" y="396" width="3" height="36" rx="1.5" fill="#4fb3b9"/>
+  <rect x="42" y="396" width="58" height="16" rx="8" fill="#1f2a3a"/>
+  <circle cx="51" cy="404" r="3" fill="#57c785"/>
+  <text x="58" y="408" font-size="10.5" fill="#cbd3dd">friends</text>
+  <text x="288" y="408" text-anchor="end" font-size="11" fill="#8b93a3">chat · 08:40</text>
+  <text x="42" y="432" font-size="13" font-weight="600">Dinner on Friday?</text>
+  <rect x="24" y="456" width="272" height="34" rx="10" fill="#10141b" stroke="#1f2630"/>
+  <text x="36" y="477" font-size="10.5" letter-spacing="1.2" fill="#8b93a3">HELD UNTIL 17:00 · 4</text>
+  <text x="284" y="478" text-anchor="end" font-size="12" fill="#8b93a3">▸</text>
+  <rect x="24" y="496" width="272" height="34" rx="10" fill="#10141b" stroke="#1f2630"/>
+  <text x="36" y="517" font-size="10.5" letter-spacing="1.2" fill="#8b93a3">WAITING ON OTHERS · 5</text>
+  <text x="284" y="518" text-anchor="end" font-size="12" fill="#8b93a3">▸</text>
+</svg>

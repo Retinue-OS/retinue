@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" role="img" aria-label="Importance and time left decide an item's treatment: plan, interrupt, quiet or hold" font-family="'Source Sans 3','Liberation Sans',Arial,sans-serif" font-size="11.5" fill="#1c2530">
+  <defs>
+    <marker id="f1-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2530"/></marker>
+    <marker id="f1-ah-teal" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#176a6d"/></marker>
+  </defs>
+  <rect x="0.5" y="0.5" width="639" height="359" rx="6" fill="#ffffff" stroke="#d5dbe1"/>
+  <rect x="84" y="44" width="288" height="106" fill="#e2f0ef"/>
+  <rect x="372" y="44" width="224" height="106" fill="#fbeedd"/>
+  <rect x="84" y="150" width="288" height="150" fill="#eef1f4"/>
+  <rect x="372" y="150" width="224" height="150" fill="#e4e8ec"/>
+  <line x1="372" y1="44" x2="372" y2="300" stroke="#5d6b7a" stroke-dasharray="4 3"/>
+  <line x1="84" y1="150" x2="596" y2="150" stroke="#5d6b7a" stroke-dasharray="4 3"/>
+  <text x="376" y="37" font-size="10.5" fill="#5d6b7a">due within 3 days</text>
+  <text x="78" y="154" font-size="10.5" fill="#5d6b7a" text-anchor="end">4</text>
+  <line x1="84" y1="300" x2="602" y2="300" stroke="#1c2530" stroke-width="1.2" marker-end="url(#f1-ah)"/>
+  <line x1="84" y1="300" x2="84" y2="38" stroke="#1c2530" stroke-width="1.2" marker-end="url(#f1-ah)"/>
+  <text x="78" y="304" font-size="10.5" fill="#5d6b7a" text-anchor="end">0</text>
+  <text x="78" y="50" font-size="10.5" fill="#5d6b7a" text-anchor="end">5</text>
+  <g font-size="10.5" fill="#5d6b7a" text-anchor="middle">
+    <text x="112" y="316">someday</text>
+    <text x="228" y="316">this month</text>
+    <text x="330" y="316">this week</text>
+    <text x="470" y="316">tomorrow</text>
+    <text x="572" y="316">overdue</text>
+  </g>
+  <text x="342" y="341" text-anchor="middle" fill="#5d6b7a">urgency — time left until it must be done</text>
+  <text transform="translate(42 172) rotate(-90)" text-anchor="middle" fill="#5d6b7a">importance 0–5 (the Herald’s scale)</text>
+  <text x="94" y="64" font-size="13" font-weight="700" fill="#176a6d" letter-spacing="1">PLAN</text>
+  <text x="94" y="81">important, not yet urgent → <tspan font-weight="600">active</tspan></text>
+  <text x="94" y="96">in the Next list, named in the digest, no push</text>
+  <text x="94" y="120" font-style="italic" fill="#5d6b7a">e.g. the VAT return, due in three weeks</text>
+  <text x="382" y="64" font-size="13" font-weight="700" fill="#d4670f" letter-spacing="1">INTERRUPT</text>
+  <text x="382" y="81">important and urgent → <tspan font-weight="600">time-sensitive</tspan></text>
+  <text x="382" y="96">pushes now, if the mode admits its sphere</text>
+  <text x="382" y="120" font-style="italic" fill="#5d6b7a">e.g. a customer waiting on a quote due 17:00</text>
+  <text x="94" y="170" font-size="13" font-weight="700" fill="#6b7580" letter-spacing="1">QUIET</text>
+  <text x="94" y="187">neither → <tspan font-weight="600">passive</tspan>: listed, never pushed</text>
+  <text x="94" y="211" font-style="italic" fill="#5d6b7a">e.g. a newsletter that needs no reply</text>
+  <text x="382" y="170" font-size="13" font-weight="700" fill="#6b7580" letter-spacing="1">HOLD</text>
+  <text x="382" y="187">urgent but unimportant → <tspan font-weight="600">passive</tspan> until</text>
+  <text x="382" y="202">its bound, then one level up: into the digest,</text>
+  <text x="382" y="217">never to the bell</text>
+  <text x="382" y="241" font-style="italic" fill="#5d6b7a">e.g. the card renewal of a rarely used service</text>
+  <circle cx="296" cy="276" r="6" fill="#8a94a0"/>
+  <text x="296" y="293" font-size="10.5" fill="#5d6b7a" text-anchor="middle">due in 10 days</text>
+  <line x1="308" y1="276" x2="450" y2="276" stroke="#176a6d" stroke-width="1.4" marker-end="url(#f1-ah-teal)"/>
+  <text x="380" y="270" font-size="10.5" fill="#176a6d" text-anchor="middle">the deadline nears</text>
+  <circle cx="462" cy="276" r="6" fill="#176a6d"/>
+  <text x="462" y="293" font-size="10.5" fill="#176a6d" text-anchor="middle">at its bound → next digest</text>
+</svg>
