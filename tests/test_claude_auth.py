@@ -3,12 +3,14 @@
 
 Exercises the pure parts — credential-state classification against the
 entrypoint's backup/marker protocol, the PKCE authorize URL, pasted-code
-parsing, and the token-install merge — on temp files; no network and no
-Claude session is needed.
+parsing, the token-install merge, and the pre-spawn refresh under the shared
+lock (contention, adoption, yielding to the CLI's own lock) — on temp files
+with a fake token endpoint; no network and no Claude session is needed.
 
     python3 tests/test_claude_auth.py
 """
 import base64
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -16,7 +18,10 @@ import os
 import re
 import sys
 import tempfile
+import threading
+import time
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -273,6 +278,310 @@ def test_oauth_in_use_gate():
             os.environ["ANTHROPIC_BASE_URL"] = old_base
         if old_flag is not None:
             os.environ["RETINUE_GATEWAY_USES_CLAUDE_OAUTH"] = old_flag
+
+
+# ── Pre-spawn refresh under the shared lock ──────────────────────────────────
+
+@contextmanager
+def _oauth_env(base_url=None):
+    """Pin the deployment mode for a test: OAuth (default) or gateway."""
+    saved = {k: os.environ.pop(k, None)
+             for k in ("ANTHROPIC_BASE_URL", "RETINUE_GATEWAY_USES_CLAUDE_OAUTH")}
+    if base_url:
+        os.environ["ANTHROPIC_BASE_URL"] = base_url
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            os.environ.pop(k, None)
+            if v is not None:
+                os.environ[k] = v
+
+
+def _cfg(tmp: Path) -> Path:
+    """A config dir nested in the temp dir, so the CLI's legacy lock path
+    (`<config-dir>.lock`) stays inside it too."""
+    cfg = tmp / ".claude"
+    cfg.mkdir(parents=True, exist_ok=True)
+    return cfg
+
+
+class _Endpoint:
+    """Fake token endpoint: records requests, answers with a fresh pair."""
+
+    def __init__(self, reply=None, error=None, delay=0.0):
+        self.calls = []
+        self.reply = reply if reply is not None else {
+            "access_token": "at2", "refresh_token": "rt2", "expires_in": 28800,
+            "refresh_token_expires_in": 30 * 24 * 3600,
+            "scope": "user:profile user:inference",
+        }
+        self.error = error
+        self.delay = delay
+
+    def __call__(self, url, payload):
+        self.calls.append((url, payload))
+        if self.delay:
+            time.sleep(self.delay)
+        if self.error:
+            raise ca.ClaudeAuthError(self.error)
+        return dict(self.reply)
+
+
+def _ensure(cred, ep=None, **kwargs):
+    kwargs.setdefault("now", NOW)
+    kwargs.setdefault("ahead_seconds", 900)
+    kwargs.setdefault("wait_seconds", 5)
+    kwargs.setdefault("log", lambda msg: None)
+    return ca.ensure_fresh_credentials(cred_file=cred, http_post=ep, **kwargs)
+
+
+def _hold_flock(lock_file: Path):
+    """Hold the spawners' flock through an independent descriptor (a separate
+    open() conflicts with flock even inside one process)."""
+    fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_access_token_due_boundaries():
+    due = lambda expires_at, ahead=900: ca.access_token_due(  # noqa: E731
+        {"expiresAt": expires_at}, now=NOW, ahead_seconds=ahead)
+    assert not due(NOW + 20 * 60_000)          # plenty of life left
+    assert due(NOW + 10 * 60_000)              # inside the margin
+    assert due(NOW - 1)                        # already expired
+    assert due(NOW + 4 * 60_000, ahead=300)    # the CLI's own margin
+    assert not ca.access_token_due({"expiresAt": "soon"}, now=NOW)  # unreadable
+    assert not ca.access_token_due({}, now=NOW)
+    assert not ca.access_token_due(None, now=NOW)
+
+
+def test_cli_refresh_lock_is_seen_only_while_live():
+    with tempfile.TemporaryDirectory() as d:
+        cfg = _cfg(Path(d))
+        cred = cfg / ".credentials.json"
+        assert not ca.cli_refresh_in_flight(cred)
+        current, legacy = ca.cli_refresh_locks(cred)
+        assert current == cfg / ".oauth_refresh.lock"
+        assert legacy == Path(d) / ".claude.lock"
+        current.mkdir()
+        assert ca.cli_refresh_in_flight(cred)
+        stale = time.time() - 120
+        os.utime(current, (stale, stale))
+        assert not ca.cli_refresh_in_flight(cred)      # older than the stale window
+        assert ca.cli_refresh_in_flight(cred, stale_seconds=600)
+        current.rmdir()
+        legacy.mkdir()
+        assert ca.cli_refresh_in_flight(cred)          # the legacy path counts too
+
+
+def test_ensure_fresh_is_a_no_op_on_a_live_token():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW + 2 * 3600_000)
+        before = cred.read_bytes()
+        ep = _Endpoint()
+        res = _ensure(cred, ep)
+        assert res["action"] == "fresh", res
+        assert res["access_expires_at"] == NOW + 2 * 3600_000
+        assert ep.calls == [] and cred.read_bytes() == before
+        assert not (cred.parent / ".credentials.json.lock").exists()  # never even locked
+
+
+def test_ensure_fresh_refreshes_a_token_about_to_expire():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW + 5 * 60_000, subscriptionType="max", rateLimitTier="t1")
+        marker = cred.with_name(".credentials.json.restored-expiry")
+        marker.write_text("stale-marker")
+        ep = _Endpoint()
+        res = _ensure(cred, ep)
+        assert res["action"] == "refreshed", res
+        assert res["access_expires_at"] == NOW + 28800 * 1000
+        # The request is the CLI's own refresh grant, with the stored scopes.
+        assert len(ep.calls) == 1
+        url, payload = ep.calls[0]
+        assert url == ca.TOKEN_URL
+        assert payload == {"grant_type": "refresh_token", "refresh_token": "rt",
+                           "client_id": ca.CLIENT_ID, "scope": "user:profile user:inference"}
+        block = json.loads(cred.read_text())["claudeAiOauth"]
+        assert (block["accessToken"], block["refreshToken"]) == ("at2", "rt2")
+        assert block["expiresAt"] == NOW + 28800 * 1000
+        assert block["refreshTokenExpiresAt"] == NOW + 30 * 24 * 3600 * 1000
+        assert block["subscriptionType"] == "max" and block["rateLimitTier"] == "t1"
+        # The watcher protocol is reset: backup renewed, rejected-marker gone.
+        assert cred.with_name(".credentials.json.bak").read_text() == cred.read_text()
+        assert not marker.exists()
+        # A second call finds the fresh token and does nothing.
+        assert _ensure(cred, ep)["action"] == "fresh" and len(ep.calls) == 1
+
+
+def test_ensure_fresh_keeps_the_refresh_token_the_server_did_not_rotate():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        ep = _Endpoint(reply={"access_token": "at2", "expires_in": 3600})
+        assert _ensure(cred, ep)["action"] == "refreshed"
+        block = json.loads(cred.read_text())["claudeAiOauth"]
+        assert (block["accessToken"], block["refreshToken"]) == ("at2", "rt")
+        assert block["expiresAt"] == NOW + 3600_000
+
+
+def test_ensure_fresh_leaves_everything_alone_when_the_endpoint_rejects():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        before = cred.read_bytes()
+        logged = []
+        ep = _Endpoint(error='Token endpoint returned HTTP 400: {"error":"invalid_grant"}')
+        res = _ensure(cred, ep, log=logged.append)
+        assert res["action"] == "failed", res
+        assert "invalid_grant" in res["reason"]
+        assert cred.read_bytes() == before                      # nothing cleared, nothing written
+        assert not cred.with_name(".credentials.json.bak").exists()
+        assert any("refresh on its own" in line for line in logged), logged
+
+
+def test_ensure_fresh_never_tries_an_expired_signin():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1, refresh_expires_at=NOW - 1000)
+        ep = _Endpoint()
+        res = _ensure(cred, ep)
+        assert res["action"] == "expired", res
+        assert ep.calls == []
+
+
+def test_ensure_fresh_skips_without_credentials_or_oauth_or_when_disabled():
+    with tempfile.TemporaryDirectory() as d:
+        cred = _cfg(Path(d)) / ".credentials.json"
+        ep = _Endpoint()
+        with _oauth_env():
+            assert _ensure(cred, ep)["action"] == "no_credentials"
+            _write(cred, expires_at=NOW - 1)
+            assert _ensure(cred, ep, ahead_seconds=0)["action"] == "disabled"
+        with _oauth_env(base_url="http://litellm:4000"):
+            assert _ensure(cred, ep)["action"] == "gateway"
+        assert ep.calls == []
+
+
+def test_ensure_fresh_adopts_a_refresh_another_process_finished_first():
+    """A spawner that waited for the lock re-reads before doing anything."""
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        fd = _hold_flock(cred.with_name(".credentials.json.lock"))
+        ep = _Endpoint()
+        result = {}
+        t = threading.Thread(target=lambda: result.update(_ensure(cred, ep)))
+        t.start()
+        time.sleep(0.3)
+        assert not result, "must block on the lock"
+        _write(cred, access="at-other", refresh="rt-other", expires_at=NOW + 2 * 3600_000)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        t.join(5)
+        assert result["action"] == "adopted", result
+        assert ep.calls == []
+        assert json.loads(cred.read_text())["claudeAiOauth"]["refreshToken"] == "rt-other"
+
+
+def test_ensure_fresh_gives_up_on_a_lock_that_never_frees():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        before = cred.read_bytes()
+        fd = _hold_flock(cred.with_name(".credentials.json.lock"))
+        try:
+            ep = _Endpoint()
+            logged = []
+            started = time.monotonic()
+            res = _ensure(cred, ep, wait_seconds=0.3, log=logged.append)
+            assert res["action"] == "lock_timeout", res
+            assert 0.3 <= time.monotonic() - started < 3
+            assert ep.calls == [] and cred.read_bytes() == before
+            assert any("leaving the refresh to the session" in line for line in logged)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+
+def test_ensure_fresh_yields_to_a_claude_refresh_in_flight():
+    """A live CLI lock means a session is mid-refresh: wait for it, then adopt
+    its tokens rather than send a competing refresh with the same pair."""
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        cli_lock = cred.parent / ".oauth_refresh.lock"
+        cli_lock.mkdir()
+        ep = _Endpoint()
+        logged = []
+        result = {}
+        t = threading.Thread(target=lambda: result.update(_ensure(cred, ep, log=logged.append)))
+        t.start()
+        time.sleep(0.3)
+        assert not result, "must wait while the CLI holds its lock"
+        _write(cred, access="at-cli", refresh="rt-cli", expires_at=NOW + 2 * 3600_000)
+        cli_lock.rmdir()
+        t.join(5)
+        assert result["action"] == "adopted", result
+        assert ep.calls == []
+        assert any("waiting for it" in line for line in logged), logged
+
+
+def test_ensure_fresh_ignores_a_stale_claude_lock():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        cli_lock = cred.parent / ".oauth_refresh.lock"
+        cli_lock.mkdir()
+        stale = time.time() - 2 * ca.CLI_LOCK_STALE_SECONDS
+        os.utime(cli_lock, (stale, stale))
+        ep = _Endpoint()
+        started = time.monotonic()
+        assert _ensure(cred, ep)["action"] == "refreshed"
+        assert time.monotonic() - started < 1
+        assert len(ep.calls) == 1
+
+
+def test_concurrent_spawners_perform_exactly_one_refresh():
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        ep = _Endpoint(delay=0.2)
+        results = []
+        lock = threading.Lock()
+
+        def spawner():
+            res = _ensure(cred, ep)
+            with lock:
+                results.append(res["action"])
+
+        threads = [threading.Thread(target=spawner) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        assert sorted(results) == ["adopted"] * 3 + ["refreshed"], results
+        assert len(ep.calls) == 1, ep.calls
+        block = json.loads(cred.read_text())["claudeAiOauth"]
+        assert (block["accessToken"], block["refreshToken"]) == ("at2", "rt2")
+
+
+def test_ensure_fresh_never_raises():
+    """A spawn must go ahead whatever this helper runs into."""
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        original = ca.credential_lock
+        ca.credential_lock = lambda *a, **k: (_ for _ in ()).throw(OSError("disk on fire"))
+        try:
+            logged = []
+            res = _ensure(cred, _Endpoint(), log=logged.append)
+        finally:
+            ca.credential_lock = original
+        assert res["action"] == "failed" and "disk on fire" in res["reason"], res
+        assert any("refresh on its own" in line for line in logged)
 
 
 def main() -> int:

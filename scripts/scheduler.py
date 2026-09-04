@@ -9,7 +9,9 @@ than data freshness.
 
 A job either:
   - **dispatches an agent task** via `prompt` → `claude -p "<prompt>"` (a fresh
-    headless session, so it reads CLAUDE.md and Ara can route to a subagent), or
+    headless session, so it reads CLAUDE.md and Ara can route to a subagent;
+    an access token about to expire is refreshed first, under the lock every
+    framework spawner shares — scripts/claude_auth.py), or
   - runs a shell **`command`**.
 
 Per-job run state lives under a state dir *outside* the chambers, so the scheduler
@@ -62,6 +64,9 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_auth  # noqa: E402
 
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 # Framework-owned base manifest, always loaded alongside the per-chamber ones.
@@ -268,6 +273,14 @@ def run_job(job: dict) -> None:
     log(f"[run] {jid} ({kind}{model_note}) from {Path(job['_source']).parent.name}")
     started = now()
     try:
+        if kind == "prompt":
+            # A session started on an access token about to expire refreshes
+            # it at once, racing every other claude process for the one
+            # rotation (docs/claude-auth.md). Refresh first — once, under the
+            # lock all framework spawners share — so the child never has to;
+            # a failure only logs, and the child then refreshes for itself.
+            claude_auth.ensure_fresh_credentials(
+                log=lambda msg: log(f"[auth] {jid}: {msg}"))
         proc = spawn_process(
             cmd,
             retry_enoent=(kind == "prompt"),

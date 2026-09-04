@@ -535,6 +535,13 @@ case "$MODE" in
       echo "[claude] Claude Code executable not found at $CLAUDE_BIN" >&2
       exit 127
     fi
+    # Start the session on a fresh access token: the same pre-spawn refresh
+    # the scheduler and the gateway perform before every `claude -p`, under
+    # the lock all of them share (scripts/claude_auth.py, docs/claude-auth.md),
+    # so the session never begins with a refresh that races theirs for the
+    # token rotation. Best-effort: if it fails, the session refreshes for
+    # itself, as before.
+    python3 /workspace/scripts/claude_auth.py refresh || true
     exec "$CLAUDE_BIN" --remote-control "$SESSION_NAME" --name "$SESSION_NAME" \
       "${CLAUDE_MODEL_ARGS[@]}" \
       --permission-mode "${CLAUDE_PERMISSION_MODE:-acceptEdits}" \

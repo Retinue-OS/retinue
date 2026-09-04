@@ -74,6 +74,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import news_ingest  # noqa: E402  (local, after sys.path tweak)
 import triage_policy as tp  # noqa: E402  (local, after sys.path tweak)
+import claude_auth  # noqa: E402  (local, after sys.path tweak)
 
 EMAIL_CLIENT = os.environ.get("EMAIL_CLIENT_PATH", "/workspace/scripts/email_client.py")
 SENT_FOLDER = os.environ.get("SENT_FOLDER", "Sent")
@@ -402,6 +403,10 @@ def spawn(mode: str, messages: list[dict]) -> int:
            "--permission-mode", PERMISSION_MODE, build_prompt(mode, messages)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
+    # Refresh an access token about to expire before the session starts —
+    # once, under the lock every framework spawner shares (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(
+        log=lambda msg: print(f"[triage-gate] {msg}", file=sys.stderr))
     return subprocess.run(cmd, cwd="/workspace").returncode
 
 

@@ -28,6 +28,9 @@ import sys
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import claude_auth  # noqa: E402
+
 KB = "https://w3id.org/retinue/kb#"
 ENDPOINT = os.environ.get("SPARQL_ENDPOINT_LIFE", "http://qlever-life:7001")
 # Self-review is supervision — an Ara senior job — so the frontier tier wins
@@ -142,6 +145,10 @@ def main() -> int:
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
         env["RETINUE_SESSION_MODEL"] = CLAUDE_MODEL
+    # Refresh an access token about to expire before the session starts —
+    # once, under the lock every framework spawner shares (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(
+        log=lambda msg: print(f"[agent-self-review] {msg}", file=sys.stderr))
     result = subprocess.run(cmd, cwd="/workspace", env=env)
     return result.returncode
 

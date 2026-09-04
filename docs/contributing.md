@@ -155,5 +155,9 @@ the Claude login or agents failing to authenticate, check
 `python3 /workspace/scripts/claude_auth.py status` and point them at
 `/claude-auth` (that script's `login` subcommand is the console fallback —
 prefer it over running `claude` via `docker exec`, which rotates tokens under
-the live session and is itself a cause of early sign-outs). Details:
+the live session and is itself a cause of early sign-outs). Every `claude` the
+framework starts first runs that script's pre-spawn refresh under a lock all
+spawners share, so its own processes never race for the rotation; before
+starting one by hand beside the live system, run
+`python3 /workspace/scripts/claude_auth.py refresh`. Details:
 `/workspace/docs/claude-auth.md`.
