@@ -42,7 +42,20 @@
   };
 
   const MESSAGES = [
-    { at: days(-1, 21, 10), chat: 'Quartier group', sender: 'Quartier group', text: '14 new messages about the street party', triage: { importance: 1, kind: 'group chatter' } },
+    { at: days(-1, 20, 12), chat: 'Quartier group', sender: 'Quartier group', from: 'Petra',   text: 'Street party is on for 20 September — who is in?', triage: { importance: 1, kind: 'group chatter' } },
+    { at: days(-1, 20, 14), chat: 'Quartier group', sender: 'Quartier group', from: 'Marco',   text: 'In. We can do the drinks again.' },
+    { at: days(-1, 20, 15), chat: 'Quartier group', sender: 'Quartier group', from: 'Sibylle', text: 'Same as last year, from 16:00?' },
+    { at: days(-1, 20, 17), chat: 'Quartier group', sender: 'Quartier group', from: 'Petra',   text: 'Yes, 16:00 until whenever. The permit is confirmed.' },
+    { at: days(-1, 20, 20), chat: 'Quartier group', sender: 'Quartier group', from: 'Dani',    text: 'Do we have a grill this time? Ours died.' },
+    { at: days(-1, 20, 21), chat: 'Quartier group', sender: 'Quartier group', from: 'Marco',   text: 'Ha. No grill here.' },
+    { at: days(-1, 20, 24), chat: 'Quartier group', sender: 'Quartier group', from: 'Sibylle', text: 'I can bring one table.' },
+    { at: days(-1, 20, 25), chat: 'Quartier group', sender: 'Quartier group', from: 'Petra',   text: 'So we need two tables and a grill. Anyone?' },
+    { at: days(-1, 20, 31), chat: 'Quartier group', sender: 'Quartier group', from: 'Ruth',    text: 'I will bake, as always.' },
+    { at: days(-1, 20, 33), chat: 'Quartier group', sender: 'Quartier group', from: 'Dani',    text: 'Kids’ corner: I will organise chalk and the water thing.' },
+    { at: days(-1, 20, 40), chat: 'Quartier group', sender: 'Quartier group', from: 'Marco',   text: 'Music: I bring the speaker, playlist suggestions welcome.' },
+    { at: days(-1, 20, 41), chat: 'Quartier group', sender: 'Quartier group', from: 'Sibylle', text: 'Not the same playlist as last year 😅' },
+    { at: days(-1, 20, 55), chat: 'Quartier group', sender: 'Quartier group', from: 'Petra',   text: 'Summary: 20 Sept, 16:00. Drinks Marco, cake Ruth, one table Sibylle, kids Dani. Still missing: a grill and one more table.' },
+    { at: days(-1, 21, 10), chat: 'Quartier group', sender: 'Quartier group', from: 'Ruth',    text: 'Reminder for the newcomers: the street is closed from 14:00.' },
     { at: t(6, 40),  chat: 'Mum',         sender: 'Mum',         text: 'Call me when you are up ☕', triage: { importance: 3, due: t(9, 0), kind: 'family note' } },
     { at: t(8, 40),  chat: 'Anna Keller', sender: 'Anna Keller', text: 'Dinner on Friday? 19:00 at ours', triage: { importance: 3, due: days(1, 18, 0), kind: 'invitation' } },
     { at: t(9, 15),  chat: 'Anna Keller', sender: 'Anna Keller', text: 'Also: could you bring the projector?', triage: { importance: 3, due: days(1, 18, 0), kind: 'invitation' } },
@@ -77,7 +90,7 @@
     events(from, to) { return MESSAGES.filter((m) => inWindow(m.at, from, to)).map((m) => ({ type: 'message', ...m })); },
     list(now) {
       const byChat = new Map();
-      for (const m of MESSAGES) { if (m.at > now) continue; const c = CONTACTS[m.chat] || {}; byChat.set(m.chat, { id: `${(c.channel || 'chat').toLowerCase()}:~acct:${m.chat}`, channel: c.channel, name: m.chat, group: !!c.group, last: { ts: m.at, text: m.text, direction: 'in' } }); }
+      for (const m of MESSAGES) { if (m.at > now) continue; const c = CONTACTS[m.chat] || {}; byChat.set(m.chat, { id: `${(c.channel || 'chat').toLowerCase()}:~acct:${m.chat}`, channel: c.channel, name: m.chat, group: !!c.group, last: { ts: m.at, text: m.text, direction: 'in', author: m.from || m.sender } }); }
       return [...byChat.values()].sort((a, b) => b.last.ts - a.last.ts);
     },
   };

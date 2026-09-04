@@ -86,7 +86,9 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .chip i{width:6px;height:6px;border-radius:50%;display:inline-block}
 .count{color:#8b93a3}
 .row-title{font-size:14.5px;font-weight:600;margin-top:5px}
+.row-preview{font-size:12.5px;color:#cbd3dd;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .row-why{font-size:11px;color:#8b93a3;margin-top:3px}
+.bub-from{font-size:11px;font-weight:600;color:#57c785;margin-bottom:2px}
 .empty{color:#8b93a3;text-align:center;padding:40px 20px}
 .banner{margin:0 12px 8px;background:#1b2536;border:1px solid #6ea8fe;border-radius:12px;padding:8px 10px;display:flex;gap:8px;align-items:flex-start;cursor:pointer;font-size:12.5px}
 .banner.high{border-color:#e08a2e}
@@ -123,7 +125,7 @@ code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:
 .info{font:inherit;font-size:18px;color:#8b93a3;background:none;border:0;cursor:pointer;padding:0 4px}
 .v-titles{flex:1;min-width:0}
 .v-title{font-weight:700;font-size:16px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.v-sub{font-size:11.5px;color:#8b93a3;margin-top:1px}
+.v-sub{font-size:11.5px;color:#8b93a3;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .segs{display:flex;gap:6px;padding:0 12px 8px}
 .seg{font:inherit;font-size:12.5px;color:#cbd3dd;background:#10141b;border:1px solid #1f2630;border-radius:14px;padding:4px 14px;cursor:pointer}
 .seg.on{background:#1b2536;border-color:#6ea8fe;color:#e7ebf2}

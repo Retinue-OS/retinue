@@ -24,7 +24,7 @@ useful when changing the engine or the script. Pass minutes since midnight to
 choose the checkpoints (`node replay.mjs 480 725`).
 
 Deep links: `index.html?at=13:35` opens the day at that time, `&play=1` starts
-playing, `&open=<item id>` opens an item (`&tab=ara` for a chat's Ara pane),
+playing, `&open=<item id>` opens an item (`&tab=chat` for a chat's message history),
 `&held=1` expands Held.
 
 ## What is in it
@@ -40,10 +40,11 @@ playing, `&open=<item id>` opens an item (`&tab=ara` for a chat's Ara pane),
 ## Tapping an item
 
 As on the real dashboard, an item opens the place where it is dealt with, not a
-checkbox. A messenger chat opens with its message history and a composer, and
-an **Ara** tab beside it: the chat's own conversation with Ara, where she
-summarises, answers questions, and can stage a reply as a draft in the composer —
-the send press stays yours, and a sent reply counts as handled. A thread or a
+checkbox. A messenger chat opens on its **Ara** tab, the chat's own conversation with
+Ara: her opening restates the one-line description the dashboard row shows,
+she answers questions, and she can stage a reply as a draft in the composer —
+the send press stays yours, and a sent reply counts as handled. The **Chat**
+tab beside it holds the full message history with a composer. A thread or a
 project opens the conversation with Ara about it; her chips are canned prompts,
 and she says what she can do and what needs you: the VAT return, for instance,
 is prepared but goes through the tax administration's portal with your login,

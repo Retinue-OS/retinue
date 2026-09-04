@@ -79,8 +79,8 @@
     }
     _onMessage(msg) {
       const id = `chat:${msg.chat}`; let item = this.byId.get(id); const tr = msg.triage || {};
-      if (!item) { item = this._add(this._chatItem(msg)); item.chat.push({ dir: 'in', text: msg.text, t: msg.at }); return this._arrive(item, msg.at); }
-      item.chat.push({ dir: 'in', text: msg.text, t: msg.at });
+      if (!item) { item = this._add(this._chatItem(msg)); item.chat.push({ dir: 'in', text: msg.text, t: msg.at, from: msg.from || null }); return this._arrive(item, msg.at); }
+      item.chat.push({ dir: 'in', text: msg.text, t: msg.at, from: msg.from || null });
       if (item.state === 'done') {
         Object.assign(item, { state: 'open', released: false, releasedBy: null, snoozedUntil: null, boost: 0, count: 1, pushed: [], body: msg.text, kindLabel: tr.kind || item.kindLabel, tags: tr.tags || [], due: tr.due != null ? tr.due : null, thread: [], chips: null, episode: item.episode + 1 });
         if (tr.importance != null) { item.importance = tr.importance; item.importanceFrom = 'triage'; } else { item.importance = this.profile.priors[msg.sender] != null ? this.profile.priors[msg.sender] : item.importance; item.importanceFrom = 'prior'; }
@@ -220,7 +220,9 @@
       if (item.kind === 'chat') { const c = D.COMPANIONS[item.id]; if (!c) return null; const ep = item.episode; return ep === 0 ? c : (c[`later${ep === 1 ? '' : ep}`] || c.later3 || c); }
       return D.THREADS[item.id] || null;
     }
-    _fill(text, item) { return text.replace('{time}', hhmm(this.now)).replace('{arrived}', hhmm(item.arrived != null ? item.arrived : this.now)); }
+    _fill(text, item) { const last = [...item.chat].reverse().find((m) => m.dir === 'in'); return text.replace('{time}', hhmm(this.now)).replace('{arrived}', hhmm(item.arrived != null ? item.arrived : this.now)).replace('{last}', last ? last.text : ''); }
+    // The one-line description a dashboard row shows; Ara's pane restates it.
+    preview(item) { const d = this._dialogue(item); if (d && d.summary) return this._fill(d.summary, item); if (item.kind === 'chat') { const last = [...item.chat].reverse().find((m) => m.dir === 'in'); return last ? `${last.from ? last.from + ': ' : ''}${last.text}` : ''; } return item.body || ''; }
     ensureThread(id) {
       const item = this.byId.get(id); if (!item || item.thread.length) return item;
       const d = this._dialogue(item);

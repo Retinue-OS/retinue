@@ -105,6 +105,7 @@
       return `<button class="row" data-act="view" data-id="${esc(item.id)}" style="--stripe:${LEVEL_COLORS[lvl]}" title="${esc(lvl)}">
         <div class="row-top"><span class="chip"><i style="background:${SPHERE_COLORS[item.sphere] || '#9aa5b1'}"></i>${esc(item.sphere)}</span>${item.count > 1 ? `<span class="count">${item.count} msgs</span>` : ''}<span class="meta">${esc(meta)}</span></div>
         <div class="row-title">${esc(item.title)}</div>
+        ${e.preview(item) ? `<div class="row-preview">${esc(e.preview(item))}</div>` : ''}
         <div class="row-why">${why}</div></button>`;
     }
     renderPhone() {
@@ -133,15 +134,15 @@
       </div></div>`;
       const bub = this.phoneEl.querySelector('#bubbles'); if (bub) bub.scrollTop = bub.scrollHeight;
     }
-    openView(id, tab) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureThread(id); this.view = { id, tab: item.kind === 'chat' ? (tab === 'ara' ? 'ara' : 'chat') : 'ara' }; this.sheet = null; this.menu = false; if (!this.draft || this.draft.id !== id) this.draft = null; }
+    openView(id, tab) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureThread(id); this.view = { id, tab: item.kind === 'chat' ? (tab === 'chat' ? 'chat' : 'ara') : 'ara' }; this.sheet = null; this.menu = false; if (!this.draft || this.draft.id !== id) this.draft = null; }
     viewHtml() {
       const e = this.engine; const item = e.byId.get(this.view.id); if (!item) { this.view = null; return ''; }
       e.ensureThread(item.id);
       const isChat = item.kind === 'chat'; const tab = isChat ? this.view.tab : 'ara'; const lvl = e.level(item);
-      const sub = isChat ? `${item.channel} · ${item.sender}` : item.kind === 'thread' ? `Thread opened by ${item.agent}` : `Project · ${item.actor === 'you' ? 'your move' : `parked on ${item.actor}`}`;
+      const sub = isChat ? `${item.channel} · ${item.count > 1 ? `${item.count} messages` : item.sender}` : item.kind === 'thread' ? `Thread opened by ${item.agent}` : `Project · ${item.actor === 'you' ? 'your move' : `parked on ${item.actor}`}`;
       const status = item.state === 'done' ? `${item.doneHow === 'replied' ? 'replied' : 'done'} ${hhmm(item.doneAt)}` : item.actor !== 'you' ? `waiting on ${item.actor}` : `${lvl} · ${e.urgencyShort(item)}`;
       const bubbles = tab === 'chat'
-        ? item.chat.map((m) => `<div class="bub ${m.dir}"><div class="bub-text">${esc(m.text)}</div><div class="bub-t">${m.dir === 'in' ? esc(item.sender) : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('')
+        ? item.chat.map((m) => `<div class="bub ${m.dir}">${m.dir === 'in' && m.from ? `<div class="bub-from">${esc(m.from)}</div>` : ''}<div class="bub-text">${esc(m.text)}</div><div class="bub-t">${m.dir === 'in' ? esc(m.from || item.sender) : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('')
         : item.thread.map((m) => `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out'}"><div class="bub-text">${esc(m.text)}</div><div class="bub-t">${m.who === 'ara' ? 'Ara' : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('');
       const chips = tab === 'ara' && item.chips && item.chips.length && item.state === 'open' ? `<div class="chips">${item.chips.map((c) => `<button class="chipbtn" data-act="chip" data-id="${esc(item.id)}" data-label="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';
       const draft = this.draft && this.draft.id === item.id && this.draft.tab === tab ? this.draft : null;
