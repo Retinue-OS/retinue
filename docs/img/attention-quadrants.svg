@@ -10,20 +10,19 @@
   <rect x="372" y="150" width="224" height="150" fill="#e4e8ec"/>
   <line x1="372" y1="44" x2="372" y2="300" stroke="#5d6b7a" stroke-dasharray="4 3"/>
   <line x1="84" y1="150" x2="596" y2="150" stroke="#5d6b7a" stroke-dasharray="4 3"/>
-  <text x="376" y="37" font-size="10.5" fill="#5d6b7a">due within 3 days</text>
+  <text x="376" y="37" font-size="10.5" fill="#5d6b7a">within the lead time</text>
   <text x="78" y="154" font-size="10.5" fill="#5d6b7a" text-anchor="end">4</text>
   <line x1="84" y1="300" x2="602" y2="300" stroke="#1c2530" stroke-width="1.2" marker-end="url(#f1-ah)"/>
   <line x1="84" y1="300" x2="84" y2="38" stroke="#1c2530" stroke-width="1.2" marker-end="url(#f1-ah)"/>
   <text x="78" y="304" font-size="10.5" fill="#5d6b7a" text-anchor="end">0</text>
   <text x="78" y="50" font-size="10.5" fill="#5d6b7a" text-anchor="end">5</text>
   <g font-size="10.5" fill="#5d6b7a" text-anchor="middle">
-    <text x="112" y="316">someday</text>
-    <text x="228" y="316">this month</text>
-    <text x="330" y="316">this week</text>
-    <text x="470" y="316">tomorrow</text>
+    <text x="112" y="316">far off</text>
+    <text x="372" y="316">lead time left</text>
+    <text x="470" y="316">a third left</text>
     <text x="572" y="316">overdue</text>
   </g>
-  <text x="342" y="341" text-anchor="middle" fill="#5d6b7a">urgency — time left until it must be done</text>
+  <text x="342" y="341" text-anchor="middle" fill="#5d6b7a">urgency — time left ÷ the item’s lead time</text>
   <text transform="translate(42 172) rotate(-90)" text-anchor="middle" fill="#5d6b7a">importance 0–5 (the Herald’s scale)</text>
   <text x="94" y="64" font-size="13" font-weight="700" fill="#176a6d" letter-spacing="1">PLAN</text>
   <text x="94" y="81">important, not yet urgent → <tspan font-weight="600">active</tspan></text>

@@ -17,7 +17,7 @@
 5. **Importance is personal, learnable, and must stay explainable.** Gmail’s Priority Inbox ranks mail by a per-user estimate of the chance of acting on it, corrected by explicit marks — as the Herald does for news. → *Priors per sender, kind and sphere; a reason line on every ranked item.*
 
 <figure>
-<figcaption><strong>Figure 1.</strong> Two axes, four treatments. Importance is the Herald’s 0–5; time left is read at query time. The card renewal starts quiet and, as its deadline nears, is held and then reaches the next digest — one level up, never the bell. The axes are Eisenhower’s (via Covey); the four ways to coordinate an interruption — immediate, scheduled, negotiated (announce, let the person choose the moment) and mediated (an agent chooses) — are McFarlane &amp; Latorella’s (2002). Retinue has an agent, so it can mediate: choose the moment on the user’s behalf.</figcaption>
+<figcaption><strong>Figure 1.</strong> Two axes, four treatments. Importance is the Herald’s 0–5; urgency is time left divided by the item’s lead time, read at query time. The card renewal starts quiet and, as its deadline nears, is held and then reaches the next digest — one level up, never the bell. The axes are Eisenhower’s (via Covey); the four ways to coordinate an interruption — immediate, scheduled, negotiated (announce, let the person choose the moment) and mediated (an agent chooses) — are McFarlane &amp; Latorella’s (2002). Retinue has an agent, so it can mediate: choose the moment on the user’s behalf.</figcaption>
 <img src="img/attention-quadrants.svg" alt="A plane with urgency on the horizontal axis and importance on the vertical axis, split into four regions: Plan, Interrupt, Quiet and Hold, with an example in each and an arrow showing a card renewal drifting from Quiet into Hold as its deadline nears.">
 </figure>
 
@@ -38,8 +38,8 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 1. **One attention model.** To the user a chat, a thread and a project are the same kind of thing: something that wants attention, with an importance, a deadline, a sphere and someone it waits on. Storage stays separate; the dashboard shows the union.
 2. **Interrupt by level, not by arrival.** Only *time-sensitive* and *critical* items push at once. *Active* items wait for the next breakpoint; *passive* ones are listed and never push.
 3. **Modes are allow-lists per sphere, with a threshold.** *Work*: customers, admin and health break through, friends wait; *Social*: the reverse; *Deep work* and *Off*: only critical, the digest waiting for the morning.
-4. **Defer with a bound.** A held item’s deadline sets how long it may wait; when the bound expires it climbs one level, never above *active* if it is unimportant — the card renewal reaches the digest, not the bell. Breakpoints are mode changes plus fixed digest times, three a day by default (Figure 2).
-5. **Learn, explain, keep the override.** Chips on every item feed priors; every ranked item shows a one-line reason, as the news feed does; a wrong call is corrected with one tap.
+4. **Defer with a bound.** A held item’s deadline sets how long it may wait; when its urgency crosses into the next band it climbs one level, never above *active* if it is unimportant — the card renewal reaches the digest, not the bell. Breakpoints are mode changes plus fixed digest times, three a day by default (Figure 2).
+5. **Learn, explain, keep the override.** Corrections on every item feed priors, lead times and permits; every row shows a three-field reason, as the news feed shows its one line; a wrong call is corrected with one tap.
 
 <figure class="wide">
 <figcaption><strong>Figure 2.</strong> One weekday. The mode band says who may break through; held items (bars) wait for the next digest at a breakpoint — a mode change or a fixed time (the batching study’s 9 / 15 / 21 h) — and a held item’s deadline bounds the wait. Spheres and hours are examples; each deployment names its own.</figcaption>
@@ -48,36 +48,36 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 
 ## 3 · Recommendation: item, mode, delivery
 
-<p class="note"><small><strong>Today’s knobs stay.</strong> The per-device <code>notification_mode</code> (<code>push_notify.py</code>), <code>muted</code> on threads and chats, and the delivery gate’s whitelist all keep working; the mode wraps them. Web Push headers per RFC 8030: <code>Urgency</code> (very-low … high), <code>Topic</code> (a new push replaces a pending one with the same topic), <code>TTL</code> — today only the TTL is set.</small></p>
+<p class="note"><small><strong>Mechanics.</strong> Threads and chats keep their JSON stores, emitted into <code>_generated/</code>; projects gain frontmatter keys; one free <code>SELECT</code> — what wants attention now, at which level — serves dashboard and scheduled jobs alike. Today’s knobs stay: the per-device <code>notification_mode</code> (<code>push_notify.py</code>), <code>muted</code> on threads and chats, and the delivery gate’s whitelist keep working; the mode wraps them. Web Push headers per RFC 8030: <code>Urgency</code> (very-low … high), <code>Topic</code> (a new push replaces a pending one with the same topic), <code>TTL</code> — today only the TTL is set. Sender side: where a contact’s send policy allows, the Secretary may tell a held sender when the message will be seen.</small></p>
 
-**The item.** All three entities get the same four properties in the `kb:` vocabulary, set where each is created:
+**The item.** All three entities get the same five properties in the `kb:` vocabulary, set where each is created:
 
 | Property | Values | Set by |
 |---|---|---|
-| `kb:importance` | 0–5, the Herald’s scale; unset counts as 2.5 | `--importance` on `conversation-push.py`, the Secretary in triage, frontmatter, a sender prior |
-| `kb:due` | `xsd:dateTime`; urgency is the time left, read at query time | `--due`, `expected_by` / `next_due`, a date the Secretary extracts |
-| `kb:sphere` | one of a small set the deployment names | chamber instructions, contact groups, frontmatter |
+| `kb:importance` | 0–5, the Herald’s scale; unset counts as 2.5 | `--importance`, the Secretary in triage, frontmatter, a prior |
+| `kb:due` | `xsd:dateTime`; urgency = time left ÷ lead time | `--due`, `expected_by` / `next_due`, a date the Secretary extracts |
+| `kb:leadTime` | `xsd:duration`; what this kind of item typically needs; default 3 days | per-kind defaults, a project’s `remind_before`, `--lead` |
+| `kb:sphere`, `kb:tag` | one primary sphere from a small deployment-named set; more as tags | chamber instructions, contact groups, frontmatter |
 | `kb:currentActor` | who holds the ball; today only on projects | already there |
 
 ```turtle
 conv:8f2c…  kb:importance 4 ;  kb:sphere sphere:customers ;
+    kb:tag sphere:finance ;  kb:leadTime "P2D"^^xsd:duration ;
     kb:due "2026-09-04T17:00:00+02:00"^^xsd:dateTime ;
     kb:currentActor actor:reto .
 ```
 
-Threads and chats keep their JSON stores, emitted into `_generated/`; projects gain frontmatter keys. One free `SELECT` — what wants attention now, at which level — serves dashboard and scheduled jobs alike.
+**The level** is arithmetic, no model turn. Urgency is *time left ÷ lead time* — three days before a tax filing and before a dinner decision are not the same — so each kind of item supplies its typical lead time (a project’s `remind_before` already is one); the three-day default keeps the old cut-offs as the special case. *Critical* is never derived, only declared:
 
-**The level** is arithmetic — no model turn; *critical* is never derived, only declared (a system alert, a contact the user marked *always*):
-
-| | no deadline, or > 3 days | ≤ 3 days | ≤ 24 h, or overdue |
+| | time left > lead time | ≤ lead time | ≤ ⅓ of it, or overdue |
 |---|---|---|---|
 | importance 4–5 | active | time-sensitive | time-sensitive |
 | importance 2–3 | passive | active | active |
 | importance 0–1 | passive | passive | active |
 
-**The mode** is one small document the gateway keeps (`focus.json`, mirrored into the store): name, allowed spheres, the lowest level that breaks through, a schedule, optionally a calendar rule. It is set by a chip in the dashboard header, a sentence to Ara (“work mode until 17:00”), a schedule or a calendar block titled *Focus*; every delivery decision reads it, nothing else needs to know it exists.
+**The mode** is one small document the gateway keeps (`focus.json`, mirrored into the store): name, admitted spheres and admitting tags (`health` may be admitted everywhere), per-sender permits, the lowest level that breaks through, a schedule, optionally a calendar rule. It is set by a chip in the dashboard header, a sentence to Ara (“work mode until 17:00”), a schedule or a calendar block; every delivery decision reads it, nothing else needs to know it exists.
 
-**Delivery** (Figure 3). An item at or above the mode’s threshold, in an admitted sphere, pushes at once with `Urgency: high`. Everything else waits for the next breakpoint, where one `Topic`-collapsed digest push lists the held items by level and importance; passive items never push. Two negotiated interruptions: a whitelisted sender who writes again within five minutes gains a level (the phone’s repeated-caller rule), and where the send policy allows, the Secretary may tell a held sender when the message will be seen. *Off* is the quiet-hours mode: only critical passes; the morning digest opens the day.
+**Delivery** (Figure 3). An item at or above the mode’s threshold, admitted by its primary sphere, a tag or a permit, pushes at once with `Urgency: high`. Everything else waits for the next breakpoint, where one `Topic`-collapsed digest push lists the held items by level and importance. A half-hourly sweep, like `recurring-projects`, re-evaluates held items: when urgency crosses into the next band the item climbs a level — that crossing is the bound. Repeats are a per-class policy, not a fixed window: off by default, on for `family` in *Off* (the phone’s repeated-caller case), elsewhere only when the follow-up’s triage classification changes — a deadline appears, a question replaces a remark.
 
 <figure>
 <figcaption><strong>Figure 3.</strong> From arrival to delivery. Every source sets the same four properties; the level is arithmetic; the mode filters; three outcomes. The dashboard’s chips feed an attention profile that supplies defaults next time. No model turn is spent on delivery.</figcaption>
@@ -87,20 +87,22 @@ Threads and chats keep their JSON stores, emitted into `_generated/`; projects g
 ## 4 · The streamlined dashboard, rollout, measures
 
 <figure class="phone">
-<figcaption><strong>Figure 4.</strong> The home screen as one list, in the dashboard’s existing palette. Stripe = level, chip = sphere, meta = deadline or channel.</figcaption>
-<img src="img/attention-dashboard.svg" alt="A phone screen titled Attention with a mode chip reading Work until 17:00, and four sections: Now with two customer items and action chips, Next with three items, Held until 17:00 (collapsed), and Waiting on others (collapsed).">
+<figcaption><strong>Figure 4.</strong> The home screen as one list, in the dashboard’s existing palette. Stripe = level, chip = sphere, meta = deadline or channel; the top item carries the three-field explanation.</figcaption>
+<img src="img/attention-dashboard.svg" alt="A phone screen titled Attention with a mode chip reading Work until 17:00, and four sections: Now with two customer items, the first explained by importance, urgency and delivery, Next with three items, Held until 17:00 (collapsed), and Waiting on others (collapsed).">
 </figure>
 
-**One list, four sections** replaces the three competing cards as the home screen. **Now**: what may interrupt under the current mode, capped at a handful. **Next**: important, not yet urgent. **Held**: collapsed — *n* items until the next breakpoint, with its time. **Waiting on others**: parked on agents or people, with the age. Each row shows its sphere, its level as a stripe, who holds it and the deadline; the reason line says why it ranks. The chats, conversations and projects pages remain as drill-downs. Three chips do the learning: **Later** (to the next breakpoint, or tomorrow), **Not important** (lowers the prior for this sender or kind), **Always interrupt** (raises it and adds the sender to the mode’s allow-list). The mode chip in the header always shows what is being filtered, so nothing is hidden silently.
+**One list, four sections** replaces the three competing cards as the home screen. **Now**: what may interrupt under the current mode, capped at a handful. **Next**: important, not yet urgent. **Held**: collapsed — *n* items until the next breakpoint, with its time. **Waiting on others**: parked on agents or people, with the age. Each row shows its sphere, its level as a stripe, who holds it and the deadline. The chats, conversations and projects pages remain as drill-downs, and the mode chip in the header always shows what is being filtered, so nothing is hidden silently.
+
+**Every row explains itself in three fields**, not one rank: *importance 4/5 · urgency: due in 5 h, lead 2 d · delivery: held, Deep work admits no customers*. A wrong call is then visibly a wrong importance estimate, a wrong deadline or a wrong Focus rule, and the correction targets that field: importance corrections adjust the item and the sender’s or kind’s *importance prior*; deadline corrections adjust the due date or the kind’s lead time; delivery corrections grant or revoke an *interruption permit* for a sender in that mode. Priors and permits are kept apart on purpose — “things from Anna are usually important” and “Anna may interrupt me during Work” are different judgements. A permit admits a sender and lowers the bar for them to *active*; importance still decides the level, so a trivial note from Anna stays in the digest.
 
 **Rollout in three slices**, each useful alone:
 
-1. **Fields and the list.** The four properties, the level table, the Attention list, the manual mode chip; badges and pushes obey the mode. No learning, no digest yet — and most of the value. Touches `web-gateway.py` (an `/attention` route), `conversation-push.py`, `push_notify.py`, and one `attention.js` in place of three cards.
-2. **Deferral.** Digests at breakpoints, `Urgency` and `Topic` headers, deadline bounds, schedules and quiet hours, the repeated-sender rule.
-3. **Learning.** Priors from the chips and from the Secretary’s triage judgement, kept in an *attention profile* the user can read and edit, as `preferences.md` is for news; calendar-driven modes; Secretary replies to held senders.
+1. **Fields and the list.** The five properties, the level table, the Attention list with its three-field explanation, the manual mode chip; badges and pushes obey the mode. No learning, no digest yet — and most of the value. Touches `web-gateway.py` (an `/attention` route), `conversation-push.py`, `push_notify.py`, and one `attention.js` in place of three cards.
+2. **Deferral.** Digests at breakpoints, `Urgency` and `Topic` headers, the half-hourly re-evaluation, schedules and quiet hours, the repeat policy.
+3. **Learning.** Priors, lead times and permits from the corrections and from the Secretary’s triage judgement, kept in an *attention profile* the user can read and edit, as `preferences.md` is for news; calendar-driven modes; Secretary replies to held senders.
 
-**Measure** pushes per day by level, time from arrival to action for time-sensitive items, digest open rate, and two error rates — *Not important* on an item that pushed (a false alarm), *Always interrupt* on one that was held (a miss). Tune the digest times and the *Now* cap from these.
+**Measure** pushes per day by level, time from arrival to action for time-sensitive items, digest open rate, and corrections by field: an importance correction on an item that pushed is a false alarm, a permit granted after an item was held is a miss. Tune the digest times, the lead-time defaults and the *Now* cap from these.
 
-**Risks.** Over-filtering hides a real emergency: the bound, the undeferrable critical level and the existing daily catch-all keep that bounded. Complexity: four levels, one small sphere set, four named modes — no sliders. Cost: the level is arithmetic; the only model judgement is the Secretary’s, which triage spends already. The defaults proposed here — spheres, allow-lists, digest times — are assumptions; record them as memories when adopted, so later sessions inherit them.
+**Risks.** Over-filtering hides a real emergency: the band crossing, the undeferrable critical level and the existing daily catch-all keep that bounded. Complexity: four levels, one small sphere set, four named modes — no sliders, and the three fields are the whole explanation. Cost: the level is arithmetic; the only model judgement is the Secretary’s, which triage spends already. The defaults proposed here are assumptions; record them as memories when adopted, so later sessions inherit them.
 
-**Decisions to take before slice 1.** The sphere set and the four mode names; which spheres each mode admits by default; the digest times; whether the Attention list replaces the three cards or sits above them; and whether the Secretary may answer held senders at all. Each becomes a memory once decided.
+**Decisions to take before slice 1.** The sphere set and the four mode names; which spheres and tags each mode admits by default; the lead time per kind of item; the digest times; the repeat policy per sender class; whether the Attention list replaces the three cards or sits above them; and whether the Secretary may answer held senders at all. Each becomes a memory once decided.

@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 312" role="img" aria-label="From arrival to delivery: every source sets the same four properties, the level is arithmetic, the focus mode filters, and the dashboard's chips feed an attention profile" font-family="'Source Sans 3','Liberation Sans',Arial,sans-serif" font-size="11.5" fill="#1c2530">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 272" role="img" aria-label="From arrival to delivery: every source sets the same four properties, the level is arithmetic, the focus mode filters, and the dashboard's chips feed an attention profile" font-family="'Source Sans 3','Liberation Sans',Arial,sans-serif" font-size="11.5" fill="#1c2530">
   <defs>
     <marker id="f3-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1c2530"/></marker>
   </defs>
-  <rect x="0.5" y="0.5" width="759" height="311" rx="6" fill="#ffffff" stroke="#d5dbe1"/>
+  <rect x="0.5" y="0.5" width="759" height="271" rx="6" fill="#ffffff" stroke="#d5dbe1"/>
   <g>
     <rect x="16" y="28" width="176" height="32" rx="4" fill="#f3f5f7" stroke="#cfd6dd"/>
     <text x="24" y="41" font-weight="700">Messenger chats</text>
@@ -28,8 +28,8 @@
   <rect x="228" y="70" width="176" height="120" rx="5" fill="#e2f0ef" stroke="#176a6d" stroke-width="1.2"/>
   <text x="240" y="90" font-weight="700" font-size="13">Attention item</text>
   <text x="240" y="108">importance 0–5</text>
-  <text x="240" y="124">due → urgency at read time</text>
-  <text x="240" y="140">sphere</text>
+  <text x="240" y="124">due, lead time → urgency</text>
+  <text x="240" y="140">sphere + tags</text>
   <text x="240" y="156">waits on: current actor</text>
   <text x="240" y="178" font-size="10" fill="#5d6b7a">on chat, thread and project</text>
   <line x1="404" y1="130" x2="456" y2="130" stroke="#1c2530" stroke-width="1.2" marker-end="url(#f3-ah)"/>
@@ -62,18 +62,18 @@
   <text x="630" y="196" font-size="9.8">passive: badge and</text>
   <text x="630" y="208" font-size="9.8">list only, no push</text>
   <g stroke="#1c2530" stroke-width="1.2" fill="none">
-    <polyline points="687,224 687,276 612,276" marker-end="url(#f3-ah)"/>
-    <line x1="458" y1="276" x2="406" y2="276" marker-end="url(#f3-ah)"/>
-    <line x1="316" y1="252" x2="316" y2="192" marker-end="url(#f3-ah)"/>
+    <polyline points="687,224 687,234 612,234" marker-end="url(#f3-ah)"/>
+    <line x1="458" y1="234" x2="406" y2="234" marker-end="url(#f3-ah)"/>
+    <line x1="316" y1="210" x2="316" y2="192" marker-end="url(#f3-ah)"/>
   </g>
-  <text x="693" y="250" font-size="10" fill="#5d6b7a">the user taps</text>
-  <text x="322" y="226" font-size="10" fill="#5d6b7a">defaults</text>
-  <rect x="458" y="252" width="152" height="48" rx="5" fill="#f3f5f7" stroke="#cfd6dd"/>
-  <text x="470" y="270" font-weight="700">Dashboard chips</text>
-  <text x="470" y="284" font-size="9.8" fill="#5d6b7a">Later · Not important ·</text>
-  <text x="470" y="296" font-size="9.8" fill="#5d6b7a">Always interrupt</text>
-  <rect x="228" y="252" width="176" height="48" rx="5" fill="#f3f5f7" stroke="#cfd6dd"/>
-  <text x="240" y="270" font-weight="700">Attention profile</text>
-  <text x="240" y="284" font-size="9.8" fill="#5d6b7a">priors per sender, kind, sphere;</text>
-  <text x="240" y="296" font-size="9.8" fill="#5d6b7a">prose the user can read and edit</text>
+  <text x="693" y="248" font-size="10" fill="#5d6b7a">the user taps</text>
+  <text x="322" y="205" font-size="10" fill="#5d6b7a">defaults</text>
+  <rect x="458" y="210" width="152" height="48" rx="5" fill="#f3f5f7" stroke="#cfd6dd"/>
+  <text x="470" y="228" font-weight="700">Corrections per field</text>
+  <text x="470" y="242" font-size="9.8" fill="#5d6b7a">importance · deadline ·</text>
+  <text x="470" y="254" font-size="9.8" fill="#5d6b7a">delivery (permit)</text>
+  <rect x="228" y="210" width="176" height="48" rx="5" fill="#f3f5f7" stroke="#cfd6dd"/>
+  <text x="240" y="228" font-weight="700">Attention profile</text>
+  <text x="240" y="242" font-size="9.8" fill="#5d6b7a">importance priors; lead times;</text>
+  <text x="240" y="254" font-size="9.8" fill="#5d6b7a">interruption permits per mode</text>
 </svg>
