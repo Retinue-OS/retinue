@@ -475,10 +475,30 @@ tokens exist to prevent. E-mail needs no context: its reply is addressed by
 Bundle **all** `archive` + `delete` items in scope into **one** dashboard
 conversation for a single batch approval. Emit at most once per interval;
 between intervals, accumulate. After emitting, write status `omnibus` for those
-messages and record the last-omnibus timestamp.
+messages and record the last-omnibus timestamp in
+**`$TRIAGE_STATE_DIR/.last-omnibus`** (that exact name — see *State &
+idempotency*).
 
+**The omnibus push always carries `--key`.** "At most once per interval" is
+enforced by the gateway, not by trusting the bookkeeping below to be reached:
+the key names the interval window, so every attempt inside one window collapses
+onto the first thread instead of raising another. Derive it mechanically —
+never from a timestamp of "now", which differs on every attempt:
+
+    OMNIBUS_KEY="triage-omnibus:$(python3 -c 'import os,time; print(int(time.time()//int(os.environ.get("EMAIL_PROCESSING_INTERVAL","86400"))))')"
     python3 /workspace/scripts/conversation-push.py --title "Triage: archive & delete" \
+    --key "$OMNIBUS_KEY" \
     "...grouped ARCHIVE / DELETE, one line per message, each ARCHIVE line with its reason...\n<approve-all chip>"
+
+This key is what makes emit-then-record safe. The bookkeeping is written
+*after* the push on purpose — writing it first would mark messages `omnibus`
+that the user never saw, had the push failed — so a run that dies in between
+leaves the items untracked and a later run re-proposes them, correctly, since
+nothing recorded that they were proposed. Without the key that re-proposal
+opens a **second thread**; with it, the user's existing thread is reused and
+nothing duplicates. A response carrying `deduplicated` means this window's
+omnibus is already up: write the bookkeeping and stop — never re-push, and
+never "try again" because a push looked unconfirmed.
 
 ### 4c. No status-report conversations — a silent run is the normal outcome
 
@@ -639,6 +659,12 @@ ledger's flag, not an INBOX move, closes the loop.
   client/channel.
 - **Garbage-collect** `resolved` entries once their message has left the INBOX
   (or after a retention window) so the store stays small.
+- **The last-omnibus timestamp lives in `$TRIAGE_STATE_DIR/.last-omnibus`** —
+  that exact filename, hyphen and not underscore, holding one ISO-8601 UTC
+  instant. A run that invents its own spelling (`.last_omnibus`) writes a file
+  no other run reads, so every subsequent run believes an omnibus is due. Where
+  both spellings exist, `.last-omnibus` is authoritative and the other is to be
+  removed.
 
 ### Messenger — the gateway delivery ledger
 
@@ -657,7 +683,12 @@ ledger's flag, not an INBOX move, closes the loop.
   it by instructing Ara (the `triage_policy.py` CLI), never by hand-typing
   identifiers.
 
-An interrupted run re-collects still-untracked items and re-proposes only those.
+An interrupted run re-collects still-untracked items and re-proposes only those
+— onto the *same* dashboard thread, because every proposal carries `--key`: the
+omnibus its interval window (Phase 4b), a messenger item its `thread_key`
+(Phase 4a). Re-proposal is therefore never a duplicate thread. A proposal
+pushed without its key turns each interruption into one instead, and repeated
+interruptions into a pile of identical threads.
 
 ---
 
