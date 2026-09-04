@@ -24,16 +24,32 @@ useful when changing the engine or the script. Pass minutes since midnight to
 choose the checkpoints (`node replay.mjs 480 725`).
 
 Deep links: `index.html?at=13:35` opens the day at that time, `&play=1` starts
-playing, `&open=<item id>` opens an item's detail sheet, `&held=1` expands Held.
+playing, `&open=<item id>` opens an item (`&tab=ara` for a chat's Ara pane),
+`&held=1` expands Held.
 
 ## What is in it
 
 | File | Role |
 |---|---|
 | `backends.js` | Three example-data backends that stand in for the real gateway routes — `/chats` (messenger messages with the Secretary's triage classification), `/conversations` (threads opened by agents), `/projects` (frontmatter, one paused project that the recurring-projects job wakes). Each has `list()` in the route's shape and `events(from, to)` for arrivals. |
+| `dialogues.js` | Canned conversations with Ara, one per item, standing in for the model turns a deployment would run: an opening, chips as canned prompts, replies with effects (handled, parked, parked on someone else, a reply drafted into the chat composer). |
 | `engine.js` | The attention engine: the four-plus-one item properties (importance, due, lead time, sphere + tags, current actor), the level table with urgency = time left ÷ lead time, focus modes with admitted spheres, admitting tags and per-sender permits, the delivery decision (push now / hold for the digest / list), breakpoints and digests, the half-hourly sweep, the repeat policy, and the three-field corrections that feed the attention profile (importance priors, lead times per kind, permits per mode). |
 | `simulation.js` | The scripted day — what you are doing, whether you follow the nudge — and the runner (clock, beats, seek, pause when the viewer takes over). |
-| `ui.js`, `style.css`, `index.html` | The phone dashboard (Now · Next · Held · Waiting, mode chip, push banners, the detail sheet with the three fields and their corrections) and the deck (clock, timeline, narration, system state, profile, backends). |
+| `ui.js`, `style.css`, `index.html` | The phone dashboard (Now · Next · Held · Waiting, mode chip, push banners), the two views a tap opens — a messenger chat with its history, a composer and an Ara pane, or a thread with Ara's turns and chips — the details sheet (ⓘ) with the three fields and their corrections, and the deck (clock, timeline, narration, system state, profile, backends). |
+
+## Tapping an item
+
+As on the real dashboard, an item opens the place where it is dealt with, not a
+checkbox. A messenger chat opens with its message history and a composer, and
+an **Ara** tab beside it: the chat's own conversation with Ara, where she
+summarises, answers questions, and can stage a reply as a draft in the composer —
+the send press stays yours, and a sent reply counts as handled. A thread or a
+project opens the conversation with Ara about it; her chips are canned prompts,
+and she says what she can do and what needs you: the VAT return, for instance,
+is prepared but goes through the tax administration's portal with your login,
+by hand or through a Cowork session with the Ara connector driving the browser.
+The ⓘ button shows the three fields (importance, urgency, delivery) with their
+corrections; *Later* and *Mark done* stay one tap away.
 
 ## How the simulation works
 

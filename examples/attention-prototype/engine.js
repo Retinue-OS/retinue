@@ -58,7 +58,7 @@
     // ---- items --------------------------------------------------------------
     _leadFor(kind) { const v = this.profile.leads[kind]; return v != null ? v : this.profile.leads.default; }
     _newItem(o) {
-      const item = Object.assign({ tags: [], count: 1, state: 'open', released: false, releasedBy: null, releasedAt: null, snoozedUntil: null, boost: 0, pushed: [], lastLevel: null, due: null, critical: false, actor: 'you' }, o);
+      const item = Object.assign({ tags: [], count: 1, state: 'open', released: false, releasedBy: null, releasedAt: null, snoozedUntil: null, boost: 0, pushed: [], lastLevel: null, due: null, critical: false, actor: 'you', thread: [], chips: null, chat: [], episode: 0 }, o);
       if (item.lead == null) { item.lead = this._leadFor(item.kindLabel); item.leadFrom = 'kind default'; }
       return item;
     }
@@ -79,9 +79,10 @@
     }
     _onMessage(msg) {
       const id = `chat:${msg.chat}`; let item = this.byId.get(id); const tr = msg.triage || {};
-      if (!item) return this._arrive(this._add(this._chatItem(msg)), msg.at);
+      if (!item) { item = this._add(this._chatItem(msg)); item.chat.push({ dir: 'in', text: msg.text, t: msg.at }); return this._arrive(item, msg.at); }
+      item.chat.push({ dir: 'in', text: msg.text, t: msg.at });
       if (item.state === 'done') {
-        Object.assign(item, { state: 'open', released: false, releasedBy: null, snoozedUntil: null, boost: 0, count: 1, pushed: [], body: msg.text, kindLabel: tr.kind || item.kindLabel, tags: tr.tags || [], due: tr.due != null ? tr.due : null });
+        Object.assign(item, { state: 'open', released: false, releasedBy: null, snoozedUntil: null, boost: 0, count: 1, pushed: [], body: msg.text, kindLabel: tr.kind || item.kindLabel, tags: tr.tags || [], due: tr.due != null ? tr.due : null, thread: [], chips: null, episode: item.episode + 1 });
         if (tr.importance != null) { item.importance = tr.importance; item.importanceFrom = 'triage'; } else { item.importance = this.profile.priors[msg.sender] != null ? this.profile.priors[msg.sender] : item.importance; item.importanceFrom = 'prior'; }
         item.lead = this._leadFor(item.kindLabel); item.leadFrom = 'kind default';
         return this._arrive(item, msg.at);
@@ -211,6 +212,45 @@
         else if (before && before !== lvl) this.emit({ kind: 'system', item, text: `${item.title}: ${before} → ${lvl} after ${why}.` });
       }
       item.lastLevel = lvl;
+    }
+
+    // ---- conversations with Ara, replies in chats -------------------------------------
+    _dialogue(item) {
+      const D = root.Dialogues;
+      if (item.kind === 'chat') { const c = D.COMPANIONS[item.id]; if (!c) return null; const ep = item.episode; return ep === 0 ? c : (c[`later${ep === 1 ? '' : ep}`] || c.later3 || c); }
+      return D.THREADS[item.id] || null;
+    }
+    _fill(text, item) { return text.replace('{time}', hhmm(this.now)).replace('{arrived}', hhmm(item.arrived != null ? item.arrived : this.now)); }
+    ensureThread(id) {
+      const item = this.byId.get(id); if (!item || item.thread.length) return item;
+      const d = this._dialogue(item);
+      const opening = d && d.opening ? d.opening : (item.kind === 'chat' ? 'What do you want to do with this?' : item.body || 'What do you want to do with this?');
+      item.thread.push({ who: 'ara', text: this._fill(opening, item), t: item.kind === 'chat' ? this.now : (item.arrived != null && item.arrived > 0 ? item.arrived : this.now) });
+      item.chips = d && d.chips ? d.chips.slice() : [];
+      return item;
+    }
+    // The user's turn in the thread: a chip label or free text. Returns Ara's reply record.
+    say(id, text) {
+      const item = this.ensureThread(id); if (!item) return null;
+      item.thread.push({ who: 'you', text, t: this.now });
+      const d = this._dialogue(item); const r = (d && d.replies && d.replies[text]) || (d && d.free) || { text: 'Noted. I keep this with the item.' };
+      const reply = { who: 'ara', text: this._fill(r.text, item), t: this.now };
+      item.thread.push(reply); item.chips = r.chips ? r.chips.slice() : (r.done || r.later || r.waitOn ? [] : item.chips);
+      const short = (x) => (x.length > 70 ? x.slice(0, 67) + '…' : x);
+      this.emit({ kind: 'action', item, text: `${item.kind === 'chat' ? 'Ara pane' : 'Thread'} “${item.title}” — you: “${short(text)}” · Ara: “${short(reply.text)}”` });
+      if (r.note) this.emit({ kind: 'system', item, text: `(${r.note})` });
+      if (r.waitOn) { item.actor = r.waitOn; item.waiting_since = this.now; item.released = true; item.snoozedUntil = null; this.emit({ kind: 'action', item, text: `${item.title} is parked on ${r.waitOn}.` }); }
+      if (r.later) this.later(id, r.later);
+      if (r.done) this.doIt(id);
+      return { reply, draft: r.draft ? this._fill(r.draft, item) : null };
+    }
+    // Send a reply in a messenger chat; the chat counts as handled.
+    sendChat(id, text) {
+      const item = this.byId.get(id); if (!item || item.kind !== 'chat') return false;
+      item.chat.push({ dir: 'out', text, t: this.now });
+      if (item.state === 'open') { item.state = 'done'; item.doneAt = this.now; item.doneHow = 'replied'; this.doneToday += 1; }
+      this.emit({ kind: 'action', item, text: `Replied to ${item.sender} on ${item.channel}: “${text}” — handled.` });
+      return true;
     }
 
     // ---- what the user can do ----------------------------------------------------

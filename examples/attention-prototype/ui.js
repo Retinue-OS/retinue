@@ -1,31 +1,33 @@
-// The prototype's interface: the phone dashboard (interactive at all times), the
-// simulation deck (clock, timeline, narration, state) and the wiring between them.
+// The prototype's interface: the phone dashboard (interactive at all times) with
+// its list, the chat and thread views and the details sheet; the simulation deck
+// (clock, timeline, narration, state); and the wiring between them.
 (function (root) {
   'use strict';
   const U = root.AttentionUtil;
-  const { hhmm, whenText, dur, DAY, rank, SCHEDULE, DIGEST_TIMES } = U;
+  const { hhmm, whenText, dur, DAY, SCHEDULE, DIGEST_TIMES } = U;
   const SPHERE_COLORS = { customers: '#6ea8fe', admin: '#c9a0ff', health: '#ff6b6b', friends: '#57c785', family: '#ffb86b', system: '#9aa5b1' };
   const LEVEL_COLORS = { critical: '#ff5d5d', 'time-sensitive': '#e08a2e', active: '#4fb3b9', passive: '#4a5563' };
   const WHO = { narrator: 'story', you: 'you', system: 'system', push: 'push', learn: 'profile' };
   const LEAD_PRESETS = [[60, '1 h'], [120, '2 h'], [360, '6 h'], [1440, '1 day'], [2880, '2 days'], [4320, '3 days'], [10080, '1 week'], [20160, '2 weeks'], [40320, '4 weeks']];
   const SPEEDS = [[2, '×1 — the day in 12 min'], [4.8, '×2 — 5 min'], [12, '×5 — 2 min'], [24, '×10 — 1 min']];
   const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
   class App {
     constructor(rootEl) {
       this.root = rootEl; this.engine = new root.AttentionEngine();
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll() });
-      this.sheet = null; this.menu = false; this.heldOpen = false; this.waitingOpen = false;
-      this.banner = null; this.bannerTimer = null; this.seenPushes = 0; this.feedLen = -1;
+      this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.heldOpen = false; this.waitingOpen = false;
+      this.banner = null; this.bannerTimer = null; this.toastTimer = null; this.seenPushes = 0; this.feedLen = -1;
       this.phoneEl = rootEl.querySelector('#phone'); this.deckEl = rootEl.querySelector('#deck');
       this.buildDeck();
       rootEl.addEventListener('click', (e) => this.onClick(e));
       rootEl.addEventListener('change', (e) => this.onInput(e));
+      rootEl.addEventListener('input', (e) => { if (e.target.id === 'composer') this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, byAra: false }; });
+      rootEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.id === 'composer') { e.preventDefault(); this.send(e.target.dataset.id, e.target.dataset.tab); } });
       const params = new URLSearchParams(location.search);
       const at = params.get('at'); if (at) { const [h, m] = at.split(':').map(Number); this.sim.seek(h * 60 + (m || 0)); this.seenPushes = this.engine.pushes.length; }
-      const open = params.get('open'); if (open && this.engine.byId.has(open)) this.sheet = open;
       if (params.get('held') === '1') this.heldOpen = true;
+      const open = params.get('open'); if (open && this.engine.byId.has(open)) this.openView(open, params.get('tab'));
       this.renderAll();
       if (params.get('play') === '1') this.sim.play();
       this.clockLoop();
@@ -94,12 +96,13 @@
       if (n > this.seenPushes) { this.banner = this.engine.pushes[n - 1]; this.seenPushes = n; clearTimeout(this.bannerTimer); this.bannerTimer = setTimeout(() => { this.banner = null; this.renderPhone(); }, 7000); this.renderPhone(); }
       else if (n < this.seenPushes) { this.seenPushes = n; this.banner = null; }
     }
+    showToast(text) { this.toast = text; clearTimeout(this.toastTimer); this.toastTimer = setTimeout(() => { this.toast = null; this.renderPhone(); }, 4500); }
 
     row(item, section) {
       const e = this.engine; const lvl = e.level(item);
       const meta = item.actor !== 'you' ? `waiting ${item.waiting_since != null ? dur(e.now - item.waiting_since) : ''}` : `${e.urgencyShort(item)} · ${item.kind === 'chat' ? item.channel : item.kind}`;
       const why = item.actor !== 'you' ? `importance ${item.importance} · parked on ${esc(item.actor)}` : `importance ${item.importance} · ${esc(e.urgencyShort(item))} · ${esc(section === 'now' ? e.admissionReason(item, e.mode()) : e.deliveryShort(item))}`;
-      return `<button class="row" data-act="open" data-id="${esc(item.id)}" style="--stripe:${LEVEL_COLORS[lvl]}" title="${esc(lvl)}">
+      return `<button class="row" data-act="view" data-id="${esc(item.id)}" style="--stripe:${LEVEL_COLORS[lvl]}" title="${esc(lvl)}">
         <div class="row-top"><span class="chip"><i style="background:${SPHERE_COLORS[item.sphere] || '#9aa5b1'}"></i>${esc(item.sphere)}</span>${item.count > 1 ? `<span class="count">${item.count} msgs</span>` : ''}<span class="meta">${esc(meta)}</span></div>
         <div class="row-title">${esc(item.title)}</div>
         <div class="row-why">${why}</div></button>`;
@@ -110,10 +113,10 @@
       const nb = e.nextBreakpointText();
       const total = s.now.length + s.next.length + s.held.length + s.waiting.length;
       const banner = this.banner ? `<div class="banner ${this.banner.urgency}" data-act="dismiss-banner"><span class="bell">🔔</span><div><div class="b-title">${esc(this.banner.title)}<span class="b-urg">Urgency: ${esc(this.banner.urgency)}${this.banner.topic ? ' · Topic: ' + esc(this.banner.topic) : ''}</span></div><div class="b-body">${esc(this.banner.body)}</div></div></div>` : '';
+      const toast = this.toast ? `<div class="toast">${esc(this.toast)}</div>` : '';
       const section = (label, items, key) => items.length ? `<section class="sec ${key}"><h4>${label} · ${items.length}</h4>${items.map((i) => this.row(i, key)).join('')}</section>` : '';
       const collapsible = (label, items, key, open) => items.length ? `<section class="sec ${key}"><button class="sec-toggle" data-act="toggle-${key}"><span>${label} · ${items.length}</span><span class="chev">${open ? '▾' : '▸'}</span></button>${open ? items.map((i) => this.row(i, key)).join('') : ''}</section>` : '';
-      this.phoneEl.innerHTML = `<div class="phone"><div class="screen">
-        <div class="ph-head"><div class="ph-title">Attention</div><button class="mode-chip" data-act="mode-menu" style="border-color:${mode.color}"><span class="dot" style="background:${mode.color}"></span>${esc(mode.name)} · ${until} ▾</button></div>
+      const list = `<div class="ph-head"><div class="ph-title">Attention</div><button class="mode-chip" data-act="mode-menu" style="border-color:${mode.color}"><span class="dot" style="background:${mode.color}"></span>${esc(mode.name)} · ${until} ▾</button></div>
         ${banner}
         <div class="ph-body">
           ${section('NOW', s.now, 'now')}
@@ -121,10 +124,34 @@
           ${collapsible(`HELD UNTIL ${nb.toUpperCase()}`, s.held, 'held', this.heldOpen)}
           ${collapsible('WAITING ON OTHERS', s.waiting, 'waiting', this.waitingOpen)}
           ${total ? '' : '<div class="empty">Nothing wants your attention.</div>'}
-        </div>
+        </div>`;
+      this.phoneEl.innerHTML = `<div class="phone"><div class="screen">
+        ${this.view ? banner + this.viewHtml() : list}
+        ${toast}
         ${this.menu ? this.modeMenu() : ''}
         ${this.sheet ? this.sheetHtml() : ''}
       </div></div>`;
+      const bub = this.phoneEl.querySelector('#bubbles'); if (bub) bub.scrollTop = bub.scrollHeight;
+    }
+    openView(id, tab) { const item = this.engine.byId.get(id); if (!item) return; this.engine.ensureThread(id); this.view = { id, tab: item.kind === 'chat' ? (tab === 'ara' ? 'ara' : 'chat') : 'ara' }; this.sheet = null; this.menu = false; if (!this.draft || this.draft.id !== id) this.draft = null; }
+    viewHtml() {
+      const e = this.engine; const item = e.byId.get(this.view.id); if (!item) { this.view = null; return ''; }
+      e.ensureThread(item.id);
+      const isChat = item.kind === 'chat'; const tab = isChat ? this.view.tab : 'ara'; const lvl = e.level(item);
+      const sub = isChat ? `${item.channel} · ${item.sender}` : item.kind === 'thread' ? `Thread opened by ${item.agent}` : `Project · ${item.actor === 'you' ? 'your move' : `parked on ${item.actor}`}`;
+      const status = item.state === 'done' ? `${item.doneHow === 'replied' ? 'replied' : 'done'} ${hhmm(item.doneAt)}` : item.actor !== 'you' ? `waiting on ${item.actor}` : `${lvl} · ${e.urgencyShort(item)}`;
+      const bubbles = tab === 'chat'
+        ? item.chat.map((m) => `<div class="bub ${m.dir}"><div class="bub-text">${esc(m.text)}</div><div class="bub-t">${m.dir === 'in' ? esc(item.sender) : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('')
+        : item.thread.map((m) => `<div class="bub ${m.who === 'ara' ? 'in ara' : 'out'}"><div class="bub-text">${esc(m.text)}</div><div class="bub-t">${m.who === 'ara' ? 'Ara' : 'you'} · ${esc(whenText(m.t, e.now))}</div></div>`).join('');
+      const chips = tab === 'ara' && item.chips && item.chips.length && item.state === 'open' ? `<div class="chips">${item.chips.map((c) => `<button class="chipbtn" data-act="chip" data-id="${esc(item.id)}" data-label="${esc(c)}">${esc(c)}</button>`).join('')}</div>` : '';
+      const draft = this.draft && this.draft.id === item.id && this.draft.tab === tab ? this.draft : null;
+      const composer = `<div class="composer">${draft && draft.byAra ? '<div class="draft-note">Ara’s draft — edit it or send it</div>' : ''}<div class="composer-row"><input id="composer" type="text" autocomplete="off" placeholder="${tab === 'chat' ? `Reply to ${esc(item.sender)}…` : 'Ask Ara…'}" value="${esc(draft ? draft.text : '')}" data-tab="${tab}" data-id="${esc(item.id)}"><button class="btn primary" data-act="send" data-id="${esc(item.id)}" data-tab="${tab}">${tab === 'chat' ? 'Send' : 'Ask'}</button></div></div>`;
+      const foot = item.state === 'open' && item.actor === 'you' ? `<div class="v-foot"><button class="btn" data-act="later" data-when="next" data-id="${esc(item.id)}">Later · ${esc(e.nextBreakpointText())}</button><button class="btn" data-act="do" data-id="${esc(item.id)}">${isChat ? 'Mark handled' : 'Mark done'}</button></div>` : '';
+      return `<div class="view">
+        <div class="v-head"><button class="back" data-act="back" aria-label="Back">‹</button><div class="v-titles"><div class="v-title">${esc(item.title)}</div><div class="v-sub">${esc(sub)} · <span style="color:${LEVEL_COLORS[lvl]}">${esc(status)}</span></div></div><button class="info" data-act="open" data-id="${esc(item.id)}" title="Importance, urgency, delivery — and their corrections">ⓘ</button></div>
+        ${isChat ? `<div class="segs"><button class="seg${tab === 'chat' ? ' on' : ''}" data-act="tab" data-tab="chat">Chat</button><button class="seg${tab === 'ara' ? ' on' : ''}" data-act="tab" data-tab="ara">Ara</button></div>` : ''}
+        <div class="bubbles" id="bubbles">${bubbles || '<div class="empty">Nothing yet.</div>'}</div>
+        ${chips}${composer}${foot}</div>`;
     }
     modeMenu() {
       const e = this.engine; const cur = e.mode(); const sched = e.scheduledMode();
@@ -138,8 +165,8 @@
       const hasPermit = item.sender && e.profile.permits[mode.id].includes(item.sender);
       const admitsSphere = mode.admits.includes(item.sphere);
       const leadSel = `<select class="select small" data-act="lead" data-id="${esc(item.id)}">${LEAD_PRESETS.map(([v, l]) => `<option value="${v}"${v === item.lead ? ' selected' : ''}>${l}</option>`).join('')}${LEAD_PRESETS.some(([v]) => v === item.lead) ? '' : `<option value="${item.lead}" selected>${dur(item.lead)}</option>`}</select>`;
-      const actions = item.state !== 'open' ? `<div class="done-note">Done at ${hhmm(item.doneAt)}.</div>` : item.actor !== 'you' ? `<div class="done-note">Parked on ${esc(item.actor)}${item.waiting_since != null ? ` for ${dur(e.now - item.waiting_since)}` : ''}. Nothing to do until they move.</div><div class="actions"><button class="btn" data-act="do" data-id="${esc(item.id)}">Mark resolved</button></div>` : `<div class="actions">
-          <button class="btn primary" data-act="do" data-id="${esc(item.id)}">Do it</button>
+      const actions = item.state !== 'open' ? `<div class="done-note">${item.doneHow === 'replied' ? 'Replied' : 'Done'} at ${hhmm(item.doneAt)}.</div><div class="actions"><button class="btn" data-act="view" data-id="${esc(item.id)}">${item.kind === 'chat' ? 'Open the chat' : 'Open the thread'}</button></div>` : item.actor !== 'you' ? `<div class="done-note">Parked on ${esc(item.actor)}${item.waiting_since != null ? ` for ${dur(e.now - item.waiting_since)}` : ''}.</div><div class="actions"><button class="btn primary" data-act="view" data-id="${esc(item.id)}">Discuss with Ara</button><button class="btn" data-act="do" data-id="${esc(item.id)}">Mark resolved</button></div>` : `<div class="actions">
+          <button class="btn primary" data-act="view" data-id="${esc(item.id)}">${item.kind === 'chat' ? 'Open the chat' : 'Work on it with Ara'}</button>
           <button class="btn" data-act="later" data-when="next" data-id="${esc(item.id)}">Later · ${esc(e.nextBreakpointText())}</button>
           <button class="btn" data-act="later" data-when="tomorrow" data-id="${esc(item.id)}">Later · tomorrow</button>
           ${!item.released ? `<button class="btn" data-act="pull" data-id="${esc(item.id)}">Pull into the list now</button>` : ''}</div>`;
@@ -182,41 +209,58 @@
           <div class="kv"><span>permits</span><div>${chips(p.permits[mode.id])}</div></div>
           <div class="kv"><span>breaks through</span><div>${esc(mode.threshold)} and above</div></div>
           <div class="kv"><span>next breakpoint</span><div>${esc(e.nextBreakpointText())}</div></div></div>
-        <div class="nums">${num(st.itemPushes, 'pushes')}${num(st.digests, 'digests')}${num(st.held, 'held')}${num(st.done, 'done')}${num(st.corrections, 'corrections')}</div>
+        <div class="nums">${num(st.itemPushes, 'pushes')}${num(st.digests, 'digests')}${num(st.held, 'held')}${num(st.done, 'handled')}${num(st.corrections, 'corrections')}</div>
         <details class="profile" open><summary>Attention profile</summary>
           <div class="kv"><span>importance priors</span><div>${Object.entries(p.priors).map(([k, v]) => `<span class="pill">${esc(k)} <b>${v}</b></span>`).join('')}</div></div>
           <div class="kv"><span>lead times</span><div>${Object.entries(p.leads).filter(([k]) => k !== 'default').map(([k, v]) => `<span class="pill">${esc(k)} <b>${dur(v)}</b></span>`).join('')}</div></div>
           <div class="kv"><span>permits</span><div>${Object.entries(p.permits).filter(([, v]) => v.length).map(([m, v]) => `<span class="pill">${esc(e.modes[m].name)}: ${v.map(esc).join(', ')}</span>`).join('') || '<span class="muted">none yet</span>'}</div></div>
-          <div class="kv"><span>learned today</span><div>${p.learned.length ? p.learned.map((l) => `<div class="learned">${hhmm(l.at)} — ${esc(l.text)}</div>`).join('') : '<span class="muted">nothing yet — correct a field on any item</span>'}</div></div>
+          <div class="kv"><span>learned today</span><div>${p.learned.length ? p.learned.map((l) => `<div class="learned">${hhmm(l.at)} — ${esc(l.text)}</div>`).join('') : '<span class="muted">nothing yet — correct a field on any item (ⓘ in its view)</span>'}</div></div>
         </details>
         <details class="sources"><summary>Backends (example data)</summary>
           ${root.Backends.all.map((b) => `<div class="kv"><span><code>${esc(b.route)}</code></span><div>${esc(String(b.list(e.now).length))} records visible at ${hhmm(e.now)}</div></div>`).join('')}
-          <p class="hint">Each backend mirrors one real gateway route and feeds the same attention model; storage stays separate, the dashboard shows the union.</p>
+          <p class="hint">Each backend mirrors one real gateway route and feeds the same attention model; storage stays separate, the dashboard shows the union. Ara’s turns in the threads are canned here; in a deployment they are model turns.</p>
         </details>`;
     }
 
     // ---- interaction ---------------------------------------------------------------
+    send(id, tab) {
+      const input = this.phoneEl.querySelector('#composer'); const text = (input ? input.value : (this.draft ? this.draft.text : '')).trim(); if (!text) return;
+      this.sim.viewerActed(); this.draft = null;
+      if (tab === 'chat') this.engine.sendChat(id, text);
+      else this.converse(id, text);
+      this.renderAll();
+    }
+    converse(id, text) {
+      const r = this.engine.say(id, text); if (!r) return;
+      if (r.draft) { this.draft = { id, tab: 'chat', text: r.draft, byAra: true }; if (this.view && this.view.id === id) this.view.tab = 'chat'; }
+      const d = this.engine._dialogue(this.engine.byId.get(id)); const rec = d && d.replies && d.replies[text]; if (rec && rec.note) this.showToast(rec.note);
+    }
     onClick(ev) {
       const el = ev.target.closest('[data-act]'); if (!el) return;
       const act = el.dataset.act; const id = el.dataset.id; const e = this.engine;
-      if (act === 'seek') { const svg = el; const pt = svg.getBoundingClientRect(); const rel = (ev.clientX - pt.left) / pt.width; const minute = Math.round(((rel * 720 - 20) / 680) * DAY); this.sim.seek(minute); this.sheet = null; this.menu = false; this.seenPushes = e.pushes.length; this.banner = null; this.renderAll(); return; }
+      if (act === 'seek') { const pt = el.getBoundingClientRect(); const rel = (ev.clientX - pt.left) / pt.width; const minute = Math.round(((rel * 720 - 20) / 680) * DAY); this.sim.seek(minute); this.sheet = null; this.menu = false; this.view = null; this.draft = null; this.seenPushes = e.pushes.length; this.banner = null; this.renderAll(); return; }
       const stop = ev.target.closest('[data-stop]');
       if ((act === 'close-sheet' || act === 'close-menu') && stop && el !== ev.target.closest('.x')) return; // clicks inside the sheet do not close it
       switch (act) {
         case 'toggle-play': this.sim.toggle(); break;
         case 'step': this.sim.step(); break;
-        case 'restart': this.sim.seek(0); this.sim.pause(); this.sheet = null; this.menu = false; this.seenPushes = 0; this.banner = null; break;
+        case 'restart': this.sim.seek(0); this.sim.pause(); this.sheet = null; this.menu = false; this.view = null; this.draft = null; this.seenPushes = 0; this.banner = null; break;
         case 'resume': this.sim.resume(); break;
         case 'dismiss-banner': this.banner = null; break;
         case 'mode-menu': this.sim.viewerActed(); this.menu = !this.menu; break;
         case 'close-menu': this.menu = false; break;
         case 'set-mode': this.sim.viewerActed(); e.setManualMode(el.dataset.mode || null); this.menu = false; break;
+        case 'view': this.sim.viewerActed(); this.openView(id); break;
+        case 'back': this.view = null; this.draft = null; break;
+        case 'tab': this.sim.viewerActed(); if (this.view) this.view.tab = el.dataset.tab; break;
+        case 'chip': this.sim.viewerActed(); this.converse(id, el.dataset.label); break;
+        case 'send': this.send(id, el.dataset.tab); return;
         case 'open': this.sim.viewerActed(); this.sheet = id; break;
         case 'close-sheet': this.sheet = null; break;
         case 'toggle-held': this.sim.viewerActed(); this.heldOpen = !this.heldOpen; break;
         case 'toggle-waiting': this.sim.viewerActed(); this.waitingOpen = !this.waitingOpen; break;
         case 'do': this.sim.viewerActed(); e.doIt(id); this.sheet = null; break;
-        case 'later': this.sim.viewerActed(); e.later(id, el.dataset.when); this.sheet = null; break;
+        case 'later': this.sim.viewerActed(); e.later(id, el.dataset.when); this.sheet = null; if (this.view && this.view.id === id) { this.view = null; this.draft = null; } break;
         case 'pull': this.sim.viewerActed(); e.pull(id); break;
         case 'imp': { this.sim.viewerActed(); const it = e.byId.get(id); const v = Math.max(0, Math.min(5, it.importance + Number(el.dataset.delta))); if (v !== it.importance) e.correct(id, { importance: v }); break; }
         case 'due': { this.sim.viewerActed(); const it = e.byId.get(id); const d = el.dataset.delta; e.correct(id, { due: d === 'none' ? null : (it.due != null ? it.due : e.now) + Number(d) }); break; }

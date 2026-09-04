@@ -6,7 +6,7 @@ index = (here / 'index.html').read_text(encoding='utf-8')
 body = index.split('<!-- artifact:start -->')[1].split('<!-- artifact:end -->')[0]
 fonts = re.search(r'<link rel="stylesheet" href="(https://fonts\.googleapis\.com[^"]+)">', index).group(1)
 css = (here / 'style.css').read_text(encoding='utf-8')
-scripts = ''.join(f"<script>\n{(here / f).read_text(encoding='utf-8')}\n</script>\n" for f in ('backends.js', 'engine.js', 'simulation.js', 'ui.js'))
+scripts = ''.join(f"<script>\n{(here / f).read_text(encoding='utf-8')}\n</script>\n" for f in ('backends.js', 'dialogues.js', 'engine.js', 'simulation.js', 'ui.js'))
 out = (f'<title>Retinue Attention Prototype</title>\n<link rel="stylesheet" href="{fonts}">\n<style>\n{css}</style>\n{body}\n'
        f'{scripts}<script>AttentionApp.boot(document.getElementById("app"));</script>\n')
 dist = here / 'dist'; dist.mkdir(exist_ok=True)

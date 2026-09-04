@@ -1,6 +1,6 @@
 // Headless replay of the scripted day: prints the narration and the dashboard
 // sections at a few points. Runs under Node (node replay.mjs) or Deno (deno run replay.mjs).
-await import('./backends.js'); await import('./engine.js'); await import('./simulation.js');
+await import('./backends.js'); await import('./dialogues.js'); await import('./engine.js'); await import('./simulation.js');
 const { hhmm } = globalThis.AttentionUtil;
 const engine = new globalThis.AttentionEngine();
 const sim = new globalThis.Simulation(engine, { beatHold: 0 });
