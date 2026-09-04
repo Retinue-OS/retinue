@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Retinue Attention Prototype</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:ital,wght@0,400;0,600;0,700;1,400&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&family=Source+Code+Pro:wght@400;500&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<!-- artifact:start -->
+<div class="app" id="app">
+  <header class="top">
+    <h1>Attention prototype</h1>
+    <p>Retinue’s dashboard on example data, playing one day. The story nudges; you may ignore it — take over at any time, the clock waits while you drive.</p>
+  </header>
+  <div class="minibar" id="minibar"><div><div class="digital" id="mini-time">00:00</div><div class="mode-line" id="mini-mode"></div></div><span class="spacer"></span><button class="btn primary" data-act="toggle-play" id="mini-play">▶ Play</button><button class="btn" data-act="step">⏭</button></div>
+  <div class="grid">
+    <div class="phone-col" id="phone"></div>
+    <aside class="deck" id="deck"></aside>
+  </div>
+</div>
+<!-- artifact:end -->
+<script src="backends.js"></script>
+<script src="engine.js"></script>
+<script src="simulation.js"></script>
+<script src="ui.js"></script>
+<script>AttentionApp.boot(document.getElementById('app'));</script>
+</body>
+</html>

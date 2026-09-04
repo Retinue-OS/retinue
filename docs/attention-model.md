@@ -106,3 +106,5 @@ conv:8f2c…  kb:importance 4 ;  kb:sphere sphere:customers ;
 **Risks.** Over-filtering hides a real emergency: the band crossing, the undeferrable critical level and the existing daily catch-all keep that bounded. Complexity: four levels, one small sphere set, four named modes — no sliders, and the three fields are the whole explanation. Cost: the level is arithmetic; the only model judgement is the Secretary’s, which triage spends already. The defaults proposed here are assumptions; record them as memories when adopted, so later sessions inherit them.
 
 **Decisions to take before slice 1.** The sphere set and the four mode names; which spheres and tags each mode admits by default; the lead time per kind of item; the digest times; the repeat policy per sender class; whether the Attention list replaces the three cards or sits above them; and whether the Secretary may answer held senders at all. Each becomes a memory once decided.
+
+**Prototype.** `examples/attention-prototype/` runs this model on example data and plays a scripted day on it, with the dashboard live throughout.
