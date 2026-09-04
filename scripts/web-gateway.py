@@ -2183,6 +2183,10 @@ def _valid_model_id(model: str | None, refresh: bool = False) -> str | None:
 # verbatim rather than reconstructed.
 _CONV_KEYS_DIR = CONVERSATIONS_DIR / ".keys"
 _CONV_KEY_MAX = 200
+# A throwaway key exists only to cover one client's retry of one timed-out
+# request; an hour outlives any such retry by a wide margin.
+_CONV_KEY_EPHEMERAL_SUFFIX = ".eph"
+_CONV_KEY_EPHEMERAL_TTL = 3600
 _conv_keys_lock = threading.Lock()
 
 
@@ -2229,7 +2233,31 @@ def _conv_for_key(key: str) -> str | None:
     return cid
 
 
-def _bind_conv_key(key: str, cid: str) -> None:
+def _prune_ephemeral_conv_keys() -> None:
+    """Drop expired throwaway bindings.
+
+    A named key is a lasting identity — the same inbound message redelivered
+    days later must still find its thread — so those bindings are kept forever.
+    An *ephemeral* key names nothing: the push client mints one per invocation
+    purely so that its own retry-after-timeout is folded into the thread the
+    timed-out attempt opened. It is dead once that retry is over, and keeping
+    one per push would grow this directory without bound."""
+    cutoff = time.time() - _CONV_KEY_EPHEMERAL_TTL
+    try:
+        markers = list(_CONV_KEYS_DIR.glob("*" + _CONV_KEY_EPHEMERAL_SUFFIX))
+    except OSError:
+        return
+    for marker in markers:
+        try:
+            if marker.stat().st_mtime > cutoff:
+                continue
+            marker.with_suffix("").unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+        except OSError:  # noqa: PERF203 - one bad file must not stop the sweep
+            continue
+
+
+def _bind_conv_key(key: str, cid: str, ephemeral: bool = False) -> None:
     """Record that `key` opened thread `cid`. Best-effort: a failure here costs
     idempotency on a later repeat, never the thread the user is waiting for."""
     try:
@@ -2237,6 +2265,10 @@ def _bind_conv_key(key: str, cid: str) -> None:
         tmp = _conv_key_path(key).with_suffix(".tmp")
         tmp.write_text(cid, encoding="utf-8")
         tmp.replace(_conv_key_path(key))
+        if ephemeral:
+            _conv_key_path(key).with_suffix(
+                _CONV_KEY_EPHEMERAL_SUFFIX).write_text("", encoding="utf-8")
+            _prune_ephemeral_conv_keys()
     except OSError as exc:  # noqa: BLE001
         print(f"[web-gateway] could not bind conversation key: {exc}", flush=True)
 
@@ -6541,6 +6573,10 @@ class Handler(BaseHTTPRequestHandler):
         # call, and again under the lock below, which is what actually makes
         # create-and-bind atomic.
         key = str(payload.get("key") or "").strip()
+        # A key the client minted for its own retry, not an identity for this
+        # item: honoured exactly like any other while it lives, but expired
+        # afterwards rather than kept forever.
+        key_ephemeral = bool(payload.get("key_ephemeral"))
         if len(key) > _CONV_KEY_MAX:
             self._send_json(400, {"error": "key too long"})
             return
@@ -6569,7 +6605,7 @@ class Handler(BaseHTTPRequestHandler):
                 conv = _new_conv("agent", owner, title, "agent", message,
                                  first_attachments=payload.get("attachments"),
                                  kind=kind, agent=agent, context=context)
-                _bind_conv_key(key, conv["id"])
+                _bind_conv_key(key, conv["id"], ephemeral=key_ephemeral)
         else:
             conv = _new_conv("agent", owner, title, "agent", message,
                              first_attachments=payload.get("attachments"),
