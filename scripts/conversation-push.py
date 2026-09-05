@@ -171,6 +171,12 @@ def main() -> int:
                      help="declared critical: rings in every mode, Off included")
     att.add_argument("--actor", metavar="NAME",
                      help="who the thread waits on when not the user (listed under Waiting, not pushed)")
+    att.add_argument("--project", metavar="URI",
+                     help="the project this thread is about (its URI in the life store): the "
+                          "home screen shows the thread in the project's place rather than both, "
+                          "and Ara's turns in the thread know the project. New threads only.")
+    att.add_argument("--project-title", dest="project_title", metavar="TEXT",
+                     help="the project's title, shown with --project")
     parser.add_argument("--url", default=None, help=f"endpoint URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()
@@ -234,6 +240,10 @@ def main() -> int:
             payload["key_ephemeral"] = not args.key
     if args.title:
         payload["title"] = args.title
+    if args.project and not args.thread and not flags_only:
+        payload["project"] = args.project
+        if args.project_title:
+            payload["project_title"] = args.project_title
     attention = {}
     if args.importance is not None:
         if not 0 <= args.importance <= 5:

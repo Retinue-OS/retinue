@@ -458,7 +458,10 @@ def main() -> int:
             block = set_field(block, "waiting_since", today.isoformat())
             path.write_text(f"---\n{block}\n---\n" + text[m.end():])
 
-        push_conversation(r_title, r_msg, args.dry_run, attention_args(fm, due, kind))
+        # The thread is about this project: the home screen shows it in the
+        # project's place rather than both, and Ara's turns know the file.
+        push_conversation(r_title, r_msg, args.dry_run,
+                          attention_args(fm, due, kind) + ["--project", proj, "--project-title", title])
         acted += 1
 
     if acted == 0:

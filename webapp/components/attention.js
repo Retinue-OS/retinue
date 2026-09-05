@@ -252,7 +252,7 @@ class RetinueAttention extends HTMLElement {
     const lvl = r.level;
     const meta = r.actor !== 'you'
       ? `waiting${r.waiting_since ? ` ${fmtAge(r.waiting_since).replace(' ago', '')}` : ''}`
-      : `${r.due ? `due ${fmtWhen(r.due)}` : (r.critical ? 'critical' : 'no deadline')} · ${r.kind === 'chat' ? (r.channel || 'chat') : r.kind}`;
+      : `${r.due ? `due ${fmtWhen(r.due)}` : (r.critical ? 'critical' : 'no deadline')} · ${r.kind === 'chat' ? (r.channel || 'chat') : (r.project ? 'project' : r.kind)}`;
     const why = r.actor !== 'you'
       ? `importance ${r.importance} · parked on ${esc(r.actor)}`
       : `importance ${r.importance} · ${esc(section === 'now' ? r.reason : r.delivery)}`;

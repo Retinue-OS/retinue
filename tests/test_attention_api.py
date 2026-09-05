@@ -435,6 +435,22 @@ def test_project_from_store(base, wg):
         assert body["degraded"] == [] and _find(body, PROJECT)[0] is None or True
     finally:
         STATE["projects"] = True
+    # A thread an agent opens about the project — recurring-projects' wake-up
+    # — takes the project's place on the list: one row, not two, linking to
+    # both; when the thread is settled the project is its own row again.
+    body = _open(base, "Due: VAT return Q3", "The return is due; the figures are ready.",
+                 {"importance": 4, "sphere": "admin", "kind": "tax filing"}, project=PROJECT, project_title="VAT return Q3")
+    tid = "thread:" + body["id"]
+    assert _find(_sections(base), PROJECT)[0] is None, "the project row folds into its thread"
+    where, row = _find(_sections(base), tid)  # active without a deadline: held in Open
+    assert where == "held" and row["project"] == PROJECT and row["project_title"] == "VAT return Q3", (where, row)
+    assert row["project_href"] == "/project.html?id=" + urllib.parse.quote(PROJECT, safe=""), row["project_href"]
+    status, conv = _http(base, "GET", f"/conversations/{body['id']}")
+    assert conv["project"] == PROJECT
+    _http(base, "POST", "/attention/items/done", {"id": tid})
+    assert _find(_sections(base), PROJECT)[0] in ("now", "next")
+    status, body = _http(base, "POST", "/internal/conversations", {"message": "x", "project": "not a uri"}, AGENT)
+    assert status == 400
     print("ok test_project_from_store")
 
 

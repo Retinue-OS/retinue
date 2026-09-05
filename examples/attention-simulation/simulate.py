@@ -508,15 +508,20 @@ class Simulation:
             dlg = story.THREAD_DIALOGUES[ev["story"]]
             attention = {"importance": ev["importance"], "sphere": ev["sphere"], "tags": ev.get("tags") or [],
                          "kind": ev["kind_label"], "lead": ev.get("remind_before"), "due": ev["expected"]}
-            self._open_agent_thread(ev["story"], f"Due: {ev['title']}", dlg, None, attention)
+            self._open_agent_thread(ev["story"], f"Due: {ev['title']}", dlg, None, attention,
+                                    project=(ev["id"], ev["title"]))
             wg._chats_cache_invalidate()
 
-    def _open_agent_thread(self, story_id: str, title: str, dlg: dict, agent: str | None, attention: dict):
+    def _open_agent_thread(self, story_id: str, title: str, dlg: dict, agent: str | None, attention: dict,
+                           project: tuple[str, str] | None = None):
         spec = {k: v for k, v in attention.items() if k not in ("due",) and v is not None}
         if attention.get("due") is not None:
             spec["due"] = self.clock.at(attention["due"]).isoformat()
         message = dlg["opening"] + "\n\n" + story.chips_markup(dlg["chips"])
         payload = {"title": title, "message": message, "key": f"story:{story_id}", "attention": spec}
+        if project:
+            # The wake-up is about the project: one row on the home, not two.
+            payload["project"], payload["project_title"] = project
         if agent:
             payload["agent"] = agent
         status, body = self.api("POST", "/internal/conversations", payload, agent=True)

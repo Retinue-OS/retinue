@@ -104,6 +104,8 @@ const CSS = `
   .head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
   .title { font-weight: 700; font-size: 16px; }
   .src { color: var(--muted, #8b93a3); font-size: 12px; margin-top: 2px; }
+  .src-link { color: var(--accent, #6ea8fe); text-decoration: none; }
+  .src-link:hover { text-decoration: underline; }
   .x { color: var(--muted, #8b93a3); background: none; border: 0; font-size: 18px;
        cursor: pointer; padding: 0 4px; }
   .body { margin: 10px 0; color: #cbd3dd; font-size: 13.5px;
@@ -317,7 +319,8 @@ class RetinueAttentionSheet extends HTMLElement {
       const src = item.kind === 'chat'
         ? `${esc(item.channel || 'chat')} · ${esc(item.sender || '')}${item.count > 1 ? ` · ${item.count} messages` : ''}`
         : item.kind === 'thread'
-          ? `Thread${item.agent ? ` opened by ${esc(item.agent)}` : ''}`
+          ? `Thread${item.agent ? ` opened by ${esc(item.agent)}` : ''}` +
+            (item.project ? ` · about <a class="src-link" href="${esc(item.project_href || '#')}">${esc(item.project_title || 'the project')}</a>` : '')
           : `Project · ${item.actor === 'you' ? 'your move' : `parked on ${esc(item.actor)}`}`;
       const busy = this._busy ? ' disabled' : '';
       const leadSel = `<select class="select" data-set="lead"${busy}>` +

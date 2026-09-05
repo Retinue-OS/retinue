@@ -176,10 +176,16 @@ def thread_item(conv: dict, profile: dict) -> dict:
         # rule on; it is listed while unread and pushed the way it always was.
         item["released"] = True
         item["importance_from"] = block.get("importance_from") or "your thread"
+    project = conv.get("project") or None
     item.update({
         "source_id": conv["id"],
         # The user's own thread stays visible in every mode (sections' fold).
         "own": conv.get("initiator") != "agent",
+        # The project the thread is about, if any: the list shows the thread
+        # in the project's place (fold_projects), the row links to both.
+        "project": project,
+        "project_title": conv.get("project_title") if project else None,
+        "project_href": ("/project.html?" + urllib.parse.urlencode({"id": project})) if project else None,
         "preview": _one_line(preview_msg.get("text") or ("Sent you a file" if preview_msg.get("attachments") else "")),
         "agent": agent,
         "unread": bool(conv.get("unread")),
@@ -303,6 +309,23 @@ def project_item(row: dict, state_block: dict | None, profile: dict, now: dateti
     return item
 
 
+def fold_projects(items: list[dict]) -> list[dict]:
+    """One row per thing: a project that an open thread is about — the
+    wake-up recurring-projects opened, a question an agent asked about it —
+    shows as that thread, not beside it. The thread carries the news and
+    the decision; the project page is one link away on its row. A project
+    nobody has a thread open about stays its own row. A thread the user
+    opened about a project is theirs, not the project's: the project stays
+    the item, the thread shows while Ara's reply lies unread, as any of
+    their threads does."""
+    claimed = {i["project"] for i in items
+               if i.get("kind") == "thread" and i.get("project") and not i.get("own")
+               and i.get("state", "open") == "open"}
+    if not claimed:
+        return items
+    return [i for i in items if not (i.get("kind") == "project" and i["id"] in claimed)]
+
+
 def _humanize(uri: str) -> str:
     tail = uri.rsplit(":", 1)[-1] if uri else ""
     for pfx in ("project-", "goal-"):
@@ -349,5 +372,5 @@ __all__ = [
     "AttentionStore", "DEFAULT_CHAT_SPHERE", "DEFAULT_SPHERES", "DEFAULT_DIRECT_IMPORTANCE",
     "DEFAULT_GROUP_IMPORTANCE", "zone",
     "thread_wants_attention", "thread_item", "chat_wants_attention", "chat_item",
-    "project_item", "block_for", "subject_iri", "emit", "default_emit_path",
+    "project_item", "fold_projects", "block_for", "subject_iri", "emit", "default_emit_path",
 ]

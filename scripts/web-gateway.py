@@ -5369,7 +5369,7 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
         except Exception as exc:  # noqa: BLE001 - transport/parse: degrade, do not fail
             print(f"[web-gateway] attention: {name} unavailable ({exc})", flush=True)
             degraded.append(name)
-    return items, degraded
+    return attention_store.fold_projects(items), degraded
 
 
 def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
@@ -5695,6 +5695,8 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "state": item.get("state", "open"), "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "pulled": bool(item.get("pulled")),
         "own": bool(item.get("own")),
+        "project": item.get("project"), "project_title": item.get("project_title"),
+        "project_href": item.get("project_href"),
         "pushed": [iso(p) for p in item.get("pushed") or []],
         "permit": bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or []),
         "admits_sphere": item["sphere"] in mode["admits"],
@@ -7357,6 +7359,16 @@ class Handler(BaseHTTPRequestHandler):
         # reply, reply token included) — replayed to Ara's sessions in this
         # thread, never rendered to the user.
         context = str(payload.get("context") or "").strip() or None
+        # The project the thread is about (a wake-up from recurring-projects,
+        # a question about a running project): the home screen then shows
+        # the thread in the project's place, and Ara's turns know the file.
+        project = str(payload.get("project") or "").strip() or None
+        if project and (len(project) > 512 or not _PROJECT_URI_RE.fullmatch(project)):
+            self._send_json(400, {"error": "invalid project"})
+            return
+        project_title = (str(payload.get("project_title") or "").strip() or None)
+        if project_title:
+            project_title = project_title[:120]
         # Idempotency: a repeat of the turn that opened this thread — an
         # escalation re-run, a redelivered inbound — must reuse it, not open a
         # second one. Checked before the lint so a duplicate costs no model
@@ -7394,12 +7406,14 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 conv = _new_conv("agent", owner, title, "agent", message,
                                  first_attachments=payload.get("attachments"),
-                                 kind=kind, agent=agent, context=context)
+                                 kind=kind, agent=agent, context=context,
+                                 project=project, project_title=project_title)
                 _bind_conv_key(key, conv["id"], ephemeral=key_ephemeral)
         else:
             conv = _new_conv("agent", owner, title, "agent", message,
                              first_attachments=payload.get("attachments"),
-                             kind=kind, agent=agent, context=context)
+                             kind=kind, agent=agent, context=context,
+                             project=project, project_title=project_title)
         body = {"id": conv["id"], "title": conv["title"]}
         if quiet:
             # A record, not a request: no badge, no push, and not an item on
