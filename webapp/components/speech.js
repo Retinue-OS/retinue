@@ -46,6 +46,19 @@ export function speechAvailable() {
 
 function engine() { return window.speechSynthesis; }
 
+// The engine is one per page, the readers are several (the news card and the
+// conversation card each have one). Whoever speaks next takes the engine
+// over, and the reader it displaces is halted first, its place kept — so
+// that whatever the cancel throws off its utterance (an error, or on some
+// engines a plain `end`) can no longer be mistaken for its own completion.
+let activeReader = null;
+
+function takeEngine(reader) {
+  const prev = activeReader;
+  activeReader = reader;
+  if (prev && prev !== reader && prev.state === 'playing') prev._halt(null);
+}
+
 // Cut text into pieces of at most MAX_CHUNK characters, on sentence ends where
 // possible (a single overlong sentence is split on the nearest space).
 export function chunk(text) {
@@ -350,6 +363,7 @@ export class Reader {
   // user's tap, which iOS requires before it will speak at all.
   _start() {
     if (!speechAvailable()) { this._halt('unavailable'); return; }
+    takeEngine(this);
     const gen = ++this._gen;
     if (this._timer) clearTimeout(this._timer);
     this._timer = null;
@@ -398,6 +412,8 @@ export class Reader {
       if (!live()) return;
       if (e && typeof e.charIndex === 'number' && e.charIndex > this._boundary) this._boundary = e.charIndex;
     };
+    // A live `end` is a natural completion: our own cancels and another
+    // reader's take-over both forget the utterance first (see takeEngine).
     utter.onend = () => {
       if (!live()) return;
       this._learnRate(piece);

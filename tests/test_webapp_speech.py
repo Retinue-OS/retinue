@@ -441,6 +441,50 @@ await ok('a speak() that throws pauses with the reason and leaves no ticker behi
   reader.stop();
 });
 
+await ok('a second reader taking the engine halts the first, whose stray events change nothing', async () => {
+  await settle();
+  const otherEvents = [];
+  const other = new Reader();
+  other.onprogress = (ev) => otherEvents.push(ev);
+  reader.play([{ id: 'first', lang: 'en', text: LONG }]);
+  await settle();
+  synth.start();
+  const firstUtter = synth.current();
+  const firstPos = reader.pos;
+  events.length = 0;
+  synth.log.length = 0;
+  // Some engines answer a cancel with a plain `end` on the live utterance.
+  const realCancel = synth.cancel;
+  synth.cancel = function () {
+    this.log.push('cancel');
+    const q = this.queue; this.queue = []; this.speaking = false; this.pending = false;
+    for (const u of q) if (u.onend) u.onend({});
+  };
+  other.play([{ id: 'second', lang: 'en', text: 'Other reader.' }]);
+  assert.equal(reader.state, 'paused', 'the displaced reader is paused');
+  assert.equal(reader.error, null);
+  assert.deepEqual(events.map((e) => e.event), ['pause']);
+  assert.equal(reader.pos, firstPos, 'at the same passage');
+  assert.equal(synth.log[0], 'cancel');
+  await settle();
+  assert.deepEqual(synth.log, ['cancel', 'speak:Other reader'], 'and the new reader speaks after the grace');
+  // Whatever else the stale utterance reports is ignored too.
+  firstUtter.onend({}); firstUtter.onerror({ error: 'interrupted' });
+  assert.equal(reader.state, 'paused');
+  assert.equal(reader.pos, firstPos);
+  assert.deepEqual(events.map((e) => e.event), ['pause'], 'no end, no progress from the first reader');
+  // Resuming the first takes the engine back and pauses the second.
+  synth.start();
+  synth.log.length = 0;
+  reader.resume();
+  assert.equal(other.state, 'paused');
+  assert.equal(otherEvents.at(-1).event, 'pause');
+  await settle();
+  assert.equal(synth.log.at(-1), 'speak:' + reader.pieces[firstPos].text.slice(0, 12));
+  reader.stop(); other.stop();
+  synth.cancel = realCancel;
+});
+
 await ok('stop from any state unloads and reports it', () => {
   reader.load([{ id: 's', lang: 'en', text: 'x.' }]);
   events.length = 0;
