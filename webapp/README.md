@@ -357,7 +357,8 @@ user's half of the learning loop:
   Markdown, shown at the bottom of the page and editable by hand.
 
 Read-aloud (`components/speech.js`) walks the ranked feed with the browser's own
-`speechSynthesis` — ▶ Listen, ⏭ skip, ⏹ stop, current item highlighted, each
+`speechSynthesis` — ▶ Listen, ⏭ skip, ⏹ stop (▶ Resume after an interruption),
+current item highlighted, each
 item spoken in the language it declares. See `docs/news.md` for the collector,
 the manifest format and the agent.
 

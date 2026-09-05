@@ -59,9 +59,12 @@ export function chunk(text) {
     if (s.length > MAX_CHUNK) {
       let rest = s;
       while (rest.length > MAX_CHUNK) {
-        // No space to cut at (a long URL or hash): cut at the limit itself.
+        // No space to cut at (a long URL or hash): cut at the limit itself —
+        // but never between the two halves of a surrogate pair (an emoji).
         const space = rest.lastIndexOf(' ', MAX_CHUNK);
-        const cut = space > 0 ? space : MAX_CHUNK;
+        let cut = space > 0 ? space : MAX_CHUNK;
+        const before = rest.charCodeAt(cut - 1);
+        if (before >= 0xD800 && before <= 0xDBFF) cut--;
         out.push(rest.slice(0, cut).trim());
         rest = rest.slice(cut);
       }

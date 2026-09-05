@@ -388,6 +388,16 @@ await ok('chunk: an unbroken token is cut at the limit, nothing lost', () => {
   for (const p of pieces) assert.ok(p.length <= 180, `piece too long: ${p.length}`);
   assert.equal(pieces.join(''), token);
   for (const p of chunk('Short. ' + 'y'.repeat(400) + ' tail.')) assert.ok(p.length <= 180);
+  // A hard cut must not land between the halves of a surrogate pair.
+  const emoji = 'a' + '\u{1F600}'.repeat(100);
+  const ep = chunk(emoji);
+  assert.ok(ep.length >= 2);
+  for (const p of ep) {
+    assert.ok(p.length <= 180);
+    assert.ok(!/[\uD800-\uDBFF]$/.test(p), 'a piece ends in a lone high surrogate');
+    assert.ok(!/^[\uDC00-\uDFFF]/.test(p), 'a piece starts with a lone low surrogate');
+  }
+  assert.equal(ep.join(''), emoji);
 });
 await ok('another reader\'s speech is not cancelled by a load or a stop', () => {
   synth.speaking = true;                 // the news reader is talking
