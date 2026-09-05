@@ -2767,6 +2767,12 @@ def _serve_http() -> None:
 
 def main() -> None:
     print(f"[whatsapp-gateway] starting (account={WHATSAPP_ACCOUNT_LABEL}, mode={WHATSAPP_GATEWAY_MODE})", flush=True)
+    # Records written before the store stated what it knows about a blob
+    # (type, size, pixel size) get that statement now, from this store's own
+    # sidecars — so no reader ever has to look at this gateway's files.
+    stated = _ibstore.backfill_media_meta(INBOUND_STORE_DIR)
+    if stated:
+        print(f"[whatsapp-gateway] stated media metadata on {stated} earlier record(s)", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
     if WHATSAPP_IQ_PROBE_SECONDS > 0:
         threading.Thread(target=_iq_probe_loop, name="iq-probe", daemon=True).start()

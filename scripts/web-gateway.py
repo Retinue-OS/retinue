@@ -4400,44 +4400,59 @@ def _parse_media_reference(url: str) -> tuple[str | None, str | None]:
     return m.group(1), parts.hostname
 
 
-def _chat_media_meta(channel: str, media_id: str) -> tuple[str | None, int | None,
-                                                           int | None, int | None]:
-    """Best-effort (content_type, size, width, height) of a ledger media blob.
+# What the gateways stated about a page's blobs, looked up in one go (see
+# inbound_store.P_CONTENT_TYPE): the type decides the element, the pixel size
+# reserves the box. The subjects are the kb:attachment IRIs themselves.
+_CHAT_MEDIA_META_SPARQL = """
+PREFIX k: <%s>
+SELECT ?att ?ct ?size ?w ?h WHERE {
+  VALUES ?att { %%(atts)s }
+  OPTIONAL { ?att k:contentType ?ct }
+  OPTIONAL { ?att k:byteSize ?size }
+  OPTIONAL { ?att k:width ?w }
+  OPTIONAL { ?att k:height ?h }
+}
+""" % _KB
 
-    The built-in channels' message volumes are mounted read-only under the
-    chambers root (docker-compose.yml), so the blob's `.type` and `.meta`
-    sidecars (the latter carries the image dimensions the store sniffed at
-    ingest) are local reads. This is display metadata only — never a message
-    read path; a miss (an extra account's volume, a pruned blob, a pre-meta
-    blob) just omits the fields and the client renders without them."""
-    if not channel or not media_id:
-        return None, None, None, None
-    base = CHAMBERS_DIR / "_generated" / "messenger" / channel / "media"
-    ctype = None
-    size = None
-    width = None
-    height = None
-    try:
-        ctype = (base / (media_id + ".type")).read_text(encoding="utf-8").strip() or None
-    except OSError:
-        pass
-    try:
-        size = (base / media_id).stat().st_size
-    except OSError:
-        pass
-    try:
-        meta = json.loads((base / (media_id + ".meta")).read_text(encoding="utf-8"))
-        if isinstance(meta, dict):
-            w, h = meta.get("width"), meta.get("height")
-            if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
-                width, height = w, h
-    except (OSError, ValueError):
-        pass
-    return ctype, size, width, height
+# An absolute IRI with nothing that could end a VALUES entry early. The
+# references come from the ledger, so this is a guard, not a parser.
+_SPARQL_IRI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:[^\s<>\"{}|\\^`]*$")
 
 
-def _shape_chat_attachments(urls: list[str], channel: str,
-                            serving_slug: str | None = None) -> list[dict]:
+def _chat_media_meta_lookup(references) -> dict:
+    """``{reference: {type, size, width, height}}`` as the gateways stated it.
+
+    A gateway writes what it knows about a blob into the record that references
+    it — the gateway's own knowledge about its own store — and this reads it
+    back from the life store like any other fact. Nothing here looks at a
+    gateway's files. A blob nobody stated anything about (a record older than
+    the statements, until its gateway backfills) simply has no entry, and the
+    client renders it as a plain file. Raises on store errors, like the
+    messages query it accompanies."""
+    iris = sorted({r for r in references or [] if r and _SPARQL_IRI_RE.match(r)})
+    if not iris:
+        return {}
+    query = _CHAT_MEDIA_META_SPARQL % {"atts": " ".join(f"<{i}>" for i in iris)}
+    out: dict = {}
+    for b in _sparql_bindings(query):
+        att = _bval(b, "att")
+        if not att:
+            continue
+        meta = out.setdefault(att, {})
+        if _bval(b, "ct"):
+            meta["type"] = _bval(b, "ct")
+        for key, var in (("size", "size"), ("width", "w"), ("height", "h")):
+            value = _bval(b, var)
+            if value is not None:
+                try:
+                    meta[key] = int(value)
+                except ValueError:
+                    pass
+    return {att: meta for att, meta in out.items() if meta}
+
+
+def _shape_chat_attachments(urls: list[str], serving_slug: str | None = None,
+                            meta: dict | None = None) -> list[dict]:
     """Shape ledger attachment references for the client.
 
     Blobs live on the gateway that received them and are served through this
@@ -4453,7 +4468,10 @@ def _shape_chat_attachments(urls: list[str], channel: str,
     first guess costs a request, never the picture. Only a channel with no
     gateway at all leaves it None; a legacy record then falls back to the
     service name it recorded, and a host-free one is passed through verbatim
-    and plainly fails to load — there is nobody to ask."""
+    and plainly fails to load — there is nobody to ask.
+
+    ``meta`` is what the gateways stated about the blobs
+    (:func:`_chat_media_meta_lookup`), keyed by the reference as recorded."""
     out = []
     for url in urls:
         if not url:
@@ -4462,16 +4480,16 @@ def _shape_chat_attachments(urls: list[str], channel: str,
         slug = serving_slug or legacy_slug
         public = f"/chats/media/{slug}/{media_id}" if (media_id and slug) else url
         att: dict = {"id": media_id or public, "url": public}
-        ctype, size, width, height = _chat_media_meta(channel, media_id or "")
-        if ctype:
-            att["type"] = ctype
-        if size is not None:
-            att["size"] = size
+        stated = (meta or {}).get(url) or {}
+        if stated.get("type"):
+            att["type"] = stated["type"]
+        if isinstance(stated.get("size"), int):
+            att["size"] = stated["size"]
         # Intrinsic size, when the store sniffed it at ingest — the client
         # reserves the image box with it, so lazy loads never shift the scroll.
-        if width is not None and height is not None:
-            att["width"] = width
-            att["height"] = height
+        if isinstance(stated.get("width"), int) and isinstance(stated.get("height"), int):
+            att["width"] = stated["width"]
+            att["height"] = stated["height"]
         out.append(att)
     return out
 
@@ -4484,7 +4502,8 @@ def _shape_chat_message(chat_id: str, channel: str, *, direction: str,
                         author: str | None = None, agent: str | None = None,
                         attachment_urls: list[str] | None = None,
                         roster: dict | None = None,
-                        serving_slug: str | None = None) -> dict:
+                        serving_slug: str | None = None,
+                        media_meta: dict | None = None) -> dict:
     """One contract Message: {id, chat, direction, …} (webapp/README.md)."""
     msg: dict = {
         "id": message_id or subject or f"{chat_id}#{ts}",
@@ -4503,8 +4522,8 @@ def _shape_chat_message(chat_id: str, channel: str, *, direction: str,
         name = sender_name or (roster or {}).get(sender or "")
         if name:
             msg["sender_name"] = name
-    atts = _shape_chat_attachments(attachment_urls or [], channel,
-                                   serving_slug=serving_slug)
+    atts = _shape_chat_attachments(attachment_urls or [], serving_slug=serving_slug,
+                                   meta=media_meta)
     if atts:
         msg["attachments"] = atts
     return msg
@@ -4923,10 +4942,15 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     # Outbound rows as (ts, text), for matching sends whose identity we never
     # learned — see the unconfirmed branch in the overlay merge below.
     store_out: list[tuple] = []
-    for b in _sparql_bindings(query):
+    rows = [b for b in _sparql_bindings(query) if _bval(b, "ts")]
+    overlay = list(_CHAT_OVERLAY.entries(chat_id)) if before is None else []
+    # What the gateways stated about this page's blobs, one lookup for the
+    # rows and the overlay together.
+    media_meta = _chat_media_meta_lookup(
+        [u for b in rows for u in (_bval(b, "atts") or "").split(" ")]
+        + [u for e in overlay for u in (e.get("attachments") or [])])
+    for b in rows:
         ts = _bval(b, "ts")
-        if not ts:
-            continue
         mid = _bval(b, "mid")
         text = _bval(b, "text") or ""
         atts = [u for u in (_bval(b, "atts") or "").split(" ") if u]
@@ -4935,7 +4959,8 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
             direction="out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
             text=text, ts=ts, message_id=mid, subject=_bval(b, "m"),
             sender=_bval(b, "sender"), author=_bval(b, "author"),
-            attachment_urls=atts, roster=roster, serving_slug=serving_slug))
+            attachment_urls=atts, roster=roster, serving_slug=serving_slug,
+            media_meta=media_meta))
         if mid:
             seen_mids.add(mid)
         seen_fallback.add((ts, text))
@@ -4946,7 +4971,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     # Merge the live overlay into the NEWEST page only — older pages are
     # settled history the overlay can no longer be ahead of.
     if before is None:
-        for entry in _CHAT_OVERLAY.entries(chat_id):
+        for entry in overlay:
             mid = entry.get("message_id")
             ts = entry.get("ts") or ""
             text = entry.get("text") or ""
@@ -4973,7 +4998,8 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
                 sender_name=entry.get("sender_name"),
                 author=entry.get("author"), agent=entry.get("agent"),
                 attachment_urls=entry.get("attachments") or [],
-                roster=roster, serving_slug=serving_slug))
+                roster=roster, serving_slug=serving_slug,
+                media_meta=media_meta))
         messages.sort(key=lambda m: m["ts"])
 
     summary = _chat_summary(chat_id)
@@ -6156,9 +6182,18 @@ class Handler(BaseHTTPRequestHandler):
         # not a host.
         gw_atts = [u for u in (result.get("attachments") or [])
                    if isinstance(u, str) and u]
+        # What the gateway stated about the blob it just stored. Best-effort
+        # here: the message has gone out, and the store may index the new
+        # record a moment later — the next page load carries the statement.
+        try:
+            media_meta = _chat_media_meta_lookup(gw_atts)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] media metadata lookup after send failed: {exc}", flush=True)
+            media_meta = {}
         msg = _shape_chat_message(chat_id, channel, direction="out", text=text,
                                   ts=ts, message_id=message_id, author="user",
-                                  attachment_urls=gw_atts, serving_slug=slug)
+                                  attachment_urls=gw_atts, serving_slug=slug,
+                                  media_meta=media_meta)
         since = chat_state_mod.iso_z(asked_at - CHAT_UNCONFIRMED_SKEW_SECONDS)
         if unconfirmed:
             # The client keeps its optimistic bubble rather than trusting this

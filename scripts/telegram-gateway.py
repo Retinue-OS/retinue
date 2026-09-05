@@ -2125,6 +2125,12 @@ def main() -> None:
     asyncio.set_event_loop(_LOOP)
     _client = _build_client()
     print(f"[telegram-gateway] starting (mode={TELEGRAM_GATEWAY_MODE})", flush=True)
+    # Records written before the store stated what it knows about a blob
+    # (type, size, pixel size) get that statement now, from this store's own
+    # sidecars — so no reader ever has to look at this gateway's files.
+    stated = _ibstore.backfill_media_meta(INBOUND_STORE_DIR)
+    if stated:
+        print(f"[telegram-gateway] stated media metadata on {stated} earlier record(s)", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
     # _run_client keeps running through disconnects and unauthorised sessions —
     # the HTTP API (health, QR re-pairing, pending sends) must outlive both.

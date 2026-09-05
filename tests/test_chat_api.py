@@ -124,6 +124,8 @@ class _MockSparql(BaseHTTPRequestHandler):
             bindings = self._unread(query)
         elif "MAX(?ts0)" in query:
             bindings = self._chat_list()
+        elif "VALUES ?att" in query:
+            bindings = self._media_meta(query)
         else:
             bindings = self._messages(query)
         # The live store's quirk, reproduced: QLever leaves a GROUP_CONCAT over
@@ -151,6 +153,17 @@ class _MockSparql(BaseHTTPRequestHandler):
             _lit_row(chat=WA_KEY, channel="whatsapp", ts=W_TS, type=T_IN,
                      text="Letzter Aufruf", sender="4176", atts=""),
         ]
+
+    def _media_meta(self, query):
+        # What the gateways stated about their blobs, on the media IRIs: the
+        # URN record carries a full statement, the legacy URL record none
+        # (written before the statements existed, gateway not yet restarted).
+        import re
+        asked = re.findall(r"<([^>]+)>", query.split("VALUES ?att", 1)[1].split("}", 1)[0])
+        stated = {f"urn:retinue:media:signal:{MID_ATT}":
+                  dict(ct="image/jpeg", size="717", w="320", h="420"),
+                  f"urn:retinue:media:signal:{MID_ATT2}": dict(ct="image/png", size="2048")}
+        return [_lit_row(att=iri, **stated[iri]) for iri in asked if iri in stated]
 
     def _unread(self, query):
         # Canned semantics: a chat whose injected cutoff is still the epoch has
@@ -472,9 +485,14 @@ def test_chat_messages_contract(base, wg):
     # that was wrong for every extra account) is deliberately overridden.
     assert atts[MID_ATT]["url"] == f"/chats/media/127.0.0.1/{MID_ATT}"
     assert atts[MID_ATT3]["url"] == f"/chats/media/127.0.0.1/{MID_ATT3}"
-    # The sniffed intrinsic size rides on the blob that has a .meta sidecar.
+    # The stated intrinsic size rides on the blob its gateway described.
     assert atts[MID_ATT]["width"] == 320 and atts[MID_ATT]["height"] == 420
-    assert "width" not in atts[MID_ATT3], "no sidecar, no guessed dimensions"
+    assert "width" not in atts[MID_ATT3] and "type" not in atts[MID_ATT3], \
+        "nothing stated, nothing guessed"
+    # The lookup asked about exactly this page's blobs, as recorded.
+    meta_qs = [q for q in STATE["queries"] if "VALUES ?att" in q]
+    assert meta_qs and f"<urn:retinue:media:signal:{MID_ATT}>" in meta_qs[-1]
+    assert f"<http://signal-gateway:8090/media/{MID_ATT3}>" in meta_qs[-1]
     print("PASS test_chat_messages_contract")
 
 
@@ -737,6 +755,10 @@ def test_send_images(base, wg):
     assert sent["images"] == [{"content_type": "image/png", "data": png_b64}]
     assert msg["attachments"][0]["url"] == f"/chats/media/127.0.0.1/{MID_ATT2}"
     assert msg["attachments"][0]["id"] == MID_ATT2
+    # ... and what the gateway stated about the blob it just stored, so the
+    # bubble renders as a picture right away, not as a file row.
+    assert msg["attachments"][0]["type"] == "image/png"
+    assert msg["attachments"][0]["size"] == 2048
     # The overlay carries the attachment too: the merged view renders the sent
     # image before the store indexes it, and the list preview knows the kind.
     status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
@@ -1167,20 +1189,13 @@ def main():
         # Capture pushes instead of talking to a push service.
         wg.push_notify.enabled = lambda: True
         wg.push_notify.notify_async = lambda *a, **k: PUSHES.append((a, k))
-        # Local media sidecars for the signal channel mount (type/size hints).
-        media_dir = Path(tmp) / "chambers" / "_generated" / "messenger" / "signal" / "media"
-        media_dir.mkdir(parents=True)
-        (media_dir / MID_ATT).write_bytes(b"x" * 717)
-        (media_dir / (MID_ATT + ".type")).write_text("image/jpeg\n")
-        (media_dir / (MID_ATT + ".meta")).write_text('{"width": 320, "height": 420}\n')
-
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
 
         test_chat_list_contract(base, wg)
-        # The sidecar hints ride on the shaped attachments — including the
-        # intrinsic size the store sniffed at ingest.
+        # What the gateway stated about the blob rides on the shaped
+        # attachment — type, size, and the intrinsic size sniffed at ingest.
         status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
         att = next(a for a in body["messages"][-1]["attachments"]
                    if a["id"] == MID_ATT)
