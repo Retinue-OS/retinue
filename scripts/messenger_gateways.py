@@ -115,14 +115,15 @@ def _extra_channel_gateways(log_prefix: str) -> dict:
 # of "signal", "whatsapp", "telegram"; unset means all three (today's
 # behaviour). Lets a deployment that never starts one of the built-in gateway
 # containers drop it from the registry with one variable, instead of having to
-# blank that channel's *_GATEWAY_BASE_URL to the same effect.
-_ALL_BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram")
+# blank that channel's *_GATEWAY_BASE_URL to the same effect. The full tuple
+# is also the set of channel names a registry slug is read against.
+BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram")
 
 
 def _enabled_builtin_channels() -> set:
     raw = os.environ.get("MESSENGER_BUILTIN_CHANNELS")
     if raw is None:
-        return set(_ALL_BUILTIN_CHANNELS)
+        return set(BUILTIN_CHANNELS)
     return {name.strip() for name in raw.split(",") if name.strip()}
 
 

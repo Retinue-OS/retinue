@@ -4435,18 +4435,18 @@ def _shape_chat_attachments(urls: list[str], channel: str,
 
     Blobs live on the gateway that received them and are served through this
     gateway's authenticated proxy, ``/chats/media/<slug>/<id>``. Which gateway
-    that is comes from ``serving_slug``, the chat's resolved account: a
-    reference names the blob, not a host (see :func:`_parse_media_reference`).
+    is asked first comes from ``serving_slug``: a reference names the blob,
+    not a host (see :func:`_parse_media_reference`).
 
-    ``serving_slug`` is only ever the answer of :func:`_chat_gateway`, which is
-    the account named by the chat's own id, else an account-derived stamp, else
-    the channel's single inbox account — never an untrusted stamp and never a
-    pick among several. So a redirect can never reach an account that may not
-    own the chat. Where ownership is unproven the caller passes None: a legacy
-    record then falls back to the service name it recorded (which may 404), and
-    a host-free one is passed through verbatim and plainly fails to load. Both
-    are honest failures in a chat whose account is ambiguous — where sending is
-    refused anyway — and both beat silently reading another account's media."""
+    ``serving_slug`` is the first answer of :func:`_media_gateways` — the
+    gateway most likely to hold the blob: the account the chat's records name,
+    else an account-derived stamp, else the channel's first gateway. It is a
+    place to ask, not a claim of ownership; the media handler falls through to
+    the channel's other gateways when the named one answers 404, so a wrong
+    first guess costs a request, never the picture. Only a channel with no
+    gateway at all leaves it None; a legacy record then falls back to the
+    service name it recorded, and a host-free one is passed through verbatim
+    and plainly fails to load — there is nobody to ask."""
     out = []
     for url in urls:
         if not url:
@@ -4894,11 +4894,12 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     channel, account, key = chat_state_mod.split_chat_ref(chat_id)
     doc = _CHAT_STATE.get(chat_id)
     roster = doc.get("roster") or {}
-    # The account this chat belongs to, when it can be told: media is served
-    # through it rather than through the host recorded in each reference (see
-    # _shape_chat_attachments). A chat whose account is ambiguous still lists
-    # its messages — only sending refuses — so this stays best-effort.
-    serving_slug, _gw, _err = _chat_gateway(doc, channel, account)
+    # Which gateway serves this chat's media is the media resolver's answer,
+    # not the send resolver's: a chat may be unsendable (two inbox accounts,
+    # owner unknown) and still perfectly readable. The slug is the gateway
+    # to ask first; the media handler asks the channel's others on a 404.
+    media_gws = _media_gateways(channel, account, doc)
+    serving_slug = media_gws[0][0] if media_gws else None
     before_clause = f"FILTER(?ts < {_sparql_datetime(before)})" if before else ""
     query = _CHAT_MESSAGES_SPARQL % {
         "chat": _sparql_str(key),
@@ -5169,6 +5170,59 @@ def _chat_gateway(doc: dict, channel: str, account: str | None = None):
         return None, None, f"no inbox-mode gateway for channel {channel}"
     return None, None, ("cannot tell which account this chat belongs to - "
                         + ", ".join(slug for slug, _ in candidates))
+
+
+def _media_gateways(channel: str, account: str | None = None,
+                    doc: dict | None = None) -> list:
+    """The gateways to ask for this chat's media, most likely first.
+
+    A different question from :func:`_chat_gateway`, and deliberately not the
+    same answer. Sending needs the one identity a message may go out AS, and
+    where that is ambiguous it must refuse. Serving a blob needs only a gateway
+    that HAS it — and a gateway asked for a blob it does not hold says so with
+    a 404, so the reader never has to guess: it asks, most likely first, and
+    moves on. Conflating the two is what left every chat of a channel with two
+    inbox accounts showing broken pictures: the send refusal was handed down
+    as "no gateway may serve this", when either could.
+
+    Most likely first: the account the chat's records name (the gateway that
+    stored them), else an account-derived stamp, else the channel's gateways
+    in registry order. Control-mode gateways are left out — ledger media is
+    inbox-only by construction, and the media handler refuses them anyway.
+    A channel with no gateway at all yields nothing, and the reference is then
+    passed through as it is: there is nobody to ask."""
+    ranked: list = []
+    seen: set = set()
+
+    def _add(slug):
+        canonical, gw = _channel_gateway(slug) if slug else (None, None)
+        if gw is None or canonical in seen:
+            return
+        if _gateway_identity(canonical, gw).get("mode") == "control":
+            return
+        seen.add(canonical)
+        ranked.append((canonical, gw))
+
+    if account:
+        _add(_slug_for_account(channel, account))
+    if doc and doc.get("gateway_source") == chat_state_mod.GATEWAY_SOURCE_ACCOUNT:
+        _add(doc.get("gateway"))
+    for slug, gw in sorted(_CHANNEL_GATEWAYS.items()):
+        if _gateway_in_channel(slug, gw, channel):
+            _add(slug)
+    return ranked
+
+
+def _slug_channel(slug: str) -> str | None:
+    """The channel a registry slug serves, from the same reading
+    :func:`_gateway_in_channel` does, or None."""
+    canonical, gw = _channel_gateway(slug)
+    if gw is None:
+        return None
+    for channel in messenger_gateways.BUILTIN_CHANNELS:
+        if _gateway_in_channel(canonical, gw, channel):
+            return channel
+    return None
 
 
 def repair_chat_gateway_stamps() -> int:
@@ -6230,7 +6284,7 @@ class Handler(BaseHTTPRequestHandler):
         media id to 32 hex chars.
 
         The slug reaching here is inbox by construction — it comes from a
-        ledger attachment reference (or the chat's resolved account), and
+        ledger attachment reference (or the media resolver's first pick), and
         ledger persistence is inbox-gated on all three gateways — but that is
         an invariant of another file, so it is verified rather than assumed:
         an account positively known to be control-mode is refused. An unknown
@@ -6246,24 +6300,47 @@ class Handler(BaseHTTPRequestHandler):
                   f"{_slug!r}", flush=True)
             self._send_json(404, {"error": "not found"})
             return
-        try:
-            with _gateway_request(gw, f"/media/{media_id}", CHAT_SEND_TIMEOUT) as resp:
-                data = resp.read()
-                content_type = resp.headers.get("Content-Type", "application/octet-stream")
-                status = resp.status
-        except urllib.error.HTTPError as exc:
-            data = exc.read()
-            content_type = exc.headers.get("Content-Type", "application/json")
-            status = exc.code
-        except Exception as exc:  # noqa: BLE001
-            self._send_json(502, {"error": f"gateway unreachable: {exc}"})
+        # The named gateway first. A 404 from it is that gateway stating it does
+        # not hold the blob — so its channel's other gateways are asked in turn
+        # (see _media_gateways). The reference named the blob, never a host; a
+        # legacy chat's records may have been stored by any of the channel's
+        # accounts, and asking is how that is settled without guessing.
+        channel = _slug_channel(_slug)
+        candidates = [(_slug, gw)] + [
+            (s, g) for s, g in _media_gateways(channel or "") if s != _slug]
+        data, content_type, status = b"", "application/json", 404
+        unreachable, answered = None, False
+        for i, (cand_slug, cand_gw) in enumerate(candidates):
+            try:
+                with _gateway_request(cand_gw, f"/media/{media_id}", CHAT_SEND_TIMEOUT) as resp:
+                    data = resp.read()
+                    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                data = exc.read()
+                content_type = exc.headers.get("Content-Type", "application/json")
+                status = exc.code
+            except Exception as exc:  # noqa: BLE001
+                unreachable = exc
+                continue
+            answered = True
+            if status != 404:
+                break
+            if i + 1 < len(candidates):
+                print(f"[web-gateway] chat media {media_id} not at {cand_slug}; "
+                      f"asking {candidates[i + 1][0]}", flush=True)
+        if not answered:
+            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"})
             return
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        # Ledger media is immutable — cache privately so a re-opened chat does
-        # not refetch every image through the proxy.
-        self.send_header("Cache-Control", "private, max-age=86400")
+        if status == 200:
+            # Ledger media is immutable — cache privately so a re-opened chat
+            # does not refetch every image through the proxy. A miss is not:
+            # a sibling that was unreachable for a moment must not turn into
+            # a day-long broken picture.
+            self.send_header("Cache-Control", "private, max-age=86400")
         self.end_headers()
         self.wfile.write(data)
 
