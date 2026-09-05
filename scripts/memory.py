@@ -372,15 +372,20 @@ def recall(args: argparse.Namespace) -> int:
         patterns.append("FILTER NOT EXISTS { ?m kb:correctedBy ?x1 }")
         patterns.append("FILTER NOT EXISTS { ?m kb:supersededBy ?x2 }")
 
+    # The challenge links are IRIs, and the life store leaves a GROUP_CONCAT
+    # over IRI values unbound — the cell is absent, not "" — while the same
+    # aggregate over literals (the tags) works; STR() makes them literals
+    # first. Verified on the live QLever; see docs/triple-stores.md. Without
+    # it no recall ever showed which entry corrected or superseded another.
     sparql = f"""
 PREFIX kb: <{KB}>
 PREFIX xsd: <{XSD}>
 SELECT ?m ?content ?t ?actor ?relevance ?model
        (GROUP_CONCAT(DISTINCT ?tag; SEPARATOR=", ") AS ?tags)
        (COUNT(DISTINCT ?r) AS ?reiterations) (MAX(?r) AS ?lastReiterated)
-       (GROUP_CONCAT(DISTINCT ?cb; SEPARATOR=", ") AS ?correctedBy)
-       (GROUP_CONCAT(DISTINCT ?sb; SEPARATOR=", ") AS ?supersededBy)
-       (GROUP_CONCAT(DISTINCT ?qb; SEPARATOR=", ") AS ?questionedBy) WHERE {{
+       (GROUP_CONCAT(DISTINCT STR(?cb); SEPARATOR=", ") AS ?correctedBy)
+       (GROUP_CONCAT(DISTINCT STR(?sb); SEPARATOR=", ") AS ?supersededBy)
+       (GROUP_CONCAT(DISTINCT STR(?qb); SEPARATOR=", ") AS ?questionedBy) WHERE {{
   ?m a kb:Memory ;
      kb:content ?content ;
      kb:recordedAt ?t .
