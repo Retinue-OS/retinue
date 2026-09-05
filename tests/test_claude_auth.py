@@ -198,7 +198,7 @@ def test_exchange_posts_expected_payload():
 def test_install_tokens_merges_writes_and_resets_marker():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
-        cred = tmp / ".credentials.json"
+        cred = _cfg(tmp) / ".credentials.json"
         # Simulate the dead state: old file with extra keys, rejected backup.
         cred.write_text(json.dumps({
             "claudeAiOauth": {"accessToken": "old", "refreshToken": "old-rt",
@@ -206,8 +206,8 @@ def test_install_tokens_merges_writes_and_resets_marker():
                               "rateLimitTier": "t1"},
             "someOtherSection": {"kept": True},
         }))
-        (tmp / ".credentials.json.bak").write_text("{}")
-        (tmp / ".credentials.json.restored-expiry").write_text("1")
+        (cred.with_name(".credentials.json.bak")).write_text("{}")
+        (cred.with_name(".credentials.json.restored-expiry")).write_text("1")
 
         summary = ca.install_tokens({
             "access_token": "new-at", "refresh_token": "new-rt",
@@ -227,8 +227,8 @@ def test_install_tokens_merges_writes_and_resets_marker():
         assert block["clientId"] == ca.CLIENT_ID
         assert (cred.stat().st_mode & 0o777) == 0o600
         # Backup renewed to the new credentials, rejected-marker cleared.
-        assert json.loads((tmp / ".credentials.json.bak").read_text()) == data
-        assert not (tmp / ".credentials.json.restored-expiry").exists()
+        assert json.loads((cred.with_name(".credentials.json.bak")).read_text()) == data
+        assert not (cred.with_name(".credentials.json.restored-expiry")).exists()
         assert summary["refresh_expires_at"] == NOW + 30 * 86400 * 1000
 
 
@@ -447,9 +447,12 @@ def test_ensure_fresh_never_tries_an_expired_signin():
         cred = _cfg(Path(d)) / ".credentials.json"
         _write(cred, expires_at=NOW - 1, refresh_expires_at=NOW - 1000)
         ep = _Endpoint()
-        res = _ensure(cred, ep)
+        logged = []
+        res = _ensure(cred, ep, log=logged.append)
         assert res["action"] == "expired", res
         assert ep.calls == []
+        assert "expired" in res["reason"]
+        assert any("only a fresh sign-in helps" in line for line in logged), logged
 
 
 def test_ensure_fresh_skips_without_credentials_or_oauth_or_when_disabled():
@@ -613,6 +616,58 @@ def test_concurrent_spawners_perform_exactly_one_refresh():
         assert len(ep.calls) == 1, ep.calls
         block = json.loads(cred.read_text())["claudeAiOauth"]
         assert (block["accessToken"], block["refreshToken"]) == ("at2", "rt2")
+
+
+def test_install_tokens_waits_for_a_refresh_in_flight():
+    """A sign-in completing while a spawner is mid-refresh is installed after
+    that refresh, never overwritten by it."""
+    with tempfile.TemporaryDirectory() as d:
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        fd = _hold_flock(cred.with_name(".credentials.json.lock"))  # a spawner, mid-refresh
+        done = {}
+        t = threading.Thread(target=lambda: done.update(ca.install_tokens(
+            {"access_token": "at-new", "refresh_token": "rt-new", "expires_in": 3600},
+            cred_file=cred, now=NOW, log=lambda msg: None)))
+        t.start()
+        time.sleep(0.3)
+        assert not done, "must wait for the spawner's lock"
+        # The spawner lands the old family's rotation, then releases.
+        _write(cred, access="at-old2", refresh="rt-old2", expires_at=NOW + 8 * 3600_000)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        t.join(5)
+        assert done.get("access_expires_at") == NOW + 3600_000, done
+        block = json.loads(cred.read_text())["claudeAiOauth"]
+        assert (block["accessToken"], block["refreshToken"]) == ("at-new", "rt-new")
+        assert not any(p.exists() for p in ca.cli_refresh_locks(cred))
+
+
+def test_install_tokens_never_loses_a_signin_to_a_stuck_lock():
+    reply = {"access_token": "a", "refresh_token": "r", "expires_in": 60}
+    with tempfile.TemporaryDirectory() as d:
+        cred = _cfg(Path(d)) / ".credentials.json"
+        # The spawners' lock never frees up.
+        fd = _hold_flock(cred.with_name(".credentials.json.lock"))
+        try:
+            logged = []
+            ca.install_tokens(reply, cred_file=cred, now=NOW, wait_seconds=0.3,
+                              log=logged.append)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        assert json.loads(cred.read_text())["claudeAiOauth"]["refreshToken"] == "r"
+        assert any("regardless" in line for line in logged), logged
+        # A claude session's own lock stays live past the wait: same outcome,
+        # and its lock is left to it.
+        current, legacy = ca.cli_refresh_locks(cred)
+        current.mkdir()
+        logged = []
+        ca.install_tokens({**reply, "refresh_token": "r2"}, cred_file=cred, now=NOW,
+                          wait_seconds=0.3, log=logged.append)
+        assert json.loads(cred.read_text())["claudeAiOauth"]["refreshToken"] == "r2"
+        assert any("regardless" in line for line in logged), logged
+        assert current.exists() and not legacy.exists()
 
 
 def test_ensure_fresh_never_raises():

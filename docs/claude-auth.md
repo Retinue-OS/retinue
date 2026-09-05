@@ -77,9 +77,12 @@ only when the access token expires within `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS`
 The child then starts on a token good for hours and refreshes nothing. The
 common case — a token with more than the margin left — costs one file read
 and takes no lock. Every outcome is non-fatal: the spawn goes ahead
-regardless, and a failure (`failed`, `lock_timeout`, `expired`) only logs, in
-the spawner's own log, why the session will be refreshing for itself. Nothing
-on this path ever clears credentials. `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS=0`
+regardless. `failed` and `lock_timeout` log, in the spawner's own log, why
+the session will be refreshing for itself; `expired` — the refresh token's
+own expiry has passed, which no session can refresh either — logs that only
+a fresh sign-in helps: the session still starts, but cannot authenticate
+until then, the state the monitor alerts on as `needs_login`. Nothing on
+this path ever clears credentials. `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS=0`
 disables it; `CLAUDE_AUTH_LOCK_WAIT_SECONDS` (default 60) bounds the wait for
 either lock.
 
@@ -90,9 +93,9 @@ only who performs them and how many at a time. The margin is wider than the
 CLI's own 300 s on purpose, so the spawner gets there first; the long-lived
 remote-control session, which refreshes for itself, then finds the newer pair
 on disk at its next refresh and adopts it (Claude Code re-reads the file
-under its lock before refreshing — verified against 2.1.261).
+under its lock before refreshing — verified against 2.1.260, the version the image pins, and 2.1.261).
 
-What Claude Code does on its own, for reference (2.1.261): a refresh is
+What Claude Code does on its own, for reference (verified against 2.1.260, the version the image pins, and 2.1.261, byte-identical in every constant below): a refresh is
 attempted when the access token is within 300 s of expiry; the lock above is
 retried five times with 1–2 s pauses, after which the process gives up
 (`lock_busy`) and the request goes out on the expired token; under the lock
@@ -149,10 +152,13 @@ the re-login:
    notification arrived on — approves, and Anthropic's callback page displays
    a code.
 3. Pasting the code back completes the exchange; the gateway writes
-   `.credentials.json` (atomic, mode 0600, unknown fields preserved), renews
-   the entrypoint's backup, clears the rejected-restore marker, and — by
-   default — restarts the container so every process starts on the fresh
-   credentials. The page reconnects by itself once the gateway is back.
+   `.credentials.json` (atomic, mode 0600, unknown fields preserved) under
+   the same two locks the pre-spawn refresh holds — so a sign-in completing
+   while a spawner is mid-refresh lands after that refresh and is never
+   overwritten by it — renews the entrypoint's backup, clears the
+   rejected-restore marker, and — by default — restarts the container so
+   every process starts on the fresh credentials. The page reconnects by
+   itself once the gateway is back.
 
 The restart matters even when re-logging in proactively: a running session
 keeps its old tokens in memory, and its next refresh would rotate the *old*
@@ -205,7 +211,8 @@ The failure mode is graceful either way: the exchange surfaces the server's
 error on the page, and the console paths keep working.
 
 The pre-spawn refresh adds two more couplings of the same kind, both
-verified against 2.1.261 and both harmless when they drift: the CLI's 300 s
+verified against 2.1.260 (the pinned image) and 2.1.261, and both harmless
+when they drift: the CLI's 300 s
 refresh margin (ours is wider, so a narrower one on their side changes
 nothing) and its lock protocol (proper-lockfile directories at
 `<config-dir>/.oauth_refresh.lock` and legacy `<config-dir>.lock`, mtime

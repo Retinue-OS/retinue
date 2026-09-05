@@ -390,7 +390,9 @@ def exchange_code(pasted: str, attempt: dict, http_post=None) -> dict:
     return reply
 
 
-def install_tokens(reply: dict, cred_file: Path | None = None, now: int | None = None) -> dict:
+def install_tokens(reply: dict, cred_file: Path | None = None, now: int | None = None,
+                   *, locked: bool = False, wait_seconds: float | None = None,
+                   log=None) -> dict:
     """Write a token reply (sign-in exchange or refresh) as a fresh
     ``.credentials.json``.
 
@@ -399,9 +401,37 @@ def install_tokens(reply: dict, cred_file: Path | None = None, now: int | None =
     ``refreshTokenExpiresAt`` survive — the same merge the CLI applies),
     writes atomically with mode 0600, renews the entrypoint's backup, and
     clears the rejected-restore marker so the watcher protocol starts over.
+
+    The write happens under the same two locks the pre-spawn refresh holds —
+    the spawners' flock and Claude Code's own refresh lock — unless ``locked``
+    says the caller holds them already. A sign-in that completes while a
+    spawner is mid-refresh is thereby installed after that refresh, never
+    overwritten by it, and a spawner arriving after the sign-in re-reads
+    under the lock and adopts it. A sign-in is never lost to a lock that will
+    not free up: past ``wait_seconds`` the write goes ahead regardless, with
+    a log line saying so.
     """
     now = now_ms() if now is None else now
     cred_file = CRED_FILE if cred_file is None else Path(cred_file)
+    if locked:
+        return _write_tokens(reply, cred_file, now)
+    log = log or _default_log
+    wait = LOCK_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    lock_file = cred_file.with_name(cred_file.name + ".lock")
+    with credential_lock(wait, lock_file) as held:
+        if not held:
+            log(f"the spawners' credential lock stayed busy for {wait:.0f}s — "
+                "installing the sign-in regardless")
+            return _write_tokens(reply, cred_file, now)
+        with cli_refresh_lock(cred_file, wait, log) as cli_held:
+            if not cli_held:
+                log("a claude session has held its own refresh lock for over "
+                    f"{wait:.0f}s — installing the sign-in regardless")
+            return _write_tokens(reply, cred_file, now)
+
+
+def _write_tokens(reply: dict, cred_file: Path, now: int) -> dict:
+    """The write behind install_tokens(); the caller holds the locks."""
     bak_file = cred_file.with_name(cred_file.name + ".bak")
     marker_file = cred_file.with_name(cred_file.name + ".restored-expiry")
 
@@ -459,7 +489,7 @@ def install_tokens(reply: dict, cred_file: Path | None = None, now: int | None =
 # scripts, the Ask-Ara server — beside the long-lived remote-control session,
 # all on one credential file. Near expiry that is N processes racing for one
 # rotation. Claude Code arbitrates among its own processes (verified against
-# 2.1.261: a proper-lockfile lock on ``<config-dir>/.oauth_refresh.lock``,
+# 2.1.260, the version the image pins, and 2.1.261: a proper-lockfile lock on ``<config-dir>/.oauth_refresh.lock``,
 # legacy ``<config-dir>.lock``, stale after 60 s and touched every 5 s while
 # held; five 1–2 s retries; a re-read under the lock that adopts tokens another
 # process landed meanwhile), but a process that exhausts the retries gives up
@@ -526,7 +556,7 @@ def access_token_due(block: dict | None, now: int | None = None,
 def cli_refresh_locks(cred_file: Path | None = None) -> list[Path]:
     """Where Claude Code itself locks while refreshing: the current lock inside
     the config directory and the legacy one beside it, in the order the CLI
-    takes them (2.1.261 takes both)."""
+    takes them (2.1.260 and 2.1.261 take both)."""
     cred_file = CRED_FILE if cred_file is None else Path(cred_file)
     config_dir = cred_file.parent
     return [config_dir / ".oauth_refresh.lock",
@@ -716,8 +746,9 @@ def ensure_fresh_credentials(cred_file: Path | None = None, now: int | None = No
       fresh           the access token outlives the margin — the common case
       adopted         another process refreshed while this one waited
       refreshed       this process performed the refresh
-      expired         the refresh token's own expiry has passed — only a
-                      fresh sign-in helps; nothing is attempted
+      expired         the refresh token's own expiry has passed, which no
+                      session can refresh either — only a fresh sign-in
+                      helps; nothing is attempted, and the log says so
       lock_timeout    neither the shared lock nor a live CLI lock freed up in
                       time; left alone rather than sent a competing refresh
       failed          the token endpoint rejected the refresh or was unreachable
@@ -736,8 +767,11 @@ def ensure_fresh_credentials(cred_file: Path | None = None, now: int | None = No
             return _outcome("no_credentials")
         if not access_token_due(block, now, ahead):
             return _outcome("fresh", block)
-        if _signin_expired(block, now):
-            return _outcome("expired", block, reason=_signin_expired(block, now))
+        reason = _signin_expired(block, now)
+        if reason:
+            log(f"{reason} — only a fresh sign-in helps; the session will start "
+                "but cannot authenticate until then")
+            return _outcome("expired", block, reason=reason)
 
         deadline = time.monotonic() + wait
         lock_file = cred_file.with_name(cred_file.name + ".lock")
@@ -772,7 +806,7 @@ def ensure_fresh_credentials(cred_file: Path | None = None, now: int | None = No
                     return _outcome("adopted", block)
                 try:
                     reply = refresh_tokens(block, http_post)
-                    summary = install_tokens(reply, cred_file, now)
+                    summary = install_tokens(reply, cred_file, now, locked=True)
                 except ClaudeAuthError as exc:
                     log(f"token refresh before spawn failed: {exc} — "
                         "the session will refresh on its own")
