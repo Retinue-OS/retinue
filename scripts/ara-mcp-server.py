@@ -85,6 +85,9 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_auth  # noqa: E402
+
 IDENTITY = os.environ.get("ARA_MCP_IDENTITY", "").strip() or "Ara"
 SCOPE_HINT = os.environ.get("ARA_MCP_SCOPE_HINT", "").strip()
 PORT = int(os.environ.get("ARA_MCP_PORT", "8110"))
@@ -389,6 +392,9 @@ def _run_once(prompt: str, model: str,
     # is variadic, so a positional prompt after it is swallowed as one more tool
     # name and the session dies with "Input must be provided either through
     # stdin or as a prompt argument when using --print".
+    # Refresh an access token about to expire before the session starts —
+    # once, under the lock every framework spawner shares (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(log=log)
     try:
         proc = subprocess.run(cmd, cwd=WORKDIR, input=prompt, capture_output=True,
                               text=True, timeout=TIMEOUT, env=env)

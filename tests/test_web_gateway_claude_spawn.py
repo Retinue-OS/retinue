@@ -7,8 +7,9 @@ FileNotFoundError; _run_claude() has to outlive the swap instead of surfacing it
 as "Sorry, an error occurred" in the user's conversation.
 
 Covers: the transient window is absorbed, the wait is bounded by a deadline
-(not a retry count), the deadline is env-tunable, and a permanently missing
-binary still raises.
+(not a retry count), the deadline is env-tunable, a permanently missing
+binary still raises, and every spawn first runs the pre-spawn credential
+refresh (scripts/claude_auth.py) exactly once, before the first attempt.
 
     python3 tests/test_web_gateway_claude_spawn.py
 """
@@ -33,6 +34,10 @@ def _load_gateway(tmp: Path, env: dict[str, str]):
     os.environ["CONVERSATION_DIR"] = str(tmp / "convlog")
     os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")
     os.environ["WEB_GATEWAY_STATE"] = str(tmp / "state.json")
+    # Keep the pre-spawn credential refresh off the real credential file —
+    # unconditionally, since an inherited value would point it at one. The
+    # module reads this at import, so the first load pins it for the process.
+    os.environ["CLAUDE_CRED_FILE"] = str(tmp / "claude" / ".credentials.json")
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
     os.environ.update(env)
     if "markdown_it" not in sys.modules:
@@ -64,9 +69,11 @@ class _FakeClock:
 
 
 def _install_fakes(wg, fail_times):
-    """Make the next `fail_times` spawns raise ENOENT; count all attempts."""
+    """Make the next `fail_times` spawns raise ENOENT; count all attempts, and
+    record how many attempts had been made whenever the pre-spawn credential
+    refresh is called."""
     clock = _FakeClock()
-    calls = {"n": 0}
+    calls = {"n": 0, "auth": []}
 
     def fake_run(cmd, **kwargs):
         calls["n"] += 1
@@ -74,7 +81,12 @@ def _install_fakes(wg, fail_times):
             raise FileNotFoundError(2, "No such file or directory", cmd[0])
         return f"ran after {calls['n']} attempt(s)"
 
+    def fake_ensure_fresh(**kwargs):
+        calls["auth"].append(calls["n"])
+        return {"action": "fresh"}
+
     wg.subprocess.run = fake_run
+    wg.claude_auth.ensure_fresh_credentials = fake_ensure_fresh
     wg.time.monotonic = clock.monotonic
     wg.time.sleep = clock.sleep
     return clock, calls
@@ -114,6 +126,14 @@ def test_first_attempt_does_not_sleep(wg):
     assert clock.now == start
 
 
+def test_refreshes_credentials_once_before_the_first_attempt(wg):
+    """The pre-spawn refresh runs once per spawn, ahead of the first attempt —
+    and is not repeated on the ENOENT retries."""
+    clock, calls = _install_fakes(wg, fail_times=3)
+    assert wg._run_claude(["/usr/bin/claude", "-p"]) == "ran after 4 attempt(s)"
+    assert calls["auth"] == [0], calls
+
+
 def test_deadline_is_env_tunable(wg_short):
     assert wg_short.CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS == 5.0
     clock, calls = _install_fakes(wg_short, fail_times=10_000)
@@ -136,6 +156,7 @@ def main():
         test_absorbs_transient_window(wg)
         test_bounded_by_deadline_not_retry_count(wg)
         test_first_attempt_does_not_sleep(wg)
+        test_refreshes_credentials_once_before_the_first_attempt(wg)
 
         wg_short = _load_gateway(
             tmp / "b", {"CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS": "5"})

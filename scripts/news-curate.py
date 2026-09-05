@@ -29,6 +29,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_auth  # noqa: E402
 import news_store as store  # noqa: E402
 
 # This turn only dispatches the Herald (which pins its own model), so it is a
@@ -129,6 +130,9 @@ def main() -> int:
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
         env["RETINUE_SESSION_MODEL"] = CLAUDE_MODEL
+    # Refresh an access token about to expire before the session starts —
+    # once, under the lock every framework spawner shares (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(log=log)
     result = subprocess.run(cmd, cwd="/workspace", env=env)
     if result.returncode == 0:
         # Only advance the cursor on a clean run: a crashed session must see the

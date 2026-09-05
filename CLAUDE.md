@@ -291,7 +291,9 @@ Sibling compose services: `qlever-life` (the life store), `stt`
 merging a Tier 3 PR, `python3 /workspace/scripts/self-update.py` rebuilds and
 restarts the stack via the updater sidecar. Claude sign-in is monitored by the
 framework — check `scripts/claude_auth.py status` and point the user at
-`/claude-auth`, never ad-hoc logins (details: `docs/contributing.md`,
+`/claude-auth`, never ad-hoc logins; before starting any extra `claude`
+process by hand, run `scripts/claude_auth.py refresh` so it cannot race the
+live sessions for the token rotation (details: `docs/contributing.md`,
 `docs/claude-auth.md`).
 
 ## Where the depth lives

@@ -150,6 +150,10 @@ Session logic:
   30 days — restarts as a fresh session instead of failing the turn.
 - Total concurrency is bounded by a small worker pool (WEB_GATEWAY_MAX_CONCURRENCY)
   to keep CPU/memory and subprocess count sane on a personal box.
+- Every spawn first refreshes an access token about to expire, under the
+  cross-process lock all framework spawners share (scripts/claude_auth.py,
+  docs/claude-auth.md), so a session never starts with a refresh that races
+  the scheduler's jobs or the remote-control session for the token rotation.
 
 State is persisted in STATE_FILE (a map of session-key -> {session_id,
 last_activity}) so restarts survive as long as the sessions themselves are still
@@ -221,9 +225,18 @@ CLAUDE_SPAWN_BACKOFF_SECONDS = 0.5
 CLAUDE_BIN = "/usr/bin/claude"
 
 
+def _log_claude_auth(msg: str) -> None:
+    print(f"[web-gateway] {msg}", flush=True)
+
+
 def _run_claude(cmd, **kwargs):
-    """subprocess.run for the `claude` binary, tolerant of the transient
-    ENOENT window while Claude Code's auto-updater replaces it."""
+    """subprocess.run for the `claude` binary — every gateway spawn goes
+    through here. Refreshes an access token about to expire first, once and
+    under the lock every framework spawner shares (scripts/claude_auth.py), so
+    the session never starts with a refresh that races the scheduler's jobs or
+    the remote-control session for the rotation; then tolerates the transient
+    ENOENT window while Claude Code's auto-updater replaces the binary."""
+    claude_auth.ensure_fresh_credentials(log=_log_claude_auth)
     deadline = time.monotonic() + CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS
     waited = False
     while True:
