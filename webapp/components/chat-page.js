@@ -126,6 +126,13 @@ function linkify(text) {
   }).replace(/\n/g, '<br>');
 }
 
+function fmtBytes(n) {
+  if (!(n > 0)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(n < 10 * 1024 * 1024 ? 1 : 0)} MB`;
+}
+
 function fmtTime(iso) {
   const t = new Date(iso);
   return Number.isNaN(t.getTime()) ? ''
@@ -721,8 +728,9 @@ class RetinueChatPage extends HTMLElement {
   // up front — the inline aspect-ratio/width below — otherwise a fixed
   // placeholder frame holds the space. Images open the lightbox; a voice
   // note's player sits above the transcript, which is already the message
-  // text; anything that is neither image, audio nor video stays a
-  // recognisable file row (type and name are best-effort in live records).
+  // text; anything that is neither image, audio nor video is a file row —
+  // the name and size the gateway stated — that opens the file itself, as
+  // the native clients do.
   _attachmentHtml(a) {
     const type = String(a.type || '');
     const w = Number(a.width);
@@ -753,7 +761,10 @@ class RetinueChatPage extends HTMLElement {
       return `<video class="att-video${hasDims ? '' : ' no-dims'}" controls preload="metadata" ` +
         `playsinline src="${esc(a.url)}"${dims}${sized(280)}></video>`;
     }
-    return `<span class="att-file">&#128206; ${esc(a.name || 'Attachment')}</span>`;
+    const size = fmtBytes(Number(a.size));
+    return `<a class="att-file" href="${esc(a.url)}" target="_blank" rel="noopener" ` +
+      `title="${esc(a.name || 'Attachment')}">&#128206; <span class="att-name">` +
+      `${esc(a.name || 'Attachment')}</span>${size ? ` <span class="att-size">${esc(size)}</span>` : ''}</a>`;
   }
 
   // ── Leaving the chat ───────────────────────────────────────────────────────
@@ -2311,7 +2322,10 @@ const CSS = `
      length, not a percentage — see .att-img.no-dims); the element letterboxes
      the frames inside the held box once metadata lands. */
   .att-video.no-dims { width: 280px; max-width: 100%; height: 180px; }
-  .att-file { display: block; font-size: .82rem; margin: 2px 0 4px; }
+  /* A file row is a link like any other in a bubble (the bubble's own link
+     styling applies); the size sits beside the name, quieter. */
+  .att-file { display: block; font-size: .82rem; margin: 2px 0 4px; overflow-wrap: anywhere; }
+  .att-size { opacity: .7; }
   /* Optimistic bubble awaiting the server's send confirmation. */
   .msg.sending .bubble { opacity: .7; }
 

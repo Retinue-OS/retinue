@@ -161,7 +161,7 @@ class _MockSparql(BaseHTTPRequestHandler):
         import re
         asked = re.findall(r"<([^>]+)>", query.split("VALUES ?att", 1)[1].split("}", 1)[0])
         stated = {f"urn:retinue:media:signal:{MID_ATT}":
-                  dict(ct="image/jpeg", size="717", w="320", h="420"),
+                  dict(ct="image/jpeg", size="717", w="320", h="420", name="IMG_0042.jpg"),
                   f"urn:retinue:media:signal:{MID_ATT2}": dict(ct="image/png", size="2048")}
         return [_lit_row(att=iri, **stated[iri]) for iri in asked if iri in stated]
 
@@ -487,6 +487,7 @@ def test_chat_messages_contract(base, wg):
     assert atts[MID_ATT3]["url"] == f"/chats/media/127.0.0.1/{MID_ATT3}"
     # The stated intrinsic size rides on the blob its gateway described.
     assert atts[MID_ATT]["width"] == 320 and atts[MID_ATT]["height"] == 420
+    assert atts[MID_ATT]["name"] == "IMG_0042.jpg"
     assert "width" not in atts[MID_ATT3] and "type" not in atts[MID_ATT3], \
         "nothing stated, nothing guessed"
     # The lookup asked about exactly this page's blobs, as recorded.

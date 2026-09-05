@@ -197,9 +197,10 @@ The API, as the components consume it:
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
   sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
-  type?, size?, width?, height?}]}`. Attachment URLs are the web-gateway's
-  authenticated media proxy (`/chats/media/…`); type and size are
-  best-effort. `width`/`height` are the medium's real intrinsic size, sniffed
+  type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
+  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  the storing gateway stated about the blob in its ledger record (absent on
+  records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
   bytes arrive, when absent (older records) it reserves a fixed placeholder
   frame; either way a lazy load can never shift the thread's scroll. By type:
@@ -208,7 +209,8 @@ The API, as the components consume it:
   closes, one history entry deep); `audio/*` is a voice note — the player
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
-  else stays a file row. Reactions and quoted replies (issue #130) will
+  else (a document, an animated sticker) is a file row showing the stated
+  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
   decorate these records later. The companion thread is not in this payload:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.

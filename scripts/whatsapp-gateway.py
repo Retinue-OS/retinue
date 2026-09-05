@@ -115,6 +115,13 @@ RETINUE_SLOW_NOTICE_SECONDS = float(os.environ.get("RETINUE_SLOW_NOTICE_SECONDS"
 # base64-encoded inside the POST /message JSON). Matches the retinue gateway's
 # own per-file attachment cap.
 MAX_INBOUND_FILE_BYTES = int(os.environ.get("WHATSAPP_MAX_INBOUND_FILE_BYTES", str(25 * 1024 * 1024)))
+# Cap on what the ledger's media store takes from one inbound file. The
+# forwarding cap above bounds what travels base64 through a triage POST; this
+# one bounds what is written to the volume at all, since the channels allow
+# files far larger than a chat archive should hold. A file over it is noted
+# in the log and the message is recorded without it.
+INBOUND_MEDIA_STORE_MAX_BYTES = int(os.environ.get("INBOUND_MEDIA_STORE_MAX_BYTES",
+                                                   str(100 * 1024 * 1024)))
 
 # Voice notes are transcribed by the shared STT service (no ASR model is loaded
 # here), identical to the Signal gateway. Best-effort: a failure degrades to a
@@ -394,7 +401,8 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
         print(f"[whatsapp-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
-def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+def _store_media_ref(data: bytes, content_type: str | None,
+                     file_name: str | None = None) -> str | None:
     """Persist inbound media durably and return its store reference.
 
     The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
@@ -414,7 +422,8 @@ def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
     if not data:
         return None
     try:
-        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type,
+                                        file_name=file_name)
     except Exception as exc:
         print(f"[whatsapp-gateway] could not store inbound media: {exc}", flush=True)
         return None
@@ -962,45 +971,86 @@ def _extract_audio(message):
     return None
 
 
-def _extract_image(message):
-    """Return the image sub-message if this message carries a real image.
+# The media a WhatsApp message can carry as its body, by proto field, and the
+# kind each is for the store: an image and a document are forwarded to the
+# agent when they fit, a video, a sticker and an audio *file* (a song, not a
+# voice note — that is _extract_audio's) are kept for the chat only.
+_MEDIA_FIELDS = (
+    ("imageMessage", "image"), ("ImageMessage", "image"),
+    ("videoMessage", "video"), ("VideoMessage", "video"),
+    ("documentMessage", "file"), ("DocumentMessage", "file"),
+    ("stickerMessage", "sticker"), ("StickerMessage", "sticker"),
+    ("audioMessage", "audio"), ("AudioMessage", "audio"),
+)
+
+
+def _extract_media(message) -> tuple:
+    """``(sub-message, kind)`` for the medium this message carries, else
+    ``(None, None)``.
 
     Protobuf returns an empty sub-message for an unset field, so mere attribute
     presence is not enough: presence is checked via HasField where available,
-    falling back to the download coordinates / media type a real image always
-    carries."""
+    falling back to the download coordinates / media type a real medium always
+    carries. A voice note (an audio message flagged push-to-talk, or one that
+    does not say) is not a medium here — it is transcribed, by
+    :func:`_extract_audio`'s path; only an audio *file* the sender attached
+    counts."""
     if message is None:
-        return None
-    for image_name in ("imageMessage", "ImageMessage"):
-        image = getattr(message, image_name, None)
-        if image is None:
+        return None, None
+    for field, kind in _MEDIA_FIELDS:
+        sub = getattr(message, field, None)
+        if sub is None:
             continue
+        present = None
         has_field = getattr(message, "HasField", None)
         if callable(has_field):
             try:
-                return image if has_field(image_name) else None
+                present = bool(has_field(field))
             except ValueError:
-                pass  # unknown field name on this proto version — fall through
-        if _attr(image, "URL", "url", "directPath", "DirectPath",
-                 "mimetype", "Mimetype"):
-            return image
-    return None
+                present = None  # unknown field name on this proto version
+        if present is None:
+            present = bool(_attr(sub, "URL", "url", "directPath", "DirectPath",
+                                 "mimetype", "Mimetype"))
+        if not present:
+            continue
+        if kind == "audio" and _attr(sub, "PTT", "ptt") is not False:
+            continue
+        return sub, kind
+    return None, None
 
 
-def _inbound_image_files(message) -> tuple[list[dict], list[str]]:
-    """Download this message's image, if any, as forward-ready files + a ref.
+def _extract_image(message):
+    """The image sub-message when this message's medium is an image, else None."""
+    sub, kind = _extract_media(message)
+    return sub if kind == "image" else None
+
+
+def _inbound_media_files(message) -> tuple[list[dict], list[str]]:
+    """Download this message's medium, if any, as a durable ref + forward-ready files.
 
     Returns ``(files, attachment_urls)`` where ``files`` is
     ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape the
     retinue gateway's POST /message accepts as ``files``, each materialized to
     disk for the answering session — and ``attachment_urls`` are the durable
-    HTTP references stored for the same image (its ``kb:attachment`` triple).
-    The durable reference is stored regardless of size (a plain on-disk blob);
-    only the forwarded ``files`` payload honours the size cap, since that one
-    travels base64-encoded through the triage POST. Best-effort: any failure
-    forwards the message without its image rather than dropping it."""
-    image = _extract_image(message)
-    if image is None:
+    references stored for the medium (its ``kb:attachment`` triple), with the
+    name the sender gave it. Every kind is stored, so the chat shows the
+    message as the native client does; what is also *forwarded* is an image or
+    a document that fits the forwarding cap — a video, a sticker or an audio
+    file is kept for the chat only. The declared size is checked before the
+    download and the real size after it, since the declaration is
+    sender-controlled. Best-effort: any failure forwards the message without
+    its medium rather than dropping it."""
+    sub, kind = _extract_media(message)
+    if sub is None:
+        return [], []
+    declared = _attr(sub, "file_length", "fileLength", "FileLength")
+    try:
+        declared = int(declared) if declared is not None else None
+    except (TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > INBOUND_MEDIA_STORE_MAX_BYTES:
+        print(f"[whatsapp-gateway] inbound {kind} over {INBOUND_MEDIA_STORE_MAX_BYTES} bytes; "
+              f"not stored", flush=True)
         return [], []
     media = _download_media(message)
     if media is None:
@@ -1011,15 +1061,25 @@ def _inbound_image_files(message) -> tuple[list[dict], list[str]]:
         media.unlink(missing_ok=True)
     if not data:
         return [], []
-    mime = str(_attr(image, "mimetype", "Mimetype") or "image/jpeg")
-    ref = _store_media_ref(data, mime)
+    if len(data) > INBOUND_MEDIA_STORE_MAX_BYTES:
+        print(f"[whatsapp-gateway] inbound {kind} over {INBOUND_MEDIA_STORE_MAX_BYTES} bytes; "
+              f"not stored ({len(data)} bytes)", flush=True)
+        return [], []
+    mime = str(_attr(sub, "mimetype", "Mimetype") or "") or {
+        "image": "image/jpeg", "sticker": "image/webp", "video": "video/mp4",
+        "audio": "audio/mpeg"}.get(kind, "application/octet-stream")
+    name = _attr(sub, "fileName", "FileName", "file_name") or (
+        _attr(sub, "title", "Title") if kind == "file" else None)
+    ref = _store_media_ref(data, mime, str(name) if name else None)
     attachment_urls = [ref] if ref else []
-    if len(data) > MAX_INBOUND_FILE_BYTES:
-        print(f"[whatsapp-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
+    if kind in ("video", "sticker", "audio"):
         return [], attachment_urls
-    suffix = mimetypes.guess_extension(mime) or ".jpg"
+    if len(data) > MAX_INBOUND_FILE_BYTES:
+        print(f"[whatsapp-gateway] inbound {kind} too large to forward ({len(data)} bytes)", flush=True)
+        return [], attachment_urls
+    suffix = mimetypes.guess_extension(mime.split(";", 1)[0].strip()) or (".jpg" if kind == "image" else "")
     files = [{
-        "filename": f"whatsapp-image{suffix}",
+        "filename": f"whatsapp-{kind}{suffix}",
         "content_type": mime,
         "data": base64.b64encode(data).decode("ascii"),
     }]
@@ -1545,22 +1605,23 @@ def _handle_message_event(event) -> None:
     text = _extract_message_text(message)
     lang = DEFAULT_LANGUAGE
 
-    # An included image is forwarded alongside the text (which, for an image
-    # message, is its caption). Status posts are excluded: they are gated to a
-    # no-model-turn path anyway, so their media is never downloaded.
-    # attachment_urls collect the durable HTTP references (kb:attachment) for
-    # every piece of media on this message — image(s) here, the voice note below.
+    # The message's medium — an image, a video, a document, a sticker, an audio
+    # file — is stored for the chat, and an image or document is forwarded
+    # alongside the text (which, for such a message, is its caption). Status
+    # posts are excluded: they are gated to a no-model-turn path anyway, so
+    # their media is never downloaded. attachment_urls collect the durable
+    # references (kb:attachment) — the medium here, the voice note below.
     if is_broadcast:
         files, attachment_urls = [], []
     else:
-        files, attachment_urls = _inbound_image_files(message)
+        files, attachment_urls = _inbound_media_files(message)
 
     # A voice note is persisted BEFORE transcription (never-drop): if the pre-
     # persist happened, this holds its store Path so the forward below reuses the
     # same record instead of writing a second one.
     voice_store_path = None
-    if not text and not files:
-        # No text — try a voice note (download + transcribe via the STT service).
+    if not text and not files and not attachment_urls:
+        # No text, no medium — try a voice note (download + transcribe via the STT service).
         audio = _extract_audio(message)
         if audio is not None:
             media = _download_media(message)
@@ -1647,14 +1708,16 @@ def _handle_message_event(event) -> None:
 
     _record_recent_sender(sender_jid, chat_jid, push_name)
 
-    if not text and not files:
+    # A message that is only its media — a video, a sticker — is still the
+    # message: it is recorded and shown, and the prompt says what it carries.
+    if not text and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
             # (delivered=False, audio retained) for the daily drain / a re-transcribe.
             print(f"[whatsapp-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
         else:
-            print(f"[whatsapp-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
+            print(f"[whatsapp-gateway] skipping message from {sender} (no text or media)", flush=True)
         return
 
     # The account's mode — not the content — decides handling. The reply
@@ -1698,7 +1761,7 @@ def _record_own_device_send(info, chat_jid, message, msg_id: str | None) -> None
     if not chat:
         return
     ts = _epoch_seconds(_attr(info, "Timestamp", "timestamp"))
-    media_sub = _extract_image(message) or _extract_audio(message)
+    media_sub = _extract_media(message)[0] or _extract_audio(message)
     if media_sub is not None:
         # The media echo needs a bridge download; hand it to a worker thread so
         # the event callback — the receive path — is never held behind it.
@@ -1709,9 +1772,8 @@ def _record_own_device_send(info, chat_jid, message, msg_id: str | None) -> None
         ).start()
         return
     if not text:
-        # Neither text nor a capturable media kind (image/audio; videos and
-        # documents stay out of the mirror for now): recording nothing beats
-        # recording an empty bubble.
+        # Neither text nor a medium: recording nothing beats recording an
+        # empty bubble.
         print(f"[whatsapp-gateway] own-device send to {chat} has no text and no "
               f"capturable media; not recorded", flush=True)
         return
@@ -1753,7 +1815,8 @@ def _record_own_device_media(chat: str, text: str, msg_id: str | None,
                           flush=True)
                 elif data:
                     mime = str(_attr(media_sub, "mimetype", "Mimetype") or "") or None
-                    ref = _store_media_ref(data, mime)
+                    name = _attr(media_sub, "fileName", "FileName", "file_name")
+                    ref = _store_media_ref(data, mime, str(name) if name else None)
         refs = [ref] if ref else []
         if not text and not refs:
             print(f"[whatsapp-gateway] own-device send to {chat} has no text and no "
@@ -1927,6 +1990,15 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"transcript).\n")
         if files else ""
     )
+    # Media kept with the message but not attached to the prompt: a video,
+    # a sticker, or anything over the forwarding cap. The agent should know
+    # the message is that medium, without it weighing on the turn.
+    kept = max(0, len(attachment_urls or []) - len(files or []))
+    if kept:
+        attachment_line += (
+            f"\nThe message also carries {kept} media file(s) — a video, a document, "
+            f"a sticker, or an image over the forwarding size — kept with the message "
+            f"in the chat and not attached to this prompt.\n")
     # The canonical idempotency key for this message's dashboard thread —
     # account and chat included, because a channel-native id alone is not
     # unique (see inbound_store.thread_key). The drain decorates its rows with

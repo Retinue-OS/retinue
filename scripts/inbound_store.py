@@ -143,6 +143,9 @@ P_CONTENT_TYPE = KB + "contentType"
 P_BYTE_SIZE = KB + "byteSize"
 P_WIDTH = KB + "width"
 P_HEIGHT = KB + "height"
+# The name the sender gave the file, when the channel carried one (a document,
+# not a photo): what a file row shows and what a download is saved as.
+P_FILE_NAME = KB + "fileName"
 XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
 # Optional reference to a retained raw-media file (e.g. a voice note's audio),
 # recorded when a message is persisted *before* transcription so a failed or
@@ -332,6 +335,8 @@ def _render(fields: dict) -> str:
         for key, pred in (("size", P_BYTE_SIZE), ("width", P_WIDTH), ("height", P_HEIGHT)):
             if isinstance(meta.get(key), int) and meta[key] >= 0:
                 lines.append(_lit(url, pred, str(meta[key]), XSD_INTEGER))
+        if meta.get("file_name"):
+            lines.append(_lit(url, P_FILE_NAME, str(meta["file_name"])))
     return "".join(l + "\n" for l in sorted(lines))
 
 
@@ -368,6 +373,8 @@ def _parse(text: str) -> dict | None:
             meta = fields["attachment_meta"].setdefault(subj, {})
             if pred == P_CONTENT_TYPE:
                 meta["content_type"] = value
+            elif pred == P_FILE_NAME:
+                meta["file_name"] = value
             elif pred in (P_BYTE_SIZE, P_WIDTH, P_HEIGHT):
                 try:
                     meta[{P_BYTE_SIZE: "size", P_WIDTH: "width",
@@ -656,7 +663,40 @@ def _image_dimensions(data: bytes) -> tuple[int, int] | None:
         return None
 
 
-def store_media(store_dir: str | Path, data: bytes, content_type: str | None) -> str:
+def media_kind(content_type: str | None) -> str:
+    """``image`` / ``audio`` / ``video`` / ``file`` from a content type.
+
+    The one reading every gateway applies when deciding what to do with an
+    inbound medium: images and documents are forwarded to the agent when
+    they fit, audio is a voice note to transcribe, a video is kept for the
+    chat only. Anything unlabeled or unrecognised is a ``file``."""
+    ct = (content_type or "").strip().lower()
+    for kind in ("image", "audio", "video"):
+        if ct.startswith(kind + "/"):
+            return kind
+    return "file"
+
+
+def safe_file_name(name) -> str | None:
+    """A sender-supplied file name reduced to something safe to show and save.
+
+    Base name only (no path), control characters dropped, capped in length
+    with the extension kept. None when nothing usable remains. Never used to
+    address a file here — blobs are keyed by their own id — only to say what
+    the sender called it."""
+    text = str(name or "").replace("\\", "/").strip()
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text.rsplit("/", 1)[-1]).strip()
+    if text in ("", ".", ".."):
+        return None
+    if len(text) > 200:
+        stem, dot, ext = text.rpartition(".")
+        ext = ("." + ext) if dot and len(ext) <= 12 else ""
+        text = (stem if ext else text)[:200 - len(ext)] + ext
+    return text
+
+
+def store_media(store_dir: str | Path, data: bytes, content_type: str | None,
+                file_name: str | None = None) -> str:
     """Persist one inbound media blob durably and return its server-generated id.
 
     The blob is keyed by ``token_hex(16)`` — never by an untrusted filename — so
@@ -667,8 +707,9 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     intrinsic size is written to a ``<id>.meta`` JSON sidecar
     (``{"width", "height"}``) so the chat surface can reserve the image box
     before the bytes arrive; an absent sidecar means unknown, exactly the
-    pre-sidecar behaviour. None of these files carries an RDF extension, so the
-    life store never indexes them.
+    pre-sidecar behaviour. ``file_name``, when the channel carried one, goes to a
+    ``<id>.name`` sidecar (see :func:`safe_file_name`). None of these files
+    carries an RDF extension, so the life store never indexes them.
 
     The caller builds the reference — a host-free
     ``urn:retinue:media:<channel>:<id>``, see :data:`P_ATTACHMENT` — and passes
@@ -687,6 +728,9 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     os.replace(tmp, blob)
     ct = (content_type or "application/octet-stream").strip() or "application/octet-stream"
     _atomic_write(ct + "\n", d / (media_id + ".type"))
+    name = safe_file_name(file_name)
+    if name:
+        _atomic_write(name + "\n", d / (media_id + ".name"))
     dims = _image_dimensions(data or b"")
     if dims:
         _atomic_write(json.dumps({"width": dims[0], "height": dims[1]}) + "\n",
@@ -734,7 +778,8 @@ def media_meta(store_dir: str | Path, media_id: str) -> dict | None:
     """What this store knows about one of its blobs, or None if it holds none.
 
     ``{"content_type", "size"}`` plus ``{"width", "height"}`` when the
-    ``.meta`` sidecar carries them — the same facts :func:`store_media` wrote,
+    ``.meta`` sidecar carries them and ``"file_name"`` when the ``.name`` one
+    does — the same facts :func:`store_media` wrote,
     read back by the store that wrote them. This is the only reader of the
     sidecars besides :func:`load_media`: a record states these on the media
     IRI (see :data:`P_CONTENT_TYPE`) so nothing outside the gateway needs to.
@@ -752,6 +797,12 @@ def media_meta(store_dir: str | Path, media_id: str) -> dict | None:
     except OSError:
         ct = ""
     meta["content_type"] = ct or "application/octet-stream"
+    try:
+        name = safe_file_name((d / (media_id + ".name")).read_text(encoding="utf-8"))
+        if name:
+            meta["file_name"] = name
+    except OSError:
+        pass
     try:
         dims = json.loads((d / (media_id + ".meta")).read_text(encoding="utf-8"))
         w, h = dims.get("width"), dims.get("height")

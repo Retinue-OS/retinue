@@ -122,6 +122,13 @@ MAX_PUSH_BODY_BYTES = int(os.environ.get("TELEGRAM_GATEWAY_MAX_BODY_BYTES", str(
 # base64-encoded inside the POST /message JSON). Matches the retinue gateway's
 # own per-file attachment cap.
 MAX_INBOUND_FILE_BYTES = int(os.environ.get("TELEGRAM_MAX_INBOUND_FILE_BYTES", str(25 * 1024 * 1024)))
+# Cap on what the ledger's media store takes from one inbound file. The
+# forwarding cap above bounds what travels base64 through a triage POST; this
+# one bounds what is written to the volume at all, since the channels allow
+# files far larger than a chat archive should hold. A file over it is noted
+# in the log and the message is recorded without it.
+INBOUND_MEDIA_STORE_MAX_BYTES = int(os.environ.get("INBOUND_MEDIA_STORE_MAX_BYTES",
+                                                   str(100 * 1024 * 1024)))
 # How long an outbound send (bridged onto the asyncio loop) may take.
 TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", "60"))
 # How many recent dialogs to expose via /recent-chats when the store is empty.
@@ -367,7 +374,8 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
         print(f"[telegram-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
-def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+def _store_media_ref(data: bytes, content_type: str | None,
+                     file_name: str | None = None) -> str | None:
     """Persist inbound media durably and return its store reference.
 
     The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
@@ -387,7 +395,8 @@ def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
     if not data:
         return None
     try:
-        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type,
+                                        file_name=file_name)
         return f"urn:retinue:media:{INBOUND_CHANNEL}:{media_id}"
     except Exception as exc:
         print(f"[telegram-gateway] could not store inbound media: {exc}", flush=True)
@@ -775,43 +784,56 @@ def _list_contacts() -> list:
     return fut.result(timeout=30)
 
 
-def _inbound_image_files(image_path, image_mime: str | None) -> tuple[list[dict], list[str]]:
-    """Read a downloaded inbound image as forward-ready files + a durable ref.
+def _inbound_media_files(path, mime: str | None, name: str | None = None) -> tuple[list[dict], list[str]]:
+    """Read a downloaded inbound medium as a durable ref + forward-ready files.
 
     Returns ``(files, attachment_urls)`` where ``files`` is
     ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape the
-    retinue gateway's POST /message accepts — and ``attachment_urls`` are
-    HTTP-resolvable references stored on this gateway's volume (never inlined in
-    RDF). Best-effort: any failure forwards the message without its image rather
-    than dropping it. The durable reference is stored regardless of size (it is a
-    plain on-disk blob); only the forwarded ``files`` payload honours the size
-    cap, since that one travels base64-encoded through the triage POST. The temp
+    retinue gateway's POST /message accepts — and ``attachment_urls`` are the
+    durable references stored on this gateway's volume (never inlined in RDF),
+    with the name the sender gave the file. Every kind is stored, so the chat
+    shows the message as the native client does; what is also *forwarded* to
+    the agent is an image or a document that fits the forwarding cap — a video
+    or an audio file is kept for the chat only. Best-effort: any failure
+    forwards the message without its medium rather than dropping it. The temp
     file is always removed."""
-    if not image_path:
+    if not path:
         return [], []
-    path = Path(image_path)
+    p = Path(path)
     try:
-        data = path.read_bytes()
+        data = p.read_bytes()
     except OSError as exc:
-        print(f"[telegram-gateway] could not read inbound image {path}: {exc}", flush=True)
+        print(f"[telegram-gateway] could not read inbound media {p}: {exc}", flush=True)
         return [], []
     finally:
-        path.unlink(missing_ok=True)
+        p.unlink(missing_ok=True)
     if not data:
         return [], []
-    mime = image_mime or "image/jpeg"
-    ref = _store_media_ref(data, mime)
+    if len(data) > INBOUND_MEDIA_STORE_MAX_BYTES:
+        print(f"[telegram-gateway] inbound media over {INBOUND_MEDIA_STORE_MAX_BYTES} bytes; "
+              f"not stored ({len(data)} bytes)", flush=True)
+        return [], []
+    mime = mime or mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+    kind = _ibstore.media_kind(mime)
+    ref = _store_media_ref(data, mime, name)
     attachment_urls = [ref] if ref else []
-    if len(data) > MAX_INBOUND_FILE_BYTES:
-        print(f"[telegram-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
+    if kind in ("video", "audio"):
         return [], attachment_urls
-    suffix = path.suffix or mimetypes.guess_extension(mime) or ".jpg"
+    if len(data) > MAX_INBOUND_FILE_BYTES:
+        print(f"[telegram-gateway] inbound {kind} too large to forward ({len(data)} bytes)", flush=True)
+        return [], attachment_urls
+    suffix = p.suffix or mimetypes.guess_extension(mime) or (".jpg" if kind == "image" else "")
     files = [{
-        "filename": f"telegram-image{suffix}",
+        "filename": f"telegram-{kind}{suffix}",
         "content_type": mime,
         "data": base64.b64encode(data).decode("ascii"),
     }]
     return files, attachment_urls
+
+
+def _inbound_image_files(image_path, image_mime: str | None) -> tuple[list[dict], list[str]]:
+    """An image: :func:`_inbound_media_files` with the photo default."""
+    return _inbound_media_files(image_path, image_mime or "image/jpeg")
 
 
 def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
@@ -827,14 +849,16 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
     writing a second one.
     """
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
-    if not text and not files:
+    # A message that is only its media — a video, a sticker — is still the
+    # message: it is recorded and shown, and the prompt says what it carries.
+    if not text and not files and not attachment_urls:
         if store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
             # (delivered=False, audio retained) for the daily drain / a re-transcribe.
             print(f"[telegram-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
         else:
-            print(f"[telegram-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
+            print(f"[telegram-gateway] skipping message from {sender} (no text or media)", flush=True)
         return
     if text and lang == DEFAULT_LANGUAGE:
         lang = _detect_text_language(text)
@@ -891,7 +915,8 @@ async def _on_new_message(event) -> None:
         text = (event.raw_text or "").strip()
         lang = DEFAULT_LANGUAGE
         media_path = None
-        if not text and (getattr(message, "voice", None) or getattr(message, "audio", None)):
+        wants_voice = not text and (getattr(message, "voice", None) or getattr(message, "audio", None))
+        if wants_voice:
             try:
                 fd, out = tempfile.mkstemp(prefix="tg-inbound-", dir=str(TELEGRAM_TMP_DIR))
                 os.close(fd)
@@ -908,8 +933,11 @@ async def _on_new_message(event) -> None:
         image_path = None
         image_mime = None
         media = getattr(message, "media", None)
-        doc_mime = str(getattr(getattr(media, "document", None), "mime_type", "") or "")
-        if getattr(media, "photo", None) is not None or doc_mime.startswith("image/"):
+        is_preview = type(media).__name__ == "MessageMediaWebPage"
+        document = None if is_preview else getattr(media, "document", None)
+        doc_mime = str(getattr(document, "mime_type", "") or "")
+        is_image = getattr(media, "photo", None) is not None or doc_mime.startswith("image/")
+        if is_image:
             image_mime = doc_mime or "image/jpeg"
             try:
                 fd, out = tempfile.mkstemp(prefix="tg-inbound-img-", dir=str(TELEGRAM_TMP_DIR))
@@ -917,6 +945,30 @@ async def _on_new_message(event) -> None:
                 image_path = await message.download_media(file=out)
             except Exception as exc:  # noqa: BLE001 - media download is best-effort
                 print(f"[telegram-gateway] image download failed: {exc}", flush=True)
+
+        # Anything else the message carries as a file — a video, a document, a
+        # sticker, an audio file under a caption — is downloaded to be kept
+        # with the message, as the native client shows it. The declared size
+        # is checked first: Telegram allows files far larger than this store
+        # should take. A link preview is not the message's medium.
+        file_path = None
+        file_mime = None
+        file_name = None
+        if document is not None and not is_image and not wants_voice:
+            file_info = getattr(message, "file", None)
+            declared = getattr(file_info, "size", None)
+            file_mime = doc_mime or str(getattr(file_info, "mime_type", "") or "") or None
+            file_name = getattr(file_info, "name", None) or None
+            if isinstance(declared, int) and declared > INBOUND_MEDIA_STORE_MAX_BYTES:
+                print(f"[telegram-gateway] media from {sender} over "
+                      f"{INBOUND_MEDIA_STORE_MAX_BYTES} bytes; not stored", flush=True)
+            else:
+                try:
+                    fd, out = tempfile.mkstemp(prefix="tg-inbound-file-", dir=str(TELEGRAM_TMP_DIR))
+                    os.close(fd)
+                    file_path = await message.download_media(file=out)
+                except Exception as exc:  # noqa: BLE001 - media download is best-effort
+                    print(f"[telegram-gateway] media download failed: {exc}", flush=True)
 
         def _work():
             nonlocal text, lang
@@ -926,7 +978,8 @@ async def _on_new_message(event) -> None:
             # in practice only one of the two ever fires — this just makes the
             # record complete whichever it is).
             image_files, image_urls = _inbound_image_files(image_path, image_mime)
-            attachment_urls: list[str] = list(image_urls)
+            file_files, file_urls = _inbound_media_files(file_path, file_mime, file_name)
+            attachment_urls: list[str] = list(image_urls) + list(file_urls)
             voice_files: list[dict] = []
             # A voice note is persisted BEFORE transcription (never-drop): if the
             # pre-persist happened, this holds its store Path so the forward reuses
@@ -996,7 +1049,7 @@ async def _on_new_message(event) -> None:
                         print(f"[telegram-gateway] transcription failed: {exc}", flush=True)
                     finally:
                         vpath.unlink(missing_ok=True)
-            files = voice_files + image_files
+            files = voice_files + image_files + file_files
             _handle_inbound(text, lang, str(chat_id), sender, is_group, sender_name,
                             files=files, attachment_urls=attachment_urls,
                             store_path=voice_store_path, message_id=msg_id)
@@ -1045,10 +1098,12 @@ async def _on_outgoing_message(event) -> None:
         # degrades to recording the caption; the text is never lost to media.
         media_path = None
         mime = None
+        file_name = None
         if has_media:
             file_info = getattr(message, "file", None)
             size = getattr(file_info, "size", None)
             mime = getattr(file_info, "mime_type", None)
+            file_name = getattr(file_info, "name", None) or None
             if isinstance(size, int) and size > CHAT_ECHO_MEDIA_MAX_BYTES:
                 print(f"[telegram-gateway] own-device media over "
                       f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it",
@@ -1082,7 +1137,7 @@ async def _on_outgoing_message(event) -> None:
                           flush=True)
                 elif data:
                     ref = _store_media_ref(
-                        data, mime or mimetypes.guess_type(str(p))[0])
+                        data, mime or mimetypes.guess_type(str(p))[0], file_name)
                     if ref:
                         refs.append(ref)
             if not text and not refs:
@@ -1424,6 +1479,15 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
          f"transcript), so the user can listen to or view the original.\n")
         if files else ""
     )
+    # Media kept with the message but not attached to the prompt: a video,
+    # a sticker, or anything over the forwarding cap. The agent should know
+    # the message is that medium, without it weighing on the turn.
+    kept = max(0, len(attachment_urls or []) - len(files or []))
+    if kept:
+        attachment_line += (
+            f"\nThe message also carries {kept} media file(s) — a video, a document, "
+            f"a sticker, or an image over the forwarding size — kept with the message "
+            f"in the chat and not attached to this prompt.\n")
     # The canonical idempotency key for this message's dashboard thread —
     # account and chat included, because a channel-native id alone is not
     # unique (see inbound_store.thread_key). The drain decorates its rows with

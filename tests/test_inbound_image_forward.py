@@ -146,13 +146,17 @@ class _FakeProtoMessage:
     """Mimics a neonize protobuf message: sub-messages exist as attributes even
     when unset; HasField is the presence oracle."""
 
+    FIELDS = ("imageMessage", "videoMessage", "documentMessage",
+              "stickerMessage", "audioMessage")
+
     def __init__(self, set_fields: dict):
         self._set = set_fields
-        self.imageMessage = set_fields.get(
-            "imageMessage", types.SimpleNamespace(URL="", mimetype=""))
+        for field in self.FIELDS:
+            setattr(self, field, set_fields.get(
+                field, types.SimpleNamespace(URL="", mimetype="")))
 
     def HasField(self, name: str) -> bool:
-        if name not in ("imageMessage",):
+        if name not in self.FIELDS:
             raise ValueError(name)
         return name in self._set
 
@@ -182,7 +186,7 @@ def test_whatsapp_inbound_image_files():
         media = Path(tmp) / "downloaded"
         media.write_bytes(PNG_BYTES)
         wg._download_media = lambda m: media
-        files, urls = wg._inbound_image_files(message)
+        files, urls = wg._inbound_media_files(message)
         assert len(files) == 1, files
         assert files[0]["content_type"] == "image/png"
         assert files[0]["filename"].endswith(".png")
@@ -196,11 +200,76 @@ def test_whatsapp_inbound_image_files():
         # reference is stored regardless of size (consistency over data-in-graph).
         media.write_bytes(PNG_BYTES)
         wg.MAX_INBOUND_FILE_BYTES = 4
-        files, urls = wg._inbound_image_files(message)
+        files, urls = wg._inbound_media_files(message)
         assert files == [] and len(urls) == 1 and "urn:retinue:media:" in urls[0], (files, urls)
         # No image in the message → no download attempted, no ref stored.
-        assert wg._inbound_image_files(types.SimpleNamespace()) == ([], [])
+        assert wg._inbound_media_files(types.SimpleNamespace()) == ([], [])
     print("ok: whatsapp inbound image becomes a files payload + durable ref")
+
+
+def test_whatsapp_every_kind_is_kept():
+    """A video, a document, a sticker, an audio file: stored, shown, named.
+
+    Only an image or a document is also forwarded to the agent; the rest is
+    kept with the message in the chat, as the native client shows it. A voice
+    note (push-to-talk) is not a medium here — it stays on the transcription
+    path — and a declared size over the store cap is never downloaded."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_whatsapp_gateway(Path(tmp))
+        ist = wg._ibstore
+        downloads = []
+
+        def fake_download(_message):
+            media = Path(tmp) / f"dl-{len(downloads)}"
+            media.write_bytes(b"MEDIA-BYTES")
+            downloads.append(media)
+            return media
+        wg._download_media = fake_download
+
+        def kind_of(message):
+            return wg._extract_media(message)[1]
+
+        video = types.SimpleNamespace(URL="https://mmg.whatsapp.net/v", mimetype="video/mp4",
+                                      fileLength=11)
+        doc = types.SimpleNamespace(URL="https://mmg.whatsapp.net/d", mimetype="application/pdf",
+                                    fileName="Offerte 2026.pdf", fileLength=11)
+        sticker = types.SimpleNamespace(URL="https://mmg.whatsapp.net/s", mimetype="image/webp")
+        song = types.SimpleNamespace(URL="https://mmg.whatsapp.net/a", mimetype="audio/mpeg",
+                                     PTT=False, fileName="track.mp3")
+        voice = types.SimpleNamespace(URL="https://mmg.whatsapp.net/p", mimetype="audio/ogg",
+                                      PTT=True)
+        assert kind_of(_FakeProtoMessage({"videoMessage": video})) == "video"
+        assert kind_of(_FakeProtoMessage({"documentMessage": doc})) == "file"
+        assert kind_of(_FakeProtoMessage({"stickerMessage": sticker})) == "sticker"
+        assert kind_of(_FakeProtoMessage({"audioMessage": song})) == "audio"
+        assert kind_of(_FakeProtoMessage({"audioMessage": voice})) is None, "a voice note is not a medium"
+        assert kind_of(_FakeProtoMessage({})) is None
+
+        # A video: stored with its type, not forwarded.
+        files, urls = wg._inbound_media_files(_FakeProtoMessage({"videoMessage": video}))
+        assert files == [] and len(urls) == 1, (files, urls)
+        meta = ist.media_meta(wg.INBOUND_STORE_DIR, ist.media_id_of(urls[0]))
+        assert meta["content_type"] == "video/mp4" and meta["size"] == 11 and "file_name" not in meta
+        # A document: stored under the sender's name, and forwarded.
+        files, urls = wg._inbound_media_files(_FakeProtoMessage({"documentMessage": doc}))
+        assert len(files) == 1 and files[0]["content_type"] == "application/pdf"
+        assert files[0]["filename"].endswith(".pdf")
+        meta = ist.media_meta(wg.INBOUND_STORE_DIR, ist.media_id_of(urls[0]))
+        assert meta["file_name"] == "Offerte 2026.pdf"
+        # A sticker and an audio file: stored, kept for the chat.
+        for message in (_FakeProtoMessage({"stickerMessage": sticker}),
+                        _FakeProtoMessage({"audioMessage": song})):
+            files, urls = wg._inbound_media_files(message)
+            assert files == [] and len(urls) == 1, (files, urls)
+        assert ist.media_meta(wg.INBOUND_STORE_DIR, ist.media_id_of(urls[0]))["file_name"] == "track.mp3"
+        assert all(not d.exists() for d in downloads), "temp files cleaned up"
+        # Declared over the store cap: not downloaded at all.
+        n = len(downloads)
+        huge = types.SimpleNamespace(URL="https://mmg.whatsapp.net/h", mimetype="video/mp4",
+                                     fileLength=wg.INBOUND_MEDIA_STORE_MAX_BYTES + 1)
+        assert wg._inbound_media_files(_FakeProtoMessage({"videoMessage": huge})) == ([], [])
+        assert len(downloads) == n
+    print("ok: whatsapp keeps every media kind, forwards images and documents")
 
 
 def test_whatsapp_forward_includes_files():
@@ -273,6 +342,25 @@ def test_signal_split_attachments():
         assert [f for f in files if f["filename"].startswith("signal-image")] == []
         assert len(urls) == 1 and "urn:retinue:media:" in urls[0], urls
 
+        # A video is kept for the chat, never transcribed, never forwarded; a
+        # document is kept under the sender's name and forwarded like an image.
+        video_file = att_dir / "clip.mp4"
+        video_file.write_bytes(b"fake-mp4")
+        doc_file = att_dir / "doc.bin"
+        doc_file.write_bytes(b"%PDF-fake")
+        voice, files, urls = sg._split_attachments(_signal_event([
+            {"contentType": "video/mp4", "file": str(video_file), "filename": "Ferien.mp4"},
+            {"contentType": "application/pdf", "file": str(doc_file), "filename": "Vertrag.pdf"},
+        ]))
+        assert voice is None
+        assert [f["filename"] for f in files] == ["signal-file.bin"], files
+        assert files[0]["content_type"] == "application/pdf"
+        assert len(urls) == 2
+        ist = sg._ibstore
+        stated = [ist.media_meta(sg.INBOUND_STORE_DIR, ist.media_id_of(u)) for u in urls]
+        assert {m["file_name"] for m in stated} == {"Ferien.mp4", "Vertrag.pdf"}
+        assert {m["content_type"] for m in stated} == {"video/mp4", "application/pdf"}
+
         # Oversized image → dropped from the forwarded payload, but its durable
         # reference is stored regardless of size (consistency over data-in-graph).
         sg.MAX_INBOUND_FILE_BYTES = 4
@@ -333,6 +421,32 @@ def test_telegram_inbound_image_files():
     print("ok: telegram inbound image becomes a files payload + durable ref")
 
 
+def test_telegram_every_kind_is_kept():
+    """A video is stored for the chat only; a document is stored under its
+    name and forwarded; over the store cap nothing is stored."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tg = _load_telegram_gateway(Path(tmp))
+        ist = tg._ibstore
+        clip = Path(tmp) / "tg-clip"
+        clip.write_bytes(b"fake-mp4")
+        files, urls = tg._inbound_media_files(str(clip), "video/mp4", "Ferien.mp4")
+        assert files == [] and len(urls) == 1 and not clip.exists()
+        meta = ist.media_meta(tg.INBOUND_STORE_DIR, ist.media_id_of(urls[0]))
+        assert meta == {"size": 8, "content_type": "video/mp4", "file_name": "Ferien.mp4"}
+        doc = Path(tmp) / "tg-doc"
+        doc.write_bytes(b"%PDF-fake")
+        files, urls = tg._inbound_media_files(str(doc), "application/pdf", "Vertrag.pdf")
+        assert len(files) == 1 and files[0]["content_type"] == "application/pdf"
+        assert files[0]["filename"] == "telegram-file.pdf"
+        assert ist.media_meta(tg.INBOUND_STORE_DIR, ist.media_id_of(urls[0]))["file_name"] == "Vertrag.pdf"
+        big = Path(tmp) / "tg-big"
+        big.write_bytes(b"x" * 20)
+        tg.INBOUND_MEDIA_STORE_MAX_BYTES = 10
+        assert tg._inbound_media_files(str(big), "video/mp4", None) == ([], []) and not big.exists()
+        assert tg._inbound_media_files(None, None) == ([], [])
+    print("ok: telegram keeps every media kind, forwards images and documents")
+
+
 def test_telegram_forward_includes_files():
     with tempfile.TemporaryDirectory() as tmp:
         tg = _load_telegram_gateway(Path(tmp))
@@ -353,10 +467,12 @@ def main():
     test_web_gateway_note_and_size_cap()
     test_whatsapp_image_detection()
     test_whatsapp_inbound_image_files()
+    test_whatsapp_every_kind_is_kept()
     test_whatsapp_forward_includes_files()
     test_signal_split_attachments()
     test_signal_forward_includes_files()
     test_telegram_inbound_image_files()
+    test_telegram_every_kind_is_kept()
     test_telegram_forward_includes_files()
     print("\nAll inbound-image forwarding checks passed.")
 

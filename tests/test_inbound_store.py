@@ -246,9 +246,12 @@ def test_attachment_metadata_is_stated_in_the_record():
     with tempfile.TemporaryDirectory() as tmp:
         pic = ist.store_media(tmp, _png(320, 420), "image/png")
         note = ist.store_media(tmp, b"OggS" + b"\0" * 100, "audio/ogg")
+        doc = ist.store_media(tmp, b"%PDF-1.7 x", "application/pdf",
+                              file_name="../Rechnung\t2026.pdf")
         refs = [f"urn:retinue:media:signal:{pic}",
                 f"urn:retinue:media:signal:{note}",
-                f"urn:retinue:media:signal:{'ab' * 16}"]  # not in this store
+                f"urn:retinue:media:signal:{'ab' * 16}",  # not in this store
+                f"urn:retinue:media:signal:{doc}"]
         subj, path = ist.write_message(
             tmp, channel="signal", sender="+41790000000", text="",
             timestamp=1000.0, attachment_urls=refs, media="/tmp/retained")
@@ -263,6 +266,10 @@ def test_attachment_metadata_is_stated_in_the_record():
         assert f"<{refs[1]}> <{ist.P_WIDTH}>" not in text, "no guessed pixel size for audio"
         assert refs[2] in text and f"<{refs[2]}> <{ist.P_CONTENT_TYPE}>" not in text, \
             "a blob this store does not hold gets no statement — nothing is invented"
+        # A document carries the name the sender gave it, made safe: base name
+        # only, control characters gone; a photo has none.
+        assert f"<{refs[3]}> <{ist.P_FILE_NAME}> \"Rechnung2026.pdf\" ." in text
+        assert f"<{refs[0]}> <{ist.P_FILE_NAME}>" not in text
         # The parse keeps the message as the subject, whatever sorts last.
         fields = ist._parse(text)
         assert fields["subject"] == subj
@@ -272,6 +279,13 @@ def test_attachment_metadata_is_stated_in_the_record():
             "width": 320, "height": 420}
         assert fields["attachment_meta"][refs[1]] == {"content_type": "audio/ogg", "size": 104}
         assert refs[2] not in fields["attachment_meta"]
+        assert fields["attachment_meta"][refs[3]] == {
+            "content_type": "application/pdf", "size": 10, "file_name": "Rechnung2026.pdf"}
+        # What a sender may call a file, reduced to what is safe to show.
+        assert ist.safe_file_name("C:\\Users\\x\\Bericht.docx") == "Bericht.docx"
+        assert ist.safe_file_name("..") is None and ist.safe_file_name("  ") is None
+        long = ist.safe_file_name("a" * 300 + ".pdf")
+        assert len(long) == 200 and long.endswith(".pdf")
         # The statements survive every in-place rewrite of the record.
         ist.update_message(path, text="transcript", clear_media=True)
         assert ist.mark_delivered(path)
@@ -297,7 +311,8 @@ def test_backfill_states_metadata_on_older_records():
     blobs and get the same statements."""
     with tempfile.TemporaryDirectory() as tmp:
         pic = ist.store_media(tmp, _png(8, 6), "image/png")
-        note = ist.store_media(tmp, b"OggS" + b"\0" * 10, "audio/ogg")
+        note = ist.store_media(tmp, b"OggS" + b"\0" * 10, "audio/ogg",
+                               file_name="memo.ogg")
         urn = f"urn:retinue:media:signal:{pic}"
         legacy = f"http://signal-gateway:8090/media/{note}"
         gone = f"urn:retinue:media:signal:{'cd' * 16}"
@@ -322,6 +337,7 @@ def test_backfill_states_metadata_on_older_records():
         assert f"<{urn}> <{ist.P_CONTENT_TYPE}> \"image/png\" ." in p_urn.read_text()
         assert f"<{urn}> <{ist.P_WIDTH}> \"8\"^^" in p_urn.read_text()
         assert f"<{legacy}> <{ist.P_CONTENT_TYPE}> \"audio/ogg\" ." in p_legacy.read_text()
+        assert f"<{legacy}> <{ist.P_FILE_NAME}> \"memo.ogg\" ." in p_legacy.read_text()
         assert p_gone.read_text() == before[p_gone.name], "nothing to state, untouched"
         assert p_plain.read_text() == before[p_plain.name]
         # Idempotent: the second pass rewrites nothing.
