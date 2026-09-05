@@ -61,6 +61,9 @@ MERGE_PEER = "+41791230000"
 MID_ATT = "ab" * 16   # recorded as a host-free urn:retinue:media:… (today's shape)
 MID_ATT2 = "cd" * 16  # the blob the mock gateway "stores" for an images send
 MID_ATT3 = "ef" * 16  # a legacy http://<service>/media/<id> record on disk
+MID_SIB = "12" * 16   # a blob only the channel's second account holds
+MID_NONE = "34" * 16  # a blob no gateway holds
+SIB_ACCOUNT = "+41765550000"  # the second Signal account (see _MockSibling)
 TS0, TS1, TS2, TS3 = ("2026-08-27T06:00:00Z", "2026-08-27T07:00:00Z",
                       "2026-08-27T07:05:00Z", "2026-08-27T07:12:00Z")
 W_TS = "2026-08-26T18:00:00Z"
@@ -73,6 +76,11 @@ STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
                # The mock account's send policy: "allow" sends on the first
                # hop, anything else queues and must be approved.
                "gw_policy": "allow", "pending": {}, "approved": [],
+               # The blobs the mock gateway holds; anything else is a 404,
+               # exactly as a real gateway answers for media it never stored.
+               "gw_media": {MID_ATT, MID_ATT2, MID_ATT3},
+               # The second account's mock (mode, request log).
+               "sib_mode": "inbox", "sib_requests": [],
                # When set, an approved send never leaves "sending" — the
                # gateway that does not confirm in time.
                "gw_never_confirms": False,
@@ -118,6 +126,14 @@ class _MockSparql(BaseHTTPRequestHandler):
             bindings = self._chat_list()
         else:
             bindings = self._messages(query)
+        # The live store's quirk, reproduced: QLever leaves a GROUP_CONCAT over
+        # IRI values unbound (the cell is absent, not ""), so attachments only
+        # reach a row when the query concatenates STR(?att). Verified on the
+        # deployment; without this the mock would keep passing a query that
+        # never shows a single picture in production.
+        if "GROUP_CONCAT(STR(?att)" not in query:
+            bindings = [{k: v for k, v in row.items() if k != "atts"}
+                        for row in bindings]
         payload = json.dumps({"results": {"bindings": bindings}}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/sparql-results+json")
@@ -201,6 +217,9 @@ class _MockGateway(BaseHTTPRequestHandler):
             if self.headers.get("Authorization", "") != "Bearer gw-secret":
                 self._json(401, {"error": "unauthorized"})
                 return
+            if self.path.rsplit("/", 1)[1] not in STATE["gw_media"]:
+                self._json(404, {"error": "not found"})
+                return
             data = b"JPEGBYTES"
             self.send_response(200)
             self.send_header("Content-Type", "image/jpeg")
@@ -271,6 +290,40 @@ class _MockGateway(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+class _MockSibling(BaseHTTPRequestHandler):
+    """The channel's second account: another Signal gateway, another store.
+
+    It holds MID_SIB and nothing else, and answers 404 for the rest — a
+    gateway *stating* it lacks a blob is what lets the web-gateway ask the
+    next one instead of guessing which account stored a legacy record."""
+
+    def log_message(self, fmt, *args):
+        pass
+
+    def do_GET(self):
+        STATE["sib_requests"].append(("GET", self.path,
+                                      self.headers.get("Authorization", "")))
+        if self.path.rstrip("/") in ("", "/health"):
+            self._json(200, {"status": "ok", "configured": True,
+                             "connected": True, "mode": STATE["sib_mode"],
+                             "account": SIB_ACCOUNT})
+            return
+        if self.path == f"/media/{MID_SIB}":
+            if self.headers.get("Authorization", "") != "Bearer sib-secret":
+                self._json(401, {"error": "unauthorized"})
+                return
+            data = b"OGGBYTES"
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/ogg")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        self._json(404, {"error": "not found"})
+
+    _json = _MockGateway._json
 
 
 def _serve(handler):
@@ -375,6 +428,26 @@ def test_chat_list_contract(base, wg):
     unread_qs = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q]
     assert unread_qs and MARA in unread_qs[-1] and "1970-01-01" in unread_qs[-1]
     print("PASS test_chat_list_contract")
+
+
+def test_chat_list_shows_media_preview(base, wg):
+    """A picture-only last message previews as an image in the chat list.
+
+    Pins the list query's STR(?att) (see _MockSparql.do_POST): with the
+    aggregate unbound the preview reads as empty text, which is how every
+    chat with a last picture looked."""
+    STATE["list_rows"] = [
+        _lit_row(chat=MARA, channel="signal", ts=TS3, type=T_IN, text="",
+                 sender=MARA, atts=f"urn:retinue:media:signal:{MID_ATT}"),
+    ]
+    try:
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        chat = next(c for c in body["chats"] if c["id"] == CHAT1)
+        assert chat["last"]["kind"] == "image", chat["last"]
+    finally:
+        STATE["list_rows"] = None
+    print("PASS test_chat_list_shows_media_preview")
 
 
 def test_chat_messages_contract(base, wg):
@@ -912,6 +985,99 @@ def test_media_proxy(base, wg):
     print("PASS test_media_proxy")
 
 
+def test_media_is_asked_for_not_guessed(base, wg, sib_port):
+    """Two inbox accounts on a channel: unsendable chats stay readable.
+
+    A legacy record names the blob, never the account that stored it. With
+    two inbox accounts the send resolver rightly refuses — it cannot tell
+    whose chat this is — but serving a picture needs no identity, only a
+    gateway that has it. So the proxy asks the named gateway and, on its
+    404, the channel's others in turn: the reader never reads another
+    service's store and never guesses; each gateway states what it holds."""
+    sib_slug = "signal-gateway-personal"
+    wg._CHANNEL_GATEWAYS[sib_slug] = {"base_url": f"http://127.0.0.1:{sib_port}",
+                                      "token": "sib-secret",
+                                      "label": "Signal (personal)"}
+    wg._gw_identity.clear()
+
+    def media(slug, mid):
+        req = urllib.request.Request(base + f"/chats/media/{slug}/{mid}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.headers.get("Content-Type"), \
+                    resp.read(), resp.headers.get("Cache-Control")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.headers.get("Content-Type"), exc.read(), \
+                exc.headers.get("Cache-Control")
+
+    def asked(log, mid):
+        return [r for r in log if r[1] == f"/media/{mid}"]
+
+    try:
+        # The legacy chat is now unsendable ...
+        STATE["sent"].clear()
+        status, body = _http(base, "POST", "/chats/" + _quote(CHAT1) + "/send",
+                             {"text": "whose account?"})
+        assert status == 409 and "cannot tell which account" in body["error"], body
+        assert STATE["sent"] == []
+        # ... and still lists its messages, media routed to a gateway to ask.
+        status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
+        assert status == 200, body
+        m_att = next(m for m in body["messages"] if m["id"] == "903")
+        atts = {a["id"]: a for a in m_att["attachments"]}
+        assert atts[MID_ATT]["url"] == f"/chats/media/127.0.0.1/{MID_ATT}"
+        assert atts[MID_ATT3]["url"] == f"/chats/media/127.0.0.1/{MID_ATT3}"
+
+        # Named gateway lacks it → the sibling is asked → served, with its
+        # own token and its own content type. Order: the named one first.
+        STATE["gw_requests"].clear(); STATE["sib_requests"].clear()
+        status, ctype, data, cache = media("127.0.0.1", MID_SIB)
+        assert (status, ctype, data) == (200, "audio/ogg", b"OGGBYTES"), (status, ctype)
+        assert cache and "max-age" in cache
+        assert asked(STATE["gw_requests"], MID_SIB) and asked(STATE["sib_requests"], MID_SIB)
+        assert asked(STATE["sib_requests"], MID_SIB)[0][2] == "Bearer sib-secret"
+        # And the other way round.
+        STATE["gw_requests"].clear(); STATE["sib_requests"].clear()
+        status, ctype, data, _ = media(sib_slug, MID_ATT)
+        assert (status, ctype, data) == (200, "image/jpeg", b"JPEGBYTES"), (status, ctype)
+        assert asked(STATE["sib_requests"], MID_ATT) and asked(STATE["gw_requests"], MID_ATT)
+        # A blob nobody holds: both asked, an honest 404, and no day-long
+        # cache on a miss.
+        STATE["gw_requests"].clear(); STATE["sib_requests"].clear()
+        status, _, _, cache = media("127.0.0.1", MID_NONE)
+        assert status == 404 and not cache, (status, cache)
+        assert asked(STATE["gw_requests"], MID_NONE) and asked(STATE["sib_requests"], MID_NONE)
+
+        # A control-mode sibling is never asked: ledger media is inbox-only,
+        # and a prompt channel is not a place to look for the user's pictures.
+        STATE["sib_mode"] = "control"
+        wg._gw_identity.clear()
+        STATE["gw_requests"].clear(); STATE["sib_requests"].clear()
+        status, _, _, _ = media("127.0.0.1", MID_SIB)
+        assert status == 404
+        assert asked(STATE["gw_requests"], MID_SIB) and not asked(STATE["sib_requests"], MID_SIB)
+        assert media(sib_slug, MID_ATT)[0] == 404, "named control gateway refused outright"
+        assert not asked(STATE["sib_requests"], MID_ATT)
+
+        # The sibling being down is not a 404: the named gateway's answer
+        # stands, and only when nobody could answer at all is it a 502.
+        STATE["sib_mode"] = "inbox"
+        wg._gw_identity.clear()
+        wg._CHANNEL_GATEWAYS[sib_slug]["base_url"] = "http://127.0.0.1:1"
+        assert media("127.0.0.1", MID_ATT)[0] == 200
+        assert media("127.0.0.1", MID_SIB)[0] == 404
+        wg._CHANNEL_GATEWAYS["127.0.0.1"] = dict(wg._CHANNEL_GATEWAYS["127.0.0.1"],
+                                                base_url="http://127.0.0.1:1")
+        assert media("127.0.0.1", MID_ATT)[0] == 502
+    finally:
+        wg._CHANNEL_GATEWAYS["127.0.0.1"] = dict(wg._CHANNEL_GATEWAYS["127.0.0.1"],
+                                                base_url=f"http://127.0.0.1:{STATE['gw_port']}")
+        wg._CHANNEL_GATEWAYS.pop(sib_slug, None)
+        STATE["sib_mode"] = "inbox"
+        wg._gw_identity.clear()
+    print("PASS test_media_is_asked_for_not_guessed")
+
+
 def test_store_down_is_502(base, wg):
     STATE["fail"] = True
     try:
@@ -994,6 +1160,7 @@ def main():
     sparql = _serve(_MockSparql)
     gw = _serve(_MockGateway)
     STATE["gw_port"] = gw.server_address[1]
+    sib = _serve(_MockSibling)
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp), sparql.server_address[1],
                            gw.server_address[1])
@@ -1019,6 +1186,7 @@ def main():
                    if a["id"] == MID_ATT)
         assert att.get("type") == "image/jpeg" and att.get("size") == 717
         assert att.get("width") == 320 and att.get("height") == 420
+        test_chat_list_shows_media_preview(base, wg)
         test_chat_messages_contract(base, wg)
         test_messages_before_paging(base, wg)
         test_read_watermark(base, wg)
@@ -1036,10 +1204,12 @@ def main():
         test_rail_attributes_by_account(base, wg)
         test_accounts_do_not_merge(base, wg)
         test_media_proxy(base, wg)
+        test_media_is_asked_for_not_guessed(base, wg, sib.server_address[1])
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()
     gw.shutdown()
+    sib.shutdown()
     print("all chat-api tests passed")
 
 
