@@ -26,7 +26,10 @@ def _load_scheduler(tmp: Path):
     os.environ["SCHEDULER_STATE_DIR"] = str(tmp / "state")
     os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")
     os.environ["BASE_SCHEDULE"] = str(tmp / "no-base-schedule.json")
-    os.environ.setdefault("CLAUDE_CRED_FILE", str(tmp / "claude" / ".credentials.json"))
+    # Sandbox the pre-spawn credential refresh unconditionally: the module
+    # reads this at import, and an inherited value would point the test at
+    # a real credential file.
+    os.environ["CLAUDE_CRED_FILE"] = str(tmp / "claude" / ".credentials.json")
     sys.path.insert(0, str(SCRIPTS_DIR))
     spec = importlib.util.spec_from_file_location(
         "scheduler_under_test", SCRIPTS_DIR / "scheduler.py")

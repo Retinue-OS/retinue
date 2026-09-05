@@ -638,7 +638,8 @@ def ensure_fresh_credentials(cred_file: Path | None = None, now: int | None = No
       refreshed       this process performed the refresh
       expired         the refresh token's own expiry has passed — only a
                       fresh sign-in helps; nothing is attempted
-      lock_timeout    the lock did not free up in time; left alone
+      lock_timeout    neither the shared lock nor a live CLI lock freed up in
+                      time; left alone rather than sent a competing refresh
       failed          the token endpoint rejected the refresh or was unreachable
     """
     log = log or _default_log
@@ -666,13 +667,18 @@ def ensure_fresh_credentials(cred_file: Path | None = None, now: int | None = No
                     "leaving the refresh to the session")
                 return _outcome("lock_timeout", block)
             # A claude process mid-refresh holds its own lock: wait for it
-            # rather than send a competing refresh with the same pair.
+            # rather than send a competing refresh with the same pair — and
+            # if it outlasts the wait while still live (its holder keeps
+            # touching it), leave the refresh to the session, exactly like
+            # the shared-lock timeout above; a lock that stopped being touched
+            # is stale by the CLI's own rule and no longer counts.
             waited = False
             while cli_refresh_in_flight(cred_file):
                 if time.monotonic() >= deadline:
-                    log("a claude session has held its refresh lock for over "
-                        f"{wait:.0f}s — proceeding as if it were stale")
-                    break
+                    log("a claude session has held its own refresh lock for over "
+                        f"{wait:.0f}s — leaving the refresh to the session")
+                    return _outcome("lock_timeout", block,
+                                    reason="a claude session's refresh lock stayed live past the wait")
                 if not waited:
                     log("a claude session is refreshing the token — waiting for it")
                     waited = True

@@ -529,6 +529,22 @@ def test_ensure_fresh_yields_to_a_claude_refresh_in_flight():
         assert any("waiting for it" in line for line in logged), logged
 
 
+def test_ensure_fresh_leaves_a_long_held_claude_lock_alone():
+    """A CLI lock that stays live past the wait is a refresh still in
+    progress: give up, as on the shared lock, never compete with it."""
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        before = cred.read_bytes()
+        (cred.parent / ".oauth_refresh.lock").mkdir()
+        ep = _Endpoint()
+        logged = []
+        res = _ensure(cred, ep, wait_seconds=0.3, log=logged.append)
+        assert res["action"] == "lock_timeout", res
+        assert ep.calls == [] and cred.read_bytes() == before
+        assert any("leaving the refresh to the session" in line for line in logged), logged
+
+
 def test_ensure_fresh_ignores_a_stale_claude_lock():
     with tempfile.TemporaryDirectory() as d, _oauth_env():
         cred = _cfg(Path(d)) / ".credentials.json"

@@ -61,7 +61,8 @@ only when the access token expires within `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS`
    `<config-dir>/.oauth_refresh.lock` or legacy `<config-dir>.lock`
    directory — the CLI's proper-lockfile lock, touched every 5 s while held
    and stale after 60 s), so no competing refresh is ever sent with a pair a
-   session is rotating at that moment;
+   session is rotating at that moment — and gives up, leaving the refresh to
+   the session, if that lock is still live when the wait runs out;
 3. re-reads the file — a spawner that waited usually finds the job done and
    **adopts** the fresh pair;
 4. otherwise performs the one refresh (the CLI's own `refresh_token` grant,

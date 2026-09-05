@@ -34,9 +34,10 @@ def _load_gateway(tmp: Path, env: dict[str, str]):
     os.environ["CONVERSATION_DIR"] = str(tmp / "convlog")
     os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")
     os.environ["WEB_GATEWAY_STATE"] = str(tmp / "state.json")
-    # Keep the pre-spawn credential refresh off the real credential file (the
-    # module reads this at import, so the first load pins it for the process).
-    os.environ.setdefault("CLAUDE_CRED_FILE", str(tmp / "claude" / ".credentials.json"))
+    # Keep the pre-spawn credential refresh off the real credential file —
+    # unconditionally, since an inherited value would point it at one. The
+    # module reads this at import, so the first load pins it for the process.
+    os.environ["CLAUDE_CRED_FILE"] = str(tmp / "claude" / ".credentials.json")
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
     os.environ.update(env)
     if "markdown_it" not in sys.modules:
