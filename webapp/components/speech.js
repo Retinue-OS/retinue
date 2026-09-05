@@ -59,7 +59,9 @@ export function chunk(text) {
     if (s.length > MAX_CHUNK) {
       let rest = s;
       while (rest.length > MAX_CHUNK) {
-        const cut = rest.lastIndexOf(' ', MAX_CHUNK) || MAX_CHUNK;
+        // No space to cut at (a long URL or hash): cut at the limit itself.
+        const space = rest.lastIndexOf(' ', MAX_CHUNK);
+        const cut = space > 0 ? space : MAX_CHUNK;
         out.push(rest.slice(0, cut).trim());
         rest = rest.slice(cut);
       }
@@ -293,8 +295,11 @@ export class Reader {
     try { this.onprogress(Object.assign({ event }, this.progress())); } catch (_) { /* a listener's bug is not ours */ }
   }
 
-  // Drop whatever the engine is doing for us, and forget it. An idle engine is
-  // left alone: a cancel() there is what sets up the cancel/speak race.
+  // Drop what the engine is doing for us, and forget it. Only an utterance of
+  // ours is cancelled: the engine is shared with the page's other readers
+  // (the news card has one too), whose speech is not ours to stop, and a
+  // cancel() on an idle engine is what sets up the cancel/speak race. A
+  // stuck engine is dealt with when playback starts (_start).
   _silence() {
     this._gen++;
     if (this._timer) clearTimeout(this._timer);
@@ -306,10 +311,28 @@ export class Reader {
     this.starting = false;
     this._startedAt = 0;
     this._boundary = 0;
-    if (speechAvailable() && (had || this._engineBusy())) {
+    if (had && speechAvailable()) {
       this._cancelledAt = Date.now();
       try { engine().cancel(); } catch (_) { /* ignore */ }
     }
+  }
+
+  // Stop where we are without touching the engine: it has already dropped
+  // (or refused) the utterance. With a reason it is an error the user can
+  // retry from the same place; without one, a plain pause.
+  _halt(kind) {
+    this._gen++;
+    if (this._timer) clearTimeout(this._timer);
+    this._timer = null;
+    if (this._ticker) clearInterval(this._ticker);
+    this._ticker = null;
+    this._utter = null;
+    this.starting = false;
+    this._startedAt = 0;
+    this._boundary = 0;
+    this.state = 'paused';
+    this.error = kind || null;
+    this._emit(kind ? 'error' : 'pause');
   }
 
   _engineBusy() {
@@ -323,7 +346,7 @@ export class Reader {
   // Otherwise speak right away: that keeps the first utterance inside the
   // user's tap, which iOS requires before it will speak at all.
   _start() {
-    if (!speechAvailable()) { this.error = 'unavailable'; this.state = 'paused'; this._emit('error'); return; }
+    if (!speechAvailable()) { this._halt('unavailable'); return; }
     const gen = ++this._gen;
     if (this._timer) clearTimeout(this._timer);
     this._timer = null;
@@ -337,6 +360,10 @@ export class Reader {
       this._cancelledAt = Date.now();
       try { engine().cancel(); } catch (_) { /* ignore */ }
     }
+    // Ticker and announcement first: a speak() that fails below halts the
+    // reader (see _halt), and that must be the last word.
+    if (!this._ticker) this._ticker = setInterval(() => this._emit('tick'), TICK_MS);
+    this._emit('start');
     if (busy || recent) {
       this._timer = setTimeout(() => {
         this._timer = null;
@@ -345,8 +372,6 @@ export class Reader {
     } else {
       this._speakCurrent(gen);
     }
-    if (!this._ticker) this._ticker = setInterval(() => this._emit('tick'), TICK_MS);
-    this._emit('start');
   }
 
   _speakCurrent(gen) {
@@ -380,20 +405,15 @@ export class Reader {
     utter.onerror = (e) => {
       if (!live()) return;
       const kind = (e && e.error) || 'error';
-      // Our own cancel() also reports here; the generation guard above keeps
-      // those out, but be explicit for engines that report late.
-      if (kind === 'interrupted' || kind === 'canceled') return;
+      // Our own cancel() reports here too, but never on a live utterance —
+      // it is forgotten before the cancel. A live interruption is someone
+      // else's: the page's other reader starting, or the platform taking
+      // the audio away. That is a pause with the place kept, not a fault.
+      if (kind === 'interrupted' || kind === 'canceled') { this._halt(null); return; }
       // Anything else — engine not ready, no permission, synthesis failure —
       // stops the queue where it is, so the user can retry from the same
       // place instead of the reader racing through every remaining piece.
-      this._utter = null;
-      this.state = 'paused';
-      this.starting = false;
-      this._startedAt = 0;
-      this.error = kind;
-      if (this._ticker) clearInterval(this._ticker);
-      this._ticker = null;
-      this._emit('error');
+      this._halt(kind);
     };
     this._utter = utter;
     // Until the engine reports the start, the position is the piece start —
@@ -407,11 +427,7 @@ export class Reader {
       if (engine().paused) engine().resume();
       engine().speak(utter);
     } catch (_) {
-      this._utter = null;
-      this.state = 'paused';
-      this.starting = false;
-      this.error = 'error';
-      this._emit('error');
+      this._halt('error');
       return;
     }
     this._emit('piece');

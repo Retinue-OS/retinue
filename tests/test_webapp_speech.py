@@ -381,6 +381,56 @@ await ok('voice: exact tag, then same language elsewhere, then none', async () =
   reader.stop();
 });
 
+await ok('chunk: an unbroken token is cut at the limit, nothing lost', () => {
+  const token = 'x'.repeat(500);
+  const pieces = chunk(token);
+  assert.ok(pieces.length >= 3);
+  for (const p of pieces) assert.ok(p.length <= 180, `piece too long: ${p.length}`);
+  assert.equal(pieces.join(''), token);
+  for (const p of chunk('Short. ' + 'y'.repeat(400) + ' tail.')) assert.ok(p.length <= 180);
+});
+await ok('another reader\'s speech is not cancelled by a load or a stop', () => {
+  synth.speaking = true;                 // the news reader is talking
+  synth.log.length = 0;
+  reader.load([{ id: 'o', lang: 'en', text: 'Later.' }]);
+  reader.stop();
+  assert.deepEqual(synth.log, []);
+  synth.speaking = false;
+});
+await ok('a live interruption (another reader, the platform) pauses with the place kept', async () => {
+  reader.play([{ id: 'i', lang: 'en', text: LONG }]);
+  await settle();
+  synth.start();
+  const piece = reader.pieces[reader.pos];
+  events.length = 0;
+  synth.fail('interrupted');
+  assert.equal(reader.state, 'paused');
+  assert.equal(reader.error, null);
+  assert.deepEqual(events.map((e) => e.event), ['pause']);
+  assert.equal(reader._ticker, null, 'no ticker while paused');
+  synth.log.length = 0;
+  reader.resume();
+  await settle();
+  assert.equal(synth.log.at(-1), 'speak:' + piece.text.slice(0, 12), 'resumes at the interrupted piece');
+  reader.stop();
+});
+await ok('a speak() that throws pauses with the reason and leaves no ticker behind', async () => {
+  await settle();
+  const real = synth.speak;
+  synth.speak = () => { throw new Error('engine down'); };
+  events.length = 0;
+  reader.play([{ id: 't', lang: 'en', text: 'Try me.' }]);
+  assert.equal(reader.state, 'paused');
+  assert.equal(reader.error, 'error');
+  assert.equal(reader._ticker, null, 'the ticker is cleared');
+  assert.equal(events.at(-1).event, 'error', 'the error is the last word');
+  synth.speak = real;
+  reader.resume();
+  assert.equal(reader.state, 'playing');
+  assert.equal(synth.log.at(-1), 'speak:Try me.');
+  reader.stop();
+});
+
 await ok('stop from any state unloads and reports it', () => {
   reader.load([{ id: 's', lang: 'en', text: 'x.' }]);
   events.length = 0;
