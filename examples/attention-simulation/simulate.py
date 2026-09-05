@@ -280,18 +280,19 @@ def load_gateway(tmp: Path, store_port: int, gateways: dict[str, int], sim_port:
         os.environ[f"{channel.upper()}_GATEWAY_BASE_URL"] = f"http://127.0.0.1:{port}"
         os.environ[f"{channel.upper()}_GATEWAY_TOKEN"] = "mock"
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
-    if "markdown_it" not in sys.modules:
-        try:
-            import markdown_it  # noqa: F401
-        except ImportError:
-            stub = types.ModuleType("markdown_it")
+    # The gateway renders its own pages with markdown-it; the simulation shows
+    # none of them, so a stock Python without the package gets a stand-in.
+    try:
+        import markdown_it  # noqa: F401
+    except ImportError:
+        stub = types.ModuleType("markdown_it")
 
-            class _MD:
-                def __init__(self, *a, **k): pass
-                def enable(self, *a, **k): return self
-                def render(self, text): return text
-            stub.MarkdownIt = _MD
-            sys.modules["markdown_it"] = stub
+        class _MD:
+            def __init__(self, *a, **k): pass
+            def enable(self, *a, **k): return self
+            def render(self, text): return text
+        stub.MarkdownIt = _MD
+        sys.modules["markdown_it"] = stub
     spec = importlib.util.spec_from_file_location("web_gateway_simulated", SCRIPTS / "web-gateway.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
