@@ -484,6 +484,24 @@ await ok('a second reader taking the engine halts the first, whose stray events 
   reader.stop(); other.stop();
   synth.cancel = realCancel;
 });
+await ok('a rapid hand-off honours the other reader\'s cancel grace', async () => {
+  await settle();
+  const other = new Reader();
+  reader.play([{ id: 'first', lang: 'en', text: LONG }]);
+  await settle();
+  synth.start();
+  const firstPos = reader.pos;
+  synth.log.length = 0;
+  other.play([{ id: 'second', lang: 'en', text: 'Other reader.' }]);   // cancels, speak deferred
+  reader.resume();                                                       // right away: still in the grace
+  assert.deepEqual(synth.log, ['cancel'], 'nothing spoken in the same task as the cancel');
+  assert.equal(reader.state, 'playing');
+  assert.equal(other.state, 'paused', 'the second reader is displaced before it ever spoke');
+  await settle();
+  assert.deepEqual(synth.log, ['cancel', 'speak:' + reader.pieces[firstPos].text.slice(0, 12)],
+    'the first reader speaks after the grace, and the second not at all');
+  reader.stop(); other.stop();
+});
 
 await ok('stop from any state unloads and reports it', () => {
   reader.load([{ id: 's', lang: 'en', text: 'x.' }]);

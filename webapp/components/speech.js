@@ -52,6 +52,15 @@ function engine() { return window.speechSynthesis; }
 // that whatever the cancel throws off its utterance (an error, or on some
 // engines a plain `end`) can no longer be mistaken for its own completion.
 let activeReader = null;
+// When the engine was last cancelled — by any reader, since the engine is one
+// and so is the cancel/speak race: a speak() within the grace of that is
+// deferred whichever reader asks (see RESTART_DELAY_MS).
+let lastCancelAt = 0;
+
+function cancelEngine() {
+  lastCancelAt = Date.now();
+  try { engine().cancel(); } catch (_) { /* ignore */ }
+}
 
 function takeEngine(reader) {
   const prev = activeReader;
@@ -147,9 +156,6 @@ export class Reader {
     this._rate = DEFAULT_RATE;
     this._startedAt = 0;
     this._boundary = 0;
-    // When we last cancelled the engine: a speak() within the grace of that
-    // is deferred even if the engine already claims to be idle.
-    this._cancelledAt = 0;
     // Some browsers populate the voice list asynchronously; asking early is
     // what makes the first tap use the right voice.
     if (speechAvailable()) {
@@ -327,10 +333,7 @@ export class Reader {
     this.starting = false;
     this._startedAt = 0;
     this._boundary = 0;
-    if (had && speechAvailable()) {
-      this._cancelledAt = Date.now();
-      try { engine().cancel(); } catch (_) { /* ignore */ }
-    }
+    if (had && speechAvailable()) cancelEngine();
   }
 
   // Stop where we are without touching the engine: it has already dropped
@@ -358,7 +361,8 @@ export class Reader {
   // (Re)start speaking at this.pos. When the engine is busy — with our own
   // previous piece, or with a zombie utterance from before a page hop — cancel
   // it and hand over the next piece a moment later (see RESTART_DELAY_MS); the
-  // same grace applies right after any cancel, whatever the engine claims.
+  // same grace applies right after any reader's cancel, whatever the engine
+  // claims.
   // Otherwise speak right away: that keeps the first utterance inside the
   // user's tap, which iOS requires before it will speak at all.
   _start() {
@@ -368,15 +372,12 @@ export class Reader {
     if (this._timer) clearTimeout(this._timer);
     this._timer = null;
     const busy = !!this._utter || this._engineBusy();
-    const recent = (Date.now() - this._cancelledAt) < RESTART_DELAY_MS;
+    const recent = (Date.now() - lastCancelAt) < RESTART_DELAY_MS;
     this._utter = null;
     this.starting = true;
     this._startedAt = 0;
     this._boundary = 0;
-    if (busy) {
-      this._cancelledAt = Date.now();
-      try { engine().cancel(); } catch (_) { /* ignore */ }
-    }
+    if (busy) cancelEngine();
     // Ticker and announcement first: a speak() that fails below halts the
     // reader (see _halt), and that must be the last word.
     if (!this._ticker) this._ticker = setInterval(() => this._emit('tick'), TICK_MS);
