@@ -34,6 +34,12 @@ body{margin:0;background:var(--paper);color:var(--ink);font-family:"Source Sans 
 .mode-line{margin-top:6px;font-weight:600;display:flex;align-items:center;gap:6px}
 .dot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle}
 .controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center}
+.voice-line{margin-top:10px;font-size:.82rem;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 10px;align-items:center}
+.vl-label{font-weight:600}
+.vl-route.stt,.vl-route.local{color:var(--accent);font-weight:600}
+.vl-route.cloud{color:var(--push);font-weight:600}
+.vl-opt{display:inline-flex;align-items:center;gap:5px}
+.voice-line .hint{flex-basis:100%;margin:0;font-size:.76rem}
 .driving,.ended{margin-top:12px;padding:10px 12px;border-radius:8px;background:color-mix(in srgb,var(--you) 14%,var(--card));border:1px solid color-mix(in srgb,var(--you) 40%,var(--line));display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;font-size:.92rem}
 .ended{background:color-mix(in srgb,var(--accent) 12%,var(--card));border-color:color-mix(in srgb,var(--accent) 40%,var(--line))}
 /* timeline */

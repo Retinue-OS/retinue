@@ -11,8 +11,8 @@ Node.
 Serve the folder with any static server and open `index.html`:
 
 ```bash
-deno run --allow-net --allow-read jsr:@std/http/file-server .   # http://localhost:8000
-# or: python3 -m http.server 8000
+STT_URL=http://localhost:8100/transcribe deno run --allow-net --allow-read --allow-env serve.ts   # http://localhost:8000, voice via your stt service
+# or any static server, without voice transcription: python3 -m http.server 8000
 ```
 
 `python3 build.py` inlines everything into one self-contained page,
@@ -53,9 +53,18 @@ paperclip inside it, send on the right. Files attach as chips above the field
 and travel with the message (25 MB cap, as on the gateway). The mic swaps the
 row for a recording bar — discard ✕, a live waveform with the elapsed time,
 transcribe for review ✓, transcribe and send ➤ — driven by the microphone
-where the browser allows it and simulated otherwise; browsers with speech
-recognition (Chrome, Edge, Safari) supply the transcript, others get a
-placeholder in its place, since the real dashboard transcribes on the server.
+where the browser allows it and simulated otherwise.
+
+Transcription follows the deployment's rule that audio does not leave your
+own systems. The routes, in order: the self-hosted **stt service** when the
+page is served by `serve.ts`, which proxies `/transcribe` to it the way the
+gateway does (`STT_URL`, `STT_TOKEN`); the browser's **on-device** recognition
+where the browser can guarantee local processing (Chrome's `processLocally`);
+and the browser's **cloud** recognition only if you tick the box under *Voice
+transcription*, since Chrome, Edge and Safari otherwise send the audio to their
+vendor. With no route, the recording is kept and a placeholder stands in for
+the transcript. `?stt=<url>` points the page at another transcription
+endpoint.
 
 A draft that came from Ara or from a transcription carries a bar with *Send
 now* and *Discard*; the text stays editable by hand, and the Ara pane shows

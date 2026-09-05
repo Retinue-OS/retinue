@@ -62,9 +62,11 @@
       this.sim = new root.Simulation(this.engine, { onChange: () => this.renderAll() });
       this.sheet = null; this.view = null; this.draft = null; this.toast = null; this.menu = false; this.heldOpen = false; this.waitingOpen = false;
       this.files = {}; this.rec = null; this.job = null; this.attachError = ''; this.wave = new Waveform(() => this.phoneEl);
+      this.sttUrl = null; this.cloudOk = false; try { this.cloudOk = localStorage.getItem('attention-voice-cloud') === '1'; } catch (_e) { /* no storage */ }
+      this.localRecognition = null; // null = unknown, then true/false
       this.banner = null; this.bannerTimer = null; this.toastTimer = null; this.seenPushes = 0; this.feedLen = -1;
       this.phoneEl = rootEl.querySelector('#phone'); this.deckEl = rootEl.querySelector('#deck');
-      this.buildDeck();
+      this.buildDeck(); this.probeVoice();
       rootEl.addEventListener('click', (e) => this.onClick(e));
       rootEl.addEventListener('change', (e) => { if (e.target.matches('[data-file]')) { this.addFiles(e.target.dataset.id, e.target.files); return; } this.onInput(e); });
       rootEl.addEventListener('input', (e) => { if (e.target.id === 'composer') { const src = this.draft && this.draft.id === e.target.dataset.id && this.draft.tab === e.target.dataset.tab ? this.draft.source : 'typed'; this.draft = { id: e.target.dataset.id, tab: e.target.dataset.tab, text: e.target.value, source: src === 'typed' ? 'typed' : src }; } });
@@ -103,6 +105,7 @@
             <button class="btn" data-act="restart" title="Back to midnight">↺ Restart</button>
             <select class="select" data-act="speed" aria-label="Speed">${SPEEDS.map(([v, l]) => `<option value="${v}"${v === this.sim.speed ? ' selected' : ''}>${l}</option>`).join('')}</select>
           </div>
+          <div class="voice-line" id="voice-line"></div>
           <div class="driving" id="driving" hidden><span>You are driving — the story is paused and will adapt to what you changed.</span><button class="btn primary" data-act="resume">▶ Resume the story</button></div>
           <div class="ended" id="ended" hidden>The day is over. <button class="btn" data-act="restart">Play it again</button></div>
         </section>
@@ -129,6 +132,20 @@
       const mm = this.root.querySelector('#mini-mode'); if (mm) mm.innerHTML = `<span class="dot" style="background:${mode.color}"></span>${esc(mode.name)}`;
       const head = this.deckEl.querySelector('#playhead'); if (head) head.setAttribute('transform', `translate(${20 + (now / DAY) * 680} 0)`);
       const headT = this.deckEl.querySelector('#playhead-t'); if (headT) headT.textContent = hhmm(now);
+    }
+    voiceRoute() { if (this.sttUrl) return ['stt', `your stt service at ${this.sttUrl}`]; if (this.localRecognition) return ['local', 'on-device, in the browser']; if (this.cloudOk && (window.SpeechRecognition || window.webkitSpeechRecognition)) return ['cloud', 'the browser’s cloud service (audio leaves the device)']; return [null, 'none — recordings are kept but not transcribed']; }
+    async probeVoice() {
+      const params = new URLSearchParams(location.search); const given = params.get('stt');
+      if (given) this.sttUrl = given;
+      else if (/^https?:$/.test(location.protocol)) { try { const r = await fetch('/transcribe', { method: 'HEAD' }); if (r.status !== 404) this.sttUrl = '/transcribe'; } catch (_e) { /* no endpoint */ } }
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      // The on-device availability check is skipped under automation (headless runs), where it can stall the renderer.
+      if (SR && typeof SR.available === 'function' && !navigator.webdriver) { try { this.localRecognition = (await SR.available({ langs: [navigator.language || 'en'], processLocally: true })) === 'available'; } catch (_e) { this.localRecognition = false; } } else this.localRecognition = false;
+      this.renderVoiceLine();
+    }
+    renderVoiceLine() {
+      const el = this.deckEl.querySelector('#voice-line'); if (!el) return; const [route, label] = this.voiceRoute();
+      el.innerHTML = `<span class="vl-label">Voice transcription:</span> <span class="vl-route ${route || 'none'}">${esc(label)}</span>` + (route === 'stt' || route === 'local' ? '' : `<label class="vl-opt"><input type="checkbox" data-act="cloud-ok"${this.cloudOk ? ' checked' : ''}> allow the browser’s cloud speech recognition</label>`) + `<span class="hint">Private routes first: the stt service behind <code>serve.ts</code>, then the browser’s on-device recognition; the cloud only if you allow it.</span>`;
     }
     renderControls() {
       const b = this.deckEl.querySelector('#btn-play'); b.textContent = this.sim.playing ? '⏸ Pause' : (this.engine.now === 0 ? '▶ Play the day' : '▶ Play');
@@ -224,7 +241,7 @@
         const placeholder = tab === 'chat' ? `Reply to ${item.sender}…` : 'Ask Ara…';
         row = `<div class="composer-row"><button type="button" class="mic" data-act="mic" data-id="${esc(id)}" data-tab="${tab}" title="Record a voice message" aria-label="Record a voice message">🎤</button><div class="field"><input id="composer" type="text" autocomplete="off" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" value="${esc(draft ? draft.text : '')}" data-tab="${tab}" data-id="${esc(id)}"><label class="clip" title="Attach a file" aria-label="Attach a file"><input type="file" multiple hidden data-file data-id="${esc(id)}"><span aria-hidden="true">📎</span></label></div><button type="button" class="send" data-act="send" data-id="${esc(id)}" data-tab="${tab}" title="${tab === 'chat' ? 'Send' : 'Ask Ara'}" aria-label="${tab === 'chat' ? 'Send' : 'Ask Ara'}">➤</button></div>`;
       }
-      const bar = draft && draft.text && draft.source !== 'typed' && !this.rec && !this.job ? `<div class="draft-bar"><span class="draft-label">${draft.source === 'ara' ? 'Ara’s draft' : 'Transcribed'} — edit it here or in the Ara pane</span><button type="button" class="btn tiny primary" data-act="send-now" data-id="${esc(id)}" data-tab="${tab}">${tab === 'chat' ? 'Send now' : 'Ask now'}</button><button type="button" class="btn tiny" data-act="discard-draft" data-id="${esc(id)}" data-tab="${tab}">Discard</button></div>` : '';
+      const bar = draft && draft.text && draft.source !== 'typed' && !this.rec && !this.job ? `<div class="draft-bar"><span class="draft-label">${draft.source === 'ara' ? 'Ara’s draft' : 'Transcribed'} — edit it here${tab === 'chat' ? ' or in the Ara pane' : ''}</span><button type="button" class="btn tiny primary" data-act="send-now" data-id="${esc(id)}" data-tab="${tab}">${tab === 'chat' ? 'Send now' : 'Ask now'}</button><button type="button" class="btn tiny" data-act="discard-draft" data-id="${esc(id)}" data-tab="${tab}">Discard</button></div>` : '';
       return `<div class="composer">${bar}${chips}${err}${row}</div>`;
     }
     // ---- attachments ------------------------------------------------------------------
@@ -237,22 +254,26 @@
     // ---- voice -----------------------------------------------------------------------------
     async startRecording(id, tab) {
       if (this.rec) return; this.sim.viewerActed(); this.attachError = '';
-      const rec = { id, tab, startMs: Date.now(), stream: null, recognition: null, transcript: '', interim: '', real: false };
+      const rec = { id, tab, startMs: Date.now(), stream: null, recognition: null, recorder: null, chunks: [], transcript: '', interim: '', real: false, route: null };
       this.rec = rec; this.renderAll();
       if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-        try { rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); rec.real = true; } catch (_e) { rec.stream = null; }
+        try { rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); rec.real = true; } catch (_e) { rec.stream = null; rec.error = 'not-allowed'; }
       }
       if (this.rec !== rec) { if (rec.stream) rec.stream.getTracks().forEach((t) => t.stop()); return; }
+      const [route] = this.voiceRoute(); rec.route = route;
       const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SR) {
+      if (route === 'stt') {
+        if (rec.stream && window.MediaRecorder) { try { const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'].find((m) => MediaRecorder.isTypeSupported(m)); rec.recorder = mime ? new MediaRecorder(rec.stream, { mimeType: mime }) : new MediaRecorder(rec.stream); rec.recorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) rec.chunks.push(ev.data); }; rec.recorder.start(250); } catch (_e) { rec.recorder = null; rec.error = 'recorder'; } }
+        else rec.error = rec.error || 'no-mic';
+      } else if ((route === 'local' || route === 'cloud') && SR) {
         try {
-          const r = new SR(); r.continuous = true; r.interimResults = true; r.lang = navigator.language || 'en';
+          const r = new SR(); r.continuous = true; r.interimResults = true; r.lang = navigator.language || 'en'; if (route === 'local') r.processLocally = true;
           r.onresult = (ev) => { let fin = '', interim = ''; for (let i = 0; i < ev.results.length; i++) { const t = ev.results[i][0].transcript; if (ev.results[i].isFinal) fin += t + ' '; else interim += t; } rec.transcript = fin.trim(); rec.interim = interim.trim(); };
           r.onerror = (ev) => { rec.error = ev.error || 'error'; };
           r.onend = () => { rec.ended = true; if (rec.onended) rec.onended(); };
           r.start(); rec.recognition = r;
         } catch (_e) { rec.recognition = null; rec.error = 'unavailable'; }
-      } else rec.error = 'unsupported';
+      } else if (!route) rec.error = rec.error || 'no-route';
       if (!rec.stream && !rec.recognition) this.showToast('No microphone here — the waveform is simulated.');
       this.wave.start(rec.stream, rec.startMs);
     }
@@ -262,22 +283,37 @@
       if (rec.recognition) { try { rec.recognition.stop(); } catch (_e) { /* ignore */ } }
       if (rec.stream) rec.stream.getTracks().forEach((t) => t.stop());
       if (mode === 'abort') { this.renderAll(); return; }
-      const { id, tab } = rec;
-      this.job = { id, tab, label: mode === 'send' ? 'Transcribing & sending …' : 'Transcribing …' }; this.renderAll();
-      // Final results can still arrive after stop(): wait for the recogniser to end, briefly.
-      const settled = new Promise((resolve) => { if (!rec.recognition || rec.ended) return resolve(); rec.onended = resolve; setTimeout(resolve, 1500); });
+      const { id, tab } = rec; const routeName = rec.route === 'stt' ? 'stt service' : rec.route === 'local' ? 'on-device' : rec.route === 'cloud' ? 'browser cloud' : null;
+      this.job = { id, tab, label: `${mode === 'send' ? 'Transcribing & sending' : 'Transcribing'}${routeName ? ` (${routeName})` : ''} …` }; this.renderAll();
+      // The stt route posts the recording; the recogniser routes wait for final results, briefly.
+      const settled = rec.route === 'stt' ? this.transcribeViaStt(rec) : new Promise((resolve) => { if (!rec.recognition || rec.ended) return resolve(); rec.onended = resolve; setTimeout(resolve, 1500); });
       settled.then(() => {
         this.job = null;
         const spoken = [rec.transcript, rec.interim].filter(Boolean).join(' ').trim();
-        if (!spoken) {
-          const why = rec.error === 'unsupported' ? 'This browser has no speech recognition (Chrome, Edge and Safari do).' : rec.error === 'not-allowed' || rec.error === 'service-not-allowed' ? 'Microphone access was refused for this page.' : rec.error === 'audio-capture' ? 'No microphone was found.' : rec.error === 'network' ? 'The browser’s speech service is unreachable.' : 'Nothing was recognised.';
-          this.showToast(`${why} A placeholder stands in for the transcript; the real dashboard transcribes on the server.`);
+        if (spoken) this.showToast(`Transcribed by ${rec.route === 'stt' ? 'your stt service' : rec.route === 'local' ? 'the browser, on-device' : 'the browser’s cloud service'}.`);
+        else {
+          const why = rec.error === 'no-route' ? 'No private transcription is available here: serve the prototype with serve.ts next to the stt service, or allow the browser’s cloud recognition under Voice transcription.' : rec.error === 'stt' ? `The stt service failed: ${rec.errorDetail || 'no answer'}.` : rec.error === 'no-mic' ? 'No microphone, so nothing was recorded.' : rec.error === 'not-allowed' || rec.error === 'service-not-allowed' ? 'Microphone access was refused for this page.' : rec.error === 'audio-capture' ? 'No microphone was found.' : rec.error === 'network' ? 'The browser’s speech service is unreachable.' : 'Nothing was recognised.';
+          this.showToast(`${why} A placeholder stands in for the transcript.`);
         }
         const text = spoken || `🎙 voice note, ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
         if (mode === 'send') { this.send(id, tab, text); return; }
         const prev = this.draft && this.draft.id === id && this.draft.tab === tab ? this.draft.text : '';
         this.draft = { id, tab, text: prev ? `${prev} ${text}` : text, source: 'voice' }; this.renderAll();
       });
+    }
+    // Post the recording to the stt endpoint (raw bytes, container type, optional language), as the gateway does.
+    async transcribeViaStt(rec) {
+      if (!rec.recorder) { rec.error = rec.error || 'no-mic'; return; }
+      await new Promise((resolve) => { if (rec.recorder.state === 'inactive') return resolve(); rec.recorder.onstop = resolve; try { rec.recorder.stop(); } catch (_e) { resolve(); } });
+      const blob = new Blob(rec.chunks, { type: rec.recorder.mimeType || 'application/octet-stream' });
+      if (!blob.size) { rec.error = 'no-mic'; return; }
+      try {
+        const lang = (navigator.language || 'en').split('-')[0];
+        const res = await fetch(`${this.sttUrl}${this.sttUrl.includes('?') ? '&' : '?'}lang=${encodeURIComponent(lang)}`, { method: 'POST', headers: { 'Content-Type': blob.type }, body: blob });
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok || typeof body.text !== 'string') { rec.error = 'stt'; rec.errorDetail = body.error || `HTTP ${res.status}`; return; }
+        rec.transcript = body.text.trim();
+      } catch (e) { rec.error = 'stt'; rec.errorDetail = String(e && e.message || e); }
     }
     modeMenu() {
       const e = this.engine; const cur = e.mode(); const sched = e.scheduledMode();
@@ -416,6 +452,7 @@
     onInput(ev) {
       const el = ev.target.closest('[data-act]'); if (!el) return;
       if (el.dataset.act === 'speed') { this.sim.speed = Number(el.value); return; }
+      if (el.dataset.act === 'cloud-ok') { this.cloudOk = !!el.checked; try { localStorage.setItem('attention-voice-cloud', this.cloudOk ? '1' : '0'); } catch (_e) { /* no storage */ } this.renderVoiceLine(); return; }
       if (el.dataset.act === 'lead') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { lead: Number(el.value) }); this.renderAll(); }
       if (el.dataset.act === 'due-set') { this.sim.viewerActed(); this.engine.correct(el.dataset.id, { due: el.value === 'none' ? null : Number(el.value) }); this.renderAll(); }
     }
