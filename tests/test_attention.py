@@ -137,6 +137,52 @@ def test_sections_and_explain():
     assert "waiting on the accountant" in A.explain(items[4], focus, profile, now)["delivery"]
 
 
+def test_fold_and_rules():
+    focus, profile = A.default_focus(), A.default_profile()
+    now = at(9, 0)  # Deep work: admits nothing, lists only what it admits
+    assert A.mode_at(focus, now)["only_admitted"]
+    items = [
+        item(id="quote", importance=4, due=at(17), lead=timedelta(days=2), released=True),
+        item(id="alert", sphere="system", importance=5, critical=True, released=True),
+        item(id="mum", sphere="family", sender="Mum", importance=3, released=True),
+        item(id="card", importance=4, due=at(12, d=1), lead=timedelta(days=2), released=False),
+        item(id="mine", importance=2.5, released=True, own=True),
+    ]
+    s = A.sections(items, focus, profile, now)
+    assert [i["id"] for i in s["now"]] == ["alert"] and [i["id"] for i in s["held"]] == ["card"]
+    assert [i["id"] for i in s["next"]] == ["mine"], "the user's own thread is never folded"
+    assert [i["id"] for i in s["not_now"]] == ["quote", "mum"]
+    # a pull keeps the item visible; a permit admits the sender
+    assert A.pull(items[3]) and items[3]["pulled"]
+    A.set_permit(profile, "Mum", "deep", True, now, focus["modes"])
+    s = A.sections(items, focus, profile, now)
+    assert [i["id"] for i in s["next"]] == ["card", "mum", "mine"] and [i["id"] for i in s["not_now"]] == ["quote"]
+    # a fresh arrival or a snooze judges it afresh
+    A.snooze(items[3], focus, now, "next")
+    assert not items[3]["pulled"]
+    A.on_arrival(items[3], focus, profile, now)
+    assert not items[3]["pulled"] and A.item_to_attention(items[3])["pulled"] is False
+    # the fold is a per-mode rule; the same patch changes the rest of the rules
+    spheres = ["customers", "admin", "health", "friends", "family", "system"]
+    assert A.apply_rules(focus, {"mode": "deep", "only_admitted": False}, spheres) == ["Deep work lists everything"]
+    assert [i["id"] for i in A.sections(items, focus, profile, now)["not_now"]] == []
+    assert A.apply_rules(focus, {"mode": "deep", "only_admitted": False}, spheres) == []
+    assert A.apply_rules(focus, {"mode": "work", "deny": ["admin"], "tag_on": ["finance"]}, spheres) == ["Work no longer admits admin", "Work admits the tag finance"]
+    assert focus["modes"]["work"]["admits"] == ["customers", "health"] and focus["modes"]["work"]["admit_tags"] == ["health", "finance"]
+    assert A.apply_rules(focus, {"mode": "home", "threshold": "active", "admits": ["family"]}, spheres) == ["Home rings from active", "Home no longer admits health"]
+    for bad in ({"mode": "nope"}, {"mode": "deep", "threshold": "passive"}, {"mode": "deep", "admit": ["pets"]},
+                {"schedule": [["25:00", "deep"]]}, {"digest_times": ["noon"]}):
+        try:
+            A.apply_rules(focus, bad, spheres)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+    assert A.apply_rules(focus, {"schedule": [["07:30", "home"], [540, "deep"], ["22:00", "off"]], "digest_times": ["08:00", "12:30", 1260]}, spheres) \
+        == ["the schedule changed", "digest times → 08:00, 12:30, 21:00"]
+    assert focus["schedule"] == [[0, "off"], [450, "home"], [540, "deep"], [1320, "off"]] and focus["digest_times"] == [480, 750, 1260]
+    assert A.parse_minute("8") == 480 and A.parse_minute(True) is None
+
+
 def test_docs_and_emit():
     profile = A.default_profile()
     doc = {"id": "8f2c", "title": "Quote for Müller AG", "attention": {"importance": 4, "due": "2026-09-03T17:00:00+02:00", "sphere": "customers", "tags": ["finance"], "kind": "customer request", "released": True}}

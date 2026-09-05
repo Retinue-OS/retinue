@@ -94,13 +94,19 @@ def _load_gateway(tmp: Path, sparql_port: int):
     os.environ["ATTENTION_TZ"] = "UTC"
     os.environ["PRESENTATION_LINT"] = "0"
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
-    if "markdown_it" not in sys.modules:
-        try:
-            import markdown_it  # noqa: F401
-        except ImportError:
-            stub = types.ModuleType("markdown_it")
-            stub.MarkdownIt = object
-            sys.modules["markdown_it"] = stub
+    # The gateway renders its own pages with markdown-it; nothing here reads
+    # them, so a stock Python without the package gets a stand-in.
+    try:
+        import markdown_it  # noqa: F401
+    except ImportError:
+        stub = types.ModuleType("markdown_it")
+
+        class _MD:
+            def __init__(self, *a, **k): pass
+            def enable(self, *a, **k): return self
+            def render(self, text): return text
+        stub.MarkdownIt = _MD
+        sys.modules["markdown_it"] = stub
     sys.path.insert(0, str(SCRIPTS_DIR))
     spec = importlib.util.spec_from_file_location("web_gateway_attention_under_test",
                                                   SCRIPTS_DIR / "web-gateway.py")
@@ -149,7 +155,7 @@ def _sections(base):
 
 
 def _find(body, item_id):
-    for key in ("now", "next", "held", "waiting"):
+    for key in ("now", "next", "held", "waiting", "not_now"):
         for row in body["sections"][key]:
             if row["id"] == item_id:
                 return key, row
@@ -196,8 +202,23 @@ def test_deep_work_holds_pull_later_done(base, wg):
     tid = "thread:" + body["id"]
     assert _find(_sections(base), tid)[0] == "held"
     status, out = _http(base, "POST", "/attention/items/pull", {"id": tid})
-    assert status == 200 and out["item"]["released"] is True, out
-    assert _find(_sections(base), tid)[0] == "next", "active is below Deep work's bar: Next, not Now"
+    assert status == 200 and out["item"]["released"] is True and out["item"]["pulled"] is True, out
+    assert _find(_sections(base), tid)[0] == "next", "active is below Deep work's bar: Next, not Now — and pulled, so not folded"
+    # Deep work lists only what it admits: a released item it does not admit
+    # folds into Not now; the pulled one above stays. The fold is a per-mode
+    # rule the menu toggles.
+    passive = _open(base, "Newsletter", "The monthly newsletter is out.", {"importance": 1, "sphere": "admin"})
+    pid = "thread:" + passive["id"]
+    assert passive["attention"]["delivery"] == "list"
+    assert _find(_sections(base), pid)[0] == "not_now"
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "deep", "only_admitted": False})
+    assert status == 200 and out["changed"] == ["Deep work lists everything"] and out["mode"]["only_admitted"] is False, out
+    assert _find(_sections(base), pid)[0] == "next"
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "deep", "only_admitted": True})
+    assert status == 200 and _find(_sections(base), pid)[0] == "not_now"
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "deep", "threshold": "passive"})
+    assert status == 400
+    _http(base, "POST", "/attention/items/done", {"id": pid})
     status, out = _http(base, "POST", "/attention/items/later", {"id": tid, "when": "tomorrow"})
     assert status == 200 and out["item"]["snoozed_until"], out
     where, row = _find(_sections(base), tid)
@@ -224,7 +245,7 @@ def test_critical_and_passive(base, wg):
     PUSHES.clear()
     body = _open(base, "Newsletter filed", "Filed the newsletter into news.", {"importance": 1})
     assert body["attention"]["delivery"] == "list" and not PUSHES
-    assert _find(_sections(base), "thread:" + body["id"])[0] == "next"
+    assert _find(_sections(base), "thread:" + body["id"])[0] == "not_now", "listed — folded, since Deep work lists only what it admits"
     # A thread that says nothing about itself is passive: listed, not pushed.
     body = _open(base, "Plain thread", "Just so you know.")
     assert body["attention"]["delivery"] == "list" and body["attention"]["level"] == "passive"
@@ -504,7 +525,8 @@ def test_payload_shape(base, wg):
     body = _sections(base)
     assert body["timezone"] == "UTC" and body["mode"]["id"] in {m["id"] for m in body["modes"]}
     assert len(body["schedule"]) == 8 and body["digest_times"] == [480, 720, 1020, 1260]
-    assert set(body["counts"]) == {"now", "next", "held", "waiting"}
+    assert set(body["counts"]) == {"now", "next", "held", "waiting", "not_now"}
+    assert all("only_admitted" in m for m in body["modes"]) and body["mode"]["only_admitted"] in (True, False)
     assert body["spheres"] == ["customers", "admin", "health", "friends", "family", "system"]
     assert body["next_breakpoint"] and body["mode"]["scheduled"]["until"]
     status, out = _http(base, "GET", "/attention/item?id=nothing")

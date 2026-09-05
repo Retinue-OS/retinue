@@ -82,6 +82,11 @@ class AttentionStore:
         with self.lock:
             focus = policy.load_json(self.dir / "focus.json", policy.default_focus())
             focus.setdefault("spheres", list(DEFAULT_SPHERES))
+            for mid, mode in focus["modes"].items():
+                # A document from before the flag: the shipped default for
+                # the mode of that name, off for one the deployment named.
+                mode.setdefault("only_admitted", bool(policy.DEFAULT_MODES.get(mid, {}).get("only_admitted")))
+                mode.setdefault("admit_tags", [])
             return focus
 
     def save_focus(self, focus: dict) -> None:
@@ -173,6 +178,8 @@ def thread_item(conv: dict, profile: dict) -> dict:
         item["importance_from"] = block.get("importance_from") or "your thread"
     item.update({
         "source_id": conv["id"],
+        # The user's own thread stays visible in every mode (sections' fold).
+        "own": conv.get("initiator") != "agent",
         "preview": _one_line(preview_msg.get("text") or ("Sent you a file" if preview_msg.get("attachments") else "")),
         "agent": agent,
         "unread": bool(conv.get("unread")),

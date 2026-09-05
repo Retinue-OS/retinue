@@ -52,13 +52,17 @@ DEFAULT_LEADS = {
     "invoice run": 1 * DAY,
 }
 
+# ``only_admitted``: the list shows only what the mode admits — everything
+# else folds into a collapsed "Not now" section (critical, permitted, pulled
+# and the user's own items stay visible). On for the two modes whose point is
+# not seeing the rest.
 DEFAULT_MODES = {
-    "off":    {"id": "off",    "name": "Off",       "admits": [],                                                    "admit_tags": [],         "threshold": "critical",       "blurb": "only critical; the digest waits for the morning"},
-    "home":   {"id": "home",   "name": "Home",      "admits": ["family", "health"],                                  "admit_tags": [],         "threshold": "time-sensitive", "blurb": "family and health may break through"},
-    "deep":   {"id": "deep",   "name": "Deep work", "admits": [],                                                    "admit_tags": [],         "threshold": "critical",       "blurb": "only critical breaks through"},
-    "open":   {"id": "open",   "name": "Open",      "admits": ["customers", "admin", "health", "friends", "family", "system"], "admit_tags": [], "threshold": "time-sensitive", "blurb": "every sphere admitted; time-sensitive rings"},
-    "work":   {"id": "work",   "name": "Work",      "admits": ["customers", "admin", "health"],                      "admit_tags": ["health"], "threshold": "time-sensitive", "blurb": "customers, admin and health may break through"},
-    "social": {"id": "social", "name": "Social",    "admits": ["friends", "family"],                                 "admit_tags": ["health"], "threshold": "time-sensitive", "blurb": "friends and family may break through"},
+    "off":    {"id": "off",    "name": "Off",       "admits": [],                                                    "admit_tags": [],         "threshold": "critical",       "only_admitted": True,  "blurb": "only critical; the digest waits for the morning"},
+    "home":   {"id": "home",   "name": "Home",      "admits": ["family", "health"],                                  "admit_tags": [],         "threshold": "time-sensitive", "only_admitted": False, "blurb": "family and health may break through"},
+    "deep":   {"id": "deep",   "name": "Deep work", "admits": [],                                                    "admit_tags": [],         "threshold": "critical",       "only_admitted": True,  "blurb": "only critical breaks through"},
+    "open":   {"id": "open",   "name": "Open",      "admits": ["customers", "admin", "health", "friends", "family", "system"], "admit_tags": [], "threshold": "time-sensitive", "only_admitted": False, "blurb": "every sphere admitted; time-sensitive rings"},
+    "work":   {"id": "work",   "name": "Work",      "admits": ["customers", "admin", "health"],                      "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": False, "blurb": "customers, admin and health may break through"},
+    "social": {"id": "social", "name": "Social",    "admits": ["friends", "family"],                                 "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": False, "blurb": "friends and family may break through"},
 }
 # minute of the local day → mode id
 DEFAULT_SCHEDULE = [[0, "off"], [7 * 60, "home"], [8 * 60, "deep"], [12 * 60, "open"], [13 * 60, "work"], [17 * 60, "open"], [18 * 60, "social"], [22 * 60, "off"]]
@@ -185,6 +189,7 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "boost": int(a.get("boost", 0)),
         "last_level": a.get("last_level"),
         "pushed": [parse_dt(x) for x in a.get("pushed") or []],
+        "pulled": bool(a.get("pulled", False)),
     }
 
 
@@ -198,7 +203,7 @@ def item_to_attention(item: dict) -> dict:
         "actor": item.get("actor"), "waiting_since": iso(item.get("waiting_since")), "sender": item.get("sender"),
         "critical": bool(item.get("critical")), "state": item.get("state", "open"), "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "boost": int(item.get("boost", 0)), "last_level": item.get("last_level"),
-        "pushed": [iso(x) for x in item.get("pushed") or []],
+        "pushed": [iso(x) for x in item.get("pushed") or []], "pulled": bool(item.get("pulled", False)),
     }
 
 
@@ -359,6 +364,7 @@ def on_arrival(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
     mode = mode_at(focus, now)
     lvl = level(item, now)
     item["last_level"] = lvl
+    item["pulled"] = False
     if item.get("actor", "you") != "you":
         item["released"] = True
         return {"deliver": "waiting", "level": lvl, "reason": f"parked on {item['actor']}"}
@@ -497,6 +503,104 @@ def set_permit(profile: dict, sender: str, mode_id: str, on: bool, now: datetime
     return True
 
 
+def parse_minute(value) -> int | None:
+    """A time of day as the settings or an agent write it — ``"08:30"``, ``"8"``,
+    or a minute count — as a minute of the day; None when it is not one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        m = int(value)
+        return m if 0 <= m < DAY else None
+    raw = str(value or "").strip()
+    m = re.match(r"^(\d{1,2})(?::(\d{2}))?$", raw)
+    if not m:
+        return None
+    minute = int(m.group(1)) * 60 + int(m.group(2) or 0)
+    return minute if 0 <= minute < DAY else None
+
+
+def apply_rules(focus: dict, patch: dict, spheres: list[str]) -> list[str]:
+    """Change the focus rules from one patch — what the mode menu, the
+    settings page and Ara all write. Returns what changed, in words; an
+    empty list means nothing did. Unknown keys are ignored; a value that is
+    not valid raises ValueError with the reason.
+
+    Per mode (``{"mode": id, ...}``): ``only_admitted`` (bool), ``threshold``
+    (a level), ``admits`` (the whole sphere list) or ``admit`` / ``deny``
+    (spheres to add / remove), ``admit_tags`` or ``tag_on`` / ``tag_off``.
+    Whole document: ``schedule`` (a list of ``[time, mode]``; a time is
+    ``"HH:MM"`` or a minute) and ``digest_times`` (a list of times).
+    """
+    changes: list[str] = []
+    mode_id = patch.get("mode")
+    if mode_id is not None:
+        mode = focus["modes"].get(str(mode_id))
+        if mode is None:
+            raise ValueError("unknown mode")
+        if "only_admitted" in patch and patch["only_admitted"] is not None:
+            on = bool(patch["only_admitted"])
+            if bool(mode.get("only_admitted")) != on:
+                mode["only_admitted"] = on
+                changes.append(f"{mode['name']} lists {'only what it admits' if on else 'everything'}")
+        if patch.get("threshold") is not None:
+            th = str(patch["threshold"])
+            if th not in RANK or th == "passive":
+                raise ValueError("threshold must be active, time-sensitive or critical")
+            if mode["threshold"] != th:
+                mode["threshold"] = th
+                changes.append(f"{mode['name']} rings from {th}")
+        for key, on_key, off_key, label in (("admits", "admit", "deny", "admits"),
+                                            ("admit_tags", "tag_on", "tag_off", "admits the tag")):
+            current = list(mode.get(key) or [])
+            wanted = list(current)
+            if isinstance(patch.get(key), list):
+                wanted = [str(x).strip().lower() for x in patch[key] if str(x).strip()]
+            for x in patch.get(on_key) or []:
+                x = str(x).strip().lower()
+                if x and x not in wanted:
+                    wanted.append(x)
+            for x in patch.get(off_key) or []:
+                wanted = [w for w in wanted if w != str(x).strip().lower()]
+            if key == "admits":
+                unknown = [w for w in wanted if w not in spheres]
+                if unknown:
+                    raise ValueError(f"unknown sphere: {', '.join(unknown)}")
+            if wanted != current:
+                mode[key] = wanted
+                for x in wanted:
+                    if x not in current:
+                        changes.append(f"{mode['name']} {label} {x}")
+                for x in current:
+                    if x not in wanted:
+                        changes.append(f"{mode['name']} no longer {label} {x}")
+    if patch.get("schedule") is not None:
+        schedule = []
+        for entry in patch["schedule"]:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
+                raise ValueError("a schedule entry is [time, mode]")
+            minute = parse_minute(entry[0])
+            if minute is None or str(entry[1]) not in focus["modes"]:
+                raise ValueError(f"bad schedule entry {entry!r}")
+            schedule.append([minute, str(entry[1])])
+        schedule.sort()
+        if not schedule:
+            raise ValueError("the schedule needs at least one entry")
+        if schedule[0][0] != 0:
+            # The day starts in whatever mode the evening ends in.
+            schedule.insert(0, [0, schedule[-1][1]])
+        if schedule != [list(x) for x in focus["schedule"]]:
+            focus["schedule"] = schedule
+            changes.append("the schedule changed")
+    if patch.get("digest_times") is not None:
+        times = sorted({parse_minute(t) for t in patch["digest_times"]})
+        if None in times or not times:
+            raise ValueError("digest times are HH:MM")
+        if times != sorted(focus["digest_times"]):
+            focus["digest_times"] = times
+            changes.append("digest times → " + ", ".join(f"{t // 60:02d}:{t % 60:02d}" for t in times))
+    return changes
+
+
 def set_admission(focus: dict, sphere: str, mode_id: str, on: bool) -> bool:
     mode = focus["modes"][mode_id]
     has = sphere in mode["admits"]
@@ -516,15 +620,36 @@ def snooze(item: dict, focus: dict, now: datetime, when: str) -> datetime:
         until = next_breakpoint(focus, now)
     item["released"] = False
     item["snoozed_until"] = until
+    item["pulled"] = False
     return until
 
 
 def pull(item: dict) -> bool:
+    """Pull a held item onto the list ahead of the digest. It stays visible
+    afterwards even where the mode folds the unadmitted away (``pulled``),
+    until the next arrival or snooze judges it afresh."""
     if item.get("state", "open") != "open" or item.get("released"):
         return False
     item["released"] = True
     item["snoozed_until"] = None
+    item["pulled"] = True
     return True
+
+
+def reopen(item: dict) -> None:
+    """Put a handled item back on the list — visibly, like a pull."""
+    item["state"] = "open"
+    item["released"] = True
+    item["snoozed_until"] = None
+    item["pulled"] = True
+
+
+def shown_anyway(item: dict, mode: dict, profile: dict, now: datetime) -> bool:
+    """What a mode that lists only the admitted still shows: critical, what
+    the mode admits (sphere, tag or permit), what the user pulled or put
+    back, and their own threads with Ara."""
+    return (level(item, now) == "critical" or admitted(item, mode, profile)
+            or bool(item.get("pulled")) or bool(item.get("own")))
 
 
 # ---- views ------------------------------------------------------------------------------
@@ -562,8 +687,13 @@ def explain(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
 
 
 def sections(items: list[dict], focus: dict, profile: dict, now: datetime) -> dict:
+    """Now · Next · Held · Waiting — and, in a mode that lists only what it
+    admits (``only_admitted``), Not now: the released items the mode does not
+    admit, folded away like Held. What is in Now breaks through, so it is
+    admitted by definition; the fold only ever takes from Next."""
     mode = mode_at(focus, now)
-    now_l, next_l, held, waiting = [], [], [], []
+    fold = bool(mode.get("only_admitted"))
+    now_l, next_l, held, waiting, not_now = [], [], [], [], []
     for i in items:
         if i.get("state", "open") != "open":
             continue
@@ -573,6 +703,8 @@ def sections(items: list[dict], focus: dict, profile: dict, now: datetime) -> di
             held.append(i)
         elif breaks_through(i, mode, profile, now):
             now_l.append(i)
+        elif fold and not shown_anyway(i, mode, profile, now):
+            not_now.append(i)
         else:
             next_l.append(i)
 
@@ -580,10 +712,11 @@ def sections(items: list[dict], focus: dict, profile: dict, now: datetime) -> di
         due = i.get("due")
         return (-RANK[level(i, now)], -i["importance"], (due - now).total_seconds() if due else float("inf"), i.get("title") or "")
 
-    for lst in (now_l, next_l, held):
+    for lst in (now_l, next_l, held, not_now):
         lst.sort(key=key)
     waiting.sort(key=lambda i: (i.get("waiting_since") or now).timestamp())
-    return {"now": now_l, "next": next_l, "held": held, "waiting": waiting, "mode": mode, "next_breakpoint": next_breakpoint(focus, now)}
+    return {"now": now_l, "next": next_l, "held": held, "waiting": waiting, "not_now": not_now,
+            "mode": mode, "next_breakpoint": next_breakpoint(focus, now)}
 
 
 # ---- the life store -------------------------------------------------------------------

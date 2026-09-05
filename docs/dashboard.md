@@ -136,8 +136,13 @@ minute-of-day → mode, the digest times, the sphere vocabulary and the manual
 override — and `profile.json` — importance and sphere priors per sender or
 kind, lead times per kind, permits per mode, and the learned log; plus
 `projects.json` with the delivery state of projects. `GET /attention/profile`
-returns both, `POST /attention/profile` replaces them; a deployment edits the
-files or drives the mode from the menu. The shipped defaults are the brief's
+returns both, `POST /attention/profile` replaces them, and `POST
+/attention/modes` changes the rules by patch (`attention.apply_rules`: a
+mode's `only_admitted`, `threshold`, `admits` or `admit`/`deny`,
+`admit_tags` or `tag_on`/`tag_off`; the `schedule` as `[time, mode]` pairs
+and the `digest_times`, times as `HH:MM` or minutes) — what the mode menu,
+the settings page and Ara write; a deployment edits the files or drives the
+mode from the menu. The shipped defaults are the brief's
 (`attention.default_focus()`, `default_profile()`).
 
 **The API** (behind the dashboard's auth like the rest): `GET /attention`
@@ -147,7 +152,8 @@ store could not answer for), `GET /attention/item?id=…`, `POST
 /attention/items/later {id, when: next|tomorrow}`, `…/pull`, `…/done`,
 `…/reopen`, `…/correct {id, importance?, due?, lead?, sphere?, tags?,
 critical?}`, `POST /attention/permits {sender, mode?, on}`, `POST
-/attention/admit {sphere, mode?, on}`; and the token-gated `POST
+/attention/admit {sphere, mode?, on}`, `POST /attention/modes {mode?, …}`
+(the rule patch above); and the token-gated `POST
 /internal/attention/set {id, …}` for agents (`attention-set.py`). Item ids are
 `thread:<id>`, `chat:<chat id>` and a project's URI.
 

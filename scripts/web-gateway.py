@@ -1049,7 +1049,7 @@ _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
 # The attention model's writes: the mode, the rules, and the actions on one
 # item (its id travels in the body — chat ids and project URIs carry
 # characters no path segment should).
-_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|permits|admit|profile|later|pull|done|reopen|correct)/?$")
+_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|admit|profile|later|pull|done|reopen|correct)/?$")
 
 # ── Push notifications ─────────────────────────────────────────────────────────
 # The unread badge only exists while the dashboard is open, which is precisely
@@ -5566,13 +5566,12 @@ def _attention_mark(item_id: str, state: str, how: str | None = None) -> bool:
         item = _attention_item(item_id, _ATTENTION.profile(), now)
         if item is None:
             return False
-        item["state"] = state
         if state == "done":
+            item["state"] = "done"
             item["done_at"] = now.isoformat()
             item["done_how"] = how
         else:
-            item["released"] = True
-            item["snoozed_until"] = None
+            attention_policy.reopen(item)
         _attention_persist(item)
         return True
 
@@ -5694,7 +5693,8 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "reason": attention_policy.admission_reason(item, mode, profile, now),
         "actor": item.get("actor") or "you", "waiting_since": iso(item.get("waiting_since")),
         "state": item.get("state", "open"), "released": bool(item.get("released")),
-        "snoozed_until": iso(item.get("snoozed_until")),
+        "snoozed_until": iso(item.get("snoozed_until")), "pulled": bool(item.get("pulled")),
+        "own": bool(item.get("own")),
         "pushed": [iso(p) for p in item.get("pushed") or []],
         "permit": bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or []),
         "admits_sphere": item["sphere"] in mode["admits"],
@@ -5714,6 +5714,7 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
         "id": mode["id"], "name": mode["name"], "blurb": mode.get("blurb", ""),
         "threshold": mode["threshold"], "admits": list(mode["admits"]),
         "admit_tags": list(mode.get("admit_tags") or []),
+        "only_admitted": bool(mode.get("only_admitted")),
         "manual": bool(focus.get("manual")),
         "scheduled": {"id": scheduled["id"], "name": scheduled["name"], "until": until_dt.isoformat()},
     }
@@ -5730,15 +5731,17 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
         "mode": _attention_mode_summary(focus, now),
         "modes": [{"id": m["id"], "name": m["name"], "blurb": m.get("blurb", ""),
                    "threshold": m["threshold"], "admits": list(m["admits"]),
-                   "admit_tags": list(m.get("admit_tags") or [])}
+                   "admit_tags": list(m.get("admit_tags") or []),
+                   "only_admitted": bool(m.get("only_admitted"))}
                   for m in focus["modes"].values()],
         "schedule": [list(x) for x in focus["schedule"]],
         "digest_times": list(focus["digest_times"]),
         "spheres": list(focus.get("spheres") or attention_store.DEFAULT_SPHERES),
         "next_breakpoint": s["next_breakpoint"].isoformat(),
         "sections": {"now": [row(i) for i in s["now"]], "next": [row(i) for i in s["next"]],
-                     "held": [row(i) for i in s["held"]], "waiting": [row(i) for i in s["waiting"]]},
-        "counts": {k: len(s[k]) for k in ("now", "next", "held", "waiting")},
+                     "held": [row(i) for i in s["held"]], "waiting": [row(i) for i in s["waiting"]],
+                     "not_now": [row(i) for i in s["not_now"]]},
+        "counts": {k: len(s[k]) for k in ("now", "next", "held", "waiting", "not_now")},
         "degraded": degraded,
         "learned": (profile.get("learned") or [])[-5:],
     }
@@ -6850,6 +6853,9 @@ class Handler(BaseHTTPRequestHandler):
             if action == "admit":
                 self._attention_set_admission(payload, focus, profile, now)
                 return
+            if action == "modes":
+                self._attention_set_rules(payload, focus, profile, now)
+                return
             if action == "profile":
                 self._attention_write_profile(payload)
                 return
@@ -6870,9 +6876,7 @@ class Handler(BaseHTTPRequestHandler):
                 item["done_at"] = now.isoformat()
                 item["done_how"] = "marked"
             elif action == "reopen":
-                item["state"] = "open"
-                item["released"] = True
-                item["snoozed_until"] = None
+                attention_policy.reopen(item)
             elif action == "correct":
                 patch = {}
                 for key in ("importance", "lead", "sphere", "tags", "critical"):
@@ -6962,6 +6966,22 @@ class Handler(BaseHTTPRequestHandler):
         pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule") if changed and payload.get("on") else []
         self._send_json(200, {"changed": changed, "mode": _attention_mode_summary(focus, now),
                               "modes": focus["modes"], "pushed": pushed})
+
+    def _attention_set_rules(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
+        """Change the Focus rules from one patch (attention.apply_rules): a
+        mode's list fold, threshold, admitted spheres and tags, the schedule,
+        the digest times. What a widened rule now admits is pushed."""
+        try:
+            changes = attention_policy.apply_rules(focus, payload, list(focus.get("spheres") or attention_store.DEFAULT_SPHERES))
+        except (ValueError, TypeError) as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        pushed: list[str] = []
+        if changes:
+            _ATTENTION.save_focus(focus)
+            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule")
+        self._send_json(200, {"changed": changes, "mode": _attention_mode_summary(focus, now),
+                              "focus": focus, "pushed": pushed})
 
     def _attention_write_profile(self, payload: dict) -> None:
         """Replace the profile and the focus rules with what the user edited:

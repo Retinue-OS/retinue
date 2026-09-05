@@ -8,6 +8,8 @@
 // with its preview and its three fields explained, the mode in force and the
 // next breakpoint — and posts the user's actions back:
 //   POST /attention/mode              {mode} by hand, or {mode: null} to follow the schedule
+//   POST /attention/modes             {mode, only_admitted} — whether this mode's list shows
+//                                     only what it admits (the rest folds into "Not now")
 //   (the sheet, components/attention-sheet.js, carries the per-item actions)
 // Opening a row goes where it goes today: a thread opens in place (the
 // conversations viewer on the same page answers the #conversation-<id> hash),
@@ -122,6 +124,11 @@ const CSS = `
   .menu-row small { color: var(--muted, #8b93a3); font-size: .8rem; }
   .menu-row.follow { margin-top: 10px; }
   .menu-note { color: var(--muted, #8b93a3); font-size: .78rem; margin: 8px 4px 0; }
+  .menu-fold { display: flex; gap: 10px; align-items: flex-start; margin: 14px 4px 0; cursor: pointer;
+               padding-top: 12px; border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
+  .menu-fold input { margin: 3px 0 0; accent-color: var(--accent, #6ea8fe); flex: none; }
+  .menu-fold b { display: block; font-size: .9rem; font-weight: 600; }
+  .menu-fold small { color: var(--muted, #8b93a3); font-size: .78rem; }
 `;
 
 class RetinueAttention extends HTMLElement {
@@ -132,6 +139,7 @@ class RetinueAttention extends HTMLElement {
     this._menu = false;
     this._heldOpen = prefGet('held', false);
     this._waitingOpen = prefGet('waiting', false);
+    this._notNowOpen = prefGet('not_now', false);
     this.shadowRoot.addEventListener('click', (e) => this._onClick(e));
     this._onChange = () => this.load();
     window.addEventListener('retinue-attention-change', this._onChange);
@@ -173,6 +181,19 @@ class RetinueAttention extends HTMLElement {
     }
   }
 
+  async _setFold(modeId, on) {
+    try {
+      const res = await fetch('/attention/modes', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: modeId, only_admitted: on }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      this._sig = '';
+      window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'rules' } }));
+    } catch (_err) { /* the next poll shows the truth */ }
+    await this.load();
+  }
+
   async _setMode(mode) {
     this._menu = false;
     try {
@@ -204,6 +225,8 @@ class RetinueAttention extends HTMLElement {
       case 'close-menu': this._menu = false; this.render(); break;
       case 'toggle-held': this._heldOpen = !this._heldOpen; prefSet('held', this._heldOpen); this.render(); break;
       case 'toggle-waiting': this._waitingOpen = !this._waitingOpen; prefSet('waiting', this._waitingOpen); this.render(); break;
+      case 'toggle-not_now': this._notNowOpen = !this._notNowOpen; prefSet('not_now', this._notNowOpen); this.render(); break;
+      case 'fold': this._setFold(el.getAttribute('data-mode'), el.getAttribute('data-on') === '1'); break;
       case 'new': location.hash = '#new'; break;
       default: break;
     }
@@ -222,7 +245,7 @@ class RetinueAttention extends HTMLElement {
 
   _rows() {
     const s = (this._data && this._data.sections) || {};
-    return [].concat(s.now || [], s.next || [], s.held || [], s.waiting || []);
+    return [].concat(s.now || [], s.next || [], s.held || [], s.waiting || [], s.not_now || []);
   }
 
   _rowHtml(r, section) {
@@ -272,6 +295,8 @@ class RetinueAttention extends HTMLElement {
       `<span class="dot" style="background:${modeColor(sch.id)}"></span><span><b>Follow the schedule</b>` +
       `<small>${esc(sch.name || '')}${sch.until ? ` until ${esc(fmtWhen(sch.until))}` : ''}</small></span></button>` +
       `<div class="menu-note">A change by hand is a breakpoint: what was held is released, and the digest goes out.</div>` +
+      `<label class="menu-fold"><input type="checkbox" data-act="fold" data-mode="${esc(cur.id)}" data-on="${cur.only_admitted ? '0' : '1'}"${cur.only_admitted ? ' checked' : ''}>` +
+      `<span><b>In ${esc(cur.name)}, list only what it admits</b><small>The rest folds into “Not now”. Critical, permitted and pulled items stay.</small></span></label>` +
       `</div></div>`;
   }
 
@@ -292,7 +317,7 @@ class RetinueAttention extends HTMLElement {
       head = `<header><h2>${esc(this.heading)}</h2>` +
         `<button class="mode-chip" data-act="mode-menu" style="border-color:${modeColor(mode.id)}" title="${esc(mode.blurb || '')}">` +
         `<span class="dot" style="background:${modeColor(mode.id)}"></span>${esc(mode.name)} · ${esc(until)} ▾</button></header>`;
-      const total = (s.now || []).length + (s.next || []).length + (s.held || []).length + (s.waiting || []).length;
+      const total = (s.now || []).length + (s.next || []).length + (s.held || []).length + (s.waiting || []).length + (s.not_now || []).length;
       const nb = fmtWhen(d.next_breakpoint);
       const degraded = (d.degraded || []).length
         ? `<div class="degraded">${esc(d.degraded.join(' and '))} unavailable right now — the life store is not answering.</div>` : '';
@@ -301,6 +326,7 @@ class RetinueAttention extends HTMLElement {
         this._sectionHtml('Next', s.next || [], 'next') +
         this._collapsibleHtml(`Held until ${nb}`, s.held || [], 'held', this._heldOpen) +
         this._collapsibleHtml('Waiting on others', s.waiting || [], 'waiting', this._waitingOpen) +
+        this._collapsibleHtml('Not now', s.not_now || [], 'not_now', this._notNowOpen) +
         (total ? '' : '<div class="empty">Nothing wants your attention.</div>') +
         `</div>`;
     }

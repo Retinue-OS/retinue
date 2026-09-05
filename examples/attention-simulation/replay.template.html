@@ -190,7 +190,7 @@ function renderState(st) {
       <div class="kv"><span>permits</span><div>${chips(permits)}</div></div>
       <div class="kv"><span>breaks through</span><div>${esc(mode.threshold || '')} and above</div></div>
       <div class="kv"><span>next breakpoint</span><div>${whenText(st.next_breakpoint)}</div></div></div>
-    <div class="nums">${num(nums.pushes || 0, 'pushes')}${num(nums.digests || 0, 'digests')}${num(counts.held || 0, 'held')}${num(nums.handled || 0, 'handled')}${num(nums.corrections || 0, 'corrections')}${num(counts.now || 0, 'in Now')}${num(counts.next || 0, 'in Next')}</div>
+    <div class="nums">${num(nums.pushes || 0, 'pushes')}${num(nums.digests || 0, 'digests')}${num(counts.held || 0, 'held')}${num(nums.handled || 0, 'handled')}${num(nums.corrections || 0, 'corrections')}${num(counts.now || 0, 'in Now')}${num(counts.next || 0, 'in Next')}${counts.not_now ? num(counts.not_now, 'not now') : ''}</div>
     <details class="profile" open><summary>Attention profile</summary>
       <div class="kv"><span>importance priors</span><div>${Object.entries(st.priors || {}).map(([k, v]) => `<span class="pill">${esc(k)} <b>${v}</b></span>`).join('')}</div></div>
       <div class="kv"><span>lead times</span><div>${Object.entries(st.leads || {}).filter(([k]) => k !== 'default').map(([k, v]) => `<span class="pill">${esc(k)} <b>${dur(v)}</b></span>`).join('')}</div></div>
