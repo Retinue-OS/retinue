@@ -59,6 +59,7 @@ import re
 import secrets
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -469,10 +470,11 @@ def install_tokens(reply: dict, cred_file: Path | None = None, now: int | None =
 # The framework's answer is to never start a child on a token that is about to
 # expire: every spawner calls ``ensure_fresh_credentials()`` first. Only when
 # the access token is due within REFRESH_AHEAD_SECONDS does it take the flock
-# all framework spawners share, yield to a refresh the CLI has in flight,
-# re-read (another spawner may have finished the job), and perform the one
-# refresh itself — the child then starts on a token good for hours and
-# refreshes nothing. This is not the out-of-band refresh the monitor refuses
+# all framework spawners share, then the CLI's own refresh lock (so a claude
+# process that wants to refresh meanwhile waits and then adopts, by its own
+# protocol, what the spawner wrote), re-read (another process may have
+# finished the job), and perform the one refresh itself under both locks —
+# the child then starts on a token good for hours and refreshes nothing. This is not the out-of-band refresh the monitor refuses
 # to perform: the rotation is exactly the one the child would trigger seconds
 # later, only serialized and done before the spawn rather than inside an agent
 # turn. Nothing here ever clears credentials, and no failure is fatal — the
@@ -494,6 +496,10 @@ CRED_LOCK = CRED_FILE.with_name(CRED_FILE.name + ".lock")
 # Claude Code's refresh lock is a directory (proper-lockfile) whose mtime the
 # holder touches every 5 s; one older than this is stale by the CLI's own rule.
 CLI_LOCK_STALE_SECONDS = 60.0
+# While the framework holds that lock it touches the mtime this often — well
+# inside the stale window, so a slow token endpoint never makes the hold look
+# abandoned to a claude process that checks it.
+CLI_LOCK_TOUCH_SECONDS = 2.0
 _LOCK_POLL_SECONDS = 0.1
 
 
@@ -519,28 +525,102 @@ def access_token_due(block: dict | None, now: int | None = None,
 
 def cli_refresh_locks(cred_file: Path | None = None) -> list[Path]:
     """Where Claude Code itself locks while refreshing: the current lock inside
-    the config directory and the legacy one beside it (2.1.261 takes both)."""
+    the config directory and the legacy one beside it, in the order the CLI
+    takes them (2.1.261 takes both)."""
     cred_file = CRED_FILE if cred_file is None else Path(cred_file)
     config_dir = cred_file.parent
     return [config_dir / ".oauth_refresh.lock",
             config_dir.with_name(config_dir.name + ".lock")]
 
 
+def _lock_dir_live(path: Path, stale_seconds: float) -> bool | None:
+    """True while the lock directory exists and is younger than the stale
+    window, False when it exists but is stale, None when it does not exist."""
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError:
+        return None
+    return age < stale_seconds
+
+
 def cli_refresh_in_flight(cred_file: Path | None = None,
                           stale_seconds: float | None = None) -> bool:
     """Whether a ``claude`` process holds its refresh lock right now — a lock
-    directory younger than the CLI's own stale window. Read-only interop: the
-    framework never takes that lock, it only declines to start a competing
-    refresh while one is in flight."""
+    directory younger than the CLI's own stale window."""
     stale = CLI_LOCK_STALE_SECONDS if stale_seconds is None else stale_seconds
-    for path in cli_refresh_locks(cred_file):
-        try:
-            age = time.time() - path.stat().st_mtime
-        except OSError:
-            continue
-        if age < stale:
-            return True
-    return False
+    return any(_lock_dir_live(path, stale) for path in cli_refresh_locks(cred_file))
+
+
+@contextlib.contextmanager
+def cli_refresh_lock(cred_file: Path | None = None, wait_seconds: float | None = None,
+                     log=None):
+    """Hold Claude Code's own refresh lock for the duration of a refresh.
+
+    The CLI serializes its refreshes with proper-lockfile directories, and a
+    process that finds one held retries, then re-reads the credential file
+    under the lock and adopts a pair another process landed meanwhile. Taking
+    the same directories, in the same order, makes the framework a participant
+    in that protocol instead of an observer: a claude process that starts
+    refreshing while a spawner is mid-refresh waits on the directory and then
+    adopts what the spawner wrote, so two grants are never sent with the same
+    refresh token. Acquisition is ``mkdir`` (atomic); a directory whose mtime
+    is older than CLI_LOCK_STALE_SECONDS is stale by the CLI's rule and is
+    removed; while held, every directory's mtime is touched so a slow token
+    endpoint never makes the hold look abandoned. Yields True with the lock
+    held, False when the wait ran out — nothing is left behind either way.
+    """
+    wait = LOCK_WAIT_SECONDS if wait_seconds is None else wait_seconds
+    log = log or _default_log
+    deadline = time.monotonic() + wait
+    held: list[Path] = []
+    stop = threading.Event()
+    toucher: threading.Thread | None = None
+    waited = False
+    try:
+        for path in cli_refresh_locks(cred_file):
+            while True:
+                live = _lock_dir_live(path, CLI_LOCK_STALE_SECONDS)
+                if live is False:
+                    # Stale by the CLI's own rule: its holder is gone.
+                    try:
+                        os.rmdir(path)
+                    except OSError:
+                        pass
+                if live is not True:
+                    try:
+                        os.mkdir(path)
+                        held.append(path)
+                        break
+                    except FileExistsError:
+                        pass  # a claude process won the race for it: wait
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                if not waited:
+                    log("a claude session is refreshing the token — waiting for it")
+                    waited = True
+                time.sleep(_LOCK_POLL_SECONDS)
+
+        def _touch() -> None:
+            while not stop.wait(CLI_LOCK_TOUCH_SECONDS):
+                for path in held:
+                    try:
+                        os.utime(path, None)
+                    except OSError:
+                        pass
+
+        toucher = threading.Thread(target=_touch, name="claude-auth-lock-touch", daemon=True)
+        toucher.start()
+        yield True
+    finally:
+        stop.set()
+        if toucher is not None:
+            toucher.join(timeout=1.0)
+        for path in reversed(held):
+            try:
+                os.rmdir(path)
+            except OSError:
+                pass
 
 
 @contextlib.contextmanager
@@ -666,42 +746,40 @@ def ensure_fresh_credentials(cred_file: Path | None = None, now: int | None = No
                 log(f"credential lock still held after {wait:.0f}s — "
                     "leaving the refresh to the session")
                 return _outcome("lock_timeout", block)
-            # A claude process mid-refresh holds its own lock: wait for it
-            # rather than send a competing refresh with the same pair — and
-            # if it outlasts the wait while still live (its holder keeps
-            # touching it), leave the refresh to the session, exactly like
-            # the shared-lock timeout above; a lock that stopped being touched
-            # is stale by the CLI's own rule and no longer counts.
-            waited = False
-            while cli_refresh_in_flight(cred_file):
-                if time.monotonic() >= deadline:
+            # Then Claude Code's own refresh lock, held across the re-read,
+            # the grant and the install: a claude process mid-refresh makes
+            # us wait, and one that starts meanwhile waits on us and then
+            # adopts what we wrote — no two grants ever carry the same pair.
+            # A live lock that outlasts the wait (its holder keeps touching
+            # it) means leaving the refresh to the session, exactly like the
+            # shared-lock timeout above; a lock that stopped being touched is
+            # stale by the CLI's own rule and is taken over.
+            remaining = max(0.0, deadline - time.monotonic())
+            with cli_refresh_lock(cred_file, remaining, log) as cli_held:
+                if not cli_held:
                     log("a claude session has held its own refresh lock for over "
                         f"{wait:.0f}s — leaving the refresh to the session")
                     return _outcome("lock_timeout", block,
                                     reason="a claude session's refresh lock stayed live past the wait")
-                if not waited:
-                    log("a claude session is refreshing the token — waiting for it")
-                    waited = True
-                time.sleep(_LOCK_POLL_SECONDS)
-            # Re-read under the lock: whoever held it before us may have
-            # done the work already.
-            block = oauth_block(_read_json(cred_file))
-            if block is None:
-                return _outcome("no_credentials")
-            if not access_token_due(block, now, ahead):
-                log("the access token was refreshed by another process "
-                    f"meanwhile — valid until {_fmt_ts(_as_int(block.get('expiresAt')))}")
-                return _outcome("adopted", block)
-            try:
-                reply = refresh_tokens(block, http_post)
-                summary = install_tokens(reply, cred_file, now)
-            except ClaudeAuthError as exc:
-                log(f"token refresh before spawn failed: {exc} — "
-                    "the session will refresh on its own")
-                return _outcome("failed", block, reason=str(exc))
-            log("access token refreshed before spawn — valid until "
-                f"{_fmt_ts(summary.get('access_expires_at'))}")
-            return _outcome("refreshed", access_expires_at=summary.get("access_expires_at"))
+                # Re-read under both locks: whoever held either before us may
+                # have done the work already.
+                block = oauth_block(_read_json(cred_file))
+                if block is None:
+                    return _outcome("no_credentials")
+                if not access_token_due(block, now, ahead):
+                    log("the access token was refreshed by another process "
+                        f"meanwhile — valid until {_fmt_ts(_as_int(block.get('expiresAt')))}")
+                    return _outcome("adopted", block)
+                try:
+                    reply = refresh_tokens(block, http_post)
+                    summary = install_tokens(reply, cred_file, now)
+                except ClaudeAuthError as exc:
+                    log(f"token refresh before spawn failed: {exc} — "
+                        "the session will refresh on its own")
+                    return _outcome("failed", block, reason=str(exc))
+                log("access token refreshed before spawn — valid until "
+                    f"{_fmt_ts(summary.get('access_expires_at'))}")
+                return _outcome("refreshed", access_expires_at=summary.get("access_expires_at"))
     except Exception as exc:  # noqa: BLE001 - a spawn must never fail on this helper
         log(f"pre-spawn credential check failed: {exc!r} — "
             "the session will refresh on its own")

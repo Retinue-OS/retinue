@@ -57,17 +57,22 @@ only when the access token expires within `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS`
 
 1. takes an `flock` on `.credentials.json.lock` — one lock for every
    framework spawner, released by the kernel if the holder dies;
-2. waits while Claude Code itself holds *its* refresh lock (a live
-   `<config-dir>/.oauth_refresh.lock` or legacy `<config-dir>.lock`
-   directory — the CLI's proper-lockfile lock, touched every 5 s while held
-   and stale after 60 s), so no competing refresh is ever sent with a pair a
-   session is rotating at that moment — and gives up, leaving the refresh to
-   the session, if that lock is still live when the wait runs out;
-3. re-reads the file — a spawner that waited usually finds the job done and
-   **adopts** the fresh pair;
+2. takes Claude Code's own refresh lock as well — the proper-lockfile
+   directories `<config-dir>/.oauth_refresh.lock` and legacy
+   `<config-dir>.lock`, in the CLI's order, created with `mkdir`, touched
+   while held, and stale after 60 s by the CLI's own rule — so a `claude`
+   process that is mid-refresh makes the spawner wait, and one that starts
+   refreshing meanwhile waits on the spawner and then adopts what it wrote:
+   no two grants ever carry the same pair. If the CLI's lock is still live
+   when the wait runs out, the spawner gives up and leaves the refresh to
+   the session; a lock nobody has touched for 60 s is taken over, as the
+   CLI itself would;
+3. re-reads the file under both locks — a spawner that waited usually finds
+   the job done and **adopts** the fresh pair;
 4. otherwise performs the one refresh (the CLI's own `refresh_token` grant,
    with the stored scopes) and installs the reply like a re-login does:
-   atomic write, backup renewed, rejected-restore marker cleared.
+   atomic write, backup renewed, rejected-restore marker cleared — still
+   under both locks.
 
 The child then starts on a token good for hours and refreshes nothing. The
 common case — a token with more than the margin left — costs one file read
@@ -202,10 +207,11 @@ error on the page, and the console paths keep working.
 The pre-spawn refresh adds two more couplings of the same kind, both
 verified against 2.1.261 and both harmless when they drift: the CLI's 300 s
 refresh margin (ours is wider, so a narrower one on their side changes
-nothing) and the names of its lock directories (`<config-dir>/.oauth_refresh.lock`,
-legacy `<config-dir>.lock`). If those move, the framework merely stops
-noticing a CLI refresh in flight and the CLI's own re-read-and-adopt covers
-that overlap, as it does today.
+nothing) and its lock protocol (proper-lockfile directories at
+`<config-dir>/.oauth_refresh.lock` and legacy `<config-dir>.lock`, mtime
+touched while held, stale after 60 s). If those move, the framework holds
+directories nobody else consults and the CLI's own re-read-and-adopt covers
+that overlap, as it did before the framework took part in the lock.
 
 One such coupling is load-bearing enough to name: Cloudflare fronts the OAuth
 endpoints and rejects generic HTTP clients outright — **"Token endpoint

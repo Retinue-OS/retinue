@@ -527,6 +527,8 @@ def test_ensure_fresh_yields_to_a_claude_refresh_in_flight():
         assert result["action"] == "adopted", result
         assert ep.calls == []
         assert any("waiting for it" in line for line in logged), logged
+        # Nothing of ours is left behind once the section ends.
+        assert not any(p.exists() for p in ca.cli_refresh_locks(cred))
 
 
 def test_ensure_fresh_leaves_a_long_held_claude_lock_alone():
@@ -536,13 +538,16 @@ def test_ensure_fresh_leaves_a_long_held_claude_lock_alone():
         cred = _cfg(Path(d)) / ".credentials.json"
         _write(cred, expires_at=NOW - 1)
         before = cred.read_bytes()
-        (cred.parent / ".oauth_refresh.lock").mkdir()
+        current, legacy = ca.cli_refresh_locks(cred)
+        current.mkdir()
         ep = _Endpoint()
         logged = []
         res = _ensure(cred, ep, wait_seconds=0.3, log=logged.append)
         assert res["action"] == "lock_timeout", res
         assert ep.calls == [] and cred.read_bytes() == before
         assert any("leaving the refresh to the session" in line for line in logged), logged
+        assert current.exists(), "a live lock is never taken away from its holder"
+        assert not legacy.exists(), "nothing of ours is left behind"
 
 
 def test_ensure_fresh_ignores_a_stale_claude_lock():
@@ -558,6 +563,32 @@ def test_ensure_fresh_ignores_a_stale_claude_lock():
         assert _ensure(cred, ep)["action"] == "refreshed"
         assert time.monotonic() - started < 1
         assert len(ep.calls) == 1
+        assert not cli_lock.exists(), "the stale lock was taken over and released"
+
+
+def test_ensure_fresh_holds_the_cli_lock_across_the_refresh():
+    """During the grant both of Claude Code's lock directories are held (so a
+    session starting a refresh meanwhile waits and then adopts), the
+    spawners' own flock is held too, and everything is released after."""
+    with tempfile.TemporaryDirectory() as d, _oauth_env():
+        cred = _cfg(Path(d)) / ".credentials.json"
+        _write(cred, expires_at=NOW - 1)
+        locks = ca.cli_refresh_locks(cred)
+        seen = {}
+
+        class _Observing(_Endpoint):
+            def __call__(self, url, payload):
+                seen["held"] = [p.is_dir() and time.time() - p.stat().st_mtime < 5
+                                for p in locks]
+                seen["in_flight"] = ca.cli_refresh_in_flight(cred)
+                return super().__call__(url, payload)
+
+        ep = _Observing()
+        assert _ensure(cred, ep)["action"] == "refreshed"
+        assert seen["held"] == [True, True], seen
+        assert seen["in_flight"] is True
+        assert not any(p.exists() for p in locks), "released after the refresh"
+        assert json.loads(cred.read_text())["claudeAiOauth"]["refreshToken"] == "rt2"
 
 
 def test_concurrent_spawners_perform_exactly_one_refresh():
