@@ -141,9 +141,11 @@ await ok('play from idle speaks at once, with no cancel first', () => {
 });
 await ok('progress moves with the engine: start, boundaries, then the next piece', async () => {
   const p0 = reader.pieces[0];
+  assert.equal(events.filter((e) => e.event === 'piece').length, 1, 'one piece event per hand-over');
+  const n = events.length;
   synth.start();
   assert.equal(reader.starting, false);
-  assert.equal(events.at(-1).event, 'piece');
+  assert.equal(events.length, n, 'the engine start itself announces nothing; ticks carry it');
   assert.equal(reader.progress().offset, 0);
   synth.boundary(10);
   assert.ok(reader.progress().offset >= 10, 'a word boundary moves the position');
@@ -153,6 +155,7 @@ await ok('progress moves with the engine: start, boundaries, then the next piece
   synth.finish();
   assert.equal(reader.pos, 1);
   assert.equal(spoken(), 2, 'the next piece is handed over as soon as one ends');
+  assert.equal(events.filter((e) => e.event === 'piece').length, 2, 'still one piece event per hand-over');
   assert.equal(reader.progress().offset, reader.pieces[1].start);
 });
 

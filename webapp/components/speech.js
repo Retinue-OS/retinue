@@ -103,7 +103,8 @@ function pickVoice(lang) {
 // `onstate(id)` fires when the item being read changes (null when done or
 // stopped), so a view can highlight the row. `onprogress(ev)` fires on every
 // transition and on a timer while playing, with `ev.event` one of load, start,
-// piece, tick, pause, seek, error, end, stop and the current `progress()`.
+// piece (a piece was handed to the engine), tick, pause, seek, error, end,
+// stop and the current `progress()`.
 export class Reader {
   constructor(onstate) {
     this.onstate = onstate || (() => {});
@@ -359,10 +360,11 @@ export class Reader {
     const live = () => gen === this._gen && this._utter === utter;
     utter.onstart = () => {
       if (!live()) return;
+      // The position was announced at hand-over; the start only anchors the
+      // in-piece estimate, which the next tick picks up.
       this.starting = false;
       this._startedAt = Date.now();
       this._boundary = 0;
-      this._emit('piece');
     };
     utter.onboundary = (e) => {
       if (!live()) return;

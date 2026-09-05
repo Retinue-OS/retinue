@@ -1448,7 +1448,8 @@ class RetinueConversations extends HTMLElement {
         const open = e.target.closest('[data-p-open]');
         if (open) this._openThread(open.getAttribute('data-p-open'));
       });
-      // Dragging previews the position; releasing seeks there.
+      // Dragging previews the position; releasing seeks there. While the
+      // drag lasts the reader's ticks leave the bar alone (see _updatePlayer).
       host.addEventListener('input', (e) => {
         if (!e.target.matches('[data-p-seek]')) return;
         this._scrubbing = true;
@@ -1459,6 +1460,19 @@ class RetinueConversations extends HTMLElement {
         this._scrubbing = false;
         this._reader.seek(Number(e.target.value) / 1000);
       });
+      // A release that lands on the value the drag started from fires no
+      // change event; the bar must not stay frozen on the preview then. The
+      // check runs a task later, after any change event of the same release.
+      const unscrub = (e) => {
+        if (!e.target.matches('[data-p-seek]')) return;
+        setTimeout(() => {
+          if (!this._scrubbing) return;
+          this._scrubbing = false;
+          this._updatePlayer();
+        }, 0);
+      };
+      host.addEventListener('pointerup', unscrub);
+      host.addEventListener('pointercancel', unscrub);
     }
     this._updatePlayer();
   }
@@ -1495,17 +1509,19 @@ class RetinueConversations extends HTMLElement {
   }
 
   // Slider and label only. `preview` (0..1) is the value under the user's
-  // finger while dragging; otherwise the reader's own position is shown.
+  // finger while dragging; otherwise the reader's own position is shown —
+  // except during a drag, when only the drag's own previews may touch the bar.
   _updatePlayer(preview) {
+    const previewing = typeof preview === 'number';
+    if (this._scrubbing && !previewing) return;
     const root = this.shadowRoot;
     const bar = root && root.querySelector('.player');
     if (!bar) return;
     const pr = this._reader.progress();
-    const previewing = typeof preview === 'number';
     const fraction = previewing ? preview : pr.fraction;
     const seek = bar.querySelector('[data-p-seek]');
     if (seek) {
-      if (!this._scrubbing || previewing) seek.value = String(Math.round(fraction * 1000));
+      seek.value = String(Math.round(fraction * 1000));
       seek.style.setProperty('--p', `${(fraction * 100).toFixed(1)}%`);
       seek.setAttribute('aria-valuetext', `${Math.round(fraction * 100)}%`);
     }
