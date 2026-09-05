@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -72,7 +73,7 @@ def default_focus() -> dict:
 
 def default_profile() -> dict:
     """The attention profile (profile.json): importance priors, lead times, permits."""
-    return {"priors": {}, "leads": dict(DEFAULT_LEADS), "permits": {mid: [] for mid in DEFAULT_MODES}, "learned": []}
+    return {"priors": {}, "spheres": {}, "leads": dict(DEFAULT_LEADS), "permits": {mid: [] for mid in DEFAULT_MODES}, "learned": []}
 
 
 def load_json(path: Path, default: dict) -> dict:
@@ -110,6 +111,47 @@ def parse_dt(value) -> datetime | None:
     if isinstance(value, datetime):
         return value
     return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+
+
+# A bare date as a deadline means the end of that working day, not midnight:
+# "due Friday" gives the whole of Friday, and the lead-time ratio then counts
+# down to an hour people actually work towards.
+DATE_DUE_HOUR = 17
+
+_LEAD_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([mhdw]?)\s*$", re.IGNORECASE)
+_LEAD_UNITS = {"": 1, "m": 1, "h": 60, "d": DAY, "w": 7 * DAY}
+
+
+def parse_lead(text) -> float | None:
+    """A lead time as agents write it — ``90`` or ``90m`` (minutes), ``2h``,
+    ``3d``, ``2w`` — in minutes; None when it is not one."""
+    if text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return float(text) if text >= 0 else None
+    m = _LEAD_RE.match(str(text))
+    if not m:
+        return None
+    return float(m.group(1)) * _LEAD_UNITS[m.group(2).lower()]
+
+
+def parse_due(text, now: datetime) -> datetime | None:
+    """A deadline as agents write it: an ISO date-time (a naive one is read in
+    ``now``'s zone) or a bare ``YYYY-MM-DD`` (DATE_DUE_HOUR of that day). None
+    when absent or unparseable."""
+    if text is None or text == "":
+        return None
+    if isinstance(text, datetime):
+        return text if text.tzinfo else text.replace(tzinfo=now.tzinfo)
+    raw = str(text).strip()
+    try:
+        if len(raw) == 10:
+            d = datetime.strptime(raw, "%Y-%m-%d")
+            return d.replace(hour=DATE_DUE_HOUR, tzinfo=now.tzinfo)
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=now.tzinfo)
 
 
 def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
@@ -246,17 +288,30 @@ def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> st
     tag = next((t for t in item.get("tags") or [] if t in mode.get("admit_tags", [])), None)
     if tag:
         return f"{mode['name']} admits the tag {tag}"
-    sender = item.get("sender")
-    if sender and sender in (profile.get("permits", {}).get(mode["id"]) or []):
-        return f"{sender} holds a {mode['name']} permit"
+    if has_permit(item, mode, profile):
+        return f"{item['sender']} holds a {mode['name']} permit"
     if mode["threshold"] == "critical":
         return f"{mode['name']} admits only critical"
     return f"{mode['name']} does not admit {item['sphere']}"
 
 
+def has_permit(item: dict, mode: dict, profile: dict) -> bool:
+    sender = item.get("sender")
+    return bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or [])
+
+
 def breaks_through(item: dict, mode: dict, profile: dict, now: datetime) -> bool:
+    """Critical rings everywhere. Otherwise an item breaks through at or above
+    the mode's threshold when its sphere or a tag is admitted — or, holding a
+    permit, at *active* already: a permit admits the sender and lowers the bar
+    for them (the brief), while importance still decides the level, so a
+    trivial note from a permitted sender stays in the digest."""
     lvl = level(item, now)
-    return lvl == "critical" or (RANK[lvl] >= RANK[mode["threshold"]] and admitted(item, mode, profile))
+    if lvl == "critical":
+        return True
+    if has_permit(item, mode, profile):
+        return RANK[lvl] >= RANK["active"]
+    return RANK[lvl] >= RANK[mode["threshold"]] and admitted(item, mode, profile)
 
 
 def next_breakpoint(focus: dict, now: datetime) -> datetime:
@@ -274,6 +329,24 @@ def next_breakpoint(focus: dict, now: datetime) -> datetime:
     if candidates:
         return start_of_day + timedelta(minutes=min(candidates))
     return start_of_day + timedelta(days=1, minutes=min(focus["digest_times"]))
+
+
+def due_events(focus: dict, now: datetime) -> set[str]:
+    """What this minute is due for: ``digest`` at a digest time, ``mode`` at a
+    scheduled change that counts as a breakpoint (see next_breakpoint), and
+    ``sweep`` every SWEEP_EVERY_MINUTES."""
+    m = minute_of_day(now)
+    events = set()
+    if m in focus["digest_times"]:
+        events.add("digest")
+    if not focus.get("manual"):
+        schedule = focus["schedule"]
+        for k, (start, _mid) in enumerate(schedule):
+            if start == m and (k == 0 or schedule[k - 1][1] != "off"):
+                events.add("mode")
+    if m % SWEEP_EVERY_MINUTES == 0:
+        events.add("sweep")
+    return events
 
 
 # ---- delivery -----------------------------------------------------------------------
@@ -396,6 +469,16 @@ def correct(item: dict, profile: dict, patch: dict, now: datetime) -> list[str]:
             learned.append(f"lead time for “{item['kind_label']}” → {fmt_duration(item['lead'])}")
     if "due" in patch:
         item["due"] = parse_dt(patch["due"])
+    if patch.get("sphere"):
+        item["sphere"] = str(patch["sphere"])
+        key = item.get("sender")
+        if key:
+            profile.setdefault("spheres", {})[key] = item["sphere"]
+            learned.append(f"sphere for {key} → {item['sphere']}")
+    if isinstance(patch.get("tags"), list):
+        item["tags"] = [str(t) for t in patch["tags"] if str(t).strip()]
+    if "critical" in patch:
+        item["critical"] = bool(patch["critical"])
     for text in learned:
         profile.setdefault("learned", []).append({"at": now.isoformat(), "text": text})
     return learned

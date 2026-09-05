@@ -52,6 +52,14 @@ import conversation_notify  # noqa: E402
 from conversation_notify import ConversationNotifier  # noqa: E402
 
 LOG = "[claude-auth-monitor]"
+# How the sign-in threads present themselves to the dashboard's attention
+# model (docs/attention-model.md). A broken sign-in stops every agent, so it
+# is declared critical — it rings in every mode, Off included. The advance
+# warning is a system alert of high importance that rings where the system
+# sphere is admitted and otherwise waits for the next digest.
+BROKEN_ATTENTION = {"importance": 5, "sphere": "system", "kind": "system alert", "critical": True}
+WARN_ATTENTION = {"importance": 4, "sphere": "system", "kind": "system alert", "lead": "1d"}
+
 
 INTERVAL = float(os.environ.get("CLAUDE_AUTH_MONITOR_INTERVAL", "") or "300")
 # Consecutive non-ok checks before the user is notified. Claude's own token
@@ -185,7 +193,8 @@ class AuthMonitorEngine:
             title = ("Claude sign-in broken" if level == "broken"
                      else "Claude sign-in expires soon")
             message = broken_message(reason) if level == "broken" else warn_message(reason)
-            thread_id = self.notifier.open_thread(title, message)
+            thread_id = self.notifier.open_thread(
+                title, message, attention=BROKEN_ATTENTION if level == "broken" else WARN_ATTENTION)
             if thread_id:
                 entry.update(thread_id=thread_id, notified=True,
                              last_notice=now, level=level)
@@ -195,7 +204,8 @@ class AuthMonitorEngine:
         if level != entry.get("level"):
             # warn → broken (the predicted outage arrived) or broken → warn
             # (partial recovery): say so right away, in the same thread.
-            if self.notifier.append(entry["thread_id"], change_message(level, reason)):
+            if self.notifier.append(entry["thread_id"], change_message(level, reason),
+                                    attention=BROKEN_ATTENTION if level == "broken" else WARN_ATTENTION):
                 entry.update(level=level, last_notice=now)
             return
 

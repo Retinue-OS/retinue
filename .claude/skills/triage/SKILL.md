@@ -265,8 +265,16 @@ without touching the gate.
        python3 /workspace/scripts/conversation-push.py \
          --title "Signal from <resolved name>" \
          --key <the prompt's thread key, verbatim> \
+         --importance 4 --due 2026-09-06T09:00 --kind "customer request" --sphere customers \
          --context 'Reply via: python3 /workspace/scripts/signal-push.py --reply-to v1.eyJyIjoi….3q2- "<text>"' \
          "<quoted original>\n\n<the secretary's reply, or the question and its chips>"
+
+   The attention flags are the classification's other half (see 4a): the
+   dashboard's home lists this thread by them and decides from them and the
+   user's focus mode whether it rings now or waits for the digest. Set them
+   on the chat as well — the chat's own row on the home — with
+   `attention-set.py chat:<the rail's chat id> --importance … --due … --kind …
+   --sphere … --sender-sphere`, so the message and the thread agree.
 
 2. **Resolves the sender to a name first** — the **messaging-contact-lookup**
    skill, before the thread is opened. A bare handle in the title makes the
@@ -424,11 +432,28 @@ quoted above it, and nothing is sent.
 
     # facts settled it — propose the reply
     python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" \
+      --importance 3 --kind acknowledgement --sphere friends \
       "<quoted original>\n\n<the secretary's reply>\n<send / adjust / discard chips>"
 
     # the user owns the answer — ask, do not draft
     python3 /workspace/scripts/conversation-push.py --title "<name> asks about <subject>" \
+      --importance 4 --due 2026-09-05T12:00 --kind invitation --sphere friends \
       "<quoted original>\n\n<the question>\n[[chip: This morning]] [[chip: Friday morning]] [[chip: Neither works]]"
+
+**Declare how much it matters.** Every thread you open carries the four
+properties of `docs/attention-model.md` — `--importance` (0–5: 4+ is worth
+an interruption on its own, 2–3 only with a deadline, 0–1 is chatter),
+`--due` with an optional `--lead`, `--kind` (which supplies the lead-time
+default: "customer request", "invitation", "appointment", "tax filing", …),
+`--sphere` with `--tag` for a second sphere — and the gateway decides from
+them and the user's focus mode whether the thread rings now, waits for the
+next digest, or is merely listed. A thread that declares nothing is passive:
+listed, never pushed. Take the values from the classification you just made
+(the sender's relationship is the sphere, the deadline the message names is
+the due date); `--critical` only for what must ring in every mode, Off
+included — an outage, a deadline within the hour — never for ordinary
+importance. The reply reports the decision (`attention.delivery`); a hold is
+not a failure, and not a notification either.
 
 **Never post a draft that defers the substance.** "Thanks for your message,
 let me check and get back to you" is not a reply: it spends a round trip to

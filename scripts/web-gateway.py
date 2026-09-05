@@ -186,11 +186,13 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
+import attention as attention_policy
+import attention_store
 import claude_auth
 import chat_state as chat_state_mod
 import email_client as ec
@@ -1044,6 +1046,10 @@ _CONV_READ_RE = re.compile(r"^/conversations/([0-9a-f]{32})/read/?$")
 _CONV_ARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/archive/?$")
 _CONV_UNARCHIVE_RE = re.compile(r"^/conversations/([0-9a-f]{32})/unarchive/?$")
 _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
+# The attention model's writes: the mode, the rules, and the actions on one
+# item (its id travels in the body — chat ids and project URIs carry
+# characters no path segment should).
+_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|permits|admit|profile|later|pull|done|reopen|correct)/?$")
 
 # ── Push notifications ─────────────────────────────────────────────────────────
 # The unread badge only exists while the dashboard is open, which is precisely
@@ -1054,6 +1060,36 @@ _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
 # endpoints report disabled and the dashboard hides its opt-in button.
 PUSH_DIR = Path(os.environ.get("PUSH_DIR", str(CONVERSATIONS_DIR.parent / "push")))
 push_notify.init(PUSH_DIR)
+
+# ── Attention (the home screen's model) ────────────────────────────────────
+# What the dashboard shows first is no longer three cards but one list of what
+# wants attention — threads, chats and projects alike — each item with an
+# importance, a deadline against a lead time, a sphere, and a delivery
+# decision made HERE: pushed now, held for the next digest, or merely listed.
+# The policy is scripts/attention.py (design: docs/attention-model.md); the
+# gateway assembles the items, keeps the two small documents the policy
+# needs (focus.json: modes and schedule; profile.json: priors, lead times,
+# permits) under ATTENTION_DIR, gates every push through the mode in force,
+# and runs the breakpoints and the half-hourly sweep on its own tick, so the
+# digest goes out with no browser open. ATTENTION_DIR defaults beside the
+# conversations, on the persistent volume.
+ATTENTION_DIR = Path(os.environ.get("ATTENTION_DIR", str(CONVERSATIONS_DIR.parent / "attention")))
+_ATTENTION = attention_store.AttentionStore(ATTENTION_DIR)
+# The tick wakes this often to see whether the minute is due for anything
+# (a digest, a scheduled mode change, the sweep); well under a minute so no
+# minute is skipped, and nothing happens on a tick that is due for nothing.
+ATTENTION_TICK_SECONDS = float(os.environ.get("ATTENTION_TICK_SECONDS", "20"))
+# The life-store emit of the open items' properties (docs/attention-model.md).
+ATTENTION_EMIT_PATH = Path(os.environ.get(
+    "ATTENTION_EMIT_PATH", str(CHAMBERS_DIR / "_generated" / "attention" / "items.nt")))
+# Whether the model's delivery decision governs the push (the default) or
+# every arrival pushes as it did before the model existed, while the decision
+# is still made and recorded (the list, the digest and the sweep work either
+# way). Off is the rollback for a deployment whose agents do not yet declare
+# importance — nothing is lost, only the quiet.
+ATTENTION_PUSH_GATE = os.environ.get("ATTENTION_PUSH_GATE", "1").strip().lower() not in ("0", "false", "no")
+# Tests pin the clock: a callable returning an aware datetime, or None for now.
+ATTENTION_CLOCK = None
 
 # ── Dashboard (PWA) static assets ──────────────────────────────────────────────
 # The dashboard front-end is a static PWA served at the site root. Its shell
@@ -2676,7 +2712,7 @@ def _conv_event_mode(conv: dict) -> str:
     return "reply"
 
 
-def _push_conv_notification(conv: dict, text: str) -> int:
+def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:
     """Notify the user's devices that a thread needs their attention.
 
     Called for every agent→user turn that lands unread: a thread Ara opens, a
@@ -2705,7 +2741,8 @@ def _push_conv_notification(conv: dict, text: str) -> int:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
                              mode=_conv_event_mode(conv),
-                             archived=bool(conv.get("archived")))
+                             archived=bool(conv.get("archived")),
+                             urgency=urgency)
     return subscribers
 
 
@@ -3957,7 +3994,8 @@ _RETO = "urn:retinue:actor:reto"
 _PROJECTS_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-SELECT ?p ?title ?actor ?next ?since ?expected ?status WHERE {
+SELECT ?p ?title ?actor ?next ?since ?expected ?status
+       ?importance ?sphere ?tag ?kind ?nextDue ?remindBefore WHERE {
   ?p rdf:type k:Project .
   OPTIONAL { ?p k:title ?title }
   OPTIONAL { ?p k:currentActor ?actor }
@@ -3966,10 +4004,20 @@ SELECT ?p ?title ?actor ?next ?since ?expected ?status WHERE {
   OPTIONAL { ?p k:expectedBy ?expected }
   OPTIONAL { ?p k:status ?status }
   OPTIONAL { ?p k:paused ?paused }
+  OPTIONAL { ?p k:importance ?importance }
+  OPTIONAL { ?p k:sphere ?sphere }
+  OPTIONAL { ?p k:tag ?tag }
+  OPTIONAL { ?p k:kind ?kind }
+  OPTIONAL { ?p k:nextDue ?nextDue }
+  OPTIONAL { ?p k:remindBefore ?remindBefore }
   FILTER (!BOUND(?paused) || ?paused = false)
   FILTER (!BOUND(?status) || ?status != "done")
 } ORDER BY ?title
 """ % _KB
+# The attention properties (importance / sphere / tag / kind, and the wake
+# fields next_due / remind_before) reach the store only where a chamber's
+# Markdown converter maps them; unmapped, they are simply unbound and the
+# attention model falls back to its defaults (docs/attention-model.md).
 
 
 def _humanize_slug(uri: str) -> str:
@@ -4002,28 +4050,60 @@ def _sparql_bindings(query: str) -> list[dict]:
     return payload.get("results", {}).get("bindings", [])
 
 
-def _fetch_projects() -> dict:
-    """Query the life store and shape the result into the card's JSON. Returns
-    {"generated": iso, "mine": [...], "waiting": [...]} on success. Raises on any
-    transport/parse error so the caller can surface an honest 502."""
-    mine, waiting = [], []
+def _fetch_project_rows() -> list[dict]:
+    """Every running project as one row — the frontmatter fields the card and
+    the attention model read. The optional ``k:tag`` multiplies a project's
+    bindings, so rows are folded on the project URI here. Raises on any
+    transport/parse error."""
+    rows: dict[str, dict] = {}
     for b in _sparql_bindings(_PROJECTS_SPARQL):
         def val(key):
             cell = b.get(key)
             return cell.get("value") if cell else None
         pid = val("p") or ""
-        actor = val("actor")
+        if not pid:
+            continue
+        row = rows.get(pid)
+        if row is None:
+            row = rows[pid] = {
+                "id": pid,
+                "title": val("title") or _humanize_slug(pid),
+                "actor": val("actor"),
+                "next": val("next"),
+                "expected": val("expected"),
+                "since": val("since"),
+                "importance": val("importance"),
+                "sphere": val("sphere"),
+                "tags": [],
+                "kind": val("kind"),
+                "next_due": val("nextDue"),
+                "remind_before": val("remindBefore"),
+            }
+        tag = val("tag")
+        if tag and tag not in row["tags"]:
+            row["tags"].append(tag)
+    return list(rows.values())
+
+
+def _fetch_projects() -> dict:
+    """Query the life store and shape the result into the card's JSON. Returns
+    {"generated": iso, "mine": [...], "waiting": [...]} on success. Raises on any
+    transport/parse error so the caller can surface an honest 502."""
+    mine, waiting = [], []
+    for row in _fetch_project_rows():
+        pid = row["id"]
+        actor = row["actor"]
         item = {
             "id": pid,
-            "title": val("title") or _humanize_slug(pid),
-            "next": val("next"),
-            "expected": val("expected"),
+            "title": row["title"],
+            "next": row["next"],
+            "expected": row["expected"],
         }
         if actor == _RETO:
             mine.append(item)
         else:
             item["waitingOn"] = _humanize_slug(actor) if actor else None
-            item["since"] = val("since")
+            item["since"] = row["since"]
             waiting.append(item)
 
     mine.sort(key=lambda i: i["title"].lower())
@@ -5210,7 +5290,7 @@ def _chats_ingest_authorized(provided: str) -> bool:
 
 
 def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
-                            had_unread: bool) -> None:
+                            had_unread: bool, urgency: str | None = None) -> None:
     """Web-Push one arrival: title = chat, body = preview, tap-through = the
     chat page. Deterministic — no model turn is spent on notification."""
     if not push_notify.enabled():
@@ -5222,7 +5302,437 @@ def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
         body = body[:157].rstrip() + "…"
     url = "/chat.html?" + urllib.parse.urlencode({"id": chat_id})
     push_notify.notify_async(title, body, url=url, tag=chat_id,
-                             mode="reply" if had_unread else "new")
+                             mode="reply" if had_unread else "new", urgency=urgency)
+
+
+# ── Attention: the home screen's model ──────────────────────────────────────
+# The policy lives in scripts/attention.py and the adapters in
+# scripts/attention_store.py; what follows is the gateway's part — assembling
+# the items from its three sources, storing each decision back on the item's
+# own document, pushing what the policy says to push, and the tick.
+
+_attention_lock = threading.RLock()
+_attention_tick_state: dict = {"minute": None, "emitted": False}
+
+
+def _attention_now() -> datetime:
+    if ATTENTION_CLOCK is not None:
+        return ATTENTION_CLOCK()
+    return _ATTENTION.now()
+
+
+def _attention_thread_items(profile: dict) -> list[dict]:
+    items = []
+    for path in CONVERSATIONS_DIR.glob("*.json"):
+        if not _CONV_ID_RE.match(path.stem):
+            continue
+        conv = _load_conv(path.stem)
+        if conv is None or not attention_store.thread_wants_attention(conv):
+            continue
+        items.append(attention_store.thread_item(conv, profile))
+    return items
+
+
+def _attention_chat_items(profile: dict) -> list[dict]:
+    """Raises when the life store is down — the caller degrades honestly."""
+    docs = _CHAT_STATE.all()
+    items = []
+    for chat in _chats_payload()["chats"]:
+        state = docs.get(chat["id"]) or {}
+        if not attention_store.chat_wants_attention(chat, state):
+            continue
+        items.append(attention_store.chat_item(chat, state, profile))
+    return items
+
+
+def _attention_project_items(profile: dict, now: datetime) -> list[dict]:
+    """Raises when the life store is down — the caller degrades honestly."""
+    states = _ATTENTION.projects()
+    return [attention_store.project_item(row, states.get(row["id"]), profile, now, _RETO)
+            for row in _fetch_project_rows()]
+
+
+def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str]]:
+    """Every item from the three sources, plus the names of the sources that
+    could not be read (the store down): the list is served with what there
+    is and says so, rather than failing whole."""
+    items = _attention_thread_items(profile)
+    degraded = []
+    for name, fetch in (("chats", lambda: _attention_chat_items(profile)),
+                        ("projects", lambda: _attention_project_items(profile, now))):
+        try:
+            items.extend(fetch())
+        except Exception as exc:  # noqa: BLE001 - transport/parse: degrade, do not fail
+            print(f"[web-gateway] attention: {name} unavailable ({exc})", flush=True)
+            degraded.append(name)
+    return items, degraded
+
+
+def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
+    """One item by its id (``thread:<cid>``, ``chat:<chat id>``, a project
+    URI), assembled the same way the list is. A chat or project whose live
+    row cannot be fetched is still resolved from what the gateway keeps, so
+    an action on it works while the store is catching up."""
+    if item_id.startswith("thread:"):
+        conv = _load_conv(item_id[len("thread:"):])
+        if conv is None or (conv.get("kind") or "chat") != "chat":
+            return None
+        return attention_store.thread_item(conv, profile)
+    if item_id.startswith("chat:"):
+        chat_id = item_id[len("chat:"):]
+        state = _CHAT_STATE.get(chat_id)
+        row = None
+        try:
+            row = next((c for c in _chats_payload()["chats"] if c["id"] == chat_id), None)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] attention: chat row unavailable ({exc})", flush=True)
+        if row is None:
+            if not state.get("attention"):
+                return None
+            channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+            row = {"id": chat_id, "name": _chat_display_name(state, channel, key),
+                   "channel": channel, "unread": 0, "last": {},
+                   "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
+                   "group": state.get("group")}
+        return attention_store.chat_item(row, state, profile)
+    states = _ATTENTION.projects()
+    row = None
+    try:
+        row = next((r for r in _fetch_project_rows() if r["id"] == item_id), None)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] attention: project row unavailable ({exc})", flush=True)
+    if row is None:
+        if item_id not in states:
+            return None
+        row = {"id": item_id, "title": _humanize_slug(item_id), "actor": _RETO}
+    return attention_store.project_item(row, states.get(item_id), profile, now, _RETO)
+
+
+def _attention_persist(item: dict) -> None:
+    """Store the item's attention block back where the item lives."""
+    block = attention_store.block_for(item)
+    kind = item.get("kind")
+    if kind == "thread":
+        with _conversations_lock:
+            conv = _load_conv(item["source_id"])
+            if conv is not None:
+                conv["attention"] = block
+                _save_conv(conv)
+    elif kind == "chat":
+        _CHAT_STATE.set_attention(item["source_id"], block)
+        _chats_cache_invalidate()
+    else:
+        _ATTENTION.save_project(item["source_id"], block)
+
+
+def _attention_spec_to_block(spec, block: dict, now: datetime) -> dict:
+    """Fold what an agent declared about an item — importance, deadline, lead,
+    sphere, tags, kind, critical, actor — into its attention block. Unknown
+    keys and unparseable values are dropped, never errors: a declaration is
+    advice to the model, not a contract."""
+    if not isinstance(spec, dict):
+        return block
+    if spec.get("importance") is not None:
+        try:
+            block["importance"] = max(0.0, min(5.0, float(spec["importance"])))
+            block["importance_from"] = str(spec.get("importance_from") or "agent")
+        except (TypeError, ValueError):
+            pass
+    if "due" in spec:
+        due = attention_policy.parse_due(spec.get("due"), now)
+        block["due"] = due.isoformat() if due else None
+    lead = attention_policy.parse_lead(spec.get("lead"))
+    if lead is not None:
+        block["lead"] = lead
+        block["lead_from"] = "agent"
+    if spec.get("sphere"):
+        block["sphere"] = str(spec["sphere"]).strip().lower()
+    if isinstance(spec.get("tags"), list):
+        block["tags"] = [str(t).strip().lower() for t in spec["tags"] if str(t).strip()]
+    if spec.get("kind"):
+        block["kind"] = str(spec["kind"]).strip().lower()
+    if "critical" in spec:
+        block["critical"] = bool(spec["critical"])
+    if spec.get("actor"):
+        block["actor"] = str(spec["actor"]).strip()
+        if block["actor"] != "you" and not block.get("waiting_since"):
+            block["waiting_since"] = now.isoformat()
+    return block
+
+
+def _attention_decision_body(decision: dict, item: dict) -> dict:
+    """What an agent is told about its item's delivery, so it can relay it
+    honestly ("held until 12:00 — Deep work admits only critical")."""
+    body = {"delivery": decision["deliver"], "level": decision["level"],
+            "reason": decision.get("reason", ""), "id": item["id"]}
+    until = decision.get("until")
+    if until is not None:
+        body["until"] = until.isoformat()
+    return body
+
+
+def _attention_arrive_thread(conv: dict, spec, reopen: bool = False) -> tuple[dict, dict]:
+    """Run the model over a thread an agent opened, or appended news to.
+
+    Returns ``(decision, item)`` and stores the block. A reopened thread is
+    judged afresh — released state and any snooze are cleared, the push
+    history kept — since the news is what the user has not seen."""
+    with _attention_lock:
+        now = _attention_now()
+        focus = _ATTENTION.focus()
+        profile = _ATTENTION.profile()
+        block = _attention_spec_to_block(spec, dict(conv.get("attention") or {}), now)
+        block["state"] = "open"
+        if conv.get("initiator") != "agent":
+            # The user's own thread is never gated: they asked, and what
+            # lands in it — Ara's answer, a file an agent adds — is pushed the
+            # way it always was. The block still records what was declared.
+            block["released"] = True
+            item = attention_store.thread_item(dict(conv, attention=block), profile)
+            _attention_persist(item)
+            return ({"deliver": "push", "level": attention_policy.level(item, now),
+                     "reason": "your own thread is never held"}, item)
+        if reopen:
+            block["released"] = False
+            block["snoozed_until"] = None
+        conv = dict(conv, attention=block)
+        item = attention_store.thread_item(conv, profile)
+        decision = attention_policy.on_arrival(item, focus, profile, now)
+        _attention_persist(item)
+        return decision, item
+
+
+def _attention_append(conv: dict, message: str, payload: dict) -> int:
+    """News appended to a thread goes through the model like an opening does;
+    a thread of another kind keeps the plain push. Returns the device count
+    the fan-out targets, as _push_conv_notification does."""
+    if (conv.get("kind") or "chat") != "chat":
+        return _push_conv_notification(conv, message)
+    decision, _item = _attention_arrive_thread(conv, payload.get("attention"), reopen=True)
+    if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
+        return _push_conv_notification(conv, message, urgency="high" if decision["deliver"] == "push" else None)
+    print(f"[web-gateway] attention: thread {conv['id']} {decision['deliver']} — "
+          f"{decision.get('reason', '')}", flush=True)
+    return push_notify.subscription_count() if push_notify.enabled() else 0
+
+
+def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None) -> tuple[dict, dict]:
+    """Run the model over one inbound chat message. The per-class repeat
+    policy applies to a chat that is already held: a family sender writing
+    again in Off breaks through, anyone else waits with the first message."""
+    with _attention_lock:
+        now = _attention_now()
+        focus = _ATTENTION.focus()
+        profile = _ATTENTION.profile()
+        mode = attention_policy.mode_at(focus, now)
+        channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+        row = {"id": chat_id, "name": _chat_display_name(doc, channel, key), "channel": channel,
+               "unread": 1, "last": {"text": entry.get("text") or "",
+                                     "kind": "image" if entry.get("attachments") and not entry.get("text") else "text"},
+               "archived": False, "muted": bool(doc.get("muted")), "group": doc.get("group")}
+        previous = dict(doc.get("attention") or {})
+        was_held = bool(previous) and previous.get("state", "open") == "open" and not previous.get("released")
+        block = _attention_spec_to_block(spec, previous, now)
+        block["state"] = "open"
+        block["released"] = False
+        block["snoozed_until"] = None
+        state = dict(doc, attention=block)
+        item = attention_store.chat_item(row, state, profile)
+        if was_held and attention_policy.repeat_policy(item, mode)["escalate"]:
+            item["released"] = True
+            item["last_level"] = attention_policy.level(item, now)
+            item.setdefault("pushed", []).append(now)
+            decision = {"deliver": "push", "level": item["last_level"], "urgency": "high",
+                        "reason": attention_policy.repeat_policy(item, mode)["reason"]}
+        else:
+            decision = attention_policy.on_arrival(item, focus, profile, now)
+        _attention_persist(item)
+        return decision, item
+
+
+def _attention_mark(item_id: str, state: str, how: str | None = None) -> bool:
+    """Mark an item done (a reply sent, *Mark done*) or open again."""
+    with _attention_lock:
+        now = _attention_now()
+        item = _attention_item(item_id, _ATTENTION.profile(), now)
+        if item is None:
+            return False
+        item["state"] = state
+        if state == "done":
+            item["done_at"] = now.isoformat()
+            item["done_how"] = how
+        else:
+            item["released"] = True
+            item["snoozed_until"] = None
+        _attention_persist(item)
+        return True
+
+
+def _attention_push_item(item: dict, reason: str = "") -> int:
+    """Push one item that the sweep, a correction or a Focus change released."""
+    if not push_notify.enabled():
+        return 0
+    kind = item.get("kind")
+    if kind == "thread":
+        conv = _load_conv(item["source_id"])
+        return _push_conv_notification(conv, item.get("preview") or item["title"], urgency="high") if conv else 0
+    title = item["title"]
+    body = " ".join(str(item.get("preview") or reason or "").split())[:160]
+    tag = item["source_id"]
+    push_notify.notify_async(title, body or "wants your attention", url=item["href"], tag=tag,
+                             mode="new", urgency="high")
+    return push_notify.subscription_count()
+
+
+def _attention_push_digest(digest: dict, now: datetime) -> int:
+    """The breakpoint's one push: what waited, collapsed on the ``digest``
+    topic so an undelivered digest is replaced rather than stacked."""
+    items = digest["items"]
+    n = len(items)
+    if not push_notify.enabled() or not n:
+        return 0
+    title = f"Digest {now.strftime('%H:%M')} · {n} thing{'s' if n != 1 else ''} waited"
+    body = "; ".join(i["title"] for i in items[:5]) + (" …" if n > 5 else "")
+    push_notify.notify_async(title, body, url="/", tag="attention-digest", mode="new",
+                             urgency="normal", topic="digest")
+    return push_notify.subscription_count()
+
+
+def _attention_breakpoint(items: list[dict], focus: dict, now: datetime, why: str) -> dict | None:
+    bp = attention_policy.breakpoint(items, focus, now)
+    digest = bp.get("digest")
+    if digest:
+        for item in digest["items"]:
+            _attention_persist(item)
+        _attention_push_digest(digest, now)
+        print(f"[web-gateway] attention: {why} released {len(digest['items'])} held item(s)", flush=True)
+    return digest
+
+
+def _attention_emit(items: list[dict]) -> None:
+    try:
+        attention_store.emit(items, ATTENTION_EMIT_PATH)
+    except OSError as exc:
+        print(f"[web-gateway] attention: emit failed ({exc})", flush=True)
+
+
+def _attention_tick(now: datetime | None = None) -> dict:
+    """What the gateway does on its own clock: at a digest time or a scheduled
+    mode change, release what was held and push the digest; every half hour,
+    the sweep — items that crossed into the next urgency band climb, and
+    those the mode now admits are pushed. Runs at most once per minute; a
+    minute due for nothing costs nothing (no store query)."""
+    now = now or _attention_now()
+    key = now.strftime("%Y-%m-%d %H:%M")
+    if _attention_tick_state["minute"] == key:
+        return {}
+    _attention_tick_state["minute"] = key
+    with _attention_lock:
+        focus = _ATTENTION.focus()
+        profile = _ATTENTION.profile()
+        events = attention_policy.due_events(focus, now)
+        if not events and _attention_tick_state["emitted"]:
+            return {}
+        items, _degraded = _attention_items(profile, now)
+        report: dict = {"at": key, "events": sorted(events), "pushed": [], "digest": 0}
+        if "digest" in events or "mode" in events:
+            digest = _attention_breakpoint(items, focus, now, "the breakpoint")
+            report["digest"] = len(digest["items"]) if digest else 0
+        if "sweep" in events:
+            before = {i["id"]: attention_store.block_for(i) for i in items}
+            for effect in attention_policy.sweep(items, focus, profile, now):
+                if effect["type"] == "push":
+                    _attention_push_item(effect["item"], effect.get("reason", ""))
+                    report["pushed"].append(effect["item"]["id"])
+                    print(f"[web-gateway] attention: sweep pushed {effect['item']['id']} — {effect.get('reason', '')}", flush=True)
+            for item in items:
+                if attention_store.block_for(item) != before[item["id"]]:
+                    _attention_persist(item)
+        _attention_emit(items)
+        _attention_tick_state["emitted"] = True
+        return report
+
+
+def _attention_tick_loop() -> None:
+    while True:
+        try:
+            _attention_tick()
+        except Exception as exc:  # noqa: BLE001 - the loop must survive a bad minute
+            print(f"[web-gateway] attention tick failed: {exc!r}", flush=True)
+        time.sleep(ATTENTION_TICK_SECONDS)
+
+
+def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
+    """One item as the home screen shows it: the display fields beside the
+    three attention fields, each explained."""
+    mode = attention_policy.mode_at(focus, now)
+    x = attention_policy.explain(item, focus, profile, now)
+    iso = lambda d: d.isoformat() if d else None  # noqa: E731
+    sender = item.get("sender")
+    return {
+        "id": item["id"], "kind": item["kind"], "title": item["title"],
+        "preview": item.get("preview") or "", "href": item.get("href"),
+        "sphere": item["sphere"], "tags": list(item.get("tags") or []), "sender": sender,
+        "channel": item.get("channel"), "group": bool(item.get("group")), "agent": item.get("agent"),
+        "count": int(item.get("count") or 1), "unread": bool(item.get("unread")),
+        "pending": bool(item.get("pending")),
+        "level": x["level"], "critical": bool(item.get("critical")),
+        "importance": item["importance"], "importance_from": item.get("importance_from"),
+        "importance_text": x["importance"],
+        "due": iso(item.get("due")), "lead": item["lead"].total_seconds() / 60,
+        "lead_from": item.get("lead_from"), "kind_label": item.get("kind_label"),
+        "urgency": x["urgency"], "delivery": x["delivery"],
+        "reason": attention_policy.admission_reason(item, mode, profile, now),
+        "actor": item.get("actor") or "you", "waiting_since": iso(item.get("waiting_since")),
+        "state": item.get("state", "open"), "released": bool(item.get("released")),
+        "snoozed_until": iso(item.get("snoozed_until")),
+        "pushed": [iso(p) for p in item.get("pushed") or []],
+        "permit": bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or []),
+        "admits_sphere": item["sphere"] in mode["admits"],
+    }
+
+
+def _attention_mode_summary(focus: dict, now: datetime) -> dict:
+    mode = attention_policy.mode_at(focus, now)
+    scheduled_id = attention_policy.scheduled_id(focus, now)
+    scheduled = focus["modes"][scheduled_id]
+    m = attention_policy.minute_of_day(now)
+    until = next((start for start, _mid in focus["schedule"] if start > m), None)
+    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    until_dt = (start_of_day + timedelta(minutes=until)) if until is not None \
+        else start_of_day + timedelta(days=1, minutes=focus["schedule"][0][0])
+    return {
+        "id": mode["id"], "name": mode["name"], "blurb": mode.get("blurb", ""),
+        "threshold": mode["threshold"], "admits": list(mode["admits"]),
+        "admit_tags": list(mode.get("admit_tags") or []),
+        "manual": bool(focus.get("manual")),
+        "scheduled": {"id": scheduled["id"], "name": scheduled["name"], "until": until_dt.isoformat()},
+    }
+
+
+def _attention_payload(items: list[dict], degraded: list[str], focus: dict, profile: dict,
+                       now: datetime) -> dict:
+    s = attention_policy.sections(items, focus, profile, now)
+    row = lambda i: _attention_row(i, focus, profile, now)  # noqa: E731
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "now": now.isoformat(),
+        "timezone": str(now.tzinfo),
+        "mode": _attention_mode_summary(focus, now),
+        "modes": [{"id": m["id"], "name": m["name"], "blurb": m.get("blurb", ""),
+                   "threshold": m["threshold"], "admits": list(m["admits"]),
+                   "admit_tags": list(m.get("admit_tags") or [])}
+                  for m in focus["modes"].values()],
+        "schedule": [list(x) for x in focus["schedule"]],
+        "digest_times": list(focus["digest_times"]),
+        "spheres": list(focus.get("spheres") or attention_store.DEFAULT_SPHERES),
+        "next_breakpoint": s["next_breakpoint"].isoformat(),
+        "sections": {"now": [row(i) for i in s["now"]], "next": [row(i) for i in s["next"]],
+                     "held": [row(i) for i in s["held"]], "waiting": [row(i) for i in s["waiting"]]},
+        "counts": {k: len(s[k]) for k in ("now", "next", "held", "waiting")},
+        "degraded": degraded,
+        "learned": (profile.get("learned") or [])[-5:],
+    }
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -5460,6 +5970,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/news/preferences":
             self._handle_news_preferences_write()
+            return
+        attention_match = _ATTENTION_POST_RE.match(self.path)
+        if attention_match:
+            self._handle_attention_post(attention_match.group(1))
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/internal/attention/set":
+            self._handle_internal_attention_set()
             return
         if self.path in ("/conversations", "/conversations/"):
             self._handle_conversation_create()
@@ -6111,6 +6628,8 @@ class Handler(BaseHTTPRequestHandler):
         })
         _CHAT_STATE.clear_draft(chat_id)
         _CHAT_STATE.advance_last_read(chat_id, ts)
+        # The reply is what the chat waited for: its attention item is handled.
+        _attention_mark(f"chat:{chat_id}", "done", "replied")
         # Deliberately no stamping here. A send either used an already
         # account-derived stamp (nothing to add) or the unambiguous
         # single-inbox-account rule, which re-derives identically next time and
@@ -6201,10 +6720,25 @@ class Handler(BaseHTTPRequestHandler):
             # treated as notify-worthy (fail open, like the gate itself).
             held = gate is not None and not gate.get("forward", True)
             if not doc.get("muted") and not held:
-                _chat_push_notification(chat_id, doc, entry, had_unread)
-                pushed = True
+                # The attention model decides whether this arrival rings now,
+                # waits for the next digest, or is merely listed — from the
+                # sender's priors and permits, the mode in force, and any
+                # classification the rail carries (``attention``: importance,
+                # deadline, kind, sphere, tags — the triage's judgement).
+                decision, _item = _attention_arrive_chat(chat_id, doc, entry,
+                                                         payload.get("attention"))
+                if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
+                    _chat_push_notification(chat_id, doc, entry, had_unread,
+                                            urgency="high" if decision["deliver"] == "push" else None)
+                    pushed = True
+                else:
+                    print(f"[web-gateway] attention: {chat_id} {decision['deliver']} — "
+                          f"{decision.get('reason', '')}", flush=True)
         elif author in ("user", "device"):
             _CHAT_STATE.advance_last_read(chat_id, ts)
+            # The user's own reply from their phone settles the chat's item.
+            if (doc.get("attention") or {}).get("state", "open") == "open":
+                _attention_mark(f"chat:{chat_id}", "done", "replied")
         self._send_json(200, {"ok": True, "id": chat_id, "pushed": pushed})
 
     def _handle_chat_media(self, slug: str, media_id: str) -> None:
@@ -6253,6 +6787,229 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "private, max-age=86400")
         self.end_headers()
         self.wfile.write(data)
+
+    # ── Attention endpoints ───────────────────────────────────────────────
+    # The home screen's API (docs/attention-model.md): the list with its
+    # sections, one item explained, the mode, and the user's actions on items
+    # and on the rules. Behind the dashboard's own auth like the rest; the one
+    # agent-facing write is /internal/attention/set, token-gated.
+
+    def _handle_attention_get(self) -> None:
+        now = _attention_now()
+        with _attention_lock:
+            focus = _ATTENTION.focus()
+            profile = _ATTENTION.profile()
+            items, degraded = _attention_items(profile, now)
+        self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
+
+    def _handle_attention_item_get(self, query: str) -> None:
+        item_id = (urllib.parse.parse_qs(query).get("id") or [""])[0]
+        now = _attention_now()
+        with _attention_lock:
+            focus = _ATTENTION.focus()
+            profile = _ATTENTION.profile()
+            item = _attention_item(item_id, profile, now) if item_id else None
+        if item is None:
+            self._send_json(404, {"error": "unknown item"})
+            return
+        self._send_json(200, self._attention_item_body(item, focus, profile, now))
+
+    def _attention_item_body(self, item: dict, focus: dict, profile: dict, now: datetime) -> dict:
+        return {
+            "item": _attention_row(item, focus, profile, now),
+            "mode": _attention_mode_summary(focus, now),
+            "next_breakpoint": attention_policy.next_breakpoint(focus, now).isoformat(),
+            "spheres": list(focus.get("spheres") or attention_store.DEFAULT_SPHERES),
+            "learned": (profile.get("learned") or [])[-3:],
+        }
+
+    def _handle_attention_post(self, action: str) -> None:
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        now = _attention_now()
+        with _attention_lock:
+            focus = _ATTENTION.focus()
+            profile = _ATTENTION.profile()
+            if action == "mode":
+                self._attention_set_mode(payload, focus, profile, now)
+                return
+            if action == "permits":
+                self._attention_set_permit(payload, focus, profile, now)
+                return
+            if action == "admit":
+                self._attention_set_admission(payload, focus, profile, now)
+                return
+            if action == "profile":
+                self._attention_write_profile(payload)
+                return
+            item_id = str(payload.get("id") or "")
+            item = _attention_item(item_id, profile, now) if item_id else None
+            if item is None:
+                self._send_json(404, {"error": "unknown item"})
+                return
+            learned: list[str] = []
+            effect = None
+            if action == "later":
+                when = "tomorrow" if payload.get("when") == "tomorrow" else "next"
+                attention_policy.snooze(item, focus, now, when)
+            elif action == "pull":
+                attention_policy.pull(item)
+            elif action == "done":
+                item["state"] = "done"
+                item["done_at"] = now.isoformat()
+                item["done_how"] = "marked"
+            elif action == "reopen":
+                item["state"] = "open"
+                item["released"] = True
+                item["snoozed_until"] = None
+            elif action == "correct":
+                patch = {}
+                for key in ("importance", "lead", "sphere", "tags", "critical"):
+                    if key in payload:
+                        patch[key] = payload[key]
+                if "due" in payload:
+                    due = attention_policy.parse_due(payload.get("due"), now)
+                    patch["due"] = due.isoformat() if due else None
+                if "lead" in patch:
+                    lead = attention_policy.parse_lead(patch["lead"])
+                    if lead is None:
+                        patch.pop("lead")
+                    else:
+                        patch["lead"] = lead
+                if "importance" in patch:
+                    try:
+                        patch["importance"] = max(0.0, min(5.0, float(patch["importance"])))
+                    except (TypeError, ValueError):
+                        patch.pop("importance")
+                if patch.get("sphere") and patch["sphere"] not in (focus.get("spheres") or attention_store.DEFAULT_SPHERES):
+                    self._send_json(400, {"error": "unknown sphere"})
+                    return
+                learned = attention_policy.correct(item, profile, patch, now)
+                effect = attention_policy.reevaluate(item, focus, profile, now, "your correction")
+                _ATTENTION.save_profile(profile)
+            else:
+                self._send_json(404, {"error": "not found"})
+                return
+            _attention_persist(item)
+            if effect and effect["type"] == "push":
+                _attention_push_item(item, effect.get("reason", ""))
+            body = self._attention_item_body(item, focus, profile, now)
+            body["learned_now"] = learned
+            body["effect"] = ({"type": effect["type"], "reason": effect.get("reason", "")}
+                              if effect else None)
+            self._send_json(200, body)
+
+    def _attention_set_mode(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
+        """Set the mode by hand, or release it to the schedule. Either is a
+        breakpoint: what was held is released, and the digest goes out."""
+        mode_id = payload.get("mode")
+        if mode_id is not None and mode_id != "" and mode_id not in focus["modes"]:
+            self._send_json(400, {"error": "unknown mode"})
+            return
+        focus["manual"] = mode_id or None
+        _ATTENTION.save_focus(focus)
+        items, degraded = _attention_items(profile, now)
+        _attention_breakpoint(items, focus, now, "the mode change")
+        self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
+
+    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str) -> list[str]:
+        """After a rule change, push what it releases; returns their ids."""
+        items, _degraded = _attention_items(profile, now)
+        pushed = []
+        for item in items:
+            effect = attention_policy.reevaluate(item, focus, profile, now, why)
+            if effect is None:
+                continue
+            _attention_persist(item)
+            if effect["type"] == "push":
+                _attention_push_item(item, effect.get("reason", ""))
+                pushed.append(item["id"])
+        return pushed
+
+    def _attention_set_permit(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
+        sender = str(payload.get("sender") or "").strip()
+        mode_id = str(payload.get("mode") or attention_policy.mode_at(focus, now)["id"])
+        if not sender or mode_id not in focus["modes"]:
+            self._send_json(400, {"error": "sender and a known mode are required"})
+            return
+        changed = attention_policy.set_permit(profile, sender, mode_id, bool(payload.get("on")), now, focus["modes"])
+        if changed:
+            _ATTENTION.save_profile(profile)
+        pushed = self._handle_reevaluate(focus, profile, now, "the permit") if changed and payload.get("on") else []
+        self._send_json(200, {"changed": changed, "permits": profile["permits"], "pushed": pushed,
+                              "learned": (profile.get("learned") or [])[-1:]})
+
+    def _attention_set_admission(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
+        sphere = str(payload.get("sphere") or "").strip()
+        mode_id = str(payload.get("mode") or attention_policy.mode_at(focus, now)["id"])
+        if not sphere or mode_id not in focus["modes"]:
+            self._send_json(400, {"error": "sphere and a known mode are required"})
+            return
+        changed = attention_policy.set_admission(focus, sphere, mode_id, bool(payload.get("on")))
+        if changed:
+            _ATTENTION.save_focus(focus)
+        pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule") if changed and payload.get("on") else []
+        self._send_json(200, {"changed": changed, "mode": _attention_mode_summary(focus, now),
+                              "modes": focus["modes"], "pushed": pushed})
+
+    def _attention_write_profile(self, payload: dict) -> None:
+        """Replace the profile and the focus rules with what the user edited:
+        the same shape GET /attention/profile returns."""
+        profile = payload.get("profile")
+        focus = payload.get("focus")
+        if profile is not None:
+            if not isinstance(profile, dict):
+                self._send_json(400, {"error": "profile must be an object"})
+                return
+            base = attention_policy.default_profile()
+            base.update({k: v for k, v in profile.items() if v is not None})
+            _ATTENTION.save_profile(base)
+        if focus is not None:
+            if not isinstance(focus, dict) or not isinstance(focus.get("modes"), dict):
+                self._send_json(400, {"error": "focus must carry its modes"})
+                return
+            base = attention_policy.default_focus()
+            base.update({k: v for k, v in focus.items() if v is not None})
+            _ATTENTION.save_focus(base)
+        self._send_json(200, {"profile": _ATTENTION.profile(), "focus": _ATTENTION.focus()})
+
+    def _handle_internal_attention_set(self) -> None:
+        """An agent declares — or revises — an item's attention properties:
+        the triage's judgement on a chat, a subagent parking a thread on
+        itself, a corrected deadline. Token-gated like the other internal
+        writes; re-evaluated at once, so a raised importance can ring."""
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        item_id = str(payload.get("id") or "").strip()
+        now = _attention_now()
+        with _attention_lock:
+            focus = _ATTENTION.focus()
+            profile = _ATTENTION.profile()
+            item = _attention_item(item_id, profile, now) if item_id else None
+            if item is None:
+                self._send_json(404, {"error": "unknown item"})
+                return
+            block = _attention_spec_to_block(payload, attention_store.block_for(item), now)
+            if payload.get("state") in ("open", "done"):
+                block["state"] = payload["state"]
+            doc = {"id": item["id"], "title": item["title"], "attention": block,
+                   "sphere": block.get("sphere") or item["sphere"], "sender": item.get("sender")}
+            revised = attention_policy.item_from_doc(doc, item["kind"], profile)
+            revised.update({k: item[k] for k in ("source_id", "preview", "href", "channel", "agent", "count", "unread")
+                            if k in item})
+            if payload.get("sender_sphere") and item.get("sender") and block.get("sphere"):
+                profile.setdefault("spheres", {})[item["sender"]] = block["sphere"]
+                _ATTENTION.save_profile(profile)
+            effect = attention_policy.reevaluate(revised, focus, profile, now, "the agent's declaration")
+            _attention_persist(revised)
+            if effect and effect["type"] == "push":
+                _attention_push_item(revised, effect.get("reason", ""))
+            body = self._attention_item_body(revised, focus, profile, now)
+            body["effect"] = ({"type": effect["type"], "reason": effect.get("reason", "")} if effect else None)
+            self._send_json(200, body)
 
     def _handle_news_preferences_write(self) -> None:
         """Replace the Herald's memory with what the user typed.
@@ -6470,6 +7227,10 @@ class Handler(BaseHTTPRequestHandler):
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
+        # Archiving settles the thread's attention item; bringing it back
+        # reopens it — on the list, never pushed again for that.
+        if conv.get("initiator") == "agent" or conv.get("attention"):
+            _attention_mark(f"thread:{cid}", "done" if archived else "open", "archived")
         self._send_json(200, _conv_summary(conv))
 
     def _handle_agent_conversation_flags(self, cid: str) -> None:
@@ -6612,7 +7373,21 @@ class Handler(BaseHTTPRequestHandler):
                              kind=kind, agent=agent, context=context)
         body = {"id": conv["id"], "title": conv["title"]}
         if quiet:
-            _conv_set_flags(conv["id"], unread=False)
+            # A record, not a request: no badge, no push, and not an item on
+            # the home screen either.
+            _conv_set_flags(conv["id"], unread=False, attention={"state": "done"})
+        elif kind == "chat":
+            # The attention model decides: pushed now, held for the digest, or
+            # listed. The agent is told which, so it can say so.
+            decision, item = _attention_arrive_thread(conv, payload.get("attention"))
+            body["attention"] = _attention_decision_body(decision, item)
+            if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
+                body["push_subscribers"] = _push_conv_notification(
+                    conv, message, urgency="high" if decision["deliver"] == "push" else None)
+            else:
+                body["push_subscribers"] = push_notify.subscription_count() if push_notify.enabled() else 0
+                print(f"[web-gateway] attention: thread {conv['id']} {decision['deliver']} — "
+                      f"{decision.get('reason', '')}", flush=True)
         else:
             body["push_subscribers"] = _push_conv_notification(conv, message)
         if CONVERSATION_BASE_URL:
@@ -6663,7 +7438,7 @@ class Handler(BaseHTTPRequestHandler):
         # A quiet writer stays quiet on this path too — a cowork audit trail
         # does not start badging the dashboard just because it was reopened.
         if not quiet:
-            body["push_subscribers"] = _push_conv_notification(conv, message)
+            body["push_subscribers"] = _attention_append(conv, message, payload)
         return body
 
     def _handle_agent_conversation_message(self, cid: str) -> None:
@@ -6710,8 +7485,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = {"id": conv["id"], "title": conv["title"]}
         if not quiet:
-            body["push_subscribers"] = _push_conv_notification(
-                conv, message or "Sent you a file")
+            body["push_subscribers"] = _attention_append(
+                conv, message or "Sent you a file", payload)
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
         self._send_json(201, body)
@@ -6816,6 +7591,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         if conv_path in ("/news/preferences", "/news/preferences/"):
             self._send_json(200, _news_preferences_payload())
+            return
+        if conv_path in ("/attention", "/attention/"):
+            self._handle_attention_get()
+            return
+        if conv_path in ("/attention/item", "/attention/item/"):
+            self._handle_attention_item_get(conv_query)
+            return
+        if conv_path in ("/attention/profile", "/attention/profile/"):
+            self._send_json(200, {"profile": _ATTENTION.profile(), "focus": _ATTENTION.focus()})
             return
         if conv_path in ("/projects", "/projects/"):
             # Live projects view, computed from the life store on demand. No
@@ -7157,6 +7941,9 @@ if __name__ == "__main__":
     # ThreadingHTTPServer so quick requests (job polls, /health) are never
     # blocked head-of-line behind a long-running job. Actual `claude` concurrency
     # is still bounded by the worker pool inside send_message().
+    # The attention model's clock: breakpoints (digest times, scheduled mode
+    # changes) and the half-hourly sweep run here, with no browser open.
+    threading.Thread(target=_attention_tick_loop, name="attention-tick", daemon=True).start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY})", flush=True)
     server.serve_forever()

@@ -94,3 +94,13 @@ the timeline replays the script deterministically up to that time.
 The schedule in the prototype (Off · Home · Deep work · Open · Work · Open ·
 Social · Off, digests at 08:00, 12:00, 17:00 and 21:00), the spheres, the
 contacts and the lead-time defaults are examples; a deployment names its own.
+
+## Where this went
+
+The dashboard now implements this model: the policy is `scripts/attention.py`,
+the gateway's part the attention section of `scripts/web-gateway.py`, the
+home `webapp/components/attention.js` with the sheet in
+`webapp/components/attention-sheet.js`. `docs/dashboard.md` ("The home")
+describes it as built; `docs/attention-migration.md` says what of the plan is
+done. The prototype stays as the illustrated, self-contained walkthrough of a
+day — its canned dialogues are the real Ara's turns in the dashboard.

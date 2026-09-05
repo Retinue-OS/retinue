@@ -296,6 +296,9 @@ def _load_gateway(tmp: Path, sparql_port: int, gw_port: int):
     os.environ["CHAT_STATE_DIR"] = str(tmp / "chat-state")
     os.environ["CHAT_LIST_CACHE_SECONDS"] = "0"
     os.environ["CONVERSATION_BACKEND_TOKEN"] = "agent-token"
+    # These checks pin the pre-model push behaviour (every whitelisted arrival
+    # notifies); the attention model's gating has its own file.
+    os.environ["ATTENTION_PUSH_GATE"] = "0"
     os.environ["CONVERSATIONS_DIR"] = str(tmp / "convs")
     os.environ["CONVERSATION_DIR"] = str(tmp / "convlog")
     os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")

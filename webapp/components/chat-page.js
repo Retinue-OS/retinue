@@ -61,6 +61,7 @@ import { esc, WIDE_FRAME } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
+import { openAttentionSheet } from './attention-sheet.js';
 
 const LIST_URL = '/chats';
 // Where the back control lands a visitor who has no app history behind them.
@@ -108,6 +109,20 @@ const QUICK_PATTERNS = [
     prompt: () => 'Translate the last message for me, and draft a reply in the same language.' },
   { id: 'summarize', label: 'Summarize',
     prompt: () => 'Summarize this chat since my last reply.' },
+  // Rewrites of the draft in the composer — the attention prototype's
+  // "shorter / warmer / more formal" as companion turns over the shared draft.
+  { id: 'shorter', label: 'Shorter',
+    prompt: (draft) => draft
+      ? `Make this draft shorter — keep the meaning, drop the rest, and stage it in the composer:\n\n${draft}`
+      : 'Draft a short reply to the last message and stage it in the composer.' },
+  { id: 'warmer', label: 'Warmer',
+    prompt: (draft) => draft
+      ? `Make this draft warmer and more personal, and stage it in the composer:\n\n${draft}`
+      : 'Draft a warm reply to the last message and stage it in the composer.' },
+  { id: 'formal', label: 'More formal',
+    prompt: (draft) => draft
+      ? `Make this draft more formal, and stage it in the composer:\n\n${draft}`
+      : 'Draft a formal reply to the last message and stage it in the composer.' },
 ];
 
 // Minimal inline rendering for mirrored channel messages: escaped text,
@@ -649,6 +664,8 @@ class RetinueChatPage extends HTMLElement {
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
+      `<button class="info" data-attention title="Importance, urgency, delivery — and their corrections" ` +
+      `aria-label="Attention details">&#9432;</button>` +
       `<nav class="pane-tabs" role="tablist" aria-label="Pane">` +
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
       `<button role="tab" data-pane-tab="companion" aria-selected="false">Ara</button>` +
@@ -1212,6 +1229,10 @@ class RetinueChatPage extends HTMLElement {
         if (sel && sel.matches && sel.matches('[data-model]')) this._onModelChange(sel.value);
       });
     }
+    // The attention sheet for this chat: its importance, urgency and delivery,
+    // the corrections, Later and Mark handled.
+    const att = root.querySelector('[data-attention]');
+    if (att) att.addEventListener('click', () => openAttentionSheet(`chat:${this._id}`, { here: true }));
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
     // the indicator honest whichever way the pane was reached (tab or swipe).
     root.querySelectorAll('[data-pane-tab]').forEach((el) =>
@@ -2204,6 +2225,11 @@ const CSS = `
         border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
         font-size: .58rem; font-weight: 800; color: #fff;
         border: 2px solid var(--bg, #0b0d12); box-sizing: content-box; }
+  .info { flex: none; width: 30px; height: 30px; border-radius: 50%; background: transparent;
+          border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);
+          cursor: pointer; font: inherit; font-size: .95rem; display: inline-flex; align-items: center;
+          justify-content: center; padding: 0; -webkit-tap-highlight-color: transparent; }
+  .info:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .head-txt { flex: 1; min-width: 0; }
   .head-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .head-sub { display: block; color: var(--muted, #8b93a3); font-size: .74rem;

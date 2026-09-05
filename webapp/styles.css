@@ -4,19 +4,20 @@
  *  - Dashboard (list mode): main is a flex column with min-height 100dvh. The
  *    .deck / .col wrappers in index.html are display:contents here, so every
  *    card stacks and contributes its natural height. On tall screens the
- *    conversations region grows to fill the leftover space (app-like, dock at
- *    the bottom); when the sections outgrow a small or short viewport the PAGE
+ *    attention list grows to fill the leftover space (app-like, dock at the
+ *    bottom); when the sections outgrow a small or short viewport the PAGE
  *    scrolls, so every section stays reachable.
  *  - Thread/composer open: the frame locks to exactly 100dvh and everything
  *    else hides, so the chat is immersive with an internally scrolled thread
- *    and a pinned composer.
- *  - Wide screens (>=1000px and tall enough): a fixed app frame. The wrappers
- *    become real columns — conversations above news on the left, projects
- *    filling the right column top to bottom — each scrolling internally, every
- *    boundary a draggable splitter (layout.js persists the sizes per device,
- *    VS Code style; double-click resets). The cards drop their dashboard row
- *    caps here (see isWideFrame in components/base.js), so the room carries
- *    content rather than empty space. */
+ *    and a pinned composer. The thread viewer on the home is otherwise
+ *    invisible — the attention list is the list.
+ *  - Wide screens (>=1000px and tall enough): a fixed app frame. The column
+ *    becomes a real one — the attention list above the news — each region
+ *    scrolling internally, the boundary a draggable splitter (layout.js
+ *    persists the size per device, VS Code style; double-click resets). The
+ *    list drops its dashboard row caps here (see isWideFrame in
+ *    components/base.js), so the room carries content rather than empty
+ *    space. */
 :root {
   --bg: #0b0d12;
   --card: #151922;
@@ -71,18 +72,18 @@ main {
 .deck, .col { display: contents; }
 .splitter { display: none; }
 
-/* The conversations region absorbs leftover height on tall screens; on small
-   ones it keeps its natural height and the page scrolls instead (min-height: 0
-   only matters once the immersive thread locks the frame below). */
-retinue-conversations { flex: 1; min-height: 0; }
+/* The attention list absorbs leftover height on tall screens; on small ones
+   it keeps its natural height and the page scrolls instead. The thread viewer
+   is invisible until a thread or the composer is open (the immersive rules
+   below), and then takes the frame. */
+retinue-attention { flex: 1; min-height: 0; }
+retinue-conversations[viewer][data-view="list"] { display: none; }
+retinue-conversations[viewer] { flex: 1; min-height: 0; }
 retinue-projects { flex: none; }
 retinue-news { flex: none; }
 /* Chats card: natural height in the phone stack, like the other list cards. */
 retinue-chats { flex: none; }
-/* Phone stacking priority: projects (actionable) before news (read-mostly).
-   The DOM nests news beside conversations for the wide columns, so flex order
-   restores the stack here; in the wide layout each region is ordered within
-   its own column, where these values reproduce the DOM order anyway. */
+/* Phone stacking: the list, then news (read-mostly), then the dock. */
 retinue-news { order: 1; }
 retinue-app-launcher { order: 2; }
 
@@ -163,33 +164,21 @@ retinue-project-page { flex: 1; min-height: 0; }
     height: var(--frame-h, 100dvh);
   }
 
-  /* The deck between header and dock: left column (conversations over news),
-     splitter, right column (projects). Visual gaps come from the splitters
+  /* The deck between header and dock: one column, the attention list over
+     the news, the boundary a splitter. Visual gaps come from the splitters
      themselves, so dragging happens exactly where the boundary is seen. */
   .deck { display: flex; flex: 1; min-height: 0; align-items: stretch; }
   .col { display: flex; flex-direction: column; min-height: 0; }
   .col-main { flex: 1 1 0; min-width: 0; }
-  /* Chats: a fixed-height region above the conversations, scrolling
-     internally — without a height of its own the card would squeeze the
-     flexible conversations region to nothing. --chats-h comes from the chats
-     splitter (layout.js). */
-  .col-main retinue-chats { flex: 0 0 auto; height: var(--chats-h, clamp(160px, 30%, 380px));
-                            min-height: 0; overflow-y: auto; }
-  /* The user can drag the chats region shut (layout.js snaps small heights to
-     closed); the splitter stays as the handle to pull it open again. */
-  .col-main[data-chats="closed"] retinue-chats { display: none; }
-  /* Defaults deliberately favor conversations (the interactive surface) over
-     news (read-mostly): roughly two thirds to one third. */
+  /* Defaults deliberately favor the attention list (the interactive surface)
+     over news (read-mostly): roughly two thirds to one third. */
+  .col-main retinue-attention { flex: 1 1 auto; min-height: 0; }
   .col-main retinue-conversations { flex: 1 1 auto; min-height: 0; }
   .col-main retinue-news { flex: 0 0 auto; height: var(--news-h, 34%);
                            min-height: 0; max-height: 75%; overflow-y: auto; }
   /* The user can drag the news region shut (layout.js snaps small heights to
      closed); the splitter stays as the handle to pull it open again. */
   .col-main[data-news="closed"] retinue-news { display: none; }
-  .col-side { flex: 0 0 auto; width: var(--side-w, clamp(320px, 24vw, 420px));
-              min-width: 280px; max-width: 45%; }
-  .col-side retinue-projects { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
-
   /* Splitters: a generous hit area around a hairline, VS Code style. */
   .splitter { display: block; flex: none; position: relative; z-index: 2;
               touch-action: none; user-select: none; -webkit-user-select: none; }

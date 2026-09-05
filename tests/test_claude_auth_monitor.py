@@ -26,13 +26,13 @@ class FakeNotifier:
         self.opened = []    # (title, message)
         self.appended = []  # (thread_id, message)
 
-    def open_thread(self, title, message):
+    def open_thread(self, title, message, attention=None):
         if self.fail:
             return None
         self.opened.append((title, message))
         return f"thread-{len(self.opened)}"
 
-    def append(self, thread_id, message):
+    def append(self, thread_id, message, attention=None):
         if self.fail:
             return False
         self.appended.append((thread_id, message))

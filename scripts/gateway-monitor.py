@@ -45,6 +45,13 @@ import messenger_gateways  # noqa: E402
 from conversation_notify import ConversationNotifier  # noqa: E402
 
 LOG = "[gateway-monitor]"
+# How the outage thread presents itself to the dashboard's attention model
+# (docs/attention-model.md): a system alert of high importance, urgent within
+# the hour. It rings in modes that admit the system sphere and waits for the
+# next digest in the others — a dead channel is serious, not critical: nothing
+# is lost, messages queue at the channel until it is back.
+OUTAGE_ATTENTION = {"importance": 5, "sphere": "system", "kind": "system alert", "lead": "60m"}
+
 
 INTERVAL = float(os.environ.get("GATEWAY_MONITOR_INTERVAL", "") or "60")
 # Consecutive failed checks before the user is notified (debounce).
@@ -188,6 +195,7 @@ class MonitorEngine:
             thread_id = self.notifier.open_thread(
                 f"{label} gateway disconnected",
                 outage_message(label, reason, entry.get("since")),
+                attention=OUTAGE_ATTENTION,
             )
             if thread_id:
                 entry["thread_id"] = thread_id

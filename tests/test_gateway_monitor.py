@@ -40,14 +40,14 @@ class FakeNotifier:
         self.appended = []  # (thread_id, message)
         self._next_id = 0
 
-    def open_thread(self, title, message):
+    def open_thread(self, title, message, attention=None):
         if self.fail:
             return None
         self.opened.append((title, message))
         self._next_id += 1
         return f"thread{self._next_id}"
 
-    def append(self, thread_id, message):
+    def append(self, thread_id, message, attention=None):
         if self.fail:
             return False
         self.appended.append((thread_id, message))

@@ -345,13 +345,43 @@ def reminder_text(
     return r_title, r_msg
 
 
-def push_conversation(title: str, message: str, dry_run: bool) -> bool:
+def attention_args(fm: dict, due: "dt.date", kind: str) -> list[str]:
+    """What the wake-up thread tells the dashboard's attention model
+    (docs/attention-model.md), read from the project's own frontmatter:
+    ``importance``, ``sphere``, ``tags``, ``kind`` as declared, the wake date
+    as the deadline, ``remind_before`` as the lead. A project that declares
+    nothing wakes as an admin chore of importance 3 with the date it named —
+    active within its lead, so the reminder is listed and rings where admin
+    is admitted, rather than silently listed at the mid importance."""
+    args = ["--due", due.isoformat()]
+    importance = fm.get("importance", "").strip()
+    args += ["--importance", importance if importance else "3"]
+    sphere = fm.get("sphere", "").strip()
+    args += ["--sphere", sphere if sphere else "admin"]
+    for tag in [t.strip(" -") for t in fm.get("tags", "").strip("[]").split(",") if t.strip(" -")]:
+        args += ["--tag", tag]
+    args += ["--kind", fm.get("kind", "").strip() or ("invoice run" if kind == "cadence" else "admin chore")]
+    lead = fm.get("remind_before", "").strip()
+    if lead:
+        # The frontmatter's "10 / 10d / 2w / 3m" is days, weeks, calendar
+        # months; the model's lead takes minutes/hours/days/weeks.
+        if lead.isdigit():
+            lead += "d"
+        elif lead.endswith("m"):
+            lead = f"{int(lead[:-1] or 1) * 30}d"
+        args += ["--lead", lead]
+    return args
+
+
+def push_conversation(title: str, message: str, dry_run: bool,
+                      extra_args: list[str] | None = None) -> bool:
     if dry_run:
         print(f"[dry-run] would push conversation: {title!r}")
         return True
     try:
         subprocess.run(
-            ["python3", CONVERSATION_PUSH, "--title", title, message], check=True
+            ["python3", CONVERSATION_PUSH, "--title", title, *(extra_args or []), message],
+            check=True,
         )
         return True
     except subprocess.CalledProcessError as exc:
@@ -428,7 +458,7 @@ def main() -> int:
             block = set_field(block, "waiting_since", today.isoformat())
             path.write_text(f"---\n{block}\n---\n" + text[m.end():])
 
-        push_conversation(r_title, r_msg, args.dry_run)
+        push_conversation(r_title, r_msg, args.dry_run, attention_args(fm, due, kind))
         acted += 1
 
     if acted == 0:

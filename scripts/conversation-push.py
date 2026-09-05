@@ -45,6 +45,27 @@ of re-resolving the sender's name (which can land on the wrong account).
 The thread appears on the dashboard with an unread badge; when the user replies,
 Ara picks up the thread (with full context) and carries out what they approve.
 
+**Say how much it matters.** The dashboard's home screen is an attention list
+(docs/attention-model.md): every thread carries an importance (0–5), an
+optional deadline against a lead time, a sphere and tags, and the gateway
+decides from those and the user's focus mode whether the thread rings now, waits
+for the next digest, or is merely listed. Declare them, or the thread gets the
+mid importance and no deadline — listed, never pushed:
+
+    conversation-push.py --title "Quote for Müller AG" --importance 4 \
+        --due 2026-09-04T17:00 --kind "customer request" --sphere customers \
+        --tag finance "Draft ready for review; Müller expects it today by 17:00."
+
+    --importance 0–5 · --due ISO date-time or YYYY-MM-DD (17:00 that day)
+    --lead 2h|3d|2w (else the kind's default) · --sphere customers|admin|health|
+    friends|family|system · --tag (repeatable) · --kind "appointment"|"tax filing"|…
+    --critical (rings in every mode; declare, never infer) · --actor NAME (parked
+    on someone: listed under Waiting, not pushed)
+
+The reply reports the decision (`attention.delivery`: push / hold / list /
+waiting, with the reason and, for a hold, until when) — relay it honestly when
+the user would otherwise assume they were notified.
+
 A request that times out has not necessarily failed — the gateway may have
 committed the write and lost only the response. Opening a thread is therefore
 always keyed (with `--key`, or a throwaway key when none is given) and retried
@@ -131,6 +152,25 @@ def main() -> int:
                              "resolving the sender's name")
     parser.add_argument("--attach", action="append", default=[], metavar="PATH",
                         help="attach a file the user can download from the thread (repeatable)")
+    att = parser.add_argument_group("attention", "how much this matters (docs/attention-model.md)")
+    att.add_argument("--importance", type=float, metavar="0-5",
+                     help="importance 0–5; 4+ is active without a deadline, 2–3 needs one to ring")
+    att.add_argument("--due", metavar="WHEN",
+                     help="deadline: ISO date-time, or YYYY-MM-DD for 17:00 that day")
+    att.add_argument("--lead", metavar="SPAN",
+                     help="lead time before the deadline in which it becomes urgent: 90m, 2h, 3d, 2w "
+                          "(default: the kind's)")
+    att.add_argument("--sphere", metavar="NAME",
+                     help="the primary sphere: customers, admin, health, friends, family, system")
+    att.add_argument("--tag", action="append", default=[], metavar="NAME",
+                     help="a further sphere this also belongs to (repeatable)")
+    att.add_argument("--kind", metavar="LABEL",
+                     help="the kind of item, which supplies the lead-time default: "
+                          "\"customer request\", \"invitation\", \"appointment\", \"tax filing\", …")
+    att.add_argument("--critical", action="store_true",
+                     help="declared critical: rings in every mode, Off included")
+    att.add_argument("--actor", metavar="NAME",
+                     help="who the thread waits on when not the user (listed under Waiting, not pushed)")
     parser.add_argument("--url", default=None, help=f"endpoint URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()
@@ -194,6 +234,32 @@ def main() -> int:
             payload["key_ephemeral"] = not args.key
     if args.title:
         payload["title"] = args.title
+    attention = {}
+    if args.importance is not None:
+        if not 0 <= args.importance <= 5:
+            print("conversation-push: --importance must be between 0 and 5", file=sys.stderr)
+            return 2
+        attention["importance"] = args.importance
+    if args.due:
+        attention["due"] = args.due
+    if args.lead:
+        attention["lead"] = args.lead
+    if args.sphere:
+        attention["sphere"] = args.sphere
+    if args.tag:
+        attention["tags"] = args.tag
+    if args.kind:
+        attention["kind"] = args.kind
+    if args.critical:
+        attention["critical"] = True
+    if args.actor:
+        attention["actor"] = args.actor
+    if attention:
+        if flags_only:
+            print("conversation-push: attention flags cannot be combined with --archive/--mute",
+                  file=sys.stderr)
+            return 2
+        payload["attention"] = attention
     if args.on_behalf_of:
         payload["on-behalf-of"] = args.on_behalf_of
     if args.attach:
@@ -263,6 +329,14 @@ def main() -> int:
         else:
             print("conversation-push: this key already opened a thread — reusing it, "
                   "nothing was posted", file=sys.stderr)
+    decision = body.get("attention") or {}
+    if decision.get("delivery") and decision["delivery"] != "push":
+        until = decision.get("until")
+        print("conversation-push: attention — "
+              f"{decision['delivery']}" + (f" until {until}" if until else "")
+              + f" ({decision.get('level', '')}): {decision.get('reason', '')}. "
+              "The user has NOT been notified; the thread is on their list.",
+              file=sys.stderr)
     if body.get("push_subscribers") == 0:
         print("conversation-push: warning — no device is subscribed to push; "
               "this thread will only be seen if the dashboard is opened",

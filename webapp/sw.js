@@ -36,6 +36,8 @@ const SHELL_ASSETS = [
   '/viewport.js',
   '/manifest.webmanifest',
   '/components/base.js',
+  '/components/attention.js',
+  '/components/attention-sheet.js',
   '/components/markdown.js',
   '/components/voice.js',
   '/components/conversations.js',
@@ -118,6 +120,10 @@ self.addEventListener('notificationclick', (e) => {
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
+
+  // The attention list and its actions are decided at request time — the
+  // mode in force, what is held until when — so a cached copy would lie.
+  if (url.pathname === '/attention' || url.pathname.startsWith('/attention/')) return;
 
   // Conversation API is dynamic (live chat with Ara): never serve from cache,
   // just pass through to the network so threads and replies stay current.

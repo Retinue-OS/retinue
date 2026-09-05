@@ -192,7 +192,8 @@ def subscription_count() -> int:
 
 
 def notify(title: str, body: str, url: str = "/", tag: str | None = None,
-           mode: str | None = None, archived: bool = False) -> int:
+           mode: str | None = None, archived: bool = False,
+           urgency: str | None = None, topic: str | None = None) -> int:
     """Push a notification to every device whose preferences match. Returns how
     many got it.
 
@@ -201,12 +202,24 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
     set to "off". `archived` says the triggering conversation is archived, so
     devices that opted out of archived threads are skipped.
 
+    `urgency` and `topic` are the Web Push request headers of RFC 8030 §5.3
+    and §5.4, the attention model's two knobs on the push service itself: a
+    "high" push wakes a phone in power-saving mode, a "normal" one waits for
+    the next wake, and a topic ("digest") replaces an undelivered push of the
+    same topic instead of stacking up. Both are optional; absent, the push
+    service's defaults apply, as before.
+
     Best effort by contract: callers invoke this from request handlers and must
     not fail because a push service is down.
     """
     if not enabled():
         return 0
     payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag or url})
+    headers = {}
+    if urgency in ("very-low", "low", "normal", "high"):
+        headers["Urgency"] = urgency
+    if topic:
+        headers["Topic"] = str(topic)[:32]
     sent = 0
     for sub in _all_subscriptions():
         user_mode = sub.get("notification_mode", "all")
@@ -224,6 +237,7 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
                 vapid_private_key=str(_key_path()),
                 vapid_claims={"sub": VAPID_SUBJECT},
                 ttl=PUSH_TTL,
+                headers=headers or None,
             )
             sent += 1
         except WebPushException as exc:
@@ -241,13 +255,14 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
 
 
 def notify_async(title: str, body: str, url: str = "/", tag: str | None = None,
-                 mode: str | None = None, archived: bool = False) -> None:
+                 mode: str | None = None, archived: bool = False,
+                 urgency: str | None = None, topic: str | None = None) -> None:
     """Fan out in the background so the triggering HTTP response isn't delayed."""
     if not enabled():
         return
     threading.Thread(
         target=notify,
-        args=(title, body, url, tag, mode, archived),
+        args=(title, body, url, tag, mode, archived, urgency, topic),
         name="push-notify",
         daemon=True,
     ).start()

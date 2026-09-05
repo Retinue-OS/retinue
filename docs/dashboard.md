@@ -53,6 +53,108 @@ an always-open window picks a deploy up within moments of being looked at. The
 settings page shows the running shell version with a manual "Check for
 updates" as fallback.
 
+## The home: the attention list
+
+The home screen is **one list of what wants attention** — threads with Ara,
+messenger chats and running projects as one kind of thing
+(`webapp/components/attention.js` over `GET /attention`), each with the four
+properties of `docs/attention-model.md`: an importance (0–5), a deadline
+against a lead time, a sphere plus tags, and who it waits on. The gateway
+turns those and the **focus mode** in force into a level (passive · active ·
+time-sensitive · critical) and a **delivery decision**: pushed now, held for
+the next digest, or merely listed. The list shows them as *Now* (may
+interrupt in this mode), *Next* (listed, below the bar), *Held until <the
+next breakpoint>* and *Waiting on others*; every row carries its preview and
+a one-line reason, and its ⓘ opens the details sheet
+(`webapp/components/attention-sheet.js`) with the three fields explained and
+correctable — importance (writes the sender's or kind's prior), deadline and
+lead (writes the kind's lead time), sphere (remembered for the sender) — plus
+a permit for the sender in this mode, a Focus rule for the sphere, and the
+actions *Later* (next breakpoint / tomorrow), *Pull into the list now* and
+*Mark done*. The same sheet opens from the thread bar and from the chat page's
+header. Rows open where the item lives: a thread in place (the conversations
+element on the home is a `viewer` — invisible until a `#conversation-<id>`
+hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
+on `project.html`. The old chats, conversations and projects cards are gone
+from the home; their pages remain, linked from the list's footer.
+
+The mode chip in the list's header shows the mode in force — by the schedule
+or set by hand — and opens the mode menu. **A change by hand is a
+breakpoint**: what was held is released and the digest goes out. The policy
+is `scripts/attention.py` (pure, tested in `tests/test_attention.py`); the
+gateway's part — assembling the items, storing each decision on the item's
+own document, the endpoints, the tick — is the attention section of
+`scripts/web-gateway.py` (tested end to end in `tests/test_attention_api.py`);
+the adapters and the two small documents are `scripts/attention_store.py`.
+
+**What carries the properties.** A thread's `attention` block is set when an
+agent opens it (`conversation-push.py --importance 4 --due 2026-09-04T17:00
+--kind "customer request" --sphere customers --tag finance`, or `--critical`,
+`--actor NAME`) and can be revised with `scripts/attention-set.py`; a thread
+that declares nothing is passive — listed, never pushed — which is the point:
+an agent has to say how much something matters. A chat's block is set on the
+notify rail when a message arrives: from the rail's `attention` (the triage's
+judgement) where it carries one, else from the profile's priors for the
+sender, else the default — a person writing directly is *active* (held for the
+next digest, rung at once where the sender holds a permit), a group is chatter
+(passive). `attention-set.py chat:<id> …` revises it; a reply (from the
+dashboard or the phone) or *Mark handled* settles it. A project's properties
+come from its frontmatter — `importance`, `sphere`, `tags`, `kind`, the
+deadline `expected_by` / `next_due`, the lead `remind_before` — where the
+chamber's Markdown converter maps them; a correction on a project changes the
+gateway's state for it, never the chamber file. `recurring-projects.py` passes
+the same fields on the wake-up thread it opens. The monitors declare their
+alerts (a broken Claude sign-in is critical; a dead channel a high system
+alert).
+
+**Delivery.** Every push to the user's devices now goes through the model:
+`_push_conv_notification` and `_chat_push_notification` are called only when
+the decision is *push* (`Urgency: high`); a held item badges the dashboard but
+stays quiet. The user's own threads with Ara are never gated — they asked.
+Breakpoints — the digest times 08:00, 12:00, 17:00, 21:00 and the scheduled
+mode changes (leaving *Off* excepted: the morning digest opens the day) —
+release what was held with one `Topic: digest` push (`Urgency: normal`), and a
+half-hourly sweep re-evaluates: an item that crossed into the next urgency
+band climbs, and one the mode now admits is pushed. Both run on the gateway's
+own tick (`ATTENTION_TICK_SECONDS`, default 20 s), with no browser open, in
+the deployment's zone (`ATTENTION_TZ`, else `TZ`, else the container's).
+Repeats are a per-class policy: a family sender writing again while held in
+*Off* breaks through; anyone else waits with their first message. The
+per-device notification modes of the settings page keep working as a second
+filter behind the model. `ATTENTION_PUSH_GATE=0` is the rollback: every
+arrival pushes as before the model, while the list, the digest and the sweep
+keep working.
+
+**The two documents** live under `ATTENTION_DIR` (default a sibling of
+`CONVERSATIONS_DIR`, so the persistent volume): `focus.json` — the modes
+(admitted spheres, admitting tags, threshold, blurb), the schedule as
+minute-of-day → mode, the digest times, the sphere vocabulary and the manual
+override — and `profile.json` — importance and sphere priors per sender or
+kind, lead times per kind, permits per mode, and the learned log; plus
+`projects.json` with the delivery state of projects. `GET /attention/profile`
+returns both, `POST /attention/profile` replaces them; a deployment edits the
+files or drives the mode from the menu. The shipped defaults are the brief's
+(`attention.default_focus()`, `default_profile()`).
+
+**The API** (behind the dashboard's auth like the rest): `GET /attention`
+(the sections, the mode, the next breakpoint, `degraded` naming a source the
+store could not answer for), `GET /attention/item?id=…`, `POST
+/attention/mode {mode}` (`null` follows the schedule), `POST
+/attention/items/later {id, when: next|tomorrow}`, `…/pull`, `…/done`,
+`…/reopen`, `…/correct {id, importance?, due?, lead?, sphere?, tags?,
+critical?}`, `POST /attention/permits {sender, mode?, on}`, `POST
+/attention/admit {sphere, mode?, on}`; and the token-gated `POST
+/internal/attention/set {id, …}` for agents (`attention-set.py`). Item ids are
+`thread:<id>`, `chat:<chat id>` and a project's URI.
+
+**The life store.** The open items' four properties are emitted as N-Triples
+into `chambers/_generated/attention/items.nt` (`kb:importance`, `kb:due`,
+`kb:leadTime`, `kb:sphere`, `kb:tag`, `kb:currentActor`; subjects
+`urn:retinue:thread:<id>`, `urn:retinue:chat:<id>`, the project URI) — by
+`scripts/emit-attention.py` at boot and by the gateway on every tick that does
+something, write-if-changed — so "what wants attention, at which level" is one
+SELECT for agents and jobs.
+
 ## Conversations
 
 The dashboard has **conversation tabs** (`webapp/components/conversations.js`):
@@ -189,11 +291,15 @@ CSV) rather than only knowing one exists. A message may be text, files, or both.
 
 The unread badge only exists while the dashboard is
 open — which is precisely not the case when an agent opens a thread that needs a
-decision. So every agent→user turn that lands unread (a thread an agent opens
+decision. So an agent→user turn that lands unread (a thread an agent opens
 via `conversation-push.py`, a message it appends, and Ara's own async reply)
-also fans out a **Web Push** notification to the user's registered devices;
-tapping it opens that thread. This is automatic — there is no separate step
-after posting to a conversation.
+fans out a **Web Push** notification to the user's registered devices when
+the attention model says so (see *The home* above: pushed now, or held for the
+digest — Ara's replies in the user's own threads always push); tapping it
+opens that thread. This is automatic — there is no separate step after
+posting to a conversation. Pushes carry the RFC 8030 headers the model uses:
+`Urgency: high` on a breakthrough, `Urgency: normal` and `Topic: digest` on
+the digest, so an undelivered digest is replaced rather than stacked.
 
 The plumbing lives in `scripts/push_notify.py` (VAPID keypair, one file per
 device subscription, both persisted under `PUSH_DIR` — by default a sibling of

@@ -19,7 +19,9 @@
 // shows the most recent active threads (capped at MAX_CARD_THREADS) plus a link
 // to the dedicated all-conversations page, so the dashboard stays uncluttered.
 // With the `full` attribute (used on conversations.html) it shows every thread
-// with an Active/Archived filter and no cap.
+// with an Active/Archived filter and no cap. With `viewer` (the home page,
+// whose list is the attention list) it renders nothing at all until a thread
+// or the composer is opened by hash, and then only that view.
 //
 // Ara answers asynchronously: a reply marks the thread `pending`, so this card
 // polls until the answer arrives. Everything degrades gracefully offline (the
@@ -31,6 +33,7 @@ import {
 } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { openAttentionSheet } from './attention-sheet.js';
 
 const LIST_URL = '/conversations';
 // Views are addressable by location hash, so opening a thread or the composer
@@ -129,6 +132,7 @@ class RetinueConversations extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._full = this.hasAttribute('full');
+    this._viewer = this.hasAttribute('viewer');
     // List rows vs reflowing tiles — a per-device choice (see base.js).
     this._view = viewPref('conversations');
     // Deep link: #conversation-<id> opens that thread (used by agent push
@@ -255,6 +259,8 @@ class RetinueConversations extends HTMLElement {
   }
 
   async refresh() {
+    // The viewer has no list of its own to keep fresh: only an open thread.
+    if (this._viewer && !this._active && !this._composing) return;
     try {
       const res = await fetch(this._listUrl(), { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
@@ -538,6 +544,12 @@ class RetinueConversations extends HTMLElement {
     // Reflect the view on the host so the page can react (styles.css hides the
     // greeting and app dock while a thread or the composer is open).
     this.setAttribute('data-view', mode);
+    if (this._viewer && mode === 'list') {
+      // Nothing to show: the home's attention list is the list.
+      this.shadowRoot.innerHTML = '';
+      this._lastMode = mode;
+      return;
+    }
     const body = this._active ? this._threadView()
       : this._composing ? this._composerView()
       : this._listView();
@@ -730,9 +742,15 @@ class RetinueConversations extends HTMLElement {
         `title="Speak Ara's replies as they arrive" aria-label="Speak replies as they arrive" ` +
         `aria-pressed="${this._autoplay}">${this._autoplay ? '\u{1F50A}' : '\u{1F507}'}</button>`
       : '';
+    // The attention sheet — importance, urgency, delivery and their
+    // corrections — for the threads the model lists: those an agent opened.
+    const attentionBtn = (t.initiator === 'agent' || t.attention)
+      ? `<button class="iconbtn" data-attention title="Importance, urgency, delivery — and their corrections" ` +
+        `aria-label="Attention details">&#9432;</button>`
+      : '';
     return `<div class="thread-bar">${this._backBtnHtml()}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
-      `<span class="bar-actions">${this._modelPickerHtml(t.model)}${autoBtn}${archiveBtn}</span></div>` +
+      `<span class="bar-actions">${this._modelPickerHtml(t.model)}${attentionBtn}${autoBtn}${archiveBtn}</span></div>` +
       `<div class="thread">${this._messagesHtml(t)}</div>` +
       this._inputRow('Reply …');
   }
@@ -1360,6 +1378,8 @@ class RetinueConversations extends HTMLElement {
     if (nw) nw.addEventListener('click', () => this._openComposer());
     const back = root.querySelector('[data-back]');
     if (back) back.addEventListener('click', () => this._openList());
+    const att = root.querySelector('[data-attention]');
+    if (att) att.addEventListener('click', () => openAttentionSheet(`thread:${this._active}`, { here: true }));
     const arch = root.querySelector('[data-archive]');
     if (arch) arch.addEventListener('click', () => this._archive(this._active, true));
     const unarch = root.querySelector('[data-unarchive]');

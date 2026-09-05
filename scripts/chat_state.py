@@ -272,6 +272,12 @@ class ChatStateStore:
             # where the user works out a reply with Ara. None until one is
             # first asked for; see `set_companion`.
             "companion": None,
+            # The attention model's block for this chat (scripts/attention.py,
+            # `item_from_doc`): importance, deadline, lead, sphere, tags, kind
+            # and the delivery state. Written by the web-gateway when an
+            # inbound message arrives and when the user acts on the home
+            # screen; None for a chat the model has not seen.
+            "attention": None,
         }
 
     def _read(self, chat_id: str) -> dict:
@@ -372,6 +378,14 @@ class ChatStateStore:
             doc = self._read(chat_id)
             doc["gateway"] = slug or None
             doc["gateway_source"] = (source or None) if slug else None
+            self._write(doc)
+            return doc
+
+    def set_attention(self, chat_id: str, block: dict | None) -> dict:
+        """Store — or clear, with None — the attention block of a chat."""
+        with self._lock:
+            doc = self._read(chat_id)
+            doc["attention"] = dict(block) if block else None
             self._write(doc)
             return doc
 

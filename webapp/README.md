@@ -33,6 +33,37 @@ a Progressive Web App on the phone home screen.
 Env: `WEBAPP_DIR` (default `/workspace/webapp`), `DASHBOARD_DATA_DIR`
 (default `WEBAPP_DIR/data`).
 
+## The home: the attention list
+
+The home screen is one list of what wants attention (`components/attention.js`
+over `GET /attention`, design in `docs/attention-model.md`, mechanics in
+`docs/dashboard.md`): threads with Ara, messenger chats and running projects as
+one kind of thing, each with an importance, a deadline against a lead time, a
+sphere, and the delivery the gateway decided — pushed, held for the next
+digest, or listed. Sections Now · Next · Held · Waiting; every row shows its
+preview and a one-line reason; ⓘ opens the details sheet
+(`components/attention-sheet.js`, shared with the thread bar and the chat
+page) with the three fields explained and correctable, the sender's permit
+and the sphere's Focus rule for the mode in force, and Later / Pull / Mark
+done. The mode chip opens the mode menu (`POST /attention/mode`). Rows open
+where the item lives: a thread in place — the `retinue-conversations` element
+sits on the home as a `viewer`, invisible until `#conversation-<id>` or `#new`
+— a chat on `chat.html`, a project on `project.html`. `?item=<id>` deep-links
+to an item's sheet. The list refreshes on the conversations cadence and after
+every action on the sheet (`retinue-attention-change` on `window`).
+
+`GET /attention` returns `{generated, now, timezone, mode: {id, name, blurb,
+threshold, admits, admit_tags, manual, scheduled: {id, name, until}}, modes,
+schedule, digest_times, spheres, next_breakpoint, sections: {now, next, held,
+waiting}, counts, degraded, learned}`; a row is `{id, kind: thread|chat|project,
+title, preview, href, sphere, tags, sender, channel, group, agent, count,
+unread, pending, level, critical, importance, importance_from, importance_text,
+due, lead (minutes), lead_from, kind_label, urgency, delivery, reason, actor,
+waiting_since, state, released, snoozed_until, pushed, permit, admits_sphere}`.
+The actions: `POST /attention/items/later|pull|done|reopen|correct` with the
+id in the body, `POST /attention/permits`, `POST /attention/admit`,
+`GET|POST /attention/profile`.
+
 ## Conversation tabs
 
 The same gateway also backs the conversation-tabs card with a small JSON API

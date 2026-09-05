@@ -207,12 +207,21 @@ Open one from any agent:
 
 ```bash
 python3 /workspace/scripts/conversation-push.py --title "Party RSVP" \
+  --importance 3 --due 2026-09-12 --kind invitation --sphere friends \
   "You've got an invite to Mara's party. Confirm and add to agenda, or decline?"
 # --attach PATH delivers files; --thread <id> appends to an existing thread
 ```
 
-Every agent→user turn that lands unread also Web-Pushes the user's devices —
-no separate step. **Before composing any dashboard text, apply the
+**Say how much it matters.** The dashboard's home is an attention list
+(`docs/attention-model.md`): every thread, chat and project carries an
+importance (0–5), an optional deadline with a lead time, a sphere and tags,
+and the gateway decides from those and the user's focus mode whether it rings
+now, waits for the next digest, or is merely listed. Declare `--importance`,
+`--due`/`--lead`, `--sphere`/`--tag`, `--kind` (and `--critical` only for
+what must ring in every mode, `--actor` when it waits on someone else); a
+thread that declares nothing is passive — listed, never pushed. The reply
+says what was decided (`attention.delivery`); relay a hold honestly. Revise
+any item with `scripts/attention-set.py`. **Before composing any dashboard text, apply the
 `dashboard-composing` skill** (chips for every option, no bare URLs, details
 chips, links for anything the user must do elsewhere). The gateway also runs a
 presentation lint over outbound thread messages — a net for form only, never a
@@ -304,6 +313,7 @@ framework — check `scripts/claude_auth.py status` and point the user at
 | editing `.refresh.json`/`.schedule.json`, project wake semantics | `docs/scheduling.md` |
 | unfamiliar messaging accounts, send policies, gateway config | `docs/messaging.md` |
 | webapp/gateway changes, attachments, push, voice input | `docs/dashboard.md` |
+| importance, urgency, focus modes, the digest — the attention model | `docs/attention-model.md`, `docs/attention-migration.md` |
 | news ranking/ingestion/learning changes | `docs/news.md` |
 | the Ask-Ara connector | `docs/ask-ara.md` |
 | opening a framework PR, self-update, sign-in issues | `docs/contributing.md` |

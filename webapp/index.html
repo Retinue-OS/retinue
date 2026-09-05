@@ -14,14 +14,20 @@
 
   <!-- Web components. Each is a standalone custom element that fetches its
        own data document. Edit this file to add, remove or reorder cards. -->
+  <!-- The home: one list of what wants attention — threads, chats and projects
+       alike, each with its importance, urgency and delivery — over the
+       gateway's GET /attention (docs/attention-model.md). -->
+  <script type="module" src="/components/attention.js"></script>
+  <!-- The thread viewer: threads with Ara open in place, answering the
+       #conversation-<id> hash that rows and push notifications use, and the
+       composer (#new) for a new conversation. Invisible until then. -->
   <script type="module" src="/components/conversations.js"></script>
-  <script type="module" src="/components/projects.js"></script>
   <script type="module" src="/components/news.js"></script>
   <script type="module" src="/components/app-launcher.js"></script>
   <!-- No opt-in element here (that UI lives on /settings.html now), but the
        module keeps an already-granted subscription healthy on every load. -->
   <script type="module" src="/components/push.js"></script>
-  <!-- Splitter manager for the wide layout: drag-resizable columns, persisted
+  <!-- Splitter manager for the wide layout: drag-resizable regions, persisted
        per device. A no-op on phones, where the splitters are hidden. -->
   <script type="module" src="/layout.js"></script>
   <!-- Keeps an open thread's locked frame the height that is actually
@@ -38,8 +44,6 @@
   <script type="module" src="/components/todo.js"></script>
   <script type="module" src="/components/briefing.js"></script>
   -->
-  <!-- Chats (messenger mirror): the home-screen list over GET /chats. -->
-  <script type="module" src="/components/chats.js"></script>
 </head>
 <body>
   <main>
@@ -54,29 +58,22 @@
 
     <!-- The deck: the resizable region between header and dock. On phones the
          wrappers are display:contents (everything stacks, the page scrolls);
-         in the wide layout they are real flex columns separated by draggable
-         splitters (see layout.js), VS Code style: conversations + news on the
-         left, projects on the right. -->
+         in the wide layout the column is a fixed frame whose regions scroll
+         internally, the boundary to the news a draggable splitter (layout.js). -->
     <div class="deck">
       <section class="col col-main">
-        <!-- Chats (messenger mirror): every channel conversation as one row,
-             from the gateway's GET /chats; rows open the chat's own page. In
-             the wide layout the card takes a draggable fixed-height region
-             above the conversations (styles.css --chats-h, managed by
-             layout.js like the news boundary — the splitter below is its
-             handle). -->
-        <retinue-chats heading="Chats"></retinue-chats>
+        <!-- The home: what wants attention now, next, held for the digest, and
+             waiting on others — threads, chats and projects as one list. Each
+             row opens where it lives (a thread here, a chat or project on its
+             page); ⓘ opens the item's details with its corrections. -->
+        <retinue-attention heading="Attention"></retinue-attention>
 
-        <div class="splitter splitter-h" data-splitter="chats" role="separator"
-             aria-orientation="horizontal" aria-label="Resize chats"
-             title="Drag to resize &middot; double-click to reset" tabindex="0"></div>
-
-        <!-- Interactive chat threads with Ara. A thread can be opened by you or
-             by a retinue agent that needs a decision; it talks to the gateway's
-             /conversations API (no static data file). It takes all remaining
-             screen height; when a thread is open the header and app dock hide
-             (see styles.css) so the chat gets the whole display. -->
-        <retinue-conversations heading="Conversations"></retinue-conversations>
+        <!-- The thread viewer (the same element the conversations page uses):
+             invisible until a thread or the composer is opened by hash, then
+             it takes the whole display (see styles.css) so the chat with Ara
+             is immersive. Its list is never shown here — the attention list
+             above is the list. -->
+        <retinue-conversations viewer heading="Conversations"></retinue-conversations>
 
         <div class="splitter splitter-h" data-splitter="news" role="separator"
              aria-orientation="horizontal" aria-label="Resize news"
@@ -88,19 +85,6 @@
              lapse), every headline a link to the source. 👍/👎/✕ teach the Herald
              agent, which keeps the profile behind the ranking. -->
         <retinue-news heading="News"></retinue-news>
-      </section>
-
-      <div class="splitter splitter-v" data-splitter="side" role="separator"
-           aria-orientation="vertical" aria-label="Resize projects column"
-           title="Drag to resize &middot; double-click to reset" tabindex="0"></div>
-
-      <section class="col col-side">
-        <!-- Running projects, computed live from the life store (GET /projects).
-             Projects where you are on the move are highlighted with an accent
-             bar; "All projects →" opens the full page, including those waiting
-             on a third person. No static data file — the .md frontmatter is the
-             source. -->
-        <retinue-projects heading="Projects"></retinue-projects>
       </section>
     </div>
     <!-- Non-functional/static mock cards are intentionally disabled until they
