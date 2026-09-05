@@ -56,10 +56,7 @@ const CSS = `
                -webkit-tap-highlight-color: transparent; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
   .content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-  .list { flex: 1; min-height: 0; }
-  @media (min-width: 1000px) and (min-height: 480px) {
-    .list { overflow-y: auto; overscroll-behavior: contain; }
-  }
+  .list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
   .sec { margin: 4px 0 12px; }
   .sec h4 { margin: 8px 4px 6px; font-size: .7rem; letter-spacing: .1em; text-transform: uppercase;
             color: var(--muted, #8b93a3); font-weight: 600; }

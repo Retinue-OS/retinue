@@ -1,12 +1,14 @@
 /* Retinue dashboard shell. Minimalist, dark, app-like on small displays.
  *
  * Layout model:
- *  - Dashboard (list mode): main is a flex column with min-height 100dvh. The
- *    .deck / .col wrappers in index.html are display:contents here, so every
- *    card stacks and contributes its natural height. On tall screens the
- *    attention list grows to fill the leftover space (app-like, dock at the
- *    bottom); when the sections outgrow a small or short viewport the PAGE
- *    scrolls, so every section stays reachable.
+ *  - Dashboard (list mode): main is a flex column locked to the visible
+ *    height (--frame-h from viewport.js, else 100dvh). The .deck / .col
+ *    wrappers in index.html are display:contents here, so the cards stack in
+ *    main's column: header, the attention list, news, the dock. The page
+ *    never scrolls — the attention list scrolls inside its own region and
+ *    the news inside a capped share of the column, so the header and the
+ *    dock always stay in view. The full list pages (chats, conversations,
+ *    news, projects) keep a scrolling document on the phone.
  *  - Thread/composer open: the frame locks to exactly 100dvh and everything
  *    else hides, so the chat is immersive with an internally scrolled thread
  *    and a pinned composer. The thread viewer on the home is otherwise
@@ -68,19 +70,32 @@ main {
 .top .gear:hover { color: var(--accent); }
 
 /* Phone layout: the deck wrappers dissolve, cards join main's flex column
-   directly, and the splitters (a wide-layout affordance) do not exist. */
+   directly, and the splitters (a wide-layout affordance) do not exist. The
+   home locks its frame to the visible height so nothing scrolls but the
+   list (and the news inside its share); the visible height can be less
+   than 100dvh, so the base min-height must not hold the frame taller. */
 .deck, .col { display: contents; }
+main:has(> .deck) {
+  height: 100vh;
+  height: 100dvh;
+  height: var(--frame-h, 100dvh);
+  min-height: 0;
+  overflow: hidden;
+}
 .splitter { display: none; }
 
-/* The attention list absorbs leftover height on tall screens; on small ones
-   it keeps its natural height and the page scrolls instead. The thread viewer
-   is invisible until a thread or the composer is open (the immersive rules
-   below), and then takes the frame. */
+/* The attention list takes the leftover height and scrolls inside it (the
+   element's own .list rule). The thread viewer is invisible until a thread or
+   the composer is open (the immersive rules below), and then takes the
+   frame. The news on a phone is a capped, self-scrolling share of the
+   column; an empty feed hides it (the explicit display:none matters because
+   the element's own :host{display:block} outranks the UA [hidden] rule). */
 retinue-attention { flex: 1; min-height: 0; }
 retinue-conversations[viewer][data-view="list"] { display: none; }
 retinue-conversations[viewer] { flex: 1; min-height: 0; }
 retinue-projects { flex: none; }
-retinue-news { flex: none; }
+retinue-news { flex: 0 0 auto; max-height: 28%; overflow-y: auto; overscroll-behavior: contain; }
+retinue-news[hidden] { display: none; }
 /* Chats card: natural height in the phone stack, like the other list cards. */
 retinue-chats { flex: none; }
 /* Phone stacking: the list, then news (read-mostly), then the dock. */
