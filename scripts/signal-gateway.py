@@ -378,7 +378,8 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
         print(f"[signal-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
-def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+def _store_media_ref(data: bytes, content_type: str | None,
+                     file_name: str | None = None) -> str | None:
     """Persist inbound media durably and return its store reference.
 
     The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
@@ -398,7 +399,8 @@ def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
     if not data:
         return None
     try:
-        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type,
+                                        file_name=file_name)
     except Exception as exc:
         print(f"[signal-gateway] could not store inbound media: {exc}", flush=True)
         return None
@@ -601,18 +603,21 @@ def _split_attachments(event: dict) -> tuple[Path | None, list[dict], list[str]]
     """Partition inbound attachments into (voice_note_path, files, attachment_urls).
 
     signal-cli labels each attachment with its contentType: ``audio/*`` is a
-    voice note to transcribe, ``image/*`` is forwarded to the agent as a file
-    payload (``{"filename", "content_type", "data"(base64)}`` — the shape the
-    retinue gateway's POST /message accepts as ``files``). An attachment with
-    no contentType keeps the legacy voice-note treatment, since before this
-    split every attachment was handed to the transcriber.
+    voice note to transcribe, ``image/*`` and documents are forwarded to the
+    agent as a file payload (``{"filename", "content_type", "data"(base64)}``
+    — the shape the retinue gateway's POST /message accepts as ``files``), a
+    ``video/*`` is kept for the chat only (the agent cannot watch it). An
+    attachment with no contentType keeps the legacy voice-note treatment,
+    since before this split every attachment was handed to the transcriber.
 
-    Every attachment (image or voice note) is ALSO persisted durably and its
-    HTTP reference collected in ``attachment_urls`` — the ``kb:attachment`` triple
-    on the stored message. The voice note is additionally added to ``files`` so
-    the original audio rides into the conversation alongside its transcript. The
-    durable reference is stored regardless of size (consistency: a reference,
-    never inline); only the transient ``files`` payload honours the size cap."""
+    Every attachment, whatever its kind, is persisted durably — with the name
+    the sender gave it — and its reference collected in ``attachment_urls``,
+    the ``kb:attachment`` triple on the stored message: the chat shows the
+    message as the native client does. The voice note is additionally added
+    to ``files`` so the original audio rides into the conversation alongside
+    its transcript. The durable reference is stored regardless of size
+    (consistency: a reference, never inline); only the transient ``files``
+    payload honours the forwarding size cap."""
     msg = event.get("envelope", {}).get("dataMessage") or {}
     attachments = msg.get("attachments") or []
     voice: Path | None = None
@@ -626,23 +631,28 @@ def _split_attachments(event: dict) -> tuple[Path | None, list[dict], list[str]]
             print(f"[signal-gateway] attachment metadata present but file not found: {att}", flush=True)
             continue
         content_type = str(att.get("contentType") or "").lower()
+        file_name = str(att.get("filename") or "") or None
+        # No label keeps the legacy voice-note treatment (see the docstring).
+        kind = _ibstore.media_kind(content_type) if content_type else "audio"
         try:
             data = path.read_bytes()
         except OSError as exc:
             print(f"[signal-gateway] could not read inbound attachment {path}: {exc}", flush=True)
             data = b""
-        if content_type.startswith("image/"):
+        if kind in ("image", "video", "file"):
             if not data:
                 continue
-            ref = _store_media_ref(data, content_type)
+            ref = _store_media_ref(data, content_type, file_name)
             if ref:
                 attachment_urls.append(ref)
+            if kind == "video":
+                continue  # kept for the chat; the agent cannot watch it
             if len(data) > MAX_INBOUND_FILE_BYTES:
-                print(f"[signal-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
+                print(f"[signal-gateway] inbound {kind} too large to forward ({len(data)} bytes)", flush=True)
                 continue
-            suffix = path.suffix or mimetypes.guess_extension(content_type) or ".jpg"
+            suffix = path.suffix or mimetypes.guess_extension(content_type) or (".jpg" if kind == "image" else "")
             files.append({
-                "filename": f"signal-image{suffix}",
+                "filename": f"signal-{kind}{suffix}",
                 "content_type": content_type,
                 "data": base64.b64encode(data).decode("ascii"),
             })
@@ -652,7 +662,7 @@ def _split_attachments(event: dict) -> tuple[Path | None, list[dict], list[str]]
             # attach the audio itself so the conversation carries it.
             mime = content_type or "audio/ogg"
             if data:
-                ref = _store_media_ref(data, mime)
+                ref = _store_media_ref(data, mime, file_name)
                 if ref:
                     attachment_urls.append(ref)
                 if len(data) <= MAX_INBOUND_FILE_BYTES:
@@ -1375,7 +1385,8 @@ def _sync_attachment_refs(sent: dict) -> list[str]:
         except OSError as exc:
             print(f"[signal-gateway] could not read own-device attachment: {exc}", flush=True)
             continue
-        ref = _store_media_ref(data, str(att.get("contentType") or "") or None)
+        ref = _store_media_ref(data, str(att.get("contentType") or "") or None,
+                               str(att.get("filename") or "") or None)
         if ref:
             refs.append(ref)
     return refs
@@ -1507,7 +1518,9 @@ def _handle_event(event: dict) -> None:
             lang = DEFAULT_LANGUAGE
         if question:
             print(f"[signal-gateway] processing text message from {sender}", flush=True)
-    if not question and not files:
+    # A message that is only its media — a video, a sticker — is still the
+    # message: it is recorded and shown, and the prompt says what it carries.
+    if not question and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
             # (delivered=False, audio retained) for the daily drain / a re-transcribe.
@@ -1518,7 +1531,7 @@ def _handle_event(event: dict) -> None:
         event_sample = json.dumps(event, default=str)
         if len(event_sample) > 500:
             event_sample = event_sample[:500] + "..."
-        print(f"[signal-gateway] skipping event from {sender} (no text/audio/image content): {event_sample}", flush=True)
+        print(f"[signal-gateway] skipping event from {sender} (no text or media): {event_sample}", flush=True)
         return
 
     # The account's mode — not the message content — decides how the message is
@@ -1690,6 +1703,15 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"transcript).\n")
         if files else ""
     )
+    # Media kept with the message but not attached to the prompt: a video,
+    # a sticker, or anything over the forwarding cap. The agent should know
+    # the message is that medium, without it weighing on the turn.
+    kept = max(0, len(attachment_urls or []) - len(files or []))
+    if kept:
+        attachment_line += (
+            f"\nThe message also carries {kept} media file(s) — a video, a document, "
+            f"a sticker, or an image over the forwarding size — kept with the message "
+            f"in the chat and not attached to this prompt.\n")
     # The canonical idempotency key for this message's dashboard thread —
     # account and chat included, because a channel-native id alone is not
     # unique (see inbound_store.thread_key). The drain decorates its rows with

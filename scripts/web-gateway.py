@@ -4405,12 +4405,13 @@ def _parse_media_reference(url: str) -> tuple[str | None, str | None]:
 # reserves the box. The subjects are the kb:attachment IRIs themselves.
 _CHAT_MEDIA_META_SPARQL = """
 PREFIX k: <%s>
-SELECT ?att ?ct ?size ?w ?h WHERE {
+SELECT ?att ?ct ?size ?w ?h ?name WHERE {
   VALUES ?att { %%(atts)s }
   OPTIONAL { ?att k:contentType ?ct }
   OPTIONAL { ?att k:byteSize ?size }
   OPTIONAL { ?att k:width ?w }
   OPTIONAL { ?att k:height ?h }
+  OPTIONAL { ?att k:fileName ?name }
 }
 """ % _KB
 
@@ -4420,7 +4421,7 @@ _SPARQL_IRI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:[^\s<>\"{}|\\^`]*$")
 
 
 def _chat_media_meta_lookup(references) -> dict:
-    """``{reference: {type, size, width, height}}`` as the gateways stated it.
+    """``{reference: {type, size, width, height, name}}`` as the gateways stated it.
 
     A gateway writes what it knows about a blob into the record that references
     it — the gateway's own knowledge about its own store — and this reads it
@@ -4441,6 +4442,8 @@ def _chat_media_meta_lookup(references) -> dict:
         meta = out.setdefault(att, {})
         if _bval(b, "ct"):
             meta["type"] = _bval(b, "ct")
+        if _bval(b, "name"):
+            meta["name"] = _bval(b, "name")
         for key, var in (("size", "size"), ("width", "w"), ("height", "h")):
             value = _bval(b, var)
             if value is not None:
@@ -4485,6 +4488,8 @@ def _shape_chat_attachments(urls: list[str], serving_slug: str | None = None,
             att["type"] = stated["type"]
         if isinstance(stated.get("size"), int):
             att["size"] = stated["size"]
+        if stated.get("name"):
+            att["name"] = stated["name"]
         # Intrinsic size, when the store sniffed it at ingest — the client
         # reserves the image box with it, so lazy loads never shift the scroll.
         if isinstance(stated.get("width"), int) and isinstance(stated.get("height"), int):
