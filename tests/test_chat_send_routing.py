@@ -351,7 +351,7 @@ def test_media_references_resolve_through_the_chats_account():
         # wrong for every extra account.
         for ref in (urn, legacy):
             att = wg._shape_chat_attachments(
-                [ref], "signal", serving_slug="signal-gateway-personal")[0]
+                [ref], serving_slug="signal-gateway-personal")[0]
             assert att["url"] == f"/chats/media/signal-gateway-personal/{mid}"
             assert att["id"] == mid
 
@@ -360,9 +360,9 @@ def test_media_references_resolve_through_the_chats_account():
         # through and plainly fails to load. Both are honest failures —
         # there is nobody to ask. (An *ambiguous* account is not this case:
         # see test_two_inbox_accounts_still_serve_media.)
-        assert wg._shape_chat_attachments([legacy], "signal")[0]["url"] == \
+        assert wg._shape_chat_attachments([legacy])[0]["url"] == \
             f"/chats/media/signal-gateway/{mid}"
-        assert wg._shape_chat_attachments([urn], "signal")[0]["url"] == urn
+        assert wg._shape_chat_attachments([urn])[0]["url"] == urn
     print("PASS test_media_references_resolve_through_the_chats_account")
 
 
@@ -406,7 +406,7 @@ def test_two_inbox_accounts_still_serve_media():
         assert slugs("signal", SYSTEM) == ["signal-gateway-personal"]
         # The whole ranking feeds the message payload: the first slug serves.
         mid = "ab" * 16
-        att = wg._shape_chat_attachments([f"urn:retinue:media:signal:{mid}"], "signal",
+        att = wg._shape_chat_attachments([f"urn:retinue:media:signal:{mid}"],
                                          serving_slug=slugs("signal")[0])[0]
         assert att["url"] == f"/chats/media/signal-gateway-personal/{mid}"
     print("PASS test_two_inbox_accounts_still_serve_media")

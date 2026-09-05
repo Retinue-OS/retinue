@@ -127,9 +127,23 @@ AUTHORS = ("user", "agent", "device")
 # *which* blob and deliberately not where to fetch it — a gateway's address is the
 # reader's configuration (its messenger registry), and a record that also carried
 # one would be a second source of truth free to drift from it. Multi-valued, so a
-# message with several images gets one triple each. The media type is not stored
-# here on purpose — it comes back in the serving response's Content-Type header.
+# message with several images gets one triple each. What the gateway knows about
+# the blob is stated on that IRI, in the same record — see P_CONTENT_TYPE.
 P_ATTACHMENT = KB + "attachment"
+# What the gateway knows about a blob it stored, stated on the media IRI (the
+# kb:attachment object) as its subject, inside the message's own record: the
+# content type the bytes are served as, their size, and — for an image — the
+# pixel size sniffed at ingest. A reader needs these BEFORE fetching (an image
+# and a voice note are different elements; a reserved box needs the ratio), and
+# they are the gateway's own knowledge about its own store — so the gateway
+# states them, and no reader ever looks at another service's files to learn
+# them. They are derived from the store's sidecars at write time
+# (:func:`media_meta`) and stated on older records by :func:`backfill_media_meta`.
+P_CONTENT_TYPE = KB + "contentType"
+P_BYTE_SIZE = KB + "byteSize"
+P_WIDTH = KB + "width"
+P_HEIGHT = KB + "height"
+XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
 # Optional reference to a retained raw-media file (e.g. a voice note's audio),
 # recorded when a message is persisted *before* transcription so a failed or
 # crashed STT run leaves a re-transcribable artifact instead of a silent drop.
@@ -308,6 +322,16 @@ def _render(fields: dict) -> str:
             lines.append(_iri(subj, P_ATTACHMENT, url))
     if fields.get("media"):
         lines.append(_lit(subj, P_MEDIA, fields["media"]))
+    # What this gateway knows about each blob, on the blob's own IRI (see
+    # P_CONTENT_TYPE). Only for references the record actually carries.
+    for url, meta in sorted((fields.get("attachment_meta") or {}).items()):
+        if url not in (fields.get("attachments") or []) or not meta:
+            continue
+        if meta.get("content_type"):
+            lines.append(_lit(url, P_CONTENT_TYPE, str(meta["content_type"])))
+        for key, pred in (("size", P_BYTE_SIZE), ("width", P_WIDTH), ("height", P_HEIGHT)):
+            if isinstance(meta.get(key), int) and meta[key] >= 0:
+                lines.append(_lit(url, pred, str(meta[key]), XSD_INTEGER))
     return "".join(l + "\n" for l in sorted(lines))
 
 
@@ -322,8 +346,8 @@ def _parse(text: str) -> dict | None:
     fields: dict = {"type": T_INBOUND, "delivered": False, "group": None,
                     "message_id": None, "chat": None, "account": None,
                     "author": None, "sent_at": None, "attachments": [],
-                    "media": None}
-    subject = None
+                    "media": None, "attachment_meta": {}}
+    triples = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -331,9 +355,26 @@ def _parse(text: str) -> dict | None:
         m = _TRIPLE_RE.match(line)
         if not m:
             return None
-        subj, pred, obj_iri, lit, _dtype = m.groups()
-        subject = subj
+        triples.append(m.groups())
+    # The record's own subject is the one that carries kb:channel; a file
+    # holds one message, so every other subject is a blob the message
+    # references, and its triples are what the gateway stated about it.
+    subject = next((t[0] for t in triples if t[1] == P_CHANNEL), None)
+    if subject is None:
+        return None
+    for subj, pred, obj_iri, lit, _dtype in triples:
         value = obj_iri if obj_iri is not None else _unesc(lit)
+        if subj != subject:
+            meta = fields["attachment_meta"].setdefault(subj, {})
+            if pred == P_CONTENT_TYPE:
+                meta["content_type"] = value
+            elif pred in (P_BYTE_SIZE, P_WIDTH, P_HEIGHT):
+                try:
+                    meta[{P_BYTE_SIZE: "size", P_WIDTH: "width",
+                          P_HEIGHT: "height"}[pred]] = int(value)
+                except ValueError:
+                    pass
+            continue
         if pred == RDF_TYPE:
             fields["type"] = value
         elif pred == P_CHANNEL:
@@ -364,8 +405,12 @@ def _parse(text: str) -> dict | None:
             fields["media"] = value
         elif pred == P_DELIVERED:
             fields["delivered"] = value.strip().lower() == "true"
-    if subject is None or "channel" not in fields:
-        return None
+    # Statements about a blob the record does not reference are noise, never
+    # re-emitted; statements about one it does are kept whether or not the
+    # blob still exists here — they are the record's, not the filesystem's.
+    fields["attachment_meta"] = {
+        url: meta for url, meta in fields["attachment_meta"].items()
+        if url in fields["attachments"] and meta}
     fields["subject"] = subject
     return fields
 
@@ -454,7 +499,9 @@ def write_message(
     ``attachment_urls`` are references to this message's media (voice note,
     image), each emitted as a ``kb:attachment`` IRI — see :data:`P_ATTACHMENT`
     for the shape. The bytes are never inlined into the graph; see
-    :func:`store_media`.
+    :func:`store_media`. For every reference naming a blob in *this* store,
+    what the store knows about it (type, size, pixel size) is stated on the
+    reference in the same record — see :data:`P_CONTENT_TYPE`.
 
     ``media`` optionally records a reference (a durable file path) to raw media
     retained alongside this message — used by the persist-before-transcribe path
@@ -480,6 +527,7 @@ def write_message(
         "attachments": [u for u in (attachment_urls or []) if u],
         "media": media or None,
     }
+    fields["attachment_meta"] = _own_attachment_meta(store_dir, fields["attachments"])
     # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
     fname = f"{int(ts * 1000):016d}-{token}.nt"
     path = messages_dir(store_dir) / fname
@@ -539,6 +587,7 @@ def write_outbound(
         "sent_at": _iso(ts),
         "attachments": [u for u in (attachment_urls or []) if u],
     }
+    fields["attachment_meta"] = _own_attachment_meta(store_dir, fields["attachments"])
     fname = f"{int(ts * 1000):016d}-{token}.nt"
     path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
@@ -625,7 +674,9 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     ``urn:retinue:media:<channel>:<id>``, see :data:`P_ATTACHMENT` — and passes
     it to :func:`write_message` as an ``attachment_urls`` entry; the bytes stay
     on disk and out of the graph, and the reader resolves the reference through
-    the account that owns the chat.
+    the account that owns the chat. The sidecars are this store's private
+    format: what they hold is stated in the record (:data:`P_CONTENT_TYPE`),
+    which is where a reader learns it.
     """
     media_id = secrets.token_hex(16)
     d = media_dir(store_dir)
@@ -666,6 +717,99 @@ def load_media(store_dir: str | Path, media_id: str) -> tuple[bytes, str] | None
     except OSError:
         pass
     return data, ct
+
+
+# A media reference's blob id: the URN a gateway records today, or the
+# ``http://<service>:<port>/media/<id>`` form written before it existed.
+_MEDIA_REF_RE = re.compile(r"(?:^urn:retinue:media:[^:]+:|/media/)([0-9a-f]{32})/?$")
+
+
+def media_id_of(reference: str) -> str | None:
+    """The blob id a ``kb:attachment`` reference names, or None."""
+    m = _MEDIA_REF_RE.search((reference or "").strip())
+    return m.group(1) if m else None
+
+
+def media_meta(store_dir: str | Path, media_id: str) -> dict | None:
+    """What this store knows about one of its blobs, or None if it holds none.
+
+    ``{"content_type", "size"}`` plus ``{"width", "height"}`` when the
+    ``.meta`` sidecar carries them — the same facts :func:`store_media` wrote,
+    read back by the store that wrote them. This is the only reader of the
+    sidecars besides :func:`load_media`: a record states these on the media
+    IRI (see :data:`P_CONTENT_TYPE`) so nothing outside the gateway needs to.
+    """
+    if not _MEDIA_ID_RE.match(media_id or ""):
+        return None
+    d = media_dir(store_dir)
+    try:
+        size = (d / media_id).stat().st_size
+    except OSError:
+        return None
+    meta: dict = {"size": int(size)}
+    try:
+        ct = (d / (media_id + ".type")).read_text(encoding="utf-8").strip()
+    except OSError:
+        ct = ""
+    meta["content_type"] = ct or "application/octet-stream"
+    try:
+        dims = json.loads((d / (media_id + ".meta")).read_text(encoding="utf-8"))
+        w, h = dims.get("width"), dims.get("height")
+        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+            meta["width"], meta["height"] = w, h
+    except (OSError, ValueError, AttributeError):
+        pass
+    return meta
+
+
+def _own_attachment_meta(store_dir: str | Path, references: list) -> dict:
+    """``{reference: media_meta}`` for the references naming blobs in this store."""
+    out: dict = {}
+    for ref in references or []:
+        mid = media_id_of(ref)
+        meta = media_meta(store_dir, mid) if mid else None
+        if meta:
+            out[ref] = meta
+    return out
+
+
+def backfill_media_meta(store_dir: str | Path) -> int:
+    """State the blob metadata on records written before it was recorded.
+
+    Walks this store's messages once, and rewrites every record that
+    references a blob this store holds but says less about it than
+    :func:`media_meta` knows. Idempotent — a second run rewrites nothing —
+    and never raises: a record that cannot be read or written is skipped.
+    A gateway calls this at startup, on its own store only, so the reader
+    never has to fall back to anyone's files. Returns the rewrite count.
+    """
+    marker = f"<{P_ATTACHMENT}>"
+    count = 0
+    try:
+        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+    except OSError:
+        return 0
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if marker not in text:
+            continue
+        fields = _parse(text)
+        if not fields:
+            continue
+        known = _own_attachment_meta(store_dir, fields["attachments"])
+        stated = fields.get("attachment_meta") or {}
+        if all(stated.get(ref) == meta for ref, meta in known.items()):
+            continue
+        fields["attachment_meta"] = {**stated, **known}
+        try:
+            _atomic_write(_render(fields), path)
+        except OSError:
+            continue
+        count += 1
+    return count
 
 
 def undelivered(

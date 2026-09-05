@@ -229,6 +229,117 @@ def test_write_without_media_has_no_media_predicate():
     print("PASS test_write_without_media_has_no_media_predicate")
 
 
+def _png(w, h):
+    """The smallest thing the store's sniffer reads as a PNG of w x h."""
+    return (b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+            + w.to_bytes(4, "big") + h.to_bytes(4, "big") + b"\x08\x06\x00\x00\x00")
+
+
+def test_attachment_metadata_is_stated_in_the_record():
+    """What the gateway knows about a blob it stored is in the record itself.
+
+    A reader needs the content type before fetching (an image and a voice note
+    are different elements) and the pixel size to reserve the box. Those are
+    facts about the gateway's own store, so the gateway states them — on the
+    media IRI, in the message's record — and no reader has to look at another
+    service's files. The record's own subject stays the message."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pic = ist.store_media(tmp, _png(320, 420), "image/png")
+        note = ist.store_media(tmp, b"OggS" + b"\0" * 100, "audio/ogg")
+        refs = [f"urn:retinue:media:signal:{pic}",
+                f"urn:retinue:media:signal:{note}",
+                f"urn:retinue:media:signal:{'ab' * 16}"]  # not in this store
+        subj, path = ist.write_message(
+            tmp, channel="signal", sender="+41790000000", text="",
+            timestamp=1000.0, attachment_urls=refs, media="/tmp/retained")
+        text = path.read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if l]
+        assert lines == sorted(lines), "still deterministic"
+        assert f"<{refs[0]}> <{ist.P_CONTENT_TYPE}> \"image/png\" ." in text
+        assert f"<{refs[0]}> <{ist.P_WIDTH}> \"320\"^^<{ist.XSD_INTEGER}> ." in text
+        assert f"<{refs[0]}> <{ist.P_HEIGHT}> \"420\"^^<{ist.XSD_INTEGER}> ." in text
+        assert f"<{refs[0]}> <{ist.P_BYTE_SIZE}> \"{len(_png(320, 420))}\"^^" in text
+        assert f"<{refs[1]}> <{ist.P_CONTENT_TYPE}> \"audio/ogg\" ." in text
+        assert f"<{refs[1]}> <{ist.P_WIDTH}>" not in text, "no guessed pixel size for audio"
+        assert refs[2] in text and f"<{refs[2]}> <{ist.P_CONTENT_TYPE}>" not in text, \
+            "a blob this store does not hold gets no statement — nothing is invented"
+        # The parse keeps the message as the subject, whatever sorts last.
+        fields = ist._parse(text)
+        assert fields["subject"] == subj
+        assert sorted(fields["attachments"]) == sorted(refs)  # the record is sorted
+        assert fields["attachment_meta"][refs[0]] == {
+            "content_type": "image/png", "size": len(_png(320, 420)),
+            "width": 320, "height": 420}
+        assert fields["attachment_meta"][refs[1]] == {"content_type": "audio/ogg", "size": 104}
+        assert refs[2] not in fields["attachment_meta"]
+        # The statements survive every in-place rewrite of the record.
+        ist.update_message(path, text="transcript", clear_media=True)
+        assert ist.mark_delivered(path)
+        again = ist._parse(path.read_text(encoding="utf-8"))
+        assert again["text"] == "transcript" and again["delivered"] is True
+        assert again["attachment_meta"] == fields["attachment_meta"]
+        assert again["media"] is None
+        # Outbound records state the same about the blobs they reference.
+        _subj, opath = ist.write_outbound(
+            tmp, channel="signal", chat="+41790000000", text="", author="device",
+            timestamp=1001.0, attachment_urls=[refs[0]])
+        assert f"<{refs[0]}> <{ist.P_CONTENT_TYPE}> \"image/png\" ." in opath.read_text()
+    print("PASS test_attachment_metadata_is_stated_in_the_record")
+
+
+def test_backfill_states_metadata_on_older_records():
+    """Records written before the metadata existed get it from the same store.
+
+    Each gateway backfills its own store at startup: a record that references
+    a blob the store holds but says less about it than the store knows is
+    rewritten; everything else is left alone. Idempotent, so a restart costs
+    nothing. Legacy ``http://<service>/media/<id>`` references name the same
+    blobs and get the same statements."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pic = ist.store_media(tmp, _png(8, 6), "image/png")
+        note = ist.store_media(tmp, b"OggS" + b"\0" * 10, "audio/ogg")
+        urn = f"urn:retinue:media:signal:{pic}"
+        legacy = f"http://signal-gateway:8090/media/{note}"
+        gone = f"urn:retinue:media:signal:{'cd' * 16}"
+
+        def old_record(ts, **kw):
+            # A record as an older gateway wrote it: the reference, no statements.
+            _s, path = ist.write_message(tmp, channel="signal", sender="+4179",
+                                         text="x", timestamp=ts, **kw)
+            fields = ist._parse(path.read_text(encoding="utf-8"))
+            fields["attachment_meta"] = {}
+            path.write_text(ist._render(fields), encoding="utf-8")
+            return path
+
+        p_urn = old_record(1000.0, attachment_urls=[urn])
+        p_legacy = old_record(1001.0, attachment_urls=[legacy])
+        p_gone = old_record(1002.0, attachment_urls=[gone])
+        p_plain = old_record(1003.0)
+        before = {p.name: p.read_text() for p in (p_urn, p_legacy, p_gone, p_plain)}
+        assert ist.P_CONTENT_TYPE not in before[p_urn.name]
+
+        assert ist.backfill_media_meta(tmp) == 2
+        assert f"<{urn}> <{ist.P_CONTENT_TYPE}> \"image/png\" ." in p_urn.read_text()
+        assert f"<{urn}> <{ist.P_WIDTH}> \"8\"^^" in p_urn.read_text()
+        assert f"<{legacy}> <{ist.P_CONTENT_TYPE}> \"audio/ogg\" ." in p_legacy.read_text()
+        assert p_gone.read_text() == before[p_gone.name], "nothing to state, untouched"
+        assert p_plain.read_text() == before[p_plain.name]
+        # Idempotent: the second pass rewrites nothing.
+        assert ist.backfill_media_meta(tmp) == 0
+        # A record that already states everything is not rewritten either.
+        _s, fresh = ist.write_message(tmp, channel="signal", sender="+4179", text="y",
+                                      timestamp=1004.0, attachment_urls=[urn])
+        stamp = fresh.stat().st_mtime_ns
+        assert ist.backfill_media_meta(tmp) == 0 and fresh.stat().st_mtime_ns == stamp
+        # No store at all: nothing to do, no error.
+        assert ist.backfill_media_meta(Path(tmp) / "nope") == 0
+        # The reference reader behind it all.
+        assert ist.media_id_of(urn) == pic and ist.media_id_of(legacy) == note
+        assert ist.media_id_of("https://example.org/pic.jpg") is None
+        assert ist.media_id_of("") is None
+    print("PASS test_backfill_states_metadata_on_older_records")
+
+
 def test_missing_dir_is_empty():
     with tempfile.TemporaryDirectory() as tmp:
         assert ist.undelivered(Path(tmp) / "nope") == []
@@ -258,6 +369,8 @@ if __name__ == "__main__":
     test_update_message_fills_transcript_and_clears_media()
     test_update_message_missing_file_returns_none()
     test_write_without_media_has_no_media_predicate()
+    test_attachment_metadata_is_stated_in_the_record()
+    test_backfill_states_metadata_on_older_records()
     test_missing_dir_is_empty()
     test_since_epoch_and_iso_equivalent()
     print("all inbound_store tests passed")
