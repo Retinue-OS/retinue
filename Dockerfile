@@ -56,7 +56,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 #
 # .github/workflows/check-claude-code.yml watches the npm registry and opens
 # a bump PR against this ARG when a newer version appears.
-ARG CLAUDE_CODE_VERSION=2.1.260
+ARG CLAUDE_CODE_VERSION=2.1.261
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # ── Core Python dependencies ────────────────────────────────────────
