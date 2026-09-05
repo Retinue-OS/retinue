@@ -107,6 +107,11 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          percent-encoded; the key is split off
                                          at the FIRST colon.
   POST /chats/<id>/read               -> advance the read watermark (body {ts}).
+  POST /chats/<id>/flags              -> {archived?, muted?}: the chat page's
+                                         archive and mute switches. Archiving
+                                         settles the chat's attention item,
+                                         unarchiving reopens it; the flags mean
+                                         what they mean on threads.
   POST /chats/<id>/draft              -> write the shared draft (body {text,
                                          version}); 409 + current state on a
                                          stale version; empty text clears it.
@@ -4289,6 +4294,7 @@ def _news_preferences_payload() -> dict:
 _CHAT_ID_MAX_LEN = 512
 _CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
 _CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
+_CHAT_FLAGS_RE = re.compile(r"^/chats/([^/]+)/flags/?$")
 _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
 _CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
@@ -5567,6 +5573,8 @@ def _attention_mark(item_id: str, state: str, how: str | None = None) -> bool:
         if item is None:
             return False
         if state == "done":
+            if item.get("state") == "done":
+                return True  # settled already: the first marker stands
             item["state"] = "done"
             item["done_at"] = now.isoformat()
             item["done_how"] = how
@@ -5936,6 +5944,10 @@ class Handler(BaseHTTPRequestHandler):
         chat_read_match = _CHAT_READ_RE.match(self.path)
         if chat_read_match:
             self._handle_chat_read(chat_read_match.group(1))
+            return
+        chat_flags_match = _CHAT_FLAGS_RE.match(self.path)
+        if chat_flags_match:
+            self._handle_chat_flags(chat_flags_match.group(1))
             return
         chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
         if chat_draft_undo_match:
@@ -6394,6 +6406,37 @@ class Handler(BaseHTTPRequestHandler):
         doc = _CHAT_STATE.advance_last_read(chat_id, ts)
         _chats_cache_invalidate()
         self._send_json(200, {"id": chat_id, "last_read": doc["last_read"]})
+
+    def _handle_chat_flags(self, raw_id: str) -> None:
+        """The chat page's archive and mute switches (body {archived?, muted?}).
+
+        The thread semantics verbatim (docs/dashboard.md, "Archived + muted"):
+        an archived chat leaves the active list and comes back when a message
+        arrives, unless it is muted; muted also silences its push. Archiving
+        settles the chat's attention item; bringing it back reopens it — on
+        the list, never pushed again for that."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        flags = {key: bool(payload[key]) for key in ("archived", "muted") if key in payload}
+        if not flags:
+            self._send_json(400, {"error": "archived and/or muted (booleans) are required"})
+            return
+        before = _CHAT_STATE.get(chat_id)
+        doc = _CHAT_STATE.set_flags(chat_id, **flags)
+        _chats_cache_invalidate()
+        if flags.get("archived"):
+            _attention_mark(f"chat:{chat_id}", "done", "archived")
+        elif "archived" in flags and (before.get("attention") or {}).get("done_how") == "archived":
+            # Only what archiving settled comes back; a chat with nothing
+            # pending does not become an item by being unarchived.
+            _attention_mark(f"chat:{chat_id}", "open", "archived")
+        self._send_json(200, {"id": chat_id, "archived": bool(doc.get("archived")),
+                              "muted": bool(doc.get("muted"))})
 
     def _handle_chat_draft(self, raw_id: str) -> None:
         """The user writes the shared draft (body {text, version}).

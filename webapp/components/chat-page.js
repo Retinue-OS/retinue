@@ -618,7 +618,7 @@ class RetinueChatPage extends HTMLElement {
       body = `<div class="center muted"><p>${esc(this._error)}</p>` +
         `<p><a class="backlink" href="${CHATS_URL}">&#8249; All chats</a></p></div>`;
     } else {
-      body = this._headHtml() + this._panesHtml();
+      body = this._headHtml() + this._flagsHtml() + this._panesHtml();
     }
     this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>` +
       `<section class="page">${body}</section>`;
@@ -670,6 +670,44 @@ class RetinueChatPage extends HTMLElement {
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
       `<button role="tab" data-pane-tab="companion" aria-selected="false">Ara</button>` +
       `</nav></header>`;
+  }
+
+  // Archive and mute, under the header (the header itself is full on a
+  // phone). Each switch shows the state it is in and offers the other:
+  // "Archive" / "Archived · Unarchive". The flags mean what they mean on
+  // threads — an archived chat comes back when a message arrives unless it
+  // is muted; muted also silences its push — and POST /chats/<id>/flags
+  // settles or reopens the chat's attention item with the archive.
+  _flagsHtml() {
+    const c = this._chat || {};
+    const sw = (flag, on, offLabel, onLabel, hint) =>
+      `<button class="flag${on ? ' on' : ''}" data-flag="${flag}" data-on="${on ? '0' : '1'}" title="${esc(hint)}">` +
+      (on ? `<b>${esc(onLabel)}</b> · Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) + `</button>`;
+    return `<div class="flags" data-flags>` +
+      sw('archived', !!c.archived, 'Archive', 'Archived',
+         'Leaves the chat list; comes back when a message arrives, unless muted') +
+      sw('muted', !!c.muted, 'Mute', 'Muted', 'No push from this chat, and archived stays archived') +
+      `</div>`;
+  }
+
+  async _setFlag(flag, on) {
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/flags`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [flag]: on }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const out = await res.json();
+      if (this._chat) { this._chat.archived = !!out.archived; this._chat.muted = !!out.muted; }
+      window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'flags' } }));
+    } catch (_err) { /* the row keeps showing the last known state */ }
+    const row = this.shadowRoot.querySelector('[data-flags]');
+    if (row) { row.outerHTML = this._flagsHtml(); this._bindFlags(); }
+  }
+
+  _bindFlags() {
+    this.shadowRoot.querySelectorAll('[data-flag]').forEach((el) =>
+      el.addEventListener('click', () => this._setFlag(el.getAttribute('data-flag'), el.getAttribute('data-on') === '1')));
   }
 
   _panesHtml() {
@@ -1233,6 +1271,7 @@ class RetinueChatPage extends HTMLElement {
     // the corrections, Later and Mark handled.
     const att = root.querySelector('[data-attention]');
     if (att) att.addEventListener('click', () => openAttentionSheet(`chat:${this._id}`, { here: true }));
+    this._bindFlags();
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
     // the indicator honest whichever way the pane was reached (tab or swipe).
     root.querySelectorAll('[data-pane-tab]').forEach((el) =>
@@ -2259,6 +2298,14 @@ const CSS = `
                       border-radius: 999px; padding: 6px 14px; font: inherit; font-size: .8rem;
                       cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .pane-tabs button.on { background: var(--accent, #6ea8fe); color: #0b0d12; font-weight: 600; }
+  /* Archive / mute switches under the header. */
+  .flags { flex: none; display: flex; gap: 8px; padding: 8px 0 6px; }
+  .flag { border: 1px solid var(--line, rgba(231, 235, 242, .08)); background: transparent;
+          color: var(--muted, #8b93a3); border-radius: 999px; padding: 4px 12px; font: inherit;
+          font-size: .76rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .flag b { color: var(--fg, #e7ebf2); font-weight: 600; }
+  .flag.on { background: var(--card-2, #1c2230); border-color: var(--card-2, #1c2230); }
+  .flag:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
 
   /* ── Panes: swipe strip on the phone, columns behind a splitter when wide ── */
   .panes { flex: 1; min-height: 0; display: flex;

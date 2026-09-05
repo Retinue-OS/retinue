@@ -190,6 +190,8 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "last_level": a.get("last_level"),
         "pushed": [parse_dt(x) for x in a.get("pushed") or []],
         "pulled": bool(a.get("pulled", False)),
+        "done_at": a.get("done_at"),
+        "done_how": a.get("done_how"),
     }
 
 
@@ -204,6 +206,7 @@ def item_to_attention(item: dict) -> dict:
         "critical": bool(item.get("critical")), "state": item.get("state", "open"), "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "boost": int(item.get("boost", 0)), "last_level": item.get("last_level"),
         "pushed": [iso(x) for x in item.get("pushed") or []], "pulled": bool(item.get("pulled", False)),
+        "done_at": item.get("done_at"), "done_how": item.get("done_how"),
     }
 
 
@@ -642,6 +645,8 @@ def reopen(item: dict) -> None:
     item["released"] = True
     item["snoozed_until"] = None
     item["pulled"] = True
+    item["done_at"] = None
+    item["done_how"] = None
 
 
 def shown_anyway(item: dict, mode: dict, profile: dict, now: datetime) -> bool:

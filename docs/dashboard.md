@@ -102,7 +102,12 @@ judgement) where it carries one, else from the profile's priors for the
 sender, else the default — a person writing directly is *active* (held for the
 next digest, rung at once where the sender holds a permit), a group is chatter
 (passive). `attention-set.py chat:<id> …` revises it; a reply (from the
-dashboard or the phone) or *Mark handled* settles it. A project's properties
+dashboard or the phone), *Mark handled* or archiving the chat settles it.
+The chat page carries **Archive** and **Mute** switches under its header
+(`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
+meaning: an archived chat leaves the chats list and comes back when a
+message arrives unless it is muted, and muted also silences its push;
+unarchiving reopens the item only where archiving settled it. A project's properties
 come from its frontmatter — `importance`, `sphere`, `tags`, `kind`, the
 deadline `expected_by` / `next_due`, the lead `remind_before` — where the
 chamber's Markdown converter maps them; a correction on a project changes the

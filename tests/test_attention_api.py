@@ -407,6 +407,24 @@ def test_chat_inbound_gated_and_settled(base, wg):
     assert body["pushed"] is False and not PUSHES
     where, row = _find(_sections(base), "chat:signal:group:street")
     assert where == "next" and row["level"] == "passive" and row["importance"] == 1, row
+    # The chat page's switches: archiving settles the item and unarchiving
+    # brings back exactly what archiving settled; mute is its own flag.
+    gid = "chat:signal:group:street"
+    status, out = _http(base, "POST", "/chats/signal:group:street/flags", {"archived": True})
+    assert status == 200 and out["archived"] is True and out["muted"] is False, out
+    assert _find(_sections(base), gid)[0] is None
+    status, out = _http(base, "POST", "/chats/signal:group:street/flags", {"muted": True})
+    assert status == 200 and out["archived"] is True and out["muted"] is True
+    status, out = _http(base, "POST", "/chats/signal:group:street/flags", {"archived": False})
+    assert status == 200 and out["archived"] is False and out["muted"] is True
+    assert _find(_sections(base), gid)[0] == "next"
+    # What Mark handled settled does not come back by being unarchived.
+    _http(base, "POST", "/attention/items/done", {"id": gid})
+    _http(base, "POST", "/chats/signal:group:street/flags", {"archived": True})
+    status, out = _http(base, "POST", "/chats/signal:group:street/flags", {"archived": False})
+    assert status == 200 and _find(_sections(base), gid)[0] is None
+    status, out = _http(base, "POST", "/chats/signal:group:street/flags", {})
+    assert status == 400
     print("ok test_chat_inbound_gated_and_settled")
 
 
