@@ -384,12 +384,26 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `docker-compose.yml`); when unset the endpoint returns 503 and the mic button
   is hidden. The mic is also hidden where `MediaRecorder`/`getUserMedia` are
   unavailable.
-- **Output (play replies).** Each of Ara's messages has a 🔊 play button that
+- **Output (play replies).** Each of Ara's messages has a 🔊 button that
   reads it aloud with the browser's built-in `speechSynthesis` — no server work,
-  works offline. A per-thread **Auto** toggle (persisted in `localStorage`)
-  speaks replies automatically as they arrive; the browser's own voice is used,
-  so quality varies by platform, and iOS may require a tap (the play button) to
-  start speech. The controls are hidden where `speechSynthesis` is unavailable.
+  works offline. The player behind it is `components/speech.js` (shared with
+  the news page): the text is spoken in sentence-sized pieces, because the
+  engines fail on long utterances (Chrome goes silent after ~15 s, Android
+  rejects a few thousand characters outright — the reason a tap used to do
+  nothing on long replies), and a **player bar** above the composer shows what
+  is being read and how far: a position slider to drag, ⏮/⏭ one sentence back
+  or forward, play/pause, and ✕ to stop. Pausing and seeking restart at a
+  sentence boundary. The bar follows into the thread list, so going back does
+  not end the reading; leaving the *page* does (the browser silences its
+  engine), but the position is remembered per sentence in `localStorage`
+  (`retinue-voice-position`, kept for a week) and the next time that thread
+  opens the bar is back, paused right there — ▶ on the message or on the bar
+  carries on from that sentence, ✕ forgets it. A per-thread **Auto** toggle
+  (persisted in `localStorage`) speaks replies automatically as they arrive;
+  the browser's own voice is used, so quality varies by platform, and iOS may
+  require a tap (the play button) to start speech — the bar says so when the
+  engine refuses. The controls are hidden where `speechSynthesis` is
+  unavailable.
 
 ## Installing on Android
 

@@ -31,6 +31,7 @@ import {
 } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { Reader, speechAvailable } from './speech.js';
 
 const LIST_URL = '/conversations';
 // Views are addressable by location hash, so opening a thread or the composer
@@ -54,6 +55,11 @@ const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
 // Keep the client cap in step with the gateway's CONVERSATION_MAX_ATTACHMENT_BYTES
 // (default 25 MiB) so oversized files are rejected before a doomed upload.
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+// Where the read-aloud player remembers how far it got (see _savePosition):
+// leaving the page kills the browser's speech, and this is what lets the
+// thread offer to carry on from that sentence instead of from the top.
+const POSITION_KEY = 'retinue-voice-position';
+const POSITION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
 // browser shows in place instead of saving. Mirrors _INLINE_SAFE_TYPES in
 // web-gateway.py — offering "view" for anything else would just download it.
@@ -113,17 +119,18 @@ class RetinueConversations extends HTMLElement {
     try { this._autoplay = localStorage.getItem('retinue-voice-autoplay') === '1'; } catch (_e) { /* ignore */ }
     this._spoken = {};       // per-thread set of message ts already voiced/seen
     this._autoReady = {};    // per-thread: initial history marked, future msgs autoplay
-    this._speakingTs = null; // ts of the message currently being spoken, if any
-    // getVoices() is empty until the engine loads its list; warm it up so a
-    // German voice is available by the time the user taps play.
-    try {
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.getVoices();
-        window.speechSynthesis.addEventListener('voiceschanged', () => {
-          try { window.speechSynthesis.getVoices(); } catch (_e) { /* ignore */ }
-        });
-      }
-    } catch (_e) { /* ignore */ }
+    // The read-aloud player (speech.js): one message at a time, cut into
+    // sentence pieces, with pause and seek. _playing names the loaded message
+    // (thread id, message ts, sender label, thread title) so the player bar
+    // can say what it is reading from any view; _scrubbing is set while the
+    // user drags the position slider, so a progress tick does not yank it.
+    this._reader = new Reader();
+    this._reader.onprogress = (ev) => this._onReaderProgress(ev);
+    this._playing = null;
+    this._scrubbing = false;
+    this._onVisible = () => {
+      if (document.visibilityState === 'visible') this._reader.resync();
+    };
   }
 
   connectedCallback() {
@@ -143,6 +150,9 @@ class RetinueConversations extends HTMLElement {
     // already-open window to #conversation-<id>, and relying on popstate alone
     // for that fragment change is implementation-dependent.
     window.addEventListener('hashchange', this._onPop);
+    // A backgrounded engine may drop the utterance it was speaking without a
+    // word; on return the reader checks and picks the sentence up again.
+    document.addEventListener('visibilitychange', this._onVisible);
     // Crossing the layout breakpoint changes how many threads fit (see
     // _shownThreads), so re-render when it flips.
     this._offFrame = onFrameChange(() => { if (!this._full) this.render(); });
@@ -179,12 +189,15 @@ class RetinueConversations extends HTMLElement {
       window.removeEventListener('hashchange', this._onPop);
     }
     this._onPop = null;
+    document.removeEventListener('visibilitychange', this._onVisible);
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
     this._stopRecording();
     this._wave.stop();
     this._stopStream();
-    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
+    // Silence the engine but keep the saved position: the element goes away
+    // with the page, and the next visit offers to resume.
+    this._reader.stop();
   }
 
   // Bring the view in line with the address bar after the browser has already
@@ -276,6 +289,7 @@ class RetinueConversations extends HTMLElement {
       this._thread = await res.json();
       if (this._thread.unread) this._markRead(id);
       this._maybeAutoplay(this._thread);
+      this._restorePosition(this._thread);
     } catch (_err) {
       // keep previous thread state
     }
@@ -595,7 +609,8 @@ class RetinueConversations extends HTMLElement {
     return this._filterHtml() +
       `<div class="tabs${this._view === 'list' ? ' as-list' : ''}">` +
       `${this._tabsHtml()}${this._emptyHtml()}</div>` +
-      `<div class="list-foot">${newBtn}${this._footerHtml()}</div>`;
+      `<div class="list-foot">${newBtn}${this._footerHtml()}</div>` +
+      this._playerHostHtml();
   }
 
   // Active/Archived/Edits/Cowork switch — only in the dedicated full-page view.
@@ -713,6 +728,7 @@ class RetinueConversations extends HTMLElement {
       `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span>` +
       hint +
       this._modelPickerHtml(this._composeModel, { wide: true }) + `</div>` +
+      this._playerHostHtml() +
       this._inputRow('Ask Ara something …');
   }
 
@@ -725,7 +741,7 @@ class RetinueConversations extends HTMLElement {
     const archiveBtn = t.archived
       ? '<button class="pill" data-unarchive>Unarchive</button>'
       : '<button class="pill" data-archive>Archive</button>';
-    const autoBtn = ('speechSynthesis' in window)
+    const autoBtn = speechAvailable()
       ? `<button class="iconbtn${this._autoplay ? ' on' : ''}" data-autoplay ` +
         `title="Speak Ara's replies as they arrive" aria-label="Speak replies as they arrive" ` +
         `aria-pressed="${this._autoplay}">${this._autoplay ? '\u{1F50A}' : '\u{1F507}'}</button>`
@@ -734,22 +750,22 @@ class RetinueConversations extends HTMLElement {
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
       `<span class="bar-actions">${this._modelPickerHtml(t.model)}${autoBtn}${archiveBtn}</span></div>` +
       `<div class="thread">${this._messagesHtml(t)}</div>` +
+      this._playerHostHtml() +
       this._inputRow('Reply …');
   }
 
   _messagesHtml(t) {
-    const canSpeak = 'speechSynthesis' in window;
+    const canSpeak = speechAvailable();
     const msgs = (t.messages || []).map((m, idx) => {
       const cls = m.role === 'user' ? 'me' : (m.role === 'agent' ? 'agent' : 'ara');
+      const reading = this._isLoaded(t, m) ? ' reading' : '';
       // The sender label: the acting agent's own name when a relay set one
       // (e.g. "Coach"), else the role default. "You" / "Retinue" / "Ara".
       const defaultWho = m.role === 'user' ? 'You' : (m.role === 'agent' ? 'Retinue' : 'Ara');
       const who = (m.role !== 'user' && m.agent) ? m.agent : defaultWho;
       const speakBtn = (canSpeak && m.role !== 'user' && (m.text || '').trim())
-        ? `<button class="speak" type="button" data-speak-idx="${idx}" ` +
-          `title="Play message" aria-label="Play message">\u{1F50A}</button>`
-        : '';
-      return `<div class="msg ${cls}"><div class="msg-head">` +
+        ? this._speakBtnHtml(t, m, idx) : '';
+      return `<div class="msg ${cls}${reading}"><div class="msg-head">` +
         `<small class="who">${esc(who)}</small>` +
         this._metaHtml(m) +
         speakBtn + `</div>` +
@@ -1056,9 +1072,10 @@ class RetinueConversations extends HTMLElement {
   // rather than raw Whisper output.
   async _startRecording() {
     if (this._recState !== 'idle') return;
-    // Tapping the mic silences any ongoing read-aloud: you are about to speak to
-    // Ara, so a previous reply still talking over you is the wrong behaviour.
-    this._stopSpeaking();
+    // Tapping the mic pauses any ongoing read-aloud: you are about to speak to
+    // Ara, so a previous reply still talking over you is the wrong behaviour —
+    // but the place is kept, so the reading can go on afterwards.
+    this._reader.pause();
     const viewKey = this._viewKey();
     // The status row hides the mic while this view's own job runs, but guard
     // anyway: one dictation job per conversation at a time.
@@ -1253,79 +1270,280 @@ class RetinueConversations extends HTMLElement {
     this._drafts[draftKey] = cur ? `${cur.replace(/\s*$/, '')} ${text}` : text;
   }
 
-  // ── Voice output: speak Ara's replies via the browser's speech synth ───────
-  // Stop any read-aloud in progress and forget what was being spoken.
-  _stopSpeaking() {
-    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
-    this._speakingTs = null;
-  }
+  // ── Voice output: the read-aloud player over Ara's replies ────────────────
+  // One message at a time is loaded into the shared Reader (speech.js), which
+  // speaks it sentence by sentence and owns pause, seek and skip. The player
+  // bar (.player-host, present in every view) shows what is being read and
+  // where; it follows the user into the list, so leaving the thread does not
+  // end the reading. Leaving the PAGE does — the browser silences its engine —
+  // which is why the position is saved per sentence (localStorage) and offered
+  // again, paused right there, when the thread is next opened.
 
   _toggleAutoplay() {
     this._autoplay = !this._autoplay;
     try { localStorage.setItem('retinue-voice-autoplay', this._autoplay ? '1' : '0'); } catch (_e) { /* ignore */ }
-    if (!this._autoplay) this._stopSpeaking();
     this.render();
   }
 
+  // The message's own button: play it, or pause/resume it when it is the one
+  // in the player (a resume goes on from where it was, never from the top).
   _onSpeakButton(btn) {
     const idx = Number(btn.dataset.speakIdx);
-    const msgs = (this._thread && this._thread.messages) || [];
-    const m = msgs[idx];
+    const t = this._thread;
+    const m = (t && t.messages) ? t.messages[idx] : null;
     if (!m) return;
-    // Second tap on the message being spoken stops it.
-    if (this._speakingTs === m.ts && window.speechSynthesis && window.speechSynthesis.speaking) {
-      this._stopSpeaking();
-      return;
-    }
-    this._speak(m.text, m.lang, m.ts);
+    if (this._isLoaded(t, m)) { this._reader.toggle(); return; }
+    this._play(t, m, 0);
   }
 
-  _speak(text, lang, ts) {
-    if (!('speechSynthesis' in window)) return;
-    const clean = this._plainForSpeech(text);
+  // Load message `m` of thread `t` into the player and speak it from `fraction`
+  // (0..1) of its text. Called from a tap where possible: the first speak of a
+  // page load must sit inside a user gesture on iOS.
+  _play(t, m, fraction) {
+    if (!t || !m || !speechAvailable()) return;
+    const clean = this._plainForSpeech(m.text);
     if (!clean) return;
+    this._playing = this._playingInfo(t, m);
+    this._reader.load([{ id: m.ts, lang: m.lang, text: clean }], { fraction: fraction || 0 });
+    this._reader.resume();
+  }
+
+  _playingInfo(t, m) {
+    const who = m.agent || (m.role === 'agent' ? 'Retinue' : 'Ara');
+    return { conv: t.id, ts: m.ts, who, title: t.title || '' };
+  }
+
+  // Is `m` (of thread `t`) the message currently in the player?
+  _isLoaded(t, m) {
+    const p = this._playing;
+    return !!(p && t && m && this._reader.loaded && p.conv === t.id && p.ts === m.ts);
+  }
+
+  _speakBtnHtml(t, m, idx) {
+    const loaded = this._isLoaded(t, m);
+    const playing = loaded && this._reader.speaking;
+    const label = playing ? 'Pause' : (loaded ? 'Resume reading' : 'Read aloud');
+    const glyph = playing ? '⏸' : (loaded ? '▶' : '\u{1F50A}');
+    return `<button class="speak${loaded ? ' on' : ''}" type="button" data-speak-idx="${idx}" ` +
+      `title="${label}" aria-label="${label}">${glyph}</button>`;
+  }
+
+  // A reading interrupted by leaving the page is offered again when its thread
+  // opens: the message goes into the player, paused, at the sentence it was in.
+  // Only when the player is free — a reading in progress is never displaced.
+  _restorePosition(t) {
+    if (!t || this._reader.loaded || !speechAvailable()) return;
+    const saved = this._savedPosition();
+    if (!saved || saved.conv !== t.id) return;
+    const m = (t.messages || []).find((x) => x.role !== 'user' && x.ts === saved.ts);
+    if (!m) return;
+    const clean = this._plainForSpeech(m.text);
+    if (!clean) return;
+    this._playing = this._playingInfo(t, m);
+    this._reader.load([{ id: m.ts, lang: m.lang, text: clean }], { fraction: saved.fraction });
+  }
+
+  _savedPosition() {
     try {
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(clean);
-      // Use the server-provided language tag. Detection is done server-side and
-      // is language-agnostic — the client privileges no language, so an
-      // untagged message just reads with the browser's default voice.
-      const code = lang;
-      if (code) {
-        u.lang = code;
-        // Setting u.lang alone is not enough in some browsers — they keep the
-        // default (often English) voice. Pick a matching voice explicitly.
-        const voice = this._voiceFor(code);
-        if (voice) u.voice = voice;
-      }
-      this._speakingTs = ts || null;
-      const done = () => { if (this._speakingTs === (ts || null)) this._speakingTs = null; };
-      u.addEventListener('end', done);
-      u.addEventListener('error', done);
-      window.speechSynthesis.speak(u);
+      const raw = localStorage.getItem(POSITION_KEY);
+      if (!raw) return null;
+      const p = JSON.parse(raw);
+      if (!p || typeof p !== 'object' || !p.conv || !p.ts) return null;
+      if (!(Date.now() - (Number(p.at) || 0) < POSITION_TTL_MS)) return null;
+      const fraction = Number(p.fraction);
+      if (!(fraction > 0 && fraction < 1)) return null;
+      return { conv: String(p.conv), ts: String(p.ts), fraction };
+    } catch (_e) { return null; }
+  }
+
+  // Remember where the reading is. A position at the very start is not worth
+  // keeping (nothing is lost by starting over), and one at the end is done.
+  _savePosition(ev) {
+    const p = this._playing;
+    if (!p) return;
+    try {
+      if (!(ev.fraction > 0 && ev.fraction < 1)) { localStorage.removeItem(POSITION_KEY); return; }
+      localStorage.setItem(POSITION_KEY, JSON.stringify({
+        conv: p.conv, ts: p.ts, fraction: ev.fraction, at: Date.now(),
+      }));
     } catch (_e) { /* ignore */ }
   }
 
-  // Pick a speechSynthesis voice whose language matches `code` (e.g. 'de').
-  // Prefers a local voice; caches nothing since getVoices() may populate late.
-  _voiceFor(code) {
-    const want = String(code || '').slice(0, 2).toLowerCase();
-    if (!want) return null;
-    let voices = [];
-    try { voices = window.speechSynthesis.getVoices() || []; } catch (_e) { return null; }
-    const match = voices.filter((v) => (v.lang || '').slice(0, 2).toLowerCase() === want);
-    if (!match.length) return null;
-    return match.find((v) => v.localService) || match[0];
+  _clearPosition() {
+    try { localStorage.removeItem(POSITION_KEY); } catch (_e) { /* ignore */ }
   }
 
-  // Strip Markdown so the synthesizer reads clean prose (no backticks, asterisks,
-  // "greater-than" quote markers, or raw URLs — link labels are kept).
+  // The ✕ on the bar: stop for good, and forget the place.
+  _closePlayer() {
+    this._reader.stop();
+    this._clearPosition();
+  }
+
+  // Every reader transition lands here (and a tick every quarter second while
+  // it plays). Bookkeeping first, then the DOM — in place, never a re-render:
+  // a full render mid-reading would drop the composer's focus and the scroll.
+  _onReaderProgress(ev) {
+    if (ev.event === 'end') this._clearPosition();
+    else if (ev.event === 'load' || ev.event === 'start' || ev.event === 'piece' ||
+             ev.event === 'pause' || ev.event === 'seek') this._savePosition(ev);
+    if (ev.event === 'stop') this._playing = null;
+    if (ev.event === 'tick') { this._updatePlayer(); return; }
+    this._applyPlayerState();
+  }
+
+  _playerHostHtml() {
+    return `<div class="player-host" data-key="${esc(this._playerKey())}">${this._playerHtml()}</div>`;
+  }
+
+  // What the bar's structure depends on; when it changes the bar is rebuilt,
+  // otherwise only its slider and label move (see _updatePlayer).
+  _playerKey() {
+    const r = this._reader;
+    const p = this._playing;
+    if (!r.loaded || !p) return 'idle';
+    return [r.state, p.conv, p.ts, r.error || '', p.conv === this._active ? 'here' : 'away'].join('|');
+  }
+
+  _playerHtml() {
+    const r = this._reader;
+    const p = this._playing;
+    if (!r.loaded || !p) return '';
+    const playing = r.speaking;
+    // Read from another view (the list, or a different thread): name the
+    // thread too, and make it a way back to the message.
+    const elsewhere = p.conv !== this._active;
+    const who = esc(p.who) + (elsewhere && p.title ? ` · ${esc(p.title)}` : '');
+    const whoEl = elsewhere
+      ? `<button type="button" class="p-who p-link" data-p-open="${esc(p.conv)}" ` +
+        `title="Open this conversation">${who}</button>`
+      : `<span class="p-who">${who}</span>`;
+    const main = playing ? 'Pause' : 'Play';
+    return `<div class="player" role="group" aria-label="Read aloud">` +
+      `<button type="button" class="p-btn" data-p-back title="Back one sentence" ` +
+      `aria-label="Back one sentence">⏮</button>` +
+      `<button type="button" class="p-btn p-main" data-p-toggle title="${main}" aria-label="${main}">` +
+      `${playing ? '⏸' : '▶'}</button>` +
+      `<button type="button" class="p-btn" data-p-fwd title="Forward one sentence" ` +
+      `aria-label="Forward one sentence">⏭</button>` +
+      `<div class="p-track">` +
+      `<input type="range" class="p-seek" min="0" max="1000" step="1" value="0" ` +
+      `aria-label="Position in the message" data-p-seek>` +
+      `<div class="p-info">${whoEl}<span class="p-pos" data-p-pos></span></div></div>` +
+      `<button type="button" class="p-btn p-close" data-p-close title="Stop reading" ` +
+      `aria-label="Stop reading">✕</button></div>`;
+  }
+
+  // Listeners live on the host, which every full render creates anew and the
+  // in-place rebuilds below keep — so they are attached once per render.
+  _wirePlayer() {
+    const host = this.shadowRoot && this.shadowRoot.querySelector('.player-host');
+    if (!host) return;
+    if (!host.dataset.wired) {
+      host.dataset.wired = '1';
+      host.addEventListener('click', (e) => {
+        if (e.target.closest('[data-p-toggle]')) { this._reader.toggle(); return; }
+        if (e.target.closest('[data-p-back]')) { this._reader.back(); return; }
+        if (e.target.closest('[data-p-fwd]')) { this._reader.forward(); return; }
+        if (e.target.closest('[data-p-close]')) { this._closePlayer(); return; }
+        const open = e.target.closest('[data-p-open]');
+        if (open) this._openThread(open.getAttribute('data-p-open'));
+      });
+      // Dragging previews the position; releasing seeks there.
+      host.addEventListener('input', (e) => {
+        if (!e.target.matches('[data-p-seek]')) return;
+        this._scrubbing = true;
+        this._updatePlayer(Number(e.target.value) / 1000);
+      });
+      host.addEventListener('change', (e) => {
+        if (!e.target.matches('[data-p-seek]')) return;
+        this._scrubbing = false;
+        this._reader.seek(Number(e.target.value) / 1000);
+      });
+    }
+    this._updatePlayer();
+  }
+
+  // Bring the bar and the message buttons in line with the reader, in place.
+  _applyPlayerState() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const host = root.querySelector('.player-host');
+    if (host) {
+      const key = this._playerKey();
+      if (host.dataset.key !== key) {
+        host.dataset.key = key;
+        host.innerHTML = this._playerHtml();
+      }
+      this._wirePlayer();
+    }
+    const t = this._thread;
+    if (!t || !this._active) return;
+    root.querySelectorAll('.speak[data-speak-idx]').forEach((btn) => {
+      const m = (t.messages || [])[Number(btn.dataset.speakIdx)];
+      if (!m) return;
+      const loaded = this._isLoaded(t, m);
+      const playing = loaded && this._reader.speaking;
+      const label = playing ? 'Pause' : (loaded ? 'Resume reading' : 'Read aloud');
+      const glyph = playing ? '⏸' : (loaded ? '▶' : '\u{1F50A}');
+      if (btn.textContent !== glyph) btn.textContent = glyph;
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+      btn.classList.toggle('on', loaded);
+      const msg = btn.closest('.msg');
+      if (msg) msg.classList.toggle('reading', loaded);
+    });
+  }
+
+  // Slider and label only. `preview` (0..1) is the value under the user's
+  // finger while dragging; otherwise the reader's own position is shown.
+  _updatePlayer(preview) {
+    const root = this.shadowRoot;
+    const bar = root && root.querySelector('.player');
+    if (!bar) return;
+    const pr = this._reader.progress();
+    const previewing = typeof preview === 'number';
+    const fraction = previewing ? preview : pr.fraction;
+    const seek = bar.querySelector('[data-p-seek]');
+    if (seek) {
+      if (!this._scrubbing || previewing) seek.value = String(Math.round(fraction * 1000));
+      seek.style.setProperty('--p', `${(fraction * 100).toFixed(1)}%`);
+      seek.setAttribute('aria-valuetext', `${Math.round(fraction * 100)}%`);
+    }
+    const pos = bar.querySelector('[data-p-pos]');
+    if (pos) {
+      const text = this._positionLabel(pr, fraction, previewing);
+      if (pos.textContent !== text) pos.textContent = text;
+    }
+  }
+
+  _positionLabel(pr, fraction, previewing) {
+    const pct = `${Math.round(fraction * 100)}%`;
+    if (previewing) return pct;
+    if (pr.error) return 'Could not play — tap ▶ to try again';
+    if (pr.state === 'paused') return `Paused · ${pct}`;
+    if (pr.starting) return 'Starting …';
+    // Time left at the measured speaking rate: an estimate, hence the tilde.
+    const left = pr.remaining;
+    const eta = left >= 90 ? `~${Math.round(left / 60)} min left` : `~${left} s left`;
+    return `${pct} · ${eta}`;
+  }
+
+  // Strip Markdown so the synthesizer reads clean prose: no code fences,
+  // backticks, emphasis marks, quote markers, list bullets or table rules;
+  // links and chips read as their labels, a raw URL as its host.
   _plainForSpeech(text) {
     return String(text == null ? '' : text)
       .replace(/```[\s\S]*?```/g, ' ')
       .replace(/`([^`]+)`/g, '$1')
-      .replace(/^\s*>\s?/gm, '')
+      .replace(/\[\[chip:\s*([^|\]]+?)\s*(?:\|[^\]]*)?\]\]/gi, '$1')
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
       .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1')
+      .replace(/\bhttps?:\/\/([^\s/)]+)[^\s)]*/g, '$1')
+      .replace(/^\s*>\s?/gm, '')
+      .replace(/^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/gm, ' ')
+      .replace(/^\s*[-*_]{3,}\s*$/gm, ' ')
+      .replace(/^\s*[-+*•]\s+/gm, ' ')
+      .replace(/\|/g, ', ')
       .replace(/[*_#]+/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -1335,7 +1553,7 @@ class RetinueConversations extends HTMLElement {
   // was opened. The first look at a thread only records its existing messages as
   // "seen" so historical replies are never blurted out on open.
   _maybeAutoplay(t) {
-    if (!t || !('speechSynthesis' in window)) return;
+    if (!t || !speechAvailable()) return;
     const cid = t.id;
     if (!this._spoken[cid]) this._spoken[cid] = new Set();
     const seen = this._spoken[cid];
@@ -1349,7 +1567,7 @@ class RetinueConversations extends HTMLElement {
     fresh.forEach((m) => seen.add(m.ts));
     if (!this._autoplay || !fresh.length) return;
     const last = fresh[fresh.length - 1];
-    this._speak(last.text, last.lang, last.ts);
+    this._play(t, last, 0);
   }
 
   _wire() {
@@ -1398,6 +1616,7 @@ class RetinueConversations extends HTMLElement {
     if (modelSel) modelSel.addEventListener('change', () => this._onModelChange(modelSel.value));
     const ap = root.querySelector('[data-autoplay]');
     if (ap) ap.addEventListener('click', () => this._toggleAutoplay());
+    this._wirePlayer();
     const fileInput = root.querySelector('[data-file]');
     if (fileInput) {
       fileInput.addEventListener('change', () => {
@@ -1594,7 +1813,7 @@ const CSS = `
      than a comfortable line. Centre the messages and the composer in a reading
      column; the bar keeps its full-width divider. */
   @media (min-width: 1000px) {
-    .thread, .composer {
+    .thread, .composer, .player-host {
       width: 100%; max-width: 900px; margin-left: auto; margin-right: auto; }
   }
   .msg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; }
@@ -1676,9 +1895,52 @@ const CSS = `
      VOICE_CSS (voice.js), appended to this sheet in render(). */
   .msg-head { display: flex; align-items: center; gap: 6px; }
   .msg.me .msg-head { flex-direction: row-reverse; }
-  .speak { background: transparent; border: 0; cursor: pointer; padding: 0 2px; font-size: .8rem;
-           line-height: 1; opacity: .65; }
+  /* A finger-sized target that still sits in a one-line header: the negative
+     margin lets the 30px hit area overhang the small text around it. */
+  .speak { background: transparent; border: 0; cursor: pointer; padding: 0; margin: -7px 0;
+           width: 30px; height: 30px; border-radius: 50%; display: inline-flex; align-items: center;
+           justify-content: center; font-size: .85rem; line-height: 1; opacity: .65;
+           color: inherit; -webkit-tap-highlight-color: transparent; }
   .speak:hover { opacity: 1; }
+  .speak.on { opacity: 1; color: var(--accent, #6ea8fe); background: rgba(110, 168, 254, .12); }
+  .msg.reading .bubble { outline: 1px solid var(--accent, #6ea8fe); }
+
+  /* ── Read-aloud player ─────────────────────────────────────────────────── */
+  /* Present (empty) in every view, so the bar can appear without a re-render
+     and follow the reading into the list. Sits above the composer. */
+  .player-host { flex: none; }
+  .player { display: flex; align-items: center; gap: 4px; margin-top: 4px; padding: 8px 0 4px;
+            border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
+  .p-btn { flex: none; width: 36px; height: 36px; border-radius: 50%; border: 0;
+           background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); cursor: pointer;
+           font-size: .95rem; line-height: 1; display: inline-flex; align-items: center;
+           justify-content: center; padding: 0; -webkit-tap-highlight-color: transparent; }
+  .p-btn:hover { background: rgba(110, 168, 254, .2); }
+  .p-btn:active { filter: brightness(1.12); }
+  .p-main { background: var(--accent, #6ea8fe); color: #0b0d12; font-size: 1.05rem; }
+  .p-main:hover { background: var(--accent, #6ea8fe); filter: brightness(1.08); }
+  .p-close { background: transparent; color: var(--muted, #8b93a3); }
+  .p-track { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0; padding: 0 4px; }
+  /* The slider is the position bar: the played part in accent, the rest in a
+     faint line (--p is set from script), with a thumb big enough to grab. */
+  .p-seek { -webkit-appearance: none; appearance: none; width: 100%; height: 28px; margin: 0;
+            background: transparent; cursor: pointer; touch-action: pan-y; }
+  .p-seek::-webkit-slider-runnable-track { height: 4px; border-radius: 2px;
+    background: linear-gradient(to right, var(--accent, #6ea8fe) var(--p, 0%),
+                                rgba(231, 235, 242, .18) var(--p, 0%)); }
+  .p-seek::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px;
+    border-radius: 50%; background: var(--accent, #6ea8fe); border: 0; margin-top: -6px; }
+  .p-seek::-moz-range-track { height: 4px; border-radius: 2px; background: rgba(231, 235, 242, .18); }
+  .p-seek::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--accent, #6ea8fe); }
+  .p-seek::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%;
+    background: var(--accent, #6ea8fe); border: 0; }
+  .p-info { display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+            font-size: .72rem; color: var(--muted, #8b93a3); margin-top: -4px; }
+  .p-who { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .p-link { background: transparent; border: 0; padding: 0; color: var(--accent, #6ea8fe);
+            font: inherit; cursor: pointer; text-align: left; }
+  .p-link:hover { text-decoration: underline; }
+  .p-pos { flex: none; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .row button[disabled], .row textarea[disabled], .clip:has(input[disabled]) { opacity: .6; cursor: default; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
   .chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 4px 6px 4px 10px;
