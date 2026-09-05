@@ -417,6 +417,15 @@ a fallback. In a deployment with a separate static store (like the genomics
 example above), all data for that store goes into the single file it indexes —
 e.g. `genetics.nt` at the chamber root, without exception.
 
+**QLever quirks** — `GROUP_CONCAT` over a variable bound to *IRIs* comes back
+unbound (the cell is simply absent from the row, not an empty string), while
+the same aggregate over literals works. Wrap the variable in `STR()` —
+`GROUP_CONCAT(STR(?att); separator=" ")` — whenever the values may be IRIs.
+Because an absent cell reads exactly like "no values", this fails silently;
+the chat media references (`kb:attachment`) were invisible for weeks this way.
+Relatedly, `BIND` on a variable already in scope is an error: `FILTER` on it,
+or `BIND` inside a subquery where nothing binds it yet.
+
 **Troubleshooting** — if a file's triples are missing, look for the diagnostic
 quad the build emits instead of failing:
 

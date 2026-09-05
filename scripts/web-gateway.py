@@ -4281,11 +4281,18 @@ def _sparql_datetime(iso: str) -> str:
 # their own rather than letting them join every account's. The subquery may BIND
 # ?account because nothing binds it there yet; the outer pattern must FILTER on
 # it instead, since binding an in-scope variable is a SPARQL error.
+#
+# Attachments are IRI objects (urn:retinue:media:…), and the life store's
+# GROUP_CONCAT leaves its result UNBOUND — not empty — when the values are
+# IRIs rather than literals (verified against the live QLever; see
+# docs/triple-stores.md). STR() makes them literals first. Without it no
+# message on any channel ever carried an attachment, silently: an absent
+# cell reads exactly like a message without media.
 _CHATS_LIST_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 SELECT ?chat ?account ?channel ?ts ?type ?text ?sender ?author ?mid
-       (GROUP_CONCAT(?att; separator=" ") AS ?atts) WHERE {
+       (GROUP_CONCAT(STR(?att); separator=" ") AS ?atts) WHERE {
   { SELECT ?chat ?account (MAX(?ts0) AS ?ts) WHERE {
       ?m0 k:chat ?chat .
       { ?m0 k:receivedAt ?ts0 } UNION { ?m0 k:sentAt ?ts0 }
@@ -4332,7 +4339,7 @@ _CHAT_MESSAGES_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 SELECT ?m ?type ?text ?sender ?author ?mid ?ts
-       (GROUP_CONCAT(?att; separator=" ") AS ?atts) WHERE {
+       (GROUP_CONCAT(STR(?att); separator=" ") AS ?atts) WHERE {
   ?m k:chat %%(chat)s ; k:channel %%(channel)s ; k:text ?text ; rdf:type ?type .
   { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
   OPTIONAL { ?m k:account ?acc0 }

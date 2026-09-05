@@ -126,6 +126,14 @@ class _MockSparql(BaseHTTPRequestHandler):
             bindings = self._chat_list()
         else:
             bindings = self._messages(query)
+        # The live store's quirk, reproduced: QLever leaves a GROUP_CONCAT over
+        # IRI values unbound (the cell is absent, not ""), so attachments only
+        # reach a row when the query concatenates STR(?att). Verified on the
+        # deployment; without this the mock would keep passing a query that
+        # never shows a single picture in production.
+        if "GROUP_CONCAT(STR(?att)" not in query:
+            bindings = [{k: v for k, v in row.items() if k != "atts"}
+                        for row in bindings]
         payload = json.dumps({"results": {"bindings": bindings}}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/sparql-results+json")
@@ -420,6 +428,26 @@ def test_chat_list_contract(base, wg):
     unread_qs = [q for q in STATE["queries"] if "VALUES (?chat ?account ?cut)" in q]
     assert unread_qs and MARA in unread_qs[-1] and "1970-01-01" in unread_qs[-1]
     print("PASS test_chat_list_contract")
+
+
+def test_chat_list_shows_media_preview(base, wg):
+    """A picture-only last message previews as an image in the chat list.
+
+    Pins the list query's STR(?att) (see _MockSparql.do_POST): with the
+    aggregate unbound the preview reads as empty text, which is how every
+    chat with a last picture looked."""
+    STATE["list_rows"] = [
+        _lit_row(chat=MARA, channel="signal", ts=TS3, type=T_IN, text="",
+                 sender=MARA, atts=f"urn:retinue:media:signal:{MID_ATT}"),
+    ]
+    try:
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        chat = next(c for c in body["chats"] if c["id"] == CHAT1)
+        assert chat["last"]["kind"] == "image", chat["last"]
+    finally:
+        STATE["list_rows"] = None
+    print("PASS test_chat_list_shows_media_preview")
 
 
 def test_chat_messages_contract(base, wg):
@@ -1158,6 +1186,7 @@ def main():
                    if a["id"] == MID_ATT)
         assert att.get("type") == "image/jpeg" and att.get("size") == 717
         assert att.get("width") == 320 and att.get("height") == 420
+        test_chat_list_shows_media_preview(base, wg)
         test_chat_messages_contract(base, wg)
         test_messages_before_paging(base, wg)
         test_read_watermark(base, wg)
