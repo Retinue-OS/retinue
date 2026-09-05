@@ -57,7 +57,7 @@ const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 // Where the read-aloud player remembers how far it got (see _savePosition):
 // leaving the page kills the browser's speech, and this is what lets the
-// thread offer to carry on from that sentence instead of from the top.
+// thread offer to carry on from that passage instead of from the top.
 const POSITION_KEY = 'retinue-voice-position';
 const POSITION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
@@ -151,7 +151,7 @@ class RetinueConversations extends HTMLElement {
     // for that fragment change is implementation-dependent.
     window.addEventListener('hashchange', this._onPop);
     // A backgrounded engine may drop the utterance it was speaking without a
-    // word; on return the reader checks and picks the sentence up again.
+    // word; on return the reader checks and picks the passage up again.
     document.addEventListener('visibilitychange', this._onVisible);
     // Crossing the layout breakpoint changes how many threads fit (see
     // _shownThreads), so re-render when it flips.
@@ -1272,11 +1272,13 @@ class RetinueConversations extends HTMLElement {
 
   // ── Voice output: the read-aloud player over Ara's replies ────────────────
   // One message at a time is loaded into the shared Reader (speech.js), which
-  // speaks it sentence by sentence and owns pause, seek and skip. The player
+  // speaks it in passages — a sentence or two, about ten seconds each — and
+  // owns pause, seek and skip at that granularity; the ⏮/⏭ controls step one
+  // passage, which is what their labels say. The player
   // bar (.player-host, present in every view) shows what is being read and
   // where; it follows the user into the list, so leaving the thread does not
   // end the reading. Leaving the PAGE does — the browser silences its engine —
-  // which is why the position is saved per sentence (localStorage) and offered
+  // which is why the position is saved per passage (localStorage) and offered
   // again, paused right there, when the thread is next opened.
 
   _toggleAutoplay() {
@@ -1329,7 +1331,7 @@ class RetinueConversations extends HTMLElement {
   }
 
   // A reading interrupted by leaving the page is offered again when its thread
-  // opens: the message goes into the player, paused, at the sentence it was in.
+  // opens: the message goes into the player, paused, at the passage it was in.
   // Only when the player is free — a reading in progress is never displaced.
   _restorePosition(t) {
     if (!t || this._reader.loaded || !speechAvailable()) return;
@@ -1419,12 +1421,12 @@ class RetinueConversations extends HTMLElement {
       : `<span class="p-who">${who}</span>`;
     const main = playing ? 'Pause' : 'Play';
     return `<div class="player" role="group" aria-label="Read aloud">` +
-      `<button type="button" class="p-btn" data-p-back title="Back one sentence" ` +
-      `aria-label="Back one sentence">⏮</button>` +
+      `<button type="button" class="p-btn" data-p-back title="Back a passage" ` +
+      `aria-label="Back a passage">⏮</button>` +
       `<button type="button" class="p-btn p-main" data-p-toggle title="${main}" aria-label="${main}">` +
       `${playing ? '⏸' : '▶'}</button>` +
-      `<button type="button" class="p-btn" data-p-fwd title="Forward one sentence" ` +
-      `aria-label="Forward one sentence">⏭</button>` +
+      `<button type="button" class="p-btn" data-p-fwd title="Forward a passage" ` +
+      `aria-label="Forward a passage">⏭</button>` +
       `<div class="p-track">` +
       `<input type="range" class="p-seek" min="0" max="1000" step="1" value="0" ` +
       `aria-label="Position in the message" data-p-seek>` +

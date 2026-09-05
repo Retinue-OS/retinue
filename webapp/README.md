@@ -392,14 +392,15 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   engines fail on long utterances (Chrome goes silent after ~15 s, Android
   rejects a few thousand characters outright — the reason a tap used to do
   nothing on long replies), and a **player bar** above the composer shows what
-  is being read and how far: a position slider to drag, ⏮/⏭ one sentence back
-  or forward, play/pause, and ✕ to stop. Pausing and seeking restart at a
-  sentence boundary. The bar follows into the thread list, so going back does
+  is being read and how far: a position slider to drag, ⏮/⏭ a passage back or
+  forward (a sentence or two, about ten seconds of speech — the unit the text
+  is spoken in), play/pause, and ✕ to stop. Pausing and seeking restart at a
+  passage boundary. The bar follows into the thread list, so going back does
   not end the reading; leaving the *page* does (the browser silences its
-  engine), but the position is remembered per sentence in `localStorage`
+  engine), but the position is remembered per passage in `localStorage`
   (`retinue-voice-position`, kept for a week) and the next time that thread
   opens the bar is back, paused right there — ▶ on the message or on the bar
-  carries on from that sentence, ✕ forgets it. A per-thread **Auto** toggle
+  carries on from that passage, ✕ forgets it. A per-thread **Auto** toggle
   (persisted in `localStorage`) speaks replies automatically as they arrive;
   the browser's own voice is used, so quality varies by platform, and iOS may
   require a tap (the play button) to start speech — the bar says so when the
