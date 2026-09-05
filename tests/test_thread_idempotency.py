@@ -20,8 +20,10 @@ Covers the whole chain:
     thereafter returns the same thread (200, deduplicated, nothing appended and
     nothing pushed); concurrent duplicates collapse; a deleted thread frees its
     key; an oversized key is rejected; keyless creates behave as before.
-  * conversation-push.py: --key reaches the payload when opening a thread, and
-    is left out when appending to one (--thread already addresses it).
+  * conversation-push.py: --key reaches the payload when opening a thread, an
+    unkeyed open still goes out under a throwaway key (so a retry after a
+    timeout lands in the thread the first attempt opened), and no key is sent
+    when appending to a thread (--thread already addresses it).
   * all three gateways: the live forward prompt and the drained ledger row
     carry the *same* key for the same message.
 
@@ -36,8 +38,11 @@ import threading
 import types
 import urllib.error
 import urllib.request
+from contextlib import redirect_stderr
 from http.server import ThreadingHTTPServer
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -233,17 +238,81 @@ def test_gateway_dedupe():
 
 # ── 3. The CLI ────────────────────────────────────────────────────────────────
 
+class _FakeResponse:
+    def __init__(self, body: dict):
+        self._body = json.dumps(body).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._body
+
+
+def _run_push(mod, argv: list[str], response: dict | None = None):
+    """Run the CLI's main() with urlopen stubbed; returns (exit code, payload
+    that would have been POSTed or None, request URL or None, stderr text)."""
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse(response or {"id": "c" * 32, "title": "T"})
+
+    err = StringIO()
+    with patch.object(mod.urllib.request, "urlopen", fake_urlopen), redirect_stderr(err):
+        old_argv = sys.argv
+        sys.argv = ["conversation-push.py"] + argv
+        try:
+            code = mod.main()
+        finally:
+            sys.argv = old_argv
+    return code, captured.get("payload"), captured.get("url"), err.getvalue()
+
+
 def test_conversation_push_key():
     print("conversation-push.py: --key")
+    # The CLI reads its token and endpoint at import time; point it somewhere
+    # unreachable so nothing can escape should the stub ever be bypassed.
+    os.environ["CONVERSATION_BACKEND_TOKEN"] = "test-token"
+    os.environ["CONVERSATION_BACKEND_URL"] = "http://gateway.invalid/internal/conversations"
     push = _load("conversation_push_under_test", "conversation-push.py")
-    src = (SCRIPTS_DIR / "conversation-push.py").read_text(encoding="utf-8")
-    check("--key is a documented option", '"--key"' in src)
+    thread_id = "a" * 32
+
+    code, payload, url, _ = _run_push(push, ["--key", "signal:+41790000000:+41791234567:1", "hello"])
+    check("--key is accepted when opening a thread", code == 0, f"exit {code}")
     check("the key reaches the payload when opening a thread",
-          'payload["key"] = args.key' in src)
+          payload is not None and payload.get("key") == "signal:+41790000000:+41791234567:1",
+          repr(payload))
+    check("a caller-supplied key is not flagged ephemeral",
+          payload is not None and payload.get("key_ephemeral") is False, repr(payload))
+
+    code, payload, url, _ = _run_push(push, ["hello"])
+    check("an unkeyed open still goes out under a throwaway key",
+          code == 0 and payload is not None and str(payload.get("key", "")).startswith("auto:"),
+          repr(payload))
+    check("the throwaway key is flagged ephemeral",
+          payload is not None and payload.get("key_ephemeral") is True, repr(payload))
+
+    code, payload, url, _ = _run_push(push, ["--thread", thread_id, "--key", "k", "follow-up"])
+    check("appending to a named thread still succeeds", code == 0, f"exit {code}")
+    check("the append is addressed by the thread id",
+          url is not None and url.endswith(f"/{thread_id}/messages"), repr(url))
     check("the key is withheld when appending to a named thread",
-          "if args.key and not args.thread:" in src)
+          payload is not None and "key" not in payload and "key_ephemeral" not in payload,
+          repr(payload))
+
+    code, payload, url, _ = _run_push(push, ["--thread", thread_id, "--archive"])
+    check("a flags-only call carries no key either",
+          code == 0 and payload is not None and "key" not in payload, repr(payload))
+
+    code, _, _, err = _run_push(push, ["--key", "k", "hello"],
+                                response={"id": "c" * 32, "title": "T", "deduplicated": True})
     check("a deduplicated response is reported to the caller",
-          'body.get("deduplicated")' in src)
+          code == 0 and "already opened a thread" in err, err.strip())
 
 
 # ── 4. Live forward and drain agree ───────────────────────────────────────────
