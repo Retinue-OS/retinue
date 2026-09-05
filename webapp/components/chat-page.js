@@ -1255,6 +1255,25 @@ class RetinueChatPage extends HTMLElement {
     this._wireChatComposer();
     this._wireComposer('companion');
 
+    // Chips in Ara's companion turns ([[chip: …]] → .md-chip, markdown.js):
+    // a tap fills the companion composer, as in a conversation thread — the
+    // user still reads and sends it. Delegated on the pane's thread container.
+    const compThread = root.querySelector('[data-comp-thread]');
+    if (compThread) {
+      compThread.addEventListener('click', (e) => {
+        const chip = e.target && e.target.closest && e.target.closest('.md-chip');
+        if (!chip) return;
+        const text = chip.getAttribute('data-fill') || chip.textContent || '';
+        this._compDraft = text;
+        const input = root.querySelector('[data-composer="companion"] textarea');
+        if (input) {
+          input.value = text;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.focus();
+        }
+      });
+    }
+
     // Image lightbox: delegated on the thread container, so bubbles appended
     // by polls and sends are covered without per-message wiring.
     const chatThread = root.querySelector('[data-chat-thread]');

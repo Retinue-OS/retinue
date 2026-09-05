@@ -1,0 +1,225 @@
+<title>A day on the attention dashboard</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@400;600;700&family=Source+Serif+4:wght@700&family=Source+Code+Pro:wght@400;500&display=swap">
+<style>
+:root{--paper:#f4f5f6;--ink:#1c2530;--muted:#5d6b7a;--line:#d3d9df;--card:#ffffff;--accent:#176a6d;--story:#176a6d;--you:#d4670f;--push:#b3261e;--learn:#7a4f96;--sys:#5d6b7a;--ara:#2e7d4f}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--paper:#12161b;--ink:#e6eaee;--muted:#9aa5b1;--line:#2a323b;--card:#181d24;--accent:#5fb7bb;--story:#5fb7bb;--you:#e8a45a;--push:#ff8a80;--learn:#c9a0ff;--sys:#9aa5b1;--ara:#57c785}}
+:root[data-theme="dark"]{--paper:#12161b;--ink:#e6eaee;--muted:#9aa5b1;--line:#2a323b;--card:#181d24;--accent:#5fb7bb;--story:#5fb7bb;--you:#e8a45a;--push:#ff8a80;--learn:#c9a0ff;--sys:#9aa5b1;--ara:#57c785}
+html{background:var(--paper)}
+[hidden]{display:none!important}
+body{margin:0;background:var(--paper);color:var(--ink);font-family:"Source Sans 3","Liberation Sans","Helvetica Neue",Arial,sans-serif;font-size:16px;line-height:1.45;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+.app{max-width:1320px;margin:0 auto;padding:20px 20px 60px;box-sizing:border-box}
+.top{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin:0 0 16px}
+.top h1{font-family:"Source Serif 4","Bitstream Charter",Charter,Georgia,serif;font-weight:700;font-size:1.7rem;margin:0;color:var(--accent);letter-spacing:-.01em}
+.top p{margin:0;color:var(--muted);max-width:66ch}
+.grid{display:grid;grid-template-columns:420px minmax(0,1fr);gap:20px;align-items:start}
+.minibar{display:none}
+@media (max-width:900px){.grid{grid-template-columns:1fr}.phone{position:static}.minibar{display:flex;position:sticky;top:0;z-index:5;gap:10px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:8px 12px;margin:0 0 14px;box-shadow:0 6px 20px rgba(0,0,0,.15)}.minibar .digital{font-size:1.5rem}.minibar .mode-line{margin:0;font-size:.85rem}.minibar .spacer{flex:1}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:0 0 14px}
+.card h3{margin:0 0 8px;font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600}
+.hint{margin:6px 0 0;font-size:.78rem;color:var(--muted)}
+.muted{color:var(--muted)}
+.btn{font:inherit;font-size:.9rem;padding:6px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer}
+.btn:hover{border-color:var(--accent)}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.on{border-color:var(--accent);color:var(--accent)}
+.select{font:inherit;font-size:.9rem;padding:6px 8px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+.clock-row{display:flex;gap:16px;align-items:center}
+.clock{width:104px;height:104px;flex:none}
+.clock-face{fill:var(--paper);stroke:var(--line);stroke-width:2}
+.tick{stroke:var(--muted);stroke-width:1}.tick.major{stroke:var(--ink);stroke-width:2}
+.hand{stroke:var(--ink);stroke-linecap:round}.hand.hour{stroke-width:4}.hand.minute{stroke-width:2.5;stroke:var(--accent)}
+.pin{fill:var(--ink)}
+.digital{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:2.4rem;font-weight:500;line-height:1;letter-spacing:.02em}
+.date{color:var(--muted);margin-top:4px}
+.mode-line{margin-top:6px;font-weight:600;display:flex;align-items:center;gap:6px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:50%;vertical-align:middle}
+.controls{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center}
+.ended{margin-top:12px;padding:10px 12px;border-radius:8px;background:color-mix(in srgb,var(--accent) 12%,var(--card));border:1px solid color-mix(in srgb,var(--accent) 40%,var(--line));font-size:.92rem}
+.timeline{width:100%;height:auto;display:block;cursor:pointer}
+.tl-mode{font-size:9px;fill:#fff;text-anchor:middle;font-weight:600;pointer-events:none}
+.tl-digest{fill:var(--accent)}
+.tl-beat{stroke:var(--story);stroke-width:1.2}.tl-beat.you{stroke:var(--you);stroke-width:2}
+.tl-hour{font-size:9px;fill:var(--muted);text-anchor:middle}
+.tl-head{stroke:var(--you);stroke-width:2}.tl-head-t{font-size:9px;fill:var(--you);text-anchor:middle;font-weight:700}
+.feed{max-height:400px;overflow:auto;display:flex;flex-direction:column;gap:6px;padding-right:4px}
+.entry{display:grid;grid-template-columns:44px 52px 1fr;gap:8px;font-size:.9rem;line-height:1.4;padding:4px 6px;border-radius:6px}
+.entry .t{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:.8rem;color:var(--muted);padding-top:2px}
+.entry .tag{font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;font-weight:700;padding-top:4px}
+.entry.narrator .tag{color:var(--story)}.entry.you .tag{color:var(--you)}.entry.system .tag{color:var(--sys)}.entry.push .tag{color:var(--push)}.entry.learn .tag{color:var(--learn)}.entry.ara .tag{color:var(--ara)}.entry.reply .tag{color:var(--sys)}
+.entry.system .txt,.entry.push .txt,.entry.learn .txt,.entry.ara .txt,.entry.reply .txt{color:var(--muted);font-size:.85rem}
+.entry.narrator .txt,.entry.you .txt{font-size:.95rem}
+.entry.summary{background:color-mix(in srgb,var(--accent) 10%,var(--card))}
+.entry.latest{background:color-mix(in srgb,var(--story) 8%,var(--card))}
+.mode-card{border-left:4px solid var(--accent);padding:6px 10px;margin:4px 0 10px;background:var(--paper);border-radius:0 8px 8px 0}
+.mode-name{font-weight:700;font-size:1.05rem}.mode-name small{font-weight:400;color:var(--muted);margin-left:6px}
+.kv{display:grid;grid-template-columns:120px 1fr;gap:8px;font-size:.85rem;margin:4px 0;align-items:baseline}
+.kv>span:first-child{color:var(--muted)}
+.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:1px 8px;margin:1px 4px 1px 0;font-size:.8rem}
+.pill b{font-weight:600}
+.nums{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0}
+.num{background:var(--paper);border-radius:8px;padding:6px 12px;min-width:64px;text-align:center}
+.num b{display:block;font-size:1.3rem;line-height:1.1}.num span{font-size:.72rem;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+details summary{cursor:pointer;font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin:8px 0 6px}
+.learned{font-size:.82rem;margin:2px 0}
+code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:.85em;background:color-mix(in srgb,var(--ink) 8%,var(--card));padding:.05em .3em;border-radius:3px}
+.phone{width:420px;max-width:100%;margin:0 auto;background:#0b0d12;border:2px solid #2a323b;border-radius:34px;padding:10px;box-sizing:border-box;box-shadow:0 20px 50px rgba(0,0,0,.3);position:sticky;top:12px}
+.screen{display:block;width:100%;height:auto;border-radius:26px;background:#0b0d12}
+.shot-toggle{display:flex;gap:6px;justify-content:center;padding:8px 0 2px}
+.shot-toggle .btn{font-size:.8rem;padding:4px 10px;background:#151922;color:#e7ebf2;border-color:#2a323b}
+.shot-toggle .btn.on{border-color:#6ea8fe;color:#6ea8fe}
+.beat-now{margin:10px 0 0;padding:10px 12px;border-radius:8px;background:color-mix(in srgb,var(--story) 10%,var(--card));border:1px solid color-mix(in srgb,var(--story) 35%,var(--line));font-size:.95rem}
+.beat-now.you{background:color-mix(in srgb,var(--you) 10%,var(--card));border-color:color-mix(in srgb,var(--you) 35%,var(--line))}
+.beat-now b{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;display:block;margin-bottom:2px}
+</style>
+<div class="app">
+  <header class="top">
+    <h1>A day on the attention dashboard</h1>
+    <p>A recorded run of the scripted day on the real stack: the gateway with the attention model behind it, the dashboard screenshotted after every beat. Play it, step through it, or click anywhere on the timeline. The live, interactive run is <code>examples/attention-simulation/simulate.py</code>.</p>
+  </header>
+  <div class="minibar" id="minibar" hidden>
+    <span class="digital" id="mini-time">00:00</span>
+    <span class="mode-line" id="mini-mode"></span>
+    <span class="spacer"></span>
+    <button class="btn primary" data-act="toggle-play" id="mini-play">▶</button>
+  </div>
+  <div class="grid">
+    <div class="phone"><img id="shot" class="screen" alt="The dashboard"><div class="shot-toggle" id="shot-toggle" hidden></div></div>
+    <div id="deck"></div>
+  </div>
+</div>
+<script>
+const DATA = __DATA__;
+const IMAGES = __IMAGES__;
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const DAY = 1440;
+const MODE_COLORS = { off: '#3a4250', home: '#a86f2c', deep: '#0f4f57', open: '#8a94a0', work: '#2f8a90', social: '#7a4f96' };
+const SPHERE_COLORS = { customers: '#6ea8fe', admin: '#c9a0ff', health: '#ff6b6b', friends: '#57c785', family: '#ffb86b', system: '#9aa5b1' };
+const WHO = { narrator: 'story', you: 'you', system: 'system', push: 'push', learn: 'profile', ara: 'Ara', reply: 'reply' };
+const pad = (n) => String(n).padStart(2, '0');
+const hhmm = (m) => { const x = ((Math.round(m) % DAY) + DAY) % DAY; return `${pad(Math.floor(x / 60))}:${pad(x % 60)}`; };
+const nice = (v) => (Math.abs(v - Math.round(v)) < 0.05 ? String(Math.round(v)) : v.toFixed(1));
+const dur = (min) => { min = Math.round(min); if (min < 60) return `${min} min`; if (min < DAY) return `${nice(min / 60)} h`; return `${nice(min / DAY)} d`; };
+const base = new Date(DATA.date + 'T00:00:00');
+const whenText = (iso) => { if (!iso) return ''; const m = (new Date(iso) - base) / 60000; return m < DAY ? hhmm(m) : `tomorrow ${hhmm(m)}`; };
+const SPEEDS = [[3000, 'slow — 3 s per beat'], [5000, 'reading pace — 5 s'], [9000, 'unhurried — 9 s']];
+
+const state = { i: 0, playing: false, timer: null, interval: 5000, showView: true };
+const frames = DATA.frames;
+
+function buildDeck() {
+  $('#deck').innerHTML = `
+    <section class="card clock-card">
+      <div class="clock-row">
+        <svg class="clock" viewBox="0 0 100 100" role="img" aria-label="Clock">
+          <circle cx="50" cy="50" r="46" class="clock-face"/>
+          ${Array.from({ length: 12 }, (_, i) => { const a = (i / 12) * Math.PI * 2; const r1 = i % 3 === 0 ? 38 : 41, r2 = 45; return `<line x1="${50 + r1 * Math.sin(a)}" y1="${50 - r1 * Math.cos(a)}" x2="${50 + r2 * Math.sin(a)}" y2="${50 - r2 * Math.cos(a)}" class="tick${i % 3 === 0 ? ' major' : ''}"/>`; }).join('')}
+          <line id="hand-h" x1="50" y1="50" x2="50" y2="24" class="hand hour"/>
+          <line id="hand-m" x1="50" y1="50" x2="50" y2="12" class="hand minute"/>
+          <circle cx="50" cy="50" r="2.4" class="pin"/>
+        </svg>
+        <div class="clock-text">
+          <div class="digital" id="digital">00:00</div>
+          <div class="date" id="date"></div>
+          <div class="mode-line" id="mode-line"></div>
+        </div>
+      </div>
+      <div class="controls">
+        <button class="btn primary" data-act="toggle-play" id="btn-play">▶ Play the day</button>
+        <button class="btn" data-act="prev" title="Previous beat">⏮</button>
+        <button class="btn" data-act="next" title="Next beat">⏭ Next beat</button>
+        <button class="btn" data-act="restart" title="Back to midnight">↺</button>
+        <select class="select" data-act="speed" aria-label="Pace">${SPEEDS.map(([v, l]) => `<option value="${v}"${v === state.interval ? ' selected' : ''}>${l}</option>`).join('')}</select>
+      </div>
+      <div class="beat-now" id="beat-now"></div>
+      <div class="ended" id="ended" hidden>The day is over. <button class="btn" data-act="restart">Play it again</button></div>
+      <p class="hint">What the phone shows is the real dashboard, screenshotted after each beat: the home list, or the chat, thread or ⓘ sheet the beat opened (toggle under the phone). Keys: space plays, ← → step.</p>
+    </section>
+    <section class="card timeline-card"><div id="timeline"></div><p class="hint">Click anywhere on the day to jump there. Bands: the mode in force; ▲ digest times; ticks: beats of the story (orange: something you do).</p></section>
+    <section class="card feed-card"><h3>The day</h3><div class="feed" id="feed"></div></section>
+    <section class="card state-card" id="state"></section>`;
+}
+
+function render() {
+  const f = frames[state.i]; const st = f.state || {}; const mode = st.mode || {};
+  const now = f.at; const h = (now / 60) % 12, m = now % 60;
+  $('#hand-h').setAttribute('transform', `rotate(${h * 30} 50 50)`);
+  $('#hand-m').setAttribute('transform', `rotate(${m * 6} 50 50)`);
+  $('#digital').textContent = hhmm(now); $('#mini-time').textContent = hhmm(now);
+  $('#date').textContent = base.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' });
+  const modeLine = `<span class="dot" style="background:${MODE_COLORS[mode.id] || '#6ea8fe'}"></span>${esc(mode.name || '')}${mode.manual ? ' · set by hand' : (mode.scheduled ? ` · until ${whenText(mode.scheduled.until)}` : '')}`;
+  $('#mode-line').innerHTML = modeLine; $('#mini-mode').innerHTML = modeLine; $('#minibar').hidden = false;
+  $('#btn-play').textContent = state.playing ? '⏸ Pause' : '▶ Play the day'; $('#mini-play').textContent = state.playing ? '⏸' : '▶';
+  const atEnd = state.i >= frames.length - 1; $('#ended').hidden = !atEnd;
+  const beat = state.i > 0 ? DATA.beats[state.i - 1] : null;
+  const bn = $('#beat-now');
+  if (beat) { bn.className = `beat-now ${beat.who}`; bn.innerHTML = `<b>${hhmm(beat.at)} · ${beat.who === 'you' ? 'you' : 'the story'}</b>${esc(beat.text)}`; bn.hidden = false; }
+  else { bn.className = 'beat-now'; bn.innerHTML = `<b>00:00</b>The day begins. Press Play, or step through the beats.`; }
+  // the phone
+  const hasView = !!f.view; const showView = hasView && state.showView;
+  $('#shot').src = IMAGES[showView ? f.view : f.home] || '';
+  const tg = $('#shot-toggle'); tg.hidden = !hasView;
+  if (hasView) tg.innerHTML = `<button class="btn${showView ? ' on' : ''}" data-act="show-view">What you opened</button><button class="btn${showView ? '' : ' on'}" data-act="show-home">The home</button>`;
+  renderTimeline(); renderFeed(f); renderState(st);
+}
+function renderTimeline() {
+  const f = frames[state.i]; const W = 680, X0 = 20; const x = (mm) => X0 + (Math.max(0, Math.min(mm, DAY)) / DAY) * W;
+  const sched = DATA.schedule || [];
+  const bands = sched.map((e, i) => { const from = e[0], to = i + 1 < sched.length ? sched[i + 1][0] : DAY; return `<rect x="${x(from)}" y="10" width="${Math.max(0, x(to) - x(from))}" height="20" fill="${MODE_COLORS[e[1]] || '#666'}" opacity="${from <= f.at ? 1 : 0.4}"><title>${esc((DATA.modes[e[1]] || {}).name || e[1])} ${hhmm(from)}–${hhmm(to)}</title></rect>`; }).join('');
+  const labels = sched.map((e, i) => { const to = i + 1 < sched.length ? sched[i + 1][0] : DAY; return to - e[0] >= 120 ? `<text x="${(x(e[0]) + x(to)) / 2}" y="24" class="tl-mode">${esc((DATA.modes[e[1]] || {}).name || e[1])}</text>` : ''; }).join('');
+  const digests = (DATA.digest_times || []).map((d) => `<polygon points="${x(d) - 4},8 ${x(d) + 4},8 ${x(d)},3" class="tl-digest"><title>digest ${hhmm(d)}</title></polygon>`).join('');
+  const beats = DATA.beats.map((b) => `<line x1="${x(b.at)}" y1="34" x2="${x(b.at)}" y2="${b.action ? 42 : 39}" class="tl-beat ${b.who}"/>`).join('');
+  const hours = [0, 3, 6, 9, 12, 15, 18, 21, 24].map((hh) => `<text x="${x(hh * 60)}" y="60" class="tl-hour">${pad(hh)}</text>`).join('');
+  $('#timeline').innerHTML = `<svg viewBox="0 0 720 66" class="timeline" data-act="seek" role="img" aria-label="Timeline of the day">${bands}${labels}${digests}${beats}${hours}<g transform="translate(${x(f.at)} 0)"><line x1="0" y1="4" x2="0" y2="48" class="tl-head"/><text x="0" y="52" class="tl-head-t">${hhmm(f.at)}</text></g></svg>`;
+}
+function renderFeed(f) {
+  const feed = DATA.feed.slice(0, f.feed_len);
+  const el = $('#feed');
+  el.innerHTML = feed.length ? feed.map((e, i) => `<div class="entry ${e.who}${e.summary ? ' summary' : ''}${i === feed.length - 1 ? ' latest' : ''}"><span class="t">${hhmm(e.t)}</span><span class="tag">${WHO[e.who] || e.who}</span><span class="txt">${esc(e.text)}</span></div>`).join('') : '<div class="entry"><span class="txt">Press Play, or click on the timeline.</span></div>';
+  el.scrollTop = el.scrollHeight;
+}
+function renderState(st) {
+  const mode = st.mode || {}; const nums = st.stats || {}; const counts = st.counts || {};
+  const chips = (arr, color) => (arr && arr.length ? arr.map((x) => `<span class="pill" style="border-color:${color ? color(x) : 'var(--line)'}">${esc(x)}</span>`).join('') : '<span class="muted">none</span>');
+  const num = (v, l) => `<div class="num"><b>${v}</b><span>${l}</span></div>`;
+  const permits = (st.permits || {})[mode.id] || [];
+  $('#state').innerHTML = `
+    <h3>System state</h3>
+    <div class="mode-card" style="border-left-color:${MODE_COLORS[mode.id] || '#6ea8fe'}"><div class="mode-name">${esc(mode.name || '')} <small>${mode.manual ? 'set by hand' : (mode.scheduled ? `scheduled until ${whenText(mode.scheduled.until)}` : '')}</small></div>
+      <div class="kv"><span>admits</span><div>${chips(mode.admits, (x) => SPHERE_COLORS[x])}${(mode.admit_tags || []).length ? ` <span class="muted">+ tag</span> ${chips(mode.admit_tags, (x) => SPHERE_COLORS[x])}` : ''}</div></div>
+      <div class="kv"><span>permits</span><div>${chips(permits)}</div></div>
+      <div class="kv"><span>breaks through</span><div>${esc(mode.threshold || '')} and above</div></div>
+      <div class="kv"><span>next breakpoint</span><div>${whenText(st.next_breakpoint)}</div></div></div>
+    <div class="nums">${num(nums.pushes || 0, 'pushes')}${num(nums.digests || 0, 'digests')}${num(counts.held || 0, 'held')}${num(nums.handled || 0, 'handled')}${num(nums.corrections || 0, 'corrections')}${num(counts.now || 0, 'in Now')}${num(counts.next || 0, 'in Next')}</div>
+    <details class="profile" open><summary>Attention profile</summary>
+      <div class="kv"><span>importance priors</span><div>${Object.entries(st.priors || {}).map(([k, v]) => `<span class="pill">${esc(k)} <b>${v}</b></span>`).join('')}</div></div>
+      <div class="kv"><span>lead times</span><div>${Object.entries(st.leads || {}).filter(([k]) => k !== 'default').map(([k, v]) => `<span class="pill">${esc(k)} <b>${dur(v)}</b></span>`).join('')}</div></div>
+      <div class="kv"><span>permits</span><div>${Object.entries(st.permits || {}).filter(([, v]) => v.length).map(([mid, v]) => `<span class="pill">${esc((DATA.modes[mid] || {}).name || mid)}: ${v.map(esc).join(', ')}</span>`).join('') || '<span class="muted">none yet</span>'}</div></div>
+      <div class="kv"><span>learned today</span><div>${(st.learned || []).length ? st.learned.map((l) => `<div class="learned">${esc(l.text)}</div>`).join('') : '<span class="muted">nothing yet</span>'}</div></div>
+    </details>
+    <details><summary>What is real here</summary><p class="hint">The gateway with the attention model, the home screen, the chat page and the threads are the deployment's own code (<code>scripts/web-gateway.py</code>, <code>webapp/</code>). The life store, the messenger gateways and Ara are stand-ins: a mock ledger with the example messages, mock gateways that accept the sends, canned dialogues in place of model turns. Everyone in the story is fictional.</p></details>`;
+}
+function go(i) { state.i = Math.max(0, Math.min(i, frames.length - 1)); state.showView = true; render(); if (state.i >= frames.length - 1) pause(); }
+function play() { if (state.i >= frames.length - 1) state.i = 0; state.playing = true; state.timer = setInterval(() => go(state.i + 1), state.interval); render(); }
+function pause() { state.playing = false; if (state.timer) clearInterval(state.timer); state.timer = null; render(); }
+document.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-act]'); if (!el) return;
+  const act = el.dataset.act;
+  if (act === 'seek') { const pt = el.getBoundingClientRect(); const minute = Math.round((((e.clientX - pt.left) / pt.width) * 720 - 20) / 680 * DAY); let best = 0; frames.forEach((f, i) => { if (f.at <= minute) best = i; }); pause(); go(best); return; }
+  if (act === 'toggle-play') { state.playing ? pause() : play(); return; }
+  if (act === 'next') { pause(); go(state.i + 1); return; }
+  if (act === 'prev') { pause(); go(state.i - 1); return; }
+  if (act === 'restart') { pause(); go(0); return; }
+  if (act === 'show-view') { state.showView = true; render(); return; }
+  if (act === 'show-home') { state.showView = false; render(); return; }
+});
+document.addEventListener('change', (e) => { const el = e.target.closest('[data-act="speed"]'); if (!el) return; state.interval = Number(el.value); if (state.playing) { pause(); play(); } });
+document.addEventListener('keydown', (e) => { if (e.key === ' ') { e.preventDefault(); state.playing ? pause() : play(); } else if (e.key === 'ArrowRight') { pause(); go(state.i + 1); } else if (e.key === 'ArrowLeft') { pause(); go(state.i - 1); } });
+buildDeck();
+// Deep links: ?t=HH:MM lands on the last frame at or before that minute, ?frame=N on a frame.
+(() => { try { const q = new URLSearchParams(location.search); const t = q.get('t'); const fr = q.get('frame');
+  if (fr != null) state.i = Math.max(0, Math.min(Number(fr) || 0, frames.length - 1));
+  else if (t) { const [h, m] = t.split(':').map(Number); const minute = (h || 0) * 60 + (m || 0); frames.forEach((f, i) => { if (f.at <= minute) state.i = i; }); }
+} catch (_e) { /* no query */ } })();
+render();
+</script>

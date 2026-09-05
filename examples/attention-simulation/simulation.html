@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>A day with the attention model — on the real dashboard</title>
+  <link rel="stylesheet" href="/deck.css">
+  <script type="module" src="/deck.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header class="top">
+      <h1>A day with the attention model</h1>
+      <p>The real dashboard in the phone, the real gateway behind it, a scripted day on the clock. Play it, or jump anywhere on the timeline. Touch the phone at any time — the story pauses and adapts to what you changed.</p>
+    </header>
+    <div class="minibar" id="minibar" hidden>
+      <span class="digital" id="mini-time">00:00</span>
+      <span class="mode-line" id="mini-mode"></span>
+      <span class="spacer"></span>
+      <button class="btn primary" data-act="toggle-play" id="mini-play">▶</button>
+    </div>
+    <div class="grid">
+      <div class="phone"><iframe id="phone" class="screen" src="/" title="The dashboard"></iframe></div>
+      <div id="deck"></div>
+    </div>
+  </div>
+</body>
+</html>

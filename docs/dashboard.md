@@ -87,6 +87,10 @@ own document, the endpoints, the tick — is the attention section of
 `scripts/web-gateway.py` (tested end to end in `tests/test_attention_api.py`);
 the adapters and the two small documents are `scripts/attention_store.py`.
 
+To see the whole mechanism at work, `examples/attention-simulation/` plays a
+scripted day on this very gateway and dashboard, with mocks for the store,
+the messenger gateways and Ara.
+
 **What carries the properties.** A thread's `attention` block is set when an
 agent opens it (`conversation-push.py --importance 4 --due 2026-09-04T17:00
 --kind "customer request" --sphere customers --tag finance`, or `--critical`,

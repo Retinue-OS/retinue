@@ -1602,6 +1602,14 @@ const CSS = `
                        max-width: 9.5rem; cursor: pointer; -webkit-appearance: none;
                        appearance: none; }
   .model-pick select:hover { border-color: var(--accent, #6ea8fe); }
+  /* A phone's thread bar holds the back button, the picker, the attention
+     ⓘ, the speaker toggle and Archive beside the title: the picker yields
+     first, so the title keeps a few words instead of its first letter. */
+  @media (max-width: 480px) {
+    .model-pick select { max-width: 5.5rem; }
+    .pill { padding: 6px 9px; }
+    .bar-title { min-width: 5ch; }
+  }
   /* The composer's roomy form: a captioned, untruncated picker centered under
      the "Ask Ara anything" hint, so the model choice is plainly offered before
      the conversation starts. */

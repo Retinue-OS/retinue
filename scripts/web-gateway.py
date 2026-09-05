@@ -2712,6 +2712,9 @@ def _conv_event_mode(conv: dict) -> str:
     return "reply"
 
 
+_CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
+
+
 def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:
     """Notify the user's devices that a thread needs their attention.
 
@@ -2736,7 +2739,8 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
               "notifies nobody", flush=True)
         return 0
     title = conv.get("title") or "Retinue"
-    body = " ".join(str(text or "").split())
+    # The notification shows words, not the chip markup the thread renders.
+    body = " ".join(_CHIP_MARKUP_RE.sub("", str(text or "")).split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
@@ -5532,6 +5536,11 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None) -> t
                "archived": False, "muted": bool(doc.get("muted")), "group": doc.get("group")}
         previous = dict(doc.get("attention") or {})
         was_held = bool(previous) and previous.get("state", "open") == "open" and not previous.get("released")
+        if isinstance(spec, dict) and spec:
+            # A classification is a complete judgement of the latest message:
+            # the earlier deadline, kind and importance do not linger on it.
+            # The sphere (the sender's) and the push history stay.
+            previous = {k: v for k, v in previous.items() if k in ("sphere", "pushed", "boost")}
         block = _attention_spec_to_block(spec, previous, now)
         block["state"] = "open"
         block["released"] = False

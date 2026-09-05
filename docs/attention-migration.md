@@ -72,7 +72,10 @@ drill-downs.
 
 ## Slices
 
-*Status: slices 1 and 2 are built on this branch (the deferral runs on the
+*Status: slices 1 and 2 are built on this branch, and the prototype's day
+replays on them — `examples/attention-simulation/` runs the real gateway and
+dashboard through the scripted twenty-four hours (`simulate.py`), or records
+them as one page (`record.py`); (the deferral runs on the
 gateway's own tick rather than a scheduler job — the tick lives where the
 push fan-out and the documents live, and needs no second process); slice 3's
 first pieces (sphere priors, the rail's `attention` for the triage's
