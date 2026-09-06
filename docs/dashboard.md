@@ -92,9 +92,14 @@ hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone
 from the home; their pages remain, linked from the list's footer.
 
-The mode chip in the list's header shows the mode in force — by the schedule
-or set by hand — and opens the mode menu. **A change by hand is a
-breakpoint**: what was held is released and the digest goes out. The policy
+**The mode is the home's title.** The first line of the page is the mode in
+force, in the largest type on the screen — *● Work · until 17:00 ▾* — with the
+date and the way to settings on the right, and it opens the mode menu; the
+home has no page header of its own above it. The state the user is in is what
+governs everything below, so it says it plainly, where a greeting used to sit
+saying nothing (and saying it in the browser's own clock, unchanged from page
+load, which is how it came to wish you good evening at breakfast). **A change
+by hand is a breakpoint**: what was held is released and the digest goes out. The policy
 is `scripts/attention.py` (pure, tested in `tests/test_attention.py`); the
 gateway's part — assembling the items, storing each decision on the item's
 own document, the endpoints, the tick — is the attention section of

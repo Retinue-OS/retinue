@@ -46,15 +46,25 @@ const CSS = `
     .card { background: var(--card, #151922); border: 1px solid var(--line, rgba(231, 235, 242, .08));
             border-radius: var(--radius, 16px); padding: 14px 16px; }
   }
-  header { flex: none; display: flex; align-items: center; justify-content: space-between;
+  /* <main> already pads the top safe-area inset for the whole page. */
+  header { flex: none; display: flex; align-items: baseline; justify-content: space-between;
            gap: 8px; padding: 0 2px 10px; }
-  h2 { font-size: .82rem; font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
-       color: var(--muted, #8b93a3); margin: 0; }
-  .mode-chip { font-size: .8rem; color: var(--fg, #e7ebf2); background: var(--card-2, #1c2230);
-               border: 1px solid var(--accent, #6ea8fe); border-radius: 14px; padding: 5px 11px;
-               cursor: pointer; display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+  /* The mode is the page's title: the state the user is in, in the biggest
+     type on the screen, and the way to change it. */
+  .mode-head { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0;
+               background: none; border: 0; padding: 0; margin: 0; cursor: pointer;
+               color: var(--fg, #e7ebf2); text-align: left;
                -webkit-tap-highlight-color: transparent; }
-  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none; }
+  .mode-name { font-size: 1.3rem; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+  .mode-when { font-size: .8rem; color: var(--muted, #8b93a3); white-space: nowrap;
+               overflow: hidden; text-overflow: ellipsis; }
+  .caret { font-size: .7rem; color: var(--muted, #8b93a3); flex: none; }
+  .head-right { display: inline-flex; align-items: baseline; gap: 12px; flex: none; }
+  .head-right .date { color: var(--muted, #8b93a3); font-size: .8rem; white-space: nowrap; }
+  .gear { color: var(--muted, #8b93a3); text-decoration: none; font-size: .95rem; }
+  .gear:hover { color: var(--accent, #6ea8fe); }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none;
+         align-self: center; }
   .content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
   .list { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
   .sec { margin: 4px 0 12px; }
@@ -160,6 +170,9 @@ class RetinueAttention extends HTMLElement {
     document.removeEventListener('visibilitychange', this._onVisible);
   }
 
+  // The list's name, for assistive tech only: the header's own words are the
+  // mode, and a second "Attention" title above a page that is nothing but
+  // the attention list was one line of chrome saying what the page already is.
   get heading() { return this.getAttribute('heading') || 'Attention'; }
 
   async load() {
@@ -279,6 +292,33 @@ class RetinueAttention extends HTMLElement {
       `</section>`;
   }
 
+  // The home's whole header: the mode in force as the page's title — the
+  // state the user is in, which is what the space above a list of what wants
+  // attention is worth spending on — plus the date and the way to settings.
+  // The date comes from the gateway's clock (`now`), not the browser's: it is
+  // the clock every deadline on the list is read against.
+  _headHtml(d) {
+    const mode = (d && d.mode) || null;
+    const date = new Date((d && d.now) || Date.now());
+    const dateText = Number.isNaN(date.getTime()) ? ''
+      : date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+    const right = `<span class="head-right"><span class="date">${esc(dateText)}</span>` +
+      `<a class="gear" href="/settings.html" title="Settings" aria-label="Settings">&#9881;</a></span>`;
+    if (!mode) {
+      return `<header><span class="mode-head"><span class="mode-when">` +
+        `${this._state === 'offline' ? 'Offline' : '&#8230;'}</span></span>${right}</header>`;
+    }
+    const until = mode.manual ? 'set by hand'
+      : `until ${esc(fmtWhen((mode.scheduled || {}).until))}`;
+    return `<header>` +
+      `<button class="mode-head" data-act="mode-menu" aria-haspopup="dialog" ` +
+      `title="${esc(mode.blurb || '')}">` +
+      `<span class="dot" style="background:${modeColor(mode.id)}"></span>` +
+      `<span class="mode-name">${esc(mode.name)}</span>` +
+      `<span class="mode-when">${until}</span><span class="caret">&#9662;</span>` +
+      `</button>${right}</header>`;
+  }
+
   _menuHtml() {
     const d = this._data;
     if (!d) return '';
@@ -301,7 +341,7 @@ class RetinueAttention extends HTMLElement {
   render() {
     const root = this.shadowRoot;
     if (!root) return;
-    let head = `<header><h2>${esc(this.heading)}</h2></header>`;
+    let head = this._headHtml(null);
     let body;
     if (this._state === 'loading') {
       body = '<p class="muted">&#8230;</p>';
@@ -311,10 +351,7 @@ class RetinueAttention extends HTMLElement {
       const d = this._data;
       const s = d.sections || {};
       const mode = d.mode || {};
-      const until = mode.manual ? 'by hand' : `until ${fmtWhen((mode.scheduled || {}).until)}`;
-      head = `<header><h2>${esc(this.heading)}</h2>` +
-        `<button class="mode-chip" data-act="mode-menu" style="border-color:${modeColor(mode.id)}" title="${esc(mode.blurb || '')}">` +
-        `<span class="dot" style="background:${modeColor(mode.id)}"></span>${esc(mode.name)} · ${esc(until)} ▾</button></header>`;
+      head = this._headHtml(d);
       const total = (s.now || []).length + (s.next || []).length + (s.held || []).length + (s.waiting || []).length + (s.not_now || []).length;
       const nb = fmtWhen(d.next_breakpoint);
       const degraded = (d.degraded || []).length
@@ -331,7 +368,7 @@ class RetinueAttention extends HTMLElement {
     const foot = `<div class="foot"><button class="new" data-act="new">+ Ask Ara</button>` +
       `<div class="links"><a href="/conversations.html">Conversations</a><a href="/chats.html">Chats</a>` +
       `<a href="/projects.html">Projects</a><a href="/news.html">News</a></div></div>`;
-    root.innerHTML = `<style>${CSS}</style><section class="card">${head}<div class="content">${body}${foot}</div></section>` +
+    root.innerHTML = `<style>${CSS}</style><section class="card" aria-label="${esc(this.heading)}">${head}<div class="content">${body}${foot}</div></section>` +
       (this._menu ? this._menuHtml() : '');
   }
 }

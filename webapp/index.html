@@ -47,16 +47,12 @@
 </head>
 <body>
   <main>
-    <header class="top">
-      <h1 id="greeting">Retinue</h1>
-      <span class="top-right">
-        <span id="today" class="date"></span>
-        <!-- Discrete way into the settings page (notifications live there). -->
-        <a class="gear" href="/settings.html" title="Settings" aria-label="Settings">&#9881;</a>
-      </span>
-    </header>
+    <!-- No page header here: the home's first line is the attention list's
+         own, where the focus mode is the title (components/attention.js).
+         The state the user is in is the one thing worth the space above a
+         list of what wants their attention — and a greeting was not it. -->
 
-    <!-- The deck: the resizable region between header and dock. On phones the
+    <!-- The deck: the resizable region above the dock. On phones the
          wrappers are display:contents (everything stacks, the page scrolls);
          in the wide layout the column is a fixed frame whose regions scroll
          internally, the boundary to the news a draggable splitter (layout.js). -->
@@ -116,16 +112,6 @@
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
     }
-
-    // Lightweight, client-side greeting and date. No server rendering.
-    (() => {
-      const now = new Date();
-      const h = now.getHours();
-      const g = h < 5 ? 'Good night' : h < 11 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
-      document.getElementById('greeting').textContent = g;
-      document.getElementById('today').textContent =
-        now.toLocaleDateString(undefined, { weekday: 'long', day: 'numeric', month: 'long' });
-    })();
   </script>
 </body>
 </html>
