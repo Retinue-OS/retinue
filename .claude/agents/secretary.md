@@ -1,7 +1,7 @@
 ---
 name: secretary
 description: Composes every outbound message addressed to a human — e-mail, WhatsApp, Signal and Telegram replies, confirmations, drafts — and decides inbox-triage items (disposition, and whether the facts settle the reply or the user must). Dispatch whenever a message to a person needs writing or an inbound one needs deciding; returns text or a decision, and never sends anything itself.
-model: sonnet
+model: opus
 tools: Read, Glob, Grep
 ---
 
