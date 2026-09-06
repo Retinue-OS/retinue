@@ -52,27 +52,36 @@ DEFAULT_LEADS = {
     "invoice run": 1 * DAY,
 }
 
-# ``only_admitted``: the list shows only what the mode admits — everything
-# else folds into a collapsed "Not now" section (critical, permitted, pulled
-# and the user's own items stay visible). On for the two modes whose point is
-# not seeing the rest.
+# A mode is how interruptible the user is right now — the mood, not the
+# subject or the hour. Each carries the threshold (the lowest level that may
+# ring), the spheres that may reach it, and ``only_admitted``: the list shows
+# only what the mode admits, the rest folding into a collapsed "Not now"
+# (critical, permitted, pulled and the user's own items stay visible).
+#
+# Focused is the head-down mood, and it takes a *scope*: nothing (only
+# critical rings — flow), one sphere ("all clients"), or one project ("this
+# one") — the nesting the data already has, sphere ⊃ project ⊃ item, offered
+# at either level. A schedule entry may name a sphere as the third element;
+# by hand, the menu offers spheres and the projects on the list. The scope
+# stands in for the rule's ``admits`` for that stint (see mode_at); what the
+# rule lists is what Focused admits when no scope is given.
 DEFAULT_MODES = {
-    "off":    {"id": "off",    "name": "Off",       "admits": [],                                                    "admit_tags": [],         "threshold": "critical",       "only_admitted": True,  "blurb": "only critical; the digest waits for the morning"},
-    "home":   {"id": "home",   "name": "Home",      "admits": ["family", "health"],                                  "admit_tags": [],         "threshold": "time-sensitive", "only_admitted": False, "blurb": "family and health may break through"},
-    "deep":   {"id": "deep",   "name": "Deep work", "admits": [],                                                    "admit_tags": [],         "threshold": "critical",       "only_admitted": True,  "blurb": "only critical breaks through"},
-    "open":   {"id": "open",   "name": "Open",      "admits": ["customers", "admin", "health", "friends", "family", "system"], "admit_tags": [], "threshold": "time-sensitive", "only_admitted": False, "blurb": "every sphere admitted; time-sensitive rings"},
-    "work":   {"id": "work",   "name": "Work",      "admits": ["customers", "admin", "health"],                      "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": False, "blurb": "customers, admin and health may break through"},
-    "social": {"id": "social", "name": "Social",    "admits": ["friends", "family"],                                 "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": False, "blurb": "friends and family may break through"},
+    "rest":    {"id": "rest",    "name": "Rest & relax", "admits": [],                                                    "admit_tags": [],         "threshold": "critical",       "only_admitted": True,  "blurb": "no interruptions; the digest waits for the morning"},
+    "focused": {"id": "focused", "name": "Focused",      "admits": [],                                                    "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": True,  "blurb": "head down — only what is about the scope at hand may ring, and health", "with_subject": True},
+    "chores":  {"id": "chores",  "name": "Chores",       "admits": ["customers", "admin", "health", "friends", "family", "system"], "admit_tags": [], "threshold": "time-sensitive", "only_admitted": False, "blurb": "interruptions welcome: anything urgent rings"},
+    "social":  {"id": "social",  "name": "Social",       "admits": ["friends", "family"],                                 "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": False, "blurb": "people, not subjects: friends and family may break through"},
 }
-# minute of the local day → mode id
-DEFAULT_SCHEDULE = [[0, "off"], [7 * 60, "home"], [8 * 60, "deep"], [12 * 60, "open"], [13 * 60, "work"], [17 * 60, "open"], [18 * 60, "social"], [22 * 60, "off"]]
+# minute of the local day → mode id, optionally the sphere Focused is on
+DEFAULT_SCHEDULE = [[0, "rest"], [7 * 60, "chores"], [8 * 60, "focused"], [12 * 60, "chores"], [13 * 60, "focused", "customers"], [17 * 60, "chores"], [18 * 60, "social"], [22 * 60, "rest"]]
 DEFAULT_DIGEST_TIMES = [8 * 60, 12 * 60, 17 * 60, 21 * 60]
 SWEEP_EVERY_MINUTES = 30
 
 
 def default_focus() -> dict:
-    """The focus document the gateway keeps (focus.json): modes, schedule, override."""
-    return {"manual": None, "modes": json.loads(json.dumps(DEFAULT_MODES)), "schedule": [list(x) for x in DEFAULT_SCHEDULE], "digest_times": list(DEFAULT_DIGEST_TIMES)}
+    """The focus document the gateway keeps (focus.json): modes, schedule,
+    the manual override and its subject."""
+    return {"manual": None, "subject": None, "modes": json.loads(json.dumps(DEFAULT_MODES)),
+            "schedule": [list(x) for x in DEFAULT_SCHEDULE], "digest_times": list(DEFAULT_DIGEST_TIMES)}
 
 
 def default_profile() -> dict:
@@ -192,6 +201,7 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "pulled": bool(a.get("pulled", False)),
         "done_at": a.get("done_at"),
         "done_how": a.get("done_how"),
+        "project": a.get("project") or doc.get("project") or None,
     }
 
 
@@ -207,6 +217,7 @@ def item_to_attention(item: dict) -> dict:
         "snoozed_until": iso(item.get("snoozed_until")), "boost": int(item.get("boost", 0)), "last_level": item.get("last_level"),
         "pushed": [iso(x) for x in item.get("pushed") or []], "pulled": bool(item.get("pulled", False)),
         "done_at": item.get("done_at"), "done_how": item.get("done_how"),
+        "project": item.get("project") or None,
     }
 
 
@@ -266,40 +277,98 @@ def minute_of_day(now: datetime) -> int:
     return now.hour * 60 + now.minute
 
 
-def scheduled_id(focus: dict, now: datetime) -> str:
+def scheduled_entry(focus: dict, now: datetime) -> list:
+    """The schedule entry in force: ``[minute, mode]`` or ``[minute, mode, sphere]``."""
     m = minute_of_day(now)
-    current = focus["schedule"][0][1]
-    for start, mid in focus["schedule"]:
-        if m >= start:
-            current = mid
-    return current
+    current = focus["schedule"][0]
+    for entry in focus["schedule"]:
+        if m >= entry[0]:
+            current = entry
+    return list(current)
+
+
+def scheduled_id(focus: dict, now: datetime) -> str:
+    return scheduled_entry(focus, now)[1]
+
+
+def scope_of(focus: dict, now: datetime) -> dict | None:
+    """What Focused is on: by hand, the override's subject — a sphere
+    (``{"kind": "sphere", "id": …}``) or a project (``{"kind": "project",
+    "id": <uri>, "title": …}``; a bare string is a sphere); by schedule, the
+    entry's third element as a sphere. None when the mode has no scope."""
+    if focus.get("manual"):
+        subject = focus.get("subject")
+        if isinstance(subject, str) and subject:
+            return {"kind": "sphere", "id": subject, "title": subject}
+        if isinstance(subject, dict) and subject.get("id"):
+            return {"kind": subject.get("kind") or "sphere", "id": subject["id"],
+                    "title": subject.get("title") or subject["id"]}
+        return None
+    entry = scheduled_entry(focus, now)
+    if len(entry) > 2 and entry[2]:
+        return {"kind": "sphere", "id": entry[2], "title": entry[2]}
+    return None
 
 
 def mode_at(focus: dict, now: datetime) -> dict:
-    return focus["modes"][focus.get("manual") or scheduled_id(focus, now)]
+    """The mode in force. A mode that takes a scope (``with_subject``) and has
+    one is returned as a copy: ``admits`` becomes that one sphere, or none
+    with ``project`` set — the mood stays, the scope stands in for the rule's
+    list — and ``subject`` carries the scope so the title can say so. The
+    stored rule is never touched; releasing the override drops its scope."""
+    mode = focus["modes"][focus.get("manual") or scheduled_id(focus, now)]
+    scope = scope_of(focus, now) if mode.get("with_subject") else None
+    if not scope:
+        return mode
+    if scope["kind"] == "project":
+        return {**mode, "admits": [], "project": scope["id"], "subject": scope}
+    return {**mode, "admits": [scope["id"]], "subject": scope}
+
+
+def about_project(item: dict, uri: str) -> bool:
+    return bool(uri) and (item.get("project") == uri or item.get("id") == uri)
 
 
 def admitted(item: dict, mode: dict, profile: dict) -> bool:
-    if item["sphere"] in mode["admits"]:
+    """A sphere in ``admits`` gets through; so does one in ``admit_tags``,
+    whether the item carries it as its sphere or as a tag — "health may
+    reach me" is about the subject, not about which slot it sits in — and,
+    with Focused on a project, whatever is about that project."""
+    tags = mode.get("admit_tags", [])
+    if item["sphere"] in mode["admits"] or item["sphere"] in tags:
         return True
-    if any(t in mode.get("admit_tags", []) for t in item.get("tags") or []):
+    if any(t in tags for t in item.get("tags") or []):
+        return True
+    if about_project(item, mode.get("project")):
         return True
     sender = item.get("sender")
     return bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or [])
 
 
+def mode_label(mode: dict) -> str:
+    """The mode as the reason line names it: "Focused on Müller AG"."""
+    scope = mode.get("subject")
+    return f"{mode['name']} on {scope['title']}" if scope else mode["name"]
+
+
 def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> str:
     if level(item, now) == "critical":
         return "critical rings in every mode"
+    if about_project(item, mode.get("project")):
+        return f"{mode_label(mode)}: this is about it"
     if item["sphere"] in mode["admits"]:
         return f"{mode['name']} admits {item['sphere']}"
-    tag = next((t for t in item.get("tags") or [] if t in mode.get("admit_tags", [])), None)
+    tag = next((t for t in [item["sphere"]] + list(item.get("tags") or []) if t in mode.get("admit_tags", [])), None)
     if tag:
-        return f"{mode['name']} admits the tag {tag}"
+        return f"{mode['name']} admits {tag} everywhere"
     if has_permit(item, mode, profile):
         return f"{item['sender']} holds a {mode['name']} permit"
     if mode["threshold"] == "critical":
         return f"{mode['name']} admits only critical"
+    if mode.get("subject"):
+        return f"{mode_label(mode)} — this is not"
+    if mode.get("with_subject") and not mode["admits"]:
+        return f"{mode['name']} on nothing admits only critical"
     return f"{mode['name']} does not admit {item['sphere']}"
 
 
@@ -323,16 +392,18 @@ def breaks_through(item: dict, mode: dict, profile: dict, now: datetime) -> bool
 
 
 def next_breakpoint(focus: dict, now: datetime) -> datetime:
-    """The next digest time or scheduled mode change. A scheduled step out of Off
-    is not a breakpoint (the morning digest opens the day); a manual override
-    suspends the schedule, so only digest times count until it is released."""
+    """The next digest time or scheduled mode change. A scheduled step out of
+    Rest is not a breakpoint (the morning digest opens the day); a manual
+    override suspends the schedule, so only digest times count until it is
+    released."""
     m = minute_of_day(now)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     candidates = [t for t in focus["digest_times"] if t > m]
     if not focus.get("manual"):
         schedule = focus["schedule"]
-        for k, (start, _mid) in enumerate(schedule):
-            if start > m and (k == 0 or schedule[k - 1][1] != "off"):
+        for k, entry in enumerate(schedule):
+            start = entry[0]
+            if start > m and (k == 0 or schedule[k - 1][1] != "rest"):
                 candidates.append(start)
     if candidates:
         return start_of_day + timedelta(minutes=min(candidates))
@@ -349,8 +420,9 @@ def due_events(focus: dict, now: datetime) -> set[str]:
         events.add("digest")
     if not focus.get("manual"):
         schedule = focus["schedule"]
-        for k, (start, _mid) in enumerate(schedule):
-            if start == m and (k == 0 or schedule[k - 1][1] != "off"):
+        for k, entry in enumerate(schedule):
+            start = entry[0]
+            if start == m and (k == 0 or schedule[k - 1][1] != "rest"):
                 events.add("mode")
     if m % SWEEP_EVERY_MINUTES == 0:
         events.add("sweep")
@@ -383,13 +455,13 @@ def on_arrival(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
 
 
 def breakpoint(items: list[dict], focus: dict, now: datetime) -> dict:
-    """Release what was held and say what the digest carries. In Off nothing is
-    released and no digest goes out; the morning digest carries it."""
+    """Release what was held and say what the digest carries. In Rest nothing
+    is released and no digest goes out; the morning digest carries it."""
     mode = mode_at(focus, now)
     due = [i for i in items if i.get("state", "open") == "open" and not i.get("released") and i.get("actor", "you") == "you"
            and (i.get("snoozed_until") is None or i["snoozed_until"] <= now)]
-    if mode["id"] == "off":
-        return {"digest": None, "held": due, "reason": "Off has no digest"}
+    if mode["id"] == "rest":
+        return {"digest": None, "held": due, "reason": "Rest has no digest"}
     for i in due:
         i["released"] = True
         i["snoozed_until"] = None
@@ -452,9 +524,9 @@ def reevaluate(item: dict, focus: dict, profile: dict, now: datetime, why: str) 
 
 
 def repeat_policy(item: dict, mode: dict) -> dict:
-    """Per-class repeat policy: off by default, on for family in Off (the repeated-caller case)."""
-    if item["sphere"] == "family" and mode["id"] == "off":
-        return {"escalate": True, "reason": "a family repeat breaks through in Off"}
+    """Per-class repeat policy: off by default, on for family in Rest (the repeated-caller case)."""
+    if item["sphere"] == "family" and mode["id"] == "rest":
+        return {"escalate": True, "reason": "a family repeat breaks through in Rest"}
     return {"escalate": False, "reason": ""}
 
 
@@ -579,12 +651,20 @@ def apply_rules(focus: dict, patch: dict, spheres: list[str]) -> list[str]:
     if patch.get("schedule") is not None:
         schedule = []
         for entry in patch["schedule"]:
-            if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-                raise ValueError("a schedule entry is [time, mode]")
+            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+                raise ValueError("a schedule entry is [time, mode] or [time, mode, sphere]")
             minute = parse_minute(entry[0])
             if minute is None or str(entry[1]) not in focus["modes"]:
                 raise ValueError(f"bad schedule entry {entry!r}")
-            schedule.append([minute, str(entry[1])])
+            row = [minute, str(entry[1])]
+            if len(entry) == 3 and entry[2]:
+                scope = sphere_id(entry[2])
+                if scope is None or scope not in spheres:
+                    raise ValueError(f"unknown sphere in schedule entry {entry!r}")
+                if not focus["modes"][row[1]].get("with_subject"):
+                    raise ValueError(f"{focus['modes'][row[1]]['name']} takes no scope")
+                row.append(scope)
+            schedule.append(row)
         schedule.sort()
         if not schedule:
             raise ValueError("the schedule needs at least one entry")

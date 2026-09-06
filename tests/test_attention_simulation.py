@@ -30,9 +30,11 @@ def main():
     assert {"narrator", "you", "system", "push", "learn", "ara"} <= who, who
     st = sim.stats
     assert st["digests"] == 3, st           # 08:00, 12:00 and the manual release at 16:15
-    # backup, physio (sweep), VAT (correction), Nadia's second message (a
-    # sender the contact card made known), Luca, NDA (permit)
-    assert st["pushes"] == 6, st
+    # backup, physio (sweep), Nadia's second message (a sender the contact
+    # card made known), Luca, NDA (permit). The VAT return climbs to
+    # time-sensitive on the corrected lead but is admin, outside the
+    # afternoon's scope: it tops Now at 17:00 without ringing.
+    assert st["pushes"] == 5, st
     assert st["corrections"] == 3, st       # the lead time, the contact card, the permit
     digests = [f["text"] for f in sim.feed if f.get("digest")]
     assert any("Anna Keller" in d and "Beat Frei" in d for d in digests), digests
@@ -42,7 +44,7 @@ def main():
     # known sender by the time she writes again (docs/attention-model.md,
     # docs/triage-delivery-gate.md).
     system = [f["text"] for f in sim.feed if f["who"] == "system"]
-    assert any("Work does not admit unknown" in x for x in system), system
+    assert any("held until Sun 17:00 — Focused on customers — this is not" in x and "+41791000042" in x for x in system), system
     assert any("+41791000042 — unknown" in x and "flagged as an unknown sender" in x
                for x in system), system
     assert any("+41791000042 — whitelisted" in x for x in system), system
@@ -53,7 +55,7 @@ def main():
     # Seeking back replays cleanly to the same state.
     sim.seek(12 * 60 + 5)
     mid = sim.snapshot()
-    assert mid["time"] == "12:05" and mid["attention"]["mode"]["name"] == "Open", mid["attention"]["mode"]
+    assert mid["time"] == "12:05" and mid["attention"]["mode"]["name"] == "Chores", mid["attention"]["mode"]
     assert not any(f.get("skipped") for f in sim.feed)
     sim.server.shutdown()
     print("ok: the day replays on the real gateway without a skipped beat")

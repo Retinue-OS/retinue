@@ -12,14 +12,14 @@ covers, end to end through HTTP:
 - the mode set by hand is a breakpoint: what was held is released, one
   Topic-collapsed digest goes out, and the item shows where the new mode puts it;
 - corrections on the three fields, and the profile learning priors and lead
-  times; a permit granted in Deep work releases the sender's held chat;
+  times; a permit granted in Focused releases the sender's held chat;
 - the chats rail: an inbound is held or pushed by the mode, the family repeat
   breaks through in Off, the user's own reply settles the chat's item;
 - a sender the delivery gate did not recognise is screened into the `unknown`
   sphere, and the contact card names them, teaches the profile, whitelists the
   handle, writes the address book and lets their next message through;
 - a project from the store carries its frontmatter's importance and deadline;
-- the tick: the 12:00 digest releases what Deep work held, the sweep pushes
+- the tick: the 12:00 digest releases what Focused held, the sweep pushes
   what crossed into the next urgency band; the life-store emit is written;
 - the agent-facing /internal/attention/set and its token.
 
@@ -176,7 +176,7 @@ def _due(hours):
 # ── threads ────────────────────────────────────────────────────────────────
 
 def test_open_mode_pushes_and_lists_now(base, wg):
-    _mode(base, "open")
+    _mode(base, "chores")
     PUSHES.clear()
     body = _open(base, "Quote for Müller AG", "Draft ready for review; due today.",
                  {"importance": 4, "sphere": "customers", "due": _due(6), "kind": "customer request",
@@ -192,12 +192,12 @@ def test_open_mode_pushes_and_lists_now(base, wg):
 
 
 def test_deep_work_holds_pull_later_done(base, wg):
-    _mode(base, "deep")
+    _mode(base, "focused")
     PUSHES.clear()
     body = _open(base, "Card renewal", "The card on file expires Friday. Renew?",
                  {"importance": 4, "sphere": "admin", "kind": "admin chore"})
     assert body["attention"]["delivery"] == "hold" and "until" in body["attention"], body
-    assert body["attention"]["reason"] == "Deep work admits only critical"
+    assert body["attention"]["reason"] == "Focused on nothing admits only critical"
     assert not PUSHES, "a held thread must not push"
     # The badge is there for whoever opens the dashboard; the push is not.
     status, conv = _http(base, "GET", f"/conversations/{body['id']}")
@@ -206,20 +206,20 @@ def test_deep_work_holds_pull_later_done(base, wg):
     assert _find(_sections(base), tid)[0] == "held"
     status, out = _http(base, "POST", "/attention/items/pull", {"id": tid})
     assert status == 200 and out["item"]["released"] is True and out["item"]["pulled"] is True, out
-    assert _find(_sections(base), tid)[0] == "next", "active is below Deep work's bar: Next, not Now — and pulled, so not folded"
-    # Deep work lists only what it admits: a released item it does not admit
+    assert _find(_sections(base), tid)[0] == "next", "active is below Focused's bar: Next, not Now — and pulled, so not folded"
+    # Focused lists only what it admits: a released item it does not admit
     # folds into Not now; the pulled one above stays. The fold is a per-mode
     # rule the menu toggles.
     passive = _open(base, "Newsletter", "The monthly newsletter is out.", {"importance": 1, "sphere": "admin"})
     pid = "thread:" + passive["id"]
     assert passive["attention"]["delivery"] == "list"
     assert _find(_sections(base), pid)[0] == "not_now"
-    status, out = _http(base, "POST", "/attention/modes", {"mode": "deep", "only_admitted": False})
-    assert status == 200 and out["changed"] == ["Deep work lists everything"] and out["mode"]["only_admitted"] is False, out
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "focused", "only_admitted": False})
+    assert status == 200 and out["changed"] == ["Focused lists everything"] and out["mode"]["only_admitted"] is False, out
     assert _find(_sections(base), pid)[0] == "next"
-    status, out = _http(base, "POST", "/attention/modes", {"mode": "deep", "only_admitted": True})
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "focused", "only_admitted": True})
     assert status == 200 and _find(_sections(base), pid)[0] == "not_now"
-    status, out = _http(base, "POST", "/attention/modes", {"mode": "deep", "threshold": "passive"})
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "focused", "threshold": "passive"})
     assert status == 400
     _http(base, "POST", "/attention/items/done", {"id": pid})
     status, out = _http(base, "POST", "/attention/items/later", {"id": tid, "when": "tomorrow"})
@@ -238,7 +238,7 @@ def test_deep_work_holds_pull_later_done(base, wg):
 
 
 def test_critical_and_passive(base, wg):
-    _mode(base, "deep")
+    _mode(base, "focused")
     PUSHES.clear()
     body = _open(base, "Backup failed", "Nightly backup exited with code 2.",
                  {"importance": 5, "sphere": "system", "kind": "system alert", "critical": True})
@@ -248,7 +248,7 @@ def test_critical_and_passive(base, wg):
     PUSHES.clear()
     body = _open(base, "Newsletter filed", "Filed the newsletter into news.", {"importance": 1})
     assert body["attention"]["delivery"] == "list" and not PUSHES
-    assert _find(_sections(base), "thread:" + body["id"])[0] == "not_now", "listed — folded, since Deep work lists only what it admits"
+    assert _find(_sections(base), "thread:" + body["id"])[0] == "not_now", "listed — folded, since Focused lists only what it admits"
     # A thread that says nothing about itself is passive: listed, not pushed.
     body = _open(base, "Plain thread", "Just so you know.")
     assert body["attention"]["delivery"] == "list" and body["attention"]["level"] == "passive"
@@ -265,7 +265,7 @@ def test_critical_and_passive(base, wg):
 
 
 def test_user_thread_never_gated(base, wg):
-    _mode(base, "deep")
+    _mode(base, "focused")
     PUSHES.clear()
     status, conv = _http(base, "POST", "/conversations", {"message": "What is on today?"})
     assert status == 201
@@ -282,7 +282,7 @@ def test_user_thread_never_gated(base, wg):
 
 
 def test_mode_change_is_a_breakpoint(base, wg):
-    _mode(base, "deep")
+    _mode(base, "focused")
     body = _open(base, "Anna: dinner Friday?", "Anna asks whether Friday 19:00 works.",
                  {"importance": 4, "sphere": "friends", "due": _due(30), "kind": "invitation"})
     assert body["attention"]["delivery"] == "hold"
@@ -304,7 +304,7 @@ def test_mode_change_is_a_breakpoint(base, wg):
 
 
 def test_corrections_learn(base, wg):
-    _mode(base, "open")
+    _mode(base, "chores")
     body = _open(base, "Tax office letter", "Statement due 30 September.",
                  {"importance": 3, "sphere": "admin", "due": "2026-09-30", "kind": "tax filing"})
     tid = "thread:" + body["id"]
@@ -325,9 +325,9 @@ def test_corrections_learn(base, wg):
     status, out = _http(base, "POST", "/attention/items/correct", {"id": "thread:" + "0" * 32, "importance": 1})
     assert status == 404
     # A Focus rule: admit a sphere in the mode in force.
-    status, out = _http(base, "POST", "/attention/admit", {"sphere": "customers", "mode": "deep", "on": True})
-    assert status == 200 and out["changed"] is True and "customers" in out["modes"]["deep"]["admits"]
-    status, out = _http(base, "POST", "/attention/admit", {"sphere": "customers", "mode": "deep", "on": False})
+    status, out = _http(base, "POST", "/attention/admit", {"sphere": "customers", "mode": "focused", "on": True})
+    assert status == 200 and out["changed"] is True and "customers" in out["modes"]["focused"]["admits"]
+    status, out = _http(base, "POST", "/attention/admit", {"sphere": "customers", "mode": "focused", "on": False})
     assert status == 200 and out["changed"] is True
     print("ok test_corrections_learn")
 
@@ -345,7 +345,7 @@ def _inbound(base, sender, name, text, ts, **extra):
 
 def test_chat_inbound_gated_and_settled(base, wg):
     mum, beat = "+41790000001", "+41790000002"
-    _mode(base, "deep")
+    _mode(base, "focused")
     PUSHES.clear()
     body = _inbound(base, mum, "Mum", "Call me when you are up", "2026-09-05T06:40:00Z")
     assert body["pushed"] is False, body
@@ -364,9 +364,9 @@ def test_chat_inbound_gated_and_settled(base, wg):
     bid = "chat:signal:" + beat
     where, row = _find(_sections(base), bid)
     assert where == "held" and row["level"] == "time-sensitive" and row["sphere"] == "customers", row
-    # A permit lets Beat interrupt Deep work: the held chat is released and pushed.
+    # A permit lets Beat interrupt Focused: the held chat is released and pushed.
     PUSHES.clear()
-    status, out = _http(base, "POST", "/attention/permits", {"sender": "Beat Frei", "mode": "deep", "on": True})
+    status, out = _http(base, "POST", "/attention/permits", {"sender": "Beat Frei", "mode": "focused", "on": True})
     assert status == 200 and out["changed"] is True and bid in out["pushed"], out
     assert len(PUSHES) == 1 and PUSHES[0][1].get("urgency") == "high"
     where, row = _find(_sections(base), bid)
@@ -382,7 +382,7 @@ def test_chat_inbound_gated_and_settled(base, wg):
     # starts clean: the first message is held, the second rings.
     status, _ = _http(base, "POST", "/attention/items/done", {"id": cid})
     assert status == 200
-    _mode(base, "off")
+    _mode(base, "rest")
     PUSHES.clear()
     body = _inbound(base, mum, "Mum", "Are you there?", "2026-09-05T23:10:00Z")
     assert body["pushed"] is False, body
@@ -399,7 +399,7 @@ def test_chat_inbound_gated_and_settled(base, wg):
     status, out = _http(base, "POST", "/attention/items/done", {"id": bid})
     assert status == 200 and _find(_sections(base), bid)[0] is None
     # A muted chat stays silent and is no item.
-    _mode(base, "open")
+    _mode(base, "chores")
     wg._CHAT_STATE.set_flags("signal:+41790000003", muted=True)
     PUSHES.clear()
     body = _inbound(base, "+41790000003", "Group", "Street party!", "2026-09-05T12:00:00Z", group=True)
@@ -438,7 +438,8 @@ def test_unknown_sender_screened_then_named(base, wg):
     nadia = "+41791000042"
     chat = "signal:" + nadia
     cid = "chat:" + chat
-    _mode(base, "work")
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
+    assert status == 200
     PUSHES.clear()
     # The gate forwarded it and said it recognised nobody, so no name rides
     # along either — the chat is a bare number.
@@ -453,7 +454,7 @@ def test_unknown_sender_screened_then_named(base, wg):
     assert row["sphere"] == "unknown" and row["importance"] == 4 and row["level"] == "active", row
     assert row["unknown_sender"] is True and row["handle"] == nadia and row["contact"] is None, row
     assert row["title"] == nadia, row
-    assert "does not admit unknown" in row["delivery"], row["delivery"]
+    assert "Focused on customers — this is not" in row["delivery"], row["delivery"]
 
     # Pulled onto the list ahead of the digest — the message is never hidden.
     status, out = _http(base, "POST", "/attention/items/pull", {"id": cid})
@@ -481,7 +482,7 @@ def test_unknown_sender_screened_then_named(base, wg):
     assert "Nadia Brunner" in wg._contact_names()
 
     # Her next message is a known sender with a deadline: time-sensitive, and
-    # Work admits customers — it rings, where the first one was screened.
+    # customers is the scope — it rings, where the first one was screened.
     PUSHES.clear()
     body = _inbound(base, nadia, "Nadia Brunner", "Can you send the studio address before 18:00?",
                     "2026-09-05T16:40:00Z",
@@ -505,6 +506,36 @@ def test_unknown_sender_screened_then_named(base, wg):
     assert "vcard:fn" not in wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
     assert nadia in triage_policy.load_messenger_policy("signal").whitelist
     print("ok test_unknown_sender_screened_then_named")
+
+
+def test_focused_takes_a_scope(base, wg):
+    """Focused on a sphere admits the sphere; on a project, only what is about it."""
+    PUSHES.clear()
+    quote = _open(base, "Quote for Müller AG", "Draft ready", {"importance": 4, "sphere": "customers", "due": _due(3), "kind": "customer request"},
+                  project="urn:retinue:project:mueller", project_title="Müller AG")
+    other = _open(base, "Frei Bau retainer", "Draft ready", {"importance": 4, "sphere": "customers", "due": _due(3), "kind": "customer request"})
+    body = _mode(base, "focused")
+    assert body["mode"]["subject"] is None and body["mode"]["label"] == "Focused"
+    # The change by hand released what was held; on nothing, Focused folds it away.
+    assert _find(_sections(base), "thread:" + quote["id"])[0] == "not_now"
+    status, body = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
+    assert status == 200 and body["mode"]["subject"]["id"] == "customers" and body["mode"]["admits"] == ["customers"], body["mode"]
+    assert body["mode"]["label"] == "Focused on customers"
+    assert _find(_sections(base), "thread:" + quote["id"])[0] == "now" and _find(_sections(base), "thread:" + other["id"])[0] == "now"
+    status, body = _http(base, "POST", "/attention/mode", {"mode": "focused", "project": "urn:retinue:project:mueller"})
+    assert status == 200 and body["mode"]["subject"]["kind"] == "project" and body["mode"]["label"] == "Focused on Müller AG", body["mode"]
+    where_q, row_q = _find(_sections(base), "thread:" + quote["id"])
+    where_o, row_o = _find(_sections(base), "thread:" + other["id"])
+    assert where_q == "now" and row_q["reason"] == "Focused on Müller AG: this is about it", row_q
+    assert where_o == "not_now" and row_o["reason"] == "Focused on Müller AG — this is not", row_o
+    status, body = _http(base, "POST", "/attention/mode", {"mode": "focused", "project": "urn:retinue:project:nope"})
+    assert status == 400
+    # Releasing the mode drops the scope with it.
+    body = _mode(base, "")
+    assert body["mode"]["manual"] is False and wg._ATTENTION.focus()["subject"] is None
+    for tid in (quote["id"], other["id"]):
+        _http(base, "POST", "/attention/items/done", {"id": "thread:" + tid})
+    print("ok test_focused_takes_a_scope")
 
 
 def test_spheres_are_a_word_away(base, wg):
@@ -542,7 +573,7 @@ def test_spheres_are_a_word_away(base, wg):
 # ── projects ───────────────────────────────────────────────────────────────
 
 def test_project_from_store(base, wg):
-    _mode(base, "open")
+    _mode(base, "chores")
     where, row = _find(_sections(base), PROJECT)
     assert where in ("now", "next") and row["kind"] == "project", (where, row)
     assert row["importance"] == 4 and row["importance_from"] == "frontmatter"
@@ -588,7 +619,7 @@ def test_project_from_store(base, wg):
 def test_tick_digest_and_sweep(base, wg):
     _mode(base, None)
     monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
-    _clock(wg, monday.replace(hour=10, minute=0))          # Deep work by schedule
+    _clock(wg, monday.replace(hour=10, minute=0))          # Focused on nothing by schedule
     body = _open(base, "Sign the NDA", "Their lawyer wants it before 12:30.",
                  {"importance": 4, "sphere": "customers", "due": monday.replace(hour=12, minute=30).isoformat(),
                   "kind": "customer request"})
@@ -605,7 +636,7 @@ def test_tick_digest_and_sweep(base, wg):
     assert report["events"] == ["sweep"] and not PUSHES, report
     assert wg._attention_tick(monday.replace(hour=10, minute=0)) == {}, "one run per minute"
     # 10:30: the sweep finds the permit within a third of its lead — it climbs,
-    # but Deep work admits nothing below critical, so it still waits.
+    # but Focused on nothing admits nothing below critical, so it still waits.
     report = wg._attention_tick(monday.replace(hour=10, minute=30))
     assert "sweep" in report["events"] and not PUSHES
     where, row = _find(_sections(base), tid2)
@@ -647,7 +678,7 @@ def test_tick_digest_and_sweep(base, wg):
 
 
 def test_internal_set(base, wg):
-    _mode(base, "open")
+    _mode(base, "chores")
     body = _open(base, "Brochure", "Draft attached.", {"importance": 2, "sphere": "customers"})
     tid = "thread:" + body["id"]
     status, out = _http(base, "POST", "/internal/attention/set", {"id": tid, "importance": 4})
@@ -702,6 +733,7 @@ def main():
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
         test_spheres_are_a_word_away(base, wg)
+        test_focused_takes_a_scope(base, wg)
         test_project_from_store(base, wg)
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)

@@ -5569,6 +5569,8 @@ def _attention_spec_to_block(spec, block: dict, now: datetime) -> dict:
         block["tags"] = [str(t).strip().lower() for t in spec["tags"] if str(t).strip()]
     if spec.get("kind"):
         block["kind"] = str(spec["kind"]).strip().lower()
+    if "project" in spec:
+        block["project"] = str(spec["project"]).strip() or None
     if "critical" in spec:
         block["critical"] = bool(spec["critical"])
     if spec.get("actor"):
@@ -5580,7 +5582,7 @@ def _attention_spec_to_block(spec, block: dict, now: datetime) -> dict:
 
 def _attention_decision_body(decision: dict, item: dict) -> dict:
     """What an agent is told about its item's delivery, so it can relay it
-    honestly ("held until 12:00 — Deep work admits only critical")."""
+    honestly ("held until 12:00 — Flow admits only critical")."""
     body = {"delivery": decision["deliver"], "level": decision["level"],
             "reason": decision.get("reason", ""), "id": item["id"]}
     until = decision.get("until")
@@ -5637,7 +5639,7 @@ def _attention_append(conv: dict, message: str, payload: dict) -> int:
 def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None) -> tuple[dict, dict]:
     """Run the model over one inbound chat message. The per-class repeat
     policy applies to a chat that is already held: a family sender writing
-    again in Off breaks through, anyone else waits with the first message."""
+    again in Rest breaks through, anyone else waits with the first message."""
     with _attention_lock:
         now = _attention_now()
         focus = _ATTENTION.focus()
@@ -5853,7 +5855,7 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
     scheduled_id = attention_policy.scheduled_id(focus, now)
     scheduled = focus["modes"][scheduled_id]
     m = attention_policy.minute_of_day(now)
-    until = next((start for start, _mid in focus["schedule"] if start > m), None)
+    until = next((entry[0] for entry in focus["schedule"] if entry[0] > m), None)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     until_dt = (start_of_day + timedelta(minutes=until)) if until is not None \
         else start_of_day + timedelta(days=1, minutes=focus["schedule"][0][0])
@@ -5862,6 +5864,9 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
         "threshold": mode["threshold"], "admits": list(mode["admits"]),
         "admit_tags": list(mode.get("admit_tags") or []),
         "only_admitted": bool(mode.get("only_admitted")),
+        "with_subject": bool(mode.get("with_subject")),
+        "subject": mode.get("subject"),
+        "label": attention_policy.mode_label(mode),
         "manual": bool(focus.get("manual")),
         "scheduled": {"id": scheduled["id"], "name": scheduled["name"], "until": until_dt.isoformat()},
     }
@@ -5879,7 +5884,8 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
         "modes": [{"id": m["id"], "name": m["name"], "blurb": m.get("blurb", ""),
                    "threshold": m["threshold"], "admits": list(m["admits"]),
                    "admit_tags": list(m.get("admit_tags") or []),
-                   "only_admitted": bool(m.get("only_admitted"))}
+                   "only_admitted": bool(m.get("only_admitted")),
+                   "with_subject": bool(m.get("with_subject"))}
                   for m in focus["modes"].values()],
         "schedule": [list(x) for x in focus["schedule"]],
         "digest_times": list(focus["digest_times"]),
@@ -7206,13 +7212,35 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, body)
 
     def _attention_set_mode(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
-        """Set the mode by hand, or release it to the schedule. Either is a
-        breakpoint: what was held is released, and the digest goes out."""
+        """Set the mode by hand — with a subject, for a mode that takes one —
+        or release it to the schedule. Either is a breakpoint: what was held
+        is released, and the digest goes out."""
         mode_id = payload.get("mode")
         if mode_id is not None and mode_id != "" and mode_id not in focus["modes"]:
             self._send_json(400, {"error": "unknown mode"})
             return
+        # The scope: a sphere (``subject``) or a project (``project``, a URI
+        # the list knows, so its title can be shown). It belongs to the
+        # override — gone when the mode is — and a mode without a scope
+        # ignores it.
+        scope = None
+        if payload.get("project"):
+            uri = str(payload["project"])
+            row = next((i for i in _attention_items(profile, now)[0]
+                        if i.get("id") == uri or i.get("project") == uri), None)
+            if row is None:
+                self._send_json(400, {"error": "unknown project"})
+                return
+            scope = {"kind": "project", "id": uri,
+                     "title": (row.get("project_title") if row.get("project") == uri else row.get("title")) or uri}
+        elif payload.get("subject"):
+            sid = attention_policy.sphere_id(payload["subject"])
+            if sid is None or sid not in (focus.get("spheres") or []):
+                self._send_json(400, {"error": "unknown sphere"})
+                return
+            scope = {"kind": "sphere", "id": sid, "title": sid}
         focus["manual"] = mode_id or None
+        focus["subject"] = scope if (mode_id and focus["modes"][mode_id].get("with_subject")) else None
         _ATTENTION.save_focus(focus)
         items, degraded = _attention_items(profile, now)
         _attention_breakpoint(items, focus, now, "the mode change")

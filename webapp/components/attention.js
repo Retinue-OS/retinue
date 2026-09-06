@@ -23,8 +23,9 @@ import {
 
 const SRC = '/attention';
 const POLL_MS = 5000;
+// Modes are moods — how interruptible — from none (rest) to all (chores).
 const MODE_COLORS = {
-  off: '#3a4250', home: '#a86f2c', deep: '#0f4f57', open: '#8a94a0', work: '#2f8a90', social: '#7a4f96',
+  rest: '#3a4250', flow: '#0f4f57', focused: '#2f8a90', chores: '#8a94a0', social: '#7a4f96',
 };
 const modeColor = (id) => MODE_COLORS[id] || '#6ea8fe';
 
@@ -51,13 +52,26 @@ const CSS = `
            gap: 8px; padding: 0 2px 10px; }
   /* The mode is the page's title: the state the user is in, in the biggest
      type on the screen, and the way to change it. */
-  .mode-head { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0;
+  .mode-head { display: inline-flex; align-items: baseline; gap: 8px; min-width: 0; flex: 1 1 auto;
                background: none; border: 0; padding: 0; margin: 0; cursor: pointer;
                color: var(--fg, #e7ebf2); text-align: left;
                -webkit-tap-highlight-color: transparent; }
-  .mode-name { font-size: 1.3rem; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+  /* The name is the one thing that must never truncate; a long scope title
+     gives way after it, then the "until" note. */
+  .mode-name { font-size: 1.3rem; font-weight: 650; letter-spacing: -.01em; white-space: nowrap;
+               min-width: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+  .mode-subject { font-weight: 500; font-size: 1.05rem; }
+  .subjects { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: -2px 0 10px 32px; }
+  .scope-k { flex-basis: 100%; font-size: .68rem; letter-spacing: .08em; text-transform: uppercase;
+             color: var(--muted, #8b93a3); margin: 2px 0 -2px; }
+  /* A scope makes the title long; on a phone the date yields to it. */
+  @media (max-width: 480px) { header.scoped .head-right .date { display: none; } }
+  .subject { font-size: 12px; padding: 3px 9px; border-radius: 8px; cursor: pointer;
+             border: 1px solid var(--line, rgba(231, 235, 242, .12));
+             background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
+  .subject.on { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .mode-when { font-size: .8rem; color: var(--muted, #8b93a3); white-space: nowrap;
-               overflow: hidden; text-overflow: ellipsis; }
+               overflow: hidden; text-overflow: ellipsis; flex: 0 3 auto; min-width: 3em; }
   .caret { font-size: .7rem; color: var(--muted, #8b93a3); flex: none; }
   .head-right { display: inline-flex; align-items: baseline; gap: 12px; flex: none; }
   .head-right .date { color: var(--muted, #8b93a3); font-size: .8rem; white-space: nowrap; }
@@ -204,12 +218,23 @@ class RetinueAttention extends HTMLElement {
     await this.load();
   }
 
-  async _setMode(mode) {
+  // The projects on the list — as items, or as what a thread is about —
+  // which is what one could be focusing on right now.
+  _projects() {
+    const seen = new Map();
+    for (const r of this._rows()) {
+      if (r.kind === 'project') seen.set(r.id, r.title);
+      else if (r.project && !seen.has(r.project)) seen.set(r.project, r.project_title || r.project);
+    }
+    return [...seen].map(([id, title]) => ({ id, title }));
+  }
+
+  async _setMode(mode, subject, project) {
     this._menu = false;
     try {
       const res = await fetch('/attention/mode', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: mode || null }),
+        body: JSON.stringify({ mode: mode || null, subject: subject || null, project: project || null }),
       });
       if (!res.ok) throw new Error(String(res.status));
       this._data = await res.json();
@@ -231,7 +256,7 @@ class RetinueAttention extends HTMLElement {
       case 'open': this._openItem(id); break;
       case 'info': e.stopPropagation(); openAttentionSheet(id); break;
       case 'mode-menu': this._menu = !this._menu; this.render(); break;
-      case 'set-mode': this._setMode(el.getAttribute('data-mode')); break;
+      case 'set-mode': this._setMode(el.getAttribute('data-mode'), el.getAttribute('data-subject'), el.getAttribute('data-project')); break;
       case 'close-menu': this._menu = false; this.render(); break;
       case 'toggle-held': this._heldOpen = !this._heldOpen; prefSet('held', this._heldOpen); this.render(); break;
       case 'toggle-waiting': this._waitingOpen = !this._waitingOpen; prefSet('waiting', this._waitingOpen); this.render(); break;
@@ -310,11 +335,14 @@ class RetinueAttention extends HTMLElement {
     }
     const until = mode.manual ? 'set by hand'
       : `until ${esc(fmtWhen((mode.scheduled || {}).until))}`;
-    return `<header>` +
+    const scope = mode.subject || null;
+    const subject = scope
+      ? ` <span class="mode-subject" style="color:${scope.kind === 'project' ? 'inherit' : sphereColor(scope.id)}">· ${esc(scope.title || scope.id)}</span>` : '';
+    return `<header${scope ? ' class="scoped"' : ''}>` +
       `<button class="mode-head" data-act="mode-menu" aria-haspopup="dialog" ` +
       `title="${esc(mode.blurb || '')}">` +
       `<span class="dot" style="background:${modeColor(mode.id)}"></span>` +
-      `<span class="mode-name">${esc(mode.name)}</span>` +
+      `<span class="mode-name">${esc(mode.name)}${subject}</span>` +
       `<span class="mode-when">${until}</span><span class="caret">&#9662;</span>` +
       `</button>${right}</header>`;
   }
@@ -323,9 +351,29 @@ class RetinueAttention extends HTMLElement {
     const d = this._data;
     if (!d) return '';
     const cur = d.mode;
-    const rows = (d.modes || []).map((m) =>
-      `<button class="menu-row${cur.id === m.id && cur.manual ? ' on' : ''}" data-act="set-mode" data-mode="${esc(m.id)}">` +
-      `<span class="dot" style="background:${modeColor(m.id)}"></span><span><b>${esc(m.name)}</b><small>${esc(m.blurb)}</small></span></button>`).join('');
+    const spheres = (d.spheres || []).filter((x) => x !== 'unknown');
+    const rows = (d.modes || []).map((m) => {
+      const on = cur.id === m.id && cur.manual;
+      let row = `<button class="menu-row${on ? ' on' : ''}" data-act="set-mode" data-mode="${esc(m.id)}">` +
+        `<span class="dot" style="background:${modeColor(m.id)}"></span><span><b>${esc(m.name)}` +
+        `${on && cur.subject ? ` · ${esc(cur.subject.title || cur.subject.id)}` : ''}</b><small>${esc(m.blurb)}</small></span></button>`;
+      if (m.with_subject) {
+        // The scope: a sphere ("all clients") or one of the projects on the
+        // list ("this one"). The row itself enters the mode on nothing.
+        const sub = (on && cur.subject) || {};
+        const chip = (kind, id, title) => {
+          const isOn = sub.kind === kind && sub.id === id;
+          const attr = kind === 'project' ? `data-project="${esc(id)}"` : `data-subject="${esc(id)}"`;
+          const color = kind === 'project' ? 'var(--muted, #8b93a3)' : sphereColor(id);
+          return `<button class="subject${isOn ? ' on' : ''}" data-act="set-mode" data-mode="${esc(m.id)}" ${attr} ` +
+            `style="border-color:${isOn ? '' : color}">${esc(title)}</button>`;
+        };
+        const projects = this._projects();
+        row += `<div class="subjects"><span class="scope-k">on a sphere</span>` + spheres.map((x) => chip('sphere', x, x)).join('') + `</div>` +
+          (projects.length ? `<div class="subjects"><span class="scope-k">on one project</span>` + projects.map((pr) => chip('project', pr.id, pr.title)).join('') + `</div>` : '');
+      }
+      return row;
+    }).join('');
     const sch = cur.scheduled || {};
     return `<div class="overlay" data-act="close-menu"><div class="menu" role="dialog" aria-label="Focus mode">` +
       `<div class="menu-head">Focus mode</div>${rows}` +

@@ -64,9 +64,13 @@ outbound send already performs.
 persistent volume) holds:
 
 - **`focus.json`** — the modes (admitted spheres, admitting tags, threshold,
-  blurb), the schedule as minute-of-day → mode, the digest times, and the
-  manual override. `attention.default_focus()` is the shipped default; a
-  deployment edits the file or, later, drives it from the calendar.
+  blurb, `with_subject` for a mode that takes a scope), the schedule as
+  `[minute, mode]` or `[minute, mode, sphere]` (the sphere Focused is on), the
+  digest times, the manual override and its `subject` — a sphere id, or
+  `{kind: "project", id, title}`. `attention.default_focus()` is the shipped
+  default: Rest & relax · Focused · Chores · Social, named for how
+  interruptible the user is; a deployment edits the file or, later, drives it
+  from the calendar.
 - **`profile.json`** — importance priors per sender or kind, lead times per
   kind, permits per mode, and the learned log. Slice 3 mirrors it as prose the
   user can read and edit, as `preferences.md` is for news.
@@ -77,7 +81,7 @@ persistent volume) holds:
 |---|---|
 | `GET /attention` | the union of open threads, chats and projects as sections Now · Next · Held · Waiting, each row with its three fields explained, plus the mode in force, the next breakpoint, the counts and `degraded` (a source the store could not answer for) |
 | `GET /attention/item?id=…` | one item, explained, with the mode and the sphere vocabulary — what the sheet shows |
-| `POST /attention/mode` `{mode}` / `{mode: null}` | set the mode by hand or release it to the schedule; a change is a breakpoint |
+| `POST /attention/mode` `{mode, subject?, project?}` / `{mode: null}` | set the mode by hand — Focused with a sphere (`subject`) or a project URI from the list (`project`) as its scope — or release it to the schedule; a change is a breakpoint |
 | `POST /attention/items/later` `{id, when: next\|tomorrow}` | snooze |
 | `POST /attention/items/pull` `{id}` | pull out of Held ahead of the digest |
 | `POST /attention/items/done` `{id}` / `…/reopen` | mark handled (a sent reply does this on chats) / put it back |
@@ -136,7 +140,7 @@ it is configured and where it is tested: `docs/dashboard.md`, "The home".*
   held with one `Topic`-collapsed digest push (`Urgency: normal`); every 30
   minutes `attention.sweep` re-evaluates — a crossing into the next urgency
   band climbs, an item the mode now admits is pushed (`Urgency: high`;
-  `push_notify.py` passes both headers to pywebpush). Quiet hours are the Off
+  `push_notify.py` passes both headers to pywebpush). Quiet hours are the Rest
   mode; a manual change is a breakpoint immediately. *Built.*
 - The repeat policy per sender class, applied on the notify rail
   (`attention.repeat_policy`). *Built.*

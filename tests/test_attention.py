@@ -60,11 +60,33 @@ def test_lead_time_urgency():
 def test_modes_and_admission():
     focus, profile = A.default_focus(), A.default_profile()
     beat = item(importance=4, sphere="customers", sender="Beat Frei", due=at(12, d=1), kind_label="customer request", lead=timedelta(days=2))
-    deep = A.mode_at(focus, at(10, 5))
-    assert deep["id"] == "deep" and A.level(beat, at(10, 5)) == "time-sensitive"
-    assert not A.breaks_through(beat, deep, profile, at(10, 5))
-    work = A.mode_at(focus, at(14, 0))
-    assert work["id"] == "work" and A.breaks_through(beat, work, profile, at(14, 0))
+    # Focused on nothing in the morning (only critical rings), on customers
+    # in the afternoon by the schedule's third element.
+    morning = A.mode_at(focus, at(10, 5))
+    assert morning["id"] == "focused" and not morning.get("subject") and A.level(beat, at(10, 5)) == "time-sensitive"
+    assert not A.breaks_through(beat, morning, profile, at(10, 5))
+    assert "on nothing" in A.admission_reason(beat, morning, profile, at(10, 5))
+    focused = A.mode_at(focus, at(14, 0))
+    assert focused["admits"] == ["customers"] and focused["subject"]["id"] == "customers"
+    assert A.breaks_through(beat, focused, profile, at(14, 0))
+    # Entered by hand with a subject, Focused admits that one sphere for the
+    # stint — health still reaches it — and the stored rule is untouched.
+    focus["manual"], focus["subject"] = "focused", "board-games"
+    hobby = A.mode_at(focus, at(14, 0))
+    assert hobby["admits"] == ["board-games"] and hobby["subject"]["id"] == "board-games"
+    assert not A.breaks_through(beat, hobby, profile, at(14, 0))
+    physio = item(sphere="health", importance=4, due=at(15, 30), lead=timedelta(hours=2))
+    assert A.admitted(physio, hobby, profile) and "health everywhere" in A.admission_reason(physio, hobby, profile, at(14))
+    assert focus["modes"]["focused"]["admits"] == []
+    # …or on one project: what is about it gets through, the rest of its sphere does not.
+    focus["subject"] = {"kind": "project", "id": "urn:retinue:project:brochure", "title": "Brochure"}
+    one = A.mode_at(focus, at(14, 0))
+    assert one["admits"] == [] and one["project"] == "urn:retinue:project:brochure"
+    thread = item(sphere="customers", importance=4, due=at(16), lead=timedelta(hours=2), project="urn:retinue:project:brochure")
+    assert A.admitted(thread, one, profile) and not A.admitted(beat, one, profile)
+    assert A.admission_reason(thread, one, profile, at(14)) == "Focused on Brochure: this is about it"
+    assert A.admission_reason(beat, one, profile, at(14)) == "Focused on Brochure — this is not"
+    focus["manual"], focus["subject"] = None, None
     social = A.mode_at(focus, at(19, 40))
     nda = item(importance=4, sphere="customers", sender="Beat Frei", due=at(22), lead=timedelta(days=2))
     assert not A.breaks_through(nda, social, profile, at(19, 40))
@@ -72,17 +94,17 @@ def test_modes_and_admission():
     assert A.breaks_through(nda, social, profile, at(20, 30))
     assert "permit" in A.admission_reason(nda, social, profile, at(20, 30))
     insurance = item(importance=4, sphere="admin", tags=["health"], due=at(12, d=1), lead=timedelta(days=2))
-    assert A.admitted(insurance, social, profile) and "tag health" in A.admission_reason(insurance, social, profile, at(19))
+    assert A.admitted(insurance, social, profile) and "health everywhere" in A.admission_reason(insurance, social, profile, at(19))
     assert A.set_admission(focus, "customers", "social", True) and A.admitted(beat, A.mode_at(focus, at(19)), profile)
 
 
 def test_breakpoints():
     focus = A.default_focus()
-    assert A.next_breakpoint(focus, at(6, 40)) == at(8)      # leaving Off at 07:00 is not a breakpoint
+    assert A.next_breakpoint(focus, at(6, 40)) == at(8)      # leaving Rest at 07:00 is not a breakpoint
     assert A.next_breakpoint(focus, at(10)) == at(12)
     assert A.next_breakpoint(focus, at(15)) == at(17)
     assert A.next_breakpoint(focus, at(22, 30)) == at(8, d=1)
-    focus["manual"] = "off"
+    focus["manual"] = "rest"
     assert A.next_breakpoint(focus, at(15)) == at(17)        # digest times still count under a manual mode
 
 
@@ -95,9 +117,9 @@ def test_arrival_breakpoint_sweep():
     assert A.on_arrival(alert, focus, profile, at(10, 40))["deliver"] == "push" and alert["pushed"] == [at(10, 40)]
     newsletter = item(id="n", sphere="friends", importance=1)
     assert A.on_arrival(newsletter, focus, profile, at(10, 41))["deliver"] == "list" and newsletter["released"]
-    # Off: a breakpoint releases nothing
-    off = A.breakpoint([mum], focus, at(6, 50))
-    assert off["digest"] is None and not mum["released"]
+    # Rest: a breakpoint releases nothing
+    rest = A.breakpoint([mum], focus, at(6, 50))
+    assert rest["digest"] is None and not mum["released"]
     # the morning digest carries it
     bp = A.breakpoint([mum, alert, newsletter], focus, at(8, 0))
     assert bp["digest"] and [i["id"] for i in bp["digest"]["items"]] == ["chat:Mum"] and mum["released"]
@@ -106,7 +128,7 @@ def test_arrival_breakpoint_sweep():
     assert A.sweep([physio], focus, profile, at(13, 0)) == []
     effects = A.sweep([physio], focus, profile, at(13, 30))
     assert effects and effects[0]["type"] == "push" and physio["pushed"] == [at(13, 30)]
-    # a held customer item stays held in Deep work even when it climbs
+    # a held customer item stays held in Flow even when it climbs
     beat = item(id="c", sphere="customers", sender="Beat Frei", importance=4, due=at(11, 30), lead=timedelta(hours=2), last_level="active")
     eff = A.sweep([beat], focus, profile, at(10, 0))
     assert eff and eff[0]["type"] == "climb" and not beat["released"]
@@ -139,7 +161,7 @@ def test_sections_and_explain():
 
 def test_fold_and_rules():
     focus, profile = A.default_focus(), A.default_profile()
-    now = at(9, 0)  # Deep work: admits nothing, lists only what it admits
+    now = at(9, 0)  # Focused on nothing: admits nothing, lists only what it admits
     assert A.mode_at(focus, now)["only_admitted"]
     items = [
         item(id="quote", importance=4, due=at(17), lead=timedelta(days=2), released=True),
@@ -154,7 +176,7 @@ def test_fold_and_rules():
     assert [i["id"] for i in s["not_now"]] == ["quote", "mum"]
     # a pull keeps the item visible; a permit admits the sender
     assert A.pull(items[3]) and items[3]["pulled"]
-    A.set_permit(profile, "Mum", "deep", True, now, focus["modes"])
+    A.set_permit(profile, "Mum", "focused", True, now, focus["modes"])
     s = A.sections(items, focus, profile, now)
     assert [i["id"] for i in s["next"]] == ["card", "mum", "mine"] and [i["id"] for i in s["not_now"]] == ["quote"]
     # a fresh arrival or a snooze judges it afresh
@@ -164,22 +186,24 @@ def test_fold_and_rules():
     assert not items[3]["pulled"] and A.item_to_attention(items[3])["pulled"] is False
     # the fold is a per-mode rule; the same patch changes the rest of the rules
     spheres = ["customers", "admin", "health", "friends", "family", "system"]
-    assert A.apply_rules(focus, {"mode": "deep", "only_admitted": False}, spheres) == ["Deep work lists everything"]
+    assert A.apply_rules(focus, {"mode": "focused", "only_admitted": False}, spheres) == ["Focused lists everything"]
     assert [i["id"] for i in A.sections(items, focus, profile, now)["not_now"]] == []
-    assert A.apply_rules(focus, {"mode": "deep", "only_admitted": False}, spheres) == []
-    assert A.apply_rules(focus, {"mode": "work", "deny": ["admin"], "tag_on": ["finance"]}, spheres) == ["Work no longer admits admin", "Work admits the tag finance"]
-    assert focus["modes"]["work"]["admits"] == ["customers", "health"] and focus["modes"]["work"]["admit_tags"] == ["health", "finance"]
-    assert A.apply_rules(focus, {"mode": "home", "threshold": "active", "admits": ["family"]}, spheres) == ["Home rings from active", "Home no longer admits health"]
-    for bad in ({"mode": "nope"}, {"mode": "deep", "threshold": "passive"}, {"mode": "deep", "admit": ["pets"]},
-                {"schedule": [["25:00", "deep"]]}, {"digest_times": ["noon"]}):
+    assert A.apply_rules(focus, {"mode": "focused", "only_admitted": False}, spheres) == []
+    assert A.apply_rules(focus, {"mode": "chores", "deny": ["admin"], "tag_on": ["finance"]}, spheres) == ["Chores no longer admits admin", "Chores admits the tag finance"]
+    assert focus["modes"]["chores"]["admits"] == ["customers", "health", "friends", "family", "system"] and focus["modes"]["chores"]["admit_tags"] == ["finance"]
+    assert A.apply_rules(focus, {"mode": "social", "threshold": "active", "admits": ["family"]}, spheres) == ["Social rings from active", "Social no longer admits friends"]
+    for bad in ({"mode": "nope"}, {"mode": "focused", "threshold": "passive"}, {"mode": "focused", "admit": ["pets"]},
+                {"schedule": [["25:00", "focused"]]}, {"schedule": [["09:00", "focused", "pets"]]},
+                {"schedule": [["09:00", "chores", "customers"]]}, {"digest_times": ["noon"]}):
         try:
             A.apply_rules(focus, bad, spheres)
             raise AssertionError(f"accepted {bad}")
         except ValueError:
             pass
-    assert A.apply_rules(focus, {"schedule": [["07:30", "home"], [540, "deep"], ["22:00", "off"]], "digest_times": ["08:00", "12:30", 1260]}, spheres) \
+    assert A.apply_rules(focus, {"schedule": [["07:30", "chores"], [540, "focused", "Customers"], ["22:00", "rest"]], "digest_times": ["08:00", "12:30", 1260]}, spheres) \
         == ["the schedule changed", "digest times → 08:00, 12:30, 21:00"]
-    assert focus["schedule"] == [[0, "off"], [450, "home"], [540, "deep"], [1320, "off"]] and focus["digest_times"] == [480, 750, 1260]
+    assert focus["schedule"] == [[0, "rest"], [450, "chores"], [540, "focused", "customers"], [1320, "rest"]] and focus["digest_times"] == [480, 750, 1260]
+    assert A.mode_at(focus, at(10))["admits"] == ["customers"]
     assert A.parse_minute("8") == 480 and A.parse_minute(True) is None
 
 

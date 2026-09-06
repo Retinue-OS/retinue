@@ -5,7 +5,7 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const DAY = 1440;
-const MODE_COLORS = { off: '#3a4250', home: '#a86f2c', deep: '#0f4f57', open: '#8a94a0', work: '#2f8a90', social: '#7a4f96' };
+const MODE_COLORS = { rest: '#3a4250', flow: '#0f4f57', focused: '#2f8a90', chores: '#8a94a0', social: '#7a4f96' };
 const SPHERE_COLORS = { customers: '#6ea8fe', admin: '#c9a0ff', health: '#ff6b6b', friends: '#57c785', family: '#ffb86b', system: '#9aa5b1' };
 const WHO = { narrator: 'story', you: 'you', system: 'system', push: 'push', learn: 'profile', ara: 'Ara', reply: 'reply' };
 const pad = (n) => String(n).padStart(2, '0');
