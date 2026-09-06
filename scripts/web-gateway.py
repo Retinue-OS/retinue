@@ -112,6 +112,14 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          settles the chat's attention item,
                                          unarchiving reopens it; the flags mean
                                          what they mean on threads.
+  POST /chats/<id>/contact            -> the contact card: {name, sphere?,
+                                         tags?, whitelist?, permit?}. Names the
+                                         chat's peer, teaches the attention
+                                         profile where they belong, re-judges
+                                         the open item, whitelists the handle
+                                         for the delivery gate and writes the
+                                         card into the life store. An empty
+                                         name puts them back into screening.
   POST /chats/<id>/draft              -> write the shared draft (body {text,
                                          version}); 409 + current state on a
                                          stale version; empty text clears it.
@@ -205,6 +213,7 @@ import gateway_auth
 import messenger_gateways
 import news_store
 import push_notify
+import triage_policy
 
 
 # Claude Code ships as an npm package whose auto-updater briefly swaps the
@@ -1087,6 +1096,14 @@ ATTENTION_TICK_SECONDS = float(os.environ.get("ATTENTION_TICK_SECONDS", "20"))
 # The life-store emit of the open items' properties (docs/attention-model.md).
 ATTENTION_EMIT_PATH = Path(os.environ.get(
     "ATTENTION_EMIT_PATH", str(CHAMBERS_DIR / "_generated" / "attention" / "items.nt")))
+# The address book the dashboard writes: one Turtle file holding the contact
+# card of every chat the user has named (POST /chats/<id>/contact), so a name
+# the user gave a number is a fact in the life store like any other — and so
+# the next session, the Secretary and the transcript repair all know it.
+# Under a chamber's `contacts/` by convention, in the generated chamber the
+# framework owns.
+CONTACTS_EMIT_PATH = Path(os.environ.get(
+    "CONTACTS_EMIT_PATH", str(CHAMBERS_DIR / "_generated" / "contacts" / "dashboard.ttl")))
 # Whether the model's delivery decision governs the push (the default) or
 # every arrival pushes as it did before the model existed, while the decision
 # is still made and recorded (the list, the digest and the sweep work either
@@ -3783,7 +3800,9 @@ def send_message(message: str, display_question: str | None = None,
 # Literal objects of any *name predicate in a chamber's contacts graph — the
 # people the user is likely to dictate about, and the words Whisper most often
 # mangles. Cached against the source files' mtimes.
-_NAME_LITERAL_RE = re.compile(r'[Nn]ame\s+"([^"\n]{2,80})"')
+# `…name "X"` covers foaf/schema/kb spellings; `:fn "X"` the vCard one the
+# dashboard's own address book writes (CONTACTS_EMIT_PATH).
+_NAME_LITERAL_RE = re.compile(r'(?:[Nn]ame|:fn)\s+"([^"\n]{2,80})"')
 _contact_names_cache: tuple[float, list[str]] | None = None
 _contact_names_lock = threading.Lock()
 
@@ -4299,6 +4318,7 @@ _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
 _CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
 _CHAT_COMPANION_RE = re.compile(r"^/chats/([^/]+)/companion/?$")
+_CHAT_CONTACT_RE = re.compile(r"^/chats/([^/]+)/contact/?$")
 _INTERNAL_CHAT_DRAFT_RE = re.compile(r"^/internal/chats/([^/]+)/draft/?$")
 # The media id is the gateways' token_hex(16) — 32 hex chars, path-safe by
 # construction; the slug charset matches the gateway-registry slugs.
@@ -4794,6 +4814,12 @@ def _chats_payload() -> dict:
             "unread": count,
             "archived": bool(doc.get("archived")),
             "muted": bool(doc.get("muted")),
+            # Whose chat this is, once the user has said: the contact card, or
+            # null while it is only a handle. `unknown_sender` is the other
+            # half — the delivery gate recognised nobody, so the dashboard
+            # screens them and offers the card.
+            "contact": doc.get("contact") or None,
+            "unknown_sender": attention_store.chat_is_unknown(doc),
             "last": last,
             "draft": doc.get("draft"),
             # This chat's companion conversation, or null until one is asked
@@ -5299,6 +5325,26 @@ def _chats_ingest_authorized(provided: str) -> bool:
     return hmac.compare_digest(provided, CHATS_INGEST_TOKEN)
 
 
+def _rail_unknown_sender(payload: dict) -> bool | None:
+    """Did the delivery gate recognise this arrival's sender?
+
+    ``True`` for the gate's *unknown* class (docs/triage-delivery-gate.md),
+    ``False`` for a handle it knows, ``None`` when the event carries no gate
+    verdict at all — an older gateway, or a caller that never gated — in which
+    case nothing is claimed and the chat keeps whatever it knew. The explicit
+    ``unknown`` flag is what the gateways send; ``reason`` is read as a
+    fallback so a container still running the previous build screens correctly
+    too.
+    """
+    gate = payload.get("gate")
+    if not isinstance(gate, dict) or not gate:
+        return None
+    if "unknown" in gate:
+        return bool(gate["unknown"])
+    reason = str(gate.get("reason") or "")
+    return reason == "unknown" if reason else None
+
+
 def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
                             had_unread: bool, urgency: str | None = None) -> None:
     """Web-Push one arrival: title = chat, body = preview, tap-through = the
@@ -5313,6 +5359,68 @@ def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
     url = "/chat.html?" + urllib.parse.urlencode({"id": chat_id})
     push_notify.notify_async(title, body, url=url, tag=chat_id,
                              mode="reply" if had_unread else "new", urgency=urgency)
+
+
+# ── Contacts: the address book the dashboard writes ─────────────────────────
+# A messenger chat is a handle until someone says whose it is. The contact
+# card (POST /chats/<id>/contact) is where the user says it, and this is the
+# record it leaves outside the gateway's own state: every named chat as one
+# vCard individual, with the spheres that name puts them in. Derived from the
+# chat documents on every write, so the file is a projection and never a
+# second truth; sorted and write-if-changed, the discover-agents discipline,
+# so an unchanged address book never triggers a qlever rebuild.
+
+VCARD = "http://www.w3.org/2006/vcard/ns#"
+_TTL_HEADER = (f"@prefix kb: <{attention_policy.KB}> .\n"
+               f"@prefix vcard: <{VCARD}> .\n"
+               "@prefix sphere: <urn:retinue:sphere:> .\n"
+               "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n")
+# A handle that is a phone number also gets the standard tel: property, so
+# "who is +41 79 …?" is one query against a vocabulary other data speaks too.
+_PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
+
+
+def _ttl_literal(value: str) -> str:
+    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def _contact_uri(channel: str, handle: str) -> str:
+    return ("urn:retinue:contact:" + urllib.parse.quote(f"{channel}:{handle}", safe=""))
+
+
+def _contacts_turtle(docs: dict) -> str:
+    blocks = []
+    for chat_id, doc in docs.items():
+        card = doc.get("contact") or {}
+        name = str(card.get("name") or "").strip()
+        if not name or doc.get("group"):
+            continue
+        parts = chat_state_mod.split_chat_id(chat_id)
+        if parts is None:
+            continue
+        channel, handle = parts
+        props = ["a vcard:Individual",
+                 f"vcard:fn {_ttl_literal(name)}",
+                 f"kb:channel {_ttl_literal(channel)}",
+                 f"kb:handle {_ttl_literal(handle)}",
+                 f"kb:chat {_ttl_literal(chat_id)}"]
+        if _PHONE_RE.match(handle):
+            props.append(f"vcard:hasTelephone <tel:{handle}>")
+        if card.get("sphere"):
+            props.append(f"kb:sphere sphere:{card['sphere']}")
+        props += [f"kb:tag sphere:{tag}" for tag in sorted(set(card.get("tags") or []))]
+        if card.get("at"):
+            props.append(f"kb:addedAt {_ttl_literal(card['at'])}^^xsd:dateTime")
+        blocks.append(f"<{_contact_uri(channel, handle)}>\n"
+                      + " ;\n".join("    " + prop for prop in props) + " .")
+    return _TTL_HEADER + "\n\n".join(sorted(blocks)) + ("\n" if blocks else "")
+
+
+def _contacts_emit() -> None:
+    try:
+        attention_policy.write_if_changed(CONTACTS_EMIT_PATH, _contacts_turtle(_CHAT_STATE.all()))
+    except OSError as exc:
+        print(f"[web-gateway] contacts: emit failed ({exc})", flush=True)
 
 
 # ── Attention: the home screen's model ──────────────────────────────────────
@@ -5401,7 +5509,7 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
                 return None
             channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
             row = {"id": chat_id, "name": _chat_display_name(state, channel, key),
-                   "channel": channel, "unread": 0, "last": {},
+                   "channel": channel, "key": key, "unread": 0, "last": {},
                    "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
                    "group": state.get("group")}
         return attention_store.chat_item(row, state, profile)
@@ -5537,8 +5645,8 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None) -> t
         mode = attention_policy.mode_at(focus, now)
         channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
         row = {"id": chat_id, "name": _chat_display_name(doc, channel, key), "channel": channel,
-               "unread": 1, "last": {"text": entry.get("text") or "",
-                                     "kind": "image" if entry.get("attachments") and not entry.get("text") else "text"},
+               "key": key, "unread": 1, "last": {"text": entry.get("text") or "",
+                                                 "kind": "image" if entry.get("attachments") and not entry.get("text") else "text"},
                "archived": False, "muted": bool(doc.get("muted")), "group": doc.get("group")}
         previous = dict(doc.get("attention") or {})
         was_held = bool(previous) and previous.get("state", "open") == "open" and not previous.get("released")
@@ -5563,6 +5671,30 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None) -> t
             decision = attention_policy.on_arrival(item, focus, profile, now)
         _attention_persist(item)
         return decision, item
+
+
+def _attention_rename_sender(profile: dict, was: str, now_name: str) -> list[str]:
+    """Move what the profile knows about a sender from one name to another.
+
+    The profile keys priors, sphere priors and permits on the sender as the
+    user sees them, which is the chat's display name — so naming a number
+    would otherwise orphan every judgement the user made while it was still a
+    number. Existing knowledge under the new name wins: it is about the
+    person, not about the handle they arrived on."""
+    moved = []
+    for key, label in (("priors", "importance prior"), ("spheres", "sphere")):
+        table = profile.get(key) or {}
+        if was in table:
+            value = table.pop(was)
+            if now_name not in table:
+                table[now_name] = value
+                moved.append(f"{label} for {was} → {now_name}")
+            profile[key] = table
+    for mode_id, senders in (profile.get("permits") or {}).items():
+        if was in senders:
+            profile["permits"][mode_id] = [now_name if x == was else x for x in senders]
+            moved.append(f"{was}’s {mode_id} permit → {now_name}")
+    return moved
 
 
 def _attention_mark(item_id: str, state: str, how: str | None = None) -> bool:
@@ -5690,6 +5822,11 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "preview": item.get("preview") or "", "href": item.get("href"),
         "sphere": item["sphere"], "tags": list(item.get("tags") or []), "sender": sender,
         "channel": item.get("channel"), "group": bool(item.get("group")), "agent": item.get("agent"),
+        # A chat whose peer the delivery gate did not recognise and nobody has
+        # named: the sheet offers the contact card instead of the usual
+        # corrections, and `handle` is what it would file.
+        "unknown_sender": bool(item.get("unknown_sender")),
+        "handle": item.get("handle") or "", "contact": item.get("contact") or None,
         "count": int(item.get("count") or 1), "unread": bool(item.get("unread")),
         "pending": bool(item.get("pending")),
         "level": x["level"], "critical": bool(item.get("critical")),
@@ -5948,6 +6085,10 @@ class Handler(BaseHTTPRequestHandler):
         chat_flags_match = _CHAT_FLAGS_RE.match(self.path)
         if chat_flags_match:
             self._handle_chat_flags(chat_flags_match.group(1))
+            return
+        chat_contact_match = _CHAT_CONTACT_RE.match(self.path)
+        if chat_contact_match:
+            self._handle_chat_contact(chat_contact_match.group(1))
             return
         chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
         if chat_draft_undo_match:
@@ -6438,6 +6579,107 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"id": chat_id, "archived": bool(doc.get("archived")),
                               "muted": bool(doc.get("muted"))})
 
+    def _handle_chat_contact(self, raw_id: str) -> None:
+        """The contact card: say who this number is, and where they belong
+        (body {name, sphere?, tags?, whitelist?, permit?}).
+
+        The answer to the message from a number nobody knows. Until it is
+        filled in, an unrecognised sender is *screened*: their message keeps
+        the importance of a human writing to a human, but its sphere is
+        ``unknown``, which no mode admits — so it is listed and carried by the
+        next digest, and never rings. Naming them settles that in one write:
+
+        - the chat is called by their name everywhere the dashboard shows it;
+        - the attention profile learns their sphere (and inherits whatever the
+          user had already taught about the bare handle — a prior, a permit);
+        - the open item is corrected to that sphere and re-judged on the spot,
+          so a customer named during Work rings a second later;
+        - the handle is whitelisted for the delivery gate, so their *next*
+          message earns a live triage turn instead of the unknown-sender
+          prompt this card just answered;
+        - the card is written into the life store's address book, so the fact
+          outlives the session (CONTACTS_EMIT_PATH).
+
+        An empty name removes the card: the chat is a handle again, its item
+        goes back to the `unknown` sphere, and the sender is screened again if
+        the gate still does not know them. The whitelist entry stays — the
+        user unfiling a contact has not asked to stop hearing from them, and
+        the gate's own blacklist is the tool for that. Groups take a name but
+        no whitelist: the gate's sender axis is about handles, and a group's
+        members are not its id.
+        """
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        if "name" not in payload:
+            self._send_json(400, {"error": "name is required (empty removes the card)"})
+            return
+        name = " ".join(str(payload.get("name") or "").split())
+        sphere = str(payload.get("sphere") or "").strip().lower() or None
+        tags = [t for t in (str(x).strip().lower() for x in (payload.get("tags") or [])) if t]
+        channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+        before = _CHAT_STATE.get(chat_id)
+        was = _chat_display_name(before, channel, key)
+        item_id = f"chat:{chat_id}"
+        with _attention_lock:
+            focus = _ATTENTION.focus()
+            profile = _ATTENTION.profile()
+            now = _attention_now()
+            spheres = focus.get("spheres") or attention_store.DEFAULT_SPHERES
+            if sphere and sphere not in spheres:
+                self._send_json(400, {"error": "unknown sphere"})
+                return
+            doc = _CHAT_STATE.set_contact(chat_id, name=name, sphere=sphere, tags=tags,
+                                          at=now.isoformat())
+            _chats_cache_invalidate()
+            learned: list[str] = []
+            if name and name != was:
+                # Priors and permits are keyed on the name the user sees, so
+                # what they taught the bare number follows it to the person.
+                learned += _attention_rename_sender(profile, was, name)
+            item = _attention_item(item_id, profile, now)
+            effect = None
+            if item is not None and item.get("state", "open") == "open":
+                patch = {}
+                if not name:
+                    patch = {"sphere": attention_store.UNKNOWN_SPHERE, "tags": []}
+                if sphere:
+                    patch["sphere"] = sphere
+                if tags:
+                    patch["tags"] = sorted(set(list(item.get("tags") or []) + tags))
+                if patch:
+                    learned += attention_policy.correct(item, profile, patch, now)
+                    effect = attention_policy.reevaluate(item, focus, profile, now, "the contact card")
+                _attention_persist(item)
+            if name and payload.get("permit"):
+                mode_id = attention_policy.mode_at(focus, now)["id"]
+                if attention_policy.set_permit(profile, name, mode_id, True, now, focus["modes"]):
+                    learned.append(f"{name} may interrupt in {focus['modes'][mode_id]['name']}")
+                    if item is not None and effect is None:
+                        effect = attention_policy.reevaluate(item, focus, profile, now, "the permit")
+                        _attention_persist(item)
+            _ATTENTION.save_profile(profile)
+            if effect and effect["type"] == "push" and item is not None:
+                _attention_push_item(item, effect.get("reason", ""))
+        whitelisted = []
+        if name and not doc.get("group") and payload.get("whitelist", True):
+            try:
+                whitelisted = triage_policy.whitelist_on_contact(channel, [key])
+            except OSError as exc:
+                print(f"[web-gateway] contacts: whitelist failed ({exc})", flush=True)
+        _contacts_emit()
+        body = {"id": chat_id, "contact": doc.get("contact"), "name": doc.get("name"),
+                "whitelisted": whitelisted, "learned_now": learned,
+                "effect": ({"type": effect["type"], "reason": effect.get("reason", "")}
+                           if effect else None)}
+        if item is not None:
+            body.update(self._attention_item_body(item, focus, profile, now))
+        self._send_json(200, body)
+
     def _handle_chat_draft(self, raw_id: str) -> None:
         """The user writes the shared draft (body {text, version}).
 
@@ -6761,7 +7003,8 @@ class Handler(BaseHTTPRequestHandler):
             group=bool(group) if group is not None else None,
             gateway=rail_slug,
             gateway_source=chat_state_mod.GATEWAY_SOURCE_ACCOUNT if rail_slug else None,
-            sender=entry["sender"], sender_name=entry["sender_name"])
+            sender=entry["sender"], sender_name=entry["sender_name"],
+            unknown_sender=_rail_unknown_sender(payload) if direction == "in" else None)
         _chats_cache_invalidate()
         pushed = False
         if direction == "in":

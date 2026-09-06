@@ -256,6 +256,7 @@ class RetinueAttention extends HTMLElement {
     const cls = `row${r.unread ? ' unread' : ''}${r.pending ? ' pending' : ''}`;
     return `<button class="${cls}" data-act="open" data-id="${esc(r.id)}" style="--stripe:${LEVEL_COLORS[lvl] || '#4a5563'}" title="${esc(lvl)}">` +
       `<div class="row-top"><span class="chip"><i style="background:${sphereColor(r.sphere)}"></i>${esc(r.sphere)}</span>` +
+      (r.unknown_sender ? '<span class="count">new number</span>' : '') +
       (r.count > 1 ? `<span class="count">${r.count} msgs</span>` : '') +
       `<span class="meta">${esc(meta)}</span></div>` +
       `<div class="row-title"><span class="t">${esc(r.title)}</span>` +

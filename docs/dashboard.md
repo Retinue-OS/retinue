@@ -72,7 +72,21 @@ lead (writes the kind's lead time), sphere (remembered for the sender) — plus
 a permit for the sender in this mode, a Focus rule for the sphere, and the
 actions *Later* (next breakpoint / tomorrow), *Pull into the list now* and
 *Mark done*. The same sheet opens from the thread bar and from the chat page's
-header. Rows open where the item lives: a thread in place (the conversations
+header.
+
+A chat from a number nobody has named is **screened**: the delivery gate says
+it recognised no sender, so the message keeps the importance of a person
+writing to a person but its sphere is `unknown`, which no mode admits — it is
+listed, carried by the next digest, and never rings. The sheet then leads with
+the **contact card**: a name, the sphere they belong to, further groups as
+tags, and optionally a permit to interrupt right now. Saving it
+(`POST /chats/<id>/contact`) names the chat, teaches the attention profile
+their sphere (carrying over whatever the bare number had already been taught),
+re-judges the open item, whitelists the handle for the delivery gate — so
+their next message earns a live triage turn — and writes the card into the
+life store's address book (`CONTACTS_EMIT_PATH`, a Turtle file of vCard
+individuals under the generated chamber). An empty name removes the card and
+puts the sender back into screening. Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone

@@ -24,7 +24,7 @@ effects, and never sends or saves anything itself (tests:
 | Entity | Store today | Gains | Set by |
 |---|---|---|---|
 | Thread | one JSON per thread under `CONVERSATIONS_DIR` | an `attention` block: `importance`, `due`, `lead`, `sphere`, `tags`, `kind`, plus the delivery state (`released`, `snoozed_until`, `boost`, `last_level`, `pushed`) | `conversation-push.py --importance --due --lead --sphere --tag --kind` → `POST /internal/conversations`; the Secretary's triage sets them on the threads it opens |
-| Chat | one JSON per chat under `CHAT_STATE_DIR` | the same block | the gateways' notify rail, from the triage classification of a whitelisted sender (importance, deadline, kind) and the contact's sphere; a sender prior from the profile otherwise |
+| Chat | one JSON per chat under `CHAT_STATE_DIR` | the same block, plus `unknown_sender` and the `contact` card | the gateways' notify rail, from the triage classification of a whitelisted sender (importance, deadline, kind) and the contact's sphere; a sender prior from the profile otherwise; the sphere `unknown` for a sender the gate did not recognise (below) |
 | Project | frontmatter in the chamber | `importance:`, `sphere:`, `tags:`, `kind:`; `expected_by` / `next_due` are the deadline, `remind_before` the lead | the chamber's author; `recurring-projects.py` passes them when it opens the wake-up thread |
 
 `attention.item_from_doc` reads that block with the brief's fallbacks
@@ -35,6 +35,28 @@ chats into `chambers/_generated/attention/` under `kb:importance`, `kb:due`,
 `kb:leadTime`, `kb:sphere`, `kb:tag` and `kb:currentActor`, so "what wants
 attention now, at which level" is one SELECT for the dashboard and the jobs
 alike, projects included through their own converters.
+
+## Screening a stranger
+
+The rail carries the delivery gate's verdict about the sender
+(`docs/triage-delivery-gate.md`), and the model uses the half of it the gate
+was already computing and nobody read: **unknown**. A chat whose last arrival
+came from a handle on no whitelist, and whom no contact card names, is put in
+the sphere `unknown` — one no mode admits. The message keeps the importance of
+a direct message (4: a person took the trouble), so it is *active*, which
+means held for the next digest and listed under Held meanwhile. Nothing is
+hidden and nothing rings: Hey's Screener, in the vocabulary the model already
+has. Guessing `friends` instead — the default for a known peer — would let
+anyone who learns the number through during Social.
+
+The way out is the contact card, and it is deliberately one gesture with five
+consequences (the chat's name, the profile's sphere, the item's re-judgement,
+the gate's whitelist, the life store's address book), because the user is
+answering one question: *who is this?* The card is stored on the chat document
+(`contact`), the address book it emits lives at `CONTACTS_EMIT_PATH` as
+vCard individuals with `kb:sphere` / `kb:tag`, and the whitelist write is
+`triage_policy.whitelist_on_contact` — the sibling of the auto-whitelist an
+outbound send already performs.
 
 ## Two small documents the gateway keeps
 
@@ -62,6 +84,7 @@ persistent volume) holds:
 | `POST /attention/items/correct` `{id, importance? due? lead? sphere? tags? critical?}` | the field correction; writes the prior, the lead time or the sender's sphere into the profile and re-evaluates |
 | `POST /attention/permits` `{sender, mode?, on}` | let a sender interrupt in a mode (the mode in force by default) |
 | `POST /attention/admit` `{sphere, mode?, on}` | change a Focus rule |
+| `POST /chats/<id>/contact` `{name, sphere?, tags?, permit?, whitelist?}` | the contact card for a screened stranger: names the chat, moves the bare handle's priors and permits onto the name, sets the sphere and tags on the item, whitelists the handle for the delivery gate and writes the address book. An empty name removes the card |
 | `GET /attention/profile`, `POST /attention/profile` | read and replace the profile and the focus rules |
 | `POST /internal/attention/set` `{id, …}` | an agent declares or revises an item's properties (token-gated; `scripts/attention-set.py`) |
 

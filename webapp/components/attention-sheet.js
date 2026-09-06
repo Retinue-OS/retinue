@@ -10,6 +10,10 @@
 //   POST /attention/items/<action>     later | pull | done | reopen | correct
 //   POST /attention/permits            {sender, on}   a sender's permit in the mode in force
 //   POST /attention/admit              {sphere, on}   a Focus rule of the mode in force
+//   POST /chats/<id>/contact           {name, sphere, tags}  the contact card
+// A chat whose sender the delivery gate did not recognise is screened — sphere
+// `unknown`, which no mode admits — and the sheet leads with the contact card
+// instead of the corrections: naming someone is the correction that matters.
 // A correction targets one field — importance, deadline, lead, sphere — and
 // the gateway writes what it learned (a prior, a lead time) into the profile;
 // the reply says so, and the sheet shows it. After every change the sheet
@@ -22,7 +26,7 @@ export const LEVEL_COLORS = {
 };
 export const SPHERE_COLORS = {
   customers: '#6ea8fe', admin: '#c9a0ff', health: '#ff6b6b', friends: '#57c785',
-  family: '#ffb86b', system: '#9aa5b1',
+  family: '#ffb86b', system: '#9aa5b1', unknown: '#7d8694',
 };
 export const sphereColor = (s) => SPHERE_COLORS[s] || '#9aa5b1';
 
@@ -134,6 +138,12 @@ const CSS = `
   .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
   .note { color: var(--muted, #8b93a3); font-size: 13px; margin: 6px 0; }
   .learned { margin-top: 10px; font-size: 12px; color: #c9a0ff; }
+  .field.screened { border: 1px solid rgba(224, 138, 46, .5); }
+  .card-form { display: flex; flex-direction: column; gap: 8px; margin-top: 6px; }
+  .card-form input[type="text"] { width: 100%; font-size: 14px; padding: 6px 8px;
+    border-radius: 8px; border: 1px solid var(--line, rgba(231, 235, 242, .12));
+    background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
   .err { color: var(--high, #ff6b6b); font-size: 12.5px; margin-top: 8px; }
   .lvl { font-weight: 700; }
 `;
@@ -144,6 +154,12 @@ class RetinueAttentionSheet extends HTMLElement {
     this._onKey = (e) => { if (e.key === 'Escape') this.close(); };
     this.shadowRoot.addEventListener('click', (e) => this._onClick(e));
     this.shadowRoot.addEventListener('change', (e) => this._onChange(e));
+    // The name field must not re-render on every keystroke (the caret would
+    // jump), so it writes straight into the pending card.
+    this.shadowRoot.addEventListener('input', (e) => {
+      const el = e.target.closest('[data-set="contact-name"]');
+      if (el && this._form) this._form.name = el.value;
+    });
   }
 
   disconnectedCallback() { window.removeEventListener('keydown', this._onKey); }
@@ -154,6 +170,7 @@ class RetinueAttentionSheet extends HTMLElement {
     this._data = null;
     this._error = '';
     this._learned = [];
+    this._form = null;
     this.hidden = false;
     window.addEventListener('keydown', this._onKey);
     this.render();
@@ -262,6 +279,24 @@ class RetinueAttentionSheet extends HTMLElement {
       case 'admit':
         if (item) this._rule('admit', { sphere: item.sphere, on: !item.admits_sphere });
         break;
+      case 'contact-edit': this._form = this._blankCard(item); this.render(); break;
+      case 'contact-cancel': this._form = null; this.render(); break;
+      case 'contact-sphere':
+        if (this._form) { this._form.sphere = el.getAttribute('data-sphere'); this.render(); }
+        break;
+      case 'contact-tag': {
+        if (!this._form) break;
+        const tag = el.getAttribute('data-sphere');
+        const at = this._form.tags.indexOf(tag);
+        if (at < 0) this._form.tags.push(tag); else this._form.tags.splice(at, 1);
+        this.render();
+        break;
+      }
+      case 'contact-permit':
+        if (this._form) { this._form.permit = !this._form.permit; this.render(); }
+        break;
+      case 'contact-save': this._saveContact(); break;
+      case 'contact-remove': this._saveContact(''); break;
       default: break;
     }
   }
@@ -280,6 +315,99 @@ class RetinueAttentionSheet extends HTMLElement {
     } else if (what === 'sphere') {
       this._act('correct', { sphere: el.value });
     }
+  }
+
+  // The card the form starts from: what the chat already says about this
+  // person, or an empty one for a number nobody has named.
+  _blankCard(item) {
+    const card = (item && item.contact) || {};
+    return {
+      name: card.name || (item && !item.unknown_sender ? item.title : '') || '',
+      sphere: card.sphere || (item && item.sphere !== 'unknown' ? item.sphere : ''),
+      tags: [...(card.tags || [])],
+      permit: false,
+    };
+  }
+
+  async _saveContact(nameOverride) {
+    const item = this._data && this._data.item;
+    if (!item || this._busy) return;
+    const form = this._form || this._blankCard(item);
+    const name = nameOverride !== undefined ? nameOverride : (form.name || '').trim();
+    if (nameOverride === undefined && !name) {
+      this._error = 'A name, so the chat can be called something.';
+      this.render();
+      return;
+    }
+    this._busy = true;
+    this.render();
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(item.id.slice('chat:'.length))}/contact`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name,
+          sphere: name ? (form.sphere || null) : null,
+          tags: name ? form.tags : [],
+          permit: Boolean(name && form.permit),
+        }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      this._form = null;
+      this._error = '';
+      this._learned = data.learned_now || [];
+      this._effect = data.effect || null;
+      if (data.item) this._data = data;
+      // The name, the sphere and the whitelist all changed at once: every
+      // open list is now showing a stranger that no longer is one.
+      window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'contact', id: this._id } }));
+      if (!data.item) await this.load();
+    } catch (err) {
+      this._error = `Could not file that contact (${String((err && err.message) || err)}).`;
+    } finally {
+      this._busy = false;
+      this.render();
+    }
+  }
+
+  // The contact card: who this number is, and which spheres they belong to.
+  // Shown for a 1:1 chat only — a group is a room, not a person.
+  _contactField(item, spheres) {
+    if (item.kind !== 'chat' || item.group) return '';
+    const busy = this._busy ? ' disabled' : '';
+    const card = item.contact;
+    if (!this._form) {
+      const label = card
+        ? `<div class="f-value">${esc(card.name)}${card.sphere ? ` · <span style="color:${sphereColor(card.sphere)}">${esc(card.sphere)}</span>` : ''}` +
+          `${(card.tags || []).length ? ` <span class="f-note">+ ${card.tags.map(esc).join(', ')}</span>` : ''}</div>`
+        : `<div class="f-value">${esc(item.handle || item.sender || '')} — nobody has this number yet.</div>` +
+          `<div class="f-note">Screened: their message is listed and carried by the next digest, but no mode admits ` +
+          `<span style="color:${sphereColor('unknown')}">unknown</span>, so it never rings.</div>`;
+      return `<div class="field${item.unknown_sender ? ' screened' : ''}">` +
+        `<div class="f-label">${card ? 'Contact' : 'New number'}</div>${label}` +
+        `<div class="f-ctl" style="margin-top:6px"><button class="btn tiny" data-act="contact-edit"${busy}>` +
+        `${card ? 'Edit the contact' : 'Add a contact'}</button>` +
+        (card ? `<button class="btn tiny" data-act="contact-remove"${busy}>Remove</button>` : '') +
+        `</div></div>`;
+    }
+    const form = this._form;
+    const pick = (s) => `<button class="btn tiny${form.sphere === s ? ' on' : ''}" data-act="contact-sphere" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`;
+    const tag = (s) => `<button class="btn tiny${form.tags.includes(s) ? ' on' : ''}" data-act="contact-tag" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`;
+    const choices = spheres.filter((s) => s !== 'unknown');
+    return `<div class="field screened"><div class="f-label">${card ? 'Contact' : 'New contact'}</div>` +
+      `<div class="card-form">` +
+      `<input type="text" data-set="contact-name" value="${esc(form.name)}" placeholder="Their name" autocomplete="off">` +
+      `<div><div class="f-k">belongs to</div><div class="chips">${choices.map(pick).join('')}</div>` +
+      `<div class="f-note">The sphere decides which modes let them through.</div></div>` +
+      `<div><div class="f-k">also</div><div class="chips">${choices.filter((s) => s !== form.sphere).map(tag).join('')}</div>` +
+      `<div class="f-note">Further groups, as tags — a mode may admit a tag on its own.</div></div>` +
+      `<div class="f-ctl"><button class="btn tiny${form.permit ? ' on' : ''}" data-act="contact-permit"${busy}>` +
+      `${form.permit ? '✓ ' : ''}May interrupt right now</button></div>` +
+      `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy}>Save the contact</button>` +
+      `<button class="btn" data-act="contact-cancel"${busy}>Cancel</button>` +
+      `<span class="f-note">Their next message reaches triage as a known sender.</span></div>` +
+      `</div></div>`;
   }
 
   _dueOptions(item) {
@@ -349,6 +477,9 @@ class RetinueAttentionSheet extends HTMLElement {
       const admitBtn = `<button class="btn tiny${item.admits_sphere ? ' on' : ''}" data-act="admit"${busy}>${item.admits_sphere
         ? `Stop admitting ${esc(item.sphere)} in ${esc(mode.name)}`
         : `Admit ${esc(item.sphere)} in ${esc(mode.name)}`}</button>`;
+      // A screened stranger leads with the card — naming them is the whole
+      // question, and the corrections below only make sense afterwards.
+      const contactField = this._contactField(item, spheres);
       const openLabel = item.kind === 'chat' ? 'Open the chat' : item.kind === 'thread' ? 'Open the thread' : 'Open the project';
       let actions;
       if (item.state !== 'open') {
@@ -375,6 +506,7 @@ class RetinueAttentionSheet extends HTMLElement {
         `<button class="x" data-act="close" aria-label="Close">✕</button></div>` +
         (item.preview ? `<div class="body">${esc(item.preview)}</div>` : '') +
         `<div class="fields">` +
+        (item.unknown_sender || this._form ? contactField : '') +
         `<div class="field"><div class="f-label">Importance</div><div class="f-value">${esc(item.importance_text)}</div>` +
         `<div class="f-ctl"><button class="btn tiny" data-act="imp" data-delta="-1"${busy}>−</button>` +
         `<button class="btn tiny" data-act="imp" data-delta="1"${busy}>+</button>` +
@@ -385,6 +517,7 @@ class RetinueAttentionSheet extends HTMLElement {
         `<div class="f-ctl">${sphereSel}<span class="f-note">${item.sender ? `remembered for ${esc(item.sender)}` : 'this item'}</span></div></div>` +
         `<div class="field"><div class="f-label">Delivery</div><div class="f-value">level <span class="lvl" style="color:${LEVEL_COLORS[lvl] || '#9aa5b1'}">${esc(lvl)}</span> · ${esc(item.delivery)}</div>` +
         `<div class="f-ctl">${permitBtn}${admitBtn}<span class="f-note">a Focus rule of ${esc(mode.name)} — importance untouched</span></div></div>` +
+        (item.unknown_sender || this._form ? '' : contactField) +
         `</div>${actions}${learned}${effect}` +
         (this._error ? `<div class="err">${esc(this._error)}</div>` : '');
     }

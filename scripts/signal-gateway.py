@@ -1630,7 +1630,10 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         ts=(int(message_id) / 1000.0) if (message_id or "").isdigit() else None,
         text=question, attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
-              "reason": str(gate.get("reason") or "")},
+              "reason": str(gate.get("reason") or ""),
+              # The sender the gate did not recognise: the dashboard screens
+              # their message instead of ranking them like a known contact.
+              "unknown": bool(gate.get("flagged_unknown"))},
     )
     if not gate["forward"]:
         # Mark delivered only for a message that is fully accounted for (a

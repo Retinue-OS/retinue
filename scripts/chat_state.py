@@ -268,6 +268,18 @@ class ChatStateStore:
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
             "unread_since": None,
+            # What the delivery gate made of the last arrival's sender: True
+            # when it recognised nobody (the "unknown sender" class of
+            # docs/triage-delivery-gate.md), False when the handle is known,
+            # None for a chat whose events carried no gate verdict. The
+            # attention model screens an unknown sender instead of ranking
+            # them like a contact; `contact` below is how that ends.
+            "unknown_sender": None,
+            # The contact card the user filled in for this chat, once they
+            # have: {"name", "sphere", "tags", "at"}. None while the chat is
+            # only a handle. Naming someone is what turns a screened stranger
+            # into a correspondent — see `set_contact`.
+            "contact": None,
             # Id of this chat's companion conversation — the dashboard thread
             # where the user works out a reply with Ara. None until one is
             # first asked for; see `set_companion`.
@@ -338,7 +350,8 @@ class ChatStateStore:
                      group: bool | None = None, gateway: str | None = None,
                      gateway_source: str | None = None,
                      sender: str | None = None,
-                     sender_name: str | None = None) -> dict:
+                     sender_name: str | None = None,
+                     unknown_sender: bool | None = None) -> dict:
         """Cache display metadata learned from a message event (the rail).
 
         The ledger persists handles, never names — names are remembered here as
@@ -361,6 +374,11 @@ class ChatStateStore:
                     roster[sender] = sender_name
                     doc["roster"] = roster
                     doc["roster_refreshed"] = time.time()
+            if unknown_sender is not None:
+                # A contact the user filed themselves outranks the gate: the
+                # whitelist write and the next arrival can race, and the
+                # address book is the more recent judgement either way.
+                doc["unknown_sender"] = bool(unknown_sender) and not doc.get("contact")
             self._write(doc)
             return doc
 
@@ -378,6 +396,43 @@ class ChatStateStore:
             doc = self._read(chat_id)
             doc["gateway"] = slug or None
             doc["gateway_source"] = (source or None) if slug else None
+            self._write(doc)
+            return doc
+
+    def set_contact(self, chat_id: str, *, name: str,
+                    sphere: str | None = None, tags=(), at: str | None = None) -> dict:
+        """File this chat's peer in the address book, or clear the card with
+        an empty name.
+
+        One write for what naming someone means to this store: the chat is
+        called by their name from now on, and the card records which spheres
+        they belong to. The rest of what the card does — the attention
+        profile, the delivery-gate whitelist, the life-store record — is the
+        web-gateway's business; this is only what a chat document knows about
+        it.
+
+        ``unknown_sender`` is deliberately left alone: it is the *gate's*
+        verdict about the handle, and the card is the *user's* about the
+        person. A named chat is not screened because a card exists (see
+        `chat_is_unknown`), so removing the card restores exactly what the
+        gate last said rather than a guess made here."""
+        with self._lock:
+            doc = self._read(chat_id)
+            clean = " ".join(str(name or "").split())
+            if not clean:
+                # Back to a handle: the name went with the card, and whatever
+                # the channel itself passes by next will name the chat again.
+                doc["contact"] = None
+                doc["name"] = None
+                self._write(doc)
+                return doc
+            doc["name"] = clean
+            doc["contact"] = {
+                "name": clean,
+                "sphere": (str(sphere).strip().lower() or None) if sphere else None,
+                "tags": [t for t in (str(x).strip().lower() for x in tags) if t],
+                "at": at or iso_z(),
+            }
             self._write(doc)
             return doc
 

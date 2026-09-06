@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """The example day (examples/attention-simulation) replays on the real gateway
 without a beat being skipped: every scripted action finds the state the story
-expects — the held message to pull, the chat to answer, the thread to tap —
-and the day ends with the numbers the brief describes.
+expects — the held message to pull, the chat to answer, the thread to tap,
+the stranger to file as a contact — and the day ends with the numbers the
+brief describes.
 
     python3 tests/test_attention_simulation.py
 """
@@ -29,12 +30,24 @@ def main():
     assert {"narrator", "you", "system", "push", "learn", "ara"} <= who, who
     st = sim.stats
     assert st["digests"] == 3, st           # 08:00, 12:00 and the manual release at 16:15
-    assert st["pushes"] == 5, st            # backup, physio (sweep), VAT (correction), Luca, NDA (permit)
-    assert st["corrections"] == 2, st       # the lead time and the permit
+    # backup, physio (sweep), VAT (correction), Nadia's second message (a
+    # sender the contact card made known), Luca, NDA (permit)
+    assert st["pushes"] == 6, st
+    assert st["corrections"] == 3, st       # the lead time, the contact card, the permit
     digests = [f["text"] for f in sim.feed if f.get("digest")]
     assert any("Anna Keller" in d and "Beat Frei" in d for d in digests), digests
     learned = [f["text"] for f in sim.feed if f["who"] == "learn"]
     assert any("tax filing" in x for x in learned) and any("Beat Frei" in x for x in learned), learned
+    # The stranger: screened on arrival, named by the contact card, and a
+    # known sender by the time she writes again (docs/attention-model.md,
+    # docs/triage-delivery-gate.md).
+    system = [f["text"] for f in sim.feed if f["who"] == "system"]
+    assert any("Work does not admit unknown" in x for x in system), system
+    assert any("+41791000042 — unknown" in x and "flagged as an unknown sender" in x
+               for x in system), system
+    assert any("+41791000042 — whitelisted" in x for x in system), system
+    assert any("sphere customers + friends" in x for x in system), system
+    assert any("whitelist" in x and "+41791000042" in x for x in learned), learned
     end = sim.snapshot()["attention"]["counts"]
     assert end["now"] == 0 and end["waiting"] == 2, end
     # Seeking back replays cleanly to the same state.

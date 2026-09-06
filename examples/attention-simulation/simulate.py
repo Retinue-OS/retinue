@@ -129,8 +129,12 @@ def _sender_key(m: dict) -> str:
     return c["chat"]
 
 
-def sender_name(m: dict) -> str:
-    return m.get("from") or m["chat"]
+def sender_name(m: dict) -> str | None:
+    """The name the channel puts on the message. A stranger's number carries
+    none — which is why the chat is a number until the contact card."""
+    if m.get("from"):
+        return m["from"]
+    return None if story.CONTACTS[m["chat"]].get("unknown") else m["chat"]
 
 
 class MockStore(BaseHTTPRequestHandler):
@@ -390,7 +394,12 @@ class Simulation:
             self.stats = {"pushes": 0, "digests": 0, "handled": 0, "corrections": 0, "replies": 0}
             self.ledger.reset()
             wg = self.wg
-            for d in (wg.CONVERSATIONS_DIR, wg.CHAT_STATE_DIR, wg.ATTENTION_DIR):
+            # The generated chamber holds what outlives a session — the
+            # delivery gate's whitelist, the address book, the attention emit
+            # — so midnight has to wipe it too, or yesterday's contact card
+            # would make today's stranger a known sender.
+            for d in (wg.CONVERSATIONS_DIR, wg.CHAT_STATE_DIR, wg.ATTENTION_DIR,
+                      wg.CHAMBERS_DIR / "_generated"):
                 shutil.rmtree(d, ignore_errors=True)
                 Path(d).mkdir(parents=True, exist_ok=True)
             wg.CONVERSATION_ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -487,11 +496,16 @@ class Simulation:
                 attention = {k: v for k, v in tr.items() if k != "due"}
                 if tr.get("due") is not None:
                     attention["due"] = self.clock.at(tr["due"]).isoformat()
-                attention["sphere"] = c["sphere"]
+                # A triage turn knows the sender's sphere because the sender is
+                # known. For someone the gate flagged unknown there is nothing
+                # to know: the sphere is the model's to withhold, and later the
+                # contact card's to set.
+                if not c.get("unknown"):
+                    attention["sphere"] = c["sphere"]
             payload = {"direction": "in", "channel": c["channel"], "chat": c["chat"], "sender": _sender_key(ev),
                        "sender_name": sender_name(ev), "text": ev["text"], "ts": self.clock.iso(ev["at"]),
                        "message_id": f"story-{ev['n']}", "group": bool(c.get("group")),
-                       "gate": {"forward": True, "class": "whitelisted"}}
+                       "gate": self._gate(ev, c)}
             if c.get("group"):
                 payload["chat_name"] = ev["chat"]
             if attention:
@@ -499,7 +513,8 @@ class Simulation:
             status, body = self.api("POST", "/internal/chats/inbound", payload)
             item = self._item("chat:" + story.chat_id(ev["chat"]))
             if item:
-                self.say("system", f"{ev['chat']} ({c['channel']}): “{ev['text'][:60]}” → {item['level']}; {item['delivery']}")
+                who = item.get("title") or ev["chat"]
+                self.say("system", f"{who} ({c['channel']}): “{ev['text'][:60]}” → {item['level']}; {item['delivery']}")
         elif ev["kind"] == "thread":
             dlg = story.THREAD_DIALOGUES[ev["id"]]
             self._open_agent_thread(ev["id"], ev["title"], dlg, ev["agent"], ev["attention"])
@@ -511,6 +526,25 @@ class Simulation:
             self._open_agent_thread(ev["story"], f"Due: {ev['title']}", dlg, None, attention,
                                     project=(ev["id"], ev["title"]))
             wg._chats_cache_invalidate()
+
+    def _gate(self, ev: dict, c: dict) -> dict:
+        """The delivery gate's verdict on this arrival.
+
+        The day's known correspondents are whitelisted by construction; anyone
+        marked `unknown` in the story is routed through the real policy
+        (scripts/triage_policy.py) against the real policy file — so a handle
+        the contact card whitelisted at 13:56 genuinely arrives as a known
+        sender at 16:20, and the difference is the gate's, not the script's."""
+        if not c.get("unknown"):
+            return {"forward": True, "reason": "whitelisted", "unknown": False}
+        dec = self.wg.triage_policy.gate_decision(c["channel"], _sender_key(ev),
+                                                  c["chat"] if c.get("group") else None)
+        verdict = {"forward": bool(dec["forward"]), "reason": str(dec["reason"]),
+                   "unknown": bool(dec["flagged_unknown"])}
+        self.say("system", f"delivery gate ({c['channel']}): {_sender_key(ev)} — {verdict['reason']}"
+                           + ("; a model turn now, flagged as an unknown sender" if verdict["unknown"]
+                              else "; a model turn now, as a known sender"))
+        return verdict
 
     def _open_agent_thread(self, story_id: str, title: str, dlg: dict, agent: str | None, attention: dict,
                            project: tuple[str, str] | None = None):
@@ -617,6 +651,10 @@ class Simulation:
                 self.api("POST", "/attention/items/later", {"id": target, "when": reply["later"]})
         if reply.get("wait_on") and item_id:
             self.api("POST", "/internal/attention/set", {"id": item_id, "actor": reply["wait_on"]}, agent=True)
+        if reply.get("contact") and chat:
+            name = next((n for n in story.CONTACTS if story.chat_id(n) == chat), None)
+            if name:
+                self._file_contact(name, reply["contact"])
         if reply.get("draft") and chat:
             wg._CHAT_STATE.set_draft(chat, reply["draft"], author="agent", agent="Ara")
             wg._chats_cache_invalidate()
@@ -642,6 +680,8 @@ class Simulation:
                 cid_chat = "chat:" + story.chat_id(a["sender"])
                 return True, "/?" + urllib.parse.urlencode({"item": cid_chat})
             return False, None
+        if kind == "contact":
+            return self._file_contact(a["id"][5:], a)
         item_id = self.item_id(a["id"])
         item = self._item(item_id) if item_id else None
         if item is None or item["state"] != "open":
@@ -699,6 +739,31 @@ class Simulation:
             self.api("POST", f"/conversations/{cid}/read", {})
             return True, f"/#conversation-{cid}"
         return False, None
+
+    def _file_contact(self, who: str, card: dict) -> tuple[bool, str | None]:
+        """The contact card, exactly as the details sheet posts it."""
+        chat = story.chat_id(who)
+        status, body = self.api("POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                                {"name": card.get("name") or "", "sphere": card.get("sphere"),
+                                 "tags": card.get("tags") or [], "permit": bool(card.get("permit"))})
+        if status != 200:
+            self.say("system", f"contact card refused: {status} {body}")
+            return False, None
+        self.stats["corrections"] += 1
+        contact = body.get("contact") or {}
+        groups = ", ".join([contact.get("sphere") or ""] + list(contact.get("tags") or [])).strip(", ")
+        self.say("you", f"You file {contact.get('name')} as a contact ({groups}).")
+        for line in body.get("learned_now") or []:
+            self.say("learn", line)
+        for handle in body.get("whitelisted") or []:
+            self.say("learn", f"{handle} is on the {chat.split(':', 1)[0]} whitelist: "
+                              f"her next message earns a triage turn as a known sender")
+        item = body.get("item")
+        if item:
+            self.say("system", f"{item['title']}: sphere {item['sphere']}"
+                               + (f" + {', '.join(item['tags'])}" if item.get("tags") else "")
+                               + f" → {item['level']}; {item['delivery']}")
+        return True, "/?" + urllib.parse.urlencode({"item": f"chat:{chat}"})
 
     # -- time ------------------------------------------------------------------------------------
 

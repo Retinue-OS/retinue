@@ -151,8 +151,21 @@ wildcards needed there.
 
 - **Whitelist:** handles the user has replied to / contacts, seeded from the
   gateway's contact directory + recent chats, extended by the ask-flow below.
+  Two writers add to it without asking anything, because the user's act has
+  already answered the question: an outbound 1:1 send
+  (`auto_whitelist_on_send`, called by each gateway's send choke point) and
+  the dashboard's **contact card** (`whitelist_on_contact`, called by
+  `POST /chats/<id>/contact` when the user names the number that wrote to
+  them — see `docs/attention-model.md`). Both refuse to override a blacklist
+  entry.
 - **Blacklist:** an unknown sender the user declines to whitelist goes here so
   the user is **never asked again**. Permanent until hand-edited.
+
+The gate's verdict about the sender also rides on the **chats rail**
+(`chat_ingest.py`: `gate.unknown`), where the attention model reads it: a
+message from a handle the gate did not recognise is *screened* on the
+dashboard — listed and carried by the next digest, never rung — until the
+contact card says who it is.
 
 ### Messenger group axis: news / quieted / ignored
 

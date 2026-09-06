@@ -75,6 +75,20 @@ conv:8f2c…  kb:importance 4 ;  kb:sphere sphere:customers ;
 | importance 2–3 | passive | active | active |
 | importance 0–1 | passive | passive | active |
 
+**The stranger** is the one case where the model withholds a guess. A message
+from a handle the delivery gate does not recognise (`docs/triage-delivery-gate.md`)
+keeps the importance of any direct message — a person took the trouble — but
+not the sphere a known peer would get, because nobody has said which one they
+belong to and “friends” would let whoever learns the number through during
+*Social*. It goes into a sphere of its own, `unknown`, which no mode admits:
+listed, carried by the next digest, never rung. Hey’s Screener, in the
+vocabulary the model already has, and the way out is a **contact card** in the
+same details sheet — a name, the sphere they belong to, further groups as
+tags. Filing it names the chat, teaches the sender’s sphere, re-judges the
+open item, whitelists the handle so the *next* message earns a live triage
+turn, and records the person in the life store. Whether they may then
+interrupt stays the separate question a permit answers.
+
 **The mode** is one small document the gateway keeps (`focus.json`, mirrored into the store): name, admitted spheres and admitting tags (`health` may be admitted everywhere), per-sender permits, the lowest level that breaks through, a schedule, optionally a calendar rule. It is set by a chip in the dashboard header, a sentence to Ara (“work mode until 17:00”), a schedule or a calendar block; every delivery decision reads it, nothing else needs to know it exists.
 
 **Delivery** (Figure 3). An item at or above the mode’s threshold, admitted by its primary sphere, a tag or a permit, pushes at once with `Urgency: high`. Everything else waits for the next breakpoint, where one `Topic`-collapsed digest push lists the held items by level and importance. A half-hourly sweep, like `recurring-projects`, re-evaluates held items: when urgency crosses into the next band the item climbs a level — that crossing is the bound. Repeats are a per-class policy, not a fixed window: off by default, on for `family` in *Off* (the phone’s repeated-caller case), elsewhere only when the follow-up’s triage classification changes — a deadline appears, a question replaces a remark.

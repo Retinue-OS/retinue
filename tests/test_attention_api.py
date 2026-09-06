@@ -15,6 +15,9 @@ covers, end to end through HTTP:
   times; a permit granted in Deep work releases the sender's held chat;
 - the chats rail: an inbound is held or pushed by the mode, the family repeat
   breaks through in Off, the user's own reply settles the chat's item;
+- a sender the delivery gate did not recognise is screened into the `unknown`
+  sphere, and the contact card names them, teaches the profile, whitelists the
+  handle, writes the address book and lets their next message through;
 - a project from the store carries its frontmatter's importance and deadline;
 - the tick: the 12:00 digest releases what Deep work held, the sweep pushes
   what crossed into the next urgency band; the life-store emit is written;
@@ -428,6 +431,82 @@ def test_chat_inbound_gated_and_settled(base, wg):
     print("ok test_chat_inbound_gated_and_settled")
 
 
+def test_unknown_sender_screened_then_named(base, wg):
+    """A stranger with the user's number: screened until the contact card."""
+    import triage_policy
+
+    nadia = "+41791000042"
+    chat = "signal:" + nadia
+    cid = "chat:" + chat
+    _mode(base, "work")
+    PUSHES.clear()
+    # The gate forwarded it and said it recognised nobody, so no name rides
+    # along either — the chat is a bare number.
+    body = _inbound(base, nadia, None, "Hi, Nadia from the workshop yesterday.",
+                    "2026-09-05T14:05:00Z",
+                    gate={"forward": True, "reason": "unknown", "unknown": True})
+    assert body["pushed"] is False and not PUSHES, PUSHES
+    where, row = _find(_sections(base), cid)
+    assert where == "held", (where, row)
+    # A human wrote to a human, so the importance stands; only the guess about
+    # where they belong is withheld, and no mode admits that sphere.
+    assert row["sphere"] == "unknown" and row["importance"] == 4 and row["level"] == "active", row
+    assert row["unknown_sender"] is True and row["handle"] == nadia and row["contact"] is None, row
+    assert row["title"] == nadia, row
+    assert "does not admit unknown" in row["delivery"], row["delivery"]
+
+    # Pulled onto the list ahead of the digest — the message is never hidden.
+    status, out = _http(base, "POST", "/attention/items/pull", {"id": cid})
+    assert status == 200 and _find(_sections(base), cid)[0] == "next"
+
+    # The contact card: a name, a sphere, and a second group as a tag.
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Nadia Brunner", "sphere": "customers", "tags": ["friends"]})
+    assert status == 200, out
+    assert out["contact"]["name"] == "Nadia Brunner" and out["contact"]["sphere"] == "customers"
+    assert out["contact"]["tags"] == ["friends"] and out["name"] == "Nadia Brunner"
+    assert out["whitelisted"] == [nadia], out
+    row = out["item"]
+    assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["unknown_sender"] is False and row["title"] == "Nadia Brunner", row
+    assert any("sphere for Nadia Brunner" in line for line in out["learned_now"]), out
+    # What the card taught, where each half of it lives.
+    profile = wg._ATTENTION.profile()
+    assert profile["spheres"]["Nadia Brunner"] == "customers"
+    assert triage_policy.handle_status(nadia, *(lambda pol: (pol.whitelist, pol.blacklist))(
+        triage_policy.load_messenger_policy("signal"))) == "whitelisted"
+    card = wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
+    assert 'vcard:fn "Nadia Brunner"' in card and "kb:sphere sphere:customers" in card
+    assert "kb:tag sphere:friends" in card and f"<tel:{nadia}>" in card
+    assert "Nadia Brunner" in wg._contact_names()
+
+    # Her next message is a known sender with a deadline: time-sensitive, and
+    # Work admits customers — it rings, where the first one was screened.
+    PUSHES.clear()
+    body = _inbound(base, nadia, "Nadia Brunner", "Can you send the studio address before 18:00?",
+                    "2026-09-05T16:40:00Z",
+                    gate={"forward": True, "reason": "whitelisted", "unknown": False},
+                    attention={"importance": 4, "due": _due(1), "kind": "customer request"})
+    assert body["pushed"] is True and PUSHES, PUSHES
+    where, row = _find(_sections(base), cid)
+    assert where == "now" and row["sphere"] == "customers" and row["level"] == "time-sensitive", row
+
+    # Removing the card takes the name off and the item back to `unknown` —
+    # but not the whitelist entry: unfiling someone is not asking the gate to
+    # stop hearing from them.
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": ""})
+    assert status == 200 and out["contact"] is None and out["name"] is None, out
+    # The item is back in the screening sphere; the title falls back to the
+    # roster, which learned her name from the channel's own second message.
+    assert out["item"]["sphere"] == "unknown" and out["item"]["contact"] is None, out["item"]
+    # The gate still knows the handle, so the chat is not screened again here.
+    assert out["item"]["unknown_sender"] is False, out["item"]
+    assert "vcard:fn" not in wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
+    assert nadia in triage_policy.load_messenger_policy("signal").whitelist
+    print("ok test_unknown_sender_screened_then_named")
+
+
 # ── projects ───────────────────────────────────────────────────────────────
 
 def test_project_from_store(base, wg):
@@ -561,7 +640,8 @@ def test_payload_shape(base, wg):
     assert len(body["schedule"]) == 8 and body["digest_times"] == [480, 720, 1020, 1260]
     assert set(body["counts"]) == {"now", "next", "held", "waiting", "not_now"}
     assert all("only_admitted" in m for m in body["modes"]) and body["mode"]["only_admitted"] in (True, False)
-    assert body["spheres"] == ["customers", "admin", "health", "friends", "family", "system"]
+    assert body["spheres"] == ["customers", "admin", "health", "friends", "family", "system",
+                               "unknown"]
     assert body["next_breakpoint"] and body["mode"]["scheduled"]["until"]
     status, out = _http(base, "GET", "/attention/item?id=nothing")
     assert status == 404
@@ -588,6 +668,7 @@ def main():
         test_mode_change_is_a_breakpoint(base, wg)
         test_corrections_learn(base, wg)
         test_chat_inbound_gated_and_settled(base, wg)
+        test_unknown_sender_screened_then_named(base, wg)
         test_project_from_store(base, wg)
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)

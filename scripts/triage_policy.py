@@ -612,19 +612,12 @@ def gate_decision(
     return dec
 
 
-def auto_whitelist_on_send(channel: str, handles) -> list[str]:
-    """Whitelist recipient handle(s) after an outbound 1:1 messenger send.
-
-    This is the messenger analogue of the e-mail Sent-folder auto-whitelist
-    (see ``load_email_whitelist``): sending to someone is standing proof they
-    are a wanted correspondent, so their reply must count as a *known* sender
-    rather than resurface as an "unknown sender" prompt. Each gateway calls this
-    from its send choke point once a send has actually gone out.
+def _whitelist_add(channel: str, handles) -> list[str]:
+    """Add handle(s) to a channel's whitelist; returns what was newly added.
 
     Idempotent and write-if-changed (an already-known handle is a no-op, so no
     qlever rebuild churn). A handle currently on the *blacklist* is never
-    re-whitelisted — an explicit block must survive an outbound send. Returns the
-    handles newly added (empty when all were already known or blocked).
+    re-whitelisted — an explicit block outranks any implicit proof of interest.
     """
     norm = {_norm_handle(h) for h in handles if h and str(h).strip()}
     if not norm:
@@ -638,6 +631,34 @@ def auto_whitelist_on_send(channel: str, handles) -> list[str]:
         messenger_policy_path(channel),
     )
     return added
+
+
+def auto_whitelist_on_send(channel: str, handles) -> list[str]:
+    """Whitelist recipient handle(s) after an outbound 1:1 messenger send.
+
+    This is the messenger analogue of the e-mail Sent-folder auto-whitelist
+    (see ``load_email_whitelist``): sending to someone is standing proof they
+    are a wanted correspondent, so their reply must count as a *known* sender
+    rather than resurface as an "unknown sender" prompt. Each gateway calls this
+    from its send choke point once a send has actually gone out.
+
+    Returns the handles newly added (empty when all were already known or
+    blocked).
+    """
+    return _whitelist_add(channel, handles)
+
+
+def whitelist_on_contact(channel: str, handles) -> list[str]:
+    """Whitelist handle(s) the user has just named as a contact.
+
+    The other half of ``auto_whitelist_on_send``: writing to someone is proof
+    they are wanted, and so is filing them in the address book. The dashboard's
+    contact card (``POST /chats/<id>/contact``) calls this, so the *next*
+    message from that number earns a live triage turn instead of the "unknown
+    sender" prompt the user has just answered. Same guarantees: idempotent,
+    write-if-changed, and an explicit blacklist entry is never overridden.
+    """
+    return _whitelist_add(channel, handles)
 
 
 # --------------------------------------------------------------------------- #

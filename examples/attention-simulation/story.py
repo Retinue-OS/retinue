@@ -25,11 +25,17 @@ def days(d: int, h: int = 0, m: int = 0) -> int:
 # `chat` is the key the channel gateway records (kb:chat); the chat's id on
 # the dashboard is "<channel>:<key>" (no account: the mock ledger predates
 # kb:account, like real history does).
+# `unknown` marks someone the deployment has never heard of: no prior, no
+# sphere, and their handle is on no whitelist, so the delivery gate flags them
+# and the model screens them. `sphere` is then what the user will file them
+# under on the contact card, not what the system knows.
 CONTACTS = {
     "Anna Keller":    {"channel": "whatsapp", "chat": "+41791000001", "sphere": "friends"},
     "Beat Frei":      {"channel": "signal",   "chat": "+41791000002", "sphere": "customers"},
     "Mum":            {"channel": "whatsapp", "chat": "+41791000003", "sphere": "family"},
     "Luca Meier":     {"channel": "telegram", "chat": "123456789",    "sphere": "friends"},
+    "Nadia Brunner":  {"channel": "whatsapp", "chat": "+41791000042", "sphere": "customers",
+                       "tags": ["friends"], "unknown": True},
     "Quartier group": {"channel": "whatsapp", "chat": "120363000000000001@g.us", "sphere": "friends", "group": True},
 }
 
@@ -43,7 +49,9 @@ def chat_id(name: str) -> str:
 # and the senders' spheres (what a deployment learns from corrections and the
 # contact groups; here given, so the day is the brief's).
 PRIORS = {"Beat Frei": 4, "Anna Keller": 3, "Mum": 3, "Luca Meier": 3, "Quartier group": 1}
-SPHERES = {name: c["sphere"] for name, c in CONTACTS.items()}
+# Nobody the day has not met yet is in here: what the profile knows about a
+# sender is exactly what makes them not a stranger.
+SPHERES = {name: c["sphere"] for name, c in CONTACTS.items() if not c.get("unknown")}
 
 # -- messages -------------------------------------------------------------------
 # `triage` is what the Secretary's triage turn classifies for a whitelisted
@@ -68,6 +76,13 @@ MESSAGES = [
     {"at": t(8, 40),  "chat": "Anna Keller", "text": "Dinner on Friday? 19:00 at ours", "triage": {"importance": 3, "due": days(1, 18, 0), "kind": "invitation"}, "stage": "base"},
     {"at": t(9, 15),  "chat": "Anna Keller", "text": "Also: could you bring the projector?", "triage": {"importance": 3, "due": days(1, 18, 0), "kind": "invitation"}, "stage": "base"},
     {"at": t(10, 5),  "chat": "Beat Frei",   "text": "Question on clause 7 of the contract — I need your view by tomorrow noon", "triage": {"importance": 4, "due": days(1, 12, 0), "kind": "customer request", "tags": ["finance"]}, "stage": "base"},
+    # A number nobody knows: you gave it out yesterday. No triage classification
+    # rides along — the gate flags the sender unknown, and there is nothing to
+    # classify them by. The second message arrives after the contact card, so
+    # the gate forwards her as a known sender and the Secretary's judgement
+    # comes with it.
+    {"at": t(13, 50), "chat": "Nadia Brunner", "text": "Hi — Nadia here, from the Kreativ workshop yesterday. You said I could ask you about the brochure work. Twenty minutes this week?", "stage": "base"},
+    {"at": t(16, 20), "chat": "Nadia Brunner", "text": "One more thing: the organiser needs your invoice address before 18:00 today to book you in.", "triage": {"importance": 4, "due": t(18, 0), "kind": "customer request"}, "stage": "known"},
     {"at": t(14, 20), "chat": "Beat Frei",   "text": "Thanks. One more: can we sign on Monday?", "triage": {"importance": 4, "due": days(4, 12, 0), "kind": "customer request"}, "stage": "later"},
     {"at": t(15, 30), "chat": "Mum",         "text": "Are you coming for lunch on Sunday?", "triage": {"importance": 3, "due": days(3, 12, 0), "kind": "family note"}, "stage": "later"},
     {"at": t(19, 5),  "chat": "Luca Meier",  "text": "We are at the Werdinsel — coming? Fire is on at 19:30", "triage": {"importance": 4, "due": t(19, 30), "kind": "invitation"}, "stage": "base"},
@@ -120,12 +135,19 @@ SCRIPT = [
     {"at": t(13, 5),  "who": "you", "action": {"type": "reply", "id": "chat:Beat Frei", "text": "Cap at the contract value, as in our standard terms — I’ll add a short note to clause 7 today."}, "text": "Beat’s chat: Ara’s pane recalls your standard position on the liability cap and drafts the reply; you send it."},
     {"at": t(13, 30), "who": "narrator", "text": "The sweep finds the physio appointment inside its two-hour lead time: it climbs to time-sensitive, health is admitted in Work, and it pushes — two hours ahead, as the lead time intended."},
     {"at": t(13, 40), "who": "you", "action": {"type": "chip", "id": "prj-invoices", "label": "Send all three"}, "text": "The invoice run: Ara has three drafts ready; you send all three. Done."},
+    {"at": t(13, 50), "who": "narrator", "text": "A number nobody knows writes on WhatsApp. You gave it out yesterday at a workshop, but the system has never seen it: the delivery gate flags the sender unknown, and the model screens them — the message keeps the importance of a person writing to a person, and loses only the guess about which sphere they belong to. No mode admits “unknown”, so it is held for 17:00 and never rings. Nothing is hidden: it is on the list under Held, one tap away."},
+    {"at": t(13, 53), "who": "you", "action": {"type": "pull", "id": "chat:Nadia Brunner"}, "text": "You were half expecting it, so you look: Held carries one item from a number, marked “new number”. You pull it onto the list and read it — screening delays a stranger, it never hides them."},
+    {"at": t(13, 56), "who": "you", "action": {"type": "contact", "id": "chat:Nadia Brunner", "name": "Nadia Brunner", "sphere": "customers", "tags": ["friends"]}, "text": "It is Nadia from the workshop. You tap ⓘ and fill the contact card: her name, the sphere she belongs to — customers — and “friends” as a second group. One write does four things: the chat is hers from now on, the profile learns her sphere, her handle joins the delivery gate’s whitelist, and the card lands in the life store’s address book."},
+    {"at": t(13, 58), "who": "narrator", "text": "The item is re-judged on the spot: sphere customers, which Work admits — but with no deadline it is only active, so it waits for the 17:00 digest rather than ringing. The name settles who she is; whether she may interrupt is the separate question, one tick away in the same card."},
+    {"at": t(14, 2),  "who": "you", "action": {"type": "reply", "id": "chat:Nadia Brunner", "text": "Hi Nadia — glad you wrote. Thursday 14:00 works for twenty minutes."}, "text": "You open her chat and answer. Handled."},
     {"at": t(14, 20), "who": "narrator", "text": "Beat asks about signing on Monday. Admitted in Work, but only active: it waits for the 17:00 digest. If you want it earlier, Held is one tap away."},
     {"at": t(14, 45), "who": "narrator", "text": "The Secretary triaged a letter from the tax office: statement due 30 September, importance 5, lead time two weeks. Twenty-seven days out it is active, so it waits for the digest too."},
     {"at": t(14, 58), "who": "you", "action": {"type": "doIt", "id": "thr-physio"}, "text": "You mark the appointment as handled and pack up."},
     {"at": t(15, 0),  "who": "you", "action": {"type": "mode", "id": "off"}, "text": "You leave for physio and switch the mode to Off by hand. The schedule is suspended until you release it."},
     {"at": t(15, 30), "who": "narrator", "text": "Your mother asks about Sunday lunch. Off: held."},
     {"at": t(16, 15), "who": "you", "action": {"type": "mode", "id": None}, "text": "Back at the desk you release the mode to the schedule. Work resumes; the change is a breakpoint, so what was held meanwhile arrives as a small digest."},
+    {"at": t(16, 20), "who": "narrator", "text": "Nadia writes again — and this time she is not a stranger. The gate recognises her handle and spends a triage turn on her message; the Secretary reads a deadline out of it (18:00) and calls it a customer request. Time-sensitive, and Work admits customers: it rings. Same person, same channel, two hours apart — the contact card is the whole difference."},
+    {"at": t(16, 24), "who": "you", "action": {"type": "reply", "id": "chat:Nadia Brunner", "text": "Sent you the invoice address just now — see you Thursday."}, "text": "You send the address. Handled."},
     {"at": t(16, 28), "who": "you", "action": {"type": "say", "id": "prj-vat", "text": "Can you file the VAT return for me?"}, "text": "The VAT return has sat in Next all day. You open its project and ask Ara to file it. She has the figures ready but cannot submit: the portal needs your login. By hand in ten minutes, or a Cowork session with the Ara connector, where Claude fills the form in your browser and asks her for the figures."},
     {"at": t(16, 30), "who": "you", "action": {"type": "lead", "id": "prj-vat", "lead": "4w"}, "text": "Two weeks is too short a lead for a filing like this, so you correct the lead time to four weeks in the details. The profile learns it for every tax filing, and with the deadline now inside the lead time the return climbs to time-sensitive and moves to Now."},
     {"at": t(16, 35), "who": "you", "action": {"type": "chip", "id": "prj-vat", "label": "Park until tomorrow"}, "text": "You look through the figures and park it until tomorrow morning."},
@@ -292,6 +314,19 @@ COMPANION_DIALOGUES = {
                  "replies": {"Draft: on my way": {"text": "Draft is in the composer.", "draft": "On my way 🔥"},
                              "Draft: not tonight": {"text": "Draft is in the composer.", "draft": "Not tonight — have one for me!"}},
                  "free": {"text": "Noted.", "chips": ["Draft: on my way"]}},
+    },
+    "Nadia Brunner": {
+        "base": {"opening": "A number that has never written here before, and nobody in the address book claims it. It is screened: listed, carried by the 17:00 digest, never rung — until you say who it is. Your agenda has the Kreativ workshop yesterday, 14:00–18:00; that is the likeliest match.",
+                 "chips": ["File her as a customer", "Draft a reply", "Not interested"],
+                 "replies": {"File her as a customer": {"text": "Filed: Nadia Brunner — customers, also friends. The chat is hers now, her number is on the delivery gate’s whitelist, and the card is in the address book. You can change any of it from the ⓘ.",
+                                                        "contact": {"name": "Nadia Brunner", "sphere": "customers", "tags": ["friends"]}},
+                             "Draft a reply": {"text": "Draft is in the composer.", "draft": "Hi Nadia — glad you wrote. Thursday 14:00 works for twenty minutes."},
+                             "Not interested": {"text": "Marked read. She stays unfiled, so anything further from this number is screened the same way; tell me to block it and the gate drops it.", "done": True}},
+                 "free": {"text": "I can file her as a contact, or draft an answer.", "chips": ["File her as a customer", "Draft a reply"]}},
+        "known": {"opening": "Nadia asks: “{last}” Your invoice address is in the business details.", "chips": ["Draft with the address", "Not now"],
+                  "replies": {"Draft with the address": {"text": "Draft is in the composer.", "draft": "Sent you the invoice address just now — see you Thursday."},
+                              "Not now": {"text": "Left alone; the deadline is 18:00, so I will put it back on the list at 17:30.", "later": "next"}},
+                  "free": {"text": "Noted.", "chips": ["Draft with the address"]}},
     },
     "Quartier group": {
         "base": {"opening": "Fourteen messages about the street party on 20 September, nothing addressed to you. Petra’s summary: 16:00 start, drinks, cake, one table and the kids’ corner are covered; still missing a grill and one more table. Ruth adds that the street closes at 14:00.", "chips": ["Mark read", "Offer the grill", "Offer a table", "Who said what?"],

@@ -670,7 +670,13 @@ def delivery_text(item: dict, focus: dict, profile: dict, now: datetime) -> str:
     if not item.get("released"):
         if item.get("snoozed_until") is not None and item["snoozed_until"] > now:
             return f"snoozed until {item['snoozed_until'].strftime('%a %H:%M')}"
-        return f"held until {next_breakpoint(focus, now).strftime('%a %H:%M')} — {admission_reason(item, mode, profile, now)}"
+        # Say which of the two held it. An admitted item waiting only because
+        # it is not urgent enough must not be explained by "Work admits
+        # customers" — that reads like a reason to ring.
+        why = (admission_reason(item, mode, profile, now)
+               if not (admitted(item, mode, profile) or has_permit(item, mode, profile))
+               else f"{lvl} is below {mode['name']}’s bar")
+        return f"held until {next_breakpoint(focus, now).strftime('%a %H:%M')} — {why}"
     if breaks_through(item, mode, profile, now):
         pushed = item.get("pushed") or []
         return (f"pushed {pushed[-1].strftime('%H:%M')}" if pushed else "in Now") + f" — {admission_reason(item, mode, profile, now)}"

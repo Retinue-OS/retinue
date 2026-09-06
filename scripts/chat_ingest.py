@@ -77,8 +77,9 @@ def notify_chat_event(
     ``*_ACCOUNT`` — how the web-gateway identifies which registry gateway sent
     the event, matched against the accounts the gateways it already knows
     report for themselves. ``gate`` carries the delivery-gate
-    verdict for inbound events (``{"forward": bool, "reason": str}``) so the
-    web-gateway can keep held/no-action classes silent. Never raises.
+    verdict for inbound events (``{"forward": bool, "reason": str,
+    "unknown": bool}``) so the web-gateway can keep held/no-action classes
+    silent and screen a sender the gate did not recognise. Never raises.
     """
     if not CHATS_INGEST_URL:
         return False

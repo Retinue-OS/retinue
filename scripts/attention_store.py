@@ -39,6 +39,14 @@ import attention as policy
 # to the user are friends until the profile, a triage turn or a correction
 # says otherwise. Threads and projects default to admin (item_from_doc).
 DEFAULT_CHAT_SPHERE = "friends"
+# …except a sender the delivery gate did not recognise (docs/triage-delivery-
+# gate.md). A stranger who has the user's number is not a friend and not a
+# customer; nobody has said which, and guessing "friends" would let anyone who
+# learns the number ring during Social. So an unnamed sender gets a sphere of
+# their own that no mode admits by default: the message is *screened* — listed
+# and carried by the next digest, never rung — until the user files a contact
+# card and says which sphere they belong to. Hey's Screener, in one word.
+UNKNOWN_SPHERE = "unknown"
 # What a message is worth before anyone has judged it. A person writing to
 # the user directly is *active* (importance 4 — 3.5 is the row's edge): held
 # for the next digest in every default mode, pushed at once where the sender
@@ -50,7 +58,7 @@ DEFAULT_GROUP_IMPORTANCE = 1.0
 
 # The sphere vocabulary the sheet offers. A deployment can extend it in
 # focus.json (``spheres``); the modes' ``admits`` lists use the same words.
-DEFAULT_SPHERES = ["customers", "admin", "health", "friends", "family", "system"]
+DEFAULT_SPHERES = ["customers", "admin", "health", "friends", "family", "system", UNKNOWN_SPHERE]
 
 
 def zone():
@@ -82,6 +90,12 @@ class AttentionStore:
         with self.lock:
             focus = policy.load_json(self.dir / "focus.json", policy.default_focus())
             focus.setdefault("spheres", list(DEFAULT_SPHERES))
+            if UNKNOWN_SPHERE not in focus["spheres"]:
+                # Structural, not a matter of taste: the model itself puts a
+                # sender nobody has named into this sphere, so a document
+                # written before it existed (or a deployment that pruned the
+                # vocabulary) still has to be able to name it in a rule.
+                focus["spheres"].append(UNKNOWN_SPHERE)
             for mid, mode in focus["modes"].items():
                 # A document from before the flag: the shipped default for
                 # the mode of that name, off for one the deployment named.
@@ -210,6 +224,13 @@ def chat_wants_attention(chat: dict, state: dict) -> bool:
     return int(chat.get("unread") or 0) > 0
 
 
+def chat_is_unknown(state: dict) -> bool:
+    """Is this chat's peer a stranger? — the gate said so about the last
+    arrival and no contact card has since named them."""
+    state = state or {}
+    return bool(state.get("unknown_sender")) and not state.get("contact")
+
+
 def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     """A messenger chat (a /chats row plus its state document) as an item.
 
@@ -218,6 +239,7 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     thinks of them."""
     block = dict((state or {}).get("attention") or {})
     name = chat.get("name") or chat.get("key") or chat.get("id") or "Chat"
+    unknown = chat_is_unknown(state)
     priors = profile.get("priors") or {}
     if "importance" not in block:
         if name in priors:
@@ -226,7 +248,10 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         else:
             block["importance"] = DEFAULT_GROUP_IMPORTANCE if chat.get("group") else DEFAULT_DIRECT_IMPORTANCE
             block["importance_from"] = "default"
-    sphere = block.get("sphere") or (profile.get("spheres") or {}).get(name) or DEFAULT_CHAT_SPHERE
+    # A stranger keeps the importance of a human writing to a human — someone
+    # took the trouble — and loses only the guess about *where they belong*.
+    sphere = (block.get("sphere") or (profile.get("spheres") or {}).get(name)
+              or (UNKNOWN_SPHERE if unknown else DEFAULT_CHAT_SPHERE))
     doc = {"id": f"chat:{chat['id']}", "title": name, "attention": block, "sphere": sphere,
            "sender": name, "archived": bool(chat.get("archived"))}
     item = policy.item_from_doc(doc, "chat", profile)
@@ -239,6 +264,13 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         "source_id": chat["id"],
         "preview": _one_line(last.get("text") or ("Photo" if last.get("kind") == "image" else "")),
         "channel": chat.get("channel"),
+        # The chat's current name, not the copy the block was persisted with:
+        # naming a number renames its peer, and the profile's priors, permits
+        # and sphere are keyed on the name the user sees.
+        "sender": name,
+        "handle": chat.get("key") or "",
+        "unknown_sender": unknown,
+        "contact": (state or {}).get("contact") or None,
         "group": bool(chat.get("group")),
         "count": int(chat.get("unread") or 0),
         "unread": int(chat.get("unread") or 0) > 0,
