@@ -507,6 +507,38 @@ def test_unknown_sender_screened_then_named(base, wg):
     print("ok test_unknown_sender_screened_then_named")
 
 
+def test_spheres_are_a_word_away(base, wg):
+    """A sphere is the user's subject; adding one costs a word."""
+    status, out = _http(base, "POST", "/attention/spheres", {"add": "Board Games"})
+    assert status == 200 and out["added"] == "board-games" and "board-games" in out["spheres"], out
+    status, out = _http(base, "POST", "/attention/spheres", {"add": "Ökologie"})
+    assert status == 200 and out["added"] == "ökologie", out
+    status, out = _http(base, "POST", "/attention/spheres", {"add": "board games"})
+    assert status == 200 and out["spheres"].count("board-games") == 1, out
+    status, out = _http(base, "POST", "/attention/spheres", {"add": "!!"})
+    assert status == 400, out
+    assert "board-games" in _sections(base)["spheres"]
+    # Usable at once: on an item, and in a rule.
+    body = _open(base, "Club night", "Thursday at the club", {"importance": 3, "sphere": "friends"})
+    tid = "thread:" + body["id"]
+    status, out = _http(base, "POST", "/attention/items/correct", {"id": tid, "sphere": "board-games"})
+    assert status == 200 and out["item"]["sphere"] == "board-games", out
+    status, out = _http(base, "POST", "/attention/admit", {"sphere": "board-games", "mode": "social", "on": True})
+    assert status == 200, out
+    # Not removable while a rule names it; removable once none does.
+    status, out = _http(base, "POST", "/attention/spheres", {"remove": "board-games"})
+    assert status == 400 and "Social" in out["error"], out
+    _http(base, "POST", "/attention/admit", {"sphere": "board-games", "mode": "social", "on": False})
+    status, out = _http(base, "POST", "/attention/spheres", {"remove": "board-games"})
+    assert status == 200 and "board-games" not in out["spheres"], out
+    status, out = _http(base, "POST", "/attention/spheres", {"remove": "unknown"})
+    assert status == 400, out
+    # The item keeps its word.
+    status, out = _http(base, "GET", "/attention/item?id=" + urllib.parse.quote(tid, safe=""))
+    assert status == 200 and out["item"]["sphere"] == "board-games", out
+    print("ok test_spheres_are_a_word_away")
+
+
 # ── projects ───────────────────────────────────────────────────────────────
 
 def test_project_from_store(base, wg):
@@ -669,6 +701,7 @@ def main():
         test_corrections_learn(base, wg)
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
+        test_spheres_are_a_word_away(base, wg)
         test_project_from_store(base, wg)
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)

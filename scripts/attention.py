@@ -604,6 +604,51 @@ def apply_rules(focus: dict, patch: dict, spheres: list[str]) -> list[str]:
     return changes
 
 
+# A word in any script: letters and digits (Unicode), hyphens between them.
+_SPHERE_RE = re.compile(r"^[^\W_](?:[^\W_]|-)*$")
+
+
+def sphere_id(text) -> str | None:
+    """A sphere as the user types it — "Board games", "Ökologie" — as the word
+    the store and the rules use: lowercase, hyphens for spaces, letters and
+    digits in any script, at most 32 characters. None when what is left is
+    not a word."""
+    raw = re.sub(r"[\s_]+", "-", str(text or "").strip().lower())
+    raw = re.sub(r"-{2,}", "-", raw).strip("-")
+    return raw if raw and len(raw) <= 32 and _SPHERE_RE.match(raw) else None
+
+
+def add_sphere(focus: dict, text) -> str:
+    """Add a sphere to the vocabulary; returns its id. Idempotent. Spheres are
+    the user's subjects — a hobby, a client, a cause — so adding one must
+    cost nothing: a word, and it exists. ValueError when it is not a word."""
+    sid = sphere_id(text)
+    if sid is None:
+        raise ValueError("a sphere is a short word: letters, digits, hyphens")
+    spheres = focus.setdefault("spheres", [])
+    if sid not in spheres:
+        spheres.append(sid)
+    return sid
+
+
+def remove_sphere(focus: dict, text) -> str:
+    """Drop a sphere from the vocabulary. Refused while a mode still admits
+    it — the rule would silently stop meaning anything — and for ``unknown``,
+    which the model itself assigns. Items already in the sphere keep their
+    word; the sheet still offers it on them. ValueError says why not."""
+    sid = sphere_id(text)
+    if sid is None or sid not in (focus.get("spheres") or []):
+        raise ValueError("no such sphere")
+    if sid == "unknown":
+        raise ValueError("the model assigns “unknown” itself; it cannot be removed")
+    admitting = [m["name"] for m in focus["modes"].values()
+                 if sid in (m.get("admits") or []) or sid in (m.get("admit_tags") or [])]
+    if admitting:
+        raise ValueError(f"still admitted in {', '.join(admitting)} — change those rules first")
+    focus["spheres"] = [x for x in focus["spheres"] if x != sid]
+    return sid
+
+
 def set_admission(focus: dict, sphere: str, mode_id: str, on: bool) -> bool:
     mode = focus["modes"][mode_id]
     has = sphere in mode["admits"]

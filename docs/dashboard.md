@@ -71,7 +71,11 @@ correctable — importance (writes the sender's or kind's prior), deadline and
 lead (writes the kind's lead time), sphere (remembered for the sender) — plus
 a permit for the sender in this mode, a Focus rule for the sphere, and the
 actions *Later* (next breakpoint / tomorrow), *Pull into the list now* and
-*Mark done*. The same sheet opens from the thread bar and from the chat page's
+*Mark done*. Spheres are the user's own subjects — a client, a hobby, a cause
+— so the vocabulary grows from wherever a sphere is chosen: *+ new sphere…*
+in the sphere selector, *+ new* on the contact card
+(`POST /attention/spheres`); a sphere the palette does not name gets a stable
+colour from its word. The same sheet opens from the thread bar and from the chat page's
 header.
 
 A chat from a number nobody has named is **screened**: the delivery gate says

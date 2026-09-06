@@ -1063,7 +1063,7 @@ _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
 # The attention model's writes: the mode, the rules, and the actions on one
 # item (its id travels in the body — chat ids and project URIs carry
 # characters no path segment should).
-_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|admit|profile|later|pull|done|reopen|correct)/?$")
+_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|admit|spheres|profile|later|pull|done|reopen|correct)/?$")
 
 # ── Push notifications ─────────────────────────────────────────────────────────
 # The unread badge only exists while the dashboard is open, which is precisely
@@ -7144,6 +7144,9 @@ class Handler(BaseHTTPRequestHandler):
             if action == "modes":
                 self._attention_set_rules(payload, focus, profile, now)
                 return
+            if action == "spheres":
+                self._attention_set_spheres(payload, focus)
+                return
             if action == "profile":
                 self._attention_write_profile(payload)
                 return
@@ -7270,6 +7273,29 @@ class Handler(BaseHTTPRequestHandler):
             pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule")
         self._send_json(200, {"changed": changes, "mode": _attention_mode_summary(focus, now),
                               "focus": focus, "pushed": pushed})
+
+    def _attention_set_spheres(self, payload: dict, focus: dict) -> None:
+        """Grow or prune the sphere vocabulary: body {add} or {remove}.
+
+        Spheres are the user's subjects — a client, a hobby, a cause — and
+        the vocabulary must cost a word to extend, from wherever a sphere is
+        chosen (the details sheet, the contact card). Removal is refused while
+        a mode still admits the sphere; items keep the word either way."""
+        try:
+            if payload.get("add") is not None:
+                sid = attention_policy.add_sphere(focus, payload["add"])
+                what = "added"
+            elif payload.get("remove") is not None:
+                sid = attention_policy.remove_sphere(focus, payload["remove"])
+                what = "removed"
+            else:
+                self._send_json(400, {"error": "add or remove a sphere"})
+                return
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        _ATTENTION.save_focus(focus)
+        self._send_json(200, {what: sid, "spheres": list(focus["spheres"])})
 
     def _attention_write_profile(self, payload: dict) -> None:
         """Replace the profile and the focus rules with what the user edited:

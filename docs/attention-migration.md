@@ -84,6 +84,7 @@ persistent volume) holds:
 | `POST /attention/items/correct` `{id, importance? due? lead? sphere? tags? critical?}` | the field correction; writes the prior, the lead time or the sender's sphere into the profile and re-evaluates |
 | `POST /attention/permits` `{sender, mode?, on}` | let a sender interrupt in a mode (the mode in force by default) |
 | `POST /attention/admit` `{sphere, mode?, on}` | change a Focus rule |
+| `POST /attention/spheres` `{add}` / `{remove}` | grow or prune the sphere vocabulary — a word, normalised to an id (`Board Games` → `board-games`, any script); removal is refused while a mode admits it |
 | `POST /chats/<id>/contact` `{name, sphere?, tags?, permit?, whitelist?}` | the contact card for a screened stranger: names the chat, moves the bare handle's priors and permits onto the name, sets the sphere and tags on the item, whitelists the handle for the delivery gate and writes the address book. An empty name removes the card |
 | `GET /attention/profile`, `POST /attention/profile` | read and replace the profile and the focus rules |
 | `POST /internal/attention/set` `{id, …}` | an agent declares or revises an item's properties (token-gated; `scripts/attention-set.py`) |

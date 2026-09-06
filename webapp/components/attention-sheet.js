@@ -28,7 +28,26 @@ export const SPHERE_COLORS = {
   customers: '#6ea8fe', admin: '#c9a0ff', health: '#ff6b6b', friends: '#57c785',
   family: '#ffb86b', system: '#9aa5b1', unknown: '#7d8694',
 };
-export const sphereColor = (s) => SPHERE_COLORS[s] || '#9aa5b1';
+// A sphere the palette does not name — the user's own subjects, added with a
+// word — gets a hue from that word, so it is the same colour on every row and
+// every device without anyone configuring one.
+export const sphereColor = (s) => {
+  if (SPHERE_COLORS[s]) return SPHERE_COLORS[s];
+  let h = 0;
+  for (const ch of String(s || '')) h = (h * 31 + ch.codePointAt(0)) % 360;
+  return `hsl(${h} 55% 62%)`;
+};
+
+const NEW_SPHERE = '__new__';
+
+export async function addSphere(name) {
+  const res = await fetch('/attention/spheres', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ add: name }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || String(res.status));
+  return data.added;
+}
 
 const LEAD_PRESETS = [
   [60, '1 h'], [120, '2 h'], [360, '6 h'], [1440, '1 day'], [2880, '2 days'], [4320, '3 days'],
@@ -144,6 +163,8 @@ const CSS = `
     border-radius: 8px; border: 1px solid var(--line, rgba(231, 235, 242, .12));
     background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  input.sphere-new { font-size: 12px; padding: 3px 6px; border-radius: 8px; width: 11em;
+    border: 1px solid var(--accent, #6ea8fe); background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
   .err { color: var(--high, #ff6b6b); font-size: 12.5px; margin-top: 8px; }
   .lvl { font-weight: 700; }
 `;
@@ -171,6 +192,7 @@ class RetinueAttentionSheet extends HTMLElement {
     this._error = '';
     this._learned = [];
     this._form = null;
+    this._newSphere = null;
     this.hidden = false;
     window.addEventListener('keydown', this._onKey);
     this.render();
@@ -295,6 +317,7 @@ class RetinueAttentionSheet extends HTMLElement {
       case 'contact-permit':
         if (this._form) { this._form.permit = !this._form.permit; this.render(); }
         break;
+      case 'contact-new-sphere': this._newSphere = 'contact'; this.render(); break;
       case 'contact-save': this._saveContact(); break;
       case 'contact-remove': this._saveContact(''); break;
       default: break;
@@ -313,7 +336,37 @@ class RetinueAttentionSheet extends HTMLElement {
     } else if (what === 'lead') {
       this._act('correct', { lead: Number(el.value) });
     } else if (what === 'sphere') {
+      if (el.value === NEW_SPHERE) { this._newSphere = 'item'; this.render(); return; }
       this._act('correct', { sphere: el.value });
+    } else if (what === 'sphere-new') {
+      // The item's own new sphere: create it, then move the item into it.
+      this._createSphere(el.value, (id) => this._act('correct', { sphere: id }));
+    } else if (what === 'contact-sphere-new') {
+      // The card's new sphere: the primary one if none is picked yet, else a further group.
+      this._createSphere(el.value, (id) => {
+        if (!this._form) return;
+        if (!this._form.sphere) this._form.sphere = id;
+        else if (!this._form.tags.includes(id)) this._form.tags.push(id);
+        this.render();
+      });
+    }
+  }
+
+  async _createSphere(text, then) {
+    const name = String(text || '').trim();
+    this._newSphere = null;
+    if (!name) { this.render(); return; }
+    try {
+      const id = await addSphere(name);
+      if (this._data) {
+        const list = this._data.spheres || [];
+        if (!list.includes(id)) this._data.spheres = list.concat([id]);
+      }
+      this._error = '';
+      then(id);
+    } catch (err) {
+      this._error = `Could not add that sphere (${String((err && err.message) || err)}).`;
+      this.render();
     }
   }
 
@@ -400,8 +453,11 @@ class RetinueAttentionSheet extends HTMLElement {
       `<input type="text" data-set="contact-name" value="${esc(form.name)}" placeholder="Their name" autocomplete="off">` +
       `<div><div class="f-k">belongs to</div><div class="chips">${choices.map(pick).join('')}</div>` +
       `<div class="f-note">The sphere decides which modes let them through.</div></div>` +
-      `<div><div class="f-k">also</div><div class="chips">${choices.filter((s) => s !== form.sphere).map(tag).join('')}</div>` +
-      `<div class="f-note">Further groups, as tags — a mode may admit a tag on its own.</div></div>` +
+      `<div><div class="f-k">also</div><div class="chips">${choices.filter((s) => s !== form.sphere).map(tag).join('')}` +
+      (this._newSphere === 'contact'
+        ? `<input class="sphere-new" type="text" data-set="contact-sphere-new" placeholder="new sphere" autocomplete="off" autofocus>`
+        : `<button class="btn tiny" data-act="contact-new-sphere"${busy}>+ new</button>`) +
+      `</div><div class="f-note">Further groups, as tags — a mode may admit a tag on its own. A sphere is a word: add one here.</div></div>` +
       `<div class="f-ctl"><button class="btn tiny${form.permit ? ' on' : ''}" data-act="contact-permit"${busy}>` +
       `${form.permit ? '✓ ' : ''}May interrupt right now</button></div>` +
       `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy}>Save the contact</button>` +
@@ -465,10 +521,12 @@ class RetinueAttentionSheet extends HTMLElement {
           `<span class="f-break"></span><span class="f-k">lead</span> ${leadSel}` +
           `<span class="f-note">${item.kind_label ? `the lead corrects every “${esc(item.kind_label)}”` : 'this item only — no kind declared'}</span>`;
       const spheres = (d.spheres || Object.keys(SPHERE_COLORS));
-      const sphereSel = `<select class="select" data-set="sphere"${busy}>` +
-        spheres.map((s) => `<option value="${esc(s)}"${s === item.sphere ? ' selected' : ''}>${esc(s)}</option>`).join('') +
-        (spheres.includes(item.sphere) ? '' : `<option value="${esc(item.sphere)}" selected>${esc(item.sphere)}</option>`) +
-        '</select>';
+      const sphereSel = (this._newSphere === 'item'
+        ? `<input class="sphere-new" type="text" data-set="sphere-new" placeholder="new sphere" autocomplete="off" autofocus>`
+        : `<select class="select" data-set="sphere"${busy}>` +
+          spheres.map((s) => `<option value="${esc(s)}"${s === item.sphere ? ' selected' : ''}>${esc(s)}</option>`).join('') +
+          (spheres.includes(item.sphere) ? '' : `<option value="${esc(item.sphere)}" selected>${esc(item.sphere)}</option>`) +
+          `<option value="${NEW_SPHERE}">+ new sphere…</option></select>`);
       const permitBtn = item.sender
         ? `<button class="btn tiny${item.permit ? ' on' : ''}" data-act="permit"${busy}>${item.permit
           ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit`
