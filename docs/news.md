@@ -183,8 +183,11 @@ with what it finds rather than clobber it.
 
 The news page reads the feed aloud through the **browser's own speech
 synthesis** (`webapp/components/speech.js`): ▶ Listen walks the ranked items,
-⏭ skips one, ⏹ stops, and the item being read is highlighted. Each item is
-spoken in the language it declares; no language is special-cased.
+⏭ skips one, ⏹ stops, and the item being read is highlighted. A reading the
+engine halts — cut off by the conversation card's player or by the platform
+taking the audio, or refused with an error — keeps its place, and ▶ Resume
+carries on from that item. Each item is spoken in the language it declares;
+no language is special-cased.
 
 This is the same choice the conversation card already makes for playing Ara's
 replies aloud, for the same reasons. Why not Piper, which this stack runs for
