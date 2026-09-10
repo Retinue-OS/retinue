@@ -54,8 +54,9 @@
 // to extract one from conversations.js rather than replicate again.
 //
 // The two rails close their loop in the shared draft: the user asks here, Ara
-// stages a reply into the chat's draft, and the chat poll adopts it into an
-// empty composer marked as hers — the send press stays the user's.
+// stages a reply into the chat's draft, and the chat poll adopts it into the
+// composer — empty, or holding the text she was asked to rework — marked as
+// hers; the send press stays the user's.
 
 import { esc, WIDE_FRAME } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
@@ -430,20 +431,43 @@ class RetinueChatPage extends HTMLElement {
         if (!newest || tsAfter(m.ts, newest)) newest = m.ts;
       }
       if (newest && stick) this._postRead(newest);
-      // Ara answers a companion turn by staging a reply here. Adopt it only
-      // into an EMPTY composer — never over what the user is typing — and
-      // only the composer block: a full render would rebuild the mirror and
-      // the companion pane under a user who is reading or typing in them.
+      // Ara answers a companion turn by staging a reply here — into an empty
+      // composer, or over the text she was asked to rework (the server let
+      // her: an agent's write is refused while the user's own draft sits
+      // there unless she names the version she read). So a NEWER draft than
+      // this page knows is adopted whenever nothing unsaved is in the box —
+      // never over keystrokes not yet saved; those meet it at their own
+      // save, where a 409 hands the server's text back. Newer, not merely
+      // different: the list view answering this poll can lag a save by a
+      // few seconds, and an older draft must never replace what the user
+      // just typed. Only the composer block is rebuilt: a full render would
+      // rebuild the mirror and the companion pane under a user who is
+      // reading or typing in them.
       const d = doc.chat && doc.chat.draft;
-      if (d && d.text && !this._draft && d.version !== this._draftVersion) {
+      const settled = this._draft === this._draftSaved;
+      if (d && d.text && settled && (d.version || 0) > (this._draftVersion || 0)) {
         this._draftVersion = d.version;
         this._draftSaved = d.text;
+        const byAra = d.author === 'agent';
+        const changed = d.text !== this._draft || byAra !== this._draftByAra;
         this._draft = d.text;
-        this._draftByAra = d.author === 'agent';
-        // A draft arriving is a better offer than the one the user just threw
-        // away; restoring the old text over it would be the wrong undo.
-        this._setUndo(null);
-        this._refreshChatComposer();
+        this._draftByAra = byAra;
+        if (changed) {
+          // A draft arriving is a better offer than the one the user just
+          // threw away; restoring the old text over it would be the wrong
+          // undo. A caret idling in the field stays there, at the end of
+          // the new text.
+          this._setUndo(null);
+          const root = this.shadowRoot;
+          const field = () => root.querySelector('[data-composer="chat"] textarea');
+          const focused = !!field() && root.activeElement === field();
+          this._refreshChatComposer();
+          const ta = focused && field();
+          if (ta) {
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+          }
+        }
       }
     } catch (_err) {
       // Offline or store blip: keep the last rendered state; the next poll
