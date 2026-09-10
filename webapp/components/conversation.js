@@ -80,15 +80,23 @@ const INLINE_SAFE_TYPES = new Set([
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
   'application/pdf', 'text/plain',
 ]);
-// The draft key of a composer that has no thread yet. One key for every such
-// composer: the text a user typed towards a new thread follows them to the
-// next new-thread composer, as it did before.
+// The draft key of a composer that has no thread yet: one per context, so a
+// plain composer and each project's composer keep their own text, files,
+// model choice and dictation — the text typed towards a plain new thread
+// follows the user to the next plain composer, and a dictation for one
+// project can never send or clear what was typed towards another.
 const NEW_KEY = 'new';
+function newKey(seed) {
+  return seed && seed.project ? `${NEW_KEY}:${seed.project}` : NEW_KEY;
+}
+function isNewKey(key) {
+  return key === NEW_KEY || String(key).startsWith(`${NEW_KEY}:`);
+}
 
 // ── Module state: what outlives one element instance ─────────────────────────
-// Drafts and picked files per conversation (or NEW_KEY): {text, files}, and
-// for NEW_KEY the model picked for the thread about to open — all of what a
-// composer holds before a send, so leaving and returning finds it intact.
+// Drafts and picked files per conversation (or composer key): {text, files},
+// and for a composer the model picked for the thread about to open — all of
+// what a composer holds before a send, so leaving and returning finds it.
 const DRAFTS = new Map();
 // Dictation jobs in flight per key: {sending, phase}. A job owns that
 // conversation's input row until it completes — every other conversation
@@ -126,8 +134,10 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // True while a page reload would lose typed-but-unsent input in any
-// conversation — components/update.js consults this before auto-reloading.
+// conversation, or a dictation still being transcribed or sent for one —
+// components/update.js consults this before auto-reloading.
 export function hasUnsentInput() {
+  if (VOICE_JOBS.size) return true;
   for (const d of DRAFTS.values()) {
     if ((d.text && d.text.trim()) || (d.files && d.files.length)) return true;
   }
@@ -540,13 +550,13 @@ class RetinueConversation extends HTMLElement {
     return !!((d.text && d.text.trim()) || d.files.length);
   }
 
-  _key() { return this._id || NEW_KEY; }
+  _key() { return this._id || newKey(this._seed()); }
   // The model picked for the thread about to open. Module state like the
   // draft it belongs to: the element is torn down whenever the host leaves
   // the composer, and a choice made before the first message must survive
   // that as the text does.
-  get _newModel() { return draftOf(NEW_KEY).model || ''; }
-  set _newModel(v) { draftOf(NEW_KEY).model = v || ''; }
+  get _newModel() { return draftOf(this._key()).model || ''; }
+  set _newModel(v) { draftOf(this._key()).model = v || ''; }
   _emit(name, detail) {
     this.dispatchEvent(new CustomEvent(name, { bubbles: true, composed: true, detail: detail || {} }));
   }
@@ -1203,7 +1213,7 @@ class RetinueConversation extends HTMLElement {
       // The thread is context for the cleanup pass: it is what tells the model
       // which names and topics this dictation is likely to be about. The
       // composer key is not a thread — only a real thread id is sent.
-      const q = key !== NEW_KEY ? `?thread=${encodeURIComponent(key)}` : '';
+      const q = !isNewKey(key) ? `?thread=${encodeURIComponent(key)}` : '';
       const res = await fetch(`/conversations/transcribe${q}`, {
         method: 'POST',
         headers: { 'Content-Type': blob.type || 'application/octet-stream' },
@@ -1229,23 +1239,22 @@ class RetinueConversation extends HTMLElement {
       VOICE_JOBS.get(key).phase = 'sending';
       if (live()) live().render();
       const el = live();
-      if (key !== NEW_KEY && el) {
+      if (!isNewKey(key) && el) {
         await el._send(toSend);
       } else {
         // Off screen, or a first message: the send goes out with the context
-        // captured when the recording started. The composer on screen now,
-        // if any, may be a different one — opened for another project while
-        // this was transcribed — and must not lend it its seed or model.
+        // captured when the recording started. The key names that context —
+        // a composer for another project meanwhile opened has its own draft
+        // and its own key, so nothing typed there can ride along or be
+        // cleared here. A composer live under this key is by construction
+        // the one this was dictated in: it goes on as the new thread.
         try {
-          const conv = await sendMessage(key === NEW_KEY ? '' : key, toSend,
+          const conv = await sendMessage(isNewKey(key) ? '' : key, toSend,
             draftOf(key).files, seed, model);
           draftOf(key).text = '';
           draftOf(key).files = [];
-          // The composer the user is looking at goes on as the new thread
-          // only when it is the one this was dictated in; any other stays
-          // what it is, and the list's next refresh shows the thread.
           const now = live();
-          if (key === NEW_KEY && now && sameSeed(now._seed(), seed)) now._becomeCreated(conv);
+          if (isNewKey(key) && now) now._becomeCreated(conv);
         } catch (_err) { /* the draft stays for a manual retry */ }
       }
     }
@@ -1466,11 +1475,6 @@ class RetinueConversation extends HTMLElement {
       }
     }
   }
-}
-
-// Two composers are about the same thing when they carry the same project.
-function sameSeed(a, b) {
-  return String((a && a.project) || '') === String((b && b.project) || '');
 }
 
 // One message onto the wire: a reply into thread `id`, or — with no id — the
