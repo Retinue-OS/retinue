@@ -993,15 +993,11 @@ class RetinueConversation extends HTMLElement {
       d.files = [];
       this._attachError = '';
       if (!this._id) {
-        // A brand-new thread: go on as it. The composer's draft is consumed;
-        // the model choice too — this thread carries it now.
-        this._newModel = '';
-        this._adopt(conv);
-        this._emit('retinue-created', { id: this._id, conversation: conv });
+        this._becomeCreated(conv);
       } else {
         this._thread = conv;
+        this._emit('retinue-sent', { id: this._id, conversation: conv });
       }
-      this._emit('retinue-sent', { id: this._id, conversation: conv });
     } catch (_err) {
       // A soft failure: the draft stays in the input for a retry.
     } finally {
@@ -1010,6 +1006,16 @@ class RetinueConversation extends HTMLElement {
       this.render();
       this._schedulePoll();
     }
+  }
+
+  // A first message opened a thread: go on as it. The composer's model
+  // choice is consumed — this thread carries it now — and the host hears
+  // of the thread before the send.
+  _becomeCreated(conv) {
+    this._newModel = '';
+    this._adopt(conv);
+    this._emit('retinue-created', { id: this._id, conversation: conv });
+    this._emit('retinue-sent', { id: this._id, conversation: conv });
   }
 
   // Become the thread a first message just opened.
@@ -1106,10 +1112,12 @@ class RetinueConversation extends HTMLElement {
       mr.addEventListener('dataavailable', (e) => {
         if (e.data && e.data.size) this._recChunks.push(e.data);
       });
-      // The job belongs to the conversation it was recorded in — the key and
-      // the seed are captured now, so a navigation away cannot re-address it.
+      // The job belongs to the conversation it was recorded in — the key,
+      // the seed and the model choice are captured now, so a navigation
+      // away cannot re-address it or lend it another composer's context.
       const seed = this._seed();
-      mr.addEventListener('stop', () => this._onRecordingStopped(key, seed));
+      const model = this._newModel;
+      mr.addEventListener('stop', () => this._onRecordingStopped(key, seed, model));
       mr.start();
       this._recState = 'recording';
       this._attachError = '';
@@ -1162,7 +1170,7 @@ class RetinueConversation extends HTMLElement {
   // screen. Completion must not interrupt whatever the user is doing now: only
   // when the conversation is on screen is it re-rendered, and only the
   // deliberate review flow pulls up the keyboard.
-  async _onRecordingStopped(key, seed) {
+  async _onRecordingStopped(key, seed, model) {
     this._wave.stop();
     this._stopStream();
     const chunks = this._recChunks || [];
@@ -1214,15 +1222,23 @@ class RetinueConversation extends HTMLElement {
       VOICE_JOBS.get(key).phase = 'sending';
       if (live()) live().render();
       const el = live();
-      if (el) {
+      if (key !== NEW_KEY && el) {
         await el._send(toSend);
       } else {
-        // The conversation has left the screen: the send goes out on its own,
-        // and the list's next refresh shows it.
+        // Off screen, or a first message: the send goes out with the context
+        // captured when the recording started. The composer on screen now,
+        // if any, may be a different one — opened for another project while
+        // this was transcribed — and must not lend it its seed or model.
         try {
-          await sendMessage(key === NEW_KEY ? '' : key, toSend, draftOf(key).files, seed, '');
+          const conv = await sendMessage(key === NEW_KEY ? '' : key, toSend,
+            draftOf(key).files, seed, model);
           draftOf(key).text = '';
           draftOf(key).files = [];
+          // The composer the user is looking at goes on as the new thread
+          // only when it is the one this was dictated in; any other stays
+          // what it is, and the list's next refresh shows the thread.
+          const now = live();
+          if (key === NEW_KEY && now && sameSeed(now._seed(), seed)) now._becomeCreated(conv);
         } catch (_err) { /* the draft stays for a manual retry */ }
       }
     }
@@ -1443,6 +1459,11 @@ class RetinueConversation extends HTMLElement {
       }
     }
   }
+}
+
+// Two composers are about the same thing when they carry the same project.
+function sameSeed(a, b) {
+  return String((a && a.project) || '') === String((b && b.project) || '');
 }
 
 // One message onto the wire: a reply into thread `id`, or — with no id — the
