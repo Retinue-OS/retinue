@@ -155,8 +155,10 @@ docstring). Pieces:
   escalated (`escalated` on the document; the gateway keeps it with Ara
   senior) shows as "Ara senior (escalated)" rather than as the default, and
   any pick — the default included — is the change that clears it. The two rails meet in the shared draft — Ara
-  stages a reply, the chat poll adopts it into an empty composer marked as
-  hers, and the send press stays the user's.
+  stages a reply, the chat poll adopts it into the composer marked as hers
+  — into an empty box, or over the text she was asked to rework, whenever
+  nothing unsaved is in it (unsaved keystrokes meet the newer draft at
+  their own save, as a conflict) — and the send press stays the user's.
 
 The API, as the components consume it:
 
