@@ -8,10 +8,25 @@ a Progressive Web App on the phone home screen.
 
 - **Static shell, no server rendering.** `index.html` is the hand-editable
   configuration: it declares the active cards and app-launch buttons.
+- **A conversation** (`components/conversation.js`) is one element,
+  `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
+  buttons on quotes and code, click-to-fill chips, attachments, model and
+  cost meta), the pending state while Ara answers, the composer with text,
+  file attachments and voice dictation, the model picker, and the read-aloud
+  player (`<retinue-read-aloud>`, its bar, placeable by any host). Given a
+  `conversation-id` it reads, polls and replies; given `for-project` and no
+  id it is the composer whose first message opens the thread, then goes on
+  as it. It reports outward with events (`retinue-back`,
+  `retinue-created`, `retinue-sent`, `retinue-archived`, `retinue-open`,
+  `retinue-thread`); drafts, dictation jobs and the reader outlive one
+  instance, so a thread left and reopened has its text, and a reading goes
+  on. Every surface that shows a conversation embeds this element.
 - **Conversation tabs** (`components/conversations.js`) are the active
-  interactive card: standalone chat threads with Ara. The user can open a
-  thread, and a retinue agent can open one when it needs a decision (e.g. an
-  RSVP). It talks to the gateway's `/conversations` API rather than a static data
+  interactive card: the list of threads with Ara, the Active/Archived filter
+  and the location-hash routing, with the open thread (or the new-thread
+  composer) being a `<retinue-conversation>`. The user can open a thread,
+  and a retinue agent can open one when it needs a decision (e.g. an RSVP).
+  It talks to the gateway's `/conversations` API rather than a static data
   file.
 - **App launcher** (`components/app-launcher.js`) provides local OS launch
   buttons.
@@ -56,7 +71,8 @@ The same gateway also backs the conversation-tabs card with a small JSON API
 - `POST /conversations/<id>/archive`  — archive a thread (drop from active list).
 - `POST /conversations/<id>/unarchive`— restore an archived thread.
 
-Ara answers asynchronously, so the card polls the thread until the reply lands.
+Ara answers asynchronously, so the open conversation polls itself until the
+reply lands (faster while a turn is pending), and the card polls the list.
 Each thread maps to its own Claude session (key `conv:<id>`). Threads persist
 under `CONVERSATIONS_DIR`, one file each — the deployment points this at the
 persistent `/root` volume (`/root/.retinue/conversations`); the
