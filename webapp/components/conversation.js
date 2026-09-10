@@ -86,7 +86,9 @@ const INLINE_SAFE_TYPES = new Set([
 const NEW_KEY = 'new';
 
 // ── Module state: what outlives one element instance ─────────────────────────
-// Drafts and picked files per conversation (or NEW_KEY): {text, files}.
+// Drafts and picked files per conversation (or NEW_KEY): {text, files}, and
+// for NEW_KEY the model picked for the thread about to open — all of what a
+// composer holds before a send, so leaving and returning finds it intact.
 const DRAFTS = new Map();
 // Dictation jobs in flight per key: {sending, phase}. A job owns that
 // conversation's input row until it completes — every other conversation
@@ -151,7 +153,7 @@ export function loadModels() {
 
 function draftOf(key) {
   let d = DRAFTS.get(key);
-  if (!d) { d = { text: '', files: [] }; DRAFTS.set(key, d); }
+  if (!d) { d = { text: '', files: [], model: '' }; DRAFTS.set(key, d); }
   return d;
 }
 
@@ -476,7 +478,6 @@ class RetinueConversation extends HTMLElement {
     this._hadFocus = false;  // the input had focus before the current re-render
     this._threadSig = '';
     this._pollTimer = null;
-    this._newModel = '';     // the model picked for the thread about to be opened
     this._adopting = false;  // the id is being set from within (a created thread)
     // Voice: record a message (server transcribes) — the recorder is one per
     // element, its job (see VOICE_JOBS) belongs to the conversation.
@@ -540,6 +541,12 @@ class RetinueConversation extends HTMLElement {
   }
 
   _key() { return this._id || NEW_KEY; }
+  // The model picked for the thread about to open. Module state like the
+  // draft it belongs to: the element is torn down whenever the host leaves
+  // the composer, and a choice made before the first message must survive
+  // that as the text does.
+  get _newModel() { return draftOf(NEW_KEY).model || ''; }
+  set _newModel(v) { draftOf(NEW_KEY).model = v || ''; }
   _emit(name, detail) {
     this.dispatchEvent(new CustomEvent(name, { bubbles: true, composed: true, detail: detail || {} }));
   }
