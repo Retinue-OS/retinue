@@ -575,6 +575,8 @@ class RetinueConversation extends HTMLElement {
     this._hadFocus = false;  // the input had focus before the current re-render
     this._threadSig = '';
     this._pollTimer = null;
+    this._loadSeq = 0;       // reads issued: only the newest one commits
+    this._pickerStale = false; // a refused pick to put back, even under focus
     this._adopting = false;  // the id is being set from within (a created thread)
     this._missing = false;   // the id points at no thread (the read said 404)
     // Voice: record a message (server transcribes) — the recorder is one per
@@ -681,14 +683,17 @@ class RetinueConversation extends HTMLElement {
     // time an answer comes, the answer is dropped (a 404 for the old thread
     // must not mark the new one missing, nor its document replace it).
     const id = this._id;
+    // Reads overlap (a poll, a pick's read, the first read): only the newest
+    // commits, so an older answer landing last cannot undo a newer one.
+    const seq = ++this._loadSeq;
     // Pins queued for the thread are stored first, so the read reflects the
     // latest pick; one queued during the read is caught by the generation.
     await settledPins(id);
-    if (this._id !== id) return false;
+    if (this._id !== id || seq !== this._loadSeq) return false;
     const gen = pinGen(id);
     try {
       const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store' });
-      if (this._id !== id) return false;
+      if (this._id !== id || seq !== this._loadSeq) return false;
       if (res.status === 404) {
         // Deleted, or a stale link: nothing to show, poll or reply to. A
         // re-point (attributeChangedCallback) starts afresh.
@@ -697,14 +702,14 @@ class RetinueConversation extends HTMLElement {
       }
       if (!res.ok) throw new Error(String(res.status));
       const t = await res.json();
-      if (this._id !== id) return false;
+      if (this._id !== id || seq !== this._loadSeq) return false;
       if (!t || (t.id && t.id !== id)) return false;
       // A pin stored while this read was under way: the read's model is
       // older than the picker's, which the pin's own read confirms. No pin
       // since, and the read's model is the server's truth — a refused pick,
       // if any, is off the picker with it.
       if (gen !== pinGen(id) && this._thread) { t.model = this._thread.model; t.escalated = this._thread.escalated; }
-      if (gen === pinGen(id)) FAILED_PINS.delete(id);
+      if (gen === pinGen(id) && FAILED_PINS.delete(id)) this._pickerStale = true;
       this._thread = t;
       this._missing = false;
       if (t.unread) this._markRead();
@@ -815,6 +820,7 @@ class RetinueConversation extends HTMLElement {
       (mode === 'thread' && !this._thread ? '' : this._inputRow(mode === 'thread' ? 'Reply …' : 'Ask Ara something …')) +
       `</div>`;
     this._threadSig = this._thread ? this._signature(this._thread) : '';
+    this._pickerStale = false; // rebuilt from the state just now
     this._wire();
     // After a full render of a thread, scroll to bottom so the latest message
     // is visible (matches typical chat-app behaviour on open).
@@ -1083,12 +1089,21 @@ class RetinueConversation extends HTMLElement {
     const host = root && root.querySelector('[data-picker]');
     if (!host) return;
     const sel = host.querySelector('[data-model]');
-    if (sel && root.activeElement === sel) return;
+    // A refused pick is put back to the server's model regardless: under
+    // the user's focus, and even when the markup is unchanged — the
+    // control's value is the user's pick, the markup's is the server's.
+    const force = this._pickerStale;
+    this._pickerStale = false;
+    const focused = !!(sel && root.activeElement === sel);
+    if (focused && !force) return;
     const html = this._modelPickerHtml({ wide: !this._id });
-    if (host.innerHTML === html) return;
+    if (host.innerHTML === html && !force) return;
     host.innerHTML = html;
     const next = host.querySelector('[data-model]');
-    if (next) next.addEventListener('change', () => this._onModelChange(next.value));
+    if (next) {
+      next.addEventListener('change', () => this._onModelChange(next.value));
+      if (focused) next.focus();
+    }
   }
 
   _inputRow(placeholder) {
@@ -1478,8 +1493,15 @@ class RetinueConversation extends HTMLElement {
           const conv = await sendMessage(isNewKey(key) ? '' : key, toSend, sentFiles, seed, model);
           clearSent(draftOf(key), toSend, sentFiles);
           const now = live();
-          if (isNewKey(key) && now) { now._becomeCreated(conv); adopted = now; }
-          if (isNewKey(key)) threadOpened(key, conv.id);
+          if (isNewKey(key)) {
+            if (now) { now._becomeCreated(conv); adopted = now; }
+            threadOpened(key, conv.id);
+          } else if (now) {
+            // The thread was reopened while the send was on the wire: it
+            // shows the reply and the host hears of it, as after _send.
+            now._thread = conv;
+            now._emit('retinue-sent', { id: key, conversation: conv });
+          }
         } catch (_err) { /* the draft stays for a manual retry */ }
       }
     }
@@ -1488,6 +1510,7 @@ class RetinueConversation extends HTMLElement {
     if (el) {
       el._focusNext = intent === 'review';
       el.render();
+      el._schedulePoll();
     }
     if (moved && el !== this) this.render();
   }
