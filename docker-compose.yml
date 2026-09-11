@@ -219,9 +219,9 @@ services:
       # sessions. Grouped by the process that reads each variable. A
       # deployment whose scripts read further names lists them in its
       # override's `environment:` (and, for session-side ones, in
-      # RETINUE_SESSION_ENV_EXTRA). Layout knobs that describe this image
-      # rather than a deployment (where the workspace, the chambers or the
-      # credential file are) are not listed; an override can still set one.
+      # RETINUE_SESSION_ENV_EXTRA). The list is the audit: every name a
+      # process in this container reads is here, the paths and endpoints
+      # that default to this image's layout included (the last group).
       #
       # Model tiers and routing (docs/model-routing.md), the per-job model
       # overrides expanded in .schedule.json manifests, and the dashboard's
@@ -389,6 +389,40 @@ services:
       - UPDATER_TIMEOUT
       - PLUGIN_SYNC_INTERVAL
       - CONVERSATION_BACKEND_TIMEOUT
+      # Paths and endpoints that default to this image's layout — where the
+      # workspace, the chambers, the credential file and the in-container
+      # backends are (scripts/entrypoint.sh, scheduler.py, memory.py,
+      # claude_auth.py, ara-mcp-server.py, conversation-push.py,
+      # chat-draft.py, recurring-projects.py, triage-gate.py,
+      # triage_policy.py, discover-agents.py, emit-conversation-models.py,
+      # web-gateway.py, git-serialize.sh). A deployment rarely sets one;
+      # listed so that the audit above holds without exception.
+      - CHAMBERS_DIR
+      - CHAMBERS_MANIFEST
+      - CHAMBERS_ROOT
+      - BASE_SCHEDULE
+      - RETINUE_WORKSPACE
+      - AGENTS_TTL_PATH
+      - CONVERSATION_MODELS_NT_PATH
+      - RETINUE_MEMORY_DIR
+      - RETINUE_MEMORY_ACTOR
+      - RETINUE_MEMORY_SESSION
+      - CLAUDE_CRED_FILE
+      - CLAUDE_BIN
+      - ARA_MCP_WORKDIR
+      - ARA_MCP_GATEWAY_URL
+      - CONVERSATION_BACKEND_URL
+      - CHAT_DRAFT_BACKEND_URL
+      - CONVERSATION_PUSH
+      - EMAIL_CLIENT_PATH
+      - TRIAGE_MESSENGER_DIR
+      - TRIAGE_EMAIL_WHITELIST_PATH
+      - WEBAPP_DIR
+      - DASHBOARD_DATA_DIR
+      - PUSH_DIR
+      - MESSAGE_FILES_DIR
+      - QLEVER_GRAPH_BASE
+      - GIT_SERIALIZE_LOCK_DIR
     command: remote-control
     stdin_open: true
     tty: true
