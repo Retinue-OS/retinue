@@ -117,7 +117,15 @@ const SENDS = new Map();
 // after a pick could otherwise start on the model the picker no longer
 // shows. Each entry resolves to whether the gateway stored that pin.
 const MODEL_PINS = new Map();
+// How many pins a thread has had: a read started before the latest pin
+// carries a model older than the picker's, and keeps its hands off it.
+const PIN_GEN = new Map();
+function pinGen(id) { return PIN_GEN.get(id) || 0; }
+// Archives in flight, by key — like sends, so any element showing the
+// thread is locked meanwhile and no other element ever is.
+const ARCHIVES = new Set();
 function pinModel(id, model) {
+  PIN_GEN.set(id, pinGen(id) + 1);
   const prev = MODEL_PINS.get(id) || Promise.resolve(true);
   const run = prev.then(async () => {
     try {
@@ -553,7 +561,6 @@ class RetinueConversation extends HTMLElement {
     super();
     this._id = '';           // the thread; '' while this is a new-thread composer
     this._thread = null;     // the thread document as last read
-    this._archiving = false; // an archive is in flight (sends: SENDS, by key)
     this._attachError = '';  // last attach error (e.g. file too big)
     this._focusNext = false; // focus the input after the next render
     this._hadFocus = false;  // the input had focus before the current re-render
@@ -624,9 +631,9 @@ class RetinueConversation extends HTMLElement {
   }
 
   _key() { return this._id || newKey(this._seed()); }
-  // Locked while this conversation's send is on the wire — whichever element
-  // instance started it, as sends are tracked by key — or an archive is.
-  get _busy() { return SENDS.has(this._key()) || this._archiving; }
+  // Locked while this conversation's send or archive is on the wire —
+  // whichever element instance started it, as both are tracked by key.
+  get _busy() { return SENDS.has(this._key()) || ARCHIVES.has(this._key()); }
   // Where a finished operation lands: this element while it is still
   // connected and still on the key the operation started under; otherwise
   // whatever is live under that key now — the element the user came back
@@ -656,8 +663,14 @@ class RetinueConversation extends HTMLElement {
   // ── Reading the thread ─────────────────────────────────────────────────────
   async _load() {
     if (!this._id) return;
+    // The read is for the thread of this moment: pointed elsewhere by the
+    // time an answer comes, the answer is dropped (a 404 for the old thread
+    // must not mark the new one missing, nor its document replace it).
+    const id = this._id;
+    const gen = pinGen(id);
     try {
-      const res = await fetch(`/conversations/${encodeURIComponent(this._id)}`, { cache: 'no-store' });
+      const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store' });
+      if (this._id !== id) return;
       if (res.status === 404) {
         // Deleted, or a stale link: nothing to show, poll or reply to. A
         // re-point (attributeChangedCallback) starts afresh.
@@ -666,7 +679,11 @@ class RetinueConversation extends HTMLElement {
       }
       if (!res.ok) throw new Error(String(res.status));
       const t = await res.json();
-      if (!t || (t.id && t.id !== this._id)) return;
+      if (this._id !== id) return;
+      if (!t || (t.id && t.id !== id)) return;
+      // A pin stored while this read was under way: the read's model is
+      // older than the picker's, which the pin's own read confirms.
+      if (gen !== pinGen(id) && this._thread) { t.model = this._thread.model; t.escalated = this._thread.escalated; }
       this._thread = t;
       this._missing = false;
       if (t.unread) this._markRead();
@@ -1143,12 +1160,15 @@ class RetinueConversation extends HTMLElement {
       } else {
         // The reply went to the thread this element was on when it left;
         // by now it may show another, or the user may have left and come
-        // back to a new element on it. The response is applied to whatever
-        // shows that thread — never to another — and the host hears of the
-        // send under the thread's own id either way.
+        // back to a new element on it. The response is applied to, and
+        // announced by, whatever shows that thread — never another: a host
+        // hearing of a send from an element on some other thread would act
+        // on the wrong one.
         const target = this._liveFor(key);
-        if (target) target._thread = conv;
-        (target || this)._emit('retinue-sent', { id: key, conversation: conv });
+        if (target) {
+          target._thread = conv;
+          target._emit('retinue-sent', { id: key, conversation: conv });
+        }
         landed = target;
       }
     } catch (_err) {
@@ -1468,22 +1488,26 @@ class RetinueConversation extends HTMLElement {
   async _archive(archived) {
     if (this._busy || !this._id) return;
     const key = this._key();
-    this._archiving = true;
+    ARCHIVES.add(key);
     try {
       const res = await fetch(`/conversations/${encodeURIComponent(key)}/${archived ? 'archive' : 'unarchive'}`,
         { method: 'POST' });
       if (!res.ok) throw new Error(String(res.status));
-      // Applied to whatever shows that thread by now (see _liveFor).
+      // Applied to, and announced by, whatever shows that thread by now (see
+      // _liveFor) — never by a detached or re-pointed instance: a host
+      // hearing "archived" from an element on another thread would leave
+      // that one (the card returns to its list on the event).
       const target = this._liveFor(key);
-      if (target && target._thread) target._thread.archived = archived;
-      (target || this)._emit('retinue-archived', { id: key, archived });
+      if (target) {
+        if (target._thread) target._thread.archived = archived;
+        target._emit('retinue-archived', { id: key, archived });
+      }
     } catch (_err) {
       // keep the thread open; a later read reconciles state
     } finally {
-      this._archiving = false;
-      if (this.isConnected) this.render();
-      const other = LIVE.get(key);
-      if (other && other !== this && other.isConnected) other.render();
+      ARCHIVES.delete(key);
+      const el = this._liveFor(key);
+      if (el) el.render();
     }
   }
 
