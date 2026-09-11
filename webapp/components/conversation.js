@@ -1040,8 +1040,13 @@ class RetinueConversation extends HTMLElement {
         adopter = this.isConnected ? this : (LIVE.get(key) || null);
         if (adopter) adopter._becomeCreated(conv);
       } else {
-        this._thread = conv;
-        this._emit('retinue-sent', { id: this._id, conversation: conv });
+        // The reply went to the thread this element was on when it left;
+        // by now it may show another. The response is applied to whatever
+        // shows that thread — never to the new one — and the host hears of
+        // the send under the thread's own id either way.
+        const target = this._key() === key ? this : LIVE.get(key);
+        if (target) target._thread = conv;
+        (target || this)._emit('retinue-sent', { id: key, conversation: conv });
       }
     } catch (_err) {
       // A soft failure: the draft stays in the input for a retry.
@@ -1347,18 +1352,24 @@ class RetinueConversation extends HTMLElement {
 
   async _archive(archived) {
     if (this._busy || !this._id) return;
+    const key = this._key();
     this._archiving = true;
     try {
-      const res = await fetch(`/conversations/${encodeURIComponent(this._id)}/${archived ? 'archive' : 'unarchive'}`,
+      const res = await fetch(`/conversations/${encodeURIComponent(key)}/${archived ? 'archive' : 'unarchive'}`,
         { method: 'POST' });
       if (!res.ok) throw new Error(String(res.status));
-      if (this._thread) this._thread.archived = archived;
-      this._emit('retinue-archived', { id: this._id, archived });
+      // Applied to whatever shows that thread by now — this element, unless
+      // it has been pointed at another one meanwhile (see _send).
+      const target = this._key() === key ? this : LIVE.get(key);
+      if (target && target._thread) target._thread.archived = archived;
+      (target || this)._emit('retinue-archived', { id: key, archived });
     } catch (_err) {
       // keep the thread open; a later read reconciles state
     } finally {
       this._archiving = false;
       if (this.isConnected) this.render();
+      const other = LIVE.get(key);
+      if (other && other !== this && other.isConnected) other.render();
     }
   }
 

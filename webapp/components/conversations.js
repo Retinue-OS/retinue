@@ -90,15 +90,19 @@ class RetinueConversations extends HTMLElement {
     this._offFrame = onFrameChange(() => { if (!this._full) this.render(); });
     // What the open conversation tells this card. The events bubble out of
     // the element (and out of the read-aloud bar in the list), so one set of
-    // listeners on the host covers every render.
-    this.addEventListener('retinue-back', () => this._openList());
-    this.addEventListener('retinue-created', (e) => this._onCreated(e.detail || {}));
-    this.addEventListener('retinue-archived', () => { this._openList(); this.refresh(); });
-    this.addEventListener('retinue-sent', () => this.refresh());
-    this.addEventListener('retinue-open', (e) => {
-      const id = e.detail && e.detail.id;
-      if (id) this._openThread(id);
-    });
+    // listeners on the host covers every render — and every connection:
+    // listeners on the host outlive a disconnect, so they go on once.
+    if (!this._listening) {
+      this._listening = true;
+      this.addEventListener('retinue-back', () => this._openList());
+      this.addEventListener('retinue-created', (e) => this._onCreated(e.detail || {}));
+      this.addEventListener('retinue-archived', () => { this._openList(); this.refresh(); });
+      this.addEventListener('retinue-sent', () => this.refresh());
+      this.addEventListener('retinue-open', (e) => {
+        const id = e.detail && e.detail.id;
+        if (id) this._openThread(id);
+      });
+    }
     this.render();
     this.refresh();
     this._timer = setInterval(() => this.refresh(), POLL_MS);
