@@ -497,7 +497,7 @@ class RetinueConversation extends HTMLElement {
     this._adopting = false;  // the id is being set from within (a created thread)
     // Voice: record a message (server transcribes) — the recorder is one per
     // element, its job (see VOICE_JOBS) belongs to the conversation.
-    this._recState = 'idle'; // idle | recording
+    this._recState = 'idle'; // idle | acquiring | recording
     this._recChunks = [];
     this._mediaRecorder = null;
     this._recStream = null;
@@ -1019,6 +1019,8 @@ class RetinueConversation extends HTMLElement {
     // re-created for this key while the message is on the wire is locked
     // the same way, so it cannot send the text a second time.
     this.render();
+    // The element that becomes the created thread, if any (see below).
+    let adopter = null;
     try {
       const conv = await sendMessage(this._id, text, sent.files, this._seed(), this._newModel);
       // Clear what went out and only that: the draft may have grown
@@ -1029,7 +1031,14 @@ class RetinueConversation extends HTMLElement {
       d.files = d.files.filter((f) => !sent.files.includes(f));
       this._attachError = '';
       if (!this._id) {
-        this._becomeCreated(conv);
+        // The composer that opened the thread goes on as it: this element,
+        // or the one re-created under its key while the send was in flight
+        // (the user left and came back — it is what they are looking at,
+        // and the host hears of the thread from it). None live, and the
+        // thread simply turns up in the list; a detached element never
+        // poses as it.
+        adopter = this.isConnected ? this : (LIVE.get(key) || null);
+        if (adopter) adopter._becomeCreated(conv);
       } else {
         this._thread = conv;
         this._emit('retinue-sent', { id: this._id, conversation: conv });
@@ -1042,10 +1051,11 @@ class RetinueConversation extends HTMLElement {
       this.render();
       this._schedulePoll();
       // The element live under this key may be another one by now — the
-      // composer the user came back to while the send was in flight. It
-      // shows the outcome too: the input unlocked, the sent text gone.
-      const other = LIVE.get(key);
-      if (other && other !== this) other.render();
+      // composer the user came back to while the send was in flight, which
+      // may just have become the thread. It shows the outcome too: the
+      // input unlocked and the sent text gone, or the thread it now is.
+      const other = adopter || LIVE.get(key);
+      if (other && other !== this) { other._focusNext = true; other.render(); }
     }
   }
 
@@ -1146,8 +1156,20 @@ class RetinueConversation extends HTMLElement {
       this.render();
       return;
     }
+    // Acquiring counts from the first tap: a second tap while the permission
+    // prompt is up must not open a second microphone.
+    this._recState = 'acquiring';
+    this.render();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // The prompt may have been up a while. Torn down meanwhile (the user
+      // left) or pointed at another thread, this element releases the
+      // microphone it just got instead of recording off screen.
+      if (!this.isConnected || this._key() !== key) {
+        stream.getTracks().forEach((tr) => tr.stop());
+        this._recState = 'idle';
+        return;
+      }
       this._recStream = stream;
       this._recChunks = [];
       this._recIntent = null;
@@ -1173,7 +1195,7 @@ class RetinueConversation extends HTMLElement {
       this._recState = 'idle';
       this._attachError = 'Microphone access was denied.';
       this._stopStream();
-      this.render();
+      if (this.isConnected) this.render();
     }
   }
 
