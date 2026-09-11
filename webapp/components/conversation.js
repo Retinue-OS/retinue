@@ -121,6 +121,10 @@ const MODEL_PINS = new Map();
 // carries a model older than the picker's, and keeps its hands off it.
 const PIN_GEN = new Map();
 function pinGen(id) { return PIN_GEN.get(id) || 0; }
+// Threads whose latest pin the gateway refused: the picker may still show
+// that choice, so a send waits until a pin is stored or a read has put the
+// server's model back into the picker (see _load).
+const FAILED_PINS = new Set();
 // Archives in flight, by key — like sends, so any element showing the
 // thread is locked meanwhile and no other element ever is.
 const ARCHIVES = new Set();
@@ -139,14 +143,19 @@ function pinModel(id, model) {
     }
   });
   MODEL_PINS.set(id, run);
-  run.then(() => { if (MODEL_PINS.get(id) === run) MODEL_PINS.delete(id); });
+  run.then((ok) => {
+    if (MODEL_PINS.get(id) !== run) return;
+    MODEL_PINS.delete(id);
+    if (ok) FAILED_PINS.delete(id); else FAILED_PINS.add(id);
+  });
   return run;
 }
 // Resolves once no pin for the thread is queued or in flight — one started
 // while waiting is waited for too — to how the last one went (true when
-// there was none).
+// there was none, or the last one was stored, or a read has since put the
+// server's model back).
 async function settledPins(id) {
-  let ok = true;
+  let ok = !FAILED_PINS.has(id);
   for (;;) {
     const p = MODEL_PINS.get(id);
     if (!p) return ok;
@@ -574,6 +583,7 @@ class RetinueConversation extends HTMLElement {
     this._recChunks = [];
     this._mediaRecorder = null;
     this._recStream = null;
+    this._recKey = '';       // the key the recording under way was started for
     this._recIntent = null;  // what to do with the transcript: 'review' | 'send'
     this._recAborted = false;
     this._wave = new Waveform(this);
@@ -606,6 +616,10 @@ class RetinueConversation extends HTMLElement {
 
   attributeChangedCallback(name, was, now) {
     if (name !== 'conversation-id' || was === now || this._adopting || !this.isConnected) return;
+    // A recording under way belongs to the thread it was started in: it is
+    // finished for review there, as on leaving (disconnectedCallback) — the
+    // new thread must not show its controls, nor send its audio.
+    this._finishRecording('review');
     // Pointed at another thread: forget this one and read that one.
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
     this._stopPolling();
@@ -667,31 +681,40 @@ class RetinueConversation extends HTMLElement {
     // time an answer comes, the answer is dropped (a 404 for the old thread
     // must not mark the new one missing, nor its document replace it).
     const id = this._id;
+    // Pins queued for the thread are stored first, so the read reflects the
+    // latest pick; one queued during the read is caught by the generation.
+    await settledPins(id);
+    if (this._id !== id) return false;
     const gen = pinGen(id);
     try {
       const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store' });
-      if (this._id !== id) return;
+      if (this._id !== id) return false;
       if (res.status === 404) {
         // Deleted, or a stale link: nothing to show, poll or reply to. A
         // re-point (attributeChangedCallback) starts afresh.
         if (!this._missing) { this._missing = true; this._stopPolling(); this.render(); }
-        return;
+        return false;
       }
       if (!res.ok) throw new Error(String(res.status));
       const t = await res.json();
-      if (this._id !== id) return;
-      if (!t || (t.id && t.id !== id)) return;
+      if (this._id !== id) return false;
+      if (!t || (t.id && t.id !== id)) return false;
       // A pin stored while this read was under way: the read's model is
-      // older than the picker's, which the pin's own read confirms.
+      // older than the picker's, which the pin's own read confirms. No pin
+      // since, and the read's model is the server's truth — a refused pick,
+      // if any, is off the picker with it.
       if (gen !== pinGen(id) && this._thread) { t.model = this._thread.model; t.escalated = this._thread.escalated; }
+      if (gen === pinGen(id)) FAILED_PINS.delete(id);
       this._thread = t;
       this._missing = false;
       if (t.unread) this._markRead();
       this._maybeAutoplay(t);
       this._restorePosition(t);
-      this._emit('retinue-thread', { id: this._id, conversation: t });
+      this._emit('retinue-thread', { id, conversation: t });
+      return true;
     } catch (_err) {
       // Offline or gateway down: keep the last rendered state.
+      return false;
     }
   }
 
@@ -1085,7 +1108,7 @@ class RetinueConversation extends HTMLElement {
     // is transcribed (and, on the send path, sent). The textarea stays out of
     // the DOM for the entire flow, so the phone keyboard never pops up
     // mid-dictation.
-    if (this._recState === 'recording') {
+    if (this._recState === 'recording' && this._recKey === key) {
       return `<div class="composer">` + chipRow + errRow + recordingRowHtml() + `</div>`;
     }
     const job = VOICE_JOBS.get(key);
@@ -1324,6 +1347,7 @@ class RetinueConversation extends HTMLElement {
       mr.addEventListener('stop', () => this._onRecordingStopped(key, seed, model));
       mr.start();
       this._recState = 'recording';
+      this._recKey = key;
       this._attachError = '';
       this.render();
       this._wave.start(stream);
@@ -1387,6 +1411,9 @@ class RetinueConversation extends HTMLElement {
     const aborted = this._recAborted;
     this._recAborted = false;
     this._recState = 'idle';
+    // Pointed at another thread since (attributeChangedCallback): that
+    // thread's row is refreshed at the end, its mic having been held.
+    const moved = this.isConnected && this._key() !== key;
     if (aborted || !chunks.length) {
       if (this.isConnected) this.render();
       return;
@@ -1462,6 +1489,7 @@ class RetinueConversation extends HTMLElement {
       el._focusNext = intent === 'review';
       el.render();
     }
+    if (moved && el !== this) this.render();
   }
 
   // ── Model, archive, autoplay ───────────────────────────────────────────────

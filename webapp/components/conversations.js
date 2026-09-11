@@ -86,8 +86,10 @@ class RetinueConversations extends HTMLElement {
     // for that fragment change is implementation-dependent.
     window.addEventListener('hashchange', this._onPop);
     // Crossing the layout breakpoint changes how many threads fit (see
-    // _shownThreads), so re-render when it flips.
-    this._offFrame = onFrameChange(() => { if (!this._full) this.render(); });
+    // _shownThreads), so re-render when it flips — the list only: an open
+    // thread or composer is torn down by a render, which would finish a
+    // dictation under way as if the user had left.
+    this._offFrame = onFrameChange(() => { if (!this._full && !this._active && !this._composing) this.render(); });
     // What the open conversation tells this card. The events bubble out of
     // the element (and out of the read-aloud bar in the list), so one set of
     // listeners on the host covers every render — and every connection:
