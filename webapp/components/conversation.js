@@ -179,6 +179,18 @@ function appendToDraft(key, text) {
   const d = draftOf(key);
   d.text = d.text ? `${d.text.replace(/\s*$/, '')} ${text}` : text;
 }
+// The composer under `key` just opened thread `id`: its model choice is
+// spent on that thread, and its draft object goes on as the thread's — a
+// file read that finishes after the send (see _addFiles) holds that object,
+// and the attachment belongs to the thread now, not to the composer opened
+// next. Whether an element adopted the thread makes no difference here.
+function threadOpened(key, id) {
+  const d = DRAFTS.get(key);
+  if (!d) return;
+  d.model = '';
+  DRAFTS.delete(key);
+  DRAFTS.set(String(id), d);
+}
 
 function fmtSize(n) {
   if (!Number.isFinite(n) || n <= 0) return '';
@@ -560,6 +572,14 @@ class RetinueConversation extends HTMLElement {
   // Locked while this conversation's send is on the wire — whichever element
   // instance started it, as sends are tracked by key — or an archive is.
   get _busy() { return SENDS.has(this._key()) || this._archiving; }
+  // Where a finished operation lands: this element while it is still
+  // connected and still on the key the operation started under; otherwise
+  // whatever is live under that key now — the element the user came back
+  // to — or nothing. A detached element, or one the host has pointed at
+  // another thread meanwhile, never takes the result.
+  _liveFor(key) {
+    return (this.isConnected && this._key() === key) ? this : (LIVE.get(key) || null);
+  }
   // The model picked for the thread about to open. Module state like the
   // draft it belongs to: the element is torn down whenever the host leaves
   // the composer, and a choice made before the first message must survive
@@ -1022,7 +1042,7 @@ class RetinueConversation extends HTMLElement {
     // The element that becomes the created thread, if any (see below).
     let adopter = null;
     try {
-      const conv = await sendMessage(this._id, text, sent.files, this._seed(), this._newModel);
+      const conv = await sendMessage(isNewKey(key) ? '' : key, text, sent.files, this._seed(), this._newModel);
       // Clear what went out and only that: the draft may have grown
       // meanwhile — a chip clicked in the thread, a dictation finished in
       // the background — and what it grew by stays.
@@ -1030,21 +1050,27 @@ class RetinueConversation extends HTMLElement {
       d.text = d.text.startsWith(base) ? d.text.slice(base.length).trimStart() : d.text;
       d.files = d.files.filter((f) => !sent.files.includes(f));
       this._attachError = '';
-      if (!this._id) {
+      // Which kind of send this was is a property of the key it started
+      // under, not of what the element shows by now.
+      if (isNewKey(key)) {
         // The composer that opened the thread goes on as it: this element,
-        // or the one re-created under its key while the send was in flight
-        // (the user left and came back — it is what they are looking at,
-        // and the host hears of the thread from it). None live, and the
-        // thread simply turns up in the list; a detached element never
-        // poses as it.
-        adopter = this.isConnected ? this : (LIVE.get(key) || null);
+        // still the composer under its key, or the one re-created under that
+        // key while the send was in flight (the user left and came back — it
+        // is what they are looking at, and the host hears of the thread from
+        // it). None live, and the thread simply turns up in the list; a
+        // detached element, or one the host has pointed at another thread
+        // meanwhile, never poses as it. Either way the composer's input is
+        // spent on the thread.
+        adopter = this._liveFor(key);
         if (adopter) adopter._becomeCreated(conv);
+        threadOpened(key, conv.id);
       } else {
         // The reply went to the thread this element was on when it left;
-        // by now it may show another. The response is applied to whatever
-        // shows that thread — never to the new one — and the host hears of
-        // the send under the thread's own id either way.
-        const target = this._key() === key ? this : LIVE.get(key);
+        // by now it may show another, or the user may have left and come
+        // back to a new element on it. The response is applied to whatever
+        // shows that thread — never to another — and the host hears of the
+        // send under the thread's own id either way.
+        const target = this._liveFor(key);
         if (target) target._thread = conv;
         (target || this)._emit('retinue-sent', { id: key, conversation: conv });
       }
@@ -1064,11 +1090,10 @@ class RetinueConversation extends HTMLElement {
     }
   }
 
-  // A first message opened a thread: go on as it. The composer's model
-  // choice is consumed — this thread carries it now — and the host hears
-  // of the thread before the send.
+  // A first message opened a thread: go on as it, and the host hears of the
+  // thread before the send. The composer's input is spent by the caller
+  // (threadOpened), whether or not an element was there to adopt.
   _becomeCreated(conv) {
-    this._newModel = '';
     this._adopt(conv);
     this._emit('retinue-created', { id: this._id, conversation: conv });
     this._emit('retinue-sent', { id: this._id, conversation: conv });
@@ -1316,6 +1341,7 @@ class RetinueConversation extends HTMLElement {
           draftOf(key).files = [];
           const now = live();
           if (isNewKey(key) && now) { now._becomeCreated(conv); adopted = now; }
+          if (isNewKey(key)) threadOpened(key, conv.id);
         } catch (_err) { /* the draft stays for a manual retry */ }
       }
     }
@@ -1358,9 +1384,8 @@ class RetinueConversation extends HTMLElement {
       const res = await fetch(`/conversations/${encodeURIComponent(key)}/${archived ? 'archive' : 'unarchive'}`,
         { method: 'POST' });
       if (!res.ok) throw new Error(String(res.status));
-      // Applied to whatever shows that thread by now — this element, unless
-      // it has been pointed at another one meanwhile (see _send).
-      const target = this._key() === key ? this : LIVE.get(key);
+      // Applied to whatever shows that thread by now (see _liveFor).
+      const target = this._liveFor(key);
       if (target && target._thread) target._thread.archived = archived;
       (target || this)._emit('retinue-archived', { id: key, archived });
     } catch (_err) {

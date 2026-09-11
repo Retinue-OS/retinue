@@ -135,8 +135,13 @@ class RetinueConversations extends HTMLElement {
     }
     const cm = COMPOSER_HASH_RE.exec(hash);
     if (cm) {
+      // The project context is snapshotted into the element's attributes at
+      // render time, so a change of context while composing re-renders.
+      const was = `${this._composeProject || ''}\n${this._composeProjectTitle}`;
       this._setComposeProject(cm[1]);
+      const now = `${this._composeProject || ''}\n${this._composeProjectTitle}`;
       if (!this._composing) this._showComposer();
+      else if (now !== was) this.render();
       return;
     }
     if (this._active || this._composing) this._showList();
