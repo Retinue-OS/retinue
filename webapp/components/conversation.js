@@ -105,6 +105,9 @@ const VOICE_JOBS = new Map();
 // Transcription errors per key, surfaced by that conversation's composer —
 // a background job's failure must not pop up in whatever is open.
 const VOICE_ERRORS = new Map();
+// Picked files still being read (see _addFiles): unsent input that no draft
+// holds yet, so hasUnsentInput counts them.
+let FILE_READS = 0;
 // Sends in flight per key: the snapshot that went out ({text, files}).
 // Module state like the drafts: a composer torn down and re-created while
 // its message is on the wire (the user left and came back) renders as
@@ -192,10 +195,11 @@ document.addEventListener('visibilitychange', () => {
 });
 
 // True while a page reload would lose typed-but-unsent input in any
-// conversation, or a dictation still being transcribed or sent for one —
-// components/update.js consults this before auto-reloading.
+// conversation, a dictation still being transcribed or sent for one, or a
+// picked file still being read — components/update.js consults this before
+// auto-reloading.
 export function hasUnsentInput() {
-  if (VOICE_JOBS.size) return true;
+  if (VOICE_JOBS.size || FILE_READS) return true;
   for (const d of DRAFTS.values()) {
     if ((d.text && d.text.trim()) || (d.files && d.files.length)) return true;
   }
@@ -657,6 +661,12 @@ class RetinueConversation extends HTMLElement {
   // another thread meanwhile, never takes the result.
   _liveFor(key) {
     return (this.isConnected && this._key() === key) ? this : (LIVE.get(key) || null);
+  }
+  // Install a document newer than any read in flight — a reply just sent, a
+  // thread just opened — so an older answer landing later is dropped.
+  _take(conv) {
+    this._loadSeq += 1;
+    this._thread = conv;
   }
   // The model picked for the thread about to open. Module state like the
   // draft it belongs to: the element is torn down whenever the host leaves
@@ -1180,6 +1190,7 @@ class RetinueConversation extends HTMLElement {
       const conv = await sendMessage(isNewKey(key) ? '' : key, text, sent.files, this._seed(), this._newModel);
       clearSent(d, text, sent.files);
       this._attachError = '';
+      VOICE_ERRORS.delete(key); // a failed dictation's note, moot once a send went out
       // Which kind of send this was is a property of the key it started
       // under, not of what the element shows by now.
       if (isNewKey(key)) {
@@ -1204,7 +1215,7 @@ class RetinueConversation extends HTMLElement {
         // on the wrong one.
         const target = this._liveFor(key);
         if (target) {
-          target._thread = conv;
+          target._take(conv);
           target._emit('retinue-sent', { id: key, conversation: conv });
         }
         landed = target;
@@ -1243,7 +1254,7 @@ class RetinueConversation extends HTMLElement {
   _adopt(conv) {
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
     this._id = String(conv.id);
-    this._thread = conv;
+    this._take(conv);
     this._adopting = true;
     try { this.setAttribute('conversation-id', this._id); } finally { this._adopting = false; }
     LIVE.set(this._key(), this);
@@ -1255,26 +1266,31 @@ class RetinueConversation extends HTMLElement {
   async _addFiles(fileList) {
     const d = draftOf(this._key());
     let error = '';
-    for (const file of Array.from(fileList || [])) {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        error = `"${file.name}" is too large (max ${fmtSize(MAX_ATTACHMENT_BYTES)}).`;
-        continue;
-      }
-      try {
-        const buf = new Uint8Array(await file.arrayBuffer());
-        let binary = '';
-        for (let i = 0; i < buf.length; i += 0x8000) {
-          binary += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    FILE_READS += 1;
+    try {
+      for (const file of Array.from(fileList || [])) {
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          error = `"${file.name}" is too large (max ${fmtSize(MAX_ATTACHMENT_BYTES)}).`;
+          continue;
         }
-        d.files.push({
-          name: file.name,
-          type: file.type || 'application/octet-stream',
-          size: file.size,
-          data: btoa(binary),
-        });
-      } catch (_err) {
-        error = `Couldn't read "${file.name}".`;
+        try {
+          const buf = new Uint8Array(await file.arrayBuffer());
+          let binary = '';
+          for (let i = 0; i < buf.length; i += 0x8000) {
+            binary += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+          }
+          d.files.push({
+            name: file.name,
+            type: file.type || 'application/octet-stream',
+            size: file.size,
+            data: btoa(binary),
+          });
+        } catch (_err) {
+          error = `Couldn't read "${file.name}".`;
+        }
       }
+    } finally {
+      FILE_READS -= 1;
     }
     // The reads may have outlived this element, or the draft may have gone
     // on as a thread's (threadOpened): the outcome shows on whatever element
@@ -1499,7 +1515,7 @@ class RetinueConversation extends HTMLElement {
           } else if (now) {
             // The thread was reopened while the send was on the wire: it
             // shows the reply and the host hears of it, as after _send.
-            now._thread = conv;
+            now._take(conv);
             now._emit('retinue-sent', { id: key, conversation: conv });
           }
         } catch (_err) { /* the draft stays for a manual retry */ }
@@ -1550,6 +1566,7 @@ class RetinueConversation extends HTMLElement {
       // that one (the card returns to its list on the event).
       const target = this._liveFor(key);
       if (target) {
+        target._loadSeq += 1; // a read in flight would put the old flag back
         if (target._thread) target._thread.archived = archived;
         target._emit('retinue-archived', { id: key, archived });
       }
