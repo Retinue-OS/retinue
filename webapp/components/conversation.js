@@ -111,6 +111,41 @@ const VOICE_ERRORS = new Map();
 // sending too, so no second copy can go out, and the outcome lands in
 // whichever element is live when it comes.
 const SENDS = new Map();
+// Model pins in flight per thread: a promise chain, so rapid re-selections
+// are stored in order, and a send waits for the pins queued before it (see
+// _send) — the gateway serves requests concurrently, so a turn posted right
+// after a pick could otherwise start on the model the picker no longer
+// shows. Each entry resolves to whether the gateway stored that pin.
+const MODEL_PINS = new Map();
+function pinModel(id, model) {
+  const prev = MODEL_PINS.get(id) || Promise.resolve(true);
+  const run = prev.then(async () => {
+    try {
+      const res = await fetch(`/conversations/${encodeURIComponent(id)}/model`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model }),
+      });
+      return res.ok;
+    } catch (_err) {
+      return false;
+    }
+  });
+  MODEL_PINS.set(id, run);
+  run.then(() => { if (MODEL_PINS.get(id) === run) MODEL_PINS.delete(id); });
+  return run;
+}
+// Resolves once no pin for the thread is queued or in flight — one started
+// while waiting is waited for too — to how the last one went (true when
+// there was none).
+async function settledPins(id) {
+  let ok = true;
+  for (;;) {
+    const p = MODEL_PINS.get(id);
+    if (!p) return ok;
+    ok = await p;
+    if (MODEL_PINS.get(id) === p) return ok;
+  }
+}
 // The connected element per key, so a job that outlived its element can
 // still refresh the thread if the user is back on it.
 const LIVE = new Map();
@@ -525,6 +560,7 @@ class RetinueConversation extends HTMLElement {
     this._threadSig = '';
     this._pollTimer = null;
     this._adopting = false;  // the id is being set from within (a created thread)
+    this._missing = false;   // the id points at no thread (the read said 404)
     // Voice: record a message (server transcribes) — the recorder is one per
     // element, its job (see VOICE_JOBS) belongs to the conversation.
     this._recState = 'idle'; // idle | acquiring | recording
@@ -570,6 +606,7 @@ class RetinueConversation extends HTMLElement {
     this._thread = null;
     this._threadSig = '';
     this._attachError = '';
+    this._missing = false;
     LIVE.set(this._key(), this);
     this._focusNext = true;
     this.render();
@@ -621,10 +658,17 @@ class RetinueConversation extends HTMLElement {
     if (!this._id) return;
     try {
       const res = await fetch(`/conversations/${encodeURIComponent(this._id)}`, { cache: 'no-store' });
+      if (res.status === 404) {
+        // Deleted, or a stale link: nothing to show, poll or reply to. A
+        // re-point (attributeChangedCallback) starts afresh.
+        if (!this._missing) { this._missing = true; this._stopPolling(); this.render(); }
+        return;
+      }
       if (!res.ok) throw new Error(String(res.status));
       const t = await res.json();
       if (!t || (t.id && t.id !== this._id)) return;
       this._thread = t;
+      this._missing = false;
       if (t.unread) this._markRead();
       this._maybeAutoplay(t);
       this._restorePosition(t);
@@ -641,7 +685,7 @@ class RetinueConversation extends HTMLElement {
 
   _schedulePoll() {
     this._stopPolling();
-    if (!this._id) return;
+    if (!this._id || this._missing) return;
     const pending = !!(this._thread && this._thread.pending);
     this._pollTimer = setTimeout(() => this._poll(), pending ? PENDING_POLL_MS : POLL_MS);
   }
@@ -672,9 +716,10 @@ class RetinueConversation extends HTMLElement {
     const t = this._thread;
     if (!root || !t) return;
     // A cold start renders the frame before the thread is read, so the
-    // message container may not exist yet — only a full render introduces it.
+    // message container, or the reply row that waits for the first read,
+    // may not exist yet — only a full render introduces them.
     const threadEl = root.querySelector('.thread');
-    if (!threadEl) { this.render(); return; }
+    if (!threadEl || !root.querySelector('.composer')) { this.render(); return; }
     const titleEl = root.querySelector('[data-title]');
     if (titleEl) {
       const want = t.title || 'Conversation';
@@ -724,7 +769,10 @@ class RetinueConversation extends HTMLElement {
       this._barHtml() +
       (mode === 'thread' ? this._threadHtml() : this._newHtml()) +
       `<retinue-read-aloud here="${here}"></retinue-read-aloud>` +
-      this._inputRow(mode === 'thread' ? 'Reply …' : 'Ask Ara something …') +
+      // A thread's reply row waits for the thread document: a cold link to
+      // a deleted or misspelt thread must not offer a reply that could only
+      // fail. The new-thread composer needs no document.
+      (mode === 'thread' && !this._thread ? '' : this._inputRow(mode === 'thread' ? 'Reply …' : 'Ask Ara something …')) +
       `</div>`;
     this._threadSig = this._thread ? this._signature(this._thread) : '';
     this._wire();
@@ -743,7 +791,8 @@ class RetinueConversation extends HTMLElement {
     }
     const t = this._thread;
     if (!t) {
-      return `<div class="thread-bar">${back}<span class="bar-title muted" data-title>&#8230;</span></div>`;
+      const title = this._missing ? 'Conversation not found' : '&#8230;';
+      return `<div class="thread-bar">${back}<span class="bar-title muted" data-title>${title}</span></div>`;
     }
     const archiveBtn = t.archived
       ? '<button class="pill" data-unarchive>Unarchive</button>'
@@ -761,6 +810,10 @@ class RetinueConversation extends HTMLElement {
 
   _threadHtml() {
     const t = this._thread;
+    if (this._missing) {
+      return `<div class="thread"><div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span>` +
+        `<p>This conversation is no longer here.</p></div></div>`;
+    }
     if (!t) return `<div class="thread"></div>`;
     return `<div class="thread">${this._messagesHtml(t)}</div>`;
   }
@@ -1057,9 +1110,18 @@ class RetinueConversation extends HTMLElement {
     // re-created for this key while the message is on the wire is locked
     // the same way, so it cannot send the text a second time.
     this.render();
-    // The element that becomes the created thread, if any (see below).
-    let adopter = null;
+    // Where the send landed (see _liveFor), for the cleanup below.
+    let landed = null;
     try {
+      // A model pin still in flight is stored before this turn starts, or
+      // the gateway may run it on the model the picker no longer shows; a
+      // pin it refused means the turn does not go out (the picker shows the
+      // server's model again by then, see _onModelChange).
+      if (!isNewKey(key) && !(await settledPins(key))) {
+        const el = this._liveFor(key);
+        if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
+        return;
+      }
       const conv = await sendMessage(isNewKey(key) ? '' : key, text, sent.files, this._seed(), this._newModel);
       clearSent(d, text, sent.files);
       this._attachError = '';
@@ -1074,9 +1136,10 @@ class RetinueConversation extends HTMLElement {
         // detached element, or one the host has pointed at another thread
         // meanwhile, never poses as it. Either way the composer's input is
         // spent on the thread.
-        adopter = this._liveFor(key);
+        const adopter = this._liveFor(key);
         if (adopter) adopter._becomeCreated(conv);
         threadOpened(key, conv.id);
+        landed = adopter;
       } else {
         // The reply went to the thread this element was on when it left;
         // by now it may show another, or the user may have left and come
@@ -1086,20 +1149,22 @@ class RetinueConversation extends HTMLElement {
         const target = this._liveFor(key);
         if (target) target._thread = conv;
         (target || this)._emit('retinue-sent', { id: key, conversation: conv });
+        landed = target;
       }
     } catch (_err) {
       // A soft failure: the draft stays in the input for a retry.
     } finally {
       SENDS.delete(key);
-      this._focusNext = true;
-      this.render();
-      this._schedulePoll();
-      // The element live under this key may be another one by now — the
-      // composer the user came back to while the send was in flight, which
-      // may just have become the thread. It shows the outcome too: the
-      // input unlocked and the sent text gone, or the thread it now is.
-      const other = adopter || LIVE.get(key);
-      if (other && other !== this) { other._focusNext = true; other.render(); }
+      // Unlock, render and poll where the send landed — or, when it did not
+      // go out, wherever the kept draft shows now (see _liveFor). A detached
+      // or re-pointed instance is left alone: this send is no longer its
+      // concern, and a render would move its scroll and focus.
+      const el = landed || this._liveFor(key);
+      if (el) {
+        el._focusNext = true;
+        el.render();
+        el._schedulePoll();
+      }
     }
   }
 
@@ -1356,6 +1421,12 @@ class RetinueConversation extends HTMLElement {
         // cleared here. A composer live under this key is by construction
         // the one this was dictated in: it goes on as the new thread.
         try {
+          // As in _send: a thread's pins are stored first, and a refused one
+          // keeps the dictation in the draft.
+          if (!isNewKey(key) && !(await settledPins(key))) {
+            VOICE_ERRORS.set(key, "The model choice wasn't saved. Please pick it again.");
+            throw new Error('model');
+          }
           const sentFiles = draftOf(key).files.slice();
           const conv = await sendMessage(isNewKey(key) ? '' : key, toSend, sentFiles, seed, model);
           clearSent(draftOf(key), toSend, sentFiles);
@@ -1383,15 +1454,13 @@ class RetinueConversation extends HTMLElement {
       this._newModel = model;
       return;
     }
-    // Optimistic: reflect it locally, then persist. On failure the next read
-    // restores the server's value.
+    const id = this._id;
+    // Optimistic: reflect it locally, then persist — in order behind any
+    // earlier pin, and ahead of the next send (pinModel). On failure the
+    // read below puts the server's value back in the picker.
     if (this._thread) { this._thread.model = model; this._thread.escalated = false; }
-    try {
-      await fetch(`/conversations/${encodeURIComponent(this._id)}/model`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model }),
-      });
-    } catch (_err) { /* the next read re-syncs the real value */ }
+    await pinModel(id, model);
+    if (this._id !== id) return; // pointed elsewhere meanwhile
     await this._load();
     this._partialUpdate();
   }
