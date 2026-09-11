@@ -105,6 +105,12 @@ const VOICE_JOBS = new Map();
 // Transcription errors per key, surfaced by that conversation's composer —
 // a background job's failure must not pop up in whatever is open.
 const VOICE_ERRORS = new Map();
+// Sends in flight per key: the snapshot that went out ({text, files}).
+// Module state like the drafts: a composer torn down and re-created while
+// its message is on the wire (the user left and came back) renders as
+// sending too, so no second copy can go out, and the outcome lands in
+// whichever element is live when it comes.
+const SENDS = new Map();
 // The connected element per key, so a job that outlived its element can
 // still refresh the thread if the user is back on it.
 const LIVE = new Map();
@@ -482,7 +488,7 @@ class RetinueConversation extends HTMLElement {
     super();
     this._id = '';           // the thread; '' while this is a new-thread composer
     this._thread = null;     // the thread document as last read
-    this._busy = false;      // a send or an archive is in flight
+    this._archiving = false; // an archive is in flight (sends: SENDS, by key)
     this._attachError = '';  // last attach error (e.g. file too big)
     this._focusNext = false; // focus the input after the next render
     this._hadFocus = false;  // the input had focus before the current re-render
@@ -551,6 +557,9 @@ class RetinueConversation extends HTMLElement {
   }
 
   _key() { return this._id || newKey(this._seed()); }
+  // Locked while this conversation's send is on the wire — whichever element
+  // instance started it, as sends are tracked by key — or an archive is.
+  get _busy() { return SENDS.has(this._key()) || this._archiving; }
   // The model picked for the thread about to open. Module state like the
   // draft it belongs to: the element is torn down whenever the host leaves
   // the composer, and a choice made before the first message must survive
@@ -1001,13 +1010,23 @@ class RetinueConversation extends HTMLElement {
   async _send(text) {
     const key = this._key();
     const d = draftOf(key);
-    // A message needs text or at least one attachment.
+    // A message needs text or at least one attachment; one send at a time.
     if (this._busy || (!text.trim() && !d.files.length)) return;
-    this._busy = true;
+    const sent = { text, files: d.files.slice() };
+    SENDS.set(key, sent);
+    // The composer locks now, not once the send is over: nothing typed or
+    // picked meanwhile can be lost to the clear below, and a composer
+    // re-created for this key while the message is on the wire is locked
+    // the same way, so it cannot send the text a second time.
+    this.render();
     try {
-      const conv = await sendMessage(this._id, text, d.files, this._seed(), this._newModel);
-      d.text = '';
-      d.files = [];
+      const conv = await sendMessage(this._id, text, sent.files, this._seed(), this._newModel);
+      // Clear what went out and only that: the draft may have grown
+      // meanwhile — a chip clicked in the thread, a dictation finished in
+      // the background — and what it grew by stays.
+      const base = text.replace(/\s*$/, '');
+      d.text = d.text.startsWith(base) ? d.text.slice(base.length).trimStart() : d.text;
+      d.files = d.files.filter((f) => !sent.files.includes(f));
       this._attachError = '';
       if (!this._id) {
         this._becomeCreated(conv);
@@ -1018,10 +1037,15 @@ class RetinueConversation extends HTMLElement {
     } catch (_err) {
       // A soft failure: the draft stays in the input for a retry.
     } finally {
-      this._busy = false;
+      SENDS.delete(key);
       this._focusNext = true;
       this.render();
       this._schedulePoll();
+      // The element live under this key may be another one by now — the
+      // composer the user came back to while the send was in flight. It
+      // shows the outcome too: the input unlocked, the sent text gone.
+      const other = LIVE.get(key);
+      if (other && other !== this) other.render();
     }
   }
 
@@ -1301,7 +1325,7 @@ class RetinueConversation extends HTMLElement {
 
   async _archive(archived) {
     if (this._busy || !this._id) return;
-    this._busy = true;
+    this._archiving = true;
     try {
       const res = await fetch(`/conversations/${encodeURIComponent(this._id)}/${archived ? 'archive' : 'unarchive'}`,
         { method: 'POST' });
@@ -1311,7 +1335,7 @@ class RetinueConversation extends HTMLElement {
     } catch (_err) {
       // keep the thread open; a later read reconciles state
     } finally {
-      this._busy = false;
+      this._archiving = false;
       if (this.isConnected) this.render();
     }
   }
