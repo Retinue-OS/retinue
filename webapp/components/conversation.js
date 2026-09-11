@@ -1035,7 +1035,11 @@ class RetinueConversation extends HTMLElement {
     this._emit('retinue-sent', { id: this._id, conversation: conv });
   }
 
-  // Become the thread a first message just opened.
+  // Become the thread a first message just opened. Polling starts here, as it
+  // does when the host points the element at a thread: the reply to that
+  // message is pending from this moment, whichever path sent it. Rendering
+  // stays with the caller, which knows what else just changed (a busy flag,
+  // a dictation job).
   _adopt(conv) {
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
     this._id = String(conv.id);
@@ -1043,6 +1047,7 @@ class RetinueConversation extends HTMLElement {
     this._adopting = true;
     try { this.setAttribute('conversation-id', this._id); } finally { this._adopting = false; }
     LIVE.set(this._key(), this);
+    this._schedulePoll();
   }
 
   // Read picked files into base64 (chunked, so large files don't overflow the
@@ -1232,6 +1237,11 @@ class RetinueConversation extends HTMLElement {
     } catch (_err) {
       VOICE_ERRORS.set(key, "Couldn't transcribe the recording. Please try again.");
     }
+    // The element this job reports into is whatever is live under its key —
+    // except a composer that adopts the thread its dictation just opened: it
+    // is live under that thread's id from then on, so it is held by
+    // reference, where the key would no longer find it.
+    let adopted = null;
     if (toSend) {
       // Send path: the status row stays in place of the textarea until the
       // send completes, so the keyboard never appears. On failure the draft
@@ -1254,12 +1264,12 @@ class RetinueConversation extends HTMLElement {
           draftOf(key).text = '';
           draftOf(key).files = [];
           const now = live();
-          if (isNewKey(key) && now) now._becomeCreated(conv);
+          if (isNewKey(key) && now) { now._becomeCreated(conv); adopted = now; }
         } catch (_err) { /* the draft stays for a manual retry */ }
       }
     }
     VOICE_JOBS.delete(key);
-    const el = live();
+    const el = adopted || live();
     if (el) {
       el._focusNext = intent === 'review';
       el.render();
