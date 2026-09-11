@@ -44,14 +44,26 @@ nothing new.
   layer is telemetry. Making it a boundary requires an `internal: true` network
   or in-container firewall rules, and is tracked as a roadmap item.
 - **The main session runs with broad tool permissions while processing
-  untrusted input.** A hostile message cannot read messaging or mailbox
-  credentials out of the agent's environment (other credentials the container
-  holds, such as a repo token or model-gateway keys, are not scrubbed the same
-  way), and an outbound send still has to clear the sending identity's policy
-  — but nothing authenticates who completes a pending `verify` approval, so
-  treat that as a workflow gate rather than a hard boundary. It can still
-  induce the agent to read across mounted chambers or write to them.
-  Reduced-privilege triage is a roadmap item.
+  untrusted input.** The messenger credentials (Signal keys, the WhatsApp and
+  Telegram sessions) live in their own containers, so a hostile message cannot
+  read them. The mailbox credentials are only partly out of reach: the
+  entrypoint strips `EMAIL_PASS*` from the main remote-control session and the
+  scheduler strips them from its jobs, and both then reach the mailbox through
+  the web gateway's e-mail backend — but the web gateway and the Ask-Ara server
+  are forked before that scrub and pass their whole environment on to the
+  sessions they spawn. A dashboard conversation therefore runs with
+  `EMAIL_PASS*`, and every other value in `.env`, in its own environment and
+  talks to IMAP/SMTP directly; for those sessions the e-mail send policy is a
+  rule the client applies, not a boundary. Scrubbing alone would not close
+  this: every process in the container runs as the same user, so any session
+  can read a daemon's `/proc/<pid>/environ`, and the repository token sits in
+  `~/.git-credentials`. Nothing authenticates who completes a pending `verify`
+  approval either, so treat send approval as a workflow gate rather than a hard
+  boundary. A hostile message can also induce the agent to read across mounted
+  chambers or write to them. The planned answer is to move secret-holding out
+  of the agent's container into sidecars, the way the messenger gateways
+  already work (retinue-os/retinue#15); reduced-privilege triage is a roadmap
+  item.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.
