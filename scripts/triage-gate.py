@@ -75,6 +75,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import news_ingest  # noqa: E402  (local, after sys.path tweak)
 import triage_policy as tp  # noqa: E402  (local, after sys.path tweak)
 import claude_auth  # noqa: E402  (local, after sys.path tweak)
+import session_env  # noqa: E402  (local, after sys.path tweak)
 
 EMAIL_CLIENT = os.environ.get("EMAIL_CLIENT_PATH", "/workspace/scripts/email_client.py")
 SENT_FOLDER = os.environ.get("SENT_FOLDER", "Sent")
@@ -407,7 +408,12 @@ def spawn(mode: str, messages: list[dict]) -> int:
     # once, under the lock every framework spawner shares (docs/claude-auth.md).
     claude_auth.ensure_fresh_credentials(
         log=lambda msg: print(f"[triage-gate] {msg}", file=sys.stderr))
-    return subprocess.run(cmd, cwd="/workspace").returncode
+    # The allowlisted environment (scripts/session_env.py), never this
+    # process's own — the triage session handles untrusted mail, so of all
+    # sessions it is the one that must not inherit a secret. Also stamps the
+    # model for memory entries (scripts/memory.py).
+    return subprocess.run(cmd, cwd="/workspace",
+                          env=session_env.build(model=CLAUDE_MODEL)).returncode
 
 
 def run_frequent() -> int:

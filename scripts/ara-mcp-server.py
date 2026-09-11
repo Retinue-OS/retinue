@@ -87,6 +87,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_auth  # noqa: E402
+import session_env  # noqa: E402
 
 IDENTITY = os.environ.get("ARA_MCP_IDENTITY", "").strip() or "Ara"
 SCOPE_HINT = os.environ.get("ARA_MCP_SCOPE_HINT", "").strip()
@@ -378,16 +379,13 @@ def _run_once(prompt: str, model: str,
         cmd += ["--model", model]
     for tool in FORBIDDEN_TOOLS:
         cmd += ["--disallowed-tools", tool]
-    # RETINUE_SESSION_MODEL advertises the model this session runs on (for
-    # memory stamping); cleared rather than inherited so a stale value never
-    # mislabels a session. RETINUE_ESCALATE_FILE is junior's escape hatch.
-    env = dict(os.environ)
-    env.pop("RETINUE_SESSION_MODEL", None)
-    env.pop("RETINUE_ESCALATE_FILE", None)
-    if model:
-        env["RETINUE_SESSION_MODEL"] = model
-    if escalate_flag is not None:
-        env["RETINUE_ESCALATE_FILE"] = str(escalate_flag)
+    # The session's environment comes from the allowlist in
+    # scripts/session_env.py, never from a copy of this daemon's (which holds
+    # whatever .env carries). RETINUE_SESSION_MODEL advertises the model this
+    # session runs on (for memory stamping), set per spawn so a stale value
+    # never mislabels a session; RETINUE_ESCALATE_FILE is junior's escape
+    # hatch.
+    env = session_env.build(model=model, escalate_file=escalate_flag)
     # The prompt goes on stdin, never as a trailing argument: --disallowed-tools
     # is variadic, so a positional prompt after it is swallowed as one more tool
     # name and the session dies with "Input must be provided either through

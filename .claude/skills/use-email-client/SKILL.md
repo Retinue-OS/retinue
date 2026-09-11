@@ -141,8 +141,12 @@ credentials and runs the real IMAP/SMTP. (This is gated by `EMAIL_BACKEND_TOKEN`
 which the entrypoint auto-generates when not supplied, so the isolation is always
 on.) You don't need to do anything differently — all commands above work
 unchanged — but you cannot read `EMAIL_PASS*` or talk to SMTP/IMAP directly to
-bypass the send-control policy. The one exception is a mailbox loaded via
-`--env-file`, whose credentials sit on disk and are therefore not isolated.
+bypass the send-control policy. This holds in every session alike — dashboard
+turns, scheduled jobs, triage, Ask-Ara answers — because each is spawned with
+the allowlisted environment of `scripts/session_env.py`, which carries the
+backend token and URL but never a mailbox credential. The one exception is a
+mailbox loaded via `--env-file`, whose credentials sit on disk and are
+therefore not isolated.
 
 ---
 

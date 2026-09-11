@@ -294,7 +294,11 @@ framework — check `scripts/claude_auth.py status` and point the user at
 `/claude-auth`, never ad-hoc logins; before starting any extra `claude`
 process by hand, run `scripts/claude_auth.py refresh` so it cannot race the
 live sessions for the token rotation (details: `docs/contributing.md`,
-`docs/claude-auth.md`).
+`docs/claude-auth.md`). Every session the framework spawns sees an
+**allowlisted environment** (`scripts/session_env.py`): capability tokens and
+model variables yes, mailbox passwords and gateway keys no — a chamber
+variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
+(`docs/contributing.md`, "Session environment").
 
 ## Where the depth lives
 

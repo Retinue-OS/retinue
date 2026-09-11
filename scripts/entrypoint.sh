@@ -65,6 +65,22 @@ if [[ -n "${GITHUB_TOKEN:-}" ]]; then
   echo "https://x-access-token:${GITHUB_TOKEN}@github.com" > ~/.git-credentials
   chmod 600 ~/.git-credentials
   echo "[git] Credential helper configured."
+  # `gh` (docs/contributing.md: `gh pr create` from inside the container) reads
+  # GITHUB_TOKEN from its environment — but the sessions the framework spawns
+  # get an allowlisted environment (scripts/session_env.py) that carries no
+  # repo token. Store the token in gh's own config on the persistent /root
+  # volume instead, next to ~/.git-credentials, so `gh` works in every session
+  # the same way `git push` does. gh prefers the variable when it is set, so it
+  # is unset for this one call; the login validates against the API, hence
+  # best-effort (an offline start leaves git working and gh unauthenticated).
+  if command -v gh >/dev/null 2>&1; then
+    if printf '%s\n' "$GITHUB_TOKEN" | env -u GITHUB_TOKEN \
+        gh auth login --hostname github.com --with-token >/dev/null 2>&1; then
+      echo "[git] gh authenticated from GITHUB_TOKEN."
+    else
+      echo "[git][warn] gh auth login failed; gh is unauthenticated in spawned sessions." >&2
+    fi
+  fi
 fi
 
 # ── Mount the chambers declared in chambers.json ─────────────────────

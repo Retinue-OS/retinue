@@ -43,14 +43,27 @@ nothing new.
   process can unset them, use a raw socket, or speak a non-HTTP protocol. The
   layer is telemetry. Making it a boundary requires an `internal: true` network
   or in-container firewall rules, and is tracked as a roadmap item.
-- **The main session runs with broad tool permissions while processing
-  untrusted input.** A hostile message cannot read messaging or mailbox
-  credentials out of the agent's environment (other credentials the container
-  holds, such as a repo token or model-gateway keys, are not scrubbed the same
-  way), and an outbound send still has to clear the sending identity's policy
+- **Sessions run with broad tool permissions while processing untrusted
+  input.** What a hostile message cannot do is read a credential out of the
+  session's environment: every `claude -p` the framework spawns — dashboard
+  turns, scheduled jobs, triage, Ask-Ara answers — gets its environment from
+  the allowlist in `scripts/session_env.py` (capability tokens, the model
+  credential, the framework's own settings) and never inherits the spawning
+  daemon's, so mailbox passwords, model-gateway keys, the repo token and any
+  secret added to `.env` later are absent by construction. The `retinue`
+  service also no longer loads `.env` wholesale, so a secret meant for another
+  service never enters the agent container at all. The remote-control main
+  session is not spawned this way and keeps the entrypoint's narrower scrub
+  (mail credentials and the API key), so it still sees the model-gateway keys
+  and the repo token. What the allowlist does *not* do: every process runs as
+  the same uid, so a session can still read a daemon's `/proc/<pid>/environ`
+  (the web gateway's holds the mailbox credentials for its e-mail backend) or
+  a credential file on the `/root` volume. Closing that means holding each
+  secret in its own sidecar or under a separate uid, which is tracked as its
+  own epic. An outbound send still has to clear the sending identity's policy
   — but nothing authenticates who completes a pending `verify` approval, so
-  treat that as a workflow gate rather than a hard boundary. It can still
-  induce the agent to read across mounted chambers or write to them.
+  treat that as a workflow gate rather than a hard boundary. A session can
+  still be induced to read across mounted chambers or write to them.
   Reduced-privilege triage is a roadmap item.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is

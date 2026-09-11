@@ -198,6 +198,7 @@ from requester_identity import normalize_requester_identity
 import claude_auth
 import chat_state as chat_state_mod
 import email_client as ec
+import session_env
 import gateway_auth
 import messenger_gateways
 import news_store
@@ -3622,19 +3623,20 @@ def send_message(message: str, display_question: str | None = None,
                 return cmd
 
             def _spawn(cmd: list[str], run_model: str):
-                # RETINUE_SESSION_MODEL advertises the model this session runs
-                # on (sessions cannot introspect their --model flag); cleared
-                # rather than inherited so a stale value never mislabels a
-                # session. The escalate flag is only offered below the
-                # frontier tier — senior has nobody to escalate to.
-                env = dict(os.environ)
-                env.pop("RETINUE_SESSION_MODEL", None)
-                env.pop("RETINUE_ESCALATE_FILE", None)
-                if run_model:
-                    env["RETINUE_SESSION_MODEL"] = run_model
-                if escalate_flag is not None and not _same_model(
-                        run_model, FRONTIER_MODEL):
-                    env["RETINUE_ESCALATE_FILE"] = str(escalate_flag)
+                # The session's environment is built from the allowlist in
+                # scripts/session_env.py, never copied from this daemon's —
+                # the gateway holds the mailbox credentials for its e-mail
+                # backend and whatever else .env carries, none of which a
+                # session may inherit. RETINUE_SESSION_MODEL advertises the
+                # model this session runs on (sessions cannot introspect
+                # their --model flag); set per spawn, so a stale value never
+                # mislabels a session. The escalate flag is only offered
+                # below the frontier tier — senior has nobody to escalate to.
+                offer_flag = (escalate_flag is not None
+                              and not _same_model(run_model, FRONTIER_MODEL))
+                env = session_env.build(
+                    model=run_model,
+                    escalate_file=escalate_flag if offer_flag else None)
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
 
@@ -3843,6 +3845,9 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
                 cmd, capture_output=True, text=True,
                 timeout=TRANSCRIPT_CLEANUP_TIMEOUT,
                 cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
+                # Tool-less, but a `claude` process all the same: the
+                # allowlisted environment, never this daemon's.
+                env=session_env.build(model=TRANSCRIPT_CLEANUP_MODEL),
             )
     except (subprocess.TimeoutExpired, OSError) as exc:
         print(f"[web-gateway] transcript cleanup failed: {exc}", flush=True)
@@ -3937,6 +3942,9 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
                 cmd, capture_output=True, text=True,
                 timeout=PRESENTATION_LINT_TIMEOUT,
                 cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
+                # Tool-less, but a `claude` process all the same: the
+                # allowlisted environment, never this daemon's.
+                env=session_env.build(model=PRESENTATION_LINT_MODEL),
             )
     except (subprocess.TimeoutExpired, OSError) as exc:
         print(f"[web-gateway] presentation lint failed: {exc}", flush=True)
