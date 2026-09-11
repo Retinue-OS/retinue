@@ -220,8 +220,18 @@ def test_per_spawn_stamps_are_never_inherited():
     assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-1"
     # An empty model is "no stamp", not the inherited one.
     assert "RETINUE_SESSION_MODEL" not in se.build(src, model="")
+    # Nor can the escape hatch bring a stale one back: naming the stamp or
+    # the flag there, verbatim or by wildcard, admits configuration only.
+    for extra in ("RETINUE_SESSION_MODEL,RETINUE_ESCALATE_FILE", "RETINUE_*"):
+        hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
+        env = se.build(hatch, model="")
+        assert "RETINUE_SESSION_MODEL" not in env, extra
+        assert "RETINUE_ESCALATE_FILE" not in env, extra
+        env = se.build(hatch, model="sonnet", escalate_file="/tmp/flag-2")
+        assert env["RETINUE_SESSION_MODEL"] == "sonnet", extra
+        assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-2", extra
     print("ok: the model stamp and the escalation flag are set per spawn, "
-          "never inherited")
+          "never inherited — not even through the escape hatch")
 
 
 def test_email_goes_through_the_gateway_backend():

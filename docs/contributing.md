@@ -188,8 +188,11 @@ messenger and calendar gateways' client side (`*_GATEWAY_TOKEN`,
 now, `GARMIN_EMAIL`/`GARMIN_PASSWORD` (`refresh.py --ensure` runs the fetch in
 the agent's own process). Everything else is dropped — `EMAIL_PASS*`,
 `LITELLM_*`, `OPENROUTER_API_KEY`, `TRAEFIK_BASIC_AUTH_USERS`, `GITHUB_TOKEN`
-(`git` and `gh` use the credentials the entrypoint stores on the `/root`
-volume instead) and any secret nobody has named yet. `RETINUE_SESSION_MODEL`
+(`git` keeps working through the credential helper the entrypoint configures;
+`gh` is unauthenticated in a spawned session, while the remote-control main
+session still carries the token) and any secret nobody has named yet. Two
+credentials pass on purpose: the model credential in `ANTHROPIC_*`, without
+which a spawned session cannot run, and Garmin's. `RETINUE_SESSION_MODEL`
 and `RETINUE_ESCALATE_FILE` are set per spawn, never inherited, and
 `EMAIL_BACKEND_URL` is pointed at the gateway's backend whenever the spawner
 holds the token, so `email_client.py` proxies in every session.

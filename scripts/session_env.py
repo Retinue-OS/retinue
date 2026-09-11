@@ -186,14 +186,19 @@ def _extra_rules(source: Mapping[str, str]) -> tuple[set[str], tuple[str, ...]]:
 def allowed(name: str, source: Mapping[str, str] | None = None) -> bool:
     """Whether `name` passes from the spawner's environment into a session.
 
-    An explicit entry in RETINUE_SESSION_ENV_EXTRA wins over everything: the
-    operator's stated decision. Otherwise the built-in exclusions apply before
-    the built-in rules, so a prefix never admits a name listed as excluded.
+    The per-spawn stamps are never inherited, whatever the operator names —
+    the escape hatch admits configuration, not a stale label or another
+    session's escalation flag. Below that, an explicit entry in
+    RETINUE_SESSION_ENV_EXTRA wins: the operator's stated decision. Otherwise
+    the built-in exclusions apply before the built-in rules, so a prefix
+    never admits a name listed as excluded.
     """
+    if name in _PER_SPAWN:
+        return False
     extra_exact, extra_prefixes = _extra_rules(os.environ if source is None else source)
     if name in extra_exact:
         return True
-    if name in SESSION_ENV_EXCLUDED or name in _PER_SPAWN:
+    if name in SESSION_ENV_EXCLUDED:
         return False
     if name in SESSION_ENV_NAMES:
         return True
