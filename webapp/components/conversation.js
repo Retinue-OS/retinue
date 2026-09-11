@@ -705,9 +705,17 @@ class RetinueConversation extends HTMLElement {
       const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store' });
       if (this._id !== id || seq !== this._loadSeq) return false;
       if (res.status === 404) {
-        // Deleted, or a stale link: nothing to show, poll or reply to. A
-        // re-point (attributeChangedCallback) starts afresh.
-        if (!this._missing) { this._missing = true; this._stopPolling(); this.render(); }
+        // Deleted, or a stale link: nothing to show, poll or reply to — a
+        // document read earlier is gone with it, or the bar and the reply
+        // row would go on as if it were there. A re-point
+        // (attributeChangedCallback) starts afresh.
+        if (!this._missing) {
+          this._missing = true;
+          this._thread = null;
+          this._threadSig = '';
+          this._stopPolling();
+          this.render();
+        }
         return false;
       }
       if (!res.ok) throw new Error(String(res.status));
@@ -1358,6 +1366,9 @@ class RetinueConversation extends HTMLElement {
       if (!this.isConnected || this._key() !== key) {
         stream.getTracks().forEach((tr) => tr.stop());
         this._recState = 'idle';
+        // Pointed at another thread meanwhile: its row was rendered with the
+        // mic held, so it is rendered again now that the mic is free.
+        if (this.isConnected) this.render();
         return;
       }
       this._recStream = stream;
