@@ -191,6 +191,24 @@ function threadOpened(key, id) {
   DRAFTS.delete(key);
   DRAFTS.set(String(id), d);
 }
+// What went out is cleared from draft `d`, and only that: the draft may have
+// grown while the message was on the wire — a chip clicked in the thread, a
+// dictation or a file read finished in the background — and what it grew by
+// stays.
+function clearSent(d, text, files) {
+  const base = text.replace(/\s*$/, '');
+  d.text = d.text.startsWith(base) ? d.text.slice(base.length).trimStart() : d.text;
+  d.files = d.files.filter((f) => !files.includes(f));
+}
+// The connected element whose composer shows draft `d`, if any: the one
+// under the key the draft lives under by now — it may have moved to a
+// thread's key since it was picked up (threadOpened).
+function liveShowing(d) {
+  for (const [key, draft] of DRAFTS) {
+    if (draft === d) return LIVE.get(key) || null;
+  }
+  return null;
+}
 
 function fmtSize(n) {
   if (!Number.isFinite(n) || n <= 0) return '';
@@ -1043,12 +1061,7 @@ class RetinueConversation extends HTMLElement {
     let adopter = null;
     try {
       const conv = await sendMessage(isNewKey(key) ? '' : key, text, sent.files, this._seed(), this._newModel);
-      // Clear what went out and only that: the draft may have grown
-      // meanwhile — a chip clicked in the thread, a dictation finished in
-      // the background — and what it grew by stays.
-      const base = text.replace(/\s*$/, '');
-      d.text = d.text.startsWith(base) ? d.text.slice(base.length).trimStart() : d.text;
-      d.files = d.files.filter((f) => !sent.files.includes(f));
+      clearSent(d, text, sent.files);
       this._attachError = '';
       // Which kind of send this was is a property of the key it started
       // under, not of what the element shows by now.
@@ -1117,11 +1130,11 @@ class RetinueConversation extends HTMLElement {
   // Read picked files into base64 (chunked, so large files don't overflow the
   // String.fromCharCode call stack) and stage them as pending attachments.
   async _addFiles(fileList) {
-    this._attachError = '';
     const d = draftOf(this._key());
+    let error = '';
     for (const file of Array.from(fileList || [])) {
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        this._attachError = `"${file.name}" is too large (max ${fmtSize(MAX_ATTACHMENT_BYTES)}).`;
+        error = `"${file.name}" is too large (max ${fmtSize(MAX_ATTACHMENT_BYTES)}).`;
         continue;
       }
       try {
@@ -1137,11 +1150,19 @@ class RetinueConversation extends HTMLElement {
           data: btoa(binary),
         });
       } catch (_err) {
-        this._attachError = `Couldn't read "${file.name}".`;
+        error = `Couldn't read "${file.name}".`;
       }
     }
-    this._focusNext = true; // return focus to the textarea to keep typing
-    this.render();
+    // The reads may have outlived this element, or the draft may have gone
+    // on as a thread's (threadOpened): the outcome shows on whatever element
+    // shows this draft now — the composer the user came back to, the thread
+    // this composer became — with the focus back on its textarea.
+    const el = liveShowing(d);
+    if (el) {
+      el._attachError = error;
+      el._focusNext = true;
+      el.render();
+    }
   }
 
   _removeFile(index) {
@@ -1335,10 +1356,9 @@ class RetinueConversation extends HTMLElement {
         // cleared here. A composer live under this key is by construction
         // the one this was dictated in: it goes on as the new thread.
         try {
-          const conv = await sendMessage(isNewKey(key) ? '' : key, toSend,
-            draftOf(key).files, seed, model);
-          draftOf(key).text = '';
-          draftOf(key).files = [];
+          const sentFiles = draftOf(key).files.slice();
+          const conv = await sendMessage(isNewKey(key) ? '' : key, toSend, sentFiles, seed, model);
+          clearSent(draftOf(key), toSend, sentFiles);
           const now = live();
           if (isNewKey(key) && now) { now._becomeCreated(conv); adopted = now; }
           if (isNewKey(key)) threadOpened(key, conv.id);
