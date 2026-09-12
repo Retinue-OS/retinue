@@ -60,10 +60,9 @@ nothing new.
   `~/.git-credentials`. Nothing authenticates who completes a pending `verify`
   approval either, so treat send approval as a workflow gate rather than a hard
   boundary. A hostile message can also induce the agent to read across mounted
-  chambers or write to them. The planned answer is to move secret-holding out
-  of the agent's container into sidecars, the way the messenger gateways
-  already work (retinue-os/retinue#15); reduced-privilege triage is a roadmap
-  item.
+   chambers or write to them. The mitigation tracked in retinue-os/retinue#15 is to stop
+   passing secrets through inherited environments; moving secret-holding into sidecars is a
+   separate roadmap item, and reduced-privilege triage is another roadmap item.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.
