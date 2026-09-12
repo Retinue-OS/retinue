@@ -195,6 +195,54 @@ def test_the_prompt_is_fed_on_stdin_not_as_an_argument():
     print("ok: the prompt reaches the session on stdin")
 
 
+def test_the_answering_session_inherits_no_secret():
+    """The server holds whatever .env put into the container; the session it
+    spawns gets the allowlist (scripts/session_env.py), not a copy of that.
+
+    An outside client's question is untrusted input, so of all sessions this
+    one must not carry the mailbox password or the model-gateway keys."""
+    secrets = {"EMAIL_PASS": "mail-pw", "LITELLM_MASTER_KEY": "sk-master",
+               "RETINUE_LITELLM_KEY": "sk-picker", "OPENROUTER_API_KEY": "sk-or",
+               "TRAEFIK_BASIC_AUTH_USERS": "u:$apr1$h", "GITHUB_TOKEN": "ghp_x"}
+    needed = {"EMAIL_BACKEND_TOKEN": "email-cap", "ANTHROPIC_API_KEY": "sk-ant",
+              "CONVERSATION_BACKEND_TOKEN": "conv-cap", "WEB_GATEWAY_PORT": "8080",
+              "RETINUE_SESSION_MODEL": "stale-stamp"}
+    saved = {k: os.environ.get(k) for k in {**secrets, **needed}}
+    os.environ.update(secrets)
+    os.environ.update(needed)
+    real_model, real_frontier = mcp.MODEL, mcp.FRONTIER_MODEL
+    try:
+        # Router tier below a configured frontier: junior gets her escape hatch.
+        mcp.MODEL, mcp.FRONTIER_MODEL = "haiku", "opus"
+        _, kw = _capture_session("what is the GV date?")
+        env = kw["env"]
+        for name in secrets:
+            assert name not in env, f"{name} inherited by the answering session"
+        for name in ("EMAIL_BACKEND_TOKEN", "ANTHROPIC_API_KEY",
+                     "CONVERSATION_BACKEND_TOKEN"):
+            assert env[name] == needed[name], name
+        assert env["EMAIL_BACKEND_URL"] == "http://localhost:8080/internal/email"
+        assert env["RETINUE_SESSION_MODEL"] == "haiku", "stamped per spawn"
+        assert env["RETINUE_ESCALATE_FILE"].startswith(
+            str(mcp.Path(mcp.tempfile.gettempdir())))
+        # Senior has nobody to escalate to: no flag, and the stamp follows.
+        mcp.MODEL = "opus"
+        _, kw = _capture_session("again")
+        assert "RETINUE_ESCALATE_FILE" not in kw["env"]
+        assert kw["env"]["RETINUE_SESSION_MODEL"] == "opus"
+        # No model at all: no stamp — never the stale inherited one.
+        mcp.MODEL, mcp.FRONTIER_MODEL = "", ""
+        assert "RETINUE_SESSION_MODEL" not in _capture_session("x")[1]["env"]
+    finally:
+        mcp.MODEL, mcp.FRONTIER_MODEL = real_model, real_frontier
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("ok: the answering session gets the allowlisted environment, no secret")
+
+
 def test_ask_ara_returns_the_answer_synchronously():
     real = mcp._run_claude
     mcp._run_claude = lambda prompt: ("done", "The GV is on 29 August.")
@@ -344,6 +392,7 @@ def main():
     test_tools_list_is_read_only()
     test_forbidden_tools_are_stripped_from_the_session()
     test_the_prompt_is_fed_on_stdin_not_as_an_argument()
+    test_the_answering_session_inherits_no_secret()
     test_ask_ara_returns_the_answer_synchronously()
     test_ask_ara_hands_back_a_job_when_slow()
     test_ask_ara_reports_a_failed_session_as_an_error()

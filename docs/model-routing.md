@@ -124,9 +124,12 @@ workflow; the model stamp (phase 2) is the ground truth beneath both.
   (`model_name` in each message record, derived from the turn's own usage
   envelope — ground truth from the API response, not the flag). What phase 2
   added is the other half: the gateway and the MCP server now export
-  `RETINUE_SESSION_MODEL` into every session they spawn (and clear an
-  inherited value), so memories written from dashboard and `ask_ara` turns
-  are `kb:model`-stamped like every other session's.
+  `RETINUE_SESSION_MODEL` into every session they spawn, so memories written
+  from dashboard and `ask_ara` turns are `kb:model`-stamped like every other
+  session's. Since a session's environment is built from the allowlist in
+  `scripts/session_env.py` (`docs/contributing.md`, "Session environment"),
+  the stamp — like `RETINUE_ESCALATE_FILE` — is set per spawn and can never
+  be inherited from the spawner.
 - The **"[[chip: Take this to Ara senior]]"** chip: CLAUDE.md instructs junior
   to offer it whenever she answers a borderline point herself; the user
   clicking it sends the explicit escalation phrase, which junior honors via

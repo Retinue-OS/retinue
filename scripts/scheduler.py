@@ -67,6 +67,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_auth  # noqa: E402
+import session_env  # noqa: E402
 
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 # Framework-owned base manifest, always loaded alongside the per-chamber ones.
@@ -124,26 +125,22 @@ def job_env(model: str = "") -> dict:
     """Environment for spawned jobs.
 
     Scheduled jobs run agents (`claude -p`) or scripts that must not hold mailbox
-    credentials. When EMAIL_BACKEND_TOKEN is set, strip EMAIL_PASS* and point
-    email_client.py at the web gateway so it proxies instead (mirrors the
-    entrypoint's remote-control setup, since the scheduler is forked before it).
+    credentials — or any other secret this daemon's environment carries (it is
+    forked by the entrypoint before the remote-control scrub, so it holds the
+    whole container environment). The environment is therefore built from the
+    allowlist in scripts/session_env.py, the same one every framework spawner
+    uses, rather than copied and stripped: EMAIL_PASS* is absent by
+    construction, and when EMAIL_BACKEND_TOKEN is set, email_client.py is
+    pointed at the web gateway so it proxies instead. A command job gets the
+    same environment as a prompt job: the base-job scripts spawn `claude -p`
+    themselves and chamber commands run in the same trust position.
 
     `model` advertises the model the spawned session runs on (a session cannot
     introspect its own --model flag), so memory entries can be stamped with it
-    (scripts/memory.py). Cleared rather than inherited when this job passes no
+    (scripts/memory.py). Absent rather than inherited when this job passes no
     --model, so a stale value can never mislabel a session.
     """
-    env = dict(os.environ)
-    if model:
-        env["RETINUE_SESSION_MODEL"] = model
-    else:
-        env.pop("RETINUE_SESSION_MODEL", None)
-    if env.get("EMAIL_BACKEND_TOKEN"):
-        port = env.get("WEB_GATEWAY_PORT", "8080")
-        env["EMAIL_BACKEND_URL"] = f"http://localhost:{port}/internal/email"
-        for key in [k for k in env if k.startswith("EMAIL_PASS")]:
-            del env[key]
-    return env
+    return session_env.build(model=model)
 
 
 def log(msg: str) -> None:
