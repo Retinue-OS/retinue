@@ -58,7 +58,7 @@ nothing new.
   this: every process in the container runs as the same user, so any session
   can read a daemon's `/proc/<pid>/environ`, and the repository token sits in
   `~/.git-credentials`. Nothing authenticates who completes a pending `verify`
-  approval either, so treat send approval as a workflow gate rather than a hard
+   approval is not bound to the requester or a distinct authorization identity, so treat send approval as a workflow gate rather than a hard
   boundary. A hostile message can also induce the agent to read across mounted
    chambers or write to them. The mitigation tracked in retinue-os/retinue#15 is to stop
    passing secrets through inherited environments; moving secret-holding into sidecars is a
