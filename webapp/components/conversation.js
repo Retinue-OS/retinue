@@ -19,8 +19,26 @@
 //   back              show a back button; a tap dispatches `retinue-back`.
 //   bar="none"        no top bar (title, model picker, autoplay, archive) —
 //                     for a host whose own header carries those.
+//   bar="actions"     the bar's actions only — model picker and autoplay, no
+//                     title and no archive — for a host that names the thread
+//                     itself and whose thread is not the user's to file away
+//                     (a messenger chat's companion belongs to its chat).
 //   stamp="clock"     stamp messages with the clock time instead of an age,
 //                     for a host that sits beside a clock-stamped timeline.
+//   placeholder       what the composer's box is called, where the host's own
+//                     framing names it better than "Reply".
+//   create-url        no thread yet, and the HOST owns creating it: the first
+//                     turn POSTs here (no body) for a {id}, then goes in as an
+//                     ordinary reply to that thread. For a thread that belongs
+//                     to something else and is minted by its own endpoint —
+//                     POST /chats/<id>/companion. Without it a first message
+//                     opens the thread itself (POST /conversations).
+//
+// Methods a host may call:
+//   fill(text)        put text in the composer for the user to read, edit and
+//                     send — the same contract as a chip's prefill.
+//   ask(text)         send a turn as though the user had typed it and pressed
+//                     Send, for a host whose own control IS the send press.
 //
 // Events (all bubble and cross the shadow boundary):
 //   retinue-back      the back button.
@@ -835,7 +853,7 @@ class RetinueConversation extends HTMLElement {
       // A thread's reply row waits for the thread document: a cold link to
       // a deleted or misspelt thread must not offer a reply that could only
       // fail. The new-thread composer needs no document.
-      (mode === 'thread' && !this._thread ? '' : this._inputRow(mode === 'thread' ? 'Reply …' : 'Ask Ara something …')) +
+      (mode === 'thread' && !this._thread ? '' : this._inputRow(this._placeholder(mode))) +
       `</div>`;
     this._threadSig = this._thread ? this._signature(this._thread) : '';
     this._pickerStale = false; // rebuilt from the state just now
@@ -847,7 +865,12 @@ class RetinueConversation extends HTMLElement {
   }
 
   _barHtml() {
-    if (this.getAttribute('bar') === 'none') return '';
+    const bar = this.getAttribute('bar');
+    if (bar === 'none') return '';
+    // The actions-only bar has nothing to show until there is a thread to act
+    // on: before the first turn the model is picked in the body instead (see
+    // _newHtml), where the choice is the one thing worth making.
+    if (bar === 'actions' && !this._id) return '';
     const back = this.hasAttribute('back')
       ? '<button class="back" data-back aria-label="Back">&#8249;</button>' : '';
     if (!this._id) {
@@ -855,6 +878,7 @@ class RetinueConversation extends HTMLElement {
     }
     const t = this._thread;
     if (!t) {
+      if (bar === 'actions') return '';
       const title = this._missing ? 'Conversation not found' : '&#8230;';
       return `<div class="thread-bar">${back}<span class="bar-title muted" data-title>${title}</span></div>`;
     }
@@ -866,10 +890,25 @@ class RetinueConversation extends HTMLElement {
         `title="Speak Ara's replies as they arrive" aria-label="Speak replies as they arrive" ` +
         `aria-pressed="${autoplay}">${autoplay ? '\u{1F50A}' : '\u{1F507}'}</button>`
       : '';
+    // Actions only: the host names the pane, and archiving is not offered for
+    // a thread the user does not own separately from what it belongs to.
+    if (bar === 'actions') {
+      return `<div class="thread-bar bar-slim">` +
+        `<span class="bar-actions"><span data-picker>${this._modelPickerHtml()}</span>` +
+        `${autoBtn}</span></div>`;
+    }
     return `<div class="thread-bar">${back}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
       `<span class="bar-actions"><span data-picker>${this._modelPickerHtml()}</span>` +
       `${autoBtn}${archiveBtn}</span></div>`;
+  }
+
+  // What the composer's box is called. A host that frames the element its own
+  // way names it too: "Reply" reads right beside a list of threads, "Ask Ara"
+  // beside a messenger chat the thread is about.
+  _placeholder(mode) {
+    return this.getAttribute('placeholder')
+      || (mode === 'thread' ? 'Reply …' : 'Ask Ara something …');
   }
 
   _threadHtml() {
@@ -1195,7 +1234,26 @@ class RetinueConversation extends HTMLElement {
         if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
         return;
       }
-      const conv = await sendMessage(isNewKey(key) ? '' : key, text, sent.files, this._seed(), this._newModel);
+      // Where this turn goes. A host that owns creation (`create-url`) mints
+      // the thread first and the turn goes in as an ordinary reply; otherwise
+      // the message itself opens the thread. Either way the composer's key is
+      // what decides how the result is handled below — not what it became.
+      let target = isNewKey(key) ? '' : key;
+      if (!target && this.getAttribute('create-url')) {
+        target = await mintThread(this.getAttribute('create-url'));
+        // The mint takes no model, so a model picked before the thread
+        // existed is stored on it now — or the turn would run on another.
+        const held = this._newModel;
+        if (held) {
+          pinModel(target, held);
+          if (!(await settledPins(target))) {
+            const el = this._liveFor(key);
+            if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
+            return;
+          }
+        }
+      }
+      const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel);
       clearSent(d, text, sent.files);
       this._attachError = '';
       VOICE_ERRORS.delete(key); // a failed dictation's note, moot once a send went out
@@ -1329,6 +1387,17 @@ class RetinueConversation extends HTMLElement {
     this._focusNext = true;
     this.render();
   }
+
+  // ── What a host may call ───────────────────────────────────────────────────
+  // Put text in the composer for the user to read, edit and send — a chip's
+  // contract, and what a host's canned prompt should normally use.
+  fill(text) { this._fillComposer(String(text == null ? '' : text)); }
+
+  // Send a turn as though the user had typed it and pressed Send — for a host
+  // whose own control IS the send press (the chat page's quick patterns: the
+  // tap is the user's, so the turn is too). Anything already typed is left in
+  // the composer, as it is when a chip is sent from a half-written draft.
+  ask(text) { return this._send(String(text == null ? '' : text)); }
 
   // ── Voice input: record → live waveform → transcribe (review or send) ──────
   // Tapping the mic swaps the input row for a recording row: a live waveform
@@ -1765,6 +1834,20 @@ class RetinueConversation extends HTMLElement {
 // first message that opens a thread, linked to the project in `seed` and
 // pinned to `model` when one was picked. Returns the thread as the gateway
 // answers it.
+// Mint a thread at the host's own endpoint (POST, no body) and return its id.
+// For a thread that belongs to something else and is created by that thing's
+// endpoint — a messenger chat's companion, POST /chats/<id>/companion — which
+// is idempotent and carries no message, so the first turn is never spent on a
+// failed create: it is still in the draft, and the retry mints nothing new.
+async function mintThread(url) {
+  const res = await fetch(url, { method: 'POST' });
+  if (!res.ok) throw new Error(String(res.status));
+  const data = await res.json();
+  const id = data && data.id;
+  if (!id) throw new Error('no id');
+  return String(id);
+}
+
 async function sendMessage(id, text, files, seed, model) {
   const body = { message: text };
   if (!id) {
@@ -1844,6 +1927,9 @@ const CSS = `
   .bar-title { flex: 1; min-width: 0; font-weight: 650; overflow: hidden;
                text-overflow: ellipsis; white-space: nowrap; }
   .bar-actions { flex: none; display: inline-flex; align-items: center; gap: 6px; }
+  /* bar="actions": no title to push the cluster across, so the row does it,
+     and it sits tighter — the host's own header is directly above it. */
+  .thread-bar.bar-slim { justify-content: flex-end; padding: 0 0 8px; }
   .iconbtn { width: 34px; height: 34px; border-radius: 50%; background: transparent;
              border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);
              cursor: pointer; font-size: .95rem; display: inline-flex; align-items: center;

@@ -20,7 +20,13 @@ a Progressive Web App on the phone home screen.
   `retinue-created`, `retinue-sent`, `retinue-archived`, `retinue-open`,
   `retinue-thread`); drafts, dictation jobs and the reader outlive one
   instance, so a thread left and reopened has its text, and a reading goes
-  on. Every surface that shows a conversation embeds this element.
+  on. A host can shape the frame without forking the thread: `bar="none"` or
+  `bar="actions"` for a header of its own, `stamp="clock"` beside a
+  clock-stamped timeline, and `create-url` where the thread belongs to
+  something else and is minted by that thing's endpoint rather than opened by
+  the first message. It takes `fill(text)` (into the composer, for the user to
+  send) and `ask(text)` (send now, for a host whose control is the send
+  press). Every surface that shows a conversation embeds this element.
 - **Conversation tabs** (`components/conversations.js`) are the active
   interactive card: the list of threads with Ara, the Active/Archived filter
   and the location-hash routing, with the open thread (or the new-thread
@@ -157,20 +163,19 @@ docstring). Pieces:
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the
-  `companion` field below): her turns render in the conversation thread's
-  visual language — including its `model_name` / `cost_usd` meta, so which
-  model answered and what that turn cost are as visible here as on the
-  conversations card — `pending` shows as her writing, and a chip is that same
-  turn with a canned prompt. The pane's bar carries the same per-thread model
-  picker as the conversation thread bar (`GET /conversation-models` for the
-  list, `POST /conversations/<id>/model` to switch; hidden below two offered
-  models, and until an existing thread's document has been read once, so a
-  pinned or escalated thread is never shown as the default): a choice made
-  before the thread exists is pinned right after the lazy creation, ahead
-  of the first turn. An unpinned thread that Ara junior
-  escalated (`escalated` on the document; the gateway keeps it with Ara
-  senior) shows as "Ara senior (escalated)" rather than as the default, and
-  any pick — the default included — is the change that clears it. The two rails meet in the shared draft — Ara
+  `companion` field below), and it *is* `<retinue-conversation>` — the same
+  element the conversations card embeds, so the two surfaces cannot drift
+  apart. It therefore has everything that element has, the model picker with
+  its escalated state and the read-aloud player included, rather than the
+  subset a hand-written copy happened to carry. What this page supplies is
+  where the pane sits and how its thread comes to exist: a companion belongs
+  to its chat, so the chat mints it (`create-url` → `POST
+  /chats/<id>/companion`) on the first turn and never on merely opening a
+  chat. `bar="actions"` keeps the picker and the speak-replies toggle while
+  dropping the title (the bar above names the pane) and Archive (a companion
+  is not filed away separately from its chat); `stamp="clock"` matches the
+  mirror beside it. A chip is a canned turn the page hands the element
+  (`ask`), exactly as if the user had typed it. The two rails meet in the shared draft — Ara
   stages a reply, the chat poll adopts it into the composer marked as hers
   — into an empty box, or over the text she was asked to rework, whenever
   nothing unsaved is in it (unsaved keystrokes meet the newer draft at
