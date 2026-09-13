@@ -191,17 +191,35 @@ def test_read_window_rejects_bad_input():
     print("ok: read window rejects bad input")
 
 
-def test_read_window_aligns_mixed_timezones():
+def test_read_window_aligns_mixed_timezones_without_moving_the_instant():
     with tempfile.TemporaryDirectory() as tmp:
         cg = _load_caldav_gateway(tmp)
         # One aware bound and one naive one must still be comparable: the naive
-        # side is read in the other's timezone rather than raising.
+        # side is read in this container's timezone rather than raising.
         start, end = cg._parse_read_window("2026-09-20T00:00:00Z", "2026-09-27", "")
         assert start.tzinfo is not None and end.tzinfo is not None
         assert end > start
         start, end = cg._parse_read_window("2026-09-20", "2026-09-27T00:00:00+02:00", "")
         assert start.tzinfo is not None and end > start
-    print("ok: mixed-timezone bounds are aligned")
+        # Crucially it is a CONVERSION, not a restamping: the naive bound keeps
+        # the instant it named. Stamping the other bound's offset onto it would
+        # shift the window by that offset — which, with the start omitted and
+        # defaulting to now(), silently moved "now" hours into the past.
+        naive = datetime.datetime(2026, 9, 20, 13, 30)
+        aware = datetime.datetime(2026, 9, 27, tzinfo=datetime.timezone(datetime.timedelta(hours=2)))
+        aligned_start, _ = cg._align_timezones(naive, aware)
+        assert aligned_start == naive.astimezone(), aligned_start
+        assert aligned_start.astimezone(datetime.timezone.utc) == \
+            naive.astimezone(datetime.timezone.utc)
+        _, aligned_end = cg._align_timezones(aware, naive)
+        assert aligned_end == naive.astimezone()
+        # An omitted start with an offset-bearing end: the window must still
+        # start at the present instant, not at a shifted wall clock.
+        before = datetime.datetime.now(datetime.timezone.utc)
+        start, end = cg._parse_read_window("", "2999-09-27T00:00:00+02:00", "")
+        after = datetime.datetime.now(datetime.timezone.utc)
+        assert before <= start.astimezone(datetime.timezone.utc) <= after, start
+    print("ok: mixed-timezone bounds are aligned without moving the instant")
 
 
 def test_read_limit_clamped_to_maximum():
@@ -230,7 +248,10 @@ def test_unusable_read_tunables_fall_back_to_their_defaults():
                         ("CALDAV_READ_DEFAULT_DAYS", "soon"),
                         # int() parses this happily; math.isfinite() then
                         # overflows converting it to float, at import time.
-                        ("CALDAV_READ_MAX_EVENTS", "1" * 400)):
+                        ("CALDAV_READ_MAX_EVENTS", "1" * 400),
+                        # Positive and finite, yet no window can be built from
+                        # it — so every no-end read would 400 at request time.
+                        ("CALDAV_READ_DEFAULT_DAYS", "1e10")):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ[name] = value
             try:
@@ -409,6 +430,48 @@ def test_pick_read_calendars():
         assert cg._pick_read_calendars(principal, "*") == [work, home]
         assert cg._pick_read_calendars(principal, "Home") == [home]
     print("ok: read calendar selection")
+
+
+def test_a_duplicate_display_name_is_ambiguous_not_a_coin_flip():
+    # Display names are not unique on a CalDAV server: two calendars can answer
+    # to "Work", and picking the first would make the answer depend on server
+    # ordering — reading, or writing to, whichever came back first.
+    first = _Calendar("cal-a", "https://dav/a", "Work")
+    second = _Calendar("cal-b", "https://dav/b", "Work")
+    principal = _Principal([first, second])
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        try:
+            cg._pick_read_calendars(principal, "Work")
+        except cg.BadRequest as exc:
+            # A 400 naming both URLs, so the caller can pick one.
+            assert "ambiguous" in str(exc) and "https://dav/a" in str(exc)
+        else:
+            raise AssertionError("expected BadRequest for an ambiguous calendar name")
+        # An id or URL still resolves it, and so does the write path.
+        assert cg._pick_read_calendars(principal, "cal-b") == [second]
+        cg._connect_principal = lambda: principal
+        assert cg._resolve_calendar("https://dav/a") is first
+        try:
+            cg._resolve_calendar("Work")
+        except cg.BadRequest as exc:
+            assert "ambiguous" in str(exc)
+        else:
+            raise AssertionError("expected BadRequest on the write path too")
+    with tempfile.TemporaryDirectory() as tmp:
+        # Configured ambiguously: a deployment fault (502), and /calendars says so.
+        cg = _load_caldav_gateway(tmp, calendar_id="Work")
+        cg._connect_principal = lambda: principal
+        try:
+            cg._pick_read_calendars(principal, None)
+        except RuntimeError as exc:
+            assert "CALDAV_CALENDAR_ID" in str(exc) and "ambiguous" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError for an ambiguous configured name")
+        snapshot = cg._calendars_snapshot()
+        assert snapshot["write_target"] is None
+        assert "ambiguous" in snapshot["write_target_error"]
+    print("ok: a duplicate display name is ambiguous, not a coin flip")
 
 
 # ── Listing, filtering, uid lookup ───────────────────────────────────────────
@@ -743,6 +806,20 @@ def test_read_endpoints_over_http():
             assert get("/calendars")[1]["write_target"]["name"] == "Personal"
             assert get("/nope")[0] == 404
 
+            # A ValueError raised INSIDE the CalDAV library is the server's
+            # problem, not the caller's: only BadRequest may become a 400.
+            def _library_value_error(*largs, **kwargs):
+                raise ValueError("malformed response from the calendar server")
+
+            saved_search = cg._search_calendar
+            cg._search_calendar = _library_value_error
+            try:
+                status, body = get("/events?days=7")
+                assert status == 502, (status, body)
+                assert "malformed response" in body["error"]
+            finally:
+                cg._search_calendar = saved_search
+
             # A backend that fails is a 502, never a 200 with nothing in it.
             # (The gateway logs the traceback as it does in production — the
             # noise below this line in the test output is that log.)
@@ -762,7 +839,7 @@ def main():
     test_read_window_defaults_to_now_plus_default_days()
     test_read_window_is_half_open_and_a_bare_end_date_covers_its_day()
     test_read_window_rejects_bad_input()
-    test_read_window_aligns_mixed_timezones()
+    test_read_window_aligns_mixed_timezones_without_moving_the_instant()
     test_read_limit_clamped_to_maximum()
     test_unusable_read_tunables_fall_back_to_their_defaults()
     test_serialize_timed_event()
@@ -772,6 +849,7 @@ def main():
     test_event_components_walks_a_calendar_instance()
     test_calendar_identity_survives_an_unreadable_property()
     test_pick_read_calendars()
+    test_a_duplicate_display_name_is_ambiguous_not_a_coin_flip()
     test_list_events_sorted_across_calendars()
     test_events_sort_on_the_instant_not_the_string()
     test_expanded_search_falls_back_when_unsupported()

@@ -58,6 +58,16 @@ except ImportError:  # pragma: no cover - exercised only when the dep is absent
     caldav = None
 
 
+class BadRequest(ValueError):
+    """A request the caller got wrong: a malformed window, an unknown calendar.
+
+    Its own class rather than a bare ValueError, because the handlers must not
+    label a ValueError raised *inside* the CalDAV library — a malformed server
+    response, a validation error out of search() or calendar discovery — as the
+    caller's fault. Subclasses ValueError, so anything catching that still works.
+    """
+
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 # Server/account. No provider-specific defaults live here — see .env.example
 # for a Zoho example, offered only as one configured endpoint among any others.
@@ -84,13 +94,28 @@ GATEWAY_TOKEN = os.environ.get("CALDAV_GATEWAY_TOKEN", "").strip()
 MAX_BODY_BYTES = int(os.environ.get("CALDAV_GATEWAY_MAX_BODY_BYTES", str(64 * 1024)))
 
 
-def _positive_env(name: str, default: str, cast):
+def _spans_a_window(days: float) -> bool:
+    """Whether a default span can actually form a window.
+
+    1e10 days is positive and finite yet outside timedelta's range, so a gateway
+    accepting it would start and then answer 400 to every read that names no
+    end — the opposite of what validating the tunable is for.
+    """
+    try:
+        datetime.datetime.now() + datetime.timedelta(days=days)
+    except (OverflowError, ValueError):
+        return False
+    return True
+
+
+def _positive_env(name: str, default: str, cast, usable=None):
     """A read tunable, refusing a value that would defeat its own purpose.
 
     A zero or negative cap silently breaks the bound it exists for
     (`matched[:0]` is empty, `matched[:-1]` is nearly everything), and a
     non-finite window is no window, so an unusable setting falls back to the
-    default with a warning rather than being served.
+    default with a warning rather than being served. `usable` adds a
+    setting-specific check on top of "positive and finite".
     """
     raw = (os.environ.get(name, default) or "").strip() or default
     fallback = cast(default)
@@ -110,6 +135,10 @@ def _positive_env(name: str, default: str, cast):
         print(f"[caldav-gateway] warning: {name}={raw!r} must be a positive, finite "
               f"number; using {fallback}", flush=True)
         return fallback
+    if usable is not None and not usable(value):
+        print(f"[caldav-gateway] warning: {name}={raw!r} is out of usable range; "
+              f"using {fallback}", flush=True)
+        return fallback
     return value
 
 
@@ -119,7 +148,8 @@ def _positive_env(name: str, default: str, cast):
 # for "the first N", so the server's answer is materialized and then paged here.
 # A read of "the next year across five calendars" is therefore narrowed by its
 # window; the cap only keeps the payload itself finite.
-READ_DEFAULT_DAYS = _positive_env("CALDAV_READ_DEFAULT_DAYS", "30", float)
+READ_DEFAULT_DAYS = _positive_env("CALDAV_READ_DEFAULT_DAYS", "30", float,
+                                  usable=_spans_a_window)
 READ_MAX_EVENTS = _positive_env("CALDAV_READ_MAX_EVENTS", "500", int)
 
 # Outbound send-control policy — the calendar analogue of EMAIL_SEND_POLICY /
@@ -222,19 +252,19 @@ def _parse_event_datetime(value: str, all_day: bool):
     """Parse an ISO 8601 date/date-time string into date (all-day) or datetime."""
     value = (value or "").strip()
     if not value:
-        raise ValueError("missing date/time value")
+        raise BadRequest("missing date/time value")
     if all_day:
         try:
             return datetime.date.fromisoformat(value[:10])
         except ValueError as exc:
-            raise ValueError(f"invalid all-day date {value!r}: {exc}") from exc
+            raise BadRequest(f"invalid all-day date {value!r}: {exc}") from exc
     # Accept a trailing "Z" (UTC) the way most JSON/ISO producers emit it;
     # datetime.fromisoformat only accepts "+00:00" for older Python versions.
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
         return datetime.datetime.fromisoformat(normalized)
     except ValueError as exc:
-        raise ValueError(f"invalid date-time {value!r}: {exc}") from exc
+        raise BadRequest(f"invalid date-time {value!r}: {exc}") from exc
 
 
 def _connect_principal():
@@ -284,6 +314,32 @@ def _match_calendar(cal, target: str) -> bool:
     return target in set(_calendar_identity(cal).values()) - {""}
 
 
+def _one_calendar(cals: list, target: str, *, from_request: bool):
+    """The single calendar `target` names, or an error saying why there isn't one.
+
+    Display names are NOT unique on a CalDAV server, so two calendars can answer
+    to "Work"; picking the first would make the result depend on server ordering,
+    silently reading (or writing) the wrong calendar. More than one match is
+    therefore an ambiguity for the caller to resolve with an id or URL.
+
+    A target the request supplied fails as a BadRequest (400 — the caller can fix
+    it); one from CALDAV_CALENDAR_ID fails as a RuntimeError (502), since that is
+    a deployment fault no caller can do anything about.
+    """
+    matches = [cal for cal in cals if _match_calendar(cal, target)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        detail = f"calendar {target!r} not found on this account"
+    else:
+        urls = ", ".join(sorted(_calendar_identity(c)["url"] or "?" for c in matches))
+        detail = (f"calendar name {target!r} is ambiguous — {len(matches)} calendars "
+                  f"match it; name one by id or URL instead ({urls})")
+    if from_request:
+        raise BadRequest(detail)
+    raise RuntimeError(f"CALDAV_CALENDAR_ID: {detail}")
+
+
 def _resolve_calendar(calendar_id: str | None):
     """Return the caldav Calendar object to write to.
 
@@ -294,10 +350,8 @@ def _resolve_calendar(calendar_id: str | None):
     target = calendar_id or CALDAV_CALENDAR_ID
     if not target:
         return principal.calendar()
-    for cal in principal.calendars():
-        if _match_calendar(cal, target):
-            return cal
-    raise RuntimeError(f"calendar {target!r} not found on the CalDAV server")
+    return _one_calendar(list(principal.calendars()), target,
+                         from_request=bool(calendar_id))
 
 
 def _create_event_on_server(entry: dict) -> str:
@@ -340,13 +394,13 @@ def _parse_window_bound(value: str, *, bare_date_ends_day: bool) -> datetime.dat
     """
     value = (value or "").strip()
     if not value:
-        raise ValueError("missing date/time value")
+        raise BadRequest("missing date/time value")
     # Accept a trailing "Z" (UTC) the way most ISO producers emit it.
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
         parsed = datetime.datetime.fromisoformat(normalized)
     except ValueError as exc:
-        raise ValueError(f"invalid date-time {value!r}: {exc}") from exc
+        raise BadRequest(f"invalid date-time {value!r}: {exc}") from exc
     date_only = not any(sep in value for sep in ("T", " ", ":"))
     if date_only and bare_date_ends_day:
         try:
@@ -354,7 +408,7 @@ def _parse_window_bound(value: str, *, bare_date_ends_day: bool) -> datetime.dat
         except OverflowError as exc:
             # A bare end date at the very end of the representable range: a bad
             # request, like an out-of-range `days`, and answered the same way.
-            raise ValueError(f"end date {value!r} is out of range") from exc
+            raise BadRequest(f"end date {value!r} is out of range") from exc
     return parsed
 
 
@@ -363,14 +417,17 @@ def _align_timezones(start: datetime.datetime, end: datetime.datetime) -> tuple:
 
     Mixing an aware and a naive datetime raises on comparison, and a caller may
     well pass `start=2026-09-20T00:00:00Z&end=2026-09-27` (or leave one side to
-    the default). The naive side is then read in the other's timezone, which is
-    what the caller meant by writing them in one breath.
+    the default, which is a naive `now()`). The naive side is read in THIS
+    CONTAINER's timezone — the same reading _event_sort_key gives a floating
+    time — rather than having the other bound's offset stamped onto it: stamping
+    moves the instant (a naive 13:30 in a UTC container is 13:30Z, not
+    13:30+02:00, so an omitted start would silently jump by the offset).
     """
     if (start.tzinfo is None) == (end.tzinfo is None):
         return start, end
     if start.tzinfo is None:
-        return start.replace(tzinfo=end.tzinfo), end
-    return start, end.replace(tzinfo=start.tzinfo)
+        return start.astimezone(), end
+    return start, end.astimezone()
 
 
 def _parse_read_window(start: str, end: str, days: str) -> tuple:
@@ -389,12 +446,12 @@ def _parse_read_window(start: str, end: str, days: str) -> tuple:
             try:
                 span = float(days)
             except ValueError as exc:
-                raise ValueError(f"invalid 'days' value {days!r}: {exc}") from exc
+                raise BadRequest(f"invalid 'days' value {days!r}: {exc}") from exc
             # float() happily returns inf/nan, which pass a plain > 0 test and
             # then blow up inside timedelta as an OverflowError/ValueError the
             # handler would not recognise as a bad request.
             if not math.isfinite(span) or span <= 0:
-                raise ValueError("'days' must be a positive, finite number")
+                raise BadRequest("'days' must be a positive, finite number")
         else:
             span = READ_DEFAULT_DAYS
         try:
@@ -402,13 +459,13 @@ def _parse_read_window(start: str, end: str, days: str) -> tuple:
         except (OverflowError, ValueError) as exc:
             # Finite but absurd (days=1e10), or a window running past
             # datetime.max: a bad request, not a server fault.
-            raise ValueError(f"'days' value {days or span!r} is out of range") from exc
+            raise BadRequest(f"'days' value {days or span!r} is out of range") from exc
     window_start, window_end = _align_timezones(window_start, window_end)
     if window_end <= window_start:
         # The window being half-open, an end at or before the start is an empty
         # window — never what a caller wants, so it is a bad request rather than
         # a silently empty answer.
-        raise ValueError("'end' must be after 'start'")
+        raise BadRequest("'end' must be after 'start'")
     return window_start, window_end
 
 
@@ -419,9 +476,9 @@ def _parse_read_limit(value: str) -> int:
     try:
         limit = int(value)
     except ValueError as exc:
-        raise ValueError(f"invalid 'limit' value {value!r}: {exc}") from exc
+        raise BadRequest(f"invalid 'limit' value {value!r}: {exc}") from exc
     if limit <= 0:
-        raise ValueError("'limit' must be positive")
+        raise BadRequest("'limit' must be positive")
     return min(limit, READ_MAX_EVENTS)
 
 
@@ -544,22 +601,18 @@ def _pick_read_calendars(principal, calendar_id: str | None) -> list:
     — "what is on my agenda" spans the account, whereas a write needs exactly
     one target.
 
-    A name that matches nothing raises ValueError when the request supplied it
-    (a typo is a 400 — it must not read as a CalDAV outage) and RuntimeError
-    when it came from CALDAV_CALENDAR_ID, which is a deployment fault (502).
+    A name that matches nothing — or, since display names are not unique, more
+    than one calendar — fails as a BadRequest (400) when the request supplied it
+    and as a RuntimeError (502) when it came from CALDAV_CALENDAR_ID; see
+    _one_calendar.
     """
     if calendar_id == "*":
         return list(principal.calendars())
     target = calendar_id or CALDAV_CALENDAR_ID
     if not target:
         return list(principal.calendars())
-    for cal in principal.calendars():
-        if _match_calendar(cal, target):
-            return [cal]
-    if calendar_id:
-        raise ValueError(f"calendar {target!r} not found on this account")
-    raise RuntimeError(
-        f"CALDAV_CALENDAR_ID {target!r} matches no calendar on this account")
+    return [_one_calendar(list(principal.calendars()), target,
+                          from_request=bool(calendar_id))]
 
 
 def _search_calendar(cal, window_start, window_end) -> list:
@@ -682,16 +735,16 @@ def _calendars_snapshot() -> dict:
         if CALDAV_CALENDAR_ID:
             # Resolved against the calendars just listed rather than through
             # _resolve_calendar, which would open a second connection.
-            target = next((c for c in cals if _match_calendar(c, CALDAV_CALENDAR_ID)), None)
-            if target is None:
-                # /create-event rejects this same configuration, so a discovery
-                # answer must name the misconfiguration instead of reporting no
-                # target as though that were a healthy state. The calendar list
-                # is still worth returning: it is what says how to fix it.
-                write_target_error = (
-                    f"CALDAV_CALENDAR_ID {CALDAV_CALENDAR_ID!r} matches no calendar on "
-                    "this account — writes will fail until it is corrected"
-                )
+            try:
+                target = _one_calendar(cals, CALDAV_CALENDAR_ID, from_request=False)
+            except RuntimeError as exc:
+                # Missing or ambiguous: /create-event rejects this same
+                # configuration, so a discovery answer names the
+                # misconfiguration instead of reporting no target as though that
+                # were a healthy state. The calendar list is still worth
+                # returning — it is what says how to fix it.
+                target = None
+                write_target_error = f"{exc} — writes will fail until it is corrected"
         else:
             target = principal.calendar()
         if target is not None:
@@ -906,8 +959,13 @@ class _PushHandler(BaseHTTPRequestHandler):
         return bool(token) and hmac.compare_digest(token, GATEWAY_TOKEN)
 
     def _read_failed(self, what: str, exc: Exception) -> None:
-        """Answer a failed read: 400 for a bad request, 502 for the server."""
-        if isinstance(exc, ValueError):
+        """Answer a failed read: 400 for a bad request, 502 for anything else.
+
+        Only BadRequest counts as the caller's fault — a plain ValueError can
+        come out of the CalDAV library itself, and calling that a 400 would send
+        the caller hunting for a mistake they did not make.
+        """
+        if isinstance(exc, BadRequest):
             self._reply(400, {"error": str(exc)})
             return
         print(f"[caldav-gateway] {what} failed: {exc}\n{traceback.format_exc()}", flush=True)
@@ -958,7 +1016,7 @@ class _PushHandler(BaseHTTPRequestHandler):
                 window_start, window_end = _parse_read_window(
                     _param(params, "start"), _param(params, "end"), _param(params, "days"))
                 limit = _parse_read_limit(_param(params, "limit"))
-            except ValueError as exc:
+            except BadRequest as exc:
                 self._reply(400, {"error": str(exc)})
                 return
             calendar_id = _param(params, "calendar_id") or None
@@ -1056,7 +1114,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         try:
             _parse_event_datetime(start, all_day)
             _parse_event_datetime(end, all_day)
-        except ValueError as exc:
+        except BadRequest as exc:
             self._reply(400, {"error": str(exc)})
             return
 
@@ -1084,7 +1142,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         }
         try:
             uid = _create_event_on_server(entry)
-        except ValueError as exc:
+        except BadRequest as exc:
             self._reply(400, {"error": str(exc)})
             return
         except Exception as exc:
