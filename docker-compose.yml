@@ -335,8 +335,8 @@ services:
       # per-call timeouts, extra gateways enrolled on /sends and the built-in
       # channel set (scripts/messenger_gateways.py), the connection monitor's
       # tunables (scripts/gateway-monitor.py), and the CalDAV gateway's client
-      # side (scripts/caldav-push.py; the calendar credentials stay in
-      # caldav-gateway).
+      # side (scripts/caldav-push.py writes, scripts/caldav-read.py reads; the
+      # calendar credentials stay in caldav-gateway).
       - SIGNAL_DEFAULT_RECIPIENT
       - SIGNAL_GATEWAY_TIMEOUT
       - WHATSAPP_DEFAULT_RECIPIENT
@@ -353,6 +353,10 @@ services:
       - GATEWAY_MONITOR_STATE_DIR
       - GATEWAY_MONITOR_PUBLIC_BASE_URL
       - CALDAV_GATEWAY_CREATE_URL=http://caldav-gateway:8094/create-event
+      # Base URL for the read side (scripts/caldav-read.py: /calendars, /events,
+      # /event) — same gateway, same token, no approval flow: a read changes
+      # nothing in the calendar.
+      - CALDAV_GATEWAY_BASE_URL=http://caldav-gateway:8094
       - CALDAV_GATEWAY_TOKEN
       - CALDAV_GATEWAY_TIMEOUT
       # Ask-Ara connector tunables (scripts/ara-mcp-server.py) beyond the
@@ -748,7 +752,7 @@ services:
     networks:
       - agents
 
-  # CalDAV gateway — writes calendar events into the user's real calendar (see
+  # CalDAV gateway — reads and writes the user's real calendar (see
   # scripts/caldav-gateway.py). Provider-agnostic by design (issue #13): the
   # backend is selected purely by configuration (CALDAV_SERVER_URL/USERNAME/
   # PASSWORD/CALENDAR_ID) via a generic RFC 4791 client library — no
@@ -783,9 +787,16 @@ services:
       # Outbound send-control policy (JSON array, like EMAIL_SEND_POLICY). Keyed
       # by the SENDING identity (CALDAV_ACCOUNT above), not any per-request
       # field. Categories: allow / trust / verify. An account matching no entry
-      # and no "*" wildcard defaults to verify (fail-safe).
-      # [{"account":"default","category":"verify"},{"account":"agent","category":"allow"}]
+      # and no "*" wildcard defaults to verify (fail-safe). Reads (/calendars,
+      # /events, /event) are not governed by it — the policy guards what an
+      # agent may change, and a read changes nothing.
       - CALDAV_SEND_POLICY
+      # Read side: the window a range read covers when the caller names no end
+      # (this is what bounds the work), and the cap on how many events one
+      # response may carry. Both must be positive and finite, or the gateway
+      # warns and uses its default.
+      - CALDAV_READ_DEFAULT_DAYS
+      - CALDAV_READ_MAX_EVENTS
       # Public base URL for approval links returned by the verify/trust flow.
       - SEND_APPROVAL_BASE_URL
       # Outbound HTTP API (internal to the agents network; not published).

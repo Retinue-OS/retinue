@@ -544,14 +544,16 @@ that gap:
 
 ## Calendar (CalDAV)
 
-The `caldav-gateway` service writes calendar events into a real calendar,
-modeled exactly like a messenger channel: it owns the CalDAV credentials in its
-own container (no `mcp__*` tool, nothing in agent context), and outbound writes
-go through the same `allow`/`trust`/`verify` send-control model as e-mail and
-the messenger gateways, with pending events approvable on the same `/sends`
-page. This replaces the old workarounds for "put this on my agenda" — a
-downloaded `.ics` file the phone won't hand to the calendar app, or an
-"add to calendar" web link that only works for Google Calendar.
+The `caldav-gateway` service reads and writes a real calendar, modeled exactly
+like a messenger channel: it owns the CalDAV credentials in its own container
+(no `mcp__*` tool, nothing in agent context), and outbound writes go through the
+same `allow`/`trust`/`verify` send-control model as e-mail and the messenger
+gateways, with pending events approvable on the same `/sends` page. This replaces
+the old workarounds for "put this on my agenda" — a downloaded `.ics` file the
+phone won't hand to the calendar app, or an "add to calendar" web link that only
+works for Google Calendar. Reading the calendar goes through the same gateway
+(`scripts/caldav-read.py`), so an agent can check what is already there before
+proposing anything.
 
 **Provider-agnostic by design.** The backend is selected purely by
 configuration (`CALDAV_SERVER_URL`/`CALDAV_USERNAME`/`CALDAV_PASSWORD`/
@@ -568,6 +570,8 @@ CALDAV_USERNAME=you@example.com
 CALDAV_PASSWORD=            # an app password, never your normal login password
 CALDAV_CALENDAR_ID=         # optional: id/URL/display name; unset = the default calendar
 CALDAV_ACCOUNT=default      # the sending-identity label CALDAV_SEND_POLICY keys on
+CALDAV_READ_DEFAULT_DAYS=30 # optional: window a read covers when it names no end
+CALDAV_READ_MAX_EVENTS=500  # optional: cap on events per read response (not per query)
 ```
 
 Like the messenger gateways, `CALDAV_ACCOUNT` is a property of the *gateway
@@ -608,6 +612,69 @@ answers `status: sending` immediately and writes in the background, so a slow
 CalDAV round trip shows `sending → approved` on the approval page instead of
 tripping the proxy timeout.
 
+### Reading the calendar
+
+A calendar an agent can only write to is half a calendar: "am I free Thursday?",
+"what did we agree on?" and "is this already in the agenda?" all need the other
+direction. The gateway answers three token-gated read endpoints —
+`GET /calendars`, `GET /events`, `GET /event?uid=…` — and
+`scripts/caldav-read.py` is their client, the calendar counterpart of
+`signal-contacts.py`:
+
+```bash
+# The next 30 days across every calendar on the account
+# (output is JSON unless --text asks for the compact rendering shown here)
+scripts/caldav-read.py --text
+# → 2026-09-13T09:00:00 → 2026-10-13T09:00:00: 2 event(s)
+#     2026-09-21T14:00:00 – 2026-09-21T14:30:00  Dentist  @ Bahnhofstrasse 1  [Personal]
+#     2026-09-23  Conference  [Work]  (all day)  (recurring)
+
+scripts/caldav-read.py --start 2026-09-20 --end 2026-09-26     # one explicit window
+scripts/caldav-read.py --days 90 --query dentist               # search the text fields
+scripts/caldav-read.py --calendars                             # what exists, and where writes land
+scripts/caldav-read.py --uid 7f3c…@example.com                 # one event, by the uid a write returned
+```
+
+What is worth knowing about the semantics:
+
+- **Reads carry no send policy.** `CALDAV_SEND_POLICY` governs what an agent may
+  *change* in the user's calendar; a read changes nothing, so it is gated by the
+  gateway token alone and never queues on `/sends`. The credentials stay in the
+  gateway container either way.
+- **A read spans the account by default**, where a write needs one target: with
+  no `CALDAV_CALENDAR_ID` and no `--calendar-id`, a read covers every calendar on
+  the account, and each event says which one it came from. `--calendar-id '*'`
+  forces that even when the gateway is configured for a single calendar.
+- **Recurring events come back expanded** into the instances that fall inside the
+  window (so "is Thursday taken?" gets a straight answer), each flagged
+  `recurring`. Should expansion fail — servers and `caldav` releases differ in
+  where and how well they do it — the read falls back to the plain time-range
+  query rather than erroring, and the series comes back unexpanded.
+- **The window is half-open, `[start, end)`** — that is what a CalDAV time-range
+  query is, and its bounds are whole seconds. A bare `--end` date becomes the
+  following midnight, so `--start 2026-09-20 --end 2026-09-20` reads the whole
+  20th with no gap in its last second; an end at or before the start is an empty
+  window and so a 400. The `range` in the response echoes the window queried.
+- **Five fields round-trip into a write**: `summary`, `start`, `end`, `all_day`
+  and `description` carry the names and conventions `/create-event` takes,
+  including an all-day `end` reported as the exclusive iCalendar `DTEND`, so a
+  read result can be handed straight back. The rest — `location`, `status`,
+  `uid`, `recurring`, the calendar identity — is **read-only**: `/create-event`
+  neither accepts nor preserves it.
+- **`CALDAV_READ_MAX_EVENTS` bounds the response, not the query.** CalDAV cannot
+  be asked for "the first N in this range", so the server's answer is
+  materialized and then paged; the *window* is what keeps a read cheap, and the
+  cap only keeps the payload finite (`truncated` says when it bit). An unusable
+  value for either tunable (zero, negative, non-finite) is refused at startup
+  with a warning and the default used, rather than silently breaking the bound.
+- **`/calendars` reports a broken write target.** If `CALDAV_CALENDAR_ID` names
+  no calendar on the account, or names one ambiguously (display names are not
+  unique), the answer still lists the calendars but carries a
+  `write_target_error` saying so, instead of reporting "no target" as a healthy
+  state. Only writes that name no calendar of their own are affected —
+  `caldav-push.py --calendar-id <valid>` still resolves, the request taking
+  precedence over the setting.
+
 ### Enrolling with `/sends`
 
 `caldav-gateway` is **not** one of the three hardcoded built-in channels
@@ -632,8 +699,9 @@ state to track, so `/health` only reports whether the gateway is configured;
 a write's own success or failure (visible on `/sends`) is what proves the
 server is reachable.
 
-**Scope.** This first cut is create-only — recurrence, update, and delete are
-out of scope (see issue #13).
+**Scope.** Create and read. Updating or deleting an existing event is still out
+of scope, as is *authoring* recurrence (see issue #13); recurring events are
+expanded on read.
 
 ## First start
 

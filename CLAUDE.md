@@ -200,6 +200,24 @@ monitored by the framework — never build ad-hoc checks; a dead-seeming channel
 is checked on `/gateways`, and `configured: false` is intentional, not broken.
 Accounts, policies, extra gateways, monitoring: `docs/messaging.md`.
 
+## Calendar
+
+The calendar is a gateway like a messenger, not a tool: credentials stay in
+`caldav-gateway`, and the two thin CLIs are yours.
+
+- **Read before you propose.** `scripts/caldav-read.py` answers what is already
+  there (`--days N`, `--start/--end`, `--query`, `--calendars`, `--uid`; `--text`
+  for a compact rendering). Reads need no approval — check the agenda before
+  offering a slot, and before adding something that may be in it twice.
+- **Write with `scripts/caldav-push.py`** (`--start/--end`, `--all-day`,
+  `--description`). Writes are gated by the same `allow`/`trust`/`verify` send
+  policy as messages: a queued event is **not** in the calendar yet, so relay the
+  approval URL the script prints as a labeled link. Updating and deleting events
+  are not supported — say so rather than improvising.
+
+Endpoints, semantics (window inclusivity, recurrence expansion, which calendars
+a read spans) and configuration: README, "Calendar (CalDAV)".
+
 ## Dashboard
 
 The phone dashboard's conversation threads are your main channel for decisions.
