@@ -4,8 +4,9 @@
 Covers the pure logic behind the new endpoints without running an HTTP server
 or a SPARQL store: project-URI -> source-file resolution (including the path
 guards), the optimistic-concurrency file write, conversation kind/project
-storage and list filtering, and the project context injected into Ara's
-engage prompt.
+storage and list filtering, the project context injected into Ara's engage
+prompt, and the RETINUE_OWNER_ACTOR-driven mine/waiting split _fetch_projects()
+feeds the dashboard's projects card.
 
     python3 tests/test_web_gateway_projects.py
 """
@@ -188,6 +189,61 @@ def test_engage_prompt_context(wg, chambers: Path):
     print("ok: engage prompt context")
 
 
+def test_fetch_projects_owner_binding(tmp: Path):
+    """RETINUE_OWNER_ACTOR (PR #224 review, finding 3) drives _fetch_projects()'s
+    mine/waiting split for the dashboard's projects card -- previously untested:
+    tests/test_project_vocabulary.py only compares the module's vocabulary
+    constants and never calls _fetch_projects() or sets this variable.
+
+    `_OWNER_ACTOR` is read once at import time (`os.environ.get(...)` at module
+    scope), so each case here loads its own fresh copy of the module -- same
+    sandboxing recipe as `_load_gateway` -- with the owner variable set, or
+    deliberately absent, *before* the module executes, matching how the real
+    process boots.
+    """
+    def bindings(owner: str, other: str) -> list[dict]:
+        return [
+            {"p": {"value": "urn:retinue:project:mine"},
+             "title": {"value": "Mine"},
+             "actor": {"value": owner}},
+            {"p": {"value": "urn:retinue:project:theirs"},
+             "title": {"value": "Theirs"},
+             "actor": {"value": other}},
+        ]
+
+    owner = "urn:retinue:actor:owner-fixture"
+    someone_else = "urn:retinue:actor:someone-else"
+
+    # Explicit owner set: the project whose currentActor matches lands in
+    # "mine", the other in "waiting on <them>".
+    os.environ["RETINUE_OWNER_ACTOR"] = owner
+    try:
+        wg = _load_gateway(tmp / "explicit")
+    finally:
+        os.environ.pop("RETINUE_OWNER_ACTOR", None)  # never leak into the next load
+    assert wg._OWNER_ACTOR == owner, wg._OWNER_ACTOR
+    wg._sparql_bindings = lambda q: bindings(owner, someone_else)
+    result = wg._fetch_projects()
+    assert [i["id"] for i in result["mine"]] == ["urn:retinue:project:mine"], result["mine"]
+    assert [i["id"] for i in result["waiting"]] == ["urn:retinue:project:theirs"], result["waiting"]
+    assert result["waiting"][0]["waitingOn"] == "Someone Else", result["waiting"]
+
+    # Variable unset: fails safe into "everything is waiting on someone else",
+    # per .env.example's own documented contract. The two bindings are
+    # unchanged from above -- one of them is even the *same* actor string the
+    # explicit-owner case above just matched on -- so this also pins that only
+    # an explicit RETINUE_OWNER_ACTOR match ever populates "mine", never the
+    # module's own internal fallback constant leaking a false positive.
+    wg2 = _load_gateway(tmp / "unset")
+    assert wg2._OWNER_ACTOR == "urn:retinue:actor:owner", wg2._OWNER_ACTOR
+    wg2._sparql_bindings = lambda q: bindings(owner, someone_else)
+    result2 = wg2._fetch_projects()
+    assert result2["mine"] == [], result2["mine"]
+    assert {i["id"] for i in result2["waiting"]} == {
+        "urn:retinue:project:mine", "urn:retinue:project:theirs"}, result2["waiting"]
+    print("ok: fetch_projects owner binding (explicit match + unset fail-safe)")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -197,6 +253,7 @@ def main():
         test_item_payload_and_write(wg, chambers)
         test_conversation_kinds(wg)
         test_engage_prompt_context(wg, chambers)
+        test_fetch_projects_owner_binding(tmp)
     print("all web-gateway project tests passed")
 
 
