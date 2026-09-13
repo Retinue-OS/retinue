@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Checks for the CalDAV gateway's read API (GET /calendars, /events, /event).
+
+Runnable without the `caldav` package or network access, like its sibling
+tests/test_caldav_send_policy.py: the gateway's `caldav` import is guarded, the
+CalDAV principal is a stub, and the iCalendar serialization is exercised against
+plain dicts — the gateway's component helpers only ever call `.get()`, and
+icalendar normalizes property names to upper case, so an upper-cased dict stands
+in for a VEVENT component exactly.
+
+    python3 tests/test_caldav_read.py
+"""
+import datetime
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = REPO_ROOT / "scripts"
+
+
+def _load_caldav_gateway(pending_dir, calendar_id="", send_policy=None):
+    """Load scripts/caldav-gateway.py with the given read-relevant config."""
+    if str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+    os.environ["CALDAV_PENDING_SENDS_DIR"] = str(pending_dir)
+    os.environ["CALDAV_CALENDAR_ID"] = calendar_id
+    # Reads are deliberately NOT governed by the send policy; every test here
+    # runs with the strictest one (verify) to prove a read is never gated by it.
+    os.environ["CALDAV_SEND_POLICY"] = json.dumps(
+        send_policy if send_policy is not None else [{"account": "*", "category": "verify"}])
+    os.environ.pop("SEND_APPROVAL_SLUG", None)
+    spec = importlib.util.spec_from_file_location(
+        "caldav_gateway_read_under_test", SCRIPTS_DIR / "caldav-gateway.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+# ── Stubs standing in for the caldav library's objects ────────────────────────
+
+class _Prop:
+    """An icalendar date/time property: the value lives in `.dt`."""
+
+    def __init__(self, dt):
+        self.dt = dt
+
+
+class _Event:
+    """A caldav event object exposing one parsed VEVENT component."""
+
+    def __init__(self, component):
+        self.icalendar_component = component
+
+
+class _Calendar:
+    def __init__(self, cal_id, url, name, events=(), by_uid=None):
+        self.id = cal_id
+        self.url = url
+        self.name = name
+        self._events = list(events)
+        self._by_uid = by_uid or {}
+
+    def search(self, start=None, end=None, event=None, expand=None):
+        return list(self._events)
+
+    def event_by_uid(self, uid):
+        if uid not in self._by_uid:
+            raise RuntimeError("404 not found")
+        return _Event(self._by_uid[uid])
+
+
+class _Principal:
+    def __init__(self, calendars, default=None):
+        self._calendars = list(calendars)
+        self._default = default if default is not None else self._calendars[0]
+
+    def calendars(self):
+        return list(self._calendars)
+
+    def calendar(self):
+        return self._default
+
+
+def _timed(summary, start, end=None, **extra):
+    component = {"UID": f"uid-{summary}", "SUMMARY": summary, "DTSTART": _Prop(start)}
+    if end is not None:
+        component["DTEND"] = _Prop(end)
+    component.update(extra)
+    return component
+
+
+# ── Window parsing ───────────────────────────────────────────────────────────
+
+def test_read_window_defaults_to_now_plus_default_days():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        before = datetime.datetime.now()
+        start, end = cg._parse_read_window("", "", "")
+        assert before <= start <= datetime.datetime.now()
+        assert abs((end - start).days - cg.READ_DEFAULT_DAYS) <= 1
+        # --days overrides the default span.
+        start, end = cg._parse_read_window("2026-09-20", "", "7")
+        assert start == datetime.datetime(2026, 9, 20)
+        assert end == datetime.datetime(2026, 9, 27)
+    print("ok: read window defaults to now + READ_DEFAULT_DAYS")
+
+
+def test_read_window_end_date_covers_the_whole_day():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        # A single-day window: a bare end date means the END of that day, so
+        # start == end reads the whole of it (unlike an exclusive DTEND).
+        start, end = cg._parse_read_window("2026-09-20", "2026-09-20", "")
+        assert start == datetime.datetime(2026, 9, 20, 0, 0, 0)
+        assert (end.hour, end.minute, end.second) == (23, 59, 59)
+        # An explicit time is taken as given.
+        _, end = cg._parse_read_window("2026-09-20", "2026-09-20T12:00:00", "")
+        assert end == datetime.datetime(2026, 9, 20, 12, 0, 0)
+    print("ok: a bare end date covers that whole day")
+
+
+def test_read_window_rejects_bad_input():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        for start, end, days in (
+            ("not-a-date", "", ""),          # unparseable start
+            ("2026-09-20", "nonsense", ""),  # unparseable end
+            ("2026-09-20", "", "soon"),      # non-numeric days
+            ("2026-09-20", "", "0"),         # non-positive days
+            ("2026-09-20", "2026-09-19", ""),  # end before start
+        ):
+            try:
+                cg._parse_read_window(start, end, days)
+            except ValueError:
+                continue
+            raise AssertionError(f"expected ValueError for {(start, end, days)!r}")
+    print("ok: read window rejects bad input")
+
+
+def test_read_window_aligns_mixed_timezones():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        # One aware bound and one naive one must still be comparable: the naive
+        # side is read in the other's timezone rather than raising.
+        start, end = cg._parse_read_window("2026-09-20T00:00:00Z", "2026-09-27", "")
+        assert start.tzinfo is not None and end.tzinfo is not None
+        assert end > start
+        start, end = cg._parse_read_window("2026-09-20", "2026-09-27T00:00:00+02:00", "")
+        assert start.tzinfo is not None and end > start
+    print("ok: mixed-timezone bounds are aligned")
+
+
+def test_read_limit_clamped_to_maximum():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        assert cg._parse_read_limit("") == cg.READ_MAX_EVENTS
+        assert cg._parse_read_limit("10") == 10
+        assert cg._parse_read_limit(str(cg.READ_MAX_EVENTS * 10)) == cg.READ_MAX_EVENTS
+        for bad in ("many", "0", "-3"):
+            try:
+                cg._parse_read_limit(bad)
+            except ValueError:
+                continue
+            raise AssertionError(f"expected ValueError for {bad!r}")
+    print("ok: read limit clamped to READ_MAX_EVENTS")
+
+
+# ── Event serialization ──────────────────────────────────────────────────────
+
+def test_serialize_timed_event():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        tz = datetime.timezone(datetime.timedelta(hours=2))
+        component = {
+            "UID": "abc@example.com",
+            "SUMMARY": "Dentist",
+            "DESCRIPTION": "annual checkup",
+            "LOCATION": "Bahnhofstrasse 1",
+            "STATUS": "CONFIRMED",
+            "DTSTART": _Prop(datetime.datetime(2026, 9, 3, 14, 0, tzinfo=tz)),
+            "DTEND": _Prop(datetime.datetime(2026, 9, 3, 14, 30, tzinfo=tz)),
+        }
+        entry = cg._serialize_event(component, {"id": "cal-1", "url": "https://dav/c1", "name": "Personal"})
+        assert entry["uid"] == "abc@example.com"
+        assert entry["summary"] == "Dentist"
+        assert entry["start"] == "2026-09-03T14:00:00+02:00"
+        assert entry["end"] == "2026-09-03T14:30:00+02:00"
+        assert entry["all_day"] is False
+        assert entry["description"] == "annual checkup"
+        assert entry["location"] == "Bahnhofstrasse 1"
+        assert entry["status"] == "CONFIRMED"
+        assert entry["recurring"] is False
+        assert entry["calendar"] == "Personal"
+        assert entry["calendar_id"] == "cal-1"
+    print("ok: timed event serialized with its timezone")
+
+
+def test_serialize_all_day_event_round_trips_into_the_write_path():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        component = {"UID": "x", "SUMMARY": "Conference",
+                     "DTSTART": _Prop(datetime.date(2026, 9, 10)),
+                     "DTEND": _Prop(datetime.date(2026, 9, 12))}
+        entry = cg._serialize_event(component)
+        assert entry["all_day"] is True
+        # The DTEND is reported as iCalendar has it (exclusive) — the same value
+        # /create-event takes, so a read result can be written back unchanged.
+        assert (entry["start"], entry["end"]) == ("2026-09-10", "2026-09-12")
+        assert cg._parse_event_datetime(entry["start"], True) == datetime.date(2026, 9, 10)
+        assert cg._parse_event_datetime(entry["end"], True) == datetime.date(2026, 9, 12)
+        # No calendar identity given → stable shape, empty strings.
+        assert entry["calendar"] == "" and entry["calendar_id"] == ""
+    print("ok: all-day event round-trips into the write path")
+
+
+def test_serialize_derives_a_missing_end():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        # DURATION instead of DTEND.
+        entry = cg._serialize_event({
+            "DTSTART": _Prop(datetime.datetime(2026, 9, 3, 14, 0)),
+            "DURATION": _Prop(datetime.timedelta(minutes=45)),
+        })
+        assert entry["end"] == "2026-09-03T14:45:00"
+        # Neither: RFC 5545 makes a timed event instantaneous …
+        entry = cg._serialize_event({"DTSTART": _Prop(datetime.datetime(2026, 9, 3, 14, 0))})
+        assert entry["end"] == "2026-09-03T14:00:00"
+        # … and an all-day event one day long.
+        entry = cg._serialize_event({"DTSTART": _Prop(datetime.date(2026, 9, 3))})
+        assert entry["end"] == "2026-09-04"
+        # A component without any start still serializes (no crash on bad data).
+        entry = cg._serialize_event({"SUMMARY": "orphan"})
+        assert entry["start"] == "" and entry["end"] == "" and entry["summary"] == "orphan"
+    print("ok: a missing end is derived per RFC 5545")
+
+
+def test_serialize_flags_recurrence():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        base = {"DTSTART": _Prop(datetime.datetime(2026, 9, 3, 9, 0))}
+        assert cg._serialize_event(dict(base, RRULE="FREQ=WEEKLY"))["recurring"] is True
+        assert cg._serialize_event(dict(base, RDATE="20260910T090000"))["recurring"] is True
+        # One expanded instance carries RECURRENCE-ID rather than the rule.
+        assert cg._serialize_event(dict(base, **{"RECURRENCE-ID": _Prop(
+            datetime.datetime(2026, 9, 10, 9, 0))}))["recurring"] is True
+        assert cg._serialize_event(base)["recurring"] is False
+    print("ok: recurrence flagged for series and expanded instances")
+
+
+def test_event_components_walks_a_calendar_instance():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+
+        class _Instance:
+            def walk(self, name):
+                assert name == "VEVENT"
+                return [{"SUMMARY": "master"}, {"SUMMARY": "override"}]
+
+        class _Both:
+            icalendar_instance = _Instance()
+            icalendar_component = {"SUMMARY": "master"}
+
+        assert [c["SUMMARY"] for c in cg._event_components(_Both())] == ["master", "override"]
+        # Only a single component available → that one.
+        assert cg._event_components(_Event({"SUMMARY": "solo"})) == [{"SUMMARY": "solo"}]
+        # Neither → nothing, rather than an exception.
+        assert cg._event_components(object()) == []
+    print("ok: event components walked from a calendar instance")
+
+
+# ── Calendar selection and identity ──────────────────────────────────────────
+
+def test_calendar_identity_survives_an_unreadable_property():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+
+        class _Hostile:
+            id = "cal-1"
+            url = "https://dav/c1"
+
+            @property
+            def name(self):
+                raise RuntimeError("server said no")
+
+        identity = cg._calendar_identity(_Hostile())
+        assert identity == {"id": "cal-1", "url": "https://dav/c1", "name": ""}
+        # Matching works on any of the three, and never on the empty one.
+        assert cg._match_calendar(_Hostile(), "cal-1") is True
+        assert cg._match_calendar(_Hostile(), "https://dav/c1") is True
+        assert cg._match_calendar(_Hostile(), "") is False
+    print("ok: calendar identity survives an unreadable property")
+
+
+def test_pick_read_calendars():
+    work = _Calendar("cal-work", "https://dav/work", "Work")
+    home = _Calendar("cal-home", "https://dav/home", "Home")
+    principal = _Principal([work, home])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)  # CALDAV_CALENDAR_ID unset
+        # Nothing configured, nothing requested → the whole account, because
+        # "what is on my agenda" spans it (a write, by contrast, needs one).
+        assert cg._pick_read_calendars(principal, None) == [work, home]
+        # An explicit name/id/URL narrows to one.
+        assert cg._pick_read_calendars(principal, "Home") == [home]
+        assert cg._pick_read_calendars(principal, "cal-work") == [work]
+        assert cg._pick_read_calendars(principal, "https://dav/home") == [home]
+        try:
+            cg._pick_read_calendars(principal, "nope")
+        except RuntimeError as exc:
+            assert "not found" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError for an unknown calendar")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp, calendar_id="cal-work")
+        # Configured for one calendar → reads default to it …
+        assert cg._pick_read_calendars(principal, None) == [work]
+        # … "*" opens the whole account anyway, and a request still wins.
+        assert cg._pick_read_calendars(principal, "*") == [work, home]
+        assert cg._pick_read_calendars(principal, "Home") == [home]
+    print("ok: read calendar selection")
+
+
+# ── Listing, filtering, uid lookup ───────────────────────────────────────────
+
+def test_list_events_sorted_across_calendars():
+    work = _Calendar("cal-work", "https://dav/work", "Work", events=[
+        _Event(_timed("standup", datetime.datetime(2026, 9, 21, 9, 0),
+                      datetime.datetime(2026, 9, 21, 9, 15))),
+    ])
+    home = _Calendar("cal-home", "https://dav/home", "Home", events=[
+        _Event(_timed("dinner", datetime.datetime(2026, 9, 20, 19, 0),
+                      datetime.datetime(2026, 9, 20, 21, 0))),
+        _Event({"UID": "trip", "SUMMARY": "trip", "DTSTART": _Prop(datetime.date(2026, 9, 21)),
+                "DTEND": _Prop(datetime.date(2026, 9, 23))}),
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        cg._connect_principal = lambda: _Principal([work, home])
+        start, end = cg._parse_read_window("2026-09-20", "2026-09-27", "")
+        events = cg._list_events_on_server(start, end)
+        # Chronological across calendars; the all-day event of the 21st sorts
+        # before that day's timed one (its start is a bare date).
+        assert [e["summary"] for e in events] == ["dinner", "trip", "standup"]
+        assert [e["calendar"] for e in events] == ["Home", "Home", "Work"]
+        # A read is never gated by CALDAV_SEND_POLICY (verify, here): it
+        # answered instead of registering anything pending.
+        assert cg._outbound_policy_category() == "verify"
+        assert cg._list_pending_sends_store() == []
+    print("ok: events listed chronologically across calendars, ungated by send policy")
+
+
+def test_expanded_search_falls_back_when_unsupported():
+    calls = []
+
+    class _PickyCalendar(_Calendar):
+        def search(self, start=None, end=None, event=None, expand=None):
+            calls.append(expand)
+            if expand:
+                raise RuntimeError("expand not supported by this server")
+            return list(self._events)
+
+    cal = _PickyCalendar("c", "https://dav/c", "C", events=[
+        _Event(_timed("weekly", datetime.datetime(2026, 9, 21, 9, 0))),
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        cg._connect_principal = lambda: _Principal([cal])
+        start, end = cg._parse_read_window("2026-09-20", "2026-09-27", "")
+        events = cg._list_events_on_server(start, end)
+        # Expansion was tried first, then the plain time-range query — a server
+        # that cannot expand still answers the read.
+        assert calls == [True, None]
+        assert [e["summary"] for e in events] == ["weekly"]
+    print("ok: unsupported expansion falls back to a plain time-range search")
+
+
+def test_query_filter_matches_text_fields():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        entry = {"uid": "u-1", "summary": "Dentist", "description": "annual Checkup",
+                 "location": "Zürich", "calendar": "Personal"}
+        for needle in ("dentist", "checkup", "zürich", "u-1", "personal", ""):
+            assert cg._matches_query(entry, needle) is True, needle
+        assert cg._matches_query(entry, "plumber") is False
+    print("ok: query filter matches an event's text fields")
+
+
+def test_find_event_by_uid_across_calendars():
+    wanted = _timed("Dentist", datetime.datetime(2026, 9, 3, 14, 0),
+                    datetime.datetime(2026, 9, 3, 14, 30))
+    empty = _Calendar("cal-work", "https://dav/work", "Work")
+    holder = _Calendar("cal-home", "https://dav/home", "Home", by_uid={"uid-Dentist": wanted})
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        cg._connect_principal = lambda: _Principal([empty, holder])
+        entry = cg._find_event_by_uid("uid-Dentist")
+        assert entry["summary"] == "Dentist" and entry["calendar"] == "Home"
+        # A uid no calendar holds is None (mapped to 404 by the handler), not an
+        # error — the first calendar's "not found" must not abort the search.
+        assert cg._find_event_by_uid("uid-nothing") is None
+    print("ok: uid lookup spans the calendars a read covers")
+
+
+def test_calendars_snapshot_names_the_write_target():
+    work = _Calendar("cal-work", "https://dav/work", "Work")
+    home = _Calendar("cal-home", "https://dav/home", "Home")
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp, calendar_id="cal-home")
+        cg._connect_principal = lambda: _Principal([work, home], default=work)
+        snapshot = cg._calendars_snapshot()
+        assert [c["name"] for c in snapshot["calendars"]] == ["Work", "Home"]
+        # Configured CALDAV_CALENDAR_ID → that is where a write lands.
+        assert snapshot["write_target"]["id"] == "cal-home"
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)  # nothing configured
+        cg._connect_principal = lambda: _Principal([work, home], default=work)
+        snapshot = cg._calendars_snapshot()
+        # … unset → the account's default calendar.
+        assert snapshot["write_target"]["id"] == "cal-work"
+    print("ok: calendars snapshot names the write target")
+
+
+def test_serialize_a_real_icalendar_component_when_available():
+    """The stubs above assume how icalendar presents a VEVENT; verify it for real.
+
+    Skipped where the package is absent (CI installs neither caldav nor its
+    icalendar dependency — the gateway guards that import for exactly this
+    reason), but it pins the assumptions the stubs encode: case-insensitive
+    property access, `.dt` payloads, decoded TEXT escapes, preserved timezones.
+    """
+    try:
+        import icalendar
+    except ImportError:
+        print("skip: icalendar not installed (the real-component check)")
+        return
+    raw = b"""BEGIN:VCALENDAR\r
+VERSION:2.0\r
+PRODID:-//retinue//test//EN\r
+BEGIN:VEVENT\r
+UID:real-1@example.com\r
+SUMMARY:Zahnarzt\r
+DESCRIPTION:Kontrolle\\nund Reinigung\r
+LOCATION:Bahnhofstrasse 1\r
+STATUS:CONFIRMED\r
+RRULE:FREQ=YEARLY\r
+DTSTART;TZID=Europe/Zurich:20260903T140000\r
+DTEND;TZID=Europe/Zurich:20260903T143000\r
+END:VEVENT\r
+BEGIN:VEVENT\r
+UID:real-2@example.com\r
+SUMMARY:Konferenz\r
+DTSTART;VALUE=DATE:20260910\r
+DURATION:P2D\r
+END:VEVENT\r
+END:VCALENDAR\r
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+
+        class _Parsed:
+            icalendar_instance = icalendar.Calendar.from_ical(raw)
+
+        components = cg._event_components(_Parsed())
+        assert len(components) == 2
+        timed, all_day = (cg._serialize_event(c) for c in components)
+        assert timed["summary"] == "Zahnarzt"
+        # The event's own timezone survives, rather than being flattened to UTC.
+        assert timed["start"] == "2026-09-03T14:00:00+02:00"
+        assert timed["end"] == "2026-09-03T14:30:00+02:00"
+        # TEXT escapes are decoded by icalendar, so the JSON carries real newlines.
+        assert timed["description"] == "Kontrolle\nund Reinigung"
+        assert timed["status"] == "CONFIRMED" and timed["recurring"] is True
+        assert timed["all_day"] is False
+        # A DATE start with a DURATION: all-day, end derived from the duration.
+        assert (all_day["all_day"], all_day["start"], all_day["end"]) == (True, "2026-09-10", "2026-09-12")
+    print("ok: a real icalendar component serializes as the stubs assume")
+
+
+# ── Request routing ──────────────────────────────────────────────────────────
+
+def test_route_and_params():
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        route, params = cg._route_and_params("/events?start=2026-09-20&days=7&query=a%20b")
+        assert route == "/events"
+        assert cg._param(params, "start") == "2026-09-20"
+        assert cg._param(params, "days") == "7"
+        assert cg._param(params, "query") == "a b"
+        assert cg._param(params, "missing") == ""
+        # A trailing slash and a query string never hide a route.
+        assert cg._route_and_params("/calendars/")[0] == "/calendars"
+        assert cg._route_and_params("/health?x=1")[0] == "/health"
+        assert cg._route_and_params("/")[0] == ""
+        # Repeated parameters: the first wins, whitespace stripped.
+        _, params = cg._route_and_params("/events?limit=%2010%20&limit=99")
+        assert cg._param(params, "limit") == "10"
+    print("ok: routes and query parameters parsed")
+
+
+def main():
+    test_read_window_defaults_to_now_plus_default_days()
+    test_read_window_end_date_covers_the_whole_day()
+    test_read_window_rejects_bad_input()
+    test_read_window_aligns_mixed_timezones()
+    test_read_limit_clamped_to_maximum()
+    test_serialize_timed_event()
+    test_serialize_all_day_event_round_trips_into_the_write_path()
+    test_serialize_derives_a_missing_end()
+    test_serialize_flags_recurrence()
+    test_event_components_walks_a_calendar_instance()
+    test_calendar_identity_survives_an_unreadable_property()
+    test_pick_read_calendars()
+    test_list_events_sorted_across_calendars()
+    test_expanded_search_falls_back_when_unsupported()
+    test_query_filter_matches_text_fields()
+    test_find_event_by_uid_across_calendars()
+    test_calendars_snapshot_names_the_write_target()
+    test_serialize_a_real_icalendar_component_when_available()
+    test_route_and_params()
+    print("\nAll CalDAV read checks passed.")
+
+
+if __name__ == "__main__":
+    main()

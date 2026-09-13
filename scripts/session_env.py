@@ -139,9 +139,10 @@ SESSION_ENV_PREFIXES: tuple[str, ...] = (
 
 SESSION_ENV_SUFFIXES: tuple[str, ...] = (
     # The messenger and calendar gateways' client side (scripts/signal-push.py
-    # and siblings, *-contacts.py, caldav-push.py): the shared token that
-    # authorises a send request and the in-network URLs. The gateway that owns
-    # the account applies the send policy; the account credential itself
+    # and siblings, *-contacts.py, caldav-push.py, caldav-read.py): the shared
+    # token that authorises a send or read request and the in-network URLs. The
+    # gateway that owns the account applies the send policy (reads carry none —
+    # they change nothing); the account credential itself
     # (SIGNAL's link, TELEGRAM_API_HASH, CALDAV_PASSWORD) never lives in this
     # container. Suffix-matched so a deployment's extra gateway
     # (FOO_GATEWAY_TOKEN) enrols the same way.
