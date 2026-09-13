@@ -1133,9 +1133,14 @@ class RetinueConversation extends HTMLElement {
     const caption = wide
       ? '<span class="mp-label">Model</span>'
       : '<span class="mp-ico" aria-hidden="true">⚙</span>';
+    // While a turn is on the wire the pick cannot reach it: the model was
+    // read when the send started, and between a host-owned mint and its pin
+    // this composer has no thread id for a change to be enqueued against. So
+    // the control says so instead of silently not applying.
+    const busy = this._busy ? ' disabled' : '';
     return `<label class="model-pick${wide ? ' wide' : ''}" title="${title}">` +
       caption +
-      `<select data-model aria-label="${title}">${opts}</select></label>`;
+      `<select data-model aria-label="${title}"${busy}>${opts}</select></label>`;
   }
 
   // Bring the picker in line with the state — in place, never a full render.
@@ -1210,12 +1215,18 @@ class RetinueConversation extends HTMLElement {
   }
 
   // ── Sending ────────────────────────────────────────────────────────────────
-  async _send(text) {
+  // `fromDraft` is what the text IS. A turn the user typed is the draft: it
+  // carries the files staged with it and is spent from the draft once it is
+  // out. A turn the host asked for (ask, a quick pattern) is its own words
+  // beside whatever the user has half-written: it takes none of their files,
+  // spends none of their text, and — having never been in the box — goes INTO
+  // it if the send fails, which is the only place a retry could come from.
+  async _send(text, { fromDraft = true } = {}) {
     const key = this._key();
     const d = draftOf(key);
     // A message needs text or at least one attachment; one send at a time.
-    if (this._busy || (!text.trim() && !d.files.length)) return;
-    const sent = { text, files: d.files.slice() };
+    if (this._busy || (!text.trim() && !(fromDraft && d.files.length))) return;
+    const sent = { text, files: fromDraft ? d.files.slice() : [] };
     SENDS.set(key, sent);
     // The composer locks now, not once the send is over: nothing typed or
     // picked meanwhile can be lost to the clear below, and a composer
@@ -1246,7 +1257,7 @@ class RetinueConversation extends HTMLElement {
         return;
       }
       const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel);
-      clearSent(d, text, sent.files);
+      if (fromDraft) clearSent(d, text, sent.files);
       this._attachError = '';
       VOICE_ERRORS.delete(key); // a failed dictation's note, moot once a send went out
       // Which kind of send this was is a property of the key it started
@@ -1279,7 +1290,9 @@ class RetinueConversation extends HTMLElement {
         landed = target;
       }
     } catch (_err) {
-      // A soft failure: the draft stays in the input for a retry.
+      // A soft failure. A typed turn is still in the input for a retry; a
+      // host's turn was never there, so it is put there now rather than lost.
+      if (!fromDraft) appendToDraft(key, text);
     } finally {
       SENDS.delete(key);
       // Unlock, render and poll where the send landed — or, when it did not
@@ -1389,7 +1402,7 @@ class RetinueConversation extends HTMLElement {
   // whose own control IS the send press (the chat page's quick patterns: the
   // tap is the user's, so the turn is too). Anything already typed is left in
   // the composer, as it is when a chip is sent from a half-written draft.
-  ask(text) { return this._send(String(text == null ? '' : text)); }
+  ask(text) { return this._send(String(text == null ? '' : text), { fromDraft: false }); }
 
   // ── Voice input: record → live waveform → transcribe (review or send) ──────
   // Tapping the mic swaps the input row for a recording row: a live waveform
