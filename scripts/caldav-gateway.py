@@ -99,7 +99,14 @@ def _positive_env(name: str, default: str, cast):
     except ValueError:
         print(f"[caldav-gateway] warning: invalid {name}={raw!r}; using {fallback}", flush=True)
         return fallback
-    if not value > 0 or not math.isfinite(value):
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:
+        # isfinite() converts to float, which itself overflows for an int of a
+        # few hundred digits. An unusable setting must fall back, not crash the
+        # gateway at import — which is when this runs.
+        finite = False
+    if not value > 0 or not finite:
         print(f"[caldav-gateway] warning: {name}={raw!r} must be a positive, finite "
               f"number; using {fallback}", flush=True)
         return fallback
@@ -342,7 +349,12 @@ def _parse_window_bound(value: str, *, bare_date_ends_day: bool) -> datetime.dat
         raise ValueError(f"invalid date-time {value!r}: {exc}") from exc
     date_only = not any(sep in value for sep in ("T", " ", ":"))
     if date_only and bare_date_ends_day:
-        parsed += datetime.timedelta(days=1)
+        try:
+            parsed += datetime.timedelta(days=1)
+        except OverflowError as exc:
+            # A bare end date at the very end of the representable range: a bad
+            # request, like an out-of-range `days`, and answered the same way.
+            raise ValueError(f"end date {value!r} is out of range") from exc
     return parsed
 
 
@@ -531,6 +543,10 @@ def _pick_read_calendars(principal, calendar_id: str | None) -> list:
     falls back to CALDAV_CALENDAR_ID and, with that unset too, to every calendar
     — "what is on my agenda" spans the account, whereas a write needs exactly
     one target.
+
+    A name that matches nothing raises ValueError when the request supplied it
+    (a typo is a 400 — it must not read as a CalDAV outage) and RuntimeError
+    when it came from CALDAV_CALENDAR_ID, which is a deployment fault (502).
     """
     if calendar_id == "*":
         return list(principal.calendars())
@@ -540,7 +556,10 @@ def _pick_read_calendars(principal, calendar_id: str | None) -> list:
     for cal in principal.calendars():
         if _match_calendar(cal, target):
             return [cal]
-    raise RuntimeError(f"calendar {target!r} not found on the CalDAV server")
+    if calendar_id:
+        raise ValueError(f"calendar {target!r} not found on this account")
+    raise RuntimeError(
+        f"CALDAV_CALENDAR_ID {target!r} matches no calendar on this account")
 
 
 def _search_calendar(cal, window_start, window_end) -> list:
@@ -627,10 +646,12 @@ def _find_event_by_uid(uid: str, calendar_id: str | None = None) -> dict | None:
     """
     principal = _connect_principal()
     for cal in _pick_read_calendars(principal, calendar_id):
-        # get_event_by_uid is the current name; the other two are the library's
-        # own deprecated aliases, kept here for older releases.
+        # Event-specific lookups first (a uid can name a todo or a journal on
+        # the same calendar), current names before the library's own deprecated
+        # aliases, which older releases may be all that a server ships with.
         finder = next((f for f in (getattr(cal, name, None) for name in
-                                   ("get_event_by_uid", "event_by_uid", "object_by_uid"))
+                                   ("get_event_by_uid", "event_by_uid",
+                                    "get_object_by_uid", "object_by_uid"))
                        if callable(f)), None)
         if finder is None:  # pragma: no cover - library version without uid lookup
             continue

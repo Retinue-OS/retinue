@@ -91,6 +91,16 @@ class _LegacyCalendar(_Calendar):
         return _Calendar.get_event_by_uid(self, uid)
 
 
+class _GenericLookupCalendar(_Calendar):
+    """A caldav release shipping only the generic object lookup."""
+
+    get_event_by_uid = None
+    event_by_uid = None
+
+    def get_object_by_uid(self, uid):
+        return _Calendar.get_event_by_uid(self, uid)
+
+
 class _UnreachableCalendar(_Calendar):
     """A calendar the gateway cannot reach at all (transport/auth failure)."""
 
@@ -169,6 +179,9 @@ def test_read_window_rejects_bad_input():
             ("2026-09-20", "", "nan"),
             ("2026-09-20", "", "1e10"),
             ("9999-12-31", "", "365"),       # window past datetime.max
+            # A bare end date is advanced by a day, which overflows here — and
+            # must answer 400 like every other bad window, not crash the read.
+            ("9999-12-30", "9999-12-31", ""),
         ):
             try:
                 cg._parse_read_window(start, end, days)
@@ -214,7 +227,10 @@ def test_unusable_read_tunables_fall_back_to_their_defaults():
                         ("CALDAV_READ_MAX_EVENTS", "lots"),
                         ("CALDAV_READ_DEFAULT_DAYS", "inf"),
                         ("CALDAV_READ_DEFAULT_DAYS", "-7"),
-                        ("CALDAV_READ_DEFAULT_DAYS", "soon")):
+                        ("CALDAV_READ_DEFAULT_DAYS", "soon"),
+                        # int() parses this happily; math.isfinite() then
+                        # overflows converting it to float, at import time.
+                        ("CALDAV_READ_MAX_EVENTS", "1" * 400)):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ[name] = value
             try:
@@ -365,12 +381,25 @@ def test_pick_read_calendars():
         assert cg._pick_read_calendars(principal, "Home") == [home]
         assert cg._pick_read_calendars(principal, "cal-work") == [work]
         assert cg._pick_read_calendars(principal, "https://dav/home") == [home]
+        # A calendar the CALLER named and that does not exist is a bad request
+        # (ValueError → 400): a typo must not read as a CalDAV outage.
         try:
             cg._pick_read_calendars(principal, "nope")
-        except RuntimeError as exc:
+        except ValueError as exc:
             assert "not found" in str(exc)
         else:
-            raise AssertionError("expected RuntimeError for an unknown calendar")
+            raise AssertionError("expected ValueError for an unknown requested calendar")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # A CONFIGURED calendar that does not exist is a deployment fault
+        # (RuntimeError → 502), not something the caller can fix.
+        cg = _load_caldav_gateway(tmp, calendar_id="cal-typo")
+        try:
+            cg._pick_read_calendars(principal, None)
+        except RuntimeError as exc:
+            assert "CALDAV_CALENDAR_ID" in str(exc)
+        else:
+            raise AssertionError("expected RuntimeError for a misconfigured calendar")
 
     with tempfile.TemporaryDirectory() as tmp:
         cg = _load_caldav_gateway(tmp, calendar_id="cal-work")
@@ -490,6 +519,13 @@ def test_find_event_by_uid_across_calendars():
         cg = _load_caldav_gateway(tmp)
         legacy = _LegacyCalendar("cal-old", "https://dav/old", "Old", by_uid={"uid-Dentist": wanted})
         cg._connect_principal = lambda: _Principal([legacy])
+        assert cg._find_event_by_uid("uid-Dentist")["summary"] == "Dentist"
+    with tempfile.TemporaryDirectory() as tmp:
+        # … and one that ships only the generic object lookup.
+        cg = _load_caldav_gateway(tmp)
+        generic = _GenericLookupCalendar("cal-gen", "https://dav/gen", "Generic",
+                                        by_uid={"uid-Dentist": wanted})
+        cg._connect_principal = lambda: _Principal([generic])
         assert cg._find_event_by_uid("uid-Dentist")["summary"] == "Dentist"
     print("ok: uid lookup spans the calendars a read covers")
 
@@ -690,7 +726,12 @@ def test_read_endpoints_over_http():
             # Malformed parameters are client errors with a JSON body.
             for path in ("/events?days=soon", "/events?days=inf", "/events?days=1e10",
                          "/events?start=nonsense", "/events?limit=0",
-                         "/events?start=2026-09-20&end=2026-09-19"):
+                         "/events?start=2026-09-20&end=2026-09-19",
+                         "/events?start=9999-12-30&end=9999-12-31",
+                         # A calendar the caller named and that does not exist:
+                         # their typo, so a 400 — never a 502 about the server.
+                         "/events?days=7&calendar_id=nope",
+                         "/event?uid=uid-Dentist&calendar_id=nope"):
                 status, body = get(path)
                 assert status == 400 and "error" in body, (path, status, body)
 
