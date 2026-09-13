@@ -184,7 +184,9 @@ it is an allowlist and not a denylist. `python3
 /workspace/scripts/session_env.py` prints the names a session spawned from
 the current environment would receive. A deployment whose chamber scripts
 read variables outside the list names them, comma-separated, in
-`RETINUE_SESSION_ENV_EXTRA` on the retinue service.
+`RETINUE_SESSION_ENV_EXTRA` on the retinue service; and since that service
+itself receives only what `docker-compose.yml` lists (it loads no `env_file`),
+the variables go into the override's `environment:` for it as well.
 
 What this does not cover: every process in the container runs as the same
 uid, so a session can still read a daemon's `/proc/<pid>/environ`; and the

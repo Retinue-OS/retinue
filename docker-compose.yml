@@ -35,8 +35,9 @@ services:
         condition: service_started
       litellm:
         condition: service_healthy
-    env_file:
-      - .env
+    # Deliberately no env_file: this container receives an explicit list of
+    # variables — see the end of `environment:` below for the reasoning and
+    # the list itself.
     volumes:
       # Persistent storage for /root (Claude login, config, scheduler state).
       - retinue-root:/root
@@ -207,6 +208,188 @@ services:
       - NODE_EXTRA_CA_CERTS=/etc/egress-audit/certs/egress-ca-cert.pem
       - SSL_CERT_FILE=/etc/egress-audit/certs/egress-ca-cert.pem
       - REQUESTS_CA_BUNDLE=/etc/egress-audit/certs/egress-ca-cert.pem
+      # ── Everything else this container's own processes read ────────────
+      # This service deliberately loads no env_file. With `env_file: .env`
+      # every variable in the deployment's .env entered the container — the
+      # LiteLLM master and salt keys, the OpenRouter key, the CalDAV password,
+      # the Telegram app hash — and every daemon the entrypoint forks, and so
+      # every agent session those daemons spawned, inherited the lot
+      # (retinue-os/retinue#15). The names below come from an audit of
+      # scripts/ for what the web gateway, the scheduler, the monitors and the
+      # agent sessions actually read. A bare name takes its value from .env
+      # and stays unset when .env does not define it. A deployment whose
+      # chamber scripts read a variable not listed here adds it to this
+      # service's `environment:` in its docker-compose.override.yml (Compose
+      # merges the two lists) — and, for it to reach the agent sessions, also
+      # names it in RETINUE_SESSION_ENV_EXTRA (scripts/session_env.py).
+      #
+      # E-mail: the web gateway's IMAP/SMTP backend is the only process that
+      # holds the mailbox password; agent sessions reach mail through it and
+      # never see EMAIL_PASS. Only the DEFAULT account can be listed here — a
+      # named account's variables carry a deployment-chosen suffix
+      # (EMAIL_USER_<NAME>, EMAIL_PASS_<NAME>, IMAP_HOST_<NAME>, …) and go
+      # into the override's `environment:` for this service.
+      - EMAIL_USER
+      - EMAIL_PASS
+      - EMAIL_FROM_NAME
+      - IMAP_HOST
+      - IMAP_PORT
+      - SMTP_HOST
+      - SMTP_PORT
+      - SENT_FOLDER
+      - DRAFTS_FOLDER
+      - SMTP_SAVE_SENT
+      - EMAIL_SEND_POLICY
+      - SEND_STRIP_HEADERS
+      - EMAIL_BACKEND_TOKEN
+      - CONVERSATION_BACKEND_TOKEN
+      - CONVERSATION_BASE_URL
+      - SEND_APPROVAL_BASE_URL
+      # Model tiers and routing (docs/model-routing.md) and the dashboard's
+      # model picker. RETINUE_LITELLM_KEY and LITELLM_MASTER_KEY are the
+      # gateway's own credentials for the proxy's management API; agent
+      # sessions never receive either. Prefer RETINUE_LITELLM_KEY (a dedicated
+      # virtual key): with it set the master key need not enter this container.
+      - RETINUE_ROUTER_MODEL
+      - RETINUE_FRONTIER_MODEL
+      - RETINUE_TRIAGE_MODEL
+      - RETINUE_LITELLM_URL
+      - RETINUE_LITELLM_KEY
+      - RETINUE_MODELS_CACHE_SECONDS
+      - RETINUE_CONVERSATION_MODELS
+      - RETINUE_CONVERSATION_MODELS_FILE
+      - RETINUE_OLLAMA_URL
+      - OLLAMA_API_BASE
+      - OLLAMA_HOST
+      - LITELLM_MASTER_KEY
+      - LITELLM_PRIMARY_MODEL
+      - TRANSCRIPT_CLEANUP
+      - TRANSCRIPT_CLEANUP_MODEL
+      - TRANSCRIPT_CLEANUP_TIMEOUT
+      - PRESENTATION_LINT
+      - PRESENTATION_LINT_MODEL
+      - PRESENTATION_LINT_TIMEOUT
+      # Agent sessions: the allowlist's escape hatch (comma-separated names
+      # every spawned session should additionally receive), the memory
+      # switches, and Claude Code's own knobs.
+      - RETINUE_SESSION_ENV_EXTRA
+      - RETINUE_MEMORY
+      - RETINUE_MEMORY_DIR
+      - CLAUDE_PERMISSION_MODE
+      - CLAUDE_AUTH_REFRESH_AHEAD_SECONDS
+      - CLAUDE_AUTH_LOCK_WAIT_SECONDS
+      - CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS
+      - DISABLE_AUTOUPDATER
+      # Data refresh (scripts/refresh.py → sync-garmin.py, garmin-reauth.py).
+      - GARMIN_EMAIL
+      - GARMIN_PASSWORD
+      # Web Push (scripts/push_notify.py): the VAPID keypair lives on the /root
+      # volume; only the contact claim and the TTL come from the environment.
+      - VAPID_SUBJECT
+      - PUSH_TTL
+      # Gateway auth beyond the users/scopes above (scripts/gateway_auth.py).
+      - GATEWAY_BASIC_AUTH_USERS
+      - GATEWAY_AUTH_REALM
+      - GATEWAY_CLIENT_CERT_HEADER
+      - GATEWAY_CLIENT_CERT_INFO_HEADER
+      - GATEWAY_FORWARDED_HOST_HEADER
+      # Messenger and calendar sidecars: default recipients for the push
+      # scripts, client timeouts, extra gateways enrolled on /sends, the
+      # built-in channels actually run, and the link monitor (docs/messaging.md).
+      - SIGNAL_DEFAULT_RECIPIENT
+      - SIGNAL_GATEWAY_TIMEOUT
+      - WHATSAPP_DEFAULT_RECIPIENT
+      - WHATSAPP_GATEWAY_TIMEOUT
+      - TELEGRAM_DEFAULT_RECIPIENT
+      - TELEGRAM_GATEWAY_TIMEOUT
+      - CALDAV_GATEWAY_TOKEN
+      - CALDAV_GATEWAY_CREATE_URL
+      - CALDAV_GATEWAY_TIMEOUT
+      - MESSENGER_GATEWAYS
+      - MESSENGER_BUILTIN_CHANNELS
+      - GATEWAY_HEALTH_TIMEOUT
+      - GATEWAY_MONITOR_INTERVAL
+      - GATEWAY_MONITOR_FAILURES
+      - GATEWAY_MONITOR_HEALTH_TIMEOUT
+      - GATEWAY_MONITOR_IGNORE
+      - GATEWAY_MONITOR_REMIND_SECONDS
+      - GATEWAY_MONITOR_STATE_DIR
+      - GATEWAY_MONITOR_PUBLIC_BASE_URL
+      # Claude sign-in monitor tunables beyond the ones above (docs/claude-auth.md).
+      - CLAUDE_AUTH_MONITOR_FAILURES
+      - CLAUDE_AUTH_MONITOR_REMIND_SECONDS
+      - CLAUDE_AUTH_MONITOR_WARN_REMIND_SECONDS
+      - CLAUDE_AUTH_MONITOR_STATE_DIR
+      - CLAUDE_AUTH_PUBLIC_BASE_URL
+      - CLAUDE_OAUTH_HTTP_TIMEOUT
+      # Scheduler, plugin watcher, self-update (docs/scheduling.md).
+      - SCHEDULER_TICK_SECONDS
+      - SCHEDULER_JOB_TIMEOUT
+      - SCHEDULER_KILL_GRACE_SECONDS
+      - SCHEDULER_STATE_DIR
+      - PLUGIN_SYNC_INTERVAL
+      - UPDATER_TIMEOUT
+      # Web gateway tunables: session windows, concurrency, the requester
+      # allowlist, attachments, chats, voice input, the projects card, the
+      # news feed (docs/dashboard.md, docs/news.md).
+      - SESSION_MAX_IDLE_SECONDS
+      - CONV_SESSION_MAX_IDLE_SECONDS
+      - WEB_GATEWAY_MAX_CONCURRENCY
+      - ACCEPTED_REQUESTERS_PATH
+      - CONVERSATION_MAX_ATTACHMENT_BYTES
+      - MESSAGE_FILES_DIR
+      - MESSAGE_FILES_TTL_SECONDS
+      - JOB_RETENTION_SECONDS
+      - CHAT_OVERLAY_TTL_SECONDS
+      - CHAT_PAGE_MESSAGES
+      - CHAT_LIST_CACHE_SECONDS
+      - CHAT_SEND_TIMEOUT
+      - CHAT_SEND_MAX_IMAGES
+      - CHAT_SEND_CONFIRM_TIMEOUT
+      - CHAT_GATEWAY_IDENTITY_TTL
+      - CHAT_GATEWAY_IDENTITY_TTL_FAIL
+      - CHAT_COMPANION_CONTEXT_MESSAGES
+      - TRANSCRIBE_TIMEOUT
+      - PUSH_DIR
+      - WEBAPP_DIR
+      - DASHBOARD_DATA_DIR
+      - QLEVER_TIMEOUT
+      - QLEVER_GRAPH_BASE
+      - MAX_PROJECT_FILE_BYTES
+      - NEWS_HALF_LIFE_HOURS
+      - NEWS_MAX_AGE_DAYS
+      - NEWS_MAX_ITEMS
+      - NEWS_CURATE_BATCH
+      - NEWS_FETCH_TIMEOUT
+      # Ask-Ara connector tunables beyond the ones above (docs/ask-ara.md).
+      - ARA_MCP_TIMEOUT
+      - ARA_MCP_SYNC_WAIT
+      - ARA_MCP_MAX_CONCURRENCY
+      - ARA_MCP_RATE_LIMIT
+      - ARA_MCP_RATE_WINDOW
+      - ARA_MCP_AUDIT
+      - ARA_MCP_JOB_RETENTION
+      - ARA_MCP_WORKDIR
+      - ARA_MCP_GATEWAY_URL
+      # The triage gate and the project wake-ups, run as scheduled jobs
+      # (docs/triage-delivery-gate.md, docs/scheduling.md).
+      - TRIAGE_STATE_DIR
+      - TRIAGE_SENT_DERIVE_LIMIT
+      - TRIAGE_INBOX_SCAN_LIMIT
+      - TRIAGE_NEWS_FOLDER
+      - TRIAGE_NEWS_EXCERPT_CHARS
+      - TRIAGE_EMAIL_WHITELIST_PATH
+      - TRIAGE_MESSENGER_DIR
+      - EMAIL_CLIENT_PATH
+      - CHAMBERS_ROOT
+      - PROJECT_DEADLINE_LEAD_DAYS
+      - CONVERSATION_PUSH
+      # Agent-side clients of the gateway's internal endpoints, and the git
+      # shim's lock directory.
+      - CONVERSATION_BACKEND_URL
+      - CONVERSATION_BACKEND_TIMEOUT
+      - CHAT_DRAFT_BACKEND_URL
+      - GIT_SERIALIZE_LOCK_DIR
     command: remote-control
     stdin_open: true
     tty: true
