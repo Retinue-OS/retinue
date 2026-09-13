@@ -14,7 +14,10 @@ These tests pin down: the target is folded into the rendered text as
 `_render_html()`'s links list (what `read --uid ...` surfaces as its `links`
 field), and the "redundant" cases (anchor text already is the URL, a
 mailto:/tel: repeating the visible address/number, no links at all) stay
-exactly as before — quiet, not padded with noise.
+exactly as before — quiet, not padded with noise. Also a follow-up review
+finding on the same PR: a mailto:'s query string (?subject=/body=/cc=) is
+part of the action and must survive even when the address alone repeats the
+visible text.
 
     python3 tests/test_email_html_links.py
 """
@@ -96,6 +99,25 @@ def test_mailto_with_distinct_text_is_kept(ec):
     print("PASS mailto: with distinct visible text is kept")
 
 
+def test_mailto_with_query_is_kept_even_if_address_repeats(ec):
+    """A mailto: query is part of the action, not decoration.
+
+    `mailto:jane@example.com?subject=Invoice` with visible text
+    `jane@example.com` used to fall into the "address repeats the visible
+    text" suppression: the query was stripped before the comparison, matched,
+    and the whole target — subject line included — was dropped. Only a
+    mailto: with *no* query left to lose is redundant with a repeated
+    address.
+    """
+    html = ('<p>Contact <a href="mailto:jane@example.com?subject=Invoice">'
+            'jane@example.com</a></p>')
+    text, links = ec._render_html(html)
+    assert "mailto:jane@example.com?subject=Invoice" in text, text
+    assert links == [{"text": "jane@example.com",
+                       "url": "mailto:jane@example.com?subject=Invoice"}], links
+    print("PASS mailto: with a query is kept even when the address repeats")
+
+
 def test_no_links_stays_quiet(ec):
     """A body with no links at all gets no links list and no stray markup."""
     html = "<p>Hallo, keine Links hier.</p>"
@@ -123,6 +145,7 @@ def main():
     test_anchor_text_equal_to_href_is_not_padded(ec)
     test_mailto_repeating_the_address_is_not_padded(ec)
     test_mailto_with_distinct_text_is_kept(ec)
+    test_mailto_with_query_is_kept_even_if_address_repeats(ec)
     test_no_links_stays_quiet(ec)
     test_empty_anchor_is_skipped(ec)
     print("all email HTML-link tests passed")

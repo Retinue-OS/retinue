@@ -335,10 +335,13 @@ def _link_target_worth_noting(href, text):
     clutter: no href (or a bare fragment/JS pseudo-link), an anchor with no
     visible text to hang the target on, a mailto:/tel: whose target merely
     repeats the visible text (a "click to email jane@x.com" link that already
-    says "jane@x.com"), or visible text that already contains the URL.
-    Everything else is the case the issue is about — a call-to-action link
-    ("Rechnungskopie einsehen") whose only trace of the actual target is the
-    href — so it is worth noting.
+    says "jane@x.com") and carries no query string beyond the address, or
+    visible text that already contains the URL. A mailto: with a query
+    (?subject=/body=/cc=, ...) is never redundant even when the address is
+    repeated, since the query is part of the action and not visible anywhere
+    in the text. Everything else is the case the issue is about — a
+    call-to-action link ("Rechnungskopie einsehen") whose only trace of the
+    actual target is the href — so it is worth noting.
     """
     if not href:
         return None
@@ -351,8 +354,12 @@ def _link_target_worth_noting(href, text):
     if href.lower() in text.lower():
         return None
     if href.lower().startswith("mailto:"):
-        address = href[len("mailto:"):].split("?", 1)[0]
-        if address and address.lower() in text.lower():
+        # The query string is part of the action, not decoration: a mailto
+        # can carry ?subject=/body=/cc= that composes the draft, so an
+        # address that merely repeats the visible text is only redundant
+        # when there is no such query left to lose.
+        address, _, query = href[len("mailto:"):].partition("?")
+        if address and not query and address.lower() in text.lower():
             return None
     elif href.lower().startswith("tel:"):
         digits_href = re.sub(r"\D", "", href[len("tel:"):])
