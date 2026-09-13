@@ -25,3 +25,8 @@ docker-compose.override.yml
 
 # Marketplace listing generated at runtime from chambers + the identity template
 /.claude-plugin/marketplace.json
+
+# Scratch git worktrees created for Claude Code subagents — each is a full
+# checkout of this repository, kept only while the agent runs and cleaned up
+# afterwards. Never commit them: the contents are duplicates of tracked files.
+/.claude/worktrees/
