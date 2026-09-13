@@ -31,17 +31,19 @@ by the HTTP caller, so the endpoint is still not an arbitrary command runner.
 When unset, the default keeps a bare framework checkout self-updating exactly as
 before.
 
-Auth: the request must carry an ``X-Update-Token`` header, or an
-``Authorization`` header using the bearer scheme, whose value matches the
-``UPDATER_TOKEN`` environment variable. Unlike the web gateway's internal
-backend tokens, this one cannot be auto-generated at container start, because
-the retinue container (the caller) and this sidecar (the callee) are separate
-processes that would each generate their own value — so it must be set explicitly in
-``.env``, shared by both services via ``env_file``. When unset, every request
-is rejected (fail closed); there is no legitimate reason to run this sidecar
-without a token, since the public HTTP path additionally sits behind Traefik
-basic auth, but the internal endpoint alone must never be an open trigger for
-rebuilding the whole stack.
+Auth: ``POST /update`` and ``GET /status`` both require the request to carry an
+``X-Update-Token`` header, or an ``Authorization`` header using the bearer
+scheme, whose value matches the ``UPDATER_TOKEN`` environment variable
+(``GET /health`` stays open — liveness only, nothing to protect). Unlike the
+web gateway's internal backend tokens, this one cannot be auto-generated at
+container start, because the retinue container (the caller) and this sidecar
+(the callee) are separate processes that would each generate their own value —
+so it must be set explicitly in ``.env``, shared by both services via
+``env_file``. When unset, every gated request is rejected (fail closed); there
+is no legitimate reason to run this sidecar without a token, since the public
+HTTP path additionally sits behind Traefik basic auth, but the internal
+endpoints alone must never be an open trigger for, or window into, rebuilding
+the whole stack.
 
 The update runs in a background thread so the HTTP response (202 Accepted)
 returns immediately; a concurrent request while an update is already running
@@ -59,7 +61,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 UPDATER_TOKEN = os.environ.get("UPDATER_TOKEN", "").strip()
 UPDATER_PORT = int(os.environ.get("UPDATER_PORT", "9000"))
 PROJECT_DIR = os.environ.get("PROJECT_DIR", "/repo")
-UPDATE_LOG_PATH = os.environ.get("UPDATE_LOG_PATH", "/tmp/update.log")
+# Default onto the bind-mounted repo (see the `.:/repo` volume in
+# docker-compose.yml), not /tmp: /tmp is the *container's* own filesystem, so
+# it is wiped every time this sidecar is recreated (an update the sidecar
+# itself just triggered included) -- the log would then never outlive the run
+# it describes. `/repo` is the host checkout, so it survives. Nested under
+# `.retinue/` (gitignored) so the rebuild log never shows up as an untracked
+# file in the live checkout's `git status`.
+UPDATE_LOG_PATH = os.environ.get("UPDATE_LOG_PATH", os.path.join(PROJECT_DIR, ".retinue", "update.log"))
+# Create the log's parent once at startup rather than per run: `_run_update`
+# opens UPDATE_LOG_PATH in append mode, which raises (and would skip the
+# update recipe entirely, not just the logging) if the directory is missing.
+_log_dir = os.path.dirname(UPDATE_LOG_PATH)
+if _log_dir:
+    try:
+        os.makedirs(_log_dir, exist_ok=True)
+    except OSError:
+        pass
 # Generous ceiling for `git pull && docker compose build && docker compose up -d`
 UPDATE_TIMEOUT = float(os.environ.get("UPDATE_TIMEOUT", "1800"))
 # The deployment-injected update recipe (see module docstring). Empty => the
@@ -201,6 +219,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True})
             return
         if self.path == "/status":
+            # Unlike /health (liveness only), this exposes run state -- and,
+            # via `failed_step`, a fragment of the update recipe -- so it is
+            # gated the same way /update is: needed before the router
+            # example can publish it alongside /update (see
+            # docker-compose.override.example.yml).
+            if not _check_token(self.headers):
+                self._send_json(401, {"error": "unauthorized"})
+                return
             with _lock:
                 self._send_json(200, dict(_state))
             return
