@@ -571,7 +571,7 @@ CALDAV_PASSWORD=            # an app password, never your normal login password
 CALDAV_CALENDAR_ID=         # optional: id/URL/display name; unset = the default calendar
 CALDAV_ACCOUNT=default      # the sending-identity label CALDAV_SEND_POLICY keys on
 CALDAV_READ_DEFAULT_DAYS=30 # optional: window a read covers when it names no end
-CALDAV_READ_MAX_EVENTS=500  # optional: cap on events per read response
+CALDAV_READ_MAX_EVENTS=500  # optional: cap on events per read response (not per query)
 ```
 
 Like the messenger gateways, `CALDAV_ACCOUNT` is a property of the *gateway
@@ -635,7 +635,7 @@ scripts/caldav-read.py --calendars                             # what exists, an
 scripts/caldav-read.py --uid 7f3c…@example.com                 # one event, by the uid a write returned
 ```
 
-Four things are worth knowing about the semantics:
+What is worth knowing about the semantics:
 
 - **Reads carry no send policy.** `CALDAV_SEND_POLICY` governs what an agent may
   *change* in the user's calendar; a read changes nothing, so it is gated by the
@@ -650,11 +650,28 @@ Four things are worth knowing about the semantics:
   `recurring`. Should expansion fail — servers and `caldav` releases differ in
   where and how well they do it — the read falls back to the plain time-range
   query rather than erroring, and the series comes back unexpanded.
-- **The window is inclusive, the event's own `end` is not.** A bare `--end` date
-  covers that whole day, so `--start 2026-09-20 --end 2026-09-20` reads the 20th.
-  An event's fields, by contrast, are reported exactly as iCalendar has them —
-  including the exclusive `DTEND` of an all-day event — and use the same names
-  `/create-event` takes, so a read result can be handed straight back to a write.
+- **The window is half-open, `[start, end)`** — that is what a CalDAV time-range
+  query is, and its bounds are whole seconds. A bare `--end` date becomes the
+  following midnight, so `--start 2026-09-20 --end 2026-09-20` reads the whole
+  20th with no gap in its last second; an end at or before the start is an empty
+  window and so a 400. The `range` in the response echoes the window queried.
+- **Five fields round-trip into a write**: `summary`, `start`, `end`, `all_day`
+  and `description` carry the names and conventions `/create-event` takes,
+  including an all-day `end` reported as the exclusive iCalendar `DTEND`, so a
+  read result can be handed straight back. The rest — `location`, `status`,
+  `uid`, `recurring`, the calendar identity — is **read-only**: `/create-event`
+  neither accepts nor preserves it.
+- **`CALDAV_READ_MAX_EVENTS` bounds the response, not the query.** CalDAV cannot
+  be asked for "the first N in this range", so the server's answer is
+  materialized and then paged; the *window* is what keeps a read cheap, and the
+  cap only keeps the payload finite (`truncated` says when it bit). An unusable
+  value for either tunable (zero, negative, non-finite) is refused at startup
+  with a warning and the default used, rather than silently breaking the bound.
+- **`/calendars` reports a broken write target.** If `CALDAV_CALENDAR_ID` names
+  no calendar on the account — the configuration under which `/create-event`
+  fails — the answer still lists the calendars but carries a
+  `write_target_error` saying so, instead of reporting "no target" as a healthy
+  state.
 
 ### Enrolling with `/sends`
 

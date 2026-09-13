@@ -134,18 +134,20 @@ def test_read_window_defaults_to_now_plus_default_days():
     print("ok: read window defaults to now + READ_DEFAULT_DAYS")
 
 
-def test_read_window_end_date_covers_the_whole_day():
+def test_read_window_is_half_open_and_a_bare_end_date_covers_its_day():
     with tempfile.TemporaryDirectory() as tmp:
         cg = _load_caldav_gateway(tmp)
-        # A single-day window: a bare end date means the END of that day, so
-        # start == end reads the whole of it (unlike an exclusive DTEND).
+        # The window is [start, end), as a CalDAV time-range query is. A bare end
+        # date therefore becomes the FOLLOWING midnight, so start == end still
+        # reads the whole day — with no gap in its last second, which an
+        # inclusive 23:59:59 bound would leave (CalDAV bounds are whole seconds).
         start, end = cg._parse_read_window("2026-09-20", "2026-09-20", "")
         assert start == datetime.datetime(2026, 9, 20, 0, 0, 0)
-        assert (end.hour, end.minute, end.second) == (23, 59, 59)
-        # An explicit time is taken as given.
+        assert end == datetime.datetime(2026, 9, 21, 0, 0, 0)
+        # An explicit time is taken as given, exclusive like the rest.
         _, end = cg._parse_read_window("2026-09-20", "2026-09-20T12:00:00", "")
         assert end == datetime.datetime(2026, 9, 20, 12, 0, 0)
-    print("ok: a bare end date covers that whole day")
+    print("ok: the window is half-open and a bare end date covers its whole day")
 
 
 def test_read_window_rejects_bad_input():
@@ -156,7 +158,11 @@ def test_read_window_rejects_bad_input():
             ("2026-09-20", "nonsense", ""),  # unparseable end
             ("2026-09-20", "", "soon"),      # non-numeric days
             ("2026-09-20", "", "0"),         # non-positive days
-            ("2026-09-20", "2026-09-19", ""),  # end before start
+            ("2026-09-20", "2026-09-19", ""),  # end date before the start date
+            ("2026-09-20", "2026-09-18", ""),  # … and further before it
+            # The window is half-open, so an end AT the start is empty, which is
+            # a bad request rather than a silently empty answer.
+            ("2026-09-20T12:00:00", "2026-09-20T12:00:00", ""),
             # float() accepts these, and timedelta then raises something the
             # handler would not map to a 400 — so reject them here instead.
             ("2026-09-20", "", "inf"),
@@ -201,6 +207,25 @@ def test_read_limit_clamped_to_maximum():
 
 
 # ── Event serialization ──────────────────────────────────────────────────────
+
+def test_unusable_read_tunables_fall_back_to_their_defaults():
+    for name, value in (("CALDAV_READ_MAX_EVENTS", "-1"),   # matched[:-1] ≈ everything
+                        ("CALDAV_READ_MAX_EVENTS", "0"),    # matched[:0] = nothing
+                        ("CALDAV_READ_MAX_EVENTS", "lots"),
+                        ("CALDAV_READ_DEFAULT_DAYS", "inf"),
+                        ("CALDAV_READ_DEFAULT_DAYS", "-7"),
+                        ("CALDAV_READ_DEFAULT_DAYS", "soon")):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ[name] = value
+            try:
+                cg = _load_caldav_gateway(tmp)
+                # A cap that would defeat its own purpose is refused, not served.
+                assert cg.READ_MAX_EVENTS == 500, (name, value, cg.READ_MAX_EVENTS)
+                assert cg.READ_DEFAULT_DAYS == 30.0, (name, value, cg.READ_DEFAULT_DAYS)
+            finally:
+                os.environ.pop(name, None)
+    print("ok: unusable read tunables fall back to their defaults")
+
 
 def test_serialize_timed_event():
     with tempfile.TemporaryDirectory() as tmp:
@@ -508,6 +533,18 @@ def test_calendars_snapshot_names_the_write_target():
         snapshot = cg._calendars_snapshot()
         # … unset → the account's default calendar.
         assert snapshot["write_target"]["id"] == "cal-work"
+        assert "write_target_error" not in snapshot
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp, calendar_id="cal-typo")
+        cg._connect_principal = lambda: _Principal([work, home], default=work)
+        snapshot = cg._calendars_snapshot()
+        # A configured calendar that matches nothing is a misconfiguration —
+        # /create-event rejects it too — so discovery says so rather than
+        # reporting "no write target" as a healthy state. The list still comes
+        # back: it is what shows how to fix the setting.
+        assert snapshot["write_target"] is None
+        assert "cal-typo" in snapshot["write_target_error"]
+        assert [c["name"] for c in snapshot["calendars"]] == ["Work", "Home"]
     print("ok: calendars snapshot names the write target")
 
 
@@ -588,12 +625,105 @@ def test_route_and_params():
     print("ok: routes and query parameters parsed")
 
 
+# ── The read endpoints over real HTTP ────────────────────────────────────────
+
+def test_read_endpoints_over_http():
+    """Drive /calendars, /events and /event through _PushHandler itself.
+
+    The checks above exercise the helpers; this one covers the HTTP boundary the
+    outside world actually meets — the token gate, the status mapping (200 / 400
+    / 404 / 502) and the promise that a read never touches the send policy, which
+    is `verify` here (the same in-process pattern as
+    test_signal_send_policy.py's handler test).
+    """
+    import http.client
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    tz = datetime.timezone(datetime.timedelta(hours=2))
+    personal = _Calendar("cal-1", "https://dav/c1", "Personal", events=[
+        _Event(_timed("Dentist", datetime.datetime(2026, 9, 21, 14, 0, tzinfo=tz),
+                      datetime.datetime(2026, 9, 21, 14, 30, tzinfo=tz),
+                      LOCATION="Bahnhofstrasse 1")),
+    ], by_uid={"uid-Dentist": _timed("Dentist", datetime.datetime(2026, 9, 21, 14, 0, tzinfo=tz))})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["CALDAV_GATEWAY_TOKEN"] = "s3cret"
+        try:
+            cg = _load_caldav_gateway(tmp)
+        finally:
+            os.environ.pop("CALDAV_GATEWAY_TOKEN", None)
+        cg._connect_principal = lambda: _Principal([personal])
+        server = ThreadingHTTPServer(("127.0.0.1", 0), cg._PushHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def get(path, token="s3cret"):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1])
+                conn.request("GET", path, headers={"Authorization": f"Bearer {token}"} if token else {})
+                resp = conn.getresponse()
+                body = json.loads(resp.read().decode("utf-8"))
+                conn.close()
+                return resp.status, body
+
+            # The token gates every read; /health stays open, as the monitor needs.
+            for path in ("/calendars", "/events", "/event?uid=uid-Dentist"):
+                assert get(path, token=None)[0] == 401, path
+                assert get(path, token="wrong")[0] == 401, path
+            assert get("/health", token=None)[0] == 200
+
+            status, body = get("/events?start=2026-09-20&end=2026-09-27")
+            assert status == 200, body
+            assert [e["summary"] for e in body["events"]] == ["Dentist"]
+            assert body["events"][0]["location"] == "Bahnhofstrasse 1"
+            assert (body["count"], body["total"], body["truncated"]) == (1, 1, False)
+            # The range echoes the half-open window actually queried.
+            assert body["range"] == {"start": "2026-09-20T00:00:00", "end": "2026-09-28T00:00:00"}
+            # A read under a verify policy answers instead of queueing anything.
+            assert cg._outbound_policy_category() == "verify"
+            assert get("/pending-sends")[1]["pending"] == []
+
+            # The text filter and the response cap, over the wire.
+            assert get("/events?days=30&query=plumber")[1]["total"] == 0
+            status, body = get("/events?days=30&limit=1")
+            assert status == 200 and body["count"] == 1
+
+            # Malformed parameters are client errors with a JSON body.
+            for path in ("/events?days=soon", "/events?days=inf", "/events?days=1e10",
+                         "/events?start=nonsense", "/events?limit=0",
+                         "/events?start=2026-09-20&end=2026-09-19"):
+                status, body = get(path)
+                assert status == 400 and "error" in body, (path, status, body)
+
+            # /event: found, missing uid (404), no uid at all (400).
+            status, body = get("/event?uid=uid-Dentist")
+            assert status == 200 and body["summary"] == "Dentist" and body["calendar"] == "Personal"
+            assert get("/event?uid=nope")[0] == 404
+            assert get("/event")[0] == 400
+            assert get("/calendars")[1]["write_target"]["name"] == "Personal"
+            assert get("/nope")[0] == 404
+
+            # A backend that fails is a 502, never a 200 with nothing in it.
+            # (The gateway logs the traceback as it does in production — the
+            # noise below this line in the test output is that log.)
+            def _unreachable():
+                raise RuntimeError("server unreachable")
+
+            cg._connect_principal = _unreachable
+            for path in ("/events?days=7", "/event?uid=uid-Dentist", "/calendars"):
+                status, body = get(path)
+                assert status == 502 and "unreachable" in body["error"], (path, status, body)
+        finally:
+            server.shutdown()
+    print("ok: the read endpoints answer correctly over HTTP")
+
+
 def main():
     test_read_window_defaults_to_now_plus_default_days()
-    test_read_window_end_date_covers_the_whole_day()
+    test_read_window_is_half_open_and_a_bare_end_date_covers_its_day()
     test_read_window_rejects_bad_input()
     test_read_window_aligns_mixed_timezones()
     test_read_limit_clamped_to_maximum()
+    test_unusable_read_tunables_fall_back_to_their_defaults()
     test_serialize_timed_event()
     test_serialize_all_day_event_round_trips_into_the_write_path()
     test_serialize_derives_a_missing_end()
@@ -610,6 +740,7 @@ def main():
     test_calendars_snapshot_names_the_write_target()
     test_serialize_a_real_icalendar_component_when_available()
     test_route_and_params()
+    test_read_endpoints_over_http()
     print("\nAll CalDAV read checks passed.")
 
 

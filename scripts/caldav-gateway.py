@@ -83,11 +83,37 @@ GATEWAY_TOKEN = os.environ.get("CALDAV_GATEWAY_TOKEN", "").strip()
 # bounded cap, defence-in-depth against an oversized body.
 MAX_BODY_BYTES = int(os.environ.get("CALDAV_GATEWAY_MAX_BODY_BYTES", str(64 * 1024)))
 
-# Read side (GET /events). The window a read covers when the caller names no
-# end, and the hard cap on how many events one response may carry — a read of
-# "the next year across five calendars" must not return an unbounded payload.
-READ_DEFAULT_DAYS = float(os.environ.get("CALDAV_READ_DEFAULT_DAYS", "30"))
-READ_MAX_EVENTS = int(os.environ.get("CALDAV_READ_MAX_EVENTS", "500"))
+
+def _positive_env(name: str, default: str, cast):
+    """A read tunable, refusing a value that would defeat its own purpose.
+
+    A zero or negative cap silently breaks the bound it exists for
+    (`matched[:0]` is empty, `matched[:-1]` is nearly everything), and a
+    non-finite window is no window, so an unusable setting falls back to the
+    default with a warning rather than being served.
+    """
+    raw = (os.environ.get(name, default) or "").strip() or default
+    fallback = cast(default)
+    try:
+        value = cast(raw)
+    except ValueError:
+        print(f"[caldav-gateway] warning: invalid {name}={raw!r}; using {fallback}", flush=True)
+        return fallback
+    if not value > 0 or not math.isfinite(value):
+        print(f"[caldav-gateway] warning: {name}={raw!r} must be a positive, finite "
+              f"number; using {fallback}", flush=True)
+        return fallback
+    return value
+
+
+# Read side (GET /events): the window a read covers when the caller names no
+# end, and the cap on how many events one RESPONSE may carry. The window, not
+# the cap, is what bounds the work — a CalDAV time-range query cannot be asked
+# for "the first N", so the server's answer is materialized and then paged here.
+# A read of "the next year across five calendars" is therefore narrowed by its
+# window; the cap only keeps the payload itself finite.
+READ_DEFAULT_DAYS = _positive_env("CALDAV_READ_DEFAULT_DAYS", "30", float)
+READ_MAX_EVENTS = _positive_env("CALDAV_READ_MAX_EVENTS", "500", int)
 
 # Outbound send-control policy — the calendar analogue of EMAIL_SEND_POLICY /
 # SIGNAL_SEND_POLICY. Keyed by the *sending* identity (CALDAV_ACCOUNT above),
@@ -294,13 +320,16 @@ def _create_event_on_server(entry: dict) -> str:
 # account.
 
 
-def _parse_window_bound(value: str, *, end_of_day: bool) -> datetime.datetime:
+def _parse_window_bound(value: str, *, bare_date_ends_day: bool) -> datetime.datetime:
     """Parse one bound of a read window into a datetime.
 
-    A bound given as a plain date (2026-09-20) means midnight for the start and
-    the very last instant of that day for the end, so `start=2026-09-20&
-    end=2026-09-20` reads the whole of the 20th — the obvious reading of a
-    window, and unlike an iCalendar DTEND, which is exclusive.
+    The window is half-open — [start, end) — because that is exactly what a
+    CalDAV time-range query is, and its bounds are second-resolution. A bare end
+    date therefore becomes the FOLLOWING midnight: `start=2026-09-20&
+    end=2026-09-20` covers the whole of the 20th, with no gap in its last second
+    (which an inclusive 23:59:59.999999 bound would leave once the client
+    serializes it to whole seconds), and without silently including an event
+    that starts exactly at the 21st.
     """
     value = (value or "").strip()
     if not value:
@@ -312,8 +341,8 @@ def _parse_window_bound(value: str, *, end_of_day: bool) -> datetime.datetime:
     except ValueError as exc:
         raise ValueError(f"invalid date-time {value!r}: {exc}") from exc
     date_only = not any(sep in value for sep in ("T", " ", ":"))
-    if date_only and end_of_day:
-        parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+    if date_only and bare_date_ends_day:
+        parsed += datetime.timedelta(days=1)
     return parsed
 
 
@@ -333,15 +362,16 @@ def _align_timezones(start: datetime.datetime, end: datetime.datetime) -> tuple:
 
 
 def _parse_read_window(start: str, end: str, days: str) -> tuple:
-    """Resolve (start, end) for a read from the request's parameters.
+    """Resolve the half-open window [start, end) a read covers.
 
     Unset start = now; unset end = start + `days` (READ_DEFAULT_DAYS when that
     too is unset). Raises ValueError — mapped to HTTP 400 — for an unparseable
-    bound or an end before the start.
+    bound, a non-finite or out-of-range span, or an end at or before the start.
     """
-    window_start = _parse_window_bound(start, end_of_day=False) if start else datetime.datetime.now()
+    window_start = (_parse_window_bound(start, bare_date_ends_day=False) if start
+                    else datetime.datetime.now())
     if end:
-        window_end = _parse_window_bound(end, end_of_day=True)
+        window_end = _parse_window_bound(end, bare_date_ends_day=True)
     else:
         if days:
             try:
@@ -362,8 +392,11 @@ def _parse_read_window(start: str, end: str, days: str) -> tuple:
             # datetime.max: a bad request, not a server fault.
             raise ValueError(f"'days' value {days or span!r} is out of range") from exc
     window_start, window_end = _align_timezones(window_start, window_end)
-    if window_end < window_start:
-        raise ValueError("'end' is before 'start'")
+    if window_end <= window_start:
+        # The window being half-open, an end at or before the start is an empty
+        # window — never what a caller wants, so it is a bad request rather than
+        # a silently empty answer.
+        raise ValueError("'end' must be after 'start'")
     return window_start, window_end
 
 
@@ -410,10 +443,13 @@ def _iso(value) -> str:
 def _serialize_event(component, calendar: dict | None = None) -> dict:
     """One VEVENT as plain JSON, in the same vocabulary /create-event accepts.
 
-    The field names match the create payload (summary/start/end/all_day/
-    description) so a read result can be handed straight back to a write. For
-    an all-day event `end` is the iCalendar DTEND — exclusive, per RFC 5545 —
-    exactly as the write path passes it, so an event round-trips unchanged.
+    The five fields the write path takes — summary, start, end, all_day,
+    description — carry the same names and the same conventions here, including
+    an all-day `end` reported as the iCalendar DTEND (exclusive, per RFC 5545)
+    exactly as the write path passes it, so those round-trip unchanged. The
+    remaining fields are READ-ONLY: location, status, uid, recurring and the
+    calendar identity describe the event as it is on the server, and
+    /create-event neither accepts nor preserves them.
     """
     start = _icomp_dt(component, "DTSTART")
     all_day = isinstance(start, datetime.date) and not isinstance(start, datetime.datetime)
@@ -620,18 +656,34 @@ def _calendars_snapshot() -> dict:
     principal = _connect_principal()
     cals = list(principal.calendars())
     write_target = None
+    write_target_error = None
     try:
         if CALDAV_CALENDAR_ID:
             # Resolved against the calendars just listed rather than through
             # _resolve_calendar, which would open a second connection.
             target = next((c for c in cals if _match_calendar(c, CALDAV_CALENDAR_ID)), None)
+            if target is None:
+                # /create-event rejects this same configuration, so a discovery
+                # answer must name the misconfiguration instead of reporting no
+                # target as though that were a healthy state. The calendar list
+                # is still worth returning: it is what says how to fix it.
+                write_target_error = (
+                    f"CALDAV_CALENDAR_ID {CALDAV_CALENDAR_ID!r} matches no calendar on "
+                    "this account — writes will fail until it is corrected"
+                )
         else:
             target = principal.calendar()
         if target is not None:
             write_target = _calendar_identity(target)
     except Exception as exc:  # pragma: no cover - server-dependent
-        print(f"[caldav-gateway] could not resolve the write target: {exc}", flush=True)
-    return {"calendars": [_calendar_identity(cal) for cal in cals], "write_target": write_target}
+        write_target_error = f"could not resolve the write target: {exc}"
+    if write_target_error:
+        print(f"[caldav-gateway] {write_target_error}", flush=True)
+    snapshot = {"calendars": [_calendar_identity(cal) for cal in cals],
+                "write_target": write_target}
+    if write_target_error:
+        snapshot["write_target_error"] = write_target_error
+    return snapshot
 
 
 def _format_pending_body(start: str, end: str, all_day: bool, description: str) -> str:

@@ -791,8 +791,10 @@ services:
       # /events, /event) are not governed by it — the policy guards what an
       # agent may change, and a read changes nothing.
       - CALDAV_SEND_POLICY
-      # Read side: the window a range read covers when the caller names no end,
-      # and the cap on how many events one response may carry.
+      # Read side: the window a range read covers when the caller names no end
+      # (this is what bounds the work), and the cap on how many events one
+      # response may carry. Both must be positive and finite, or the gateway
+      # warns and uses its default.
       - CALDAV_READ_DEFAULT_DAYS
       - CALDAV_READ_MAX_EVENTS
       # Public base URL for approval links returned by the verify/trust flow.

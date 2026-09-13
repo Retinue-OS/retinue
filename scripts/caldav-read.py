@@ -35,8 +35,10 @@ Configuration (environment):
     CALDAV_GATEWAY_TIMEOUT   HTTP timeout in seconds (default 30)
 """
 import argparse
+import datetime
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -70,8 +72,29 @@ def _fetch_or_exit(base: str, path: str, params: dict, timeout: float) -> dict:
 
 
 def _short(stamp: str) -> str:
-    """An ISO stamp without its sub-second noise, for the window header."""
-    return stamp.split(".", 1)[0] if "." in stamp else stamp
+    """An ISO stamp without its sub-second noise, for the window header.
+
+    Only the fractional seconds go: splitting at the "." would take a trailing
+    "Z" or "+02:00" with them and misstate the window's timezone.
+    """
+    return re.sub(r"\.\d+", "", stamp, count=1)
+
+
+def _all_day_span(event: dict) -> str:
+    """The days an all-day event covers, as its own dates read them.
+
+    Its `end` is the exclusive iCalendar DTEND, so a one-day event ends the
+    following day and prints as a single date, while a longer one prints through
+    its last covered day — otherwise a three-day conference reads as one day.
+    """
+    start = event.get("start", "?")
+    end = event.get("end", "")
+    try:
+        first = datetime.date.fromisoformat(start)
+        last = datetime.date.fromisoformat(end) - datetime.timedelta(days=1)
+    except ValueError:
+        return start
+    return start if last <= first else f"{start} – {last.isoformat()}"
 
 
 def _render_events(body: dict) -> str:
@@ -85,7 +108,7 @@ def _render_events(body: dict) -> str:
         if body.get("truncated"):
             lines[0] += f" (showing {body.get('count', len(events))})"
     for event in events:
-        when = event.get("start", "?") if event.get("all_day") else \
+        when = _all_day_span(event) if event.get("all_day") else \
             f"{event.get('start', '?')} – {event.get('end', '?')}"
         parts = [when, event.get("summary") or "(no title)"]
         if event.get("location"):
@@ -105,6 +128,8 @@ def _render_events(body: dict) -> str:
 def _render_calendars(body: dict) -> str:
     write_target = body.get("write_target") or {}
     lines = [f"account: {body.get('account', '?')}"]
+    if body.get("write_target_error"):
+        lines.append(f"  ⚠ {body['write_target_error']}")
     for cal in body.get("calendars", []):
         marker = " ← writes land here" if cal.get("url") and cal.get("url") == write_target.get("url") else ""
         lines.append(f"  {cal.get('name') or '(unnamed)'}{marker}")
