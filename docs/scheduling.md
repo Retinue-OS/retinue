@@ -155,8 +155,12 @@ and an `expected_by`, the cadence wins: the deadline is then the end of the
 whole standing arrangement, not the next occurrence.
 
 For the store to carry these, the chamber's Markdown→triples converter must map
-`recurring`/`due_day`/`next_due`/`expected_by` (in `md2ttl.py`'s scalar table);
-`remind_before` need not be mapped, since it is read from the file. The store is
+`recurring`/`next_due`/`expected_by` (in `md2ttl.py`'s scalar table);
+`remind_before` need not be mapped, since it is read from the file. `due_day`
+need not be mapped either: unlike `remind_before` it is never read back by any
+code, from the store or the file — it is a plain annotation in the frontmatter
+for whoever next advances `next_due` by hand, and `recurring-projects.py`'s own
+SELECT does not ask the store for it. The store is
 read-only, so the job splits **detect** (the free, chamber-agnostic SELECT,
 which returns each candidate with its `file:` named graph) from **reactivate**
 (resolve the graph to the file, flip `paused: false` and set `waiting_since`,

@@ -324,7 +324,8 @@ def main() -> int:
 
         print("\nresting project due for its recurring wake")
         fx_b = write_fixture(tmp, "fixture-resting", "coach",
-                              "paused: true\nrecurring: monthly\nnext_due: 2026-09-01\n")
+                              "paused: true\nrecurring: monthly\nnext_due: 2026-09-01\n"
+                              "due_day: 8\n")
         store_b = parse_data(convert(SCRIPTS_DIR / "md2ttl.py", fx_b))
         subj_b = md2ttl_mod.PROJECT_PREFIX + "fixture-resting"
         rp_query = rp.build_query(dt.date(2026, 9, 13))
@@ -338,6 +339,19 @@ def main() -> int:
             check(f"recurring-projects' FILTER NOT EXISTS({pred}={token}) does not "
                   "exclude this row",
                   literal_check(store_b, subj_b, KB, pred, token), False)
+
+        # `due_day` (PR #224 review, finding 2): docs/scheduling.md documents it
+        # as frontmatter but is explicit that it need not reach the store, since
+        # unlike `remind_before` no code -- store or file side -- ever reads it
+        # back; recurring-projects.py's own SELECT does not name `dueDay` either.
+        # Pin both halves of that contract so a converter that starts emitting
+        # it, or a query that starts requiring it without the other, is caught.
+        check("md2ttl.py does not emit kb:dueDay (informational-only field, "
+              "docs/scheduling.md)",
+              "dueDay" in {p.rsplit("#", 1)[-1] for _, p, _ in store_b}, False)
+        check("recurring-projects' own query does not read kb:dueDay either "
+              "(so the omission above loses no query-visible data)",
+              "dueDay" in all_predicate_locals(rp_query), False)
 
         print("\nresolved project (retinue-os/retinue#23 regression)")
         fx_c = write_fixture(tmp, "fixture-resolved", "coach",
