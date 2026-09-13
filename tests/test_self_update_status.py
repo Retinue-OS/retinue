@@ -185,6 +185,17 @@ def test_poll_until_done_detects_run_superseded(su):
           bool(message) and "5" in message and "6" in message, True)
 
 
+def test_default_poll_timeout_covers_the_whole_recipe(su):
+    print("DEFAULT_POLL_TIMEOUT accounts for all three steps of the built-in recipe")
+    # updater/update-server.py applies its UPDATE_TIMEOUT (default 1800s) per
+    # step, and the built-in recipe is three steps (git pull, docker compose
+    # build, docker compose up -d) -- so the client's own default wait must
+    # cover all three, or a legitimate run can report a timeout while it is
+    # still going (see the module docstring's Configuration section).
+    check("default poll timeout is 3x the updater's default per-step UPDATE_TIMEOUT",
+          su.DEFAULT_POLL_TIMEOUT, 3 * 1800)
+
+
 def main():
     su = _load_self_update()
     test_status_url_derivation(su)
@@ -194,6 +205,7 @@ def main():
     test_poll_until_done_matching_run_id_reports_normally(su)
     test_poll_until_done_ignores_run_id_when_updater_omits_it(su)
     test_poll_until_done_detects_run_superseded(su)
+    test_default_poll_timeout_covers_the_whole_recipe(su)
     if failures:
         print(f"FAILED: {len(failures)} check(s): {failures}")
         sys.exit(1)

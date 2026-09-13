@@ -40,8 +40,20 @@ Configuration (environment):
     UPDATER_TOKEN          shared secret; must match the updater's UPDATER_TOKEN
     UPDATER_TIMEOUT        per-HTTP-request timeout in seconds (default 30)
     UPDATER_POLL_TIMEOUT   total time to wait for the update to finish, in
-                            seconds (default 1800 -- matches the updater's own
-                            UPDATE_TIMEOUT ceiling for the rebuild recipe)
+                            seconds (default 5400). The updater applies its
+                            own UPDATE_TIMEOUT (default 1800) *per step*, and
+                            the built-in recipe is three steps (git pull,
+                            docker compose build, docker compose up -d), so a
+                            legitimate run can take close to 3x UPDATE_TIMEOUT
+                            before the updater itself gives up -- this default
+                            is that same 3x, not UPDATE_TIMEOUT's own default.
+                            The two settings live in different processes (and
+                            potentially different .env scopes) and are not
+                            linked automatically: a deployment that raises
+                            UPDATE_TIMEOUT, or sets a single-step UPDATE_COMMAND
+                            that legitimately runs longer or shorter than the
+                            built-in recipe, should set UPDATER_POLL_TIMEOUT to
+                            match its own recipe's real ceiling.
     UPDATER_POLL_INTERVAL  seconds between status polls (default 5)
 """
 import json
@@ -55,7 +67,10 @@ from urllib.parse import urlsplit, urlunsplit
 DEFAULT_URL = os.environ.get("UPDATER_URL", "http://updater:9000/update")
 TOKEN = os.environ.get("UPDATER_TOKEN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("UPDATER_TIMEOUT", "30"))
-DEFAULT_POLL_TIMEOUT = float(os.environ.get("UPDATER_POLL_TIMEOUT", "1800"))
+# 3x the updater's own UPDATE_TIMEOUT default (1800s, applied *per step* of
+# the three-step built-in recipe) -- see the module docstring above for how
+# the two relate and when a deployment needs to override this.
+DEFAULT_POLL_TIMEOUT = float(os.environ.get("UPDATER_POLL_TIMEOUT", "5400"))
 DEFAULT_POLL_INTERVAL = float(os.environ.get("UPDATER_POLL_INTERVAL", "5"))
 
 
