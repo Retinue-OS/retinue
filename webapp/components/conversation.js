@@ -1234,24 +1234,16 @@ class RetinueConversation extends HTMLElement {
         if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
         return;
       }
-      // Where this turn goes. A host that owns creation (`create-url`) mints
-      // the thread first and the turn goes in as an ordinary reply; otherwise
-      // the message itself opens the thread. Either way the composer's key is
-      // what decides how the result is handled below — not what it became.
-      let target = isNewKey(key) ? '' : key;
-      if (!target && this.getAttribute('create-url')) {
-        target = await mintThread(this.getAttribute('create-url'));
-        // The mint takes no model, so a model picked before the thread
-        // existed is stored on it now — or the turn would run on another.
-        const held = this._newModel;
-        if (held) {
-          pinModel(target, held);
-          if (!(await settledPins(target))) {
-            const el = this._liveFor(key);
-            if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
-            return;
-          }
-        }
+      // Where this turn goes: the thread, or one minted for a host that owns
+      // creation. Either way the composer's KEY is what decides how the result
+      // is handled below — not what the thread became.
+      let target;
+      try {
+        target = await targetFor(key, this.getAttribute('create-url'), this._newModel);
+      } catch (_pin) {
+        const el = this._liveFor(key);
+        if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
+        return;
       }
       const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel);
       clearSent(d, text, sent.files);
@@ -1455,7 +1447,11 @@ class RetinueConversation extends HTMLElement {
       // away cannot re-address it or lend it another composer's context.
       const seed = this._seed();
       const model = this._newModel;
-      mr.addEventListener('stop', () => this._onRecordingStopped(key, seed, model));
+      // The host's creation endpoint belongs to the captured context too: a
+      // first turn dictated here must open the thread this composer is for,
+      // even if the element has been pointed elsewhere by the time it lands.
+      const createUrl = this.getAttribute('create-url');
+      mr.addEventListener('stop', () => this._onRecordingStopped(key, seed, model, createUrl));
       mr.start();
       this._recState = 'recording';
       this._recKey = key;
@@ -1509,7 +1505,7 @@ class RetinueConversation extends HTMLElement {
   // screen. Completion must not interrupt whatever the user is doing now: only
   // when the conversation is on screen is it re-rendered, and only the
   // deliberate review flow pulls up the keyboard.
-  async _onRecordingStopped(key, seed, model) {
+  async _onRecordingStopped(key, seed, model, createUrl) {
     this._wave.stop();
     this._stopStream();
     const chunks = this._recChunks || [];
@@ -1585,8 +1581,17 @@ class RetinueConversation extends HTMLElement {
             VOICE_ERRORS.set(key, "The model choice wasn't saved. Please pick it again.");
             throw new Error('model');
           }
+          // The same resolution the typed path uses, so a dictated first turn
+          // opens the thread the host owns rather than one of its own.
+          let target;
+          try {
+            target = await targetFor(key, createUrl, model);
+          } catch (_pin) {
+            VOICE_ERRORS.set(key, "The model choice wasn't saved. Please pick it again.");
+            throw _pin;
+          }
           const sentFiles = draftOf(key).files.slice();
-          const conv = await sendMessage(isNewKey(key) ? '' : key, toSend, sentFiles, seed, model);
+          const conv = await sendMessage(target, toSend, sentFiles, seed, model);
           clearSent(draftOf(key), toSend, sentFiles);
           const now = live();
           if (isNewKey(key)) {
@@ -1834,6 +1839,24 @@ class RetinueConversation extends HTMLElement {
 // first message that opens a thread, linked to the project in `seed` and
 // pinned to `model` when one was picked. Returns the thread as the gateway
 // answers it.
+// Where a turn under `key` is to be posted: the thread's own id, or — for a
+// composer whose host owns creation — the id minted at `createUrl`, with a
+// model picked before the thread existed stored on it first. Shared by the
+// typed send path and the dictated one, which must open the same thread: a
+// first turn spoken into a companion cannot be allowed to open a thread of
+// its own instead of the chat's. Throws if the mint or that pin fails, and
+// the caller keeps the draft for a retry.
+async function targetFor(key, createUrl, heldModel) {
+  if (!isNewKey(key)) return key;
+  if (!createUrl) return '';
+  const id = await mintThread(createUrl);
+  if (heldModel) {
+    pinModel(id, heldModel);
+    if (!(await settledPins(id))) throw new Error('model');
+  }
+  return id;
+}
+
 // Mint a thread at the host's own endpoint (POST, no body) and return its id.
 // For a thread that belongs to something else and is created by that thing's
 // endpoint — a messenger chat's companion, POST /chats/<id>/companion — which
