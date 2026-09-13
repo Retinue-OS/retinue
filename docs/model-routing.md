@@ -208,7 +208,7 @@ router-tier model reliably forgot chips and composed bullet lists, which no
 amount of prompt discipline fixed.
 
 Lints run on their **own** concurrency bound (`PRESENTATION_LINT_CONCURRENCY`,
-default 1) and wait at most `PRESENTATION_LINT_WAIT` seconds (default 30) for a
+default 1) and wait at most `PRESENTATION_LINT_WAIT` seconds (default 20) for a
 slot, after which the message is delivered unlinted. That separation is a
 correctness requirement, not a tuning knob. The lint runs inside a request, and
 that request's caller is regularly a spawned session already holding one of the

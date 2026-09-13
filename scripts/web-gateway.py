@@ -1056,7 +1056,7 @@ PRESENTATION_LINT_TIMEOUT = float(os.environ.get("PRESENTATION_LINT_TIMEOUT", "4
 # waiting for in order to fix its *formatting* is the wrong trade.
 PRESENTATION_LINT_CONCURRENCY = max(
     1, int(os.environ.get("PRESENTATION_LINT_CONCURRENCY", "1")))
-PRESENTATION_LINT_WAIT = float(os.environ.get("PRESENTATION_LINT_WAIT", "30"))
+PRESENTATION_LINT_WAIT = float(os.environ.get("PRESENTATION_LINT_WAIT", "20"))
 # Chips and link labels legitimately grow a message, so the allowance is wider
 # than the cleanup pass's; a model that starts answering instead of linting
 # still blows past it. A shrunken result dropped content — equally distrusted.
