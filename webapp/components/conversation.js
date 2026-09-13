@@ -1224,8 +1224,11 @@ class RetinueConversation extends HTMLElement {
   async _send(text, { fromDraft = true } = {}) {
     const key = this._key();
     const d = draftOf(key);
-    // A message needs text or at least one attachment; one send at a time.
-    if (this._busy || (!text.trim() && !(fromDraft && d.files.length))) return;
+    // A message needs text or at least one attachment.
+    if (!text.trim() && !(fromDraft && d.files.length)) return;
+    // One send at a time. The host's controls stay live through it, so a
+    // second ask arriving now is kept rather than dropped (see _keepUnsent).
+    if (this._busy) { this._keepUnsent(key, text, fromDraft); return; }
     const sent = { text, files: fromDraft ? d.files.slice() : [] };
     SENDS.set(key, sent);
     // The composer locks now, not once the send is over: nothing typed or
@@ -1240,22 +1243,13 @@ class RetinueConversation extends HTMLElement {
       // the gateway may run it on the model the picker no longer shows; a
       // pin it refused means the turn does not go out (the picker shows the
       // server's model again by then, see _onModelChange).
-      if (!isNewKey(key) && !(await settledPins(key))) {
-        const el = this._liveFor(key);
-        if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
-        return;
-      }
+      if (!isNewKey(key) && !(await settledPins(key))) throw new Error('model');
       // Where this turn goes: the thread, or one minted for a host that owns
       // creation. Either way the composer's KEY is what decides how the result
-      // is handled below — not what the thread became.
-      let target;
-      try {
-        target = await targetFor(key, this.getAttribute('create-url'), this._newModel);
-      } catch (_pin) {
-        const el = this._liveFor(key);
-        if (el) el._attachError = "The model choice wasn't saved. Please pick it again.";
-        return;
-      }
+      // is handled below — not what the thread became. Both of these throw
+      // rather than return, so there is ONE way out of a turn that did not go
+      // and no exit can forget what it owes the composer.
+      const target = await targetFor(key, this.getAttribute('create-url'), this._newModel);
       const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel);
       if (fromDraft) clearSent(d, text, sent.files);
       this._attachError = '';
@@ -1289,10 +1283,21 @@ class RetinueConversation extends HTMLElement {
         }
         landed = target;
       }
-    } catch (_err) {
-      // A soft failure. A typed turn is still in the input for a retry; a
-      // host's turn was never there, so it is put there now rather than lost.
-      if (!fromDraft) appendToDraft(key, text);
+    } catch (err) {
+      // Why it turned back, in words the user can act on: a thread that could
+      // not be started asks for a retry, a model that would not store asks for
+      // the pick again, and an ordinary send failure needs no note — the words
+      // are back in the box and the box is the invitation.
+      const why = err && err.message;
+      if (why === 'mint' || why === 'model') {
+        const el = this._liveFor(key);
+        if (el) {
+          el._attachError = why === 'mint'
+            ? "Couldn't start this conversation. Please try again."
+            : "The model choice wasn't saved. Please pick it again.";
+        }
+      }
+      this._keepUnsent(key, text, fromDraft);
     } finally {
       SENDS.delete(key);
       // Unlock, render and poll where the send landed — or, when it did not
@@ -1391,6 +1396,18 @@ class RetinueConversation extends HTMLElement {
     appendToDraft(this._key(), text);
     this._focusNext = true;
     this.render();
+  }
+
+  // A turn that did not go out. The user's own is still in the composer —
+  // it was never taken from there — but a host's turn (ask) was never in it,
+  // so it goes in now and can be sent again. Every way out of _send that is
+  // not a delivered message comes through here, which is what keeps a chip
+  // tapped during another send from vanishing without trace.
+  _keepUnsent(key, text, fromDraft) {
+    if (fromDraft) return;
+    appendToDraft(key, text);
+    const el = this._liveFor(key);
+    if (el) { el._focusNext = true; el.render(); }
   }
 
   // ── What a host may call ───────────────────────────────────────────────────
@@ -1599,9 +1616,11 @@ class RetinueConversation extends HTMLElement {
           let target;
           try {
             target = await targetFor(key, createUrl, model);
-          } catch (_pin) {
-            VOICE_ERRORS.set(key, "The model choice wasn't saved. Please pick it again.");
-            throw _pin;
+          } catch (err) {
+            VOICE_ERRORS.set(key, err && err.message === 'mint'
+              ? "Couldn't start this conversation. Please try again."
+              : "The model choice wasn't saved. Please pick it again.");
+            throw err;
           }
           const sentFiles = draftOf(key).files.slice();
           const conv = await sendMessage(target, toSend, sentFiles, seed, model);
@@ -1862,7 +1881,10 @@ class RetinueConversation extends HTMLElement {
 async function targetFor(key, createUrl, heldModel) {
   if (!isNewKey(key)) return key;
   if (!createUrl) return '';
-  const id = await mintThread(createUrl);
+  // Which step failed decides what the user is told: a thread that could not
+  // be started is not a model that would not store, and the retry differs.
+  let id;
+  try { id = await mintThread(createUrl); } catch (_e) { throw new Error('mint'); }
   if (heldModel) {
     pinModel(id, heldModel);
     if (!(await settledPins(id))) throw new Error('model');
