@@ -280,6 +280,36 @@ def test_oauth_in_use_gate():
             os.environ["RETINUE_GATEWAY_USES_CLAUDE_OAUTH"] = old_flag
 
 
+def test_remote_control_available_only_on_anthropic_api():
+    """Remote control is served by api.anthropic.com only — and the OAuth flag
+    does not change that: a gateway carrying the sign-in still cannot serve it.
+    The entrypoint starts no session where this is false."""
+    old_base = os.environ.pop("ANTHROPIC_BASE_URL", None)
+    old_flag = os.environ.pop("RETINUE_GATEWAY_USES_CLAUDE_OAUTH", None)
+    try:
+        assert ca.remote_control_available()  # unset: direct to Anthropic
+        for base in ("https://api.anthropic.com", "https://api.anthropic.com/v1",
+                     "https://API.ANTHROPIC.COM/v1",
+                     "api.anthropic.com", "https://api.anthropic.com:443/v1"):
+            os.environ["ANTHROPIC_BASE_URL"] = base
+            assert ca.remote_control_available(), base
+        for base in ("http://litellm:4000", "http://host.docker.internal:11434",
+                     "https://openrouter.ai/api",
+                     "https://api.anthropic.com.example.net/v1"):
+            os.environ["ANTHROPIC_BASE_URL"] = base
+            assert not ca.remote_control_available(), base
+        os.environ["RETINUE_GATEWAY_USES_CLAUDE_OAUTH"] = "true"
+        assert not ca.remote_control_available()
+        assert ca.oauth_in_use()  # the sign-in lives on; only the session goes
+    finally:
+        os.environ.pop("ANTHROPIC_BASE_URL", None)
+        os.environ.pop("RETINUE_GATEWAY_USES_CLAUDE_OAUTH", None)
+        if old_base is not None:
+            os.environ["ANTHROPIC_BASE_URL"] = old_base
+        if old_flag is not None:
+            os.environ["RETINUE_GATEWAY_USES_CLAUDE_OAUTH"] = old_flag
+
+
 # ── Pre-spawn refresh under the shared lock ──────────────────────────────────
 
 @contextmanager

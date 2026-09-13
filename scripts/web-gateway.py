@@ -3310,6 +3310,7 @@ def _claude_auth_status_payload() -> dict:
     status = claude_auth.credential_status()
     status["mode"] = "oauth" if claude_auth.oauth_in_use() else "gateway"
     status["remote_control_running"] = _pid1_is_claude()
+    status["remote_control_available"] = claude_auth.remote_control_available()
     return status
 
 
@@ -3370,8 +3371,16 @@ def _render_claude_auth_html(status: dict) -> str:
             detail.append(("Subscription", str(status["subscription"])))
         detail.append(("Sign-in valid until", ts(status.get("refresh_expires_at"))))
         detail.append(("Access token expires", ts(status.get("access_expires_at"))))
-        detail.append(("Agent session process", "running" if status.get("remote_control_running")
-                       else "not running"))
+        if status.get("remote_control_running"):
+            session_state = "running"
+        elif status.get("remote_control_available"):
+            session_state = "not running"
+        else:
+            # Not a fault: behind a gateway the entrypoint deliberately starts
+            # no session, since Claude Code would ignore --remote-control and
+            # leave it rotating the shared tokens (docs/claude-auth.md).
+            session_state = "not started — remote control needs api.anthropic.com"
+        detail.append(("Agent session process", session_state))
         backup = "present" if status.get("backup_present") else "none"
         if status.get("backup_rejected"):
             backup = "present, but rejected by the server"
