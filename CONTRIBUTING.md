@@ -49,8 +49,17 @@ runner — but the gateway modules they import need a few packages:
 
 ```bash
 pip install markdown-it-py requests pywebpush
-for t in tests/test_*.py; do python3 "$t" || echo "FAILED: $t"; done
+( failed=0
+  for t in tests/test_*.py; do python3 "$t" || { echo "FAILED: $t"; failed=1; }; done
+  exit $failed )
 ```
+
+The subshell is what makes that a check rather than a report: `|| echo` alone
+swallows every failure's exit status, so the loop ends in success and anything
+reading the result — you, a script, an agent following this page — is told the
+suite passed while it did not. Running it in a subshell yields the real status,
+the way `.github/workflows/tests.yml` does, without a bare `exit` closing the
+shell you pasted it into.
 
 Keep them that way — no pytest, no fixtures requiring the full runtime. A test
 that needs signal-cli installed is a test that won't run in CI. If you add a
