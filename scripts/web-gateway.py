@@ -149,7 +149,10 @@ Session logic:
 - A resume Claude refuses — the transcript is gone, which it is after roughly
   30 days — restarts as a fresh session instead of failing the turn.
 - Total concurrency is bounded by a small worker pool (WEB_GATEWAY_MAX_CONCURRENCY)
-  to keep CPU/memory and subprocess count sane on a personal box.
+  to keep CPU/memory and subprocess count sane on a personal box. The
+  presentation lint has a *separate* bound (PRESENTATION_LINT_CONCURRENCY): it
+  runs inside a request whose caller is frequently a spawned session holding a
+  worker slot, so sharing the pool would deadlock the caller against itself.
 - Every spawn first refreshes an access token about to expire, under the
   cross-process lock all framework spawners share (scripts/claude_auth.py,
   docs/claude-auth.md), so a session never starts with a refresh that races
@@ -1042,6 +1045,18 @@ PRESENTATION_LINT_MODEL = (
     or ROUTER_MODEL or CLAUDE_MODEL or "haiku"
 )
 PRESENTATION_LINT_TIMEOUT = float(os.environ.get("PRESENTATION_LINT_TIMEOUT", "45"))
+# The lint is a `claude` subprocess like any other, but unlike a session it runs
+# *inside* a request someone is waiting on — and that someone is often a session
+# that already holds a `_worker_pool` slot, because every conversation-push.py
+# from a gateway-spawned session is exactly that. Sharing the session pool
+# therefore deadlocks: the holder blocks on the resource it is holding, and with
+# WEB_GATEWAY_MAX_CONCURRENCY=2 one other busy session is enough. So lints get
+# their own small bound, and even that wait is capped — a lint that cannot get a
+# slot is skipped, never queued forever. Withholding a message the user is
+# waiting for in order to fix its *formatting* is the wrong trade.
+PRESENTATION_LINT_CONCURRENCY = max(
+    1, int(os.environ.get("PRESENTATION_LINT_CONCURRENCY", "1")))
+PRESENTATION_LINT_WAIT = float(os.environ.get("PRESENTATION_LINT_WAIT", "30"))
 # Chips and link labels legitimately grow a message, so the allowance is wider
 # than the cleanup pass's; a model that starts answering instead of linting
 # still blows past it. A shrunken result dropped content — equally distrusted.
@@ -1347,12 +1362,20 @@ def _classify_request_origin(peer: str | None,
 # Concurrency model:
 # - `_session_locks` holds one lock per session key, so a single conversation is
 #   serialized while different conversations proceed in parallel.
-# - `_worker_pool` bounds the total number of concurrent `claude` subprocesses.
+# - `_worker_pool` bounds concurrent `claude` *sessions*. Waiting on it is
+#   unbounded on purpose: a queued turn should wait its turn.
+# - `_lint_pool` bounds concurrent presentation lints, separately and with a
+#   capped wait. Never fold these two together: a lint runs inside a request,
+#   and that request's caller is often a session already holding a worker slot,
+#   so one pool means the caller deadlocks against itself.
 # - `_state_lock` guards read-modify-write access to the shared STATE_FILE.
 # - `_conversation_lock` guards the append to the per-day conversation log.
 _session_locks: dict[str, threading.Lock] = {}
 _session_locks_guard = threading.Lock()
 _worker_pool = threading.BoundedSemaphore(MAX_CONCURRENCY)
+# Deliberately NOT _worker_pool — see PRESENTATION_LINT_CONCURRENCY for why
+# sharing it deadlocks. Total `claude` processes are bounded by the sum.
+_lint_pool = threading.BoundedSemaphore(PRESENTATION_LINT_CONCURRENCY)
 _state_lock = threading.Lock()
 _conversation_lock = threading.Lock()
 # Guards read-modify-write of the per-thread conversation-tab files.
@@ -3918,8 +3941,9 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     Runs on everything that lands in a dashboard thread — Ara's replies and
     the token-gated agent posts alike — so the chips/links conventions hold
     regardless of which agent or model composed the text. Form only, never
-    content; returns `text` unchanged on any failure, oversized drift, or for
-    the quiet cowork audit threads (a record, not a UI surface)."""
+    content; returns `text` unchanged on any failure, oversized drift, no free
+    lint slot, or for the quiet cowork audit threads (a record, not a UI
+    surface)."""
     if not PRESENTATION_LINT or kind == "cowork":
         return text
     raw = (text or "").strip()
@@ -3945,19 +3969,28 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
         "--system-prompt", _LINT_SYSTEM_PROMPT,
         "--", "\n\n".join(parts),
     ]
+    # Bounded, and on its own pool: an unbounded wait here hangs the caller's
+    # request forever whenever the pool is full, which for a caller that is
+    # itself a spawned session is a guaranteed self-deadlock.
+    if not _lint_pool.acquire(timeout=PRESENTATION_LINT_WAIT):
+        print(f"[web-gateway] presentation lint skipped: no lint slot within "
+              f"{PRESENTATION_LINT_WAIT:g}s — delivering the text unchanged",
+              flush=True)
+        return text
     try:
-        with _worker_pool:
-            result = _run_claude(
-                cmd, capture_output=True, text=True,
-                timeout=PRESENTATION_LINT_TIMEOUT,
-                cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
-                # Tool-less, but a `claude` process all the same: the
-                # allowlisted environment, never this daemon's.
-                env=session_env.build(model=PRESENTATION_LINT_MODEL),
-            )
+        result = _run_claude(
+            cmd, capture_output=True, text=True,
+            timeout=PRESENTATION_LINT_TIMEOUT,
+            cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
+            # Tool-less, but a `claude` process all the same: the
+            # allowlisted environment, never this daemon's.
+            env=session_env.build(model=PRESENTATION_LINT_MODEL),
+        )
     except (subprocess.TimeoutExpired, OSError) as exc:
         print(f"[web-gateway] presentation lint failed: {exc}", flush=True)
         return text
+    finally:
+        _lint_pool.release()
     if result.returncode != 0:
         print(f"[web-gateway] presentation lint exited {result.returncode}",
               flush=True)
