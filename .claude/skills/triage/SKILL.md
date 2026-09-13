@@ -136,7 +136,7 @@ status. Reconcile in both directions:
    Phase 6 would. This catches e.g. the already-answered path (which proposes no
    reply, so never reaches Phase 6's move) and verify-queued sends (deferred
    until approval, then forgotten). Only genuinely non-terminal states
-   (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item still awaiting
+   (`proposed`, `omnibus`, `deferred`, an `engaged` item still awaiting
    *user* input) legitimately stay in the INBOX.
 4. **Re-collect `stalled`** — the same backstop for the *non-terminal* states.
    An item whose proposal was never engaged and whose thread was archived or

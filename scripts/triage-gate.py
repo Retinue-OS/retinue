@@ -403,6 +403,9 @@ def route(unread: list[dict], mode: str) -> list[dict]:
 # `self_filed`, `abstain`, …) is settled as far as this gate is concerned. An
 # allowlist of *unfinished* states rather than of terminal ones, because a rail
 # added later must not have its records silently re-armed by this code.
+# `omnibus_pending` is not a name the skill writes (it writes `omnibus`); it is
+# kept because an older run may have left records under it, and a stale alias
+# costs nothing here while dropping it would re-hide that mail.
 OPEN_STATUSES = frozenset(
     {"proposed", "omnibus", "omnibus_pending", "deferred", "engaged"}
 )
