@@ -48,6 +48,13 @@ the whole stack.
 The update runs in a background thread so the HTTP response (202 Accepted)
 returns immediately; a concurrent request while an update is already running
 is rejected with 409 Conflict rather than queued or run twice.
+
+Both that 202 response and every GET /status carry a monotonically
+increasing ``run_id``, assigned synchronously before the 202 is sent (see
+``do_POST``) -- so a caller can tell whether the state it just read
+describes the run it dispatched, an earlier one, or a later one, instead
+of trusting ``running``/``returncode`` at face value the instant they come
+back.
 """
 import hmac
 import json
@@ -91,7 +98,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 
 _lock = threading.Lock()
 _state = {"running": False, "started_at": None, "finished_at": None,
-          "returncode": None, "failed_step": None}
+          "returncode": None, "failed_step": None, "run_id": None}
 
 
 def _git_pull_argv() -> list:
@@ -131,15 +138,22 @@ def _check_token(headers) -> bool:
     return hmac.compare_digest(supplied, UPDATER_TOKEN)
 
 
-def _run_update():
-    started = time.time()
-    with _lock:
-        _state["running"] = True
-        _state["started_at"] = started
-        _state["finished_at"] = None
-        _state["returncode"] = None
-        _state["failed_step"] = None
+def _run_update(run_id: int):
+    """Run the configured update recipe and record its outcome under `run_id`.
 
+    `do_POST` already stamped `_state["running"] = True` and this same
+    `run_id` synchronously -- inside the lock that starts this thread, before
+    the 202 response went out -- so a caller polling `GET /status` right
+    after dispatch can never observe a stale, *previous* run's
+    finished-looking state (`running: false` plus its old
+    `returncode`/`failed_step`) for a run that has in fact just started (see
+    `do_POST`). The write-back in `finally` below only applies if `run_id`
+    still matches the current `_state`, as a belt-and-braces guard:
+    `POST /update` never starts a second worker while one is `running`, so
+    today only one of these threads is ever alive at a time -- but this
+    keeps a stray thread from clobbering a newer run's state if that
+    invariant ever stopped holding.
+    """
     # A "step" is (argv_or_command, shell, shown). When UPDATE_COMMAND is set the
     # deployment owns the whole recipe, run as a single shell step; otherwise we
     # run the framework's built-in three-step default as separate argv steps.
@@ -192,12 +206,14 @@ def _run_update():
             pass
     finally:
         with _lock:
-            _state["running"] = False
-            _state["finished_at"] = time.time()
-            _state["returncode"] = returncode
-            # Which step failed is the one thing GET /status could not tell you,
-            # and the log lives inside this container where the caller cannot read it.
-            _state["failed_step"] = failed_step
+            if _state.get("run_id") == run_id:
+                _state["running"] = False
+                _state["finished_at"] = time.time()
+                _state["returncode"] = returncode
+                # Which step failed is the one thing GET /status could not
+                # tell you, and the log lives inside this container where
+                # the caller cannot read it.
+                _state["failed_step"] = failed_step
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -243,9 +259,27 @@ class Handler(BaseHTTPRequestHandler):
             if _state["running"]:
                 self._send_json(409, {"error": "update already in progress"})
                 return
-            thread = threading.Thread(target=_run_update, daemon=True)
+            # Initialise the new run's state -- including a fresh run_id --
+            # synchronously, inside this same lock acquisition and before
+            # the 202 goes out. `_run_update`'s own first lock acquisition
+            # happens whenever the OS gets around to scheduling that thread,
+            # which is too late: without this, a caller could win that race
+            # and read GET /status back with `running: false` plus the
+            # *previous* run's returncode/failed_step, misreporting a
+            # brand-new update as an already-finished one. Echoing run_id
+            # also lets a client that keeps polling across a *second*
+            # update starting later detect that its own run's slot has been
+            # taken over, not just protect this first read.
+            run_id = (_state["run_id"] or 0) + 1
+            _state["run_id"] = run_id
+            _state["running"] = True
+            _state["started_at"] = time.time()
+            _state["finished_at"] = None
+            _state["returncode"] = None
+            _state["failed_step"] = None
+            thread = threading.Thread(target=_run_update, args=(run_id,), daemon=True)
             thread.start()
-        self._send_json(202, {"status": "started"})
+        self._send_json(202, {"status": "started", "run_id": run_id})
 
 
 def main():

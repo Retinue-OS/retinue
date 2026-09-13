@@ -16,7 +16,12 @@ worked. After a successful dispatch this script polls the sidecar's own
 configure) until the run is no longer `running`, then prints the outcome and
 exits non-zero — naming `failed_step` and `returncode` — when the update
 failed. A 409 ("already in progress") and an unreachable updater are still
-reported the way they always were, without polling.
+reported the way they always were, without polling. The dispatch response
+also carries a `run_id`, which every poll is checked against (see
+`poll_until_done`): if the sidecar starts reporting a *different* run --
+someone else's `POST /update` landing while this one is still being polled
+for -- that is surfaced as its own error rather than risking that later
+run's outcome being reported as this one's.
 
 What the caller can actually *observe* through that poll is asymmetric, per
 the opening paragraph above: when the recipe succeeds, `docker compose up -d`
@@ -72,8 +77,22 @@ def status_url(update_url: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
 
 
+class RunSuperseded(Exception):
+    """Raised when GET /status starts reporting a different `run_id` than
+    the one this poll is waiting for.
+
+    The updater keeps exactly one run's state in memory (see
+    updater/update-server.py); once a *later* `POST /update` lands -- e.g.
+    someone else triggering an update while this one is still being polled
+    for -- that state is overwritten and there is no way left to learn our
+    run's actual outcome. Better to say so loudly than to attribute the
+    later run's result to the one we dispatched.
+    """
+
+
 def poll_until_done(url: str, headers: dict, request_timeout: float,
-                     poll_timeout: float, poll_interval: float) -> dict | None:
+                     poll_timeout: float, poll_interval: float,
+                     run_id: int | None = None) -> dict | None:
     """Poll `GET url` until the updater reports the run is no longer running.
 
     Returns the final state dict, or None if `poll_timeout` elapsed first (the
@@ -81,12 +100,24 @@ def poll_until_done(url: str, headers: dict, request_timeout: float,
     verdict). Network/HTTP errors propagate to the caller: once the update has
     been dispatched, losing the status endpoint is a real problem, not
     something to swallow silently.
+
+    When `run_id` is given, every polled state is checked against it (see
+    `RunSuperseded`); a state with no `run_id` at all (an updater too old to
+    send one) is not treated as a mismatch, so polling against such an
+    updater keeps working exactly as it did before this check existed.
     """
     deadline = time.monotonic() + poll_timeout
     while True:
         request = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(request, timeout=request_timeout) as resp:
             state = json.loads(resp.read().decode("utf-8"))
+        polled_run_id = state.get("run_id")
+        if run_id is not None and polled_run_id is not None and polled_run_id != run_id:
+            raise RunSuperseded(
+                f"expected run_id {run_id}, updater is now reporting run_id "
+                f"{polled_run_id!r} -- a different update has since started, "
+                "so this run's outcome can no longer be confirmed"
+            )
         if not state.get("running"):
             return state
         if time.monotonic() >= deadline:
@@ -112,12 +143,16 @@ def main() -> int:
 
     headers = {"X-Update-Token": TOKEN}
     request = urllib.request.Request(args.url, data=b"", headers=headers, method="POST")
+    # None when the updater predates run_id: poll_until_done then skips the
+    # mismatch check below and polling behaves exactly as it used to.
+    run_id = None
     try:
         with urllib.request.urlopen(request, timeout=args.timeout) as resp:
             raw = resp.read().decode("utf-8")
         try:
             body = json.loads(raw)
             status = body.get("status", "ok")
+            run_id = body.get("run_id")
         except ValueError:
             status = raw.strip()[:200] or "ok"
         print(f"self-update: {status}")
@@ -146,7 +181,11 @@ def main() -> int:
     # poll -- survives to report it.
     poll_url = status_url(args.url)
     try:
-        final = poll_until_done(poll_url, headers, args.timeout, args.poll_timeout, args.poll_interval)
+        final = poll_until_done(poll_url, headers, args.timeout, args.poll_timeout, args.poll_interval,
+                                 run_id=run_id)
+    except RunSuperseded as exc:
+        print(f"self-update: {exc}", file=sys.stderr)
+        return 1
     except urllib.error.HTTPError as exc:
         print(f"self-update: {poll_url} returned {exc.code} while polling for completion", file=sys.stderr)
         return 1

@@ -10,6 +10,11 @@ fake HTTP server standing in for the updater: the URL derivation, a run that
 finishes successfully, one that fails (naming the failed step), and a run that
 never finishes inside the bounded wait.
 
+Also covered (PR #223 review, closing out part of #46): the `run_id` the
+updater now echoes is checked on every poll, so a *different* run taking
+over mid-poll is reported as RunSuperseded rather than silently attributed
+to the run this client dispatched.
+
     python3 tests/test_self_update_status.py
 """
 import importlib.util
@@ -131,12 +136,64 @@ def test_poll_until_done_times_out(su):
     check("None signals a bounded-wait timeout, not a verdict", final, None)
 
 
+def test_poll_until_done_matching_run_id_reports_normally(su):
+    print("poll_until_done: a run_id that matches throughout reports that run's own outcome")
+    states = [
+        {"running": True, "returncode": None, "failed_step": None, "run_id": 7},
+        {"running": False, "returncode": 1, "failed_step": "docker compose build", "run_id": 7},
+    ]
+    with _FakeUpdater(states) as fake:
+        final = su.poll_until_done(fake.url, {}, request_timeout=5, poll_timeout=10,
+                                    poll_interval=0.05, run_id=7)
+    check("matching run_id throughout: reports the real outcome", final.get("returncode"), 1)
+
+
+def test_poll_until_done_ignores_run_id_when_updater_omits_it(su):
+    print("poll_until_done: an updater too old to send run_id is not treated as a mismatch")
+    states = [
+        {"running": True, "returncode": None, "failed_step": None},
+        {"running": False, "returncode": 0, "failed_step": None},
+    ]
+    with _FakeUpdater(states) as fake:
+        final = su.poll_until_done(fake.url, {}, request_timeout=5, poll_timeout=10,
+                                    poll_interval=0.05, run_id=7)
+    check("no run_id in the response is not treated as a mismatch",
+          final.get("returncode"), 0)
+
+
+def test_poll_until_done_detects_run_superseded(su):
+    print("poll_until_done: a different run_id appearing mid-poll raises RunSuperseded")
+    # Simulates a second `POST /update` landing on the sidecar while this
+    # client is still polling for its own run (run_id 5): the updater's
+    # single-slot _state now describes run 6, and there is no way left to
+    # learn run 5's outcome, so this must be reported rather than silently
+    # attributed to run 5.
+    states = [
+        {"running": True, "returncode": None, "failed_step": None, "run_id": 5},
+        {"running": True, "returncode": None, "failed_step": None, "run_id": 6},
+        {"running": False, "returncode": 0, "failed_step": None, "run_id": 6},
+    ]
+    with _FakeUpdater(states) as fake:
+        try:
+            su.poll_until_done(fake.url, {}, request_timeout=5, poll_timeout=10,
+                                poll_interval=0.05, run_id=5)
+            message = None
+        except su.RunSuperseded as exc:
+            message = str(exc)
+    check("a run_id change mid-poll raises RunSuperseded", message is not None, True)
+    check("the message names both the expected and the newly-seen run_id",
+          bool(message) and "5" in message and "6" in message, True)
+
+
 def main():
     su = _load_self_update()
     test_status_url_derivation(su)
     test_poll_until_done_success(su)
     test_poll_until_done_reports_failure(su)
     test_poll_until_done_times_out(su)
+    test_poll_until_done_matching_run_id_reports_normally(su)
+    test_poll_until_done_ignores_run_id_when_updater_omits_it(su)
+    test_poll_until_done_detects_run_superseded(su)
     if failures:
         print(f"FAILED: {len(failures)} check(s): {failures}")
         sys.exit(1)
