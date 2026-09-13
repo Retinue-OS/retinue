@@ -621,6 +621,27 @@ def test_an_unreadable_record_re_arms_rather_than_hiding_the_mail():
     print("PASS test_an_unreadable_record_re_arms_rather_than_hiding_the_mail")
 
 
+def test_a_corrupt_record_re_arms_instead_of_crashing_the_tick():
+    # Fail open for every shape of corruption, not just invalid JSON: a
+    # non-UTF-8 file and a record whose `status` is not a string must re-arm,
+    # never raise out of the gate and abort the whole tick.
+    for body in (b"\xff\xfe not utf-8", b'{"status": 123}'):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = _fresh(tmp)
+            _whitelist_all(gate)
+            gate.unread_inbox = lambda: [
+                {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+            ]
+            path = gate._status_path("<a@work.com>")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+            rec = Recorder()
+            gate.spawn = rec
+            assert gate.run_frequent() == 0
+            assert len(rec.calls) == 1, f"a corrupt record must re-arm: {body!r}"
+    print("PASS test_a_corrupt_record_re_arms_instead_of_crashing_the_tick")
+
+
 def test_a_saturated_scan_window_widens_instead_of_hiding_old_mail():
     # The listing is newest-first, so stopping at the limit hides the *oldest*
     # unread mail — permanently, and precisely once the backlog is big enough to
@@ -721,6 +742,7 @@ if __name__ == "__main__":
     test_a_settled_status_never_re_arms_however_old()
     test_a_recent_non_terminal_item_is_left_alone()
     test_an_unreadable_record_re_arms_rather_than_hiding_the_mail()
+    test_a_corrupt_record_re_arms_instead_of_crashing_the_tick()
     test_a_saturated_scan_window_widens_instead_of_hiding_old_mail()
     test_an_unsaturated_scan_does_not_pay_for_a_second_listing()
     test_a_failed_widened_rescan_keeps_the_narrow_result()

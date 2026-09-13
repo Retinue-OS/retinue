@@ -463,13 +463,18 @@ def _stalled(path: Path) -> bool:
     """
     try:
         record = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         # Unreadable record: treat as stalled so a model turn can repair it,
         # rather than leaving the message invisible forever.
         return True
     if not isinstance(record, dict):
         return True
-    if (record.get("status") or "").strip() not in OPEN_STATUSES:
+    status = record.get("status")
+    if not isinstance(status, str) or not status.strip():
+        # Parseable but malformed: no usable status at all. Same rule as an
+        # unreadable record — stalled, so a model turn can repair it.
+        return True
+    if status.strip() not in OPEN_STATUSES:
         return False
     age = datetime.now(timezone.utc) - _last_touched(path, record)
     return age > timedelta(days=STALL_DAYS)
