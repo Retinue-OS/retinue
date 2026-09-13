@@ -51,10 +51,15 @@ For context, the tiers that govern maintainer changes are:
 **Before opening a PR**, run the test suite:
 ```bash
 pip install markdown-it-py requests pywebpush
-failed=0
-for t in tests/test_*.py; do python3 "$t" || failed=1; done
-exit $failed
+( failed=0
+  for t in tests/test_*.py; do python3 "$t" || { echo "FAILED: $t"; failed=1; }; done
+  exit $failed )
 ```
+
+The subshell is deliberate: it yields a real non-zero exit status when any test
+failed, the way the CI workflow does, without a bare `exit` closing the shell of
+whoever pasted the block. Each failure is named as it happens, so a long run
+does not have to be scrolled back to find out which test broke.
 
 **Architecture and roadmap**: [`review.md`](../review.md) is an honest assessment
 of the codebase, its strengths and weaknesses, and the priorities for future work.
