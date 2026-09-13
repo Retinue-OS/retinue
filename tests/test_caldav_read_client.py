@@ -108,6 +108,19 @@ def test_render_calendars_surfaces_a_broken_write_target():
     })
     assert "cal-typo" in broken and "⚠" in broken
     assert "← writes land here" not in broken
+    # The marker matches on id too: the gateway keeps whichever identity the
+    # server let it read, so a calendar whose URL property is unreadable is
+    # still the write target and must still be marked.
+    by_id = cr._render_calendars({
+        "account": "default",
+        "write_target": {"id": "cal-1", "url": "", "name": "Personal"},
+        "calendars": [{"id": "cal-1", "url": "", "name": "Personal"},
+                      {"id": "cal-2", "url": "", "name": "Work"}],
+    })
+    assert "Personal ← writes land here" in by_id
+    assert "Work ← writes land here" not in by_id
+    # Two calendars with nothing readable in common are not "the same" either.
+    assert cr._same_calendar({"id": "", "url": ""}, {"id": "", "url": ""}) is False
     print("ok: the calendar listing surfaces a broken write target")
 
 

@@ -125,13 +125,28 @@ def _render_events(body: dict) -> str:
     return "\n".join(lines)
 
 
+def _same_calendar(one: dict, other: dict) -> bool:
+    """Whether two calendar identities name the same calendar.
+
+    Either a shared URL or a shared id settles it; empty values never match, so
+    two calendars whose URLs are both unreadable are not thereby "the same".
+    """
+    for key in ("url", "id"):
+        if one.get(key) and one.get(key) == other.get(key):
+            return True
+    return False
+
+
 def _render_calendars(body: dict) -> str:
     write_target = body.get("write_target") or {}
     lines = [f"account: {body.get('account', '?')}"]
     if body.get("write_target_error"):
         lines.append(f"  ⚠ {body['write_target_error']}")
     for cal in body.get("calendars", []):
-        marker = " ← writes land here" if cal.get("url") and cal.get("url") == write_target.get("url") else ""
+        # Match on URL or id: _calendar_identity keeps whichever the server let
+        # it read, so a calendar with an unreadable URL property is still
+        # identifiable by its id — and must still be marked.
+        marker = " ← writes land here" if _same_calendar(cal, write_target) else ""
         lines.append(f"  {cal.get('name') or '(unnamed)'}{marker}")
         lines.append(f"      id: {cal.get('id') or '—'}   url: {cal.get('url') or '—'}")
     return "\n".join(lines)

@@ -95,17 +95,19 @@ MAX_BODY_BYTES = int(os.environ.get("CALDAV_GATEWAY_MAX_BODY_BYTES", str(64 * 10
 
 
 def _spans_a_window(days: float) -> bool:
-    """Whether a default span can actually form a window.
+    """Whether a default span can actually form a window: an end after the start.
 
-    1e10 days is positive and finite yet outside timedelta's range, so a gateway
-    accepting it would start and then answer 400 to every read that names no
-    end — the opposite of what validating the tunable is for.
+    Both ends of the range fail that: 1e10 days is positive and finite yet
+    outside timedelta's range, and 1e-20 days rounds down to zero, which leaves
+    an empty window. Either way a gateway accepting the value would start and
+    then answer 400 to every read that names no end — the opposite of what
+    validating the tunable is for.
     """
     try:
-        datetime.datetime.now() + datetime.timedelta(days=days)
+        now = datetime.datetime.now()
+        return now + datetime.timedelta(days=days) > now
     except (OverflowError, ValueError):
         return False
-    return True
 
 
 def _positive_env(name: str, default: str, cast, usable=None):
@@ -573,6 +575,19 @@ def _event_sort_key(entry: dict) -> datetime.datetime:
     return parsed.astimezone(datetime.timezone.utc)
 
 
+def _is_vevent(component) -> bool:
+    """Whether a component says it is a VEVENT.
+
+    A component that does not say what it is at all (a stub, or a library that
+    exposes no name) is taken at face value; one that says VTODO or VJOURNAL is
+    not. This matters for the uid lookup: a uid can be shared with a task, and
+    the generic get_object_by_uid will hand that back — serializing it would
+    answer /event with a "successful" event whose every time field is empty.
+    """
+    name = getattr(component, "name", None)
+    return name is None or str(name).upper() == "VEVENT"
+
+
 def _event_components(event) -> list:
     """The VEVENT components of one caldav event object.
 
@@ -589,7 +604,9 @@ def _event_components(event) -> list:
         if walked:
             return walked
     component = getattr(event, "icalendar_component", None)
-    return [component] if component is not None else []
+    if component is None or not _is_vevent(component):
+        return []
+    return [component]
 
 
 def _pick_read_calendars(principal, calendar_id: str | None) -> list:
@@ -744,7 +761,11 @@ def _calendars_snapshot() -> dict:
                 # were a healthy state. The calendar list is still worth
                 # returning — it is what says how to fix it.
                 target = None
-                write_target_error = f"{exc} — writes will fail until it is corrected"
+                # Only writes that name no calendar of their own break: a
+                # caldav-push.py --calendar-id <valid> still resolves, since the
+                # request takes precedence in _resolve_calendar.
+                write_target_error = (f"{exc} — writes that do not name a calendar of "
+                                      "their own will fail until it is corrected")
         else:
             target = principal.calendar()
         if target is not None:

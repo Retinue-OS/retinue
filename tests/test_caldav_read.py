@@ -120,6 +120,14 @@ class _Principal:
         return self._default
 
 
+class _NamedComponent(dict):
+    """An icalendar-like component that knows its own name (VEVENT, VTODO, …)."""
+
+    def __init__(self, name, **fields):
+        super().__init__(**fields)
+        self.name = name
+
+
 def _timed(summary, start, end=None, **extra):
     component = {"UID": f"uid-{summary}", "SUMMARY": summary, "DTSTART": _Prop(start)}
     if end is not None:
@@ -251,7 +259,10 @@ def test_unusable_read_tunables_fall_back_to_their_defaults():
                         ("CALDAV_READ_MAX_EVENTS", "1" * 400),
                         # Positive and finite, yet no window can be built from
                         # it — so every no-end read would 400 at request time.
-                        ("CALDAV_READ_DEFAULT_DAYS", "1e10")):
+                        ("CALDAV_READ_DEFAULT_DAYS", "1e10"),
+                        # And this one rounds DOWN to zero in timedelta, leaving
+                        # an empty window — unusable from the other direction.
+                        ("CALDAV_READ_DEFAULT_DAYS", "1e-20")):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ[name] = value
             try:
@@ -362,6 +373,16 @@ def test_event_components_walks_a_calendar_instance():
         assert cg._event_components(_Event({"SUMMARY": "solo"})) == [{"SUMMARY": "solo"}]
         # Neither → nothing, rather than an exception.
         assert cg._event_components(object()) == []
+        # A component that says it is NOT an event is not one: a uid can be
+        # shared with a task, and the generic uid lookup hands that back.
+        # Serializing it would answer with an "event" whose times are all empty.
+        todo = _NamedComponent("VTODO", UID="shared", SUMMARY="buy milk")
+        assert cg._event_components(_Event(todo)) == []
+        assert cg._is_vevent(todo) is False
+        assert cg._is_vevent(_NamedComponent("VEVENT", UID="e")) is True
+        # A nameless stub is taken at face value (it is how these tests and some
+        # library versions present a component).
+        assert cg._is_vevent({"UID": "e"}) is True
     print("ok: event components walked from a calendar instance")
 
 
@@ -593,6 +614,19 @@ def test_find_event_by_uid_across_calendars():
     print("ok: uid lookup spans the calendars a read covers")
 
 
+def test_a_task_sharing_the_uid_is_not_served_as_an_event():
+    todo = _NamedComponent("VTODO", UID="shared-uid", SUMMARY="buy milk")
+    holder = _Calendar("cal-home", "https://dav/home", "Home", by_uid={"shared-uid": todo})
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        cg._connect_principal = lambda: _Principal([holder])
+        # The generic get_object_by_uid can return a VTODO or VJOURNAL with the
+        # requested uid; /event must answer 404 rather than serialize a task as
+        # an event with every time field empty.
+        assert cg._find_event_by_uid("shared-uid") is None
+    print("ok: a task sharing the uid is not served as an event")
+
+
 def test_unreachable_calendar_is_not_reported_as_a_missing_event():
     wanted = _timed("Dentist", datetime.datetime(2026, 9, 3, 14, 0))
     broken = _UnreachableCalendar("cal-work", "https://dav/work", "Work")
@@ -643,6 +677,9 @@ def test_calendars_snapshot_names_the_write_target():
         # back: it is what shows how to fix the setting.
         assert snapshot["write_target"] is None
         assert "cal-typo" in snapshot["write_target_error"]
+        # Precisely which writes break: only those naming no calendar of their
+        # own, since a request's --calendar-id takes precedence over the setting.
+        assert "do not name a calendar" in snapshot["write_target_error"]
         assert [c["name"] for c in snapshot["calendars"]] == ["Work", "Home"]
     print("ok: calendars snapshot names the write target")
 
@@ -855,6 +892,7 @@ def main():
     test_expanded_search_falls_back_when_unsupported()
     test_query_filter_matches_text_fields()
     test_find_event_by_uid_across_calendars()
+    test_a_task_sharing_the_uid_is_not_served_as_an_event()
     test_unreachable_calendar_is_not_reported_as_a_missing_event()
     test_calendars_snapshot_names_the_write_target()
     test_serialize_a_real_icalendar_component_when_available()

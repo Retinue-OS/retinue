@@ -668,10 +668,12 @@ What is worth knowing about the semantics:
   value for either tunable (zero, negative, non-finite) is refused at startup
   with a warning and the default used, rather than silently breaking the bound.
 - **`/calendars` reports a broken write target.** If `CALDAV_CALENDAR_ID` names
-  no calendar on the account — the configuration under which `/create-event`
-  fails — the answer still lists the calendars but carries a
+  no calendar on the account, or names one ambiguously (display names are not
+  unique), the answer still lists the calendars but carries a
   `write_target_error` saying so, instead of reporting "no target" as a healthy
-  state.
+  state. Only writes that name no calendar of their own are affected —
+  `caldav-push.py --calendar-id <valid>` still resolves, the request taking
+  precedence over the setting.
 
 ### Enrolling with `/sends`
 
