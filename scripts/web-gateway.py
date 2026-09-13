@@ -3975,14 +3975,21 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
 
 # ── Projects (live SPARQL over the life store) ────────────────────────────────
 
-# The retinue knowledge-base namespace the qlever-dir Markdown converter emits
-# for project/goal frontmatter (see the chambers' .qlever/md2ttl.py).
+# The framework's own knowledge-base namespace: emitted for AI agents by
+# scripts/discover-agents.py (kb:AiAgent, urn:retinue:actor:<slug>) and read
+# here and by scripts/agent-self-review.py and scripts/recurring-projects.py.
+# A chamber's own Markdown->Turtle converter (e.g. md2ttl.py, docs/triple-
+# stores.md) must emit the same vocabulary for its project frontmatter to show
+# up anywhere in the framework — nothing here follows a chamber's choice.
 _KB = "https://w3id.org/retinue/kb#"
-_RETO = "urn:retinue:actor:reto"
+# The owner's own actor URI, in the urn:retinue:actor:<slug> shape every AI
+# agent also uses (discover-agents.py) — deployment-specific, so it comes from
+# the environment rather than being baked into this public repo.
+_OWNER_ACTOR = os.environ.get("RETINUE_OWNER_ACTOR", "").strip() or "urn:retinue:actor:owner"
 
 # One query returns every active project with the fields the card needs. Paused
 # projects and non-active statuses are excluded so the dashboard shows only what
-# is actually running. currentActor drives the split: reto == "your move",
+# is actually running. currentActor drives the split: the owner == "your move",
 # anyone else == "waiting on <them>".
 _PROJECTS_SPARQL = """
 PREFIX k: <%s>
@@ -4049,7 +4056,7 @@ def _fetch_projects() -> dict:
             "next": val("next"),
             "expected": val("expected"),
         }
-        if actor == _RETO:
+        if actor == _OWNER_ACTOR:
             mine.append(item)
         else:
             item["waitingOn"] = _humanize_slug(actor) if actor else None
