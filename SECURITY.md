@@ -26,9 +26,10 @@ behaviour, not a given operator's configuration:
   category is `verify`.
 - Bypasses of the account trust boundaries: an `inbox`-mode account driving the
   system, or a sender not on the allowlist reaching `control` mode.
-- Credential exposure: anything that puts messaging or mail credentials into the
-  agent's context or environment, which the sidecar-gateway architecture exists
-  to prevent.
+- Credential exposure: anything that puts messaging or mail credentials — or
+  any other secret the session-environment allowlist withholds — into the
+  agent's context or environment, which the sidecar-gateway architecture and
+  `scripts/session_env.py` exist to prevent.
 - Authentication and path-traversal issues in the web gateway, including
   attachment and static-file serving.
 
@@ -44,14 +45,24 @@ nothing new.
   layer is telemetry. Making it a boundary requires an `internal: true` network
   or in-container firewall rules, and is tracked as a roadmap item.
 - **The main session runs with broad tool permissions while processing
-  untrusted input.** A hostile message cannot read messaging or mailbox
-  credentials out of the agent's environment (other credentials the container
-  holds, such as a repo token or model-gateway keys, are not scrubbed the same
-  way), and an outbound send still has to clear the sending identity's policy
-  — but nothing authenticates who completes a pending `verify` approval, so
-  treat that as a workflow gate rather than a hard boundary. It can still
-  induce the agent to read across mounted chambers or write to them.
-  Reduced-privilege triage is a roadmap item.
+  untrusted input.** A hostile message cannot read messaging, mailbox,
+  calendar or model-gateway credentials out of the agent's environment: no
+  session the framework spawns (dashboard turns, scheduled jobs, Ask-Ara
+  answers) inherits a secret, because each is started from an explicit
+  allowlist (`scripts/session_env.py`) that passes service URLs, capability
+  tokens and model settings and nothing else — messaging credentials live in
+  the sidecar gateways and never enter this container at all. What the
+  allowlist does not cover: every process in the container runs as the same
+  uid, so a session can still read a daemon's `/proc/<pid>/environ` (the web
+  gateway's, for one, holds the mailbox password for its e-mail backend), and
+  the main remote-control session is not spawned through it — the entrypoint
+  scrubs the model API key and `EMAIL_PASS*` from it and it keeps the rest,
+  the repo token included. Both close with the sidecar/uid work tracked
+  separately. An outbound send still has to clear the sending identity's
+  policy — but nothing authenticates who completes a pending `verify`
+  approval, so treat that as a workflow gate rather than a hard boundary. It
+  can still induce the agent to read across mounted chambers or write to
+  them. Reduced-privilege triage is a roadmap item.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.

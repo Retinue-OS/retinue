@@ -202,6 +202,7 @@ import gateway_auth
 import messenger_gateways
 import news_store
 import push_notify
+import session_env
 
 
 # Claude Code ships as an npm package whose auto-updater briefly swaps the
@@ -235,7 +236,15 @@ def _run_claude(cmd, **kwargs):
     under the lock every framework spawner shares (scripts/claude_auth.py), so
     the session never starts with a refresh that races the scheduler's jobs or
     the remote-control session for the rotation; then tolerates the transient
-    ENOENT window while Claude Code's auto-updater replaces the binary."""
+    ENOENT window while Claude Code's auto-updater replaces the binary.
+
+    The child never inherits this process's environment: the gateway holds
+    the mailbox credentials for its e-mail backend and whatever else the
+    container was started with, and a session runs untrusted input with a
+    Bash tool. A caller that passes no `env` gets the allowlisted session
+    environment (scripts/session_env.py); a caller that builds its own starts
+    from the same allowlist and only adds per-spawn stamps."""
+    kwargs.setdefault("env", session_env.session_environment())
     claude_auth.ensure_fresh_credentials(log=_log_claude_auth)
     deadline = time.monotonic() + CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS
     waited = False
@@ -3622,14 +3631,15 @@ def send_message(message: str, display_question: str | None = None,
                 return cmd
 
             def _spawn(cmd: list[str], run_model: str):
+                # The allowlisted session environment (scripts/session_env.py):
+                # no mailbox password, no LiteLLM or OpenRouter key, nothing
+                # the gateway holds for itself — and never a stale per-spawn
+                # stamp, which the allowlist clears for exactly this reason.
                 # RETINUE_SESSION_MODEL advertises the model this session runs
-                # on (sessions cannot introspect their --model flag); cleared
-                # rather than inherited so a stale value never mislabels a
-                # session. The escalate flag is only offered below the
-                # frontier tier — senior has nobody to escalate to.
-                env = dict(os.environ)
-                env.pop("RETINUE_SESSION_MODEL", None)
-                env.pop("RETINUE_ESCALATE_FILE", None)
+                # on (sessions cannot introspect their --model flag). The
+                # escalate flag is only offered below the frontier tier —
+                # senior has nobody to escalate to.
+                env = session_env.session_environment()
                 if run_model:
                     env["RETINUE_SESSION_MODEL"] = run_model
                 if escalate_flag is not None and not _same_model(

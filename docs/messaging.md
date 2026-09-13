@@ -159,6 +159,40 @@ the fail-safe default means every send needs approval unless a policy entry gran
 it. Pending Telegram sends appear on `/sends` with the others. Text plus optional
 image attachments only.
 
+## What an agent session can see
+
+Credential isolation is the reason the gateways are sidecars: the Signal keys,
+the WhatsApp session, the Telegram login and the CalDAV password live in their
+own containers, and the mailbox password lives with the web gateway's e-mail
+backend inside the `retinue` container. An agent reaches every one of them
+through a thin script that authenticates with a **capability token**
+(`SIGNAL_GATEWAY_TOKEN`, `EMAIL_BACKEND_TOKEN`, `CONVERSATION_BACKEND_TOKEN`,
+…): a token buys one capability behind a send policy; a password would buy the
+account.
+
+That only holds if the tokens are the *only* secrets a session inherits, so
+every `claude -p` session the framework spawns — dashboard turns, scheduled
+jobs, Ask-Ara answers, the transcript-cleanup and presentation-lint passes —
+starts from an **allowlisted environment** (`scripts/session_env.py`): process
+basics, the egress proxy and its CA, the model endpoint (`ANTHROPIC_*`), the
+framework's own settings (`RETINUE_*`, `CLAUDE_*`, `SPARQL_ENDPOINT_*`, the
+news and triage tunables), the service URLs and capability tokens, the repo
+token and, for now, the Garmin login. Everything else is dropped by
+construction — mailbox and CalDAV passwords, the LiteLLM and OpenRouter keys,
+the htpasswd line, and whatever secret the next sidecar brings — which is why
+it is an allowlist and not a denylist. `python3
+/workspace/scripts/session_env.py` prints the names a session spawned from
+the current environment would receive. A deployment whose chamber scripts
+read variables outside the list names them, comma-separated, in
+`RETINUE_SESSION_ENV_EXTRA` on the retinue service.
+
+What this does not cover: every process in the container runs as the same
+uid, so a session can still read a daemon's `/proc/<pid>/environ`; and the
+main remote-control session is not spawned through the allowlist — the
+entrypoint scrubs the model API key and `EMAIL_PASS*` from it and it keeps the
+rest. Both close with the sidecar/uid work tracked separately (`SECURITY.md`,
+"Known limitations").
+
 ## Gateway connection monitoring
 
 Linked-device sessions (Signal, WhatsApp, Telegram) die silently — the phone
