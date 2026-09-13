@@ -116,6 +116,14 @@ def poll_until_done(url: str, headers: dict, request_timeout: float,
     been dispatched, losing the status endpoint is a real problem, not
     something to swallow silently.
 
+    `poll_timeout` bounds the *total* wait, not just the gap between polls:
+    the deadline is checked before every request (a request is never even
+    started once time is up), and both that request's own timeout and the
+    sleep afterwards are capped to whatever time remains -- otherwise a
+    slow or hanging response could block for the full `request_timeout`, or
+    a sleep could run for the full `poll_interval`, well past a deadline
+    that had almost already arrived.
+
     When `run_id` is given, every polled state is checked against it (see
     `RunSuperseded`); a state with no `run_id` at all (an updater too old to
     send one) is not treated as a mismatch, so polling against such an
@@ -123,8 +131,11 @@ def poll_until_done(url: str, headers: dict, request_timeout: float,
     """
     deadline = time.monotonic() + poll_timeout
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
         request = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(request, timeout=request_timeout) as resp:
+        with urllib.request.urlopen(request, timeout=min(request_timeout, remaining)) as resp:
             state = json.loads(resp.read().decode("utf-8"))
         polled_run_id = state.get("run_id")
         if run_id is not None and polled_run_id is not None and polled_run_id != run_id:
@@ -135,9 +146,10 @@ def poll_until_done(url: str, headers: dict, request_timeout: float,
             )
         if not state.get("running"):
             return state
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             return None
-        time.sleep(poll_interval)
+        time.sleep(min(poll_interval, remaining))
 
 
 def main() -> int:

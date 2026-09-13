@@ -13,7 +13,10 @@ never finishes inside the bounded wait.
 Also covered (PR #223 review, closing out part of #46): the `run_id` the
 updater now echoes is checked on every poll, so a *different* run taking
 over mid-poll is reported as RunSuperseded rather than silently attributed
-to the run this client dispatched.
+to the run this client dispatched; and the bounded wait is actually
+bounded -- a request or a sleep can no longer carry the total wait
+meaningfully past poll_timeout just because request_timeout or
+poll_interval individually happen to be larger.
 
     python3 tests/test_self_update_status.py
 """
@@ -22,6 +25,8 @@ import json
 import sys
 import threading
 import time
+import traceback
+import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -51,15 +56,20 @@ def check(label, got, want):
 class _FakeUpdater:
     """A stand-in for the updater sidecar's GET /status: serves a scripted
     sequence of states (one per request) and records the auth header of every
-    request it was asked."""
+    request it was asked. An optional `delay` makes every response wait that
+    many seconds first, standing in for a slow or hanging updater.
+    """
 
-    def __init__(self, states):
+    def __init__(self, states, delay: float = 0.0):
         self._states = list(states)
+        self._delay = delay
         self.requests: list[str] = []
         sink = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
+                if sink._delay:
+                    time.sleep(sink._delay)
                 sink.requests.append(self.headers.get("X-Update-Token") or "")
                 state = sink._states[min(len(sink._states) - 1, len(sink.requests) - 1)]
                 body = json.dumps(state).encode("utf-8")
@@ -73,6 +83,12 @@ class _FakeUpdater:
                 pass
 
         self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        # A client that hits its own capped timeout closes the connection
+        # before this handler's delayed write goes out, so the server sees a
+        # routine BrokenPipeError/ConnectionResetError -- expected, and not
+        # worth the default traceback-to-stderr noise; anything else still
+        # prints, so a genuine bug in the handler is not hidden.
+        self.server.handle_error = self._handle_error
         self.port = self.server.server_address[1]
 
     def __enter__(self):
@@ -82,6 +98,14 @@ class _FakeUpdater:
     def __exit__(self, *exc):
         self.server.shutdown()
         self.server.server_close()
+
+    @staticmethod
+    def _handle_error(request, client_address):
+        import sys as _sys
+        exc = _sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        traceback.print_exc()
 
     @property
     def url(self) -> str:
@@ -134,6 +158,49 @@ def test_poll_until_done_times_out(su):
         final = su.poll_until_done(fake.url, {}, request_timeout=5,
                                     poll_timeout=0.2, poll_interval=0.05)
     check("None signals a bounded-wait timeout, not a verdict", final, None)
+
+
+def test_poll_until_done_respects_deadline_despite_long_poll_interval(su):
+    print("poll_until_done: a poll_interval longer than poll_timeout does not "
+          "delay the timeout verdict")
+    # Before the fix, the sleep between polls was never capped: a fast-but-
+    # perpetually-running response would still sleep the *full*
+    # poll_interval before the deadline was checked again, so a poll_timeout
+    # of 0.3s with a poll_interval of 5s took upwards of 5s to give up, not
+    # ~0.3s. Pin the fix by measuring wall-clock time, not just the outcome.
+    states = [{"running": True, "returncode": None, "failed_step": None}]
+    with _FakeUpdater(states) as fake:
+        started = time.monotonic()
+        final = su.poll_until_done(fake.url, {}, request_timeout=5,
+                                    poll_timeout=0.3, poll_interval=5)
+        elapsed = time.monotonic() - started
+    check("still a bounded-wait timeout, not a verdict", final, None)
+    check("elapsed time tracked poll_timeout, not poll_interval", elapsed < 2.0, True)
+
+
+def test_poll_until_done_caps_request_timeout_to_remaining(su):
+    print("poll_until_done: a slow response is cut off by the deadline, not by "
+          "request_timeout")
+    # Before the fix, each request's own timeout was the full request_timeout
+    # regardless of how little of poll_timeout was left, so a response slower
+    # than the remaining budget but faster than request_timeout would still be
+    # awaited in full. Here the fake updater takes 1.5s to answer, request_timeout
+    # is a generous 5s, but only 0.3s of poll_timeout remains -- the fix must cut
+    # the wait to ~0.3s rather than let the 1.5s response come back normally.
+    states = [{"running": True, "returncode": None, "failed_step": None}]
+    with _FakeUpdater(states, delay=1.5) as fake:
+        started = time.monotonic()
+        try:
+            su.poll_until_done(fake.url, {}, request_timeout=5,
+                                poll_timeout=0.3, poll_interval=5)
+            raised_promptly = False
+        except (urllib.error.URLError, OSError):
+            raised_promptly = True
+        elapsed = time.monotonic() - started
+    check("the capped request timeout surfaced as a network error, "
+          "not a clean result", raised_promptly, True)
+    check("elapsed time tracked the remaining budget, not the full response delay",
+          elapsed < 1.0, True)
 
 
 def test_poll_until_done_matching_run_id_reports_normally(su):
@@ -202,6 +269,8 @@ def main():
     test_poll_until_done_success(su)
     test_poll_until_done_reports_failure(su)
     test_poll_until_done_times_out(su)
+    test_poll_until_done_respects_deadline_despite_long_poll_interval(su)
+    test_poll_until_done_caps_request_timeout_to_remaining(su)
     test_poll_until_done_matching_run_id_reports_normally(su)
     test_poll_until_done_ignores_run_id_when_updater_omits_it(su)
     test_poll_until_done_detects_run_superseded(su)
