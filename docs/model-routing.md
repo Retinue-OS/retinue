@@ -207,6 +207,20 @@ first live tier deployment is what motivated shipping this early: a
 router-tier model reliably forgot chips and composed bullet lists, which no
 amount of prompt discipline fixed.
 
+Lints run on their **own** concurrency bound (`PRESENTATION_LINT_CONCURRENCY`,
+default 1) and wait at most `PRESENTATION_LINT_WAIT` seconds (default 20) for a
+slot, after which the message is delivered unlinted. That separation is a
+correctness requirement, not a tuning knob. The lint runs inside a request, and
+that request's caller is regularly a spawned session already holding one of the
+`WEB_GATEWAY_MAX_CONCURRENCY` session slots — every `conversation-push.py` from
+an agent session is that case. While the lint shared the session pool, such a
+caller waited for a slot it was itself holding: with the default bound of 2, one
+other busy session hung the push forever, the client timed out, the gateway
+thread stayed queued on the semaphore, and the thread never reached the
+dashboard at all. Total `claude` processes are now bounded by the sum of the two
+pools rather than by `WEB_GATEWAY_MAX_CONCURRENCY` alone — a deliberate, small
+increase, since a lint is tool-less, MCP-less and context-less.
+
 The field test also showed the flag-file escalation failing on the weakest
 models — junior *echoed* `touch "$RETINUE_ESCALATE_FILE"` into her reply
 instead of executing it, so the turn was never re-run. Open hardening ideas,
