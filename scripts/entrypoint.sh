@@ -350,6 +350,12 @@ CRED_MARKER="${CRED_FILE}.restored-expiry"
 _start_credential_watcher() {
   {
     last_seen_expiry=""
+    if _cred_has_token "$CRED_FILE"; then
+      last_seen_expiry=$(jq -r '.claudeAiOauth.expiresAt // "0"' "$CRED_FILE" 2>/dev/null)
+      if [[ -z "$last_seen_expiry" || "$last_seen_expiry" == "0" ]]; then
+        last_seen_expiry=""
+      fi
+    fi
     empty_count=0
     while true; do
       sleep 3
@@ -401,6 +407,7 @@ _url_host() {
   h="${h%%/*}"
   h="${h%%\?*}"
   h="${h%%:*}"
+  h="${h,,}"
   printf '%s' "$h"
 }
 

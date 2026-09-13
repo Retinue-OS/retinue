@@ -289,6 +289,7 @@ def test_remote_control_available_only_on_anthropic_api():
     try:
         assert ca.remote_control_available()  # unset: direct to Anthropic
         for base in ("https://api.anthropic.com", "https://api.anthropic.com/v1",
+                     "https://API.ANTHROPIC.COM/v1",
                      "api.anthropic.com", "https://api.anthropic.com:443/v1"):
             os.environ["ANTHROPIC_BASE_URL"] = base
             assert ca.remote_control_available(), base

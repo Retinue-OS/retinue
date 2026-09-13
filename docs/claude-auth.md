@@ -12,7 +12,7 @@ that replaces the console procedure.
 
 ## Why sign-ins end
 
-Two distinct mechanisms:
+Three distinct mechanisms:
 
 1. **The refresh token has a fixed lifetime.** The credential file records it
    (`claudeAiOauth.refreshTokenExpiresAt`). Access tokens are refreshed
