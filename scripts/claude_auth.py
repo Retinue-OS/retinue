@@ -147,14 +147,34 @@ def now_ms() -> int:
 def oauth_in_use() -> bool:
     """Whether this deployment authenticates Claude Code via OAuth at all.
 
-    Mirrors the entrypoint's remote-control condition: a configured
-    Claude-compatible gateway (ANTHROPIC_BASE_URL) replaces the OAuth login —
-    unless RETINUE_GATEWAY_USES_CLAUDE_OAUTH declares the gateway itself relies
-    on the subscription credentials.
+    A configured Claude-compatible gateway (ANTHROPIC_BASE_URL) replaces the
+    OAuth login — unless RETINUE_GATEWAY_USES_CLAUDE_OAUTH declares the gateway
+    itself relies on the subscription credentials. Independent of
+    ``remote_control_available()``: such a gateway carries the sign-in, but
+    never a remote-control session.
     """
     if not os.environ.get("ANTHROPIC_BASE_URL", "").strip():
         return True
     return os.environ.get("RETINUE_GATEWAY_USES_CLAUDE_OAUTH", "").strip().lower() == "true"
+
+
+def remote_control_available() -> bool:
+    """Whether a Claude.ai remote-control session can run in this deployment.
+
+    Claude Code serves remote control from api.anthropic.com only; pointed at
+    any other base URL it ignores ``--remote-control`` and starts an ordinary
+    session, which then sits on the shared credentials and rotates itself out
+    of them (docs/claude-auth.md). The entrypoint applies the same rule when
+    deciding whether to start one at all (``_remote_control_reachable`` in
+    scripts/entrypoint.sh); this is its read-only counterpart, for the
+    dashboard's sign-in page.
+    """
+    base = os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+    if not base:
+        return True
+    if "://" not in base:
+        base = f"//{base}"
+    return urllib.parse.urlsplit(base).hostname == "api.anthropic.com"
 
 
 # ── Reading and classifying stored credentials ────────────────────────────────

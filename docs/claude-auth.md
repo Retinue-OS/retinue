@@ -42,6 +42,33 @@ Two distinct mechanisms:
    credentials while remote-control is active without running
    `claude_auth.py refresh` first.
 
+3. **An idle long-lived session rotates itself out.** A session refreshes for
+   itself and holds the pair it last used; the spawners rotate the pair on
+   disk whenever one of them starts near expiry. Hours later the session's own
+   refresh can therefore present a token that has since been rotated away —
+   Anthropic answers HTTP 400, and the whole token family dies with it, the
+   entrypoint's backup included: the watcher's restore is rejected too, and
+   the deployment is signed out early with no warning possible. This is the
+   near-daily "sign-in broken" pattern, and the session it needs is not even
+   one doing work. Observed on 2026-09-07 in a gateway deployment: a spawn
+   rotated the pair on disk at 14:30:17, the remote-control session (running
+   since 06:39) refreshed at 22:39:38 and logged `OAuth refresh failed
+   (expected): Request failed with status code 400`, cleared the credential
+   file, and the restored backup was rejected as well.
+
+   The aggravating case is a session that cannot do anything at all: Claude
+   Code serves remote control from `api.anthropic.com` only, so behind a
+   Claude-compatible gateway it ignores `--remote-control` ("Remote Control is
+   only available when using Claude via api.anthropic.com … `--rc` flag
+   ignored") and leaves an ordinary session sitting on the shared tokens. The
+   entrypoint therefore starts the session only where remote control is
+   actually served — `ANTHROPIC_BASE_URL` unset or pointing at
+   `api.anthropic.com` — and idles on `tail -f /dev/null` otherwise, with the
+   credential watcher still running and every spawner refreshing under the
+   shared lock as before. Deployments that reach Anthropic directly keep the
+   session and with it this failure mode; there, the pre-spawn refresh below
+   is what keeps its window small.
+
 ## The pre-spawn refresh (`claude_auth.py refresh`)
 
 Every `claude` process the framework starts — the scheduler's prompt jobs
@@ -90,10 +117,14 @@ This is not the out-of-band refresh the monitor refuses to perform: the
 rotation is exactly the one the child would trigger seconds later, moved
 before the spawn and under a lock — the number of rotations does not change,
 only who performs them and how many at a time. The margin is wider than the
-CLI's own 300 s on purpose, so the spawner gets there first; the long-lived
-remote-control session, which refreshes for itself, then finds the newer pair
-on disk at its next refresh and adopts it (Claude Code re-reads the file
+CLI's own 300 s on purpose, so the spawner gets there first; a long-lived
+session, which refreshes for itself, is then *expected* to find the newer pair
+on disk at its next refresh and adopt it (Claude Code re-reads the file
 under its lock before refreshing — verified against 2.1.260, the version the image pins, and 2.1.261).
+The 2026-09-07 incident above shows that this is not something to rely on: a
+session idle for hours still presented a rotated token and took the whole
+family down with it. The pre-spawn refresh bounds how often that window opens;
+what closes it is not keeping a session alive that has nothing to do.
 
 What Claude Code does on its own, for reference (verified against 2.1.260, the version the image pins, and 2.1.261, byte-identical in every constant below): a refresh is
 attempted when the access token is within 300 s of expiry; the lock above is
