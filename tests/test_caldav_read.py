@@ -57,6 +57,14 @@ class _Event:
         self.icalendar_component = component
 
 
+class NotFoundError(Exception):
+    """Stands in for caldav.lib.error.NotFoundError (the package is not installed).
+
+    The gateway recognizes it by name when the real class cannot be imported,
+    which is exactly the situation here.
+    """
+
+
 class _Calendar:
     def __init__(self, cal_id, url, name, events=(), by_uid=None):
         self.id = cal_id
@@ -68,10 +76,26 @@ class _Calendar:
     def search(self, start=None, end=None, event=None, expand=None):
         return list(self._events)
 
-    def event_by_uid(self, uid):
+    def get_event_by_uid(self, uid):
         if uid not in self._by_uid:
-            raise RuntimeError("404 not found")
+            raise NotFoundError(f"{uid} not found on server")
         return _Event(self._by_uid[uid])
+
+
+class _LegacyCalendar(_Calendar):
+    """A caldav release exposing only the deprecated alias, not the current name."""
+
+    get_event_by_uid = None  # not callable, so the finder falls through
+
+    def event_by_uid(self, uid):
+        return _Calendar.get_event_by_uid(self, uid)
+
+
+class _UnreachableCalendar(_Calendar):
+    """A calendar the gateway cannot reach at all (transport/auth failure)."""
+
+    def get_event_by_uid(self, uid):
+        raise RuntimeError("connection reset by peer")
 
 
 class _Principal:
@@ -133,6 +157,12 @@ def test_read_window_rejects_bad_input():
             ("2026-09-20", "", "soon"),      # non-numeric days
             ("2026-09-20", "", "0"),         # non-positive days
             ("2026-09-20", "2026-09-19", ""),  # end before start
+            # float() accepts these, and timedelta then raises something the
+            # handler would not map to a 400 — so reject them here instead.
+            ("2026-09-20", "", "inf"),
+            ("2026-09-20", "", "nan"),
+            ("2026-09-20", "", "1e10"),
+            ("9999-12-31", "", "365"),       # window past datetime.max
         ):
             try:
                 cg._parse_read_window(start, end, days)
@@ -356,6 +386,30 @@ def test_list_events_sorted_across_calendars():
     print("ok: events listed chronologically across calendars, ungated by send policy")
 
 
+def test_events_sort_on_the_instant_not_the_string():
+    tz_zurich = datetime.timezone(datetime.timedelta(hours=2))
+    tz_utc = datetime.timezone.utc
+    # 09:00+02:00 is 07:00 UTC, so it happens BEFORE 08:00+00:00 — while sorting
+    # the ISO strings would put it after.
+    early = _Calendar("cal-a", "https://dav/a", "A", events=[
+        _Event(_timed("zurich-morning", datetime.datetime(2026, 9, 21, 9, 0, tzinfo=tz_zurich))),
+    ])
+    later = _Calendar("cal-b", "https://dav/b", "B", events=[
+        _Event(_timed("utc-morning", datetime.datetime(2026, 9, 21, 8, 0, tzinfo=tz_utc))),
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        cg._connect_principal = lambda: _Principal([later, early])
+        start, end = cg._parse_read_window("2026-09-20", "2026-09-27", "")
+        events = cg._list_events_on_server(start, end)
+        assert [e["summary"] for e in events] == ["zurich-morning", "utc-morning"]
+        # An unparseable start sorts last rather than breaking the read.
+        assert cg._event_sort_key({"start": "nonsense"}) == \
+            datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+        assert cg._event_sort_key({}) == datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    print("ok: events sort on the instant, not the ISO string")
+
+
 def test_expanded_search_falls_back_when_unsupported():
     calls = []
 
@@ -405,7 +459,37 @@ def test_find_event_by_uid_across_calendars():
         # A uid no calendar holds is None (mapped to 404 by the handler), not an
         # error — the first calendar's "not found" must not abort the search.
         assert cg._find_event_by_uid("uid-nothing") is None
+    with tempfile.TemporaryDirectory() as tmp:
+        # A library release without the current method name still resolves,
+        # through its own deprecated alias.
+        cg = _load_caldav_gateway(tmp)
+        legacy = _LegacyCalendar("cal-old", "https://dav/old", "Old", by_uid={"uid-Dentist": wanted})
+        cg._connect_principal = lambda: _Principal([legacy])
+        assert cg._find_event_by_uid("uid-Dentist")["summary"] == "Dentist"
     print("ok: uid lookup spans the calendars a read covers")
+
+
+def test_unreachable_calendar_is_not_reported_as_a_missing_event():
+    wanted = _timed("Dentist", datetime.datetime(2026, 9, 3, 14, 0))
+    broken = _UnreachableCalendar("cal-work", "https://dav/work", "Work")
+    holder = _Calendar("cal-home", "https://dav/home", "Home", by_uid={"uid-Dentist": wanted})
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        cg._connect_principal = lambda: _Principal([broken, holder])
+        # A transport/auth/server failure must NOT be swallowed into a None the
+        # handler reports as 404 — an outage is a 502, and only a genuine
+        # "not found" moves on to the next calendar.
+        try:
+            cg._find_event_by_uid("uid-Dentist")
+        except RuntimeError as exc:
+            assert "connection reset" in str(exc)
+        else:
+            raise AssertionError("a transport failure must not read as 'not found'")
+        # The name-based recognition that makes that distinction work without
+        # the caldav package installed.
+        assert cg._is_not_found(NotFoundError("gone")) is True
+        assert cg._is_not_found(RuntimeError("connection reset by peer")) is False
+    print("ok: an unreachable calendar is not a missing event")
 
 
 def test_calendars_snapshot_names_the_write_target():
@@ -518,9 +602,11 @@ def main():
     test_calendar_identity_survives_an_unreadable_property()
     test_pick_read_calendars()
     test_list_events_sorted_across_calendars()
+    test_events_sort_on_the_instant_not_the_string()
     test_expanded_search_falls_back_when_unsupported()
     test_query_filter_matches_text_fields()
     test_find_event_by_uid_across_calendars()
+    test_unreachable_calendar_is_not_reported_as_a_missing_event()
     test_calendars_snapshot_names_the_write_target()
     test_serialize_a_real_icalendar_component_when_available()
     test_route_and_params()

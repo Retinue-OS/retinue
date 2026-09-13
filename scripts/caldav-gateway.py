@@ -37,6 +37,7 @@ recurring events are expanded into their instances on read.
 import datetime
 import hmac
 import json
+import math
 import os
 import re
 import threading
@@ -347,11 +348,19 @@ def _parse_read_window(start: str, end: str, days: str) -> tuple:
                 span = float(days)
             except ValueError as exc:
                 raise ValueError(f"invalid 'days' value {days!r}: {exc}") from exc
-            if span <= 0:
-                raise ValueError("'days' must be positive")
+            # float() happily returns inf/nan, which pass a plain > 0 test and
+            # then blow up inside timedelta as an OverflowError/ValueError the
+            # handler would not recognise as a bad request.
+            if not math.isfinite(span) or span <= 0:
+                raise ValueError("'days' must be a positive, finite number")
         else:
             span = READ_DEFAULT_DAYS
-        window_end = window_start + datetime.timedelta(days=span)
+        try:
+            window_end = window_start + datetime.timedelta(days=span)
+        except (OverflowError, ValueError) as exc:
+            # Finite but absurd (days=1e10), or a window running past
+            # datetime.max: a bad request, not a server fault.
+            raise ValueError(f"'days' value {days or span!r} is out of range") from exc
     window_start, window_end = _align_timezones(window_start, window_end)
     if window_end < window_start:
         raise ValueError("'end' is before 'start'")
@@ -438,6 +447,27 @@ def _serialize_event(component, calendar: dict | None = None) -> dict:
     return entry
 
 
+def _event_sort_key(entry: dict) -> datetime.datetime:
+    """A comparable instant for one serialized event, for chronological sorting.
+
+    Each `start` carries its own event's UTC offset — or none at all, for an
+    all-day date or a floating time — so lexicographic order is not chronological
+    across calendars: 09:00+02:00 precedes 08:00+00:00 but sorts after it. Every
+    start is therefore read as an instant: an all-day date is the start of that
+    day, a naive time is read in this container's timezone, and the comparison
+    happens in UTC. An unparseable start sorts last instead of breaking the read.
+    """
+    value = entry.get("start") or ""
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError:
+        return datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.astimezone(datetime.timezone.utc)
+
+
 def _event_components(event) -> list:
     """The VEVENT components of one caldav event object.
 
@@ -495,9 +525,10 @@ def _search_calendar(cal, window_start, window_end) -> list:
 def _list_events_on_server(window_start, window_end, calendar_id: str | None = None) -> list:
     """Read the events of one window across the calendars a read covers.
 
-    Sorted by start, so callers get a chronological agenda across calendars
-    (an all-day event sorts before the timed events of the same day, its start
-    being a bare date).
+    Sorted on each event's actual instant (see _event_sort_key), so callers get a
+    chronological agenda across calendars even when the events carry different
+    UTC offsets; an all-day event still sorts before the timed events of its day,
+    starting as it does at midnight.
     """
     principal = _connect_principal()
     entries = []
@@ -506,7 +537,7 @@ def _list_events_on_server(window_start, window_end, calendar_id: str | None = N
         for event in _search_calendar(cal, window_start, window_end):
             for component in _event_components(event):
                 entries.append(_serialize_event(component, identity))
-    entries.sort(key=lambda entry: entry.get("start") or "")
+    entries.sort(key=_event_sort_key)
     return entries
 
 
@@ -524,22 +555,55 @@ def _matches_query(entry: dict, needle: str) -> bool:
                for key in ("summary", "description", "location", "uid", "calendar"))
 
 
+def _caldav_not_found_class():
+    """The caldav exception class meaning "no such object here", when importable."""
+    if caldav is None:
+        return None
+    try:
+        from caldav.lib import error as caldav_error
+    except Exception:  # pragma: no cover - library layout differs
+        return None
+    cls = getattr(caldav_error, "NotFoundError", None)
+    return cls if isinstance(cls, type) else None
+
+
+def _is_not_found(exc: BaseException) -> bool:
+    """Whether an exception means this calendar simply does not hold the object.
+
+    Prefers the caldav library's own NotFoundError, falling back to the class
+    name so a release that renames or moves it does not turn a missing event into
+    a 502. Everything else — a transport, auth or server failure — is NOT a "not
+    found", so a calendar outage surfaces as 502 instead of a false 404.
+    """
+    not_found = _caldav_not_found_class()
+    if not_found is not None and isinstance(exc, not_found):
+        return True
+    return "notfound" in type(exc).__name__.replace("_", "").lower()
+
+
 def _find_event_by_uid(uid: str, calendar_id: str | None = None) -> dict | None:
     """One event by its iCalendar uid — the uid /create-event returns.
 
-    Searches the same calendars a range read covers, and answers None when no
-    calendar holds it.
+    Searches the same calendars a range read covers, and answers None when none
+    of them holds it. Only a genuine "not found" moves on to the next calendar;
+    any other failure is raised, so a calendar the gateway cannot reach is
+    reported as such rather than as a missing event.
     """
     principal = _connect_principal()
     for cal in _pick_read_calendars(principal, calendar_id):
-        finder = getattr(cal, "event_by_uid", None) or getattr(cal, "object_by_uid", None)
+        # get_event_by_uid is the current name; the other two are the library's
+        # own deprecated aliases, kept here for older releases.
+        finder = next((f for f in (getattr(cal, name, None) for name in
+                                   ("get_event_by_uid", "event_by_uid", "object_by_uid"))
+                       if callable(f)), None)
         if finder is None:  # pragma: no cover - library version without uid lookup
             continue
         try:
             event = finder(uid)
-        except Exception:
-            # Not in this calendar (caldav raises NotFoundError) — keep looking.
-            continue
+        except Exception as exc:
+            if _is_not_found(exc):
+                continue
+            raise
         identity = _calendar_identity(cal)
         for component in _event_components(event):
             return _serialize_event(component, identity)
