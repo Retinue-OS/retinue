@@ -42,6 +42,18 @@ python3 /workspace/scripts/email_client.py search --folder INBOX --from user@exa
 # Read a message (does NOT automatically mark it as read)
 python3 /workspace/scripts/email_client.py read --uid <UID>
 
+# Read: `body` is a rendered plain-text version; an HTML-only sender's
+# <a href> targets that aren't already implied by their visible text are
+# folded in as `label <url>` right there in the text, and the same targets
+# are always listed separately in the `links` array — so a link-only call to
+# action (a "Rechnungskopie einsehen" button with no other clue to the URL)
+# never gets lost in rendering, and losing one would show up as an empty
+# `links` array. Add --html for the text/html part verbatim (null if the
+# message has none) or --raw for the original MIME source, base64-encoded,
+# when even that isn't enough:
+python3 /workspace/scripts/email_client.py read --uid <UID> --html
+python3 /workspace/scripts/email_client.py read --uid <UID> --raw
+
 # Mark as read
 python3 /workspace/scripts/email_client.py flag --uid <UID> --read
 

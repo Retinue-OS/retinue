@@ -45,6 +45,8 @@ Examples
     email_client.py list --folder INBOX --limit 20
     email_client.py search --folder INBOX --from schaerer --subject rezept
     email_client.py read --uid 1234 --folder INBOX
+    email_client.py read --uid 1234 --html   # + the raw text/html part
+    email_client.py read --uid 1234 --raw    # + the original MIME, base64
     email_client.py fetch-attachment --uid 1234 --part 1 --out /tmp/rezept.pdf
     email_client.py move --uid 1234 --from INBOX --to "Archiv/Apotheke"
     email_client.py flag --uid 1234 --folder INBOX --read
@@ -326,9 +328,59 @@ def _iter_attachments(msg):
             yield idx, part
 
 
+def _link_target_worth_noting(href, text):
+    """Should an <a href> target be carried into the rendered text?
+
+    Returns the stripped href to emit, or None when doing so would just be
+    clutter: no href (or a bare fragment/JS pseudo-link), an anchor with no
+    visible text to hang the target on, a mailto:/tel: whose target merely
+    repeats the visible text (a "click to email jane@x.com" link that already
+    says "jane@x.com") and carries no query string beyond the address, or
+    visible text that already contains the URL. A mailto: with a query
+    (?subject=/body=/cc=, ...) is never redundant even when the address is
+    repeated, since the query is part of the action and not visible anywhere
+    in the text. Everything else is the case the issue is about — a
+    call-to-action link ("Rechnungskopie einsehen") whose only trace of the
+    actual target is the href — so it is worth noting.
+    """
+    if not href:
+        return None
+    href = href.strip()
+    if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+        return None
+    text = (text or "").strip()
+    if not text:
+        return None
+    if href.lower() in text.lower():
+        return None
+    if href.lower().startswith("mailto:"):
+        # The query string is part of the action, not decoration: a mailto
+        # can carry ?subject=/body=/cc= that composes the draft, so an
+        # address that merely repeats the visible text is only redundant
+        # when there is no such query left to lose.
+        address, _, query = href[len("mailto:"):].partition("?")
+        if address and not query and address.lower() in text.lower():
+            return None
+    elif href.lower().startswith("tel:"):
+        digits_href = re.sub(r"\D", "", href[len("tel:"):])
+        digits_text = re.sub(r"\D", "", text)
+        if digits_href and digits_href in digits_text:
+            return None
+    return href
+
+
 class _HTMLTextExtractor(HTMLParser):
     """Collapse HTML into readable plain text: drop tags, keep text, turn
-    block-level elements and <br> into newlines. Stdlib-only, no dependency."""
+    block-level elements and <br> into newlines. Stdlib-only, no dependency.
+
+    <a href> targets are folded into the text inline, as ``label <url>``,
+    right after the anchor's own text — so "Rechnungskopie einsehen" becomes
+    "Rechnungskopie einsehen <https://…>" instead of silently losing the only
+    call to action the mail had. See _link_target_worth_noting() for when a
+    target is skipped as redundant rather than noted. The same targets are
+    also collected separately (get_links()) for callers that want them as
+    structured data rather than folded into the prose.
+    """
 
     _BLOCK = {
         "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -341,14 +393,25 @@ class _HTMLTextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._parts = []
         self._skip_depth = 0
+        self._link_stack = []  # open <a> tags: (href, start index into _parts)
+        self._links = []
 
     def handle_starttag(self, tag, attrs):
         if tag in self._SKIP:
             self._skip_depth += 1
         elif tag in self._BLOCK:
             self._parts.append("\n")
+        if tag == "a" and not self._skip_depth:
+            self._link_stack.append((dict(attrs).get("href"), len(self._parts)))
 
     def handle_endtag(self, tag):
+        if tag == "a" and self._link_stack:
+            href, start = self._link_stack.pop()
+            text = "".join(self._parts[start:]).strip()
+            target = _link_target_worth_noting(href, text)
+            if target:
+                self._links.append({"text": text, "url": target})
+                self._parts.append(f" <{target}>")
         if tag in self._SKIP and self._skip_depth:
             self._skip_depth -= 1
         elif tag in self._BLOCK:
@@ -374,21 +437,40 @@ class _HTMLTextExtractor(HTMLParser):
                 blank = True
         return "\n".join(out).strip()
 
+    def get_links(self):
+        """The <a href> targets folded into get_text(), as structured data
+        (in document order, duplicates included) — for callers (e.g. the
+        `read` command's `links` field) that want them without re-parsing."""
+        return list(self._links)
 
-def _html_to_text(html):
-    """Best-effort readable plain text from an HTML string."""
+
+def _render_html(html):
+    """Parse an HTML string into (text, links): the readable rendering from
+    _HTMLTextExtractor.get_text() and its get_links() in one pass, so callers
+    that want both (e.g. `read`) don't parse twice. On a malformed document
+    that trips the parser, falls back to the raw markup as text with no
+    links — better than losing the message body entirely."""
     parser = _HTMLTextExtractor()
     try:
         parser.feed(html)
         parser.close()
     except Exception:
-        return html
-    return parser.get_text()
+        return html, []
+    return parser.get_text(), parser.get_links()
 
 
-def _body_text(msg):
-    """Best-effort plain-text body. Prefer a genuine text/plain part; fall back
-    to a *rendered* text version of an HTML-only body rather than raw markup."""
+def _html_to_text(html):
+    """Best-effort readable plain text from an HTML string, with <a href>
+    targets folded in inline (see _HTMLTextExtractor)."""
+    return _render_html(html)[0]
+
+
+def _body_parts(msg):
+    """Return (plain, html): the raw text/plain and text/html part contents,
+    whichever exist (either may be None). Neither is rendered — that split is
+    what lets `read` offer the raw text/html part (--html) and the links
+    extracted from it independently of which one _body_text() picks to show
+    as the body."""
     if msg.is_multipart():
         plain = None
         html = None
@@ -402,18 +484,52 @@ def _body_text(msg):
                 plain = part.get_content()
             elif ctype == "text/html" and html is None:
                 html = part.get_content()
-        if plain is not None:
-            return plain
-        if html is not None:
-            return _html_to_text(html)
-        return ""
+        return plain, html
     try:
         content = msg.get_content()
     except Exception:
         content = msg.get_payload(decode=True).decode("utf-8", errors="replace")
     if (msg.get_content_type() or "").lower() == "text/html":
-        return _html_to_text(content)
-    return content
+        return None, content
+    return content, None
+
+
+def _body_text(msg):
+    """Best-effort plain-text body. Prefer a genuine text/plain part; fall back
+    to a *rendered* text version of an HTML-only body rather than raw markup."""
+    plain, html = _body_parts(msg)
+    if plain is not None:
+        return plain
+    if html is not None:
+        return _html_to_text(html)
+    return ""
+
+
+def _select_body_and_links(plain, html):
+    """(body, links) for `read`, given the (plain, html) pair from _body_parts().
+
+    `body` follows the same preference as _body_text() — a genuine text/plain
+    part over a rendered HTML one. Link extraction does NOT follow that
+    preference, per _body_parts()'s own docstring: a multipart/alternative
+    message — the single most common shape for transactional mail — carries
+    both a plain and an HTML part, and the plain part never has hrefs to lose
+    in the first place, so the HTML part is rendered for its links whenever
+    one is present, regardless of which part wins for `body`. Skipping that
+    render whenever a plain part existed used to silently drop the links
+    `read` exists to surface (issue #174), for exactly the common case the
+    issue was filed about.
+    """
+    links = []
+    html_text = None
+    if html is not None:
+        html_text, links = _render_html(html)
+    if plain is not None:
+        body = plain
+    elif html_text is not None:
+        body = html_text
+    else:
+        body = ""
+    return body, links
 
 
 def _summary(M, uid):
@@ -730,6 +846,13 @@ def cmd_read(cfg, args):
         iso = parsedate_to_datetime(date).isoformat() if date else None
     except Exception:
         iso = date
+    # Render the body ourselves (rather than call _body_text) so we get the
+    # extracted links in the same pass instead of re-parsing the HTML part;
+    # `html` (the raw part, unrendered) also feeds --html below. See
+    # _select_body_and_links()'s docstring for why link extraction does not
+    # follow `body`'s plain-over-HTML preference.
+    plain, html = _body_parts(msg)
+    body, links = _select_body_and_links(plain, html)
     out = {
         "uid": str(args.uid),
         "folder": args.folder,
@@ -749,9 +872,24 @@ def cmd_read(cfg, args):
         # identity the triage gate groups a mailing list by.
         "list_id": _decode(msg.get("List-Id")),
         "flags": [f.decode() if isinstance(f, bytes) else f for f in flags],
-        "body": _body_text(msg),
+        "body": body,
+        # <a href> targets folded into `body` (see _HTMLTextExtractor), also
+        # surfaced as structured data — regardless of --html/--raw — so a
+        # caller never has to guess whether a link was lost in rendering.
+        "links": links,
         "attachments": attachments,
     }
+    if args.html:
+        # The text/html part verbatim, for a caller that wants to render it
+        # itself (or double-check `body`/`links`) rather than trust our
+        # best-effort text extraction. None when the message has no HTML part.
+        out["html"] = html
+    if args.raw:
+        # The original MIME source, byte for byte, base64-encoded because it
+        # may carry binary attachments that don't survive JSON as text. The
+        # last-resort escape hatch when even --html isn't enough.
+        out["raw"] = base64.b64encode(raw).decode("ascii")
+        out["raw_encoding"] = "base64"
     M.logout()
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
@@ -1469,6 +1607,11 @@ def main():
     sp = sub.add_parser("read", help="read one message by UID")
     sp.add_argument("--uid", required=True)
     sp.add_argument("--folder", default="INBOX")
+    sp.add_argument("--html", action="store_true",
+                    help="also include the text/html part verbatim (null if none)")
+    sp.add_argument("--raw", action="store_true",
+                    help="also include the original MIME source, base64-encoded "
+                         "(escape hatch when --html still isn't enough)")
     sp.set_defaults(func=cmd_read)
 
     sp = sub.add_parser("fetch-attachment", help="download an attachment by part number")
