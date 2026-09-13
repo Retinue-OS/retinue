@@ -113,13 +113,18 @@ services:
   # router; the updater's own UPDATER_TOKEN (see .env.example) is a second,
   # independent layer of auth beneath that, since a fixed rebuild recipe run
   # with docker-socket access is a high-blast-radius endpoint.
+  #
+  # The PathPrefix also publishes GET /status (the outcome of the last/current
+  # run) -- without it, a caller outside the container has no way to learn
+  # whether a dispatched update actually succeeded. It is safe to publish
+  # alongside /update because it carries the same UPDATER_TOKEN gate.
   # updater:
   #   networks:
   #     - agents
   #     - web
   #   labels:
   #     - "traefik.enable=true"
-  #     - "traefik.http.routers.updater.rule=Host(`agents.example.com`) && PathPrefix(`/update`)"
+  #     - "traefik.http.routers.updater.rule=Host(`agents.example.com`) && PathPrefix(`/update`, `/status`)"
   #     - "traefik.http.routers.updater.entrypoints=web,websecure"
   #     - "traefik.http.routers.updater.middlewares=agents-clientcert,agents-auth"
   #     - "traefik.http.services.updater.loadbalancer.server.port=9000"
