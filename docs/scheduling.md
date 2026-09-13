@@ -59,6 +59,10 @@ to a subagent) or runs a shell `command`.
 }
 ```
 
+`interval_seconds` is measured **completion to next start**, not start to
+start: the scheduler writes a job's state once it has finished running, so a
+job's own run time is extra spacing on top of the interval, not part of it.
+
 A prompt job may pin its model with an optional `"model"` field, which
 supports `${VAR:-default}` expansion and overrides the tier default (see
 `docs/model-routing.md`). Per-job state lives outside the chambers (default
@@ -66,6 +70,25 @@ supports `${VAR:-default}` expansion and overrides the tier default (see
 noise. The manifest is re-read every tick, so adding or editing a
 `.schedule.json` takes effect without a restart. Tunables:
 `SCHEDULER_TICK_SECONDS`, `SCHEDULER_JOB_TIMEOUT`, `SCHEDULER_STATE_DIR`.
+
+A job may also declare an optional `"retry_after_seconds"`: when the last
+recorded run did **not** end in `status: "success"` (a failure, a timeout, an
+internal error), the job becomes due after that many seconds instead of the
+full `interval_seconds`. Leaving it unset is the safe default — a failed run
+stays due at exactly the same point a successful one would have been, so one
+bad run costs at most its own interval rather than turning into a retry storm.
+Set it on a job whose failures tend to be transient (a rate-limited API, a
+flaky upstream) so a whole `interval_seconds` slot (a day, for a daily job)
+isn't burned on one bad run:
+
+```json
+{
+  "id": "herald-fetch",
+  "command": "python3 /workspace/scripts/herald-fetch.py",
+  "interval_seconds": 86400,
+  "retry_after_seconds": 900
+}
+```
 
 Besides the per-chamber manifests, the scheduler always loads a **framework base
 manifest** at `/workspace/.schedule.json` for cross-cutting jobs that belong to
