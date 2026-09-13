@@ -57,12 +57,15 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
 - **A silent run is the normal outcome.** The only conversations triage may open
   are Phase 4's two kinds — an individual proposal or the omnibus. A run never
   reports on itself. See **4c** below.
-- **An archived conversation is a user decision.** Archiving means the user is
-  not pursuing the topic at this stage. Never un-archive a thread — or post into
-  it, which un-archives it as a side effect — just to remind the user. Only
-  genuinely new external content (a new inbound message on the subject) may bring
-  an archived thread back, and that happens through Phases 1–4, never through a
-  reminder.
+- **An archived conversation is not a decision on the message.** Archiving means
+  the user is not pursuing the topic at this stage. Never un-archive a thread —
+  or post into it, which un-archives it as a side effect — just to remind the
+  user. What may bring the subject back is genuinely new external content (a new
+  inbound message) or a **stalled** item re-collected by Phase 1's fourth pass,
+  and either way through Phases 1–4 in a *new* thread, never through a reminder.
+  Only **`muted`** (with `archived`) is the user saying the topic is done for
+  good — per CLAUDE.md, the one decidable signal — and only that stops triage
+  from asking again.
 
 ### The delivery gate
 
@@ -133,8 +136,33 @@ status. Reconcile in both directions:
    Phase 6 would. This catches e.g. the already-answered path (which proposes no
    reply, so never reaches Phase 6's move) and verify-queued sends (deferred
    until approval, then forgotten). Only genuinely non-terminal states
-   (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item still awaiting
+   (`proposed`, `omnibus`, `deferred`, an `engaged` item still awaiting
    *user* input) legitimately stay in the INBOX.
+4. **Re-collect `stalled`** — the same backstop for the *non-terminal* states.
+   An item whose proposal was never engaged and whose thread was archived or
+   deleted stays in the INBOX forever: nothing revisits it. The gate therefore
+   re-arms any INBOX message on a non-terminal status untouched for
+   `TRIAGE_STALL_DAYS` (default 7, `triage-gate.py`) — but re-arming only buys
+   this turn; without this pass the item is re-armed again on every later tick
+   and still never leaves. For each such message, look its `conversation_id` up
+   in `GET /conversations?all=1` and take one of three branches:
+   - **Thread archived *and* muted** → that is the user's decision on the
+     message (per CLAUDE.md `muted` is the only decidable signal of "archive
+     this for good"). Do not re-propose: resolve it out of the INBOX exactly as
+     pass 3 does — `flag --read` + `move` to its disposition folder — and write
+     `resolved`, recording the muted thread as the reason.
+   - **Thread gone, or archived and not muted** → the proposal never landed.
+     Re-collect the message as if it were untracked: it goes through Phases 2–4
+     and gets a **new** proposal thread (or a place in the omnibus), reusing the
+     status file. Never post into the archived thread and never un-archive it —
+     a quiet or archived thread is not a decision, so the new thread is the only
+     way to ask again.
+   - **Thread alive** → the proposal is intact and merely old; leave the
+     decision to the user and let Phase 5 nudge it, but **stamp `updated` on the
+     status record** so the gate stops counting it as stalled.
+
+   Every branch must leave the record with either a new status or a fresh
+   timestamp; one that leaves it untouched re-arms the item on every tick.
 
 **Messaging** — messenger has **no live listing** (Signal/WhatsApp/Telegram are
 push-only). The held backlog lives in each gateway's delivery ledger, so the
@@ -546,8 +574,8 @@ remind — scaled by urgency and importance:
 have decided not to pursue the topic for now — respect that. Send no nudge and
 no push for it, and never un-archive it as a reminder (posting into it would
 un-archive it as a side effect, so don't post either). Only a **new external
-message on the subject** — arriving through Phases 1–4 — may bring an archived
-thread back.
+message on the subject**, or Phase 1's re-collection of a stalled item — both
+arriving through Phases 1–4, in a new thread — may raise the subject again.
 
 **Urgency scaling:** Signal/WhatsApp/SMS escalate **sooner** and prefer the
 Signal push; e-mail defaults to the in-thread nudge. Record `last_nudge` in the
