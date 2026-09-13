@@ -36,16 +36,25 @@ Before making changes, read the conventions and process that govern this project
   style and comment density.
 
 **Change tiers and process** (from [`CONTRIBUTING.md`](../CONTRIBUTING.md)):
-- **Tier 1** (operational output): direct to `main`.
+- **Tier 1** (operational output): direct to `main` for repository-owned work.
 - **Tier 2** (sensitive content changes): in-conversation consent, then direct to
-  `main`.
+  `main` for repository-owned work.
 - **Tier 3** (system changes): `scripts/`, `Dockerfile`, `docker-compose.yml`,
   `CLAUDE.md`, `agents/`, `.claude/`, `webapp/` — feature branch + PR.
+- **Coding-agent contributions are external contributions and therefore always
+  Tier 3**; use the feature-branch/PR workflow above.
 
 **Before opening a PR**, run the test suite:
-```bash
-pip install markdown-it-py requests pywebpush
-for t in tests/test_*.py; do python3 "$t" || echo "FAILED: $t"; done
+failed=0
+for t in tests/test_*.py; do
+  if python3 "$t"; then
+    :
+  else
+    echo "FAILED: $t"
+    failed=1
+  fi
+done
+exit "$failed"
 ```
 
 **Architecture and roadmap**: [`review.md`](../review.md) is an honest assessment
