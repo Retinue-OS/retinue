@@ -260,8 +260,17 @@ def is_due(job: dict) -> bool:
     # investigating before a bare retry, not worth hammering. A job that knows
     # its own failures are often transient (a rate limit, a flaky upstream)
     # can shorten that wait explicitly.
+    #
+    # "scheduled" is excluded here even though it is not "success": it is the
+    # bookkeeping status the block above writes on a job's first sighting, to
+    # start the interval clock -- not the record of an actual run. Without
+    # this exclusion, a job seen for the first time reads back as a
+    # non-success "last run" on the very next tick, so a job with
+    # retry_after_seconds set would fire after that short delay instead of
+    # ever waiting out its documented full interval_seconds for its first run.
     retry_after = job.get("retry_after_seconds")
-    if retry_after and read_last_status(job["id"]) != "success":
+    last_status = read_last_status(job["id"])
+    if retry_after and last_status not in ("success", "scheduled"):
         return elapsed >= int(retry_after)
     return False
 

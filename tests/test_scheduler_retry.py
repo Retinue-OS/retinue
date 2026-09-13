@@ -9,7 +9,11 @@ whole `interval_seconds` slot before the next attempt. `retry_after_seconds`
 lets a job opt into a shorter wait after a non-success run, without changing
 the default (no field set => unchanged behaviour) or making *any* non-success
 status due at the very next tick, which would just trade one failure mode
-(a burned slot) for another (a retry storm).
+(a burned slot) for another (a retry storm). It also must not fire early
+for a job that has simply never run yet: a first sighting writes a
+"scheduled" bookkeeping status (so the interval clock starts immediately
+rather than on the first tick after the process restarts), which is not
+"success" either, but is not a failed run to retry.
 
     python3 tests/test_scheduler_retry.py
 """
@@ -104,6 +108,30 @@ def test_disabled_job_never_due(sched, tmp):
     check("disabled beats retry_after_seconds", sched.is_due(job), False)
 
 
+def test_first_sighting_with_retry_after_waits_full_interval(sched, tmp):
+    print("first sighting of a job with retry_after_seconds: waits out the full "
+          "interval, not just retry_after_seconds")
+    job = {"id": "j8", "interval_seconds": 1800, "retry_after_seconds": 300}
+    # No state file yet: is_due writes a "scheduled" bookkeeping entry (to
+    # start the interval clock from now) and reports not due -- the job has
+    # never actually run, so there is nothing to retry.
+    check("first tick, no prior state: not due", sched.is_due(job), False)
+    got_status = sched.read_last_status("j8")
+    check("first tick wrote a 'scheduled' bookkeeping status", got_status, "scheduled")
+    # Past retry_after_seconds (300s) but nowhere near interval_seconds
+    # (1800s): if "scheduled" were mistaken for a failed run, the job would
+    # wrongly fire here already, on what is really still its first run.
+    _seed_state(tmp, "j8", "scheduled", seconds_ago=400)
+    check("past retry_after_seconds on an unstarted first run: still not due",
+          sched.is_due(job), False)
+    # Only once the full interval_seconds has elapsed does the first run
+    # become due -- confirming the fix does not also break the ordinary
+    # first-run-after-one-interval case.
+    _seed_state(tmp, "j8", "scheduled", seconds_ago=2000)
+    check("past interval_seconds on an unstarted first run: due",
+          sched.is_due(job), True)
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -114,6 +142,7 @@ def main():
         test_success_ignores_retry_after_seconds(sched, tmp)
         test_interval_elapsed_wins_regardless_of_status(sched, tmp)
         test_disabled_job_never_due(sched, tmp)
+        test_first_sighting_with_retry_after_waits_full_interval(sched, tmp)
     if failures:
         print(f"FAILED: {len(failures)} check(s): {failures}")
         sys.exit(1)
