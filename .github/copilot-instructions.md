@@ -44,18 +44,18 @@ Before making changes, read the conventions and process that govern this project
 - **Coding-agent contributions are external contributions and therefore always
   Tier 3**; use the feature-branch/PR workflow above.
 
-**Before opening a PR**, run the test suite:
-failed=0
-for t in tests/test_*.py; do
-  if python3 "$t"; then
-    :
-  else
-    echo "FAILED: $t"
-    failed=1
-  fi
-done
-exit "$failed"
+**Before opening a PR**, run the test suite. The tests are standalone scripts,
+but the gateway modules they import need a few packages:
+
+```bash
+pip install markdown-it-py requests pywebpush
+( failed=0
+  for t in tests/test_*.py; do python3 "$t" || { echo "FAILED: $t"; failed=1; }; done
+  exit $failed )
 ```
+
+The subshell gives the run a real exit status, as `.github/workflows/tests.yml`
+does, without a bare `exit` closing the shell it was pasted into.
 
 **Architecture and roadmap**: [`review.md`](../review.md) is an honest assessment
 of the codebase, its strengths and weaknesses, and the priorities for future work.
