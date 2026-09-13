@@ -14,10 +14,12 @@ These tests pin down: the target is folded into the rendered text as
 `_render_html()`'s links list (what `read --uid ...` surfaces as its `links`
 field), and the "redundant" cases (anchor text already is the URL, a
 mailto:/tel: repeating the visible address/number, no links at all) stay
-exactly as before — quiet, not padded with noise. Also a follow-up review
-finding on the same PR: a mailto:'s query string (?subject=/body=/cc=) is
+exactly as before — quiet, not padded with noise. Also two follow-up review
+findings on the same PR: a mailto:'s query string (?subject=/body=/cc=) is
 part of the action and must survive even when the address alone repeats the
-visible text.
+visible text; and `read`'s `links` must come from the HTML part whenever one
+exists, independent of `body` preferring a genuine text/plain part — the
+multipart/alternative shape most transactional mail actually uses.
 
     python3 tests/test_email_html_links.py
 """
@@ -47,6 +49,19 @@ def _html_only_message(html):
     msg["To"] = "recipient@example.org"
     msg["Subject"] = "Test"
     msg.set_content(html, subtype="html")
+    return msg
+
+
+def _multipart_alternative_message(plain, html):
+    """A plain+HTML mail — the single most common transactional-mail shape,
+    and the one `read` silently dropped links for (issue #174's real-world
+    case): `_body_parts` returns both parts, and `body` prefers `plain`."""
+    msg = EmailMessage(policy=policy.default)
+    msg["From"] = "sender@example.com"
+    msg["To"] = "recipient@example.org"
+    msg["Subject"] = "Test"
+    msg.set_content(plain)
+    msg.add_alternative(html, subtype="html")
     return msg
 
 
@@ -139,6 +154,37 @@ def test_empty_anchor_is_skipped(ec):
     print("PASS empty anchor is skipped")
 
 
+def test_multipart_alternative_links_come_from_html_part(ec):
+    """`read`'s links must not depend on which part wins for `body`.
+
+    A multipart/alternative message carries both a text/plain and a
+    text/html part — the single most common shape for transactional mail.
+    `_body_parts` returns both, and `body` prefers the genuine plain part
+    (which never has an href to lose), but `read` used to set `links` to
+    `[]` whenever that plain part existed, so the HTML part's call-to-action
+    link was silently dropped for exactly this common case — defeating the
+    point of issue #174. `body` must still come from the plain part; `links`
+    must still be populated from the HTML part.
+    """
+    # set_content() appends the trailing newline a real text/plain part has.
+    plain = "Hallo\n\nBitte im Portal ansehen.\n"
+    html = ('<p>Hallo</p><p><a href="https://portal.example.com/doc/abc123">'
+            'Rechnungskopie einsehen</a></p>')
+    msg = _multipart_alternative_message(plain, html)
+
+    # Mirrors what cmd_read does: split the parts, then select body/links.
+    got_plain, got_html = ec._body_parts(msg)
+    assert got_plain == plain, got_plain
+    assert got_html is not None, got_html
+    body, links = ec._select_body_and_links(got_plain, got_html)
+
+    assert body == plain, body
+    assert "https://portal.example.com/doc/abc123" not in body, body
+    assert links == [{"text": "Rechnungskopie einsehen",
+                       "url": "https://portal.example.com/doc/abc123"}], links
+    print("PASS multipart/alternative: body from plain, links from html")
+
+
 def main():
     ec = _load_email_client()
     test_link_only_call_to_action_survives(ec)
@@ -148,6 +194,7 @@ def main():
     test_mailto_with_query_is_kept_even_if_address_repeats(ec)
     test_no_links_stays_quiet(ec)
     test_empty_anchor_is_skipped(ec)
+    test_multipart_alternative_links_come_from_html_part(ec)
     print("all email HTML-link tests passed")
     return 0
 

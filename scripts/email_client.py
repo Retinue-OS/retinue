@@ -505,6 +505,33 @@ def _body_text(msg):
     return ""
 
 
+def _select_body_and_links(plain, html):
+    """(body, links) for `read`, given the (plain, html) pair from _body_parts().
+
+    `body` follows the same preference as _body_text() — a genuine text/plain
+    part over a rendered HTML one. Link extraction does NOT follow that
+    preference, per _body_parts()'s own docstring: a multipart/alternative
+    message — the single most common shape for transactional mail — carries
+    both a plain and an HTML part, and the plain part never has hrefs to lose
+    in the first place, so the HTML part is rendered for its links whenever
+    one is present, regardless of which part wins for `body`. Skipping that
+    render whenever a plain part existed used to silently drop the links
+    `read` exists to surface (issue #174), for exactly the common case the
+    issue was filed about.
+    """
+    links = []
+    html_text = None
+    if html is not None:
+        html_text, links = _render_html(html)
+    if plain is not None:
+        body = plain
+    elif html_text is not None:
+        body = html_text
+    else:
+        body = ""
+    return body, links
+
+
 def _summary(M, uid):
     typ, data = M.uid(
         "fetch", uid,
@@ -820,14 +847,12 @@ def cmd_read(cfg, args):
     except Exception:
         iso = date
     # Render the body ourselves (rather than call _body_text) so we get the
-    # extracted links in the same pass instead of re-parsing the HTML part.
+    # extracted links in the same pass instead of re-parsing the HTML part;
+    # `html` (the raw part, unrendered) also feeds --html below. See
+    # _select_body_and_links()'s docstring for why link extraction does not
+    # follow `body`'s plain-over-HTML preference.
     plain, html = _body_parts(msg)
-    if plain is not None:
-        body, links = plain, []
-    elif html is not None:
-        body, links = _render_html(html)
-    else:
-        body, links = "", []
+    body, links = _select_body_and_links(plain, html)
     out = {
         "uid": str(args.uid),
         "folder": args.folder,
