@@ -528,6 +528,176 @@ def test_message_without_an_id_always_arms():
     print("PASS test_message_without_an_id_always_arms")
 
 
+def _record_at(gate, message_id, status, stamp):
+    """A status record whose newest timestamp is `stamp` (ISO-8601, UTC)."""
+    path = gate._status_path(message_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"status": status, "message_id": message_id, "proposed": stamp}))
+
+
+def _whitelist_all(gate):
+    gate.tp.write_if_changed(
+        gate.tp.render_email_whitelist(set(), {"*@work.com"}),
+        gate.tp.email_whitelist_path(),
+    )
+
+
+def test_stalled_non_terminal_mail_re_arms_the_gate():
+    # The inbox-zero stall: a proposal whose thread the user archived without
+    # deciding keeps a non-terminal status forever, and the old "any record at
+    # all settles it" rule meant nothing ever looked at that mail again. After
+    # TRIAGE_STALL_DAYS an unfinished item is abandoned, not in progress.
+    for status in ("proposed", "omnibus", "omnibus_pending", "deferred", "engaged"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = _fresh(tmp)
+            _whitelist_all(gate)
+            gate.unread_inbox = lambda: [
+                {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+            ]
+            _record_at(gate, "<a@work.com>", status, "2020-01-01T00:00:00Z")
+            rec = Recorder()
+            gate.spawn = rec
+            assert gate.run_frequent() == 0
+            assert len(rec.calls) == 1, f"a stalled {status} item must re-arm"
+    print("PASS test_stalled_non_terminal_mail_re_arms_the_gate")
+
+
+def test_a_settled_status_never_re_arms_however_old():
+    # The flip side, and the reason this is an allowlist of *unfinished* states:
+    # `resolved` mail, and mail owned by another rail, must stay quiet forever.
+    # Otherwise every old record in the store buys a model turn on every tick.
+    for status in ("resolved", "status_filed", "self_filed", "abstain"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = _fresh(tmp)
+            _whitelist_all(gate)
+            gate.unread_inbox = lambda: [
+                {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+            ]
+            _record_at(gate, "<a@work.com>", status, "2020-01-01T00:00:00Z")
+            rec = Recorder()
+            gate.spawn = rec
+            assert gate.run_frequent() == 0
+            assert rec.calls == [], f"an ancient {status} item must not re-arm"
+    print("PASS test_a_settled_status_never_re_arms_however_old")
+
+
+def test_a_recent_non_terminal_item_is_left_alone():
+    # Re-arming is a backstop, not an override of Phase 5: an item that is
+    # genuinely waiting on the user, and being nudged, must not be re-collected.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.unread_inbox = lambda: [
+            {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+        ]
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _record_at(gate, "<a@work.com>", "proposed", now)
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert rec.calls == [], "a fresh proposal must not re-arm the gate"
+    print("PASS test_a_recent_non_terminal_item_is_left_alone")
+
+
+def test_an_unreadable_record_re_arms_rather_than_hiding_the_mail():
+    # Records have been written brace-less in the past; a record nobody can
+    # parse must fall on the side of getting a look, since the alternative is
+    # mail that is invisible to every future run.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.unread_inbox = lambda: [
+            {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+        ]
+        path = gate._status_path("<a@work.com>")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('"status": "omnibus",\n"disposition": "archive",\n')
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert len(rec.calls) == 1, "an unparseable record must re-arm the gate"
+    print("PASS test_an_unreadable_record_re_arms_rather_than_hiding_the_mail")
+
+
+def test_a_saturated_scan_window_widens_instead_of_hiding_old_mail():
+    # The listing is newest-first, so stopping at the limit hides the *oldest*
+    # unread mail — permanently, and precisely once the backlog is big enough to
+    # matter. Saturation must trigger a widened re-scan.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 3
+        gate.INBOX_SCAN_MAX = 10
+        everything = [{"message_id": f"<{i}@work.com>"} for i in range(7)]
+        limits = []
+
+        def fake_client(*args):
+            limit = int(args[args.index("--limit") + 1])
+            limits.append(limit)
+            return {"messages": everything[:limit]}
+
+        gate._email_client = fake_client
+        got = gate.unread_inbox()
+        assert limits == [3, 10], f"expected a widened re-scan, got limits {limits}"
+        assert len(got) == 7, f"widened scan returned {len(got)} of 7"
+    print("PASS test_a_saturated_scan_window_widens_instead_of_hiding_old_mail")
+
+
+def test_an_unsaturated_scan_does_not_pay_for_a_second_listing():
+    # The common case is a near-empty INBOX; it must stay one round trip.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 3
+        limits = []
+
+        def fake_client(*args):
+            limits.append(int(args[args.index("--limit") + 1]))
+            return {"messages": [{"message_id": "<a@work.com>"}]}
+
+        gate._email_client = fake_client
+        assert len(gate.unread_inbox()) == 1
+        assert limits == [3], f"unsaturated scan should list once, got {limits}"
+    print("PASS test_an_unsaturated_scan_does_not_pay_for_a_second_listing")
+
+
+def test_a_failed_widened_rescan_keeps_the_narrow_result():
+    # Triaging the newest INBOX_SCAN_LIMIT beats triaging nothing when the
+    # second listing fails.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 2
+        calls = []
+
+        def fake_client(*args):
+            calls.append(args)
+            if len(calls) == 1:
+                return {"messages": [{"message_id": "<a@x>"}, {"message_id": "<b@x>"}]}
+            return None
+
+        gate._email_client = fake_client
+        got = gate.unread_inbox()
+        assert len(got) == 2, f"narrow result should survive a failed re-scan: {got}"
+    print("PASS test_a_failed_widened_rescan_keeps_the_narrow_result")
+
+
+def test_the_prompt_listing_is_capped_and_says_so():
+    # A long backlog must cost a truncated listing, never unseen mail: the
+    # prompt has to admit the truncation so the session works from the mailbox.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.PROMPT_LIST_LIMIT = 5
+        messages = [
+            {"from": "a@work.com", "subject": f"s{i}", "message_id": f"<{i}@work.com>"}
+            for i in range(12)
+        ]
+        prompt = gate.build_prompt("daily", messages)
+        assert prompt.count("\n  - ") == 5, "listing should stop at the cap"
+        assert "and 7 more" in prompt, "truncation must be stated"
+        assert "work from the mailbox" in prompt
+    print("PASS test_the_prompt_listing_is_capped_and_says_so")
+
+
 if __name__ == "__main__":
     test_frequent_spawns_only_for_whitelisted()
     test_frequent_no_whitelisted_no_spawn()
@@ -547,4 +717,12 @@ if __name__ == "__main__":
     test_recorded_mail_does_not_arm_the_gate()
     test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones()
     test_message_without_an_id_always_arms()
+    test_stalled_non_terminal_mail_re_arms_the_gate()
+    test_a_settled_status_never_re_arms_however_old()
+    test_a_recent_non_terminal_item_is_left_alone()
+    test_an_unreadable_record_re_arms_rather_than_hiding_the_mail()
+    test_a_saturated_scan_window_widens_instead_of_hiding_old_mail()
+    test_an_unsaturated_scan_does_not_pay_for_a_second_listing()
+    test_a_failed_widened_rescan_keeps_the_narrow_result()
+    test_the_prompt_listing_is_capped_and_says_so()
     print("all triage-gate tests passed")
