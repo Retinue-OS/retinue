@@ -1,16 +1,12 @@
-# Copilot instructions for interactive VS Code sessions
+# Copilot instructions
 
-These instructions apply to interactive GitHub Copilot sessions in VS Code working
-on this repository.
+These instructions apply to GitHub Copilot sessions working on this repository.
+This project uses two modes: interactive editing sessions in VS Code, and an
+automated coding agent that works on assigned issues or pull requests.
 
-## Commit and push policy
+## Interactive VS Code sessions
 
-The branch/commit rules in [`CLAUDE.md`](../CLAUDE.md) (the tiered "push directly to
-main" permissions, the PR workflow, etc.) describe how the **deployed Retinue
-runtime** (Ara / Claude Code inside the container) operates. **They do not apply to
-interactive Copilot sessions.**
-
-In an interactive session:
+In an interactive session you are editing with the user present:
 
 - Make and edit files freely in the working tree.
 - **Do not commit and do not push.** The user commits and pushes themselves.
@@ -19,3 +15,54 @@ In an interactive session:
 
 When work is complete, summarize what changed and leave staging, committing, and
 pushing to the user.
+
+## Coding agent
+
+When assigned an issue or asked to fix a pull request, you are a coding agent
+whose work product is a branch and a pull request:
+
+- Commits to your own feature branch are expected and correct.
+- Pushing to your branch (to open or update a PR) is expected and correct.
+- **Do not push to `main`.** Your changes go to a feature branch and a PR.
+
+## Repository rules
+
+Before making changes, read the conventions and process that govern this project.
+
+**Conventions** (from [`CONTRIBUTING.md`](../CONTRIBUTING.md)):
+- All non-user-facing natural language — code comments, commit messages, PR titles
+  and bodies, documentation — is English.
+- Comments and commits explain *why*, not *what*. Match the surrounding code's
+  style and comment density.
+
+**Change tiers and process** (from [`CONTRIBUTING.md`](../CONTRIBUTING.md)):
+- **Tier 1** (operational output): direct to `main` for repository-owned work.
+- **Tier 2** (sensitive content changes): in-conversation consent, then direct to
+  `main` for repository-owned work.
+- **Tier 3** (system changes): `scripts/`, `Dockerfile`, `docker-compose.yml`,
+  `CLAUDE.md`, `agents/`, `.claude/`, `webapp/` — feature branch + PR.
+- **Coding-agent contributions are external contributions and therefore always
+  Tier 3**; use the feature-branch/PR workflow above.
+
+**Before opening a PR**, run the test suite:
+failed=0
+for t in tests/test_*.py; do
+  if python3 "$t"; then
+    :
+  else
+    echo "FAILED: $t"
+    failed=1
+  fi
+done
+exit "$failed"
+```
+
+**Architecture and roadmap**: [`review.md`](../review.md) is an honest assessment
+of the codebase, its strengths and weaknesses, and the priorities for future work.
+Skim it to understand the context.
+
+---
+
+**Note:** The branch/commit rules in [`CLAUDE.md`](../CLAUDE.md) describe how the
+**deployed Retinue runtime** (Ara / Claude Code inside the container) operates.
+**They do not apply to Copilot in either mode.**
