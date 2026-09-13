@@ -30,12 +30,28 @@ Manifest format  (`/workspace/chambers/<chamber>/.schedule.json`):
     ]
   }
 
+`interval_seconds` measures from the *previous run's completion* to the next
+run's start, not start-to-start: `write_state` (below) is called once the job
+has finished, so a job that takes real wall-clock time to run is spaced out by
+that much extra, and a job whose run time varies does not compress its own gap
+when it happens to run long.
+
 A prompt job may pin the model its `claude -p` session runs on with an optional
 `"model"` field. It takes precedence over the global RETINUE_CLAUDE_MODEL and
 supports `${VAR:-default}` shell-style expansion, so a chamber can default a job
 to a model while letting the deployment override it via one env var — without
 naming the chamber in this framework file. Example:
   {"id": "triage", "prompt": "...", "model": "${RETINUE_TRIAGE_MODEL:-sonnet}"}
+
+A job may also carry an optional `"retry_after_seconds"`, consulted only when
+the last recorded run did not end in `"success"`: the job is then due as soon
+as that many seconds have passed, instead of waiting out the full
+`interval_seconds`. Leaving it unset means a failed run is due at exactly the
+same point a successful one would be (the safe default — most failures deserve
+a look before a bare retry, not a tight retry loop). Example, for a job whose
+failures are usually transient (a rate limit, a flaky upstream):
+  {"id": "herald-fetch", "command": "...", "interval_seconds": 86400,
+   "retry_after_seconds": 900}
 
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
@@ -171,6 +187,14 @@ def read_last_run(job_id: str) -> float | None:
         return None
 
 
+def read_last_status(job_id: str) -> str | None:
+    try:
+        with open(_state_path(job_id), encoding="utf-8") as fh:
+            return json.load(fh).get("status")
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def write_state(job_id: str, status: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     tmp = _state_path(job_id).with_suffix(".tmp")
@@ -226,7 +250,20 @@ def is_due(job: dict) -> bool:
         # job fires one full interval later, not immediately.
         write_state(job["id"], "scheduled")
         return False
-    return (now() - last) >= int(job["interval_seconds"])
+    elapsed = now() - last
+    if elapsed >= int(job["interval_seconds"]):
+        return True
+    # A run that did not succeed may retry sooner than interval_seconds, but
+    # only if the job opts in -- an unset retry_after_seconds leaves a failed
+    # run due at exactly the same point a successful one would be, which is
+    # deliberate (see the module docstring): most failures are worth
+    # investigating before a bare retry, not worth hammering. A job that knows
+    # its own failures are often transient (a rate limit, a flaky upstream)
+    # can shorten that wait explicitly.
+    retry_after = job.get("retry_after_seconds")
+    if retry_after and read_last_status(job["id"]) != "success":
+        return elapsed >= int(retry_after)
+    return False
 
 
 def spawn_process(cmd, *, retry_enoent, **kwargs):
