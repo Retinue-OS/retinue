@@ -36,6 +36,12 @@ Before making changes, read the conventions and process that govern this project
   style and comment density.
 
 **Change tiers and process** (from [`CONTRIBUTING.md`](../CONTRIBUTING.md)):
+
+Your contributions as a coding agent are **external contributions and always
+Tier 3**, regardless of what tier the touched paths would be for a maintainer
+in the deployed runtime. Branch and PR are required; expect review.
+
+For context, the tiers that govern maintainer changes are:
 - **Tier 1** (operational output): direct to `main`.
 - **Tier 2** (sensitive content changes): in-conversation consent, then direct to
   `main`.
@@ -45,7 +51,9 @@ Before making changes, read the conventions and process that govern this project
 **Before opening a PR**, run the test suite:
 ```bash
 pip install markdown-it-py requests pywebpush
-for t in tests/test_*.py; do python3 "$t" || echo "FAILED: $t"; done
+failed=0
+for t in tests/test_*.py; do python3 "$t" || failed=1; done
+exit $failed
 ```
 
 **Architecture and roadmap**: [`review.md`](../review.md) is an honest assessment
