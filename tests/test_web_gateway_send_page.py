@@ -122,7 +122,7 @@ def test_event_approval_page_shows_the_event():
         assert "<h1>Approve Caldav-Gateway Event</h1>" in out   # not "Send"
         assert "<th>Event</th><td>Dentist</td>" in out
         assert "<th>When</th><td>Thu 03 Sep 2026, 14:00 \u2013 14:30</td>" in out
-        assert "default calendar" in out
+        assert "the gateway's configured calendar" in out
         assert "Bring the insurance card" in out
         # Never the empty message box the messenger renderer would leave.
         assert '<pre class="msg-body"></pre>' not in out
@@ -210,6 +210,71 @@ def test_overlap_rules():
         assert not clashes("whenever", "whenever")
 
 
+def test_agenda_window_covers_only_the_days_the_event_touches():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        assert wg._agenda_window({"start": "2026-09-03T14:00:00",
+                                  "end": "2026-09-03T14:30:00"}) == ("2026-09-03", "2026-09-03")
+        # Ending exactly at midnight belongs to the start day alone — the read
+        # window's bare end date is inclusive, so naming the 4th would list a
+        # day the event never touches.
+        assert wg._agenda_window({"start": "2026-09-03T23:00:00",
+                                  "end": "2026-09-04T00:00:00"}) == ("2026-09-03", "2026-09-03")
+        # A minute past midnight really does reach into the next day.
+        assert wg._agenda_window({"start": "2026-09-03T23:00:00",
+                                  "end": "2026-09-04T00:01:00"}) == ("2026-09-03", "2026-09-04")
+        # All-day DTEND is exclusive.
+        assert wg._agenda_window({"start": "2026-09-10", "end": "2026-09-12",
+                                  "all_day": True}) == ("2026-09-10", "2026-09-11")
+        # An end before the start never yields a window running backwards.
+        assert wg._agenda_window({"start": "2026-09-10T14:00:00",
+                                  "end": "2026-09-09T14:00:00"}) == ("2026-09-10", "2026-09-10")
+
+
+def test_agenda_read_is_bounded_in_time_and_size():
+    """urlopen's timeout bounds each socket read, not the exchange: a gateway
+    that accepts the connection and never finishes the body must cost a note on
+    the card, not a page that never renders."""
+    import threading
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Dripping(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", "100000")
+            self.end_headers()
+            for _ in range(40):          # a trickle, each write well inside the timeout
+                try:
+                    self.wfile.write(b" " * 8)
+                    self.wfile.flush()
+                except OSError:
+                    return
+                time.sleep(0.2)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Dripping)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            wg = _load_gateway(Path(tmp))
+            started = time.monotonic()
+            body, error = wg._fetch_json_bounded(
+                f"http://127.0.0.1:{srv.server_port}/events", {}, 1.0, wg._AGENDA_MAX_BYTES)
+            elapsed = time.monotonic() - started
+            assert body is None and error and "1s" in error
+            assert elapsed < 3, f"the caller waited {elapsed:.1f}s for a 1s deadline"
+            # An oversized body is refused rather than read into memory.
+            _body, big = wg._fetch_json_bounded(
+                f"http://127.0.0.1:{srv.server_port}/events", {}, 1.0, 4)
+            assert big
+    finally:
+        srv.shutdown()
+
+
 def test_agenda_read_asks_the_gateway_for_the_right_window():
     """The read goes to the calendar gateway's own /events endpoint, over the
     days the pending event covers, and tags each answer with its overlap."""
@@ -244,6 +309,9 @@ def test_agenda_read_asks_the_gateway_for_the_right_window():
             agenda = wg._calendar_agenda(gw, _event("pending"))
             assert "/events?" in seen["path"]
             assert "start=2026-09-03" in seen["path"] and "end=2026-09-03" in seen["path"]
+            # Explicitly account-wide: without it the endpoint narrows to
+            # CALDAV_CALENDAR_ID wherever a deployment configures one.
+            assert "calendar_id=%2A" in seen["path"] or "calendar_id=*" in seen["path"]
             assert seen["auth"] == "Bearer t0ken"
             assert [e["overlaps"] for e in agenda["events"]] == [False, True]
             assert agenda["error"] is None
@@ -258,9 +326,35 @@ def test_agenda_read_asks_the_gateway_for_the_right_window():
 def test_named_calendar_is_shown():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp))
-        out = wg._render_channel_send_html(_event("pending", calendar_id="reminders"),
-                                           "caldav-gateway", "a" * 32, None)
+        out = wg._render_channel_send_html(
+            _event("pending", calendar_id="reminders", calendar_target="reminders"),
+            "caldav-gateway", "a" * 32, None)
         assert "<th>Calendar</th><td>reminders</td>" in out
+        # A request without its own target still lands in the gateway's
+        # configured calendar, which the card names rather than claiming the
+        # server's default.
+        configured = wg._render_channel_send_html(
+            _event("pending", calendar_target="Work"), "caldav-gateway", "a" * 32, None)
+        assert "<th>Calendar</th><td>Work</td>" in configured
+        unset = wg._render_channel_send_html(_event("pending", calendar_target=""),
+                                             "caldav-gateway", "a" * 32, None)
+        assert "the gateway's configured calendar" in unset
+
+
+def test_a_span_never_runs_backwards():
+    """Nothing validates end > start before an event is queued, so the card
+    must not describe a range that cannot exist."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        same = wg._render_channel_send_html(
+            _event("pending", start="2026-09-10", end="2026-09-10", all_day=True),
+            "caldav-gateway", "a" * 32, None)
+        assert "<th>When</th><td>Thu 10 Sep 2026 (all day)</td>" in same
+        assert "Wed 09 Sep 2026" not in same
+        backwards = wg._render_channel_send_html(
+            _event("pending", start="2026-09-10T14:00:00", end="2026-09-09T14:00:00"),
+            "caldav-gateway", "a" * 32, None)
+        assert "<th>When</th><td>Thu 10 Sep 2026, 14:00</td>" in backwards
 
 
 def test_event_status_page_talks_about_the_calendar():
@@ -318,6 +412,9 @@ def main() -> int:
              test_agenda_lists_the_day_and_flags_the_clash,
              test_agenda_says_when_the_days_are_empty_or_unreadable,
              test_overlap_rules,
+             test_a_span_never_runs_backwards,
+             test_agenda_window_covers_only_the_days_the_event_touches,
+             test_agenda_read_is_bounded_in_time_and_size,
              test_agenda_read_asks_the_gateway_for_the_right_window,
              test_unparsable_times_fall_back_to_the_raw_value,
              test_index_row_names_the_event_time,

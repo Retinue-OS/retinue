@@ -3016,10 +3016,29 @@ def _all_day_last_day(end: str) -> str:
         return end or ""
 
 
+def _ends_before_it_starts(start: str, end: str, all_day: bool) -> bool:
+    """Whether an event's end lies before its start (an unparsable pair: no)."""
+    try:
+        if all_day:
+            return datetime.fromisoformat(end[:10]) < datetime.fromisoformat(start[:10])
+        first = datetime.fromisoformat(start[:-1] + "+00:00" if start.endswith("Z") else start)
+        last = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
+    except (ValueError, IndexError):
+        return False
+    return last.replace(tzinfo=None) < first.replace(tzinfo=None)
+
+
 def _format_event_when(start: str, end: str, all_day: bool) -> str:
     """One line for an event's span, e.g. "Thu 03 Sep 2026, 14:00 - 14:30"."""
     first = _format_iso_moment(start, all_day=all_day)
-    last = _format_iso_moment(_all_day_last_day(end) if all_day else end, all_day=all_day)
+    closing = _all_day_last_day(end) if all_day else end
+    last = _format_iso_moment(closing, all_day=all_day)
+    # An entry whose end is not after its start (nothing validates that before
+    # it is queued) would otherwise read as a span running backwards, e.g.
+    # "Thu 10 Sep 2026 – Wed 09 Sep 2026" for an all-day request with
+    # start == end. Say only what is certain: when it starts.
+    if _ends_before_it_starts(start, closing, all_day):
+        last = ""
     if not first:
         return last
     if all_day:
@@ -3080,11 +3099,69 @@ def _events_overlap(one, other) -> bool:
     return a_start < b_end and b_start < a_end
 
 
-# How many of the day's existing events the card lists before it stops, and how
-# long it waits for them: the approval must stay usable even when the calendar
-# server is slow or the day is packed.
+# How many of the day's existing events the card lists before it stops, how
+# long it waits for them and how much body it will read: the approval must stay
+# usable even when the calendar server is slow, endless or the day is packed.
 _AGENDA_MAX_EVENTS = 12
 _AGENDA_TIMEOUT = 8
+_AGENDA_MAX_BYTES = 512 * 1024
+
+
+def _fetch_json_bounded(url: str, headers: dict, timeout: float, max_bytes: int):
+    """GET one JSON body under a *total* deadline. Returns (body, error).
+
+    urlopen's own timeout bounds each socket operation, not the exchange: a
+    server that accepts the connection and then drips bytes keeps every single
+    read under the limit while the response never ends, which would leave the
+    page-rendering handler blocked and the approval unreachable. The request
+    therefore runs on its own daemon thread and the caller waits exactly
+    `timeout` for it — a stalled read costs a note on the page, not the page.
+    The body is capped as well, so an oversized answer cannot be read into
+    memory either.
+    """
+    outcome: dict = {}
+
+    def fetch():
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError(f"response exceeds {max_bytes} bytes")
+            outcome["body"] = json.loads(raw.decode("utf-8"))
+        except Exception as exc:  # reported to the caller, never raised here
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=fetch, name="agenda-read", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return None, f"no complete response within {timeout:g}s"
+    return outcome.get("body"), outcome.get("error")
+
+
+def _agenda_window(detail: dict) -> tuple:
+    """The first and last date a pending event actually covers, as ISO dates.
+
+    Both bounds are inclusive, which is what the read endpoint's bare-date
+    parameters mean. The end is half-open on both sides of the wire: an all-day
+    DTEND is exclusive, and a timed event that ends at exactly midnight covers
+    only the days before it — 23:00–00:00 belongs to its start day alone.
+    """
+    start = (detail.get("start") or "").strip()
+    end = (detail.get("end") or "").strip() or start
+    if detail.get("all_day"):
+        last = _all_day_last_day(end)
+    else:
+        last = end[:10]
+        try:
+            closing = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
+            if (closing.hour, closing.minute, closing.second) == (0, 0, 0) and last > start[:10]:
+                last = (closing.replace(tzinfo=None) - timedelta(days=1)).date().isoformat()
+        except ValueError:
+            pass
+    first = start[:10]
+    return (first, last if last and last >= first else first)
 
 
 def _calendar_agenda(gw: dict, detail: dict) -> dict:
@@ -3098,20 +3175,23 @@ def _calendar_agenda(gw: dict, detail: dict) -> dict:
     start = (detail.get("start") or "").strip()
     if not start:
         return {"events": [], "error": None, "truncated": False}
-    end = (detail.get("end") or "").strip() or start
-    last = _all_day_last_day(end) if detail.get("all_day") else end[:10]
-    query = urllib.parse.urlencode({"start": start[:10], "end": last[:10] or start[:10],
+    first, last = _agenda_window(detail)
+    # "*" is the read endpoint's explicit account-wide scope. Omitting it would
+    # narrow the agenda to CALDAV_CALENDAR_ID wherever that is configured — the
+    # question here is "am I free?", which no single calendar answers, and a
+    # request naming its own target calendar could otherwise be weighed against
+    # a different one entirely.
+    query = urllib.parse.urlencode({"start": first, "end": last, "calendar_id": "*",
                                     "limit": str(_AGENDA_MAX_EVENTS + 1)})
     headers = {}
     if gw.get("token"):
         headers["Authorization"] = "Bearer " + gw["token"]
-    try:
-        req = urllib.request.Request(f"{gw['base_url']}/events?{query}", headers=headers)
-        with urllib.request.urlopen(req, timeout=_AGENDA_TIMEOUT) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except Exception as exc:
-        print(f"[web-gateway] agenda read failed for a pending event: {exc}", flush=True)
-        return {"events": [], "error": str(exc), "truncated": False}
+    body, error = _fetch_json_bounded(f"{gw['base_url']}/events?{query}", headers,
+                                      _AGENDA_TIMEOUT, _AGENDA_MAX_BYTES)
+    if error or not isinstance(body, dict):
+        error = error or "unexpected answer from the calendar gateway"
+        print(f"[web-gateway] agenda read failed for a pending event: {error}", flush=True)
+        return {"events": [], "error": error, "truncated": False}
     events = [e for e in (body.get("events") or []) if isinstance(e, dict)]
     proposed = _event_interval(detail)
     for event in events:
@@ -3194,7 +3274,10 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         when = html.escape(_format_event_when(detail.get("start") or "",
                                               detail.get("end") or "",
                                               bool(detail.get("all_day"))))
-        calendar = html.escape(detail.get("calendar_id") or "")
+        # The effective write target, which is the request's own calendar_id or
+        # else the gateway's configured CALDAV_CALENDAR_ID — not necessarily
+        # the server's default calendar, so the card must not claim it is.
+        calendar = html.escape(detail.get("calendar_target") or detail.get("calendar_id") or "")
         meta_rows = [
             f"<tr><th>Channel</th><td>{label_e}</td></tr>",
             f"<tr><th>Event</th><td>{summary}</td></tr>",
@@ -3202,7 +3285,7 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         if when:
             meta_rows.append(f"<tr><th>When</th><td>{when}</td></tr>")
         meta_rows.append("<tr><th>Calendar</th><td>"
-                         + (calendar or "the account's default calendar")
+                         + (calendar or "the gateway's configured calendar")
                          + "</td></tr>")
         if recipient:
             meta_rows.append(f"<tr><th>Account</th><td>{recipient}</td></tr>")
