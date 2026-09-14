@@ -686,11 +686,16 @@ class RetinueChatPage extends HTMLElement {
   //    drops the title (the bar above names the pane) and Archive (a companion
   //    is not filed away separately from the chat it belongs to).
   //  - `stamp="clock"` matches the mirror's clock-stamped timeline beside it.
+  //  - `no-autofocus` because this pane is mounted whether or not the user is
+  //    looking at it. On the phone the panes are one scroll-snap strip, so
+  //    anything here taking focus scrolls itself into view — which IS a switch
+  //    to the Ara tab, on every re-render and on first open.
   _companionHtml() {
     const at = this._companionId
       ? ` conversation-id="${esc(this._companionId)}"`
       : ` create-url="/chats/${encodeURIComponent(this._id)}/companion"`;
-    return `<retinue-conversation bar="actions" stamp="clock" placeholder="Ask Ara …"${at}></retinue-conversation>`;
+    return `<retinue-conversation bar="actions" stamp="clock" placeholder="Ask Ara …" ` +
+      `no-autofocus${at}></retinue-conversation>`;
   }
 
   // The element, while it is on screen.

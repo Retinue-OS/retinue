@@ -27,6 +27,13 @@
 //                     for a host that sits beside a clock-stamped timeline.
 //   placeholder       what the composer's box is called, where the host's own
 //                     framing names it better than "Reply".
+//   no-autofocus      do not take focus when connected. The default suits a
+//                     host that mounts the element BECAUSE the user just asked
+//                     for this conversation (the card opening a thread), where
+//                     the composer is what they came for. A host that keeps it
+//                     mounted whether or not it is on screen must set this:
+//                     taking focus scrolls the element into view, which on the
+//                     chat page's phone strip is a tab switch nobody asked for.
 //   create-url        no thread yet, and the HOST owns creating it: the first
 //                     turn POSTs here (no body) for a {id}, then goes in as an
 //                     ordinary reply to that thread. For a thread that belongs
@@ -618,7 +625,7 @@ class RetinueConversation extends HTMLElement {
     this._id = this.getAttribute('conversation-id') || '';
     LIVE.set(this._key(), this);
     loadModels().then(() => this._syncPicker());
-    this._focusNext = true;
+    this._focusOnOpen();
     this.render();
     if (this._id) {
       this._load().then(() => this.render());
@@ -653,12 +660,26 @@ class RetinueConversation extends HTMLElement {
     this._attachError = '';
     this._missing = false;
     LIVE.set(this._key(), this);
-    this._focusNext = true;
+    this._focusOnOpen();
     this.render();
     if (this._id) {
       this._load().then(() => this.render());
       this._schedulePoll();
     }
+  }
+
+  // Opening a conversation focuses its composer: a host that connects the
+  // element, or points it at another thread, has been asked for that
+  // conversation, and the composer is what the user came for. A host that
+  // keeps the element mounted whether or not it is on screen has been asked
+  // for nothing, and says so with `no-autofocus` — taking focus scrolls the
+  // element into view, which on the chat page's phone strip is a switch to
+  // the Ara tab nobody asked for. Both openings go through here, because the
+  // one that does not is the one that gets missed: the attribute path fires
+  // at upgrade too, before the element is ever "re-pointed" at anything.
+  _focusOnOpen() {
+    if (this.hasAttribute('no-autofocus')) return;
+    this._focusNext = true;
   }
 
   get conversationId() { return this._id; }

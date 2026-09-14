@@ -22,7 +22,10 @@ a Progressive Web App on the phone home screen.
   instance, so a thread left and reopened has its text, and a reading goes
   on. A host can shape the frame without forking the thread: `bar="none"` or
   `bar="actions"` for a header of its own, `stamp="clock"` beside a
-  clock-stamped timeline, and `create-url` where the thread belongs to
+  clock-stamped timeline, `no-autofocus` where the host keeps it mounted
+  whether or not it is on screen (taking focus scrolls the element into view,
+  which on the chat page's phone strip is a tab switch), and `create-url`
+  where the thread belongs to
   something else and is minted by that thing's endpoint rather than opened by
   the first message. It takes `fill(text)` (into the composer, for the user to
   send) and `ask(text)` (send now, for a host whose control is the send
