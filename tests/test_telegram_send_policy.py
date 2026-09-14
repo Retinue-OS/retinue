@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -209,6 +210,58 @@ def test_pending_send_reject_does_not_send():
     print("ok: pending send reject does not send")
 
 
+def test_atomic_write_never_exposes_torn_json():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_telegram_gateway([], tmp)
+        rid = "a" * 32
+        path = Path(tmp) / f"{rid}.json"
+        old_entry = {"id": rid, "status": "pending"}
+        new_entry = {"id": rid, "status": "approved"}
+        path.write_text(json.dumps(old_entry, ensure_ascii=False), encoding="utf-8")
+
+        entered_replace = threading.Event()
+        allow_replace = threading.Event()
+        real_replace = wg.os.replace
+
+        def _pause_before_replace(src, dst):
+            entered_replace.set()
+            if not allow_replace.wait(timeout=5.0):
+                raise AssertionError("timed out waiting to resume os.replace")
+            return real_replace(src, dst)
+
+        wg.os.replace = _pause_before_replace
+        writer_errors = []
+
+        def _writer():
+            try:
+                wg._write_pending_send(path, new_entry)
+            except BaseException as exc:  # noqa: BLE001
+                writer_errors.append(exc)
+
+        thread = threading.Thread(target=_writer)
+        thread.start()
+        assert entered_replace.wait(timeout=5.0), "writer never reached os.replace"
+
+        observed = []
+        for _ in range(100):
+            detail = wg._get_pending_send_detail(rid)
+            assert detail is not None, "reader observed unreadable entry during write"
+            observed.append(detail["status"])
+            time.sleep(0.001)
+
+        allow_replace.set()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "writer thread did not finish"
+        assert not writer_errors, writer_errors
+
+        assert set(observed) <= {"pending", "approved"}, observed
+        assert "pending" in observed, observed
+        assert wg._get_pending_send_detail(rid)["status"] == "approved"
+
+        wg.os.replace = real_replace
+    print("ok: atomic write never exposes torn json")
+
+
 def test_malformed_request_id_rejected():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_telegram_gateway([], tmp)
@@ -262,6 +315,7 @@ def main():
     test_approved_entry_carries_the_send_outcome()
     test_send_outcome_falls_back_when_unreadable()
     test_pending_send_reject_does_not_send()
+    test_atomic_write_never_exposes_torn_json()
     test_malformed_request_id_rejected()
     test_policy_alone_decides_directness()
     print("\nAll Telegram send-policy checks passed.")
