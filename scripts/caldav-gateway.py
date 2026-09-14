@@ -846,6 +846,10 @@ def _new_pending_send(summary: str, start: str, end: str, all_day: bool,
     request_id = uuid.uuid4().hex
     entry = {
         "id": request_id,
+        # The approval page renders an event as an event (title, time, target
+        # calendar) rather than as a message with an empty body — "kind" is how
+        # it tells the two apart without guessing from the fields present.
+        "kind": "event",
         "to": CALDAV_ACCOUNT,
         "subject": summary,
         "summary": summary,
@@ -854,6 +858,12 @@ def _new_pending_send(summary: str, start: str, end: str, all_day: bool,
         "all_day": all_day,
         "description": description,
         "calendar_id": calendar_id,
+        # Where the write would actually land: the request's own target, or
+        # else this gateway's configured calendar (_resolve_calendar falls back
+        # to CALDAV_CALENDAR_ID). Kept beside calendar_id rather than folded
+        # into it, so the write path still sees what the request asked for and
+        # the approval card can name the effective target without guessing.
+        "calendar_target": calendar_id or CALDAV_CALENDAR_ID or "",
         "body": _format_pending_body(start, end, all_day, description),
         "category": category,
         "created": int(time.time()),

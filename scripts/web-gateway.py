@@ -193,7 +193,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from markdown_it import MarkdownIt
@@ -2884,6 +2884,12 @@ def _render_sends_index_html(pending: list[dict]) -> str:
             subj = html.escape(p.get("subject") or "(no subject)")
             to = html.escape(p.get("to") or "")
             cat = html.escape(p.get("category") or "")
+            # For an event the recipient is only the gateway's account label;
+            # when it happens is what tells one pending event from another.
+            if p.get("kind") == "event" or p.get("start"):
+                to = html.escape(_format_event_when(p.get("start") or "",
+                                                    p.get("end") or "",
+                                                    bool(p.get("all_day")))) or to
             rows.append(
                 f'  <li><a href="/sends/{acc}/{rid}">{subj}</a>'
                 f'<span class="meta"> — {to} · <em>{cat}</em></span></li>'
@@ -2969,8 +2975,278 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
     )
 
 
-def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None) -> str:
-    """Render the page for a channel (Signal/WhatsApp/Telegram) pending send.
+# ── Pending-send detail rendering ────────────────────────────────────────────
+# Every channel gateway describes its pending request in its own terms: a
+# messenger hands over a recipient and a message, the calendar gateway an event
+# (title, start/end, all-day flag, target calendar). The approval card renders
+# whatever the entry actually carries — an approval the user cannot read is no
+# approval at all, so an event shows its title, its time and its notes instead
+# of the empty message box a messenger-shaped renderer leaves behind.
+
+
+def _format_iso_moment(value: str, *, all_day: bool) -> str:
+    """Human rendering of an ISO 8601 date or date-time.
+
+    Returns the raw string unchanged when it does not parse — an approval card
+    showing an odd-looking timestamp is still better than one showing nothing.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        if all_day or len(text) == 10:
+            return datetime.fromisoformat(text[:10]).strftime("%a %d %b %Y")
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return raw
+    return moment.strftime("%a %d %b %Y, %H:%M")
+
+
+def _all_day_last_day(end: str) -> str:
+    """The last day an all-day event covers, as an ISO date.
+
+    Its `end` is the exclusive iCalendar DTEND (the convention the gateway
+    reads and writes, see caldav-read.py's _all_day_span), so the covered span
+    ends the day before — otherwise a two-day trip reads as a three-day one.
+    """
+    try:
+        return (datetime.fromisoformat((end or "")[:10]) - timedelta(days=1)).date().isoformat()
+    except ValueError:
+        return end or ""
+
+
+def _ends_before_it_starts(start: str, end: str, all_day: bool) -> bool:
+    """Whether an event's end lies before its start (an unparsable pair: no)."""
+    try:
+        if all_day:
+            return datetime.fromisoformat(end[:10]) < datetime.fromisoformat(start[:10])
+        first = datetime.fromisoformat(start[:-1] + "+00:00" if start.endswith("Z") else start)
+        last = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
+    except (ValueError, IndexError):
+        return False
+    return last.replace(tzinfo=None) < first.replace(tzinfo=None)
+
+
+def _format_event_when(start: str, end: str, all_day: bool) -> str:
+    """One line for an event's span, e.g. "Thu 03 Sep 2026, 14:00 - 14:30"."""
+    first = _format_iso_moment(start, all_day=all_day)
+    closing = _all_day_last_day(end) if all_day else end
+    last = _format_iso_moment(closing, all_day=all_day)
+    # An entry whose end is not after its start (nothing validates that before
+    # it is queued) would otherwise read as a span running backwards, e.g.
+    # "Thu 10 Sep 2026 – Wed 09 Sep 2026" for an all-day request with
+    # start == end. Say only what is certain: when it starts.
+    if _ends_before_it_starts(start, closing, all_day):
+        last = ""
+    if not first:
+        return last
+    if all_day:
+        span = first if (not last or last == first) else f"{first} \u2013 {last}"
+        return f"{span} (all day)"
+    if not last or last == first:
+        return first
+    # Within one day only the end time is added — repeating the date reads as
+    # two separate days at a glance.
+    if start[:10] == end[:10] and ", " in last:
+        return f"{first} \u2013 {last.split(', ', 1)[1]}"
+    return f"{first} \u2013 {last}"
+
+
+def _event_interval(entry: dict):
+    """A pending or existing event as a comparable (start, end) pair.
+
+    Offsets are dropped rather than converted: both sides of the comparison are
+    the same calendar's wall clock, and the pending event — typed by an agent
+    as a local time — carries no offset to convert from. Returns None when the
+    entry has no usable start, so an unparsable event is listed but never
+    claimed to clash.
+    """
+    all_day = bool(entry.get("all_day"))
+    raw_start = (entry.get("start") or "").strip()
+    raw_end = (entry.get("end") or "").strip()
+    if not raw_start:
+        return None
+    try:
+        if all_day:
+            first = datetime.fromisoformat(raw_start[:10])
+            last = datetime.fromisoformat(raw_end[:10]) if raw_end else first + timedelta(days=1)
+            return (first, max(last, first + timedelta(days=1)))
+        start = datetime.fromisoformat(raw_start[:-1] + "+00:00" if raw_start.endswith("Z") else raw_start)
+        end = (datetime.fromisoformat(raw_end[:-1] + "+00:00" if raw_end.endswith("Z") else raw_end)
+               if raw_end else start)
+    except ValueError:
+        return None
+    start = start.replace(tzinfo=None)
+    end = end.replace(tzinfo=None)
+    return (start, max(end, start))
+
+
+def _events_overlap(one, other) -> bool:
+    """Whether two (start, end) pairs share any time at all.
+
+    Touching ends do not overlap — a 14:00 event does not clash with one that
+    ends at 14:00 — and a zero-length event counts as clashing with whatever
+    surrounds it.
+    """
+    if not one or not other:
+        return False
+    (a_start, a_end), (b_start, b_end) = one, other
+    if a_start == a_end:
+        return b_start <= a_start < b_end or b_start == b_end == a_start
+    if b_start == b_end:
+        return a_start <= b_start < a_end
+    return a_start < b_end and b_start < a_end
+
+
+# How many of the day's existing events the card lists before it stops, how
+# long it waits for them and how much body it will read: the approval must stay
+# usable even when the calendar server is slow, endless or the day is packed.
+_AGENDA_MAX_EVENTS = 12
+_AGENDA_TIMEOUT = 8
+_AGENDA_MAX_BYTES = 512 * 1024
+
+
+def _fetch_json_bounded(url: str, headers: dict, timeout: float, max_bytes: int):
+    """GET one JSON body under a *total* deadline. Returns (body, error).
+
+    urlopen's own timeout bounds each socket operation, not the exchange: a
+    server that accepts the connection and then drips bytes keeps every single
+    read under the limit while the response never ends, which would leave the
+    page-rendering handler blocked and the approval unreachable. The request
+    therefore runs on its own daemon thread and the caller waits exactly
+    `timeout` for it — a stalled read costs a note on the page, not the page.
+    The body is capped as well, so an oversized answer cannot be read into
+    memory either.
+    """
+    outcome: dict = {}
+
+    def fetch():
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError(f"response exceeds {max_bytes} bytes")
+            outcome["body"] = json.loads(raw.decode("utf-8"))
+        except Exception as exc:  # reported to the caller, never raised here
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=fetch, name="agenda-read", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return None, f"no complete response within {timeout:g}s"
+    return outcome.get("body"), outcome.get("error")
+
+
+def _agenda_window(detail: dict) -> tuple:
+    """The first and last date a pending event actually covers, as ISO dates.
+
+    Both bounds are inclusive, which is what the read endpoint's bare-date
+    parameters mean. The end is half-open on both sides of the wire: an all-day
+    DTEND is exclusive, and a timed event that ends at exactly midnight covers
+    only the days before it — 23:00–00:00 belongs to its start day alone.
+    """
+    start = (detail.get("start") or "").strip()
+    end = (detail.get("end") or "").strip() or start
+    if detail.get("all_day"):
+        last = _all_day_last_day(end)
+    else:
+        last = end[:10]
+        try:
+            closing = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
+            if (closing.hour, closing.minute, closing.second) == (0, 0, 0) and last > start[:10]:
+                last = (closing.replace(tzinfo=None) - timedelta(days=1)).date().isoformat()
+        except ValueError:
+            pass
+    first = start[:10]
+    return (first, last if last and last >= first else first)
+
+
+def _calendar_agenda(gw: dict, detail: dict) -> dict:
+    """What is already in the calendar on the days a pending event covers.
+
+    The same read endpoint `caldav-read.py` uses, so the card answers "is this
+    a double booking?" without the user opening their calendar app. A failure
+    is reported, never raised: an agenda that could not be loaded must not cost
+    the user the ability to approve or deny.
+    """
+    start = (detail.get("start") or "").strip()
+    if not start:
+        return {"events": [], "error": None, "truncated": False}
+    first, last = _agenda_window(detail)
+    # "*" is the read endpoint's explicit account-wide scope. Omitting it would
+    # narrow the agenda to CALDAV_CALENDAR_ID wherever that is configured — the
+    # question here is "am I free?", which no single calendar answers, and a
+    # request naming its own target calendar could otherwise be weighed against
+    # a different one entirely.
+    query = urllib.parse.urlencode({"start": first, "end": last, "calendar_id": "*",
+                                    "limit": str(_AGENDA_MAX_EVENTS + 1)})
+    headers = {}
+    if gw.get("token"):
+        headers["Authorization"] = "Bearer " + gw["token"]
+    body, error = _fetch_json_bounded(f"{gw['base_url']}/events?{query}", headers,
+                                      _AGENDA_TIMEOUT, _AGENDA_MAX_BYTES)
+    if error or not isinstance(body, dict):
+        error = error or "unexpected answer from the calendar gateway"
+        print(f"[web-gateway] agenda read failed for a pending event: {error}", flush=True)
+        return {"events": [], "error": error, "truncated": False}
+    events = [e for e in (body.get("events") or []) if isinstance(e, dict)]
+    proposed = _event_interval(detail)
+    for event in events:
+        event["overlaps"] = _events_overlap(proposed, _event_interval(event))
+    return {"events": events[:_AGENDA_MAX_EVENTS], "error": None,
+            "truncated": bool(body.get("truncated")) or len(events) > _AGENDA_MAX_EVENTS}
+
+
+def _render_agenda_html(agenda: dict | None) -> str:
+    """The "already in the calendar" block under a pending event's details."""
+    if not agenda:
+        return ""
+    out = ["<h2>Already in the calendar</h2>"]
+    if agenda.get("error"):
+        out.append('<p class="meta">The agenda for these days could not be loaded '
+                   f'({html.escape(str(agenda["error"]))}) — check the calendar itself '
+                   "before approving.</p>")
+        return "\n".join(out) + "\n"
+    events = agenda.get("events") or []
+    if not events:
+        out.append('<p class="meta">Nothing else on these days.</p>')
+        return "\n".join(out) + "\n"
+    rows = []
+    for event in events:
+        when = html.escape(_format_event_when(event.get("start") or "", event.get("end") or "",
+                                              bool(event.get("all_day"))))
+        summary = html.escape(event.get("summary") or "(no title)")
+        extra = []
+        if event.get("location"):
+            extra.append("@ " + html.escape(event["location"]))
+        if event.get("calendar"):
+            extra.append("[" + html.escape(event["calendar"]) + "]")
+        if event.get("recurring"):
+            extra.append("(recurring)")
+        tail = (' <span class="meta">' + " ".join(extra) + "</span>") if extra else ""
+        clash = ' <span class="clash">overlaps</span>' if event.get("overlaps") else ""
+        rows.append(f'  <li><span class="meta">{when}</span> {summary}{tail}{clash}</li>')
+    out.append('<ul class="days">\n' + "\n".join(rows) + "\n</ul>")
+    if agenda.get("truncated"):
+        out.append('<p class="meta">Only the first '
+                   f'{_AGENDA_MAX_EVENTS} events of these days are listed.</p>')
+    return "\n".join(out) + "\n"
+
+
+_AGENDA_CSS = ("<style>\n"
+               "  .clash{background:var(--high);color:#0b0d12;border-radius:6px;"
+               "padding:.05rem .4rem;font-size:.75rem;font-weight:700}\n"
+               "</style>\n")
+
+
+def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None,
+                              agenda: dict | None = None) -> str:
+    """Render the page for a channel pending send — a messenger message
+    (Signal/WhatsApp/Telegram) or a calendar event, each described in its own
+    terms (see the note above the formatting helpers).
 
     A "pending" entry gets the Allow/Deny approval UI. Any other status renders
     as a status page instead: gateways execute an approved send asynchronously
@@ -2985,16 +3261,58 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
     label_e = html.escape(label)
     recipient = html.escape(detail.get("recipient") or detail.get("to") or "")
     cat = html.escape(detail.get("category") or "")
-    msg = html.escape(detail.get("message") or "")
     # "Skip" jumps to the next pending request — rendered only when one exists
     # (the nav already links back to /sends and the dashboard).
     skip_btn = (f'  <a href="{html.escape(next_url)}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
                 if next_url else "")
-    meta_rows = [
-        f"<tr><th>Channel</th><td>{label_e}</td></tr>",
-        f"<tr><th>To</th><td>{recipient}</td></tr>",
-        f"<tr><th>Category</th><td>{cat}</td></tr>",
-    ]
+    # An event entry (the calendar gateway) carries no "message" at all; it is
+    # recognised by its own kind, with the presence of a start as the fallback
+    # for an entry written by an older gateway build.
+    is_event = detail.get("kind") == "event" or bool(detail.get("start"))
+    if is_event:
+        summary = html.escape(detail.get("summary") or detail.get("subject") or "(untitled event)")
+        when = html.escape(_format_event_when(detail.get("start") or "",
+                                              detail.get("end") or "",
+                                              bool(detail.get("all_day"))))
+        # The effective write target, which is the request's own calendar_id or
+        # else the gateway's configured CALDAV_CALENDAR_ID — not necessarily
+        # the server's default calendar, so the card must not claim it is.
+        calendar = html.escape(detail.get("calendar_target") or detail.get("calendar_id") or "")
+        meta_rows = [
+            f"<tr><th>Channel</th><td>{label_e}</td></tr>",
+            f"<tr><th>Event</th><td>{summary}</td></tr>",
+        ]
+        if when:
+            meta_rows.append(f"<tr><th>When</th><td>{when}</td></tr>")
+        meta_rows.append("<tr><th>Calendar</th><td>"
+                         + (calendar or "the gateway's configured calendar")
+                         + "</td></tr>")
+        if recipient:
+            meta_rows.append(f"<tr><th>Account</th><td>{recipient}</td></tr>")
+        meta_rows.append(f"<tr><th>Category</th><td>{cat}</td></tr>")
+        description = html.escape(detail.get("description") or "")
+        body_html = (f'<pre class="msg-body">{description}</pre>\n' if description
+                     else '<p class="meta">No description.</p>\n')
+        noun = "Event"
+        note_pending = "Adding to the calendar…"
+        note_done = "Added to the calendar."
+        note_rejected = "The event was discarded; nothing was added to the calendar."
+        note_error = "The gateway could not create the event: "
+    else:
+        # A gateway that stores its text as "body" (the e-mail-shaped entry) is
+        # read too, so no channel renders an empty box.
+        msg = html.escape(detail.get("message") or detail.get("body") or "")
+        meta_rows = [
+            f"<tr><th>Channel</th><td>{label_e}</td></tr>",
+            f"<tr><th>To</th><td>{recipient}</td></tr>",
+            f"<tr><th>Category</th><td>{cat}</td></tr>",
+        ]
+        body_html = f'<pre class="msg-body">{msg}</pre>\n'
+        noun = "Send"
+        note_pending = "Delivering in the background…"
+        note_done = "Sent."
+        note_rejected = "The message was discarded without sending."
+        note_error = "The gateway could not deliver the message: "
     status = detail.get("status") or "pending"
     if status != "pending":
         # Status page: a "sending" entry shows a spinner and polls the JSON
@@ -3007,20 +3325,19 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         # error and stays put so the user can read it.
         if status == "sending":
             icon = '<div class="spin" role="status" aria-label="sending"></div>'
-            note = "Delivering in the background…"
+            note = note_pending
         elif status == "approved":
             icon = '<div class="check">✓</div>'
-            note = "Sent."
+            note = note_done
         elif status == "rejected":
             icon = '<div class="cross">✕</div>'
-            note = "The message was discarded without sending."
+            note = note_rejected
         else:  # "error"
             icon = '<div class="cross">✕</div>'
-            note = ("The gateway could not deliver the message: "
-                    + (detail.get("error") or "unknown error"))
+            note = note_error + (detail.get("error") or "unknown error")
         return (
             _HTML_HEAD
-            + f"<title>Retinue — {label_e} Send {rid}</title>\n"
+            + f"<title>Retinue — {label_e} {noun} {rid}</title>\n"
             # No-JS fallback only: with scripting available the page polls
             # instead of reloading.
             + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
@@ -3036,10 +3353,10 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
               "  .cross{background:var(--high);color:#0b0d12}\n"
               "</style>\n"
             + "<body>\n"
-            + f"<h1>{label_e} send</h1>\n"
+            + f"<h1>{label_e} {noun.lower()}</h1>\n"
             + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
             + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-            + f'<pre class="msg-body">{msg}</pre>\n'
+            + body_html
             + f'<div class="st-row"><div id="st-icon">{icon}</div>'
             + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
             + '<div class="actions">\n'
@@ -3051,6 +3368,9 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
             + f"  var status={json.dumps(status)};\n"
             + f"  var nextUrl={json.dumps(next_url)};\n"
             + f"  var pollUrl={json.dumps(f'/sends/{channel}/{request_id}/status')};\n"
+            + f"  var noteDone={json.dumps(note_done)};\n"
+            + f"  var noteRejected={json.dumps(note_rejected)};\n"
+            + f"  var noteError={json.dumps(note_error)};\n"
             + "  var icon=document.getElementById('st-icon');\n"
               "  var note=document.getElementById('st-note');\n"
               "  var nextBtn=document.getElementById('st-next');\n"
@@ -3063,15 +3383,15 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
               "  function terminal(st,err){\n"
               "    if(st==='approved'){\n"
               "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-              "      note.textContent='Sent.';\n"
+              "      note.textContent=noteDone;\n"
               "      setTimeout(advance,1500);\n"
               "    }else if(st==='rejected'){\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent='The message was discarded without sending.';\n"
+              "      note.textContent=noteRejected;\n"
               "      showNext();\n"
               "    }else{\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent='The gateway could not deliver the message: '+(err||'unknown error');\n"
+              "      note.textContent=noteError+(err||'unknown error');\n"
               "      showNext();\n"
               "    }\n"
               "  }\n"
@@ -3092,12 +3412,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         )
     return (
         _HTML_HEAD
-        + f"<title>Retinue — Approve {label_e} Send {rid}</title>\n"
+        + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
+        + (_AGENDA_CSS if agenda else "")
         + "<body>\n"
-        + f"<h1>Approve {label_e} Send</h1>\n"
+        + f"<h1>Approve {label_e} {noun}</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-        + f'<pre class="msg-body">{msg}</pre>\n'
+        + body_html
+        + _render_agenda_html(agenda)
         + '<div class="actions">\n'
         + f'  <form method="post" action="/sends/{chan}/{rid}/approve" id="form-approve">'
           f'<button type="submit" id="btn-approve" class="btn btn-allow">Allow</button></form>\n'
@@ -7207,7 +7529,15 @@ class Handler(BaseHTTPRequestHandler):
             # one, if any — the status page advances there after success.
             if pending:
                 next_url = f"/sends/{pending[0]['account']}/{pending[0]['request_id']}"
-        self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url))
+        # For an event still awaiting a decision, the days it covers are read
+        # from the calendar and shown with it: "is this already in the agenda,
+        # and does it clash?" is the question the approval actually turns on.
+        agenda = None
+        is_event = detail.get("kind") == "event" or bool(detail.get("start"))
+        if is_event and (detail.get("status") or "pending") == "pending":
+            agenda = _calendar_agenda(gw, detail)
+        self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url,
+                                                       agenda))
 
     def _handle_channel_send_status(self, account: str, request_id: str) -> None:
         """Lean JSON status for a channel pending send.
