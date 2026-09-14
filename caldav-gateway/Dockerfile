@@ -13,7 +13,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # caldav is a generic RFC 4791 client library (pulls in icalendar/vobject/lxml).
-RUN pip install --no-cache-dir caldav
+# Pinned, not left to resolve "latest": this layer depends on no repo file, so
+# an unpinned install is cached forever at whatever was current on first build.
+# 3.2.1 in particular silently returns no events from a server that answers a
+# calendar-query with hrefs only (no inline calendar-data): the objects it then
+# loads keep a stale cached "no data" state and are discarded as empty. Fixed
+# in 3.3.0. Bumping this version is what rebuilds the layer.
+RUN pip install --no-cache-dir caldav==3.3.0
 
 WORKDIR /app
 COPY scripts/caldav-gateway.py /app/caldav-gateway.py
