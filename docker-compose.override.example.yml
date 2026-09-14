@@ -38,8 +38,9 @@ services:
       # base file cannot know goes here: a named e-mail account's suffixed
       # variables, a chamber script's own settings. Names that a spawned agent
       # session should ALSO receive go into RETINUE_SESSION_ENV_EXTRA
-      # (scripts/session_env.py); the e-mail ones must not — the gateway's
-      # backend keeps the mailbox credentials on the agent's behalf.
+      # (scripts/session_env.py; `PREFIX_*` admits a family); the e-mail ones
+      # must not — the gateway's backend keeps the mailbox credentials on the
+      # agent's behalf.
       # - EMAIL_USER_ARI
       # - EMAIL_PASS_ARI
       # - IMAP_HOST_ARI
