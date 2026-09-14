@@ -573,6 +573,45 @@ def test_expanded_search_falls_back_when_unsupported():
     print("ok: unsupported expansion falls back to a plain time-range search")
 
 
+def test_empty_expanded_search_falls_back():
+    calls = []
+
+    class _SilentCalendar(_Calendar):
+        """Answers an expansion it cannot do with nothing rather than an error."""
+
+        def search(self, start=None, end=None, event=None, expand=None):
+            calls.append(expand)
+            return [] if expand else list(self._events)
+
+    cal = _SilentCalendar("c", "https://dav/c", "C", events=[
+        _Event(_timed("weekly", datetime.datetime(2026, 9, 21, 9, 0))),
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        cg = _load_caldav_gateway(tmp)
+        cg._connect_principal = lambda: _Principal([cal])
+        start, end = cg._parse_read_window("2026-09-20", "2026-09-27", "")
+        events = cg._list_events_on_server(start, end)
+        # The empty expansion was not taken at its word: the plain query found
+        # the event, so the read is not silently empty.
+        assert calls == [True, None]
+        assert [e["summary"] for e in events] == ["weekly"]
+
+        # A non-empty expansion is served as is, with no second query.
+        calls.clear()
+        cal.search = lambda start=None, end=None, event=None, expand=None: (
+            calls.append(expand) or list(cal._events))
+        assert [e["summary"] for e in cg._list_events_on_server(start, end)] == ["weekly"]
+        assert calls == [True]
+
+        # When both agree the window is empty, it is empty.
+        calls.clear()
+        empty = _SilentCalendar("e", "https://dav/e", "E")
+        cg._connect_principal = lambda: _Principal([empty])
+        assert cg._list_events_on_server(start, end) == []
+        assert calls == [True, None]
+    print("ok: an empty expansion is confirmed by a plain time-range search")
+
+
 def test_query_filter_matches_text_fields():
     with tempfile.TemporaryDirectory() as tmp:
         cg = _load_caldav_gateway(tmp)
@@ -890,6 +929,7 @@ def main():
     test_list_events_sorted_across_calendars()
     test_events_sort_on_the_instant_not_the_string()
     test_expanded_search_falls_back_when_unsupported()
+    test_empty_expanded_search_falls_back()
     test_query_filter_matches_text_fields()
     test_find_event_by_uid_across_calendars()
     test_a_task_sharing_the_uid_is_not_served_as_an_event()
