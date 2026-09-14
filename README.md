@@ -614,8 +614,13 @@ scripts/caldav-push.py "Conference" --start 2026-09-10 --end 2026-09-12 --all-da
 
 The approval card describes the **event**, not a message: its title, when it
 runs (a same-day event as `Thu 03 Sep 2026, 14:00 – 14:30`, an all-day one as a
-span of days), which calendar it would land in, and its description — a pending
-write is only approvable if the user can see what would be written.
+span of days through its last covered day), which calendar it would land in,
+and its description — a pending write is only approvable if the user can see
+what would be written. Under it the card reads back **what is already in the
+calendar** on those days through the same `GET /events` endpoint, with anything
+sharing time with the proposal marked `overlaps`, so a double booking is
+visible without leaving the page. A calendar that cannot be read says so and
+still lets the write be approved or denied.
 
 Approval is **asynchronous**, same as the messenger gateways: the gateway
 answers `status: sending` immediately and writes in the background, so a slow

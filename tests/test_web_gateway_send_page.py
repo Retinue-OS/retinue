@@ -8,8 +8,9 @@ next-request button appears only when a next request actually exists — on the
 approval page's Skip too.
 
 Also covers what a pending *calendar* event renders as: the approval card has
-to say which event would be written, since a card showing an empty message box
-asks the user to approve something they cannot see.
+to say which event would be written — and what is already in the calendar on
+those days — since a card showing an empty message box asks the user to approve
+something they cannot see.
 
     python3 tests/test_web_gateway_send_page.py
 """
@@ -139,10 +140,119 @@ def test_event_without_description_says_so():
 def test_all_day_event_reads_as_a_span_of_days():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp))
+        # DTEND is exclusive (RFC 5545), so this covers the 10th and the 11th —
+        # the card must not promise a day the calendar will not carry.
         out = wg._render_channel_send_html(
             _event("pending", start="2026-09-10", end="2026-09-12", all_day=True),
             "caldav-gateway", "a" * 32, None)
-        assert "Thu 10 Sep 2026 \u2013 Sat 12 Sep 2026 (all day)" in out
+        assert "Thu 10 Sep 2026 \u2013 Fri 11 Sep 2026 (all day)" in out
+        one_day = wg._render_channel_send_html(
+            _event("pending", start="2026-09-10", end="2026-09-11", all_day=True),
+            "caldav-gateway", "a" * 32, None)
+        assert "<th>When</th><td>Thu 10 Sep 2026 (all day)</td>" in one_day
+
+
+def _agenda_event(start, end, summary, **extra):
+    return {"start": start, "end": end, "summary": summary, "all_day": False,
+            "uid": summary, "calendar": "Personal", **extra}
+
+
+def test_agenda_lists_the_day_and_flags_the_clash():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        agenda = {"events": [
+            dict(_agenda_event("2026-09-03T09:00:00", "2026-09-03T09:15:00", "Standup"),
+                 overlaps=False),
+            dict(_agenda_event("2026-09-03T14:15:00", "2026-09-03T15:00:00", "Call with Mara",
+                               location="Zoom"), overlaps=True),
+        ], "error": None, "truncated": False}
+        out = wg._render_channel_send_html(_event("pending"), "caldav-gateway", "a" * 32, None,
+                                           agenda)
+        assert "Already in the calendar" in out
+        assert "Standup" in out and "Call with Mara" in out
+        assert "@ Zoom" in out and "[Personal]" in out
+        # The clash marker sits on the overlapping event only.
+        assert out.count('<span class="clash">overlaps</span>') == 1
+        assert out.index("Call with Mara") < out.index('<span class="clash">')
+        assert ".clash{" in out  # the marker's style rides along
+
+
+def test_agenda_says_when_the_days_are_empty_or_unreadable():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        empty = wg._render_channel_send_html(_event("pending"), "caldav-gateway", "a" * 32, None,
+                                             {"events": [], "error": None, "truncated": False})
+        assert "Nothing else on these days." in empty
+        broken = wg._render_channel_send_html(_event("pending"), "caldav-gateway", "a" * 32, None,
+                                              {"events": [], "error": "timed out",
+                                               "truncated": False})
+        assert "could not be loaded" in broken and "timed out" in broken
+        # A failed read never costs the user the decision itself.
+        assert 'id="btn-approve"' in broken and 'id="btn-reject"' in broken
+
+
+def test_overlap_rules():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        proposed = wg._event_interval({"start": "2026-09-03T14:00:00", "end": "2026-09-03T14:30:00"})
+        def clashes(start, end, **extra):
+            return wg._events_overlap(proposed, wg._event_interval(
+                {"start": start, "end": end, **extra}))
+        assert clashes("2026-09-03T14:15:00", "2026-09-03T15:00:00")      # starts inside
+        assert clashes("2026-09-03T13:00:00", "2026-09-03T18:00:00")      # contains it
+        assert clashes("2026-09-03T14:10:00", "2026-09-03T14:20:00")      # inside it
+        assert not clashes("2026-09-03T13:00:00", "2026-09-03T14:00:00")  # ends as it starts
+        assert not clashes("2026-09-03T14:30:00", "2026-09-03T15:00:00")  # starts as it ends
+        # An offset on the other side is the same calendar's wall clock.
+        assert clashes("2026-09-03T14:15:00+02:00", "2026-09-03T15:00:00+02:00")
+        # An all-day event covers the whole day, an unparsable one nothing.
+        assert clashes("2026-09-03", "2026-09-04", all_day=True)
+        assert not clashes("whenever", "whenever")
+
+
+def test_agenda_read_asks_the_gateway_for_the_right_window():
+    """The read goes to the calendar gateway's own /events endpoint, over the
+    days the pending event covers, and tags each answer with its overlap."""
+    import json as _json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    seen = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen["path"] = self.path
+            seen["auth"] = self.headers.get("Authorization")
+            body = _json.dumps({"events": [
+                _agenda_event("2026-09-03T09:00:00", "2026-09-03T09:15:00", "Standup"),
+                _agenda_event("2026-09-03T14:15:00", "2026-09-03T15:00:00", "Call"),
+            ], "truncated": False}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            wg = _load_gateway(Path(tmp))
+            gw = {"base_url": f"http://127.0.0.1:{srv.server_port}", "token": "t0ken"}
+            agenda = wg._calendar_agenda(gw, _event("pending"))
+            assert "/events?" in seen["path"]
+            assert "start=2026-09-03" in seen["path"] and "end=2026-09-03" in seen["path"]
+            assert seen["auth"] == "Bearer t0ken"
+            assert [e["overlaps"] for e in agenda["events"]] == [False, True]
+            assert agenda["error"] is None
+            # An unreachable gateway is reported, not raised.
+            dead = wg._calendar_agenda({"base_url": "http://127.0.0.1:1", "token": ""},
+                                       _event("pending"))
+            assert dead["error"] and dead["events"] == []
+    finally:
+        srv.shutdown()
 
 
 def test_named_calendar_is_shown():
@@ -205,6 +315,10 @@ def main() -> int:
              test_all_day_event_reads_as_a_span_of_days,
              test_named_calendar_is_shown,
              test_event_status_page_talks_about_the_calendar,
+             test_agenda_lists_the_day_and_flags_the_clash,
+             test_agenda_says_when_the_days_are_empty_or_unreadable,
+             test_overlap_rules,
+             test_agenda_read_asks_the_gateway_for_the_right_window,
              test_unparsable_times_fall_back_to_the_raw_value,
              test_index_row_names_the_event_time,
              test_messenger_page_is_unchanged]

@@ -193,7 +193,7 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from markdown_it import MarkdownIt
@@ -3003,10 +3003,23 @@ def _format_iso_moment(value: str, *, all_day: bool) -> str:
     return moment.strftime("%a %d %b %Y, %H:%M")
 
 
+def _all_day_last_day(end: str) -> str:
+    """The last day an all-day event covers, as an ISO date.
+
+    Its `end` is the exclusive iCalendar DTEND (the convention the gateway
+    reads and writes, see caldav-read.py's _all_day_span), so the covered span
+    ends the day before — otherwise a two-day trip reads as a three-day one.
+    """
+    try:
+        return (datetime.fromisoformat((end or "")[:10]) - timedelta(days=1)).date().isoformat()
+    except ValueError:
+        return end or ""
+
+
 def _format_event_when(start: str, end: str, all_day: bool) -> str:
     """One line for an event's span, e.g. "Thu 03 Sep 2026, 14:00 - 14:30"."""
     first = _format_iso_moment(start, all_day=all_day)
-    last = _format_iso_moment(end, all_day=all_day)
+    last = _format_iso_moment(_all_day_last_day(end) if all_day else end, all_day=all_day)
     if not first:
         return last
     if all_day:
@@ -3021,7 +3034,136 @@ def _format_event_when(start: str, end: str, all_day: bool) -> str:
     return f"{first} \u2013 {last}"
 
 
-def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None) -> str:
+def _event_interval(entry: dict):
+    """A pending or existing event as a comparable (start, end) pair.
+
+    Offsets are dropped rather than converted: both sides of the comparison are
+    the same calendar's wall clock, and the pending event — typed by an agent
+    as a local time — carries no offset to convert from. Returns None when the
+    entry has no usable start, so an unparsable event is listed but never
+    claimed to clash.
+    """
+    all_day = bool(entry.get("all_day"))
+    raw_start = (entry.get("start") or "").strip()
+    raw_end = (entry.get("end") or "").strip()
+    if not raw_start:
+        return None
+    try:
+        if all_day:
+            first = datetime.fromisoformat(raw_start[:10])
+            last = datetime.fromisoformat(raw_end[:10]) if raw_end else first + timedelta(days=1)
+            return (first, max(last, first + timedelta(days=1)))
+        start = datetime.fromisoformat(raw_start[:-1] + "+00:00" if raw_start.endswith("Z") else raw_start)
+        end = (datetime.fromisoformat(raw_end[:-1] + "+00:00" if raw_end.endswith("Z") else raw_end)
+               if raw_end else start)
+    except ValueError:
+        return None
+    start = start.replace(tzinfo=None)
+    end = end.replace(tzinfo=None)
+    return (start, max(end, start))
+
+
+def _events_overlap(one, other) -> bool:
+    """Whether two (start, end) pairs share any time at all.
+
+    Touching ends do not overlap — a 14:00 event does not clash with one that
+    ends at 14:00 — and a zero-length event counts as clashing with whatever
+    surrounds it.
+    """
+    if not one or not other:
+        return False
+    (a_start, a_end), (b_start, b_end) = one, other
+    if a_start == a_end:
+        return b_start <= a_start < b_end or b_start == b_end == a_start
+    if b_start == b_end:
+        return a_start <= b_start < a_end
+    return a_start < b_end and b_start < a_end
+
+
+# How many of the day's existing events the card lists before it stops, and how
+# long it waits for them: the approval must stay usable even when the calendar
+# server is slow or the day is packed.
+_AGENDA_MAX_EVENTS = 12
+_AGENDA_TIMEOUT = 8
+
+
+def _calendar_agenda(gw: dict, detail: dict) -> dict:
+    """What is already in the calendar on the days a pending event covers.
+
+    The same read endpoint `caldav-read.py` uses, so the card answers "is this
+    a double booking?" without the user opening their calendar app. A failure
+    is reported, never raised: an agenda that could not be loaded must not cost
+    the user the ability to approve or deny.
+    """
+    start = (detail.get("start") or "").strip()
+    if not start:
+        return {"events": [], "error": None, "truncated": False}
+    end = (detail.get("end") or "").strip() or start
+    last = _all_day_last_day(end) if detail.get("all_day") else end[:10]
+    query = urllib.parse.urlencode({"start": start[:10], "end": last[:10] or start[:10],
+                                    "limit": str(_AGENDA_MAX_EVENTS + 1)})
+    headers = {}
+    if gw.get("token"):
+        headers["Authorization"] = "Bearer " + gw["token"]
+    try:
+        req = urllib.request.Request(f"{gw['base_url']}/events?{query}", headers=headers)
+        with urllib.request.urlopen(req, timeout=_AGENDA_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        print(f"[web-gateway] agenda read failed for a pending event: {exc}", flush=True)
+        return {"events": [], "error": str(exc), "truncated": False}
+    events = [e for e in (body.get("events") or []) if isinstance(e, dict)]
+    proposed = _event_interval(detail)
+    for event in events:
+        event["overlaps"] = _events_overlap(proposed, _event_interval(event))
+    return {"events": events[:_AGENDA_MAX_EVENTS], "error": None,
+            "truncated": bool(body.get("truncated")) or len(events) > _AGENDA_MAX_EVENTS}
+
+
+def _render_agenda_html(agenda: dict | None) -> str:
+    """The "already in the calendar" block under a pending event's details."""
+    if not agenda:
+        return ""
+    out = ["<h2>Already in the calendar</h2>"]
+    if agenda.get("error"):
+        out.append('<p class="meta">The agenda for these days could not be loaded '
+                   f'({html.escape(str(agenda["error"]))}) — check the calendar itself '
+                   "before approving.</p>")
+        return "\n".join(out) + "\n"
+    events = agenda.get("events") or []
+    if not events:
+        out.append('<p class="meta">Nothing else on these days.</p>')
+        return "\n".join(out) + "\n"
+    rows = []
+    for event in events:
+        when = html.escape(_format_event_when(event.get("start") or "", event.get("end") or "",
+                                              bool(event.get("all_day"))))
+        summary = html.escape(event.get("summary") or "(no title)")
+        extra = []
+        if event.get("location"):
+            extra.append("@ " + html.escape(event["location"]))
+        if event.get("calendar"):
+            extra.append("[" + html.escape(event["calendar"]) + "]")
+        if event.get("recurring"):
+            extra.append("(recurring)")
+        tail = (' <span class="meta">' + " ".join(extra) + "</span>") if extra else ""
+        clash = ' <span class="clash">overlaps</span>' if event.get("overlaps") else ""
+        rows.append(f'  <li><span class="meta">{when}</span> {summary}{tail}{clash}</li>')
+    out.append('<ul class="days">\n' + "\n".join(rows) + "\n</ul>")
+    if agenda.get("truncated"):
+        out.append('<p class="meta">Only the first '
+                   f'{_AGENDA_MAX_EVENTS} events of these days are listed.</p>')
+    return "\n".join(out) + "\n"
+
+
+_AGENDA_CSS = ("<style>\n"
+               "  .clash{background:var(--high);color:#0b0d12;border-radius:6px;"
+               "padding:.05rem .4rem;font-size:.75rem;font-weight:700}\n"
+               "</style>\n")
+
+
+def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None,
+                              agenda: dict | None = None) -> str:
     """Render the page for a channel pending send — a messenger message
     (Signal/WhatsApp/Telegram) or a calendar event, each described in its own
     terms (see the note above the formatting helpers).
@@ -3188,11 +3330,13 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
     return (
         _HTML_HEAD
         + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
+        + (_AGENDA_CSS if agenda else "")
         + "<body>\n"
         + f"<h1>Approve {label_e} {noun}</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
+        + _render_agenda_html(agenda)
         + '<div class="actions">\n'
         + f'  <form method="post" action="/sends/{chan}/{rid}/approve" id="form-approve">'
           f'<button type="submit" id="btn-approve" class="btn btn-allow">Allow</button></form>\n'
@@ -7302,7 +7446,15 @@ class Handler(BaseHTTPRequestHandler):
             # one, if any — the status page advances there after success.
             if pending:
                 next_url = f"/sends/{pending[0]['account']}/{pending[0]['request_id']}"
-        self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url))
+        # For an event still awaiting a decision, the days it covers are read
+        # from the calendar and shown with it: "is this already in the agenda,
+        # and does it clash?" is the question the approval actually turns on.
+        agenda = None
+        is_event = detail.get("kind") == "event" or bool(detail.get("start"))
+        if is_event and (detail.get("status") or "pending") == "pending":
+            agenda = _calendar_agenda(gw, detail)
+        self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url,
+                                                       agenda))
 
     def _handle_channel_send_status(self, account: str, request_id: str) -> None:
         """Lean JSON status for a channel pending send.
