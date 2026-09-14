@@ -846,6 +846,10 @@ def _new_pending_send(summary: str, start: str, end: str, all_day: bool,
     request_id = uuid.uuid4().hex
     entry = {
         "id": request_id,
+        # The approval page renders an event as an event (title, time, target
+        # calendar) rather than as a message with an empty body — "kind" is how
+        # it tells the two apart without guessing from the fields present.
+        "kind": "event",
         "to": CALDAV_ACCOUNT,
         "subject": summary,
         "summary": summary,

@@ -2884,6 +2884,12 @@ def _render_sends_index_html(pending: list[dict]) -> str:
             subj = html.escape(p.get("subject") or "(no subject)")
             to = html.escape(p.get("to") or "")
             cat = html.escape(p.get("category") or "")
+            # For an event the recipient is only the gateway's account label;
+            # when it happens is what tells one pending event from another.
+            if p.get("kind") == "event" or p.get("start"):
+                to = html.escape(_format_event_when(p.get("start") or "",
+                                                    p.get("end") or "",
+                                                    bool(p.get("all_day")))) or to
             rows.append(
                 f'  <li><a href="/sends/{acc}/{rid}">{subj}</a>'
                 f'<span class="meta"> — {to} · <em>{cat}</em></span></li>'
@@ -2969,8 +2975,56 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
     )
 
 
+# ── Pending-send detail rendering ────────────────────────────────────────────
+# Every channel gateway describes its pending request in its own terms: a
+# messenger hands over a recipient and a message, the calendar gateway an event
+# (title, start/end, all-day flag, target calendar). The approval card renders
+# whatever the entry actually carries — an approval the user cannot read is no
+# approval at all, so an event shows its title, its time and its notes instead
+# of the empty message box a messenger-shaped renderer leaves behind.
+
+
+def _format_iso_moment(value: str, *, all_day: bool) -> str:
+    """Human rendering of an ISO 8601 date or date-time.
+
+    Returns the raw string unchanged when it does not parse — an approval card
+    showing an odd-looking timestamp is still better than one showing nothing.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        if all_day or len(text) == 10:
+            return datetime.fromisoformat(text[:10]).strftime("%a %d %b %Y")
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return raw
+    return moment.strftime("%a %d %b %Y, %H:%M")
+
+
+def _format_event_when(start: str, end: str, all_day: bool) -> str:
+    """One line for an event's span, e.g. "Thu 03 Sep 2026, 14:00 - 14:30"."""
+    first = _format_iso_moment(start, all_day=all_day)
+    last = _format_iso_moment(end, all_day=all_day)
+    if not first:
+        return last
+    if all_day:
+        span = first if (not last or last == first) else f"{first} \u2013 {last}"
+        return f"{span} (all day)"
+    if not last or last == first:
+        return first
+    # Within one day only the end time is added — repeating the date reads as
+    # two separate days at a glance.
+    if start[:10] == end[:10] and ", " in last:
+        return f"{first} \u2013 {last.split(', ', 1)[1]}"
+    return f"{first} \u2013 {last}"
+
+
 def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None) -> str:
-    """Render the page for a channel (Signal/WhatsApp/Telegram) pending send.
+    """Render the page for a channel pending send — a messenger message
+    (Signal/WhatsApp/Telegram) or a calendar event, each described in its own
+    terms (see the note above the formatting helpers).
 
     A "pending" entry gets the Allow/Deny approval UI. Any other status renders
     as a status page instead: gateways execute an approved send asynchronously
@@ -2985,16 +3039,55 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
     label_e = html.escape(label)
     recipient = html.escape(detail.get("recipient") or detail.get("to") or "")
     cat = html.escape(detail.get("category") or "")
-    msg = html.escape(detail.get("message") or "")
     # "Skip" jumps to the next pending request — rendered only when one exists
     # (the nav already links back to /sends and the dashboard).
     skip_btn = (f'  <a href="{html.escape(next_url)}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
                 if next_url else "")
-    meta_rows = [
-        f"<tr><th>Channel</th><td>{label_e}</td></tr>",
-        f"<tr><th>To</th><td>{recipient}</td></tr>",
-        f"<tr><th>Category</th><td>{cat}</td></tr>",
-    ]
+    # An event entry (the calendar gateway) carries no "message" at all; it is
+    # recognised by its own kind, with the presence of a start as the fallback
+    # for an entry written by an older gateway build.
+    is_event = detail.get("kind") == "event" or bool(detail.get("start"))
+    if is_event:
+        summary = html.escape(detail.get("summary") or detail.get("subject") or "(untitled event)")
+        when = html.escape(_format_event_when(detail.get("start") or "",
+                                              detail.get("end") or "",
+                                              bool(detail.get("all_day"))))
+        calendar = html.escape(detail.get("calendar_id") or "")
+        meta_rows = [
+            f"<tr><th>Channel</th><td>{label_e}</td></tr>",
+            f"<tr><th>Event</th><td>{summary}</td></tr>",
+        ]
+        if when:
+            meta_rows.append(f"<tr><th>When</th><td>{when}</td></tr>")
+        meta_rows.append("<tr><th>Calendar</th><td>"
+                         + (calendar or "the account's default calendar")
+                         + "</td></tr>")
+        if recipient:
+            meta_rows.append(f"<tr><th>Account</th><td>{recipient}</td></tr>")
+        meta_rows.append(f"<tr><th>Category</th><td>{cat}</td></tr>")
+        description = html.escape(detail.get("description") or "")
+        body_html = (f'<pre class="msg-body">{description}</pre>\n' if description
+                     else '<p class="meta">No description.</p>\n')
+        noun = "Event"
+        note_pending = "Adding to the calendar…"
+        note_done = "Added to the calendar."
+        note_rejected = "The event was discarded; nothing was added to the calendar."
+        note_error = "The gateway could not create the event: "
+    else:
+        # A gateway that stores its text as "body" (the e-mail-shaped entry) is
+        # read too, so no channel renders an empty box.
+        msg = html.escape(detail.get("message") or detail.get("body") or "")
+        meta_rows = [
+            f"<tr><th>Channel</th><td>{label_e}</td></tr>",
+            f"<tr><th>To</th><td>{recipient}</td></tr>",
+            f"<tr><th>Category</th><td>{cat}</td></tr>",
+        ]
+        body_html = f'<pre class="msg-body">{msg}</pre>\n'
+        noun = "Send"
+        note_pending = "Delivering in the background…"
+        note_done = "Sent."
+        note_rejected = "The message was discarded without sending."
+        note_error = "The gateway could not deliver the message: "
     status = detail.get("status") or "pending"
     if status != "pending":
         # Status page: a "sending" entry shows a spinner and polls the JSON
@@ -3007,20 +3100,19 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         # error and stays put so the user can read it.
         if status == "sending":
             icon = '<div class="spin" role="status" aria-label="sending"></div>'
-            note = "Delivering in the background…"
+            note = note_pending
         elif status == "approved":
             icon = '<div class="check">✓</div>'
-            note = "Sent."
+            note = note_done
         elif status == "rejected":
             icon = '<div class="cross">✕</div>'
-            note = "The message was discarded without sending."
+            note = note_rejected
         else:  # "error"
             icon = '<div class="cross">✕</div>'
-            note = ("The gateway could not deliver the message: "
-                    + (detail.get("error") or "unknown error"))
+            note = note_error + (detail.get("error") or "unknown error")
         return (
             _HTML_HEAD
-            + f"<title>Retinue — {label_e} Send {rid}</title>\n"
+            + f"<title>Retinue — {label_e} {noun} {rid}</title>\n"
             # No-JS fallback only: with scripting available the page polls
             # instead of reloading.
             + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
@@ -3036,10 +3128,10 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
               "  .cross{background:var(--high);color:#0b0d12}\n"
               "</style>\n"
             + "<body>\n"
-            + f"<h1>{label_e} send</h1>\n"
+            + f"<h1>{label_e} {noun.lower()}</h1>\n"
             + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
             + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-            + f'<pre class="msg-body">{msg}</pre>\n'
+            + body_html
             + f'<div class="st-row"><div id="st-icon">{icon}</div>'
             + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
             + '<div class="actions">\n'
@@ -3051,6 +3143,9 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
             + f"  var status={json.dumps(status)};\n"
             + f"  var nextUrl={json.dumps(next_url)};\n"
             + f"  var pollUrl={json.dumps(f'/sends/{channel}/{request_id}/status')};\n"
+            + f"  var noteDone={json.dumps(note_done)};\n"
+            + f"  var noteRejected={json.dumps(note_rejected)};\n"
+            + f"  var noteError={json.dumps(note_error)};\n"
             + "  var icon=document.getElementById('st-icon');\n"
               "  var note=document.getElementById('st-note');\n"
               "  var nextBtn=document.getElementById('st-next');\n"
@@ -3063,15 +3158,15 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
               "  function terminal(st,err){\n"
               "    if(st==='approved'){\n"
               "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-              "      note.textContent='Sent.';\n"
+              "      note.textContent=noteDone;\n"
               "      setTimeout(advance,1500);\n"
               "    }else if(st==='rejected'){\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent='The message was discarded without sending.';\n"
+              "      note.textContent=noteRejected;\n"
               "      showNext();\n"
               "    }else{\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent='The gateway could not deliver the message: '+(err||'unknown error');\n"
+              "      note.textContent=noteError+(err||'unknown error');\n"
               "      showNext();\n"
               "    }\n"
               "  }\n"
@@ -3092,12 +3187,12 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         )
     return (
         _HTML_HEAD
-        + f"<title>Retinue — Approve {label_e} Send {rid}</title>\n"
+        + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
         + "<body>\n"
-        + f"<h1>Approve {label_e} Send</h1>\n"
+        + f"<h1>Approve {label_e} {noun}</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-        + f'<pre class="msg-body">{msg}</pre>\n'
+        + body_html
         + '<div class="actions">\n'
         + f'  <form method="post" action="/sends/{chan}/{rid}/approve" id="form-approve">'
           f'<button type="submit" id="btn-approve" class="btn btn-allow">Allow</button></form>\n'

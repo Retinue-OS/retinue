@@ -7,6 +7,10 @@ meta-refresh), success renders the green check and auto-advance, and the
 next-request button appears only when a next request actually exists — on the
 approval page's Skip too.
 
+Also covers what a pending *calendar* event renders as: the approval card has
+to say which event would be written, since a card showing an empty message box
+asks the user to approve something they cannot see.
+
     python3 tests/test_web_gateway_send_page.py
 """
 import importlib.util
@@ -99,12 +103,111 @@ def test_approval_page_skip_only_with_next():
         assert 'id="btn-skip"' in with_next and "/sends/signal-gateway/bbb" in with_next
 
 
+def _event(status, **extra):
+    """A pending calendar event as the caldav-gateway stores it: no "message"
+    anywhere, the event itself in its own fields."""
+    return {"status": status, "kind": "event", "to": "default", "category": "verify",
+            "subject": "Dentist", "summary": "Dentist",
+            "start": "2026-09-03T14:00:00", "end": "2026-09-03T14:30:00",
+            "all_day": False, "description": "Bring the insurance card",
+            "calendar_id": None, **extra}
+
+
+def test_event_approval_page_shows_the_event():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(_event("pending"), "caldav-gateway", "a" * 32, None)
+        # What is being approved: title, when, target calendar, notes.
+        assert "<h1>Approve Caldav-Gateway Event</h1>" in out   # not "Send"
+        assert "<th>Event</th><td>Dentist</td>" in out
+        assert "<th>When</th><td>Thu 03 Sep 2026, 14:00 \u2013 14:30</td>" in out
+        assert "default calendar" in out
+        assert "Bring the insurance card" in out
+        # Never the empty message box the messenger renderer would leave.
+        assert '<pre class="msg-body"></pre>' not in out
+
+
+def test_event_without_description_says_so():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(_event("pending", description=""),
+                                           "caldav-gateway", "a" * 32, None)
+        assert "No description." in out
+        assert '<pre class="msg-body"></pre>' not in out
+
+
+def test_all_day_event_reads_as_a_span_of_days():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(
+            _event("pending", start="2026-09-10", end="2026-09-12", all_day=True),
+            "caldav-gateway", "a" * 32, None)
+        assert "Thu 10 Sep 2026 \u2013 Sat 12 Sep 2026 (all day)" in out
+
+
+def test_named_calendar_is_shown():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(_event("pending", calendar_id="reminders"),
+                                           "caldav-gateway", "a" * 32, None)
+        assert "<th>Calendar</th><td>reminders</td>" in out
+
+
+def test_event_status_page_talks_about_the_calendar():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(_event("approved"), "caldav-gateway", "a" * 32, None)
+        assert "Added to the calendar." in out
+        assert "Sent." not in out
+        err = wg._render_channel_send_html(_event("error", error="calendar is read-only"),
+                                           "caldav-gateway", "a" * 32, None)
+        assert "could not create the event: calendar is read-only" in err
+
+
+def test_unparsable_times_fall_back_to_the_raw_value():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(_event("pending", start="whenever", end="whenever"),
+                                           "caldav-gateway", "a" * 32, None)
+        assert "whenever" in out
+
+
+def test_index_row_names_the_event_time():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_sends_index_html([
+            {"account": "caldav-gateway", "request_id": "a" * 32, "subject": "Dentist",
+             "to": "default", "category": "verify", "kind": "event",
+             "start": "2026-09-03T14:00:00", "end": "2026-09-03T14:30:00", "all_day": False},
+        ])
+        assert "Thu 03 Sep 2026, 14:00 \u2013 14:30" in out
+        assert "Dentist" in out
+
+
+def test_messenger_page_is_unchanged():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(_detail("pending"), "whatsapp-gateway", "a" * 32, None)
+        assert "<h1>Approve Whatsapp-Gateway Send</h1>" in out
+        assert "<th>To</th><td>+15551112222</td>" in out
+        assert '<pre class="msg-body">hello</pre>' in out
+        assert "<th>Event</th>" not in out
+
+
 def main() -> int:
     tests = [test_sending_page_polls_with_spinner,
              test_sending_page_with_next_shows_button,
              test_approved_page_shows_check_and_advances,
              test_error_page_shows_gateway_error,
-             test_approval_page_skip_only_with_next]
+             test_approval_page_skip_only_with_next,
+             test_event_approval_page_shows_the_event,
+             test_event_without_description_says_so,
+             test_all_day_event_reads_as_a_span_of_days,
+             test_named_calendar_is_shown,
+             test_event_status_page_talks_about_the_calendar,
+             test_unparsable_times_fall_back_to_the_raw_value,
+             test_index_row_names_the_event_time,
+             test_messenger_page_is_unchanged]
     failures = 0
     for test in tests:
         try:
