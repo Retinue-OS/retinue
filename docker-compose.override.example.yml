@@ -33,6 +33,20 @@ services:
       # Uncomment when running the optional qlever-genomics service below:
       # - SPARQL_ENDPOINT_GENOMICS=http://qlever-genomics:7001
       # - SPARQL_ENDPOINT_GENOMICS_DESC=whole-genome variants (large, static; Sequence Ontology)
+      # The base file loads no env_file into this service — it lists what the
+      # container's processes read (see docker-compose.yml). Anything the
+      # base file cannot know goes here: a named e-mail account's suffixed
+      # variables, a chamber script's own settings. Names that a spawned agent
+      # session should ALSO receive go into RETINUE_SESSION_ENV_EXTRA
+      # (scripts/session_env.py; `PREFIX_*` admits a family); the e-mail ones
+      # must not — the gateway's backend keeps the mailbox credentials on the
+      # agent's behalf.
+      # - EMAIL_USER_ARI
+      # - EMAIL_PASS_ARI
+      # - IMAP_HOST_ARI
+      # - SMTP_HOST_ARI
+      # - MY_CHAMBER_API_KEY
+      # - RETINUE_SESSION_ENV_EXTRA=MY_CHAMBER_API_KEY
     networks:
       - agents
       - web

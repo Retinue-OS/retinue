@@ -228,7 +228,8 @@ services:
       # model-picker sources (web-gateway.py: LiteLLM's /model/info, Ollama's
       # live tags). LITELLM_MASTER_KEY is the picker's auth fallback and
       # RETINUE_LITELLM_KEY its override; only the gateway reads them, and the
-      # session allowlist withholds both.
+      # session allowlist withholds both by default (RETINUE_SESSION_ENV_EXTRA
+      # can name either — the operator's explicit decision).
       - RETINUE_ROUTER_MODEL
       - RETINUE_FRONTIER_MODEL
       - RETINUE_TRIAGE_MODEL

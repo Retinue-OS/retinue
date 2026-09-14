@@ -159,6 +159,22 @@ the fail-safe default means every send needs approval unless a policy entry gran
 it. Pending Telegram sends appear on `/sends` with the others. Text plus optional
 image attachments only.
 
+## What an agent session can see
+
+The gateways are sidecars for credential isolation: the Signal keys, the
+WhatsApp session, the Telegram login and the CalDAV password live in their own
+containers, and an agent reaches each through a thin script that authenticates
+with a **capability token** (`SIGNAL_GATEWAY_TOKEN`, `CALDAV_GATEWAY_TOKEN`, …)
+— a token buys one request behind the send policy, where a password would buy
+the account. Those tokens are also the *only* secrets a session inherits: every
+`claude -p` the framework spawns starts from the allowlist in
+`scripts/session_env.py`, which passes the tokens, the framework's own settings
+and the model credential (`ANTHROPIC_*`, `ANTHROPIC_CUSTOM_HEADERS` included
+when it carries a LiteLLM virtual key) and withholds everything else — mailbox
+passwords, the LiteLLM master and picker keys, the repo token. What passes,
+the `RETINUE_SESSION_ENV_EXTRA` escape hatch and the remaining gaps:
+`docs/contributing.md`, "Session environment — the allowlist".
+
 ## Gateway connection monitoring
 
 Linked-device sessions (Signal, WhatsApp, Telegram) die silently — the phone
