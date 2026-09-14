@@ -30,6 +30,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claude_auth  # noqa: E402
+import session_env  # noqa: E402
 
 KB = "https://w3id.org/retinue/kb#"
 ENDPOINT = os.environ.get("SPARQL_ENDPOINT_LIFE", "http://qlever-life:7001")
@@ -138,13 +139,14 @@ def main() -> int:
           "spawning session", file=sys.stderr)
     cmd = ["claude", "-p", "--output-format=json",
            "--permission-mode", PERMISSION_MODE, build_prompt(rows)]
-    # Advertise the session's model so memory entries can be stamped with it
-    # (scripts/memory.py); cleared when no --model is passed, never inherited.
-    env = dict(os.environ)
-    env.pop("RETINUE_SESSION_MODEL", None)
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
-        env["RETINUE_SESSION_MODEL"] = CLAUDE_MODEL
+    # The allowlisted environment (scripts/session_env.py), never a copy of
+    # this process's own: under the scheduler that is already clean, but run
+    # by hand from a session it would not be. It also stamps the session's
+    # model so memory entries can record it (scripts/memory.py); no --model,
+    # no stamp — never an inherited one.
+    env = session_env.build(model=CLAUDE_MODEL)
     # Refresh an access token about to expire before the session starts —
     # once, under the lock every framework spawner shares (docs/claude-auth.md).
     claude_auth.ensure_fresh_credentials(

@@ -30,12 +30,28 @@ Manifest format  (`/workspace/chambers/<chamber>/.schedule.json`):
     ]
   }
 
+`interval_seconds` measures from the *previous run's completion* to the next
+run's start, not start-to-start: `write_state` (below) is called once the job
+has finished, so a job that takes real wall-clock time to run is spaced out by
+that much extra, and a job whose run time varies does not compress its own gap
+when it happens to run long.
+
 A prompt job may pin the model its `claude -p` session runs on with an optional
 `"model"` field. It takes precedence over the global RETINUE_CLAUDE_MODEL and
 supports `${VAR:-default}` shell-style expansion, so a chamber can default a job
 to a model while letting the deployment override it via one env var — without
 naming the chamber in this framework file. Example:
   {"id": "triage", "prompt": "...", "model": "${RETINUE_TRIAGE_MODEL:-sonnet}"}
+
+A job may also carry an optional `"retry_after_seconds"`, consulted only when
+the last recorded run did not end in `"success"`: the job is then due as soon
+as that many seconds have passed, instead of waiting out the full
+`interval_seconds`. Leaving it unset means a failed run is due at exactly the
+same point a successful one would be (the safe default — most failures deserve
+a look before a bare retry, not a tight retry loop). Example, for a job whose
+failures are usually transient (a rate limit, a flaky upstream):
+  {"id": "herald-fetch", "command": "...", "interval_seconds": 86400,
+   "retry_after_seconds": 900}
 
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
@@ -124,24 +140,23 @@ def job_model(job: dict) -> str:
 def job_env(model: str = "") -> dict:
     """Environment for spawned jobs.
 
-    Scheduled jobs run agents (`claude -p`) or scripts that must not hold
-    mailbox credentials — or any other secret the scheduler, forked by the
-    entrypoint before its scrub, carries. The allowlisted session environment
-    (scripts/session_env.py) holds none by construction, EMAIL_PASS* included,
-    and points email_client.py at the web gateway's backend whenever
-    EMAIL_BACKEND_TOKEN is set, so a job still reads and sends mail through the
-    process that keeps the credentials (mirrors the entrypoint's
-    remote-control setup for the main session).
+    Scheduled jobs run agents (`claude -p`) or scripts that must not hold mailbox
+    credentials — or any other secret this daemon's environment carries (it is
+    forked by the entrypoint before the remote-control scrub, so it holds the
+    whole container environment). The environment is therefore built from the
+    allowlist in scripts/session_env.py, the same one every framework spawner
+    uses, rather than copied and stripped: EMAIL_PASS* is absent by
+    construction, and when EMAIL_BACKEND_TOKEN is set, email_client.py is
+    pointed at the web gateway so it proxies instead. A command job gets the
+    same environment as a prompt job: the base-job scripts spawn `claude -p`
+    themselves and chamber commands run in the same trust position.
 
     `model` advertises the model the spawned session runs on (a session cannot
     introspect its own --model flag), so memory entries can be stamped with it
-    (scripts/memory.py). The allowlist clears an inherited value, so a job that
-    passes no --model carries no stamp rather than a stale one.
+    (scripts/memory.py). Absent rather than inherited when this job passes no
+    --model, so a stale value can never mislabel a session.
     """
-    env = session_env.session_environment()
-    if model:
-        env["RETINUE_SESSION_MODEL"] = model
-    return env
+    return session_env.build(model=model)
 
 
 def log(msg: str) -> None:
@@ -168,6 +183,14 @@ def read_last_run(job_id: str) -> float | None:
         with open(_state_path(job_id), encoding="utf-8") as fh:
             ts = json.load(fh).get("last_run")
         return datetime.fromisoformat(ts).timestamp() if ts else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def read_last_status(job_id: str) -> str | None:
+    try:
+        with open(_state_path(job_id), encoding="utf-8") as fh:
+            return json.load(fh).get("status")
     except (OSError, ValueError, json.JSONDecodeError):
         return None
 
@@ -227,7 +250,29 @@ def is_due(job: dict) -> bool:
         # job fires one full interval later, not immediately.
         write_state(job["id"], "scheduled")
         return False
-    return (now() - last) >= int(job["interval_seconds"])
+    elapsed = now() - last
+    if elapsed >= int(job["interval_seconds"]):
+        return True
+    # A run that did not succeed may retry sooner than interval_seconds, but
+    # only if the job opts in -- an unset retry_after_seconds leaves a failed
+    # run due at exactly the same point a successful one would be, which is
+    # deliberate (see the module docstring): most failures are worth
+    # investigating before a bare retry, not worth hammering. A job that knows
+    # its own failures are often transient (a rate limit, a flaky upstream)
+    # can shorten that wait explicitly.
+    #
+    # "scheduled" is excluded here even though it is not "success": it is the
+    # bookkeeping status the block above writes on a job's first sighting, to
+    # start the interval clock -- not the record of an actual run. Without
+    # this exclusion, a job seen for the first time reads back as a
+    # non-success "last run" on the very next tick, so a job with
+    # retry_after_seconds set would fire after that short delay instead of
+    # ever waiting out its documented full interval_seconds for its first run.
+    retry_after = job.get("retry_after_seconds")
+    last_status = read_last_status(job["id"])
+    if retry_after and last_status not in ("success", "scheduled"):
+        return elapsed >= int(retry_after)
+    return False
 
 
 def spawn_process(cmd, *, retry_enoent, **kwargs):

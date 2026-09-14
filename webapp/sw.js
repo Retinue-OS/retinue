@@ -38,6 +38,7 @@ const SHELL_ASSETS = [
   '/components/base.js',
   '/components/markdown.js',
   '/components/voice.js',
+  '/components/conversation.js',
   '/components/conversations.js',
   '/components/projects.js',
   '/components/project-page.js',

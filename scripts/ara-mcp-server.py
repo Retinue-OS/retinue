@@ -379,17 +379,13 @@ def _run_once(prompt: str, model: str,
         cmd += ["--model", model]
     for tool in FORBIDDEN_TOOLS:
         cmd += ["--disallowed-tools", tool]
-    # The allowlisted session environment (scripts/session_env.py) — this
-    # daemon carries everything the container was started with, and the
-    # answering session runs an outside client's question. The allowlist also
-    # clears the per-spawn stamps, so a stale value never mislabels a session:
-    # RETINUE_SESSION_MODEL advertises the model this session runs on (for
-    # memory stamping); RETINUE_ESCALATE_FILE is junior's escape hatch.
-    env = session_env.session_environment()
-    if model:
-        env["RETINUE_SESSION_MODEL"] = model
-    if escalate_flag is not None:
-        env["RETINUE_ESCALATE_FILE"] = str(escalate_flag)
+    # The session's environment comes from the allowlist in
+    # scripts/session_env.py, never from a copy of this daemon's (which holds
+    # whatever .env carries). RETINUE_SESSION_MODEL advertises the model this
+    # session runs on (for memory stamping), set per spawn so a stale value
+    # never mislabels a session; RETINUE_ESCALATE_FILE is junior's escape
+    # hatch.
+    env = session_env.build(model=model, escalate_file=escalate_flag)
     # The prompt goes on stdin, never as a trailing argument: --disallowed-tools
     # is variadic, so a positional prompt after it is swallowed as one more tool
     # name and the session dies with "Input must be provided either through

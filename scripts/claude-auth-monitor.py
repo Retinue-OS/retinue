@@ -95,7 +95,7 @@ def level_of(status: dict) -> str:
 def broken_message(reason: str) -> str:
     return (
         "The Claude sign-in of the agent system is broken — scheduled jobs, "
-        "dashboard conversations and the remote-control session cannot "
+        "dashboard conversations and every agent session cannot "
         "authenticate until it is renewed.\n\n"
         f"{reason}\n\n"
         f"Open {signin_link()} to sign in again from this browser (no console "

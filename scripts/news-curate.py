@@ -31,6 +31,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_auth  # noqa: E402
 import news_store as store  # noqa: E402
+import session_env  # noqa: E402
 
 # This turn only dispatches the Herald (which pins its own model), so it is a
 # router-tier Ara junior turn (docs/model-routing.md).
@@ -123,13 +124,14 @@ def main() -> int:
     cmd = ["claude", "-p", "--output-format=json",
            "--permission-mode", PERMISSION_MODE,
            build_prompt(path, len(items), len(feedback))]
-    # Advertise the session's model so memory entries can be stamped with it
-    # (scripts/memory.py); cleared when no --model is passed, never inherited.
-    env = dict(os.environ)
-    env.pop("RETINUE_SESSION_MODEL", None)
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
-        env["RETINUE_SESSION_MODEL"] = CLAUDE_MODEL
+    # The allowlisted environment (scripts/session_env.py), never a copy of
+    # this process's own: under the scheduler that is already clean, but run
+    # by hand from a session it would not be. It also stamps the session's
+    # model so memory entries can record it (scripts/memory.py); no --model,
+    # no stamp — never an inherited one.
+    env = session_env.build(model=CLAUDE_MODEL)
     # Refresh an access token about to expire before the session starts —
     # once, under the lock every framework spawner shares (docs/claude-auth.md).
     claude_auth.ensure_fresh_credentials(log=log)

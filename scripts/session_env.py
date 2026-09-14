@@ -1,50 +1,43 @@
 #!/usr/bin/env python3
-"""The environment every `claude -p` session the framework spawns starts with.
+"""Environment for the `claude -p` sessions the framework spawns.
 
-Three daemons spawn agent sessions — the web gateway (dashboard turns, the
-transcript cleanup and presentation lint passes), the scheduler (prompt and
-command jobs) and the Ask-Ara MCP server (answering sessions). All three used
-to hand the child a copy of their own environment, and a daemon forked by the
-entrypoint carries everything the container was started with: the mailbox
-passwords the gateway needs for its IMAP/SMTP backend, the LiteLLM master key,
-the OpenRouter key, the basic-auth htpasswd line — anything a deployment's
-`.env` happened to contain (retinue-os/retinue#15). A session processes
-untrusted input with a Bash tool, so every one of those was one `env` away.
+Every headless session the framework starts — dashboard turns, the transcript
+cleanup and the presentation lint (scripts/web-gateway.py), scheduler prompt
+jobs and the sessions the command jobs spawn themselves (scripts/scheduler.py,
+agent-self-review.py, news-curate.py, triage-gate.py), Ask-Ara answers
+(scripts/ara-mcp-server.py) — gets its environment from build() below, never
+from a copy of the spawner's os.environ.
 
-This module is the single answer to "what does a session inherit": an
-**allowlist**, built from the audit of what the scripts a session runs read
-from the environment. Everything not named here is dropped by construction.
+Why an allowlist and not a denylist
+-----------------------------------
+The spawning daemons (the web gateway, the scheduler, the MCP server) are
+forked by the entrypoint before it scrubs anything, so they hold the whole
+container environment: the mailbox passwords the gateway's IMAP/SMTP backend
+needs, the model-gateway keys, whatever else a deployment's .env carried. A
+child that inherits a copy of that environment inherits every secret in it
+(retinue-os/retinue#15). A denylist — "strip EMAIL_PASS*, strip the API key" —
+is what the entrypoint did for the main session, and it rots: every new secret
+(a second mailbox, a new gateway's credential, a key added to .env for some
+other service) leaks until someone remembers to extend the list, and nothing
+fails when they forget. An allowlist names what a session needs; a new secret
+is dropped by construction, and a forgotten *non*-secret fails loudly (the
+script that reads it reports it unset), which is the failure mode to prefer.
 
-Why an allowlist and not a denylist: a denylist rots. It knows the secrets of
-the day it was written (`EMAIL_PASS*`, `ANTHROPIC_API_KEY`) and lets the next
-one through — `CALDAV_PASSWORD`, `LITELLM_SALT_KEY`, whatever the next sidecar
-brings — until someone notices. An allowlist fails the other way: a new
-variable a session needs is missing until it is added, which is a visible
-failure in a log, not an invisible leak. That is the trade this module makes
-on purpose; `RETINUE_SESSION_ENV_EXTRA` (below) is the operator's escape hatch
-so a deployment whose chamber scripts read custom variables need not edit the
-framework to pass them.
+What passes is data, in one place: exact names, name prefixes and name
+suffixes below. Deployments whose chamber scripts read variables the framework
+does not know about name them in RETINUE_SESSION_ENV_EXTRA (comma-separated;
+a trailing `*` admits a prefix) instead of editing this file.
 
-What deliberately still reaches a session:
+Two per-session values are never inherited, whatever the source holds:
+RETINUE_SESSION_MODEL (the model stamp scripts/memory.py records; a stale one
+would mislabel a session) and RETINUE_ESCALATE_FILE (Ara junior's escape
+hatch, docs/model-routing.md) — the spawner sets them per spawn through the
+`model` and `escalate_file` arguments.
 
-* the model credential (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
-  `ANTHROPIC_BASE_URL`, `ANTHROPIC_CUSTOM_HEADERS`): spawned sessions run in
-  API-key or gateway mode and need it. Moving that into a sidecar is the
-  separate epic; this module only stops the *unrelated* secrets.
-* capability tokens (`EMAIL_BACKEND_TOKEN`, `CONVERSATION_BACKEND_TOKEN`, the
-  `*_GATEWAY_TOKEN`s, `NEWS_INGEST_TOKEN`, `UPDATER_TOKEN`): they are what
-  the push, contact, conversation and e-mail scripts authenticate with. A
-  token buys one capability behind a policy gate; a password buys the account.
-* `GITHUB_TOKEN`: the entrypoint already writes it into `~/.git-credentials`,
-  which a session can read, and the `gh` CLI the Tier 3 workflow relies on
-  reads it from the environment — withholding it would break `gh pr create`
-  while hiding nothing.
-* the Garmin login, for now: `scripts/refresh.py --ensure` runs the Garmin
-  sync synchronously inside the agent's own process.
-
-What this does not do: every process in the container runs as the same uid,
-so a session can still read a daemon's `/proc/<pid>/environ`. That is the
-sidecar/uid work tracked separately; this module closes the inheritance path.
+What this does NOT do: a session runs as the same uid as the daemons, so it can
+still read a daemon's /proc/<pid>/environ. Keeping the secrets out of the
+daemons' environments altogether (sidecars, a separate uid) is tracked
+separately; this module only guarantees that no session *inherits* one.
 """
 from __future__ import annotations
 
@@ -52,148 +45,215 @@ import os
 import sys
 from collections.abc import Mapping
 
-# Comma-separated names a deployment wants passed through in addition to the
-# lists below — the operator's explicit word, so it overrides even the
-# withheld set. Set it on the retinue service (it is itself a RETINUE_* name,
-# so nested spawners see it too).
-EXTRA_VAR = "RETINUE_SESSION_ENV_EXTRA"
+# ── The allowlist ─────────────────────────────────────────────────────────────
+# Kept as plain data so the tests (tests/test_session_env.py) and an operator
+# reading this file see the same list. Comments say why a group is here, so a
+# future entry can be judged by the same standard: a session needs it, and it
+# is not a credential — capability tokens (which authorise a request to a
+# framework service that then applies its own send policy) are deliberately in,
+# credentials (which open a third-party account directly) are deliberately out.
 
-# Names passed through verbatim, grouped by why a session needs them.
-PASSTHROUGH_NAMES: frozenset[str] = frozenset({
-    # Process basics: where binaries and the Claude config live, locale, time.
+SESSION_ENV_NAMES: frozenset[str] = frozenset({
+    # Process basics: where the binaries, the Claude config (/root/.claude) and
+    # the temp dir are, and how text is encoded. Claude Code will not start
+    # without HOME and PATH.
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "HOSTNAME",
     "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR",
-    # The egress-audit proxy and the CA it signs with: without these a session
-    # either bypasses the audit or fails TLS against the proxy's certificates.
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
-    "http_proxy", "https_proxy", "no_proxy",
+    # Egress-audit proxy and its CA (docker-compose.yml, the retinue service):
+    # without these a session's HTTP traffic bypasses the audit or fails TLS
+    # verification against the MITM certificates. Both spellings, since curl
+    # and requests read the lower-case ones.
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+    "http_proxy", "https_proxy", "no_proxy", "all_proxy",
     "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
-    # Claude Code's own settings that carry no CLAUDE_ prefix: the auto-updater
-    # switch a deployment sets (docs/contributing.md), the API/tool/MCP
-    # timeouts, output caps, telemetry switches. Bedrock/Vertex credentials
-    # (AWS_*, GOOGLE_*) are not listed — a deployment on those providers names
-    # them in RETINUE_SESSION_ENV_EXTRA.
+    # Runtime knobs an operator may set for node (Claude Code runs on it).
+    "NODE_OPTIONS",
+    # Claude Code's documented switches that do not carry the CLAUDE_ prefix.
     "DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING",
     "DISABLE_BUG_COMMAND", "DISABLE_COST_WARNINGS",
     "DISABLE_NON_ESSENTIAL_MODEL_CALLS", "DISABLE_PROMPT_CACHING",
-    "FALLBACK_FOR_ALL_PRIMARY_MODELS", "FORCE_HYPERLINK",
-    "MAX_THINKING_TOKENS", "MAX_MCP_OUTPUT_TOKENS", "MCP_TIMEOUT",
-    "MCP_TOOL_TIMEOUT", "BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS",
-    "BASH_MAX_OUTPUT_LENGTH", "API_TIMEOUT_MS", "API_FORCE_IDLE_TIMEOUT",
-    "USE_BUILTIN_RIPGREP",
-    # Where the chambers are (exported by the entrypoint; recurring-projects.py
-    # reads CHAMBERS_ROOT).
-    "CHAMBERS_DIR", "CHAMBERS_MANIFEST", "CHAMBERS_ROOT",
-    # Reaching the web gateway from inside the container: dashboard threads
-    # (conversation-push.py, chat-draft.py), links back to the dashboard, and
-    # the e-mail backend that keeps the mailbox credentials on the gateway's
-    # side. SENT_FOLDER is a folder name the triage gate lists, not a secret.
-    "WEB_GATEWAY_PORT", "CONVERSATION_BACKEND_URL", "CONVERSATION_BACKEND_TOKEN",
-    "CONVERSATION_BACKEND_TIMEOUT", "CONVERSATION_BASE_URL", "CONVERSATION_PUSH",
-    "CHAT_DRAFT_BACKEND_URL", "SEND_APPROVAL_BASE_URL",
-    "EMAIL_BACKEND_URL", "EMAIL_BACKEND_TOKEN", "EMAIL_CLIENT_PATH", "SENT_FOLDER",
-    # The messenger and calendar sidecars: the push and contact-lookup scripts
-    # authenticate with the shared token; the credentials themselves never
-    # leave the sidecar.
-    "SIGNAL_GATEWAY_SEND_URL", "SIGNAL_GATEWAY_BASE_URL", "SIGNAL_GATEWAY_TOKEN",
-    "SIGNAL_GATEWAY_TIMEOUT", "SIGNAL_DEFAULT_RECIPIENT",
-    "WHATSAPP_GATEWAY_SEND_URL", "WHATSAPP_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_TOKEN",
-    "WHATSAPP_GATEWAY_TIMEOUT", "WHATSAPP_DEFAULT_RECIPIENT",
-    "TELEGRAM_GATEWAY_SEND_URL", "TELEGRAM_GATEWAY_BASE_URL", "TELEGRAM_GATEWAY_TOKEN",
-    "TELEGRAM_GATEWAY_TIMEOUT", "TELEGRAM_DEFAULT_RECIPIENT",
-    "CALDAV_GATEWAY_CREATE_URL", "CALDAV_GATEWAY_TOKEN", "CALDAV_GATEWAY_TIMEOUT",
-    # The updater sidecar (scripts/self-update.py).
-    "UPDATER_URL", "UPDATER_TOKEN", "UPDATER_TIMEOUT",
-    # The git shim's lock directory, and the repo token — already on disk in
-    # ~/.git-credentials for the same uid; `gh` reads it from the environment.
-    "GIT_SERIALIZE_LOCK_DIR", "GITHUB_TOKEN",
-    # Project wake-up tuning (recurring-projects.py).
+    "MAX_THINKING_TOKENS", "MAX_MCP_OUTPUT_TOKENS", "API_TIMEOUT_MS",
+    "MCP_TIMEOUT", "MCP_TOOL_TIMEOUT", "USE_BUILTIN_RIPGREP",
+    "BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS", "BASH_MAX_OUTPUT_LENGTH",
+    # Where the chambers are (scripts/memory.py, news-fetch.py, refresh.py,
+    # triage_policy.py, recurring-projects.py, sync-garmin.py).
+    "CHAMBERS_DIR", "CHAMBERS_MANIFEST", "CHAMBERS_ROOT", "CHAMBER_DIR",
+    # Capability tokens and the in-container service URLs they authorise
+    # against. A token lets a session *ask* a framework service (send this
+    # mail, open this thread, file this news item); the service still applies
+    # the send policy and holds the credential. That is the whole design of
+    # the credential isolation (.env.example, "E-mail credential isolation").
+    "EMAIL_BACKEND_TOKEN", "EMAIL_BACKEND_URL", "EMAIL_CLIENT_PATH",
+    "CONVERSATION_BACKEND_TOKEN", "CONVERSATION_BACKEND_URL",
+    "CONVERSATION_BACKEND_TIMEOUT", "CONVERSATION_BASE_URL",
+    "CONVERSATION_PUSH", "CHAT_DRAFT_BACKEND_URL", "SEND_APPROVAL_BASE_URL",
+    "CHATS_INGEST_TOKEN", "CHATS_INGEST_URL",
+    "UPDATER_TOKEN", "UPDATER_URL", "UPDATER_TIMEOUT",
+    "WEB_GATEWAY_PORT",
+    # The life store as the gateway's own scripts address it (projects card,
+    # recurring-projects.py); the SPARQL_ENDPOINT_ prefix below carries the
+    # advertised form.
+    "QLEVER_LIFE_URL", "QLEVER_TIMEOUT", "QLEVER_GRAPH_BASE",
+    # Triage: the gate lists the Sent folder of the default account by name
+    # (scripts/triage-gate.py) and the skill derives its omnibus window from
+    # the processing interval. Non-secret mailbox *settings*; the credentials
+    # stay with the gateway's backend.
+    "SENT_FOLDER", "EMAIL_PROCESSING_INTERVAL",
     "PROJECT_DEADLINE_LEAD_DAYS",
-    # Garmin: refresh.py --ensure runs sync-garmin.py in the agent's process.
-    # Goes away with the sidecar epic.
+    # Garmin stays for now: scripts/refresh.py --ensure runs sync-garmin.py
+    # synchronously inside the agent's own process, so the credential has to
+    # be where that process is. Moving the fetch into a sidecar is the
+    # separate epic; when it lands, these two lines go.
     "GARMIN_EMAIL", "GARMIN_PASSWORD",
 })
 
-# Name prefixes passed through: the framework's own configuration
-# (RETINUE_*, including the tier models, memory switches and this module's
-# escape hatch), Claude Code and the model endpoint (CLAUDE_*, ANTHROPIC_*),
-# the advertised SPARQL stores, locale, and the news-feed and triage tunables
-# the scheduled scripts read. A prefix is the compromise between a closed list
-# and chamber-defined configuration: a deployment may set any RETINUE_* knob
-# without touching this file — which is exactly why no secret may be named
-# RETINUE_*; the one that is, is withheld below.
-PASSTHROUGH_PREFIXES: tuple[str, ...] = (
-    "RETINUE_", "CLAUDE_", "ANTHROPIC_", "SPARQL_ENDPOINT_", "LC_", "XDG_",
+SESSION_ENV_PREFIXES: tuple[str, ...] = (
+    # Locale.
+    "LC_",
+    # Python and git configuration a deployment may set (PYTHONPATH,
+    # PYTHONUNBUFFERED, GIT_AUTHOR_*, GIT_SSL_CAINFO, GIT_SERIALIZE_LOCK_DIR).
+    "PYTHON", "GIT_",
+    # The model endpoint and credential: ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
+    # ANTHROPIC_BASE_URL, ANTHROPIC_CUSTOM_HEADERS, ANTHROPIC_MODEL, … Sessions
+    # the gateway and the scheduler spawn run in API-key/gateway mode (the
+    # entrypoint drops the key only for the OAuth main session), so this is
+    # the one credential a session legitimately needs.
+    "ANTHROPIC_",
+    # Claude Code itself (CLAUDE_CODE_*, CLAUDE_CONFIG_DIR) and the framework's
+    # own Claude-side settings (CLAUDE_PERMISSION_MODE, CLAUDE_AUTH_*,
+    # CLAUDE_OAUTH_*, CLAUDE_CRED_FILE — paths and public identifiers, never
+    # a token).
+    "CLAUDE_",
+    # The framework's configuration namespace: models and tiers, memory,
+    # the escape hatch, chamber-defined RETINUE_* settings expanded in
+    # .schedule.json manifests. One name in it holds a key and is excluded
+    # below.
+    "RETINUE_",
+    # Read-only store advertisement (CLAUDE.md "SPARQL endpoints").
+    "SPARQL_ENDPOINT_",
+    # News feed (scripts/news_store.py, news-fetch.py, news-curate.py,
+    # news_ingest.py) and triage tunables (scripts/triage-gate.py).
     "NEWS_", "TRIAGE_",
 )
 
-# Under an allowed prefix, but not for sessions: the picker's LiteLLM key is
-# the web gateway's credential for the proxy's management API, nothing a
-# session calls.
-WITHHELD_NAMES: frozenset[str] = frozenset({
-    "RETINUE_LITELLM_KEY",
-})
+SESSION_ENV_SUFFIXES: tuple[str, ...] = (
+    # The messenger and calendar gateways' client side (scripts/signal-push.py
+    # and siblings, *-contacts.py, caldav-push.py, caldav-read.py): the shared
+    # token that authorises a send or read request and the in-network URLs. The
+    # gateway that owns the account applies the send policy (reads carry none —
+    # they change nothing); the account credential itself
+    # (SIGNAL's link, TELEGRAM_API_HASH, CALDAV_PASSWORD) never lives in this
+    # container. Suffix-matched so a deployment's extra gateway
+    # (FOO_GATEWAY_TOKEN) enrols the same way.
+    "_GATEWAY_TOKEN", "_GATEWAY_BASE_URL", "_GATEWAY_SEND_URL",
+    "_GATEWAY_CREATE_URL", "_GATEWAY_TIMEOUT", "_DEFAULT_RECIPIENT",
+)
 
-# Per-spawn stamps the spawner sets itself, after building the base
-# environment: RETINUE_SESSION_MODEL advertises the model the child runs on
-# (a session cannot introspect its own --model flag; scripts/memory.py stamps
-# memories with it) and RETINUE_ESCALATE_FILE is Ara junior's escape hatch.
-# Both are cleared rather than inherited so a stale value never mislabels a
-# session or offers an escalation to a tier that has nobody above it.
-PER_SPAWN_NAMES: tuple[str, ...] = ("RETINUE_SESSION_MODEL", "RETINUE_ESCALATE_FILE")
+# A name that matches an allowed prefix but holds a secret. Keep this set at
+# one entry if at all possible: a secret named into an allowed namespace is a
+# denylist in miniature, with the same rot. RETINUE_LITELLM_KEY is the picker's
+# auth override for the model gateway (web-gateway.py); only the gateway reads
+# it. New secrets should not be named RETINUE_*.
+SESSION_ENV_EXCLUDED: frozenset[str] = frozenset({"RETINUE_LITELLM_KEY"})
+
+# Never inherited: set per spawn (see build()).
+_PER_SPAWN: tuple[str, ...] = ("RETINUE_SESSION_MODEL", "RETINUE_ESCALATE_FILE")
+
+EXTRA_VAR = "RETINUE_SESSION_ENV_EXTRA"
 
 
-def extra_names(spec: str | None) -> frozenset[str]:
-    """The names listed in a RETINUE_SESSION_ENV_EXTRA value."""
-    if not spec:
-        return frozenset()
-    return frozenset(n.strip() for n in spec.split(",") if n.strip())
+def _extra_rules(source: Mapping[str, str]) -> tuple[set[str], tuple[str, ...]]:
+    """Parse RETINUE_SESSION_ENV_EXTRA into (exact names, prefixes).
+
+    Comma- or whitespace-separated; an entry ending in `*` is a prefix
+    (`MYCHAMBER_*`). The escape hatch is for a deployment whose chamber scripts
+    read variables the framework does not know about; it is read from the
+    source mapping, so it is itself part of the spawner's environment (and
+    passes through under the RETINUE_ prefix, so nested spawns honour it too).
+    """
+    raw = source.get(EXTRA_VAR, "") or ""
+    exact: set[str] = set()
+    prefixes: list[str] = []
+    for entry in raw.replace(",", " ").split():
+        if entry.endswith("*"):
+            if len(entry) > 1:
+                prefixes.append(entry[:-1])
+        else:
+            exact.add(entry)
+    return exact, tuple(prefixes)
 
 
-def allowed(name: str, extra: frozenset[str] = frozenset()) -> bool:
-    """Whether a variable of this name may reach a spawned session."""
-    if name in extra:
-        return True
-    if name in WITHHELD_NAMES:
+def allowed(name: str, source: Mapping[str, str] | None = None) -> bool:
+    """Whether `name` passes from the spawner's environment into a session.
+
+    The per-spawn stamps are never inherited, whatever the operator names —
+    the escape hatch admits configuration, not a stale label or another
+    session's escalation flag. Below that, an explicit entry in
+    RETINUE_SESSION_ENV_EXTRA wins: the operator's stated decision. Otherwise
+    the built-in exclusions apply before the built-in rules, so a prefix
+    never admits a name listed as excluded.
+    """
+    if name in _PER_SPAWN:
         return False
-    if name in PASSTHROUGH_NAMES:
+    extra_exact, extra_prefixes = _extra_rules(os.environ if source is None else source)
+    if name in extra_exact:
         return True
-    return name.startswith(PASSTHROUGH_PREFIXES)
+    if name in SESSION_ENV_EXCLUDED:
+        return False
+    if name in SESSION_ENV_NAMES:
+        return True
+    if name.startswith(SESSION_ENV_PREFIXES) or name.startswith(extra_prefixes):
+        return True
+    return name.endswith(SESSION_ENV_SUFFIXES)
 
 
-def session_environment(source: Mapping[str, str] | None = None) -> dict[str, str]:
-    """The child environment for a `claude -p` session, from `source`
-    (default: this process's environment).
+def build(source: Mapping[str, str] | None = None, *, model: str = "",
+          escalate_file: "str | os.PathLike[str] | None" = None) -> dict[str, str]:
+    """Return the environment for one spawned session.
 
-    Beyond filtering, one rewrite every spawner needs: when the container runs
-    the e-mail backend (EMAIL_BACKEND_TOKEN is set — the entrypoint always
-    generates one), point email_client.py at the gateway's internal endpoint,
-    so a session that holds no mailbox password still reads and sends mail
-    through the process that does (mirrors the entrypoint's setup for the main
-    session; the daemons are forked before that export and never had it).
+    `source` is the spawner's environment (default os.environ); only the
+    allowlisted names are copied. `model` advertises the model the session runs
+    on as RETINUE_SESSION_MODEL (a session cannot introspect its own --model
+    flag; empty means no stamp, never an inherited one). `escalate_file` hands
+    Ara junior her escalation flag path as RETINUE_ESCALATE_FILE; None means
+    the session has nobody to escalate to.
+
+    E-mail goes through the gateway's backend: whenever the spawner holds the
+    EMAIL_BACKEND_TOKEN (the entrypoint always mints one in remote-control
+    mode), EMAIL_BACKEND_URL is pointed at the gateway's /internal/email, so
+    scripts/email_client.py proxies instead of looking for EMAIL_PASS* — which
+    is not here, by construction. This is the rewrite the scheduler always did
+    for its jobs, now applied to every session alike.
     """
     src = os.environ if source is None else source
-    extra = extra_names(src.get(EXTRA_VAR))
-    env = {name: value for name, value in src.items() if allowed(name, extra)}
-    for name in PER_SPAWN_NAMES:
-        env.pop(name, None)
+    env = {name: value for name, value in src.items() if allowed(name, src)}
+    if model:
+        env["RETINUE_SESSION_MODEL"] = model
+    if escalate_file is not None:
+        env["RETINUE_ESCALATE_FILE"] = str(escalate_file)
     if env.get("EMAIL_BACKEND_TOKEN"):
         port = env.get("WEB_GATEWAY_PORT", "8080")
         env["EMAIL_BACKEND_URL"] = f"http://localhost:{port}/internal/email"
     return env
 
 
-def main(argv: list[str]) -> int:
-    """`python3 session_env.py` prints the names a session spawned from this
-    environment would receive — the operator's answer to "why does my chamber
-    script not see its variable"; `--values` prints them as KEY=VALUE."""
-    env = session_environment()
-    show_values = "--values" in argv
-    for name in sorted(env):
-        print(f"{name}={env[name]}" if show_values else name)
+def main(argv: list[str] | None = None) -> int:
+    """Diagnostic: list the names the current environment would pass to a
+    session, or with --dropped the names it withholds. Names only — a value
+    is never printed, that is the point."""
+    args = sys.argv[1:] if argv is None else argv
+    if args not in ([], ["--dropped"]):
+        print("usage: session_env.py [--dropped]", file=sys.stderr)
+        return 2
+    passed = build()
+    if args == ["--dropped"]:
+        names = sorted(n for n in os.environ if n not in passed)
+    else:
+        names = sorted(passed)
+    print("\n".join(names))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main())

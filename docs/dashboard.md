@@ -16,6 +16,12 @@ lives in `webapp/` (baked into the image):
   the app-launch buttons (`tel:`/`sms:`/`mailto:`/`geo:`/`intent://`).
 - `webapp/components/*.js` are web components that each fetch one JSON document
   and render it, degrading to the last cached state offline.
+  `<retinue-conversation>` (`conversation.js`) is the one exception in
+  kind: not a card but one conversation with Ara — thread, composer,
+  dictation, attachments, chips, copy buttons, model picker, read-aloud —
+  embedded wherever a conversation is shown (the conversations card's open
+  thread and its new-thread composer today; the chat page's companion pane
+  next), so every surface renders it with the same code.
 - `webapp/data/*.json` is the curated content. The static data cards that
   consume these files are commented out in `webapp/index.html` until a
   scheduler-driven refresh job regenerates them. **Refreshing these is Ara's job**

@@ -25,3 +25,8 @@ docker-compose.override.yml
 
 # Marketplace listing generated at runtime from chambers + the identity template
 /.claude-plugin/marketplace.json
+
+# The updater sidecar's rebuild log (updater/update-server.py), written into
+# the bind-mounted repo checkout rather than the sidecar's own /tmp so it
+# survives the sidecar container being recreated — never commit.
+/.retinue/

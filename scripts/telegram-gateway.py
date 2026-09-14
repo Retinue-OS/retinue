@@ -1689,6 +1689,33 @@ _pending_sends_lock = threading.Lock()
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def _write_pending_send(path: Path, entry: dict) -> None:
+    """Persist a pending-send entry so a concurrent GET never observes a torn file.
+
+    ``Path.write_text`` truncates the file and then writes, in place; a GET
+    that lands mid-write (or between those two steps) can read a partial file,
+    fail to parse it, and — since the status transition has already dropped
+    the entry from the in-memory ``_pending_sends`` map by the time the
+    background sender writes the terminal state — read back as "not found"
+    (a body with no "status" key at all) rather than as the entry's actual
+    state. Writing to a same-directory temp file and renaming into place is
+    atomic on POSIX, so a reader always sees either the previous full content
+    or the new one, never a mix. Same fix as signal-gateway.py (88dbbf0),
+    where a tight polling test caught the race in CI.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _lookup_existing_path(request_id: str) -> Path | None:
     """Find the on-disk file for a request id by scanning the pending directory.
 
@@ -1732,7 +1759,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
     }
     path = TELEGRAM_PENDING_SENDS_DIR / f"{request_id}.json"
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[telegram-gateway] warning: could not persist pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -1816,7 +1843,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
         entry.pop("error", None)
         print(f"[telegram-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[telegram-gateway] warning: could not update pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -1849,7 +1876,7 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return entry
         entry["status"] = "sending" if approved else "rejected"
         try:
-            path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+            _write_pending_send(path, entry)
         except OSError as exc:
             print(f"[telegram-gateway] warning: could not update pending send: {exc}", flush=True)
         _pending_sends.pop(request_id, None)

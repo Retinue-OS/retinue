@@ -1,66 +1,59 @@
 #!/usr/bin/env python3
-"""Checks for the allowlisted session environment (scripts/session_env.py).
+"""Checks for the session-environment allowlist (scripts/session_env.py).
 
-Every `claude -p` session the framework spawns used to inherit a copy of the
-spawning daemon's environment, and the daemons — forked by the entrypoint
-before its scrub — carry everything the container was started with: mailbox
-passwords, the LiteLLM keys, the OpenRouter key, the htpasswd line
-(retinue-os/retinue#15). A session runs untrusted input with a Bash tool.
-
-Covers: the module drops every such secret and keeps what a session needs,
-withholds the one secret that sits under an allowed prefix, clears the
-per-spawn stamps, honours the RETINUE_SESSION_ENV_EXTRA escape hatch and points
-email_client.py at the gateway backend; and that the three spawners — the web
-gateway (dashboard turns plus the cheap cleanup/lint passes), the scheduler
-and the Ask-Ara MCP server — hand their child exactly that environment, with
-the model and escalation stamps set per spawn.
+Every `claude -p` the framework spawns gets its environment from build(),
+never from a copy of the spawner's os.environ (retinue-os/retinue#15). These
+checks feed build() a fake container environment — the secrets a deployment's
+.env carries next to the values a session needs — and assert the line falls
+where the module says it does: credentials out by construction, capability
+tokens and the model variables in, the per-spawn stamps never inherited, and
+the RETINUE_SESSION_ENV_EXTRA escape hatch admitting what a deployment names.
 
     python3 tests/test_session_env.py
 """
+import contextlib
 import importlib.util
-import json
+import io
 import os
 import sys
-import tempfile
-import types
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
 
-import session_env as se  # noqa: E402
+spec = importlib.util.spec_from_file_location(
+    "session_env_under_test", SCRIPTS_DIR / "session_env.py")
+se = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(se)
 
-# What a deployment's .env carries that no session may ever see. The last one
-# stands for whatever the next sidecar brings: an allowlist drops it unnamed.
+
+# What a deployment's .env puts into the container next to what the framework
+# sets itself — the secrets a session must never see …
 SECRETS = {
-    "EMAIL_PASS": "mailbox-password",
-    "EMAIL_PASS_ARI": "ari-mailbox-password",
-    "EMAIL_USER": "you@example.com",
-    "IMAP_HOST": "imap.example.com",
-    "SMTP_HOST": "smtp.example.com",
-    "CALDAV_PASSWORD": "calendar-password",
-    "CALDAV_USERNAME": "you@example.com",
+    "EMAIL_PASS": "mail-pw",
+    "EMAIL_PASS_ARI": "ari-pw",
+    "CALDAV_PASSWORD": "caldav-pw",
     "LITELLM_MASTER_KEY": "sk-master",
     "LITELLM_SALT_KEY": "salt",
-    "LITELLM_DB_PASSWORD": "db-password",
-    "DATABASE_URL": "postgresql://litellm:db-password@litellm-db/litellm",
-    "OPENROUTER_API_KEY": "sk-or-v1-secret",
+    "LITELLM_DB_PASSWORD": "db-pw",
+    "DATABASE_URL": "postgresql://litellm:db-pw@litellm-db:5432/litellm",
+    "OPENROUTER_API_KEY": "sk-or-v1-x",
     "RETINUE_LITELLM_KEY": "sk-picker",
     "TRAEFIK_BASIC_AUTH_USERS": "user:$apr1$hash",
-    "GATEWAY_BASIC_AUTH_USERS": "user:$apr1$hash",
-    "VAPID_PRIVATE_KEY": "-----BEGIN EC PRIVATE KEY-----",
-    "TELEGRAM_API_HASH": "0123456789abcdef",
-    "STT_TOKEN": "stt-secret",
-    "CHATS_INGEST_TOKEN": "chats-rail-secret",
-    "SOME_FUTURE_SECRET": "still-dropped",
+    "GITHUB_TOKEN": "ghp_x",
+    "TELEGRAM_API_HASH": "tg-hash",
+    "TELEGRAM_2FA_PASSWORD": "tg-2fa",
+    "REPLY_TOKEN_KEY": "hmac-key",
+    "VAPID_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----",
+    # The reason this is an allowlist: a secret nobody has heard of yet.
+    "FUTURE_SERVICE_PASSWORD": "not-yet-invented",
+    "SOME_NEW_API_KEY": "also-unknown",
 }
 
-# What a session needs: process basics, the egress proxy, the model endpoint,
-# the framework's own settings, and the capability tokens its scripts use.
-# Values are compared verbatim — the allowlist copies, it does not rewrite.
+# … and what a session does need.
 NEEDED = {
-    "PATH": "/root/.venv/bin:/usr/local/lib/retinue-git-shim:/usr/bin",
+    # process basics and the egress proxy
+    "PATH": "/usr/local/lib/retinue-git-shim:/root/.venv/bin:/usr/bin",
     "HOME": "/root",
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
@@ -68,326 +61,275 @@ NEEDED = {
     "TZ": "Europe/Zurich",
     "HTTP_PROXY": "http://egress-audit:8080",
     "HTTPS_PROXY": "http://egress-audit:8080",
-    "NO_PROXY": "localhost,127.0.0.1,retinue,litellm",
+    "NO_PROXY": "localhost,127.0.0.1,retinue",
     "NODE_EXTRA_CA_CERTS": "/etc/egress-audit/certs/egress-ca-cert.pem",
     "SSL_CERT_FILE": "/etc/egress-audit/certs/egress-ca-cert.pem",
     "REQUESTS_CA_BUNDLE": "/etc/egress-audit/certs/egress-ca-cert.pem",
-    "ANTHROPIC_API_KEY": "sk-ant-model-credential",
-    "ANTHROPIC_AUTH_TOKEN": "gateway-token",
-    # The known-external host, so the gateway's model picker never phones out
-    # of the test (it skips api.anthropic.com by design).
-    "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+    # the model credential and endpoint, Claude Code's own settings
+    "ANTHROPIC_API_KEY": "sk-ant-api",
+    "ANTHROPIC_AUTH_TOKEN": "oauth-or-gateway-token",
+    "ANTHROPIC_BASE_URL": "http://litellm:4000",
     "ANTHROPIC_CUSTOM_HEADERS": "x-litellm-api-key: Bearer sk-retinue",
     "ANTHROPIC_MODEL": "retinue-claude",
-    "RETINUE_CLAUDE_MODEL": "retinue-claude",
-    "RETINUE_TRIAGE_MODEL": "sonnet",
-    "RETINUE_MEMORY": "1",
-    "CLAUDE_PERMISSION_MODE": "acceptEdits",
     "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "CLAUDE_PERMISSION_MODE": "acceptEdits",
+    "CLAUDE_CRED_FILE": "/root/.claude/.credentials.json",
     "DISABLE_AUTOUPDATER": "1",
+    # the framework's own namespaces
+    "RETINUE_CLAUDE_MODEL": "retinue-claude",
+    "RETINUE_ROUTER_MODEL": "haiku",
+    "RETINUE_FRONTIER_MODEL": "opus",
+    "RETINUE_MEMORY": "1",
     "SPARQL_ENDPOINT_LIFE": "http://qlever-life:7001",
-    "SPARQL_ENDPOINT_LIFE_DESC": "the life store",
+    "SPARQL_ENDPOINT_LIFE_DESC": "general-purpose life store",
     "CHAMBERS_DIR": "/workspace/chambers",
+    "QLEVER_LIFE_URL": "http://qlever-life:7001",
     "WEB_GATEWAY_PORT": "8080",
-    "CONVERSATION_BACKEND_TOKEN": "conversation-capability",
+    # capability tokens and the services they open
+    "EMAIL_BACKEND_TOKEN": "email-cap",
+    "CONVERSATION_BACKEND_TOKEN": "conv-cap",
     "CONVERSATION_BASE_URL": "https://agents.example.com",
     "SEND_APPROVAL_BASE_URL": "https://agents.example.com",
-    "EMAIL_BACKEND_TOKEN": "email-capability",
-    "SENT_FOLDER": "Sent",
+    "NEWS_INGEST_TOKEN": "news-cap",
     "NEWS_INGEST_URL": "http://retinue:8080/internal/news",
-    "NEWS_INGEST_TOKEN": "news-capability",
     "NEWS_DIR": "/root/.retinue/news",
-    "TRIAGE_STATE_DIR": "/root/.retinue/triage",
+    "CHATS_INGEST_TOKEN": "chats-cap",
+    "UPDATER_TOKEN": "updater-cap",
     "UPDATER_URL": "http://updater:9000/update",
-    "UPDATER_TOKEN": "updater-capability",
+    "SIGNAL_GATEWAY_TOKEN": "signal-cap",
     "SIGNAL_GATEWAY_SEND_URL": "http://signal-gateway:8090/send",
     "SIGNAL_GATEWAY_BASE_URL": "http://signal-gateway:8090",
-    "SIGNAL_GATEWAY_TOKEN": "signal-capability",
     "SIGNAL_DEFAULT_RECIPIENT": "+15551234567",
-    "WHATSAPP_GATEWAY_SEND_URL": "http://whatsapp-gateway:8092/send",
-    "WHATSAPP_GATEWAY_BASE_URL": "http://whatsapp-gateway:8092",
-    "WHATSAPP_GATEWAY_TOKEN": "whatsapp-capability",
-    "TELEGRAM_GATEWAY_SEND_URL": "http://telegram-gateway:8093/send",
-    "TELEGRAM_GATEWAY_BASE_URL": "http://telegram-gateway:8093",
-    "TELEGRAM_GATEWAY_TOKEN": "telegram-capability",
-    "CALDAV_GATEWAY_TOKEN": "caldav-capability",
-    "GITHUB_TOKEN": "ghp_repo-token",
+    "WHATSAPP_GATEWAY_TOKEN": "wa-cap",
+    "TELEGRAM_GATEWAY_TOKEN": "tg-cap",
+    "CALDAV_GATEWAY_TOKEN": "caldav-cap",
+    # non-secret mailbox setting the triage gate lists by name
+    "SENT_FOLDER": "Sent",
+    "TRIAGE_STATE_DIR": "/root/.retinue/triage",
+    # git shim and python
+    "GIT_SERIALIZE_LOCK_DIR": "/tmp/git-locks",
+    "PYTHONPATH": "/workspace/scripts",
+    # Garmin stays until the fetch moves into a sidecar
     "GARMIN_EMAIL": "you@example.com",
-    "GARMIN_PASSWORD": "garmin-password",
+    "GARMIN_PASSWORD": "garmin-pw",
 }
 
-# Set by the gateway backend rewrite, never copied from the spawner.
-EMAIL_BACKEND_URL = "http://localhost:8080/internal/email"
+# Non-secret configuration that only the daemons read: dropped too, because
+# nothing in a session needs it — the list is what a session needs, not what
+# is harmless.
+DAEMON_ONLY = {
+    "EMAIL_USER": "you@example.com",
+    "IMAP_HOST": "imap.example.com",
+    "SMTP_HOST": "smtp.example.com",
+    "EMAIL_SEND_POLICY": "[]",
+    "MESSENGER_GATEWAYS": '[{"base_url":"http://x:1","token":"t"}]',
+    "SCHEDULER_TICK_SECONDS": "30",
+    "GATEWAY_BASIC_AUTH_SCOPES": "ara-mcp:ara.example.com",
+    "ARA_MCP_ENABLED": "1",
+    "VAPID_SUBJECT": "mailto:admin@example.com",
+}
 
 
-def _assert_session_env(env: dict, where: str) -> None:
-    """The contract every spawner has to meet."""
-    leaked = sorted(name for name in SECRETS if name in env)
-    assert not leaked, f"{where}: secrets reached the session: {leaked}"
+def _source(**overrides):
+    src = {**SECRETS, **NEEDED, **DAEMON_ONLY}
+    src.update(overrides)
+    return src
+
+
+def test_secrets_never_pass():
+    env = se.build(_source())
+    leaked = sorted(n for n in SECRETS if n in env)
+    assert not leaked, f"secrets inherited by the session: {leaked}"
+    # Not merely renamed or re-keyed: no secret value survives anywhere.
+    joined = "\n".join(env.values())
+    for name, value in SECRETS.items():
+        assert value not in joined, f"value of {name} reached the session"
+    print("ok: no credential in the container environment reaches a session")
+
+
+def test_needed_variables_pass_verbatim():
+    env = se.build(_source())
+    missing = sorted(n for n in NEEDED if n not in env)
+    assert not missing, f"session lost variables it needs: {missing}"
     for name, value in NEEDED.items():
-        assert env.get(name) == value, f"{where}: {name} missing or changed: {env.get(name)!r}"
-    assert env.get("EMAIL_BACKEND_URL") == EMAIL_BACKEND_URL, \
-        f"{where}: email_client.py is not pointed at the gateway backend"
+        assert env[name] == value, (name, env[name])
+    print("ok: process basics, proxy/CA, model, framework and capability "
+          "variables pass unchanged")
 
 
-# ── The module on a plain mapping ────────────────────────────────────────────
-
-def test_drops_secrets_and_keeps_what_a_session_needs():
-    source = {**SECRETS, **NEEDED, "http_proxy": "http://egress-audit:8080"}
-    env = se.session_environment(source)
-    _assert_session_env(env, "module")
-    # curl reads the lowercase name; the compose file sets the uppercase one.
-    assert env["http_proxy"] == "http://egress-audit:8080"
-    # Nothing unlisted rides along: the output is the allowlist and the one
-    # rewrite, not "the input minus a denylist".
-    assert set(env) == set(NEEDED) | {"http_proxy", "EMAIL_BACKEND_URL"}, \
-        sorted(set(env) - set(NEEDED))
-    print("PASS secrets are dropped, the needed variables pass verbatim")
+def test_daemon_only_configuration_is_dropped():
+    env = se.build(_source())
+    passed = sorted(n for n in DAEMON_ONLY if n in env)
+    assert not passed, f"daemon-only configuration reached the session: {passed}"
+    print("ok: what only the daemons read stays with the daemons")
 
 
-def test_withholds_the_secret_under_an_allowed_prefix():
-    env = se.session_environment({"RETINUE_LITELLM_KEY": "sk-picker",
-                                  "RETINUE_LITELLM_URL": "http://litellm:4000",
-                                  "RETINUE_ROUTER_MODEL": "haiku"})
+def test_prefixes_admit_the_framework_namespaces():
+    src = _source(RETINUE_TRIAGE_MODEL="sonnet", RETINUE_ANYTHING_NEW="x",
+                  SPARQL_ENDPOINT_GENOMICS="http://qlever-genomics:7001",
+                  CLAUDE_CODE_FUTURE_FLAG="1", ANTHROPIC_SMALL_FAST_MODEL="haiku",
+                  LC_MESSAGES="C", NEWS_MAX_ITEMS="500", TRIAGE_INBOX_SCAN_LIMIT="50",
+                  GIT_AUTHOR_NAME="Ara", PYTHONUNBUFFERED="1")
+    env = se.build(src)
+    for name in ("RETINUE_TRIAGE_MODEL", "RETINUE_ANYTHING_NEW",
+                 "SPARQL_ENDPOINT_GENOMICS", "CLAUDE_CODE_FUTURE_FLAG",
+                 "ANTHROPIC_SMALL_FAST_MODEL", "LC_MESSAGES", "NEWS_MAX_ITEMS",
+                 "TRIAGE_INBOX_SCAN_LIMIT", "GIT_AUTHOR_NAME", "PYTHONUNBUFFERED"):
+        assert name in env, name
+    # A prefix never admits the one key that lives under an allowed namespace.
     assert "RETINUE_LITELLM_KEY" not in env
-    assert env["RETINUE_ROUTER_MODEL"] == "haiku"
-    assert env["RETINUE_LITELLM_URL"] == "http://litellm:4000"
-    print("PASS RETINUE_LITELLM_KEY is withheld although RETINUE_* passes")
+    print("ok: the RETINUE_/CLAUDE_/ANTHROPIC_/SPARQL_ENDPOINT_ namespaces pass, "
+          "minus the excluded key")
 
 
-def test_clears_the_per_spawn_stamps():
-    """A stale stamp would mislabel memories or offer an escalation to the
-    tier that has nobody above it; the spawner sets them itself."""
-    env = se.session_environment({"RETINUE_SESSION_MODEL": "stale",
-                                  "RETINUE_ESCALATE_FILE": "/tmp/stale-flag",
-                                  "RETINUE_CLAUDE_MODEL": "opus"})
+def test_excluded_names_are_prefix_matches():
+    """An exclusion that no prefix reaches is dead code — and a sign the
+    secret was renamed out from under the list."""
+    for name in se.SESSION_ENV_EXCLUDED:
+        assert name.startswith(se.SESSION_ENV_PREFIXES), name
+        assert name not in se.SESSION_ENV_NAMES, name
+    print("ok: every exclusion shadows a prefix match, none is dead")
+
+
+def test_gateway_client_suffixes_cover_deployment_added_gateways():
+    src = _source(FOO_GATEWAY_TOKEN="foo-cap", FOO_GATEWAY_BASE_URL="http://foo:1",
+                  FOO_GATEWAY_SEND_URL="http://foo:1/send",
+                  FOO_GATEWAY_CREATE_URL="http://foo:1/create",
+                  FOO_GATEWAY_TIMEOUT="30", FOO_DEFAULT_RECIPIENT="+1",
+                  # the gateway's own side, never in this container by design
+                  FOO_GATEWAY_MODE="inbox", FOO_ACCOUNT="+2",
+                  FOO_SEND_POLICY="[]", FOO_PASSWORD="pw")
+    env = se.build(src)
+    for name in ("FOO_GATEWAY_TOKEN", "FOO_GATEWAY_BASE_URL", "FOO_GATEWAY_SEND_URL",
+                 "FOO_GATEWAY_CREATE_URL", "FOO_GATEWAY_TIMEOUT",
+                 "FOO_DEFAULT_RECIPIENT"):
+        assert name in env, name
+    for name in ("FOO_GATEWAY_MODE", "FOO_ACCOUNT", "FOO_SEND_POLICY", "FOO_PASSWORD"):
+        assert name not in env, name
+    print("ok: a deployment's extra gateway enrols its client side by suffix only")
+
+
+def test_per_spawn_stamps_are_never_inherited():
+    src = _source(RETINUE_SESSION_MODEL="stale-model",
+                  RETINUE_ESCALATE_FILE="/tmp/stale-flag")
+    env = se.build(src)
     assert "RETINUE_SESSION_MODEL" not in env
     assert "RETINUE_ESCALATE_FILE" not in env
-    assert env["RETINUE_CLAUDE_MODEL"] == "opus"
-    print("PASS the per-spawn stamps are never inherited")
-
-
-def test_escape_hatch_passes_named_variables():
-    source = {"RETINUE_SESSION_ENV_EXTRA": " MY_CHAMBER_API_KEY, ,OTHER_KEY ",
-              "MY_CHAMBER_API_KEY": "chamber-secret",
-              "OTHER_KEY": "other",
-              "NOT_LISTED": "dropped"}
-    env = se.session_environment(source)
-    assert env["MY_CHAMBER_API_KEY"] == "chamber-secret"
-    assert env["OTHER_KEY"] == "other"
-    assert "NOT_LISTED" not in env
-    # The list itself travels (a RETINUE_* name), so a session-side script
-    # that spawns its own `claude -p` sees the operator's decision too.
-    assert env["RETINUE_SESSION_ENV_EXTRA"] == source["RETINUE_SESSION_ENV_EXTRA"]
-    # An explicit operator decision overrides the withheld set.
-    env = se.session_environment({"RETINUE_SESSION_ENV_EXTRA": "RETINUE_LITELLM_KEY",
-                                  "RETINUE_LITELLM_KEY": "sk-picker"})
-    assert env["RETINUE_LITELLM_KEY"] == "sk-picker"
-    # Unset or empty: nothing extra, no error.
-    assert "X" not in se.session_environment({"X": "1", "RETINUE_SESSION_ENV_EXTRA": ""})
-    assert "X" not in se.session_environment({"X": "1"})
-    print("PASS RETINUE_SESSION_ENV_EXTRA passes exactly the named variables")
-
-
-def test_points_email_client_at_the_gateway_backend():
-    """A session holds no mailbox password, so it must reach mail through the
-    process that does — on the gateway's actual port."""
-    env = se.session_environment({"EMAIL_BACKEND_TOKEN": "t", "WEB_GATEWAY_PORT": "9090",
-                                  "EMAIL_BACKEND_URL": "http://stale:1/internal/email"})
-    assert env["EMAIL_BACKEND_URL"] == "http://localhost:9090/internal/email"
-    assert env["EMAIL_BACKEND_TOKEN"] == "t"
-    # Default port when the variable is absent.
-    assert se.session_environment({"EMAIL_BACKEND_TOKEN": "t"})["EMAIL_BACKEND_URL"] \
-        == "http://localhost:8080/internal/email"
-    # No backend token, no rewrite: whatever the spawner had passes through.
-    assert "EMAIL_BACKEND_URL" not in se.session_environment({"WEB_GATEWAY_PORT": "8080"})
-    env = se.session_environment({"EMAIL_BACKEND_URL": "http://elsewhere/internal/email"})
-    assert env["EMAIL_BACKEND_URL"] == "http://elsewhere/internal/email"
-    print("PASS email_client.py is pointed at the gateway backend")
-
-
-def test_default_source_is_this_process():
-    os.environ["RETINUE_SESSION_ENV_PROBE"] = "seen"
-    try:
-        assert se.session_environment()["RETINUE_SESSION_ENV_PROBE"] == "seen"
-    finally:
-        del os.environ["RETINUE_SESSION_ENV_PROBE"]
-    print("PASS the default source is os.environ")
-
-
-# ── The three spawners ───────────────────────────────────────────────────────
-
-def _seed_process_environment(tmp: Path) -> None:
-    """Make this process look like a daemon forked with the whole .env."""
-    os.environ.update(SECRETS)
-    os.environ.update(NEEDED)
-    # Sandbox the pre-spawn credential refresh and every state file the
-    # modules read at import (the sibling spawn tests do the same).
-    os.environ["CLAUDE_CRED_FILE"] = str(tmp / "claude" / ".credentials.json")
-    os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")
-    (tmp / "chambers").mkdir(parents=True, exist_ok=True)
-    NEEDED["CHAMBERS_DIR"] = os.environ["CHAMBERS_DIR"]
-
-
-def _load(name: str, filename: str):
-    if "markdown_it" not in sys.modules:
-        try:
-            import markdown_it  # noqa: F401
-        except ImportError:
-            stub = types.ModuleType("markdown_it")
-            stub.MarkdownIt = object
-            sys.modules["markdown_it"] = stub
-    spec = importlib.util.spec_from_file_location(name, SCRIPTS_DIR / filename)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-class _Result:
-    def __init__(self, returncode=0, stdout="", stderr=""):
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-class _Proc:
-    pid = 4242
-    returncode = 0
-
-    def communicate(self, timeout=None):
-        return "{}", ""
-
-
-def check_scheduler(tmp: Path):
-    os.environ["SCHEDULER_STATE_DIR"] = str(tmp / "sched-state")
-    os.environ["BASE_SCHEDULE"] = str(tmp / "no-base-schedule.json")
-    os.environ["RETINUE_ROUTER_MODEL"] = "haiku"
-    sched = _load("scheduler_session_env_under_test", "scheduler.py")
-
-    env = sched.job_env("sonnet")
-    _assert_session_env(env, "scheduler job_env")
+    env = se.build(src, model="sonnet", escalate_file=Path("/tmp/flag-1"))
     assert env["RETINUE_SESSION_MODEL"] == "sonnet"
-    assert "RETINUE_SESSION_MODEL" not in sched.job_env(""), "a job without --model carries no stamp"
-    assert "RETINUE_ESCALATE_FILE" not in env
-
-    # And a real prompt job hands exactly that environment to Popen.
-    spawned = {}
-
-    def fake_spawn(cmd, **kwargs):
-        spawned["cmd"], spawned["env"] = cmd, kwargs["env"]
-        return _Proc()
-
-    sched.spawn_process = fake_spawn
-    sched.claude_auth.ensure_fresh_credentials = lambda **kw: {"action": "fresh"}
-    sched.run_job({"id": "probe", "prompt": "hello", "interval_seconds": 60,
-                   "_source": str(tmp / "chambers" / "x" / ".schedule.json")})
-    _assert_session_env(spawned["env"], "scheduler run_job")
-    assert spawned["env"]["RETINUE_SESSION_MODEL"] == "haiku", spawned["env"].get("RETINUE_SESSION_MODEL")
-    # A command job (a script, not claude) is spawned with the same environment.
-    sched.run_job({"id": "probe-cmd", "command": "true", "interval_seconds": 60,
-                   "_source": str(tmp / "chambers" / "x" / ".schedule.json")})
-    _assert_session_env(spawned["env"], "scheduler command job")
-    assert "RETINUE_SESSION_MODEL" not in spawned["env"]
-    print("PASS the scheduler spawns jobs with the allowlisted environment")
+    assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-1"
+    # An empty model is "no stamp", not the inherited one.
+    assert "RETINUE_SESSION_MODEL" not in se.build(src, model="")
+    # Nor can the escape hatch bring a stale one back: naming the stamp or
+    # the flag there, verbatim or by wildcard, admits configuration only.
+    for extra in ("RETINUE_SESSION_MODEL,RETINUE_ESCALATE_FILE", "RETINUE_*"):
+        hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
+        env = se.build(hatch, model="")
+        assert "RETINUE_SESSION_MODEL" not in env, extra
+        assert "RETINUE_ESCALATE_FILE" not in env, extra
+        env = se.build(hatch, model="sonnet", escalate_file="/tmp/flag-2")
+        assert env["RETINUE_SESSION_MODEL"] == "sonnet", extra
+        assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-2", extra
+    print("ok: the model stamp and the escalation flag are set per spawn, "
+          "never inherited — not even through the escape hatch")
 
 
-def check_ara_mcp(tmp: Path):
-    os.environ["ARA_MCP_STATE_DIR"] = str(tmp / "ara-mcp")
-    os.environ["ARA_MCP_AUDIT"] = "0"
-    os.environ["ARA_MCP_SYNC_WAIT"] = "1"
-    mcp = _load("ara_mcp_session_env_under_test", "ara-mcp-server.py")
-    captured = {}
-
-    def fake_run(cmd, **kwargs):
-        captured["env"] = kwargs["env"]
-        raise RuntimeError("stop before exec")
-
-    mcp.subprocess.run = fake_run
-    mcp.claude_auth.ensure_fresh_credentials = lambda **kw: {"action": "fresh"}
-    flag = tmp / "ara-mcp-escalate-flag"
-    status, _text = mcp._run_once("what is due?", "haiku", flag)
-    assert status == "error", status  # the fake stopped it; the env was built first
-    _assert_session_env(captured["env"], "ara-mcp _run_once")
-    assert captured["env"]["RETINUE_SESSION_MODEL"] == "haiku"
-    assert captured["env"]["RETINUE_ESCALATE_FILE"] == str(flag)
-    # Senior's re-run: no model stamp when none is pinned, no escape hatch.
-    mcp._run_once("what is due?", "", None)
-    assert "RETINUE_SESSION_MODEL" not in captured["env"]
-    assert "RETINUE_ESCALATE_FILE" not in captured["env"]
-    print("PASS the Ask-Ara answering session gets the allowlisted environment")
+def test_email_goes_through_the_gateway_backend():
+    # The spawner holds the token: the session is pointed at the backend, and
+    # a stale inherited URL does not survive.
+    env = se.build(_source(EMAIL_BACKEND_URL="http://stale:1/internal/email",
+                           WEB_GATEWAY_PORT="8181"))
+    assert env["EMAIL_BACKEND_URL"] == "http://localhost:8181/internal/email"
+    assert env["EMAIL_BACKEND_TOKEN"] == "email-cap"
+    # The port default matches the entrypoint's.
+    src = _source()
+    del src["WEB_GATEWAY_PORT"]
+    assert se.build(src)["EMAIL_BACKEND_URL"] == "http://localhost:8080/internal/email"
+    # No token (interactive mode): nothing is invented, an explicit URL passes.
+    src = _source()
+    del src["EMAIL_BACKEND_TOKEN"]
+    assert "EMAIL_BACKEND_URL" not in se.build(src)
+    src["EMAIL_BACKEND_URL"] = "http://elsewhere:1/internal/email"
+    assert se.build(src)["EMAIL_BACKEND_URL"] == "http://elsewhere:1/internal/email"
+    print("ok: email_client.py in a session is routed through the gateway backend")
 
 
-def check_web_gateway(tmp: Path):
-    for var in ("RETINUE_CONVERSATION_MODELS", "RETINUE_LITELLM_URL"):
-        os.environ.pop(var, None)
-    os.environ["CONVERSATIONS_DIR"] = str(tmp / "convs")
-    os.environ["CONVERSATION_DIR"] = str(tmp / "convlog")
-    os.environ["WEB_GATEWAY_STATE"] = str(tmp / "state" / "state.json")
-    os.environ["RETINUE_ROUTER_MODEL"] = "haiku"
-    os.environ["RETINUE_FRONTIER_MODEL"] = "opus"
-    wg = _load("web_gateway_session_env_under_test", "web-gateway.py")
-    wg.claude_auth.ensure_fresh_credentials = lambda **kw: {"action": "fresh"}
-    spawns = []
+def test_escape_hatch_admits_what_a_deployment_names():
+    src = _source(MY_CHAMBER_KEY="k", OTHER_THING="t", OTHERX="no",
+                  RETINUE_SESSION_ENV_EXTRA="MY_CHAMBER_KEY, OTHER_*")
+    env = se.build(src)
+    assert env["MY_CHAMBER_KEY"] == "k"
+    assert env["OTHER_THING"] == "t"
+    assert "OTHERX" not in env, "a wildcard is a prefix, not a substring"
+    # The hatch itself travels along, so a session that spawns a session
+    # (news-curate.py under the scheduler) applies the same extras.
+    assert env["RETINUE_SESSION_ENV_EXTRA"] == "MY_CHAMBER_KEY, OTHER_*"
+    # Naming a variable is the operator's decision and wins over the built-in
+    # exclusion; a wildcard does not — it is not a decision about that name.
+    env = se.build(_source(RETINUE_SESSION_ENV_EXTRA="RETINUE_LITELLM_KEY"))
+    assert env["RETINUE_LITELLM_KEY"] == "sk-picker"
+    env = se.build(_source(RETINUE_SESSION_ENV_EXTRA="RETINUE_*"))
+    assert "RETINUE_LITELLM_KEY" not in env
+    # Whitespace-separated and a lone `*` are tolerated, and neither widens
+    # the list to everything.
+    env = se.build(_source(RETINUE_SESSION_ENV_EXTRA="  MY_CHAMBER_KEY *  ",
+                           MY_CHAMBER_KEY="k"))
+    assert env["MY_CHAMBER_KEY"] == "k"
+    assert "EMAIL_PASS" not in env
+    print("ok: RETINUE_SESSION_ENV_EXTRA admits named variables and prefixes only")
 
-    def fake_run(cmd, **kwargs):
-        env = kwargs["env"]
-        spawns.append((cmd, env))
-        # Junior escalates on her first turn: she creates the flag file.
-        if len(spawns) == 1 and env.get("RETINUE_ESCALATE_FILE"):
-            Path(env["RETINUE_ESCALATE_FILE"]).write_text("")
-        return _Result(stdout=json.dumps({"session_id": "s1", "result": "done"}))
 
-    wg.subprocess.run = fake_run
-    out = wg.send_message("hello", session_key="conv:session-env")
-    assert out.get("escalated") is True, out
-    assert len(spawns) == 2, [c[:4] for c, _ in spawns]
-    junior_cmd, junior_env = spawns[0]
-    senior_cmd, senior_env = spawns[1]
-    _assert_session_env(junior_env, "web-gateway dashboard turn (junior)")
-    _assert_session_env(senior_env, "web-gateway dashboard turn (senior)")
-    assert junior_env["RETINUE_SESSION_MODEL"] == "haiku" and "--model" in junior_cmd
-    assert junior_env["RETINUE_ESCALATE_FILE"], "junior must be offered the escape hatch"
-    assert senior_env["RETINUE_SESSION_MODEL"] == "opus"
-    assert "RETINUE_ESCALATE_FILE" not in senior_env, "senior has nobody to escalate to"
+def test_default_source_is_the_process_environment():
+    os.environ["FUTURE_SERVICE_PASSWORD"] = "leak?"
+    os.environ["RETINUE_PROBE"] = "seen"
+    try:
+        env = se.build()
+        assert "FUTURE_SERVICE_PASSWORD" not in env
+        assert env["RETINUE_PROBE"] == "seen"
+        assert env["PATH"] == os.environ["PATH"]
+    finally:
+        del os.environ["FUTURE_SERVICE_PASSWORD"]
+        del os.environ["RETINUE_PROBE"]
+    print("ok: build() without a source reads os.environ")
 
-    # The cheap passes spawn through _run_claude without an env of their own
-    # and must get the allowlist by default, not the gateway's environment.
-    spawns.clear()
 
-    def fake_lint(cmd, **kwargs):
-        spawns.append((cmd, kwargs["env"]))
-        message = cmd[-1].split("Message to lint:\n", 1)[-1]
-        return _Result(stdout=json.dumps({"result": message}))
-
-    wg.subprocess.run = fake_lint
-    text = "Approve the pending send at /sends when you have a moment, please."
-    assert wg._lint_presentation(text) == text
-    _assert_session_env(spawns[-1][1], "web-gateway presentation lint")
-    assert "RETINUE_ESCALATE_FILE" not in spawns[-1][1]
-
-    def fake_cleanup(cmd, **kwargs):
-        spawns.append((cmd, kwargs["env"]))
-        return _Result(stdout=json.dumps({"result": "raw transcript, repaired."}))
-
-    wg.subprocess.run = fake_cleanup
-    assert wg._cleanup_transcript("raw transcript repaired") == "raw transcript, repaired."
-    _assert_session_env(spawns[-1][1], "web-gateway transcript cleanup")
-    print("PASS the web gateway spawns every claude with the allowlisted environment")
+def test_cli_prints_names_never_values():
+    os.environ["FUTURE_SERVICE_PASSWORD"] = "the-secret-value"
+    os.environ["RETINUE_PROBE"] = "the-probe-value"
+    try:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert se.main([]) == 0
+        names = out.getvalue().split()
+        assert "RETINUE_PROBE" in names and "FUTURE_SERVICE_PASSWORD" not in names
+        assert "the-probe-value" not in out.getvalue()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            assert se.main(["--dropped"]) == 0
+        dropped = out.getvalue().split()
+        assert "FUTURE_SERVICE_PASSWORD" in dropped and "RETINUE_PROBE" not in dropped
+        assert "the-secret-value" not in out.getvalue()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            assert se.main(["--values"]) == 2
+    finally:
+        del os.environ["FUTURE_SERVICE_PASSWORD"]
+        del os.environ["RETINUE_PROBE"]
+    print("ok: the diagnostic lists names and never a value")
 
 
 def main():
-    test_drops_secrets_and_keeps_what_a_session_needs()
-    test_withholds_the_secret_under_an_allowed_prefix()
-    test_clears_the_per_spawn_stamps()
-    test_escape_hatch_passes_named_variables()
-    test_points_email_client_at_the_gateway_backend()
-    test_default_source_is_this_process()
-    with tempfile.TemporaryDirectory() as td:
-        tmp = Path(td)
-        _seed_process_environment(tmp)
-        check_scheduler(tmp / "sched")
-        check_ara_mcp(tmp / "mcp")
-        check_web_gateway(tmp / "wg")
+    test_secrets_never_pass()
+    test_needed_variables_pass_verbatim()
+    test_daemon_only_configuration_is_dropped()
+    test_prefixes_admit_the_framework_namespaces()
+    test_excluded_names_are_prefix_matches()
+    test_gateway_client_suffixes_cover_deployment_added_gateways()
+    test_per_spawn_stamps_are_never_inherited()
+    test_email_goes_through_the_gateway_backend()
+    test_escape_hatch_admits_what_a_deployment_names()
+    test_default_source_is_the_process_environment()
+    test_cli_prints_names_never_values()
     print("all session-env tests passed")
 
 
