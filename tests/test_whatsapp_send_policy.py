@@ -273,35 +273,36 @@ def test_atomic_write_never_exposes_torn_json():
             return real_replace(src, dst)
 
         wg.os.replace = _pause_before_replace
-        writer_errors = []
+        try:
+            writer_errors = []
 
-        def _writer():
-            try:
-                wg._write_pending_send(path, new_entry)
-            except BaseException as exc:  # noqa: BLE001
-                writer_errors.append(exc)
+            def _writer():
+                try:
+                    wg._write_pending_send(path, new_entry)
+                except BaseException as exc:  # noqa: BLE001
+                    writer_errors.append(exc)
 
-        thread = threading.Thread(target=_writer)
-        thread.start()
-        assert entered_replace.wait(timeout=5.0), "writer never reached os.replace"
+            thread = threading.Thread(target=_writer)
+            thread.start()
+            assert entered_replace.wait(timeout=5.0), "writer never reached os.replace"
 
-        observed = []
-        for _ in range(100):
-            detail = wg._get_pending_send_detail(rid)
-            assert detail is not None, "reader observed unreadable entry during write"
-            observed.append(detail["status"])
-            time.sleep(0.001)
+            observed = []
+            for _ in range(100):
+                detail = wg._get_pending_send_detail(rid)
+                assert detail is not None, "reader observed unreadable entry during write"
+                observed.append(detail["status"])
+                time.sleep(0.001)
 
-        allow_replace.set()
-        thread.join(timeout=5.0)
-        assert not thread.is_alive(), "writer thread did not finish"
-        assert not writer_errors, writer_errors
+            allow_replace.set()
+            thread.join(timeout=5.0)
+            assert not thread.is_alive(), "writer thread did not finish"
+            assert not writer_errors, writer_errors
 
-        assert set(observed) <= {"pending", "approved"}, observed
-        assert "pending" in observed, observed
-        assert wg._get_pending_send_detail(rid)["status"] == "approved"
-
-        wg.os.replace = real_replace
+            assert set(observed) <= {"pending", "approved"}, observed
+            assert "pending" in observed, observed
+            assert wg._get_pending_send_detail(rid)["status"] == "approved"
+        finally:
+            wg.os.replace = real_replace
     print("ok: atomic write never exposes torn json")
 
 
