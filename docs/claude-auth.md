@@ -12,7 +12,7 @@ that replaces the console procedure.
 
 ## Why sign-ins end
 
-Three distinct mechanisms:
+Four distinct mechanisms:
 
 1. **The refresh token has a fixed lifetime.** The credential file records it
    (`claudeAiOauth.refreshTokenExpiresAt`). Access tokens are refreshed
@@ -69,15 +69,37 @@ Three distinct mechanisms:
    session and with it this failure mode; there, the pre-spawn refresh below
    is what keeps its window small.
 
+4. **A background loop holds the credentials on a timer.** Not every `claude`
+   invocation is a session: `claude plugin …`, like any other subcommand,
+   reads the shared credential file and refreshes an access token near expiry.
+   A loop that runs one on a fixed cadence is therefore a token-rotating actor
+   that no spawn discipline covers, and it wins by sheer frequency — a session
+   starts a few dozen times a day, a 60 s loop 1440 times. Observed on
+   2026-09-14, after mechanism 3 had been closed: the deployment ran for five
+   hours with no session at all, the plugin sync's `claude plugin marketplace
+   update` fired every minute throughout, and at ~00:25 — the moment the
+   access token expired — it was the process that presented the rotated
+   refresh token, got it refused, and left the credential file cleared. The
+   entrypoint watcher found its backup already marked rejected and gave up, so
+   the deployment stayed signed out until the owner re-logged in six hours
+   later. The rule this yields: **anything that runs `claude` on a timer must
+   only run it when it has work**, and must take the pre-spawn refresh when it
+   does. `scripts/sync-plugins.py` compares the plugin trees in plain Python
+   first and starts no CLI at all on a pass with no drift.
+
 ## The pre-spawn refresh (`claude_auth.py refresh`)
 
-Every `claude` process the framework starts — the scheduler's prompt jobs
-(`scripts/scheduler.py`), every gateway spawn (`_run_claude()` in
+Every `claude` process the framework starts — every scheduler job, prompt or
+command (`scripts/scheduler.py`; a command job gets the refresh whether or not
+its script loads a model, because the scheduler cannot know, and a chamber's
+script cannot be required to know about `claude_auth`), every gateway spawn (`_run_claude()` in
 `scripts/web-gateway.py`: conversation turns, transcript cleanup, the
 presentation lint), the base-job scripts (`agent-self-review.py`,
 `news-curate.py`, `triage-gate.py`), Ask-Ara answers (`ara-mcp-server.py`),
-the remote-control session itself (the entrypoint, right before `exec`) and
-sub-sessions from the `spawn-session` skill — first calls
+the chamber plugin sync when it has an install to do
+(`scripts/sync-plugins.py`), the remote-control session itself (the
+entrypoint, right before `exec`) and sub-sessions from the `spawn-session`
+skill — first calls
 `claude_auth.ensure_fresh_credentials()`. It reads the credential file and,
 only when the access token expires within `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS`
 (default 900):

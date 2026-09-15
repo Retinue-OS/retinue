@@ -316,14 +316,20 @@ def run_job(job: dict) -> None:
     log(f"[run] {jid} ({kind}{model_note}) from {Path(job['_source']).parent.name}")
     started = now()
     try:
-        if kind == "prompt":
-            # A session started on an access token about to expire refreshes
-            # it at once, racing every other claude process for the one
-            # rotation (docs/claude-auth.md). Refresh first — once, under the
-            # lock all framework spawners share — so the child never has to;
-            # a failure only logs, and the child then refreshes for itself.
-            claude_auth.ensure_fresh_credentials(
-                log=lambda msg: log(f"[auth] {jid}: {msg}"))
+        # A `claude` started on an access token about to expire refreshes it
+        # at once, racing every other claude process for the one rotation
+        # (docs/claude-auth.md). Refresh first — once, under the lock all
+        # framework spawners share — so the child never has to; a failure only
+        # logs, and the child then refreshes for itself.
+        #
+        # Command jobs get this too, even though most of them never load a
+        # model: a job script that does spawn `claude` may be a chamber's, and
+        # a chamber cannot be required to know about claude_auth — one
+        # unguarded hourly spawn is enough to sign the whole deployment out.
+        # The call is idempotent and, away from expiry, one file read, so the
+        # scripts that already refresh for themselves pay nothing for it.
+        claude_auth.ensure_fresh_credentials(
+            log=lambda msg: log(f"[auth] {jid}: {msg}"))
         proc = spawn_process(
             cmd,
             retry_enoent=(kind == "prompt"),
