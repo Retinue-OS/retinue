@@ -253,9 +253,32 @@ credits):
 
 ### Messenger — gateway-owned store + delivery flag (push)
 
-Signal / WhatsApp / Telegram have **no queryable backlog** — a message exists
-only at the instant the gateway receives it. So the messenger backlog is
-**synthesized in the life store**, and the gateway owns it.
+On messenger the gateway **cannot ask for a message twice**. Each transport
+hands one over exactly once, when the client is connected, and will not hand it
+over again — so from that moment the gateway's own record is the only copy.
+There is nothing to query later the way IMAP is queried. So the messenger
+backlog is **synthesized in the life store**, and the gateway owns it.
+
+That is not the same as losing what arrives while the system is down. All three
+transports queue for an offline client and deliver the queue on reconnect:
+signal-cli's `receive` drains it, Telethon fetches the updates it missed and
+replays them as ordinary new-message events, and neonize does the same. The
+gateway still only ever sees a message as it arrives — it just arrives later
+than it was sent, and the gate decides on it then.
+
+The three differ in what they *could* offer, which is worth stating plainly
+because the constraint above is a choice for one of them:
+
+| Channel | History available to this client |
+|---|---|
+| Signal | none — signal-cli keeps no queryable message history |
+| WhatsApp | none exposed to neonize |
+| Telegram | **yes** — Telethon can read it; this gateway deliberately does not |
+
+The Telegram gateway reads `iter_dialogs` for the conversation list and never
+reads messages that way. Nothing below depends on that staying true: the
+synthesized backlog is what the gate and the daily drain work from on every
+channel, so a future history read would be an extra source, not a replacement.
 
 **Write path — one volume per gateway, not one across all of them.** Each gateway
 has its **own** volume; three gateways → three independent volumes, so Signal's
