@@ -38,6 +38,7 @@ class FakeNotifier:
         self.fail = fail
         self.opened = []    # (title, message)
         self.appended = []  # (thread_id, message)
+        self.quiet_flags = []  # one per append, in order
         self._next_id = 0
 
     def open_thread(self, title, message):
@@ -47,10 +48,11 @@ class FakeNotifier:
         self._next_id += 1
         return f"thread{self._next_id}"
 
-    def append(self, thread_id, message):
+    def append(self, thread_id, message, quiet=False):
         if self.fail:
             return False
         self.appended.append((thread_id, message))
+        self.quiet_flags.append(quiet)
         return True
 
 
@@ -111,6 +113,9 @@ def test_recovery_reports_in_same_thread():
     assert len(n.appended) == 1
     thread_id, message = n.appended[0]
     assert thread_id == "thread1" and "connected again" in message
+    # The all-clear is a record, not news: no push, and an archived thread
+    # stays archived.
+    assert n.quiet_flags == [True]
     assert e.state["telegram"]["status"] == "up"
 
 
@@ -125,6 +130,7 @@ def test_reminder_cadence():
     e.step("signal", "Signal", "down", "x", now=1000 + 3700)
     assert len(n.appended) == 1
     assert n.appended[0][0] == "thread1" and "still disconnected" in n.appended[0][1]
+    assert n.quiet_flags == [False]
     # And not again right away.
     e.step("signal", "Signal", "down", "x", now=1000 + 3760)
     assert len(n.appended) == 1

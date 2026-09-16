@@ -150,7 +150,7 @@ incoming message; the notice links to `/claude-auth`):
 
 | State | Meaning | Notification |
 |-------|---------|--------------|
-| `ok` | Refresh token present, nothing due | none; recovery is reported when an incident ends |
+| `ok` | Refresh token present, nothing due | none; when an incident ends, recovery is recorded quietly in its thread (no push, no unread badge, an archived thread stays archived) |
 | `expiring` | Refresh token expires within `CLAUDE_AUTH_WARN_DAYS` (default 3) | "expires soon" thread, reminded daily |
 | `stale` | Live file cleared with a valid backup (auto-restore should fix it), or access token unrefreshed for over `CLAUDE_AUTH_STALE_HOURS` (default 24) | same warning thread |
 | `needs_login` | No credentials anywhere, backup rejected by the server, or refresh token expired | "sign-in broken" thread, reminded every 6 h |
