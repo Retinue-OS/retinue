@@ -72,6 +72,11 @@ COPY scripts/        /workspace/scripts/
 COPY .claude/        /workspace/.claude/
 COPY .claude-plugin/ /workspace/.claude-plugin/
 COPY CLAUDE.md       /workspace/CLAUDE.md
+# The framework base schedule: scheduler.py reads it from /workspace/.schedule.json
+# (BASE_SCHEDULE), so unbaked it is simply absent and every cross-cutting job in
+# it — news-fetch, news-curate, agent-self-review, recurring-projects — silently
+# never runs, with only the chamber manifests left to schedule anything.
+COPY .schedule.json  /workspace/.schedule.json
 COPY examples/       /workspace/examples/
 COPY docs/           /workspace/docs/
 COPY webapp/         /workspace/webapp/
