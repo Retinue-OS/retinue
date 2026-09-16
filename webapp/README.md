@@ -135,7 +135,10 @@ docstring). Pieces:
 - `components/chats.js` — the Chats card on the dashboard and, with `full`,
   the whole `chats.html` page: avatar, channel mark, last-message preview,
   unread badge, non-archived chats ordered by last activity; the full page
-  adds an Active/Archived filter like the conversations page. In the wide
+  adds an Active/Hidden filter like the conversations page, and a **Hide**
+  beside each row (`POST /chats/<id>/flags`) — the dashboard card stays a
+  glance and carries none. Hide sets `archived` *and* `muted`, which is what
+  makes it stick: archived alone is undone by the next message. In the wide
   layout the card has its own fixed-height region above the conversations
   (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
   (`data-splitter="chats"`). The card refreshes on an ambient cadence and
@@ -212,9 +215,20 @@ The API, as the components consume it:
   and the Active list (the full page's Archived filter keeps it reachable),
   and a new inbound message **un-archives** an archived chat unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
-  that chat's Web Push and keeps an archived chat archived; as with
-  conversations, the Archive button leaves `muted` untouched, while "archive
-  this chat" said to Ara sets both. No pinning yet: favourites-on-top would
+  that chat's Web Push and keeps an archived chat archived. The full page's
+  **Hide** sets both at once through `POST /chats/<id>/flags` (body
+  `{archived?, muted?}`, either or both), which is why the tab that holds
+  them says *Hidden*: the pair is the only way into it from the dashboard, so
+  nothing lands there that a new message would bring back.
+
+  Hiding is **independent of the triage delivery gate**, on purpose. Whether a
+  group's messages are filed to the news feed for the Herald, and whether they
+  are worth a model turn, is the policy's business (`scripts/triage_policy.py`
+  `news-add` / `ignore-add`, see `docs/triage-delivery-gate.md`); whether the
+  user wants the chat in their list is this flag's. A subscribed channel one
+  keeps only for its content is `news` + `ignored` **and** hidden — three
+  separate statements, because a list one both reads as news and answers in is
+  `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
   be a later `pinned` flag, deliberately deferred. A store outage answers an
   honest 502 (the page shows it; the card keeps its last state).
 - `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:

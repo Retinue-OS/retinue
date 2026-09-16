@@ -13,6 +13,9 @@ direct user-send contract and serving token-gated media). Covers:
   un-archive-unless-muted rule, held-gate and muted silence, push mode
   new-vs-reply, and echoes advancing the read watermark;
 - the read watermark, the version-guarded draft (409), agent staging;
+- POST /chats/<id>/flags: hiding a chat (archived + muted) takes it out of the
+  list and keeps it out when a message arrives, showing it again brings it
+  back, and a non-boolean is refused;
 - POST /chats/<id>/companion: idempotent create-or-get, the id surfacing on the
   ChatSummary, and the thread staying out of the default conversation list;
 - POST /chats/<id>/send: the message reaches the gateway as author "user"
@@ -1101,6 +1104,70 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
     print("PASS test_media_is_asked_for_not_guessed")
 
 
+def test_hide_flags(base, wg):
+    """Hide is archived + muted, and it survives the next inbound message.
+
+    Archiving alone is undone by an arrival (the un-archive rule); muting is
+    what makes it stick. The dashboard's Hide sends both, so a subscribed
+    channel one keeps for its content rather than its correspondence stays out
+    of the list however busy it is.
+
+    On a chat of its own: this test posts arrivals, which reorder the list, and
+    the rail test asserts what sorts first."""
+    cid = "telegram:900900"
+    rail = "/internal/chats/inbound"
+    event = {"direction": "in", "channel": "telegram", "chat": "900900",
+             "sender": "900900", "sender_name": "Quartierverein", "group": True,
+             "message_id": "h1", "text": "Sommerfest am 30.", "gateway": "127.0.0.1",
+             "gate": {"forward": True, "reason": "whitelisted"}}
+    _http(base, "POST", rail, event)
+    flags_path = "/chats/" + _quote(cid) + "/flags"
+
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert not c.get("archived"), "a new chat starts visible"
+
+    # Both flags together: the chat leaves the active list.
+    status, body = _http(base, "POST", flags_path, {"archived": True, "muted": True})
+    assert status == 200 and body["archived"] is True and body["muted"] is True, body
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is True and c["muted"] is True, c
+
+    # An arrival does NOT bring a hidden chat back: muted defeats un-archive.
+    _http(base, "POST", rail, dict(event, message_id="h2", text="noch was"))
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is True, "a hidden chat must not return on a new message"
+
+    # Archiving WITHOUT muting is the softer state, and an arrival does undo it
+    # — which is why Hide sends both.
+    _http(base, "POST", flags_path, {"archived": True, "muted": False})
+    _http(base, "POST", rail, dict(event, message_id="h3", text="und noch was"))
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is False, "archived alone is undone by an arrival"
+
+    # Showing a hidden chat again clears both.
+    _http(base, "POST", flags_path, {"archived": True, "muted": True})
+    status, body = _http(base, "POST", flags_path, {"archived": False, "muted": False})
+    assert status == 200 and body["archived"] is False and body["muted"] is False, body
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is False and c["muted"] is False, c
+
+    # Either flag alone is a legitimate body; neither of them is not.
+    status, _ = _http(base, "POST", flags_path, {"muted": True})
+    assert status == 200
+    status, _ = _http(base, "POST", flags_path, {"muted": False})
+    assert status == 200
+    status, _ = _http(base, "POST", flags_path, {})
+    assert status == 400, "a body with no flag is refused"
+    status, _ = _http(base, "POST", flags_path, {"archived": "yes"})
+    assert status == 400, "a non-boolean flag is refused"
+    print("PASS test_hide_flags")
+
+
 def test_store_down_is_502(base, wg):
     STATE["fail"] = True
     try:
@@ -1221,6 +1288,7 @@ def main():
         test_accounts_do_not_merge(base, wg)
         test_media_proxy(base, wg)
         test_media_is_asked_for_not_guessed(base, wg, sib.server_address[1])
+        test_hide_flags(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()
