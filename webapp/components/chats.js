@@ -109,6 +109,11 @@ class RetinueChats extends RetinueCard {
   connectedCallback() {
     this._full = this.hasAttribute('full');
     this._scope = 'active';  // full-mode filter: active | archived
+    // Bumped by a flag write. A refresh that began before one is stale by the
+    // time it answers — it carries the pre-hide list — and rendering it would
+    // put the row back and flip the button to the wrong inverse until the next
+    // poll. The epoch is how such an answer is recognised and dropped.
+    this._epoch = 0;
     // Crossing the layout breakpoint changes how many rows fit (cap vs all).
     this._offFrame = onFrameChange(() => {
       if (this._data) this.renderState({ state: 'ok', data: this._data });
@@ -131,10 +136,15 @@ class RetinueChats extends RetinueCard {
   // reconcile. Only a failure with nothing rendered yet shows the offline
   // state.
   async load() {
+    const epoch = this._epoch;
     try {
       const res = await fetch(this.dataUrl, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
+      // A hide or unhide landed while this was in flight: this answer predates
+      // it and would undo it on screen. The write already re-rendered, and the
+      // next tick fetches the list as it now is.
+      if (epoch !== this._epoch) return;
       // Re-render only when the list actually changed — a rebuild would reset
       // the region's scroll and the filter wiring for nothing.
       const sig = JSON.stringify(data.chats || []);
@@ -183,6 +193,8 @@ class RetinueChats extends RetinueCard {
       const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
       if (chat) { chat.archived = hidden; chat.muted = hidden; }
       this._sig = '';
+      // Any refresh already on the wire answers from before this write.
+      this._epoch += 1;
       if (this._data) this.renderState({ state: 'ok', data: this._data });
     } catch (_err) {
       // Left as it was; the row stays where it is and the next tap can retry.

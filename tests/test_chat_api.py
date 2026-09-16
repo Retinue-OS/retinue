@@ -15,7 +15,9 @@ direct user-send contract and serving token-gated media). Covers:
 - the read watermark, the version-guarded draft (409), agent staging;
 - POST /chats/<id>/flags: hiding a chat (archived + muted) takes it out of the
   list and keeps it out when a message arrives, showing it again brings it
-  back, and a non-boolean is refused;
+  back, and a non-boolean is refused; and a hide racing an arrival never
+  half-applies (the server is threaded, so the un-archive decides under the
+  state lock rather than from a snapshot);
 - POST /chats/<id>/companion: idempotent create-or-get, the id surfacing on the
   ChatSummary, and the thread staying out of the default conversation list;
 - POST /chats/<id>/send: the message reaches the gateway as author "user"
@@ -1168,6 +1170,48 @@ def test_hide_flags(base, wg):
     print("PASS test_hide_flags")
 
 
+def test_hide_races_an_arrival(base, wg):
+    """A Hide landing while a message arrives is never half-applied.
+
+    The rail brings an archived chat back unless it is muted. Decided from a
+    snapshot read a moment earlier, a Hide (archived AND muted) landing in
+    between is read back stale: the arrival clears `archived` from what it saw
+    while `muted` stays, and a chat the user just hid is in the active list
+    again. The decision belongs under the state lock.
+
+    The precondition is a chat archived but NOT muted, which the endpoint
+    allows; the bad end state is archived=False with muted=True, which no
+    ordering of the two requests can legitimately produce."""
+    cid = "telegram:900901"
+    rail = "/internal/chats/inbound"
+    flags_path = "/chats/" + _quote(cid) + "/flags"
+    event = {"direction": "in", "channel": "telegram", "chat": "900901",
+             "sender": "900901", "sender_name": "Verein", "group": True,
+             "message_id": "r0", "text": "hallo", "gateway": "127.0.0.1",
+             "gate": {"forward": True, "reason": "whitelisted"}}
+    _http(base, "POST", rail, event)
+
+    for i in range(40):
+        # Archived but unmuted: what the arrival would legitimately undo.
+        _http(base, "POST", flags_path, {"archived": True, "muted": False})
+        out = []
+        def hide():
+            out.append(_http(base, "POST", flags_path, {"archived": True, "muted": True}))
+        def arrive():
+            out.append(_http(base, "POST", rail, dict(event, message_id=f"r{i}")))
+        threads = [threading.Thread(target=hide), threading.Thread(target=arrive)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        _, body = _http(base, "GET", "/chats")
+        c = next(c for c in body["chats"] if c["id"] == cid)
+        assert not (c["archived"] is False and c["muted"] is True), (
+            f"round {i}: a hide was half-applied — archived cleared from a stale "
+            f"read while muted stayed: {c}")
+    print("PASS test_hide_races_an_arrival")
+
+
 def test_store_down_is_502(base, wg):
     STATE["fail"] = True
     try:
@@ -1289,6 +1333,7 @@ def main():
         test_media_proxy(base, wg)
         test_media_is_asked_for_not_guessed(base, wg, sib.server_address[1])
         test_hide_flags(base, wg)
+        test_hide_races_an_arrival(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()

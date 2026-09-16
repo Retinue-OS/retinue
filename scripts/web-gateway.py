@@ -6737,11 +6737,13 @@ class Handler(BaseHTTPRequestHandler):
         _chats_cache_invalidate()
         pushed = False
         if direction == "in":
-            doc, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
+            _, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
             # A new message in an archived chat would otherwise land invisible;
-            # muted is the explicit "keep it archived" opt-out.
-            if doc.get("archived") and not doc.get("muted"):
-                doc = _CHAT_STATE.set_flags(chat_id, archived=False)
+            # muted is the explicit "keep it archived" opt-out. Decided inside
+            # the state lock (see ChatState.unarchive_unless_muted): the
+            # dashboard can set these flags concurrently now, and deciding
+            # from a snapshot read a moment earlier would undo half of a Hide.
+            doc = _CHAT_STATE.unarchive_unless_muted(chat_id)
             gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else None
             # Held/no-action classes (blacklisted, ignored-group, quieted, …)
             # update the mirror silently — the gate already decided they are
