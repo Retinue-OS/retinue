@@ -1684,6 +1684,16 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # companion thread) falls through to the triage forward below, unchanged.
     rail = _chats.notify_chat_event(**rail_event, files=files,
                                     timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Forwarding it here as well would be the one outcome worse
+        # than waiting: two turns racing over the same draft, plus the
+        # dashboard conversation this replaced. It stays delivered=False, which
+        # is exactly what the daily drain reads.
+        print(f"[signal-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered for the daily drain "
+              f"rather than handled twice", flush=True)
+        return
     rail_job = ((rail or {}).get("job_url") or "").strip() or None
     if rail_job:
         print(f"[signal-gateway] the chat's companion turn took the message "

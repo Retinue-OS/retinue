@@ -386,9 +386,12 @@ and what a model turn is *for*:
      wants a chat on their screen; the gate says what a message is worth. The
      two are independent on purpose, and hiding a chat must not quietly stop
      its messages being worked.
-5. **Daily drain** — unchanged mechanics; the drained messages are already in
-   their chats' mirrors, and the drain turn walks the affected companions
-   instead of opening per-message threads.
+5. **Daily drain** — unchanged, and still triage: `GET /undelivered` hands the
+   held and the failed messages to the triage skill, which proposes in
+   dashboard conversations as it always has. The drained messages are already
+   in their chats' mirrors, so having the drain turn walk the affected
+   companions instead is the obvious next step — but it is **not built**, and
+   nothing in phase 4 changed it.
 
 The simple case end-to-end: message arrives → push notification → open the
 chat → read it *in the conversation it belongs to* → type (or touch up the

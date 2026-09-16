@@ -14,10 +14,13 @@ direct user-send contract and serving token-gated media). Covers:
   new-vs-reply, and echoes advancing the read watermark;
 - the forward path landing in the chat instead of in triage: a forwarded
   arrival answers 202 with the job handle of a turn in that chat's companion
-  thread, the turn's prompt carries the arrival and the chat note, a held class
-  and a switched-off rail answer no handle at all (so the gateway keeps its own
-  forward), arrivals during a turn fold into one follow-up without losing a job,
-  and the turn pushes nothing the arrival has already pushed;
+  thread, the turn's prompt carries the arrival's own text (delimited as data)
+  and the chat note, a held class, a verdictless event and a switched-off rail
+  answer no handle at all (so the gateway keeps its own forward), the same
+  message id is only ever worked once however often the rail delivers it,
+  arrivals during a turn fold into one follow-up without losing a job, a reply
+  that could not be stored fails its job rather than reporting delivery, and
+  the turn pushes nothing the arrival has already pushed;
 - the read watermark, the version-guarded draft (409), agent staging;
 - POST /chats/<id>/flags: hiding a chat (archived + muted) takes it out of the
   list and keeps it out when a message arrives, showing it again brings it
@@ -1125,6 +1128,11 @@ def test_arrival_starts_a_companion_turn(base, wg):
     assert "UNKNOWN" in TURNS[0]["prompt"]
     assert "whitelist-add --channel telegram" in TURNS[0]["prompt"]
 
+    # The message itself is in the instruction, not only in the chat note the
+    # store builds: a store outage must not leave a turn answering about a
+    # message it never saw while its job still reports done.
+    assert "<external_message>" in prompt and "Passt Samstag 15 Uhr?" in prompt
+
     # A held class buys nothing: no handle, so the gateway holds the message
     # for the daily drain exactly as it did before.
     TURNS.clear()
@@ -1133,6 +1141,28 @@ def test_arrival_starts_a_companion_turn(base, wg):
                               gate={"forward": False, "reason": "blacklisted"}))
     assert status == 200 and "job_url" not in body
     assert TURNS == []
+
+    # Nor does an event with no verdict at all. Notification fails open, but a
+    # model turn must not: a caller that sent no gate is one that still runs its
+    # own triage forward, and the message would be handled twice.
+    TURNS.clear()
+    no_gate = {k: v for k, v in event.items() if k != "gate"}
+    status, body = _http(base, "POST", rail, dict(no_gate, message_id="a3b"))
+    assert status == 200 and "job_url" not in body, body
+    assert body["pushed"] is True, "notification still fails open"
+    assert TURNS == []
+
+    # One message, one turn — however often the rail delivers it. A gateway
+    # retries a POST whose answer was lost, and a ledger can redeliver a
+    # stanza; both must get the handle the first call minted back.
+    TURNS.clear()
+    status, first_delivery = _http(base, "POST", rail,
+                                   dict(event, message_id="dup1", text="hoi"))
+    status, again = _http(base, "POST", rail,
+                          dict(event, message_id="dup1", text="hoi"))
+    assert again["job_url"] == first_delivery["job_url"], (first_delivery, again)
+    assert _await_job(base, first_delivery["job_url"])["status"] == "done"
+    assert len(TURNS) == 1, TURNS
 
     # What the message carried travels with it, so the turn can open it rather
     # than answer a photo it never saw.
@@ -1181,6 +1211,20 @@ def test_arrival_starts_a_companion_turn(base, wg):
         assert failed["status"] == "error", failed
     finally:
         wg.send_message = _stub_send_message
+
+    # So does a turn whose reply could not be stored. "Delivered" means a model
+    # turn accounted for the message; a reply that reached no thread accounts
+    # for nothing, however well the model answered.
+    TURNS.clear()
+    real_add = wg._conv_add_message
+    wg._conv_add_message = lambda *a, **k: None
+    try:
+        status, body = _http(base, "POST", rail,
+                             dict(event, message_id="d2", text="und jetzt?"))
+        lost = _await_job(base, body["job_url"])
+        assert lost["status"] == "error", lost
+    finally:
+        wg._conv_add_message = real_add
 
     # And the switch is reversible without a revert: off, the rail answers no
     # handle and the gateway forwards to triage exactly as it always has.

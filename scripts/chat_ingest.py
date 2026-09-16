@@ -83,8 +83,19 @@ def notify_chat_event(
 
     An accepted event answers with a JSON object: ``{"job_url": …}`` when the
     web-gateway started a companion turn for it, and nothing but ``ok`` other-
-    wise. None means the event did not land at all — no endpoint configured, a
-    transport error, a refusal — which is the caller's cue to fall back.
+    wise. None means the event did not land — no endpoint configured, a
+    refusal, a connection that never got there — which is the caller's cue to
+    fall back.
+
+    ``{"uncertain": True}`` is the third answer, and the one that matters for a
+    forwarded message: the request timed out twice, so whether the event landed
+    is **unknown**. The handler may well have accepted it and started a turn
+    before the answer was lost, and treating that as "did not land" would have
+    the caller forward the same message to triage as well — two turns racing
+    over one draft, and a dashboard conversation the switch exists to stop. The
+    caller must neither confirm delivery nor fall back on it: leaving the
+    message undelivered hands it to the daily drain, which is where an unknown
+    outcome belongs.
 
     ``direction`` is ``in`` for an arrival, ``out`` for an outbound echo (the
     user's own send from another device). ``account`` is this gateway's own
@@ -131,14 +142,32 @@ def notify_chat_event(
             "X-Conversation-Backend-Token": CHATS_INGEST_TOKEN,
         },
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if not 200 <= resp.status < 300:
+    # One retry, and only for a timeout. The web-gateway mints one handle per
+    # message id and hands the same one back for a repeat, so re-sending an
+    # event that may already have been accepted cannot start a second turn —
+    # which is what makes retrying the right move rather than a risk.
+    raw = None
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if not 200 <= resp.status < 300:
+                    return None
+                raw = resp.read().decode("utf-8", errors="replace")
+            break
+        except Exception as exc:  # noqa: BLE001 — best-effort, never propagates
+            reason = getattr(exc, "reason", None)
+            timed_out = isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError)
+            if not timed_out:
+                print(f"[chat_ingest] notify failed ({exc})", file=sys.stderr,
+                      flush=True)
                 return None
-            raw = resp.read().decode("utf-8", errors="replace")
-    except Exception as exc:  # noqa: BLE001 — best-effort, must never propagate
-        print(f"[chat_ingest] notify failed ({exc})", file=sys.stderr, flush=True)
-        return None
+            if attempt == 1:
+                print(f"[chat_ingest] notify timed out ({exc}); retrying once",
+                      file=sys.stderr, flush=True)
+                continue
+            print(f"[chat_ingest] notify timed out twice ({exc}); whether it "
+                  "landed is unknown", file=sys.stderr, flush=True)
+            return {"uncertain": True}
     try:
         body = json.loads(raw) if raw.strip() else {}
     except ValueError:

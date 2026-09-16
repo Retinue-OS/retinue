@@ -275,6 +275,18 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         assert "triage" in posts[0]["message"], posts[0]["message"][:200]
         assert _await_flag(tmp, True), _stored_flags(tmp)
 
+    # A rail answer that was lost says nothing about whether the chat took the
+    # message. Forwarding it here as well would be worse than waiting.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t3"})
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = lambda **kwargs: {"uncertain": True}
+        forward(gw)
+        assert posts == [], "an uncertain answer must not also reach triage"
+        assert _stored_flags(tmp) == [False], _stored_flags(tmp)
+
     print(f"ok: {name} lets the chat take a forwarded message, or forwards it "
           "to triage as before")
 
@@ -317,8 +329,72 @@ def test_telegram_rail_takes_the_message():
         lambda gw: gw._forward_to_inbox("hello", "en", "12345"))
 
 
+class _RailResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"ok": true, "job_url": "/jobs/r9"}'
+
+
+def test_a_lost_rail_answer_is_uncertain_not_a_refusal():
+    """A timeout is retried once, and a second one is reported as unknown.
+
+    The handler may have accepted the event and started a turn before the
+    answer was lost, so "did not land" would be a guess — and the wrong one
+    costs two turns over one draft. Retrying is safe because the web-gateway
+    mints one handle per message id; after that, the honest answer is that it
+    does not know, and the caller leaves the message to the daily drain."""
+    ci = _load("chat_ingest_uncertainty_under_test", "chat_ingest.py")
+    ci.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+    original = ci.urllib.request.urlopen
+    event = dict(direction="in", channel="signal", chat="+15551234567")
+    calls = []
+
+    def _timeout_then_answer(req, timeout=None):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise TimeoutError("read timed out")
+        return _RailResponse()
+
+    def _always_timeout(req, timeout=None):
+        calls.append(timeout)
+        raise TimeoutError("read timed out")
+
+    def _refused(req, timeout=None):
+        calls.append(timeout)
+        raise ConnectionRefusedError("nobody listening")
+
+    try:
+        ci.urllib.request.urlopen = _timeout_then_answer
+        body = ci.notify_chat_event(**event)
+        assert len(calls) == 2, f"a timeout is retried exactly once ({calls})"
+        assert (body or {}).get("job_url") == "/jobs/r9", body
+
+        calls.clear()
+        ci.urllib.request.urlopen = _always_timeout
+        body = ci.notify_chat_event(**event)
+        assert body == {"uncertain": True}, body
+        assert len(calls) == 2, calls
+
+        # A refusal is not uncertainty: nothing landed, so the caller falls back.
+        calls.clear()
+        ci.urllib.request.urlopen = _refused
+        assert ci.notify_chat_event(**event) is None
+        assert len(calls) == 1, "a refusal is not retried"
+    finally:
+        ci.urllib.request.urlopen = original
+    print("ok: a lost rail answer is uncertain, a refused one is a refusal")
+
+
 def main():
     test_await_job_outcomes()
+    test_a_lost_rail_answer_is_uncertain_not_a_refusal()
     test_confirm_delivery_runs_callback_on_success_only()
     test_whatsapp_delivery_confirmation()
     test_signal_delivery_confirmation()
