@@ -12,6 +12,15 @@ direct user-send contract and serving token-gated media). Covers:
 - the notify rail (POST /internal/chats/inbound): open-vs-token auth, the
   un-archive-unless-muted rule, held-gate and muted silence, push mode
   new-vs-reply, and echoes advancing the read watermark;
+- the forward path landing in the chat instead of in triage: a forwarded
+  arrival answers 202 with the job handle of a turn in that chat's companion
+  thread, the turn's prompt carries the arrival's own text (delimited as data)
+  and the chat note, a held class, a verdictless event and a switched-off rail
+  answer no handle at all (so the gateway keeps its own forward), the same
+  message id is only ever worked once however often the rail delivers it,
+  arrivals during a turn fold into one follow-up without losing a job, a reply
+  that could not be stored fails its job rather than reporting delivery, and
+  the turn pushes nothing the arrival has already pushed;
 - the read watermark, the version-guarded draft (409), agent staging;
 - POST /chats/<id>/flags: hiding a chat (archived + muted) takes it out of the
   list and keeps it out when a message arrives, showing it again brings it
@@ -32,6 +41,7 @@ Standalone (stdlib + the gateway module's own deps):
 
     python3 tests/test_chat_api.py
 """
+import base64
 import importlib.util
 import json
 import os
@@ -372,6 +382,12 @@ def _load_gateway(tmp: Path, sparql_port: int, gw_port: int):
     os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")
     os.environ["WEB_GATEWAY_STATE"] = str(tmp / "state.json")
     os.environ["PUSH_DIR"] = str(tmp / "push")
+    os.environ["MESSAGE_FILES_DIR"] = str(tmp / "message-files")
+    # The lint shells out to `claude`; a companion turn now runs on every
+    # forwarded arrival, so leaving it on would have this suite spawning
+    # sessions. Its own behaviour is covered in
+    # tests/test_presentation_lint_deadlock.py.
+    os.environ["PRESENTATION_LINT"] = "0"
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
     if "markdown_it" not in sys.modules:
         try:
@@ -409,6 +425,44 @@ def _quote(chat_id):
 
 
 PUSHES: list = []
+# Model turns the gateway asked for, captured instead of spawning `claude`.
+# Every forwarded arrival now runs one, so without this the suite would try to
+# start sessions.
+TURNS: list = []
+# A test sets "hold" to an Event to stall turns inside send_message, which is
+# what lets the coalescing case observe a turn that is still running.
+TURN_GATE: dict = {"hold": None}
+
+
+def _stub_send_message(prompt, display_question=None, session_key=None,
+                       model=None, restart_message=None):
+    TURNS.append({"prompt": prompt, "question": display_question,
+                  "session": session_key})
+    hold = TURN_GATE.get("hold")
+    if hold is not None:
+        hold.wait(20)
+    return {"response": "Read it and staged a reply in the composer.",
+            "model_name": "stub-model", "cost_usd": 0.0}
+
+
+def _await_job(base, job_url, timeout=20):
+    """Poll a job handle the way the messenger gateways' job_delivery does."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, body = _http(base, "GET", job_url)
+        if status == 200 and body.get("status") != "pending":
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_url} never resolved")
+
+
+def _wait_for(pred, what, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"never happened: {what}")
 
 
 def test_chat_list_contract(base, wg):
@@ -615,7 +669,10 @@ def test_rail_auth_and_notifications(base, wg):
              "message_id": "e1", "text": "ciao!", "gateway": "127.0.0.1",
              "gate": {"forward": True, "reason": "whitelisted"}}
     status, body = _http(base, "POST", rail, event)
-    assert status == 200 and body["pushed"] is True
+    # Forwarded: 202 and a job handle for the turn started in the chat's
+    # companion thread (test_arrival_starts_a_companion_turn covers the turn
+    # itself; here only that notification still behaves).
+    assert status == 202 and body["pushed"] is True
     # First unread → mode "new"; the push targets the chat page.
     assert len(PUSHES) == 1
     args, kw = PUSHES[0]
@@ -639,6 +696,7 @@ def test_rail_auth_and_notifications(base, wg):
                 gate={"forward": False, "reason": "blacklisted"})
     status, body = _http(base, "POST", rail, held)
     assert status == 200 and body["pushed"] is False and len(PUSHES) == n
+    assert "job_url" not in body, "a held message must not buy a model turn"
 
     # Muted silences; archived+muted stays archived. Archived alone un-archives.
     wg._CHAT_STATE.set_flags(cid, archived=True, muted=True)
@@ -670,7 +728,7 @@ def test_rail_auth_and_notifications(base, wg):
         assert status == 403
         status, _ = _http(base, "POST", rail, dict(event, message_id="e7"),
                           headers={"X-Conversation-Backend-Token": "railtok"})
-        assert status == 200
+        assert status == 202
     finally:
         wg.CHATS_INGEST_TOKEN = ""
     print("PASS test_rail_auth_and_notifications")
@@ -820,7 +878,9 @@ def test_rail_attributes_by_account(base, wg):
                           "account": STATE["gw_account"],
                           "gateway": "signal-gateway",
                           "gate": {"forward": True, "reason": "whitelisted"}})
-    assert status == 200, body
+    # 202: forwarded, so the chat's companion turn took it (see
+    # test_arrival_starts_a_companion_turn). Attribution is the point here.
+    assert status == 202, body
     # The registry entry for this account is the mock's slug, not the slug the
     # event claimed — and the stamp is marked as account-derived, which is what
     # makes it authoritative later.
@@ -839,7 +899,7 @@ def test_rail_attributes_by_account(base, wg):
                        "message_id": "acct-2", "text": "hi",
                        "account": "+15559990000", "gateway": "signal-gateway",
                        "gate": {"forward": True, "reason": "whitelisted"}})
-    assert status == 200
+    assert status == 202
     # …but the chat is still that account's own: an id is composed from the
     # account the event asserts, which is a fact about the sender, while the
     # gateway stamp is a lookup in the reader's registry that can simply miss.
@@ -959,6 +1019,11 @@ def test_unconfirmed_send_is_not_rendered_twice(base, wg):
 def test_companion_endpoint(base, wg):
     """The chat's linked conversation: created once, returned forever after."""
     path = "/chats/" + _quote(CHAT2) + "/companion"
+    # Chats that have had a forwarded arrival already have a companion of their
+    # own by now — the arrival turn opens one. What must hold is that opening
+    # this one changes nothing about them.
+    status, before = _http(base, "GET", "/chats")
+    others = {c["id"]: c["companion"] for c in before["chats"] if c["id"] != CHAT2}
     status, body = _http(base, "POST", path, {})
     assert status == 201, body
     cid = body["id"]
@@ -972,9 +1037,10 @@ def test_companion_endpoint(base, wg):
     status, chats = _http(base, "GET", "/chats")
     summary = next(c for c in chats["chats"] if c["id"] == CHAT2)
     assert summary["companion"] == cid
-    # Every other chat is unaffected.
-    other = next(c for c in chats["chats"] if c["id"] == CHAT1)
-    assert other["companion"] is None
+    # Every other chat is unaffected, and none of them was handed this thread.
+    after = {c["id"]: c["companion"] for c in chats["chats"] if c["id"] != CHAT2}
+    assert after == others, "opening one companion touched another chat"
+    assert cid not in others.values()
 
     # It is an ordinary conversation the dashboard drives through
     # /conversations — no second read API for companion threads.
@@ -994,6 +1060,182 @@ def test_companion_endpoint(base, wg):
     status, body = _http(base, "POST", "/chats/nothing/companion", {})
     assert status == 404, body
     print("PASS test_companion_endpoint")
+
+
+def test_arrival_starts_a_companion_turn(base, wg):
+    """The delivery gate's forward path: worked in the chat, not in triage.
+
+    A forwarded arrival used to leave the gateway to spawn a triage session
+    whose job was to open a dashboard conversation *about* the message. It now
+    starts a turn in the chat's own companion thread, and the rail answers 202
+    with that turn's job handle — the same contract POST /message answers with,
+    because it is what the gateway's never-drop machinery polls before it dares
+    flip the message's `delivered` flag.
+    """
+    rail = "/internal/chats/inbound"
+    chat = "telegram:777001"
+    PUSHES.clear()
+    TURNS.clear()
+    event = {"direction": "in", "channel": "telegram", "chat": "777001",
+             "sender": "777001", "sender_name": "Nina", "group": False,
+             "message_id": "a1", "text": "Passt Samstag 15 Uhr?",
+             "gate": {"forward": True, "flagged_unknown": False,
+                      "reason": "whitelisted"}}
+    status, body = _http(base, "POST", rail, event)
+    assert status == 202, body
+    assert body["job_url"].startswith("/jobs/"), body
+    assert body["pushed"] is True
+
+    done = _await_job(base, body["job_url"])
+    assert done["status"] == "done", done
+    assert done["chat"] == chat
+
+    # Exactly one turn, and it ran in this chat's companion thread — the same
+    # thread the user types into when they ask Ara about the chat themselves.
+    assert len(TURNS) == 1, TURNS
+    status, chats = _http(base, "GET", "/chats")
+    summary = next(c for c in chats["chats"] if c["id"] == chat)
+    comp = summary["companion"]
+    assert comp, "the arrival turn had nowhere to run"
+    assert TURNS[0]["session"] == f"conv:{comp}"
+
+    prompt = TURNS[0]["prompt"]
+    assert "A new message has arrived in this chat" in prompt
+    assert "Nina" in prompt
+    # The chat note rides along, so the turn reads the message in its
+    # conversation, sees the draft, and is told where its answer goes and who
+    # writes it — none of which the arrival head restates.
+    assert "Passt Samstag 15 Uhr?" in prompt
+    assert "chat-draft.py" in prompt and "secretary" in prompt
+    # And when a dashboard conversation is warranted, and when it is not.
+    assert "conversation-push.py" in prompt
+
+    # Ara's note lands in the companion thread and notifies nobody a second
+    # time: the arrival already pushed, and one message is one notification.
+    status, conv = _http(base, "GET", f"/conversations/{comp}")
+    assert conv["messages"][-1]["role"] == "assistant"
+    assert "staged" in conv["messages"][-1]["text"]
+    assert len(PUSHES) == 1, "the companion turn pushed on top of the arrival"
+
+    # An unknown sender is still asked about. That decision is not "send this
+    # reply", so the turn is told to take it to a dashboard conversation.
+    TURNS.clear()
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="a2", text="wer bist du?",
+                              gate={"forward": True, "flagged_unknown": True,
+                                    "reason": "unknown"}))
+    assert _await_job(base, body["job_url"])["status"] == "done"
+    assert "UNKNOWN" in TURNS[0]["prompt"]
+    assert "whitelist-add --channel telegram" in TURNS[0]["prompt"]
+
+    # The message itself is in the instruction, not only in the chat note the
+    # store builds: a store outage must not leave a turn answering about a
+    # message it never saw while its job still reports done.
+    assert "<external_message>" in prompt and "Passt Samstag 15 Uhr?" in prompt
+
+    # A held class buys nothing: no handle, so the gateway holds the message
+    # for the daily drain exactly as it did before.
+    TURNS.clear()
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="a3", text="spam",
+                              gate={"forward": False, "reason": "blacklisted"}))
+    assert status == 200 and "job_url" not in body
+    assert TURNS == []
+
+    # Nor does an event with no verdict at all. Notification fails open, but a
+    # model turn must not: a caller that sent no gate is one that still runs its
+    # own triage forward, and the message would be handled twice.
+    TURNS.clear()
+    no_gate = {k: v for k, v in event.items() if k != "gate"}
+    status, body = _http(base, "POST", rail, dict(no_gate, message_id="a3b"))
+    assert status == 200 and "job_url" not in body, body
+    assert body["pushed"] is True, "notification still fails open"
+    assert TURNS == []
+
+    # One message, one turn — however often the rail delivers it. A gateway
+    # retries a POST whose answer was lost, and a ledger can redeliver a
+    # stanza; both must get the handle the first call minted back.
+    TURNS.clear()
+    status, first_delivery = _http(base, "POST", rail,
+                                   dict(event, message_id="dup1", text="hoi"))
+    status, again = _http(base, "POST", rail,
+                          dict(event, message_id="dup1", text="hoi"))
+    assert again["job_url"] == first_delivery["job_url"], (first_delivery, again)
+    assert _await_job(base, first_delivery["job_url"])["status"] == "done"
+    assert len(TURNS) == 1, TURNS
+
+    # What the message carried travels with it, so the turn can open it rather
+    # than answer a photo it never saw.
+    TURNS.clear()
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="a4", text="schau mal",
+                              files=[{"filename": "x.png",
+                                      "content_type": "image/png",
+                                      "data": png}]))
+    assert _await_job(base, body["job_url"])["status"] == "done"
+    assert "image/png" in TURNS[0]["prompt"], TURNS[0]["prompt"][-400:]
+
+    # Messages arriving while a turn runs fold into one follow-up turn — a turn
+    # reads the chat as it stands, so a second one would re-read the first's
+    # messages and the two would overwrite each other's draft. Every arrival
+    # still gets its own handle, and the turn that covers it answers all of
+    # them: no message is ever reported delivered that no turn has seen.
+    TURNS.clear()
+    hold = threading.Event()
+    TURN_GATE["hold"] = hold
+    try:
+        first = _http(base, "POST", rail,
+                      dict(event, message_id="b1", text="eins"))[1]
+        _wait_for(lambda: len(TURNS) == 1, "the first turn to start")
+        rest = [_http(base, "POST", rail,
+                      dict(event, message_id=f"b{i}", text=str(i)))[1]
+                for i in (2, 3)]
+        assert all(r.get("job_url") for r in rest), rest
+        assert len(TURNS) == 1, "a second turn started while one was running"
+    finally:
+        hold.set()
+        TURN_GATE["hold"] = None
+    for handle in [first] + rest:
+        assert _await_job(base, handle["job_url"])["status"] == "done", handle
+    assert len(TURNS) == 2, TURNS
+
+    # A turn that fails resolves its jobs as errors, which is what leaves the
+    # message undelivered at the gateway for the daily drain to retry.
+    TURNS.clear()
+    wg.send_message = lambda *a, **k: {"error": "upstream is down"}
+    try:
+        status, body = _http(base, "POST", rail,
+                             dict(event, message_id="d1", text="hallo?"))
+        failed = _await_job(base, body["job_url"])
+        assert failed["status"] == "error", failed
+    finally:
+        wg.send_message = _stub_send_message
+
+    # So does a turn whose reply could not be stored. "Delivered" means a model
+    # turn accounted for the message; a reply that reached no thread accounts
+    # for nothing, however well the model answered.
+    TURNS.clear()
+    real_add = wg._conv_add_message
+    wg._conv_add_message = lambda *a, **k: None
+    try:
+        status, body = _http(base, "POST", rail,
+                             dict(event, message_id="d2", text="und jetzt?"))
+        lost = _await_job(base, body["job_url"])
+        assert lost["status"] == "error", lost
+    finally:
+        wg._conv_add_message = real_add
+
+    # And the switch is reversible without a revert: off, the rail answers no
+    # handle and the gateway forwards to triage exactly as it always has.
+    wg.CHAT_ARRIVAL_TURNS = False
+    try:
+        TURNS.clear()
+        status, body = _http(base, "POST", rail, dict(event, message_id="c1"))
+        assert status == 200 and "job_url" not in body and TURNS == []
+    finally:
+        wg.CHAT_ARRIVAL_TURNS = True
+    print("PASS test_arrival_starts_a_companion_turn")
 
 
 def test_media_proxy(base, wg):
@@ -1301,6 +1543,9 @@ def main():
         # Capture pushes instead of talking to a push service.
         wg.push_notify.enabled = lambda: True
         wg.push_notify.notify_async = lambda *a, **k: PUSHES.append((a, k))
+        # A forwarded arrival runs a companion turn (see
+        # test_arrival_starts_a_companion_turn); no test may spawn `claude`.
+        wg.send_message = _stub_send_message
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -1332,6 +1577,7 @@ def main():
         test_accounts_do_not_merge(base, wg)
         test_media_proxy(base, wg)
         test_media_is_asked_for_not_guessed(base, wg, sib.server_address[1])
+        test_arrival_starts_a_companion_turn(base, wg)
         test_hide_flags(base, wg)
         test_hide_races_an_arrival(base, wg)
         test_store_down_is_502(base, wg)

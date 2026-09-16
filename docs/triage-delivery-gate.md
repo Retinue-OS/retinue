@@ -153,6 +153,14 @@ newsletter that turns out to carry a `List-Id` is not silently un-filed.
 Messenger identity is a **handle**, not a domain — no aliasing problem, so no
 wildcards needed there.
 
+The handle is **the person who wrote**, which in a shared chat is the poster and
+never the room: a group is matched on the group axis, and only there. Each
+gateway must therefore hand the two facts over separately — Telegram keyed both
+on the chat id until this was fixed, which made a whitelisted correspondent
+writing in a group look like an unknown handle whose id happened to be the
+room's. Where a post genuinely has no individual sender — a broadcast channel —
+the channel itself is the only identity there is, and it stands in for one.
+
 - **Whitelist:** handles the user has replied to / contacts, seeded from the
   gateway's contact directory + recent chats, extended by the ask-flow below.
 - **Blacklist:** an unknown sender the user declines to whitelist goes here so
@@ -345,6 +353,19 @@ So the `delivered` flag encodes exactly the drain decision: `false` means "held,
 the daily drain picks it up" (blacklisted handle, quieted group); `true` means
 "accounted for, never drained" (ignored group — the message is on record and
 queryable, but no model ever looks at it unprompted).
+
+**Where a forwarded message now goes.** The gate decides *whether* a message is
+worth a model turn; it no longer decides that the turn is a triage session.
+Since `docs/messenger-chats.md` phase 4, the forward class is handed to the
+chats rail (`POST /internal/chats/inbound`), which starts a turn in that chat's
+own companion thread and answers `202` with its job handle — so the reply is
+staged in the chat's composer for the user's send press instead of arriving as
+a dashboard conversation about the message. The gateway still owns the
+`delivered` flag and still waits for a job to report `done`; only which job has
+changed. A rail that cannot take the message answers no handle, and the gateway
+forwards to triage exactly as described below. **Triage itself is unchanged**
+and still owns the daily drain, the e-mail channel, and anything the rail hands
+back.
 
 - The daily catch-all calls each inbox-mode gateway's
   `GET /undelivered?since=…`, processes the returned messages; the flag flips as

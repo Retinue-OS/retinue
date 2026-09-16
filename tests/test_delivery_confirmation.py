@@ -15,6 +15,13 @@ contract:
     job that errors leaves it undelivered for the drain.
   * a synchronous answer (no ``job_url``) still marks delivered immediately.
 
+Since the chat surface started taking messages (docs/messenger-chats.md, phase
+4) the handle can also come from the chats rail, for a turn in the message's own
+chat rather than a triage session. That path is pinned here too: when the rail
+answers with a handle the gateway forwards nothing to triage and confirms
+against that job, and when it does not, the triage forward runs exactly as it
+always has.
+
     python3 tests/test_delivery_confirmation.py
 """
 import importlib.util
@@ -225,6 +232,65 @@ def _check_gateway(name: str, loader, forward):
     print(f"ok: {name} marks delivered only once the triage job reports done")
 
 
+def _check_rail_takes_the_message(name: str, loader, forward):
+    """The switch: a forwarded message is worked in the chat it arrived in.
+
+    When the chats rail answers with a job handle it has started a turn in that
+    chat's companion thread, so this gateway must not also spawn the triage
+    session it used to — that duplicate is exactly the per-message dashboard
+    conversation the chat surface replaced. The `delivered` flag still belongs
+    to the gateway and still waits for a job to report done; only which job has
+    changed."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t1"})
+        rail_calls = []
+
+        def _rail(**kwargs):
+            rail_calls.append(kwargs)
+            return {"ok": True, "job_url": "/jobs/r1"}
+
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = _rail
+        _stub_job_polls(gw._jobs, [_Resp(200, {"status": "done"})])
+        forward(gw)
+        assert rail_calls and rail_calls[0]["direction"] == "in", rail_calls
+        assert rail_calls[0]["gate"]["forward"] is True, rail_calls[0]["gate"]
+        assert "flagged_unknown" in rail_calls[0]["gate"], rail_calls[0]["gate"]
+        assert posts == [], "the message went to triage as well as to its chat"
+        assert _await_flag(tmp, True), _stored_flags(tmp)
+
+    # A rail that cannot take it — switched off, unreachable, or unable to open
+    # the companion thread — leaves this gateway doing what it always did.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t2"})
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = lambda **kwargs: {"ok": True}
+        _stub_job_polls(gw._jobs, [_Resp(200, {"status": "done"})])
+        forward(gw)
+        assert len(posts) == 1, posts
+        assert "triage" in posts[0]["message"], posts[0]["message"][:200]
+        assert _await_flag(tmp, True), _stored_flags(tmp)
+
+    # A rail answer that was lost says nothing about whether the chat took the
+    # message. Forwarding it here as well would be worse than waiting.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t3"})
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = lambda **kwargs: {"uncertain": True}
+        forward(gw)
+        assert posts == [], "an uncertain answer must not also reach triage"
+        assert _stored_flags(tmp) == [False], _stored_flags(tmp)
+
+    print(f"ok: {name} lets the chat take a forwarded message, or forwards it "
+          "to triage as before")
+
+
 def test_whatsapp_delivery_confirmation():
     _check_gateway(
         "whatsapp", _load_whatsapp_gateway,
@@ -244,12 +310,98 @@ def test_telegram_delivery_confirmation():
         lambda gw: gw._forward_to_inbox("hello", "en", "12345"))
 
 
+def test_whatsapp_rail_takes_the_message():
+    _check_rail_takes_the_message(
+        "whatsapp", _load_whatsapp_gateway,
+        lambda gw: gw._forward_to_inbox("hello", "en", "+15551234567",
+                                        origin="+15551234567@s.whatsapp.net"))
+
+
+def test_signal_rail_takes_the_message():
+    _check_rail_takes_the_message(
+        "signal", _load_signal_gateway,
+        lambda gw: gw._forward_to_inbox("hello", "en", "+15551234567"))
+
+
+def test_telegram_rail_takes_the_message():
+    _check_rail_takes_the_message(
+        "telegram", _load_telegram_gateway,
+        lambda gw: gw._forward_to_inbox("hello", "en", "12345"))
+
+
+class _RailResponse:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"ok": true, "job_url": "/jobs/r9"}'
+
+
+def test_a_lost_rail_answer_is_uncertain_not_a_refusal():
+    """A timeout is retried once, and a second one is reported as unknown.
+
+    The handler may have accepted the event and started a turn before the
+    answer was lost, so "did not land" would be a guess — and the wrong one
+    costs two turns over one draft. Retrying is safe because the web-gateway
+    mints one handle per message id; after that, the honest answer is that it
+    does not know, and the caller leaves the message to the daily drain."""
+    ci = _load("chat_ingest_uncertainty_under_test", "chat_ingest.py")
+    ci.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+    original = ci.urllib.request.urlopen
+    event = dict(direction="in", channel="signal", chat="+15551234567")
+    calls = []
+
+    def _timeout_then_answer(req, timeout=None):
+        calls.append(timeout)
+        if len(calls) == 1:
+            raise TimeoutError("read timed out")
+        return _RailResponse()
+
+    def _always_timeout(req, timeout=None):
+        calls.append(timeout)
+        raise TimeoutError("read timed out")
+
+    def _refused(req, timeout=None):
+        calls.append(timeout)
+        raise ConnectionRefusedError("nobody listening")
+
+    try:
+        ci.urllib.request.urlopen = _timeout_then_answer
+        body = ci.notify_chat_event(**event)
+        assert len(calls) == 2, f"a timeout is retried exactly once ({calls})"
+        assert (body or {}).get("job_url") == "/jobs/r9", body
+
+        calls.clear()
+        ci.urllib.request.urlopen = _always_timeout
+        body = ci.notify_chat_event(**event)
+        assert body == {"uncertain": True}, body
+        assert len(calls) == 2, calls
+
+        # A refusal is not uncertainty: nothing landed, so the caller falls back.
+        calls.clear()
+        ci.urllib.request.urlopen = _refused
+        assert ci.notify_chat_event(**event) is None
+        assert len(calls) == 1, "a refusal is not retried"
+    finally:
+        ci.urllib.request.urlopen = original
+    print("ok: a lost rail answer is uncertain, a refused one is a refusal")
+
+
 def main():
     test_await_job_outcomes()
+    test_a_lost_rail_answer_is_uncertain_not_a_refusal()
     test_confirm_delivery_runs_callback_on_success_only()
     test_whatsapp_delivery_confirmation()
     test_signal_delivery_confirmation()
     test_telegram_delivery_confirmation()
+    test_whatsapp_rail_takes_the_message()
+    test_signal_rail_takes_the_message()
+    test_telegram_rail_takes_the_message()
     print("\nAll delivery-confirmation checks passed.")
 
 

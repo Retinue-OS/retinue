@@ -310,8 +310,14 @@ def _mark_delivered(store_path) -> None:
         print(f"[telegram-gateway] could not mark inbound delivered: {exc}", flush=True)
 
 
-def _confirm_delivery(job_path: str, store_path, label: str) -> None:
-    """Mark a forwarded inbound delivered once its triage job reports success.
+def _confirm_delivery(job_path: str, store_path, label: str,
+                      base: str | None = None) -> None:
+    """Mark a forwarded inbound delivered once the job that took it succeeds.
+
+    That job is either the triage forward's or the chats rail's companion
+    turn, so ``base`` names the service whose handle this is; it defaults to
+    the retinue gateway, where every handle came from until the chat surface
+    started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
     never finishes leaves delivered=False, so the daily drain retries it.
@@ -320,7 +326,7 @@ def _confirm_delivery(job_path: str, store_path, label: str) -> None:
         return
     from urllib.parse import urljoin
     _jobs.confirm_delivery(
-        urljoin(RETINUE_GATEWAY_URL, job_path),
+        urljoin(base or RETINUE_GATEWAY_URL, job_path),
         lambda: _mark_delivered(store_path),
         log=lambda msg: print(f"[telegram-gateway] {label}: {msg}", flush=True),
         timeout=RETINUE_GATEWAY_TIMEOUT,
@@ -840,13 +846,19 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
                     is_group: bool, sender_name: str | None,
                     files: list[dict] | None = None,
                     attachment_urls: list[str] | None = None,
-                    store_path=None, message_id: str | None = None) -> None:
+                    store_path=None, message_id: str | None = None,
+                    sender_key: str | None = None) -> None:
     """Blocking dispatch — runs in a worker thread, off the asyncio loop.
 
     ``store_path`` is set when the caller already persisted this message before
     transcription (the never-drop voice-note path): it is threaded to
     :func:`_forward_to_inbox` so the forward reuses that record instead of
     writing a second one.
+
+    ``sender`` is for people to read — a username where there is one — while
+    ``sender_key`` is the poster's id, which is what the policy matches and what
+    the ledger records. A username can be changed by the person who holds it;
+    an id cannot, and it is what whitelist entries already carry.
     """
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
     # A message that is only its media — a video, a sticker — is still the
@@ -866,7 +878,8 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
         _forward_to_inbox(text, lang, str(chat_id), is_group=is_group,
                           sender_name=sender_name, files=files,
                           attachment_urls=attachment_urls,
-                          store_path=store_path, message_id=message_id)
+                          store_path=store_path, message_id=message_id,
+                          sender_handle=sender_key)
     else:
         _handle_control_message(text, lang, str(chat_id), sender, files=files)
 
@@ -1024,7 +1037,7 @@ async def _on_new_message(event) -> None:
                     durable = _retain_media(media_path) or media_path
                     grp = str(chat_id) if is_group else None
                     voice_store_path = _persist_inbound(
-                        "", sender, grp, delivered=False, media=str(durable),
+                        "", str(sender_id), grp, delivered=False, media=str(durable),
                         attachment_urls=attachment_urls,
                         chat=str(chat_id), message_id=msg_id,
                     )
@@ -1052,7 +1065,8 @@ async def _on_new_message(event) -> None:
             files = voice_files + image_files + file_files
             _handle_inbound(text, lang, str(chat_id), sender, is_group, sender_name,
                             files=files, attachment_urls=attachment_urls,
-                            store_path=voice_store_path, message_id=msg_id)
+                            store_path=voice_store_path, message_id=msg_id,
+                            sender_key=str(sender_id))
 
         _LOOP.run_in_executor(None, _work)
     except Exception as exc:  # noqa: BLE001 - one bad message must not stall the loop
@@ -1373,24 +1387,39 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
                       files: list[dict] | None = None,
                       attachment_urls: list[str] | None = None,
                       store_path=None,
-                      message_id: str | None = None) -> None:
+                      message_id: str | None = None,
+                      sender_handle: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     ``store_path`` is set when the caller already persisted this message before
     transcription (the never-drop voice-note path): the persist-first step below
     is then skipped so the same record is reused instead of a second one written.
-    """
-    sender_label = sender_name or chat_id
-    if sender_name:
-        sender_label = f"{sender_name} ({chat_id})"
-    if is_group:
-        sender_label += " [group]"
 
-    # The gate matches on the stable chat identity (the chat_id, also the reply
-    # address). For a group that chat_id *is* the group, so it is what the
-    # group-block policy matches on; a 1:1 has no group.
-    handle = str(chat_id) if chat_id else "unknown"
-    group_id = handle if is_group else None
+    ``sender_handle`` is who wrote, as an id (Telethon's ``sender_id``);
+    ``chat_id`` is where. They differ only in a shared chat — see below.
+    """
+    # Where the message is (the chat, also the reply address) and who wrote it
+    # are two different facts, and the delivery gate reads them on two different
+    # axes. Keying both on the chat_id — as this did — collapses them in exactly
+    # the place it matters: **a group is never whitelisted, only a sender is**,
+    # so in a group every message looked like one from an unknown handle whose
+    # id happened to be the room's, and a whitelisted correspondent writing
+    # there was never recognised as one. The group's quieted/ignored flag then
+    # decided a message the sender axis should have won.
+    #
+    # In a 1:1 Telethon reports the same id for both, so whitelist entries
+    # written while this keyed on the chat go on matching unchanged. A broadcast
+    # channel has no individual sender, and falls back to the channel itself —
+    # which is the only identity such a post has.
+    chat_key = str(chat_id) if chat_id else "unknown"
+    group_id = chat_key if is_group else None
+    handle = str(sender_handle or chat_key)
+
+    sender_label = sender_name or handle
+    if sender_name:
+        sender_label = f"{sender_name} ({handle})"
+    if is_group:
+        sender_label += f" [group {chat_key}]"
 
     # Persist FIRST, before any routing decision — the never-drop invariant. The
     # inbound event has already been consumed from the Telegram session, so if it
@@ -1402,28 +1431,41 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     if store_path is None:
         store_path = _persist_inbound(question, handle, group_id, delivered=False,
                                       attachment_urls=attachment_urls,
-                                      chat=handle, message_id=message_id)
+                                      chat=chat_key, message_id=message_id)
 
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(handle, group_id)
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
     if gate.get("news"):
-        _forward_news(question, sender_name or handle, group_id, lang)
-    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
-    # surface lights up (and the user is Web-Pushed) with no model turn.
-    # Fire-and-forget on its own thread — it must never delay or reorder the
-    # persist → gate → forward path below. Held classes go too (the mirror
-    # updates silently); the gate verdict rides along so they stay quiet.
-    _chats.notify_chat_event_async(
-        direction="in", channel=INBOUND_CHANNEL, chat=handle,
+        # The feed's source is the channel or group a post came from, never
+        # whoever posted in it — one source per broadcast source, as on the
+        # other gateways. (Unchanged by the sender/chat split above: this is
+        # the exact value it resolved to before.)
+        _forward_news(question, sender_name or (chat_key if is_group else handle),
+                      group_id, lang)
+    # Chats rail. Every arrival's metadata goes to the web-gateway so the chat
+    # surface lights up and the user is Web-Pushed, with no model turn spent on
+    # the notification. For a message the gate forwards the same call does one
+    # thing more: it starts a turn in that chat's companion thread and answers
+    # with its job handle, which is what replaces the triage session this
+    # gateway used to spawn (docs/messenger-chats.md, phase 4). Held classes go
+    # too — the mirror updates silently — and the gate verdict rides along so
+    # they stay quiet.
+    rail_event = dict(
+        direction="in", channel=INBOUND_CHANNEL, chat=chat_key,
         account=TELEGRAM_ACCOUNT, sender=handle, sender_name=sender_name,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
+              "flagged_unknown": bool(gate.get("flagged_unknown")),
               "reason": str(gate.get("reason") or "")},
     )
     if not gate["forward"]:
+        # Held classes want the mirror updated and nothing else, so the rail
+        # stays fire-and-forget for them: it must never delay or reorder the
+        # persist → gate → forward path.
+        _chats.notify_chat_event_async(**rail_event)
         # Mark delivered only for a fully-accounted class (blacklisted/no-action)
         # the drain must never re-surface. One held merely for a not-yet-
         # whitelisted sender stays delivered=False for the daily drain.
@@ -1434,6 +1476,35 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
             f"({gate['reason']}); no model turn",
             flush=True,
         )
+        return
+
+    # The forward class is worked in the chat it arrived in. The rail call is
+    # synchronous here because its answer decides what happens next, and the
+    # forward below has always been a synchronous POST on this path anyway. A
+    # job handle means the chat's companion turn has taken the message: it reads
+    # the chat, stages any reply into that chat's shared draft for the user's
+    # send press, and opens a dashboard conversation only for a decision that is
+    # not "send this reply" — so nothing here opens one per message any more. No
+    # handle (the rail switched off, unreachable, or unable to open the
+    # companion thread) falls through to the triage forward below, unchanged.
+    rail = _chats.notify_chat_event(**rail_event, files=files,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Forwarding it here as well would be the one outcome worse
+        # than waiting: two turns racing over the same draft, plus the
+        # dashboard conversation this replaced. It stays delivered=False, which
+        # is exactly what the daily drain reads.
+        print(f"[telegram-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered for the daily drain "
+              f"rather than handled twice", flush=True)
+        return
+    rail_job = ((rail or {}).get("job_url") or "").strip() or None
+    if rail_job:
+        print(f"[telegram-gateway] the chat's companion turn took the message "
+              f"from {sender_label} ({gate['reason']})", flush=True)
+        _confirm_delivery(rail_job, store_path, sender_label,
+                          base=_chats.CHATS_INGEST_URL)
         return
 
     # The Telegram reply address is the chat_id itself, which _resolve_entity

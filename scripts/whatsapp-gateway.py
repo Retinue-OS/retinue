@@ -337,8 +337,14 @@ def _mark_delivered(store_path) -> None:
         print(f"[whatsapp-gateway] could not mark inbound delivered: {exc}", flush=True)
 
 
-def _confirm_delivery(job_path: str, store_path, label: str) -> None:
-    """Mark a forwarded inbound delivered once its triage job reports success.
+def _confirm_delivery(job_path: str, store_path, label: str,
+                      base: str | None = None) -> None:
+    """Mark a forwarded inbound delivered once the job that took it succeeds.
+
+    That job is either the triage forward's or the chats rail's companion
+    turn, so ``base`` names the service whose handle this is; it defaults to
+    the retinue gateway, where every handle came from until the chat surface
+    started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
     never finishes leaves delivered=False, so the daily drain retries it.
@@ -347,7 +353,7 @@ def _confirm_delivery(job_path: str, store_path, label: str) -> None:
         return
     from urllib.parse import urljoin
     _jobs.confirm_delivery(
-        urljoin(RETINUE_GATEWAY_URL, job_path),
+        urljoin(base or RETINUE_GATEWAY_URL, job_path),
         lambda: _mark_delivered(store_path),
         log=lambda msg: print(f"[whatsapp-gateway] {label}: {msg}", flush=True),
         timeout=RETINUE_GATEWAY_TIMEOUT,
@@ -1926,20 +1932,28 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # flagged `news` goes to the feed whether or not it earns a model turn.
     if gate.get("news"):
         _forward_news(question, sender_name or (group_id if is_group else sender), group_id, lang)
-    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
-    # surface lights up (and the user is Web-Pushed) with no model turn.
-    # Fire-and-forget on its own thread — it must never delay or reorder the
-    # persist → gate → forward path below. Held classes go too (the mirror
-    # updates silently); the gate verdict rides along so they stay quiet.
-    _chats.notify_chat_event_async(
+    # Chats rail. Every arrival's metadata goes to the web-gateway so the chat
+    # surface lights up and the user is Web-Pushed, with no model turn spent on
+    # the notification. For a message the gate forwards the same call does one
+    # thing more: it starts a turn in that chat's companion thread and answers
+    # with its job handle, which is what replaces the triage session this
+    # gateway used to spawn (docs/messenger-chats.md, phase 4). Held classes go
+    # too — the mirror updates silently — and the gate verdict rides along so
+    # they stay quiet.
+    rail_event = dict(
         direction="in", channel=INBOUND_CHANNEL, chat=origin or sender,
         account=WHATSAPP_ACCOUNT, sender=sender, sender_name=sender_name,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
+              "flagged_unknown": bool(gate.get("flagged_unknown")),
               "reason": str(gate.get("reason") or "")},
     )
     if not gate["forward"]:
+        # Held classes want the mirror updated and nothing else, so the rail
+        # stays fire-and-forget for them: it must never delay or reorder the
+        # persist → gate → forward path.
+        _chats.notify_chat_event_async(**rail_event)
         # Mark delivered only for a fully-accounted class (blacklisted/no-action)
         # the drain must never re-surface. One held merely for a not-yet-
         # whitelisted sender stays delivered=False for the daily drain.
@@ -1950,6 +1964,35 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
             f"({gate['reason']}); no model turn",
             flush=True,
         )
+        return
+
+    # The forward class is worked in the chat it arrived in. The rail call is
+    # synchronous here because its answer decides what happens next, and the
+    # forward below has always been a synchronous POST on this path anyway. A
+    # job handle means the chat's companion turn has taken the message: it reads
+    # the chat, stages any reply into that chat's shared draft for the user's
+    # send press, and opens a dashboard conversation only for a decision that is
+    # not "send this reply" — so nothing here opens one per message any more. No
+    # handle (the rail switched off, unreachable, or unable to open the
+    # companion thread) falls through to the triage forward below, unchanged.
+    rail = _chats.notify_chat_event(**rail_event, files=files,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Forwarding it here as well would be the one outcome worse
+        # than waiting: two turns racing over the same draft, plus the
+        # dashboard conversation this replaced. It stays delivered=False, which
+        # is exactly what the daily drain reads.
+        print(f"[whatsapp-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered for the daily drain "
+              f"rather than handled twice", flush=True)
+        return
+    rail_job = ((rail or {}).get("job_url") or "").strip() or None
+    if rail_job:
+        print(f"[whatsapp-gateway] the chat's companion turn took the message "
+              f"from {sender_label} ({gate['reason']})", flush=True)
+        _confirm_delivery(rail_job, store_path, sender_label,
+                          base=_chats.CHATS_INGEST_URL)
         return
 
     reply_token = None
