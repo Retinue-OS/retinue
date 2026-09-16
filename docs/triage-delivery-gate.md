@@ -153,6 +153,14 @@ newsletter that turns out to carry a `List-Id` is not silently un-filed.
 Messenger identity is a **handle**, not a domain — no aliasing problem, so no
 wildcards needed there.
 
+The handle is **the person who wrote**, which in a shared chat is the poster and
+never the room: a group is matched on the group axis, and only there. Each
+gateway must therefore hand the two facts over separately — Telegram keyed both
+on the chat id until this was fixed, which made a whitelisted correspondent
+writing in a group look like an unknown handle whose id happened to be the
+room's. Where a post genuinely has no individual sender — a broadcast channel —
+the channel itself is the only identity there is, and it stands in for one.
+
 - **Whitelist:** handles the user has replied to / contacts, seeded from the
   gateway's contact directory + recent chats, extended by the ask-flow below.
 - **Blacklist:** an unknown sender the user declines to whitelist goes here so

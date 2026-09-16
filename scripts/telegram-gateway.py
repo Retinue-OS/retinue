@@ -846,13 +846,19 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
                     is_group: bool, sender_name: str | None,
                     files: list[dict] | None = None,
                     attachment_urls: list[str] | None = None,
-                    store_path=None, message_id: str | None = None) -> None:
+                    store_path=None, message_id: str | None = None,
+                    sender_key: str | None = None) -> None:
     """Blocking dispatch — runs in a worker thread, off the asyncio loop.
 
     ``store_path`` is set when the caller already persisted this message before
     transcription (the never-drop voice-note path): it is threaded to
     :func:`_forward_to_inbox` so the forward reuses that record instead of
     writing a second one.
+
+    ``sender`` is for people to read — a username where there is one — while
+    ``sender_key`` is the poster's id, which is what the policy matches and what
+    the ledger records. A username can be changed by the person who holds it;
+    an id cannot, and it is what whitelist entries already carry.
     """
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
     # A message that is only its media — a video, a sticker — is still the
@@ -872,7 +878,8 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
         _forward_to_inbox(text, lang, str(chat_id), is_group=is_group,
                           sender_name=sender_name, files=files,
                           attachment_urls=attachment_urls,
-                          store_path=store_path, message_id=message_id)
+                          store_path=store_path, message_id=message_id,
+                          sender_handle=sender_key)
     else:
         _handle_control_message(text, lang, str(chat_id), sender, files=files)
 
@@ -1030,7 +1037,7 @@ async def _on_new_message(event) -> None:
                     durable = _retain_media(media_path) or media_path
                     grp = str(chat_id) if is_group else None
                     voice_store_path = _persist_inbound(
-                        "", sender, grp, delivered=False, media=str(durable),
+                        "", str(sender_id), grp, delivered=False, media=str(durable),
                         attachment_urls=attachment_urls,
                         chat=str(chat_id), message_id=msg_id,
                     )
@@ -1058,7 +1065,8 @@ async def _on_new_message(event) -> None:
             files = voice_files + image_files + file_files
             _handle_inbound(text, lang, str(chat_id), sender, is_group, sender_name,
                             files=files, attachment_urls=attachment_urls,
-                            store_path=voice_store_path, message_id=msg_id)
+                            store_path=voice_store_path, message_id=msg_id,
+                            sender_key=str(sender_id))
 
         _LOOP.run_in_executor(None, _work)
     except Exception as exc:  # noqa: BLE001 - one bad message must not stall the loop
@@ -1379,24 +1387,39 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
                       files: list[dict] | None = None,
                       attachment_urls: list[str] | None = None,
                       store_path=None,
-                      message_id: str | None = None) -> None:
+                      message_id: str | None = None,
+                      sender_handle: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     ``store_path`` is set when the caller already persisted this message before
     transcription (the never-drop voice-note path): the persist-first step below
     is then skipped so the same record is reused instead of a second one written.
-    """
-    sender_label = sender_name or chat_id
-    if sender_name:
-        sender_label = f"{sender_name} ({chat_id})"
-    if is_group:
-        sender_label += " [group]"
 
-    # The gate matches on the stable chat identity (the chat_id, also the reply
-    # address). For a group that chat_id *is* the group, so it is what the
-    # group-block policy matches on; a 1:1 has no group.
-    handle = str(chat_id) if chat_id else "unknown"
-    group_id = handle if is_group else None
+    ``sender_handle`` is who wrote, as an id (Telethon's ``sender_id``);
+    ``chat_id`` is where. They differ only in a shared chat — see below.
+    """
+    # Where the message is (the chat, also the reply address) and who wrote it
+    # are two different facts, and the delivery gate reads them on two different
+    # axes. Keying both on the chat_id — as this did — collapses them in exactly
+    # the place it matters: **a group is never whitelisted, only a sender is**,
+    # so in a group every message looked like one from an unknown handle whose
+    # id happened to be the room's, and a whitelisted correspondent writing
+    # there was never recognised as one. The group's quieted/ignored flag then
+    # decided a message the sender axis should have won.
+    #
+    # In a 1:1 Telethon reports the same id for both, so whitelist entries
+    # written while this keyed on the chat go on matching unchanged. A broadcast
+    # channel has no individual sender, and falls back to the channel itself —
+    # which is the only identity such a post has.
+    chat_key = str(chat_id) if chat_id else "unknown"
+    group_id = chat_key if is_group else None
+    handle = str(sender_handle or chat_key)
+
+    sender_label = sender_name or handle
+    if sender_name:
+        sender_label = f"{sender_name} ({handle})"
+    if is_group:
+        sender_label += f" [group {chat_key}]"
 
     # Persist FIRST, before any routing decision — the never-drop invariant. The
     # inbound event has already been consumed from the Telegram session, so if it
@@ -1408,14 +1431,19 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     if store_path is None:
         store_path = _persist_inbound(question, handle, group_id, delivered=False,
                                       attachment_urls=attachment_urls,
-                                      chat=handle, message_id=message_id)
+                                      chat=chat_key, message_id=message_id)
 
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(handle, group_id)
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
     if gate.get("news"):
-        _forward_news(question, sender_name or handle, group_id, lang)
+        # The feed's source is the channel or group a post came from, never
+        # whoever posted in it — one source per broadcast source, as on the
+        # other gateways. (Unchanged by the sender/chat split above: this is
+        # the exact value it resolved to before.)
+        _forward_news(question, sender_name or (chat_key if is_group else handle),
+                      group_id, lang)
     # Chats rail. Every arrival's metadata goes to the web-gateway so the chat
     # surface lights up and the user is Web-Pushed, with no model turn spent on
     # the notification. For a message the gate forwards the same call does one
@@ -1425,7 +1453,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # too — the mirror updates silently — and the gate verdict rides along so
     # they stay quiet.
     rail_event = dict(
-        direction="in", channel=INBOUND_CHANNEL, chat=handle,
+        direction="in", channel=INBOUND_CHANNEL, chat=chat_key,
         account=TELEGRAM_ACCOUNT, sender=handle, sender_name=sender_name,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
