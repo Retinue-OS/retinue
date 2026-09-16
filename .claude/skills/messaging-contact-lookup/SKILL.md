@@ -4,6 +4,9 @@ description: >
   Use this skill whenever the user wants to send a message via WhatsApp, Signal, or Telegram,
   or whenever a contact needs to be found in any of these apps.
   ALWAYS use this skill before sending any message — even if the contact name seems clear.
+  ONE exception: a reply that already carries a reply token (a "--reply-to <token>" command in
+  the thread's agent context or a gateway prompt) needs NO lookup — the token already addresses
+  the exact conversation; run that command verbatim.
   This skill tells Claude to search recent conversations first (never the contacts directory),
   and to account for speech recognition errors in the contact's name (phonetic variants, typos,
   mishearings). Trigger on any request like "send a WhatsApp to X", "schreib X auf Signal",
@@ -11,6 +14,18 @@ description: >
 ---
 
 # Messaging Contact Lookup
+
+## Exception first: token-addressed replies need no lookup
+
+When the message is a **reply** to a forwarded inbound message and a reply
+command with a token is already at hand — the dashboard thread's agent context
+or a gateway prompt carries `…-push.py --reply-to <token>` — **skip this skill's
+lookup entirely** and run that command verbatim with the reply text. The token
+routes the reply back to the exact conversation the message arrived in, which
+is more precise than any name resolution (and immune to the mishearing problem
+this skill works around); resolving the name anyway risks sending to the wrong
+account. Everything below applies to *initiating* a message to a person, or to
+a reply for which no token exists.
 
 ## Grundprinzip
 

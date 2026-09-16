@@ -12,7 +12,7 @@ that replaces the console procedure.
 
 ## Why sign-ins end
 
-Two distinct mechanisms:
+Four distinct mechanisms:
 
 1. **The refresh token has a fixed lifetime.** The credential file records it
    (`claudeAiOauth.refreshTokenExpiresAt`). Access tokens are refreshed
@@ -23,31 +23,156 @@ Two distinct mechanisms:
    monitor does.
 
 2. **Concurrent sessions rotate each other out.** Anthropic rotates the token
-   pair on refresh. Two Claude processes sharing the file (the remote-control
-   session plus a `claude` run via `docker exec`, or a `--resume` session)
-   race: the loser holds stale tokens, notices, and clears the credential
-   file. The entrypoint keeps a backup (`.credentials.json.bak`) and a
-   watcher that restores it and restarts the container; when the backup's
-   tokens have themselves been rotated away, the server rejects them, the
-   watcher records that in the `.restored-expiry` marker and gives up — the
-   system is then signed out early, with no warning possible. Avoid this
-   class entirely by not running extra `claude` processes against the same
-   credentials while remote-control is active.
+   pair on refresh, and every Claude process refreshes on its own once the
+   access token is within five minutes of expiry. The framework runs several
+   such processes beside the remote-control session — scheduled jobs,
+   dashboard turns, the base-job scripts, Ask-Ara answers — all on the same
+   file, so near expiry they race for the one rotation. Claude Code
+   arbitrates among its own processes with a lock (see the next section), but
+   a process that gives up waiting fails its turn on the expired token, and
+   the loser of an unarbitrated race (older versions, a lock gone stale)
+   holds stale tokens, notices, and clears the credential file. The
+   entrypoint keeps a backup (`.credentials.json.bak`) and a watcher that
+   restores it and restarts the container; when the backup's tokens have
+   themselves been rotated away, the server rejects them, the watcher records
+   that in the `.restored-expiry` marker and gives up — the system is then
+   signed out early, with no warning possible. The framework keeps its own
+   processes out of this race with the pre-spawn refresh below; what remains
+   is never to start an extra `claude` process by hand against the same
+   credentials while remote-control is active without running
+   `claude_auth.py refresh` first.
+
+3. **An idle long-lived session rotates itself out.** A session refreshes for
+   itself and holds the pair it last used; the spawners rotate the pair on
+   disk whenever one of them starts near expiry. Hours later the session's own
+   refresh can therefore present a token that has since been rotated away —
+   Anthropic answers HTTP 400, and the whole token family dies with it, the
+   entrypoint's backup included: the watcher's restore is rejected too, and
+   the deployment is signed out early with no warning possible. This is the
+   near-daily "sign-in broken" pattern, and the session it needs is not even
+   one doing work. Observed on 2026-09-07 in a gateway deployment: a spawn
+   rotated the pair on disk at 14:30:17, the remote-control session (running
+   since 06:39) refreshed at 22:39:38 and logged `OAuth refresh failed
+   (expected): Request failed with status code 400`, cleared the credential
+   file, and the restored backup was rejected as well.
+
+   The aggravating case is a session that cannot do anything at all: Claude
+   Code serves remote control from `api.anthropic.com` only, so behind a
+   Claude-compatible gateway it ignores `--remote-control` ("Remote Control is
+   only available when using Claude via api.anthropic.com … `--rc` flag
+   ignored") and leaves an ordinary session sitting on the shared tokens. The
+   entrypoint therefore starts the session only where remote control is
+   actually served — `ANTHROPIC_BASE_URL` unset or pointing at
+   `api.anthropic.com` — and idles on `tail -f /dev/null` otherwise, with the
+   credential watcher still running and every spawner refreshing under the
+   shared lock as before. Deployments that reach Anthropic directly keep the
+   session and with it this failure mode; there, the pre-spawn refresh below
+   is what keeps its window small.
+
+4. **A background loop holds the credentials on a timer.** Not every `claude`
+   invocation is a session: `claude plugin …`, like any other subcommand,
+   reads the shared credential file and refreshes an access token near expiry.
+   A loop that runs one on a fixed cadence is therefore a token-rotating actor
+   that no spawn discipline covers, and it wins by sheer frequency — a session
+   starts a few dozen times a day, a 60 s loop 1440 times. Observed on
+   2026-09-14, after mechanism 3 had been closed: the deployment ran for five
+   hours with no session at all, the plugin sync's `claude plugin marketplace
+   update` fired every minute throughout, and at ~00:25 — the moment the
+   access token expired — it was the process that presented the rotated
+   refresh token, got it refused, and left the credential file cleared. The
+   entrypoint watcher found its backup already marked rejected and gave up, so
+   the deployment stayed signed out until the owner re-logged in six hours
+   later. The rule this yields: **anything that runs `claude` on a timer must
+   only run it when it has work**, and must take the pre-spawn refresh when it
+   does. `scripts/sync-plugins.py` compares the plugin trees in plain Python
+   first and starts no CLI at all on a pass with no drift.
+
+## The pre-spawn refresh (`claude_auth.py refresh`)
+
+Every `claude` process the framework starts — every scheduler job, prompt or
+command (`scripts/scheduler.py`; a command job gets the refresh whether or not
+its script loads a model, because the scheduler cannot know, and a chamber's
+script cannot be required to know about `claude_auth`), every gateway spawn (`_run_claude()` in
+`scripts/web-gateway.py`: conversation turns, transcript cleanup, the
+presentation lint), the base-job scripts (`agent-self-review.py`,
+`news-curate.py`, `triage-gate.py`), Ask-Ara answers (`ara-mcp-server.py`),
+the chamber plugin sync when it has an install to do
+(`scripts/sync-plugins.py`), the remote-control session itself (the
+entrypoint, right before `exec`) and sub-sessions from the `spawn-session`
+skill — first calls
+`claude_auth.ensure_fresh_credentials()`. It reads the credential file and,
+only when the access token expires within `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS`
+(default 900):
+
+1. takes an `flock` on `.credentials.json.lock` — one lock for every
+   framework spawner, released by the kernel if the holder dies;
+2. takes Claude Code's own refresh lock as well — the proper-lockfile
+   directories `<config-dir>/.oauth_refresh.lock` and legacy
+   `<config-dir>.lock`, in the CLI's order, created with `mkdir`, touched
+   while held, and stale after 60 s by the CLI's own rule — so a `claude`
+   process that is mid-refresh makes the spawner wait, and one that starts
+   refreshing meanwhile waits on the spawner and then adopts what it wrote:
+   no two grants ever carry the same pair. If the CLI's lock is still live
+   when the wait runs out, the spawner gives up and leaves the refresh to
+   the session; a lock nobody has touched for 60 s is taken over, as the
+   CLI itself would;
+3. re-reads the file under both locks — a spawner that waited usually finds
+   the job done and **adopts** the fresh pair;
+4. otherwise performs the one refresh (the CLI's own `refresh_token` grant,
+   with the stored scopes) and installs the reply like a re-login does:
+   atomic write, backup renewed, rejected-restore marker cleared — still
+   under both locks.
+
+The child then starts on a token good for hours and refreshes nothing. The
+common case — a token with more than the margin left — costs one file read
+and takes no lock. Every outcome is non-fatal: the spawn goes ahead
+regardless. `failed` and `lock_timeout` log, in the spawner's own log, why
+the session will be refreshing for itself; `expired` — the refresh token's
+own expiry has passed, which no session can refresh either — logs that only
+a fresh sign-in helps: the session still starts, but cannot authenticate
+until then, the state the monitor alerts on as `needs_login`. Nothing on
+this path ever clears credentials. `CLAUDE_AUTH_REFRESH_AHEAD_SECONDS=0`
+disables it; `CLAUDE_AUTH_LOCK_WAIT_SECONDS` (default 60) bounds the wait for
+either lock.
+
+This is not the out-of-band refresh the monitor refuses to perform: the
+rotation is exactly the one the child would trigger seconds later, moved
+before the spawn and under a lock — the number of rotations does not change,
+only who performs them and how many at a time. The margin is wider than the
+CLI's own 300 s on purpose, so the spawner gets there first; a long-lived
+session, which refreshes for itself, is then *expected* to find the newer pair
+on disk at its next refresh and adopt it (Claude Code re-reads the file
+under its lock before refreshing — verified against 2.1.260, the version the image pins, and 2.1.261).
+The 2026-09-07 incident above shows that this is not something to rely on: a
+session idle for hours still presented a rotated token and took the whole
+family down with it. The pre-spawn refresh bounds how often that window opens;
+what closes it is not keeping a session alive that has nothing to do.
+
+What Claude Code does on its own, for reference (verified against 2.1.260, the version the image pins, and 2.1.261, byte-identical in every constant below): a refresh is
+attempted when the access token is within 300 s of expiry; the lock above is
+retried five times with 1–2 s pauses, after which the process gives up
+(`lock_busy`) and the request goes out on the expired token; under the lock
+the file is re-read and a newer pair adopted; a refresh rejected with
+`invalid_grant` marks the pair dead and clears it on disk. The pre-spawn
+refresh removes the framework's processes from that contention altogether;
+it cannot cover a `claude` started by hand — hence the rule above.
 
 ## The monitor (`scripts/claude-auth-monitor.py`)
 
 Forked by the entrypoint alongside the messenger gateway monitor; it costs no
 Claude credits — each tick is a handful of file reads via
 `claude_auth.credential_status()`. It deliberately performs **no token refresh
-of its own**: an out-of-band refresh would join the rotation race above and
-cause the clobbering it is meant to prevent.
+of its own**: an out-of-band refresh — one at a time of the monitor's choosing,
+with no session about to need it — would join the rotation race above and
+cause the clobbering it is meant to prevent. (The pre-spawn refresh is the
+opposite case: a session is about to start and would refresh at once.)
 
 Verdicts and what they trigger (dashboard conversation → Web Push, like an
 incoming message; the notice links to `/claude-auth`):
 
 | State | Meaning | Notification |
 |-------|---------|--------------|
-| `ok` | Refresh token present, nothing due | none; recovery is reported when an incident ends |
+| `ok` | Refresh token present, nothing due | none; when an incident ends, recovery is recorded quietly in its thread (no push, no unread badge, an archived thread stays archived) |
 | `expiring` | Refresh token expires within `CLAUDE_AUTH_WARN_DAYS` (default 3) | "expires soon" thread, reminded daily |
 | `stale` | Live file cleared with a valid backup (auto-restore should fix it), or access token unrefreshed for over `CLAUDE_AUTH_STALE_HOURS` (default 24) | same warning thread |
 | `needs_login` | No credentials anywhere, backup rejected by the server, or refresh token expired | "sign-in broken" thread, reminded every 6 h |
@@ -80,10 +205,13 @@ the re-login:
    notification arrived on — approves, and Anthropic's callback page displays
    a code.
 3. Pasting the code back completes the exchange; the gateway writes
-   `.credentials.json` (atomic, mode 0600, unknown fields preserved), renews
-   the entrypoint's backup, clears the rejected-restore marker, and — by
-   default — restarts the container so every process starts on the fresh
-   credentials. The page reconnects by itself once the gateway is back.
+   `.credentials.json` (atomic, mode 0600, unknown fields preserved) under
+   the same two locks the pre-spawn refresh holds — so a sign-in completing
+   while a spawner is mid-refresh lands after that refresh and is never
+   overwritten by it — renews the entrypoint's backup, clears the
+   rejected-restore marker, and — by default — restarts the container so
+   every process starts on the fresh credentials. The page reconnects by
+   itself once the gateway is back.
 
 The restart matters even when re-logging in proactively: a running session
 keeps its old tokens in memory, and its next refresh would rotate the *old*
@@ -96,6 +224,7 @@ Console equivalents, for completeness (both write the same file):
 # without stopping anything, from any shell in the container:
 python3 /workspace/scripts/claude_auth.py login    # prints URL, prompts for code
 python3 /workspace/scripts/claude_auth.py status   # diagnosis
+python3 /workspace/scripts/claude_auth.py refresh  # the pre-spawn refresh, by hand
 
 # the original procedure still works:
 docker compose stop retinue && docker compose run --rm retinue interactive  # then: claude
@@ -133,6 +262,16 @@ CLAUDE_OAUTH_SCOPES=…          CLAUDE_OAUTH_USER_AGENT=…
 
 The failure mode is graceful either way: the exchange surfaces the server's
 error on the page, and the console paths keep working.
+
+The pre-spawn refresh adds two more couplings of the same kind, both
+verified against 2.1.260 (the pinned image) and 2.1.261, and both harmless
+when they drift: the CLI's 300 s
+refresh margin (ours is wider, so a narrower one on their side changes
+nothing) and its lock protocol (proper-lockfile directories at
+`<config-dir>/.oauth_refresh.lock` and legacy `<config-dir>.lock`, mtime
+touched while held, stale after 60 s). If those move, the framework holds
+directories nobody else consults and the CLI's own re-read-and-adopt covers
+that overlap, as it did before the framework took part in the lock.
 
 One such coupling is load-bearing enough to name: Cloudflare fronts the OAuth
 endpoints and rejects generic HTTP clients outright — **"Token endpoint

@@ -35,8 +35,11 @@ services:
         condition: service_started
       litellm:
         condition: service_healthy
-    env_file:
-      - .env
+    # Deliberately no env_file: this container runs the agent sessions, and
+    # `env_file: .env` handed it every secret in the deployment — the LiteLLM
+    # database password and salt, the OpenRouter key, the calendar password —
+    # none of which any process in it reads. Every variable it does read is
+    # named under `environment:` below (retinue-os/retinue#15).
     volumes:
       # Persistent storage for /root (Claude login, config, scheduler state).
       - retinue-root:/root
@@ -174,6 +177,24 @@ services:
       # to normal triage and never reaches the feed.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Messenger-chat state (read watermarks, shared drafts, archive/mute,
+      # cached display metadata) — one JSON doc per chat, written only by the
+      # web-gateway. Persistent /root volume like CONVERSATIONS_DIR: losing it
+      # would resurrect every read message as unread and drop staged drafts.
+      - CHAT_STATE_DIR=/root/.retinue/chats
+      # Optional shared secret for the gateways' chats notify rail
+      # (POST /internal/chats/inbound). Open when unset — the news-rail model;
+      # set it here and on the gateways to lock the endpoint down.
+      - CHATS_INGEST_TOKEN
+      # Which TCP peers count as "arrived through the reverse proxy" for the
+      # endpoints that act with the user's own authority: the chat send press
+      # and approving a pending send. Defence in depth only — no send skips an
+      # account's policy any more, whoever calls. Unset (the default) means anything that
+      # is neither loopback nor this container's own address — which is what
+      # Traefik in its own container looks like. Set it (addresses or CIDRs)
+      # to pin the proxy explicitly, and set it to include loopback only in a
+      # host-networking topology, where the distinction is unavailable.
+      - EDGE_PROXY_PEERS
       # scripts/self-update.py pokes the updater sidecar (below) to rebuild
       # and restart the whole stack; must match the updater's own token.
       - UPDATER_URL=http://updater:9000/update
@@ -189,6 +210,233 @@ services:
       - NODE_EXTRA_CA_CERTS=/etc/egress-audit/certs/egress-ca-cert.pem
       - SSL_CERT_FILE=/etc/egress-audit/certs/egress-ca-cert.pem
       - REQUESTS_CA_BUNDLE=/etc/egress-audit/certs/egress-ca-cert.pem
+      # ── Everything below used to arrive through `env_file: .env` ─────────
+      # A variable enters this container only if it is named here: a bare name
+      # passes the value from .env (or the shell) when set and nothing when
+      # unset. That is what keeps secrets meant for other services out of the
+      # agent container altogether, on top of the per-session allowlist
+      # (scripts/session_env.py) that keeps what IS here out of the spawned
+      # sessions. Grouped by the process that reads each variable. A
+      # deployment whose scripts read further names lists them in its
+      # override's `environment:` (and, for session-side ones, in
+      # RETINUE_SESSION_ENV_EXTRA). The list is the audit: every name a
+      # process in this container reads is here, the paths and endpoints
+      # that default to this image's layout included (the last group).
+      #
+      # Model tiers and routing (docs/model-routing.md), the per-job model
+      # overrides expanded in .schedule.json manifests, and the dashboard's
+      # model-picker sources (web-gateway.py: LiteLLM's /model/info, Ollama's
+      # live tags). LITELLM_MASTER_KEY is the picker's auth fallback and
+      # RETINUE_LITELLM_KEY its override; only the gateway reads them, and the
+      # session allowlist withholds both by default (RETINUE_SESSION_ENV_EXTRA
+      # can name either — the operator's explicit decision).
+      - RETINUE_ROUTER_MODEL
+      - RETINUE_FRONTIER_MODEL
+      - RETINUE_TRIAGE_MODEL
+      - RETINUE_CONVERSATION_MODELS
+      - RETINUE_CONVERSATION_MODELS_FILE
+      - RETINUE_LITELLM_URL
+      - RETINUE_LITELLM_KEY
+      - RETINUE_MODELS_CACHE_SECONDS
+      - RETINUE_OLLAMA_URL
+      - OLLAMA_API_BASE
+      - OLLAMA_HOST
+      - LITELLM_MASTER_KEY
+      - LITELLM_PRIMARY_MODEL
+      # Session environment escape hatch (scripts/session_env.py): names a
+      # deployment's chamber scripts read that the framework allowlist does
+      # not know, comma-separated, `PREFIX_*` for a family.
+      - RETINUE_SESSION_ENV_EXTRA
+      # Memory (scripts/memory.py): RETINUE_MEMORY=0 disables the store.
+      - RETINUE_MEMORY
+      # Claude Code: the permission mode for every `claude` the framework
+      # starts, the pre-spawn token refresh and the monitor's remaining
+      # tunables (docs/claude-auth.md), the in-container auto-updater switch
+      # (docs/contributing.md).
+      - CLAUDE_PERMISSION_MODE
+      - CLAUDE_AUTH_REFRESH_AHEAD_SECONDS
+      - CLAUDE_AUTH_LOCK_WAIT_SECONDS
+      - CLAUDE_AUTH_MONITOR_FAILURES
+      - CLAUDE_AUTH_MONITOR_REMIND_SECONDS
+      - CLAUDE_AUTH_MONITOR_WARN_REMIND_SECONDS
+      - CLAUDE_AUTH_MONITOR_STATE_DIR
+      - CLAUDE_AUTH_PUBLIC_BASE_URL
+      - CLAUDE_OAUTH_HTTP_TIMEOUT
+      - CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS
+      - DISABLE_AUTOUPDATER
+      # Scheduler tunables (scripts/scheduler.py).
+      - SCHEDULER_TICK_SECONDS
+      - SCHEDULER_JOB_TIMEOUT
+      - SCHEDULER_KILL_GRACE_SECONDS
+      - SCHEDULER_STATE_DIR
+      # E-mail: the default account for the web gateway's IMAP/SMTP backend
+      # (scripts/email_client.py, which the gateway runs on the agents'
+      # behalf — the credentials never reach a session), the send policy, and
+      # the backend token (auto-generated by the entrypoint when unset). A
+      # NAMED account (EMAIL_USER_ARI, EMAIL_PASS_ARI, IMAP_HOST_ARI, …) is
+      # deployment content: list its variables in the override.
+      - EMAIL_USER
+      - EMAIL_FROM_NAME
+      - EMAIL_PASS
+      - IMAP_HOST
+      - IMAP_PORT
+      - SMTP_HOST
+      - SMTP_PORT
+      - SENT_FOLDER
+      - DRAFTS_FOLDER
+      - SMTP_SAVE_SENT
+      - EMAIL_SEND_POLICY
+      - SEND_STRIP_HEADERS
+      - EMAIL_BACKEND_TOKEN
+      - EMAIL_ENV_FILE
+      - EMAIL_PROCESSING_INTERVAL
+      # Dashboard: the conversation backend token (auto-generated when unset),
+      # the public base URLs links are built with, Web Push (the VAPID key
+      # pair itself is a file on the /root volume, never an env var), the
+      # accepted-requesters allowlist, and the gateway's session, helper and
+      # chat-surface tunables (all optional, documented in web-gateway.py).
+      - CONVERSATION_BACKEND_TOKEN
+      - CONVERSATION_BASE_URL
+      - SEND_APPROVAL_BASE_URL
+      # The owner's actor URI (urn:retinue:actor:<slug>), driving the projects
+      # card's "your move" vs "waiting on <them>" split (.env.example has the
+      # full rationale).
+      - RETINUE_OWNER_ACTOR
+      - VAPID_SUBJECT
+      - PUSH_TTL
+      - ACCEPTED_REQUESTERS_PATH
+      - SESSION_MAX_IDLE_SECONDS
+      - CONV_SESSION_MAX_IDLE_SECONDS
+      - WEB_GATEWAY_MAX_CONCURRENCY
+      - JOB_RETENTION_SECONDS
+      - CONVERSATION_MAX_ATTACHMENT_BYTES
+      - MESSAGE_FILES_TTL_SECONDS
+      - MAX_PROJECT_FILE_BYTES
+      - QLEVER_TIMEOUT
+      - TRANSCRIPT_CLEANUP
+      - TRANSCRIPT_CLEANUP_MODEL
+      - TRANSCRIPT_CLEANUP_TIMEOUT
+      - TRANSCRIBE_TIMEOUT
+      - PRESENTATION_LINT
+      - PRESENTATION_LINT_MODEL
+      - PRESENTATION_LINT_TIMEOUT
+      - PRESENTATION_LINT_CONCURRENCY
+      - PRESENTATION_LINT_WAIT
+      - CHAT_COMPANION_CONTEXT_MESSAGES
+      - CHAT_GATEWAY_IDENTITY_TTL
+      - CHAT_GATEWAY_IDENTITY_TTL_FAIL
+      - CHAT_LIST_CACHE_SECONDS
+      - CHAT_OVERLAY_TTL_SECONDS
+      - CHAT_PAGE_MESSAGES
+      - CHAT_SEND_CONFIRM_TIMEOUT
+      - CHAT_SEND_MAX_IMAGES
+      - CHAT_SEND_TIMEOUT
+      - GATEWAY_HEALTH_TIMEOUT
+      # Gateway auth (scripts/gateway_auth.py) beyond the three above.
+      - GATEWAY_BASIC_AUTH_USERS
+      - GATEWAY_AUTH_REALM
+      - GATEWAY_CLIENT_CERT_HEADER
+      - GATEWAY_CLIENT_CERT_INFO_HEADER
+      - GATEWAY_FORWARDED_HOST_HEADER
+      # Messengers, client side: default push recipients (scripts/*-push.py),
+      # per-call timeouts, extra gateways enrolled on /sends and the built-in
+      # channel set (scripts/messenger_gateways.py), the connection monitor's
+      # tunables (scripts/gateway-monitor.py), and the CalDAV gateway's client
+      # side (scripts/caldav-push.py writes, scripts/caldav-read.py reads; the
+      # calendar credentials stay in caldav-gateway).
+      - SIGNAL_DEFAULT_RECIPIENT
+      - SIGNAL_GATEWAY_TIMEOUT
+      - WHATSAPP_DEFAULT_RECIPIENT
+      - WHATSAPP_GATEWAY_TIMEOUT
+      - TELEGRAM_DEFAULT_RECIPIENT
+      - TELEGRAM_GATEWAY_TIMEOUT
+      - MESSENGER_GATEWAYS
+      - MESSENGER_BUILTIN_CHANNELS
+      - GATEWAY_MONITOR_IGNORE
+      - GATEWAY_MONITOR_INTERVAL
+      - GATEWAY_MONITOR_FAILURES
+      - GATEWAY_MONITOR_HEALTH_TIMEOUT
+      - GATEWAY_MONITOR_REMIND_SECONDS
+      - GATEWAY_MONITOR_STATE_DIR
+      - GATEWAY_MONITOR_PUBLIC_BASE_URL
+      - CALDAV_GATEWAY_CREATE_URL=http://caldav-gateway:8094/create-event
+      # Base URL for the read side (scripts/caldav-read.py: /calendars, /events,
+      # /event) — same gateway, same token, no approval flow: a read changes
+      # nothing in the calendar.
+      - CALDAV_GATEWAY_BASE_URL=http://caldav-gateway:8094
+      - CALDAV_GATEWAY_TOKEN
+      - CALDAV_GATEWAY_TIMEOUT
+      # Ask-Ara connector tunables (scripts/ara-mcp-server.py) beyond the
+      # identity block above.
+      - ARA_MCP_AUDIT
+      - ARA_MCP_TIMEOUT
+      - ARA_MCP_SYNC_WAIT
+      - ARA_MCP_MAX_CONCURRENCY
+      - ARA_MCP_RATE_LIMIT
+      - ARA_MCP_RATE_WINDOW
+      - ARA_MCP_JOB_RETENTION
+      # Data refresh: Garmin (scripts/sync-garmin.py, run synchronously in the
+      # agent's own process by refresh.py --ensure, so this credential does
+      # reach sessions — until the fetch moves into a sidecar).
+      - GARMIN_EMAIL
+      - GARMIN_PASSWORD
+      # News feed and triage tunables (scripts/news_store.py, news-fetch.py,
+      # news-curate.py, triage-gate.py), the project-deadline lead
+      # (scripts/recurring-projects.py), the self-update call timeout
+      # (scripts/self-update.py), the chamber plugin watcher's interval
+      # (scripts/sync-plugins.py) and the session-side scripts' backend
+      # timeouts (scripts/conversation-push.py, chat-draft.py).
+      - NEWS_HALF_LIFE_HOURS
+      - NEWS_MAX_AGE_DAYS
+      - NEWS_MAX_ITEMS
+      - NEWS_FETCH_TIMEOUT
+      - NEWS_CURATE_BATCH
+      - TRIAGE_STATE_DIR
+      - TRIAGE_INBOX_SCAN_LIMIT
+      - TRIAGE_INBOX_SCAN_MAX
+      - TRIAGE_PROMPT_LIST_LIMIT
+      - TRIAGE_STALL_DAYS
+      - TRIAGE_SENT_DERIVE_LIMIT
+      - TRIAGE_NEWS_FOLDER
+      - TRIAGE_NEWS_EXCERPT_CHARS
+      - PROJECT_DEADLINE_LEAD_DAYS
+      - UPDATER_TIMEOUT
+      - PLUGIN_SYNC_INTERVAL
+      - CONVERSATION_BACKEND_TIMEOUT
+      # Paths and endpoints that default to this image's layout — where the
+      # workspace, the chambers, the credential file and the in-container
+      # backends are (scripts/entrypoint.sh, scheduler.py, memory.py,
+      # claude_auth.py, ara-mcp-server.py, conversation-push.py,
+      # chat-draft.py, recurring-projects.py, triage-gate.py,
+      # triage_policy.py, discover-agents.py, emit-conversation-models.py,
+      # web-gateway.py, git-serialize.sh). A deployment rarely sets one;
+      # listed so that the audit above holds without exception.
+      - CHAMBERS_DIR
+      - CHAMBERS_MANIFEST
+      - CHAMBERS_ROOT
+      - BASE_SCHEDULE
+      - RETINUE_WORKSPACE
+      - AGENTS_TTL_PATH
+      - CONVERSATION_MODELS_NT_PATH
+      - RETINUE_MEMORY_DIR
+      - RETINUE_MEMORY_ACTOR
+      - RETINUE_MEMORY_SESSION
+      - CLAUDE_CRED_FILE
+      - CLAUDE_BIN
+      - ARA_MCP_WORKDIR
+      - ARA_MCP_GATEWAY_URL
+      - CONVERSATION_BACKEND_URL
+      - CHAT_DRAFT_BACKEND_URL
+      - CONVERSATION_PUSH
+      - EMAIL_CLIENT_PATH
+      - TRIAGE_MESSENGER_DIR
+      - TRIAGE_EMAIL_WHITELIST_PATH
+      - WEBAPP_DIR
+      - DASHBOARD_DATA_DIR
+      - PUSH_DIR
+      - MESSAGE_FILES_DIR
+      - QLEVER_GRAPH_BASE
+      - GIT_SERIALIZE_LOCK_DIR
     command: remote-control
     stdin_open: true
     tty: true
@@ -303,6 +551,13 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Chats notify rail: on every arrival (and own-device echo) the gateway
+      # POSTs the message's metadata here so the dashboard's chat surface
+      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
+      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
+      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -382,6 +637,13 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Chats notify rail: on every arrival (and own-device echo) the gateway
+      # POSTs the message's metadata here so the dashboard's chat surface
+      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
+      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
+      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -462,6 +724,13 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
+      # Chats notify rail: on every arrival (and own-device echo) the gateway
+      # POSTs the message's metadata here so the dashboard's chat surface
+      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
+      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
+      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service.
       - STT_SERVICE_URL=http://stt:8100/transcribe
       - STT_TOKEN
@@ -493,7 +762,7 @@ services:
     networks:
       - agents
 
-  # CalDAV gateway — writes calendar events into the user's real calendar (see
+  # CalDAV gateway — reads and writes the user's real calendar (see
   # scripts/caldav-gateway.py). Provider-agnostic by design (issue #13): the
   # backend is selected purely by configuration (CALDAV_SERVER_URL/USERNAME/
   # PASSWORD/CALENDAR_ID) via a generic RFC 4791 client library — no
@@ -528,9 +797,16 @@ services:
       # Outbound send-control policy (JSON array, like EMAIL_SEND_POLICY). Keyed
       # by the SENDING identity (CALDAV_ACCOUNT above), not any per-request
       # field. Categories: allow / trust / verify. An account matching no entry
-      # and no "*" wildcard defaults to verify (fail-safe).
-      # [{"account":"default","category":"verify"},{"account":"agent","category":"allow"}]
+      # and no "*" wildcard defaults to verify (fail-safe). Reads (/calendars,
+      # /events, /event) are not governed by it — the policy guards what an
+      # agent may change, and a read changes nothing.
       - CALDAV_SEND_POLICY
+      # Read side: the window a range read covers when the caller names no end
+      # (this is what bounds the work), and the cap on how many events one
+      # response may carry. Both must be positive and finite, or the gateway
+      # warns and uses its default.
+      - CALDAV_READ_DEFAULT_DAYS
+      - CALDAV_READ_MAX_EVENTS
       # Public base URL for approval links returned by the verify/trust flow.
       - SEND_APPROVAL_BASE_URL
       # Outbound HTTP API (internal to the agents network; not published).
@@ -635,6 +911,14 @@ services:
       - messenger-signal:/data/_generated/messenger/signal:ro
       - messenger-whatsapp:/data/_generated/messenger/whatsapp:ro
       - messenger-telegram:/data/_generated/messenger/telegram:ro
+      # Persist both blue-green index slots so a restart resumes serving the
+      # last completed build immediately instead of 502ing for the whole
+      # duration of a fresh rebuild (qlever-dir still always rebuilds on
+      # startup to catch up on anything that changed while the container was
+      # down — this only avoids the gap in service while it does). See
+      # qlever-dir's "Resuming across a restart" README section.
+      - life-index-a:/index-a
+      - life-index-b:/index-b
     environment:
       BASE_URI: "file:"
       REBUILD_DELAY: "15"
@@ -723,6 +1007,10 @@ volumes:
   messenger-signal:
   messenger-whatsapp:
   messenger-telegram:
+  # qlever-life's two blue-green index slots — see the qlever-life service
+  # above for why these are persisted.
+  life-index-a:
+  life-index-b:
   piper-data:
   stt-models:
   egress-audit-certs:

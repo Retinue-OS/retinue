@@ -9,7 +9,9 @@ than data freshness.
 
 A job either:
   - **dispatches an agent task** via `prompt` → `claude -p "<prompt>"` (a fresh
-    headless session, so it reads CLAUDE.md and Ara can route to a subagent), or
+    headless session, so it reads CLAUDE.md and Ara can route to a subagent;
+    an access token about to expire is refreshed first, under the lock every
+    framework spawner shares — scripts/claude_auth.py), or
   - runs a shell **`command`**.
 
 Per-job run state lives under a state dir *outside* the chambers, so the scheduler
@@ -28,12 +30,28 @@ Manifest format  (`/workspace/chambers/<chamber>/.schedule.json`):
     ]
   }
 
+`interval_seconds` measures from the *previous run's completion* to the next
+run's start, not start-to-start: `write_state` (below) is called once the job
+has finished, so a job that takes real wall-clock time to run is spaced out by
+that much extra, and a job whose run time varies does not compress its own gap
+when it happens to run long.
+
 A prompt job may pin the model its `claude -p` session runs on with an optional
 `"model"` field. It takes precedence over the global RETINUE_CLAUDE_MODEL and
 supports `${VAR:-default}` shell-style expansion, so a chamber can default a job
 to a model while letting the deployment override it via one env var — without
 naming the chamber in this framework file. Example:
   {"id": "triage", "prompt": "...", "model": "${RETINUE_TRIAGE_MODEL:-sonnet}"}
+
+A job may also carry an optional `"retry_after_seconds"`, consulted only when
+the last recorded run did not end in `"success"`: the job is then due as soon
+as that many seconds have passed, instead of waiting out the full
+`interval_seconds`. Leaving it unset means a failed run is due at exactly the
+same point a successful one would be (the safe default — most failures deserve
+a look before a bare retry, not a tight retry loop). Example, for a job whose
+failures are usually transient (a rate limit, a flaky upstream):
+  {"id": "herald-fetch", "command": "...", "interval_seconds": 86400,
+   "retry_after_seconds": 900}
 
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
@@ -45,8 +63,11 @@ Environment:
                                  job's process group, in seconds (default 10)
   SCHEDULER_STATE_DIR           state/log dir (default /root/.retinue/scheduler)
   CLAUDE_PERMISSION_MODE        permission mode for `claude -p` (default acceptEdits)
-  RETINUE_CLAUDE_MODEL          global model for all prompt jobs (a job's own
-                                 "model" field overrides it)
+  RETINUE_ROUTER_MODEL          router-tier model for prompt jobs (Ara junior
+                                 turns — see docs/model-routing.md); falls back
+                                 to RETINUE_CLAUDE_MODEL when unset
+  RETINUE_CLAUDE_MODEL          global fallback model (a job's own "model"
+                                 field overrides both)
 """
 
 import glob
@@ -60,6 +81,10 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_auth  # noqa: E402
+import session_env  # noqa: E402
+
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 # Framework-owned base manifest, always loaded alongside the per-chamber ones.
 # Holds cross-cutting jobs that belong to the framework itself (e.g. agent
@@ -72,7 +97,13 @@ JOB_TIMEOUT = int(os.environ.get("SCHEDULER_JOB_TIMEOUT", "900"))
 KILL_GRACE_SECONDS = int(os.environ.get("SCHEDULER_KILL_GRACE_SECONDS", "10"))
 STATE_DIR = Path(os.environ.get("SCHEDULER_STATE_DIR", "/root/.retinue/scheduler"))
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
-CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# Prompt jobs are routing-shaped Ara turns (dispatch, relay), so the router
+# tier wins when the deployment declares one; a job's own "model" field still
+# overrides either (docs/model-routing.md).
+CLAUDE_MODEL = (
+    os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
+    or os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+)
 LOG_FILE = STATE_DIR / "scheduler.log"
 
 
@@ -106,21 +137,26 @@ def job_model(job: dict) -> str:
     return CLAUDE_MODEL
 
 
-def job_env() -> dict:
+def job_env(model: str = "") -> dict:
     """Environment for spawned jobs.
 
     Scheduled jobs run agents (`claude -p`) or scripts that must not hold mailbox
-    credentials. When EMAIL_BACKEND_TOKEN is set, strip EMAIL_PASS* and point
-    email_client.py at the web gateway so it proxies instead (mirrors the
-    entrypoint's remote-control setup, since the scheduler is forked before it).
+    credentials — or any other secret this daemon's environment carries (it is
+    forked by the entrypoint before the remote-control scrub, so it holds the
+    whole container environment). The environment is therefore built from the
+    allowlist in scripts/session_env.py, the same one every framework spawner
+    uses, rather than copied and stripped: EMAIL_PASS* is absent by
+    construction, and when EMAIL_BACKEND_TOKEN is set, email_client.py is
+    pointed at the web gateway so it proxies instead. A command job gets the
+    same environment as a prompt job: the base-job scripts spawn `claude -p`
+    themselves and chamber commands run in the same trust position.
+
+    `model` advertises the model the spawned session runs on (a session cannot
+    introspect its own --model flag), so memory entries can be stamped with it
+    (scripts/memory.py). Absent rather than inherited when this job passes no
+    --model, so a stale value can never mislabel a session.
     """
-    env = dict(os.environ)
-    if env.get("EMAIL_BACKEND_TOKEN"):
-        port = env.get("WEB_GATEWAY_PORT", "8080")
-        env["EMAIL_BACKEND_URL"] = f"http://localhost:{port}/internal/email"
-        for key in [k for k in env if k.startswith("EMAIL_PASS")]:
-            del env[key]
-    return env
+    return session_env.build(model=model)
 
 
 def log(msg: str) -> None:
@@ -147,6 +183,14 @@ def read_last_run(job_id: str) -> float | None:
         with open(_state_path(job_id), encoding="utf-8") as fh:
             ts = json.load(fh).get("last_run")
         return datetime.fromisoformat(ts).timestamp() if ts else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def read_last_status(job_id: str) -> str | None:
+    try:
+        with open(_state_path(job_id), encoding="utf-8") as fh:
+            return json.load(fh).get("status")
     except (OSError, ValueError, json.JSONDecodeError):
         return None
 
@@ -206,7 +250,29 @@ def is_due(job: dict) -> bool:
         # job fires one full interval later, not immediately.
         write_state(job["id"], "scheduled")
         return False
-    return (now() - last) >= int(job["interval_seconds"])
+    elapsed = now() - last
+    if elapsed >= int(job["interval_seconds"]):
+        return True
+    # A run that did not succeed may retry sooner than interval_seconds, but
+    # only if the job opts in -- an unset retry_after_seconds leaves a failed
+    # run due at exactly the same point a successful one would be, which is
+    # deliberate (see the module docstring): most failures are worth
+    # investigating before a bare retry, not worth hammering. A job that knows
+    # its own failures are often transient (a rate limit, a flaky upstream)
+    # can shorten that wait explicitly.
+    #
+    # "scheduled" is excluded here even though it is not "success": it is the
+    # bookkeeping status the block above writes on a job's first sighting, to
+    # start the interval clock -- not the record of an actual run. Without
+    # this exclusion, a job seen for the first time reads back as a
+    # non-success "last run" on the very next tick, so a job with
+    # retry_after_seconds set would fire after that short delay instead of
+    # ever waiting out its documented full interval_seconds for its first run.
+    retry_after = job.get("retry_after_seconds")
+    last_status = read_last_status(job["id"])
+    if retry_after and last_status not in ("success", "scheduled"):
+        return elapsed >= int(retry_after)
+    return False
 
 
 def spawn_process(cmd, *, retry_enoent, **kwargs):
@@ -250,6 +316,20 @@ def run_job(job: dict) -> None:
     log(f"[run] {jid} ({kind}{model_note}) from {Path(job['_source']).parent.name}")
     started = now()
     try:
+        # A `claude` started on an access token about to expire refreshes it
+        # at once, racing every other claude process for the one rotation
+        # (docs/claude-auth.md). Refresh first — once, under the lock all
+        # framework spawners share — so the child never has to; a failure only
+        # logs, and the child then refreshes for itself.
+        #
+        # Command jobs get this too, even though most of them never load a
+        # model: a job script that does spawn `claude` may be a chamber's, and
+        # a chamber cannot be required to know about claude_auth — one
+        # unguarded hourly spawn is enough to sign the whole deployment out.
+        # The call is idempotent and, away from expiry, one file read, so the
+        # scripts that already refresh for themselves pay nothing for it.
+        claude_auth.ensure_fresh_credentials(
+            log=lambda msg: log(f"[auth] {jid}: {msg}"))
         proc = spawn_process(
             cmd,
             retry_enoent=(kind == "prompt"),
@@ -258,7 +338,7 @@ def run_job(job: dict) -> None:
             stderr=subprocess.PIPE,
             text=True,
             cwd="/workspace",
-            env=job_env(),
+            env=job_env(model),
             # Own process group, so a timeout can reach descendants too --
             # subprocess.run's timeout path only ever signalled the direct
             # child, leaving any grandchildren it spawned running.

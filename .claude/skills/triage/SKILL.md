@@ -57,12 +57,15 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
 - **A silent run is the normal outcome.** The only conversations triage may open
   are Phase 4's two kinds — an individual proposal or the omnibus. A run never
   reports on itself. See **4c** below.
-- **An archived conversation is a user decision.** Archiving means the user is
-  not pursuing the topic at this stage. Never un-archive a thread — or post into
-  it, which un-archives it as a side effect — just to remind the user. Only
-  genuinely new external content (a new inbound message on the subject) may bring
-  an archived thread back, and that happens through Phases 1–4, never through a
-  reminder.
+- **An archived conversation is not a decision on the message.** Archiving means
+  the user is not pursuing the topic at this stage. Never un-archive a thread —
+  or post into it, which un-archives it as a side effect — just to remind the
+  user. What may bring the subject back is genuinely new external content (a new
+  inbound message) or a **stalled** item re-collected by Phase 1's fourth pass,
+  and either way through Phases 1–4 in a *new* thread, never through a reminder.
+  Only **`muted`** (with `archived`) is the user saying the topic is done for
+  good — per CLAUDE.md, the one decidable signal — and only that stops triage
+  from asking again.
 
 ### The delivery gate
 
@@ -133,8 +136,33 @@ status. Reconcile in both directions:
    Phase 6 would. This catches e.g. the already-answered path (which proposes no
    reply, so never reaches Phase 6's move) and verify-queued sends (deferred
    until approval, then forgotten). Only genuinely non-terminal states
-   (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item still awaiting
+   (`proposed`, `omnibus`, `deferred`, an `engaged` item still awaiting
    *user* input) legitimately stay in the INBOX.
+4. **Re-collect `stalled`** — the same backstop for the *non-terminal* states.
+   An item whose proposal was never engaged and whose thread was archived or
+   deleted stays in the INBOX forever: nothing revisits it. The gate therefore
+   re-arms any INBOX message on a non-terminal status untouched for
+   `TRIAGE_STALL_DAYS` (default 7, `triage-gate.py`) — but re-arming only buys
+   this turn; without this pass the item is re-armed again on every later tick
+   and still never leaves. For each such message, look its `conversation_id` up
+   in `GET /conversations?all=1` and take one of three branches:
+   - **Thread archived *and* muted** → that is the user's decision on the
+     message (per CLAUDE.md `muted` is the only decidable signal of "archive
+     this for good"). Do not re-propose: resolve it out of the INBOX exactly as
+     pass 3 does — `flag --read` + `move` to its disposition folder — and write
+     `resolved`, recording the muted thread as the reason.
+   - **Thread gone, or archived and not muted** → the proposal never landed.
+     Re-collect the message as if it were untracked: it goes through Phases 2–4
+     and gets a **new** proposal thread (or a place in the omnibus), reusing the
+     status file. Never post into the archived thread and never un-archive it —
+     a quiet or archived thread is not a decision, so the new thread is the only
+     way to ask again.
+   - **Thread alive** → the proposal is intact and merely old; leave the
+     decision to the user and let Phase 5 nudge it, but **stamp `updated` on the
+     status record** so the gate stops counting it as stalled.
+
+   Every branch must leave the record with either a new status or a fresh
+   timestamp; one that leaves it untouched re-arms the item on every tick.
 
 **Messaging** — messenger has **no live listing** (Signal/WhatsApp/Telegram are
 push-only). The held backlog lives in each gateway's delivery ledger, so the
@@ -148,7 +176,19 @@ daily catch-all **drains the gateway** instead of listing chats:
 `GET /undelivered` returns the held messages **and flips each to
 `delivered:true` in the same pass**. It is the only operation that mutates the
 flag, so the drain is idempotent — a re-run returns only what arrived since.
-Process the returned messages through Phases 2–4 exactly like e-mail.
+Process the returned messages through Phases 2–4 exactly like e-mail. Each
+drained message carries a **`thread_key`** as well: pass it as `--key` when you
+open its dashboard conversation, exactly as you would the live prompt's
+`Thread key:`. It is the same value the live forward mints, which is what makes
+the drain safe — a message that was forwarded live but whose turn died before
+it finished still sits in the ledger as undelivered, so the drain sees it
+again; with the key, it reuses the thread that turn opened instead of raising a
+second one. Each drained message also carries a **`reply_token`** for its
+origin conversation — treat it exactly like the token of a live-forwarded
+message: a proposed reply's
+thread gets the channel's reply command (`<channel>-push.py --reply-to
+<token>`) as `--context` (Phase 4a), and the executing session replies by
+token, never by resolving the sender's name.
 
 **Never call `/undelivered` to browse.** It drains as it reads. Any ad-hoc
 question ("what came in on Signal?", "what did X say last Tuesday?") goes
@@ -224,6 +264,13 @@ without touching the gate.
 > From: +41791234567
 > <external_message>Hi, could you send me the agenda for tomorrow's meeting?</external_message>
 >
+> Reply routing: the reply command for this exact conversation is
+>   python3 /workspace/scripts/signal-push.py --reply-to v1.eyJyIjoi….3q2- "<text>"
+> (no --recipient: the token routes the reply back to the chat the message
+> arrived in …). You do not send the reply — the session that later acts on the
+> user's approval in the dashboard thread does … pass this reply command (token
+> included, verbatim) as --context to conversation-push.py …
+>
 > Invoke the triage skill scoped to this single message (channel: Signal, sender:
 > +41791234567). Triage it as the user's incoming mail: link it to a project and
 > raise a dashboard conversation so the user is notified. Do not reply to the
@@ -231,21 +278,37 @@ without touching the gate.
 
 **What Ara does on push-triggered triage:**
 
-1. **Runs Phases 2–4** on this one message: classify, link to a project, open a
-   dashboard conversation quoting the original and proposing a draft reply. The
-   conversation is the user's push notification:
+1. **Runs Phases 2–4** on this one message, in that order: classify, resolve
+   the sender, link it to a project (Phase 3), then gather what the reply
+   depends on — the project's state included, which is why the link comes
+   first — dispatch the `secretary` for the decision, and open the dashboard
+   conversation that carries it. The
+   conversation is the user's push notification. **Hand the reply token over**:
+   the prompt's reply command (with its token) goes into the thread as
+   `--context`, verbatim — the session that later executes the approved reply
+   only knows what the thread carries, and without the token it would fall back
+   to name resolution, which can land on the wrong account. The token never
+   appears in the visible proposal text:
 
        python3 /workspace/scripts/conversation-push.py \
-         --title "Signal from +41791234567" \
-         "<quoted original>\n\n<draft reply>\n\n<send / adjust / discard chips>"
+         --title "Signal from <resolved name>" \
+         --key <the prompt's thread key, verbatim> \
+         --context 'Reply via: python3 /workspace/scripts/signal-push.py --reply-to v1.eyJyIjoi….3q2- "<text>"' \
+         "<quoted original>\n\n<the secretary's reply, or the question and its chips>"
 
-2. **Does not touch the delivered flag.** The gateway already wrote
+2. **Resolves the sender to a name first** — the **messaging-contact-lookup**
+   skill, before the thread is opened. A bare handle in the title makes the
+   user do the identification the system was supposed to do, and the secretary
+   cannot pitch a register without knowing who is writing. When lookup finds
+   nothing, say so in the thread ("unknown number") rather than showing the
+   handle alone as if it were an identity.
+3. **Does not touch the delivered flag.** The gateway already wrote
    `delivered: true` when it forwarded the message live, so the daily drain will
    not re-surface it. Messenger bookkeeping lives in the ledger, not a status
    file.
-3. **Does not reply to the sender.** The source channel is the user's own inbox;
+4. **Does not reply to the sender.** The source channel is the user's own inbox;
    any response goes out later, through the user's chosen channel, once they
-   approve a draft on the dashboard.
+   have approved a reply — or chosen the answer — on the dashboard.
 
 ---
 
@@ -255,6 +318,13 @@ Resolve the **sender** to a contact note, read the content, assign **one
 disposition**: `archive` (keep, no action) · `delete` (drop, no action) ·
 `reply` (needs a response) · `action` (needs something done — calendar, task,
 forward).
+
+This first cut is yours and it is final for `archive` and `delete`: bulk mail
+that needs no answer goes straight to the omnibus, and dispatching a subagent
+per newsletter would spend turns where they earn nothing. For `reply` and
+`action` the cut only decides that the item deserves a proposal — the
+`secretary` confirms or corrects the disposition as part of the decision it
+returns in Phase 4a, and its verdict wins.
 
 ### `archive` vs `delete` — is there an honest reason to keep it?
 
@@ -345,31 +415,118 @@ Committing link updates is routine operational output — commit and push direct
 ### 4a. Individual proposals — every run (not interval-gated)
 
 Each `reply` / `action` item, any channel, becomes its **own dashboard
-conversation** on the run that first sees it — a draft reply or the specific
-action. Messaging is more urgent → propose promptly (or on push). Then write
-status `proposed` with the returned conversation id.
+conversation** on the run that first sees it. Messaging is more urgent →
+propose promptly (or on push). Then write status `proposed` with the returned
+conversation id.
 
-    python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" "...draft...\n<send / adjust / discard chips>"
+A proposal is built in three steps, in this order. **You do not decide the
+substance and you do not write the words** — steps 1 and 3 are yours, step 2
+belongs to the `secretary` subagent, whose model is the one this system trusts
+with correspondence.
 
-Titles and body above are English placeholders — the text you actually compose
-is in the **recipient's / thread's** language. Apply the Secretary's style
-rules: the persona (`agents/secretary.md`) for the generic mechanics, plus the
-chamber style overrides (`chambers/*/style/secretary.md`) that carry the
-owner's own conventions. Never bundle replies. Compose the conversation text
-per the **dashboard-composing** skill: a `[[chip: …]]` for each proposed
-disposition (send / adjust / discard) and no bare URLs. The
-original is quoted in the thread, so it needs no details chip — those are for
-e-mails referred to but not shown (related earlier mails, omnibus lines).
+**1. Gather what the reply depends on.** Before dispatching, collect the facts
+that could settle the answer, from whatever sources this deployment actually
+has: the sender resolved to a contact (the **messaging-contact-lookup** skill
+for messenger; the contact note for e-mail), the linked project's state,
+`memory.py recall` for the standing preferences and past decisions on this
+person or topic, the life store, and — where the deployment provides one — the
+calendar for any date or slot the message proposes. A source this deployment
+does not have is simply a fact you lack; note it and move on, never guess it.
+
+**2. Dispatch `secretary` for the decision.** Hand over the message, the
+sender as resolved, the channel, the thread so far, and every fact from step 1.
+It returns the disposition plus **either** ready-to-send `REPLY` text (the
+facts settle it) **or** a `DECISION NEEDED` question with `OPTIONS` (the answer
+is the user's to give) — the contract in `.claude/agents/secretary.md`. Its
+`BASIS` line says which facts decided, and names any that were missing.
+
+**3. Open the thread around what came back**, one of three shapes. A `REPLY`
+becomes a proposal with send / adjust / discard chips. A `DECISION NEEDED`
+becomes a question with one chip per returned option — and **no draft at
+all**: the user answers by chip, and the reply is composed on a second
+dispatch once they have. A `NO MESSAGE` owes the sender nothing: propose the
+work it names (the calendar entry, the forward) with its own chips, or — when
+it corrects the disposition to `archive`/`delete` — drop the item into the
+omnibus instead of opening a thread at all. Whichever shape, the original is
+quoted above it, and nothing is sent.
+
+    # facts settled it — propose the reply
+    python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" \
+      "<quoted original>\n\n<the secretary's reply>\n<send / adjust / discard chips>"
+
+    # the user owns the answer — ask, do not draft
+    python3 /workspace/scripts/conversation-push.py --title "<name> asks about <subject>" \
+      "<quoted original>\n\n<the question>\n[[chip: This morning]] [[chip: Friday morning]] [[chip: Neither works]]"
+
+**Never post a draft that defers the substance.** "Thanks for your message,
+let me check and get back to you" is not a reply: it spends a round trip to
+say nothing, and leaves the user the same decision plus a second message to
+approve. If the substance is not settled by the facts, ask — that is what the
+`DECISION NEEDED` branch is for.
+
+Titles and chip labels above are English placeholders — the text that reaches
+the recipient is the secretary's, in the **recipient's / thread's** language,
+and the thread text you write around it follows the user's. You no longer read
+the style files yourself: the persona and the chamber overrides are the
+secretary's layer. Never bundle replies. Compose the conversation text per the
+**dashboard-composing** skill: a `[[chip: …]]` for every option offered and no
+bare URLs. The original is quoted in the thread, so it needs no details chip —
+those are for e-mails referred to but not shown (related earlier mails,
+omnibus lines).
+
+**A messenger item's proposal thread carries its thread key.** A live forward
+names one in the prompt (`Thread key: …`) and a drained record carries one in
+its `thread_key` field — pass it verbatim as `--key` on the
+`conversation-push.py` call that opens the thread. Never build the key
+yourself: it names the receiving account and chat as well as the message id,
+because a channel-native id alone is not unique across chats or accounts. It makes the thread
+idempotent: the same turn can legitimately run twice (an escalation re-runs
+the prompt after a junior turn already opened a thread; a gateway can
+redeliver a message after a reconnect), and without the key each run raises
+its own thread, so the user gets the same item twice. With it, the second run
+is handed the first thread and posts nothing. A key belongs only on the call
+that *opens* a thread — appending to one already addresses it by id.
+
+**A messenger item's proposal thread must carry its reply token.** The item
+came with a reply command (`<channel>-push.py --reply-to <token>` — in the
+gateway's live prompt, or as the drained message's `reply_token`): pass that
+command, token included, as `--context` on the `conversation-push.py` call.
+The context is stored with the message and replayed to every later Ara session
+in the thread, invisible to the user — it is the only way the token reaches
+the session that executes the approved reply. A proposal thread opened without
+it forces that session back onto name resolution, the failure mode reply
+tokens exist to prevent. E-mail needs no context: its reply is addressed by
+`--uid` from the status store (Phase 6).
 
 ### 4b. Omnibus proposal — once per `EMAIL_PROCESSING_INTERVAL`
 
 Bundle **all** `archive` + `delete` items in scope into **one** dashboard
 conversation for a single batch approval. Emit at most once per interval;
 between intervals, accumulate. After emitting, write status `omnibus` for those
-messages and record the last-omnibus timestamp.
+messages and record the last-omnibus timestamp in
+**`$TRIAGE_STATE_DIR/.last-omnibus`** (that exact name — see *State &
+idempotency*).
 
+**The omnibus push always carries `--key`.** "At most once per interval" is
+enforced by the gateway, not by trusting the bookkeeping below to be reached:
+the key names the interval window, so every attempt inside one window collapses
+onto the first thread instead of raising another. Derive it mechanically —
+never from a timestamp of "now", which differs on every attempt:
+
+    OMNIBUS_KEY="triage-omnibus:$(python3 -c 'import os,time; print(int(time.time()//int(os.environ.get("EMAIL_PROCESSING_INTERVAL","86400"))))')"
     python3 /workspace/scripts/conversation-push.py --title "Triage: archive & delete" \
+    --key "$OMNIBUS_KEY" \
     "...grouped ARCHIVE / DELETE, one line per message, each ARCHIVE line with its reason...\n<approve-all chip>"
+
+This key is what makes emit-then-record safe. The bookkeeping is written
+*after* the push on purpose — writing it first would mark messages `omnibus`
+that the user never saw, had the push failed — so a run that dies in between
+leaves the items untracked and a later run re-proposes them, correctly, since
+nothing recorded that they were proposed. Without the key that re-proposal
+opens a **second thread**; with it, the user's existing thread is reused and
+nothing duplicates. A response carrying `deduplicated` means this window's
+omnibus is already up: write the bookkeeping and stop — never re-push, and
+never "try again" because a push looked unconfirmed.
 
 ### 4c. No status-report conversations — a silent run is the normal outcome
 
@@ -417,8 +574,8 @@ remind — scaled by urgency and importance:
 have decided not to pursue the topic for now — respect that. Send no nudge and
 no push for it, and never un-archive it as a reminder (posting into it would
 un-archive it as a side effect, so don't post either). Only a **new external
-message on the subject** — arriving through Phases 1–4 — may bring an archived
-thread back.
+message on the subject**, or Phase 1's re-collection of a stalled item — both
+arriving through Phases 1–4, in a new thread — may raise the subject again.
 
 **Urgency scaling:** Signal/WhatsApp/SMS escalate **sooner** and prefer the
 Signal push; e-mail defaults to the in-thread nudge. Record `last_nudge` in the
@@ -429,7 +586,27 @@ status file; nudge at most once per interval.
 ## Phase 6 — Execute on approval & inbox-zero
 
 Ara picks up each thread, carries out what was approved, then writes status
-`resolved`:
+`resolved`.
+
+**A chip the user picked is an answer, not a reply.** When the thread asked a
+`DECISION NEEDED` question, their choice is the fact that was missing — feed it
+back to the `secretary` (message, sender, context, and now the user's answer)
+and post the text it returns into the thread as a proposal, with the same
+send / adjust / discard chips. **Only `send` sends.** An answer to a question
+and an adjustment are both instructions about what the reply should say, not
+approval of words the user has not yet seen; the same holds for a proposal the
+user adjusted rather than approved — their instruction goes to the secretary,
+whose text comes back for approval like any other. No session composes the
+outgoing words itself, on any tier, and no text reaches a recipient that the
+user has not seen and approved.
+
+**A `CANNOT COMPOSE:` line is never sendable text.** When the secretary
+returns one — a missing convention, an unreadable style layer — post what is
+missing into the thread so the user can repair it, and leave the item
+non-terminal. Never send that line, and never re-dispatch for the same text
+until the cause is fixed; a second dispatch would only return it again.
+
+Then carry out the disposition:
 
 - **Archive / delete** → apply per channel (e-mail `move`/delete; messaging
   archive), honouring named exceptions.
@@ -443,6 +620,17 @@ Ara picks up each thread, carries out what was approved, then writes status
   send instead of trusting the `resolved` flag. A `verify` reply becomes
   `resolved` only once its pending send is approved — until then it stays
   non-terminal.
+
+  For a **messenger** reply, the thread's agent context (replayed in the
+  engage prompt: "Reply via: … --reply-to <token>") carries the exact send
+  command — run it with the approved text. The token addresses the reply back
+  to the conversation the message arrived in; **never resolve the sender's
+  name to an address when a token is present** (the messaging-contact-lookup
+  path is only the fallback for a thread that carries no token). The send
+  still passes the channel's `*_SEND_POLICY`: the user's in-thread approval
+  justifies `--user-approved` for a `trust` account, while `verify` queues at
+  `/sends` and — as with e-mail — the item stays non-terminal until that send
+  is approved.
 - **Action** → do the concrete thing; if it advanced a project, append to its
   log.
 
@@ -499,6 +687,12 @@ ledger's flag, not an INBOX move, closes the loop.
   client/channel.
 - **Garbage-collect** `resolved` entries once their message has left the INBOX
   (or after a retention window) so the store stays small.
+- **The last-omnibus timestamp lives in `$TRIAGE_STATE_DIR/.last-omnibus`** —
+  that exact filename, hyphen and not underscore, holding one ISO-8601 UTC
+  instant. A run that invents its own spelling (`.last_omnibus`) writes a file
+  no other run reads, so every subsequent run believes an omnibus is due. Where
+  both spellings exist, `.last-omnibus` is authoritative and the other is to be
+  removed.
 
 ### Messenger — the gateway delivery ledger
 
@@ -517,7 +711,12 @@ ledger's flag, not an INBOX move, closes the loop.
   it by instructing Ara (the `triage_policy.py` CLI), never by hand-typing
   identifiers.
 
-An interrupted run re-collects still-untracked items and re-proposes only those.
+An interrupted run re-collects still-untracked items and re-proposes only those
+— onto the *same* dashboard thread, because every proposal carries `--key`: the
+omnibus its interval window (Phase 4b), a messenger item its `thread_key`
+(Phase 4a). Re-proposal is therefore never a duplicate thread. A proposal
+pushed without its key turns each interruption into one instead, and repeated
+interruptions into a pile of identical threads.
 
 ---
 

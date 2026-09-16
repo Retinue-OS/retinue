@@ -53,20 +53,55 @@ def _load_gateway(tmp: Path):
     return mod
 
 
+class _FakeConnection:
+    def __init__(self, local):
+        self._local = local
+
+    def getsockname(self):
+        return (self._local, 8080)
+
+
 class _FakeSendHandler:
     """Just enough of the request handler for _handle_send_action: it only
     ever calls self._send_html() (on error) or self._redirect() (on
-    success), so those are stand-ins rather than the real socket-backed ones."""
+    success), so those are stand-ins rather than the real socket-backed ones.
 
-    def __init__(self):
+    The addresses are real, though: approving a pending send is the user's own
+    decision, so the handler runs the origin check first, and these tests drive
+    the genuine one rather than stubbing it out. Default is a proxy-shaped
+    peer; pass loopback for the in-container caller."""
+
+    def __init__(self, peer="172.19.0.4", local="172.19.0.9"):
         self.html = None
         self.redirected_to = None
+        self.client_address = (peer, 51234)
+        self.connection = _FakeConnection(local)
 
     def _send_html(self, status, body):
         self.html = (status, body)
 
     def _redirect(self, location):
         self.redirected_to = location
+
+
+def _bind_real_gate(wg):
+    """Run the handler's own origin check against the fake, unbound — the
+    point is to exercise the gate, not to stub it away."""
+    _FakeSendHandler._request_from_edge = wg.Handler._request_from_edge
+
+
+def test_in_container_caller_cannot_approve(wg):
+    """An agent that could approve its own pending send would defeat `verify`
+    entirely: queue, then approve. The origin check covers this handler too."""
+    fake = _FakeSendHandler(peer="127.0.0.1", local="127.0.0.1")
+    buf = io.StringIO()
+    with patch.object(wg.ec, "approve_pending_send") as approve:
+        with redirect_stdout(buf):
+            wg.Handler._handle_send_action(fake, "default", "42", "approve")
+    approve.assert_not_called()
+    assert fake.redirected_to is None
+    assert fake.html and fake.html[0] == 403, fake.html
+    assert "REFUSED" in buf.getvalue(), buf.getvalue()
 
 
 def test_approve_logs_stripped_headers(wg):
@@ -108,6 +143,8 @@ def test_reject_path_unaffected(wg):
 def main():
     with tempfile.TemporaryDirectory() as td:
         wg = _load_gateway(Path(td))
+        _bind_real_gate(wg)
+        test_in_container_caller_cannot_approve(wg)
         test_approve_logs_stripped_headers(wg)
         test_approve_silent_when_nothing_stripped(wg)
         test_reject_path_unaffected(wg)

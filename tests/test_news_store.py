@@ -26,6 +26,12 @@ def load_store(tmp: Path):
     spec.loader.exec_module(mod)
     mod.NEWS_DIR = tmp
     tmp.mkdir(parents=True, exist_ok=True)
+    # The store's clock is pinned to T0. The ranking checks below sample
+    # explicit instants already, but pruning reads the clock itself, and it
+    # runs inside add_items: once the calendar moved MAX_AGE_DAYS past T0
+    # every fixture item was dropped on the way in and the suite went red on
+    # its own, with nothing changed. A test's day must not be its input.
+    mod.now = lambda: T0
     return mod
 
 

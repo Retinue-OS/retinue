@@ -21,10 +21,12 @@ GET /conversation/YYYY-MM-DD
 
 Conversation tabs (dashboard chat threads, distinct from the per-day log):
   GET  /conversations                 -> {"conversations": [summary, ...]}
-                                         Optional filters: ?kind=chat|edit|all
-                                         (default chat — project edit-command
-                                         threads are hidden from normal lists)
-                                         and ?project=<uri>.
+                                         Optional filters:
+                                         ?kind=chat|edit|cowork|companion|all
+                                         (default chat — edit-command, cowork
+                                         and messenger-companion threads are
+                                         hidden from normal lists) and
+                                         ?project=<uri>.
   GET  /conversations/<id>            -> full thread {id,title,messages,...}
   POST /conversations                 -> open a new thread (body {message};
                                          optional kind: "chat"|"edit", project:
@@ -44,14 +46,26 @@ Projects (dashboard project pages):
                                          CONVERSATION_BACKEND_TOKEN (header
                                          X-Conversation-Backend-Token). Optional
                                          {kind: "cowork"} for the MCP connector's
-                                         audit trail and {quiet: true} to append
-                                         without an unread badge or Web Push.
+                                         audit trail, {quiet: true} to append
+                                         without an unread badge or Web Push, and
+                                         {context: "..."} — agent-only context
+                                         stored on the message and replayed to
+                                         every later Ara session in the thread,
+                                         never rendered to the user (e.g. the
+                                         exact reply command, with reply token,
+                                         for a proposed messenger reply), and
+                                         {key: "..."} — an idempotency key: a
+                                         second create under a key already used
+                                         returns that thread (200, with
+                                         "deduplicated": true) instead of
+                                         opening a duplicate.
   POST /internal/conversations/<id>/messages
                                       -> a retinue agent appends a message (with
                                          attachments) to an existing thread. Same
-                                         token gate; same optional {quiet: true}.
-                                         A non-quiet append un-archives the
-                                         thread unless it is muted.
+                                         token gate; same optional {quiet: true}
+                                         and {context: "..."}. A non-quiet append
+                                         un-archives the thread unless it is
+                                         muted.
   POST /internal/conversations/<id>/flags
                                       -> a retinue agent sets {archived, muted}
                                          (either or both). Same token gate. The
@@ -77,6 +91,60 @@ Push notifications (dashboard PWA; see scripts/push_notify.py):
                                          browser's subscription JSON verbatim).
   POST /push/unsubscribe              -> drop one (body {endpoint}); idempotent.
 
+Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
+  GET  /chats                         -> {"generated", "chats": [ChatSummary]}
+                                         — every chat in the message ledgers,
+                                         SPARQL over the life store merged with
+                                         the live overlay and the chat state,
+                                         ordered by last activity.
+  GET  /chats/<id>/messages           -> {"generated", "chat": ChatSummary,
+                                         "messages": [Message]} ascending, the
+                                         last CHAT_PAGE_MESSAGES by default.
+                                         ?before=<ts> pages older history (a
+                                         contract addition over the fixture:
+                                         the fixture documents were unpaged).
+                                         <id> is <channel>:<chat-key>,
+                                         percent-encoded; the key is split off
+                                         at the FIRST colon.
+  POST /chats/<id>/read               -> advance the read watermark (body {ts}).
+  POST /chats/<id>/flags              -> set {archived, muted} (either or both,
+                                         booleans). Archived leaves the active
+                                         list; a new message brings it back
+                                         unless it is muted, so hiding a chat
+                                         for good is both together. Independent
+                                         of the triage delivery gate: whether a
+                                         group is a news source, or costs a
+                                         model turn, is that policy's business.
+  POST /chats/<id>/draft              -> write the shared draft (body {text,
+                                         version}); 409 + current state on a
+                                         stale version; empty text clears it.
+  POST /chats/<id>/send               -> send {text} through the chat's own
+                                         gateway as the user (author "user" —
+                                         direct under every policy category:
+                                         the authenticated send press IS the
+                                         approval `verify` exists for). Returns
+                                         the sent Message.
+  POST /chats/<id>/companion          -> {"id"} the chat's companion thread —
+                                         the conversation where the user works
+                                         out a reply with Ara. Creates it on
+                                         the first call (201) and returns the
+                                         same one afterwards (200); the id is
+                                         also the ChatSummary's `companion`.
+                                         An ordinary conversation of kind
+                                         "companion", so the client drives it
+                                         entirely through /conversations/<id>.
+  GET  /chats/media/<slug>/<media-id> -> authenticated proxy for ledger media
+                                         (the gateways' token-gated /media/<id>).
+  POST /internal/chats/inbound        -> the gateways' notify rail: one message
+                                         event (arrival or own-device echo).
+                                         Feeds the overlay, keeps chat state,
+                                         Web-Pushes arrivals. Open unless
+                                         CHATS_INGEST_TOKEN is set (news-rail
+                                         model — see the handler).
+  POST /internal/chats/<id>/draft     -> an agent stages the draft (token-gated
+                                         via CONVERSATION_BACKEND_TOKEN; see
+                                         scripts/chat-draft.py).
+
 Session logic:
 - Conversations are keyed by requester identity (the "on-behalf-of" field, e.g.
   the Signal sender). Each key gets its own Claude session, state entry and lock,
@@ -89,7 +157,14 @@ Session logic:
 - A resume Claude refuses — the transcript is gone, which it is after roughly
   30 days — restarts as a fresh session instead of failing the turn.
 - Total concurrency is bounded by a small worker pool (WEB_GATEWAY_MAX_CONCURRENCY)
-  to keep CPU/memory and subprocess count sane on a personal box.
+  to keep CPU/memory and subprocess count sane on a personal box. The
+  presentation lint has a *separate* bound (PRESENTATION_LINT_CONCURRENCY): it
+  runs inside a request whose caller is frequently a spawned session holding a
+  worker slot, so sharing the pool would deadlock the caller against itself.
+- Every spawn first refreshes an access token about to expire, under the
+  cross-process lock all framework spawners share (scripts/claude_auth.py,
+  docs/claude-auth.md), so a session never starts with a refresh that races
+  the scheduler's jobs or the remote-control session for the token rotation.
 
 State is persisted in STATE_FILE (a map of session-key -> {session_id,
 last_activity}) so restarts survive as long as the sessions themselves are still
@@ -111,10 +186,12 @@ import binascii
 import hashlib
 import html
 import hmac
+import ipaddress
 import json
 import mimetypes
 import os
 import re
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -124,13 +201,15 @@ import urllib.parse
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
 import claude_auth
+import chat_state as chat_state_mod
 import email_client as ec
+import session_env
 import gateway_auth
 import messenger_gateways
 import news_store
@@ -158,9 +237,18 @@ CLAUDE_SPAWN_BACKOFF_SECONDS = 0.5
 CLAUDE_BIN = "/usr/bin/claude"
 
 
+def _log_claude_auth(msg: str) -> None:
+    print(f"[web-gateway] {msg}", flush=True)
+
+
 def _run_claude(cmd, **kwargs):
-    """subprocess.run for the `claude` binary, tolerant of the transient
-    ENOENT window while Claude Code's auto-updater replaces it."""
+    """subprocess.run for the `claude` binary — every gateway spawn goes
+    through here. Refreshes an access token about to expire first, once and
+    under the lock every framework spawner shares (scripts/claude_auth.py), so
+    the session never starts with a refresh that races the scheduler's jobs or
+    the remote-control session for the rotation; then tolerates the transient
+    ENOENT window while Claude Code's auto-updater replaces the binary."""
+    claude_auth.ensure_fresh_credentials(log=_log_claude_auth)
     deadline = time.monotonic() + CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS
     waited = False
     while True:
@@ -189,6 +277,12 @@ STATE_FILE = os.environ.get("WEB_GATEWAY_STATE", "/tmp/web-session-state.json")
 PORT = int(os.environ.get("WEB_GATEWAY_PORT", "8080"))
 CLAUDE_PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# Model tiers (docs/model-routing.md): a turn with no pinned model starts on
+# the router tier — Ara junior answers the door — and a turn junior escalates
+# is re-run on the frontier tier as Ara senior. Both optional: with neither
+# set the deployment runs untiered and nothing below changes behaviour.
+ROUTER_MODEL = os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
+FRONTIER_MODEL = os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
 
 # ── Per-conversation model selection ───────────────────────────────────────────
 # Each turn is its own `claude -p` process — a resumed one keeps the transcript,
@@ -217,19 +311,19 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # RETINUE_CONVERSATION_MODELS_FILE; also derived into the life store by
 # scripts/emit-conversation-models.py), else the built-in default below.
 # Those static Claude aliases are NOT used when LiteLLM is configured: an
-# empty or failed advertisement then offers only "Default", never a model
-# the proxy does not serve.
+# empty or failed advertisement then offers nothing (the picker hides
+# itself), never a model the proxy does not serve.
 #
 # Either way the list holds {"id","label"} objects. `id` is passed to
 # `claude --model` (for LiteLLM-sourced entries the id is the route's
 # model_name, which `claude` sends verbatim); `label` is what the dashboard
-# shows. The empty-string id means "use the gateway's configured default"
-# (CLAUDE_MODEL / whatever `claude` resolves) — always offered first so a
-# thread can defer.
-_DEFAULT_MODEL_ENTRY = {"id": "", "label": "Default"}
-
+# shows. The list carries only concrete models — no synthetic "Default" row.
+# Instead, the entry the gateway's configured default (CLAUDE_MODEL, resolved
+# through LiteLLM's route aliases when it is one) actually runs on is flagged
+# `default: true` and says so in its label; a thread without a stored choice
+# runs that default, stored as the empty string internally. Empty-id entries
+# in a static source are dropped for the same reason.
 _DEFAULT_CONVERSATION_MODELS = [
-    {"id": "", "label": "Default"},
     {"id": "opus", "label": "Opus (deepest reasoning)"},
     {"id": "sonnet", "label": "Sonnet (balanced)"},
     {"id": "haiku", "label": "Haiku (fastest)"},
@@ -250,6 +344,8 @@ def _coerce_conversation_models(parsed: object) -> list[dict]:
     """Normalise a parsed models array into validated {"id","label"} dicts.
 
     Accepts the array itself or a JSON-LD document wrapping it under `models`.
+    Empty-id rows (the legacy synthetic "Default" option) are dropped — the
+    default is flagged on its concrete entry instead (see _mark_default).
     Returns [] when nothing usable is present, so callers can fall back."""
     if isinstance(parsed, dict):
         parsed = parsed.get("models", [])
@@ -260,7 +356,9 @@ def _coerce_conversation_models(parsed: object) -> list[dict]:
         if not isinstance(item, dict) or "id" not in item:
             continue
         mid = str(item["id"]).strip()
-        label = str(item.get("label") or mid or "Default").strip()
+        if not mid:
+            continue
+        label = str(item.get("label") or mid).strip()
         models.append({"id": mid, "label": label})
     return models
 
@@ -398,6 +496,74 @@ def _litellm_model_id(item: dict) -> str:
         return mid
     # /v1/models rows use `id`; keep reading them through the same helper.
     return str(item.get("id") or "").strip()
+
+
+# route name -> upstream model (litellm_params.model), from the last good
+# GET /model/info. This is what lets a plumbing alias like `retinue-claude`
+# resolve to the concrete model it serves — both to flag the picker's default
+# entry and to name the answering model in a message header instead of the
+# route label.
+_litellm_route_upstreams: dict[str, str] = {}
+
+
+def _record_route_upstreams(parsed: object) -> None:
+    """Remember each concrete route's upstream model from a /model/info body."""
+    global _litellm_route_upstreams
+    if not isinstance(parsed, dict):
+        return
+    routes: dict[str, str] = {}
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        mid = _litellm_model_id(item)
+        params = item.get("litellm_params")
+        upstream = (
+            str(params.get("model") or "").strip()
+            if isinstance(params, dict) else ""
+        )
+        if mid and upstream and "*" not in mid and upstream != mid:
+            routes.setdefault(mid, upstream)
+    _litellm_route_upstreams = routes
+
+
+def _resolve_route_model(mid: str) -> str:
+    """Follow LiteLLM route aliases to the concrete model a name serves.
+
+    Also resolves `os.environ/VAR` upstream values (LiteLLM echoes those
+    verbatim when it has not substituted them). Returns the input unchanged
+    when nothing maps it further, so callers can use it unconditionally."""
+    mid = str(mid or "").strip()
+    seen: set[str] = set()
+    while mid and mid not in seen:
+        seen.add(mid)
+        nxt = _litellm_route_upstreams.get(mid, "")
+        if nxt.startswith("os.environ/"):
+            nxt = os.environ.get(nxt[len("os.environ/"):], "").strip()
+        if not nxt or nxt == mid:
+            break
+        mid = nxt
+    return mid
+
+
+def _same_model(a: str, b: str) -> bool:
+    """Whether two model names denote the same concrete model.
+
+    Model names reach the gateway from two namespaces that never had to agree
+    until the tiers arrived: the picker offers LiteLLM route ids
+    (`anthropic/claude-opus-5`) while RETINUE_ROUTER_MODEL/_FRONTIER_MODEL name
+    bare models (`claude-opus-5`). Comparing those as strings makes the
+    frontier model look unequal to itself — so a thread pinned to the frontier
+    tier via the picker would be handed junior's escalation hatch and could
+    escalate Opus to Opus. Both sides are resolved through LiteLLM's route
+    aliases and compared tail-insensitively to the provider prefix, which is
+    how _mark_default has always matched the default entry."""
+    a, b = str(a or "").strip(), str(b or "").strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    ra, rb = _resolve_route_model(a), _resolve_route_model(b)
+    return ra == rb or ra.split("/")[-1] == rb.split("/")[-1]
 
 
 def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) -> list[dict]:
@@ -589,6 +755,7 @@ def _merge_ollama_tags(models: list[dict], tags: list[dict] | None) -> list[dict
 
 def _fetch_litellm_models() -> list[dict]:
     info = _fetch_litellm_json("/model/info")
+    _record_route_upstreams(info)
     listed = None
     try:
         listed = _listed_model_ids(_fetch_litellm_json("/v1/models"))
@@ -648,21 +815,59 @@ def _litellm_conversation_models(force: bool = False) -> list[dict] | None:
         return _litellm_models_cache["models"]
 
 
+def _offered_entry_for(model_name: str, models: list[dict]) -> dict | None:
+    """The entry in `models` naming the same concrete model as `model_name`.
+
+    The name is resolved through LiteLLM's route aliases (retinue-claude →
+    its upstream) and matched tail-insensitively to the provider prefix
+    (`anthropic/claude-opus-5` names `claude-opus-5`)."""
+    target = _resolve_route_model(model_name) if model_name else ""
+    if not target:
+        return None
+    for m in models:
+        if _same_model(target, m["id"]):
+            return m
+    return None
+
+
+def _mark_default(models: list[dict]) -> list[dict]:
+    """Return a copy with the entry un-pinned threads actually run flagged.
+
+    The picker offers no synthetic "Default" row; instead the concrete entry
+    that default turns actually run on carries `default: true` and says so in
+    its label — so the dropdown always names a real model. Since the tiers,
+    an un-pinned thread runs the ROUTER tier when one is set (Ara junior at
+    the door — docs/model-routing.md), else the gateway default — so that is
+    the row to flag, or the picker lies about new threads (observed live: the
+    header showed the gateway default while the turns ran the router model).
+    A router model the list does not offer falls back to flagging the gateway
+    default, so the picker keeps its default row. When neither candidate
+    resolves to an offered entry, nothing is flagged."""
+    out = [dict(m) for m in models]
+    for candidate in (ROUTER_MODEL, CLAUDE_MODEL):
+        entry = _offered_entry_for(candidate, out)
+        if entry is not None:
+            entry["default"] = True
+            label = str(entry.get("label") or entry["id"])
+            entry["label"] = (label[:-1] + ", default)" if label.endswith(")")
+                              else label + " (default)")
+            break
+    return out
+
+
 def _conversation_models(force: bool = False) -> list[dict]:
     """The list the picker offers right now, in precedence order:
     env override > LiteLLM-advertised > file > built-in default.
 
     When LiteLLM is configured, a reachable empty list or a failed fetch with
-    no last-good cache offers only the synthetic Default entry — never the
+    no last-good cache offers nothing (the picker hides itself) — never the
     static Claude aliases, which would not be served."""
     if _ENV_CONVERSATION_MODELS:
-        return _ENV_CONVERSATION_MODELS
+        return _mark_default(_ENV_CONVERSATION_MODELS)
     if _LITELLM_URL:
         dynamic = _litellm_conversation_models(force=force)
-        if dynamic is None:
-            return [dict(_DEFAULT_MODEL_ENTRY)]
-        return [dict(_DEFAULT_MODEL_ENTRY), *dynamic]
-    return _STATIC_CONVERSATION_MODELS
+        return _mark_default(dynamic or [])
+    return _mark_default(_STATIC_CONVERSATION_MODELS)
 
 
 def _model_offered(mid: str, refresh: bool = False) -> bool:
@@ -680,6 +885,23 @@ def _model_offered(mid: str, refresh: bool = False) -> bool:
     if not refresh:
         return False
     return any(m["id"] == mid for m in _conversation_models(force=True))
+
+
+def _offered_equivalent(mid: str | None) -> str | None:
+    """The offered id naming the same model as `mid`, or None.
+
+    A pin stored before the picker moved to LiteLLM route ids holds a bare name
+    (`claude-haiku-4-5`) that is no longer on the offered list, so
+    _valid_model_id rejects it and the thread behaves as if unpinned. This
+    recovers the choice the user actually made instead of flattening it to the
+    default."""
+    mid = str(mid or "").strip()
+    if not mid:
+        return None
+    for m in _conversation_models():
+        if _same_model(mid, m["id"]):
+            return m["id"]
+    return None
 
 # ── How long a session stays resumable ────────────────────────────────────────
 # Resuming is what keeps a turn's work — files read, contacts looked up — from
@@ -744,6 +966,49 @@ CONVERSATION_BACKEND_TOKEN = os.environ.get("CONVERSATION_BACKEND_TOKEN", "")
 # and a variable the entrypoint generates when missing can never be unset. See
 # _news_ingest_authorized() for why this one endpoint is open by default.
 NEWS_INGEST_TOKEN = os.environ.get("NEWS_INGEST_TOKEN", "").strip()
+
+# ── Messenger chats ────────────────────────────────────────────────────────────
+# Per-chat state (read watermark, shared draft, archive/mute, cached display
+# metadata) — one JSON doc per chat, single-writer = this gateway. The
+# deployment pins it to the persistent /root volume like CONVERSATIONS_DIR.
+CHAT_STATE_DIR = Path(os.environ.get("CHAT_STATE_DIR", "/tmp/web-chat-state"))
+_CHAT_STATE = chat_state_mod.ChatStateStore(CHAT_STATE_DIR)
+# The live overlay bridging the life store's few seconds of indexing lag — fed
+# by the notify rail and the dashboard send path, merged over every SPARQL
+# answer, deduplicated on the channel message id. Entries outlive the store's
+# catch-up window and then expire; a restart loses only that freshness.
+CHAT_OVERLAY_TTL_SECONDS = float(os.environ.get("CHAT_OVERLAY_TTL_SECONDS", "90"))
+_CHAT_OVERLAY = chat_state_mod.ChatOverlay(ttl=CHAT_OVERLAY_TTL_SECONDS)
+# The chats rail's optional token — the NEWS_INGEST_TOKEN model, its own
+# variable for the same reason (an entrypoint-generated token can never be
+# unset, so "open by default" needs a variable nothing generates).
+CHATS_INGEST_TOKEN = os.environ.get("CHATS_INGEST_TOKEN", "").strip()
+# How many messages one GET /chats/<id>/messages page carries (the newest;
+# ?before pages older history).
+CHAT_PAGE_MESSAGES = int(os.environ.get("CHAT_PAGE_MESSAGES", "200"))
+# How long the SPARQL-derived chat-list skeleton is reused between polls; state
+# and overlay are applied fresh on every request, and any write that changes
+# the skeleton's truth (a rail event, a read, a send) invalidates it early.
+CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "3"))
+# Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
+CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
+# How many images one chat send may carry; each is size-capped by
+# MAX_ATTACHMENT_BYTES like every other upload through this gateway.
+CHAT_SEND_MAX_IMAGES = int(os.environ.get("CHAT_SEND_MAX_IMAGES", "5"))
+# How long a gateway's identity (mode + account, read from its /health) is
+# reused. Long on success — an account's mode and number do not change under a
+# running container — and short after a failed probe, so a gateway that was
+# unreachable or still starting is re-checked promptly.
+CHAT_GATEWAY_IDENTITY_TTL = float(os.environ.get("CHAT_GATEWAY_IDENTITY_TTL", "300"))
+CHAT_GATEWAY_IDENTITY_TTL_FAIL = float(
+    os.environ.get("CHAT_GATEWAY_IDENTITY_TTL_FAIL", "15"))
+# How many of a chat's newest messages a companion turn is shown. A hard cap,
+# not a summary: everything older is simply absent from the prompt, so a long
+# correspondence reaches Ara truncated rather than compressed. Enough for the
+# current exchange, small enough that the note stays bounded however long the
+# chat is; a rolling summary replaces the truncation later.
+CHAT_COMPANION_CONTEXT_MESSAGES = int(
+    os.environ.get("CHAT_COMPANION_CONTEXT_MESSAGES", "20"))
 # Voice input: the dashboard uploads recorded audio here and we proxy it to the
 # shared STT service (scripts/stt-service.py), which owns the Whisper model — so
 # this image ships no ASR stack. Empty URL disables the feature (the endpoint
@@ -771,6 +1036,40 @@ TRANSCRIPT_CLEANUP_TIMEOUT = float(os.environ.get("TRANSCRIPT_CLEANUP_TIMEOUT", 
 # answering instead of correcting returns something much longer).
 TRANSCRIPT_CLEANUP_CONTEXT_MESSAGES = 6
 TRANSCRIPT_CLEANUP_MAX_GROWTH = 1.6
+# Presentation lint (docs/model-routing.md, phase 4). Everything that lands in
+# a dashboard thread as an agent→user message passes through a cheap-model
+# lint that enforces the dashboard-composing form rules — reply chips for
+# offered options, no bare or relative URLs — regardless of which agent or
+# model wrote the text. Structural enforcement at the choke point, same move
+# as the transcript cleanup and the send policies: the rules hold even when a
+# small model forgot them while composing. Form only, fail-open: the lint
+# never adds content, and any failure delivers the original text.
+PRESENTATION_LINT = os.environ.get("PRESENTATION_LINT", "1").strip().lower() not in ("0", "false", "no")
+# An explicit PRESENTATION_LINT_MODEL wins; else the router tier (the lint is
+# a routing-priced job), else the gateway default — so a non-Anthropic
+# deployment lints on its own backend; "haiku" is the last-resort default.
+PRESENTATION_LINT_MODEL = (
+    os.environ.get("PRESENTATION_LINT_MODEL", "").strip()
+    or ROUTER_MODEL or CLAUDE_MODEL or "haiku"
+)
+PRESENTATION_LINT_TIMEOUT = float(os.environ.get("PRESENTATION_LINT_TIMEOUT", "45"))
+# The lint is a `claude` subprocess like any other, but unlike a session it runs
+# *inside* a request someone is waiting on — and that someone is often a session
+# that already holds a `_worker_pool` slot, because every conversation-push.py
+# from a gateway-spawned session is exactly that. Sharing the session pool
+# therefore deadlocks: the holder blocks on the resource it is holding, and with
+# WEB_GATEWAY_MAX_CONCURRENCY=2 one other busy session is enough. So lints get
+# their own small bound, and even that wait is capped — a lint that cannot get a
+# slot is skipped, never queued forever. Withholding a message the user is
+# waiting for in order to fix its *formatting* is the wrong trade.
+PRESENTATION_LINT_CONCURRENCY = max(
+    1, int(os.environ.get("PRESENTATION_LINT_CONCURRENCY", "1")))
+PRESENTATION_LINT_WAIT = float(os.environ.get("PRESENTATION_LINT_WAIT", "20"))
+# Chips and link labels legitimately grow a message, so the allowance is wider
+# than the cleanup pass's; a model that starts answering instead of linting
+# still blows past it. A shrunken result dropped content — equally distrusted.
+PRESENTATION_LINT_MAX_GROWTH = 2.5
+PRESENTATION_LINT_MIN_KEEP = 0.6
 _CONV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _ATT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONV_GET_RE = re.compile(r"^/conversations/([0-9a-f]{32})/?$")
@@ -949,15 +1248,142 @@ def _channel_gateway(slug: str):
 # are never gated by this. See scripts/gateway_auth.py for the decision logic.
 AUTH_CONFIG = gateway_auth.config_from_env()
 
+# ── Which requests carry the user's own authority ─────────────────────────────
+# Two endpoints act *as the user* rather than on their behalf: the chat send
+# press, and approving a pending send on /sends. Both are where `verify` is
+# satisfied and a message reaches the wire.
+#
+# THIS IS THE SECOND LAYER, NOT THE GUARANTEE. What actually keeps a message
+# from going out unbidden lives at the messenger gateways: no caller-supplied
+# field skips an account's send policy any more, so under `verify` every send
+# is queued — the dashboard's own press included, which satisfies the policy by
+# releasing the queued send rather than by stepping around it (see
+# _chat_send_via_gateway). An agent that calls a gateway's /send is left with a
+# message somebody still has to release, whatever it puts in the body.
+#
+# The check here is worth keeping anyway, because these endpoints used to be
+# justified by "they sit behind the edge auth" and that was false. The edge
+# auth is a Traefik forward-auth: the proxy asks GET /auth and then forwards
+# the request, so it only ever sees traffic that reached Traefik, and an
+# in-container caller talking straight to this port is never asked (see the
+# AUTH_CONFIG comment). Any agent in this container can curl them.
+#
+# What distinguishes the two callers is the TCP peer address, which they cannot
+# choose: Traefik connects from another container's address, while an
+# in-container caller connects either from loopback or, having dialled this
+# container's own address, from the very address this socket is bound to. That
+# is the discriminator; it fails closed on anything it cannot classify.
+#
+# BE CLEAR ABOUT WHAT THIS IS. The web-gateway and the agents share one
+# container, and the channel gateways' tokens are in that container's
+# environment. Anything this process can reach, an agent can reach too, and an
+# agent that obtains the edge credentials can come through Traefik like a
+# browser. This closes the easy, obvious path — the one a helpful agent takes
+# without meaning any harm — and makes any attempt visible in the log. It is
+# defence in depth, in the same spirit as the Ask-Ara boundary being "the
+# allowlist plus the prompt, not a sandbox". It is not a hard boundary, and no
+# arrangement inside a shared container could make it one.
+#
+# EDGE_PROXY_PEERS pins it explicitly: comma-separated addresses or CIDRs the
+# reverse proxy connects from. When set it is the whole rule — which is also
+# how a deployment whose proxy legitimately arrives on loopback (host
+# networking) states that, accepting that the distinction is then unavailable.
+EDGE_PROXY_PEERS = os.environ.get("EDGE_PROXY_PEERS", "").strip()
+
+
+def _parse_edge_peers(raw: str) -> list:
+    nets = []
+    for part in (raw or "").replace(" ", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            print(f"[web-gateway] EDGE_PROXY_PEERS: ignoring unparseable "
+                  f"entry {part!r}", flush=True)
+    return nets
+
+
+_EDGE_PEER_NETS = _parse_edge_peers(EDGE_PROXY_PEERS)
+# Set but yielding nothing usable is a typo, not a decision to go back to the
+# heuristic. Both cases produce an empty list, so without this flag a
+# mistyped value would silently buy the permissive fallback — the opposite of
+# what a deployment that bothered to pin its proxy asked for, and it would do
+# so quietly, which is the worst way for a security control to fail.
+_EDGE_PEERS_INVALID = bool(EDGE_PROXY_PEERS) and not _EDGE_PEER_NETS
+if _EDGE_PEERS_INVALID:
+    print(f"[web-gateway] EDGE_PROXY_PEERS is set to {EDGE_PROXY_PEERS!r} but "
+          "names no usable address or CIDR: refusing every request to a "
+          "user-authority endpoint until it is corrected", flush=True)
+if any(n.is_loopback for n in _EDGE_PEER_NETS):
+    print("[web-gateway] EDGE_PROXY_PEERS includes loopback: user-authority "
+          "endpoints accept in-container callers on this deployment", flush=True)
+
+
+def _normalize_peer(value: str | None):
+    """An ip_address for a socket peer, unmapping ::ffff:1.2.3.4 — which is how
+    a v4 client reaches a dual-stack listener, and which reports itself as
+    neither loopback nor private until unmapped. None when unparseable."""
+    try:
+        addr = ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return None
+    return getattr(addr, "ipv4_mapped", None) or addr
+
+
+def _classify_request_origin(peer: str | None,
+                             local: str | None) -> tuple[bool, str]:
+    """Whether a request arrived through the reverse proxy; (ok, reason).
+
+    `peer` is the connection's remote address and `local` the address this
+    socket is bound to for that same connection — read per connection rather
+    than resolved from the hostname, so it cannot go stale and needs no name
+    lookup. A peer equal to `local` is this host talking to itself over a
+    non-loopback address, which is an in-container caller just as much as
+    loopback is.
+
+    Unclassifiable input is refused: a missing or unparseable peer address
+    means we cannot tell, and "cannot tell" must not read as "allowed". A
+    misconfigured EDGE_PROXY_PEERS is refused for the same reason — a value
+    that parses to nothing is a typo, and reading it as "unset" would hand the
+    deployment the permissive heuristic it was trying to replace."""
+    if _EDGE_PEERS_INVALID:
+        return False, (f"EDGE_PROXY_PEERS is set to {EDGE_PROXY_PEERS!r} but "
+                       f"names no usable address or CIDR")
+    addr = _normalize_peer(peer)
+    if addr is None:
+        return False, f"unclassifiable peer address {peer!r}"
+    if _EDGE_PEER_NETS:
+        if any(addr in net for net in _EDGE_PEER_NETS):
+            return True, ""
+        return False, (f"peer {addr} is not in EDGE_PROXY_PEERS "
+                       f"({EDGE_PROXY_PEERS})")
+    if addr.is_loopback:
+        return False, f"peer {addr} is loopback — an in-container caller"
+    local_addr = _normalize_peer(local)
+    if local_addr is not None and addr == local_addr:
+        return False, (f"peer {addr} is this container's own address — an "
+                       f"in-container caller")
+    return True, ""
+
 # Concurrency model:
 # - `_session_locks` holds one lock per session key, so a single conversation is
 #   serialized while different conversations proceed in parallel.
-# - `_worker_pool` bounds the total number of concurrent `claude` subprocesses.
+# - `_worker_pool` bounds concurrent `claude` *sessions*. Waiting on it is
+#   unbounded on purpose: a queued turn should wait its turn.
+# - `_lint_pool` bounds concurrent presentation lints, separately and with a
+#   capped wait. Never fold these two together: a lint runs inside a request,
+#   and that request's caller is often a session already holding a worker slot,
+#   so one pool means the caller deadlocks against itself.
 # - `_state_lock` guards read-modify-write access to the shared STATE_FILE.
 # - `_conversation_lock` guards the append to the per-day conversation log.
 _session_locks: dict[str, threading.Lock] = {}
 _session_locks_guard = threading.Lock()
 _worker_pool = threading.BoundedSemaphore(MAX_CONCURRENCY)
+# Deliberately NOT _worker_pool — see PRESENTATION_LINT_CONCURRENCY for why
+# sharing it deadlocks. Total `claude` processes are bounded by the sum.
+_lint_pool = threading.BoundedSemaphore(PRESENTATION_LINT_CONCURRENCY)
 _state_lock = threading.Lock()
 _conversation_lock = threading.Lock()
 # Guards read-modify-write of the per-thread conversation-tab files.
@@ -1417,11 +1843,15 @@ def _conv_summary(conv: dict) -> dict:
         "title": conv.get("title", ""),
         "initiator": conv.get("initiator", "user"),
         # "chat" is the default and what every pre-existing thread means; "edit"
-        # marks quick edit commands issued from a project page, which the
-        # dashboard hides from the normal conversation list.
+        # marks quick edit commands issued from a project page and "companion"
+        # a messenger chat's linked thread, both of which the dashboard hides
+        # from the normal conversation list.
         "kind": conv.get("kind") or "chat",
         "project": conv.get("project"),
         "project_title": conv.get("project_title"),
+        # The chat a companion thread belongs to, as `project` is for an edit
+        # thread: the id the /chats API uses, <channel>:<chat-key>.
+        "chat": conv.get("chat"),
         # The thread's model choice (validated; empty string => gateway default),
         # so the picker can show the current selection without a second fetch.
         "model": _conv_model(conv) or "",
@@ -1454,10 +1884,13 @@ def _list_convs(scope: str = "active", kind: str = "chat",
       - "all":      every thread regardless of archive state.
 
     `kind` filters by thread kind:
-      - "chat" (default): normal conversations only. Edit-command and cowork
-        threads are deliberately absent from every default listing.
+      - "chat" (default): normal conversations only. Edit-command, cowork and
+        companion threads are deliberately absent from every default listing.
       - "edit": only project edit-command threads.
       - "cowork": only the audit threads written by the Ask-Ara MCP connector.
+      - "companion": only messenger chats' companion threads. No dashboard
+        filter asks for these — a companion belongs to its chat and is reached
+        from the chat page — so this exists for inspection, not for browsing.
       - "all":  every kind.
 
     `project` (a project URI) restricts the list to threads linked to that
@@ -1621,7 +2054,9 @@ def _new_conv(initiator: str, owner: str, title: str | None,
               project: str | None = None,
               project_title: str | None = None,
               model: str | None = None,
-              agent: str | None = None) -> dict:
+              agent: str | None = None,
+              context: str | None = None,
+              chat: str | None = None) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     cid = uuid.uuid4().hex
     first_msg = {"role": first_role, "text": first_text, "ts": now}
@@ -1632,6 +2067,10 @@ def _new_conv(initiator: str, owner: str, title: str | None,
         # Overrides the displayed sender name (e.g. "Coach") when a relay
         # opens a thread on a subagent's behalf — see _conv_add_message.
         first_msg["agent"] = agent
+    if context:
+        # Agent-only context replayed to Ara's sessions, never rendered to the
+        # user — see _conv_context_note.
+        first_msg["context"] = context
     conv = {
         "id": cid,
         "title": title or _derive_title(first_text),
@@ -1640,7 +2079,8 @@ def _new_conv(initiator: str, owner: str, title: str | None,
         "initiator": initiator,
         "owner": owner,
         # "chat" is a normal conversation; "edit" is a quick edit command from a
-        # project page — marked so default listings can leave it out.
+        # project page and "companion" a messenger chat's linked thread — both
+        # marked so default listings can leave them out.
         "kind": kind,
         # An agent-initiated thread arrives unread (it needs the user's
         # attention); a user starting their own thread has already seen it.
@@ -1652,6 +2092,8 @@ def _new_conv(initiator: str, owner: str, title: str | None,
         conv["project"] = project
         if project_title:
             conv["project_title"] = project_title
+    if chat:
+        conv["chat"] = chat
     # Persist a validated model choice on the thread; None (the default) is left
     # unset so existing threads keep behaving exactly as before.
     valid_model = _valid_model_id(model)
@@ -1692,6 +2134,7 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       model_name: str | None = None,
                       cost_usd: float | None = None,
                       agent: str | None = None,
+                      context: str | None = None,
                       wake: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
@@ -1699,7 +2142,9 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     label and whole-turn list-price cost) so the dashboard can show it in the
     bubble header; both are byproducts of the answer call and cost nothing extra
     to surface. `agent` overrides the displayed sender name (e.g. "Coach") when
-    a relay answers on a subagent's behalf.
+    a relay answers on a subagent's behalf. `context` is agent-only context
+    stored with the message and replayed to Ara's sessions, never rendered to
+    the user — see _conv_context_note.
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -1728,6 +2173,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["cost_usd"] = float(cost_usd)
         if agent:
             message["agent"] = agent
+        if context:
+            message["context"] = context
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
         if wake and conv.get("archived") and not conv.get("muted"):
@@ -1760,9 +2207,174 @@ def _valid_model_id(model: str | None, refresh: bool = False) -> str | None:
     return None
 
 
+# ── Idempotent thread creation ────────────────────────────────────────────────
+# A dashboard thread is a side effect, and the same turn can legitimately run
+# twice. The escalation re-run replays a junior turn's prompt on the frontier
+# model — its reply is discarded, but a thread it already opened is not — and a
+# messenger gateway can redeliver a stanza after a reconnect. Either way the
+# user gets two identical threads for one message. A caller that can name what
+# it is reacting to passes that name as `key`: the first thread opened under a
+# key is the only one, and a repeat is handed the same thread back instead of
+# opening another.
+#
+# The key namespace is global, so the name has to be globally unique. A
+# channel's own message id is NOT: Telegram numbers messages per chat, Signal
+# identifies one by (source, sent timestamp), and a deployment may run several
+# gateways on one channel — so two different messages can share an id and would
+# collapse onto one thread, reply context included. Messenger callers therefore
+# use the key `inbound_store.thread_key()` builds, which carries the receiving
+# account and the chat alongside the native id; the gateways hand it to the
+# agent both on the live forward and on a drained record, and it is passed
+# verbatim rather than reconstructed.
+_CONV_KEYS_DIR = CONVERSATIONS_DIR / ".keys"
+_CONV_KEY_MAX = 200
+# A throwaway key exists only to cover one client's retry of one timed-out
+# request; an hour outlives any such retry by a wide margin.
+_CONV_KEY_EPHEMERAL_SUFFIX = ".eph"
+_CONV_KEY_EPHEMERAL_TTL = 3600
+_conv_keys_lock = threading.Lock()
+
+
+def _conv_key_path(key: str) -> Path:
+    # Hashed, so any channel's id scheme is a safe filename.
+    return _CONV_KEYS_DIR / hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _conv_already_says(cid: str, message: str, payload: dict,
+                       context: str | None) -> bool:
+    """Whether this thread already carries exactly what a repeat wants to say.
+
+    The test for "redelivery, not correction". It looks at every message in the
+    thread, not just the one the key opened it with: once an escalation has
+    appended a corrected answer, a later redelivery of *that* answer is the
+    thing most likely to arrive, and matching only the opening message would
+    append it a second time. Anything already in the thread has been said, and
+    saying it again adds nothing — which is the whole promise of the key.
+
+    Attachments count as new by their presence: they are stored per message, so
+    a repeat carrying files is not word-for-word the same as one that did not.
+    Context is compared too — a repeat whose agent-only context has changed
+    (a fresher reply token, say) is carrying something the thread lacks.
+    """
+    if payload.get("attachments"):
+        return False
+    conv = _load_conv(cid) or {}
+    return any(str(m.get("text") or "") == message
+               and str(m.get("context") or "") == (context or "")
+               for m in (conv.get("messages") or []))
+
+
+def _conv_for_key(key: str) -> str | None:
+    """The live thread already opened under `key`, or None.
+
+    A binding whose thread has since been deleted counts as unbound: a removed
+    thread must not silently swallow the next message about the same item."""
+    try:
+        cid = _conv_key_path(key).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not _CONV_ID_RE.match(cid) or _load_conv(cid) is None:
+        return None
+    return cid
+
+
+def _prune_ephemeral_conv_keys() -> None:
+    """Drop expired throwaway bindings.
+
+    A named key is a lasting identity — the same inbound message redelivered
+    days later must still find its thread — so those bindings are kept forever.
+    An *ephemeral* key names nothing: the push client mints one per invocation
+    purely so that its own retry-after-timeout is folded into the thread the
+    timed-out attempt opened. It is dead once that retry is over, and keeping
+    one per push would grow this directory without bound."""
+    cutoff = time.time() - _CONV_KEY_EPHEMERAL_TTL
+    try:
+        markers = list(_CONV_KEYS_DIR.glob("*" + _CONV_KEY_EPHEMERAL_SUFFIX))
+    except OSError:
+        return
+    for marker in markers:
+        try:
+            if marker.stat().st_mtime > cutoff:
+                continue
+            marker.with_suffix("").unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+        except OSError:  # noqa: PERF203 - one bad file must not stop the sweep
+            continue
+
+
+def _bind_conv_key(key: str, cid: str, ephemeral: bool = False) -> None:
+    """Record that `key` opened thread `cid`. Best-effort: a failure here costs
+    idempotency on a later repeat, never the thread the user is waiting for."""
+    try:
+        _CONV_KEYS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _conv_key_path(key).with_suffix(".tmp")
+        tmp.write_text(cid, encoding="utf-8")
+        tmp.replace(_conv_key_path(key))
+        if ephemeral:
+            _conv_key_path(key).with_suffix(
+                _CONV_KEY_EPHEMERAL_SUFFIX).write_text("", encoding="utf-8")
+            _prune_ephemeral_conv_keys()
+    except OSError as exc:  # noqa: BLE001
+        print(f"[web-gateway] could not bind conversation key: {exc}", flush=True)
+
+
 def _conv_model(conv: dict) -> str | None:
     """The validated model a thread should run on, or None for the default."""
     return _valid_model_id(conv.get("model"))
+
+
+# Threads that predate the model tiers carry no pin, because back then they
+# did not need one: an unpinned thread ran the gateway default. Introducing
+# RETINUE_ROUTER_MODEL redefined that same absent value as "the router tier",
+# so those threads silently dropped to the cheap model mid-conversation while
+# the picker still showed the default. Stored state must never change meaning
+# under a deploy — so the old implicit default is written in explicitly, once.
+_MODEL_PIN_MIGRATION_MARKER = ".model-pin-migration-done"
+
+
+def materialise_pre_tier_model_pins() -> int:
+    """Pin threads that predate the tiers to the gateway default. Returns the
+    number of threads rewritten.
+
+    Runs at most once, guarded by a marker file: at that moment every existing
+    thread predates the migration by definition, so no timestamp has to be
+    guessed. Threads created afterwards genuinely mean "defer to the tier
+    default" and are never touched — nor is any thread that carries a real
+    explicit choice.
+
+    A thread holding a legacy pin the current list no longer offers (a bare
+    `claude-haiku-4-5` from before the picker moved to route ids) is repaired
+    to the offered id naming that same model, not flattened to the default:
+    it lost its pin to a format change, and the user did choose it."""
+    marker = CONVERSATIONS_DIR / _MODEL_PIN_MIGRATION_MARKER
+    if marker.exists():
+        return 0
+    # Pre-tier threads ran the GATEWAY default, so the pin target deliberately
+    # bypasses the picker's `default` flag — which, since the tiers, names the
+    # router model an un-pinned thread runs today. Pinning those threads to
+    # the router would repeat the very downgrade this migration exists to
+    # prevent.
+    entry = _offered_entry_for(CLAUDE_MODEL, _conversation_models())
+    target = entry["id"] if entry else None
+    if not target:
+        # Model list unreachable at boot. Leave the marker unwritten so the
+        # next start retries, rather than recording the migration as done.
+        print("[web-gateway] model-pin migration deferred: no default model "
+              "offered yet", flush=True)
+        return 0
+    migrated = 0
+    with _conversations_lock:
+        for path in sorted(CONVERSATIONS_DIR.glob("*.json")):
+            if not _CONV_ID_RE.match(path.stem):
+                continue
+            conv = _load_conv(path.stem)
+            if conv is None or _valid_model_id(conv.get("model")):
+                continue
+            conv["model"] = _offered_equivalent(conv.get("model")) or target
+            _save_conv(conv)
+            migrated += 1
+    marker.write_text(target + "\n", encoding="utf-8")
+    return migrated
 
 
 def _conv_set_flags(cid: str, **flags) -> dict | None:
@@ -1808,15 +2420,33 @@ def _conv_attachment_note(conv: dict, msg: dict) -> str:
             "relevant (you run in the same container):\n" + "\n".join(lines))
 
 
+def _conv_context_note(msg: dict) -> str:
+    """Agent-only context carried by a message, framed for Ara's transcript.
+
+    An agent posting into a thread may attach machine-usable context the user
+    should never see — canonically the exact reply command (with its reply
+    token) for a proposed messenger reply, so the session that later acts on
+    the user's approval addresses the reply by token instead of re-resolving
+    the sender's name. The dashboard renders only a message's `text`, so the
+    context is invisible there; this note is how it reaches every later Ara
+    session in the thread."""
+    ctx = str(msg.get("context") or "").strip()
+    if not ctx:
+        return ""
+    return ("\n\n[Agent context carried with this message — for you, "
+            "not shown to the user:\n" + ctx + "]")
+
+
 # How a message's author is named when a transcript is replayed to Ara.
 _CONV_ROLE_LABEL = {"user": "User", "assistant": "You (Ara)", "agent": "Retinue agent"}
 
 
 def _conv_render_messages(conv: dict, messages: list) -> str:
-    """Render messages as a labelled transcript, each with its attachments."""
+    """Render messages as a labelled transcript, each with its attachments
+    and any agent-only context."""
     return "\n".join(
         f"{_CONV_ROLE_LABEL.get(m.get('role'), m.get('role'))}: "
-        f"{m.get('text', '')}{_conv_attachment_note(conv, m)}"
+        f"{m.get('text', '')}{_conv_attachment_note(conv, m)}{_conv_context_note(m)}"
         for m in messages
     )
 
@@ -1876,6 +2506,135 @@ def _conv_project_note(conv: dict) -> str:
     return "\n\n[Context: " + "\n".join(lines) + "]"
 
 
+# How one chat message is labelled when a companion thread replays it. The
+# ledger's own axes (direction, and for outbound the author) already say who
+# spoke; this only puts a name to each.
+def _companion_speaker(msg: dict, chat_name: str) -> str:
+    if msg.get("direction") != "out":
+        return msg.get("sender_name") or msg.get("sender") or chat_name
+    author = msg.get("author")
+    if author == "device":
+        return "The user (sent from their own phone)"
+    if author == "agent":
+        return msg.get("agent") or "You (Ara)"
+    return "The user (sent from the dashboard)"
+
+
+def _conv_chat_note(conv: dict) -> str:
+    """Context block for a messenger chat's companion thread.
+
+    Gives Ara what the thread itself never says: which chat this is about, how
+    the conversation has been going, what is currently staged in the shared
+    draft, and that her output belongs in that draft rather than on the wire.
+
+    The chat excerpt is a **hard cap, not a summary**: the newest
+    CHAT_COMPANION_CONTEXT_MESSAGES messages are replayed verbatim and
+    everything older is simply absent, so a long correspondence arrives
+    truncated rather than compressed. The cap is stated in the note so Ara can
+    ask instead of assuming she has seen the beginning. A rolling per-chat
+    summary — maintained as the chat grows, and carrying the older history
+    the cap drops — replaces the truncation later.
+
+    Unlike the project note, which points at a file Ara re-reads, this carries
+    live values that go stale, so it is appended to *every* companion turn
+    rather than only the first."""
+    chat_id = conv.get("chat")
+    if not chat_id:
+        return ""
+    parts = chat_state_mod.split_chat_id(chat_id)
+    channel, key = parts if parts else ("", chat_id)
+    doc = _CHAT_STATE.get(chat_id)
+    name = _chat_display_name(doc, channel, key)
+    where = f'the {channel} chat "{name}"' if channel else f'the chat "{name}"'
+    group = doc.get("group")
+    if group is None:
+        group = _chat_is_group(channel, key)
+    if group:
+        where += " (a group)"
+    lines = [
+        f"This thread is the companion to {where} — chat id {chat_id}. It is "
+        "where you and the user work out what to say; it is not the chat "
+        "itself, and nothing you write here reaches the correspondent.",
+    ]
+    try:
+        messages = _chat_messages_payload(chat_id)["messages"]
+    except Exception as exc:  # store down — the thread still works, with less
+        print(f"[web-gateway] companion context lookup failed for {chat_id}: "
+              f"{exc}", flush=True)
+        messages = None
+    if messages is None:
+        lines.append("The chat's messages could not be read just now (the "
+                     "life store did not answer), so this note carries none. "
+                     "Say so rather than answering as if you had seen them.")
+    elif not messages:
+        lines.append("The chat has no messages yet.")
+    else:
+        shown = messages[-CHAT_COMPANION_CONTEXT_MESSAGES:]
+        rendered = []
+        for m in shown:
+            text = " ".join(str(m.get("text") or "").split())
+            atts = m.get("attachments") or []
+            if atts:
+                kinds = sorted({a.get("type") for a in atts if a.get("type")})
+                label = f"{len(atts)} attachment" + ("s" if len(atts) > 1 else "")
+                if kinds:
+                    label += ": " + ", ".join(kinds)
+                text = (text + " " if text else "") + f"[{label}]"
+            rendered.append(f"  {m.get('ts')} {_companion_speaker(m, name)}: "
+                            + (text or "(empty)"))
+        head = f"The {len(shown)} most recent messages, oldest first"
+        if len(messages) > len(shown):
+            head += (" — a cap, not a summary: older messages exist and are "
+                     "not shown here")
+        lines.append(head + ":\n" + "\n".join(rendered))
+    draft = doc.get("draft") or {}
+    draft_text = " ".join(str(draft.get("text") or "").split())
+    if draft_text:
+        by = draft.get("author") or "user"
+        who = ("the user" if by == "user"
+               else (draft.get("agent") or "an agent"))
+        lines.append("The chat's shared draft currently holds, written by "
+                     f"{who}: " + json.dumps(draft_text, ensure_ascii=False))
+    else:
+        lines.append("The chat's shared draft is empty.")
+    lines.append(
+        "The words for the correspondent are written by the `secretary` "
+        "subagent, not by you: dispatch it with the channel, the "
+        "correspondent, the exchange above and what the user wants to get "
+        "across, and use the text it returns verbatim."
+    )
+    lines.append(
+        "There is exactly one thing you do with that text — you put it in "
+        "this chat's shared draft:\n"
+        "  python3 /workspace/scripts/chat-draft.py --chat "
+        f"{shlex.quote(chat_id)} '<the message>'\n"
+        "Then say here, in one or two sentences, what you staged and why. The "
+        "draft carries the message, so do not repeat it in full."
+    )
+    lines.append(
+        "You do not send, under any circumstances, and this is not a "
+        "preference to weigh against what the user asks. If they tell you "
+        "here to send it — \"and then send it\", \"schick das ab\", "
+        "\"just send it\" — that does not make sending allowed: stage the "
+        "text and answer that it is in the composer, ready for their send "
+        "press. The press is what puts a message on the wire in their name, "
+        "and a message that went out any other way is one they never "
+        "approved, however plainly they seemed to ask for it. If they insist, "
+        "say plainly that you cannot and that the send button is the only way."
+    )
+    lines.append(
+        "In particular, never answer a correspondent with signal-push.py, "
+        "whatsapp-push.py, telegram-push.py or any other send tool. Those go "
+        "out over the system's own account, not the user's: the correspondent "
+        "receives a message from a number they do not know, as a message "
+        "request, signed by nobody they recognise — which has happened, and "
+        "is worse than not answering at all. They exist for alerts and "
+        "briefings to the owner. This chat has exactly one correct outbound "
+        "path and it is the user's press on the draft you staged."
+    )
+    return "\n\n[Context: " + "\n\n".join(lines) + "]"
+
+
 def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     """Build the prompt for Ara's next turn in a thread.
 
@@ -1884,15 +2643,22 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
     any project note sent on the first turn) — normally just the latest user
     message, but any message pushed into the thread meanwhile comes with it.
     Otherwise — a new or expired session, or an agent-initiated thread Ara has
-    never seen — we replay the transcript so Ara has full context."""
+    never seen — we replay the transcript so Ara has full context.
+
+    A companion thread's chat note rides on every turn, fresh session or not:
+    it carries live values (the chat's newest messages, the shared draft) that
+    a session sent them once would go on answering from after they changed."""
     messages = conv.get("messages", [])
     latest_msg = messages[-1] if messages else {}
     latest = latest_msg.get("text", "")
     note = _conv_attachment_note(conv, latest_msg)
+    chat_note = (_conv_chat_note(conv)
+                 if (conv.get("kind") or "chat") == "companion" else "")
     if fresh:
         unseen = _conv_unseen_messages(messages)
         if len(unseen) <= 1:
-            return (latest + note) or latest
+            return ((latest + note + _conv_context_note(latest_msg) + chat_note)
+                    or latest)
         return (
             "These messages arrived in this thread since your last reply, "
             "oldest first — you have not seen them yet:\n\n"
@@ -1900,6 +2666,7 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
             "Reply to the user's latest message in your own voice, taking the "
             "others into account. If they approve a concrete action, carry it "
             "out with your tools and confirm what you did."
+            + chat_note
         )
     # The transcript already carries each message's own attachment note, so the
     # latest message's files need no second mention here.
@@ -1910,7 +2677,7 @@ def _conv_engage_prompt(conv: dict, fresh: bool) -> str:
         "Reply to the user's latest message in your own voice. If they approve a "
         "concrete action (e.g. updating the agenda, sending a reply, declining an "
         "invitation), carry it out with your tools and confirm what you did."
-        + _conv_project_note(conv)
+        + _conv_project_note(conv) + chat_note
     )
 
 
@@ -2002,13 +2769,26 @@ def _conv_worker(cid: str, session_key: str) -> None:
         # resume is refused the turn must fall back to the full transcript — not
         # to a fragment whose context is missing.
         restart = _conv_engage_prompt(conv, False) if fresh else None
+        # An explicit per-thread choice wins; an escalated thread without one
+        # stays with Ara senior (the frontier tier) rather than re-paying a
+        # junior turn plus an escalation on every message.
+        chosen = _conv_model(conv)
+        if chosen is None and conv.get("escalated") and FRONTIER_MODEL:
+            chosen = FRONTIER_MODEL
         result = send_message(prompt, display_question=latest, session_key=session_key,
-                              model=_conv_model(conv), restart_message=restart)
+                              model=chosen, restart_message=restart)
+        if result.get("escalated"):
+            _conv_set_flags(cid, escalated=True)
         if "error" in result:
             reply = ("Sorry, I couldn't reply just now "
                      f"({result['error']}). Please try again.")
         else:
-            reply = result.get("response") or "(no reply)"
+            # The lint enforces the dashboard-composing form (chips for
+            # options, no bare URLs) on the way out — the net under whichever
+            # model composed the reply. Error replies above skip it: they are
+            # gateway-authored and already plain.
+            reply = _lint_presentation(result.get("response") or "(no reply)",
+                                       kind=conv.get("kind") or "chat")
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
@@ -2112,6 +2892,12 @@ def _render_sends_index_html(pending: list[dict]) -> str:
             subj = html.escape(p.get("subject") or "(no subject)")
             to = html.escape(p.get("to") or "")
             cat = html.escape(p.get("category") or "")
+            # For an event the recipient is only the gateway's account label;
+            # when it happens is what tells one pending event from another.
+            if p.get("kind") == "event" or p.get("start"):
+                to = html.escape(_format_event_when(p.get("start") or "",
+                                                    p.get("end") or "",
+                                                    bool(p.get("all_day")))) or to
             rows.append(
                 f'  <li><a href="/sends/{acc}/{rid}">{subj}</a>'
                 f'<span class="meta"> — {to} · <em>{cat}</em></span></li>'
@@ -2197,8 +2983,278 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
     )
 
 
-def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None) -> str:
-    """Render the page for a channel (Signal/WhatsApp/Telegram) pending send.
+# ── Pending-send detail rendering ────────────────────────────────────────────
+# Every channel gateway describes its pending request in its own terms: a
+# messenger hands over a recipient and a message, the calendar gateway an event
+# (title, start/end, all-day flag, target calendar). The approval card renders
+# whatever the entry actually carries — an approval the user cannot read is no
+# approval at all, so an event shows its title, its time and its notes instead
+# of the empty message box a messenger-shaped renderer leaves behind.
+
+
+def _format_iso_moment(value: str, *, all_day: bool) -> str:
+    """Human rendering of an ISO 8601 date or date-time.
+
+    Returns the raw string unchanged when it does not parse — an approval card
+    showing an odd-looking timestamp is still better than one showing nothing.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        if all_day or len(text) == 10:
+            return datetime.fromisoformat(text[:10]).strftime("%a %d %b %Y")
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return raw
+    return moment.strftime("%a %d %b %Y, %H:%M")
+
+
+def _all_day_last_day(end: str) -> str:
+    """The last day an all-day event covers, as an ISO date.
+
+    Its `end` is the exclusive iCalendar DTEND (the convention the gateway
+    reads and writes, see caldav-read.py's _all_day_span), so the covered span
+    ends the day before — otherwise a two-day trip reads as a three-day one.
+    """
+    try:
+        return (datetime.fromisoformat((end or "")[:10]) - timedelta(days=1)).date().isoformat()
+    except ValueError:
+        return end or ""
+
+
+def _ends_before_it_starts(start: str, end: str, all_day: bool) -> bool:
+    """Whether an event's end lies before its start (an unparsable pair: no)."""
+    try:
+        if all_day:
+            return datetime.fromisoformat(end[:10]) < datetime.fromisoformat(start[:10])
+        first = datetime.fromisoformat(start[:-1] + "+00:00" if start.endswith("Z") else start)
+        last = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
+    except (ValueError, IndexError):
+        return False
+    return last.replace(tzinfo=None) < first.replace(tzinfo=None)
+
+
+def _format_event_when(start: str, end: str, all_day: bool) -> str:
+    """One line for an event's span, e.g. "Thu 03 Sep 2026, 14:00 - 14:30"."""
+    first = _format_iso_moment(start, all_day=all_day)
+    closing = _all_day_last_day(end) if all_day else end
+    last = _format_iso_moment(closing, all_day=all_day)
+    # An entry whose end is not after its start (nothing validates that before
+    # it is queued) would otherwise read as a span running backwards, e.g.
+    # "Thu 10 Sep 2026 – Wed 09 Sep 2026" for an all-day request with
+    # start == end. Say only what is certain: when it starts.
+    if _ends_before_it_starts(start, closing, all_day):
+        last = ""
+    if not first:
+        return last
+    if all_day:
+        span = first if (not last or last == first) else f"{first} \u2013 {last}"
+        return f"{span} (all day)"
+    if not last or last == first:
+        return first
+    # Within one day only the end time is added — repeating the date reads as
+    # two separate days at a glance.
+    if start[:10] == end[:10] and ", " in last:
+        return f"{first} \u2013 {last.split(', ', 1)[1]}"
+    return f"{first} \u2013 {last}"
+
+
+def _event_interval(entry: dict):
+    """A pending or existing event as a comparable (start, end) pair.
+
+    Offsets are dropped rather than converted: both sides of the comparison are
+    the same calendar's wall clock, and the pending event — typed by an agent
+    as a local time — carries no offset to convert from. Returns None when the
+    entry has no usable start, so an unparsable event is listed but never
+    claimed to clash.
+    """
+    all_day = bool(entry.get("all_day"))
+    raw_start = (entry.get("start") or "").strip()
+    raw_end = (entry.get("end") or "").strip()
+    if not raw_start:
+        return None
+    try:
+        if all_day:
+            first = datetime.fromisoformat(raw_start[:10])
+            last = datetime.fromisoformat(raw_end[:10]) if raw_end else first + timedelta(days=1)
+            return (first, max(last, first + timedelta(days=1)))
+        start = datetime.fromisoformat(raw_start[:-1] + "+00:00" if raw_start.endswith("Z") else raw_start)
+        end = (datetime.fromisoformat(raw_end[:-1] + "+00:00" if raw_end.endswith("Z") else raw_end)
+               if raw_end else start)
+    except ValueError:
+        return None
+    start = start.replace(tzinfo=None)
+    end = end.replace(tzinfo=None)
+    return (start, max(end, start))
+
+
+def _events_overlap(one, other) -> bool:
+    """Whether two (start, end) pairs share any time at all.
+
+    Touching ends do not overlap — a 14:00 event does not clash with one that
+    ends at 14:00 — and a zero-length event counts as clashing with whatever
+    surrounds it.
+    """
+    if not one or not other:
+        return False
+    (a_start, a_end), (b_start, b_end) = one, other
+    if a_start == a_end:
+        return b_start <= a_start < b_end or b_start == b_end == a_start
+    if b_start == b_end:
+        return a_start <= b_start < a_end
+    return a_start < b_end and b_start < a_end
+
+
+# How many of the day's existing events the card lists before it stops, how
+# long it waits for them and how much body it will read: the approval must stay
+# usable even when the calendar server is slow, endless or the day is packed.
+_AGENDA_MAX_EVENTS = 12
+_AGENDA_TIMEOUT = 8
+_AGENDA_MAX_BYTES = 512 * 1024
+
+
+def _fetch_json_bounded(url: str, headers: dict, timeout: float, max_bytes: int):
+    """GET one JSON body under a *total* deadline. Returns (body, error).
+
+    urlopen's own timeout bounds each socket operation, not the exchange: a
+    server that accepts the connection and then drips bytes keeps every single
+    read under the limit while the response never ends, which would leave the
+    page-rendering handler blocked and the approval unreachable. The request
+    therefore runs on its own daemon thread and the caller waits exactly
+    `timeout` for it — a stalled read costs a note on the page, not the page.
+    The body is capped as well, so an oversized answer cannot be read into
+    memory either.
+    """
+    outcome: dict = {}
+
+    def fetch():
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise ValueError(f"response exceeds {max_bytes} bytes")
+            outcome["body"] = json.loads(raw.decode("utf-8"))
+        except Exception as exc:  # reported to the caller, never raised here
+            outcome["error"] = str(exc)
+
+    worker = threading.Thread(target=fetch, name="agenda-read", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if worker.is_alive():
+        return None, f"no complete response within {timeout:g}s"
+    return outcome.get("body"), outcome.get("error")
+
+
+def _agenda_window(detail: dict) -> tuple:
+    """The first and last date a pending event actually covers, as ISO dates.
+
+    Both bounds are inclusive, which is what the read endpoint's bare-date
+    parameters mean. The end is half-open on both sides of the wire: an all-day
+    DTEND is exclusive, and a timed event that ends at exactly midnight covers
+    only the days before it — 23:00–00:00 belongs to its start day alone.
+    """
+    start = (detail.get("start") or "").strip()
+    end = (detail.get("end") or "").strip() or start
+    if detail.get("all_day"):
+        last = _all_day_last_day(end)
+    else:
+        last = end[:10]
+        try:
+            closing = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
+            if (closing.hour, closing.minute, closing.second) == (0, 0, 0) and last > start[:10]:
+                last = (closing.replace(tzinfo=None) - timedelta(days=1)).date().isoformat()
+        except ValueError:
+            pass
+    first = start[:10]
+    return (first, last if last and last >= first else first)
+
+
+def _calendar_agenda(gw: dict, detail: dict) -> dict:
+    """What is already in the calendar on the days a pending event covers.
+
+    The same read endpoint `caldav-read.py` uses, so the card answers "is this
+    a double booking?" without the user opening their calendar app. A failure
+    is reported, never raised: an agenda that could not be loaded must not cost
+    the user the ability to approve or deny.
+    """
+    start = (detail.get("start") or "").strip()
+    if not start:
+        return {"events": [], "error": None, "truncated": False}
+    first, last = _agenda_window(detail)
+    # "*" is the read endpoint's explicit account-wide scope. Omitting it would
+    # narrow the agenda to CALDAV_CALENDAR_ID wherever that is configured — the
+    # question here is "am I free?", which no single calendar answers, and a
+    # request naming its own target calendar could otherwise be weighed against
+    # a different one entirely.
+    query = urllib.parse.urlencode({"start": first, "end": last, "calendar_id": "*",
+                                    "limit": str(_AGENDA_MAX_EVENTS + 1)})
+    headers = {}
+    if gw.get("token"):
+        headers["Authorization"] = "Bearer " + gw["token"]
+    body, error = _fetch_json_bounded(f"{gw['base_url']}/events?{query}", headers,
+                                      _AGENDA_TIMEOUT, _AGENDA_MAX_BYTES)
+    if error or not isinstance(body, dict):
+        error = error or "unexpected answer from the calendar gateway"
+        print(f"[web-gateway] agenda read failed for a pending event: {error}", flush=True)
+        return {"events": [], "error": error, "truncated": False}
+    events = [e for e in (body.get("events") or []) if isinstance(e, dict)]
+    proposed = _event_interval(detail)
+    for event in events:
+        event["overlaps"] = _events_overlap(proposed, _event_interval(event))
+    return {"events": events[:_AGENDA_MAX_EVENTS], "error": None,
+            "truncated": bool(body.get("truncated")) or len(events) > _AGENDA_MAX_EVENTS}
+
+
+def _render_agenda_html(agenda: dict | None) -> str:
+    """The "already in the calendar" block under a pending event's details."""
+    if not agenda:
+        return ""
+    out = ["<h2>Already in the calendar</h2>"]
+    if agenda.get("error"):
+        out.append('<p class="meta">The agenda for these days could not be loaded '
+                   f'({html.escape(str(agenda["error"]))}) — check the calendar itself '
+                   "before approving.</p>")
+        return "\n".join(out) + "\n"
+    events = agenda.get("events") or []
+    if not events:
+        out.append('<p class="meta">Nothing else on these days.</p>')
+        return "\n".join(out) + "\n"
+    rows = []
+    for event in events:
+        when = html.escape(_format_event_when(event.get("start") or "", event.get("end") or "",
+                                              bool(event.get("all_day"))))
+        summary = html.escape(event.get("summary") or "(no title)")
+        extra = []
+        if event.get("location"):
+            extra.append("@ " + html.escape(event["location"]))
+        if event.get("calendar"):
+            extra.append("[" + html.escape(event["calendar"]) + "]")
+        if event.get("recurring"):
+            extra.append("(recurring)")
+        tail = (' <span class="meta">' + " ".join(extra) + "</span>") if extra else ""
+        clash = ' <span class="clash">overlaps</span>' if event.get("overlaps") else ""
+        rows.append(f'  <li><span class="meta">{when}</span> {summary}{tail}{clash}</li>')
+    out.append('<ul class="days">\n' + "\n".join(rows) + "\n</ul>")
+    if agenda.get("truncated"):
+        out.append('<p class="meta">Only the first '
+                   f'{_AGENDA_MAX_EVENTS} events of these days are listed.</p>')
+    return "\n".join(out) + "\n"
+
+
+_AGENDA_CSS = ("<style>\n"
+               "  .clash{background:var(--high);color:#0b0d12;border-radius:6px;"
+               "padding:.05rem .4rem;font-size:.75rem;font-weight:700}\n"
+               "</style>\n")
+
+
+def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None,
+                              agenda: dict | None = None) -> str:
+    """Render the page for a channel pending send — a messenger message
+    (Signal/WhatsApp/Telegram) or a calendar event, each described in its own
+    terms (see the note above the formatting helpers).
 
     A "pending" entry gets the Allow/Deny approval UI. Any other status renders
     as a status page instead: gateways execute an approved send asynchronously
@@ -2213,16 +3269,58 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
     label_e = html.escape(label)
     recipient = html.escape(detail.get("recipient") or detail.get("to") or "")
     cat = html.escape(detail.get("category") or "")
-    msg = html.escape(detail.get("message") or "")
     # "Skip" jumps to the next pending request — rendered only when one exists
     # (the nav already links back to /sends and the dashboard).
     skip_btn = (f'  <a href="{html.escape(next_url)}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
                 if next_url else "")
-    meta_rows = [
-        f"<tr><th>Channel</th><td>{label_e}</td></tr>",
-        f"<tr><th>To</th><td>{recipient}</td></tr>",
-        f"<tr><th>Category</th><td>{cat}</td></tr>",
-    ]
+    # An event entry (the calendar gateway) carries no "message" at all; it is
+    # recognised by its own kind, with the presence of a start as the fallback
+    # for an entry written by an older gateway build.
+    is_event = detail.get("kind") == "event" or bool(detail.get("start"))
+    if is_event:
+        summary = html.escape(detail.get("summary") or detail.get("subject") or "(untitled event)")
+        when = html.escape(_format_event_when(detail.get("start") or "",
+                                              detail.get("end") or "",
+                                              bool(detail.get("all_day"))))
+        # The effective write target, which is the request's own calendar_id or
+        # else the gateway's configured CALDAV_CALENDAR_ID — not necessarily
+        # the server's default calendar, so the card must not claim it is.
+        calendar = html.escape(detail.get("calendar_target") or detail.get("calendar_id") or "")
+        meta_rows = [
+            f"<tr><th>Channel</th><td>{label_e}</td></tr>",
+            f"<tr><th>Event</th><td>{summary}</td></tr>",
+        ]
+        if when:
+            meta_rows.append(f"<tr><th>When</th><td>{when}</td></tr>")
+        meta_rows.append("<tr><th>Calendar</th><td>"
+                         + (calendar or "the gateway's configured calendar")
+                         + "</td></tr>")
+        if recipient:
+            meta_rows.append(f"<tr><th>Account</th><td>{recipient}</td></tr>")
+        meta_rows.append(f"<tr><th>Category</th><td>{cat}</td></tr>")
+        description = html.escape(detail.get("description") or "")
+        body_html = (f'<pre class="msg-body">{description}</pre>\n' if description
+                     else '<p class="meta">No description.</p>\n')
+        noun = "Event"
+        note_pending = "Adding to the calendar…"
+        note_done = "Added to the calendar."
+        note_rejected = "The event was discarded; nothing was added to the calendar."
+        note_error = "The gateway could not create the event: "
+    else:
+        # A gateway that stores its text as "body" (the e-mail-shaped entry) is
+        # read too, so no channel renders an empty box.
+        msg = html.escape(detail.get("message") or detail.get("body") or "")
+        meta_rows = [
+            f"<tr><th>Channel</th><td>{label_e}</td></tr>",
+            f"<tr><th>To</th><td>{recipient}</td></tr>",
+            f"<tr><th>Category</th><td>{cat}</td></tr>",
+        ]
+        body_html = f'<pre class="msg-body">{msg}</pre>\n'
+        noun = "Send"
+        note_pending = "Delivering in the background…"
+        note_done = "Sent."
+        note_rejected = "The message was discarded without sending."
+        note_error = "The gateway could not deliver the message: "
     status = detail.get("status") or "pending"
     if status != "pending":
         # Status page: a "sending" entry shows a spinner and polls the JSON
@@ -2235,20 +3333,19 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         # error and stays put so the user can read it.
         if status == "sending":
             icon = '<div class="spin" role="status" aria-label="sending"></div>'
-            note = "Delivering in the background…"
+            note = note_pending
         elif status == "approved":
             icon = '<div class="check">✓</div>'
-            note = "Sent."
+            note = note_done
         elif status == "rejected":
             icon = '<div class="cross">✕</div>'
-            note = "The message was discarded without sending."
+            note = note_rejected
         else:  # "error"
             icon = '<div class="cross">✕</div>'
-            note = ("The gateway could not deliver the message: "
-                    + (detail.get("error") or "unknown error"))
+            note = note_error + (detail.get("error") or "unknown error")
         return (
             _HTML_HEAD
-            + f"<title>Retinue — {label_e} Send {rid}</title>\n"
+            + f"<title>Retinue — {label_e} {noun} {rid}</title>\n"
             # No-JS fallback only: with scripting available the page polls
             # instead of reloading.
             + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
@@ -2264,10 +3361,10 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
               "  .cross{background:var(--high);color:#0b0d12}\n"
               "</style>\n"
             + "<body>\n"
-            + f"<h1>{label_e} send</h1>\n"
+            + f"<h1>{label_e} {noun.lower()}</h1>\n"
             + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
             + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-            + f'<pre class="msg-body">{msg}</pre>\n'
+            + body_html
             + f'<div class="st-row"><div id="st-icon">{icon}</div>'
             + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
             + '<div class="actions">\n'
@@ -2279,6 +3376,9 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
             + f"  var status={json.dumps(status)};\n"
             + f"  var nextUrl={json.dumps(next_url)};\n"
             + f"  var pollUrl={json.dumps(f'/sends/{channel}/{request_id}/status')};\n"
+            + f"  var noteDone={json.dumps(note_done)};\n"
+            + f"  var noteRejected={json.dumps(note_rejected)};\n"
+            + f"  var noteError={json.dumps(note_error)};\n"
             + "  var icon=document.getElementById('st-icon');\n"
               "  var note=document.getElementById('st-note');\n"
               "  var nextBtn=document.getElementById('st-next');\n"
@@ -2291,15 +3391,15 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
               "  function terminal(st,err){\n"
               "    if(st==='approved'){\n"
               "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-              "      note.textContent='Sent.';\n"
+              "      note.textContent=noteDone;\n"
               "      setTimeout(advance,1500);\n"
               "    }else if(st==='rejected'){\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent='The message was discarded without sending.';\n"
+              "      note.textContent=noteRejected;\n"
               "      showNext();\n"
               "    }else{\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent='The gateway could not deliver the message: '+(err||'unknown error');\n"
+              "      note.textContent=noteError+(err||'unknown error');\n"
               "      showNext();\n"
               "    }\n"
               "  }\n"
@@ -2320,12 +3420,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         )
     return (
         _HTML_HEAD
-        + f"<title>Retinue — Approve {label_e} Send {rid}</title>\n"
+        + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
+        + (_AGENDA_CSS if agenda else "")
         + "<body>\n"
-        + f"<h1>Approve {label_e} Send</h1>\n"
+        + f"<h1>Approve {label_e} {noun}</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/sends">\u2191 All pending sends</a></nav>\n'
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-        + f'<pre class="msg-body">{msg}</pre>\n'
+        + body_html
+        + _render_agenda_html(agenda)
         + '<div class="actions">\n'
         + f'  <form method="post" action="/sends/{chan}/{rid}/approve" id="form-approve">'
           f'<button type="submit" id="btn-approve" class="btn btn-allow">Allow</button></form>\n'
@@ -2561,6 +3663,7 @@ def _claude_auth_status_payload() -> dict:
     status = claude_auth.credential_status()
     status["mode"] = "oauth" if claude_auth.oauth_in_use() else "gateway"
     status["remote_control_running"] = _pid1_is_claude()
+    status["remote_control_available"] = claude_auth.remote_control_available()
     return status
 
 
@@ -2621,8 +3724,16 @@ def _render_claude_auth_html(status: dict) -> str:
             detail.append(("Subscription", str(status["subscription"])))
         detail.append(("Sign-in valid until", ts(status.get("refresh_expires_at"))))
         detail.append(("Access token expires", ts(status.get("access_expires_at"))))
-        detail.append(("Agent session process", "running" if status.get("remote_control_running")
-                       else "not running"))
+        if status.get("remote_control_running"):
+            session_state = "running"
+        elif status.get("remote_control_available"):
+            session_state = "not running"
+        else:
+            # Not a fault: behind a gateway the entrypoint deliberately starts
+            # no session, since Claude Code would ignore --remote-control and
+            # leave it rotating the shared tokens (docs/claude-auth.md).
+            session_state = "not started — remote control needs api.anthropic.com"
+        detail.append(("Agent session process", session_state))
         backup = "present" if status.get("backup_present") else "none"
         if status.get("backup_rejected"):
             backup = "present, but rejected by the server"
@@ -2744,7 +3855,7 @@ def _short_model_name(canonical: str) -> str:
             return fam.capitalize()
     # Unknown id: drop a leading vendor token and title-case the rest.
     tail = cid.split("/")[-1]
-    tail = re.sub(r"^claude[-_]?", "", tail)
+    tail = re.sub(r"^(retinue|claude)[-_]?", "", tail)
     tail = re.sub(r"[-_]\d.*$", "", tail)  # trim trailing version segments
     return tail.capitalize() if tail else ""
 
@@ -2780,7 +3891,16 @@ def _envelope_model_name(data: dict) -> str | None:
     if isinstance(best_entry, dict):
         canonical = best_entry.get("canonicalModel") or ""
     canonical = canonical or best_id or ""
-    return _short_model_name(canonical) or None
+    # Behind LiteLLM the envelope reports the route name it was called with
+    # (e.g. `retinue-claude`), not the model that answered. Resolve it through
+    # the route map so the header names a concrete model, warming the cached
+    # model-list fetch once when the map has not seen this name yet.
+    resolved = _resolve_route_model(canonical)
+    if (resolved == canonical and _LITELLM_URL
+            and canonical not in _litellm_route_upstreams):
+        _litellm_conversation_models()  # cached; refreshes the route map
+        resolved = _resolve_route_model(canonical)
+    return _short_model_name(resolved) or None
 
 
 def send_message(message: str, display_question: str | None = None,
@@ -2793,16 +3913,27 @@ def send_message(message: str, display_question: str | None = None,
     keys run in parallel up to the worker-pool bound.
 
     `model` overrides the model for this turn (a validated per-thread choice);
-    when None the gateway's configured default (CLAUDE_MODEL) applies. A turn
-    resumes the thread's existing session when one is still fresh, so switching
-    models between turns is free not because the session is new but because a
-    session transcript is model-independent.
+    when None the router tier applies (Ara junior at the door), falling back
+    to the gateway default (CLAUDE_MODEL). A turn resumes the thread's
+    existing session when one is still fresh, so switching models between
+    turns is free not because the session is new but because a session
+    transcript is model-independent.
 
     `restart_message` is the prompt to send if that resume is refused because
     Claude no longer holds the session. A prompt written for a resumed session
     deliberately omits what the session already carries, so replaying it into a
     fresh one would strip the thread of its context — the caller passes its
     full-context variant here and only that is used on the second attempt.
+
+    Escalation (docs/model-routing.md, phase 2): when a frontier tier is
+    configured and this turn runs below it, the session is handed
+    RETINUE_ESCALATE_FILE; creating that file is Ara junior's signal that the
+    turn is outside her whitelist. The junior reply is then discarded and the
+    same prompt is re-run on the frontier tier against the same pre-turn
+    resume point — the abandoned junior fork never enters the thread's
+    session lineage. The result carries "escalated": True so the caller can
+    keep the thread escalated. Every spawned session also gets
+    RETINUE_SESSION_MODEL, the stamp scripts/memory.py records on memories.
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
@@ -2811,11 +3942,29 @@ def send_message(message: str, display_question: str | None = None,
         with _worker_pool:
             state = _get_session_entry(session_key)
 
-            # A per-thread model choice (validated by the caller) wins over the
-            # gateway default. An explicit empty string means "defer to default".
-            effective_model = CLAUDE_MODEL if model is None else model
+            # A per-thread model choice (validated by the caller) wins over
+            # the tier default. An explicit empty string means "defer".
+            #
+            # INVARIANT: what "defer" resolves to is stored state's meaning,
+            # not its value — so any future change to this line changes the
+            # model of every unpinned thread retroactively, mid-conversation.
+            # Ship such a change together with a one-shot migration that
+            # materialises the previous default into an explicit pin (see
+            # materialise_pre_tier_model_pins), or existing threads silently
+            # move to a model nobody chose for them.
+            effective_model = (ROUTER_MODEL or CLAUDE_MODEL) if model is None else model
 
-            def _build_cmd(resume_id: str | None, prompt: str) -> list[str]:
+            # A turn below the frontier tier may be escalated by the session
+            # itself: it creates the file named in RETINUE_ESCALATE_FILE.
+            escalatable = bool(FRONTIER_MODEL) and not _same_model(
+                effective_model, FRONTIER_MODEL)
+            escalate_flag = (
+                Path(tempfile.gettempdir()) / f"retinue-escalate-{uuid.uuid4().hex}"
+                if escalatable else None
+            )
+
+            def _build_cmd(resume_id: str | None, prompt: str,
+                           run_model: str) -> list[str]:
                 # Grant the session read access both to composer uploads and to
                 # thread attachments. The latter (CONVERSATION_ATTACHMENTS_DIR,
                 # under CONVERSATIONS_DIR) is where files pushed into a thread —
@@ -2826,8 +3975,8 @@ def send_message(message: str, display_question: str | None = None,
                        "--permission-mode", CLAUDE_PERMISSION_MODE,
                        "--add-dir", "/root/.claude/uploads",
                        "--add-dir", str(CONVERSATION_ATTACHMENTS_DIR)]
-                if effective_model:
-                    cmd += ["--model", effective_model]
+                if run_model:
+                    cmd += ["--model", run_model]
                 if resume_id:
                     cmd += ["--resume", resume_id]
                 # End option parsing with "--" so a user-supplied message that
@@ -2835,12 +3984,32 @@ def send_message(message: str, display_question: str | None = None,
                 cmd.extend(["--", prompt])
                 return cmd
 
-            def _spawn(cmd: list[str]):
-                return _run_claude(cmd, capture_output=True, text=True, cwd="/workspace")
+            def _spawn(cmd: list[str], run_model: str):
+                # The session's environment is built from the allowlist in
+                # scripts/session_env.py, never copied from this daemon's —
+                # the gateway holds the mailbox credentials for its e-mail
+                # backend and whatever else .env carries, none of which a
+                # session may inherit. RETINUE_SESSION_MODEL advertises the
+                # model this session runs on (sessions cannot introspect
+                # their --model flag); set per spawn, so a stale value never
+                # mislabels a session. The escalate flag is only offered
+                # below the frontier tier — senior has nobody to escalate to.
+                offer_flag = (escalate_flag is not None
+                              and not _same_model(run_model, FRONTIER_MODEL))
+                env = session_env.build(
+                    model=run_model,
+                    escalate_file=escalate_flag if offer_flag else None)
+                return _run_claude(cmd, capture_output=True, text=True,
+                                   cwd="/workspace", env=env)
 
+            # Remember the resume point and prompt the final first-pass run
+            # used, so an escalated re-run replays exactly that turn on the
+            # frontier tier — abandoning junior's fork, never stacking on it.
             if _session_is_fresh(state, session_key):
                 session_action = "resumed"
-                result = _spawn(_build_cmd(state["session_id"], message))
+                run_resume, run_prompt = state["session_id"], message
+                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                effective_model)
                 if result.returncode != 0 and _resume_refused(result):
                     # The state file outlived the transcript. Start over rather
                     # than hand the user an error for a session they never chose.
@@ -2850,10 +4019,25 @@ def send_message(message: str, display_question: str | None = None,
                         flush=True,
                     )
                     session_action = "restarted"
-                    result = _spawn(_build_cmd(None, restart_message or message))
+                    run_resume, run_prompt = None, restart_message or message
+                    result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                    effective_model)
             else:
                 session_action = "new"
-                result = _spawn(_build_cmd(None, message))
+                run_resume, run_prompt = None, message
+                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                effective_model)
+
+            escalated = False
+            if escalate_flag is not None and escalate_flag.exists():
+                escalate_flag.unlink(missing_ok=True)
+                if result.returncode == 0:
+                    escalated = True
+                    print(f"[web-gateway] {session_key}: junior escalated — "
+                          f"re-running on {FRONTIER_MODEL}", flush=True)
+                    result = _spawn(
+                        _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
+                        FRONTIER_MODEL)
 
             if result.returncode != 0:
                 err_detail = result.stderr.strip()
@@ -2913,6 +4097,8 @@ def send_message(message: str, display_question: str | None = None,
                 # the dominant-cost entry of the per-model usage breakdown.
                 "model_name": _envelope_model_name(data),
             }
+            if escalated:
+                out["escalated"] = True
 
             if response_text:
                 shown_question = display_question or message
@@ -3021,6 +4207,9 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
                 cmd, capture_output=True, text=True,
                 timeout=TRANSCRIPT_CLEANUP_TIMEOUT,
                 cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
+                # Tool-less, but a `claude` process all the same: the
+                # allowlisted environment, never this daemon's.
+                env=session_env.build(model=TRANSCRIPT_CLEANUP_MODEL),
             )
     except (subprocess.TimeoutExpired, OSError) as exc:
         print(f"[web-gateway] transcript cleanup failed: {exc}", flush=True)
@@ -3039,16 +4228,131 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     return cleaned
 
 
+# ── Presentation lint ─────────────────────────────────────────────────────────
+
+_LINT_SYSTEM_PROMPT = (
+    "You are a formatting lint for messages an assistant sends to its user's "
+    "phone dashboard. The dashboard renders Markdown plus one extra "
+    "affordance, the reply chip: [[chip: Label | prefill text]] — an inline "
+    "click-to-fill button; clicking it drops the prefill into the composer "
+    "for the user to review and send themselves, it never auto-sends.\n\n"
+    "Return the message below with ONLY these presentation rules enforced, "
+    "changing nothing else:\n\n"
+    "1. Options get chips. When the message asks the user to choose, confirm "
+    "or decide (send/adjust/discard a draft, yes/no, pick one of several), "
+    "add one chip per offered option on a final line, separated by \" · \". "
+    "The Label is one or two words; the prefill is a complete one-line reply "
+    "in the thread's language stating the user's intention (\"Yes, send it "
+    "as proposed.\") — it leans on the message above and never restates its "
+    "data. An open \"or something else?\" needs no chip. If the message "
+    "already carries chips for its options, leave them exactly as they are.\n"
+    "2. No bare URLs. Every URL becomes [short label](url) with a meaningful "
+    "label. A bare domain (example.ch) becomes [example.ch](https://example.ch). "
+    "A relative path (/sends, /gateways) becomes an absolute link using the "
+    "base URL given above, linked by name.\n"
+    "3. Never invent a URL or a fact. If the message tells the user to act "
+    "somewhere but carries no URL for it, leave that sentence unchanged.\n\n"
+    "Keep the message's language, wording, structure and content exactly — do "
+    "not translate, summarise, rephrase, shorten, answer, or comment. If "
+    "nothing violates the rules, return the message unchanged.\n\n"
+    "Output only the final message text, nothing else."
+)
+
+
+# Anything URL-shaped, for the lint's credit-free skip gate: a scheme, a
+# `word.word` token (bare domains like example.ch — also matches filenames,
+# which merely over-lints, and the lint returns a compliant message
+# unchanged), or a `/path` token (relative URLs like /sends).
+_LINT_URLISH_RE = re.compile(r"https?://|\w\.\w|/\w")
+
+def _lint_presentation(text: str, *, kind: str = "chat") -> str:
+    """Enforce the dashboard-composing form on an agent→user message.
+
+    Runs on everything that lands in a dashboard thread — Ara's replies and
+    the token-gated agent posts alike — so the chips/links conventions hold
+    regardless of which agent or model composed the text. Form only, never
+    content; returns `text` unchanged on any failure, oversized drift, no free
+    lint slot, or for the quiet cowork audit threads (a record, not a UI
+    surface)."""
+    if not PRESENTATION_LINT or kind == "cowork":
+        return text
+    raw = (text or "").strip()
+    if not raw:
+        return text
+    # Credit-free gate: a very short message with nothing URL-shaped in it —
+    # no scheme, no bare domain, no relative path — has nothing to lint.
+    if len(raw) < 40 and not _LINT_URLISH_RE.search(raw):
+        return text
+    parts = []
+    if CONVERSATION_BASE_URL:
+        parts.append("Dashboard base URL for relative paths: "
+                     + CONVERSATION_BASE_URL)
+    parts.append("Message to lint:\n" + raw)
+    cmd = [
+        "claude", "-p", "--output-format=json",
+        "--model", PRESENTATION_LINT_MODEL,
+        # A lint pass needs no tools, no MCP servers and no project context —
+        # excluding them is what keeps it cheap and fast.
+        "--allowed-tools", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--exclude-dynamic-system-prompt-sections",
+        "--system-prompt", _LINT_SYSTEM_PROMPT,
+        "--", "\n\n".join(parts),
+    ]
+    # Bounded, and on its own pool: an unbounded wait here hangs the caller's
+    # request forever whenever the pool is full, which for a caller that is
+    # itself a spawned session is a guaranteed self-deadlock.
+    if not _lint_pool.acquire(timeout=PRESENTATION_LINT_WAIT):
+        print(f"[web-gateway] presentation lint skipped: no lint slot within "
+              f"{PRESENTATION_LINT_WAIT:g}s — delivering the text unchanged",
+              flush=True)
+        return text
+    try:
+        result = _run_claude(
+            cmd, capture_output=True, text=True,
+            timeout=PRESENTATION_LINT_TIMEOUT,
+            cwd=tempfile.gettempdir(),  # away from /workspace, so no CLAUDE.md is loaded
+            # Tool-less, but a `claude` process all the same: the
+            # allowlisted environment, never this daemon's.
+            env=session_env.build(model=PRESENTATION_LINT_MODEL),
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        print(f"[web-gateway] presentation lint failed: {exc}", flush=True)
+        return text
+    finally:
+        _lint_pool.release()
+    if result.returncode != 0:
+        print(f"[web-gateway] presentation lint exited {result.returncode}",
+              flush=True)
+        return text
+    try:
+        linted = (json.loads(result.stdout).get("result") or "").strip()
+    except (json.JSONDecodeError, AttributeError):
+        return text
+    if (not linted
+            or len(linted) < len(raw) * PRESENTATION_LINT_MIN_KEEP
+            or len(linted) > len(raw) * PRESENTATION_LINT_MAX_GROWTH + 200):
+        return text
+    return linted
+
+
 # ── Projects (live SPARQL over the life store) ────────────────────────────────
 
-# The retinue knowledge-base namespace the qlever-dir Markdown converter emits
-# for project/goal frontmatter (see the chambers' .qlever/md2ttl.py).
+# The framework's own knowledge-base namespace: emitted for AI agents by
+# scripts/discover-agents.py (kb:AiAgent, urn:retinue:actor:<slug>) and read
+# here and by scripts/agent-self-review.py and scripts/recurring-projects.py.
+# A chamber's own Markdown->Turtle converter (e.g. md2ttl.py, docs/triple-
+# stores.md) must emit the same vocabulary for its project frontmatter to show
+# up anywhere in the framework — nothing here follows a chamber's choice.
 _KB = "https://w3id.org/retinue/kb#"
-_RETO = "urn:retinue:actor:reto"
+# The owner's own actor URI, in the urn:retinue:actor:<slug> shape every AI
+# agent also uses (discover-agents.py) — deployment-specific, so it comes from
+# the environment rather than being baked into this public repo.
+_OWNER_ACTOR = os.environ.get("RETINUE_OWNER_ACTOR", "").strip() or "urn:retinue:actor:owner"
 
 # One query returns every active project with the fields the card needs. Paused
 # projects and non-active statuses are excluded so the dashboard shows only what
-# is actually running. currentActor drives the split: reto == "your move",
+# is actually running. currentActor drives the split: the owner == "your move",
 # anyone else == "waiting on <them>".
 _PROJECTS_SPARQL = """
 PREFIX k: <%s>
@@ -3115,7 +4419,7 @@ def _fetch_projects() -> dict:
             "next": val("next"),
             "expected": val("expected"),
         }
-        if actor == _RETO:
+        if actor == _OWNER_ACTOR:
             mine.append(item)
         else:
             item["waitingOn"] = _humanize_slug(actor) if actor else None
@@ -3284,6 +4588,1134 @@ def _news_preferences_payload() -> dict:
     except OSError:
         updated = None
     return {"markdown": news_store.load_preferences(), "updated": updated}
+
+
+# ── Messenger chats (SPARQL over the ledgers + live overlay) ──────────────────
+# The chat surface is a deterministic mirror of the gateways' message ledgers
+# (kb:InboundMessage / kb:OutboundMessage, both stamped with kb:chat), served
+# SPARQL-first: the merged cross-channel view is a query, not a directory scan,
+# and the store's few seconds of indexing lag are bridged by the in-memory
+# overlay fed by the notify rail and the dashboard send path. There is
+# deliberately NO raw-file read path behind it: if the life store is down the
+# chat endpoints answer an honest 502 (the dashboard components keep their last
+# cached state), the same stance /projects takes — a store that is frequently
+# down is an infrastructure defect to fix at the store, not something each
+# consumer papers over.
+
+_CHAT_ID_MAX_LEN = 512
+_CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
+_CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
+_CHAT_FLAGS_RE = re.compile(r"^/chats/([^/]+)/flags/?$")
+_CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
+_CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
+_CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
+_CHAT_COMPANION_RE = re.compile(r"^/chats/([^/]+)/companion/?$")
+_INTERNAL_CHAT_DRAFT_RE = re.compile(r"^/internal/chats/([^/]+)/draft/?$")
+# The media id is the gateways' token_hex(16) — 32 hex chars, path-safe by
+# construction; the slug charset matches the gateway-registry slugs.
+_CHAT_MEDIA_RE = re.compile(r"^/chats/media/([A-Za-z0-9._-]+)/([0-9a-f]{32})/?$")
+_CHAT_MEDIA_PATH_RE = re.compile(r"^/media/([0-9a-f]{32})/?$")
+# The host-free reference a gateway records today: urn:retinue:media:<channel>:<id>.
+_CHAT_MEDIA_URN_RE = re.compile(r"^urn:retinue:media:([a-z0-9_]+):([0-9a-f]{32})$")
+_CHAT_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$")
+_T_CHAT_OUTBOUND = _KB + "OutboundMessage"
+
+
+def _chat_id_from_path(raw: str) -> str | None:
+    """Decode and sanity-check the <id> path segment (<channel>:<chat-key>).
+
+    The id travels percent-encoded (keys contain ':', '@', '+', and Signal
+    group ids are base64 with '/' and '='); the split at the FIRST colon is
+    what keeps a key's own colons intact."""
+    chat_id = urllib.parse.unquote(raw or "")
+    if not chat_id or len(chat_id) > _CHAT_ID_MAX_LEN:
+        return None
+    if chat_state_mod.split_chat_id(chat_id) is None:
+        return None
+    return chat_id
+
+
+def _chat_messages_url(chat_id: str) -> str:
+    """The URL the client follows for a chat's messages — served here, but the
+    client never constructs it (the fixture→API contract)."""
+    return "/chats/" + urllib.parse.quote(chat_id, safe="") + "/messages"
+
+
+def _sparql_str(value: str) -> str:
+    """Quote a string as a SPARQL literal. Chat keys come out of the store and
+    go back in as filters, so they are escaped like any untrusted literal."""
+    escaped = (str(value).replace("\\", "\\\\").replace('"', '\\"')
+               .replace("\n", "\\n").replace("\r", "\\r"))
+    return f'"{escaped}"'
+
+
+def _sparql_datetime(iso: str) -> str:
+    return f'"{iso}"^^<http://www.w3.org/2001/XMLSchema#dateTime>'
+
+
+# One row per chat: the per-chat MAX(ts) subquery joins back (on the shared
+# ?chat/?account/?ts variables) to the message that carries it, so the list
+# skeleton — every chat with its latest message — is one query, not a per-chat
+# fan-out. COALESCE-by-UNION: inbound rows carry receivedAt, outbound rows
+# sentAt, and either is the message's timeline instant.
+#
+# A chat is (chat key, account), not the key alone: one channel's message volume
+# is shared by every account on it, and a key identifies a peer only within an
+# account (see inbound_store.P_ACCOUNT). Grouping by the key alone is what let a
+# second account's traffic land in another account's conversation.
+#
+# kb:account is OPTIONAL — records written before the predicate existed have
+# none — so it is folded to the empty string, giving those records a group of
+# their own rather than letting them join every account's. The subquery may BIND
+# ?account because nothing binds it there yet; the outer pattern must FILTER on
+# it instead, since binding an in-scope variable is a SPARQL error.
+#
+# Attachments are IRI objects (urn:retinue:media:…), and the life store's
+# GROUP_CONCAT leaves its result UNBOUND — not empty — when the values are
+# IRIs rather than literals (verified against the live QLever; see
+# docs/triple-stores.md). STR() makes them literals first. Without it no
+# message on any channel ever carried an attachment, silently: an absent
+# cell reads exactly like a message without media.
+_CHATS_LIST_SPARQL = """
+PREFIX k: <%s>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?chat ?account ?channel ?ts ?type ?text ?sender ?author ?mid
+       (GROUP_CONCAT(STR(?att); separator=" ") AS ?atts) WHERE {
+  { SELECT ?chat ?account (MAX(?ts0) AS ?ts) WHERE {
+      ?m0 k:chat ?chat .
+      { ?m0 k:receivedAt ?ts0 } UNION { ?m0 k:sentAt ?ts0 }
+      OPTIONAL { ?m0 k:account ?acc0 }
+      BIND(COALESCE(?acc0, "") AS ?account)
+    } GROUP BY ?chat ?account }
+  ?m k:chat ?chat ; k:channel ?channel ; k:text ?text ; rdf:type ?type .
+  { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
+  OPTIONAL { ?m k:account ?acc1 }
+  FILTER(COALESCE(?acc1, "") = ?account)
+  OPTIONAL { ?m k:sender ?sender }
+  OPTIONAL { ?m k:author ?author }
+  OPTIONAL { ?m k:messageId ?mid }
+  OPTIONAL { ?m k:attachment ?att }
+} GROUP BY ?chat ?account ?channel ?ts ?type ?text ?sender ?author ?mid
+""" % _KB
+
+# Unread = COUNT of inbound above each chat's own read watermark. The per-chat
+# cutoffs are injected as a VALUES table, so one bounded query returns one
+# count per chat and no message rows ever cross the wire — chosen over
+# fetching (chat, ts) pairs and counting here, whose payload grows with every
+# never-opened noisy group (a chat with no watermark counts from the epoch).
+# The row key is (chat key, account) for the same reason the list query groups
+# by both: counting a key across accounts would badge one account's chat with
+# another's arrivals. ?account arrives bound from VALUES, so the account test is
+# a FILTER — a BIND on an in-scope variable is a SPARQL error.
+_CHATS_UNREAD_SPARQL = """
+PREFIX k: <%s>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?chat ?account (COUNT(?m) AS ?n) WHERE {
+  VALUES (?chat ?account ?cut) { %%s }
+  ?m rdf:type k:InboundMessage ; k:chat ?chat ; k:receivedAt ?ts .
+  OPTIONAL { ?m k:account ?acc0 }
+  FILTER(COALESCE(?acc0, "") = ?account)
+  FILTER(?ts > ?cut)
+} GROUP BY ?chat ?account
+""" % _KB
+
+# One chat's messages. Both halves of the identity are injected as literals —
+# the key and the account — so a chat never shows another account's messages to
+# the same peer. An empty account literal selects exactly the records that carry
+# no kb:account, which is the pre-predicate history and nothing else.
+_CHAT_MESSAGES_SPARQL = """
+PREFIX k: <%s>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT ?m ?type ?text ?sender ?author ?mid ?ts
+       (GROUP_CONCAT(STR(?att); separator=" ") AS ?atts) WHERE {
+  ?m k:chat %%(chat)s ; k:channel %%(channel)s ; k:text ?text ; rdf:type ?type .
+  { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
+  OPTIONAL { ?m k:account ?acc0 }
+  FILTER(COALESCE(?acc0, "") = %%(account)s)
+  OPTIONAL { ?m k:sender ?sender }
+  OPTIONAL { ?m k:author ?author }
+  OPTIONAL { ?m k:messageId ?mid }
+  OPTIONAL { ?m k:attachment ?att }
+  %%(before)s
+} GROUP BY ?m ?type ?text ?sender ?author ?mid ?ts
+ORDER BY DESC(?ts) LIMIT %%(limit)d
+""" % _KB
+
+
+def _bval(binding: dict, key: str) -> str | None:
+    cell = binding.get(key)
+    return cell.get("value") if cell else None
+
+
+def _chat_is_group(channel: str, key: str) -> bool:
+    """Deterministic group heuristic from the key's own channel encoding —
+    exactly how the gateways encode groups into the chat key. The rail's
+    explicit flag (cached in chat state) wins where present; this covers
+    history that predates the rail."""
+    if channel == "signal":
+        return key.startswith("group:")
+    if channel == "whatsapp":
+        return key.endswith("@g.us")
+    if channel == "telegram":
+        return key.startswith("-")
+    return False
+
+
+def _parse_media_reference(url: str) -> tuple[str | None, str | None]:
+    """Read a ledger media reference: ``(media_id, legacy_slug)``.
+
+    Two shapes exist. Current records are host-free URNs,
+    ``urn:retinue:media:<channel>:<id>`` — a gateway states which blob, never
+    where to fetch it, because the address of an account is the reader's own
+    registry entry. Records written before that carry the gateway's self-
+    declared URL, ``http://<service>:<port>/media/<id>``; those still render,
+    with the recorded service name kept as a last-resort serving slug.
+
+    Either way the id identifies the blob; who serves it is decided by the
+    caller from the chat's account. Returns ``(None, None)`` for anything that
+    is not a media reference."""
+    text = (url or "").strip()
+    m = _CHAT_MEDIA_URN_RE.match(text)
+    if m:
+        return m.group(2), None
+    try:
+        parts = urllib.parse.urlsplit(text)
+    except ValueError:
+        return None, None
+    m = _CHAT_MEDIA_PATH_RE.match(parts.path or "")
+    if not m or not parts.hostname:
+        return None, None
+    return m.group(1), parts.hostname
+
+
+# What the gateways stated about a page's blobs, looked up in one go (see
+# inbound_store.P_CONTENT_TYPE): the type decides the element, the pixel size
+# reserves the box. The subjects are the kb:attachment IRIs themselves.
+_CHAT_MEDIA_META_SPARQL = """
+PREFIX k: <%s>
+SELECT ?att ?ct ?size ?w ?h ?name WHERE {
+  VALUES ?att { %%(atts)s }
+  OPTIONAL { ?att k:contentType ?ct }
+  OPTIONAL { ?att k:byteSize ?size }
+  OPTIONAL { ?att k:width ?w }
+  OPTIONAL { ?att k:height ?h }
+  OPTIONAL { ?att k:fileName ?name }
+}
+""" % _KB
+
+# An absolute IRI with nothing that could end a VALUES entry early. The
+# references come from the ledger, so this is a guard, not a parser.
+_SPARQL_IRI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:[^\s<>\"{}|\\^`]*$")
+
+
+def _chat_media_meta_lookup(references) -> dict:
+    """``{reference: {type, size, width, height, name}}`` as the gateways stated it.
+
+    A gateway writes what it knows about a blob into the record that references
+    it — the gateway's own knowledge about its own store — and this reads it
+    back from the life store like any other fact. Nothing here looks at a
+    gateway's files. A blob nobody stated anything about (a record older than
+    the statements, until its gateway backfills) simply has no entry, and the
+    client renders it as a plain file. Raises on store errors, like the
+    messages query it accompanies."""
+    iris = sorted({r for r in references or [] if r and _SPARQL_IRI_RE.match(r)})
+    if not iris:
+        return {}
+    query = _CHAT_MEDIA_META_SPARQL % {"atts": " ".join(f"<{i}>" for i in iris)}
+    out: dict = {}
+    for b in _sparql_bindings(query):
+        att = _bval(b, "att")
+        if not att:
+            continue
+        meta = out.setdefault(att, {})
+        if _bval(b, "ct"):
+            meta["type"] = _bval(b, "ct")
+        if _bval(b, "name"):
+            meta["name"] = _bval(b, "name")
+        for key, var in (("size", "size"), ("width", "w"), ("height", "h")):
+            value = _bval(b, var)
+            if value is not None:
+                try:
+                    meta[key] = int(value)
+                except ValueError:
+                    pass
+    return {att: meta for att, meta in out.items() if meta}
+
+
+def _shape_chat_attachments(urls: list[str], serving_slug: str | None = None,
+                            meta: dict | None = None) -> list[dict]:
+    """Shape ledger attachment references for the client.
+
+    Blobs live on the gateway that received them and are served through this
+    gateway's authenticated proxy, ``/chats/media/<slug>/<id>``. Which gateway
+    is asked first comes from ``serving_slug``: a reference names the blob,
+    not a host (see :func:`_parse_media_reference`).
+
+    ``serving_slug`` is the first answer of :func:`_media_gateways` — the
+    gateway most likely to hold the blob: the account the chat's records name,
+    else an account-derived stamp, else the channel's first gateway. It is a
+    place to ask, not a claim of ownership; the media handler falls through to
+    the channel's other gateways when the named one answers 404, so a wrong
+    first guess costs a request, never the picture. Only a channel with no
+    gateway at all leaves it None; a legacy record then falls back to the
+    service name it recorded, and a host-free one is passed through verbatim
+    and plainly fails to load — there is nobody to ask.
+
+    ``meta`` is what the gateways stated about the blobs
+    (:func:`_chat_media_meta_lookup`), keyed by the reference as recorded."""
+    out = []
+    for url in urls:
+        if not url:
+            continue
+        media_id, legacy_slug = _parse_media_reference(url)
+        slug = serving_slug or legacy_slug
+        public = f"/chats/media/{slug}/{media_id}" if (media_id and slug) else url
+        att: dict = {"id": media_id or public, "url": public}
+        stated = (meta or {}).get(url) or {}
+        if stated.get("type"):
+            att["type"] = stated["type"]
+        if isinstance(stated.get("size"), int):
+            att["size"] = stated["size"]
+        if stated.get("name"):
+            att["name"] = stated["name"]
+        # Intrinsic size, when the store sniffed it at ingest — the client
+        # reserves the image box with it, so lazy loads never shift the scroll.
+        if isinstance(stated.get("width"), int) and isinstance(stated.get("height"), int):
+            att["width"] = stated["width"]
+            att["height"] = stated["height"]
+        out.append(att)
+    return out
+
+
+def _shape_chat_message(chat_id: str, channel: str, *, direction: str,
+                        text: str, ts: str, message_id: str | None,
+                        subject: str | None = None,
+                        sender: str | None = None,
+                        sender_name: str | None = None,
+                        author: str | None = None, agent: str | None = None,
+                        attachment_urls: list[str] | None = None,
+                        roster: dict | None = None,
+                        serving_slug: str | None = None,
+                        media_meta: dict | None = None) -> dict:
+    """One contract Message: {id, chat, direction, …} (webapp/README.md)."""
+    msg: dict = {
+        "id": message_id or subject or f"{chat_id}#{ts}",
+        "chat": chat_id,
+        "direction": direction,
+        "text": text or "",
+        "ts": ts,
+    }
+    if direction == "out":
+        msg["author"] = author if author in chat_state_mod.AUTHORS else "agent"
+        if agent:
+            msg["agent"] = agent
+    else:
+        if sender:
+            msg["sender"] = sender
+        name = sender_name or (roster or {}).get(sender or "")
+        if name:
+            msg["sender_name"] = name
+    atts = _shape_chat_attachments(attachment_urls or [], serving_slug=serving_slug,
+                                   meta=media_meta)
+    if atts:
+        msg["attachments"] = atts
+    return msg
+
+
+def _chat_last_preview(*, direction: str, text: str, ts: str,
+                       sender: str | None, sender_name: str | None,
+                       author: str | None, has_attachments: bool,
+                       roster: dict | None = None) -> dict:
+    last: dict = {
+        "ts": ts,
+        "direction": direction,
+        "kind": "image" if has_attachments and not text else "text",
+        "text": text or "",
+    }
+    if direction == "out":
+        last["author"] = author if author in chat_state_mod.AUTHORS else "agent"
+    else:
+        name = sender_name or (roster or {}).get(sender or "")
+        if name:
+            last["sender_name"] = name
+    return last
+
+
+def _chat_display_name(doc: dict, channel: str, key: str) -> str:
+    """Cached name, else the 1:1 peer's roster name, else the raw key — the
+    honest fallback until a name has passed by on the rail."""
+    if doc.get("name"):
+        return doc["name"]
+    roster = doc.get("roster") or {}
+    if not _chat_is_group(channel, key) and roster.get(key):
+        return roster[key]
+    return key
+
+
+# The SPARQL-derived skeleton (chat list + unread counts) reused between
+# dashboard polls; state and overlay are merged fresh on every request. Any
+# write that changes the skeleton's truth invalidates it early.
+_chats_cache_lock = threading.Lock()
+_chats_cache: dict = {"at": 0.0, "skeleton": None, "unread": None}
+
+
+def _chats_cache_invalidate() -> None:
+    with _chats_cache_lock:
+        _chats_cache["skeleton"] = None
+        _chats_cache["unread"] = None
+
+
+def _fetch_chats_skeleton() -> dict[str, dict]:
+    """One entry per chat from the ledgers: channel + its latest message row.
+
+    Keyed by the composed chat id, so two accounts talking to the same peer are
+    two entries. A row whose ``?account`` is the empty string carries no
+    ``kb:account`` at all — history from before the predicate — and composes to
+    the plain ``<channel>:<key>`` id it has always had, which is why nothing
+    that already exists moves, is renamed, or loses its state document."""
+    skeleton: dict[str, dict] = {}
+    for b in _sparql_bindings(_CHATS_LIST_SPARQL):
+        key = _bval(b, "chat")
+        channel = _bval(b, "channel")
+        ts = _bval(b, "ts")
+        if not key or not channel or not ts:
+            continue
+        account = _bval(b, "account") or None
+        chat_id = chat_state_mod.make_chat_id(channel, key, account)
+        # Two messages can share the max timestamp; keep the first row.
+        if chat_id in skeleton:
+            continue
+        atts = [u for u in (_bval(b, "atts") or "").split(" ") if u]
+        skeleton[chat_id] = {
+            "channel": channel,
+            "key": key,
+            "account": account,
+            "ts": ts,
+            "direction": "out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
+            "text": _bval(b, "text") or "",
+            "sender": _bval(b, "sender"),
+            "author": _bval(b, "author"),
+            "mid": _bval(b, "mid"),
+            "attachments": atts,
+        }
+    return skeleton
+
+
+def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
+    """Per-chat unread counts in one VALUES-bounded query (see the SPARQL).
+
+    The VALUES row is (chat key, account, cutoff) and results map back on the
+    same pair, so two accounts' chats with one peer are counted apart. Ids the
+    module never composed are skipped rather than sent as a half-formed row."""
+    if not cutoffs:
+        return {}
+    epoch = "1970-01-01T00:00:00Z"
+    refs = {}
+    for cid, cut in cutoffs.items():
+        parts = chat_state_mod.split_chat_ref(cid)
+        if parts is None:
+            continue
+        refs[cid] = (parts[2], parts[1] or "", cut)
+    if not refs:
+        return {}
+    rows = " ".join(
+        f"({_sparql_str(key)} {_sparql_str(account)} "
+        f"{_sparql_datetime(cut or epoch)})"
+        for key, account, cut in refs.values()
+    )
+    counts: dict[str, int] = {}
+    by_pair = {(key, account): cid for cid, (key, account, _c) in refs.items()}
+    for b in _sparql_bindings(_CHATS_UNREAD_SPARQL % rows):
+        pair = (_bval(b, "chat"), _bval(b, "account") or "")
+        n = _bval(b, "n")
+        if pair in by_pair and n is not None:
+            try:
+                counts[by_pair[pair]] = int(n)
+            except ValueError:
+                continue
+    return counts
+
+
+def _chats_payload() -> dict:
+    """The GET /chats body: store skeleton ∪ overlay, merged with chat state.
+
+    Raises on a store transport/parse error so the caller can answer an honest
+    502 — the overlay alone is seconds of traffic, not a view worth faking."""
+    now = time.time()
+    with _chats_cache_lock:
+        cached = (_chats_cache["skeleton"] is not None
+                  and now - _chats_cache["at"] <= CHAT_LIST_CACHE_SECONDS)
+        skeleton = dict(_chats_cache["skeleton"]) if cached else None
+        unread = dict(_chats_cache["unread"]) if cached else None
+    if skeleton is None:
+        skeleton = _fetch_chats_skeleton()
+        docs_for_cutoffs = _CHAT_STATE.all()
+        unread = _fetch_unread_counts({
+            cid: (docs_for_cutoffs.get(cid) or {}).get("last_read")
+            for cid in skeleton
+        })
+        with _chats_cache_lock:
+            _chats_cache.update({"at": now, "skeleton": dict(skeleton),
+                                 "unread": dict(unread)})
+    docs = _CHAT_STATE.all()
+
+    # Overlay: entries newer than the store's view update each chat's preview
+    # and unread count, and a chat the store has not indexed at all yet still
+    # appears — the message a push announced is in the view the tap opens.
+    overlay_by_chat: dict[str, list[dict]] = {}
+    for entry in _CHAT_OVERLAY.entries():
+        cid = entry.get("chat_id")
+        if cid:
+            overlay_by_chat.setdefault(cid, []).append(entry)
+
+    chats = []
+    for chat_id in set(skeleton) | set(overlay_by_chat):
+        parts = chat_state_mod.split_chat_id(chat_id)
+        if parts is None:
+            continue
+        channel, key = parts
+        doc = docs.get(chat_id) or _CHAT_STATE.get(chat_id)
+        roster = doc.get("roster") or {}
+        row = skeleton.get(chat_id)
+        last = None
+        last_ts = ""
+        if row is not None:
+            last_ts = row["ts"]
+            last = _chat_last_preview(
+                direction=row["direction"], text=row["text"], ts=row["ts"],
+                sender=row.get("sender"), sender_name=None,
+                author=row.get("author"),
+                has_attachments=bool(row.get("attachments")), roster=roster)
+        count = unread.get(chat_id, 0) if row is not None else 0
+        last_read = doc.get("last_read") or ""
+        store_ts = row["ts"] if row is not None else ""
+        store_mid = row.get("mid") if row is not None else None
+        for entry in overlay_by_chat.get(chat_id, []):  # ascending by (ts, id)
+            ts = entry.get("ts") or ""
+            if ts < store_ts:
+                continue  # certainly indexed (and counted) by the store already
+            # Count only overlay inbound the store has not counted. On an exact
+            # timestamp tie with the store's latest row the message ids decide;
+            # an id-less tie is conservatively treated as the same message —
+            # a rare briefly-missing count beats a double one.
+            same_as_store = ts == store_ts and (
+                not entry.get("message_id")
+                or entry.get("message_id") == store_mid)
+            if (entry.get("direction") == "in" and not same_as_store
+                    and ts > last_read):
+                count += 1
+            if ts >= last_ts:
+                last_ts = ts
+                last = _chat_last_preview(
+                    direction=entry.get("direction") or "in",
+                    text=entry.get("text") or "", ts=ts,
+                    sender=entry.get("sender"),
+                    sender_name=entry.get("sender_name"),
+                    author=entry.get("author"),
+                    has_attachments=bool(entry.get("attachments")),
+                    roster=roster)
+        if last is None:
+            continue
+        group = doc.get("group")
+        if group is None:
+            group = _chat_is_group(channel, key)
+        chats.append({
+            "id": chat_id,
+            "channel": channel,
+            # Which of the channel's accounts this conversation belongs to, or
+            # null for history written before the ledger recorded it. Exposed
+            # because two accounts talking to one peer are two chats with the
+            # same name, and the name alone cannot tell them apart.
+            "account": (chat_state_mod.split_chat_ref(chat_id) or (None, None, None))[1],
+            # The peer, as the ledger and the send path name them. Stable across
+            # the accounts that talk to them, which is what lets the client give
+            # one person one avatar colour however many chats they appear in.
+            "key": key,
+            "name": _chat_display_name(doc, channel, key),
+            "group": bool(group),
+            "unread": count,
+            "archived": bool(doc.get("archived")),
+            "muted": bool(doc.get("muted")),
+            "last": last,
+            "draft": doc.get("draft"),
+            # This chat's companion conversation, or null until one is asked
+            # for — see POST /chats/<id>/companion.
+            "companion": doc.get("companion"),
+            "messages": _chat_messages_url(chat_id),
+        })
+    chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "chats": chats,
+    }
+
+
+def _chat_summary(chat_id: str) -> dict | None:
+    """One chat's ChatSummary, from the already-merged list view."""
+    for chat in _chats_payload()["chats"]:
+        if chat["id"] == chat_id:
+            return chat
+    return None
+
+
+# Serializes create-or-get for companion threads. The web-gateway is the only
+# writer of chat state, so one process-wide lock is all that keeps two
+# simultaneous opens from each creating a thread and one of them winning.
+_companion_lock = threading.Lock()
+
+
+def _chat_companion(chat_id: str) -> tuple[str, bool]:
+    """This chat's companion conversation id, creating it on first ask.
+
+    Returns ``(conversation_id, created)``. Idempotent through the chat's state
+    doc, which is where the id lives, so every later call — from any device —
+    gets the same thread. A recorded id whose conversation is gone (a thread
+    the user deleted) is replaced rather than handed back, so the endpoint
+    never returns an id that cannot then be read.
+
+    The thread is an ordinary conversation in every respect but its `kind` and
+    its link back here: the dashboard drives it through /conversations, Ara
+    answers in it as she does anywhere, and her reply lands unread and pushed.
+    Its opening message is written here rather than by a model turn — it costs
+    nothing, always says the same thing, and is what tells the user that Ara
+    drafts into the chat's composer instead of sending."""
+    with _companion_lock:
+        doc = _CHAT_STATE.get(chat_id)
+        existing = doc.get("companion")
+        if existing and _load_conv(str(existing)) is not None:
+            return str(existing), False
+        parts = chat_state_mod.split_chat_id(chat_id)
+        channel, key = parts if parts else ("", chat_id)
+        name = _chat_display_name(doc, channel, key)
+        where = (f'the {channel} chat "{name}"' if channel
+                 else f'the chat "{name}"')
+        conv = _new_conv(
+            "user", DEFAULT_SESSION_KEY, f"Companion: {name}", "agent",
+            f"This thread is where we work out what to say in {where}. "
+            "Tell me what you want to get across and I'll put a draft in that "
+            "chat's composer — you read it, change what you like, and your "
+            "send press is what sends it.",
+            kind="companion", chat=chat_id)
+        _CHAT_STATE.set_companion(chat_id, conv["id"])
+        return conv["id"], True
+
+
+# How long to wait for a gateway to report back what an approved send actually
+# did. Approval executes asynchronously there (a slow send must not hold the
+# approving request open), so the outcome is read by polling the pending entry.
+CHAT_SEND_CONFIRM_TIMEOUT = float(
+    os.environ.get("CHAT_SEND_CONFIRM_TIMEOUT", "30"))
+CHAT_SEND_CONFIRM_INTERVAL = 0.2
+# Slack when matching an unconfirmed send against its ledger row by time. The
+# row carries the instant the CHANNEL accepted the message, stamped by another
+# machine's clock, so it can read a little earlier than the moment this process
+# asked for the send. Generous on purpose: over-matching briefly hides one of
+# two identical messages, under-matching shows the user their own message twice.
+CHAT_UNCONFIRMED_SKEW_SECONDS = 60.0
+
+
+def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
+                 method: str = "POST") -> tuple[int, dict]:
+    """One authenticated request to a channel gateway; (status, parsed body).
+
+    Raises on a transport failure, which the caller turns into a 502."""
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    if gw.get("token"):
+        headers["Authorization"] = "Bearer " + gw["token"]
+    req = urllib.request.Request(gw["base_url"] + path, data=data,
+                                 headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=CHAT_SEND_TIMEOUT) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")[:500]
+        try:
+            return exc.code, json.loads(raw)
+        except ValueError:
+            return exc.code, {"error": raw}
+
+
+def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
+    """Put one chat message on the wire; ({message_id, ts, attachments}, error).
+
+    The gateway's send policy decides, and nothing here asks it to skip that.
+    An `allow` account sends on the first hop. Anything stricter answers 202
+    with a pending send, and this releases it through the gateway's own
+    /pending-sends/<id>/approve in the same request — so the message is
+    recorded in the pending store *with* its approval rather than going around
+    the mechanism, and the dashboard press still completes in one action.
+
+    That is the whole difference between the user's press and an agent: an
+    agent that calls /send gets a queued message somebody still has to release.
+    An agent that also calls approve has deliberately simulated the button
+    press, which no arrangement inside a shared container can prevent — the
+    agents hold this gateway's token. What it can no longer do is send by
+    accident, which is what happened when `author: "user"` was a bypass.
+
+    Approval executes asynchronously at the gateway, so the outcome is polled
+    off the pending entry. A confirmation that does not arrive in time is not
+    a failed send — the message is very likely on the wire, and reporting it as
+    failed would put the words back in the composer for the user to send a
+    second time, which is a worse error than a display artifact. So the send is
+    reported, and reported honestly: `unconfirmed` says the identity is not
+    known, because there is none to give. Every timestamp available at that
+    point is this process's own clock rather than the instant the channel
+    accepted the message, so a caller must not match such a send on (ts, text)
+    — the ledger row will carry the gateway's own instant and its message id,
+    and neither will agree. It is matched on text and direction instead; see
+    the merge in _chat_messages_payload.
+    """
+    status, answer = _gateway_hop(gw, "/send", send_payload)
+    if not isinstance(answer, dict):
+        return {}, f"gateway returned a non-object body (HTTP {status})"
+    if status == 200 and answer.get("status") == "sent":
+        return {"message_id": answer.get("message_id"),
+                "ts": answer.get("ts"),
+                "attachments": answer.get("attachments") or []}, ""
+    if answer.get("status") != "pending_approval":
+        return {}, (f"gateway rejected the send (HTTP {status}): "
+                    + json.dumps(answer)[:300])
+
+    request_id = str(answer.get("request_id") or "").strip()
+    if not request_id:
+        return {}, "gateway queued the send but named no request id"
+    status, approved = _gateway_hop(
+        gw, f"/pending-sends/{request_id}/approve")
+    if status != 200:
+        return {}, (f"gateway refused to approve the queued send "
+                    f"(HTTP {status}): {json.dumps(approved)[:300]}")
+
+    deadline = time.time() + CHAT_SEND_CONFIRM_TIMEOUT
+    entry = approved if isinstance(approved, dict) else {}
+    while entry.get("status") == "sending" and time.time() < deadline:
+        time.sleep(CHAT_SEND_CONFIRM_INTERVAL)
+        status, entry = _gateway_hop(
+            gw, f"/pending-sends/{request_id}", method="GET")
+        if status != 200 or not isinstance(entry, dict):
+            entry = {"status": "sending"}
+            break
+    state = entry.get("status")
+    if state == "error":
+        return {}, f"the send failed at the gateway: {entry.get('error')}"
+    if state == "sending":
+        print(f"[web-gateway] send {request_id} not confirmed within "
+              f"{CHAT_SEND_CONFIRM_TIMEOUT}s; reporting it unconfirmed",
+              flush=True)
+    return {"message_id": entry.get("message_id"),
+            "ts": entry.get("sent_at"),
+            "unconfirmed": state == "sending",
+            "attachments": entry.get("attachments") or []}, ""
+
+
+def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
+    """The GET /chats/<id>/messages body. Raises on store errors (→ 502)."""
+    channel, account, key = chat_state_mod.split_chat_ref(chat_id)
+    doc = _CHAT_STATE.get(chat_id)
+    roster = doc.get("roster") or {}
+    # Which gateway serves this chat's media is the media resolver's answer,
+    # not the send resolver's: a chat may be unsendable (two inbox accounts,
+    # owner unknown) and still perfectly readable. The slug is the gateway
+    # to ask first; the media handler asks the channel's others on a 404.
+    media_gws = _media_gateways(channel, account, doc)
+    serving_slug = media_gws[0][0] if media_gws else None
+    before_clause = f"FILTER(?ts < {_sparql_datetime(before)})" if before else ""
+    query = _CHAT_MESSAGES_SPARQL % {
+        "chat": _sparql_str(key),
+        "channel": _sparql_str(channel),
+        # The empty literal selects the records carrying no kb:account, which
+        # is exactly the history an unqualified id names.
+        "account": _sparql_str(account or ""),
+        "before": before_clause,
+        "limit": CHAT_PAGE_MESSAGES,
+    }
+    messages = []
+    seen_mids: set[str] = set()
+    seen_fallback: set[tuple] = set()
+    # Outbound rows as (ts, text), for matching sends whose identity we never
+    # learned — see the unconfirmed branch in the overlay merge below.
+    store_out: list[tuple] = []
+    rows = [b for b in _sparql_bindings(query) if _bval(b, "ts")]
+    overlay = list(_CHAT_OVERLAY.entries(chat_id)) if before is None else []
+    # What the gateways stated about this page's blobs, one lookup for the
+    # rows and the overlay together.
+    media_meta = _chat_media_meta_lookup(
+        [u for b in rows for u in (_bval(b, "atts") or "").split(" ")]
+        + [u for e in overlay for u in (e.get("attachments") or [])])
+    for b in rows:
+        ts = _bval(b, "ts")
+        mid = _bval(b, "mid")
+        text = _bval(b, "text") or ""
+        atts = [u for u in (_bval(b, "atts") or "").split(" ") if u]
+        messages.append(_shape_chat_message(
+            chat_id, channel,
+            direction="out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
+            text=text, ts=ts, message_id=mid, subject=_bval(b, "m"),
+            sender=_bval(b, "sender"), author=_bval(b, "author"),
+            attachment_urls=atts, roster=roster, serving_slug=serving_slug,
+            media_meta=media_meta))
+        if mid:
+            seen_mids.add(mid)
+        seen_fallback.add((ts, text))
+        if _bval(b, "type") == _T_CHAT_OUTBOUND:
+            store_out.append((ts, text))
+    messages.reverse()  # the query pages newest-first; the contract is ascending
+
+    # Merge the live overlay into the NEWEST page only — older pages are
+    # settled history the overlay can no longer be ahead of.
+    if before is None:
+        for entry in overlay:
+            mid = entry.get("message_id")
+            ts = entry.get("ts") or ""
+            text = entry.get("text") or ""
+            if (mid and mid in seen_mids) or (not mid and (ts, text) in seen_fallback):
+                continue
+            # A send the gateway never confirmed carries neither its message id
+            # nor the instant the channel accepted it, so neither of the tests
+            # above can ever match its ledger row — which is how the user's own
+            # message came to be rendered twice. Such an entry is by
+            # construction one specific send, so an outbound row with the same
+            # words, recorded at or after the moment we gave up waiting, is
+            # that send. Matching two genuinely identical messages as one costs
+            # a bubble for the seconds until the overlay expires; not matching
+            # them showed a duplicate for as long as the page stayed open.
+            if entry.get("unconfirmed") and any(
+                    otext == text and ots >= (entry.get("since") or ts)
+                    for ots, otext in store_out):
+                continue
+            messages.append(_shape_chat_message(
+                chat_id, channel,
+                direction=entry.get("direction") or "in",
+                text=text, ts=ts, message_id=mid,
+                sender=entry.get("sender"),
+                sender_name=entry.get("sender_name"),
+                author=entry.get("author"), agent=entry.get("agent"),
+                attachment_urls=entry.get("attachments") or [],
+                roster=roster, serving_slug=serving_slug,
+                media_meta=media_meta))
+        messages.sort(key=lambda m: m["ts"])
+
+    summary = _chat_summary(chat_id)
+    if summary is None:
+        # A chat paged well into the past (or older than the current list
+        # view) still gets a well-formed summary from its state + this page.
+        newest = messages[-1] if messages else None
+        summary = {
+            "id": chat_id,
+            "channel": channel,
+            "name": _chat_display_name(doc, channel, key),
+            "group": bool(doc.get("group")
+                          if doc.get("group") is not None
+                          else _chat_is_group(channel, key)),
+            "unread": 0,
+            "archived": bool(doc.get("archived")),
+            "muted": bool(doc.get("muted")),
+            "last": None if newest is None else {
+                "ts": newest["ts"],
+                "direction": newest["direction"],
+                "kind": ("image" if newest.get("attachments")
+                         and not newest["text"] else "text"),
+                "text": newest["text"],
+            },
+            "draft": doc.get("draft"),
+            "companion": doc.get("companion"),
+            "messages": _chat_messages_url(chat_id),
+        }
+    return {
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "chat": summary,
+        "messages": messages,
+    }
+
+
+# -- Which account a chat belongs to ------------------------------------------
+# Sending as the wrong identity is worse than not sending: the message goes out
+# over a conversation the user cannot see, and the reply lands somewhere they
+# will never look. So chat routing is identity-first and fail-closed:
+#
+#   * only an **inbox**-mode account may own a chat (a control account's traffic
+#     is prompts to Ara, and ledger persistence is inbox-gated, so a control
+#     account can never legitimately hold one);
+#   * a gateway's identity comes from its own /health — its mode and the account
+#     it sends as — and never from a slug or address a container states about
+#     itself. Where a gateway lives is this side's configuration (the messenger
+#     registry); a gateway that also declared it was a second source of truth,
+#     and its drift is what stamped one account's chats with another's slug;
+#   * when the correct account cannot be determined, the send is REFUSED with
+#     the real reason rather than routed by guess.
+
+_gw_identity_lock = threading.Lock()
+# slug -> {"mode": str|None, "account": str|None, "at": float, "ok": bool}
+_gw_identity: dict[str, dict] = {}
+
+
+def _gateway_identity(slug: str, gw: dict, refresh: bool = False) -> dict:
+    """One gateway's ``{"mode", "account"}``, cached; never raises.
+
+    A failed probe keeps the last known-good identity and merely re-probes
+    sooner: a health blip must degrade gracefully — an account known to be
+    inbox a minute ago still routes — rather than lock the user out of sending.
+    A gateway that has never answered, or one too old to report a mode, has
+    mode None, which is eligible for nothing."""
+    now = time.time()
+    with _gw_identity_lock:
+        entry = _gw_identity.get(slug)
+    if entry is not None and not refresh:
+        ttl = CHAT_GATEWAY_IDENTITY_TTL if entry["ok"] else CHAT_GATEWAY_IDENTITY_TTL_FAIL
+        if now - entry["at"] <= ttl:
+            return entry
+    health = _fetch_gateway_health(gw)  # unreachable is a verdict, not a raise
+    mode = health.get("mode")
+    if isinstance(mode, str) and mode:
+        fresh = {"mode": mode, "account": (health.get("account") or None),
+                 "at": now, "ok": True}
+    else:
+        fresh = ({"mode": entry["mode"], "account": entry["account"]}
+                 if entry is not None else {"mode": None, "account": None})
+        fresh.update({"at": now, "ok": False})
+    with _gw_identity_lock:
+        _gw_identity[slug] = fresh
+    return fresh
+
+
+def _gateway_is_inbox(slug: str, gw: dict) -> bool:
+    return _gateway_identity(slug, gw).get("mode") == "inbox"
+
+
+def _gateway_in_channel(slug: str, gw: dict, channel: str) -> bool:
+    """Whether a registry gateway serves this channel.
+
+    The registry keys by service hostname and keeps no channel field, so this
+    reads the two things that do carry it: the slug (``signal-gateway``,
+    ``signal-gateway-personal`` — the /gateways pairing hints match the same
+    way) and the label the built-ins set to the channel name. A gateway named
+    after neither is not considered for an unstamped chat: refusing beats
+    guessing an identity."""
+    channel = (channel or "").lower()
+    if not channel:
+        return False
+    if slug == channel or slug.startswith(channel + "-"):
+        return True
+    return str(gw.get("label") or "").strip().lower().startswith(channel)
+
+
+def _inbox_gateways(channel: str) -> list:
+    """Every inbox-mode gateway serving this channel, slug-sorted."""
+    return [(slug, gw) for slug, gw in sorted(_CHANNEL_GATEWAYS.items())
+            if _gateway_in_channel(slug, gw, channel) and _gateway_is_inbox(slug, gw)]
+
+
+def _slug_for_account(channel: str, account: str) -> str | None:
+    """The registry slug of the gateway sending as ``account``, or None.
+
+    This is the rail's routing key: an account is unambiguous per container, a
+    self-derived slug is not. Identities are compared normalized, so the same
+    number formatted differently on either side still matches."""
+    wanted = normalize_requester_identity(account or "")
+    if not wanted:
+        return None
+    for slug, gw in sorted(_CHANNEL_GATEWAYS.items()):
+        if not _gateway_in_channel(slug, gw, channel):
+            continue
+        known = _gateway_identity(slug, gw).get("account")
+        if known and normalize_requester_identity(known) == wanted:
+            return slug
+    return None
+
+
+def _rail_gateway_slug(channel: str, account: str | None) -> str | None:
+    """Attribute one rail event to a registry gateway by account, or None.
+
+    The account is the only identity an event asserts, and the only one worth
+    trusting: it is matched against what the registry's gateways report for
+    themselves. An event states nothing about where it came from — a gateway
+    that named its own address or slug would be a second source of truth, and
+    its drift is what mis-routed sends to the wrong identity. An unrecognised
+    (or absent) account leaves the chat unstamped, and routing falls back to
+    the unambiguous single-inbox-account case or refuses."""
+    return _slug_for_account(channel, (account or "").strip())
+
+
+def _chat_gateway(doc: dict, channel: str, account: str | None = None):
+    """Resolve the account a chat's sends go out as.
+
+    Returns ``(slug, gateway, error)`` — exactly one of ``gateway`` / ``error``
+    is set.
+
+    ``account`` is the chat id's own account segment, and where it is present it
+    settles the question outright: the id was composed from the ``kb:account``
+    the writing gateway stamped on this chat's records, so it names the identity
+    that actually holds this conversation. That is a stronger fact than any
+    cached stamp — it comes from the messages themselves rather than from state
+    this process maintains — so it is tried first, and an account naming no
+    registry gateway is an error rather than a licence to fall through: falling
+    back would send a known account's chat out as a different identity, which is
+    the failure this whole mechanism exists to prevent.
+
+    Without one — a chat whose records predate ``kb:account`` — the old ladder
+    stands. A stamped slug is authoritative only when its provenance says it was
+    established from the account a gateway reported (``gateway_source``) *and* it
+    still resolves to an inbox-mode gateway. Mode alone is not enough: the stamps
+    that caused the incident named the built-in service, which may itself be
+    inbox-mode, so trusting any inbox-resolving stamp would have left every
+    poisoned chat sending as the wrong account. An untrusted stamp is discarded
+    and re-derived here — not only by the repair pass — so correctness never
+    depends on that sweep having run. With no usable stamp, exactly one inbox
+    account for the channel is unambiguous and used; zero or several are
+    refused."""
+    if account:
+        slug = _slug_for_account(channel, account)
+        canonical, gw = _channel_gateway(slug) if slug else (None, None)
+        if gw is not None and _gateway_is_inbox(canonical, gw):
+            return canonical, gw, None
+        # Two distinct refusals, and neither may fall through to the ladder
+        # below: sending a chat whose owning account is known out as some other
+        # identity is precisely the failure this mechanism exists to prevent.
+        # An account that is no longer inbox-mode is the deployment saying this
+        # identity is not for chats, so its history stays readable and unsendable
+        # rather than being answered from elsewhere.
+        why = ("is no longer an inbox-mode account" if gw is not None
+               else "is not a configured gateway")
+        return None, None, (f"the account this chat belongs to ({account}) "
+                            f"{why} on channel {channel}")
+    stamped = (doc.get("gateway") or "").strip()
+    if stamped:
+        trusted = doc.get("gateway_source") == chat_state_mod.GATEWAY_SOURCE_ACCOUNT
+        canonical, gw = _channel_gateway(stamped)
+        if trusted and gw is not None and _gateway_is_inbox(canonical, gw):
+            return canonical, gw, None
+        why = ("not established from a reported account" if not trusted
+               else "no longer an inbox-mode account")
+        print(f"[web-gateway] discarding chat gateway stamp {stamped!r} for channel "
+              f"{channel!r}: {why}", flush=True)
+    candidates = _inbox_gateways(channel)
+    if len(candidates) == 1:
+        slug, gw = candidates[0]
+        return slug, gw, None
+    if not candidates:
+        return None, None, f"no inbox-mode gateway for channel {channel}"
+    return None, None, ("cannot tell which account this chat belongs to - "
+                        + ", ".join(slug for slug, _ in candidates))
+
+
+def _media_gateways(channel: str, account: str | None = None,
+                    doc: dict | None = None) -> list:
+    """The gateways to ask for this chat's media, most likely first.
+
+    A different question from :func:`_chat_gateway`, and deliberately not the
+    same answer. Sending needs the one identity a message may go out AS, and
+    where that is ambiguous it must refuse. Serving a blob needs only a gateway
+    that HAS it — and a gateway asked for a blob it does not hold says so with
+    a 404, so the reader never has to guess: it asks, most likely first, and
+    moves on. Conflating the two is what left every chat of a channel with two
+    inbox accounts showing broken pictures: the send refusal was handed down
+    as "no gateway may serve this", when either could.
+
+    Most likely first: the account the chat's records name (the gateway that
+    stored them), else an account-derived stamp, else the channel's gateways
+    in registry order. Control-mode gateways are left out — ledger media is
+    inbox-only by construction, and the media handler refuses them anyway.
+    A channel with no gateway at all yields nothing, and the reference is then
+    passed through as it is: there is nobody to ask."""
+    ranked: list = []
+    seen: set = set()
+
+    def _add(slug):
+        canonical, gw = _channel_gateway(slug) if slug else (None, None)
+        if gw is None or canonical in seen:
+            return
+        if _gateway_identity(canonical, gw).get("mode") == "control":
+            return
+        seen.add(canonical)
+        ranked.append((canonical, gw))
+
+    if account:
+        _add(_slug_for_account(channel, account))
+    if doc and doc.get("gateway_source") == chat_state_mod.GATEWAY_SOURCE_ACCOUNT:
+        _add(doc.get("gateway"))
+    for slug, gw in sorted(_CHANNEL_GATEWAYS.items()):
+        if _gateway_in_channel(slug, gw, channel):
+            _add(slug)
+    return ranked
+
+
+def _slug_channel(slug: str) -> str | None:
+    """The channel a registry slug serves, from the same reading
+    :func:`_gateway_in_channel` does, or None."""
+    canonical, gw = _channel_gateway(slug)
+    if gw is None:
+        return None
+    for channel in messenger_gateways.BUILTIN_CHANNELS:
+        if _gateway_in_channel(canonical, gw, channel):
+            return channel
+    return None
+
+
+def repair_chat_gateway_stamps() -> int:
+    """Drop chat-state gateway stamps not provably established by account.
+
+    One-time repair for docs stamped before rail events carried an account:
+    every additional account of a channel reported the *built-in's* slug, so
+    chats belonging to the user's own number were stamped with — and their
+    sends routed to — another account. The test is provenance, not mode: the
+    built-in may itself be inbox-mode, in which case a mode-only check would
+    pass every poisoned stamp and change nothing.
+
+    Idempotent, and it never clobbers a genuinely account-derived stamp: a
+    repaired doc has no stamp to re-clear, and a re-stamped one carries the
+    marker. A cleared stamp is re-established by that chat's next
+    account-attributed rail event. Returns how many docs were repaired."""
+    repaired = 0
+    for chat_id, doc in _CHAT_STATE.all().items():
+        stamped = (doc.get("gateway") or "").strip()
+        if not stamped:
+            continue
+        if doc.get("gateway_source") == chat_state_mod.GATEWAY_SOURCE_ACCOUNT:
+            canonical, gw = _channel_gateway(stamped)
+            if gw is not None and _gateway_is_inbox(canonical, gw):
+                continue
+            why = "no longer an inbox-mode account"
+        else:
+            why = "not established from a reported account"
+        _CHAT_STATE.set_gateway(chat_id, None)
+        repaired += 1
+        print(f"[web-gateway] repaired chat {chat_id}: dropped gateway stamp "
+              f"{stamped!r} ({why})", flush=True)
+    return repaired
+
+
+def _chats_ingest_authorized(provided: str) -> bool:
+    """Authorize a POST /internal/chats/inbound call. Open when no token is set.
+
+    The news-rail model, for the news rail's own reason: this rail is fed by
+    gateway forwards that are fire-and-forget and swallow errors by contract,
+    so a fail-closed default would fail *silently* — a token mismatch between
+    containers produces a chat surface that looks wired and quietly never
+    lights up. The events describe messages the ledgers already hold, and the
+    one outward action (a Web Push previewing the user's own inbound mail) is
+    bounded by what the preview shows. A deployment that wants the endpoint
+    locked sets CHATS_INGEST_TOKEN on both sides and it is enforced — its own
+    variable, because the entrypoint-generated CONVERSATION_BACKEND_TOKEN can
+    never be unset."""
+    if not CHATS_INGEST_TOKEN:
+        return True
+    return hmac.compare_digest(provided, CHATS_INGEST_TOKEN)
+
+
+def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
+                            had_unread: bool) -> None:
+    """Web-Push one arrival: title = chat, body = preview, tap-through = the
+    chat page. Deterministic — no model turn is spent on notification."""
+    if not push_notify.enabled():
+        return
+    channel, key = chat_state_mod.split_chat_id(chat_id)
+    title = _chat_display_name(doc, channel, key)
+    body = " ".join(str(entry.get("text") or "").split()) or "(attachment)"
+    if len(body) > 160:
+        body = body[:157].rstrip() + "…"
+    url = "/chat.html?" + urllib.parse.urlencode({"id": chat_id})
+    push_notify.notify_async(title, body, url=url, tag=chat_id,
+                             mode="reply" if had_unread else "new")
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
@@ -3463,6 +5895,37 @@ class Handler(BaseHTTPRequestHandler):
         if self.path in ("/internal/news", "/internal/news/"):
             self._handle_internal_news()
             return
+        if self.path in ("/internal/chats/inbound", "/internal/chats/inbound/"):
+            self._handle_chats_inbound()
+            return
+        internal_chat_draft_match = _INTERNAL_CHAT_DRAFT_RE.match(self.path)
+        if internal_chat_draft_match:
+            self._handle_internal_chat_draft(internal_chat_draft_match.group(1))
+            return
+        chat_read_match = _CHAT_READ_RE.match(self.path)
+        if chat_read_match:
+            self._handle_chat_read(chat_read_match.group(1))
+            return
+        chat_flags_match = _CHAT_FLAGS_RE.match(self.path)
+        if chat_flags_match:
+            self._handle_chat_flags(chat_flags_match.group(1))
+            return
+        chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
+        if chat_draft_undo_match:
+            self._handle_chat_draft_undo(chat_draft_undo_match.group(1))
+            return
+        chat_draft_match = _CHAT_DRAFT_RE.match(self.path)
+        if chat_draft_match:
+            self._handle_chat_draft(chat_draft_match.group(1))
+            return
+        chat_send_match = _CHAT_SEND_RE.match(self.path)
+        if chat_send_match:
+            self._handle_chat_send(chat_send_match.group(1))
+            return
+        chat_companion_match = _CHAT_COMPANION_RE.match(self.path)
+        if chat_companion_match:
+            self._handle_chat_companion(chat_companion_match.group(1))
+            return
         internal_msg_match = _INTERNAL_CONV_MSG_RE.match(self.path)
         if internal_msg_match:
             self._handle_agent_conversation_message(internal_msg_match.group(1))
@@ -3562,6 +6025,23 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def _handle_send_action(self, account: str, request_id: str, verb: str) -> None:
+        """Approve or reject one pending send — the user's decision, and the
+        other place `verify` is satisfied.
+
+        Gated like the chat send, and for the same reason: an agent that could
+        POST .../approve here would simply queue its own send and then approve
+        it, which would leave the send gate closing nothing at all. Reject is
+        gated too — it cannot cause a send, but suppressing a message the user
+        meant to allow is equally not an agent's call."""
+        ok, reason = self._request_from_edge(
+            f"{verb} of pending send {account}/{request_id}")
+        if not ok:
+            self._send_html(403, _HTML_HEAD + "<body><h1>Not allowed</h1><p>"
+                            "Approving or rejecting a pending send is the "
+                            "user's own decision and is accepted only from the "
+                            "dashboard through the reverse proxy.</p><p>"
+                            + html.escape(reason) + "</p></body></html>")
+            return
         channel, _gw = _channel_gateway(account)
         if channel:
             self._handle_channel_send_action(channel, request_id, verb)
@@ -3807,6 +6287,546 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"ok": True, "added": added, "id": item["id"]})
 
+    # ── Messenger chat endpoints ───────────────────────────────────────────
+    # Dashboard-side routes sit behind the edge auth like /conversations; the
+    # two /internal/chats/* routes are for in-container callers (the gateways'
+    # rail, agent draft staging).
+
+    def _request_from_edge(self, what: str) -> tuple[bool, str]:
+        """Gate for the endpoints that act with the user's own authority.
+
+        Returns ``(ok, reason)``; a refusal is printed loudly, because the whole
+        value of this check is that an attempt to act as the user is visible
+        rather than silent. See the EDGE_PROXY_PEERS block for what it does and
+        does not prevent."""
+        try:
+            peer = self.client_address[0]
+        except Exception:  # noqa: BLE001 - no address is itself unclassifiable
+            peer = None
+        try:
+            local = self.connection.getsockname()[0]
+        except Exception:  # noqa: BLE001 - fall through to the peer checks
+            local = None
+        ok, reason = _classify_request_origin(peer, local)
+        if not ok:
+            print(f"[web-gateway] REFUSED {what}: {reason}. This endpoint acts "
+                  f"with the user's own authority and is accepted only through "
+                  f"the reverse proxy — an agent must stage a draft and let the "
+                  f"user press send.", flush=True)
+        return ok, reason
+
+    def _chat_id_or_404(self, raw: str) -> str | None:
+        chat_id = _chat_id_from_path(raw)
+        if chat_id is None:
+            self._send_json(404, {"error": "not a chat id"})
+        return chat_id
+
+    def _handle_chats_list(self) -> None:
+        try:
+            self._send_json(200, _chats_payload())
+        except Exception as exc:  # store down — honest 502, like /projects
+            self._send_json(502, {"error": "life store unreachable",
+                                  "detail": str(exc)})
+
+    def _handle_chat_messages(self, raw_id: str, query: str) -> None:
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        params = urllib.parse.parse_qs(query)
+        before = (params.get("before") or [None])[0]
+        if before is not None and not _CHAT_TS_RE.match(before):
+            self._send_json(400, {"error": "before must be an ISO-8601 timestamp"})
+            return
+        try:
+            self._send_json(200, _chat_messages_payload(chat_id, before=before))
+        except Exception as exc:
+            self._send_json(502, {"error": "life store unreachable",
+                                  "detail": str(exc)})
+
+    def _handle_chat_read(self, raw_id: str) -> None:
+        """Advance one chat's read watermark (body {ts}) — forward only."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        ts = payload.get("ts")
+        if not isinstance(ts, (str, int, float)) or (
+                isinstance(ts, str) and not _CHAT_TS_RE.match(ts)):
+            self._send_json(400, {"error": "ts must be an ISO-8601 timestamp or epoch seconds"})
+            return
+        doc = _CHAT_STATE.advance_last_read(chat_id, ts)
+        _chats_cache_invalidate()
+        self._send_json(200, {"id": chat_id, "last_read": doc["last_read"]})
+
+    def _handle_chat_flags(self, raw_id: str) -> None:
+        """Set one chat's `archived` / `muted` flags (body {archived?, muted?}).
+
+        The two carry the dashboard-conversation semantics verbatim (see
+        chat_state): archived leaves the active list, and a new inbound message
+        brings it back *unless* the chat is muted. So archiving alone is "out
+        of the way until it speaks again", and hiding a chat for good is both
+        together — which is what the dashboard's Hide sends.
+
+        Deliberately independent of the triage delivery gate. Whether a group
+        is a news source, and whether its messages are worth a model turn, is
+        that policy's business (scripts/triage_policy.py); whether the user
+        wants the chat in their list is this one's. A group can be filed to the
+        news feed and still be a chat one reads and answers in, which is the
+        distinction `news` + `quieted` exists to make.
+        """
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        flags: dict[str, bool] = {}
+        for name in ("archived", "muted"):
+            if name not in payload:
+                continue
+            if not isinstance(payload[name], bool):
+                self._send_json(400, {"error": f"{name} must be a boolean"})
+                return
+            flags[name] = payload[name]
+        if not flags:
+            self._send_json(400, {"error": "archived and/or muted (boolean) is required"})
+            return
+        doc = _CHAT_STATE.set_flags(chat_id, **flags)
+        # The list is cached; a hidden chat must leave it now, not on the next
+        # refresh window.
+        _chats_cache_invalidate()
+        self._send_json(200, {"id": chat_id,
+                              "archived": bool(doc.get("archived")),
+                              "muted": bool(doc.get("muted"))})
+
+    def _handle_chat_draft(self, raw_id: str) -> None:
+        """The user writes the shared draft (body {text, version}).
+
+        `version` is the draft version the client based its edit on; a stale
+        one answers 409 with the current state (the project-file sha-guard
+        precedent) so concurrent edits — the user typing while an agent stages
+        — surface instead of clobbering. Empty text is the composer's ✕: the
+        draft (and its author tag) is cleared."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        text = payload.get("text")
+        version = payload.get("version")
+        if not isinstance(text, str) or not isinstance(version, int):
+            self._send_json(400, {"error": "text (string) and version (int) are required"})
+            return
+        ok, doc = _CHAT_STATE.set_draft(chat_id, text, author="user",
+                                        base_version=version)
+        status = 200 if ok else 409
+        self._send_json(status, {"id": chat_id, "draft": doc["draft"],
+                                 "version": doc["draft_version"]})
+
+    def _handle_chat_draft_undo(self, raw_id: str) -> None:
+        """Put back the draft the composer's ✕ just cleared (no body).
+
+        The restore is a server-side step rather than the client resubmitting
+        the text, and that is the whole point of the endpoint: the draft comes
+        back with the **author** it had, so one an agent staged is still marked
+        as the agent's. A client rewriting it could only claim it as the user's
+        own, and that marker is what tells the user whose words they are about
+        to send in their name. It also cannot race the clear that produced it —
+        one guarded step, either order of arrival, coherent state.
+
+        409 when there is nothing to put back (nothing was cleared, something
+        was written since, or the stash has aged out), with the current draft
+        state so the client can settle on the truth."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        restored, doc = _CHAT_STATE.undo_clear(chat_id)
+        self._send_json(200 if restored else 409,
+                        {"id": chat_id, "draft": doc["draft"],
+                         "version": doc["draft_version"]})
+
+    def _handle_internal_chat_draft(self, raw_id: str) -> None:
+        """An agent stages the shared draft (author "agent" + its name).
+
+        Token-gated like the other agent write paths. Without an explicit
+        {version}, an existing non-empty *user-authored* draft is never
+        overwritten (409) — an agent must not clobber what the user is typing;
+        re-staging its own earlier draft is fine."""
+        chat_id = _chat_id_from_path(raw_id)
+        if chat_id is None:
+            self._send_json(404, {"error": "not a chat id"})
+            return
+        payload = self._agent_conversation_payload()
+        if payload is None:
+            return
+        text = payload.get("text")
+        if not isinstance(text, str):
+            self._send_json(400, {"error": "text (string) is required"})
+            return
+        version = payload.get("version")
+        if version is not None and not isinstance(version, int):
+            self._send_json(400, {"error": "version must be an int"})
+            return
+        agent = (payload.get("agent") or "").strip() or None
+        ok, doc = _CHAT_STATE.set_draft(chat_id, text, author="agent",
+                                        agent=agent, base_version=version,
+                                        require_free=version is None)
+        status = 200 if ok else 409
+        self._send_json(status, {"id": chat_id, "draft": doc["draft"],
+                                 "version": doc["draft_version"]})
+
+    def _handle_chat_companion(self, raw_id: str) -> None:
+        """Open (or re-open) this chat's companion conversation.
+
+        Idempotent: the first call creates the thread and records it on the
+        chat, every later one returns the same id — so the client may call it
+        unconditionally when the companion pane opens, without first reading
+        the chat's `companion` field."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        try:
+            cid, created = _chat_companion(chat_id)
+        except OSError as exc:
+            self._send_json(500, {"error": "could not open the companion thread",
+                                  "detail": str(exc)})
+            return
+        self._send_json(201 if created else 200, {"id": cid})
+
+    def _handle_chat_send(self, raw_id: str) -> None:
+        """Send {text} through the chat's own gateway as the user.
+
+        `verify` exists to put the user's decision between agent-composed
+        content and the wire, and the send press in the dashboard IS that
+        decision. It satisfies the policy rather than skipping it: the send is
+        queued at the gateway like any other and released through the
+        gateway's own approve endpoint in this same request (see
+        _chat_send_via_gateway). Nothing sends because a field said "user",
+        which is how a message once went out that nobody pressed send on.
+
+        The request must also have arrived through the reverse proxy (see
+        EDGE_PROXY_PEERS). That is defence in depth rather than the guarantee:
+        the guarantee is that no send skips the queue at all. It is worth
+        keeping because the endpoint used to be justified by "this sits behind
+        the edge auth", which was false — that auth is a forward-auth the proxy
+        consults, so an in-container caller is never asked for it.
+
+        On success the message enters the overlay, the draft is cleared and the
+        watermark advances, and the sent Message is returned so the UI renders
+        it without waiting for the store."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        ok, reason = self._request_from_edge(f"chat send to {chat_id}")
+        if not ok:
+            self._send_json(403, {
+                "error": "a chat send is the user's own action and is accepted "
+                         "only from the dashboard through the reverse proxy",
+                "detail": reason,
+                "remedy": "To propose a message, stage it as the chat's shared "
+                          "draft (scripts/chat-draft.py) and let the user press "
+                          "send.",
+            })
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        text = (payload.get("text") or "").strip()
+        # Optional images, in the gateways' own /send shape. Validated here —
+        # count, base64, decoded size — so a bad upload fails fast with a 400
+        # instead of a gateway round trip; the gateway persists the bytes into
+        # its ledger media store and reports the stored references back.
+        raw_images = payload.get("images") or []
+        if not isinstance(raw_images, list):
+            self._send_json(400, {"error": "'images' must be a list"})
+            return
+        if len(raw_images) > CHAT_SEND_MAX_IMAGES:
+            self._send_json(400, {"error": f"at most {CHAT_SEND_MAX_IMAGES} images per send"})
+            return
+        images = []
+        for img in raw_images:
+            if not isinstance(img, dict) or not isinstance(img.get("data"), str):
+                self._send_json(400, {"error": "each image needs base64 'data'"})
+                return
+            ctype = img.get("content_type")
+            if ctype is not None and not isinstance(ctype, str):
+                self._send_json(400, {"error": "image content_type must be a string"})
+                return
+            try:
+                raw = base64.b64decode(img["data"], validate=True)
+            except (ValueError, binascii.Error):
+                self._send_json(400, {"error": "invalid base64 image data"})
+                return
+            if len(raw) > MAX_ATTACHMENT_BYTES:
+                self._send_json(400, {"error": "image too large"})
+                return
+            images.append({"content_type": (ctype or "").strip(), "data": img["data"]})
+        if not text and not images:
+            self._send_json(400, {"error": "empty text"})
+            return
+        channel, account, key = chat_state_mod.split_chat_ref(chat_id)
+        doc = _CHAT_STATE.get(chat_id)
+        slug, gw, route_error = _chat_gateway(doc, channel, account)
+        if gw is None:
+            # Refuse, naming the real reason. Sending as the wrong identity is
+            # worse than not sending at all — see _chat_gateway.
+            print(f"[web-gateway] refusing chat send to {chat_id}: {route_error}",
+                  flush=True)
+            self._send_json(409, {"error": route_error})
+            return
+        send_payload = {
+            "recipient": key,
+            "message": text,
+            # Ledger provenance only: who composed the words. It carries no
+            # authority at the gateway — that conflation is what let a message
+            # go out under `verify` that nobody pressed send on.
+            "author": "user",
+            # A chat send is a text message like the real client's — never the
+            # push CLIs' spoken rendering.
+            "voice": False,
+        }
+        if images:
+            send_payload["images"] = images
+        # The instant the send was asked for. A record the channel writes for it
+        # cannot predate this by more than clock skew, which is what makes it a
+        # sound lower bound when the send comes back without an identity.
+        asked_at = time.time()
+        try:
+            result, send_error = _chat_send_via_gateway(gw, send_payload)
+        except Exception as exc:  # noqa: BLE001 - unreachable gateway is a 502
+            self._send_json(502, {"error": f"gateway unreachable: {exc}"})
+            return
+        if send_error:
+            self._send_json(502, {"error": send_error})
+            return
+        message_id = (str(result.get("message_id") or "").strip() or None)
+        unconfirmed = bool(result.get("unconfirmed"))
+        # With no confirmation there is no channel instant either, so this is
+        # our own clock — good enough to order the bubble, and explicitly not
+        # something to match the ledger row on later.
+        ts = chat_state_mod.iso_z(result.get("ts"))
+        # The stored ledger media references the gateway reports back — the
+        # same host-free urn:retinue:media:… form it writes into the record.
+        # Shaping resolves them onto the authenticated proxy through the very
+        # account this send just used, so the returned Message (and the merged
+        # view, via the overlay) renders the sent image immediately. Passing
+        # that slug is what makes a URN resolvable at all: it names the blob,
+        # not a host.
+        gw_atts = [u for u in (result.get("attachments") or [])
+                   if isinstance(u, str) and u]
+        # What the gateway stated about the blob it just stored. Best-effort
+        # here: the message has gone out, and the store may index the new
+        # record a moment later — the next page load carries the statement.
+        try:
+            media_meta = _chat_media_meta_lookup(gw_atts)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[web-gateway] media metadata lookup after send failed: {exc}", flush=True)
+            media_meta = {}
+        msg = _shape_chat_message(chat_id, channel, direction="out", text=text,
+                                  ts=ts, message_id=message_id, author="user",
+                                  attachment_urls=gw_atts, serving_slug=slug,
+                                  media_meta=media_meta)
+        since = chat_state_mod.iso_z(asked_at - CHAT_UNCONFIRMED_SKEW_SECONDS)
+        if unconfirmed:
+            # The client keeps its optimistic bubble rather than trusting this
+            # id, and reconciles it against the first outbound record from
+            # `since` onwards carrying these words.
+            msg["unconfirmed"] = True
+            msg["since"] = since
+        # The overlay entry goes under the id the user sent FROM, which is where
+        # they are looking. For a chat whose records predate kb:account that is
+        # the unattributed id, while the gateway stamps its own account on the
+        # record it writes — so once the store indexes it, this message is the
+        # first of that peer's conversation *on this account*, and the reply to
+        # it lands there too. The overlay is not made to point at that new id
+        # instead: a sent message has to appear in the chat it was sent from.
+        # The visible effect is the one-time hand-over described in chat_state —
+        # the unattributed history stays readable, and the conversation carries
+        # on under the account that actually holds it.
+        _CHAT_OVERLAY.insert({
+            "chat_id": chat_id, "channel": channel, "direction": "out",
+            "author": "user", "text": text, "ts": ts, "message_id": message_id,
+            "unconfirmed": unconfirmed,
+            "since": since if unconfirmed else None,
+            "attachments": gw_atts,
+        })
+        _CHAT_STATE.clear_draft(chat_id)
+        _CHAT_STATE.advance_last_read(chat_id, ts)
+        # Deliberately no stamping here. A send either used an already
+        # account-derived stamp (nothing to add) or the unambiguous
+        # single-inbox-account rule, which re-derives identically next time and
+        # is not evidence of *this chat's* account — writing it would recreate
+        # the sticky-wrong-stamp failure this incident was.
+        _chats_cache_invalidate()
+        print(f"[web-gateway] chat send to {chat_id} via {slug}", flush=True)
+        self._send_json(200, msg)
+
+    def _handle_chats_inbound(self) -> None:
+        """The gateways' notify rail: one message event, zero model turns.
+
+        The deterministic replacement for notification-by-triage-session: the
+        gateway POSTs the metadata of a message its ledger already holds, and
+        this handler updates the chat's state, feeds the live overlay, and —
+        for an arrival that deserves it — fans out the Web Push whose
+        tap-through opens the chat. Held/no-action gate classes and muted
+        chats stay silent; an arrival un-archives an archived chat unless it
+        is muted (the conversation rule, verbatim). Outbound echoes with
+        author user/device advance the read watermark — the user was visibly
+        in that chat on their phone; an agent-authored outbound advances
+        nothing. Open unless CHATS_INGEST_TOKEN is set — see
+        _chats_ingest_authorized for why fail-open is the fail-safe here."""
+        token = self.headers.get("X-Conversation-Backend-Token", "")
+        if not _chats_ingest_authorized(token):
+            self._send_json(403, {"error": "forbidden"})
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        direction = (payload.get("direction") or "").strip()
+        channel = (payload.get("channel") or "").strip()
+        chat_key = (payload.get("chat") or "").strip()
+        if direction not in ("in", "out") or not channel or not chat_key:
+            self._send_json(400, {"error": "direction (in|out), channel and chat are required"})
+            return
+        # The account rides on the event and is half the chat's identity — the
+        # same value the writing gateway stamped as kb:account on the ledger
+        # record for this very message, so the overlay entry and the row the
+        # store indexes seconds later compose to the same id. A gateway that
+        # does not know its own account yet (Telegram before the session
+        # authorizes) sends none, and its events compose the unqualified id its
+        # records will also produce.
+        account = (payload.get("account") or "").strip() or None
+        chat_id = chat_state_mod.make_chat_id(channel, chat_key, account)
+        ts = chat_state_mod.iso_z(payload.get("ts"))
+        author = (payload.get("author") or "").strip() or None
+        entry = {
+            "chat_id": chat_id,
+            "channel": channel,
+            "direction": direction,
+            "sender": (payload.get("sender") or "").strip() or None,
+            "sender_name": (payload.get("sender_name") or "").strip() or None,
+            "author": author,
+            "message_id": (str(payload.get("message_id") or "").strip() or None),
+            "ts": ts,
+            "text": str(payload.get("text") or ""),
+            "attachments": [u for u in (payload.get("attachments") or []) if u],
+        }
+        _CHAT_OVERLAY.insert(entry)
+        group = payload.get("group")
+        # Which account this arrived on, resolved from the account the gateway
+        # reports (see _rail_gateway_slug). This is the ONLY writer of a chat's gateway
+        # stamp, and every stamp it writes is marked as account-derived; an
+        # unresolvable account leaves the existing stamp alone.
+        rail_slug = _rail_gateway_slug(channel, account)
+        doc = _CHAT_STATE.note_message(
+            chat_id,
+            name=(payload.get("chat_name") or "").strip()
+                 or (entry["sender_name"] if not group and direction == "in" else None),
+            group=bool(group) if group is not None else None,
+            gateway=rail_slug,
+            gateway_source=chat_state_mod.GATEWAY_SOURCE_ACCOUNT if rail_slug else None,
+            sender=entry["sender"], sender_name=entry["sender_name"])
+        _chats_cache_invalidate()
+        pushed = False
+        if direction == "in":
+            _, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
+            # A new message in an archived chat would otherwise land invisible;
+            # muted is the explicit "keep it archived" opt-out. Decided inside
+            # the state lock (see ChatState.unarchive_unless_muted): the
+            # dashboard can set these flags concurrently now, and deciding
+            # from a snapshot read a moment earlier would undo half of a Hide.
+            doc = _CHAT_STATE.unarchive_unless_muted(chat_id)
+            gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else None
+            # Held/no-action classes (blacklisted, ignored-group, quieted, …)
+            # update the mirror silently — the gate already decided they are
+            # not worth the user's attention; absent gate info an arrival is
+            # treated as notify-worthy (fail open, like the gate itself).
+            held = gate is not None and not gate.get("forward", True)
+            if not doc.get("muted") and not held:
+                _chat_push_notification(chat_id, doc, entry, had_unread)
+                pushed = True
+        elif author in ("user", "device"):
+            _CHAT_STATE.advance_last_read(chat_id, ts)
+        self._send_json(200, {"ok": True, "id": chat_id, "pushed": pushed})
+
+    def _handle_chat_media(self, slug: str, media_id: str) -> None:
+        """Authenticated proxy for a ledger media blob.
+
+        The gateways serve their media token-gated on the internal network;
+        this passes the registry token and relays bytes and Content-Type (the
+        /gateways/<slug>/qr proxy precedent), so chat bubbles render media
+        with no gateway token in the browser. The route regex already pins the
+        media id to 32 hex chars.
+
+        The slug reaching here is inbox by construction — it comes from a
+        ledger attachment reference (or the media resolver's first pick), and
+        ledger persistence is inbox-gated on all three gateways — but that is
+        an invariant of another file, so it is verified rather than assumed:
+        an account positively known to be control-mode is refused. An unknown
+        mode (an unreachable gateway) still serves, since this is a read of
+        the user's own media behind the dashboard's own auth and blocking it
+        would only break image rendering during a health blip."""
+        _slug, gw = _channel_gateway(slug)
+        if not gw:
+            self._send_json(404, {"error": "unknown gateway"})
+            return
+        if _gateway_identity(_slug, gw).get("mode") == "control":
+            print(f"[web-gateway] refusing chat media from control-mode gateway "
+                  f"{_slug!r}", flush=True)
+            self._send_json(404, {"error": "not found"})
+            return
+        # The named gateway first. A 404 from it is that gateway stating it does
+        # not hold the blob — so its channel's other gateways are asked in turn
+        # (see _media_gateways). The reference named the blob, never a host; a
+        # legacy chat's records may have been stored by any of the channel's
+        # accounts, and asking is how that is settled without guessing.
+        channel = _slug_channel(_slug)
+        candidates = [(_slug, gw)] + [
+            (s, g) for s, g in _media_gateways(channel or "") if s != _slug]
+        data, content_type, status = b"", "application/json", 404
+        unreachable, answered = None, False
+        for i, (cand_slug, cand_gw) in enumerate(candidates):
+            try:
+                with _gateway_request(cand_gw, f"/media/{media_id}", CHAT_SEND_TIMEOUT) as resp:
+                    data = resp.read()
+                    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                    status = resp.status
+            except urllib.error.HTTPError as exc:
+                data = exc.read()
+                content_type = exc.headers.get("Content-Type", "application/json")
+                status = exc.code
+            except Exception as exc:  # noqa: BLE001
+                unreachable = exc
+                continue
+            answered = True
+            if status != 404:
+                break
+            if i + 1 < len(candidates):
+                print(f"[web-gateway] chat media {media_id} not at {cand_slug}; "
+                      f"asking {candidates[i + 1][0]}", flush=True)
+        if not answered:
+            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"})
+            return
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        if status == 200:
+            # Ledger media is immutable — cache privately so a re-opened chat
+            # does not refetch every image through the proxy. A miss is not:
+            # a sibling that was unreachable for a moment must not turn into
+            # a day-long broken picture.
+            self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _handle_news_preferences_write(self) -> None:
         """Replace the Herald's memory with what the user typed.
 
@@ -4001,7 +7021,9 @@ class Handler(BaseHTTPRequestHandler):
         if raw and not _model_offered(raw, refresh=True):
             self._send_json(400, {"error": "unknown model"})
             return
-        conv = _conv_set_flags(cid, model=raw)
+        # Touching the picker is the user taking manual control of the
+        # thread's tier, so it also clears a standing escalation.
+        conv = _conv_set_flags(cid, model=raw, escalated=False)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
@@ -4090,8 +7112,9 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_agent_conversation(self) -> None:
         """A retinue agent opens a thread that needs the user's decision.
 
-        The message is stored verbatim (the agent has already composed it); Ara
-        only engages once the user replies."""
+        The agent has already composed the message; the presentation lint
+        below enforces only its form (chips, labeled links), never its
+        content. Ara only engages once the user replies."""
         payload = self._agent_conversation_payload()
         if payload is None:
             return
@@ -4113,9 +7136,53 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid kind"})
             return
         quiet = bool(payload.get("quiet"))
-        conv = _new_conv("agent", owner, title, "agent", message,
-                         first_attachments=payload.get("attachments"),
-                         kind=kind, agent=agent)
+        # Agent-only context (e.g. the reply command for a proposed messenger
+        # reply, reply token included) — replayed to Ara's sessions in this
+        # thread, never rendered to the user.
+        context = str(payload.get("context") or "").strip() or None
+        # Idempotency: a repeat of the turn that opened this thread — an
+        # escalation re-run, a redelivered inbound — must reuse it, not open a
+        # second one. Checked before the lint so a duplicate costs no model
+        # call, and again under the lock below, which is what actually makes
+        # create-and-bind atomic.
+        key = str(payload.get("key") or "").strip()
+        # A key the client minted for its own retry, not an identity for this
+        # item: honoured exactly like any other while it lives, but expired
+        # afterwards rather than kept forever.
+        key_ephemeral = bool(payload.get("key_ephemeral"))
+        if len(key) > _CONV_KEY_MAX:
+            self._send_json(400, {"error": "key too long"})
+            return
+        if key:
+            with _conv_keys_lock:
+                existing = _conv_for_key(key)
+            if existing is not None:
+                # Word-for-word what the thread already holds: a redelivery,
+                # absorbed here without a model call. Anything else has to be
+                # linted before it can be compared at all — the stored text
+                # went through the lint, so raw text would look "different"
+                # even when it is the same message.
+                if not _conv_already_says(existing, message, payload, context):
+                    message = _lint_presentation(message, kind=kind)
+                self._send_json(200, self._reuse_thread(
+                    existing, key, message, payload, context, agent, quiet))
+                return
+        message = _lint_presentation(message, kind=kind)
+        if key:
+            with _conv_keys_lock:
+                existing = _conv_for_key(key)
+                if existing is not None:
+                    self._send_json(200, self._reuse_thread(
+                        existing, key, message, payload, context, agent, quiet))
+                    return
+                conv = _new_conv("agent", owner, title, "agent", message,
+                                 first_attachments=payload.get("attachments"),
+                                 kind=kind, agent=agent, context=context)
+                _bind_conv_key(key, conv["id"], ephemeral=key_ephemeral)
+        else:
+            conv = _new_conv("agent", owner, title, "agent", message,
+                             first_attachments=payload.get("attachments"),
+                             kind=kind, agent=agent, context=context)
         body = {"id": conv["id"], "title": conv["title"]}
         if quiet:
             _conv_set_flags(conv["id"], unread=False)
@@ -4124,6 +7191,53 @@ class Handler(BaseHTTPRequestHandler):
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
         self._send_json(201, body)
+
+    def _reuse_thread(self, cid: str, key: str, message: str,
+                      payload: dict, context: str | None,
+                      agent: str | None = None, quiet: bool = False) -> dict:
+        """The answer to a second open under one key: never a second thread.
+
+        Whether it is also a second *message* depends on what the writer has to
+        say, and the two cases this key exists for differ exactly there.
+
+        A **redelivery** replays a stanza the channel already delivered: same
+        words, nothing new. It is absorbed silently — no message, no push, no
+        unread badge — because the user has this already.
+
+        An **escalation re-run** is the same turn done properly. Junior's reply
+        was discarded and the prompt replayed on the frontier tier, but a thread
+        junior opened before escalating is a side effect that survived, and it
+        holds junior's incomplete attempt. Discarding senior's message here
+        would leave the user with only that — the failure this whole mechanism
+        was meant to prevent, arriving by the other door. So a writer with
+        something different to say is appended to the thread and pushed.
+
+        Appended rather than substituted on purpose: junior's words may already
+        have reached the user's phone, and silently rewriting what someone has
+        read is worse than showing them the correction after it. The thread then
+        reads as what actually happened.
+        """
+        conv = _load_conv(cid) or {}
+        attachments = payload.get("attachments")
+        same = _conv_already_says(cid, message, payload, context)
+        body = {"id": cid, "title": conv.get("title") or "", "deduplicated": True}
+        if CONVERSATION_BASE_URL:
+            body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{cid}"
+        if same:
+            print(f"[web-gateway] conversation key already open; reusing {cid}",
+                  flush=True)
+            return body
+        print(f"[web-gateway] conversation key already open with different "
+              f"words; appending to {cid} rather than dropping them", flush=True)
+        conv = _conv_add_message(cid, "agent", message, agent=agent,
+                                 attachments=attachments, context=context,
+                                 unread=not quiet, wake=not quiet) or conv
+        body["appended"] = True
+        # A quiet writer stays quiet on this path too — a cowork audit trail
+        # does not start badging the dashboard just because it was reopened.
+        if not quiet:
+            body["push_subscribers"] = _push_conv_notification(conv, message)
+        return body
 
     def _handle_agent_conversation_message(self, cid: str) -> None:
         """A retinue agent appends a message to an existing thread.
@@ -4141,9 +7255,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Check the thread up front: _conv_add_message persists attachments
         # before it loads the thread, so an unknown id would leave orphan files.
-        if _load_conv(cid) is None:
+        # The load also supplies the thread's kind for the presentation lint.
+        target = _load_conv(cid)
+        if target is None:
             self._send_json(404, {"error": "not found"})
             return
+        if message:
+            message = _lint_presentation(message,
+                                         kind=target.get("kind") or "chat")
         # A quiet append is a record, not a request for attention: no unread
         # badge and no Web Push. Used by the cowork audit trail, which would
         # otherwise buzz the user's phone on every question the MCP connector
@@ -4155,9 +7274,10 @@ class Handler(BaseHTTPRequestHandler):
         # `agent` overrides the displayed sender name (e.g. "Coach") when a
         # relay answers on a subagent's behalf — this is that relay path.
         agent = (payload.get("agent") or "").strip() or None
+        context = str(payload.get("context") or "").strip() or None
         conv = _conv_add_message(cid, "agent", message, unread=not quiet,
                                  attachments=attachments, wake=not quiet,
-                                 agent=agent)
+                                 agent=agent, context=context)
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
@@ -4237,7 +7357,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 scope = "active"
             kind = (params.get("kind") or ["chat"])[0]
-            if kind not in ("chat", "edit", "cowork", "all"):
+            if kind not in ("chat", "edit", "cowork", "companion", "all"):
                 kind = "chat"
             project = (params.get("project") or [None])[0]
             self._send_json(200, {"conversations": _list_convs(scope, kind, project)})
@@ -4280,6 +7400,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(502, {"error": "life store unreachable",
                                       "detail": str(exc)})
             return
+        if conv_path in ("/chats", "/chats/"):
+            self._handle_chats_list()
+            return
+        chat_media_match = _CHAT_MEDIA_RE.match(conv_path)
+        if chat_media_match:
+            self._handle_chat_media(chat_media_match.group(1),
+                                    chat_media_match.group(2))
+            return
+        chat_msgs_match = _CHAT_MSGS_RE.match(conv_path)
+        if chat_msgs_match:
+            self._handle_chat_messages(chat_msgs_match.group(1), conv_query)
+            return
         att_match = _CONV_ATT_RE.match(conv_path)
         if att_match:
             inline = "inline" in urllib.parse.parse_qs(conv_query)
@@ -4314,7 +7446,13 @@ class Handler(BaseHTTPRequestHandler):
             if not gw:
                 self._send_json(404, {"error": "unknown gateway"})
             else:
-                self._send_json(200, _fetch_gateway_health(gw))
+                # `account` is the routing key this gateway matches rail events
+                # against — a phone number. It stays server-side: the page
+                # needs the link state, not the user's own number in a JSON
+                # body the browser caches.
+                health = {k: v for k, v in _fetch_gateway_health(gw).items()
+                          if k != "account"}
+                self._send_json(200, health)
             return
         gw_qr_match = _GATEWAY_QR_RE.match(conv_path)
         if gw_qr_match:
@@ -4448,7 +7586,15 @@ class Handler(BaseHTTPRequestHandler):
             # one, if any — the status page advances there after success.
             if pending:
                 next_url = f"/sends/{pending[0]['account']}/{pending[0]['request_id']}"
-        self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url))
+        # For an event still awaiting a decision, the days it covers are read
+        # from the calendar and shown with it: "is this already in the agenda,
+        # and does it clash?" is the question the approval actually turns on.
+        agenda = None
+        is_event = detail.get("kind") == "event" or bool(detail.get("start"))
+        if is_event and (detail.get("status") or "pending") == "pending":
+            agenda = _calendar_agenda(gw, detail)
+        self._send_html(200, _render_channel_send_html(detail, channel, request_id, next_url,
+                                                       agenda))
 
     def _handle_channel_send_status(self, account: str, request_id: str) -> None:
         """Lean JSON status for a channel pending send.
@@ -4569,6 +7715,26 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Repair chat-state gateway stamps written before rail events carried an
+    # account (they named the built-in service for every additional account of
+    # a channel, so sends routed to the wrong identity). Idempotent, and
+    # best-effort: a probe failure must never keep the gateway from starting.
+    try:
+        repaired = repair_chat_gateway_stamps()
+        if repaired:
+            print(f"[web-gateway] repaired {repaired} chat gateway stamp(s)", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] chat gateway repair skipped: {exc}", flush=True)
+    # Pin threads that predate the model tiers to the gateway default, so the
+    # introduction of RETINUE_ROUTER_MODEL does not retroactively move them to
+    # the router tier. Idempotent (marker-guarded) and best-effort.
+    try:
+        pinned = materialise_pre_tier_model_pins()
+        if pinned:
+            print(f"[web-gateway] pinned {pinned} pre-tier thread(s) to the "
+                  "gateway default", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] model-pin migration skipped: {exc}", flush=True)
     # ThreadingHTTPServer so quick requests (job polls, /health) are never
     # blocked head-of-line behind a long-running job. Actual `claude` concurrency
     # is still bounded by the worker pool inside send_message().

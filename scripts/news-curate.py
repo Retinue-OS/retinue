@@ -29,9 +29,16 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_auth  # noqa: E402
 import news_store as store  # noqa: E402
+import session_env  # noqa: E402
 
-CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+# This turn only dispatches the Herald (which pins its own model), so it is a
+# router-tier Ara junior turn (docs/model-routing.md).
+CLAUDE_MODEL = (
+    os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
+    or os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
+)
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 # Scoring a whole backlog in one session is slower and no better than scoring
 # the freshest slice; the rest comes round on the next run an hour later.
@@ -119,7 +126,16 @@ def main() -> int:
            build_prompt(path, len(items), len(feedback))]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
-    result = subprocess.run(cmd, cwd="/workspace")
+    # The allowlisted environment (scripts/session_env.py), never a copy of
+    # this process's own: under the scheduler that is already clean, but run
+    # by hand from a session it would not be. It also stamps the session's
+    # model so memory entries can record it (scripts/memory.py); no --model,
+    # no stamp — never an inherited one.
+    env = session_env.build(model=CLAUDE_MODEL)
+    # Refresh an access token about to expire before the session starts —
+    # once, under the lock every framework spawner shares (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(log=log)
+    result = subprocess.run(cmd, cwd="/workspace", env=env)
     if result.returncode == 0:
         # Only advance the cursor on a clean run: a crashed session must see the
         # same feedback again rather than lose it.

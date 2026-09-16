@@ -50,7 +50,6 @@ CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 WORKSPACE = Path(os.environ.get("RETINUE_WORKSPACE") or "/workspace")
 
 _DEFAULT_CONVERSATION_MODELS = [
-    {"id": "", "label": "Default"},
     {"id": "opus", "label": "Opus (deepest reasoning)"},
     {"id": "sonnet", "label": "Sonnet (balanced)"},
     {"id": "haiku", "label": "Haiku (fastest)"},
@@ -76,8 +75,10 @@ def _coerce(parsed: object) -> list[dict]:
     """Normalise a parsed models value into validated {"id","label"} dicts.
 
     Accepts the bare array or a JSON-LD document wrapping it under `models` —
-    the same shapes the gateway's loader accepts. Returns [] when nothing usable
-    is present so the caller can fall back."""
+    the same shapes the gateway's loader accepts, including its dropping of
+    empty-id rows (the legacy synthetic "Default" option), so the store mirrors
+    what is actually served. Returns [] when nothing usable is present so the
+    caller can fall back."""
     if isinstance(parsed, dict):
         parsed = parsed.get("models", [])
     if not isinstance(parsed, list):
@@ -87,7 +88,9 @@ def _coerce(parsed: object) -> list[dict]:
         if not isinstance(item, dict) or "id" not in item:
             continue
         mid = str(item["id"]).strip()
-        label = str(item.get("label") or mid or "Default").strip()
+        if not mid:
+            continue
+        label = str(item.get("label") or mid).strip()
         models.append({"id": mid, "label": label})
     return models
 

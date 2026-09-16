@@ -4,9 +4,10 @@
 Covers the pure logic without an HTTP server or a live LiteLLM: parsing a
 GET /model/info response (picker flag, labels, wildcard filtering, duplicate
 name and duplicate label collapsing),
-the env > LiteLLM > file > default precedence, the cache (TTL, last-good on
-failure, forced refresh on a validation miss), and the auth-header derivation
-from ANTHROPIC_CUSTOM_HEADERS.
+the env > LiteLLM > file > default precedence, the route-alias resolution that
+flags the gateway default on its concrete entry and names the answering model
+in message headers, the cache (TTL, last-good on failure, forced refresh on a
+validation miss), and the auth-header derivation from ANTHROPIC_CUSTOM_HEADERS.
 
     python3 tests/test_web_gateway_models.py
 """
@@ -218,39 +219,102 @@ def test_merge_replaces_stale_ollama_catalog(wg):
     ]
 
 
-def test_dynamic_list_and_default_entry(wg):
+def test_dynamic_list_has_no_default_entry(wg):
     wg._fetch_litellm_models = lambda: [
         {"id": "claude-opus-5", "label": "Opus"}]
     models = wg._conversation_models()
-    assert models == [{"id": "", "label": "Default"},
-                      {"id": "claude-opus-5", "label": "Opus"}], models
-    # The offered ids drive validation.
+    # Only concrete models — no synthetic "" Default row.
+    assert models == [{"id": "claude-opus-5", "label": "Opus"}], models
+    # The offered ids drive validation; "" still means "gateway default".
     assert wg._model_offered("claude-opus-5")
     assert wg._valid_model_id("claude-opus-5") == "claude-opus-5"
     assert wg._valid_model_id("") is None
 
 
+def test_default_flagged_on_concrete_entry(wg):
+    # The gateway default (a plumbing route) resolves through /model/info's
+    # litellm_params to a concrete model; that entry — not a synthetic row —
+    # carries the default flag and says so in its label.
+    wg._record_route_upstreams(_model_info_response(
+        {"model_name": "retinue-claude",
+         "litellm_params": {"model": "anthropic/claude-opus-5"}},
+        {"model_name": "claude-opus-5",
+         "litellm_params": {"model": "anthropic/claude-opus-5"}},
+    ))
+    assert wg._resolve_route_model("retinue-claude") == "anthropic/claude-opus-5"
+    wg.CLAUDE_MODEL = "retinue-claude"
+    try:
+        wg._fetch_litellm_models = lambda: [
+            {"id": "claude-opus-5", "label": "Opus (deepest reasoning)"},
+            {"id": "claude-sonnet-5", "label": "Sonnet (balanced)"},
+        ]
+        models = wg._conversation_models(force=True)
+        assert models == [
+            {"id": "claude-opus-5", "label": "Opus (deepest reasoning, default)",
+             "default": True},
+            {"id": "claude-sonnet-5", "label": "Sonnet (balanced)"},
+        ], models
+        # An os.environ/ upstream that LiteLLM echoed unresolved still resolves.
+        os.environ["LITELLM_PRIMARY_MODEL"] = "ollama/qwen3.6"
+        wg._record_route_upstreams(_model_info_response(
+            {"model_name": "retinue-claude",
+             "litellm_params": {"model": "os.environ/LITELLM_PRIMARY_MODEL"}},
+        ))
+        assert wg._resolve_route_model("retinue-claude") == "ollama/qwen3.6"
+    finally:
+        os.environ.pop("LITELLM_PRIMARY_MODEL", None)
+        wg.CLAUDE_MODEL = ""
+        wg._record_route_upstreams(_model_info_response())
+
+
+def test_envelope_model_name_resolves_route_label(wg):
+    # The claude -p envelope reports the LiteLLM route it was called with; the
+    # bubble header must name the concrete model that answered, not the route.
+    wg._record_route_upstreams(_model_info_response(
+        {"model_name": "retinue-claude",
+         "litellm_params": {"model": "anthropic/claude-opus-5"}},
+    ))
+    try:
+        envelope = {"modelUsage": {
+            "retinue-claude": {"costUSD": 0.2, "canonicalModel": "retinue-claude"}}}
+        assert wg._envelope_model_name(envelope) == "Opus"
+    finally:
+        wg._record_route_upstreams(_model_info_response())
+    # Unresolvable route names degrade to a cleaned-up form, never the raw
+    # "Retinue-…" route label. (URL cleared so no warm-fetch is attempted.)
+    orig_url = wg._LITELLM_URL
+    wg._LITELLM_URL = ""
+    try:
+        assert wg._short_model_name("retinue-claude") == "Claude"
+        envelope = {"modelUsage": {
+            "retinue-claude": {"costUSD": 0.2, "canonicalModel": "retinue-claude"}}}
+        assert wg._envelope_model_name(envelope) == "Claude"
+    finally:
+        wg._LITELLM_URL = orig_url
+
+
 def test_static_fallback_when_litellm_empty_or_down(wg):
-    # Reachable but nothing advertised -> Default only, not the Claude aliases.
+    # Reachable but nothing advertised -> nothing offered (picker hides),
+    # not the static Claude aliases.
     wg._fetch_litellm_models = lambda: []
-    assert wg._conversation_models(force=True) == [wg._DEFAULT_MODEL_ENTRY]
-    # Unreachable with no last-good list -> Default only.
+    assert wg._conversation_models(force=True) == []
+    # Unreachable with no last-good list -> nothing offered either.
     def boom():
         raise OSError("connection refused")
     wg._fetch_litellm_models = boom
-    assert wg._conversation_models(force=True) == [wg._DEFAULT_MODEL_ENTRY]
+    assert wg._conversation_models(force=True) == []
     assert not wg._model_offered("claude-opus-5")
     assert not wg._model_offered("opus")
 
 
 def test_last_good_survives_refresh_failure(wg):
     wg._fetch_litellm_models = lambda: [{"id": "claude-opus-5", "label": "Opus"}]
-    assert wg._conversation_models(force=True)[1]["id"] == "claude-opus-5"
+    assert wg._conversation_models(force=True)[0]["id"] == "claude-opus-5"
     def boom():
         raise OSError("restarting")
     wg._fetch_litellm_models = boom
     models = wg._conversation_models(force=True)
-    assert models[1]["id"] == "claude-opus-5", models
+    assert models[0]["id"] == "claude-opus-5", models
 
 
 def test_cache_ttl_and_forced_refresh(wg):
@@ -292,18 +356,18 @@ def test_fetch_does_not_block_cache_readers(wg):
     assert entered.wait(5)
     # While the forced refresh is in flight, cache-hit readers must not queue
     # behind the upstream call.
-    assert wg._conversation_models()[1]["id"] == "base"
+    assert wg._conversation_models()[0]["id"] == "base"
     release.set()
     t.join(5)
     assert not t.is_alive()
-    assert wg._conversation_models()[1]["id"] == "slow"
+    assert wg._conversation_models()[0]["id"] == "slow"
 
 
 def test_env_override_wins_over_litellm(wg_env):
     wg = wg_env
     wg._fetch_litellm_models = lambda: [{"id": "claude-opus-5", "label": "Opus"}]
-    assert wg._conversation_models() == [
-        {"id": "", "label": "Standard"}, {"id": "opus", "label": "Opus"}]
+    # The env list's legacy empty-id "Standard" row is dropped at coercion.
+    assert wg._conversation_models() == [{"id": "opus", "label": "Opus"}]
     assert wg._model_offered("opus")
     assert not wg._model_offered("claude-opus-5")
 
@@ -354,7 +418,9 @@ def main() -> None:
         test_fetch_ollama_bypasses_http_proxy_for_local_host(wg)
         test_fetch_ollama_keeps_proxy_for_remote_host(wg)
         test_merge_replaces_stale_ollama_catalog(wg)
-        test_dynamic_list_and_default_entry(wg)
+        test_dynamic_list_has_no_default_entry(wg)
+        test_default_flagged_on_concrete_entry(wg)
+        test_envelope_model_name_resolves_route_label(wg)
         test_static_fallback_when_litellm_empty_or_down(wg)
         test_last_good_survives_refresh_failure(wg)
         test_litellm_headers(wg)

@@ -5,7 +5,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl ffmpeg libespeak-ng1 openjdk-21-jre-headless python3 python3-pip wget \
     && rm -rf /var/lib/apt/lists/*
 
-ARG SIGNAL_CLI_VERSION=0.14.7
+ARG SIGNAL_CLI_VERSION=0.14.8
 RUN wget -qO /tmp/signal-cli.tar.gz \
       "https://github.com/AsamK/signal-cli/releases/download/v${SIGNAL_CLI_VERSION}/signal-cli-${SIGNAL_CLI_VERSION}-Linux-native.tar.gz" \
     && tar xf /tmp/signal-cli.tar.gz -C /opt/ \
@@ -32,5 +32,6 @@ COPY scripts/triage_policy.py /app/triage_policy.py
 COPY scripts/inbound_store.py /app/inbound_store.py
 COPY scripts/job_delivery.py /app/job_delivery.py
 COPY scripts/news_ingest.py /app/news_ingest.py
+COPY scripts/chat_ingest.py /app/chat_ingest.py
 
 CMD ["python3", "/app/signal-gateway.py"]

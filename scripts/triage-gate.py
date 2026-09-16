@@ -67,18 +67,35 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import news_ingest  # noqa: E402  (local, after sys.path tweak)
 import triage_policy as tp  # noqa: E402  (local, after sys.path tweak)
+import claude_auth  # noqa: E402  (local, after sys.path tweak)
+import session_env  # noqa: E402  (local, after sys.path tweak)
 
 EMAIL_CLIENT = os.environ.get("EMAIL_CLIENT_PATH", "/workspace/scripts/email_client.py")
 SENT_FOLDER = os.environ.get("SENT_FOLDER", "Sent")
 SENT_DERIVE_LIMIT = int(os.environ.get("TRIAGE_SENT_DERIVE_LIMIT", "500"))
 INBOX_SCAN_LIMIT = int(os.environ.get("TRIAGE_INBOX_SCAN_LIMIT", "100"))
+# Hard ceiling for the widened re-scan when the first pass saturates. The scan
+# window is newest-first, so a backlog larger than INBOX_SCAN_LIMIT would hide
+# its own oldest mail from every future run — the one failure mode that gets
+# worse the longer it lasts. Raise only if a mailbox legitimately holds more
+# unread mail than this.
+INBOX_SCAN_MAX = int(os.environ.get("TRIAGE_INBOX_SCAN_MAX", "2000"))
+# How many messages the spawn prompt enumerates. Only the prompt is capped —
+# the gate itself scans the whole backlog, and the prompt says so, so a long
+# backlog costs a truncated listing rather than unseen mail.
+PROMPT_LIST_LIMIT = int(os.environ.get("TRIAGE_PROMPT_LIST_LIMIT", "150"))
+# How long a message may sit in the INBOX on a non-terminal status before the
+# gate treats it as stalled and re-arms it. Longer than the nudge cycle
+# (EMAIL_PROCESSING_INTERVAL), so an item merely awaiting the user is not
+# re-collected while the reminder mechanism is still working on it.
+STALL_DAYS = float(os.environ.get("TRIAGE_STALL_DAYS", "7"))
 # Where a filed newsletter goes. Non-destructive by default: the news rail files
 # a *reference* into the feed, so the mail itself is archived, never deleted.
 # Set empty to leave it in the INBOX (triage's Phase-1 backstop then moves it).
@@ -131,11 +148,45 @@ def _list_id(msg: dict) -> str:
 
 
 def unread_inbox() -> list[dict]:
-    """Unread INBOX messages, newest first (or [] on failure)."""
+    """Unread INBOX messages, newest first (or [] on failure).
+
+    The listing is newest-first, so a plain `--limit INBOX_SCAN_LIMIT` does not
+    merely sample the mailbox — it hides its *oldest* unread mail, permanently
+    and silently, from the moment the backlog outgrows the window. The mail
+    hidden that way is exactly the mail that most needs triaging. So when the
+    first pass comes back saturated, widen it once, up to INBOX_SCAN_MAX, and
+    say so on stderr either way.
+    """
     res = _email_client(
         "search", "--folder", "INBOX", "--unseen", "--limit", str(INBOX_SCAN_LIMIT)
     )
-    return res.get("messages", []) if res else []
+    if not res:
+        return []
+    messages = res.get("messages", [])
+    if len(messages) < INBOX_SCAN_LIMIT:
+        return messages
+
+    print(
+        f"[triage-gate] unread INBOX saturated the {INBOX_SCAN_LIMIT}-message scan "
+        f"window; re-scanning up to {INBOX_SCAN_MAX}",
+        file=sys.stderr,
+    )
+    wide = _email_client(
+        "search", "--folder", "INBOX", "--unseen", "--limit", str(INBOX_SCAN_MAX)
+    )
+    if not wide:
+        # The widened scan failed; the narrow result is still real mail, and
+        # triaging its newest INBOX_SCAN_LIMIT beats triaging nothing.
+        return messages
+    messages = wide.get("messages", [])
+    if len(messages) >= INBOX_SCAN_MAX:
+        print(
+            f"[triage-gate] unread INBOX also filled the {INBOX_SCAN_MAX}-message "
+            f"ceiling — older unread mail is still out of view. Raise "
+            f"TRIAGE_INBOX_SCAN_MAX.",
+            file=sys.stderr,
+        )
+    return messages
 
 
 def refresh_whitelist_from_sent() -> int:
@@ -346,23 +397,137 @@ def route(unread: list[dict], mode: str) -> list[dict]:
     return keep
 
 
-def _already_recorded(msg: dict) -> bool:
-    """True when triage has already written a status record for this message.
+# The statuses the triage skill names as legitimate INBOX residents — an item
+# that owes something and is waiting for it. Only these can stall; every other
+# status (`resolved`, and the statuses the other rails write — `status_filed`,
+# `self_filed`, `abstain`, …) is settled as far as this gate is concerned. An
+# allowlist of *unfinished* states rather than of terminal ones, because a rail
+# added later must not have its records silently re-armed by this code.
+# `omnibus_pending` is not a name the skill writes (it writes `omnibus`); it is
+# kept because an older run may have left records under it, and a stale alias
+# costs nothing here while dropping it would re-hide that mail.
+OPEN_STATUSES = frozenset(
+    {"proposed", "omnibus", "omnibus_pending", "deferred", "engaged"}
+)
 
-    Any record at all counts — `proposed`, `engaged`, `omnibus_pending`,
-    `resolved`. They differ in what is still owed, but none of them is *new*
-    work, and only new work justifies spending a model turn.
+# Every field triage may stamp a status record with. Which ones a record
+# carries depends on how far it got; the newest of those present is how long
+# ago anything actually happened to it.
+_STATUS_TIME_FIELDS = (
+    "classified",
+    "proposed",
+    "omnibus",
+    "last_nudge",
+    "updated",
+    "resolved",
+    "resolved_at",
+)
+
+
+def _parse_ts(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip().replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _last_touched(path: Path, record: dict) -> datetime:
+    """When anything last happened to this item.
+
+    The newest timestamp the record carries, or the file's mtime when it
+    carries none — a record with no readable timestamp is still evidence of
+    *something*, and mtime never makes an item look fresher than it is.
+    """
+    stamps = [
+        ts for ts in (_parse_ts(record.get(f)) for f in _STATUS_TIME_FIELDS) if ts
+    ]
+    if stamps:
+        return max(stamps)
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+
+
+def _stalled(path: Path) -> bool:
+    """True when a recorded, non-terminal item has sat untouched past STALL_DAYS.
+
+    An item still in the INBOX on a non-terminal status is work that was
+    started and never finished. Normally the nudge cycle finishes it; when it
+    does not — the proposal thread was archived or deleted, the omnibus was
+    never approved — nothing else in the system ever looks at that item again,
+    because the gate treats *any* record as "not new work". So the item freezes
+    in the INBOX permanently. Age is the only signal available here that
+    distinguishes that from an item legitimately awaiting the user, and it is
+    deliberately not read off the dashboard store: an archived thread is not a
+    decision (see CLAUDE.md — `muted` is the only decidable signal of that),
+    so a thread that has gone quiet is exactly the case this must catch.
+    """
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        # Unreadable record: treat as stalled so a model turn can repair it,
+        # rather than leaving the message invisible forever.
+        return True
+    if not isinstance(record, dict):
+        return True
+    status = record.get("status")
+    if not isinstance(status, str) or not status.strip():
+        # Parseable but malformed: no usable status at all. Same rule as an
+        # unreadable record — stalled, so a model turn can repair it.
+        return True
+    if status.strip() not in OPEN_STATUSES:
+        return False
+    age = datetime.now(timezone.utc) - _last_touched(path, record)
+    return age > timedelta(days=STALL_DAYS)
+
+
+def _already_recorded(msg: dict) -> bool:
+    """True when triage has a *live* status record for this message.
+
+    Any record at all normally counts — `proposed`, `engaged`,
+    `omnibus_pending`, `resolved`. They differ in what is still owed, but none
+    of them is *new* work, and only new work justifies spending a model turn.
+
+    The exception is a stalled one (see `_stalled`): a non-terminal record that
+    nothing has touched in STALL_DAYS is not "in progress", it is abandoned,
+    and re-arming it is the only way its mail ever leaves the INBOX.
     """
     path = _status_path(msg.get("message_id") or "")
-    return bool(path and path.exists())
+    if not (path and path.exists()):
+        return False
+    return not _stalled(path)
 
 
 def arming(messages: list[dict]) -> list[dict]:
     """The subset of `messages` that justifies a spawn: the ones triage has
-    never seen. Everything else is settled as far as the gate is concerned and
-    is merely waiting on the user or on an execution step — it must not keep
-    re-spawning a session for as long as it stays in the INBOX."""
+    never seen, plus the ones it saw but never finished (`_stalled`).
+    Everything else is settled as far as the gate is concerned and is merely
+    waiting on the user or on an execution step — it must not keep re-spawning
+    a session for as long as it stays in the INBOX."""
     return [m for m in messages if not _already_recorded(m)]
+
+
+def _report_arming(mode: str, hits: list[dict], fresh: list[dict]) -> None:
+    """Log why the gate armed, splitting never-seen mail from stalled mail.
+
+    A rising stalled count is the signature of the inbox-zero backstop failing,
+    and it is otherwise invisible: both kinds look identical in the spawn line.
+    """
+    stalled = sum(
+        1
+        for m in fresh
+        if (p := _status_path(m.get("message_id") or "")) is not None and p.exists()
+    )
+    parts = [f"{len(fresh) - stalled} never seen"]
+    if stalled:
+        parts.append(f"{stalled} stalled >{STALL_DAYS:g}d on a non-terminal status")
+    print(
+        f"[triage-gate] {mode}: arming on {len(fresh)} of {len(hits)} "
+        f"({', '.join(parts)})",
+        file=sys.stderr,
+    )
 
 
 def build_prompt(mode: str, messages: list[dict]) -> str:
@@ -385,11 +550,17 @@ def build_prompt(mode: str, messages: list[dict]) -> str:
         "The messages the gate saw (the mailbox listing remains authoritative — "
         "reconcile, do not assume this list is complete):",
     ]
-    for m in messages:
+    for m in messages[:PROMPT_LIST_LIMIT]:
         frm = m.get("from") or "(unknown)"
         subj = (m.get("subject") or "").strip() or "(no subject)"
         mid = m.get("message_id") or "(no id)"
         lines.append(f"  - {frm} — {subj} [{mid}]")
+    if len(messages) > PROMPT_LIST_LIMIT:
+        lines.append(
+            f"  … and {len(messages) - PROMPT_LIST_LIMIT} more the gate saw but did "
+            "not list here. This listing is truncated, the mailbox is not: work "
+            "from the mailbox."
+        )
     return "\n".join(lines)
 
 
@@ -402,7 +573,16 @@ def spawn(mode: str, messages: list[dict]) -> int:
            "--permission-mode", PERMISSION_MODE, build_prompt(mode, messages)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
-    return subprocess.run(cmd, cwd="/workspace").returncode
+    # Refresh an access token about to expire before the session starts —
+    # once, under the lock every framework spawner shares (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(
+        log=lambda msg: print(f"[triage-gate] {msg}", file=sys.stderr))
+    # The allowlisted environment (scripts/session_env.py), never this
+    # process's own — the triage session handles untrusted mail, so of all
+    # sessions it is the one that must not inherit a secret. Also stamps the
+    # model for memory entries (scripts/memory.py).
+    return subprocess.run(cmd, cwd="/workspace",
+                          env=session_env.build(model=CLAUDE_MODEL)).returncode
 
 
 def run_frequent() -> int:
@@ -423,6 +603,7 @@ def run_frequent() -> int:
             file=sys.stderr,
         )
         return 0
+    _report_arming("frequent", hits, fresh)
     return spawn("frequent", hits)
 
 
@@ -440,6 +621,7 @@ def run_daily() -> int:
         print(f"[triage-gate] daily: {len(hits)} unread, all already in the "
               "status store; nothing spawned", file=sys.stderr)
         return 0
+    _report_arming("daily", hits, fresh)
     return spawn("daily", hits)
 
 

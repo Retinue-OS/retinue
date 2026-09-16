@@ -8,10 +8,34 @@ a Progressive Web App on the phone home screen.
 
 - **Static shell, no server rendering.** `index.html` is the hand-editable
   configuration: it declares the active cards and app-launch buttons.
+- **A conversation** (`components/conversation.js`) is one element,
+  `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
+  buttons on quotes and code, click-to-fill chips, attachments, model and
+  cost meta), the pending state while Ara answers, the composer with text,
+  file attachments and voice dictation, the model picker, and the read-aloud
+  player (`<retinue-read-aloud>`, its bar, placeable by any host). Given a
+  `conversation-id` it reads, polls and replies; given `for-project` and no
+  id it is the composer whose first message opens the thread, then goes on
+  as it. It reports outward with events (`retinue-back`,
+  `retinue-created`, `retinue-sent`, `retinue-archived`, `retinue-open`,
+  `retinue-thread`); drafts, dictation jobs and the reader outlive one
+  instance, so a thread left and reopened has its text, and a reading goes
+  on. A host can shape the frame without forking the thread: `bar="none"` or
+  `bar="actions"` for a header of its own, `stamp="clock"` beside a
+  clock-stamped timeline, `no-autofocus` where the host keeps it mounted
+  whether or not it is on screen (taking focus scrolls the element into view,
+  which on the chat page's phone strip is a tab switch), and `create-url`
+  where the thread belongs to
+  something else and is minted by that thing's endpoint rather than opened by
+  the first message. It takes `fill(text)` (into the composer, for the user to
+  send) and `ask(text)` (send now, for a host whose control is the send
+  press). Every surface that shows a conversation embeds this element.
 - **Conversation tabs** (`components/conversations.js`) are the active
-  interactive card: standalone chat threads with Ara. The user can open a
-  thread, and a retinue agent can open one when it needs a decision (e.g. an
-  RSVP). It talks to the gateway's `/conversations` API rather than a static data
+  interactive card: the list of threads with Ara, the Active/Archived filter
+  and the location-hash routing, with the open thread (or the new-thread
+  composer) being a `<retinue-conversation>`. The user can open a thread,
+  and a retinue agent can open one when it needs a decision (e.g. an RSVP).
+  It talks to the gateway's `/conversations` API rather than a static data
   file.
 - **App launcher** (`components/app-launcher.js`) provides local OS launch
   buttons.
@@ -56,7 +80,8 @@ The same gateway also backs the conversation-tabs card with a small JSON API
 - `POST /conversations/<id>/archive`  — archive a thread (drop from active list).
 - `POST /conversations/<id>/unarchive`— restore an archived thread.
 
-Ara answers asynchronously, so the card polls the thread until the reply lands.
+Ara answers asynchronously, so the open conversation polls itself until the
+reply lands (faster while a turn is pending), and the card polls the list.
 Each thread maps to its own Claude session (key `conv:<id>`). Threads persist
 under `CONVERSATIONS_DIR`, one file each — the deployment points this at the
 persistent `/root` volume (`/root/.retinue/conversations`); the
@@ -96,6 +121,218 @@ conversation-push.py --title "Party RSVP" \
 The thread shows up with an unread badge; when the user replies, Ara picks it up
 with full context. The endpoint is gated by `CONVERSATION_BACKEND_TOKEN` (set by
 the entrypoint) so only in-container agents can post on the user's behalf.
+
+## Messenger chats
+
+The chat surface of the messenger-chats redesign: each messenger conversation
+(Signal / WhatsApp / Telegram, one peer or group) is a **chat** — a
+deterministic mirror rendered like the messenger client — with its
+**companion pane** (the conversation-with-Ara rail) beside it. It runs against
+the gateway's chat API (SPARQL over the message ledgers plus a live overlay;
+the endpoints and their rationale live in `scripts/web-gateway.py`'s module
+docstring). Pieces:
+
+- `components/chats.js` — the Chats card on the dashboard and, with `full`,
+  the whole `chats.html` page: avatar, channel mark, last-message preview,
+  unread badge, non-archived chats ordered by last activity; the full page
+  adds an Active/Hidden filter like the conversations page, and a **Hide**
+  beside each row (`POST /chats/<id>/flags`) — the dashboard card stays a
+  glance and carries none. Hide sets `archived` *and* `muted`, which is what
+  makes it stick: archived alone is undone by the next message. In the wide
+  layout the card has its own fixed-height region above the conversations
+  (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
+  (`data-splitter="chats"`). The card refreshes on an ambient cadence and
+  keeps its last rendered state over a failed fetch.
+- `chat.html?id=<chat id>` (`components/chat-page.js`) — one chat: bubbles
+  with day separators and an unread waterline, sender labels in groups, the
+  author on every outbound bubble (you / Ara / your phone), inline media
+  (images with a lightbox, voice-note and video players — see the Message
+  contract below), a live composer (send, shared draft, one-tap clear ✕,
+  dictation, image attach with client-side downscale), quick-pattern chips,
+  and the companion pane — swipe between panes on a phone, a draggable
+  splitter on a wide screen. The composer row is the conversation composer's
+  row: mic on the left, send on the right, both always there, and the paperclip
+  inside the text field (whose chooser is also the camera on a phone) — one
+  layout across both surfaces, and one place to reach for each affordance.
+  Keeping only two round controls is what buys the field its width, since each
+  one costs 46px of a phone's; the chat field additionally carries the clear ✕,
+  beside the clip and only while there is something to clear. A clear is
+  **undoable**: the ✕'s slot becomes an undo that restores the draft through
+  `POST /chats/<id>/draft/undo` — verbatim, its "drafted by Ara" marker
+  included — and lapses after 12s or as soon as the user has moved on (typing,
+  dictating, sending, or Ara staging a new draft). One tap emptying the box is
+  only safe if the tap can be taken back, and a staged draft is not something
+  the user can retype.
+  Back goes back where the chat was opened from within the
+  app, and to the chats list for a chat opened cold (a notification, a
+  bookmark). The open chat polls on the conversations cadence,
+  appending only unseen messages, and posts the read watermark on open, on
+  arrivals while at the bottom, and when the page becomes visible again.
+  The companion pane is the chat's own conversation with Ara (see the
+  `companion` field below), and it *is* `<retinue-conversation>` — the same
+  element the conversations card embeds, so the two surfaces cannot drift
+  apart. It therefore has everything that element has, the model picker with
+  its escalated state and the read-aloud player included, rather than the
+  subset a hand-written copy happened to carry. What this page supplies is
+  where the pane sits and how its thread comes to exist: a companion belongs
+  to its chat, so the chat mints it (`create-url` → `POST
+  /chats/<id>/companion`) on the first turn and never on merely opening a
+  chat. `bar="actions"` keeps the picker and the speak-replies toggle while
+  dropping the title (the bar above names the pane) and Archive (a companion
+  is not filed away separately from its chat); `stamp="clock"` matches the
+  mirror beside it. A chip is a canned turn the page hands the element
+  (`ask`), exactly as if the user had typed it. The two rails meet in the shared draft — Ara
+  stages a reply, the chat poll adopts it into the composer marked as hers
+  — into an empty box, or over the text she was asked to rework, whenever
+  nothing unsaved is in it (unsaved keystrokes meet the newer draft at
+  their own save, as a conflict) — and the send press stays the user's.
+
+The API, as the components consume it:
+
+- `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
+  activity. A `ChatSummary` is `{id, channel, account, key, name, group,
+  members?, unread, archived, muted, companion, last, draft, messages}`.
+
+  A chat is one peer **on one account**, and `id` names both:
+  `<channel>:~<account>:<chat-key>`, or `<channel>:<chat-key>` for history
+  written before the ledger recorded the account. `key` is the chat key on its
+  own — the exact recipient string that channel's send path accepts — and
+  `account` the gateway account, or null for that older history. Both are
+  surfaced because the name identifies neither: two accounts talking to the
+  same person are two chats called the same thing, so the client labels a
+  repeated name with its account, and keys the avatar colour on the *peer* so
+  one person keeps one colour across all of them. Clients must treat the id as
+  opaque and read `key`/`account` rather than splitting it.
+
+  `unread` derives from the user's `last_read` watermark, `last` is
+  the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
+  is the shared draft `{text, author, agent?, ts, version}` or null,
+  `companion` is the conversation id of this chat's companion thread (null
+  until one exists), and
+  `messages` is the URL of the chat's message document — the client follows
+  it and never constructs message URLs. `archived` and `muted` carry the
+  dashboard-conversation semantics verbatim: an archived chat leaves the card
+  and the Active list (the full page's Archived filter keeps it reachable),
+  and a new inbound message **un-archives** an archived chat unless it is
+  muted — the server's rule, applied on the notify rail. `muted` silences
+  that chat's Web Push and keeps an archived chat archived. The full page's
+  **Hide** sets both at once through `POST /chats/<id>/flags` (body
+  `{archived?, muted?}`, either or both), which is why the tab that holds
+  them says *Hidden*: the pair is the only way into it from the dashboard, so
+  nothing lands there that a new message would bring back.
+
+  Hiding is **independent of the triage delivery gate**, on purpose. Whether a
+  group's messages are filed to the news feed for the Herald, and whether they
+  are worth a model turn, is the policy's business (`scripts/triage_policy.py`
+  `news-add` / `ignore-add`, see `docs/triage-delivery-gate.md`); whether the
+  user wants the chat in their list is this flag's. A subscribed channel one
+  keeps only for its content is `news` + `ignored` **and** hidden — three
+  separate statements, because a list one both reads as news and answers in is
+  `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
+  be a later `pinned` flag, deliberately deferred. A store outage answers an
+  honest 502 (the page shows it; the card keeps its last state).
+- `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
+  [Message]}`, ascending by `ts`, the newest page by default;
+  `?before=<ISO ts>` pages older history (the page renders the newest page —
+  a load-older affordance is future work). A `Message` is `{id, chat,
+  direction, author? (out: user|agent|device, plus agent name),
+  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
+  type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
+  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  the storing gateway stated about the blob in its ledger record (absent on
+  records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
+  at ingest — when present the client reserves the true aspect box before the
+  bytes arrive, when absent (older records) it reserves a fixed placeholder
+  frame; either way a lazy load can never shift the thread's scroll. By type:
+  `image/*` renders inline and opens a full-screen lightbox on tap (same
+  proxied URL — it is the original; tap, Esc or the platform back gesture
+  closes, one history entry deep); `audio/*` is a voice note — the player
+  above the transcript, which is already the message `text`; `video/*` is an
+  inline player (`preload=metadata`, box-reserved the same way); anything
+  else (a document, an animated sticker) is a file row showing the stated
+  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
+  decorate these records later. The companion thread is not in this payload:
+  it is an ordinary conversation, named by the summary's `companion` id and
+  read through `/conversations`.
+- `POST /chats/<id>/send` `{text?, images?}` — sends through the chat's own
+  gateway and returns the sent `Message`. It does not skip the account's send
+  policy: under `allow` the gateway sends outright, and otherwise the send is
+  **queued and then released** through that gateway's own approve endpoint in
+  the same request — the press IS the approval `verify` exists for, but it is
+  spent on the mechanism rather than around it, so the send is recorded in the
+  pending store with its approval. (What that does and does not prevent is in
+  `_chat_send_via_gateway`: an agent calling `/send` gets a queued message; an
+  agent that also calls approve has simulated the press, which nothing inside a
+  shared container can stop.) The page shows an optimistic bubble and reconciles
+  it with the response, and a failed send puts the words back into the composer.
+  `images` is `[{content_type, data(base64)}]`, at most 5, each at most
+  ~8 MB decoded (400 on violations); `text` may be absent when images are
+  sent. The returned `Message` (and later polls) carries the sent
+  attachments with proxied URLs and their sniffed dimensions. The client
+  downscales picked photos before upload — longest edge 1600 px, JPEG — as
+  the native clients do; animated GIFs pass through unchanged under the size
+  cap. A failed image send keeps the staged previews (and the text) in the
+  composer for retry.
+
+  **The send honours the account's send policy rather than skipping it.** The
+  message goes to the gateway as author `user` — provenance, nothing more —
+  and carries no field that asks it to bypass anything. Under `allow` it goes
+  out on that hop; under `verify` (or `trust`) the gateway queues it as a
+  pending send and the web-gateway releases it through the gateway's own
+  `/pending-sends/<id>/approve` in the same request, so the press still
+  completes in one action while the send is recorded in the pending store with
+  its approval. This is what makes an accidental send impossible: an agent that
+  POSTs a gateway's `/send` gets a queued message somebody still has to
+  release, whatever it writes in the body. `author: "user"` used to bypass the
+  policy outright, which is how a message once went out that nobody pressed
+  send on.
+
+  As a second, lesser layer, this endpoint (and the `/sends` approve action)
+  also refuses a request that did not arrive through the reverse proxy — the
+  TCP peer address decides, since the edge auth is a forward-auth Traefik
+  consults and so never sees an in-container caller. Refusals answer 403 naming
+  the reason and are logged loudly. Pin the proxy's peers with
+  `EDGE_PROXY_PEERS` (addresses or CIDRs); a deployment whose proxy arrives on
+  loopback must set it. Neither layer is a boundary against a determined agent:
+  the web-gateway shares a container with the agents and they hold the
+  gateways' tokens, so an agent can make the approve call itself — a deliberate
+  simulation of the button press, not an accident. An agent proposes a message
+  by staging the shared draft; the user's press is what sends.
+- `POST /chats/<id>/draft` `{text, version}` — the shared draft, saved
+  ~1 s after the user stops typing and on blur; dictation participates in the
+  same debounced save, and the ✕ posts empty text. Writes are
+  version-guarded: a stale version answers 409 with the current state, which
+  the page adopts (with a "draft updated elsewhere" note when the words
+  actually differ) rather than clobbering.
+- `POST /chats/<id>/draft/undo` (no body) — restores the draft the ✕ last
+  cleared, with its original `author`/`agent`, and answers the new
+  `{id, draft, version}`. 409 with the current state when there is nothing to
+  put back: nothing was cleared, a draft has been written since, or the stash
+  has aged out. Server-side on purpose — the draft endpoint stamps every write
+  `user`, so a client resubmitting the text would quietly reattribute Ara's
+  words to the user about to send them in their own name — and one guarded
+  step, so it cannot race the clear that produced it whichever order the two
+  requests arrive in.
+- `POST /chats/<id>/read` `{ts}` — advances the read watermark, forward-only.
+- `POST /chats/<id>/companion` — `{id}`, the chat's companion conversation.
+  Idempotent: it creates the thread on the first call and returns the same id
+  afterwards. The page calls it lazily — on the user's first turn or chip, so
+  that a chat merely opened leaves no empty thread behind. From that id on,
+  the pane is a plain conversation client: `GET /conversations/<id>` for the
+  thread (`pending` is Ara writing), the reply POST for a turn, the read POST
+  when the pane shows it.
+
+**Reference documents:** `data/chats.json` and `data/chats/<slug>.json` are
+static documents in the API's response shapes — the contract drafts the API
+was built against, kept as its reference documents and as the Playwright test
+corpus (the validation suite serves them as mocked `/chats*` responses). They
+are no longer a serving source. The corpus covers the media shapes: image
+attachments with intrinsic dimensions, a voice note (`audio/*` with the
+transcript as the message text) and a video (`video/*` with dimensions), all
+with playable `data:` URLs, and both companion states: one chat names an
+existing thread, the rest carry `companion: null`. Companion messages
+themselves are conversation documents, not chat ones, so the corpus holds
+none — the suite mocks `/conversations/<id>` for those.
 
 ## Markdown rendering
 
@@ -162,7 +399,8 @@ user's half of the learning loop:
   Markdown, shown at the bottom of the page and editable by hand.
 
 Read-aloud (`components/speech.js`) walks the ranked feed with the browser's own
-`speechSynthesis` — ▶ Listen, ⏭ skip, ⏹ stop, current item highlighted, each
+`speechSynthesis` — ▶ Listen, ⏭ skip, ⏹ stop (▶ Resume after an interruption),
+current item highlighted, each
 item spoken in the language it declares. See `docs/news.md` for the collector,
 the manifest format and the agent.
 
@@ -189,12 +427,27 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `docker-compose.yml`); when unset the endpoint returns 503 and the mic button
   is hidden. The mic is also hidden where `MediaRecorder`/`getUserMedia` are
   unavailable.
-- **Output (play replies).** Each of Ara's messages has a 🔊 play button that
+- **Output (play replies).** Each of Ara's messages has a 🔊 button that
   reads it aloud with the browser's built-in `speechSynthesis` — no server work,
-  works offline. A per-thread **Auto** toggle (persisted in `localStorage`)
-  speaks replies automatically as they arrive; the browser's own voice is used,
-  so quality varies by platform, and iOS may require a tap (the play button) to
-  start speech. The controls are hidden where `speechSynthesis` is unavailable.
+  works offline. The player behind it is `components/speech.js` (shared with
+  the news page): the text is spoken in sentence-sized pieces, because the
+  engines fail on long utterances (Chrome goes silent after ~15 s, Android
+  rejects a few thousand characters outright — the reason a tap used to do
+  nothing on long replies), and a **player bar** above the composer shows what
+  is being read and how far: a position slider to drag, ⏮/⏭ a passage back or
+  forward (a sentence or two, about ten seconds of speech — the unit the text
+  is spoken in), play/pause, and ✕ to stop. Pausing and seeking restart at a
+  passage boundary. The bar follows into the thread list, so going back does
+  not end the reading; leaving the *page* does (the browser silences its
+  engine), but the position is remembered per passage in `localStorage`
+  (`retinue-voice-position`, kept for a week) and the next time that thread
+  opens the bar is back, paused right there — ▶ on the message or on the bar
+  carries on from that passage, ✕ forgets it. A per-thread **Auto** toggle
+  (persisted in `localStorage`) speaks replies automatically as they arrive;
+  the browser's own voice is used, so quality varies by platform, and iOS may
+  require a tap (the play button) to start speech — the bar says so when the
+  engine refuses. The controls are hidden where `speechSynthesis` is
+  unavailable.
 
 ## Installing on Android
 

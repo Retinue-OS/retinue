@@ -79,9 +79,11 @@ def test_file_jsonld_doc():
         _, out_path, text = _run(tmp, file_content=JSONLD_DOC)
         # Directory was created on demand (idempotent mkdir).
         assert out_path.parent.is_dir(), "nested output dir not created"
-        # The list node and both models are present.
+        # The list node and the concrete model are present; the legacy
+        # empty-id "Default" row is dropped, mirroring the gateway's loader.
         assert "<https://retinue-os.github.io/ns/conversation#conversationModelList>" in text
-        assert '<https://retinue-os.github.io/ns/conversation#modelId> ""' in text
+        assert '<https://retinue-os.github.io/ns/conversation#modelId> ""' not in text
+        assert '"Default"' not in text
         assert '"Opus"' in text
         # Deterministic: N-Triples, sorted, one triple per line, no blank nodes.
         lines = [l for l in text.splitlines() if l]
@@ -105,13 +107,11 @@ def test_env_inline_array_wins_over_file():
 def test_missing_file_falls_back_to_default():
     with tempfile.TemporaryDirectory() as tmp:
         mod, _, text = _run(tmp, file_missing=True)
-        # The built-in default list (4 models) is emitted.
-        for label in ("Default", "Opus", "Sonnet", "Haiku"):
+        # The built-in default list (3 concrete models, no synthetic
+        # "Default" row) is emitted.
+        for label in ("Opus", "Sonnet", "Haiku"):
             assert label in text, f"default label {label} missing"
-        # Empty-id default option gets a slug-less (but legal) node, not the
-        # literal string "default" -- that would collide with an explicit
-        # id of "default" (see #28).
-        assert "#model->" in text
+        assert '"Default"' not in text
     print("PASS test_missing_file_falls_back_to_default")
 
 
@@ -151,8 +151,9 @@ def test_slug_sanitises_ids():
 
 def test_slug_is_injective_for_former_collisions():
     """Regression for #28: the old slug (default-fallback + `[^A-Za-z0-9._-]`
-    -> `_`) merged distinct ids onto one node. Both collision shapes from the
-    issue must now stay distinct."""
+    -> `_`) merged distinct ids onto one node. The collision shapes from the
+    issue must stay distinct; the empty id (the legacy gateway-default row)
+    is dropped at coercion now, so it can no longer collide with anything."""
     with tempfile.TemporaryDirectory() as tmp:
         inline = json.dumps([
             {"id": "", "label": "Gateway default"},
@@ -162,21 +163,21 @@ def test_slug_is_injective_for_former_collisions():
         ])
         mod, _, text = _run(tmp, env_inline=inline)
 
-        # '' vs 'default': previously both slugged to "model-default".
-        assert "#model->" in text, "empty id lost its slug-less node"
+        # '' is dropped; an explicit id 'default' keeps its own node.
+        assert "#model->" not in text, "empty id should be dropped, not emitted"
         assert "#model-default>" in text, "explicit id 'default' lost its own node"
 
         # '/' vs ':': previously both folded to "model-anthropic_claude-opus-4".
         assert "#model-anthropic%2Fclaude-opus-4>" in text
         assert "#model-anthropic%3Aclaude-opus-4>" in text
 
-        # Four distinct ids -> four distinct model subjects, four offersModel
-        # edges (render() sorts but does not dedupe, so a collision would
-        # have shown as a repeated node/edge rather than a missing one).
+        # Three distinct ids -> three distinct model subjects (render() sorts
+        # but does not dedupe, so a collision would have shown as a repeated
+        # node/edge rather than a missing one).
         type_suffix = "<https://retinue-os.github.io/ns/conversation#ConversationModel> ."
         subj_lines = [l for l in text.splitlines() if l.endswith(type_suffix)]
-        assert len(subj_lines) == 4, f"expected 4 distinct model nodes, got {len(subj_lines)}"
-        assert len(set(subj_lines)) == 4, "two ids rendered the identical type triple"
+        assert len(subj_lines) == 3, f"expected 3 distinct model nodes, got {len(subj_lines)}"
+        assert len(set(subj_lines)) == 3, "two ids rendered the identical type triple"
     print("PASS test_slug_is_injective_for_former_collisions")
 
 

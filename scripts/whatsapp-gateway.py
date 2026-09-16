@@ -55,6 +55,7 @@ from reply_tokens import ReplyTokenStore
 import inbound_store as _ibstore
 import triage_policy as _triage
 import news_ingest as _news
+import chat_ingest as _chats
 import job_delivery as _jobs
 from requester_identity import normalize_requester_identity
 
@@ -114,6 +115,13 @@ RETINUE_SLOW_NOTICE_SECONDS = float(os.environ.get("RETINUE_SLOW_NOTICE_SECONDS"
 # base64-encoded inside the POST /message JSON). Matches the retinue gateway's
 # own per-file attachment cap.
 MAX_INBOUND_FILE_BYTES = int(os.environ.get("WHATSAPP_MAX_INBOUND_FILE_BYTES", str(25 * 1024 * 1024)))
+# Cap on what the ledger's media store takes from one inbound file. The
+# forwarding cap above bounds what travels base64 through a triage POST; this
+# one bounds what is written to the volume at all, since the channels allow
+# files far larger than a chat archive should hold. A file over it is noted
+# in the log and the message is recorded without it.
+INBOUND_MEDIA_STORE_MAX_BYTES = int(os.environ.get("INBOUND_MEDIA_STORE_MAX_BYTES",
+                                                   str(100 * 1024 * 1024)))
 
 # Voice notes are transcribed by the shared STT service (no ASR model is loaded
 # here), identical to the Signal gateway. Best-effort: a failure degrades to a
@@ -197,6 +205,30 @@ REPLY_TOKENS = ReplyTokenStore(
     os.environ.get("WHATSAPP_REPLY_TOKENS_DIR", str(WHATSAPP_DATA_DIR / "reply-tokens"))
 )
 
+
+def _attach_reply_tokens(messages: list) -> None:
+    """Give each drained /undelivered message a reply token for its origin.
+
+    The drain hands raw ledger rows to the daily triage; without a token those
+    replies fall back to name resolution — the exact failure that by-token
+    routing exists to prevent and that live forwards already avoid. The origin
+    is the group chat when there is one, else the stored sender. For a 1:1 that is the
+    bare user part rather than the live path's full ``user@server`` chat JID —
+    i.e. the same addressing an explicit ``--recipient <sender>`` would get
+    (``_to_jid`` still resolves LID-only contacts through the bridge's LID
+    store at send time)."""
+    for msg in messages:
+        origin = msg.get("group") or msg.get("sender")
+        if origin:
+            msg["reply_token"] = REPLY_TOKENS.mint(str(origin), channel="whatsapp")
+        # …and the same thread key the live forward would mint, so a record
+        # that was already forwarded (a live turn that died before finishing,
+        # say) reuses its thread instead of opening a second one. The record's
+        # own subject is the fallback when the channel gave no message id.
+        msg["thread_key"] = _ibstore.thread_key(
+            "whatsapp", WHATSAPP_ACCOUNT, msg.get("chat"), msg.get("message_id"),
+            subject=msg.get("subject"))
+
 # ── Inbound triage delivery gate ──────────────────────────────────────────────
 # Spend model credits only on senders that matter (see
 # docs/triage-delivery-gate.md). Every inbound inbox message is persisted as one
@@ -224,18 +256,10 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
 
 
-# This gateway's own base URL on the internal Docker network, used to build the
-# HTTP references stored for inbound media (GET /media/<id> below). Defaults to
-# the compose service name + HTTP port; a deployment running more than one
-# WhatsApp identity overrides it per container (as it does SEND_APPROVAL_*).
-GATEWAY_SELF_URL = os.environ.get(
-    "WHATSAPP_GATEWAY_SELF_URL", f"http://whatsapp-gateway:{HTTP_PORT}"
-).rstrip("/")
-
-
 def _persist_inbound(question: str, sender: str, group_id: str | None,
                      delivered: bool, media: str | None = None,
-                     attachment_urls: list[str] | None = None):
+                     attachment_urls: list[str] | None = None,
+                     chat: str | None = None, message_id: str | None = None):
     """Best-effort persist of one inbound message to the store; never raises.
 
     Returns the store ``Path`` (so the caller can later flip the delivered flag
@@ -243,17 +267,64 @@ def _persist_inbound(question: str, sender: str, group_id: str | None,
     records a retained raw-audio file for a voice note persisted before
     transcription (see :func:`_retain_media`); ``attachment_urls`` are the
     durable HTTP references to this message's media (see :func:`_store_media_ref`).
+    ``chat`` is the chat key (kb:chat — the full origin chat JID, the same
+    string the reply token stores) and ``message_id`` the whatsmeow StanzaID.
     """
     try:
         _, path = _ibstore.write_message(
             INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, sender=sender or "unknown",
             text=question, group=group_id or None, delivered=delivered, media=media,
             attachment_urls=attachment_urls or None,
+            chat=chat, account=WHATSAPP_ACCOUNT, message_id=message_id,
         )
         return path
     except Exception as exc:
         print(f"[whatsapp-gateway] could not persist inbound message: {exc}", flush=True)
         return None
+
+
+# Echo-dedup memory for outbound recording (see inbound_store.RecentSends).
+RECENT_SENDS = _ibstore.RecentSends()
+
+
+def _record_outbound(chat: str, text: str, author: str,
+                     message_id: str | None = None,
+                     timestamp: float | None = None,
+                     attachment_urls: list[str] | None = None) -> None:
+    """Best-effort ledger record of one successfully sent message; never raises.
+
+    Inbox-mode only, like inbound persistence: the ledger mirrors the user's
+    own conversations, and a control account's traffic (prompts in, Ara's
+    replies out) is persisted on neither direction. ``attachment_urls`` are
+    the durable media references stored for this send (see
+    :func:`_store_media_ref`).
+    """
+    if WHATSAPP_GATEWAY_MODE != "inbox":
+        return
+    try:
+        _ibstore.write_outbound(
+            INBOUND_STORE_DIR, channel=INBOUND_CHANNEL, chat=chat, text=text,
+            author=author, account=WHATSAPP_ACCOUNT, message_id=message_id,
+            timestamp=timestamp,
+            attachment_urls=attachment_urls or None,
+        )
+    except Exception as exc:
+        print(f"[whatsapp-gateway] could not record outbound message: {exc}", flush=True)
+
+
+# Cap on an own-device echo's media: an echo above this records its caption
+# only (or is skipped when it has none), exactly the pre-media behaviour.
+CHAT_ECHO_MEDIA_MAX_BYTES = int(
+    os.environ.get("CHAT_ECHO_MEDIA_MAX_BYTES", str(10 * 1024 * 1024)))
+
+
+def _epoch_seconds(value) -> float | None:
+    """Coerce a bridge timestamp (unix seconds, occasionally millis) to seconds."""
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return None
+    return ts / 1000.0 if ts > 1e11 else ts
 
 
 def _mark_delivered(store_path) -> None:
@@ -330,21 +401,33 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
         print(f"[whatsapp-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
-def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
-    """Persist inbound media durably and return its HTTP-resolvable reference URL.
+def _store_media_ref(data: bytes, content_type: str | None,
+                     file_name: str | None = None) -> str | None:
+    """Persist inbound media durably and return its store reference.
+
+    The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
+    and deliberately not a URL: where the blob can be fetched is a property of
+    the gateway's *address*, which the reader already holds in its registry
+    (``MESSENGER_GATEWAYS`` / ``*_GATEWAY_BASE_URL``). A container writing its
+    own address into the record duplicates that as a second source of truth,
+    and a wrong one for every extra account of a channel. The reference carries
+    only what identifies the blob; the reader resolves it through the account
+    that owns the chat. It is also a valid N-Triples IRI and matches the
+    ``urn:retinue:…`` shape the ledger's own subjects use.
 
     Best-effort: any failure returns None so the message still forwards and
-    persists with its transcript — only the audio/image link is skipped, never
-    the message. The bytes go to disk (out of the graph); the returned URL is
-    what lands in the message's ``kb:attachment`` triple."""
+    persists with its transcript — only the media link is skipped. The bytes go
+    to disk (out of the graph); the returned reference is what lands in the
+    message's ``kb:attachment`` triple."""
     if not data:
         return None
     try:
-        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type,
+                                        file_name=file_name)
     except Exception as exc:
         print(f"[whatsapp-gateway] could not store inbound media: {exc}", flush=True)
         return None
-    return f"{GATEWAY_SELF_URL}/media/{media_id}"
+    return f"urn:retinue:media:{INBOUND_CHANNEL}:{media_id}"
 
 
 # Public base URL used to build approval links returned to the caller.
@@ -527,6 +610,15 @@ def _health_snapshot() -> dict:
     return {
         "status": "ok",
         "configured": True,  # linking IS the configuration; nothing else is needed
+        # Routing identity for the chat surface. `mode` says whether this
+        # account may own a chat at all (only "inbox" may: a control account's
+        # traffic is prompts to Ara, never the user's correspondence), and
+        # `account` is what the web-gateway matches a rail event against to
+        # find this gateway's registry slug. A container deliberately never
+        # names its own address or slug: the reader's registry already holds
+        # that, and a second source of truth is what mis-routed sends here.
+        "mode": WHATSAPP_GATEWAY_MODE,
+        "account": WHATSAPP_ACCOUNT or None,
         "connected": connected,
         "linked": state["linked"],
         "logged_out": state["logged_out"],
@@ -879,45 +971,86 @@ def _extract_audio(message):
     return None
 
 
-def _extract_image(message):
-    """Return the image sub-message if this message carries a real image.
+# The media a WhatsApp message can carry as its body, by proto field, and the
+# kind each is for the store: an image and a document are forwarded to the
+# agent when they fit, a video, a sticker and an audio *file* (a song, not a
+# voice note — that is _extract_audio's) are kept for the chat only.
+_MEDIA_FIELDS = (
+    ("imageMessage", "image"), ("ImageMessage", "image"),
+    ("videoMessage", "video"), ("VideoMessage", "video"),
+    ("documentMessage", "file"), ("DocumentMessage", "file"),
+    ("stickerMessage", "sticker"), ("StickerMessage", "sticker"),
+    ("audioMessage", "audio"), ("AudioMessage", "audio"),
+)
+
+
+def _extract_media(message) -> tuple:
+    """``(sub-message, kind)`` for the medium this message carries, else
+    ``(None, None)``.
 
     Protobuf returns an empty sub-message for an unset field, so mere attribute
     presence is not enough: presence is checked via HasField where available,
-    falling back to the download coordinates / media type a real image always
-    carries."""
+    falling back to the download coordinates / media type a real medium always
+    carries. A voice note (an audio message flagged push-to-talk, or one that
+    does not say) is not a medium here — it is transcribed, by
+    :func:`_extract_audio`'s path; only an audio *file* the sender attached
+    counts."""
     if message is None:
-        return None
-    for image_name in ("imageMessage", "ImageMessage"):
-        image = getattr(message, image_name, None)
-        if image is None:
+        return None, None
+    for field, kind in _MEDIA_FIELDS:
+        sub = getattr(message, field, None)
+        if sub is None:
             continue
+        present = None
         has_field = getattr(message, "HasField", None)
         if callable(has_field):
             try:
-                return image if has_field(image_name) else None
+                present = bool(has_field(field))
             except ValueError:
-                pass  # unknown field name on this proto version — fall through
-        if _attr(image, "URL", "url", "directPath", "DirectPath",
-                 "mimetype", "Mimetype"):
-            return image
-    return None
+                present = None  # unknown field name on this proto version
+        if present is None:
+            present = bool(_attr(sub, "URL", "url", "directPath", "DirectPath",
+                                 "mimetype", "Mimetype"))
+        if not present:
+            continue
+        if kind == "audio" and _attr(sub, "PTT", "ptt") is not False:
+            continue
+        return sub, kind
+    return None, None
 
 
-def _inbound_image_files(message) -> tuple[list[dict], list[str]]:
-    """Download this message's image, if any, as forward-ready files + a ref.
+def _extract_image(message):
+    """The image sub-message when this message's medium is an image, else None."""
+    sub, kind = _extract_media(message)
+    return sub if kind == "image" else None
+
+
+def _inbound_media_files(message) -> tuple[list[dict], list[str]]:
+    """Download this message's medium, if any, as a durable ref + forward-ready files.
 
     Returns ``(files, attachment_urls)`` where ``files`` is
     ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape the
     retinue gateway's POST /message accepts as ``files``, each materialized to
     disk for the answering session — and ``attachment_urls`` are the durable
-    HTTP references stored for the same image (its ``kb:attachment`` triple).
-    The durable reference is stored regardless of size (a plain on-disk blob);
-    only the forwarded ``files`` payload honours the size cap, since that one
-    travels base64-encoded through the triage POST. Best-effort: any failure
-    forwards the message without its image rather than dropping it."""
-    image = _extract_image(message)
-    if image is None:
+    references stored for the medium (its ``kb:attachment`` triple), with the
+    name the sender gave it. Every kind is stored, so the chat shows the
+    message as the native client does; what is also *forwarded* is an image or
+    a document that fits the forwarding cap — a video, a sticker or an audio
+    file is kept for the chat only. The declared size is checked before the
+    download and the real size after it, since the declaration is
+    sender-controlled. Best-effort: any failure forwards the message without
+    its medium rather than dropping it."""
+    sub, kind = _extract_media(message)
+    if sub is None:
+        return [], []
+    declared = _attr(sub, "file_length", "fileLength", "FileLength")
+    try:
+        declared = int(declared) if declared is not None else None
+    except (TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > INBOUND_MEDIA_STORE_MAX_BYTES:
+        print(f"[whatsapp-gateway] inbound {kind} over {INBOUND_MEDIA_STORE_MAX_BYTES} bytes; "
+              f"not stored", flush=True)
         return [], []
     media = _download_media(message)
     if media is None:
@@ -928,15 +1061,25 @@ def _inbound_image_files(message) -> tuple[list[dict], list[str]]:
         media.unlink(missing_ok=True)
     if not data:
         return [], []
-    mime = str(_attr(image, "mimetype", "Mimetype") or "image/jpeg")
-    ref = _store_media_ref(data, mime)
+    if len(data) > INBOUND_MEDIA_STORE_MAX_BYTES:
+        print(f"[whatsapp-gateway] inbound {kind} over {INBOUND_MEDIA_STORE_MAX_BYTES} bytes; "
+              f"not stored ({len(data)} bytes)", flush=True)
+        return [], []
+    mime = str(_attr(sub, "mimetype", "Mimetype") or "") or {
+        "image": "image/jpeg", "sticker": "image/webp", "video": "video/mp4",
+        "audio": "audio/mpeg"}.get(kind, "application/octet-stream")
+    name = _attr(sub, "fileName", "FileName", "file_name") or (
+        _attr(sub, "title", "Title") if kind == "file" else None)
+    ref = _store_media_ref(data, mime, str(name) if name else None)
     attachment_urls = [ref] if ref else []
-    if len(data) > MAX_INBOUND_FILE_BYTES:
-        print(f"[whatsapp-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
+    if kind in ("video", "sticker", "audio"):
         return [], attachment_urls
-    suffix = mimetypes.guess_extension(mime) or ".jpg"
+    if len(data) > MAX_INBOUND_FILE_BYTES:
+        print(f"[whatsapp-gateway] inbound {kind} too large to forward ({len(data)} bytes)", flush=True)
+        return [], attachment_urls
+    suffix = mimetypes.guess_extension(mime.split(";", 1)[0].strip()) or (".jpg" if kind == "image" else "")
     files = [{
-        "filename": f"whatsapp-image{suffix}",
+        "filename": f"whatsapp-{kind}{suffix}",
         "content_type": mime,
         "data": base64.b64encode(data).decode("ascii"),
     }]
@@ -1021,7 +1164,7 @@ def _build_send_ops(text: str | None, media_paths: list[Path] | None) -> list[di
     return ops
 
 
-def _run_send_op(jid, op: dict) -> None:
+def _run_send_op(jid, op: dict):
     """Execute one send operation against the bridge (serialized via the lock).
 
     Deliberately per-op locking, not one lock around the whole logical send:
@@ -1029,30 +1172,41 @@ def _run_send_op(jid, op: dict) -> None:
     through a backoff would block the receive callback and the IQ probe. The
     accepted trade-off is that two concurrently-approved multi-part sends may
     interleave their parts in a chat.
+
+    Returns the bridge's send response: its ID is the sent message's StanzaID,
+    which the ledger record carries and _record_own_device_send matches echoes
+    against.
     """
     client = _wa_client
     with WA_CLIENT_LOCK:
         if op["kind"] == "text":
-            client.send_message(jid, op["text"])
-            return
-        path = op["path"]
-        data = path.read_bytes()
-        mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-        if mime.startswith("image/"):
-            # build_image_message derives the mime type from the bytes itself
-            # and takes no mime keyword — passing one raises TypeError.
-            msg = client.build_image_message(data, caption=op["caption"] or "")
+            resp = client.send_message(jid, op["text"])
         else:
-            # neonize's document builder spells the parameter `mimetype`
-            # (not `mime_type`); the wrong spelling crashed every PDF send.
-            msg = client.build_document_message(
-                data, filename=path.name, caption=op["caption"] or "", mimetype=mime
-            )
-        client.send_message(jid, message=msg)
+            path = op["path"]
+            data = path.read_bytes()
+            mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+            if mime.startswith("image/"):
+                # build_image_message derives the mime type from the bytes itself
+                # and takes no mime keyword — passing one raises TypeError.
+                msg = client.build_image_message(data, caption=op["caption"] or "")
+            else:
+                # neonize's document builder spells the parameter `mimetype`
+                # (not `mime_type`); the wrong spelling crashed every PDF send.
+                msg = client.build_document_message(
+                    data, filename=path.name, caption=op["caption"] or "", mimetype=mime
+                )
+            resp = client.send_message(jid, message=msg)
+    # Note the performed op right away — before the bridge could plausibly echo
+    # it back as is_from_me — and even if a later op of the same logical send
+    # fails: this one DID go out, so its echo must be recognized either way.
+    RECENT_SENDS.note(str(_attr(resp, "ID", "Id", "id") or "") or None,
+                      chat=_jid_addr(jid),
+                      text=op.get("text") or op.get("caption") or "")
+    return resp
 
 
 def _send_ops_with_retry(candidates: list, ops: list[dict], runner, label: str,
-                         retries: int | None = None, backoff: float | None = None) -> None:
+                         retries: int | None = None, backoff: float | None = None) -> list:
     """Run `ops` in order, retrying usync/device-list failures (issue #120).
 
     `candidates` are the JIDs to try, best first — typically the phone-number
@@ -1064,19 +1218,23 @@ def _send_ops_with_retry(candidates: list, ops: list[dict], runner, label: str,
     A non-usync failure propagates immediately. When every attempt fails, the
     recipient-lookup health signal is recorded and a clear terminal error is
     raised — this is what the /sends page shows (issue #116).
+
+    Returns the per-op runner results in op order (for _run_send_op, the
+    bridge's send responses — the ledger reads the message id off the first).
     """
     retries = WHATSAPP_SEND_USYNC_RETRIES if retries is None else retries
     backoff = WHATSAPP_SEND_USYNC_BACKOFF if backoff is None else backoff
     plan = [(cand, 0.0) for cand in candidates]
     plan += [(candidates[-1], backoff)] * max(0, retries)
     idx = 0
+    results: list = []
     last_exc: Exception | None = None
     for attempt_no, (jid, delay) in enumerate(plan):
         if delay:
             time.sleep(delay)
         try:
             while idx < len(ops):
-                runner(jid, ops[idx])
+                results.append(runner(jid, ops[idx]))
                 idx += 1
             if last_exc is None:
                 _note_recipient_lookup(True)
@@ -1088,7 +1246,7 @@ def _send_ops_with_retry(candidates: list, ops: list[dict], runner, label: str,
                 # remain unreachable, instead of the rescue masking the state.
                 _note_recipient_lookup(False, "delivered via fallback/retry; raw-number "
                                               f"usync lookup failed: {last_exc}")
-            return
+            return results
         except Exception as exc:  # noqa: BLE001 - classified below
             if not _is_usync_error(exc):
                 raise
@@ -1104,21 +1262,49 @@ def _send_ops_with_retry(candidates: list, ops: list[dict], runner, label: str,
     )
 
 
-def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = None) -> None:
+def _wa_chat_key(recipient: str) -> str:
+    """The chat key (kb:chat) for an outbound recipient: ``user@server``.
+
+    Deliberately the recipient *as addressed* — no LID→PN resolution — so a
+    reply sent via its reply token (the stored inbound origin, LID or PN form)
+    records exactly the key its inbound message carries. Known aliasing limit:
+    a bare number addressed directly keys as ``<user>@s.whatsapp.net`` even
+    when that contact's inbound chat is a ``@lid`` JID; the two then read as
+    two chats until merged upstream — the same number-vs-UUID caveat as the
+    Signal chat key.
+    """
+    r = (recipient or "").strip()
+    user, _, server = r.partition("@")
+    user = user.lstrip("+")
+    server = server.split(":", 1)[0] if server else WA_PN_SERVER
+    return f"{user}@{server}" if user else (r or "unknown")
+
+
+def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = None,
+             author: str = "agent",
+             attachment_urls: list[str] | None = None) -> tuple[str | None, float | None]:
     """Send a WhatsApp message: optional text plus any number of media files.
 
     Bridge calls are serialized via WA_CLIENT_LOCK (inside _run_send_op) so
     they never race the receive callback. A usync/device-list failure — the
     first-contact stall of issue #120 — is retried: first against the
     recipient's LID when the store knows one, then after a backoff.
+
+    Every send funnels through here, so this is also where the outbound ledger
+    record is written once success is known; ``author`` (kb:author) says who
+    composed the message and never affects delivery. Returns ``(message_id,
+    sent_at_epoch)`` — the recorded ledger identity, surfaced in the /send
+    response so the dashboard's chat view can show the sent message under its
+    real id — or ``(None, None)`` when the bridge reported neither.
     """
     client = _wa_client
     if client is None:
         raise RuntimeError("WhatsApp bridge is not connected yet")
+    chat = _wa_chat_key(recipient)
     jid = _to_jid(recipient)
     ops = _build_send_ops(text, media_paths)
     if not ops:
-        return
+        return None, None
     candidates = [jid]
     server = str(_attr(jid, "Server", "server", default="")) or str(jid).rpartition("@")[2]
     if server == WA_PN_SERVER:
@@ -1126,7 +1312,17 @@ def _wa_send(recipient: str, text: str | None, media_paths: list[Path] | None = 
         if lid_user:
             from neonize.utils import build_jid  # noqa: PLC0415 - localized bridge dep
             candidates.append(build_jid(lid_user, WA_LID_SERVER))
-    _send_ops_with_retry(candidates, ops, _run_send_op, recipient)
+    responses = _send_ops_with_retry(candidates, ops, _run_send_op, recipient)
+    # Success: complete the ledger. A multi-part send is one logical message
+    # here (text + attachments), recorded once; the first part's response
+    # carries the StanzaID and send timestamp.
+    first = next((r for r in responses if r is not None), None)
+    msg_id = str(_attr(first, "ID", "Id", "id") or "") or None
+    ts = _epoch_seconds(_attr(first, "Timestamp", "timestamp"))
+    _record_outbound(chat, (text or "").strip(), author,
+                     message_id=msg_id, timestamp=ts,
+                     attachment_urls=attachment_urls)
+    return msg_id, ts
 
 
 def _start_bridge() -> None:
@@ -1369,11 +1565,20 @@ def _handle_message_event(event) -> None:
     """Normalize a neonize MessageEv and route it by account mode."""
     info = getattr(event, "info", None) or getattr(event, "Info", None)
     source = _attr(info, "message_source", "MessageSource")
-    # Ignore our own outgoing messages echoed back by the bridge.
-    if bool(_attr(source, "is_from_me", "IsFromMe", default=False)):
-        return
     sender_jid = _attr(source, "sender", "Sender")
     chat_jid = _attr(source, "chat", "Chat")
+    message = getattr(event, "message", None) or getattr(event, "Message", None)
+    # The channel-native message id (whatsmeow's StanzaID), persisted on both
+    # directions so a reaction or quoted reply can later target the exact
+    # message (issue #130).
+    msg_id = str(_attr(info, "ID", "Id", "id") or "") or None
+    # An event flagged is_from_me is the account's own outgoing message: the
+    # user's send from their phone — which completes the conversation in the
+    # ledger — or possibly an echo of this gateway's own, already-recorded
+    # send. Either way it is nobody's inbound mail: record-or-skip, then stop.
+    if bool(_attr(source, "is_from_me", "IsFromMe", default=False)):
+        _record_own_device_send(info, chat_jid, message, msg_id)
+        return
     sender = _jid_user(sender_jid)
     if not sender:
         return
@@ -1389,26 +1594,34 @@ def _handle_message_event(event) -> None:
     is_group = bool(_attr(source, "is_group", "IsGroup", default=False)) or _jid_is_group(chat_jid)
     push_name = _attr(info, "push_name", "PushName", "Pushname")
 
-    message = getattr(event, "message", None) or getattr(event, "Message", None)
+    # The conversation's exact origin address — the chat key (kb:chat) and the
+    # reply target. For a 1:1 the full user@server (so the office-vs-mobile /
+    # PN-vs-LID distinction survives and a reply goes back to the precise chat
+    # the message arrived in, never a name-resolved guess); for a group the
+    # chat JID *is* the group address (…@g.us), so the same origin routes a
+    # reply back into that group.
+    origin = _jid_addr(chat_jid) or _jid_addr(sender_jid)
+
     text = _extract_message_text(message)
     lang = DEFAULT_LANGUAGE
 
-    # An included image is forwarded alongside the text (which, for an image
-    # message, is its caption). Status posts are excluded: they are gated to a
-    # no-model-turn path anyway, so their media is never downloaded.
-    # attachment_urls collect the durable HTTP references (kb:attachment) for
-    # every piece of media on this message — image(s) here, the voice note below.
+    # The message's medium — an image, a video, a document, a sticker, an audio
+    # file — is stored for the chat, and an image or document is forwarded
+    # alongside the text (which, for such a message, is its caption). Status
+    # posts are excluded: they are gated to a no-model-turn path anyway, so
+    # their media is never downloaded. attachment_urls collect the durable
+    # references (kb:attachment) — the medium here, the voice note below.
     if is_broadcast:
         files, attachment_urls = [], []
     else:
-        files, attachment_urls = _inbound_image_files(message)
+        files, attachment_urls = _inbound_media_files(message)
 
     # A voice note is persisted BEFORE transcription (never-drop): if the pre-
     # persist happened, this holds its store Path so the forward below reuses the
     # same record instead of writing a second one.
     voice_store_path = None
-    if not text and not files:
-        # No text — try a voice note (download + transcribe via the STT service).
+    if not text and not files and not attachment_urls:
+        # No text, no medium — try a voice note (download + transcribe via the STT service).
         audio = _extract_audio(message)
         if audio is not None:
             media = _download_media(message)
@@ -1460,10 +1673,11 @@ def _handle_message_event(event) -> None:
                     # the transcript lands; the kb:attachment blob stored above is
                     # the message's permanent media and stays.
                     durable = _retain_media(media) or media
-                    grp = _jid_addr(chat_jid) if is_group else None
+                    grp = origin if is_group else None
                     voice_store_path = _persist_inbound(
                         "", sender, grp, delivered=False, media=str(durable),
                         attachment_urls=attachment_urls,
+                        chat=origin, message_id=msg_id,
                     )
                     try:
                         print(f"[whatsapp-gateway] transcribing voice note from {sender}", flush=True)
@@ -1494,33 +1708,139 @@ def _handle_message_event(event) -> None:
 
     _record_recent_sender(sender_jid, chat_jid, push_name)
 
-    if not text and not files:
+    # A message that is only its media — a video, a sticker — is still the
+    # message: it is recorded and shown, and the prompt says what it carries.
+    if not text and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
             # (delivered=False, audio retained) for the daily drain / a re-transcribe.
             print(f"[whatsapp-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
         else:
-            print(f"[whatsapp-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
+            print(f"[whatsapp-gateway] skipping message from {sender} (no text or media)", flush=True)
         return
 
-    # The account's mode — not the content — decides handling.
+    # The account's mode — not the content — decides handling. The reply
+    # address handed on is the origin chat JID computed above, so a reply goes
+    # back to the exact conversation; the send still passes through the normal
+    # send-approval policy, so a group send is not silent.
     if WHATSAPP_GATEWAY_MODE == "inbox":
-        # The reply address is the *chat* JID, not the sender: for a 1:1 that is
-        # the correspondent; passing the exact origin (full user@server, so the
-        # office-vs-mobile / PN-vs-LID distinction survives) means a reply goes
-        # back to the conversation the message arrived in, never a name-resolved
-        # guess. For a group the chat JID *is* the group address (…@g.us), so the
-        # same origin routes a reply back into the same group — which is what the
-        # user wants when a group message needs an answer. The send still passes
-        # through the normal send-approval policy, so a group send is not silent.
-        origin = _jid_addr(chat_jid) or _jid_addr(sender_jid)
         _forward_to_inbox(text, lang, sender, is_group=is_group,
                           sender_name=push_name, origin=origin, files=files,
                           attachment_urls=attachment_urls,
-                          store_path=voice_store_path)
+                          store_path=voice_store_path, message_id=msg_id)
     else:
         _handle_control_message(text, lang, sender, files=files)
+
+
+def _record_own_device_send(info, chat_jid, message, msg_id: str | None) -> None:
+    """Ledger-record an is_from_me event: the user's send from another device.
+
+    These events used to be dropped, which left the store holding only half of
+    every conversation. Ledger only: an own send is nobody's inbound mail, so
+    it must not touch the delivery gate, the news rail, triage forwarding, the
+    unknown-sender flow or the recent-senders store — and, being
+    kb:OutboundMessage, it can never surface in the /undelivered drain.
+
+    Whether the bridge also replays this gateway's *own* sends as is_from_me
+    events varies by whatsmeow version (whatsmeow historically emits Message
+    events only for server-delivered messages, i.e. other devices' sends, but
+    this is not contractual). RECENT_SENDS holds what this process sent, keyed
+    by the StanzaID the send response reported, so a match here is such an echo
+    — already recorded at send time — and anything else is a genuine
+    other-device send.
+    """
+    if _jid_is_broadcast(chat_jid):
+        return  # the user's own status posts are broadcasts, not chat traffic
+    if WHATSAPP_GATEWAY_MODE != "inbox":
+        return  # the ledger is inbox-only; control mode must not store blobs either
+    chat = _jid_addr(chat_jid)
+    text = _extract_message_text(message)
+    if RECENT_SENDS.seen(msg_id, chat=chat, text=text):
+        return
+    if not chat:
+        return
+    ts = _epoch_seconds(_attr(info, "Timestamp", "timestamp"))
+    media_sub = _extract_media(message)[0] or _extract_audio(message)
+    if media_sub is not None:
+        # The media echo needs a bridge download; hand it to a worker thread so
+        # the event callback — the receive path — is never held behind it.
+        threading.Thread(
+            target=_record_own_device_media,
+            args=(chat, text, msg_id, ts, message, media_sub),
+            name="echo-media", daemon=True,
+        ).start()
+        return
+    if not text:
+        # Neither text nor a medium: recording nothing beats recording an
+        # empty bubble.
+        print(f"[whatsapp-gateway] own-device send to {chat} has no text and no "
+              f"capturable media; not recorded", flush=True)
+        return
+    _finish_own_device_record(chat, text, msg_id, ts, [])
+
+
+def _record_own_device_media(chat: str, text: str, msg_id: str | None,
+                             ts: float | None, message, media_sub) -> None:
+    """Worker half of a media echo: download, store, record; never raises.
+
+    Bounded by CHAT_ECHO_MEDIA_MAX_BYTES — checked against the declared
+    fileLength before downloading and against the real size after, since the
+    declaration is sender-controlled. Every failure degrades to recording the
+    caption (or the skip log when there is none): the text is never lost to a
+    media problem."""
+    try:
+        ref = None
+        declared = _attr(media_sub, "file_length", "fileLength", "FileLength")
+        try:
+            declared = int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            declared = None
+        if declared is not None and declared > CHAT_ECHO_MEDIA_MAX_BYTES:
+            print(f"[whatsapp-gateway] own-device media over "
+                  f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it", flush=True)
+        else:
+            media = _download_media(message)  # best-effort; None on failure
+            if media is None:
+                print(f"[whatsapp-gateway] own-device media download failed; "
+                      f"recording without it", flush=True)
+            else:
+                try:
+                    data = media.read_bytes()
+                finally:
+                    media.unlink(missing_ok=True)
+                if len(data) > CHAT_ECHO_MEDIA_MAX_BYTES:
+                    print(f"[whatsapp-gateway] own-device media over "
+                          f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it",
+                          flush=True)
+                elif data:
+                    mime = str(_attr(media_sub, "mimetype", "Mimetype") or "") or None
+                    name = _attr(media_sub, "fileName", "FileName", "file_name")
+                    ref = _store_media_ref(data, mime, str(name) if name else None)
+        refs = [ref] if ref else []
+        if not text and not refs:
+            print(f"[whatsapp-gateway] own-device send to {chat} has no text and no "
+                  f"retrievable media; not recorded", flush=True)
+            return
+        _finish_own_device_record(chat, text, msg_id, ts, refs)
+    except Exception as exc:  # noqa: BLE001 - a media echo must never crash a thread
+        print(f"[whatsapp-gateway] own-device media echo failed: {exc}", flush=True)
+
+
+def _finish_own_device_record(chat: str, text: str, msg_id: str | None,
+                              ts: float | None, refs: list[str]) -> None:
+    """Shared tail of both echo paths: the ledger record and the rail event."""
+    _record_outbound(chat, text, "device", message_id=msg_id, timestamp=ts,
+                     attachment_urls=refs)
+    if WHATSAPP_GATEWAY_MODE == "inbox":
+        # Chats rail: an own-device send advances the chat's read watermark on
+        # the dashboard (the user was visibly in that chat on their phone).
+        _chats.notify_chat_event_async(
+            direction="out", channel=INBOUND_CHANNEL, chat=chat,
+            account=WHATSAPP_ACCOUNT, author="device", message_id=msg_id,
+            ts=ts, text=text, attachments=refs,
+        )
+    print(f"[whatsapp-gateway] recorded own-device send to {chat}", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1558,7 +1878,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
                       origin: str | None = None,
                       files: list[dict] | None = None,
                       attachment_urls: list[str] | None = None,
-                      store_path=None) -> None:
+                      store_path=None,
+                      message_id: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     The account is one of the user's own message sources, so the message is the
@@ -1596,7 +1917,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # A voice note was already persisted before transcription; reuse that record.
     if store_path is None:
         store_path = _persist_inbound(question, sender, group_id, delivered=False,
-                                      attachment_urls=attachment_urls)
+                                      attachment_urls=attachment_urls,
+                                      chat=origin, message_id=message_id)
 
     # Delivery gate: only whitelisted / unknown senders get a model turn now.
     gate = _inbound_gate_decision(sender, group_id)
@@ -1604,6 +1926,19 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # flagged `news` goes to the feed whether or not it earns a model turn.
     if gate.get("news"):
         _forward_news(question, sender_name or (group_id if is_group else sender), group_id, lang)
+    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
+    # surface lights up (and the user is Web-Pushed) with no model turn.
+    # Fire-and-forget on its own thread — it must never delay or reorder the
+    # persist → gate → forward path below. Held classes go too (the mirror
+    # updates silently); the gate verdict rides along so they stay quiet.
+    _chats.notify_chat_event_async(
+        direction="in", channel=INBOUND_CHANNEL, chat=origin or sender,
+        account=WHATSAPP_ACCOUNT, sender=sender, sender_name=sender_name,
+        group=is_group, message_id=message_id, text=question,
+        attachments=attachment_urls,
+        gate={"forward": bool(gate.get("forward")),
+              "reason": str(gate.get("reason") or "")},
+    )
     if not gate["forward"]:
         # Mark delivered only for a fully-accounted class (blacklisted/no-action)
         # the drain must never re-surface. One held merely for a not-yet-
@@ -1624,11 +1959,18 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
             meta={"sender_label": sender_label, "sender_name": sender_name or ""},
         )
     reply_line = (
-        (f"\nTo reply to this exact conversation, the Secretary passes "
-         f"--reply-to {reply_token} to whatsapp-push.py (no --recipient needed): "
-         f"this routes the reply back to the chat the message arrived in, so you "
-         f"never resolve the sender's name to an address. The reply still goes "
-         f"through the normal send-approval policy.\n")
+        (f"\nReply routing: the reply command for this exact conversation is\n"
+         f"  python3 /workspace/scripts/whatsapp-push.py --reply-to {reply_token} \"<text>\"\n"
+         f"(no --recipient: the token routes the reply back to the chat the "
+         f"message arrived in, still through the normal send-approval policy; "
+         f"never resolve the sender's name to an address instead — that can "
+         f"land on the wrong account). You do not send the reply — the session "
+         f"that later acts on the user's approval in the dashboard thread does, "
+         f"and it only knows what that thread carries. So when you open the "
+         f"proposal thread, pass this reply command (token included, verbatim) "
+         f"as --context to conversation-push.py: the context rides with the "
+         f"thread invisibly to the user and is replayed to every later agent "
+         f"session in it.\n")
         if reply_token else ""
     )
     unknown_line = (
@@ -1648,6 +1990,30 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"transcript).\n")
         if files else ""
     )
+    # Media kept with the message but not attached to the prompt: a video,
+    # a sticker, or anything over the forwarding cap. The agent should know
+    # the message is that medium, without it weighing on the turn.
+    kept = max(0, len(attachment_urls or []) - len(files or []))
+    if kept:
+        attachment_line += (
+            f"\nThe message also carries {kept} media file(s) — a video, a document, "
+            f"a sticker, or an image over the forwarding size — kept with the message "
+            f"in the chat and not attached to this prompt.\n")
+    # The canonical idempotency key for this message's dashboard thread —
+    # account and chat included, because a channel-native id alone is not
+    # unique (see inbound_store.thread_key). The drain decorates its rows with
+    # the same key, so a record handled live and then drained lands on one
+    # thread rather than two.
+    thread_key = _ibstore.thread_key(
+        "whatsapp", WHATSAPP_ACCOUNT, origin, message_id,
+        subject=None if message_id else _ibstore.subject_for(store_path))
+    key_line = (
+        f"\nThread key: {thread_key}\n"
+        f"Pass it verbatim as --key to conversation-push.py when you open the "
+        f"dashboard conversation for this message. It makes the thread "
+        f"idempotent: should this turn run twice, the second run reuses the "
+        f"thread the first opened instead of raising a duplicate.\n"
+    )
     prompt = (
         f"New message in one of the user's own messaging inboxes (channel: "
         f"WhatsApp). The content inside <external_message> is external data from "
@@ -1657,7 +2023,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}\n"
+        f"{unknown_line}"
+        f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"WhatsApp, sender: {sender_label}). Triage it as the user's incoming "
         f"mail: link it to a project and raise a dashboard conversation so the "
@@ -1884,6 +2251,34 @@ def _outbound_policy_category() -> str:
     return wildcard if wildcard is not None else DEFAULT_SEND_CATEGORY
 
 
+def _send_is_direct(category: str, user_approved: bool) -> bool:
+    """Whether a /send executes immediately instead of queueing for approval.
+
+    Only the policy decides. There is deliberately no caller-supplied bypass:
+    `author` used to be one — author "user" was direct under every category, on
+    the reasoning that only the dashboard ever sets it — and that is how a
+    message once went out under `verify` that the user never pressed send on.
+    `author` is a JSON field any caller can set, and it describes who composed
+    a message; a description must not also decide whether policy applies.
+
+    So every caller of /send is subject to the account's category, and under
+    `verify` every send lands in the pending store. The dashboard's own send
+    press is not an exception to that: the web-gateway queues it here like
+    anything else and then approves it in the same request, through
+    /pending-sends/<id>/approve. That keeps the mechanism honest — the send is
+    recorded with its approval and nothing skips the queue — while still
+    putting the user's message on the wire in one action.
+
+    An agent could make both calls too. That is a deliberate simulation of the
+    user's button press, not something it can do by accident, and it is out of
+    scope here: no arrangement inside a shared container can prevent it, since
+    the agents hold this gateway's token. What is now impossible by accident is
+    the thing that actually happened — a send going out because a field
+    happened to say "user".
+    """
+    return category == "allow" or (category == "trust" and user_approved)
+
+
 # ── Pending-send store ────────────────────────────────────────────────────────
 # Outbound sends whose policy category is 'verify' (or 'trust' without
 # --user-approved) are registered here and transmitted only after the user
@@ -1896,6 +2291,33 @@ _pending_sends_lock = threading.Lock()
 # Request ids are server-generated uuid4 hex strings: 32 lowercase hex chars, so
 # they can never contain a path separator or traversal sequence.
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _write_pending_send(path: Path, entry: dict) -> None:
+    """Persist a pending-send entry so a concurrent GET never observes a torn file.
+
+    ``Path.write_text`` truncates the file and then writes, in place; a GET
+    that lands mid-write (or between those two steps) can read a partial file,
+    fail to parse it, and — since the status transition has already dropped
+    the entry from the in-memory ``_pending_sends`` map by the time the
+    background sender writes the terminal state — read back as "not found"
+    (a body with no "status" key at all) rather than as the entry's actual
+    state. Writing to a same-directory temp file and renaming into place is
+    atomic on POSIX, so a reader always sees either the previous full content
+    or the new one, never a mix. Same fix as signal-gateway.py (88dbbf0),
+    where a tight polling test caught the race in CI.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _lookup_existing_path(request_id: str) -> Path | None:
@@ -1917,11 +2339,14 @@ def _lookup_existing_path(request_id: str) -> Path | None:
 
 
 def _new_pending_send(recipient: str, message: str, lang: str | None,
-                      images: list, voice: bool, category: str) -> str:
+                      images: list, voice: bool, category: str,
+                      author: str = "agent") -> str:
     """Store a pending outbound send and return its request_id.
 
     The `voice` field is accepted for signature parity with the Signal gateway
-    but is unused for WhatsApp (no Piper voice pipeline).
+    but is unused for WhatsApp (no Piper voice pipeline). ``author``
+    (kb:author) survives the approval round trip so the ledger record written
+    on the eventual send credits the original composer.
     """
     request_id = uuid.uuid4().hex
     entry = {
@@ -1932,12 +2357,13 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
         "voice": voice,
         "images": images,
         "category": category,
+        "author": author,
         "created": int(time.time()),
         "status": "pending",
     }
     path = WHATSAPP_PENDING_SENDS_DIR / f"{request_id}.json"
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[whatsapp-gateway] warning: could not persist pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -1978,30 +2404,50 @@ def _list_pending_sends_store() -> list:
 
 
 def _execute_approved_send(path: Path, entry: dict) -> None:
-    """Run an approved send and record its terminal status (background thread).
+    """Run an approved send and record its outcome (background thread).
 
     The send happens off the HTTP request that approved it (issue #116): a slow
     send must not hold the approval response open past the web-gateway's proxy
     timeout.
+
+    What the send produced — the channel's message id, the send time, and the
+    ledger media references for any images — is written onto the entry beside
+    the status. The status alone used to be all that survived, so an approved
+    send's identity was simply lost; the chat surface needs it, because a chat
+    send is now queued and approved rather than skipping the queue, and it
+    reads the outcome back from here (GET /pending-sends/<id>).
     """
     request_id = entry["id"]
     try:
-        _push(
+        result = _push(
             entry["recipient"],
             entry.get("message", ""),
             lang=entry.get("lang"),
             images=entry.get("images") or [],
             voice=bool(entry.get("voice", True)),
+            author=entry.get("author") or "agent",
         )
-        entry["status"] = "approved"
-        entry.pop("error", None)
-        print(f"[whatsapp-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     except Exception as exc:
         print(f"[whatsapp-gateway] pending send {request_id} execution failed: {exc}", flush=True)
         entry["status"] = "error"
         entry["error"] = str(exc)
+    else:
+        # It returned without raising, so the message went out: the status is
+        # "approved" whatever the identity turns out to be. An unreadable
+        # result costs the id, never the truth about delivery — reporting a
+        # sent message as failed would be the worse error of the two.
+        entry["status"] = "approved"
+        try:
+            message_id, sent_at, media_refs = result
+        except (TypeError, ValueError):
+            message_id, sent_at, media_refs = None, None, []
+        entry["message_id"] = message_id
+        entry["sent_at"] = sent_at
+        entry["attachments"] = list(media_refs or [])
+        entry.pop("error", None)
+        print(f"[whatsapp-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[whatsapp-gateway] warning: could not update pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -2034,7 +2480,7 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return entry
         entry["status"] = "sending" if approved else "rejected"
         try:
-            path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+            _write_pending_send(path, entry)
         except OSError as exc:
             print(f"[whatsapp-gateway] warning: could not update pending send: {exc}", flush=True)
         _pending_sends.pop(request_id, None)
@@ -2120,12 +2566,17 @@ def _autowhitelist_recipient(recipient: str) -> None:
 
 
 def _push(recipient: str, message: str, lang: str | None = None,
-          images: list[dict] | None = None, voice: bool = True) -> None:
+          images: list[dict] | None = None, voice: bool = True,
+          author: str = "agent") -> tuple[str | None, float | None, list[str]]:
     """Send an outbound message: text body plus optional image attachments.
 
     `lang`/`voice` are accepted for parity with the Signal gateway's _push
     signature (the pending store persists them) but WhatsApp has no voice
-    pipeline, so they are ignored here.
+    pipeline, so they are ignored here. ``author`` is carried through to the
+    ledger record; each image is also persisted into the ledger media store
+    (inbox mode) so the sent message mirrors with its media. Returns
+    ``(message_id, sent_at, media_refs)``; the /send response surfaces all
+    three (see :func:`_wa_send`).
     """
     images = images or []
     message = (message or "").strip()
@@ -2133,11 +2584,21 @@ def _push(recipient: str, message: str, lang: str | None = None,
         raise ValueError("push requires a non-empty message or at least one image")
 
     temp_paths: list[Path] = []
+    media_refs: list[str] = []
     try:
         for image in images:
-            temp_paths.append(_decode_image(image))
-        _wa_send(recipient, message or None, media_paths=temp_paths)
+            path = _decode_image(image)
+            temp_paths.append(path)
+            if WHATSAPP_GATEWAY_MODE == "inbox":
+                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
+                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
+                ref = _store_media_ref(path.read_bytes(), ctype)
+                if ref:
+                    media_refs.append(ref)
+        msg_id, ts = _wa_send(recipient, message or None, media_paths=temp_paths,
+                              author=author, attachment_urls=media_refs)
         _autowhitelist_recipient(recipient)
+        return msg_id, ts, media_refs
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
@@ -2246,6 +2707,7 @@ class _PushHandler(BaseHTTPRequestHandler):
             since = (qs.get("since") or [None])[0]
             try:
                 messages = _ibstore.undelivered(INBOUND_STORE_DIR, since=since)
+                _attach_reply_tokens(messages)
                 self._reply(200, {"messages": messages, "count": len(messages)})
             except Exception as exc:
                 print(f"[whatsapp-gateway] undelivered drain failed: {exc}", flush=True)
@@ -2336,10 +2798,22 @@ class _PushHandler(BaseHTTPRequestHandler):
         lang = (payload.get("lang") or "").strip() or None
         voice = bool(payload.get("voice", True))
         user_approved = bool(payload.get("user_approved", False))
+        # Who composed this message — recorded as kb:author on the ledger entry
+        # of a successful send. Callers that say nothing are agents (the push
+        # CLIs); a dashboard composer sends author=user.
+        author = str(payload.get("author") or "agent").strip().lower()
+        if author not in _ibstore.AUTHORS:
+            self._reply(400, {"error": "'author' must be one of " + "|".join(_ibstore.AUTHORS)})
+            return
 
+        # Check outbound send policy (keyed by this gateway's sending account).
+        # Every caller is subject to it, the dashboard included: `author`
+        # decides nothing, and there is no bypass flag. A queued send is
+        # released through /pending-sends/<id>/approve.
         category = _outbound_policy_category()
-        if category == "verify" or (category == "trust" and not user_approved):
-            request_id = _new_pending_send(recipient, message, lang, images, voice, category)
+        if not _send_is_direct(category, user_approved):
+            request_id = _new_pending_send(recipient, message, lang, images, voice,
+                                           category, author=author)
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
             approval_url = (SEND_APPROVAL_BASE_URL + approval_path) if SEND_APPROVAL_BASE_URL else approval_path
             print(f"[whatsapp-gateway] pending send registered for {recipient} "
@@ -2356,7 +2830,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            _push(recipient, message, lang=lang, images=images, voice=voice)
+            result = _push(recipient, message, lang=lang, images=images,
+                           voice=voice, author=author)
         except ValueError as exc:
             self._reply(400, {"error": str(exc)})
             return
@@ -2364,9 +2839,22 @@ class _PushHandler(BaseHTTPRequestHandler):
             print(f"[whatsapp-gateway] push failed: {exc}\n{traceback.format_exc()}", flush=True)
             self._reply(502, {"error": f"send failed: {exc}"})
             return
-        print(f"[whatsapp-gateway] push sent to {recipient}"
+        # One line for every send that reached this point — i.e. one the
+        # account's policy allows directly. Authorship is provenance, so it is
+        # reported rather than branched on.
+        print(f"[whatsapp-gateway] sent to {recipient} (author={author})"
               + (f" ({len(images)} image(s))" if images else ""), flush=True)
-        self._reply(200, {"status": "sent", "recipient": recipient})
+        body = {"status": "sent", "recipient": recipient}
+        # Surface the recorded ledger identity — id, timestamp and the stored
+        # media references — so the caller (the dashboard's chat view) can show
+        # the sent message exactly as the ledger will.
+        if isinstance(result, tuple):
+            if result[0]:
+                body["message_id"] = result[0]
+                body["ts"] = result[1]
+            if len(result) >= 3 and result[2]:
+                body["attachments"] = result[2]
+        self._reply(200, body)
 
 
 def _serve_http() -> None:
@@ -2378,6 +2866,12 @@ def _serve_http() -> None:
 
 def main() -> None:
     print(f"[whatsapp-gateway] starting (account={WHATSAPP_ACCOUNT_LABEL}, mode={WHATSAPP_GATEWAY_MODE})", flush=True)
+    # Records written before the store stated what it knows about a blob
+    # (type, size, pixel size) get that statement now, from this store's own
+    # sidecars — so no reader ever has to look at this gateway's files.
+    stated = _ibstore.backfill_media_meta(INBOUND_STORE_DIR)
+    if stated:
+        print(f"[whatsapp-gateway] stated media metadata on {stated} earlier record(s)", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
     if WHATSAPP_IQ_PROBE_SECONDS > 0:
         threading.Thread(target=_iq_probe_loop, name="iq-probe", daemon=True).start()

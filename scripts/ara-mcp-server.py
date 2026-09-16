@@ -71,6 +71,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import tempfile
 import textwrap
 import threading
 import time
@@ -83,12 +85,21 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_auth  # noqa: E402
+import session_env  # noqa: E402
+
 IDENTITY = os.environ.get("ARA_MCP_IDENTITY", "").strip() or "Ara"
 SCOPE_HINT = os.environ.get("ARA_MCP_SCOPE_HINT", "").strip()
 PORT = int(os.environ.get("ARA_MCP_PORT", "8110"))
 WORKDIR = os.environ.get("ARA_MCP_WORKDIR", "/workspace")
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
-MODEL = os.environ.get("ARA_MCP_MODEL", "").strip()
+# The answering session is Ara at the door: an explicit ARA_MCP_MODEL wins,
+# else the router tier answers (Ara junior) and may escalate to the frontier
+# tier (docs/model-routing.md). Unset everything = untiered, as before.
+MODEL = (os.environ.get("ARA_MCP_MODEL", "").strip()
+         or os.environ.get("RETINUE_ROUTER_MODEL", "").strip())
+FRONTIER_MODEL = os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
 TIMEOUT = float(os.environ.get("ARA_MCP_TIMEOUT", "600"))
 SYNC_WAIT = float(os.environ.get("ARA_MCP_SYNC_WAIT", "60"))
 MAX_CONCURRENCY = int(os.environ.get("ARA_MCP_MAX_CONCURRENCY", "2"))
@@ -360,20 +371,31 @@ def _build_prompt(question: str, context: str, identity: str | None = None,
     return "\n".join(parts)
 
 
-def _run_claude(prompt: str) -> tuple[str, str]:
-    """Run one answering session. Returns ``(status, text)``."""
+def _run_once(prompt: str, model: str,
+              escalate_flag: Path | None) -> tuple[str, str]:
+    """One `claude -p` answering run on `model`. Returns ``(status, text)``."""
     cmd = [CLAUDE_BIN, "-p", "--output-format=json"]
-    if MODEL:
-        cmd += ["--model", MODEL]
+    if model:
+        cmd += ["--model", model]
     for tool in FORBIDDEN_TOOLS:
         cmd += ["--disallowed-tools", tool]
+    # The session's environment comes from the allowlist in
+    # scripts/session_env.py, never from a copy of this daemon's (which holds
+    # whatever .env carries). RETINUE_SESSION_MODEL advertises the model this
+    # session runs on (for memory stamping), set per spawn so a stale value
+    # never mislabels a session; RETINUE_ESCALATE_FILE is junior's escape
+    # hatch.
+    env = session_env.build(model=model, escalate_file=escalate_flag)
     # The prompt goes on stdin, never as a trailing argument: --disallowed-tools
     # is variadic, so a positional prompt after it is swallowed as one more tool
     # name and the session dies with "Input must be provided either through
     # stdin or as a prompt argument when using --print".
+    # Refresh an access token about to expire before the session starts —
+    # once, under the lock every framework spawner shares (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(log=log)
     try:
         proc = subprocess.run(cmd, cwd=WORKDIR, input=prompt, capture_output=True,
-                              text=True, timeout=TIMEOUT)
+                              text=True, timeout=TIMEOUT, env=env)
     except subprocess.TimeoutExpired:
         return "error", f"Ara did not answer within {int(TIMEOUT)}s."
     except Exception as exc:  # noqa: BLE001 — surfaced to the caller as-is
@@ -387,6 +409,30 @@ def _run_claude(prompt: str) -> tuple[str, str]:
     except Exception:
         text = (proc.stdout or "").strip()
     return ("done", text) if text else ("error", "Ara returned an empty answer.")
+
+
+def _run_claude(prompt: str) -> tuple[str, str]:
+    """Run one answering session, escalating junior to senior when signalled.
+
+    Below the frontier tier the session gets RETINUE_ESCALATE_FILE; if it
+    creates that file the junior answer is discarded and the same prompt is
+    re-run on the frontier tier. The existing slow-answer/job-id flow absorbs
+    the extra latency of an escalated answer.
+    """
+    escalatable = bool(FRONTIER_MODEL) and MODEL != FRONTIER_MODEL
+    flag = (Path(tempfile.gettempdir()) / f"ara-mcp-escalate-{uuid.uuid4().hex}"
+            if escalatable else None)
+    try:
+        status, text = _run_once(prompt, MODEL, flag)
+        if flag is not None and flag.exists():
+            print(f"[ara-mcp] junior escalated — re-running on {FRONTIER_MODEL}",
+                  file=sys.stderr, flush=True)
+            flag.unlink(missing_ok=True)
+            status, text = _run_once(prompt, FRONTIER_MODEL, None)
+        return status, text
+    finally:
+        if flag is not None:
+            flag.unlink(missing_ok=True)
 
 
 def _answer_worker(job_id: str, question: str, context: str) -> None:

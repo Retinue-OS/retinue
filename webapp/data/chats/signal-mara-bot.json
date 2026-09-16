@@ -1,0 +1,34 @@
+{
+ "generated": "2026-08-27T09:45:00+02:00",
+ "chat": {
+  "id": "signal:~+41766029556:+41794456312",
+  "channel": "signal",
+  "account": "+41766029556",
+  "key": "+41794456312",
+  "name": "Mara Meier",
+  "group": false,
+  "unread": 0,
+  "archived": false,
+  "muted": false,
+  "companion": null,
+  "last": {
+   "ts": "2026-08-26T08:04:00+02:00",
+   "direction": "out",
+   "kind": "text",
+   "author": "agent",
+   "text": "Systemhinweis: Backup gestern Nacht ok."
+  },
+  "draft": null,
+  "messages": "/data/chats/signal-mara-bot.json"
+ },
+ "messages": [
+  {
+   "id": "SGB001",
+   "chat": "signal:~+41766029556:+41794456312",
+   "direction": "out",
+   "author": "agent",
+   "text": "Systemhinweis: Backup gestern Nacht ok.",
+   "ts": "2026-08-26T08:04:00+02:00"
+  }
+ ]
+}

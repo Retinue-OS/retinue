@@ -9,7 +9,6 @@
   "@id": "rn:conversationModelList",
   "@type": "rn:ConversationModelList",
   "models": [
-    { "@type": "rn:ConversationModel", "id": "", "label": "Default" },
     { "@type": "rn:ConversationModel", "id": "opus", "label": "Opus (deepest reasoning)" },
     { "@type": "rn:ConversationModel", "id": "sonnet", "label": "Sonnet (balanced)" },
     { "@type": "rn:ConversationModel", "id": "haiku", "label": "Haiku (fastest)" }

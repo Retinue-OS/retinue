@@ -63,7 +63,7 @@ def test_channel_message_reaches_the_gate_with_a_group_id(gw):
                 "delivered_if_held": True, "reason": "test", "news": False}
 
     def _fake_persist(question, sender, group_id, delivered=False, media=None,
-                      attachment_urls=None):
+                      attachment_urls=None, **kw):
         seen["persisted_group"] = group_id
         return None
 

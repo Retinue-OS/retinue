@@ -143,6 +143,12 @@ class RetinueNews extends HTMLElement {
     // List rows vs reflowing tiles — a per-device choice (see base.js).
     this._view = viewPref('news');
     this._reader = new Reader((id) => this._markReading(id));
+    // A reading the engine halted — cut off by the conversation card's reader
+    // or by the platform taking the audio, or refused with an error — keeps
+    // its place; the bar must offer to carry on rather than start over.
+    this._reader.onprogress = (ev) => {
+      if ((ev.event === 'pause' || ev.event === 'error') && this.isConnected) this.render();
+    };
     this.render();
     this.load();
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
@@ -231,6 +237,7 @@ class RetinueNews extends HTMLElement {
     if (act === 'listen') { this.speak(this.items); return; }
     if (act === 'stop') { this._reader.stop(); this.render(); return; }
     if (act === 'skip') { this._reader.skip(); return; }
+    if (act === 'resume') { this._reader.resume(); this.render(); return; }
     if (act === 'scope') { this._scope = el.dataset.scope; this.load(); return; }
     if (act === 'note') { this.submitNote(); return; }
     if (act === 'edit-prefs') { this._editing = true; this.render(); return; }
@@ -341,10 +348,16 @@ class RetinueNews extends HTMLElement {
     const scopeBtn = (scope, label) =>
       `<button data-act="scope" data-scope="${scope}" ` +
       `aria-pressed="${this._scope === scope}">${label}</button>`;
-    const listenBtns = !speech ? '' : (this._reader.speaking
-      ? '<button data-act="skip" title="Next item">&#9197;</button>' +
-        '<button data-act="stop" title="Stop">&#9209;</button>'
-      : '<button data-act="listen" title="Read the feed aloud">&#128266; Listen</button>');
+    // Three states: reading (skip/stop), halted with its place kept
+    // (resume/stop), idle (listen).
+    const listenBtns = !speech ? ''
+      : this._reader.speaking
+        ? '<button data-act="skip" title="Next item">&#9197;</button>' +
+          '<button data-act="stop" title="Stop">&#9209;</button>'
+        : this._reader.loaded
+          ? '<button data-act="resume" title="Carry on reading">&#9654; Resume</button>' +
+            '<button data-act="stop" title="Stop">&#9209;</button>'
+          : '<button data-act="listen" title="Read the feed aloud">&#128266; Listen</button>';
     const bar =
       `<div class="bar">${scopeBtn('feed', 'Feed')}${scopeBtn('read', 'Read')}` +
       `${scopeBtn('hidden', 'Hidden')}<span class="spacer"></span>${listenBtns}</div>`;

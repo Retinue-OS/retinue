@@ -1,0 +1,354 @@
+// Chats card: the messenger mirror's home screen — every channel conversation
+// (Signal / WhatsApp / Telegram, one peer or group each) as one row, ordered by
+// last activity, with unread badge, channel mark and last-message preview. Rows
+// link to the chat's own page (chat.html), which renders the full mirror beside
+// its companion thread. With the `full` attribute (chats.html) the list drops
+// the dashboard cap and adds an Active/Hidden filter, like the conversations
+// page. Archived chats are excluded everywhere else; `muted` only changes the
+// badge treatment here (its real meaning — no Web Push, and no un-archive on a
+// new inbound message — is the server's).
+//
+// The filter's second tab says "Hidden" rather than "Archived" because that is
+// what the set contains: the one way in from the dashboard is the chat page's
+// Hide, which sets archived AND muted together (see chat-page.js), so nothing
+// lands there that a new message would bring back. The field names stay as
+// they are — the state is the dashboard-conversation pair verbatim.
+//
+// The list comes from the gateway's GET /chats (the default `src`, still
+// overridable by attribute) — SPARQL over the message ledgers merged with the
+// live overlay and the chat state. The response shape is documented in
+// webapp/README.md, "Messenger chats"; the reference documents under
+// webapp/data/chats* mirror it for tests. The card refreshes on an ambient
+// cadence and keeps its last rendered state over a failed fetch (a store blip
+// must not blank the list).
+
+import { RetinueCard, esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
+
+const LIST_URL = '/chats';
+// Rows shown on the dashboard card before "All chats →" takes over — the same
+// cap logic as the conversations card: only the phone layout, where each row
+// lengthens the page, caps the list.
+const MAX_CARD_CHATS = 5;
+// Ambient refresh: the card carries summaries, not the open thread — a gentler
+// cadence than the conversations card's 4s poll is enough (the server caches
+// the SPARQL skeleton between polls anyway).
+const REFRESH_MS = 15000;
+
+// Channel marks: no brand assets in the shell, so a lettered dot in the
+// channel's recognisable colour does the telling.
+export const CHANNELS = {
+  signal: { label: 'Signal', mark: 'S', color: '#3a76f0' },
+  whatsapp: { label: 'WhatsApp', mark: 'W', color: '#25d366' },
+  telegram: { label: 'Telegram', mark: 'T', color: '#2aabee' },
+};
+
+export function channelMarkHtml(channel) {
+  const c = CHANNELS[channel] || { label: channel, mark: '?', color: 'var(--muted, #8b93a3)' };
+  return `<span class="ch" style="background:${c.color}" title="${esc(c.label)}" ` +
+    `aria-label="${esc(c.label)}">${esc(c.mark)}</span>`;
+}
+
+// Deterministic avatar/sender colour from any stable key (chat id, sender key):
+// a small palette that reads on the dark shell, same hue for the same person on
+// every render and every page.
+const AVATAR_COLORS = ['#b0713f', '#3f8fb0', '#7d6cc9', '#4f9e63', '#b04f77', '#8a9a3d', '#c07840'];
+
+export function colorFor(key) {
+  let h = 0;
+  const s = String(key || '');
+  for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return AVATAR_COLORS[h % AVATAR_COLORS.length];
+}
+
+export function initials(name) {
+  const words = String(name || '?').trim().split(/\s+/).filter(Boolean);
+  const first = (w) => {
+    // First base character, robust for astral-plane characters (emoji names).
+    const cp = w.codePointAt(0);
+    return cp ? String.fromCodePoint(cp).toUpperCase() : '';
+  };
+  if (!words.length) return '?';
+  if (words.length === 1) return first(words[0]);
+  return first(words[0]) + first(words[words.length - 1]);
+}
+
+// Avatar disc (deterministic colour, initials) with the channel mark docked to
+// its corner — one glance answers both "who" and "over which channel".
+// The avatar's colour identifies the PEER, not the chat: it is keyed on the
+// channel and chat key, so the same person keeps one colour across every
+// account that talks to them — including the unattributed history beside an
+// account-named chat. Keying it on the chat id instead would paint one person
+// in as many colours as there are chats with them, in exactly the list where
+// telling those chats apart is already the difficulty. The key rather than the
+// name, because a roster update renames a contact and must not repaint them.
+export function avatarHtml(chat) {
+  const peer = `${chat.channel || ''}\u0000${chat.key || chat.id || ''}`;
+  return `<span class="av" style="background:${colorFor(peer)}" aria-hidden="true">` +
+    `${esc(initials(chat.name))}${channelMarkHtml(chat.channel)}</span>`;
+}
+
+// The one-line preview under the chat name, messenger-home style: who said the
+// last thing, then what. Outbound gets its author ("You", the agent's name,
+// "You (phone)" for an own-device echo); group inbound gets the sender's first
+// name. An image message shows a camera mark before any caption.
+export function previewHtml(chat) {
+  const last = chat.last || {};
+  let who = '';
+  if (last.direction === 'out') {
+    who = last.author === 'agent' ? 'Ara'
+      : last.author === 'device' ? 'You (phone)' : 'You';
+  } else if (chat.group && last.sender_name) {
+    who = String(last.sender_name).split(/\s+/)[0];
+  }
+  const img = last.kind === 'image' ? '<span class="pv-img" aria-label="Image">&#128247;</span> ' : '';
+  const text = last.text || (last.kind === 'image' ? 'Photo' : '');
+  return (who ? `<span class="pv-who">${esc(who)}:</span> ` : '') + img + esc(text);
+}
+
+class RetinueChats extends RetinueCard {
+  connectedCallback() {
+    this._full = this.hasAttribute('full');
+    this._scope = 'active';  // full-mode filter: active | archived
+    // Bumped by a flag write. A refresh that began before one is stale by the
+    // time it answers — it carries the pre-hide list — and rendering it would
+    // put the row back and flip the button to the wrong inverse until the next
+    // poll. The epoch is how such an answer is recognised and dropped.
+    this._epoch = 0;
+    // Crossing the layout breakpoint changes how many rows fit (cap vs all).
+    this._offFrame = onFrameChange(() => {
+      if (this._data) this.renderState({ state: 'ok', data: this._data });
+    });
+    super.connectedCallback();
+    this._timer = setInterval(() => this.load(), REFRESH_MS);
+  }
+
+  disconnectedCallback() {
+    if (this._offFrame) this._offFrame();
+    this._offFrame = null;
+    if (this._timer) clearInterval(this._timer);
+    this._timer = null;
+  }
+
+  get dataUrl() { return this.getAttribute('src') || LIST_URL; }
+
+  // Unlike the one-shot base loader, a refreshing card must not blank itself
+  // over one failed fetch: keep the last rendered list and let the next tick
+  // reconcile. Only a failure with nothing rendered yet shows the offline
+  // state.
+  async load() {
+    const epoch = this._epoch;
+    try {
+      const res = await fetch(this.dataUrl, { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      // A hide or unhide landed while this was in flight: this answer predates
+      // it and would undo it on screen. The write already re-rendered, and the
+      // next tick fetches the list as it now is.
+      if (epoch !== this._epoch) return;
+      // Re-render only when the list actually changed — a rebuild would reset
+      // the region's scroll and the filter wiring for nothing.
+      const sig = JSON.stringify(data.chats || []);
+      if (sig === this._sig) { this._data = data; return; }
+      this._sig = sig;
+      this.renderState({ state: 'ok', data });
+    } catch (_err) {
+      if (!this._data) this.renderState({ state: 'offline' });
+    }
+  }
+
+  // RetinueCard renders static content; the full page's scope filter and its
+  // per-row Hide are the interactive parts, wired after each render.
+  renderState(s) {
+    super.renderState(s);
+    this.shadowRoot.querySelectorAll('[data-scope]').forEach((el) =>
+      el.addEventListener('click', () => {
+        const scope = el.getAttribute('data-scope');
+        if (scope === this._scope) return;
+        this._scope = scope;
+        if (this._data) this.renderState({ state: 'ok', data: this._data });
+      }));
+    this.shadowRoot.querySelectorAll('[data-hide]').forEach((el) =>
+      el.addEventListener('click', () => this._setHidden(
+        el.getAttribute('data-hide'), el.getAttribute('data-hidden') !== 'true')));
+  }
+
+  // Hide takes a chat out of the list: `archived` so it leaves the active one,
+  // `muted` so the next message does not bring it back — the pair is what makes
+  // it stick, and either alone is a softer state this button does not offer.
+  // It is the shape of a group one subscribes to for what it says rather than
+  // to talk in. Whether such a group also reaches the Herald is the triage
+  // policy's business and not this button's: the two are independent, so a
+  // chat can be a news source AND stay in the list (`news` + `quieted`).
+  async _setHidden(id, hidden) {
+    if (!id || this._flagging) return;
+    this._flagging = true;
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(id)}/flags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ archived: hidden, muted: hidden }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      // Reflect it locally so the row moves now; the next load reconciles.
+      const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
+      if (chat) { chat.archived = hidden; chat.muted = hidden; }
+      this._sig = '';
+      // Any refresh already on the wire answers from before this write.
+      this._epoch += 1;
+      if (this._data) this.renderState({ state: 'ok', data: this._data });
+    } catch (_err) {
+      // Left as it was; the row stays where it is and the next tap can retry.
+    } finally {
+      this._flagging = false;
+    }
+  }
+
+  css() {
+    return `
+      ul.list { gap: 4px; }
+      li { margin: 0; }
+      /* A row with an action beside it: the link keeps the whole width it had,
+         the button takes its own. */
+      li.actionable { display: flex; align-items: center; gap: 2px; }
+      li.actionable .row { flex: 1; min-width: 0; }
+      .hide-btn { flex: none; border: 0; border-radius: 999px; padding: 6px 10px;
+                  background: transparent; color: var(--muted, #8b93a3); cursor: pointer;
+                  font: inherit; font-size: .74rem; -webkit-tap-highlight-color: transparent; }
+      .hide-btn:hover { background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
+      .hide-btn:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 1px; }
+      .row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+             grid-template-rows: auto auto; align-items: center; column-gap: 10px; row-gap: 1px;
+             padding: 8px 10px; border-radius: 12px; text-decoration: none; color: var(--fg, #e7ebf2);
+             background: transparent; -webkit-tap-highlight-color: transparent; }
+      .row:hover { background: var(--card-2, #1c2230); }
+      .av { grid-row: 1 / 3; position: relative; width: 40px; height: 40px; border-radius: 50%;
+            display: inline-flex; align-items: center; justify-content: center;
+            color: rgba(255, 255, 255, .92); font-size: .85rem; font-weight: 700; }
+      .ch { position: absolute; right: -3px; bottom: -3px; width: 16px; height: 16px;
+            border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+            font-size: .58rem; font-weight: 800; color: #fff;
+            border: 2px solid var(--card, #151922); box-sizing: content-box; }
+      .name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+              white-space: nowrap; }
+      /* Which account this row is, shown only when a name repeats within a
+         channel. Quiet and inline: it disambiguates, it is not a second name. */
+      .name .acct { margin-left: 6px; font-weight: 400; font-size: .72rem;
+                    color: var(--muted, #8b93a3); }
+      .when { grid-column: 3; color: var(--muted, #8b93a3); font-size: .72rem; white-space: nowrap; }
+      .row.has-unread .when { color: var(--accent, #6ea8fe); }
+      .prev { grid-column: 2; color: var(--muted, #8b93a3); font-size: .8rem; line-height: 1.35;
+              min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .prev .pv-who { color: var(--fg, #e7ebf2); opacity: .75; }
+      .prev .pv-draft { color: var(--accent, #6ea8fe); font-style: italic; }
+      .unread { grid-column: 3; justify-self: end; min-width: 18px; height: 18px; padding: 0 5px;
+                border-radius: 9px; background: var(--accent, #6ea8fe); color: #0b0d12;
+                font-size: .68rem; font-weight: 700; display: inline-flex;
+                align-items: center; justify-content: center; }
+      .unread.muted-chat { background: var(--card-2, #1c2230); color: var(--muted, #8b93a3); }
+      .mute-mark { grid-column: 3; justify-self: end; color: var(--muted, #8b93a3);
+                   font-size: .68rem; }
+      .foot { display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
+      .all-link { color: var(--accent, #6ea8fe); text-decoration: none; font-size: .85rem;
+                  text-align: center; padding: 2px; }
+      .all-link:hover { text-decoration: underline; }
+      /* Active/Archived switch — full page only; same look as the
+         conversations page's filter. */
+      .filter { display: flex; background: var(--card-2, #1c2230); border-radius: 12px;
+                padding: 3px; margin-bottom: 10px; }
+      .filter-tab { flex: 1; background: transparent; border: 0; border-radius: 9px; padding: 7px;
+                    color: var(--muted, #8b93a3); cursor: pointer; }
+      .filter-tab.on { background: var(--accent, #6ea8fe); color: #0b0d12; font-weight: 600; }
+    `;
+  }
+
+  // The Active/Hidden switch shown on the full page. No pinning and no
+  // unread-only view — deliberately deferred (see the README contract notes).
+  _filterHtml() {
+    if (!this._full) return '';
+    const tab = (scope, label) =>
+      `<button class="filter-tab${this._scope === scope ? ' on' : ''}" ` +
+      `data-scope="${scope}">${label}</button>`;
+    return `<div class="filter">${tab('active', 'Active')}${tab('archived', 'Hidden')}</div>`;
+  }
+
+  body(d) {
+    this._data = d;
+    const all = Array.isArray(d.chats) ? d.chats.slice() : [];
+    // The API contract returns the list ordered by last activity; keep that
+    // guarantee client-side too, so a hand-edited fixture cannot scramble it.
+    all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
+    // Hidden chats leave the card and the Active list; the full page's
+    // Hidden filter is where they remain reachable — and where the chat page's
+    // Hide can be undone.
+    const archived = this._full && this._scope === 'archived';
+    const chats = all.filter((c) => !!c.archived === archived);
+    if (!chats.length) {
+      const msg = archived ? 'No hidden chats.' : 'No chats yet.';
+      return `${this._filterHtml()}<p class="muted">${msg}</p>${this._footHtml()}`;
+    }
+    const shown = (this._full || isWideFrame()) ? chats : chats.slice(0, MAX_CARD_CHATS);
+    // Two accounts of one channel talking to the same peer are two chats with
+    // the same name (and so is a peer's unattributed history beside its
+    // account-named chat). The name alone cannot tell them apart, so where —
+    // and only where — a name repeats within a channel, each row also says
+    // which account it is. Computed over the rows actually shown, so an
+    // unambiguous list carries no such label at all.
+    const nameCount = {};
+    for (const c of shown) {
+      const k = `${c.channel}\u0000${c.name}`;
+      nameCount[k] = (nameCount[k] || 0) + 1;
+    }
+    const rows = shown.map((c) => {
+      const badge = c.unread
+        ? `<span class="unread${c.muted ? ' muted-chat' : ''}">${c.unread}</span>`
+        : (c.muted ? '<span class="mute-mark" title="Muted" aria-label="Muted">&#128277;</span>' : '');
+      // A staged draft outranks the last message in the preview — it is what
+      // this chat is waiting on.
+      const draft = c.draft && c.draft.text;
+      const prev = draft
+        ? `<span class="pv-draft">${c.draft.author === 'agent'
+          ? `Draft by ${esc(c.draft.agent || 'Ara')}` : 'Draft'}:</span> ${esc(c.draft.text)}`
+        : previewHtml(c);
+      // The action sits BESIDE the row, never inside it: a row is a link, and
+      // a button within a link is not a button. Only on the full page — the
+      // dashboard card is a glance, not a place to curate.
+      const act = this._full
+        ? `<button class="hide-btn" data-hide="${esc(c.id)}" data-hidden="${archived}" ` +
+          `title="${archived ? 'Show this chat in the list again' : 'Hide this chat from the list'}">` +
+          `${archived ? 'Show' : 'Hide'}</button>`
+        : '';
+      return `<li${this._full ? ' class="actionable"' : ''}>` +
+        `<a class="row${c.unread ? ' has-unread' : ''}" ` +
+        `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
+        `${avatarHtml(c)}` +
+        `<span class="name">${esc(c.name)}` +
+        (nameCount[`${c.channel}\u0000${c.name}`] > 1
+          ? `<span class="acct" title="${c.account
+              ? `On the account ${esc(c.account)}`
+              : 'Older messages, from before the account was recorded'}">${
+              c.account ? esc(c.account) : 'earlier'}</span>`
+          : '') +
+        `</span>` +
+        `<span class="when">${esc(fmtAge((c.last || {}).ts))}</span>` +
+        `<span class="prev">${prev}</span>` +
+        badge +
+        `</a>${act}</li>`;
+    }).join('');
+    return `${this._filterHtml()}<ul class="list">${rows}</ul>${this._footHtml()}`;
+  }
+
+  // The card leads deeper (the full list); the full page leads back out. The
+  // way back matters more than it looks: chats.html carries no chrome of its
+  // own, so without this link the only exit is the browser's back gesture —
+  // and there is none at all once the page is opened from the home screen as
+  // an installed PWA. Every other full list page (conversations, projects,
+  // news) offers the same return, in the same place.
+  _footHtml() {
+    const link = this._full
+      ? '<a class="all-link" href="/">&larr; Back to dashboard</a>'
+      : '<a class="all-link" href="/chats.html">All chats &#8594;</a>';
+    return `<div class="foot">${link}</div>`;
+  }
+}
+
+customElements.define('retinue-chats', RetinueChats);
