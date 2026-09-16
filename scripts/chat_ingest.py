@@ -17,11 +17,19 @@ also declared its own address would be a second source of truth free to drift
 from the first — which is exactly what once attributed one account's chats to
 another.
 
-Fire-and-forget by contract: :func:`notify_chat_event_async` runs the POST on
-a daemon thread with a short timeout, never raises, and never blocks or
-reorders the gateway's own hot path (persist → gate → triage forward). A lost
-rail event costs a notification and a few seconds of freshness, never a
-message — the ledger already holds it and the store catches up on its own.
+Fire-and-forget by contract *for the classes the gate holds back*:
+:func:`notify_chat_event_async` runs the POST on a daemon thread with a short
+timeout, never raises, and never blocks the gateway's own hot path. A lost rail
+event costs a notification and a few seconds of freshness, never a message —
+the ledger already holds it and the store catches up on its own.
+
+A message the gate **forwards** is different. The web-gateway answers that one
+with a job handle for the companion turn it started in the message's own chat
+(docs/messenger-chats.md, phase 4), and the gateway needs that handle to learn
+whether the message was ever accounted for. So the forward class calls
+:func:`notify_chat_event` directly and reads its answer: no handle means the
+rail is switched off, unreachable, or could not take the message, and the
+caller falls back to the triage forward it has always done.
 
 ``CHATS_INGEST_URL`` defaults to the in-network web-gateway address in the
 base compose file, so the rail works with no deployment configuration; with it
@@ -68,20 +76,30 @@ def notify_chat_event(
     attachments: list[str] | None = None,
     author: str | None = None,
     gate: dict | None = None,
+    files: list[dict] | None = None,
     timeout: float = 3.0,
-) -> bool:
-    """Synchronous rail POST; returns True when the web-gateway accepted it.
+) -> dict | None:
+    """Synchronous rail POST; returns the answer body, or None if it failed.
+
+    An accepted event answers with a JSON object: ``{"job_url": …}`` when the
+    web-gateway started a companion turn for it, and nothing but ``ok`` other-
+    wise. None means the event did not land at all — no endpoint configured, a
+    transport error, a refusal — which is the caller's cue to fall back.
 
     ``direction`` is ``in`` for an arrival, ``out`` for an outbound echo (the
     user's own send from another device). ``account`` is this gateway's own
     ``*_ACCOUNT`` — how the web-gateway identifies which registry gateway sent
     the event, matched against the accounts the gateways it already knows
     report for themselves. ``gate`` carries the delivery-gate
-    verdict for inbound events (``{"forward": bool, "reason": str}``) so the
-    web-gateway can keep held/no-action classes silent. Never raises.
+    verdict for inbound events (``{"forward": bool, "flagged_unknown": bool,
+    "reason": str}``) so the web-gateway can keep held/no-action classes silent,
+    and can tell a turn that this sender is not on the whitelist yet. ``files``
+    are the message's own attachments in the ``POST /message`` shape
+    (``{"filename", "content_type", "data"}``, base64) so a turn started there
+    can open them; they ride along only for a forwarded message. Never raises.
     """
     if not CHATS_INGEST_URL:
-        return False
+        return None
     payload = {
         "direction": direction,
         "channel": channel,
@@ -101,6 +119,7 @@ def notify_chat_event(
         "attachments": [u for u in (attachments or []) if u],
         "author": author or None,
         "gate": gate or None,
+        "files": files or None,
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -114,15 +133,28 @@ def notify_chat_event(
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
+            if not 200 <= resp.status < 300:
+                return None
+            raw = resp.read().decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001 — best-effort, must never propagate
         print(f"[chat_ingest] notify failed ({exc})", file=sys.stderr, flush=True)
-        return False
+        return None
+    try:
+        body = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        body = {}
+    # An accepted event whose body is not an object is still accepted; it just
+    # carries no handle.
+    return body if isinstance(body, dict) else {}
 
 
 def notify_chat_event_async(**kwargs) -> None:
-    """Fire the rail POST on a daemon thread so the gateway hot path — persist,
-    gate, triage forward — is never delayed or reordered by it."""
+    """Fire the rail POST on a daemon thread and discard its answer.
+
+    For the classes the gate holds back, which want the mirror updated and
+    nothing more: the gateway's hot path — persist, gate, forward — is never
+    delayed or reordered by it. A forwarded message calls the synchronous
+    :func:`notify_chat_event` instead, because it needs the answer."""
     if not CHATS_INGEST_URL:
         return
     threading.Thread(

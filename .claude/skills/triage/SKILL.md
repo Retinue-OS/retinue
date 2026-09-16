@@ -74,6 +74,13 @@ the same "check for free, spend only on a hit" shape as `agent-self-review`. It
 runs in two places, one policy but two mechanisms, because e-mail is **pull** and
 messenger is **push**:
 
+- **Messenger (push), since the chat surface.** A message the gate forwards is
+  no longer triaged at all: the gateway hands it to the web-gateway's chats
+  rail, which runs a turn in that chat's companion thread — it stages any reply
+  into the chat's shared draft for the user's send press, and opens a dashboard
+  conversation only for a decision that is not "send this reply". Triage keeps
+  the **daily drain** (everything the gate held back) and every channel that
+  has no chat surface. See `docs/messenger-chats.md`.
 - **E-mail (pull).** `scripts/triage-gate.py`, a scheduler `command` job.
   **Frequent** tick: list new INBOX mail, keep only whitelisted senders, spawn
   the model *only* if any survive. **Daily** tick: refresh the whitelist from the

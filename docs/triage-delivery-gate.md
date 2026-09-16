@@ -346,6 +346,19 @@ the daily drain picks it up" (blacklisted handle, quieted group); `true` means
 "accounted for, never drained" (ignored group — the message is on record and
 queryable, but no model ever looks at it unprompted).
 
+**Where a forwarded message now goes.** The gate decides *whether* a message is
+worth a model turn; it no longer decides that the turn is a triage session.
+Since `docs/messenger-chats.md` phase 4, the forward class is handed to the
+chats rail (`POST /internal/chats/inbound`), which starts a turn in that chat's
+own companion thread and answers `202` with its job handle — so the reply is
+staged in the chat's composer for the user's send press instead of arriving as
+a dashboard conversation about the message. The gateway still owns the
+`delivered` flag and still waits for a job to report `done`; only which job has
+changed. A rail that cannot take the message answers no handle, and the gateway
+forwards to triage exactly as described below. **Triage itself is unchanged**
+and still owns the daily drain, the e-mail channel, and anything the rail hands
+back.
+
 - The daily catch-all calls each inbox-mode gateway's
   `GET /undelivered?since=…`, processes the returned messages; the flag flips as
   a side effect of the fetch, so a re-run is naturally idempotent. It does **not**

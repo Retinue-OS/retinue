@@ -15,6 +15,13 @@ contract:
     job that errors leaves it undelivered for the drain.
   * a synchronous answer (no ``job_url``) still marks delivered immediately.
 
+Since the chat surface started taking messages (docs/messenger-chats.md, phase
+4) the handle can also come from the chats rail, for a turn in the message's own
+chat rather than a triage session. That path is pinned here too: when the rail
+answers with a handle the gateway forwards nothing to triage and confirms
+against that job, and when it does not, the triage forward runs exactly as it
+always has.
+
     python3 tests/test_delivery_confirmation.py
 """
 import importlib.util
@@ -225,6 +232,53 @@ def _check_gateway(name: str, loader, forward):
     print(f"ok: {name} marks delivered only once the triage job reports done")
 
 
+def _check_rail_takes_the_message(name: str, loader, forward):
+    """The switch: a forwarded message is worked in the chat it arrived in.
+
+    When the chats rail answers with a job handle it has started a turn in that
+    chat's companion thread, so this gateway must not also spawn the triage
+    session it used to — that duplicate is exactly the per-message dashboard
+    conversation the chat surface replaced. The `delivered` flag still belongs
+    to the gateway and still waits for a job to report done; only which job has
+    changed."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t1"})
+        rail_calls = []
+
+        def _rail(**kwargs):
+            rail_calls.append(kwargs)
+            return {"ok": True, "job_url": "/jobs/r1"}
+
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = _rail
+        _stub_job_polls(gw._jobs, [_Resp(200, {"status": "done"})])
+        forward(gw)
+        assert rail_calls and rail_calls[0]["direction"] == "in", rail_calls
+        assert rail_calls[0]["gate"]["forward"] is True, rail_calls[0]["gate"]
+        assert "flagged_unknown" in rail_calls[0]["gate"], rail_calls[0]["gate"]
+        assert posts == [], "the message went to triage as well as to its chat"
+        assert _await_flag(tmp, True), _stored_flags(tmp)
+
+    # A rail that cannot take it — switched off, unreachable, or unable to open
+    # the companion thread — leaves this gateway doing what it always did.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t2"})
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = lambda **kwargs: {"ok": True}
+        _stub_job_polls(gw._jobs, [_Resp(200, {"status": "done"})])
+        forward(gw)
+        assert len(posts) == 1, posts
+        assert "triage" in posts[0]["message"], posts[0]["message"][:200]
+        assert _await_flag(tmp, True), _stored_flags(tmp)
+
+    print(f"ok: {name} lets the chat take a forwarded message, or forwards it "
+          "to triage as before")
+
+
 def test_whatsapp_delivery_confirmation():
     _check_gateway(
         "whatsapp", _load_whatsapp_gateway,
@@ -244,12 +298,34 @@ def test_telegram_delivery_confirmation():
         lambda gw: gw._forward_to_inbox("hello", "en", "12345"))
 
 
+def test_whatsapp_rail_takes_the_message():
+    _check_rail_takes_the_message(
+        "whatsapp", _load_whatsapp_gateway,
+        lambda gw: gw._forward_to_inbox("hello", "en", "+15551234567",
+                                        origin="+15551234567@s.whatsapp.net"))
+
+
+def test_signal_rail_takes_the_message():
+    _check_rail_takes_the_message(
+        "signal", _load_signal_gateway,
+        lambda gw: gw._forward_to_inbox("hello", "en", "+15551234567"))
+
+
+def test_telegram_rail_takes_the_message():
+    _check_rail_takes_the_message(
+        "telegram", _load_telegram_gateway,
+        lambda gw: gw._forward_to_inbox("hello", "en", "12345"))
+
+
 def main():
     test_await_job_outcomes()
     test_confirm_delivery_runs_callback_on_success_only()
     test_whatsapp_delivery_confirmation()
     test_signal_delivery_confirmation()
     test_telegram_delivery_confirmation()
+    test_whatsapp_rail_takes_the_message()
+    test_signal_rail_takes_the_message()
+    test_telegram_rail_takes_the_message()
     print("\nAll delivery-confirmation checks passed.")
 
 

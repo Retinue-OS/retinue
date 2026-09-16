@@ -181,7 +181,9 @@ docstring). Pieces:
   dropping the title (the bar above names the pane) and Archive (a companion
   is not filed away separately from its chat); `stamp="clock"` matches the
   mirror beside it. A chip is a canned turn the page hands the element
-  (`ask`), exactly as if the user had typed it. The two rails meet in the shared draft — Ara
+  (`ask`), exactly as if the user had typed it — **Propose** being the manual
+  form of what a forwarded arrival now runs by itself, so the pane may already
+  carry Ara's note on a message before the user asks anything. The two rails meet in the shared draft — Ara
   stages a reply, the chat poll adopts it into the composer marked as hers
   — into an empty box, or over the text she was asked to rework, whenever
   nothing unsaved is in it (unsaved keystrokes meet the newer draft at

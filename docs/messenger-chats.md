@@ -1,8 +1,12 @@
 # Messenger chats — a deterministic chat surface with an agent at its side
 
-**Status: design proposal.** Nothing below is implemented yet; this document is
-the target picture and the migration path. It supersedes the "one dashboard
-conversation per inbound message" model for messenger channels.
+**Status: phases 1–4 are built.** The delivery ledger, the chat mirror and its
+page, the composer with the user's own send, and the companion thread that
+stages drafts into it are live — and, with the change that landed this
+document, so is the piece the rest of it was for: **the delivery gate's forward
+path now lands in the chat, not in triage.** Phases 5 and 6 (summaries, forking,
+the polish list) are still the target picture. This supersedes the "one
+dashboard conversation per inbound message" model for messenger channels.
 
 ## Problem
 
@@ -356,6 +360,32 @@ and what a model turn is *for*:
    normal dashboard conversation. The job-status contract (`202` + `job_url`)
    is kept so the gateway's `confirm_delivery` / never-drop machinery works
    unchanged.
+
+   As built, five things are worth naming:
+
+   - **The gateway asks, it does not assume.** It calls the rail
+     synchronously for a forwarded message and reads the answer. A job handle
+     means the chat took it, and nothing is posted to triage. **No** handle —
+     `CHAT_ARRIVAL_TURNS=0`, an unreachable web-gateway, a companion thread
+     that could not be opened — and the gateway forwards to triage exactly as
+     it always has. The switch degrades to the old path, never to a message
+     nothing looks at, and it is reversible without a revert.
+   - **Every arrival is answered, but not every arrival is a turn.** Messages
+     landing while a chat's turn runs are folded into one follow-up turn: a
+     turn reads the chat as it stands, so a second one would re-read the
+     first's messages and the two would fight over the draft. Each arrival
+     still gets its own job handle and the covering turn resolves all of them,
+     so `delivered` is never set for a message no turn saw.
+   - **What the message carried travels with it.** Attachments ride the rail in
+     the `POST /message` shape and are materialized in the retinue container,
+     so a turn opens the photo rather than answering one it never saw.
+   - **One message, one notification.** The arrival's own Web Push already
+     fired, deterministically and at once; the turn's note lands in the
+     companion thread without pushing again.
+   - **`muted` and `archived` are not consulted.** They say where the user
+     wants a chat on their screen; the gate says what a message is worth. The
+     two are independent on purpose, and hiding a chat must not quietly stop
+     its messages being worked.
 5. **Daily drain** — unchanged mechanics; the drained messages are already in
    their chats' mirrors, and the drain turn walks the affected companions
    instead of opening per-message threads.
@@ -456,20 +486,20 @@ chat page is the missing answer to where reactions and quoted replies surface.
 ## Phases
 
 Each phase is independently shippable and useful; all are Tier 3 (gateway
-serving logic, `webapp/`, `scripts/`).
+serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 
-1. **Complete the ledger** (gateways ×3): `kb:chat` + `kb:messageId` on
+1. ✅ **Complete the ledger** (gateways ×3): `kb:chat` + `kb:messageId` on
    inbound; `kb:OutboundMessage` on every successful send; own-device echo
    capture. Pure plumbing, also unblocks #130.
-2. **Read-only chats:** web-gateway chat API (SPARQL + live overlay); Chats
+2. ✅ **Read-only chats:** web-gateway chat API (SPARQL + live overlay); Chats
    card + chat page; `last_read`/unread;
    `POST /internal/chats/inbound` with deterministic Web Push; media proxy.
    Triage still runs as today — the value is *seeing whole conversations at
    last*.
-3. **The composer:** draft store, direct user send (`author: user`), the ✕
+3. ✅ **The composer:** draft store, direct user send (`author: user`), the ✕
    button, voice input. From here the user can answer any message with zero
    model turns.
-4. **The companion:** kind `companion`, the pane, engage-prompt builder,
+4. ✅ **The companion:** kind `companion`, the pane, engage-prompt builder,
    `chat-draft.py`, policy-mapped send, quick-pattern chips; the gate's
    forward path redirected from triage-prompt sessions to companion turns.
    Per-message conversation spam ends here.
@@ -481,10 +511,15 @@ serving logic, `webapp/`, `scripts/`).
 
 ## Open questions
 
-1. **Companion turns for groups.** 1:1 chats keep gate parity (a forwarded
-   message = one warm companion turn). Busy groups would burn turns on chatter;
-   proposal: groups default to notification-only (companion strictly
-   on-demand), revisit per-chat once an `assist` setting exists.
+1. ~~**Companion turns for groups.**~~ **Settled: gate parity, groups
+   included.** Everything the gate forwards gets a companion turn, 1:1 and
+   group alike — the same messages that used to buy a triage session, so the
+   switch costs no more turns than it replaced. What quiets a busy group is
+   what always did: the group's own `quieted` / `ignored` flags, which hold its
+   unknown senders back from a turn entirely. Worth remembering while reading
+   the gate's table — **a group is never whitelisted; only a sender is.** A
+   per-chat `assist` setting (phase 6) can still turn an individual chat down
+   later.
 2. **Draft staging threshold.** "Stage a draft when a reply is plausibly
    wanted" is the companion's judgement; if it over-stages, a per-chat or
    per-sender preference belongs in the summary/style memory, not in code.
