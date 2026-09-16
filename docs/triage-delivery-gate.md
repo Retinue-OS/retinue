@@ -103,7 +103,11 @@ opposite of `ignored` — "in the feed **and** in the triage" — which is exact
 the distinction between a list one only reads and one one also writes to:
 
 - a read-only newsletter → **`news` + `ignored`** (filed to the feed, never a
-  model turn);
+  model turn). On messenger, that still leaves the chat in the dashboard's
+  list: whether a chat is *shown* is a separate flag the user sets there
+  (Hide, on the full chats page — `POST /chats/<id>/flags`), deliberately not
+  implied by anything here. A group can be a news source and still be a chat
+  one reads and answers in, which is what the next line is;
 - a list one both reads and answers on → **`news` + `quieted`** (filed to the
   feed *and* still triaged).
 

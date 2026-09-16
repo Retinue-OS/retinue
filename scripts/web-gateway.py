@@ -107,6 +107,14 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          percent-encoded; the key is split off
                                          at the FIRST colon.
   POST /chats/<id>/read               -> advance the read watermark (body {ts}).
+  POST /chats/<id>/flags              -> set {archived, muted} (either or both,
+                                         booleans). Archived leaves the active
+                                         list; a new message brings it back
+                                         unless it is muted, so hiding a chat
+                                         for good is both together. Independent
+                                         of the triage delivery gate: whether a
+                                         group is a news source, or costs a
+                                         model turn, is that policy's business.
   POST /chats/<id>/draft              -> write the shared draft (body {text,
                                          version}); 409 + current state on a
                                          stale version; empty text clears it.
@@ -4597,6 +4605,7 @@ def _news_preferences_payload() -> dict:
 _CHAT_ID_MAX_LEN = 512
 _CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
 _CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
+_CHAT_FLAGS_RE = re.compile(r"^/chats/([^/]+)/flags/?$")
 _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
 _CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
@@ -5897,6 +5906,10 @@ class Handler(BaseHTTPRequestHandler):
         if chat_read_match:
             self._handle_chat_read(chat_read_match.group(1))
             return
+        chat_flags_match = _CHAT_FLAGS_RE.match(self.path)
+        if chat_flags_match:
+            self._handle_chat_flags(chat_flags_match.group(1))
+            return
         chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
         if chat_draft_undo_match:
             self._handle_chat_draft_undo(chat_draft_undo_match.group(1))
@@ -6348,6 +6361,48 @@ class Handler(BaseHTTPRequestHandler):
         _chats_cache_invalidate()
         self._send_json(200, {"id": chat_id, "last_read": doc["last_read"]})
 
+    def _handle_chat_flags(self, raw_id: str) -> None:
+        """Set one chat's `archived` / `muted` flags (body {archived?, muted?}).
+
+        The two carry the dashboard-conversation semantics verbatim (see
+        chat_state): archived leaves the active list, and a new inbound message
+        brings it back *unless* the chat is muted. So archiving alone is "out
+        of the way until it speaks again", and hiding a chat for good is both
+        together — which is what the dashboard's Hide sends.
+
+        Deliberately independent of the triage delivery gate. Whether a group
+        is a news source, and whether its messages are worth a model turn, is
+        that policy's business (scripts/triage_policy.py); whether the user
+        wants the chat in their list is this one's. A group can be filed to the
+        news feed and still be a chat one reads and answers in, which is the
+        distinction `news` + `quieted` exists to make.
+        """
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        flags: dict[str, bool] = {}
+        for name in ("archived", "muted"):
+            if name not in payload:
+                continue
+            if not isinstance(payload[name], bool):
+                self._send_json(400, {"error": f"{name} must be a boolean"})
+                return
+            flags[name] = payload[name]
+        if not flags:
+            self._send_json(400, {"error": "archived and/or muted (boolean) is required"})
+            return
+        doc = _CHAT_STATE.set_flags(chat_id, **flags)
+        # The list is cached; a hidden chat must leave it now, not on the next
+        # refresh window.
+        _chats_cache_invalidate()
+        self._send_json(200, {"id": chat_id,
+                              "archived": bool(doc.get("archived")),
+                              "muted": bool(doc.get("muted"))})
+
     def _handle_chat_draft(self, raw_id: str) -> None:
         """The user writes the shared draft (body {text, version}).
 
@@ -6682,11 +6737,13 @@ class Handler(BaseHTTPRequestHandler):
         _chats_cache_invalidate()
         pushed = False
         if direction == "in":
-            doc, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
+            _, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
             # A new message in an archived chat would otherwise land invisible;
-            # muted is the explicit "keep it archived" opt-out.
-            if doc.get("archived") and not doc.get("muted"):
-                doc = _CHAT_STATE.set_flags(chat_id, archived=False)
+            # muted is the explicit "keep it archived" opt-out. Decided inside
+            # the state lock (see ChatState.unarchive_unless_muted): the
+            # dashboard can set these flags concurrently now, and deciding
+            # from a snapshot read a moment earlier would undo half of a Hide.
+            doc = _CHAT_STATE.unarchive_unless_muted(chat_id)
             gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else None
             # Held/no-action classes (blacklisted, ignored-group, quieted, …)
             # update the mirror silently — the gate already decided they are

@@ -416,6 +416,25 @@ class ChatStateStore:
                 self._write(doc)
             return doc, had_unread
 
+    def unarchive_unless_muted(self, chat_id: str) -> dict:
+        """Bring an archived chat back for a new message — unless it is muted.
+
+        The check and the write are one operation under the lock because they
+        are one decision. Taken apart, a flag write landing between them is
+        read back stale and half-undone: the dashboard's Hide sets archived
+        AND muted, and an arrival deciding from a snapshot taken before it
+        would clear `archived` while `muted` stayed, putting a chat the user
+        just hid back in the active list. Nothing wrote these flags
+        concurrently with the rail until the dashboard could, which is why the
+        split version stood for as long as it did.
+        """
+        with self._lock:
+            doc = self._read(chat_id)
+            if doc.get("archived") and not doc.get("muted"):
+                doc["archived"] = False
+                self._write(doc)
+            return doc
+
     def set_flags(self, chat_id: str, *, archived: bool | None = None,
                   muted: bool | None = None) -> dict:
         with self._lock:
