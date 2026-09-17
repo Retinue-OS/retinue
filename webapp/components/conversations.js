@@ -66,6 +66,12 @@ class RetinueConversations extends HTMLElement {
     this._composeProject = null;      // project URI the composer is about, if any
     this._composeProjectTitle = '';   // its display title (for the chip)
     this._pushDepth = 0;     // history entries we pushed and have not unwound
+    // Bumped whenever the list is changed from this side — an archive, a
+    // scope switch. A refresh that began before the bump answers with the
+    // list as it was, and rendering that would put an archived thread back
+    // in the list (with its button reading Unarchive when opened) until the
+    // next poll. The epoch is how such an answer is recognised and dropped.
+    this._epoch = 0;
   }
 
   connectedCallback() {
@@ -98,7 +104,7 @@ class RetinueConversations extends HTMLElement {
       this._listening = true;
       this.addEventListener('retinue-back', () => this._openList());
       this.addEventListener('retinue-created', (e) => this._onCreated(e.detail || {}));
-      this.addEventListener('retinue-archived', () => { this._openList(); this.refresh(); });
+      this.addEventListener('retinue-archived', (e) => this._onArchived(e.detail || {}));
       this.addEventListener('retinue-sent', () => this.refresh());
       this.addEventListener('retinue-open', (e) => {
         const id = e.detail && e.detail.id;
@@ -193,10 +199,15 @@ class RetinueConversations extends HTMLElement {
   }
 
   async refresh() {
+    const epoch = this._epoch;
     try {
       const res = await fetch(this._listUrl(), { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
+      // An archive or a scope switch landed while this was on the wire: the
+      // answer predates it. The change already showed itself, and the next
+      // tick fetches the list as it now is.
+      if (epoch !== this._epoch) return;
       this._threads = Array.isArray(data.conversations) ? data.conversations : [];
       // In place: a full render would tear down the open conversation.
       this._partialUpdate();
@@ -250,7 +261,26 @@ class RetinueConversations extends HTMLElement {
     if (this._scope === scope) return;
     this._scope = scope;
     this._threads = [];
+    this._epoch += 1; // a refresh of the old scope in flight must not land here
     this.render();
+    this.refresh();
+  }
+
+  // The open thread was archived or restored. The row leaves (or joins) the
+  // list at once, from what the thread told us, before the list is shown
+  // again: an archived thread is out of the active scope and a restored one
+  // out of the archived scope, and no scope holds both. The refresh then
+  // confirms it — and any refresh that began before the archive answers from
+  // before it, so it is stale by definition and dropped (see _epoch).
+  _onArchived(detail) {
+    const id = detail.id;
+    const archived = !!detail.archived;
+    const scope = this._full ? this._scope : 'active';
+    const leaves = (scope === 'active' && archived) || (scope === 'archived' && !archived);
+    if (id && leaves) this._threads = this._threads.filter((t) => t.id !== id);
+    else if (id) this._threads.forEach((t) => { if (t.id === id) t.archived = archived; });
+    this._epoch += 1;
+    this._openList();
     this.refresh();
   }
 
