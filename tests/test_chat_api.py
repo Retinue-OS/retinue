@@ -35,7 +35,9 @@ direct user-send contract and serving token-gated media). Covers:
   draft clears,
   the watermark advances, and the sent message is returned and visible in the
   merged view before the store knows it (the overlay);
-- honest 502 when the life store is down — no raw fallback.
+- the life store down: the last good list is served for a bounded while
+  (reads made meanwhile still clear badges), then an honest 502 — never a raw
+  fallback.
 
 Standalone (stdlib + the gateway module's own deps):
 
@@ -73,6 +75,9 @@ ACCT_A = "+41791112233"   # the mock gateway's own account
 ACCT_B = "+41764445566"   # a second, unregistered account of the same channel
 # Its own peer, untouched by the other tests' sends and overlay entries.
 MERGE_PEER = "+41791230000"
+# A peer of the store-outage test alone, so its unread count is never read
+# down by another test first (see test_store_down_serves_recent_list).
+STALE_PEER = "+41791239999"
 MID_ATT = "ab" * 16   # recorded as a host-free urn:retinue:media:… (today's shape)
 MID_ATT2 = "cd" * 16  # the blob the mock gateway "stores" for an images send
 MID_ATT3 = "ef" * 16  # a legacy http://<service>/media/<id> record on disk
@@ -138,7 +143,9 @@ class _MockSparql(BaseHTTPRequestHandler):
         if "VALUES (?chat ?account ?cut)" in query:
             bindings = self._unread(query)
         elif "MAX(?ts0)" in query:
-            bindings = self._chat_list()
+            bindings = self._chat_heads()
+        elif "VALUES ?m {" in query:
+            bindings = self._records(query)
         elif "VALUES ?att" in query:
             bindings = self._media_meta(query)
         else:
@@ -158,6 +165,11 @@ class _MockSparql(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    # The canned chat list: one row per chat with its latest message, in the
+    # flat shape the tests author (and override via STATE["list_rows"]). The
+    # gateway reads the list in two queries — the head message per chat, then
+    # the heads' records as (m, p, o) rows — so both are derived from here:
+    # row i heads the mock message IRI urn:mock:head:<i>.
     def _chat_list(self):
         if STATE.get("list_rows") is not None:
             return STATE["list_rows"]
@@ -168,6 +180,43 @@ class _MockSparql(BaseHTTPRequestHandler):
             _lit_row(chat=WA_KEY, channel="whatsapp", ts=W_TS, type=T_IN,
                      text="Letzter Aufruf", sender="4176", atts=""),
         ]
+
+    @staticmethod
+    def _head_iri(index):
+        return f"urn:mock:head:{index}"
+
+    def _chat_heads(self):
+        return [_lit_row(m=self._head_iri(i), chat=row["chat"]["value"],
+                         account=(row.get("account") or {"value": ""})["value"],
+                         ts=row["ts"]["value"])
+                for i, row in enumerate(self._chat_list())]
+
+    def _records(self, query):
+        """The (m, p, o) rows of the asked-for head messages, from the flat
+        canned rows — one attachment row per URL, as the ledger holds them."""
+        import re
+        asked = set(re.findall(r"<([^>]+)>", query.split("VALUES ?m {", 1)[1].split("}", 1)[0]))
+        rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+        flat = {"channel": KB + "channel", "text": KB + "text",
+                "sender": KB + "sender", "author": KB + "author",
+                "mid": KB + "messageId", "type": rdf_type}
+        out = []
+        for i, row in enumerate(self._chat_list()):
+            m = self._head_iri(i)
+            if m not in asked:
+                continue
+            for key, predicate in flat.items():
+                if key in row:
+                    out.append(_lit_row(m=m, p=predicate, o=row[key]["value"]))
+            ts_pred = KB + ("sentAt" if row.get("type", {}).get("value") == T_OUT
+                            else "receivedAt")
+            out.append(_lit_row(m=m, p=ts_pred, o=row["ts"]["value"]))
+            if (row.get("account") or {}).get("value"):
+                out.append(_lit_row(m=m, p=KB + "account", o=row["account"]["value"]))
+            for url in (row.get("atts") or {"value": ""})["value"].split(" "):
+                if url:
+                    out.append(_lit_row(m=m, p=KB + "attachment", o=url))
+        return out
 
     def _media_meta(self, query):
         # What the gateways stated about their blobs, on the media IRIs: the
@@ -189,7 +238,8 @@ class _MockSparql(BaseHTTPRequestHandler):
         rows = re.findall(
             r'\("((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"\s+"([^"]+)"\^\^', query)
         counts = {(MARA, ""): "2", (WA_KEY, ""): "1",
-                  (MERGE_PEER, ACCT_A): "2", (MERGE_PEER, ACCT_B): "1"}
+                  (MERGE_PEER, ACCT_A): "2", (MERGE_PEER, ACCT_B): "1",
+                  (STALE_PEER, ""): "3"}
         return [_lit_row(chat=key, account=acct, n=counts[(key, acct)])
                 for key, acct, cut in rows
                 if (key, acct) in counts and cut.startswith("1970-")]
@@ -505,9 +555,10 @@ def test_chat_list_contract(base, wg):
 def test_chat_list_shows_media_preview(base, wg):
     """A picture-only last message previews as an image in the chat list.
 
-    Pins the list query's STR(?att) (see _MockSparql.do_POST): with the
-    aggregate unbound the preview reads as empty text, which is how every
-    chat with a last picture looked."""
+    The head message's attachments reach the skeleton as one records row each
+    (see _MockSparql._records) — when the list still read them through a
+    GROUP_CONCAT over IRIs, the aggregate came back unbound and every chat
+    with a last picture previewed as empty text."""
     STATE["list_rows"] = [
         _lit_row(chat=MARA, channel="signal", ts=TS3, type=T_IN, text="",
                  sender=MARA, atts=f"urn:retinue:media:signal:{MID_ATT}"),
@@ -1454,15 +1505,144 @@ def test_hide_races_an_arrival(base, wg):
     print("PASS test_hide_races_an_arrival")
 
 
+def test_store_down_serves_recent_list(base, wg):
+    """A store that cannot answer a rebuild does not blank the phone: the last
+    good skeleton is served while it is recent. Expiry (what every rail event,
+    read and send does) keeps it as the fallback; the fallback then counts as
+    fresh for one cache window, so the polls behind it do not each wait out a
+    store timeout; a read made meanwhile still clears the badge; and only age
+    beyond CHAT_LIST_STALE_SECONDS makes the failure a 502 again."""
+    STATE["list_rows"] = [
+        _lit_row(chat=STALE_PEER, channel="signal", ts=TS3, type=T_IN,
+                 text="noch ungelesen", sender=STALE_PEER, atts=""),
+    ]
+    chat_id = "signal:" + STALE_PEER
+    wg._chats_cache_clear()
+    try:
+        status, before = _http(base, "GET", "/chats")
+        assert status == 200, before
+        assert next(c for c in before["chats"] if c["id"] == chat_id)["unread"] == 3
+        wg._chats_cache_invalidate()
+        STATE["fail"] = True
+        wg.CHAT_LIST_CACHE_SECONDS = 30.0
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert [c["id"] for c in body["chats"]] == [c["id"] for c in before["chats"]]
+        assert next(c for c in body["chats"] if c["id"] == chat_id)["unread"] == 3
+        # The polls behind it reuse the fallback: nothing reaches the store.
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200 and len(STATE["queries"]) == seen
+        # A read while the store is down still clears the badge.
+        status, _ = _http(base, "POST", "/chats/" + _quote(chat_id) + "/read",
+                          {"ts": TS3})
+        assert status == 200
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert next(c for c in body["chats"] if c["id"] == chat_id)["unread"] == 0
+        # Too old to be honest: the same failure is a 502 again.
+        wg._chats_cache_invalidate()
+        wg._chats_cache["built"] -= wg.CHAT_LIST_STALE_SECONDS + 1
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and "life store" in body["error"]
+    finally:
+        STATE["fail"] = False
+        STATE["list_rows"] = None
+        wg.CHAT_LIST_CACHE_SECONDS = 0.0
+        wg._chats_cache_clear()
+    print("PASS test_store_down_serves_recent_list")
+
+
+def test_write_during_rebuild_is_not_lost(base, wg):
+    """A write that expires the cache while a rebuild is querying the store is
+    not in that rebuild's result — so the result is published already expired
+    (kept as the fallback, rebuilt on the next poll) rather than served as
+    fresh for a whole window."""
+    fetch = wg._fetch_chats_skeleton
+
+    def fetch_and_race(deadline=None):
+        skeleton = fetch(deadline)
+        wg._chats_cache_invalidate()  # a rail event landing mid-flight
+        return skeleton
+
+    wg.CHAT_LIST_CACHE_SECONDS = 30.0
+    wg._fetch_chats_skeleton = fetch_and_race
+    try:
+        wg._chats_cache_clear()
+        wg._chats_skeleton_and_unread()
+        assert wg._chats_cache["skeleton"] is not None
+        assert wg._chats_cache["at"] == 0.0, "raced result published as fresh"
+        wg._fetch_chats_skeleton = fetch
+        wg._chats_skeleton_and_unread()
+        assert wg._chats_cache["at"] > 0.0
+    finally:
+        wg._fetch_chats_skeleton = fetch
+        wg.CHAT_LIST_CACHE_SECONDS = 0.0
+        wg._chats_cache_clear()
+    print("PASS test_write_during_rebuild_is_not_lost")
+
+
+def test_empty_store_is_an_empty_list(base, wg):
+    """No messages at all is an empty list, not an error: the heads query
+    returns nothing and no records query is sent (an empty VALUES block is
+    not a query)."""
+    STATE["list_rows"] = []
+    wg._chats_cache_clear()
+    try:
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert not any("VALUES ?m {" in q for q in STATE["queries"][seen:])
+        # Every chat left comes from the overlay, none from the store.
+        assert all(c["last"]["ts"] for c in body["chats"])
+    finally:
+        STATE["list_rows"] = None
+        wg._chats_cache_clear()
+    print("PASS test_empty_store_is_an_empty_list")
+
+
+def test_rebuild_deadline_bounds_a_stalling_store(base, wg):
+    """One rebuild works to a total deadline across its round trips: once it
+    has passed, no further store call is made and the fallback is served.
+    (The store here is fine — the budget is set to zero, so the very first
+    call is already over the deadline.)"""
+    status, before = _http(base, "GET", "/chats")
+    assert status == 200, before
+    wg._chats_cache_invalidate()
+    wg.CHAT_LIST_REBUILD_TIMEOUT = 0.0
+    try:
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert len(STATE["queries"]) == seen, "deadline passed but the store was queried"
+        assert [c["id"] for c in body["chats"]] == [c["id"] for c in before["chats"]]
+    finally:
+        wg.CHAT_LIST_REBUILD_TIMEOUT = 20.0
+        wg._chats_cache_clear()
+    print("PASS test_rebuild_deadline_bounds_a_stalling_store")
+
+
 def test_store_down_is_502(base, wg):
+    """With nothing cached to fall back on, a store failure is an honest 502 —
+    and the requests that follow within CHAT_LIST_FAILURE_BACKOFF share that
+    verdict without asking the store again; past it, the store is retried."""
+    wg._chats_cache_clear()
     STATE["fail"] = True
     try:
         status, body = _http(base, "GET", "/chats")
         assert status == 502 and "life store" in body["error"]
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and "not retried" in body["detail"], body
+        assert len(STATE["queries"]) == seen, "store asked again inside the backoff"
+        wg._chats_cache["failed_at"] -= wg.CHAT_LIST_FAILURE_BACKOFF + 1
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and len(STATE["queries"]) > seen, body
         status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
         assert status == 502
     finally:
         STATE["fail"] = False
+        wg._chats_cache_clear()
     print("PASS test_store_down_is_502")
 
 
@@ -1580,6 +1760,10 @@ def main():
         test_arrival_starts_a_companion_turn(base, wg)
         test_hide_flags(base, wg)
         test_hide_races_an_arrival(base, wg)
+        test_store_down_serves_recent_list(base, wg)
+        test_write_during_rebuild_is_not_lost(base, wg)
+        test_empty_store_is_an_empty_list(base, wg)
+        test_rebuild_deadline_bounds_a_stalling_store(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()

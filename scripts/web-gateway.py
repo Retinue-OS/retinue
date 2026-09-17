@@ -1029,8 +1029,27 @@ CHATS_INGEST_TOKEN = os.environ.get("CHATS_INGEST_TOKEN", "").strip()
 CHAT_PAGE_MESSAGES = int(os.environ.get("CHAT_PAGE_MESSAGES", "200"))
 # How long the SPARQL-derived chat-list skeleton is reused between polls; state
 # and overlay are applied fresh on every request, and any write that changes
-# the skeleton's truth (a rail event, a read, a send) invalidates it early.
-CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "3"))
+# the skeleton's truth (a rail event, a read, a send) expires it early. The
+# window can be generous because those events cover every change the dashboard
+# must show at once, and the overlay (CHAT_OVERLAY_TTL_SECONDS) bridges the
+# store's indexing lag; it only bounds how long a change nobody announced
+# (a ledger backfill, a re-index) takes to appear. The 4 s dashboard poll used
+# to rebuild on nearly every tick with the old 3 s default.
+CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "30"))
+# How old an expired skeleton may be and still be served when the store cannot
+# answer a rebuild: a list from a few minutes ago beats a 502 on the phone.
+# Beyond this the 502 is honest — the view would be fiction.
+CHAT_LIST_STALE_SECONDS = float(os.environ.get("CHAT_LIST_STALE_SECONDS", "600"))
+# The whole of one list rebuild — heads, records, unread counts, several
+# store round trips — shares this budget, so a store that accepts requests
+# and then stalls holds a handler for at most this long before the fallback
+# is served, whatever QLEVER_TIMEOUT allows a single query.
+CHAT_LIST_REBUILD_TIMEOUT = float(os.environ.get("CHAT_LIST_REBUILD_TIMEOUT", "20"))
+# After a rebuild failed with nothing to fall back on (an outage at startup,
+# or past the stale window), the store is not asked again for this long: the
+# requests queued behind that attempt and the polls of the next few seconds
+# share its verdict instead of each waiting out the budget.
+CHAT_LIST_FAILURE_BACKOFF = float(os.environ.get("CHAT_LIST_FAILURE_BACKOFF", "10"))
 # Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
 CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
 # How many images one chat send may carry; each is size-capped by
@@ -1220,7 +1239,11 @@ def _shell_hash() -> str:
 # indexed as triples by the qlever-dir Markdown converter, and the card is just
 # a query result over it.
 QLEVER_LIFE_URL = os.environ.get("QLEVER_LIFE_URL", "http://qlever-life:7001").rstrip("/")
-QLEVER_TIMEOUT = float(os.environ.get("QLEVER_TIMEOUT", "8"))
+# QLever's planner, not its executor, is what runs long here (see the chat
+# queries below): on a loaded host a query that executes in milliseconds can
+# spend seconds being planned, so the timeout is a net for a stuck store, not
+# a budget for a normal query.
+QLEVER_TIMEOUT = float(os.environ.get("QLEVER_TIMEOUT", "20"))
 # qlever-dir synthesizes each file's named graph as <BASE_URI + path relative
 # to the chambers root> (BASE_URI is "file:" in docker-compose.yml). Inverting
 # that mapping is how a project URI resolves back to its editable source file.
@@ -4497,9 +4520,10 @@ def _humanize_slug(uri: str) -> str:
     return " ".join(w.capitalize() for w in tail.replace("_", "-").split("-") if w)
 
 
-def _sparql_bindings(query: str) -> list[dict]:
+def _sparql_bindings(query: str, timeout: float | None = None) -> list[dict]:
     """POST a SPARQL query to the life store and return its result bindings.
-    Raises on any transport/parse error so callers can surface an honest 502."""
+    Raises on any transport/parse error so callers can surface an honest 502.
+    `timeout` overrides QLEVER_TIMEOUT for a caller working to a deadline."""
     data = urllib.parse.urlencode({"query": query}).encode("utf-8")
     req = urllib.request.Request(
         QLEVER_LIFE_URL,
@@ -4510,7 +4534,8 @@ def _sparql_bindings(query: str) -> list[dict]:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=QLEVER_TIMEOUT) as resp:
+    with urllib.request.urlopen(
+            req, timeout=QLEVER_TIMEOUT if timeout is None else timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload.get("results", {}).get("bindings", [])
 
@@ -4766,11 +4791,28 @@ def _sparql_datetime(iso: str) -> str:
     return f'"{iso}"^^<http://www.w3.org/2001/XMLSchema#dateTime>'
 
 
-# One row per chat: the per-chat MAX(ts) subquery joins back (on the shared
-# ?chat/?account/?ts variables) to the message that carries it, so the list
-# skeleton — every chat with its latest message — is one query, not a per-chat
-# fan-out. COALESCE-by-UNION: inbound rows carry receivedAt, outbound rows
-# sentAt, and either is the message's timeline instant.
+# The chat list is two lean queries, not one wide one, because of how QLever
+# spends its time. The single query this replaced — the MAX(ts) subquery joined
+# to the head message with its five OPTIONAL properties and an attachment
+# GROUP_CONCAT — executed in about a millisecond and took 6–9 s to PLAN
+# (`time_query_planning` in the runtime information, measured on the live store
+# with 738 messages), which is over QLEVER_TIMEOUT on a loaded host and the
+# "message store unreachable" the dashboard showed. Planning cost grows with
+# the number of patterns joined in one group, and a subquery joined to a chain
+# of OPTIONALs is the worst shape; it does not shrink with the data. So:
+#
+# 1. _CHATS_HEADS_SPARQL — which message heads each chat. The per-chat MAX(ts)
+#    subquery joins back (on the shared ?chat/?account/?ts) to the message
+#    carrying it, and nothing else: four patterns around the subquery, ~0.3 s
+#    of planning where the wide query took 6 s. COALESCE-by-UNION: inbound rows
+#    carry receivedAt, outbound rows sentAt, and either is the message's
+#    timeline instant.
+# 2. _CHAT_RECORDS_SPARQL — everything the store says about those messages,
+#    as (message, predicate, object) rows from ONE triple pattern bounded by
+#    VALUES. Planning is trivial, execution is an index scan per subject, and
+#    the rows are folded into per-message records here. Attachments arrive as
+#    one row each, so the GROUP_CONCAT-over-IRIs quirk (docs/triple-stores.md)
+#    no longer applies to this path.
 #
 # A chat is (chat key, account), not the key alone: one channel's message volume
 # is shared by every account on it, and a key identifies a peer only within an
@@ -4782,34 +4824,76 @@ def _sparql_datetime(iso: str) -> str:
 # their own rather than letting them join every account's. The subquery may BIND
 # ?account because nothing binds it there yet; the outer pattern must FILTER on
 # it instead, since binding an in-scope variable is a SPARQL error.
-#
-# Attachments are IRI objects (urn:retinue:media:…), and the life store's
-# GROUP_CONCAT leaves its result UNBOUND — not empty — when the values are
-# IRIs rather than literals (verified against the live QLever; see
-# docs/triple-stores.md). STR() makes them literals first. Without it no
-# message on any channel ever carried an attachment, silently: an absent
-# cell reads exactly like a message without media.
-_CHATS_LIST_SPARQL = """
+_CHATS_HEADS_SPARQL = """
 PREFIX k: <%s>
-PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-SELECT ?chat ?account ?channel ?ts ?type ?text ?sender ?author ?mid
-       (GROUP_CONCAT(STR(?att); separator=" ") AS ?atts) WHERE {
+SELECT ?m ?chat ?account ?ts WHERE {
   { SELECT ?chat ?account (MAX(?ts0) AS ?ts) WHERE {
       ?m0 k:chat ?chat .
       { ?m0 k:receivedAt ?ts0 } UNION { ?m0 k:sentAt ?ts0 }
       OPTIONAL { ?m0 k:account ?acc0 }
       BIND(COALESCE(?acc0, "") AS ?account)
     } GROUP BY ?chat ?account }
-  ?m k:chat ?chat ; k:channel ?channel ; k:text ?text ; rdf:type ?type .
+  ?m k:chat ?chat .
   { ?m k:receivedAt ?ts } UNION { ?m k:sentAt ?ts }
   OPTIONAL { ?m k:account ?acc1 }
   FILTER(COALESCE(?acc1, "") = ?account)
-  OPTIONAL { ?m k:sender ?sender }
-  OPTIONAL { ?m k:author ?author }
-  OPTIONAL { ?m k:messageId ?mid }
-  OPTIONAL { ?m k:attachment ?att }
-} GROUP BY ?chat ?account ?channel ?ts ?type ?text ?sender ?author ?mid
+}
 """ % _KB
+
+_CHAT_RECORDS_SPARQL = """
+SELECT ?m ?p ?o WHERE {
+  VALUES ?m { %s }
+  ?m ?p ?o
+}
+"""
+# How many message IRIs one records query carries; the chat list is well under
+# this today, and a longer list simply takes a few round trips.
+_CHAT_RECORDS_CHUNK = 200
+
+# The ledger predicates the skeleton reads back from a message's records
+# (inbound_store writes them; the names are its P_* constants).
+_P_CHANNEL = _KB + "channel"
+_P_TEXT = _KB + "text"
+_P_SENDER = _KB + "sender"
+_P_AUTHOR = _KB + "author"
+_P_MESSAGE_ID = _KB + "messageId"
+_P_ATTACHMENT = _KB + "attachment"
+_P_RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+
+
+def _budget_left(deadline: float | None) -> float:
+    """The timeout for the next store call of a rebuild working to `deadline`
+    (None: the plain per-query timeout). Raises once the deadline has passed,
+    so a stalled store costs the budget once, not once per round trip."""
+    if deadline is None:
+        return QLEVER_TIMEOUT
+    left = deadline - time.time()
+    if left <= 0:
+        raise TimeoutError("chat list rebuild deadline passed")
+    return min(left, QLEVER_TIMEOUT)
+
+
+def _fetch_chat_records(iris: list[str], deadline: float | None = None) -> dict[str, dict]:
+    """``{message IRI: {predicate: [objects…]}}`` for the given messages.
+
+    One VALUES-bounded pattern per chunk (see _CHAT_RECORDS_SPARQL) — none at
+    all for no messages, since an empty VALUES block is not a query; every
+    object the store holds is kept as a list, since a message may carry several
+    attachments. Raises on store errors like the query it serves."""
+    records: dict[str, dict] = {iri: {} for iri in iris}
+    for start in range(0, len(iris), _CHAT_RECORDS_CHUNK):
+        chunk = iris[start:start + _CHAT_RECORDS_CHUNK]
+        query = _CHAT_RECORDS_SPARQL % " ".join(f"<{iri}>" for iri in chunk)
+        for b in _sparql_bindings(query, timeout=_budget_left(deadline)):
+            m, p, o = _bval(b, "m"), _bval(b, "p"), _bval(b, "o")
+            if m in records and p and o is not None:
+                records[m].setdefault(p, []).append(o)
+    return records
+
+
+def _record_value(record: dict, predicate: str) -> str | None:
+    values = record.get(predicate)
+    return values[0] if values else None
 
 # Unread = COUNT of inbound above each chat's own read watermark. The per-chat
 # cutoffs are injected as a VALUES table, so one bounded query returns one
@@ -5067,18 +5151,134 @@ def _chat_display_name(doc: dict, channel: str, key: str) -> str:
 
 # The SPARQL-derived skeleton (chat list + unread counts) reused between
 # dashboard polls; state and overlay are merged fresh on every request. Any
-# write that changes the skeleton's truth invalidates it early.
+# write that changes the skeleton's truth expires it early — expires, not
+# drops: the last good skeleton stays as the fallback for a rebuild the store
+# cannot answer (see _chats_skeleton_and_unread). `at` is the instant its
+# freshness counts from (zeroed to expire), `built` when it was computed, and
+# `gen` counts expiries, so a rebuild that was in flight when a write landed
+# can tell that its result predates the write.
 _chats_cache_lock = threading.Lock()
-_chats_cache: dict = {"at": 0.0, "skeleton": None, "unread": None}
+_chats_cache: dict = {"at": 0.0, "built": 0.0, "gen": 0, "skeleton": None,
+                      "unread": None,
+                      # The last rebuild that failed with nothing to serve, and
+                      # when — shared with the requests that follow within
+                      # CHAT_LIST_FAILURE_BACKOFF; cleared by a success.
+                      "failure": None, "failed_at": 0.0}
+# Rebuilds are single-flight: with several dashboards polling, concurrent
+# requests that all miss the cache wait for the one rebuild in progress rather
+# than each sending the store the same queries.
+_chats_rebuild_lock = threading.Lock()
 
 
 def _chats_cache_invalidate() -> None:
     with _chats_cache_lock:
-        _chats_cache["skeleton"] = None
-        _chats_cache["unread"] = None
+        _chats_cache["at"] = 0.0
+        _chats_cache["gen"] += 1
 
 
-def _fetch_chats_skeleton() -> dict[str, dict]:
+def _chats_cache_clear() -> None:
+    """Drop the skeleton entirely, fallback included (the tests' reset)."""
+    with _chats_cache_lock:
+        _chats_cache.update({"at": 0.0, "built": 0.0, "skeleton": None,
+                             "unread": None, "failure": None, "failed_at": 0.0})
+        _chats_cache["gen"] += 1
+
+
+def _chats_cached(now: float) -> tuple[dict | None, dict | None]:
+    """The skeleton and unread counts if still fresh, else (None, None)."""
+    with _chats_cache_lock:
+        if (_chats_cache["skeleton"] is not None
+                and now - _chats_cache["at"] <= CHAT_LIST_CACHE_SECONDS):
+            return dict(_chats_cache["skeleton"]), dict(_chats_cache["unread"])
+    return None, None
+
+
+def _unread_after_reads(skeleton: dict, unread: dict) -> dict:
+    """The store's last unread counts, corrected by the read watermarks written
+    since: a chat read up to (or past) its head message has nothing unread the
+    store could know of, whatever it counted before the read. The other counts
+    stand — the store's answer is the best there is without the store."""
+    docs = _CHAT_STATE.all()
+    corrected = {}
+    for cid, n in unread.items():
+        row = skeleton.get(cid)
+        last_read = (docs.get(cid) or {}).get("last_read") or ""
+        corrected[cid] = 0 if row is not None and last_read >= row["ts"] else n
+    return corrected
+
+
+def _chats_skeleton_and_unread() -> tuple[dict, dict]:
+    """The cached skeleton, rebuilt when expired; the last good one when the
+    rebuild fails and it is not older than CHAT_LIST_STALE_SECONDS. Raises
+    only when there is nothing honest to serve — and, for
+    CHAT_LIST_FAILURE_BACKOFF after such a failure, raises it again without
+    asking the store, so an outage costs one attempt per backoff, not one
+    per poll."""
+    skeleton, unread = _chats_cached(time.time())
+    if skeleton is not None:
+        return skeleton, unread
+    with _chats_rebuild_lock:
+        # Another request may have rebuilt while this one waited for the lock.
+        now = time.time()
+        skeleton, unread = _chats_cached(now)
+        if skeleton is not None:
+            return skeleton, unread
+        with _chats_cache_lock:
+            gen = _chats_cache["gen"]
+            failure = _chats_cache["failure"]
+            if failure and now - _chats_cache["failed_at"] < CHAT_LIST_FAILURE_BACKOFF:
+                # The requests queued behind the attempt that failed, and the
+                # polls of the next few seconds, share its verdict. Nothing
+                # to fall back on existed then, and nothing has appeared
+                # since — only a rebuild creates a skeleton.
+                raise RuntimeError(
+                    f"{failure} (not retried for {CHAT_LIST_FAILURE_BACKOFF:g}s "
+                    f"after a failed rebuild)")
+        deadline = now + CHAT_LIST_REBUILD_TIMEOUT
+        try:
+            skeleton = _fetch_chats_skeleton(deadline)
+            docs_for_cutoffs = _CHAT_STATE.all()
+            unread = _fetch_unread_counts({
+                cid: (docs_for_cutoffs.get(cid) or {}).get("last_read")
+                for cid in skeleton
+            }, deadline)
+        except Exception as exc:  # noqa: BLE001 - a stale list beats no list
+            now = time.time()
+            with _chats_cache_lock:
+                stale = _chats_cache["skeleton"]
+                age = now - _chats_cache["built"]
+                if stale is None or age > CHAT_LIST_STALE_SECONDS:
+                    _chats_cache["failure"] = str(exc) or exc.__class__.__name__
+                    _chats_cache["failed_at"] = now
+                    raise
+                stale_unread = _chats_cache["unread"]
+            unread = _unread_after_reads(stale, stale_unread)
+            with _chats_cache_lock:
+                # The fallback counts as fresh for one cache window, so the
+                # polls behind this one reuse it instead of each waiting out
+                # QLEVER_TIMEOUT against a store that just failed; the next
+                # window retries. A write that landed meanwhile keeps it
+                # expired — that retry is owed.
+                if _chats_cache["gen"] == gen:
+                    _chats_cache["at"] = now
+                _chats_cache["unread"] = dict(unread)
+            print(f"[web-gateway] chat list rebuild failed ({exc}); serving "
+                  f"the skeleton built {age:.0f}s ago", flush=True)
+            return dict(stale), unread
+        now = time.time()
+        with _chats_cache_lock:
+            # A write that expired the cache while the store was answering is
+            # not in this result. It is still the newest skeleton — kept as
+            # the fallback — but published expired, so the next poll rebuilds
+            # rather than serving the pre-write list for a whole window.
+            raced = _chats_cache["gen"] != gen
+            _chats_cache.update({"at": 0.0 if raced else now, "built": now,
+                                 "skeleton": dict(skeleton), "unread": dict(unread),
+                                 "failure": None})
+        return skeleton, unread
+
+
+def _fetch_chats_skeleton(deadline: float | None = None) -> dict[str, dict]:
     """One entry per chat from the ledgers: channel + its latest message row.
 
     Keyed by the composed chat id, so two accounts talking to the same peer are
@@ -5086,35 +5286,40 @@ def _fetch_chats_skeleton() -> dict[str, dict]:
     ``kb:account`` at all — history from before the predicate — and composes to
     the plain ``<channel>:<key>`` id it has always had, which is why nothing
     that already exists moves, is renamed, or loses its state document."""
+    heads: list[tuple] = []
+    for b in _sparql_bindings(_CHATS_HEADS_SPARQL, timeout=_budget_left(deadline)):
+        m, key, ts = _bval(b, "m"), _bval(b, "chat"), _bval(b, "ts")
+        if m and key and ts:
+            heads.append((m, key, _bval(b, "account") or None, ts))
+    records = _fetch_chat_records(sorted({m for m, _k, _a, _t in heads}), deadline)
     skeleton: dict[str, dict] = {}
-    for b in _sparql_bindings(_CHATS_LIST_SPARQL):
-        key = _bval(b, "chat")
-        channel = _bval(b, "channel")
-        ts = _bval(b, "ts")
-        if not key or not channel or not ts:
+    for m, key, account, ts in heads:
+        record = records.get(m) or {}
+        channel = _record_value(record, _P_CHANNEL)
+        if not channel:
             continue
-        account = _bval(b, "account") or None
         chat_id = chat_state_mod.make_chat_id(channel, key, account)
         # Two messages can share the max timestamp; keep the first row.
         if chat_id in skeleton:
             continue
-        atts = [u for u in (_bval(b, "atts") or "").split(" ") if u]
         skeleton[chat_id] = {
             "channel": channel,
             "key": key,
             "account": account,
             "ts": ts,
-            "direction": "out" if _bval(b, "type") == _T_CHAT_OUTBOUND else "in",
-            "text": _bval(b, "text") or "",
-            "sender": _bval(b, "sender"),
-            "author": _bval(b, "author"),
-            "mid": _bval(b, "mid"),
-            "attachments": atts,
+            "direction": ("out" if _T_CHAT_OUTBOUND in record.get(_P_RDF_TYPE, [])
+                          else "in"),
+            "text": _record_value(record, _P_TEXT) or "",
+            "sender": _record_value(record, _P_SENDER),
+            "author": _record_value(record, _P_AUTHOR),
+            "mid": _record_value(record, _P_MESSAGE_ID),
+            "attachments": list(record.get(_P_ATTACHMENT, [])),
         }
     return skeleton
 
 
-def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
+def _fetch_unread_counts(cutoffs: dict[str, str | None],
+                         deadline: float | None = None) -> dict[str, int]:
     """Per-chat unread counts in one VALUES-bounded query (see the SPARQL).
 
     The VALUES row is (chat key, account, cutoff) and results map back on the
@@ -5138,7 +5343,8 @@ def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
     )
     counts: dict[str, int] = {}
     by_pair = {(key, account): cid for cid, (key, account, _c) in refs.items()}
-    for b in _sparql_bindings(_CHATS_UNREAD_SPARQL % rows):
+    for b in _sparql_bindings(_CHATS_UNREAD_SPARQL % rows,
+                              timeout=_budget_left(deadline)):
         pair = (_bval(b, "chat"), _bval(b, "account") or "")
         n = _bval(b, "n")
         if pair in by_pair and n is not None:
@@ -5152,24 +5358,10 @@ def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
 def _chats_payload() -> dict:
     """The GET /chats body: store skeleton ∪ overlay, merged with chat state.
 
-    Raises on a store transport/parse error so the caller can answer an honest
-    502 — the overlay alone is seconds of traffic, not a view worth faking."""
-    now = time.time()
-    with _chats_cache_lock:
-        cached = (_chats_cache["skeleton"] is not None
-                  and now - _chats_cache["at"] <= CHAT_LIST_CACHE_SECONDS)
-        skeleton = dict(_chats_cache["skeleton"]) if cached else None
-        unread = dict(_chats_cache["unread"]) if cached else None
-    if skeleton is None:
-        skeleton = _fetch_chats_skeleton()
-        docs_for_cutoffs = _CHAT_STATE.all()
-        unread = _fetch_unread_counts({
-            cid: (docs_for_cutoffs.get(cid) or {}).get("last_read")
-            for cid in skeleton
-        })
-        with _chats_cache_lock:
-            _chats_cache.update({"at": now, "skeleton": dict(skeleton),
-                                 "unread": dict(unread)})
+    Raises on a store transport/parse error with no recent skeleton to fall
+    back on, so the caller can answer an honest 502 — the overlay alone is
+    seconds of traffic, not a view worth faking."""
+    skeleton, unread = _chats_skeleton_and_unread()
     docs = _CHAT_STATE.all()
 
     # Overlay: entries newer than the store's view update each chat's preview
