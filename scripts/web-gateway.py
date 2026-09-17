@@ -204,6 +204,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
 import claude_auth
@@ -3121,8 +3122,77 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
 # of the empty message box a messenger-shaped renderer leaves behind.
 
 
+def _display_tz():
+    """The zone every event time is rendered in: RETINUE_DISPLAY_TZ, TZ, or UTC.
+
+    The container runs on UTC, so `astimezone()` with no argument would render
+    the user's calendar two hours off for half the year. A deployment whose
+    owner does not live in UTC sets RETINUE_DISPLAY_TZ, which the compose file
+    passes into this service; TZ is read only for a deployment that passes that
+    one through itself, since the service takes no env_file. An unknown name
+    falls back to UTC rather than taking the whole approval page down.
+    """
+    name = (os.environ.get("RETINUE_DISPLAY_TZ") or os.environ.get("TZ") or "").strip()
+    if not name:
+        return timezone.utc
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return timezone.utc
+
+
+def _parse_iso_moment(value: str):
+    """An ISO 8601 date-time as a datetime in the display zone, or None.
+
+    An offset-carrying value is *converted*, not truncated — 16:00+00:00 and
+    16:00+02:00 are two different moments and must not render alike. A naive
+    value carries no offset to convert from and is taken as already local,
+    which is the convention caldav-push.py's callers type in.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return moment.astimezone(_display_tz()) if moment.tzinfo is not None else moment
+
+
+def _as_display_moment(value: str):
+    """Like _parse_iso_moment, but always aware: a naive value is *localized*
+    to the display zone rather than left as a bare wall clock.
+
+    Comparing wall clocks loses exactly what the conversion just established.
+    Around a DST fold two moments 45 minutes apart can read as running
+    backwards (02:30+02:00 then 02:15+01:00), and a naive pending time and a
+    stored offset-carrying one are only comparable once both name the same
+    zone. An ambiguous local time inside a fold still resolves to the first
+    pass, which is all a value with no offset can say.
+    """
+    moment = _parse_iso_moment(value)
+    if moment is None:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=_display_tz())
+
+
+def _event_instant(value: str):
+    """One moment on the absolute timeline, for ordering and overlap.
+
+    Python compares two aware datetimes that share a tzinfo *object* by their
+    wall clocks, skipping the conversion entirely — and the display zone gives
+    every parsed moment the same one. Across the autumn fold 02:15 CET would
+    then count as earlier than 02:30 CEST although it comes 45 minutes later,
+    which is the very information the conversion established. Normalising to
+    UTC is what keeps the ordering; rendering reads the display zone instead.
+    """
+    moment = _as_display_moment(value)
+    return None if moment is None else moment.astimezone(timezone.utc)
+
+
 def _format_iso_moment(value: str, *, all_day: bool) -> str:
-    """Human rendering of an ISO 8601 date or date-time.
+    """Human rendering of an ISO 8601 date or date-time, in the display zone.
 
     Returns the raw string unchanged when it does not parse — an approval card
     showing an odd-looking timestamp is still better than one showing nothing.
@@ -3130,14 +3200,19 @@ def _format_iso_moment(value: str, *, all_day: bool) -> str:
     raw = (value or "").strip()
     if not raw:
         return ""
-    text = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-    try:
-        if all_day or len(text) == 10:
-            return datetime.fromisoformat(text[:10]).strftime("%a %d %b %Y")
-        moment = datetime.fromisoformat(text)
-    except ValueError:
+    if all_day or len(raw) == 10:
+        try:
+            return datetime.fromisoformat(raw[:10]).strftime("%a %d %b %Y")
+        except ValueError:
+            return raw
+    moment = _parse_iso_moment(raw)
+    if moment is None:
         return raw
-    return moment.strftime("%a %d %b %Y, %H:%M")
+    rendered = moment.strftime("%a %d %b %Y, %H:%M")
+    # The zone name is what tells a mis-zoned event from a correct one at a
+    # glance; a naive value has none to name.
+    zone = moment.strftime("%Z") if moment.tzinfo is not None else ""
+    return f"{rendered} {zone}" if zone else rendered
 
 
 def _all_day_last_day(end: str) -> str:
@@ -3155,14 +3230,16 @@ def _all_day_last_day(end: str) -> str:
 
 def _ends_before_it_starts(start: str, end: str, all_day: bool) -> bool:
     """Whether an event's end lies before its start (an unparsable pair: no)."""
-    try:
-        if all_day:
+    if all_day:
+        try:
             return datetime.fromisoformat(end[:10]) < datetime.fromisoformat(start[:10])
-        first = datetime.fromisoformat(start[:-1] + "+00:00" if start.endswith("Z") else start)
-        last = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
-    except (ValueError, IndexError):
+        except (ValueError, IndexError):
+            return False
+    first = _event_instant(start)
+    last = _event_instant(end)
+    if first is None or last is None:
         return False
-    return last.replace(tzinfo=None) < first.replace(tzinfo=None)
+    return last < first
 
 
 def _format_event_when(start: str, end: str, all_day: bool) -> str:
@@ -3184,8 +3261,10 @@ def _format_event_when(start: str, end: str, all_day: bool) -> str:
     if not last or last == first:
         return first
     # Within one day only the end time is added — repeating the date reads as
-    # two separate days at a glance.
-    if start[:10] == end[:10] and ", " in last:
+    # two separate days at a glance. The comparison is on the rendered days,
+    # not the raw strings: converting to the display zone can move either end
+    # across midnight.
+    if ", " in first and ", " in last and first.split(", ", 1)[0] == last.split(", ", 1)[0]:
         return f"{first} \u2013 {last.split(', ', 1)[1]}"
     return f"{first} \u2013 {last}"
 
@@ -3193,29 +3272,37 @@ def _format_event_when(start: str, end: str, all_day: bool) -> str:
 def _event_interval(entry: dict):
     """A pending or existing event as a comparable (start, end) pair.
 
-    Offsets are dropped rather than converted: both sides of the comparison are
-    the same calendar's wall clock, and the pending event — typed by an agent
-    as a local time — carries no offset to convert from. Returns None when the
-    entry has no usable start, so an unparsable event is listed but never
-    claimed to clash.
+    Both sides are read in the display zone and then normalised to UTC, so the
+    comparison is one absolute timeline rather than several wall clocks: an
+    event stored as 16:00+00:00 clashes with a pending 18:00 in Zurich and not
+    with a pending 16:00, and a DST fold cannot make a later moment look
+    earlier (see _event_instant). An all-day entry becomes that zone's
+    midnight-to-midnight, so every pair compares. Returns None when the entry
+    has no usable start, so an unparsable event is listed but never claimed to
+    clash.
     """
     all_day = bool(entry.get("all_day"))
     raw_start = (entry.get("start") or "").strip()
     raw_end = (entry.get("end") or "").strip()
     if not raw_start:
         return None
-    try:
-        if all_day:
-            first = datetime.fromisoformat(raw_start[:10])
-            last = datetime.fromisoformat(raw_end[:10]) if raw_end else first + timedelta(days=1)
-            return (first, max(last, first + timedelta(days=1)))
-        start = datetime.fromisoformat(raw_start[:-1] + "+00:00" if raw_start.endswith("Z") else raw_start)
-        end = (datetime.fromisoformat(raw_end[:-1] + "+00:00" if raw_end.endswith("Z") else raw_end)
-               if raw_end else start)
-    except ValueError:
+    if all_day:
+        try:
+            zone = _display_tz()
+            first = datetime.fromisoformat(raw_start[:10]).replace(tzinfo=zone)
+            last = (datetime.fromisoformat(raw_end[:10]).replace(tzinfo=zone) if raw_end
+                    else first + timedelta(days=1))
+        except ValueError:
+            return None
+        first = first.astimezone(timezone.utc)
+        last = last.astimezone(timezone.utc)
+        return (first, max(last, first + timedelta(days=1)))
+    start = _event_instant(raw_start)
+    if start is None:
         return None
-    start = start.replace(tzinfo=None)
-    end = end.replace(tzinfo=None)
+    end = _event_instant(raw_end) if raw_end else start
+    if end is None:
+        end = start
     return (start, max(end, start))
 
 
@@ -3284,20 +3371,27 @@ def _agenda_window(detail: dict) -> tuple:
     parameters mean. The end is half-open on both sides of the wire: an all-day
     DTEND is exclusive, and a timed event that ends at exactly midnight covers
     only the days before it — 23:00–00:00 belongs to its start day alone.
+
+    The days are the *rendered* ones. Converting into the display zone can move
+    either end across midnight, and asking for the raw dates would then fetch a
+    day the card never shows while leaving the day it does show — the one whose
+    clashes the user is being asked about — unfetched.
     """
     start = (detail.get("start") or "").strip()
     end = (detail.get("end") or "").strip() or start
     if detail.get("all_day"):
-        last = _all_day_last_day(end)
+        # A date carries no offset: it names the same day in every zone.
+        first, last = start[:10], _all_day_last_day(end)
     else:
-        last = end[:10]
-        try:
-            closing = datetime.fromisoformat(end[:-1] + "+00:00" if end.endswith("Z") else end)
-            if (closing.hour, closing.minute, closing.second) == (0, 0, 0) and last > start[:10]:
-                last = (closing.replace(tzinfo=None) - timedelta(days=1)).date().isoformat()
-        except ValueError:
-            pass
-    first = start[:10]
+        opening = _as_display_moment(start)
+        closing = _as_display_moment(end) or opening
+        if opening is None:
+            first, last = start[:10], end[:10]
+        else:
+            first = opening.date().isoformat()
+            last = closing.date().isoformat()
+            if (closing.hour, closing.minute, closing.second) == (0, 0, 0) and closing > opening:
+                last = (closing - timedelta(days=1)).date().isoformat()
     return (first, last if last and last >= first else first)
 
 
