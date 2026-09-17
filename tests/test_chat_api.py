@@ -35,7 +35,9 @@ direct user-send contract and serving token-gated media). Covers:
   draft clears,
   the watermark advances, and the sent message is returned and visible in the
   merged view before the store knows it (the overlay);
-- honest 502 when the life store is down — no raw fallback.
+- the life store down: the last good list is served for a bounded while
+  (reads made meanwhile still clear badges), then an honest 502 — never a raw
+  fallback.
 
 Standalone (stdlib + the gateway module's own deps):
 
@@ -73,6 +75,9 @@ ACCT_A = "+41791112233"   # the mock gateway's own account
 ACCT_B = "+41764445566"   # a second, unregistered account of the same channel
 # Its own peer, untouched by the other tests' sends and overlay entries.
 MERGE_PEER = "+41791230000"
+# A peer of the store-outage test alone, so its unread count is never read
+# down by another test first (see test_store_down_serves_recent_list).
+STALE_PEER = "+41791239999"
 MID_ATT = "ab" * 16   # recorded as a host-free urn:retinue:media:… (today's shape)
 MID_ATT2 = "cd" * 16  # the blob the mock gateway "stores" for an images send
 MID_ATT3 = "ef" * 16  # a legacy http://<service>/media/<id> record on disk
@@ -233,7 +238,8 @@ class _MockSparql(BaseHTTPRequestHandler):
         rows = re.findall(
             r'\("((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"\s+"([^"]+)"\^\^', query)
         counts = {(MARA, ""): "2", (WA_KEY, ""): "1",
-                  (MERGE_PEER, ACCT_A): "2", (MERGE_PEER, ACCT_B): "1"}
+                  (MERGE_PEER, ACCT_A): "2", (MERGE_PEER, ACCT_B): "1",
+                  (STALE_PEER, ""): "3"}
         return [_lit_row(chat=key, account=acct, n=counts[(key, acct)])
                 for key, acct, cut in rows
                 if (key, acct) in counts and cut.startswith("1970-")]
@@ -1502,23 +1508,78 @@ def test_hide_races_an_arrival(base, wg):
 def test_store_down_serves_recent_list(base, wg):
     """A store that cannot answer a rebuild does not blank the phone: the last
     good skeleton is served while it is recent. Expiry (what every rail event,
-    read and send does) keeps it as the fallback; only age beyond
-    CHAT_LIST_STALE_SECONDS makes the failure a 502 again."""
-    status, before = _http(base, "GET", "/chats")
-    assert status == 200, before
-    wg._chats_cache_invalidate()
-    STATE["fail"] = True
+    read and send does) keeps it as the fallback; the fallback then counts as
+    fresh for one cache window, so the polls behind it do not each wait out a
+    store timeout; a read made meanwhile still clears the badge; and only age
+    beyond CHAT_LIST_STALE_SECONDS makes the failure a 502 again."""
+    STATE["list_rows"] = [
+        _lit_row(chat=STALE_PEER, channel="signal", ts=TS3, type=T_IN,
+                 text="noch ungelesen", sender=STALE_PEER, atts=""),
+    ]
+    chat_id = "signal:" + STALE_PEER
+    wg._chats_cache_clear()
     try:
+        status, before = _http(base, "GET", "/chats")
+        assert status == 200, before
+        assert next(c for c in before["chats"] if c["id"] == chat_id)["unread"] == 3
+        wg._chats_cache_invalidate()
+        STATE["fail"] = True
+        wg.CHAT_LIST_CACHE_SECONDS = 30.0
         status, body = _http(base, "GET", "/chats")
         assert status == 200, body
         assert [c["id"] for c in body["chats"]] == [c["id"] for c in before["chats"]]
+        assert next(c for c in body["chats"] if c["id"] == chat_id)["unread"] == 3
+        # The polls behind it reuse the fallback: nothing reaches the store.
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200 and len(STATE["queries"]) == seen
+        # A read while the store is down still clears the badge.
+        status, _ = _http(base, "POST", "/chats/" + _quote(chat_id) + "/read",
+                          {"ts": TS3})
+        assert status == 200
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert next(c for c in body["chats"] if c["id"] == chat_id)["unread"] == 0
+        # Too old to be honest: the same failure is a 502 again.
+        wg._chats_cache_invalidate()
         wg._chats_cache["built"] -= wg.CHAT_LIST_STALE_SECONDS + 1
         status, body = _http(base, "GET", "/chats")
         assert status == 502 and "life store" in body["error"]
     finally:
         STATE["fail"] = False
+        STATE["list_rows"] = None
+        wg.CHAT_LIST_CACHE_SECONDS = 0.0
         wg._chats_cache_clear()
     print("PASS test_store_down_serves_recent_list")
+
+
+def test_write_during_rebuild_is_not_lost(base, wg):
+    """A write that expires the cache while a rebuild is querying the store is
+    not in that rebuild's result — so the result is published already expired
+    (kept as the fallback, rebuilt on the next poll) rather than served as
+    fresh for a whole window."""
+    fetch = wg._fetch_chats_skeleton
+
+    def fetch_and_race():
+        skeleton = fetch()
+        wg._chats_cache_invalidate()  # a rail event landing mid-flight
+        return skeleton
+
+    wg.CHAT_LIST_CACHE_SECONDS = 30.0
+    wg._fetch_chats_skeleton = fetch_and_race
+    try:
+        wg._chats_cache_clear()
+        wg._chats_skeleton_and_unread()
+        assert wg._chats_cache["skeleton"] is not None
+        assert wg._chats_cache["at"] == 0.0, "raced result published as fresh"
+        wg._fetch_chats_skeleton = fetch
+        wg._chats_skeleton_and_unread()
+        assert wg._chats_cache["at"] > 0.0
+    finally:
+        wg._fetch_chats_skeleton = fetch
+        wg.CHAT_LIST_CACHE_SECONDS = 0.0
+        wg._chats_cache_clear()
+    print("PASS test_write_during_rebuild_is_not_lost")
 
 
 def test_store_down_is_502(base, wg):
@@ -1650,6 +1711,7 @@ def main():
         test_hide_flags(base, wg)
         test_hide_races_an_arrival(base, wg)
         test_store_down_serves_recent_list(base, wg)
+        test_write_during_rebuild_is_not_lost(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()

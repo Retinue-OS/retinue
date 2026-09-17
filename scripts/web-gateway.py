@@ -5075,10 +5075,13 @@ def _chat_display_name(doc: dict, channel: str, key: str) -> str:
 # dashboard polls; state and overlay are merged fresh on every request. Any
 # write that changes the skeleton's truth expires it early — expires, not
 # drops: the last good skeleton stays as the fallback for a rebuild the store
-# cannot answer (see _chats_payload). `built` is when it was computed, `at`
-# the instant its freshness counts from (zeroed to expire).
+# cannot answer (see _chats_skeleton_and_unread). `at` is the instant its
+# freshness counts from (zeroed to expire), `built` when it was computed, and
+# `gen` counts expiries, so a rebuild that was in flight when a write landed
+# can tell that its result predates the write.
 _chats_cache_lock = threading.Lock()
-_chats_cache: dict = {"at": 0.0, "built": 0.0, "skeleton": None, "unread": None}
+_chats_cache: dict = {"at": 0.0, "built": 0.0, "gen": 0, "skeleton": None,
+                      "unread": None}
 # Rebuilds are single-flight: with several dashboards polling, concurrent
 # requests that all miss the cache wait for the one rebuild in progress rather
 # than each sending the store the same queries.
@@ -5088,6 +5091,7 @@ _chats_rebuild_lock = threading.Lock()
 def _chats_cache_invalidate() -> None:
     with _chats_cache_lock:
         _chats_cache["at"] = 0.0
+        _chats_cache["gen"] += 1
 
 
 def _chats_cache_clear() -> None:
@@ -5095,6 +5099,7 @@ def _chats_cache_clear() -> None:
     with _chats_cache_lock:
         _chats_cache.update({"at": 0.0, "built": 0.0, "skeleton": None,
                              "unread": None})
+        _chats_cache["gen"] += 1
 
 
 def _chats_cached(now: float) -> tuple[dict | None, dict | None]:
@@ -5106,20 +5111,34 @@ def _chats_cached(now: float) -> tuple[dict | None, dict | None]:
     return None, None
 
 
+def _unread_after_reads(skeleton: dict, unread: dict) -> dict:
+    """The store's last unread counts, corrected by the read watermarks written
+    since: a chat read up to (or past) its head message has nothing unread the
+    store could know of, whatever it counted before the read. The other counts
+    stand — the store's answer is the best there is without the store."""
+    docs = _CHAT_STATE.all()
+    corrected = {}
+    for cid, n in unread.items():
+        row = skeleton.get(cid)
+        last_read = (docs.get(cid) or {}).get("last_read") or ""
+        corrected[cid] = 0 if row is not None and last_read >= row["ts"] else n
+    return corrected
+
+
 def _chats_skeleton_and_unread() -> tuple[dict, dict]:
     """The cached skeleton, rebuilt when expired; the last good one when the
     rebuild fails and it is not older than CHAT_LIST_STALE_SECONDS. Raises
     only when there is nothing honest to serve."""
-    now = time.time()
-    skeleton, unread = _chats_cached(now)
+    skeleton, unread = _chats_cached(time.time())
     if skeleton is not None:
         return skeleton, unread
     with _chats_rebuild_lock:
         # Another request may have rebuilt while this one waited for the lock.
-        now = time.time()
-        skeleton, unread = _chats_cached(now)
+        skeleton, unread = _chats_cached(time.time())
         if skeleton is not None:
             return skeleton, unread
+        with _chats_cache_lock:
+            gen = _chats_cache["gen"]
         try:
             skeleton = _fetch_chats_skeleton()
             docs_for_cutoffs = _CHAT_STATE.all()
@@ -5128,17 +5147,35 @@ def _chats_skeleton_and_unread() -> tuple[dict, dict]:
                 for cid in skeleton
             })
         except Exception as exc:  # noqa: BLE001 - a stale list beats no list
+            now = time.time()
             with _chats_cache_lock:
                 stale = _chats_cache["skeleton"]
                 age = now - _chats_cache["built"]
                 if stale is None or age > CHAT_LIST_STALE_SECONDS:
                     raise
-                print(f"[web-gateway] chat list rebuild failed ({exc}); serving "
-                      f"the skeleton built {age:.0f}s ago", flush=True)
-                return dict(stale), dict(_chats_cache["unread"])
+                stale_unread = _chats_cache["unread"]
+            unread = _unread_after_reads(stale, stale_unread)
+            with _chats_cache_lock:
+                # The fallback counts as fresh for one cache window, so the
+                # polls behind this one reuse it instead of each waiting out
+                # QLEVER_TIMEOUT against a store that just failed; the next
+                # window retries. A write that landed meanwhile keeps it
+                # expired — that retry is owed.
+                if _chats_cache["gen"] == gen:
+                    _chats_cache["at"] = now
+                _chats_cache["unread"] = dict(unread)
+            print(f"[web-gateway] chat list rebuild failed ({exc}); serving "
+                  f"the skeleton built {age:.0f}s ago", flush=True)
+            return dict(stale), unread
+        now = time.time()
         with _chats_cache_lock:
-            _chats_cache.update({"at": now, "built": now, "skeleton": dict(skeleton),
-                                 "unread": dict(unread)})
+            # A write that expired the cache while the store was answering is
+            # not in this result. It is still the newest skeleton — kept as
+            # the fallback — but published expired, so the next poll rebuilds
+            # rather than serving the pre-write list for a whole window.
+            raced = _chats_cache["gen"] != gen
+            _chats_cache.update({"at": 0.0 if raced else now, "built": now,
+                                 "skeleton": dict(skeleton), "unread": dict(unread)})
         return skeleton, unread
 
 
