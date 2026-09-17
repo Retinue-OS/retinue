@@ -347,9 +347,24 @@ and what a model turn is *for*:
    preview, tap-through = the chat — honouring the per-chat `muted` flag
    and the gate class (an `ignored`-group or no-action-class message updates
    the mirror silently). **Notification no longer costs a model turn.**
-4. **Forward — as a companion turn.** Where the gate says `forward`, the same
-   web-gateway call starts a turn in that chat's companion thread instead of a
-   fresh `claude -p` triage session opening a new dashboard conversation. The
+4. **Accepted by the chat — and, where the user asked for it, worked.** The
+   same web-gateway call now *accepts* the message: the chat has it, the user
+   is pushed, and the gateway forwards it nowhere else. That is the delivery,
+   and it costs no model turn at all.
+
+   Whether a **turn** also runs is one question with one answer: the chat's
+   `assist` flag, which the user sets per correspondent and which is **off by
+   default and off for anyone new**. This replaced the sender whitelist, and
+   the reason is worth stating plainly: the whitelist decided whose message was
+   worth a session to *notify* about, and notification is free now. The only
+   thing a turn still buys is a proposal, and a proposal is something the user
+   asks for, not something a correspondent earns by writing. There is no
+   unknown-sender ask-flow any more — nothing opens a thread to ask whether to
+   trust a stranger, because nothing needs the answer.
+
+   Where `assist` is on, the turn starts in that chat's companion thread
+   instead of a fresh `claude -p` triage session opening a new dashboard
+   conversation. The
    turn runs warm (per-chat session, summary + tail — the generalization of
    the `a95b19c` fix from "the thread's own appends" to "the channel
    itself"). Its job, in order: read the message in context; stage a draft
@@ -514,15 +529,14 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 
 ## Open questions
 
-1. ~~**Companion turns for groups.**~~ **Settled: gate parity, groups
-   included.** Everything the gate forwards gets a companion turn, 1:1 and
-   group alike — the same messages that used to buy a triage session, so the
-   switch costs no more turns than it replaced. What quiets a busy group is
-   what always did: the group's own `quieted` / `ignored` flags, which hold its
-   unknown senders back from a turn entirely. Worth remembering while reading
-   the gate's table — **a group is never whitelisted; only a sender is.** A
-   per-chat `assist` setting (phase 6) can still turn an individual chat down
-   later.
+1. ~~**Companion turns for groups.**~~ **Moot: it is per chat, and off.**
+   The question assumed turns happen by default and asked which chats to spare.
+   They do not: `assist` is off everywhere until the user switches it on for a
+   correspondent, so a busy group costs nothing unless somebody decided it
+   should. That also retires the messenger sender whitelist — see *Inbound
+   flow*, step 4 — and with it the unknown-sender ask-flow. The group flags
+   stay: the news rail still reads them, and `quieted` / `ignored` still keep a
+   group's arrivals quiet.
 2. **Draft staging threshold.** "Stage a draft when a reply is plausibly
    wanted" is the companion's judgement; if it over-stages, a per-chat or
    per-sender preference belongs in the summary/style memory, not in code.

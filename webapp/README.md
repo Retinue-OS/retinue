@@ -209,6 +209,14 @@ The API, as the components consume it:
   `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
   is the shared draft `{text, author, agent?, ts, version}` or null,
+  `assist` is this chat's auto-propose switch: with it on, a message arriving
+  here has Ara read it and propose a reply into the draft, without being asked.
+  It is **off by default and off for a correspondent nobody has opted in for** —
+  a proposal is the only thing a model turn still buys, since the messages
+  themselves arrive for free, so it is the user's choice per chat and never a
+  correspondent's to earn. The Ara pane carries the switch; `POST
+  /chats/<id>/flags` with `{"assist": true|false}` is what it writes.
+
   `companion` is the conversation id of this chat's companion thread (null
   until one exists), and
   `messages` is the URL of the chat's message document — the client follows

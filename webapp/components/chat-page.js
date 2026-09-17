@@ -101,6 +101,18 @@ const IMAGE_JPEG_QUALITY = 0.85;
 // where it would offer to restore text they have long since abandoned.
 const UNDO_CLEAR_MS = 12000;
 
+// What the Ara pane says about itself, and what the switch beside it promises.
+const ASSIST_HINT = {
+  on: 'proposes as messages arrive',
+  off: 'reads this chat, writes into your draft',
+};
+const ASSIST_TITLE = {
+  on: 'Ara reads each message arriving here and proposes a reply. '
+      + 'Tap to stop.',
+  off: 'Ara acts here only when you ask. Tap to have her propose a reply '
+       + 'as messages arrive.',
+};
+
 // Quick patterns: canned companion prompts over the current draft/thread.
 // A chip is nothing but a pre-filled companion turn (see the design doc) —
 // the user still reads and sends it.
@@ -669,6 +681,7 @@ class RetinueChatPage extends HTMLElement {
   }
 
   _panesHtml() {
+    const assist = !!(this._chat && this._chat.assist);
     return `<div class="panes" data-panes>` +
       `<section class="pane pane-chat" aria-label="Chat">` +
       `<div class="thread" data-chat-thread>${this._chatThreadHtml()}</div>` +
@@ -679,7 +692,15 @@ class RetinueChatPage extends HTMLElement {
       `title="Drag to resize &middot; double-click to reset"></div>` +
       `<section class="pane pane-companion" aria-label="Ara">` +
       `<div class="comp-bar"><span class="comp-who">Ara</span>` +
-      `<span class="comp-hint">reads this chat, writes into your draft</span></div>` +
+      `<span class="comp-hint">${esc(ASSIST_HINT[assist ? 'on' : 'off'])}</span>` +
+      // Off by default, and off for anyone new: a proposal is the only thing a
+      // model turn still buys here — the messages themselves arrive in the
+      // chat for free — so it is something the user switches on for a
+      // correspondent, never something a correspondent earns by writing.
+      `<button type="button" class="assist${assist ? ' on' : ''}" role="switch" ` +
+      `aria-checked="${assist ? 'true' : 'false'}" data-assist ` +
+      `title="${esc(ASSIST_TITLE[assist ? 'on' : 'off'])}">Auto&#8209;propose</button>` +
+      `</div>` +
       this._companionHtml() +
       `</section></div>`;
   }
@@ -1110,6 +1131,11 @@ class RetinueChatPage extends HTMLElement {
     // and bring that pane forward — a chip is a companion turn, nothing more.
     root.querySelectorAll('[data-quick]').forEach((el) =>
       el.addEventListener('click', () => this._quickPattern(el.getAttribute('data-quick'))));
+    const assistSwitch = root.querySelector('[data-assist]');
+    if (assistSwitch) {
+      assistSwitch.addEventListener('click', () =>
+        this._setAssist(!(this._chat && this._chat.assist)));
+    }
     // Preview removes live outside the input row, so they stay tappable even
     // while a recording or dictation job holds the row.
     root.querySelectorAll('[data-rmimg]').forEach((el) =>
@@ -1793,6 +1819,44 @@ class RetinueChatPage extends HTMLElement {
 
   // A chip is a companion turn with a canned prompt over the current draft:
   // it brings the pane forward and runs, exactly as if the user had typed it.
+  // The one setting that spends: with it on, every message arriving in this
+  // chat has Ara read it and propose. Painted rather than re-rendered — a full
+  // render here would fight the composer's focus and the thread's scroll for a
+  // change that touches two words and a button.
+  async _setAssist(on) {
+    if (!this._chat) return;
+    const before = !!this._chat.assist;
+    if (before === on) return;
+    this._chat.assist = on;
+    this._paintAssist();
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/flags`,
+                              { method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ assist: on }) });
+      if (!res.ok) throw new Error(String(res.status));
+    } catch (_e) {
+      this._chat.assist = before;
+      this._paintAssist();
+      this._showNote(on ? 'Could not switch auto-propose on just now.'
+                        : 'Could not switch auto-propose off just now.');
+    }
+  }
+
+  _paintAssist() {
+    const root = this.shadowRoot;
+    if (!root) return;
+    const on = !!(this._chat && this._chat.assist);
+    const btn = root.querySelector('[data-assist]');
+    if (btn) {
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-checked', on ? 'true' : 'false');
+      btn.title = ASSIST_TITLE[on ? 'on' : 'off'];
+    }
+    const hint = root.querySelector('.comp-hint');
+    if (hint) hint.textContent = ASSIST_HINT[on ? 'on' : 'off'];
+  }
+
   _quickPattern(id) {
     const p = QUICK_PATTERNS.find((x) => x.id === id);
     if (!p) return;
@@ -1852,7 +1916,14 @@ const CSS = `
   .comp-bar { flex: none; display: flex; align-items: baseline; gap: 8px; padding: 8px 2px 0; }
   .comp-who { font-weight: 650; font-size: .85rem; }
   .comp-hint { color: var(--muted, #8b93a3); font-size: .72rem; overflow: hidden;
-               text-overflow: ellipsis; white-space: nowrap; }
+               text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }
+  .assist { flex: none; margin-left: auto; border: 1px solid var(--line, rgba(231, 235, 242, .14));
+            border-radius: 999px; background: transparent; color: var(--muted, #8b93a3);
+            cursor: pointer; padding: 2px 10px; font: inherit; font-size: .7rem;
+            white-space: nowrap; -webkit-tap-highlight-color: transparent; }
+  .assist:hover { color: var(--accent, #6ea8fe); border-color: var(--accent, #6ea8fe); }
+  .assist.on { color: var(--accent, #6ea8fe); border-color: var(--accent, #6ea8fe);
+               background: color-mix(in srgb, var(--accent, #6ea8fe) 14%, transparent); }
   @media ${WIDE_FRAME} {
     .panes { overflow-x: visible; scroll-snap-type: none; }
     .pane-chat { flex: 1 1 auto; }

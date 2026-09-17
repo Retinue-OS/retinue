@@ -5196,6 +5196,7 @@ def _chats_payload() -> dict:
             "unread": count,
             "archived": bool(doc.get("archived")),
             "muted": bool(doc.get("muted")),
+            "assist": bool(doc.get("assist")),
             "last": last,
             "draft": doc.get("draft"),
             # This chat's companion conversation, or null until one is asked
@@ -5302,8 +5303,14 @@ _CHAT_ARRIVAL_JOBS: dict[tuple, str] = {}
 _CHAT_ARRIVAL_JOBS_MAX = 4096
 
 
-def _chat_arrival_prompt(arrivals: list[dict], channel: str) -> str:
+def _chat_arrival_prompt(arrivals: list[dict]) -> str:
     """The instruction for a turn the chat itself triggered.
+
+    Never asks the user to rule on a correspondent. Who is worth a turn is
+    already settled before this runs — it is the chat's `assist` flag, which
+    the user set — so there is nothing left here to ask about, and a thread
+    asking it would be the per-message dashboard conversation this replaced
+    wearing a different hat.
 
     Nobody wrote in the companion thread, so there is no message to answer:
     this says what happened and what the turn is for. The chat note appended
@@ -5311,13 +5318,11 @@ def _chat_arrival_prompt(arrivals: list[dict], channel: str) -> str:
     draft, and the standing rules — that the words for a correspondent come
     from the `secretary` subagent, that they go into the chat's shared draft,
     and that nothing here reaches the wire without the user's send press."""
-    names, handles, quoted = [], [], []
+    names, quoted = [], []
     for arrival in arrivals:
         who = arrival.get("who") or arrival.get("handle") or ""
         if who and who not in names:
             names.append(who)
-        if arrival.get("unknown") and arrival.get("handle"):
-            handles.append(arrival["handle"])
         # The message travels in the instruction itself, not only in the chat
         # note below: that note is built from the store, which can be down, and
         # a turn that answered "the messages could not be read" would still
@@ -5355,16 +5360,6 @@ def _chat_arrival_prompt(arrivals: list[dict], channel: str) -> str:
         "announce a draft you staged: the chat is where the user sees that, "
         "and a thread per message is exactly what this replaced.",
     ]
-    if handles:
-        listed = ", ".join(sorted(set(handles)))
-        lines.append(
-            f"The sender ({listed}) is UNKNOWN — not on the triage whitelist. "
-            "This is a decision, so it takes a dashboard conversation: ask "
-            "whether to whitelist them (future messages are worked on arrival) "
-            "or blacklist them (they are never asked about again), and apply "
-            "the answer with `python3 /workspace/scripts/triage_policy.py "
-            f"whitelist-add --channel {channel or '<channel>'} --handle "
-            "<handle>` (or `blacklist-add`).")
     lines.append(
         "Then answer here in one or two sentences: what arrived, and what you "
         "staged or why you staged nothing. This note is what the user reads in "
@@ -5374,7 +5369,6 @@ def _chat_arrival_prompt(arrivals: list[dict], channel: str) -> str:
 
 
 def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
-                             flagged_unknown: bool = False,
                              files=None) -> str | None:
     """Queue a companion turn for one arrival; return its job path, or None.
 
@@ -5402,7 +5396,6 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
         "who": entry.get("sender_name") or entry.get("sender") or "",
         "handle": entry.get("sender") or "",
         "text": entry.get("text") or "",
-        "unknown": bool(flagged_unknown),
         "files": stored,
     }
     with _chat_turns_lock:
@@ -5435,8 +5428,6 @@ def _chat_arrival_worker(chat_id: str, cid: str) -> None:
     each. Whatever the batch's turn reports is reported to every job in it: a
     turn that failed leaves its messages `delivered=False` at the gateway, and
     the daily drain picks them up — at-least-once, as everywhere else here."""
-    parts = chat_state_mod.split_chat_id(chat_id)
-    channel = parts[0] if parts else ""
     while True:
         with _chat_turns_lock:
             state = _CHAT_TURNS.get(chat_id)
@@ -5448,7 +5439,7 @@ def _chat_arrival_worker(chat_id: str, cid: str) -> None:
                 return
             jobs, arrivals = state["jobs"], state["arrivals"]
             state["jobs"], state["arrivals"] = [], []
-        prompt = _chat_arrival_prompt(arrivals, channel)
+        prompt = _chat_arrival_prompt(arrivals)
         stored = [f for a in arrivals for f in (a.get("files") or [])]
         if stored:
             prompt += _message_files_note(stored)
@@ -5685,6 +5676,7 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
                 "text": newest["text"],
             },
             "draft": doc.get("draft"),
+            "assist": bool(doc.get("assist")),
             "companion": doc.get("companion"),
             "messages": _chat_messages_url(chat_id),
         }
@@ -6653,7 +6645,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"id": chat_id, "last_read": doc["last_read"]})
 
     def _handle_chat_flags(self, raw_id: str) -> None:
-        """Set one chat's `archived` / `muted` flags (body {archived?, muted?}).
+        """Set one chat's flags (body {archived?, muted?, assist?}).
 
         The two carry the dashboard-conversation semantics verbatim (see
         chat_state): archived leaves the active list, and a new inbound message
@@ -6667,6 +6659,13 @@ class Handler(BaseHTTPRequestHandler):
         wants the chat in their list is this one's. A group can be filed to the
         news feed and still be a chat one reads and answers in, which is the
         distinction `news` + `quieted` exists to make.
+
+        `assist` is the third, and the only one that costs anything: with it
+        on, a message arriving in this chat has Ara read it and propose — the
+        same turn the Propose chip asks for, run without being asked. It is off
+        until the user turns it on **for this chat**, and that is the whole
+        setting: no sender status grants it, no policy file carries it, and an
+        unknown correspondent certainly does not earn it by writing.
         """
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
@@ -6676,7 +6675,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid JSON"})
             return
         flags: dict[str, bool] = {}
-        for name in ("archived", "muted"):
+        for name in ("archived", "muted", "assist"):
             if name not in payload:
                 continue
             if not isinstance(payload[name], bool):
@@ -6684,7 +6683,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             flags[name] = payload[name]
         if not flags:
-            self._send_json(400, {"error": "archived and/or muted (boolean) is required"})
+            self._send_json(400, {
+                "error": "archived, muted and/or assist (boolean) is required"})
             return
         doc = _CHAT_STATE.set_flags(chat_id, **flags)
         # The list is cached; a hidden chat must leave it now, not on the next
@@ -6692,7 +6692,8 @@ class Handler(BaseHTTPRequestHandler):
         _chats_cache_invalidate()
         self._send_json(200, {"id": chat_id,
                               "archived": bool(doc.get("archived")),
-                              "muted": bool(doc.get("muted"))})
+                              "muted": bool(doc.get("muted")),
+                              "assist": bool(doc.get("assist"))})
 
     def _handle_chat_draft(self, raw_id: str) -> None:
         """The user writes the shared draft (body {text, version}).
@@ -7031,6 +7032,7 @@ class Handler(BaseHTTPRequestHandler):
         _chats_cache_invalidate()
         pushed = False
         job_url = None
+        accepted = False
         if direction == "in":
             _, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
             # A new message in an archived chat would otherwise land invisible;
@@ -7048,34 +7050,41 @@ class Handler(BaseHTTPRequestHandler):
             if not doc.get("muted") and not held:
                 _chat_push_notification(chat_id, doc, entry, had_unread)
                 pushed = True
-            # The forward class earns its model turn here, in the chat it
-            # belongs to. `muted` and `archived` are deliberately not consulted:
-            # they say where the user wants the chat on their screen, and the
-            # gate says what a message is worth — the two were kept independent
-            # on purpose, and hiding a chat must not quietly stop its messages
-            # being worked.
+            # Acceptance: a caller that offers the handover is told the chat
+            # has this message, and stops forwarding it anywhere else. That is
+            # the whole delivery — the user has it, in the conversation it
+            # belongs to, pushed, within seconds, for no model turn at all.
+            # Which is exactly why the old sender whitelist has nothing left to
+            # decide: it existed to say whose message was worth a session to
+            # *notify* about, and notification is free now.
             #
-            # An *explicit* forward verdict, though, not merely the absence of
-            # a held one — and an explicit handover with it. Notification fails
-            # open, because a missing verdict costs at worst a notification too
-            # many. A turn must not: a caller that did not offer to hand the
-            # message over is one that forwards it to triage itself, whatever
-            # its gate says, and the message would then be handled twice. That
-            # is not hypothetical — it is every gateway built before this
-            # contract, which is exactly what a deployment runs in the window
-            # between rebuilding this container and rebuilding those.
-            if gate is not None and gate.get("forward") and payload.get("handover"):
-                job_url = _start_chat_arrival_turn(
-                    chat_id, entry,
-                    flagged_unknown=bool(gate and gate.get("flagged_unknown")),
-                    files=payload.get("files"))
+            # A turn is a separate question with a single answer: this chat's
+            # `assist` flag. Off by default, off for anyone new, and set by the
+            # user per correspondent — because the only thing a turn still buys
+            # is a proposal, and nobody should be handed one uninvited. `muted`
+            # and `archived` stay out of it: they say where the user wants the
+            # chat on their screen, not what should happen to its messages.
+            #
+            # The handover matters on its own account. A gateway built before
+            # this contract offers none and forwards to triage itself, so
+            # acting on its event would have one message handled twice.
+            if payload.get("handover") and not held:
+                accepted = True
+                if doc.get("assist"):
+                    job_url = _start_chat_arrival_turn(
+                        chat_id, entry, files=payload.get("files"))
         elif author in ("user", "device"):
             _CHAT_STATE.advance_last_read(chat_id, ts)
         body = {"ok": True, "id": chat_id, "pushed": pushed}
+        if accepted:
+            # The chat has it: the caller may mark the message delivered and
+            # must not forward it anywhere else.
+            body["accepted"] = True
         if job_url:
             # 202 with a job handle, the same contract POST /message answers a
-            # forwarded message with: accepted, not yet done. The gateway polls
-            # it and only then flips the message's `delivered` flag.
+            # forwarded message with: accepted, not yet done. Here the caller
+            # waits for that job before flipping `delivered`, because a turn is
+            # still owed something — a plain `accepted` above is already final.
             body["job_url"] = job_url
             self._send_json(202, body)
             return

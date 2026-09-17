@@ -257,9 +257,8 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         forward(gw)
         assert rail_calls and rail_calls[0]["direction"] == "in", rail_calls
         assert rail_calls[0].get("handover") is True, \
-            "the rail may only start a turn for a caller that offers to hand over"
+            "the rail may only take a message from a caller that hands it over"
         assert rail_calls[0]["gate"]["forward"] is True, rail_calls[0]["gate"]
-        assert "flagged_unknown" in rail_calls[0]["gate"], rail_calls[0]["gate"]
         assert posts == [], "the message went to triage as well as to its chat"
         assert _await_flag(tmp, True), _stored_flags(tmp)
 
@@ -288,6 +287,18 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         forward(gw)
         assert posts == [], "an uncertain answer must not also reach triage"
         assert _stored_flags(tmp) == [False], _stored_flags(tmp)
+
+    # Accepted with no turn — the chat has it, the user reads it there. That is
+    # a delivery: the record says so, and nothing is forwarded.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t4"})
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = lambda **kwargs: {"accepted": True}
+        forward(gw)
+        assert posts == [], "an accepted message must not also reach triage"
+        assert _stored_flags(tmp) == [True], _stored_flags(tmp)
 
     print(f"ok: {name} lets the chat take a forwarded message, or forwards it "
           "to triage as before")

@@ -1458,7 +1458,6 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
-              "flagged_unknown": bool(gate.get("flagged_unknown")),
               "reason": str(gate.get("reason") or "")},
     )
     if not gate["forward"]:
@@ -1505,6 +1504,16 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
               f"from {sender_label} ({gate['reason']})", flush=True)
         _confirm_delivery(rail_job, store_path, sender_label,
                           base=_chats.CHATS_INGEST_URL)
+        return
+    if rail and rail.get("accepted"):
+        # Accepted with no turn: the chat has the message, the user has been
+        # pushed, and that is the delivery. Nothing is owed a model here — the
+        # chat's `assist` flag is off, which is the user saying they will read
+        # this one themselves. So the record says delivered and no drain ever
+        # re-surfaces it.
+        _mark_delivered(store_path)
+        print(f"[telegram-gateway] the chat took the message from {sender_label} "
+              f"({gate['reason']}); no turn asked for", flush=True)
         return
 
     # The Telegram reply address is the chat_id itself, which _resolve_entity

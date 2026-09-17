@@ -75,16 +75,18 @@ runs in two places, one policy but two mechanisms, because e-mail is **pull** an
 messenger is **push**:
 
 - **Messenger (push), since the chat surface.** A message the gate forwards is
-  normally not triaged: the gateway hands it to the web-gateway's chats rail,
-  which runs a turn in that chat's companion thread — it stages any reply into
-  the chat's shared draft for the user's send press, and opens a dashboard
-  conversation only for a decision that is not "send this reply". *Normally*,
-  because the rail can decline — switched off with `CHAT_ARRIVAL_TURNS=0`,
-  unreachable, or unable to open the companion thread — and the gateway then
-  forwards to triage exactly as it always did, so a triage run must still
-  expect messenger messages. Triage also keeps the **daily drain** (everything
-  the gate held back, plus anything whose turn failed) and every channel with
-  no chat surface. See `docs/messenger-chats.md`.
+  normally not triaged at all: the gateway hands it to the web-gateway's chats
+  rail, which accepts it — the user sees it in the chat, pushed, for no model
+  turn — and the gateway marks it delivered. Where the user switched that
+  chat's `assist` on, the rail also runs a turn in its companion thread, which
+  stages any reply into the chat's shared draft for the user's send press. **No
+  messenger message asks the user to whitelist or blacklist anyone any more**;
+  that ask-flow is gone with the whitelist it served. *Normally*, because the
+  rail can decline — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or
+  unable to open the companion thread — and the gateway then forwards to triage
+  exactly as it always did, so a triage run must still expect messenger
+  messages. Triage keeps the e-mail channel, and every channel with no chat
+  surface. See `docs/messenger-chats.md`.
 - **E-mail (pull).** `scripts/triage-gate.py`, a scheduler `command` job.
   **Frequent** tick: list new INBOX mail, keep only whitelisted senders, spawn
   the model *only* if any survive. **Daily** tick: refresh the whitelist from the

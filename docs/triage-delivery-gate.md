@@ -354,17 +354,26 @@ the daily drain picks it up" (blacklisted handle, quieted group); `true` means
 "accounted for, never drained" (ignored group — the message is on record and
 queryable, but no model ever looks at it unprompted).
 
-**Where a forwarded message now goes.** The gate decides *whether* a message is
-worth a model turn; it no longer decides that the turn is a triage session.
-Since `docs/messenger-chats.md` phase 4, the forward class is handed to the
-chats rail (`POST /internal/chats/inbound`), which starts a turn in that chat's
-own companion thread and answers `202` with its job handle — so the reply is
-staged in the chat's composer for the user's send press instead of arriving as
-a dashboard conversation about the message. The gateway still owns the
-`delivered` flag and still waits for a job to report `done`; only which job has
-changed. A rail that cannot take the message answers no handle, and the gateway
-forwards to triage exactly as described below. **Triage itself is unchanged**
-and still owns the daily drain, the e-mail channel, and anything the rail hands
+**Where a forwarded message now goes — and what the sender axis still decides.**
+Since `docs/messenger-chats.md` phase 4, a forwarded message is handed to the
+chats rail (`POST /internal/chats/inbound`), which **accepts** it: the chat has
+the message, the user is pushed, and the gateway marks it delivered and
+forwards it nowhere else. That is the delivery, and it costs no model turn.
+
+So on messenger the sender axis no longer decides whether a message is *worked*
+— it decides whether the arrival is worth the user's attention (a held class
+stays silent) and nothing more. What decides a model turn is the chat's own
+`assist` flag, set by the user per correspondent and **off by default**: with it
+on, the rail also starts a turn in that chat's companion thread and answers
+`202` with its job handle, which the gateway waits on before flipping
+`delivered`. The messenger **whitelist is therefore retired**, and with it the
+unknown-sender ask-flow: both existed to decide who was worth a session to
+*notify* about, and notification is free now. The group flags are untouched —
+the news rail reads them, and `quieted`/`ignored` still keep a group quiet.
+
+A rail that cannot take the message answers no handle and no acceptance, and
+the gateway forwards to triage exactly as described below. **Triage itself is
+unchanged**, and still owns the e-mail channel and anything the rail hands
 back.
 
 - The daily catch-all calls each inbox-mode gateway's

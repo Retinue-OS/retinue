@@ -436,13 +436,21 @@ class ChatStateStore:
             return doc
 
     def set_flags(self, chat_id: str, *, archived: bool | None = None,
-                  muted: bool | None = None) -> dict:
+                  muted: bool | None = None,
+                  assist: bool | None = None) -> dict:
+        """Set a chat's user-facing flags. ``assist`` is the one that spends:
+        with it on, a message arriving here has Ara read it and propose. It is
+        **off unless the user turned it on for this chat** — nothing about a
+        correspondent earns it, and least of all a correspondent nobody knows
+        yet."""
         with self._lock:
             doc = self._read(chat_id)
             if archived is not None:
                 doc["archived"] = bool(archived)
             if muted is not None:
                 doc["muted"] = bool(muted)
+            if assist is not None:
+                doc["assist"] = bool(assist)
             self._write(doc)
             return doc
 

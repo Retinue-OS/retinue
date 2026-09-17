@@ -12,12 +12,14 @@ direct user-send contract and serving token-gated media). Covers:
 - the notify rail (POST /internal/chats/inbound): open-vs-token auth, the
   un-archive-unless-muted rule, held-gate and muted silence, push mode
   new-vs-reply, and echoes advancing the read watermark;
-- the forward path landing in the chat instead of in triage: an arrival whose
-  caller offers to hand it over answers 202 with the job handle of a turn in
-  that chat's companion thread, the turn's prompt carries the arrival's own
-  text (delimited as data) and the chat note, while a held class, an event with
-  no handover, a verdictless event and a switched-off rail answer no handle at
-  all (so the gateway keeps its own forward), the same
+- the forward path landing in the chat, not in triage: an arrival whose caller
+  offers to hand it over is accepted — the chat has it, the gateway stops — and
+  a turn runs on top of that only where the user switched the chat's `assist`
+  on, which is off by default and for anyone new; the turn's prompt carries the
+  arrival's own text (delimited as data) and the chat note and never asks the
+  user to rule on a correspondent, while a held class, an event with no
+  handover and a switched-off rail answer no handle at all (so the gateway
+  keeps its own forward), the same
   message id is only ever worked once however often the rail delivers it,
   arrivals during a turn fold into one follow-up without losing a job, a reply
   that could not be stored fails its job rather than reporting delivery, and
@@ -1081,10 +1083,27 @@ def test_arrival_starts_a_companion_turn(base, wg):
              "handover": True,
              "gate": {"forward": True, "flagged_unknown": False,
                       "reason": "whitelisted"}}
+    # Off by default, and for this correspondent nobody has turned it on: the
+    # chat has the message and the user was pushed, both for no model turn at
+    # all. `accepted` is what tells the gateway to stop — the message is
+    # delivered, and it goes nowhere else.
     status, body = _http(base, "POST", rail, event)
-    assert status == 202, body
-    assert body["job_url"].startswith("/jobs/"), body
+    assert status == 200, body
+    assert body["accepted"] is True and "job_url" not in body, body
     assert body["pushed"] is True
+    assert TURNS == [], "a stranger's message bought a model turn"
+
+    # The user switches auto-propose on for this chat — the same endpoint Hide
+    # uses, and the only thing anywhere that makes a turn happen here.
+    flags = "/chats/" + _quote(chat) + "/flags"
+    status, flagged = _http(base, "POST", flags, {"assist": True})
+    assert status == 200 and flagged["assist"] is True, flagged
+    status, chats = _http(base, "GET", "/chats")
+    assert next(c for c in chats["chats"] if c["id"] == chat)["assist"] is True
+
+    status, body = _http(base, "POST", rail, dict(event, message_id="a1b"))
+    assert status == 202, body
+    assert body["job_url"].startswith("/jobs/") and body["accepted"] is True, body
 
     done = _await_job(base, body["job_url"])
     assert done["status"] == "done", done
@@ -1115,18 +1134,14 @@ def test_arrival_starts_a_companion_turn(base, wg):
     status, conv = _http(base, "GET", f"/conversations/{comp}")
     assert conv["messages"][-1]["role"] == "assistant"
     assert "staged" in conv["messages"][-1]["text"]
-    assert len(PUSHES) == 1, "the companion turn pushed on top of the arrival"
+    # Two arrivals so far, two pushes: the turn added none of its own.
+    assert len(PUSHES) == 2, "the companion turn pushed on top of the arrivals"
 
-    # An unknown sender is still asked about. That decision is not "send this
-    # reply", so the turn is told to take it to a dashboard conversation.
-    TURNS.clear()
-    status, body = _http(base, "POST", rail,
-                         dict(event, message_id="a2", text="wer bist du?",
-                              gate={"forward": True, "flagged_unknown": True,
-                                    "reason": "unknown"}))
-    assert _await_job(base, body["job_url"])["status"] == "done"
-    assert "UNKNOWN" in TURNS[0]["prompt"]
-    assert "whitelist-add --channel telegram" in TURNS[0]["prompt"]
+    # And it never asks the user to rule on a correspondent. Who is worth a
+    # turn was settled by the switch above; a thread asking it would be the
+    # per-message dashboard conversation this replaced, in a hat.
+    low = prompt.lower()
+    assert "whitelist" not in low and "blacklist" not in low, prompt
 
     # The message itself is in the instruction, not only in the chat note the
     # store builds: a store outage must not leave a turn answering about a
@@ -1142,6 +1157,16 @@ def test_arrival_starts_a_companion_turn(base, wg):
     assert status == 200 and "job_url" not in body
     assert TURNS == []
 
+    # Switching it back off stops the turns without touching anything else.
+    status, flagged = _http(base, "POST", flags, {"assist": False})
+    assert status == 200 and flagged["assist"] is False, flagged
+    TURNS.clear()
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="a2", text="und jetzt?"))
+    assert status == 200 and body["accepted"] is True and "job_url" not in body
+    assert TURNS == []
+    _http(base, "POST", flags, {"assist": True})
+
     # Nor does a forward from a caller that did not offer to hand the message
     # over. That caller forwards it to triage itself whatever its gate says —
     # every gateway built before this contract does, which is what a deployment
@@ -1154,15 +1179,16 @@ def test_arrival_starts_a_companion_turn(base, wg):
     assert body["pushed"] is True, "notification is not what is being withheld"
     assert TURNS == []
 
-    # Nor does an event with no verdict at all. Notification fails open, but a
-    # model turn must not: a caller that sent no gate is one that still runs its
-    # own triage forward, and the message would be handled twice.
+    # An event with no verdict at all is still taken: the gate says what a
+    # message is worth to *notify* about, and the handover says who owns it.
+    # Neither decides the turn any more — the chat's own switch does.
     TURNS.clear()
     no_gate = {k: v for k, v in event.items() if k != "gate"}
     status, body = _http(base, "POST", rail, dict(no_gate, message_id="a3b"))
-    assert status == 200 and "job_url" not in body, body
-    assert body["pushed"] is True, "notification still fails open"
-    assert TURNS == []
+    assert status == 202 and body["accepted"] is True, body
+    assert body["pushed"] is True, "notification fails open"
+    assert _await_job(base, body["job_url"])["status"] == "done"
+    assert len(TURNS) == 1, TURNS
 
     # One message, one turn — however often the rail delivers it. A gateway
     # retries a POST whose answer was lost, and a ledger can redeliver a

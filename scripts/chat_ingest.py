@@ -82,11 +82,15 @@ def notify_chat_event(
 ) -> dict | None:
     """Synchronous rail POST; returns the answer body, or None if it failed.
 
-    An accepted event answers with a JSON object: ``{"job_url": …}`` when the
-    web-gateway started a companion turn for it, and nothing but ``ok`` other-
-    wise. None means the event did not land — no endpoint configured, a
-    refusal, a connection that never got there — which is the caller's cue to
-    fall back.
+    An accepted event answers with a JSON object. ``{"accepted": true}`` means
+    the chat has the message and the caller must not forward it anywhere else —
+    the user sees it in the conversation it belongs to, and that is the
+    delivery. ``job_url`` comes with it when a companion turn was started too,
+    because that one is not finished yet and the caller waits for the job
+    before flipping ``delivered``; a plain ``accepted`` is already final.
+    Neither key means the rail took nothing, which is the caller's cue to fall
+    back. None means the event did not land at all — no endpoint configured, a
+    refusal, a connection that never got there.
 
     ``{"uncertain": True}`` is the third answer, and the one that matters for a
     forwarded message: the request timed out twice, so whether the event landed
@@ -103,16 +107,17 @@ def notify_chat_event(
     ``*_ACCOUNT`` — how the web-gateway identifies which registry gateway sent
     the event, matched against the accounts the gateways it already knows
     report for themselves. ``gate`` carries the delivery-gate
-    verdict for inbound events (``{"forward": bool, "flagged_unknown": bool,
-    "reason": str}``) so the web-gateway can keep held/no-action classes silent,
-    and can tell a turn that this sender is not on the whitelist yet. ``files``
+    verdict for inbound events (``{"forward": bool, "reason": str}``) so the
+    web-gateway can keep held/no-action classes silent. It no longer decides
+    whether a turn runs: that is the chat's own ``assist`` flag, which the user
+    sets per correspondent. ``files``
     are the message's attachments in the ``POST /message`` shape
     (``{"filename", "content_type", "data"}``, base64) so a turn started there
     can open them; they ride along only for a forwarded message.
 
     ``handover`` is the caller's offer: *if you take this message, I will not
-    forward it to triage myself.* Only a call that makes that offer can buy a
-    companion turn, and that is deliberate — a gateway built before this
+    forward it to triage myself.* Only a call that makes that offer is accepted
+    or can buy a companion turn, and that is deliberate — a gateway built before this
     contract existed fires the rail and forwards to triage regardless, so
     starting a turn on its event would have the message handled twice. During
     a rollout where the web-gateway is rebuilt before the gateways, the absent
