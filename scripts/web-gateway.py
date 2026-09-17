@@ -999,6 +999,11 @@ CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "30"))
 # answer a rebuild: a list from a few minutes ago beats a 502 on the phone.
 # Beyond this the 502 is honest — the view would be fiction.
 CHAT_LIST_STALE_SECONDS = float(os.environ.get("CHAT_LIST_STALE_SECONDS", "600"))
+# The whole of one list rebuild — heads, records, unread counts, several
+# store round trips — shares this budget, so a store that accepts requests
+# and then stalls holds a handler for at most this long before the fallback
+# is served, whatever QLEVER_TIMEOUT allows a single query.
+CHAT_LIST_REBUILD_TIMEOUT = float(os.environ.get("CHAT_LIST_REBUILD_TIMEOUT", "20"))
 # Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
 CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
 # How many images one chat send may carry; each is size-capped by
@@ -4457,9 +4462,10 @@ def _humanize_slug(uri: str) -> str:
     return " ".join(w.capitalize() for w in tail.replace("_", "-").split("-") if w)
 
 
-def _sparql_bindings(query: str) -> list[dict]:
+def _sparql_bindings(query: str, timeout: float | None = None) -> list[dict]:
     """POST a SPARQL query to the life store and return its result bindings.
-    Raises on any transport/parse error so callers can surface an honest 502."""
+    Raises on any transport/parse error so callers can surface an honest 502.
+    `timeout` overrides QLEVER_TIMEOUT for a caller working to a deadline."""
     data = urllib.parse.urlencode({"query": query}).encode("utf-8")
     req = urllib.request.Request(
         QLEVER_LIFE_URL,
@@ -4470,7 +4476,8 @@ def _sparql_bindings(query: str) -> list[dict]:
         },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=QLEVER_TIMEOUT) as resp:
+    with urllib.request.urlopen(
+            req, timeout=QLEVER_TIMEOUT if timeout is None else timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     return payload.get("results", {}).get("bindings", [])
 
@@ -4796,17 +4803,30 @@ _P_ATTACHMENT = _KB + "attachment"
 _P_RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 
 
-def _fetch_chat_records(iris: list[str]) -> dict[str, dict]:
+def _budget_left(deadline: float | None) -> float:
+    """The timeout for the next store call of a rebuild working to `deadline`
+    (None: the plain per-query timeout). Raises once the deadline has passed,
+    so a stalled store costs the budget once, not once per round trip."""
+    if deadline is None:
+        return QLEVER_TIMEOUT
+    left = deadline - time.time()
+    if left <= 0:
+        raise TimeoutError("chat list rebuild deadline passed")
+    return min(left, QLEVER_TIMEOUT)
+
+
+def _fetch_chat_records(iris: list[str], deadline: float | None = None) -> dict[str, dict]:
     """``{message IRI: {predicate: [objects…]}}`` for the given messages.
 
-    One VALUES-bounded pattern per chunk (see _CHAT_RECORDS_SPARQL); every
+    One VALUES-bounded pattern per chunk (see _CHAT_RECORDS_SPARQL) — none at
+    all for no messages, since an empty VALUES block is not a query; every
     object the store holds is kept as a list, since a message may carry several
     attachments. Raises on store errors like the query it serves."""
     records: dict[str, dict] = {iri: {} for iri in iris}
     for start in range(0, len(iris), _CHAT_RECORDS_CHUNK):
         chunk = iris[start:start + _CHAT_RECORDS_CHUNK]
         query = _CHAT_RECORDS_SPARQL % " ".join(f"<{iri}>" for iri in chunk)
-        for b in _sparql_bindings(query):
+        for b in _sparql_bindings(query, timeout=_budget_left(deadline)):
             m, p, o = _bval(b, "m"), _bval(b, "p"), _bval(b, "o")
             if m in records and p and o is not None:
                 records[m].setdefault(p, []).append(o)
@@ -5139,13 +5159,14 @@ def _chats_skeleton_and_unread() -> tuple[dict, dict]:
             return skeleton, unread
         with _chats_cache_lock:
             gen = _chats_cache["gen"]
+        deadline = time.time() + CHAT_LIST_REBUILD_TIMEOUT
         try:
-            skeleton = _fetch_chats_skeleton()
+            skeleton = _fetch_chats_skeleton(deadline)
             docs_for_cutoffs = _CHAT_STATE.all()
             unread = _fetch_unread_counts({
                 cid: (docs_for_cutoffs.get(cid) or {}).get("last_read")
                 for cid in skeleton
-            })
+            }, deadline)
         except Exception as exc:  # noqa: BLE001 - a stale list beats no list
             now = time.time()
             with _chats_cache_lock:
@@ -5179,7 +5200,7 @@ def _chats_skeleton_and_unread() -> tuple[dict, dict]:
         return skeleton, unread
 
 
-def _fetch_chats_skeleton() -> dict[str, dict]:
+def _fetch_chats_skeleton(deadline: float | None = None) -> dict[str, dict]:
     """One entry per chat from the ledgers: channel + its latest message row.
 
     Keyed by the composed chat id, so two accounts talking to the same peer are
@@ -5188,11 +5209,11 @@ def _fetch_chats_skeleton() -> dict[str, dict]:
     the plain ``<channel>:<key>`` id it has always had, which is why nothing
     that already exists moves, is renamed, or loses its state document."""
     heads: list[tuple] = []
-    for b in _sparql_bindings(_CHATS_HEADS_SPARQL):
+    for b in _sparql_bindings(_CHATS_HEADS_SPARQL, timeout=_budget_left(deadline)):
         m, key, ts = _bval(b, "m"), _bval(b, "chat"), _bval(b, "ts")
         if m and key and ts:
             heads.append((m, key, _bval(b, "account") or None, ts))
-    records = _fetch_chat_records(sorted({m for m, _k, _a, _t in heads}))
+    records = _fetch_chat_records(sorted({m for m, _k, _a, _t in heads}), deadline)
     skeleton: dict[str, dict] = {}
     for m, key, account, ts in heads:
         record = records.get(m) or {}
@@ -5219,7 +5240,8 @@ def _fetch_chats_skeleton() -> dict[str, dict]:
     return skeleton
 
 
-def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
+def _fetch_unread_counts(cutoffs: dict[str, str | None],
+                         deadline: float | None = None) -> dict[str, int]:
     """Per-chat unread counts in one VALUES-bounded query (see the SPARQL).
 
     The VALUES row is (chat key, account, cutoff) and results map back on the
@@ -5243,7 +5265,8 @@ def _fetch_unread_counts(cutoffs: dict[str, str | None]) -> dict[str, int]:
     )
     counts: dict[str, int] = {}
     by_pair = {(key, account): cid for cid, (key, account, _c) in refs.items()}
-    for b in _sparql_bindings(_CHATS_UNREAD_SPARQL % rows):
+    for b in _sparql_bindings(_CHATS_UNREAD_SPARQL % rows,
+                              timeout=_budget_left(deadline)):
         pair = (_bval(b, "chat"), _bval(b, "account") or "")
         n = _bval(b, "n")
         if pair in by_pair and n is not None:

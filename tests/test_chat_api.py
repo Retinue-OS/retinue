@@ -1560,8 +1560,8 @@ def test_write_during_rebuild_is_not_lost(base, wg):
     fresh for a whole window."""
     fetch = wg._fetch_chats_skeleton
 
-    def fetch_and_race():
-        skeleton = fetch()
+    def fetch_and_race(deadline=None):
+        skeleton = fetch(deadline)
         wg._chats_cache_invalidate()  # a rail event landing mid-flight
         return skeleton
 
@@ -1580,6 +1580,46 @@ def test_write_during_rebuild_is_not_lost(base, wg):
         wg.CHAT_LIST_CACHE_SECONDS = 0.0
         wg._chats_cache_clear()
     print("PASS test_write_during_rebuild_is_not_lost")
+
+
+def test_empty_store_is_an_empty_list(base, wg):
+    """No messages at all is an empty list, not an error: the heads query
+    returns nothing and no records query is sent (an empty VALUES block is
+    not a query)."""
+    STATE["list_rows"] = []
+    wg._chats_cache_clear()
+    try:
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert not any("VALUES ?m {" in q for q in STATE["queries"][seen:])
+        # Every chat left comes from the overlay, none from the store.
+        assert all(c["last"]["ts"] for c in body["chats"])
+    finally:
+        STATE["list_rows"] = None
+        wg._chats_cache_clear()
+    print("PASS test_empty_store_is_an_empty_list")
+
+
+def test_rebuild_deadline_bounds_a_stalling_store(base, wg):
+    """One rebuild works to a total deadline across its round trips: once it
+    has passed, no further store call is made and the fallback is served.
+    (The store here is fine — the budget is set to zero, so the very first
+    call is already over the deadline.)"""
+    status, before = _http(base, "GET", "/chats")
+    assert status == 200, before
+    wg._chats_cache_invalidate()
+    wg.CHAT_LIST_REBUILD_TIMEOUT = 0.0
+    try:
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert len(STATE["queries"]) == seen, "deadline passed but the store was queried"
+        assert [c["id"] for c in body["chats"]] == [c["id"] for c in before["chats"]]
+    finally:
+        wg.CHAT_LIST_REBUILD_TIMEOUT = 20.0
+        wg._chats_cache_clear()
+    print("PASS test_rebuild_deadline_bounds_a_stalling_store")
 
 
 def test_store_down_is_502(base, wg):
@@ -1712,6 +1752,8 @@ def main():
         test_hide_races_an_arrival(base, wg)
         test_store_down_serves_recent_list(base, wg)
         test_write_during_rebuild_is_not_lost(base, wg)
+        test_empty_store_is_an_empty_list(base, wg)
+        test_rebuild_deadline_bounds_a_stalling_store(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()
