@@ -283,6 +283,29 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # set the deployment runs untiered and nothing below changes behaviour.
 ROUTER_MODEL = os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
 FRONTIER_MODEL = os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
+# The dashboard is only one of the router tier's entry points:
+# RETINUE_ROUTER_MODEL is also read by the scheduler's prompt jobs,
+# news-curate.py, ask_ara and the presentation lint's default. A deployment
+# that wants cheap dispatch turns but a strong model answering the dashboard
+# cannot say so with the two tier variables alone — this one splits that off.
+# Unset (the default), the gateway behaves exactly as before. Deliberately not
+# named RETINUE_CONVERSATION_MODEL: RETINUE_CONVERSATION_MODELS below is the
+# picker's *list*, and a one-character difference between two model variables
+# is a configuration trap.
+DASHBOARD_MODEL = os.environ.get("RETINUE_DASHBOARD_MODEL", "").strip()
+
+
+def _default_thread_model() -> str:
+    """The model an unpinned dashboard THREAD turn runs on.
+
+    Dashboard threads only, which is the point of the variable. The gateway's
+    other user-facing entry point — POST /message, where the messenger
+    channels deliver inbound turns (and the async jobs they spawn) — resolves
+    its own default inside send_message() and stays on the router tier with
+    junior's escalation. RETINUE_DASHBOARD_MODEL buys a strong model at the
+    dashboard door, not a blanket upgrade of every turn the gateway runs.
+    """
+    return DASHBOARD_MODEL or ROUTER_MODEL or CLAUDE_MODEL
 
 # ── Per-conversation model selection ───────────────────────────────────────────
 # Each turn is its own `claude -p` process — a resumed one keeps the transcript,
@@ -318,8 +341,8 @@ FRONTIER_MODEL = os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
 # `claude --model` (for LiteLLM-sourced entries the id is the route's
 # model_name, which `claude` sends verbatim); `label` is what the dashboard
 # shows. The list carries only concrete models — no synthetic "Default" row.
-# Instead, the entry the gateway's configured default (CLAUDE_MODEL, resolved
-# through LiteLLM's route aliases when it is one) actually runs on is flagged
+# Instead, the entry an un-pinned thread actually runs on
+# (_default_thread_model(), resolved through LiteLLM's route aliases) is flagged
 # `default: true` and says so in its label; a thread without a stored choice
 # runs that default, stored as the empty string internally. Empty-id entries
 # in a static source are dropped for the same reason.
@@ -830,28 +853,46 @@ def _offered_entry_for(model_name: str, models: list[dict]) -> dict | None:
     return None
 
 
+_warned_missing_defaults: set[str] = set()
+
+
+def _warn_default_not_offered(model_name: str) -> None:
+    """Log once per model that the picker cannot represent the actual default.
+
+    The list is rebuilt on every cache miss, so an unconditional print would
+    repeat for as long as the misconfiguration lasts."""
+    if model_name in _warned_missing_defaults:
+        return
+    _warned_missing_defaults.add(model_name)
+    print(f"[web-gateway] default model {model_name!r} is not in the offered "
+          "model list — the picker shows no default row", flush=True)
+
+
 def _mark_default(models: list[dict]) -> list[dict]:
     """Return a copy with the entry un-pinned threads actually run flagged.
 
     The picker offers no synthetic "Default" row; instead the concrete entry
     that default turns actually run on carries `default: true` and says so in
-    its label — so the dropdown always names a real model. Since the tiers,
-    an un-pinned thread runs the ROUTER tier when one is set (Ara junior at
-    the door — docs/model-routing.md), else the gateway default — so that is
-    the row to flag, or the picker lies about new threads (observed live: the
-    header showed the gateway default while the turns ran the router model).
-    A router model the list does not offer falls back to flagging the gateway
-    default, so the picker keeps its default row. When neither candidate
-    resolves to an offered entry, nothing is flagged."""
+    its label — so the dropdown always names a real model. That entry is
+    whatever _default_thread_model() resolves to (the dashboard tier when the
+    deployment sets one, else the router tier — Ara junior at the door,
+    docs/model-routing.md — else the gateway default), and only that one: a
+    flag on any other row would repeat the very lie this flag exists to end
+    (observed live: the header showed the gateway default while the turns ran
+    the router model). So when the configured model is not in the offered
+    list, nothing is flagged and the operator gets one warning naming it,
+    rather than a different model silently wearing the "(default)" label."""
     out = [dict(m) for m in models]
-    for candidate in (ROUTER_MODEL, CLAUDE_MODEL):
-        entry = _offered_entry_for(candidate, out)
-        if entry is not None:
-            entry["default"] = True
-            label = str(entry.get("label") or entry["id"])
-            entry["label"] = (label[:-1] + ", default)" if label.endswith(")")
-                              else label + " (default)")
-            break
+    configured = _default_thread_model()
+    entry = _offered_entry_for(configured, out)
+    if entry is None:
+        if configured and out:
+            _warn_default_not_offered(configured)
+        return out
+    entry["default"] = True
+    label = str(entry.get("label") or entry["id"])
+    entry["label"] = (label[:-1] + ", default)" if label.endswith(")")
+                      else label + " (default)")
     return out
 
 
@@ -2812,10 +2853,15 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         restart = _conv_engage_prompt(conv, False, arrival) if fresh else None
         # An explicit per-thread choice wins; an escalated thread without one
         # stays with Ara senior (the frontier tier) rather than re-paying a
-        # junior turn plus an escalation on every message.
+        # junior turn plus an escalation on every message. Otherwise the
+        # thread default applies — the dashboard's own tier where the
+        # deployment configures one, else the router tier send_message()
+        # would have picked anyway.
         chosen = _conv_model(conv)
         if chosen is None and conv.get("escalated") and FRONTIER_MODEL:
             chosen = FRONTIER_MODEL
+        elif chosen is None and DASHBOARD_MODEL:
+            chosen = _default_thread_model()
         result = send_message(prompt, display_question=latest, session_key=session_key,
                               model=chosen, restart_message=restart)
         if result.get("escalated"):
@@ -3972,8 +4018,9 @@ def send_message(message: str, display_question: str | None = None,
     Serialized per session key so one conversation stays ordered, while different
     keys run in parallel up to the worker-pool bound.
 
-    `model` overrides the model for this turn (a validated per-thread choice);
-    when None the router tier applies (Ara junior at the door), falling back
+    `model` overrides the model for this turn (a validated per-thread choice,
+    or a dashboard thread's resolved default — _default_thread_model()); when
+    None the router tier applies (Ara junior at the door), falling back
     to the gateway default (CLAUDE_MODEL). A turn resumes the thread's
     existing session when one is still fresh, so switching models between
     turns is free not because the session is new but because a session
@@ -4012,6 +4059,12 @@ def send_message(message: str, display_question: str | None = None,
             # materialises the previous default into an explicit pin (see
             # materialise_pre_tier_model_pins), or existing threads silently
             # move to a model nobody chose for them.
+            #
+            # Dashboard threads resolve their own default before calling
+            # (_conv_worker → _default_thread_model), so RETINUE_DASHBOARD_MODEL
+            # does not reach this line: what defers here is POST /message —
+            # the messenger channels' inbound turns — and that path keeps the
+            # router tier.
             effective_model = (ROUTER_MODEL or CLAUDE_MODEL) if model is None else model
 
             # A turn below the frontier tier may be escalated by the session
