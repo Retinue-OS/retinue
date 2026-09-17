@@ -1004,6 +1004,11 @@ CHAT_LIST_STALE_SECONDS = float(os.environ.get("CHAT_LIST_STALE_SECONDS", "600")
 # and then stalls holds a handler for at most this long before the fallback
 # is served, whatever QLEVER_TIMEOUT allows a single query.
 CHAT_LIST_REBUILD_TIMEOUT = float(os.environ.get("CHAT_LIST_REBUILD_TIMEOUT", "20"))
+# After a rebuild failed with nothing to fall back on (an outage at startup,
+# or past the stale window), the store is not asked again for this long: the
+# requests queued behind that attempt and the polls of the next few seconds
+# share its verdict instead of each waiting out the budget.
+CHAT_LIST_FAILURE_BACKOFF = float(os.environ.get("CHAT_LIST_FAILURE_BACKOFF", "10"))
 # Timeout for the one hop POST /chats/<id>/send makes to the channel gateway.
 CHAT_SEND_TIMEOUT = float(os.environ.get("CHAT_SEND_TIMEOUT", "30"))
 # How many images one chat send may carry; each is size-capped by
@@ -5101,7 +5106,11 @@ def _chat_display_name(doc: dict, channel: str, key: str) -> str:
 # can tell that its result predates the write.
 _chats_cache_lock = threading.Lock()
 _chats_cache: dict = {"at": 0.0, "built": 0.0, "gen": 0, "skeleton": None,
-                      "unread": None}
+                      "unread": None,
+                      # The last rebuild that failed with nothing to serve, and
+                      # when — shared with the requests that follow within
+                      # CHAT_LIST_FAILURE_BACKOFF; cleared by a success.
+                      "failure": None, "failed_at": 0.0}
 # Rebuilds are single-flight: with several dashboards polling, concurrent
 # requests that all miss the cache wait for the one rebuild in progress rather
 # than each sending the store the same queries.
@@ -5118,7 +5127,7 @@ def _chats_cache_clear() -> None:
     """Drop the skeleton entirely, fallback included (the tests' reset)."""
     with _chats_cache_lock:
         _chats_cache.update({"at": 0.0, "built": 0.0, "skeleton": None,
-                             "unread": None})
+                             "unread": None, "failure": None, "failed_at": 0.0})
         _chats_cache["gen"] += 1
 
 
@@ -5148,18 +5157,31 @@ def _unread_after_reads(skeleton: dict, unread: dict) -> dict:
 def _chats_skeleton_and_unread() -> tuple[dict, dict]:
     """The cached skeleton, rebuilt when expired; the last good one when the
     rebuild fails and it is not older than CHAT_LIST_STALE_SECONDS. Raises
-    only when there is nothing honest to serve."""
+    only when there is nothing honest to serve — and, for
+    CHAT_LIST_FAILURE_BACKOFF after such a failure, raises it again without
+    asking the store, so an outage costs one attempt per backoff, not one
+    per poll."""
     skeleton, unread = _chats_cached(time.time())
     if skeleton is not None:
         return skeleton, unread
     with _chats_rebuild_lock:
         # Another request may have rebuilt while this one waited for the lock.
-        skeleton, unread = _chats_cached(time.time())
+        now = time.time()
+        skeleton, unread = _chats_cached(now)
         if skeleton is not None:
             return skeleton, unread
         with _chats_cache_lock:
             gen = _chats_cache["gen"]
-        deadline = time.time() + CHAT_LIST_REBUILD_TIMEOUT
+            failure = _chats_cache["failure"]
+            if failure and now - _chats_cache["failed_at"] < CHAT_LIST_FAILURE_BACKOFF:
+                # The requests queued behind the attempt that failed, and the
+                # polls of the next few seconds, share its verdict. Nothing
+                # to fall back on existed then, and nothing has appeared
+                # since — only a rebuild creates a skeleton.
+                raise RuntimeError(
+                    f"{failure} (not retried for {CHAT_LIST_FAILURE_BACKOFF:g}s "
+                    f"after a failed rebuild)")
+        deadline = now + CHAT_LIST_REBUILD_TIMEOUT
         try:
             skeleton = _fetch_chats_skeleton(deadline)
             docs_for_cutoffs = _CHAT_STATE.all()
@@ -5173,6 +5195,8 @@ def _chats_skeleton_and_unread() -> tuple[dict, dict]:
                 stale = _chats_cache["skeleton"]
                 age = now - _chats_cache["built"]
                 if stale is None or age > CHAT_LIST_STALE_SECONDS:
+                    _chats_cache["failure"] = str(exc) or exc.__class__.__name__
+                    _chats_cache["failed_at"] = now
                     raise
                 stale_unread = _chats_cache["unread"]
             unread = _unread_after_reads(stale, stale_unread)
@@ -5196,7 +5220,8 @@ def _chats_skeleton_and_unread() -> tuple[dict, dict]:
             # rather than serving the pre-write list for a whole window.
             raced = _chats_cache["gen"] != gen
             _chats_cache.update({"at": 0.0 if raced else now, "built": now,
-                                 "skeleton": dict(skeleton), "unread": dict(unread)})
+                                 "skeleton": dict(skeleton), "unread": dict(unread),
+                                 "failure": None})
         return skeleton, unread
 
 

@@ -1623,16 +1623,26 @@ def test_rebuild_deadline_bounds_a_stalling_store(base, wg):
 
 
 def test_store_down_is_502(base, wg):
-    """With nothing cached to fall back on, a store failure is an honest 502."""
+    """With nothing cached to fall back on, a store failure is an honest 502 —
+    and the requests that follow within CHAT_LIST_FAILURE_BACKOFF share that
+    verdict without asking the store again; past it, the store is retried."""
     wg._chats_cache_clear()
     STATE["fail"] = True
     try:
         status, body = _http(base, "GET", "/chats")
         assert status == 502 and "life store" in body["error"]
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and "not retried" in body["detail"], body
+        assert len(STATE["queries"]) == seen, "store asked again inside the backoff"
+        wg._chats_cache["failed_at"] -= wg.CHAT_LIST_FAILURE_BACKOFF + 1
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and len(STATE["queries"]) > seen, body
         status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
         assert status == 502
     finally:
         STATE["fail"] = False
+        wg._chats_cache_clear()
     print("PASS test_store_down_is_502")
 
 
