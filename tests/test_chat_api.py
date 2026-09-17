@@ -138,7 +138,9 @@ class _MockSparql(BaseHTTPRequestHandler):
         if "VALUES (?chat ?account ?cut)" in query:
             bindings = self._unread(query)
         elif "MAX(?ts0)" in query:
-            bindings = self._chat_list()
+            bindings = self._chat_heads()
+        elif "VALUES ?m {" in query:
+            bindings = self._records(query)
         elif "VALUES ?att" in query:
             bindings = self._media_meta(query)
         else:
@@ -158,6 +160,11 @@ class _MockSparql(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    # The canned chat list: one row per chat with its latest message, in the
+    # flat shape the tests author (and override via STATE["list_rows"]). The
+    # gateway reads the list in two queries — the head message per chat, then
+    # the heads' records as (m, p, o) rows — so both are derived from here:
+    # row i heads the mock message IRI urn:mock:head:<i>.
     def _chat_list(self):
         if STATE.get("list_rows") is not None:
             return STATE["list_rows"]
@@ -168,6 +175,43 @@ class _MockSparql(BaseHTTPRequestHandler):
             _lit_row(chat=WA_KEY, channel="whatsapp", ts=W_TS, type=T_IN,
                      text="Letzter Aufruf", sender="4176", atts=""),
         ]
+
+    @staticmethod
+    def _head_iri(index):
+        return f"urn:mock:head:{index}"
+
+    def _chat_heads(self):
+        return [_lit_row(m=self._head_iri(i), chat=row["chat"]["value"],
+                         account=(row.get("account") or {"value": ""})["value"],
+                         ts=row["ts"]["value"])
+                for i, row in enumerate(self._chat_list())]
+
+    def _records(self, query):
+        """The (m, p, o) rows of the asked-for head messages, from the flat
+        canned rows — one attachment row per URL, as the ledger holds them."""
+        import re
+        asked = set(re.findall(r"<([^>]+)>", query.split("VALUES ?m {", 1)[1].split("}", 1)[0]))
+        rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+        flat = {"channel": KB + "channel", "text": KB + "text",
+                "sender": KB + "sender", "author": KB + "author",
+                "mid": KB + "messageId", "type": rdf_type}
+        out = []
+        for i, row in enumerate(self._chat_list()):
+            m = self._head_iri(i)
+            if m not in asked:
+                continue
+            for key, predicate in flat.items():
+                if key in row:
+                    out.append(_lit_row(m=m, p=predicate, o=row[key]["value"]))
+            ts_pred = KB + ("sentAt" if row.get("type", {}).get("value") == T_OUT
+                            else "receivedAt")
+            out.append(_lit_row(m=m, p=ts_pred, o=row["ts"]["value"]))
+            if (row.get("account") or {}).get("value"):
+                out.append(_lit_row(m=m, p=KB + "account", o=row["account"]["value"]))
+            for url in (row.get("atts") or {"value": ""})["value"].split(" "):
+                if url:
+                    out.append(_lit_row(m=m, p=KB + "attachment", o=url))
+        return out
 
     def _media_meta(self, query):
         # What the gateways stated about their blobs, on the media IRIs: the
@@ -505,9 +549,10 @@ def test_chat_list_contract(base, wg):
 def test_chat_list_shows_media_preview(base, wg):
     """A picture-only last message previews as an image in the chat list.
 
-    Pins the list query's STR(?att) (see _MockSparql.do_POST): with the
-    aggregate unbound the preview reads as empty text, which is how every
-    chat with a last picture looked."""
+    The head message's attachments reach the skeleton as one records row each
+    (see _MockSparql._records) — when the list still read them through a
+    GROUP_CONCAT over IRIs, the aggregate came back unbound and every chat
+    with a last picture previewed as empty text."""
     STATE["list_rows"] = [
         _lit_row(chat=MARA, channel="signal", ts=TS3, type=T_IN, text="",
                  sender=MARA, atts=f"urn:retinue:media:signal:{MID_ATT}"),
@@ -1454,7 +1499,31 @@ def test_hide_races_an_arrival(base, wg):
     print("PASS test_hide_races_an_arrival")
 
 
+def test_store_down_serves_recent_list(base, wg):
+    """A store that cannot answer a rebuild does not blank the phone: the last
+    good skeleton is served while it is recent. Expiry (what every rail event,
+    read and send does) keeps it as the fallback; only age beyond
+    CHAT_LIST_STALE_SECONDS makes the failure a 502 again."""
+    status, before = _http(base, "GET", "/chats")
+    assert status == 200, before
+    wg._chats_cache_invalidate()
+    STATE["fail"] = True
+    try:
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert [c["id"] for c in body["chats"]] == [c["id"] for c in before["chats"]]
+        wg._chats_cache["built"] -= wg.CHAT_LIST_STALE_SECONDS + 1
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and "life store" in body["error"]
+    finally:
+        STATE["fail"] = False
+        wg._chats_cache_clear()
+    print("PASS test_store_down_serves_recent_list")
+
+
 def test_store_down_is_502(base, wg):
+    """With nothing cached to fall back on, a store failure is an honest 502."""
+    wg._chats_cache_clear()
     STATE["fail"] = True
     try:
         status, body = _http(base, "GET", "/chats")
@@ -1580,6 +1649,7 @@ def main():
         test_arrival_starts_a_companion_turn(base, wg)
         test_hide_flags(base, wg)
         test_hide_races_an_arrival(base, wg)
+        test_store_down_serves_recent_list(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()

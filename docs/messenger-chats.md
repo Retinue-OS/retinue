@@ -203,9 +203,12 @@ both.
 There is deliberately **no second read path**. A raw-scan fallback would be a
 second, growing reader of the same records — exactly the duplication choosing
 the store avoids — and it would mask store trouble instead of surfacing it.
-If `qlever-life` is unreachable, the chat API answers with an error, and the
-dashboard components do what they already do offline: show their last cached
-state, which covers a restart or a brief blip with no new code. A store that
+If `qlever-life` cannot answer, the chat list serves its last good skeleton
+for a bounded while (`CHAT_LIST_STALE_SECONDS`, logged each time) and then
+answers with an error — the same last-known-state the dashboard components
+already show offline, held one hop earlier so a blip during a poll does not
+blank the list; no record is ever read another way. That covers a restart or
+a brief blip with no new code. A store that
 turns out to be frequently down or behind is an infrastructure defect to fix
 at the store (it ships a healthcheck and supervision since the #150 bump),
 not something each consumer works around — the same stance the framework
