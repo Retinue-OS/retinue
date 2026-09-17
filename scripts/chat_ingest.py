@@ -7,8 +7,11 @@ seconds are exactly the two this rail carries: an arrival that should light up
 the chat surface (and Web-Push the user) *now*, and an own-device echo that
 should advance the read watermark *now*. The gateway POSTs the event's
 metadata to the web-gateway's ``POST /internal/chats/inbound``, which updates
-the chat's state and the in-memory live overlay — the deterministic,
-credit-free notification path (no model turn).
+the chat's state and the in-memory live overlay. Notification itself stays
+deterministic and credit-free — no model turn is spent telling the user a
+message arrived — but the rail is no longer only that: it **takes** the
+message (see ``handover`` below), and for a VIP sender it also starts a turn
+in that chat's companion thread.
 
 An event asserts *which account* sent it and nothing about where that account
 lives: a gateway's address is configured on the reader's side (the
@@ -17,19 +20,18 @@ also declared its own address would be a second source of truth free to drift
 from the first — which is exactly what once attributed one account's chats to
 another.
 
-Fire-and-forget by contract *for the classes the gate holds back*:
-:func:`notify_chat_event_async` runs the POST on a daemon thread with a short
-timeout, never raises, and never blocks the gateway's own hot path. A lost rail
-event costs a notification and a few seconds of freshness, never a message —
-the ledger already holds it and the store catches up on its own.
+**Inbound events are synchronous, because the caller needs the answer.** An
+arrival is offered to the rail with ``handover``, and what comes back decides
+what the gateway does next: an acceptance means the chat has the message and
+the gateway marks it delivered; a job handle with it means a VIP's message is
+also being worked, and the gateway waits for that job first; neither means the
+rail could not take it — switched off, unreachable, an older web-gateway — and
+the caller falls back to everything it did before the chat surface existed.
 
-A message the gate **forwards** is different. The web-gateway answers that one
-with a job handle for the companion turn it started in the message's own chat
-(docs/messenger-chats.md, phase 4), and the gateway needs that handle to learn
-whether the message was ever accounted for. So the forward class calls
-:func:`notify_chat_event` directly and reads its answer: no handle means the
-rail is switched off, unreachable, or could not take the message, and the
-caller falls back to the triage forward it has always done.
+:func:`notify_chat_event_async` remains for the events with no answer worth
+waiting for — the own-device echoes that advance a read watermark. It runs the
+POST on a daemon thread, never raises, and never blocks the gateway's hot
+path; a lost one costs a few seconds of freshness, never a message.
 
 ``CHATS_INGEST_URL`` defaults to the in-network web-gateway address in the
 base compose file, so the rail works with no deployment configuration; with it

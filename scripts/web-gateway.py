@@ -7082,9 +7082,15 @@ class Handler(BaseHTTPRequestHandler):
             # The handover matters on its own account. A gateway built before
             # this contract offers none and forwards to triage itself, so
             # acting on its event would have one message handled twice.
-            if payload.get("handover"):
+            # Both reads are strict: this is a JSON boundary, and both fields
+            # are documented booleans that callers of ours send as booleans.
+            # Truthiness would let `"false"` or `1` pass for an offer — the
+            # first reintroducing the double handling this contract exists to
+            # prevent, the second spending a model turn on somebody nobody
+            # named a VIP.
+            if payload.get("handover") is True:
                 accepted = True
-                if gate is not None and gate.get("vip"):
+                if gate is not None and gate.get("vip") is True:
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"))
         elif author in ("user", "device"):

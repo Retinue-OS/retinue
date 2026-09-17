@@ -16,7 +16,9 @@ contract:
   * a synchronous answer (no ``job_url``) still marks delivered immediately;
   * every inbound message — held classes included — is offered to the chats
     rail, and its acceptance is what marks the message delivered, so nothing
-    accumulates undelivered waiting for a drain that no longer exists.
+    accumulates undelivered waiting for a drain that no longer exists;
+  * and the two fields that contract turns on, ``handover`` and the gate's
+    ``vip``, are asserted on the wire and not only through a mock.
 
 Since the chat surface started taking messages (docs/messenger-chats.md, phase
 4) the handle can also come from the chats rail, for a turn in the message's own
@@ -28,6 +30,7 @@ always has.
     python3 tests/test_delivery_confirmation.py
 """
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -364,6 +367,57 @@ def test_telegram_rail_takes_the_message():
         lambda gw: gw._forward_to_inbox("hello", "en", "12345"))
 
 
+class _RailAccepted:
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"accepted": true}'
+
+
+def test_the_handover_offer_reaches_the_wire():
+    """The two fields the contract turns on, asserted where they actually live.
+
+    Everything else about them is checked through a mocked notify_chat_event
+    or a hand-built payload at the handler, so a dropped or renamed key here
+    would leave every gateway silently falling back to triage — and every VIP's
+    message unworked — with the whole suite still green. This reads the bytes
+    that go out."""
+    ci = _load("chat_ingest_wire_under_test", "chat_ingest.py")
+    ci.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+    original = ci.urllib.request.urlopen
+    sent = []
+
+    def _capture(req, timeout=None):
+        sent.append(json.loads(req.data.decode("utf-8")))
+        return _RailAccepted()
+
+    try:
+        ci.urllib.request.urlopen = _capture
+        ci.notify_chat_event(direction="in", channel="signal",
+                             chat="+15551234567", handover=True,
+                             gate={"forward": True, "vip": True,
+                                   "reason": "vip"})
+        ci.notify_chat_event(direction="out", channel="signal",
+                             chat="+15551234567", author="device")
+    finally:
+        ci.urllib.request.urlopen = original
+
+    assert len(sent) == 2, sent
+    # A real JSON boolean, not a truthy stand-in: the handler reads it strictly.
+    assert sent[0].get("handover") is True, sent[0]
+    assert sent[0].get("gate", {}).get("vip") is True, sent[0]
+    # And nothing is offered by default — an own-device echo hands over no
+    # message, so it must not look like a caller that did.
+    assert sent[1].get("handover") in (None, False), sent[1]
+    print("ok: the handover offer and the VIP verdict are on the wire")
+
+
 class _RailResponse:
     status = 200
 
@@ -430,6 +484,7 @@ def test_a_lost_rail_answer_is_uncertain_not_a_refusal():
 def main():
     test_await_job_outcomes()
     test_a_lost_rail_answer_is_uncertain_not_a_refusal()
+    test_the_handover_offer_reaches_the_wire()
     test_confirm_delivery_runs_callback_on_success_only()
     test_whatsapp_delivery_confirmation()
     test_signal_delivery_confirmation()

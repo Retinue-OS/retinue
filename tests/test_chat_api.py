@@ -1192,6 +1192,22 @@ def test_arrival_starts_a_companion_turn(base, wg):
     assert body["pushed"] is True, "notification is not what is being withheld"
     assert TURNS == []
 
+    # Both opt-ins are read strictly, because this is a JSON boundary and both
+    # are documented booleans. A truthy stand-in must not pass for either: the
+    # first would reintroduce the double handling the handover prevents, the
+    # second would spend a turn on somebody nobody named a VIP.
+    TURNS.clear()
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="s1", handover="true"))
+    assert status == 200 and "accepted" not in body, body
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="s2",
+                              gate={"forward": True, "vip": 1,
+                                    "reason": "unknown"}))
+    assert status == 200 and body["accepted"] is True, body
+    assert "job_url" not in body, body
+    assert TURNS == []
+
     # An event with no verdict at all is still taken — notification fails open
     # — but nobody is a VIP by default, so no turn runs.
     TURNS.clear()
