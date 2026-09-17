@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -87,9 +88,11 @@ class Recorder:
 
     def __init__(self):
         self.calls = []
+        self.due = []
 
-    def __call__(self, mode, messages):
+    def __call__(self, mode, messages, due=0):
         self.calls.append((mode, list(messages)))
+        self.due.append(due)
         return 0
 
 
@@ -461,6 +464,14 @@ def _record(gate, message_id, status="omnibus_pending"):
     path.write_text(json.dumps({"status": status, "message_id": message_id}))
 
 
+def _omnibus_sent(gate, ago_seconds=0):
+    """Stamp the marker the skill writes when a digest goes out."""
+    stamp = datetime.now(timezone.utc) - timedelta(seconds=ago_seconds)
+    path = gate.TRIAGE_STATE_DIR / ".last-omnibus"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(stamp.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
 def test_recorded_mail_does_not_arm_the_gate():
     # Triage never marks mail read, so everything it classified stays unread in
     # the INBOX until its disposition is executed. Without this, every tick
@@ -476,6 +487,9 @@ def test_recorded_mail_does_not_arm_the_gate():
                 {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
             ]
             _record(gate, "<a@work.com>", status)
+            # A bundle whose digest went out moments ago is in progress, not
+            # owed — the due path below is what covers the other case.
+            _omnibus_sent(gate)
             rec = Recorder()
             gate.spawn = rec
             assert gate.run_frequent() == 0
@@ -484,6 +498,100 @@ def test_recorded_mail_does_not_arm_the_gate():
             assert gate.run_daily() == 0
             assert rec.calls == [], f"daily spawned over a message already {status}"
     print("PASS test_recorded_mail_does_not_arm_the_gate")
+
+
+def test_a_due_omnibus_digest_arms_the_gate_on_its_own():
+    # The accrual deadlock: `omnibus_pending` is an open status, so the mail on
+    # it does not arm the gate — and the gate is the only thing that spawns a
+    # triage session. Without this path a bundle goes out only when unrelated
+    # new mail happens to arm a run, or days later via the stall backstop.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        msg = {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+        gate.unread_inbox = lambda: [msg]
+        _record(gate, "<a@work.com>", "omnibus_pending")
+        _omnibus_sent(gate, ago_seconds=gate.OMNIBUS_INTERVAL + 60)
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert len(rec.calls) == 1, "a due omnibus digest must arm the gate"
+        assert rec.due == [1], f"the spawn was not told the digest is due: {rec.due}"
+        ids = {m["message_id"] for m in rec.calls[0][1]}
+        assert ids == {"<a@work.com>"}, f"the bundled mail was not handed over: {ids}"
+    print("PASS test_a_due_omnibus_digest_arms_the_gate_on_its_own")
+
+
+def test_a_pending_omnibus_stays_quiet_inside_its_interval():
+    # The other half of the bargain: accrual is the whole point of the omnibus,
+    # so a bundle whose digest is not yet due must not buy a model turn. This
+    # is what keeps the user from being pinged several times a day.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.unread_inbox = lambda: [
+            {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+        ]
+        _record(gate, "<a@work.com>", "omnibus_pending")
+        _omnibus_sent(gate, ago_seconds=gate.OMNIBUS_INTERVAL / 2)
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert rec.calls == [], "a bundle inside its interval must stay quiet"
+    print("PASS test_a_pending_omnibus_stays_quiet_inside_its_interval")
+
+
+def test_a_missing_omnibus_marker_counts_as_due():
+    # No marker means no digest on record. Erring towards "due" costs one
+    # digest; erring the other way leaves bundled mail unseen indefinitely.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.unread_inbox = lambda: [
+            {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
+        ]
+        _record(gate, "<a@work.com>", "omnibus_pending")
+        assert not (gate.TRIAGE_STATE_DIR / ".last-omnibus").exists()
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert len(rec.calls) == 1, "a bundle with no marker must arm the gate"
+    print("PASS test_a_missing_omnibus_marker_counts_as_due")
+
+
+def test_a_due_digest_arms_even_when_its_sender_is_not_whitelisted():
+    # A bundle accrued by a daily run holds mail from senders the frequent pass
+    # does not trust. The digest is still owed on time, so due-ness is read off
+    # the whole unread listing rather than off the whitelisted subset.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)  # no whitelist at all
+        gate.unread_inbox = lambda: [
+            {"from": "stranger@random.io", "subject": "s", "message_id": "<a@x.io>"}
+        ]
+        _record(gate, "<a@x.io>", "omnibus_pending")
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert len(rec.calls) == 1, "a due digest must arm regardless of sender"
+        assert rec.due == [1]
+        ids = {m["message_id"] for m in rec.calls[0][1]}
+        assert ids == {"<a@x.io>"}, f"the bundled mail was not handed over: {ids}"
+    print("PASS test_a_due_digest_arms_even_when_its_sender_is_not_whitelisted")
+
+
+def test_the_prompt_tells_a_due_run_to_send_the_digest():
+    # A run armed only by a due digest has to say so, or the session reads it as
+    # an ordinary collect-and-propose run and the bundle accrues another cycle.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        messages = [{"from": "a@b.c", "subject": "s", "message_id": "<1>"}]
+        plain = gate.build_prompt("frequent", messages)
+        due = gate.build_prompt("frequent", messages, 1)
+        assert "omnibus_pending" not in plain, "the plain prompt should not mention it"
+        assert "omnibus_pending" in due and "Phase 4b" in due, (
+            "the due prompt must name the pending bundle and the phase that sends it"
+        )
+    print("PASS test_the_prompt_tells_a_due_run_to_send_the_digest")
 
 
 def test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones():
@@ -499,7 +607,7 @@ def test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones():
             {"from": "boss@work.com", "subject": "old", "message_id": "<a@work.com>"},
             {"from": "boss@work.com", "subject": "new", "message_id": "<b@work.com>"},
         ]
-        _record(gate, "<a@work.com>")
+        _record(gate, "<a@work.com>", "proposed")
         rec = Recorder()
         gate.spawn = rec
         assert gate.run_frequent() == 0
@@ -736,6 +844,11 @@ if __name__ == "__main__":
     test_wildcard_covers_the_lists_under_a_platform_domain()
     test_whitelisted_sender_beats_an_ignored_list()
     test_recorded_mail_does_not_arm_the_gate()
+    test_a_due_omnibus_digest_arms_the_gate_on_its_own()
+    test_a_pending_omnibus_stays_quiet_inside_its_interval()
+    test_a_missing_omnibus_marker_counts_as_due()
+    test_a_due_digest_arms_even_when_its_sender_is_not_whitelisted()
+    test_the_prompt_tells_a_due_run_to_send_the_digest()
     test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones()
     test_message_without_an_id_always_arms()
     test_stalled_non_terminal_mail_re_arms_the_gate()

@@ -96,6 +96,12 @@ PROMPT_LIST_LIMIT = int(os.environ.get("TRIAGE_PROMPT_LIST_LIMIT", "150"))
 # (EMAIL_PROCESSING_INTERVAL), so an item merely awaiting the user is not
 # re-collected while the reminder mechanism is still working on it.
 STALL_DAYS = float(os.environ.get("TRIAGE_STALL_DAYS", "7"))
+# How long the triage skill accrues archive/delete candidates before sending one
+# omnibus digest — the skill's own cadence knob, read here under the same name
+# and meaning. The gate needs it because the gate owns every triage spawn: an
+# accrued bundle sits on a non-terminal status, which by design does *not* arm
+# the gate, so without a due check nothing would ever come back to send it.
+OMNIBUS_INTERVAL = float(os.environ.get("EMAIL_PROCESSING_INTERVAL", "86400"))
 # Where a filed newsletter goes. Non-destructive by default: the news rail files
 # a *reference* into the feed, so the mail itself is archived, never deleted.
 # Set empty to leave it in the INBOX (triage's Phase-1 backstop then moves it).
@@ -403,9 +409,11 @@ def route(unread: list[dict], mode: str) -> list[dict]:
 # `self_filed`, `abstain`, …) is settled as far as this gate is concerned. An
 # allowlist of *unfinished* states rather than of terminal ones, because a rail
 # added later must not have its records silently re-armed by this code.
-# `omnibus_pending` is not a name the skill writes (it writes `omnibus`); it is
-# kept because an older run may have left records under it, and a stale alias
-# costs nothing here while dropping it would re-hide that mail.
+# `omnibus_pending` is a live name the skill writes: an item classified for the
+# omnibus whose digest has not gone out yet. It belongs here — it owes the user
+# a digest, not a model turn — but it is the one open status this gate also
+# arms on directly, once that digest is due (`omnibus_due`). Removing it from
+# this set would re-spawn a session over the same bundle on every tick.
 OPEN_STATUSES = frozenset(
     {"proposed", "omnibus", "omnibus_pending", "deferred", "engaged"}
 )
@@ -450,6 +458,19 @@ def _last_touched(path: Path, record: dict) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
 
 
+def _read_record(path: Path) -> dict | None:
+    """The status record at `path`, or None when it is unreadable or malformed.
+
+    Every caller here fails open on None rather than trusting a record it could
+    not parse — the alternative is mail no future run ever looks at again.
+    """
+    try:
+        record = json.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return record if isinstance(record, dict) else None
+
+
 def _stalled(path: Path) -> bool:
     """True when a recorded, non-terminal item has sat untouched past STALL_DAYS.
 
@@ -464,13 +485,10 @@ def _stalled(path: Path) -> bool:
     decision (see CLAUDE.md — `muted` is the only decidable signal of that),
     so a thread that has gone quiet is exactly the case this must catch.
     """
-    try:
-        record = json.loads(path.read_text())
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        # Unreadable record: treat as stalled so a model turn can repair it,
-        # rather than leaving the message invisible forever.
-        return True
-    if not isinstance(record, dict):
+    record = _read_record(path)
+    if record is None:
+        # Unreadable or malformed record: treat as stalled so a model turn can
+        # repair it, rather than leaving the message invisible forever.
         return True
     status = record.get("status")
     if not isinstance(status, str) or not status.strip():
@@ -509,28 +527,115 @@ def arming(messages: list[dict]) -> list[dict]:
     return [m for m in messages if not _already_recorded(m)]
 
 
-def _report_arming(mode: str, hits: list[dict], fresh: list[dict]) -> None:
-    """Log why the gate armed, splitting never-seen mail from stalled mail.
+def _last_omnibus() -> datetime | None:
+    """When the last omnibus digest went out, per the skill's marker file.
+
+    None when the marker is missing or unparseable, which reads as "no digest
+    on record" and so makes a pending bundle due. That direction is the safe
+    one: its cost is one digest the user may not have been owed yet, while the
+    other direction leaves mail bundled and unseen indefinitely.
+    """
+    try:
+        raw = (TRIAGE_STATE_DIR / ".last-omnibus").read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return _parse_ts(raw.strip())
+
+
+def _pending_omnibus(messages: list[dict]) -> list[dict]:
+    """The listed messages bundled for the omnibus but not yet sent.
+
+    Read off the mailbox listing rather than by walking the status store:
+    triage never touches mailbox flags, so an item awaiting its digest is by
+    definition still unread in the INBOX and therefore already in `messages` —
+    and this runs on every tick, where walking thousands of records would not
+    be free.
+    """
+    pending = []
+    for msg in messages:
+        path = _status_path(msg.get("message_id") or "")
+        if not (path and path.exists()):
+            continue
+        record = _read_record(path)
+        if record is None:
+            continue  # corruption is the stall path's business, not this one
+        status = record.get("status")
+        if isinstance(status, str) and status.strip() == "omnibus_pending":
+            pending.append(msg)
+    return pending
+
+
+def omnibus_due(messages: list[dict]) -> list[dict]:
+    """The pending-omnibus messages whose digest is now due, else [].
+
+    The skill accrues archive/delete candidates on `omnibus_pending` and sends
+    one digest per OMNIBUS_INTERVAL — that accrual is what keeps the user from
+    being pinged four times a day. But this gate is the only thing that spawns
+    a triage session, and an accrued item does not arm it (`_already_recorded`:
+    `omnibus_pending` is an open status, so it counts as work in progress). So
+    the digest has to be armed on its own terms here; otherwise it goes out
+    only when unrelated new mail happens to arm the gate, or — worse — when the
+    STALL_DAYS backstop eventually fires, days late.
+    """
+    pending = _pending_omnibus(messages)
+    if not pending:
+        return []
+    last = _last_omnibus()
+    if last is None:
+        return pending
+    if datetime.now(timezone.utc) - last >= timedelta(seconds=OMNIBUS_INTERVAL):
+        return pending
+    return []
+
+
+def _merge(*groups: list[dict]) -> list[dict]:
+    """The groups concatenated, deduplicated on Message-ID, order preserved.
+
+    Messages without an id are kept as they come: there is nothing to dedupe
+    them on, and dropping them would hide mail.
+    """
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for group in groups:
+        for msg in group:
+            mid = (msg.get("message_id") or "").strip()
+            if mid:
+                if mid in seen:
+                    continue
+                seen.add(mid)
+            merged.append(msg)
+    return merged
+
+
+def _report_arming(
+    mode: str, hits: list[dict], fresh: list[dict], due: list[dict]
+) -> None:
+    """Log why the gate armed: never-seen mail, stalled mail, a due digest.
 
     A rising stalled count is the signature of the inbox-zero backstop failing,
-    and it is otherwise invisible: both kinds look identical in the spawn line.
+    and it is otherwise invisible: all three kinds look identical in the spawn
+    line. A run armed only by a due digest is likewise worth seeing as such.
     """
     stalled = sum(
         1
         for m in fresh
         if (p := _status_path(m.get("message_id") or "")) is not None and p.exists()
     )
-    parts = [f"{len(fresh) - stalled} never seen"]
-    if stalled:
-        parts.append(f"{stalled} stalled >{STALL_DAYS:g}d on a non-terminal status")
+    parts = []
+    if fresh:
+        parts.append(f"{len(fresh) - stalled} never seen")
+        if stalled:
+            parts.append(f"{stalled} stalled >{STALL_DAYS:g}d on a non-terminal status")
+    if due:
+        parts.append(f"{len(due)} bundled, omnibus digest due")
     print(
-        f"[triage-gate] {mode}: arming on {len(fresh)} of {len(hits)} "
-        f"({', '.join(parts)})",
+        f"[triage-gate] {mode}: arming on {len(fresh) + len(due)} "
+        f"({', '.join(parts)}); {len(hits)} message(s) in scope",
         file=sys.stderr,
     )
 
 
-def build_prompt(mode: str, messages: list[dict]) -> str:
+def build_prompt(mode: str, messages: list[dict], due: int = 0) -> str:
     scope = (
         "from a whitelisted sender"
         if mode == "frequent"
@@ -546,6 +651,18 @@ def build_prompt(mode: str, messages: list[dict]) -> str:
         "conversations with archivals/deletions bundled into the omnibus. Do not "
         "answer in chat and do not push results via Signal. A run with nothing to "
         "propose ends silently.",
+    ]
+    if due:
+        lines += [
+            "",
+            f"{due} of these are already bundled on `omnibus_pending` and their "
+            "digest is now due: send the omnibus this run (Phase 4b), even if "
+            "nothing else here is worth proposing — that bundle is the reason "
+            "this run was armed at all. What is in the bundle is what the status "
+            "store says is in it: reconcile from the store, never from this "
+            "listing or from a thread's prose.",
+        ]
+    lines += [
         "",
         "The messages the gate saw (the mailbox listing remains authoritative — "
         "reconcile, do not assume this list is complete):",
@@ -564,13 +681,15 @@ def build_prompt(mode: str, messages: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def spawn(mode: str, messages: list[dict]) -> int:
+def spawn(mode: str, messages: list[dict], due: int = 0) -> int:
     print(
-        f"[triage-gate] {mode}: {len(messages)} message(s) to triage; spawning session",
+        f"[triage-gate] {mode}: {len(messages)} message(s) to triage"
+        + (f", {due} of them a due omnibus digest" if due else "")
+        + "; spawning session",
         file=sys.stderr,
     )
     cmd = ["claude", "-p", "--output-format=json",
-           "--permission-mode", PERMISSION_MODE, build_prompt(mode, messages)]
+           "--permission-mode", PERMISSION_MODE, build_prompt(mode, messages, due)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
     # Refresh an access token about to expire before the session starts —
@@ -588,41 +707,50 @@ def spawn(mode: str, messages: list[dict]) -> int:
 def run_frequent() -> int:
     unread = unread_inbox()
     hits = route(unread, "frequent")
-    if not hits:
-        print(
-            f"[triage-gate] frequent: {len(unread)} unread, none whitelisted; "
-            "nothing spawned",
-            file=sys.stderr,
-        )
-        return 0
+    # A due digest is looked for across the whole unread listing, not just the
+    # whitelisted `hits`: a bundle accrued by a daily run may well hold mail
+    # from senders this pass does not whitelist, and the user is owed that
+    # digest on time regardless of who sent what is in it.
+    due = omnibus_due(unread)
     fresh = arming(hits)
-    if not fresh:
-        print(
-            f"[triage-gate] frequent: {len(hits)} whitelisted, all already in the "
-            "status store; nothing spawned",
-            file=sys.stderr,
-        )
+    if not fresh and not due:
+        if not hits:
+            print(
+                f"[triage-gate] frequent: {len(unread)} unread, none whitelisted; "
+                "nothing spawned",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"[triage-gate] frequent: {len(hits)} whitelisted, all already in the "
+                "status store; nothing spawned",
+                file=sys.stderr,
+            )
         return 0
-    _report_arming("frequent", hits, fresh)
-    return spawn("frequent", hits)
+    _report_arming("frequent", hits, fresh, due)
+    # The routed set plus whatever the digest needs: narrowing the payload to
+    # what armed the run would hide the rest of the stack from reconciliation.
+    return spawn("frequent", _merge(hits, due), due=len(due))
 
 
 def run_daily() -> int:
     n = refresh_whitelist_from_sent()
     if n >= 0:
         print(f"[triage-gate] daily: whitelist now {n} address(es)", file=sys.stderr)
-    hits = route(unread_inbox(), "daily")
-    if not hits:
-        print("[triage-gate] daily: nothing unread that triage owes a look; "
-              "nothing spawned", file=sys.stderr)
-        return 0
+    unread = unread_inbox()
+    hits = route(unread, "daily")
+    due = omnibus_due(unread)
     fresh = arming(hits)
-    if not fresh:
-        print(f"[triage-gate] daily: {len(hits)} unread, all already in the "
-              "status store; nothing spawned", file=sys.stderr)
+    if not fresh and not due:
+        if not hits:
+            print("[triage-gate] daily: nothing unread that triage owes a look; "
+                  "nothing spawned", file=sys.stderr)
+        else:
+            print(f"[triage-gate] daily: {len(hits)} unread, all already in the "
+                  "status store; nothing spawned", file=sys.stderr)
         return 0
-    _report_arming("daily", hits, fresh)
-    return spawn("daily", hits)
+    _report_arming("daily", hits, fresh, due)
+    return spawn("daily", _merge(hits, due), due=len(due))
 
 
 def main(argv: list[str] | None = None) -> int:

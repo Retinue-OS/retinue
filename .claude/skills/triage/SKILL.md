@@ -147,16 +147,25 @@ status. Reconcile in both directions:
    Phase 6 would. This catches e.g. the already-answered path (which proposes no
    reply, so never reaches Phase 6's move) and verify-queued sends (deferred
    until approval, then forgotten). Only genuinely non-terminal states
-   (`proposed`, `omnibus`, `deferred`, an `engaged` item still awaiting
-   *user* input) legitimately stay in the INBOX.
+   (`proposed`, `omnibus_pending`, `omnibus`, `deferred`, an `engaged` item
+   still awaiting *user* input) legitimately stay in the INBOX.
+   **`omnibus_pending` is not drift**: it is an item deliberately held back
+   until its digest is due, so the user has not seen it yet — never dispose of
+   one under this pass.
 4. **Re-collect `stalled`** — the same backstop for the *non-terminal* states.
    An item whose proposal was never engaged and whose thread was archived or
    deleted stays in the INBOX forever: nothing revisits it. The gate therefore
    re-arms any INBOX message on a non-terminal status untouched for
    `TRIAGE_STALL_DAYS` (default 7, `triage-gate.py`) — but re-arming only buys
    this turn; without this pass the item is re-armed again on every later tick
-   and still never leaves. For each such message, look its `conversation_id` up
-   in `GET /conversations?all=1` and take one of three branches:
+   and still never leaves. For each such message, look its thread up in
+   `GET /conversations?all=1` — under `conversation_id` for an individually
+   proposed item, under `omnibus_conversation_id` for one an omnibus already
+   carried (two distinct fields; see *State & idempotency*) — and take one of
+   the three branches below. An `omnibus_pending` record carries **neither**:
+   it was never shown to the user, so there is no thread to judge and no
+   decision to read off one. Treat it as the "thread gone" branch — re-collect
+   it into the next due digest, never resolve it.
    - **Thread archived *and* muted** → that is the user's decision on the
      message (per CLAUDE.md `muted` is the only decidable signal of "archive
      this for good"). Do not re-propose: resolve it out of the INBOX exactly as
@@ -518,26 +527,67 @@ messages and record the last-omnibus timestamp in
 **`$TRIAGE_STATE_DIR/.last-omnibus`** (that exact name — see *State &
 idempotency*).
 
-**The omnibus push always carries `--key`.** "At most once per interval" is
-enforced by the gateway, not by trusting the bookkeeping below to be reached:
-the key names the interval window, so every attempt inside one window collapses
-onto the first thread instead of raising another. Derive it mechanically —
-never from a timestamp of "now", which differs on every attempt:
+**"Accumulate" means touch the status store only — never the dashboard.**
+Check `$TRIAGE_STATE_DIR/.last-omnibus` before doing anything else in this
+phase. If less than `EMAIL_PROCESSING_INTERVAL` has elapsed since it, the
+omnibus is **not due**, full stop — regardless of whether an omnibus thread
+from earlier in the window is still open, unread, or awaiting the user's
+approval. An unresolved thread is not an invitation to add to it: write status
+`omnibus_pending` for each newly classified `archive`/`delete` item (the
+status the rest of this skill and `triage-gate.py` both already treat as
+open-but-not-yet-proposed) and stop — **no `conversation-push.py` call of any
+kind for these items**, new thread or append. The existing thread, if any, is
+left exactly as the user last saw it until the next `4b` emission gathers
+every `omnibus_pending` item — the ones just accumulated together with any
+from earlier passes — into that one fresh conversation. Do not reach for
+`--thread <existing-omnibus-id>` here: that flag exists to add material to a
+conversation the user is already looking at (an attachment, a Phase 5 nudge on
+a *proposed* item), not to slip more omnibus content into a batch the user has
+not approved yet — every append fires its own unread badge and Web Push, which
+is exactly the per-item noise the single-digest design exists to prevent. A
+run that finds new archive/delete items mid-interval ends silently on this
+front, same as Phase 4c.
+
+**The omnibus push always carries `--key`, and only fires when due.** "At most
+once per interval" is enforced by the gateway, not by trusting the bookkeeping
+below to be reached: the key names the interval window, so every attempt
+inside one window collapses onto the first thread instead of raising another.
+Derive it mechanically — never from a timestamp of "now", which differs on
+every attempt:
 
     OMNIBUS_KEY="triage-omnibus:$(python3 -c 'import os,time; print(int(time.time()//int(os.environ.get("EMAIL_PROCESSING_INTERVAL","86400"))))')"
     python3 /workspace/scripts/conversation-push.py --title "Triage: archive & delete" \
     --key "$OMNIBUS_KEY" \
     "...grouped ARCHIVE / DELETE, one line per message, each ARCHIVE line with its reason...\n<approve-all chip>"
 
-This key is what makes emit-then-record safe. The bookkeeping is written
-*after* the push on purpose — writing it first would mark messages `omnibus`
-that the user never saw, had the push failed — so a run that dies in between
-leaves the items untracked and a later run re-proposes them, correctly, since
-nothing recorded that they were proposed. Without the key that re-proposal
-opens a **second thread**; with it, the user's existing thread is reused and
-nothing duplicates. A response carrying `deduplicated` means this window's
-omnibus is already up: write the bookkeeping and stop — never re-push, and
-never "try again" because a push looked unconfirmed.
+This key protects a *due* emission from raising two threads when it is
+attempted more than once inside the same window (a retried run, an
+escalation) — it is not what decides whether to emit at all; the
+`.last-omnibus` check above is. This key is also what makes emit-then-record
+safe. The bookkeeping is written *after* the push on purpose — writing it
+first would mark messages `omnibus` that the user never saw, had the push
+failed — so a run that dies in between leaves the items untracked and a later
+run re-proposes them, correctly, since nothing recorded that they were
+proposed. Without the key that re-proposal opens a **second thread**; with it,
+the user's existing thread is reused and nothing duplicates. A response
+carrying `deduplicated` means this window's omnibus is already up: write the
+bookkeeping and stop — never re-push, and never "try again" because a push
+looked unconfirmed.
+
+**Reuse is byte-exact, or it is an append.** The key guarantees one *thread*,
+not one *message*. The gateway compares the incoming text with what the thread
+already says, and on any difference it **appends** the new text and fires its
+own unread badge and Web Push — while still answering `deduplicated: true`.
+Digest prose is composed fresh in each run, so a re-render essentially never
+matches byte-for-byte, which means a naive retry delivers the user a second
+digest under a key that was supposed to prevent exactly that. So **snapshot
+the exact string you pushed** — write it beside the bookkeeping, in
+`$TRIAGE_STATE_DIR/.last-omnibus-text` — and on any retry inside the same
+window re-push that snapshot verbatim instead of re-composing. Read the
+response accordingly: `deduplicated` on its own does **not** prove nothing was
+delivered. A response that also carries `appended` means a message did go out,
+so write the bookkeeping and stop; only a `deduplicated` response *without*
+`appended` means the push collapsed silently onto the existing thread.
 
 ### 4c. No status-report conversations — a silent run is the normal outcome
 
@@ -620,7 +670,26 @@ until the cause is fixed; a second dispatch would only return it again.
 Then carry out the disposition:
 
 - **Archive / delete** → apply per channel (e-mail `move`/delete; messaging
-  archive), honouring named exceptions.
+  archive), honouring named exceptions. **Resolve each omnibus line to its
+  message via the status store, never via the line's own text.** The
+  executing session is very often a different `claude -p` run than the one
+  that composed the omnibus, so it cannot rely on remembering which message a
+  line meant — and a support ticket's replies routinely share one subject
+  line verbatim ("Re: Re: <original subject>") across weeks of back-and-forth,
+  so re-deriving identity from subject/sender text can match more than one
+  message, some of them with a live, unrelated disposition. Every item an
+  omnibus ever carried is stamped in its status file with
+  `omnibus_conversation_id` set to that thread's id (see *State &
+  idempotency*) — grep the store for that id to get the exact, unambiguous
+  set this thread's approval covers, then act on each by its `uid`/
+  `message_id`, not by re-matching text. A line whose message cannot be found
+  this way is left non-terminal and flagged rather than guessed at. The lookup
+  spans **every** channel an omnibus can bundle, not e-mail alone: a messenger
+  item's record may still sit under the legacy `whatsapp_<jid>_<epoch>` scheme
+  beside the canonical `whatsapp:<jid>:<ISO-timestamp>` one, so grep the store
+  for the thread id rather than assuming a filename shape — and a bundled
+  messenger line with no record at all *is* the "cannot be found" case: flag
+  it, never match it back by its text.
 - **Reply** → for e-mail use `email_client.py reply --uid <UID>`, which derives
   the threading headers (`In-Reply-To`/`References`) from the source — an
   unthreaded reply defeats the already-answered check and gets re-proposed as a
@@ -681,7 +750,24 @@ ledger's flag, not an INBOX move, closes the loop.
   `omnibus`, `last_nudge`, `resolved`). For a sent reply also record `sent_uid` +
   `sent_message_id` so the send is verifiable against the Sent folder, not
   merely asserted. Write a status only once a message has actually been
-  proposed, bundled, or resolved — never on mere reading.
+  proposed, bundled, or resolved — never on mere reading. The single exception
+  is `omnibus_pending` (Phase 4b), which is written at classification time
+  precisely because the item is *not* being shown yet: it records a deliberate
+  hold, and without it an accrued item is invisible both to the next run and to
+  the gate's due-digest check, so its digest would never be armed.
+- **`omnibus_pending` vs `omnibus`, `conversation_id` vs `omnibus_conversation_id`.**
+  An item accrued between omnibus emissions (Phase 4b) carries `status:
+  omnibus_pending` and no conversation reference yet — it has been classified
+  but not shown to the user. Once actually bundled into an emitted thread, it
+  becomes `status: omnibus` and records that thread's id under
+  **`omnibus_conversation_id`** — a distinct field from `conversation_id`,
+  which is reserved for an individually-proposed `reply`/`action` item's own
+  thread (Phase 4a). Keeping the two fields separate is what lets a later
+  session — Phase 6 executing an omnibus approval, or anyone auditing the
+  store — recover exactly which messages one omnibus thread covers by
+  querying the field (`grep -l '"omnibus_conversation_id": "<id>"'`), a lookup
+  that stays correct even when several messages in the same thread (a support
+  ticket's reply chain, e.g.) share an identical subject and sender.
 - **Diff on the sanitized id, never the raw Message-ID** — the filename scheme
   is `message_id.strip('<>')` with `/` → `_`, exactly `triage-gate.py`'s
   `_status_path()`. An id containing a slash (GitHub notifications) otherwise
