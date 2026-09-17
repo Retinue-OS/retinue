@@ -40,6 +40,7 @@ def _load_gateway(tmp: Path, env: dict[str, str]):
                 "RETINUE_CONVERSATION_MODELS", "RETINUE_LITELLM_URL",
                 "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
                 "RETINUE_ROUTER_MODEL", "RETINUE_FRONTIER_MODEL",
+                "RETINUE_DASHBOARD_MODEL",
                 "RETINUE_CLAUDE_MODEL", "TRANSCRIPT_CLEANUP_MODEL",
                 "PRESENTATION_LINT_MODEL", "CONVERSATION_BASE_URL"):
         os.environ.pop(var, None)
@@ -279,6 +280,36 @@ def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
     assert "RETINUE_ESCALATE_FILE" not in senior_env
 
 
+def test_dashboard_model_overrides_the_router_tier_at_the_door(wg_dashboard):
+    """RETINUE_DASHBOARD_MODEL governs the gateway's own unpinned turns, while
+    the router tier keeps governing everything else that reads it."""
+    # An unpinned turn runs the dashboard model, not the router tier...
+    spawns = _capture_spawns(wg_dashboard,
+                             json.dumps({"result": "ok", "session_id": "s-4"}))
+    with _daemon_environment():
+        out = wg_dashboard.send_message("hello", session_key="env-dash")
+    assert out.get("response") == "ok", out
+    cmd, kwargs = spawns[0]
+    assert "--model" in cmd and "opus" in cmd, cmd
+    assert kwargs["env"]["RETINUE_SESSION_MODEL"] == "opus"
+    # ...and, being the frontier model here, it is senior: no escalation flag.
+    assert "RETINUE_ESCALATE_FILE" not in kwargs["env"]
+    # A per-thread pin still wins over it.
+    spawns.clear()
+    with _daemon_environment():
+        wg_dashboard.send_message("hello", session_key="env-dash-2", model="haiku")
+    cmd, kwargs = spawns[0]
+    assert "haiku" in cmd, cmd
+    assert kwargs["env"]["RETINUE_SESSION_MODEL"] == "haiku"
+    # The picker's "(default)" row names what unpinned turns actually run.
+    marked = wg_dashboard._mark_default([{"id": "opus", "label": "Opus"},
+                                         {"id": "sonnet", "label": "Sonnet"}])
+    assert marked[0].get("default") is True and "default" in marked[0]["label"]
+    assert "default" not in marked[1]
+    # The lint's default tier is the router model, untouched by the split.
+    assert wg_dashboard.PRESENTATION_LINT_MODEL == "sonnet"
+
+
 def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     """The tool-less helper sessions are `claude` processes all the same."""
     spawns = _capture_spawns(wg, json.dumps({"result": "hello world"}))
@@ -323,6 +354,12 @@ def main():
             tmp / "c", {"RETINUE_ROUTER_MODEL": "haiku",
                         "RETINUE_FRONTIER_MODEL": "opus"})
         test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered)
+
+        wg_dashboard = _load_gateway(
+            tmp / "d", {"RETINUE_ROUTER_MODEL": "sonnet",
+                        "RETINUE_FRONTIER_MODEL": "opus",
+                        "RETINUE_DASHBOARD_MODEL": "opus"})
+        test_dashboard_model_overrides_the_router_tier_at_the_door(wg_dashboard)
     print("all web-gateway claude-spawn tests passed")
 
 

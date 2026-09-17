@@ -241,6 +241,9 @@ services:
       # can name either — the operator's explicit decision).
       - RETINUE_ROUTER_MODEL
       - RETINUE_FRONTIER_MODEL
+      # Overrides the router tier for the dashboard's own turns only, so the
+      # door in front of the user can be strong while dispatch stays cheap.
+      - RETINUE_DASHBOARD_MODEL
       - RETINUE_TRIAGE_MODEL
       - RETINUE_CONVERSATION_MODELS
       - RETINUE_CONVERSATION_MODELS_FILE

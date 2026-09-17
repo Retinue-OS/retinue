@@ -283,6 +283,22 @@ CLAUDE_MODEL = os.environ.get("RETINUE_CLAUDE_MODEL", "").strip()
 # set the deployment runs untiered and nothing below changes behaviour.
 ROUTER_MODEL = os.environ.get("RETINUE_ROUTER_MODEL", "").strip()
 FRONTIER_MODEL = os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
+# The door in front of the *user* is only one of the router tier's entry
+# points: RETINUE_ROUTER_MODEL is also read by the scheduler's prompt jobs,
+# news-curate.py, ask_ara and the presentation lint's default. A deployment
+# that wants cheap dispatch turns but a strong model answering the dashboard
+# cannot say so with the two tier variables alone — this one splits that off,
+# overriding the router tier for the gateway's own turns only. Unset (the
+# default), the gateway behaves exactly as before. Deliberately not named
+# RETINUE_CONVERSATION_MODEL: RETINUE_CONVERSATION_MODELS below is the
+# picker's *list*, and a one-character difference between two model variables
+# is a configuration trap.
+DASHBOARD_MODEL = os.environ.get("RETINUE_DASHBOARD_MODEL", "").strip()
+
+
+def _default_turn_model() -> str:
+    """The model a turn carrying no per-thread pin runs on."""
+    return DASHBOARD_MODEL or ROUTER_MODEL or CLAUDE_MODEL
 
 # ── Per-conversation model selection ───────────────────────────────────────────
 # Each turn is its own `claude -p` process — a resumed one keeps the transcript,
@@ -318,8 +334,8 @@ FRONTIER_MODEL = os.environ.get("RETINUE_FRONTIER_MODEL", "").strip()
 # `claude --model` (for LiteLLM-sourced entries the id is the route's
 # model_name, which `claude` sends verbatim); `label` is what the dashboard
 # shows. The list carries only concrete models — no synthetic "Default" row.
-# Instead, the entry the gateway's configured default (CLAUDE_MODEL, resolved
-# through LiteLLM's route aliases when it is one) actually runs on is flagged
+# Instead, the entry an un-pinned turn actually runs on (_default_turn_model(),
+# resolved through LiteLLM's route aliases when it is one) is flagged
 # `default: true` and says so in its label; a thread without a stored choice
 # runs that default, stored as the empty string internally. Empty-id entries
 # in a static source are dropped for the same reason.
@@ -836,15 +852,16 @@ def _mark_default(models: list[dict]) -> list[dict]:
     The picker offers no synthetic "Default" row; instead the concrete entry
     that default turns actually run on carries `default: true` and says so in
     its label — so the dropdown always names a real model. Since the tiers,
-    an un-pinned thread runs the ROUTER tier when one is set (Ara junior at
-    the door — docs/model-routing.md), else the gateway default — so that is
-    the row to flag, or the picker lies about new threads (observed live: the
-    header showed the gateway default while the turns ran the router model).
-    A router model the list does not offer falls back to flagging the gateway
-    default, so the picker keeps its default row. When neither candidate
-    resolves to an offered entry, nothing is flagged."""
+    an un-pinned thread runs the dashboard model when one is set, else the
+    ROUTER tier (Ara junior at the door — docs/model-routing.md), else the
+    gateway default — so that is the row to flag, or the picker lies about
+    new threads (observed live: the header showed the gateway default while
+    the turns ran the router model). The candidates are tried in the same
+    order _default_turn_model() resolves them, and one the list does not
+    offer falls through to the next, so the picker keeps its default row.
+    When no candidate resolves to an offered entry, nothing is flagged."""
     out = [dict(m) for m in models]
-    for candidate in (ROUTER_MODEL, CLAUDE_MODEL):
+    for candidate in (DASHBOARD_MODEL, ROUTER_MODEL, CLAUDE_MODEL):
         entry = _offered_entry_for(candidate, out)
         if entry is not None:
             entry["default"] = True
@@ -3973,8 +3990,10 @@ def send_message(message: str, display_question: str | None = None,
     keys run in parallel up to the worker-pool bound.
 
     `model` overrides the model for this turn (a validated per-thread choice);
-    when None the router tier applies (Ara junior at the door), falling back
-    to the gateway default (CLAUDE_MODEL). A turn resumes the thread's
+    when None the dashboard model applies (RETINUE_DASHBOARD_MODEL, when the
+    deployment gives the door its own tier), else the router tier (Ara junior
+    at the door), else the gateway default (CLAUDE_MODEL) —
+    _default_turn_model(). A turn resumes the thread's
     existing session when one is still fresh, so switching models between
     turns is free not because the session is new but because a session
     transcript is model-independent.
@@ -4011,8 +4030,12 @@ def send_message(message: str, display_question: str | None = None,
             # Ship such a change together with a one-shot migration that
             # materialises the previous default into an explicit pin (see
             # materialise_pre_tier_model_pins), or existing threads silently
-            # move to a model nobody chose for them.
-            effective_model = (ROUTER_MODEL or CLAUDE_MODEL) if model is None else model
+            # move to a model nobody chose for them. RETINUE_DASHBOARD_MODEL
+            # needs no such migration: the code change alone is inert (the
+            # resolution order is unchanged while the variable is unset), and
+            # what moves the unpinned threads is then the operator setting it
+            # — a deliberate act on their own deployment, not a deploy.
+            effective_model = _default_turn_model() if model is None else model
 
             # A turn below the frontier tier may be escalated by the session
             # itself: it creates the file named in RETINUE_ESCALATE_FILE.

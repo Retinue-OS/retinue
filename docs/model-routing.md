@@ -45,6 +45,23 @@ behaves exactly as before:
 - **`RETINUE_FRONTIER_MODEL`** — the strong model for supervision, escalation,
   and system work (Ara senior).
 
+A third, optional variable splits one entry point off the router tier:
+
+- **`RETINUE_DASHBOARD_MODEL`** — the model the web gateway's own turns default
+  to, overriding the router tier there and nowhere else. The router tier is
+  shared by the scheduler's prompt jobs, `news-curate.py`, `ask_ara` and the
+  presentation lint's default, so without this a deployment cannot have cheap
+  dispatch turns and a strong model at the door at the same time. Unset, the
+  gateway follows `RETINUE_ROUTER_MODEL` exactly as before. Setting it to the
+  frontier model makes dashboard escalation a no-op by construction — senior
+  answers directly, at senior's price for every turn, routing-shaped ones
+  included; that is the trade the variable exists to let an operator make.
+  A thread pinned in the model picker is unaffected either way; unpinned
+  threads move to the new default on their next turn (unlike the tiers'
+  introduction, this is an operator setting a variable, not a deploy silently
+  redefining stored state — hence no migration, see
+  `materialise_pre_tier_model_pins`).
+
 Difficulty is decided by **entry point first**, because most sessions know
 their difficulty before any model runs:
 
@@ -54,7 +71,7 @@ their difficulty before any model runs:
 | `news-curate.py` spawn | router | The turn only dispatches the Herald. |
 | `agent-self-review.py` spawn | frontier | Supervision by construction, and rare — the free SPARQL gate means it usually spawns nothing. |
 | Main remote-control session | frontier | Interactive system administration and development — Ara senior's desk. |
-| Dashboard turns, `ask_ara` | phase 2 | Difficulty unknown before a model reads the message; needs the escalation flow below. |
+| Dashboard turns, `ask_ara` | phase 2 | Difficulty unknown before a model reads the message; needs the escalation flow below. Dashboard turns take `RETINUE_DASHBOARD_MODEL` when the deployment sets one. |
 
 A job manifest can still pin any prompt job explicitly
 (`"model": "${RETINUE_TRIAGE_MODEL:-sonnet}"`); the per-job field always wins
@@ -109,7 +126,8 @@ workflow; the model stamp (phase 2) is the ground truth beneath both.
 
 - **Escalation flow** for the unknown-difficulty entry points. A gateway turn
   with no per-thread model choice now runs on the router tier
-  (`RETINUE_ROUTER_MODEL`, falling back to the gateway default). When a
+  (`RETINUE_ROUTER_MODEL`, or `RETINUE_DASHBOARD_MODEL` where the deployment
+  gives the door its own tier, falling back to the gateway default). When a
   frontier tier is configured and the turn runs below it, the session is
   handed **`RETINUE_ESCALATE_FILE`**: creating that file is junior's signal
   (CLAUDE.md tells her how and when), the junior reply is discarded, and
