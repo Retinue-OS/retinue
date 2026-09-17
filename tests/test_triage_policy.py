@@ -278,6 +278,14 @@ def test_vip_follows_the_sender_and_only_the_sender():
         # Nobody is a VIP by default.
         assert _gate(_policy_file(tmp), "+41791112233", None)["vip"] is False
 
+        # …but the gate turned off still means every message is worked. That
+        # switch has always meant "forward everything"; since `vip` is what
+        # decides a turn now, it has to say so, or turning the gate off would
+        # quietly turn off the handling it exists to force on.
+        off = tp.gate_decision(CH, "+41791112233", None,
+                               path=_policy_file(tmp), enabled=False)
+        assert off["forward"] is True and off["vip"] is True, off
+
 
 def test_routing_matrix():
     with tempfile.TemporaryDirectory() as d:

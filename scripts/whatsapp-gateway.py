@@ -253,7 +253,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         )
     except Exception as exc:
         print(f"[whatsapp-gateway] triage policy unreadable ({exc}); forwarding", flush=True)
-        return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
+        # Fails open on both axes. `vip` is what the chat rail reads to decide
+        # a turn, so leaving it out would have an unreadable policy silently
+        # demote everyone to no-turn — the opposite of failing open.
+        return {"forward": True, "flagged_unknown": False, "vip": True,
+                "delivered_if_held": True, "reason": "policy-error"}
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,

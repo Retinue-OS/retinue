@@ -602,8 +602,13 @@ def gate_decision(
     policy file is present but unreadable; the caller decides fail-open.
     """
     if not enabled:
+        # The gate off has always meant "forward everything", i.e. every message
+        # gets a model turn. Since the chat rail reads `vip` and not `forward`
+        # to decide that, the translation is that the switch treats everyone as
+        # a VIP — otherwise turning the gate off would quietly turn *off* the
+        # handling it exists to force on.
         return {"forward": True, "flagged_unknown": False,
-                "delivered_if_held": True, "news": False, "vip": False,
+                "delivered_if_held": True, "news": False, "vip": True,
                 "reason": "gate-disabled"}
     pol = load_messenger_policy(channel, path=path)
     grp = group_id.strip() if group_id else None

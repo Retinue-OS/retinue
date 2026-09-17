@@ -380,6 +380,30 @@ class _RailAccepted:
         return b'{"accepted": true}'
 
 
+def test_an_unreadable_policy_fails_open_on_both_axes():
+    """The fail-open that had grown a hole.
+
+    A policy file the gateway cannot read has always meant "forward it anyway"
+    — better a message worked twice than one nobody looks at. The chat rail
+    reads `vip` to decide that work, so a fallback that omitted the field
+    silently demoted everyone to no-turn: accepted, delivered, never looked
+    at. Exactly the opposite of failing open."""
+    for name, loader in (("signal", _load_signal_gateway),
+                         ("whatsapp", _load_whatsapp_gateway),
+                         ("telegram", _load_telegram_gateway)):
+        with tempfile.TemporaryDirectory() as raw:
+            gw = loader(Path(raw))
+
+            def _unreadable(*a, **k):
+                raise OSError("policy file is gone")
+
+            gw._triage.gate_decision = _unreadable
+            dec = gw._inbound_gate_decision("+15551234567", None)
+            assert dec["reason"] == "policy-error", dec
+            assert dec["forward"] is True and dec["vip"] is True, (name, dec)
+    print("ok: an unreadable policy still forwards and still earns a turn")
+
+
 def test_the_handover_offer_reaches_the_wire():
     """The two fields the contract turns on, asserted where they actually live.
 
@@ -485,6 +509,7 @@ def main():
     test_await_job_outcomes()
     test_a_lost_rail_answer_is_uncertain_not_a_refusal()
     test_the_handover_offer_reaches_the_wire()
+    test_an_unreadable_policy_fails_open_on_both_axes()
     test_confirm_delivery_runs_callback_on_success_only()
     test_whatsapp_delivery_confirmation()
     test_signal_delivery_confirmation()

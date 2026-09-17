@@ -7088,11 +7088,22 @@ class Handler(BaseHTTPRequestHandler):
             # first reintroducing the double handling this contract exists to
             # prevent, the second spending a model turn on somebody nobody
             # named a VIP.
-            if payload.get("handover") is True:
+            # Accepting means telling the caller to stop, so it may only be
+            # said where this rail really has the message. With
+            # CHAT_ARRIVAL_TURNS off it does not: the switch exists to hand
+            # every message back, and accepting anyway would mark it delivered
+            # and skip the forward the switch is meant to restore.
+            if payload.get("handover") is True and CHAT_ARRIVAL_TURNS:
                 accepted = True
                 if gate is not None and gate.get("vip") is True:
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"))
+                    # A VIP is owed work. If the companion thread could not be
+                    # opened, this rail cannot do it — so the message is not
+                    # accepted either, and the gateway's own forward gets it
+                    # done. Degrade to the old path, never to a message the
+                    # user was promised would be dealt with and was not.
+                    accepted = job_url is not None
         elif author in ("user", "device"):
             _CHAT_STATE.advance_last_read(chat_id, ts)
         body = {"ok": True, "id": chat_id, "pushed": pushed}

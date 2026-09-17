@@ -208,13 +208,14 @@ The API, as the components consume it:
 
   `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
-  is the shared draft `{text, author, agent?, ts, version}` or null,
+  is the shared draft `{text, author, agent?, ts, version}` or null, and
+  `companion` is the conversation id of this chat's companion thread (null
+  until one exists).
+
   Nothing here says whether Ara works a message on arrival: that follows the
   **sender** (their VIP flag in the triage policy), not the chat, so it holds
   wherever that person writes. See `docs/triage-delivery-gate.md`.
 
-  `companion` is the conversation id of this chat's companion thread (null
-  until one exists), and
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
   dashboard-conversation semantics verbatim: an archived chat leaves the card

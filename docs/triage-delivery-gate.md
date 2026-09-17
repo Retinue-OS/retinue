@@ -373,11 +373,15 @@ Two consequences, both deliberate:
   ask-flow. Both existed to decide whose message was worth a session to
   *notify* about; notification is free now. What is left of the sender axis is
   the blacklist, which still keeps an arrival silent.
-- **There is no undelivered backlog and no daily drain on messenger.**
-  `delivered` used to mean "a model turn accounted for this"; it now means
-  "the user has this", which the chat surface makes true within seconds. The
-  gateway's `GET /undelivered` endpoint stays for a re-surfacing that no
-  longer has anything to re-surface.
+- **Nothing is left undelivered on the normal path, so there is no daily
+  drain on messenger.** `delivered` used to mean "a model turn accounted for
+  this"; it now means "the user has this", which the chat surface makes true
+  within seconds, for every message. What still leaves `delivered=false` is
+  the handful of cases where the rail did *not* take the message — it refused,
+  its answer was lost in flight, or a VIP's turn failed — and the gateway's
+  `GET /undelivered` is how those are recovered, into triage as before. The
+  endpoint stays and is still load-bearing; what is gone is the standing
+  backlog it used to sweep.
 
 What buys a **model turn** is the new sender-level **`vip`** flag
 (`triageVipHandle`): a person whose messages the user wants dealt with the

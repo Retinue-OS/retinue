@@ -1291,13 +1291,38 @@ def test_arrival_starts_a_companion_turn(base, wg):
     finally:
         wg._conv_add_message = real_add
 
-    # And the switch is reversible without a revert: off, the rail answers no
-    # handle and the gateway forwards to triage exactly as it always has.
+    # A VIP is owed work, so a VIP's message is accepted only once the turn is
+    # actually running. With no companion thread to be had this rail cannot do
+    # it, and saying "I have this" anyway would have the gateway record it
+    # delivered and skip the forward that would still have got it done.
+    TURNS.clear()
+    real_companion = wg._chat_companion
+
+    def _no_companion(_chat_id):
+        raise RuntimeError("the store is down")
+
+    wg._chat_companion = _no_companion
+    try:
+        status, body = _http(base, "POST", rail, vip(message_id="c0"))
+        assert status == 200, body
+        assert "accepted" not in body and "job_url" not in body, body
+        assert TURNS == []
+        # A non-VIP in the same state is still accepted: nothing was owed.
+        status, body = _http(base, "POST", rail, dict(event, message_id="c0b"))
+        assert status == 200 and body["accepted"] is True, body
+    finally:
+        wg._chat_companion = real_companion
+
+    # And the switch is reversible without a revert: off, the rail takes
+    # nothing at all — no acceptance and no handle — so every gateway falls
+    # back to the held/forward path it had before the chat surface existed.
     wg.CHAT_ARRIVAL_TURNS = False
     try:
         TURNS.clear()
-        status, body = _http(base, "POST", rail, dict(event, message_id="c1"))
-        assert status == 200 and "job_url" not in body and TURNS == []
+        status, body = _http(base, "POST", rail, vip(message_id="c1"))
+        assert status == 200, body
+        assert "accepted" not in body and "job_url" not in body, body
+        assert TURNS == []
     finally:
         wg.CHAT_ARRIVAL_TURNS = True
     print("PASS test_arrival_starts_a_companion_turn")

@@ -370,17 +370,13 @@ and what a model turn is *for*:
    store a memory where the rest of the system should know what the user was
    just told), stage a reply when one is wanted, and fork to a dashboard
    conversation only for a decision that is not "send this reply". Filing is
-   worth doing even when no reply is. The
-   turn runs warm (per-chat session, summary + tail — the generalization of
-   the `a95b19c` fix from "the thread's own appends" to "the channel
-   itself"). Its job, in order: read the message in context; stage a draft
-   reply *when a reply is plausibly wanted* (a bare "thanks!" stages nothing);
-   link the message to a project if substantive; and only when something
-   needs a decision that is not "send this reply" — the unknown-sender
-   ask-flow, an action item, a scheduling conflict — **fork** it into a
-   normal dashboard conversation. The job-status contract (`202` + `job_url`)
-   is kept so the gateway's `confirm_delivery` / never-drop machinery works
-   unchanged.
+   worth doing even when no reply is, and a bare "thanks!" earns no draft: an
+   unwanted one costs the user more than a missing one, since they have to
+   read it to discard it. The turn runs warm (per-chat session, summary +
+   tail — the generalization of the `a95b19c` fix from "the thread's own
+   appends" to "the channel itself"), and the job-status contract (`202` +
+   `job_url`) is kept so the gateway's `confirm_delivery` / never-drop
+   machinery works unchanged.
 
    As built, five things are worth naming:
 
@@ -407,12 +403,16 @@ and what a model turn is *for*:
      wants a chat on their screen; the gate says what a message is worth. The
      two are independent on purpose, and hiding a chat must not quietly stop
      its messages being worked.
-5. **Daily drain** — unchanged, and still triage: `GET /undelivered` hands the
-   held and the failed messages to the triage skill, which proposes in
-   dashboard conversations as it always has. The drained messages are already
-   in their chats' mirrors, so having the drain turn walk the affected
-   companions instead is the obvious next step — but it is **not built**, and
-   nothing in phase 4 changed it.
+5. **The drain is a recovery path, not a daily sweep.** Nothing is left
+   undelivered on the normal path any more: the chat's acceptance is what
+   marks a message delivered, and every message is offered. What still leaves
+   `delivered=false` is the handful of cases where this rail did *not* take
+   the message — a refusal, an answer lost in flight, a VIP's turn that failed
+   — and `GET /undelivered` is how those are re-surfaced, into triage as
+   before. So the endpoint stays and matters; it is simply no longer a daily
+   pass over a backlog that exists by design. Having it walk the affected
+   companions instead of opening dashboard conversations is the obvious next
+   step, and is **not built**.
 
 The simple case end-to-end: message arrives → push notification → open the
 chat → read it *in the conversation it belongs to* → type (or touch up the
