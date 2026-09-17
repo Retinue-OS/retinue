@@ -7055,12 +7055,16 @@ class Handler(BaseHTTPRequestHandler):
             # on purpose, and hiding a chat must not quietly stop its messages
             # being worked.
             #
-            # An *explicit* forward verdict, though, not merely the absence of a
-            # held one. Notification fails open because a missing verdict costs
-            # at worst a notification too many; a turn must not, because the
-            # caller that sent no verdict is one that still does its own triage
-            # forward, and the message would then be handled twice.
-            if gate is not None and gate.get("forward"):
+            # An *explicit* forward verdict, though, not merely the absence of
+            # a held one — and an explicit handover with it. Notification fails
+            # open, because a missing verdict costs at worst a notification too
+            # many. A turn must not: a caller that did not offer to hand the
+            # message over is one that forwards it to triage itself, whatever
+            # its gate says, and the message would then be handled twice. That
+            # is not hypothetical — it is every gateway built before this
+            # contract, which is exactly what a deployment runs in the window
+            # between rebuilding this container and rebuilding those.
+            if gate is not None and gate.get("forward") and payload.get("handover"):
                 job_url = _start_chat_arrival_turn(
                     chat_id, entry,
                     flagged_unknown=bool(gate and gate.get("flagged_unknown")),

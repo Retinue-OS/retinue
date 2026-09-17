@@ -12,11 +12,12 @@ direct user-send contract and serving token-gated media). Covers:
 - the notify rail (POST /internal/chats/inbound): open-vs-token auth, the
   un-archive-unless-muted rule, held-gate and muted silence, push mode
   new-vs-reply, and echoes advancing the read watermark;
-- the forward path landing in the chat instead of in triage: a forwarded
-  arrival answers 202 with the job handle of a turn in that chat's companion
-  thread, the turn's prompt carries the arrival's own text (delimited as data)
-  and the chat note, a held class, a verdictless event and a switched-off rail
-  answer no handle at all (so the gateway keeps its own forward), the same
+- the forward path landing in the chat instead of in triage: an arrival whose
+  caller offers to hand it over answers 202 with the job handle of a turn in
+  that chat's companion thread, the turn's prompt carries the arrival's own
+  text (delimited as data) and the chat note, while a held class, an event with
+  no handover, a verdictless event and a switched-off rail answer no handle at
+  all (so the gateway keeps its own forward), the same
   message id is only ever worked once however often the rail delivers it,
   arrivals during a turn fold into one follow-up without losing a job, a reply
   that could not be stored fails its job rather than reporting delivery, and
@@ -669,10 +670,10 @@ def test_rail_auth_and_notifications(base, wg):
              "message_id": "e1", "text": "ciao!", "gateway": "127.0.0.1",
              "gate": {"forward": True, "reason": "whitelisted"}}
     status, body = _http(base, "POST", rail, event)
-    # Forwarded: 202 and a job handle for the turn started in the chat's
-    # companion thread (test_arrival_starts_a_companion_turn covers the turn
-    # itself; here only that notification still behaves).
-    assert status == 202 and body["pushed"] is True
+    # No `handover`, so no turn: these events are about notification, and a
+    # caller that has not offered to hand the message over keeps it (see
+    # test_arrival_starts_a_companion_turn).
+    assert status == 200 and body["pushed"] is True
     # First unread → mode "new"; the push targets the chat page.
     assert len(PUSHES) == 1
     args, kw = PUSHES[0]
@@ -728,7 +729,7 @@ def test_rail_auth_and_notifications(base, wg):
         assert status == 403
         status, _ = _http(base, "POST", rail, dict(event, message_id="e7"),
                           headers={"X-Conversation-Backend-Token": "railtok"})
-        assert status == 202
+        assert status == 200
     finally:
         wg.CHATS_INGEST_TOKEN = ""
     print("PASS test_rail_auth_and_notifications")
@@ -878,9 +879,7 @@ def test_rail_attributes_by_account(base, wg):
                           "account": STATE["gw_account"],
                           "gateway": "signal-gateway",
                           "gate": {"forward": True, "reason": "whitelisted"}})
-    # 202: forwarded, so the chat's companion turn took it (see
-    # test_arrival_starts_a_companion_turn). Attribution is the point here.
-    assert status == 202, body
+    assert status == 200, body
     # The registry entry for this account is the mock's slug, not the slug the
     # event claimed — and the stamp is marked as account-derived, which is what
     # makes it authoritative later.
@@ -899,7 +898,7 @@ def test_rail_attributes_by_account(base, wg):
                        "message_id": "acct-2", "text": "hi",
                        "account": "+15559990000", "gateway": "signal-gateway",
                        "gate": {"forward": True, "reason": "whitelisted"}})
-    assert status == 202
+    assert status == 200
     # …but the chat is still that account's own: an id is composed from the
     # account the event asserts, which is a fact about the sender, while the
     # gateway stamp is a lookup in the reader's registry that can simply miss.
@@ -1079,6 +1078,7 @@ def test_arrival_starts_a_companion_turn(base, wg):
     event = {"direction": "in", "channel": "telegram", "chat": "777001",
              "sender": "777001", "sender_name": "Nina", "group": False,
              "message_id": "a1", "text": "Passt Samstag 15 Uhr?",
+             "handover": True,
              "gate": {"forward": True, "flagged_unknown": False,
                       "reason": "whitelisted"}}
     status, body = _http(base, "POST", rail, event)
@@ -1140,6 +1140,18 @@ def test_arrival_starts_a_companion_turn(base, wg):
                          dict(event, message_id="a3", text="spam",
                               gate={"forward": False, "reason": "blacklisted"}))
     assert status == 200 and "job_url" not in body
+    assert TURNS == []
+
+    # Nor does a forward from a caller that did not offer to hand the message
+    # over. That caller forwards it to triage itself whatever its gate says —
+    # every gateway built before this contract does, which is what a deployment
+    # runs between rebuilding the web-gateway and rebuilding the gateways — so
+    # a turn here would be the second handling of one message.
+    TURNS.clear()
+    no_handover = {k: v for k, v in event.items() if k != "handover"}
+    status, body = _http(base, "POST", rail, dict(no_handover, message_id="a3c"))
+    assert status == 200 and "job_url" not in body, body
+    assert body["pushed"] is True, "notification is not what is being withheld"
     assert TURNS == []
 
     # Nor does an event with no verdict at all. Notification fails open, but a

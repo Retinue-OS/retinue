@@ -256,6 +256,8 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         _stub_job_polls(gw._jobs, [_Resp(200, {"status": "done"})])
         forward(gw)
         assert rail_calls and rail_calls[0]["direction"] == "in", rail_calls
+        assert rail_calls[0].get("handover") is True, \
+            "the rail may only start a turn for a caller that offers to hand over"
         assert rail_calls[0]["gate"]["forward"] is True, rail_calls[0]["gate"]
         assert "flagged_unknown" in rail_calls[0]["gate"], rail_calls[0]["gate"]
         assert posts == [], "the message went to triage as well as to its chat"

@@ -1487,7 +1487,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # not "send this reply" — so nothing here opens one per message any more. No
     # handle (the rail switched off, unreachable, or unable to open the
     # companion thread) falls through to the triage forward below, unchanged.
-    rail = _chats.notify_chat_event(**rail_event, files=files,
+    rail = _chats.notify_chat_event(**rail_event, files=files, handover=True,
                                     timeout=RETINUE_POST_TIMEOUT)
     if rail is not None and rail.get("uncertain"):
         # The rail's answer was lost, so whether the chat took this message is

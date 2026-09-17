@@ -77,6 +77,7 @@ def notify_chat_event(
     author: str | None = None,
     gate: dict | None = None,
     files: list[dict] | None = None,
+    handover: bool = False,
     timeout: float = 3.0,
 ) -> dict | None:
     """Synchronous rail POST; returns the answer body, or None if it failed.
@@ -105,9 +106,18 @@ def notify_chat_event(
     verdict for inbound events (``{"forward": bool, "flagged_unknown": bool,
     "reason": str}``) so the web-gateway can keep held/no-action classes silent,
     and can tell a turn that this sender is not on the whitelist yet. ``files``
-    are the message's own attachments in the ``POST /message`` shape
+    are the message's attachments in the ``POST /message`` shape
     (``{"filename", "content_type", "data"}``, base64) so a turn started there
-    can open them; they ride along only for a forwarded message. Never raises.
+    can open them; they ride along only for a forwarded message.
+
+    ``handover`` is the caller's offer: *if you take this message, I will not
+    forward it to triage myself.* Only a call that makes that offer can buy a
+    companion turn, and that is deliberate — a gateway built before this
+    contract existed fires the rail and forwards to triage regardless, so
+    starting a turn on its event would have the message handled twice. During
+    a rollout where the web-gateway is rebuilt before the gateways, the absent
+    offer is what keeps the old behaviour whole instead of doubling it.
+    Never raises.
     """
     if not CHATS_INGEST_URL:
         return None
@@ -131,6 +141,7 @@ def notify_chat_event(
         "author": author or None,
         "gate": gate or None,
         "files": files or None,
+        "handover": True if handover else None,
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
