@@ -332,15 +332,38 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         gw = loader(tmp)
         posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t5"})
         gw._inbound_gate_decision = lambda sender, group_id: {
-            "forward": False, "flagged_unknown": False,
-            "delivered_if_held": False, "news": False, "vip": False,
-            "reason": "blacklisted"}
+            "forward": False, "delivered_if_held": False, "news": False,
+            "vip": False, "reason": "group-quieted"}
         gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
         gw._chats.notify_chat_event = lambda **kwargs: {"accepted": True}
         forward(gw)
         assert posts == [], "a held message must not reach triage either"
         assert _stored_flags(tmp) == [True], \
             "a held message the chat shows is accounted for, not left undelivered"
+
+    # A **VIP in a held group**, with the rail declining. The two axes are
+    # independent — `forward` is about the group's noise, `vip` about the
+    # person — so this combination is ordinary, not a corner. The fallback path
+    # used to read `forward` alone and hold it: for an `ignored` group that
+    # meant marking the VIP's message delivered with no turn and nothing left
+    # to recover it, letting the group override the sender the whole design
+    # says it never does.
+    for reason, held_delivered in (("group-ignored", True), ("group-quieted", False)):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            gw = loader(tmp)
+            posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t7"})
+            gw._inbound_gate_decision = lambda sender, group_id: {
+                "forward": False, "delivered_if_held": held_delivered,
+                "news": False, "vip": True, "reason": reason}
+            gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+            gw._chats.notify_chat_event = lambda **kwargs: {"ok": True}
+            _stub_job_polls(gw._jobs, [_Resp(200, {"status": "done"})])
+            forward(gw)
+            assert len(posts) == 1, (
+                f"a VIP in a {reason} group was dropped when the rail declined: "
+                f"the group must not override the sender ({posts})")
+            assert _await_flag(tmp, True), _stored_flags(tmp)
 
     print(f"ok: {name} lets the chat take a forwarded message, or forwards it "
           "to triage as before")

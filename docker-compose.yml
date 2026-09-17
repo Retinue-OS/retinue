@@ -571,17 +571,21 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
-      # Chats rail: on every arrival (and own-device echo) the gateway POSTs
-      # the message's metadata here so the dashboard's chat surface updates and
-      # the user is Web-Pushed — the notification itself still costs no model
-      # turn. A message the delivery gate *forwards* is different: the same call
-      # starts a turn in that chat's companion thread and answers with its job
-      # handle, and this gateway then forwards nothing to triage
+      # Chats rail: on every arrival the gateway hands the message's metadata
+      # over here, synchronously, and the answer says whether the chat took it.
+      # It normally does — for every class, a quieted or ignored group
+      # included — so the dashboard's chat surface has the message, the user is
+      # Web-Pushed unless the gate says to stay quiet, and this gateway marks it
+      # delivered and forwards nothing to triage. For a sender the user marked
+      # a **VIP** the same call also starts a turn in that chat's companion
+      # thread and answers with its job handle, which this gateway waits on
       # (docs/messenger-chats.md, phase 4; CHAT_ARRIVAL_TURNS on the retinue
-      # service switches it off). Held classes stay fire-and-forget with a short
-      # timeout; empty to disable the rail entirely. Open unless
-      # CHATS_INGEST_TOKEN is set on both sides — worth setting now that an
-      # unauthenticated caller could spend a model turn and stage a draft.
+      # service switches all of it off, and each gateway then falls back to the
+      # held/forward path it had before). Own-device echoes are the one
+      # fire-and-forget call left: nothing is being handed over. Empty to
+      # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
+      # sides — worth setting now that an unauthenticated caller could spend a
+      # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
@@ -663,17 +667,21 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
-      # Chats rail: on every arrival (and own-device echo) the gateway POSTs
-      # the message's metadata here so the dashboard's chat surface updates and
-      # the user is Web-Pushed — the notification itself still costs no model
-      # turn. A message the delivery gate *forwards* is different: the same call
-      # starts a turn in that chat's companion thread and answers with its job
-      # handle, and this gateway then forwards nothing to triage
+      # Chats rail: on every arrival the gateway hands the message's metadata
+      # over here, synchronously, and the answer says whether the chat took it.
+      # It normally does — for every class, a quieted or ignored group
+      # included — so the dashboard's chat surface has the message, the user is
+      # Web-Pushed unless the gate says to stay quiet, and this gateway marks it
+      # delivered and forwards nothing to triage. For a sender the user marked
+      # a **VIP** the same call also starts a turn in that chat's companion
+      # thread and answers with its job handle, which this gateway waits on
       # (docs/messenger-chats.md, phase 4; CHAT_ARRIVAL_TURNS on the retinue
-      # service switches it off). Held classes stay fire-and-forget with a short
-      # timeout; empty to disable the rail entirely. Open unless
-      # CHATS_INGEST_TOKEN is set on both sides — worth setting now that an
-      # unauthenticated caller could spend a model turn and stage a draft.
+      # service switches all of it off, and each gateway then falls back to the
+      # held/forward path it had before). Own-device echoes are the one
+      # fire-and-forget call left: nothing is being handed over. Empty to
+      # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
+      # sides — worth setting now that an unauthenticated caller could spend a
+      # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
@@ -756,17 +764,21 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
-      # Chats rail: on every arrival (and own-device echo) the gateway POSTs
-      # the message's metadata here so the dashboard's chat surface updates and
-      # the user is Web-Pushed — the notification itself still costs no model
-      # turn. A message the delivery gate *forwards* is different: the same call
-      # starts a turn in that chat's companion thread and answers with its job
-      # handle, and this gateway then forwards nothing to triage
+      # Chats rail: on every arrival the gateway hands the message's metadata
+      # over here, synchronously, and the answer says whether the chat took it.
+      # It normally does — for every class, a quieted or ignored group
+      # included — so the dashboard's chat surface has the message, the user is
+      # Web-Pushed unless the gate says to stay quiet, and this gateway marks it
+      # delivered and forwards nothing to triage. For a sender the user marked
+      # a **VIP** the same call also starts a turn in that chat's companion
+      # thread and answers with its job handle, which this gateway waits on
       # (docs/messenger-chats.md, phase 4; CHAT_ARRIVAL_TURNS on the retinue
-      # service switches it off). Held classes stay fire-and-forget with a short
-      # timeout; empty to disable the rail entirely. Open unless
-      # CHATS_INGEST_TOKEN is set on both sides — worth setting now that an
-      # unauthenticated caller could spend a model turn and stage a draft.
+      # service switches all of it off, and each gateway then falls back to the
+      # held/forward path it had before). Own-device echoes are the one
+      # fire-and-forget call left: nothing is being handed over. Empty to
+      # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
+      # sides — worth setting now that an unauthenticated caller could spend a
+      # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
       # Voice notes are transcribed by the shared STT service.

@@ -137,10 +137,13 @@ plumbing. Reactions, once received (#130), decorate the mirrored message they
 target — which answers that epic's open "surfacing shape" question: the chat
 page is where a reaction is seen.
 
-The ledger semantics are untouched: `kb:delivered` remains triage bookkeeping,
-owned by the gateway, flipped only by the drain and the forward-confirmation
-path. The chat view is a **pure read** and never touches the flag — the same
-rule the SPARQL browse path already follows.
+The flag stays the gateway's alone, and the chat view is a **pure read** that
+never touches it — the same rule the SPARQL browse path already follows. What
+*does* flip it changed in phase 4: the usual writer is now the gateway acting
+on the rail's acceptance, within seconds of arrival, and the drain and the
+forward-confirmation path are what remain for the exceptions. `delivered`
+changed meaning with it, from "a model turn accounted for this" to "the user
+has this" — see *Inbound flow* below.
 
 ### Serving — raw files or the triple store?
 
@@ -217,9 +220,10 @@ no ad-hoc per-consumer liveness workarounds.
 
 None of this touches the paths that must stay off SPARQL: the gateways'
 classify hot path keeps reading `policy/` raw off their own volumes, and the
-`delivered` flag is still mutated only through the gateway drain — the
-delivery-gate doc's freshness reasoning was always about those, not about
-serving reads. Folder ownership is likewise preserved: gateways own
+`delivered` flag is still mutated by the gateway alone — on the rail's
+acceptance since phase 4, on a confirmed forward, or through the drain — never
+by a serving read. The delivery-gate doc's freshness reasoning was always about
+those paths, not about serving reads. Folder ownership is likewise preserved: gateways own
 `messages/` (and the new outbound records), retinue owns `policy/` and the
 chat state; the chat API adds no writer to any of it.
 

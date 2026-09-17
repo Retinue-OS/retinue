@@ -117,11 +117,15 @@ messenger is **push**:
 
   | class | reaches triage? | what happens instead |
   |---|---|---|
-  | **VIP sender** | no | a turn in that chat's companion thread files it and stages any reply |
+  | **VIP sender**, any group | no | a turn in that chat's companion thread files it and stages any reply |
   | anyone else | no | the chat shows it; the user reads and answers there |
-  | **`ignored` / `quieted`** group | no | the chat shows it, silently — no push |
-  | a chat the user **muted** | no | the chat shows it, silently — no push, and it stays archived |
+  | a **non-VIP** in an `ignored` / `quieted` group | no | the chat shows it, silently — no push |
+  | a **non-VIP** in a chat the user **muted** | no | the chat shows it, silently — no push, and it stays archived |
   | **no-action-class** (status/echo/news/note-to-self) | no | as before: on record, nobody prompted |
+
+  The group flags and the chat's own mute suppress the **push**, never a VIP's
+  turn: `vip` is sender-only and group-independent, so a VIP writing into a
+  quieted group is still worked — quietly.
 
   A messenger message reaches **this skill** only when the rail did not take
   it — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or unable to open
@@ -762,9 +766,12 @@ reply queued at `/sends` is not resolved until it is sent **and** the source
 mail has left the INBOX.
 
 For **messenger** there is no mailbox to empty: a message leaves the backlog
-when the gateway marks it `delivered` (on live forward or daily drain).
-Approval-side execution (sending an approved reply) still runs here; the
-ledger's flag, not an INBOX move, closes the loop.
+when the gateway marks it `delivered`. That is normally the chats rail's
+acceptance, within seconds of arrival and with no model turn — so there is no
+standing backlog; `GET /undelivered` and a confirmed forward are what close the
+loop for the exceptions that reach this skill at all. Approval-side execution
+(sending an approved reply) still runs here; the ledger's flag, not an INBOX
+move, closes the loop.
 
 ---
 

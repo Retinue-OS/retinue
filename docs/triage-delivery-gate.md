@@ -38,10 +38,15 @@ arrives.
 
 | Class | On arrival | Owed afterwards |
 |---|---|---|
-| **VIP sender**, any group | the chat shows it, pushes, **and** a model turn runs | nothing |
-| anyone else, normal group | the chat shows it and pushes | nothing |
-| **quieted** group | the chat shows it, silently | held `delivered:false` — a recovery sweep can find it |
-| **ignored** group | the chat shows it, silently | nothing, ever |
+| **VIP sender**, any group | the chat shows it, **and** a model turn runs; it pushes unless the group is quieted/ignored | nothing |
+| a non-VIP, normal group | the chat shows it and pushes | nothing |
+| a non-VIP, **quieted** group | the chat shows it, silently | held `delivered:false` — a recovery sweep can find it |
+| a non-VIP, **ignored** group | the chat shows it, silently | nothing, ever |
+
+The group flags suppress the **push**, never a VIP's turn. That is the whole
+point of `vip` being sender-only: a quieted group is the user saying *do not
+interrupt me about this room*, not *and ignore this person when they write in
+it*. A VIP in such a group is worked quietly.
 
 E-mail keeps **both** axes, including its own whitelist, with one
 channel-specific twist: a mail's "group" is its **mailing list** (`List-Id`),
@@ -388,6 +393,9 @@ see *The VIP axis* below for what does buy a model turn.
 | any sender, normal group | yes | accepted by the chat; delivered |
 | quieted group | no | accepted silently; delivered |
 | ignored group | no | accepted silently; delivered |
+
+A **VIP** in any of these rows also gets a turn — that is the other axis, and
+it reads `vip`, not this column.
 
 A muted chat does not push either — but that is the chat state's doing, on the
 web-gateway side, not the gate's.

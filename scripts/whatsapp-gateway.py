@@ -2003,7 +2003,13 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
 
     # From here down: the rail declined, so this is the pre-chat-surface path,
     # unchanged.
-    if not gate["forward"]:
+    # A VIP is never held here: the two axes are independent, so `forward` is
+    # about the group's noise and `vip` about the person, and the fallback
+    # reading `forward` alone let the group override the sender the whole
+    # design says it never does — for an `ignored` group, silently, by marking
+    # the message delivered with nothing left to recover it. The rail could not
+    # work this VIP's message, so the pre-chat-surface forward does.
+    if not gate["forward"] and not gate.get("vip"):
         # Mark delivered only for a fully-accounted class (an ignored group)
         # the drain must never re-surface. One held from a quieted group stays
         # delivered=False, so a sweep can still find it.
