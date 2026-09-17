@@ -14,6 +14,7 @@ something they cannot see.
 
     python3 tests/test_web_gateway_send_page.py
 """
+import contextlib
 import importlib.util
 import os
 import sys
@@ -44,6 +45,26 @@ def _load_gateway(tmp: Path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+@contextlib.contextmanager
+def _display_zone(name):
+    """Pin RETINUE_DISPLAY_TZ for one test, then put back what was there.
+
+    Without it these assertions only hold where the host happens to run on UTC:
+    _display_tz() falls back to TZ, so a developer (or runner) in
+    Europe/Zurich would see 14:15+02:00 render as 14:15 and the test fail for
+    no fault of the code.
+    """
+    previous = os.environ.get("RETINUE_DISPLAY_TZ")
+    os.environ["RETINUE_DISPLAY_TZ"] = name
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("RETINUE_DISPLAY_TZ", None)
+        else:
+            os.environ["RETINUE_DISPLAY_TZ"] = previous
 
 
 def _detail(status, **extra):
@@ -192,7 +213,7 @@ def test_agenda_says_when_the_days_are_empty_or_unreadable():
 
 
 def test_overlap_rules():
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, _display_zone("UTC"):
         wg = _load_gateway(Path(tmp))
         proposed = wg._event_interval({"start": "2026-09-03T14:00:00", "end": "2026-09-03T14:30:00"})
         def clashes(start, end, **extra):
@@ -220,11 +241,9 @@ def test_offsets_are_read_in_the_configured_display_zone():
     reads. Rendering both as a bare "16:00" made a mis-zoned calendar entry
     look correct on its own approval page, and hid the clash between the two.
     """
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory() as tmp, _display_zone("Europe/Zurich"):
         wg = _load_gateway(Path(tmp))
-        previous = os.environ.get("RETINUE_DISPLAY_TZ")
-        os.environ["RETINUE_DISPLAY_TZ"] = "Europe/Zurich"
-        try:
+        if True:
             in_utc = wg._format_event_when("2026-09-18T16:00:00+00:00",
                                            "2026-09-18T16:45:00+00:00", False)
             local = wg._format_event_when("2026-09-18T16:00:00+02:00",
@@ -247,28 +266,62 @@ def test_offsets_are_read_in_the_configured_display_zone():
                                            "end": "2026-09-18T18:45:00"})
             assert wg._events_overlap(proposed, wg._event_interval(
                 {"start": "2026-09-18T16:00:00+00:00", "end": "2026-09-18T16:45:00+00:00"}))
-        finally:
-            if previous is None:
-                os.environ.pop("RETINUE_DISPLAY_TZ", None)
-            else:
-                os.environ["RETINUE_DISPLAY_TZ"] = previous
+            # An all-day entry is that zone's whole day, and still comparable
+            # with an offset-carrying one.
+            assert wg._events_overlap(
+                wg._event_interval({"start": "2026-09-18", "end": "2026-09-19", "all_day": True}),
+                wg._event_interval({"start": "2026-09-18T16:00:00+00:00",
+                                    "end": "2026-09-18T16:45:00+00:00"}))
 
 
 def test_an_unknown_display_zone_falls_back_to_utc():
     """A typo in the setting must not take the approval page down."""
+    with tempfile.TemporaryDirectory() as tmp, _display_zone("Europe/Nowhere"):
+        wg = _load_gateway(Path(tmp))
+        assert wg._format_event_when("2026-09-18T16:00:00+02:00",
+                                     "2026-09-18T16:45:00+02:00", False).startswith(
+                                         "Fri 18 Sep 2026, 14:00")
+
+
+def test_a_span_across_the_dst_fold_is_not_backwards():
+    """Converting into the display zone and then comparing bare wall clocks
+    loses what the conversion established: across the autumn fold 02:30+02:00
+    and 02:15+01:00 are 45 minutes apart, in that order, while their local
+    clocks read 02:30 then 02:15. Treated as backwards, the card silently
+    dropped the end of a perfectly valid span."""
+    with tempfile.TemporaryDirectory() as tmp, _display_zone("Europe/Zurich"):
+        wg = _load_gateway(Path(tmp))
+        start, end = "2026-10-25T02:30:00+02:00", "2026-10-25T02:15:00+01:00"
+        assert not wg._ends_before_it_starts(start, end, False)
+        assert "02:15" in wg._format_event_when(start, end, False)
+        # A genuinely backwards pair is still caught.
+        assert wg._ends_before_it_starts("2026-10-25T02:30:00+02:00",
+                                         "2026-10-25T02:00:00+02:00", False)
+
+
+def test_agenda_window_follows_the_rendered_day():
+    """The window must name the days the card shows. A pending 00:30+02:00 is
+    rendered on the previous day where the display zone is UTC, so asking the
+    gateway for the raw date would fetch a day the user never sees and leave
+    the day whose clashes they are being asked about unfetched."""
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp))
-        previous = os.environ.get("RETINUE_DISPLAY_TZ")
-        os.environ["RETINUE_DISPLAY_TZ"] = "Europe/Nowhere"
-        try:
-            assert wg._format_event_when("2026-09-18T16:00:00+02:00",
-                                         "2026-09-18T16:45:00+02:00", False).startswith(
-                                             "Fri 18 Sep 2026, 14:00")
-        finally:
-            if previous is None:
-                os.environ.pop("RETINUE_DISPLAY_TZ", None)
-            else:
-                os.environ["RETINUE_DISPLAY_TZ"] = previous
+        event = {"start": "2026-09-18T00:30:00+02:00", "end": "2026-09-18T01:30:00+02:00"}
+        with _display_zone("UTC"):
+            assert "Thu 17 Sep 2026, 22:30" in wg._format_event_when(
+                event["start"], event["end"], False)
+            assert wg._agenda_window(event) == ("2026-09-17", "2026-09-17")
+        with _display_zone("Europe/Zurich"):
+            assert wg._agenda_window(event) == ("2026-09-18", "2026-09-18")
+        # Midnight still belongs to the day before — in the rendered zone.
+        with _display_zone("UTC"):
+            assert wg._agenda_window({"start": "2026-09-18T20:00:00+00:00",
+                                      "end": "2026-09-19T00:00:00+00:00"}) == ("2026-09-18",
+                                                                               "2026-09-18")
+        # A date names the same day everywhere: an all-day window is unmoved.
+        with _display_zone("Pacific/Kiritimati"):
+            assert wg._agenda_window({"start": "2026-09-10", "end": "2026-09-12",
+                                      "all_day": True}) == ("2026-09-10", "2026-09-11")
 
 
 def test_agenda_window_covers_only_the_days_the_event_touches():
@@ -475,6 +528,8 @@ def main() -> int:
              test_overlap_rules,
              test_offsets_are_read_in_the_configured_display_zone,
              test_an_unknown_display_zone_falls_back_to_utc,
+             test_a_span_across_the_dst_fold_is_not_backwards,
+             test_agenda_window_follows_the_rendered_day,
              test_a_span_never_runs_backwards,
              test_agenda_window_covers_only_the_days_the_event_touches,
              test_agenda_read_is_bounded_in_time_and_size,
