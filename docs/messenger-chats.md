@@ -352,19 +352,25 @@ and what a model turn is *for*:
    is pushed, and the gateway forwards it nowhere else. That is the delivery,
    and it costs no model turn at all.
 
-   Whether a **turn** also runs is one question with one answer: the chat's
-   `assist` flag, which the user sets per correspondent and which is **off by
-   default and off for anyone new**. This replaced the sender whitelist, and
-   the reason is worth stating plainly: the whitelist decided whose message was
-   worth a session to *notify* about, and notification is free now. The only
-   thing a turn still buys is a proposal, and a proposal is something the user
-   asks for, not something a correspondent earns by writing. There is no
-   unknown-sender ask-flow any more — nothing opens a thread to ask whether to
-   trust a stranger, because nothing needs the answer.
+   Whether a **turn** also runs is one question, and the answer is the
+   **sender**: their `vip` flag in the triage policy. Sender-only and
+   group-independent — a VIP writing in a room of forty is still the person the
+   user wanted to hear from, so the same message gets the same handling
+   wherever it arrives. Nothing about a chat grants it.
 
-   Where `assist` is on, the turn starts in that chat's companion thread
-   instead of a fresh `claude -p` triage session opening a new dashboard
-   conversation. The
+   This replaced the sender whitelist, and the reason is worth stating plainly:
+   the whitelist decided whose message was worth a session to *notify* about,
+   and notification is free now. What a turn buys is that the message is
+   **dealt with** — and there is no unknown-sender ask-flow any more, because
+   nothing needs the answer.
+
+   For a VIP the turn starts in that chat's companion thread instead of a fresh
+   `claude -p` triage session, and its job is wider than a draft: read the
+   message in context, **file what it changes** (link and update a project,
+   store a memory where the rest of the system should know what the user was
+   just told), stage a reply when one is wanted, and fork to a dashboard
+   conversation only for a decision that is not "send this reply". Filing is
+   worth doing even when no reply is. The
    turn runs warm (per-chat session, summary + tail — the generalization of
    the `a95b19c` fix from "the thread's own appends" to "the channel
    itself"). Its job, in order: read the message in context; stage a draft
@@ -529,14 +535,15 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 
 ## Open questions
 
-1. ~~**Companion turns for groups.**~~ **Moot: it is per chat, and off.**
+1. ~~**Companion turns for groups.**~~ **Moot: it follows the sender.**
    The question assumed turns happen by default and asked which chats to spare.
-   They do not: `assist` is off everywhere until the user switches it on for a
-   correspondent, so a busy group costs nothing unless somebody decided it
-   should. That also retires the messenger sender whitelist — see *Inbound
-   flow*, step 4 — and with it the unknown-sender ask-flow. The group flags
-   stay: the news rail still reads them, and `quieted` / `ignored` still keep a
-   group's arrivals quiet.
+   They do not: a turn runs for a **VIP sender** and nobody else, so a busy
+   group costs exactly as many turns as it has VIPs writing in it — usually
+   none. And a VIP is worked in a group precisely as in a 1:1, which is the
+   point: the user's interest is in a person, and a chat is only a place. That
+   retires the messenger sender whitelist — see *Inbound flow*, step 4 — and
+   with it the unknown-sender ask-flow. The group flags stay: the news rail
+   reads them, and `quieted` / `ignored` still keep a group's arrivals quiet.
 2. **Draft staging threshold.** "Stage a draft when a reply is plausibly
    wanted" is the companion's judgement; if it over-stages, a per-chat or
    per-sender preference belongs in the summary/style memory, not in code.

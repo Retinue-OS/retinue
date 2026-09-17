@@ -87,6 +87,11 @@ P_NEWS_ADDRESS = KB + "triageNewsAddress"
 P_NEWS_WILDCARD = KB + "triageNewsWildcard"
 P_HANDLE = KB + "triageWhitelistHandle"
 P_BLOCKED_HANDLE = KB + "triageBlacklistHandle"
+# The VIP axis: a person whose message is worked by a model the moment it
+# arrives, wherever it arrives. Keyed on the sender and only on the sender, so
+# it holds in a group exactly as in a 1:1 — being one of forty people in a room
+# does not make what this person says any less worth reading.
+P_VIP_HANDLE = KB + "triageVipHandle"
 # Group flags — three orthogonal axes (see module docstring).
 P_IGNORED_GROUP = KB + "triageIgnoredGroup"
 P_QUIETED_GROUP = KB + "triageQuietedGroup"
@@ -116,9 +121,11 @@ EmailPolicy = namedtuple(
     defaults=(frozenset(),) * 6,
 )
 
-# The loaded messenger policy: two sender sets plus the three group-flag sets.
+# The loaded messenger policy: the sender sets plus the three group-flag sets.
+# `vip` defaults to empty so a caller that predates the axis still constructs.
 MessengerPolicy = namedtuple(
-    "MessengerPolicy", "whitelist blacklist ignored quieted news"
+    "MessengerPolicy", "whitelist blacklist ignored quieted news vip",
+    defaults=(frozenset(),),
 )
 
 
@@ -503,6 +510,7 @@ def load_messenger_policy(
     ignored: set[str] = set()
     quieted: set[str] = set()
     news: set[str] = set()
+    vip: set[str] = set()
     for _subj, pred, lit in _parse(path):
         val = lit.strip()
         if not val:
@@ -511,19 +519,22 @@ def load_messenger_policy(
             whitelist.add(_norm_handle(val))
         elif pred == P_BLOCKED_HANDLE:
             blacklist.add(_norm_handle(val))
+        elif pred == P_VIP_HANDLE:
+            vip.add(_norm_handle(val))
         elif pred in (P_IGNORED_GROUP, P_BLOCKED_GROUP):
             ignored.add(val)
         elif pred == P_QUIETED_GROUP:
             quieted.add(val)
         elif pred == P_NEWS_GROUP:
             news.add(val)
-    return MessengerPolicy(whitelist, blacklist, ignored, quieted, news)
+    return MessengerPolicy(whitelist, blacklist, ignored, quieted, news, vip)
 
 
 def render_messenger_policy(channel: str, pol: MessengerPolicy) -> str:
     subj = _channel_subject(channel)
     lines = [_triple(subj, P_HANDLE, h) for h in pol.whitelist]
     lines += [_triple(subj, P_BLOCKED_HANDLE, h) for h in pol.blacklist]
+    lines += [_triple(subj, P_VIP_HANDLE, h) for h in pol.vip]
     lines += [_triple(subj, P_IGNORED_GROUP, g) for g in pol.ignored]
     lines += [_triple(subj, P_QUIETED_GROUP, g) for g in pol.quieted]
     lines += [_triple(subj, P_NEWS_GROUP, g) for g in pol.news]
@@ -565,6 +576,12 @@ def gate_decision(
     - ``news`` — the message's group is a news source: forward it to the news
       feed (Herald) too. This rail is *independent* of the triage decision above
       (a message can be both, either, or neither).
+    - ``vip`` — this **sender** is one the user wants worked by a model the
+      moment they write: read in context, filed to a project, remembered where
+      it matters, and answered with a staged draft. Sender-only and
+      group-independent by design — a VIP writing in a group of forty is still
+      the person the user wanted to hear from — and independent of every other
+      flag here, which govern attention, not handling.
     - ``reason`` — a short label for the gateway log.
 
     Triage rail (news rail is orthogonal, driven only by group ∈ news):
@@ -586,10 +603,12 @@ def gate_decision(
     """
     if not enabled:
         return {"forward": True, "flagged_unknown": False,
-                "delivered_if_held": True, "news": False, "reason": "gate-disabled"}
+                "delivered_if_held": True, "news": False, "vip": False,
+                "reason": "gate-disabled"}
     pol = load_messenger_policy(channel, path=path)
     grp = group_id.strip() if group_id else None
     news = bool(grp and grp in pol.news)
+    vip = _norm_handle(sender) in pol.vip
     status = handle_status(sender, pol.whitelist, pol.blacklist)
 
     if status == "whitelisted":
@@ -609,6 +628,7 @@ def gate_decision(
                "delivered_if_held": True, "reason": "unknown"}
 
     dec["news"] = news
+    dec["vip"] = vip
     return dec
 
 
@@ -689,13 +709,16 @@ def _mutate_email(add_addresses=(), add_wildcards=(), remove=(),
 
 def _mutate_messenger(channel, *, wl_add=(), wl_del=(), bl_add=(), bl_del=(),
                       ig_add=(), ig_del=(), q_add=(), q_del=(),
-                      news_add=(), news_del=()) -> None:
+                      news_add=(), news_del=(), vip_add=(), vip_del=()) -> None:
     pol = load_messenger_policy(channel)
     whitelist = set(pol.whitelist)
     blacklist = set(pol.blacklist)
     ignored = set(pol.ignored)
     quieted = set(pol.quieted)
     news = set(pol.news)
+    vip = set(pol.vip)
+    vip |= {_norm_handle(h) for h in vip_add if h.strip()}
+    vip -= {_norm_handle(h) for h in vip_del}
     whitelist |= {_norm_handle(h) for h in wl_add if h.strip()}
     whitelist -= {_norm_handle(h) for h in wl_del}
     blacklist |= {_norm_handle(h) for h in bl_add if h.strip()}
@@ -712,7 +735,8 @@ def _mutate_messenger(channel, *, wl_add=(), wl_del=(), bl_add=(), bl_del=(),
     quieted -= {g.strip() for g in ig_add if g.strip()}
     write_if_changed(
         render_messenger_policy(
-            channel, MessengerPolicy(whitelist, blacklist, ignored, quieted, news)
+            channel,
+            MessengerPolicy(whitelist, blacklist, ignored, quieted, news, vip)
         ),
         messenger_policy_path(channel),
     )
@@ -740,7 +764,8 @@ def main(argv: list[str] | None = None) -> int:
     # Handle commands take --handle; group commands take --group. `groupblock-*`
     # is kept as a legacy alias of `ignore-*`.
     handle_cmds = ("whitelist-add", "whitelist-remove",
-                   "blacklist-add", "blacklist-remove")
+                   "blacklist-add", "blacklist-remove",
+                   "vip-add", "vip-remove")
     group_cmds = ("ignore-add", "ignore-remove", "quiet-add", "quiet-remove",
                   "news-add", "news-remove", "groupblock-add", "groupblock-remove")
     for name in ("show",) + handle_cmds + group_cmds:
@@ -799,6 +824,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"whitelist\t{h}")
         for h in sorted(pol.blacklist):
             print(f"blacklist\t{h}")
+        for h in sorted(pol.vip):
+            print(f"vip\t{h}")
         for g in sorted(pol.ignored):
             print(f"ignore\t{g}")
         for g in sorted(pol.quieted):
@@ -809,6 +836,10 @@ def main(argv: list[str] | None = None) -> int:
         _mutate_messenger(args.channel, wl_add=args.handle)
     elif args.cmd == "whitelist-remove":
         _mutate_messenger(args.channel, wl_del=args.handle)
+    elif args.cmd == "vip-add":
+        _mutate_messenger(args.channel, vip_add=args.handle)
+    elif args.cmd == "vip-remove":
+        _mutate_messenger(args.channel, vip_del=args.handle)
     elif args.cmd == "blacklist-add":
         _mutate_messenger(args.channel, bl_add=args.handle)
     elif args.cmd == "blacklist-remove":
@@ -829,6 +860,10 @@ def main(argv: list[str] | None = None) -> int:
         pol = load_messenger_policy(args.channel)
         status = handle_status(args.handle, pol.whitelist, pol.blacklist)
         print(status)
+        # Two independent answers, printed as two lines: the sender's status on
+        # the old attention axis, and whether they are a VIP — which is what
+        # now decides that a model works their message on arrival.
+        print("vip" if _norm_handle(args.handle) in pol.vip else "not-vip")
         return 0 if status == "whitelisted" else 3
     return 0
 

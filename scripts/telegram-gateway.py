@@ -1458,13 +1458,55 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
+              "vip": bool(gate.get("vip")),
               "reason": str(gate.get("reason") or "")},
     )
+
+    # The chat surface is where an inbound message is delivered now — whatever
+    # the gate made of it. The mirror shows it, the user is pushed unless the
+    # gate says to stay quiet, and the record says delivered. So every message
+    # is offered to the rail, not only the ones that used to buy a triage
+    # session: that is what empties the undelivered backlog the daily drain
+    # existed to sweep, because there is no longer anything left un-handled.
+    #
+    # The call is synchronous because its answer decides what happens next, and
+    # this path has always made a synchronous POST here anyway. A job handle
+    # means a VIP's message is being worked in its chat's companion thread; a
+    # plain acceptance means the chat has it and nothing more is owed. Neither
+    # — the rail switched off, unreachable, or an older web-gateway — falls
+    # through to everything this gateway did before the chat surface existed.
+    rail = _chats.notify_chat_event(**rail_event, handover=True,
+                                    files=files if gate.get("vip") else None,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Handling it here as well would be the one outcome worse than
+        # waiting: two turns racing over the same draft, plus the dashboard
+        # conversation this replaced. It stays delivered=False.
+        print(f"[telegram-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered rather than handled twice",
+              flush=True)
+        return
+    rail_job = ((rail or {}).get("job_url") or "").strip() or None
+    if rail_job:
+        print(f"[telegram-gateway] the chat's companion turn took the message "
+              f"from {sender_label} (vip)", flush=True)
+        _confirm_delivery(rail_job, store_path, sender_label,
+                          base=_chats.CHATS_INGEST_URL)
+        return
+    if rail and rail.get("accepted"):
+        # Accepted with no turn: the chat has the message and the user has been
+        # pushed, and that is the delivery. Nothing is owed a model — this
+        # sender is not a VIP — so the record says delivered and nothing ever
+        # re-surfaces it.
+        _mark_delivered(store_path)
+        print(f"[telegram-gateway] the chat took the message from {sender_label} "
+              f"({gate['reason']}); no turn asked for", flush=True)
+        return
+
+    # From here down: the rail declined, so this is the pre-chat-surface path,
+    # unchanged.
     if not gate["forward"]:
-        # Held classes want the mirror updated and nothing else, so the rail
-        # stays fire-and-forget for them: it must never delay or reorder the
-        # persist → gate → forward path.
-        _chats.notify_chat_event_async(**rail_event)
         # Mark delivered only for a fully-accounted class (blacklisted/no-action)
         # the drain must never re-surface. One held merely for a not-yet-
         # whitelisted sender stays delivered=False for the daily drain.
@@ -1475,45 +1517,6 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
             f"({gate['reason']}); no model turn",
             flush=True,
         )
-        return
-
-    # The forward class is worked in the chat it arrived in. The rail call is
-    # synchronous here because its answer decides what happens next, and the
-    # forward below has always been a synchronous POST on this path anyway. A
-    # job handle means the chat's companion turn has taken the message: it reads
-    # the chat, stages any reply into that chat's shared draft for the user's
-    # send press, and opens a dashboard conversation only for a decision that is
-    # not "send this reply" — so nothing here opens one per message any more. No
-    # handle (the rail switched off, unreachable, or unable to open the
-    # companion thread) falls through to the triage forward below, unchanged.
-    rail = _chats.notify_chat_event(**rail_event, files=files, handover=True,
-                                    timeout=RETINUE_POST_TIMEOUT)
-    if rail is not None and rail.get("uncertain"):
-        # The rail's answer was lost, so whether the chat took this message is
-        # unknown. Forwarding it here as well would be the one outcome worse
-        # than waiting: two turns racing over the same draft, plus the
-        # dashboard conversation this replaced. It stays delivered=False, which
-        # is exactly what the daily drain reads.
-        print(f"[telegram-gateway] the chats rail did not answer for the message "
-              f"from {sender_label}; left undelivered for the daily drain "
-              f"rather than handled twice", flush=True)
-        return
-    rail_job = ((rail or {}).get("job_url") or "").strip() or None
-    if rail_job:
-        print(f"[telegram-gateway] the chat's companion turn took the message "
-              f"from {sender_label} ({gate['reason']})", flush=True)
-        _confirm_delivery(rail_job, store_path, sender_label,
-                          base=_chats.CHATS_INGEST_URL)
-        return
-    if rail and rail.get("accepted"):
-        # Accepted with no turn: the chat has the message, the user has been
-        # pushed, and that is the delivery. Nothing is owed a model here — the
-        # chat's `assist` flag is off, which is the user saying they will read
-        # this one themselves. So the record says delivered and no drain ever
-        # re-surfaces it.
-        _mark_delivered(store_path)
-        print(f"[telegram-gateway] the chat took the message from {sender_label} "
-              f"({gate['reason']}); no turn asked for", flush=True)
         return
 
     # The Telegram reply address is the chat_id itself, which _resolve_entity

@@ -189,13 +189,13 @@ services:
       # can spend a model turn, though still nothing that reaches a
       # correspondent — only the user's send press does that.
       - CHATS_INGEST_TOKEN
-      # The delivery gate's forward path: "1" (the default) has the chat take
-      # a forwarded message — the user sees it there, pushed, for no model
-      # turn — and run a companion turn on top only where that chat's `assist`
-      # flag is on (the user's per-correspondent switch, off by default). Set
-      # it to "0" and the rail accepts nothing, so each gateway falls back to
-      # the triage forward it did before: the switch off, without a revert
-      # (docs/messenger-chats.md, phase 4).
+      # The chat surface's ownership of inbound messages: "1" (the default)
+      # has the chat take every arrival — the user sees it there, pushed, for
+      # no model turn, and the gateway marks it delivered — and run a companion
+      # turn on top only for a sender the user marked a VIP in the triage
+      # policy. Set it to "0" and the rail accepts nothing, so each gateway
+      # falls back to the held/forward path it had before: the switch off,
+      # without a revert (docs/messenger-chats.md, phase 4).
       - CHAT_ARRIVAL_TURNS=1
       # Which TCP peers count as "arrived through the reverse proxy" for the
       # endpoints that act with the user's own authority: the chat send press

@@ -13,7 +13,10 @@ contract:
   * all three inbox gateways: a forward that yields a ``job_url`` leaves the
     persisted message ``delivered=false`` until the job reports done — and a
     job that errors leaves it undelivered for the drain.
-  * a synchronous answer (no ``job_url``) still marks delivered immediately.
+  * a synchronous answer (no ``job_url``) still marks delivered immediately;
+  * every inbound message — held classes included — is offered to the chats
+    rail, and its acceptance is what marks the message delivered, so nothing
+    accumulates undelivered waiting for a drain that no longer exists.
 
 Since the chat surface started taking messages (docs/messenger-chats.md, phase
 4) the handle can also come from the chats rail, for a turn in the message's own
@@ -259,6 +262,7 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         assert rail_calls[0].get("handover") is True, \
             "the rail may only take a message from a caller that hands it over"
         assert rail_calls[0]["gate"]["forward"] is True, rail_calls[0]["gate"]
+        assert "vip" in rail_calls[0]["gate"], rail_calls[0]["gate"]
         assert posts == [], "the message went to triage as well as to its chat"
         assert _await_flag(tmp, True), _stored_flags(tmp)
 
@@ -299,6 +303,24 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         forward(gw)
         assert posts == [], "an accepted message must not also reach triage"
         assert _stored_flags(tmp) == [True], _stored_flags(tmp)
+
+    # A held class goes through the rail too, and the acceptance delivers it:
+    # the mirror shows the message, so there is nothing left for a daily drain
+    # to sweep — which is why there is no daily drain left to run.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t5"})
+        gw._inbound_gate_decision = lambda sender, group_id: {
+            "forward": False, "flagged_unknown": False,
+            "delivered_if_held": False, "news": False, "vip": False,
+            "reason": "blacklisted"}
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = lambda **kwargs: {"accepted": True}
+        forward(gw)
+        assert posts == [], "a held message must not reach triage either"
+        assert _stored_flags(tmp) == [True], \
+            "a held message the chat shows is accounted for, not left undelivered"
 
     print(f"ok: {name} lets the chat take a forwarded message, or forwards it "
           "to triage as before")

@@ -24,7 +24,9 @@ are untouched.
 Messenger routing is decided on **two independent axes**, so the classes below
 are a *combination* of a sender status and a group's flags, not a single ladder:
 
-- **Sender** — a handle is **whitelisted**, **blacklisted**, or **unknown**.
+- **Sender** — a handle is **whitelisted**, **blacklisted**, or **unknown**,
+  and independently of that it is or is not a **VIP** (messenger only; see
+  *The VIP axis* below).
 - **Group** — three independent flags: **news** (its messages are also forwarded
   to the news feed / Herald), and at most one of **quieted** or **ignored**
   (which govern *unknown* senders in that group).
@@ -148,7 +150,7 @@ Address-level `news` entries written before list detection existed keep working:
 news is matched against the group **and** the bare sender address, so a
 newsletter that turns out to carry a `List-Id` is not silently un-filed.
 
-### Messenger sender axis: whitelist / blacklist
+### Messenger sender axis: whitelist / blacklist / vip
 
 Messenger identity is a **handle**, not a domain — no aliasing problem, so no
 wildcards needed there.
@@ -165,6 +167,9 @@ the channel itself is the only identity there is, and it stands in for one.
   gateway's contact directory + recent chats, extended by the ask-flow below.
 - **Blacklist:** an unknown sender the user declines to whitelist goes here so
   the user is **never asked again**. Permanent until hand-edited.
+- **VIP:** a person whose messages are worked by a model on arrival, wherever
+  they arrive. Independent of the two above and of every group flag — see *The
+  VIP axis* above, which is where this now matters.
 
 ### Messenger group axis: news / quieted / ignored
 
@@ -354,26 +359,48 @@ the daily drain picks it up" (blacklisted handle, quieted group); `true` means
 "accounted for, never drained" (ignored group — the message is on record and
 queryable, but no model ever looks at it unprompted).
 
-**Where a forwarded message now goes — and what the sender axis still decides.**
-Since `docs/messenger-chats.md` phase 4, a forwarded message is handed to the
-chats rail (`POST /internal/chats/inbound`), which **accepts** it: the chat has
-the message, the user is pushed, and the gateway marks it delivered and
-forwards it nowhere else. That is the delivery, and it costs no model turn.
+### The VIP axis, and what became of `delivered` on messenger
 
-So on messenger the sender axis no longer decides whether a message is *worked*
-— it decides whether the arrival is worth the user's attention (a held class
-stays silent) and nothing more. What decides a model turn is the chat's own
-`assist` flag, set by the user per correspondent and **off by default**: with it
-on, the rail also starts a turn in that chat's companion thread and answers
-`202` with its job handle, which the gateway waits on before flipping
-`delivered`. The messenger **whitelist is therefore retired**, and with it the
-unknown-sender ask-flow: both existed to decide who was worth a session to
-*notify* about, and notification is free now. The group flags are untouched —
-the news rail reads them, and `quieted`/`ignored` still keep a group quiet.
+Since `docs/messenger-chats.md` phase 4, **every** inbound messenger message —
+held classes included — is handed to the chats rail
+(`POST /internal/chats/inbound`), which **accepts** it: the chat has the
+message, the user is pushed unless the gate says to stay quiet, and the gateway
+marks it `delivered`. That is the delivery, and it costs no model turn.
 
-A rail that cannot take the message answers no handle and no acceptance, and
-the gateway forwards to triage exactly as described below. **Triage itself is
-unchanged**, and still owns the e-mail channel and anything the rail hands
+Two consequences, both deliberate:
+
+- **The messenger whitelist is retired**, and with it the unknown-sender
+  ask-flow. Both existed to decide whose message was worth a session to
+  *notify* about; notification is free now. What is left of the sender axis is
+  the blacklist, which still keeps an arrival silent.
+- **There is no undelivered backlog and no daily drain on messenger.**
+  `delivered` used to mean "a model turn accounted for this"; it now means
+  "the user has this", which the chat surface makes true within seconds. The
+  gateway's `GET /undelivered` endpoint stays for a re-surfacing that no
+  longer has anything to re-surface.
+
+What buys a **model turn** is the new sender-level **`vip`** flag
+(`triageVipHandle`): a person whose messages the user wants dealt with the
+moment they arrive. It is **sender-only and group-independent** — a VIP writing
+in a room of forty is still the person the user wanted to hear from — and
+independent of every other flag here, which govern attention rather than
+handling. For a VIP the rail also starts a turn in that chat's companion thread
+and answers `202` with its job handle, which the gateway waits on before
+flipping `delivered`; that turn reads the message, files what it changes (a
+project, a memory), and stages a reply where one is wanted.
+
+```bash
+python3 scripts/triage_policy.py vip-add --channel signal --handle +41791234567
+python3 scripts/triage_policy.py vip-remove --channel signal --handle +41791234567
+python3 scripts/triage_policy.py show --channel signal      # …and a vip line
+```
+
+Like every other entry here, this is normally edited by talking to Ara.
+
+A rail that cannot take the message answers no acceptance and no handle, and
+the gateway falls back to everything it did before the chat surface existed —
+the held classes' `delivered_if_held` and the triage forward. **Triage itself
+is unchanged**, and still owns the e-mail channel and anything the rail hands
 back.
 
 - The daily catch-all calls each inbox-mode gateway's

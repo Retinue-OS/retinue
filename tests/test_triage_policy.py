@@ -188,6 +188,7 @@ def _policy_file(tmp: Path, **kw) -> Path:
         ignored=set(kw.get("ignored", [])),
         quieted=set(kw.get("quieted", [])),
         news=set(kw.get("news", [])),
+        vip=set(kw.get("vip", [])),
     )
     path = tmp / "policy.nt"
     path.write_text(tp.render_messenger_policy(CH, pol), encoding="utf-8")
@@ -236,6 +237,47 @@ def test_literal_escaping_roundtrip():
 # --------------------------------------------------------------------------- #
 # Messenger policy — three-axis routing matrix                                #
 # --------------------------------------------------------------------------- #
+
+def test_vip_follows_the_sender_and_only_the_sender():
+    """The one axis that buys a model turn, and the one that is about a person.
+
+    Everything else here is about attention — whether an arrival is worth
+    interrupting the user for — and is read off the group as much as the
+    sender. A VIP is the user saying "I want this person's messages dealt
+    with", which is true of the person wherever they write, so being one voice
+    in a room of forty must not dilute it."""
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+
+        # In a 1:1 and in a group: the same person, the same answer. And the
+        # group's own flags do not touch it — `ignored` still means nobody is
+        # interrupted, which is a different question.
+        path = _policy_file(tmp, vip=["+41791112233"], ignored=[GROUP])
+        assert _gate(path, "+41791112233", None)["vip"] is True
+        assert _gate(path, "+41791112233", GROUP)["vip"] is True
+        # …while the room itself is nobody: a VIP group id is not a thing.
+        assert _gate(path, "+41799999999", GROUP)["vip"] is False
+        assert _gate(path, GROUP, GROUP)["vip"] is False
+
+        # Independent of the attention axes in both directions: a whitelisted
+        # or blacklisted sender is not thereby a VIP, and a VIP is not thereby
+        # whitelisted.
+        path = _policy_file(tmp, whitelist=["+41791112233"],
+                            blacklist=["+41790000000"], vip=["+41795555555"])
+        assert _gate(path, "+41791112233", None)["vip"] is False
+        assert _gate(path, "+41790000000", None)["vip"] is False
+        vip = _gate(path, "+41795555555", None)
+        assert vip["vip"] is True and vip["reason"] == "unknown", vip
+
+        # Case- and whitespace-insensitive, like every other handle here, and
+        # it survives a render/load round trip.
+        path = _policy_file(tmp, vip=["@Nina"])
+        assert _gate(path, " @nina ", None)["vip"] is True
+        assert tp.load_messenger_policy(CH, path=path).vip == {"@nina"}
+
+        # Nobody is a VIP by default.
+        assert _gate(_policy_file(tmp), "+41791112233", None)["vip"] is False
+
 
 def test_routing_matrix():
     with tempfile.TemporaryDirectory() as d:

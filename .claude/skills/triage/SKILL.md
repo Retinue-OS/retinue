@@ -38,8 +38,8 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
   status plus bookkeeping (disposition, conversation id,
   proposed/omnibus/nudge/resolved timestamps). Messenger: the gateway persists
   **one `kb:InboundMessage` `.nt` per message** on its own volume with a
-  `kb:delivered` flag; "delivered" means *a model turn has already accounted for
-  this message*, and only the gateway's `GET /undelivered` drain flips it.
+  `kb:delivered` flag; since the chat surface, "delivered" means *the user has
+  this message*, and the chats rail's acceptance is what flips it.
   Neither is touched by reading or replying in a client, and the mechanism works
   for **every channel**.
 - **The mailbox / delivery ledger is authoritative for what is present; the store
@@ -77,16 +77,19 @@ messenger is **push**:
 - **Messenger (push), since the chat surface.** A message the gate forwards is
   normally not triaged at all: the gateway hands it to the web-gateway's chats
   rail, which accepts it — the user sees it in the chat, pushed, for no model
-  turn — and the gateway marks it delivered. Where the user switched that
-  chat's `assist` on, the rail also runs a turn in its companion thread, which
-  stages any reply into the chat's shared draft for the user's send press. **No
-  messenger message asks the user to whitelist or blacklist anyone any more**;
-  that ask-flow is gone with the whitelist it served. *Normally*, because the
+  turn — and the gateway marks it delivered. For a sender the user marked a
+  **VIP**, the rail also runs a turn in that chat's companion thread: it files
+  what the message changes (a project, a memory) and stages any reply into the
+  chat's shared draft for the user's send press. The VIP flag follows the
+  person, so it holds in a group exactly as in a 1:1. **No messenger message
+  asks the user to whitelist or blacklist anyone any more**; that ask-flow is
+  gone with the whitelist it served. *Normally*, because the
   rail can decline — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or
   unable to open the companion thread — and the gateway then forwards to triage
   exactly as it always did, so a triage run must still expect messenger
   messages. Triage keeps the e-mail channel, and every channel with no chat
-  surface. See `docs/messenger-chats.md`.
+  surface; the messenger daily drain is gone, because nothing is left
+  undelivered. See `docs/messenger-chats.md`.
 - **E-mail (pull).** `scripts/triage-gate.py`, a scheduler `command` job.
   **Frequent** tick: list new INBOX mail, keep only whitelisted senders, spawn
   the model *only* if any survive. **Daily** tick: refresh the whitelist from the

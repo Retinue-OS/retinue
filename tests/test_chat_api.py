@@ -13,13 +13,14 @@ direct user-send contract and serving token-gated media). Covers:
   un-archive-unless-muted rule, held-gate and muted silence, push mode
   new-vs-reply, and echoes advancing the read watermark;
 - the forward path landing in the chat, not in triage: an arrival whose caller
-  offers to hand it over is accepted — the chat has it, the gateway stops — and
-  a turn runs on top of that only where the user switched the chat's `assist`
-  on, which is off by default and for anyone new; the turn's prompt carries the
-  arrival's own text (delimited as data) and the chat note and never asks the
-  user to rule on a correspondent, while a held class, an event with no
-  handover and a switched-off rail answer no handle at all (so the gateway
-  keeps its own forward), the same
+  offers to hand it over is accepted — the chat has it, the gateway stops, held
+  classes included — and a turn runs on top of that only for a **VIP sender**,
+  which is a fact about the person and holds in a group exactly as in a 1:1;
+  the turn's prompt carries the arrival's own text (delimited as data) and the
+  chat note, asks for the message to be filed as well as answered, and never
+  asks the user to rule on a correspondent, while a non-VIP, an event with no
+  handover and a switched-off rail run no turn (and the last answers nothing at
+  all, so the gateway keeps its own forward), the same
   message id is only ever worked once however often the rail delivers it,
   arrivals during a turn fold into one follow-up without losing a job, a reply
   that could not be stored fails its job rather than reporting delivery, and
@@ -1081,27 +1082,21 @@ def test_arrival_starts_a_companion_turn(base, wg):
              "sender": "777001", "sender_name": "Nina", "group": False,
              "message_id": "a1", "text": "Passt Samstag 15 Uhr?",
              "handover": True,
-             "gate": {"forward": True, "flagged_unknown": False,
-                      "reason": "whitelisted"}}
-    # Off by default, and for this correspondent nobody has turned it on: the
-    # chat has the message and the user was pushed, both for no model turn at
-    # all. `accepted` is what tells the gateway to stop — the message is
-    # delivered, and it goes nowhere else.
+             "gate": {"forward": True, "vip": False, "reason": "unknown"}}
+    # The same message from the same person, once the user has said they want
+    # to hear from them. Nothing else about it differs.
+    vip = lambda **kw: dict(event, gate=dict(event["gate"], vip=True), **kw)
+    # Not a VIP: the chat has the message and the user was pushed, both for no
+    # model turn at all. `accepted` is what tells the gateway to stop — the
+    # message is delivered, and it goes nowhere else.
     status, body = _http(base, "POST", rail, event)
     assert status == 200, body
     assert body["accepted"] is True and "job_url" not in body, body
     assert body["pushed"] is True
-    assert TURNS == [], "a stranger's message bought a model turn"
+    assert TURNS == [], "a message from nobody in particular bought a turn"
 
-    # The user switches auto-propose on for this chat — the same endpoint Hide
-    # uses, and the only thing anywhere that makes a turn happen here.
-    flags = "/chats/" + _quote(chat) + "/flags"
-    status, flagged = _http(base, "POST", flags, {"assist": True})
-    assert status == 200 and flagged["assist"] is True, flagged
-    status, chats = _http(base, "GET", "/chats")
-    assert next(c for c in chats["chats"] if c["id"] == chat)["assist"] is True
-
-    status, body = _http(base, "POST", rail, dict(event, message_id="a1b"))
+    # A VIP's message is worked the moment it lands.
+    status, body = _http(base, "POST", rail, vip(message_id="a1b"))
     assert status == 202, body
     assert body["job_url"].startswith("/jobs/") and body["accepted"] is True, body
 
@@ -1115,6 +1110,7 @@ def test_arrival_starts_a_companion_turn(base, wg):
     status, chats = _http(base, "GET", "/chats")
     summary = next(c for c in chats["chats"] if c["id"] == chat)
     comp = summary["companion"]
+    assert "assist" not in summary, "a chat does not carry this; a sender does"
     assert comp, "the arrival turn had nowhere to run"
     assert TURNS[0]["session"] == f"conv:{comp}"
 
@@ -1128,6 +1124,9 @@ def test_arrival_starts_a_companion_turn(base, wg):
     assert "chat-draft.py" in prompt and "secretary" in prompt
     # And when a dashboard conversation is warranted, and when it is not.
     assert "conversation-push.py" in prompt
+    # Answering is only part of it: what the user gets from a VIP turn is that
+    # the system knows what they were just told.
+    assert "memory.py store" in prompt and "project" in prompt
 
     # Ara's note lands in the companion thread and notifies nobody a second
     # time: the arrival already pushed, and one message is one notification.
@@ -1148,24 +1147,38 @@ def test_arrival_starts_a_companion_turn(base, wg):
     # message it never saw while its job still reports done.
     assert "<external_message>" in prompt and "Passt Samstag 15 Uhr?" in prompt
 
-    # A held class buys nothing: no handle, so the gateway holds the message
-    # for the daily drain exactly as it did before.
+    # A held class is accepted like everything else — the mirror has it, so
+    # there is nothing left for a drain to sweep — but it notifies nobody and
+    # buys no turn.
     TURNS.clear()
+    n = len(PUSHES)
     status, body = _http(base, "POST", rail,
                          dict(event, message_id="a3", text="spam",
-                              gate={"forward": False, "reason": "blacklisted"}))
-    assert status == 200 and "job_url" not in body
-    assert TURNS == []
+                              gate={"forward": False, "vip": False,
+                                    "reason": "blacklisted"}))
+    assert status == 200 and body["accepted"] is True, body
+    assert "job_url" not in body and body["pushed"] is False
+    assert len(PUSHES) == n and TURNS == []
 
-    # Switching it back off stops the turns without touching anything else.
-    status, flagged = _http(base, "POST", flags, {"assist": False})
-    assert status == 200 and flagged["assist"] is False, flagged
+    # It follows the person, not the room: the same VIP writing in a group is
+    # worked exactly as in a 1:1, and a non-VIP in that group is not.
+    TURNS.clear()
+    grp = {"direction": "in", "channel": "telegram", "chat": "-100777",
+           "group": True, "handover": True, "sender": "777001",
+           "sender_name": "Nina", "message_id": "g1", "text": "wer kommt mit?",
+           "gate": {"forward": True, "vip": True, "reason": "vip"}}
+    status, body = _http(base, "POST", rail, grp)
+    assert status == 202 and body["accepted"] is True, body
+    assert _await_job(base, body["job_url"])["status"] == "done"
+    assert len(TURNS) == 1, TURNS
     TURNS.clear()
     status, body = _http(base, "POST", rail,
-                         dict(event, message_id="a2", text="und jetzt?"))
+                         dict(grp, sender="777002", sender_name="Someone",
+                              message_id="g2",
+                              gate={"forward": True, "vip": False,
+                                    "reason": "unknown"}))
     assert status == 200 and body["accepted"] is True and "job_url" not in body
-    assert TURNS == []
-    _http(base, "POST", flags, {"assist": True})
+    assert TURNS == [], "the room is not the VIP; the person is"
 
     # Nor does a forward from a caller that did not offer to hand the message
     # over. That caller forwards it to triage itself whatever its gate says —
@@ -1179,25 +1192,23 @@ def test_arrival_starts_a_companion_turn(base, wg):
     assert body["pushed"] is True, "notification is not what is being withheld"
     assert TURNS == []
 
-    # An event with no verdict at all is still taken: the gate says what a
-    # message is worth to *notify* about, and the handover says who owns it.
-    # Neither decides the turn any more — the chat's own switch does.
+    # An event with no verdict at all is still taken — notification fails open
+    # — but nobody is a VIP by default, so no turn runs.
     TURNS.clear()
     no_gate = {k: v for k, v in event.items() if k != "gate"}
     status, body = _http(base, "POST", rail, dict(no_gate, message_id="a3b"))
-    assert status == 202 and body["accepted"] is True, body
-    assert body["pushed"] is True, "notification fails open"
-    assert _await_job(base, body["job_url"])["status"] == "done"
-    assert len(TURNS) == 1, TURNS
+    assert status == 200 and body["accepted"] is True, body
+    assert "job_url" not in body and body["pushed"] is True
+    assert TURNS == []
 
     # One message, one turn — however often the rail delivers it. A gateway
     # retries a POST whose answer was lost, and a ledger can redeliver a
     # stanza; both must get the handle the first call minted back.
     TURNS.clear()
     status, first_delivery = _http(base, "POST", rail,
-                                   dict(event, message_id="dup1", text="hoi"))
+                                   vip(message_id="dup1", text="hoi"))
     status, again = _http(base, "POST", rail,
-                          dict(event, message_id="dup1", text="hoi"))
+                          vip(message_id="dup1", text="hoi"))
     assert again["job_url"] == first_delivery["job_url"], (first_delivery, again)
     assert _await_job(base, first_delivery["job_url"])["status"] == "done"
     assert len(TURNS) == 1, TURNS
@@ -1207,7 +1218,7 @@ def test_arrival_starts_a_companion_turn(base, wg):
     TURNS.clear()
     png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
     status, body = _http(base, "POST", rail,
-                         dict(event, message_id="a4", text="schau mal",
+                         vip(message_id="a4", text="schau mal",
                               files=[{"filename": "x.png",
                                       "content_type": "image/png",
                                       "data": png}]))
@@ -1224,10 +1235,10 @@ def test_arrival_starts_a_companion_turn(base, wg):
     TURN_GATE["hold"] = hold
     try:
         first = _http(base, "POST", rail,
-                      dict(event, message_id="b1", text="eins"))[1]
+                      vip(message_id="b1", text="eins"))[1]
         _wait_for(lambda: len(TURNS) == 1, "the first turn to start")
         rest = [_http(base, "POST", rail,
-                      dict(event, message_id=f"b{i}", text=str(i)))[1]
+                      vip(message_id=f"b{i}", text=str(i)))[1]
                 for i in (2, 3)]
         assert all(r.get("job_url") for r in rest), rest
         assert len(TURNS) == 1, "a second turn started while one was running"
@@ -1244,7 +1255,7 @@ def test_arrival_starts_a_companion_turn(base, wg):
     wg.send_message = lambda *a, **k: {"error": "upstream is down"}
     try:
         status, body = _http(base, "POST", rail,
-                             dict(event, message_id="d1", text="hallo?"))
+                             vip(message_id="d1", text="hallo?"))
         failed = _await_job(base, body["job_url"])
         assert failed["status"] == "error", failed
     finally:
@@ -1258,7 +1269,7 @@ def test_arrival_starts_a_companion_turn(base, wg):
     wg._conv_add_message = lambda *a, **k: None
     try:
         status, body = _http(base, "POST", rail,
-                             dict(event, message_id="d2", text="und jetzt?"))
+                             vip(message_id="d2", text="und jetzt?"))
         lost = _await_job(base, body["job_url"])
         assert lost["status"] == "error", lost
     finally:

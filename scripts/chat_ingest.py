@@ -107,10 +107,11 @@ def notify_chat_event(
     ``*_ACCOUNT`` — how the web-gateway identifies which registry gateway sent
     the event, matched against the accounts the gateways it already knows
     report for themselves. ``gate`` carries the delivery-gate
-    verdict for inbound events (``{"forward": bool, "reason": str}``) so the
-    web-gateway can keep held/no-action classes silent. It no longer decides
-    whether a turn runs: that is the chat's own ``assist`` flag, which the user
-    sets per correspondent. ``files``
+    verdict for inbound events (``{"forward": bool, "vip": bool, "reason":
+    str}``) so the web-gateway can keep held/no-action classes silent and can
+    see whose message the user asked to have worked on arrival. ``forward`` no
+    longer decides a turn — ``vip`` does, and it is a fact about the sender
+    alone, true in a group exactly as in a 1:1. ``files``
     are the message's attachments in the ``POST /message`` shape
     (``{"filename", "content_type", "data"}``, base64) so a turn started there
     can open them; they ride along only for a forwarded message.
