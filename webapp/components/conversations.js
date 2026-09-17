@@ -67,10 +67,12 @@ class RetinueConversations extends HTMLElement {
     this._composeProjectTitle = '';   // its display title (for the chip)
     this._pushDepth = 0;     // history entries we pushed and have not unwound
     // Bumped whenever the list is changed from this side — an archive, a
-    // scope switch. A refresh that began before the bump answers with the
-    // list as it was, and rendering that would put an archived thread back
-    // in the list (with its button reading Unarchive when opened) until the
-    // next poll. The epoch is how such an answer is recognised and dropped.
+    // scope switch, a thread created or written to. A refresh that began
+    // before the bump answers with the list as it was, and rendering that
+    // would put an archived thread back in the list (with its button reading
+    // Unarchive when opened), or hide a just-created one, until the next
+    // poll. The epoch is how such an answer is recognised and dropped: every
+    // local change goes through _changed(), never a bare refresh().
     this._epoch = 0;
   }
 
@@ -105,7 +107,7 @@ class RetinueConversations extends HTMLElement {
       this.addEventListener('retinue-back', () => this._openList());
       this.addEventListener('retinue-created', (e) => this._onCreated(e.detail || {}));
       this.addEventListener('retinue-archived', (e) => this._onArchived(e.detail || {}));
-      this.addEventListener('retinue-sent', () => this.refresh());
+      this.addEventListener('retinue-sent', () => this._changed());
       this.addEventListener('retinue-open', (e) => {
         const id = e.detail && e.detail.id;
         if (id) this._openThread(id);
@@ -198,6 +200,14 @@ class RetinueConversations extends HTMLElement {
       ? this._threads : this._threads.slice(0, MAX_CARD_THREADS);
   }
 
+  // The list changed on the server because of something done here (a send, an
+  // archive, a new thread): fetch it again, and let no answer from before the
+  // change land after this one was asked for.
+  _changed() {
+    this._epoch += 1;
+    this.refresh();
+  }
+
   async refresh() {
     const epoch = this._epoch;
     try {
@@ -261,9 +271,8 @@ class RetinueConversations extends HTMLElement {
     if (this._scope === scope) return;
     this._scope = scope;
     this._threads = [];
-    this._epoch += 1; // a refresh of the old scope in flight must not land here
     this.render();
-    this.refresh();
+    this._changed(); // a refresh of the old scope in flight must not land here
   }
 
   // The open thread was archived or restored. The row leaves (or joins) the
@@ -279,9 +288,8 @@ class RetinueConversations extends HTMLElement {
     const leaves = (scope === 'active' && archived) || (scope === 'archived' && !archived);
     if (id && leaves) this._threads = this._threads.filter((t) => t.id !== id);
     else if (id) this._threads.forEach((t) => { if (t.id === id) t.archived = archived; });
-    this._epoch += 1;
     this._openList();
-    this.refresh();
+    this._changed();
   }
 
   // The composer's first message opened a thread: the element already went on
@@ -297,7 +305,7 @@ class RetinueConversations extends HTMLElement {
     this._setComposeProject(undefined); // link consumed by this thread
     this._lastMode = 'thread';
     this.setAttribute('data-view', 'thread');
-    this.refresh();
+    this._changed();
   }
 
   // _open* are user intents: they move the history stack, and the matching

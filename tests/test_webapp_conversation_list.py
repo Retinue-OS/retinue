@@ -7,7 +7,9 @@ test drives the element under Node with a scripted DOM and a scripted fetch —
 the test decides when each request is answered — and pins what the user sees:
 an archived thread leaves the list at once and stays gone, even when the poll
 that predates the archive answers afterwards. Before the epoch guard that
-answer put the row back, and opening it showed an Unarchive button.
+answer put the row back, and opening it showed an Unarchive button. The same
+guard covers every other change made from this side — a scope switch, a
+thread created from the composer, a message sent — so those are pinned too.
 
 Standalone like the rest of the suite. Needs `node` on PATH (GitHub's runners
 have it); without it the test reports a skip and passes, so the Python-only
@@ -163,6 +165,38 @@ await ok('a scope switch drops the answer meant for the scope left behind', asyn
   wire.shift().answer([thread(A, { archived: true })]);
   await settle();
   assert.deepEqual(ids(card), [A]);
+  card.disconnectedCallback();
+});
+
+await ok('a thread created from the composer is not hidden by the poll before it', async () => {
+  const card = await mount({ threads: [thread(B)] });
+  card._openComposer();
+  card.refresh();
+  const stale = wire.shift();
+  card.dispatchEvent(new CustomEvent('retinue-created', { detail: { id: A } }));
+  assert.equal(card._active, A, 'the element went on as the new thread');
+  pending(1);
+  const fresh = wire.shift();
+  stale.answer([thread(B)]);                 // from before the thread existed
+  fresh.answer([thread(A), thread(B)]);      // asked for after it did
+  await settle();
+  assert.deepEqual(ids(card), [A, B], 'the answer from before the create is dropped');
+  card.disconnectedCallback();
+});
+
+await ok('a send drops the poll from before it', async () => {
+  const card = await mount({ threads: [thread(A, { preview: 'old' })] });
+  card._openThread(A);
+  card.refresh();
+  const stale = wire.shift();
+  card.dispatchEvent(new CustomEvent('retinue-sent', { detail: { id: A } }));
+  pending(1);
+  const fresh = wire.shift();
+  fresh.answer([thread(A, { preview: 'new' })]);
+  await settle();
+  stale.answer([thread(A, { preview: 'old' })]);
+  await settle();
+  assert.equal(card._threads[0].preview, 'new', 'the list keeps the answer from after the send');
   card.disconnectedCallback();
 });
 
