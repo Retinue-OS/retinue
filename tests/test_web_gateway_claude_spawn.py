@@ -40,6 +40,7 @@ def _load_gateway(tmp: Path, env: dict[str, str]):
                 "RETINUE_CONVERSATION_MODELS", "RETINUE_LITELLM_URL",
                 "ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS",
                 "RETINUE_ROUTER_MODEL", "RETINUE_FRONTIER_MODEL",
+                "RETINUE_DASHBOARD_MODEL",
                 "RETINUE_CLAUDE_MODEL", "TRANSCRIPT_CLEANUP_MODEL",
                 "PRESENTATION_LINT_MODEL", "CONVERSATION_BASE_URL"):
         os.environ.pop(var, None)
@@ -279,6 +280,72 @@ def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
     assert "RETINUE_ESCALATE_FILE" not in senior_env
 
 
+def _run_thread_turn(wg, *, escalated: bool = False, **conv_kwargs) -> str | None:
+    """Run one dashboard-thread turn and return the model it asked for."""
+    conv = wg._new_conv("user", "reto", "t", "user", "hello", **conv_kwargs)
+    if escalated:
+        wg._conv_set_flags(conv["id"], escalated=True)
+    picked = {}
+
+    def fake_send(prompt, **kwargs):
+        picked["model"] = kwargs.get("model")
+        return {"response": "ok", "session_id": "s"}
+
+    send, lint, push = wg.send_message, wg._lint_presentation, wg._push_conv_notification
+    wg.send_message = fake_send
+    wg._lint_presentation = lambda text, **kw: text
+    wg._push_conv_notification = lambda *a, **kw: None
+    try:
+        assert wg._conv_worker(conv["id"], f"conv:{conv['id']}") is True
+    finally:
+        wg.send_message, wg._lint_presentation, wg._push_conv_notification = send, lint, push
+    return picked["model"]
+
+
+def test_dashboard_model_governs_threads_and_only_threads(wg_dashboard):
+    """RETINUE_DASHBOARD_MODEL is the dashboard door's own tier: it governs
+    unpinned threads, and nothing else the gateway spawns."""
+    # An unpinned thread runs the dashboard model, not the router tier.
+    assert _run_thread_turn(wg_dashboard) == "sonnet"
+    # A per-thread pin still wins over it.
+    assert _run_thread_turn(wg_dashboard, model="opus") == "opus"
+
+    # POST /message — the messenger channels' inbound turns and the async jobs
+    # they spawn — defers to send_message(), which keeps the router tier so a
+    # cheap-dispatch deployment does not pay dashboard prices for chat traffic.
+    spawns = _capture_spawns(wg_dashboard,
+                             json.dumps({"result": "ok", "session_id": "s-4"}))
+    with _daemon_environment():
+        out = wg_dashboard.send_message("hello", session_key="env-message")
+    assert out.get("response") == "ok", out
+    cmd, kwargs = spawns[0]
+    assert "--model" in cmd and "haiku" in cmd, cmd
+    assert kwargs["env"]["RETINUE_SESSION_MODEL"] == "haiku"
+    # Below the frontier tier, so that path keeps junior's escalation flag.
+    assert "RETINUE_ESCALATE_FILE" in kwargs["env"]
+
+    # The picker's "(default)" row names what unpinned threads actually run…
+    marked = wg_dashboard._mark_default([{"id": "opus", "label": "Opus"},
+                                         {"id": "sonnet", "label": "Sonnet"}])
+    assert marked[1].get("default") is True and "default" in marked[1]["label"]
+    assert "default" not in marked[0]
+    # …and flags nothing at all rather than mislabelling another row when the
+    # configured model is not offered.
+    unoffered = wg_dashboard._mark_default([{"id": "opus", "label": "Opus"},
+                                            {"id": "haiku", "label": "Haiku"}])
+    assert unoffered == [{"id": "opus", "label": "Opus"},
+                         {"id": "haiku", "label": "Haiku"}], unoffered
+
+    # The lint's default tier is the router model, untouched by the split.
+    assert wg_dashboard.PRESENTATION_LINT_MODEL == "haiku"
+
+
+def test_escalated_thread_stays_with_senior(wg_dashboard):
+    """An escalated thread keeps running on the frontier tier — the dashboard
+    default must not take that decision back."""
+    assert _run_thread_turn(wg_dashboard, escalated=True) == "opus"
+
+
 def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     """The tool-less helper sessions are `claude` processes all the same."""
     spawns = _capture_spawns(wg, json.dumps({"result": "hello world"}))
@@ -323,6 +390,14 @@ def main():
             tmp / "c", {"RETINUE_ROUTER_MODEL": "haiku",
                         "RETINUE_FRONTIER_MODEL": "opus"})
         test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered)
+
+        # Three distinct tiers, so every assertion below names exactly one.
+        wg_dashboard = _load_gateway(
+            tmp / "d", {"RETINUE_ROUTER_MODEL": "haiku",
+                        "RETINUE_DASHBOARD_MODEL": "sonnet",
+                        "RETINUE_FRONTIER_MODEL": "opus"})
+        test_dashboard_model_governs_threads_and_only_threads(wg_dashboard)
+        test_escalated_thread_stays_with_senior(wg_dashboard)
     print("all web-gateway claude-spawn tests passed")
 
 

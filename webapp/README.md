@@ -246,8 +246,10 @@ The API, as the components consume it:
   keeps only for its content is `news` + `ignored` **and** muted — three
   separate statements, because a list one both reads as news and answers in is
   `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
-  be a later `pinned` flag, deliberately deferred. A store outage answers an
-  honest 502 (the page shows it; the card keeps its last state).
+  be a later `pinned` flag, deliberately deferred. A store outage is answered
+  from the last good list for up to `CHAT_LIST_STALE_SECONDS` (10 min by
+  default), then with an honest 502 (the page shows it; the card keeps its
+  last state).
 - `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
   [Message]}`, ascending by `ts`, the newest page by default;
   `?before=<ISO ts>` pages older history (the page renders the newest page —
