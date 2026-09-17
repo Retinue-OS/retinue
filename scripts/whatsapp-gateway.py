@@ -1979,14 +1979,19 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
               f"from {sender_label}; left undelivered rather than handled twice",
               flush=True)
         return
-    rail_job = ((rail or {}).get("job_url") or "").strip() or None
-    if rail_job:
-        print(f"[whatsapp-gateway] the chat's companion turn took the message "
-              f"from {sender_label} (vip)", flush=True)
-        _confirm_delivery(rail_job, store_path, sender_label,
-                          base=_chats.CHATS_INGEST_URL)
-        return
-    if rail and rail.get("accepted"):
+    # Only an explicit acceptance is a handover — a job handle on its own is
+    # not. A web-gateway built before this contract ignores `handover` and will
+    # hand back a job it started on its own rules, for a non-VIP among others;
+    # treating that as ours would apply the old policy under the new one's name
+    # for as long as the images are out of step.
+    if rail is not None and rail.get("accepted") is True:
+        rail_job = (rail.get("job_url") or "").strip() or None
+        if rail_job:
+            print(f"[whatsapp-gateway] the chat's companion turn took the message "
+                  f"from {sender_label} (vip)", flush=True)
+            _confirm_delivery(rail_job, store_path, sender_label,
+                              base=_chats.CHATS_INGEST_URL)
+            return
         # Accepted with no turn: the chat has the message and the user has been
         # pushed, and that is the delivery. Nothing is owed a model — this
         # sender is not a VIP — so the record says delivered and nothing ever
@@ -2032,13 +2037,16 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"session in it.\n")
         if reply_token else ""
     )
+    # The sender being unknown is context, not a question. Whether a
+    # correspondent is worth anything is the user's VIP list now, and this
+    # path is a fallback for when the chat surface could not take the
+    # message — the one moment least suited to asking them to rule on a
+    # stranger. The ask-flow is gone everywhere, including here.
     unknown_line = (
-        (f"\nThis sender ({sender}) is UNKNOWN — not on the triage whitelist. "
-         f"After triaging, open a dashboard conversation asking whether to "
-         f"whitelist this sender (so future messages trigger a turn on arrival) "
-         f"or blacklist them (so they are never asked about again). Apply the "
-         f"user's answer with: python3 /workspace/scripts/triage_policy.py "
-         f"whitelist-add --channel whatsapp --handle {sender}  (or blacklist-add).\n")
+        (f"\nThis sender ({sender}) is not one the user has said anything "
+         f"about — no reason to treat the message differently, and no "
+         f"reason to ask them about the sender. Do not open a conversation "
+         f"proposing to whitelist or blacklist anybody.\n")
         if gate["flagged_unknown"] else ""
     )
     attachment_line = (

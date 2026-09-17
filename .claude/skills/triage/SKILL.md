@@ -5,8 +5,10 @@ description: >
   the user wants to "triage", "go through the inbox", "clear messages", "was ist
   reingekommen", when the scheduled triage job runs, or when an inbound message
   triggers triage. A credit-free **delivery gate** decides before any model turn
-  whether a message deserves one: whitelisted (and first-time unknown) senders
-  are handled live; everything else waits for the once-a-day catch-all. Triage
+  whether a message deserves one: on e-mail, whitelisted senders are handled
+  live and everything else waits for the once-a-day catch-all; on messenger the
+  chat surface takes every message and only a **VIP sender** buys a turn, so
+  triage sees a messenger message only when that rail could not take it. Triage
   collects the messages in scope, links each to a project, then proposes
   dispositions as dashboard conversations — one thread per reply/action (every
   run), one periodic omnibus for archivals and deletions. Handled-state lives in
@@ -31,8 +33,10 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
 - **Spend model turns only where they earn their keep.** The delivery gate
   (below) classifies every inbound *before* a model session is spawned — a plain
   script for e-mail, the gateway inbound handler for messenger, both credit-free.
-  On frequent runs only whitelisted senders (plus first-time unknowns) cost a
-  turn; everything else waits for the single daily catch-all.
+  On e-mail's frequent runs only whitelisted senders cost a turn and everything
+  else waits for the single daily catch-all. On messenger nothing costs a turn
+  by default at all: the chat surface delivers every message for free, and only
+  a **VIP sender** earns one.
 - **Handled-state lives outside the mailbox.** E-mail: `TRIAGE_STATE_DIR` holds
   **one file per message** — filename = the RFC Message-ID, content = triage
   status plus bookkeeping (disposition, conversation id,
@@ -229,10 +233,12 @@ When invoked for a single channel or a single message, collect only that.
 
 An **inbox-mode** messaging gateway (e.g. `signal-gateway.py` with
 `SIGNAL_GATEWAY_MODE=inbox`) monitors one of the user's own message sources.
-Each inbound first passes the delivery gate: a **whitelisted** or **unknown**
-sender is dispatched straight to Ara via the web-gateway; blacklisted /
-group-blocked / no-action-class messages are persisted `delivered` and never
-pushed.
+Each inbound first passes the delivery gate and is then taken by the chats
+rail, which is where messenger messages are handled now — so **this path is a
+fallback**, reached only when that rail could not take the message. It arrives
+here exactly as it always did. One thing has changed and it is absolute: **do
+not ask the user to whitelist or blacklist a sender.** The prompt may say a
+sender is unknown; that is context, not a question, and the ask-flow is gone.
 The account's **mode** — not the content, not triage — already established that
 this is the user's incoming mail; **triage never has to decide whether a message
 is an instruction or user mail.** The prompt contains the message and sender, so
@@ -244,9 +250,12 @@ So every push-triggered triage message is the user's own inbound mail, processed
 under the owner's session, and **never replied to on the source channel** — Ara
 only proposes via the dashboard.
 
-An **unknown**-sender push is tagged as such: Ara's proposal asks whether to
-whitelist the handle (yes → whitelist, no → blacklist), alongside the normal
-disposition. This is the one path by which a new handle enters the policy.
+An **unknown**-sender push is tagged as such, and that is all it is — a note
+that nobody has said anything about this sender. **Do not propose whitelisting
+or blacklisting them.** That ask-flow is gone: the whitelist no longer decides
+anything on messenger, and who is worth a model turn is the user's VIP list,
+which they set by telling Ara — never by being asked about a stranger who just
+wrote to them.
 
 ### Status updates (broadcast posts) — filed silently by default
 

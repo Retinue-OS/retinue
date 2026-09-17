@@ -255,7 +255,7 @@ def _check_rail_takes_the_message(name: str, loader, forward):
 
         def _rail(**kwargs):
             rail_calls.append(kwargs)
-            return {"ok": True, "job_url": "/jobs/r1"}
+            return {"accepted": True, "job_url": "/jobs/r1"}
 
         gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
         gw._chats.notify_chat_event = _rail
@@ -267,6 +267,23 @@ def _check_rail_takes_the_message(name: str, loader, forward):
         assert rail_calls[0]["gate"]["forward"] is True, rail_calls[0]["gate"]
         assert "vip" in rail_calls[0]["gate"], rail_calls[0]["gate"]
         assert posts == [], "the message went to triage as well as to its chat"
+        assert _await_flag(tmp, True), _stored_flags(tmp)
+
+    # A job handle without an acceptance is not a handover. A web-gateway built
+    # before this contract ignores `handover` and hands back a job it started on
+    # its own rules — for a non-VIP among others — and honouring that would
+    # apply the old policy under the new one's name while the images are out of
+    # step. The message stays this gateway's to forward.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        gw = loader(tmp)
+        posts = _accept_post(gw, {"status": "pending", "job_url": "/jobs/t6"})
+        gw._chats.CHATS_INGEST_URL = "http://retinue:8080/internal/chats/inbound"
+        gw._chats.notify_chat_event = lambda **kwargs: {"ok": True,
+                                                        "job_url": "/jobs/old"}
+        _stub_job_polls(gw._jobs, [_Resp(200, {"status": "done"})])
+        forward(gw)
+        assert len(posts) == 1, "an unaccepted job handle was taken for ours"
         assert _await_flag(tmp, True), _stored_flags(tmp)
 
     # A rail that cannot take it — switched off, unreachable, or unable to open

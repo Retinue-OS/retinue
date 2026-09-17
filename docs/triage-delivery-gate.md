@@ -341,23 +341,25 @@ This is the IMAP analogy, renamed: "fetch unseen → mark `\Seen`" ≡ "fetch
 undelivered → mark delivered." Both are stateful fetches owned by the message
 store; a read-only query of either changes nothing.
 
-**Fast loop vs. daily drain.** On arrival, the gateway classifies on both axes
-(`triage_policy.gate_decision`) and acts on the two flags it returns —
-`forward` (spend a model turn now) and, when not forwarding, `delivered_if_held`
-(the `delivered` flag to persist):
+**What the classes decide now.** On arrival the gateway classifies on both
+axes (`triage_policy.gate_decision`), and on the normal path the verdict has
+one job left: whether the arrival is worth interrupting the user for. Every
+message is then offered to the chats rail, accepted, and recorded delivered —
+see *The VIP axis* below for what does buy a model turn.
 
-| Class | forward | held `delivered` | drained daily |
-|---|---|---|---|
-| whitelisted handle | yes (delivered once the job succeeds) | — | — |
-| unknown, normal group | yes, flagged unknown | — | — |
-| blacklisted handle | no | `false` | yes |
-| unknown, quieted group | no | `false` | yes |
-| unknown, ignored group | no | `true` | **no** |
+| Class | notifies? | what happens |
+|---|---|---|
+| whitelisted handle | yes | accepted by the chat; delivered |
+| unknown, normal group | yes | the same — the whitelist changes nothing here any more |
+| blacklisted handle | no | accepted silently; delivered |
+| unknown, quieted group | no | accepted silently; delivered |
+| unknown, ignored group | no | accepted silently; delivered |
 
-So the `delivered` flag encodes exactly the drain decision: `false` means "held,
-the daily drain picks it up" (blacklisted handle, quieted group); `true` means
-"accounted for, never drained" (ignored group — the message is on record and
-queryable, but no model ever looks at it unprompted).
+The `delivered_if_held` flag the gate also returns belongs to the **fallback**
+path, where the rail refused and the old behaviour runs whole: `false` means
+"held, the drain picks it up" (blacklisted handle, quieted group); `true` means
+"accounted for, never drained" (ignored group). On the normal path nothing
+reads it, because the chat's acceptance is what sets the flag.
 
 ### The VIP axis, and what became of `delivered` on messenger
 

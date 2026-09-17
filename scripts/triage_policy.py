@@ -566,13 +566,19 @@ def gate_decision(
     docs/triage-delivery-gate.md); all three gateways call it so they can never
     drift. Returns a dict with:
 
-    - ``forward`` — spend a model turn on this message now (the triage rail).
-    - ``flagged_unknown`` — annotate that turn as an unknown sender (ask the user
-      whether to whitelist/blacklist the handle).
+    - ``forward`` — worth the user's attention. On messenger this decides
+      whether the arrival notifies (a held class updates the chat silently) and
+      nothing else; it stopped deciding a model turn when the chat surface took
+      over delivery, and ``vip`` decides that now. On the gateways' fallback
+      path — the rail refusing — it still means what it always did.
+    - ``flagged_unknown`` — nobody has said anything about this sender. It is
+      context for a fallback turn, **not** a question to put to the user: the
+      unknown-sender ask-flow is gone, on every path.
     - ``delivered_if_held`` — the ``delivered`` flag to persist when NOT
-      forwarding: ``True`` means "accounted for, never drained" (ignored group),
-      ``False`` means "held, the daily drain picks it up" (blacklisted handle or
-      quieted group).
+      forwarding *and* the chat did not take the message either: ``True`` means
+      "accounted for, never drained" (ignored group), ``False`` means "held,
+      the drain picks it up" (blacklisted handle or quieted group). On the
+      normal path the chat's acceptance sets the flag and this is unused.
     - ``news`` — the message's group is a news source: forward it to the news
       feed (Herald) too. This rail is *independent* of the triage decision above
       (a message can be both, either, or neither).
@@ -584,19 +590,22 @@ def gate_decision(
       flag here, which govern attention, not handling.
     - ``reason`` — a short label for the gateway log.
 
-    Triage rail (news rail is orthogonal, driven only by group ∈ news):
+    Attention rail (news and vip are orthogonal — news is driven only by
+    group ∈ news, vip only by sender ∈ vip):
 
-    | class                    | forward | flagged | held-flag | drained daily |
-    |--------------------------|---------|---------|-----------|---------------|
-    | whitelisted handle       | yes     | no      | —         | —             |
-    | blacklisted handle       | no      | no      | false     | yes           |
-    | unknown, normal group    | yes     | yes     | —         | —             |
-    | unknown, quieted group   | no      | no      | false     | yes           |
-    | unknown, ignored group   | no      | no      | true      | no            |
+    | class                    | forward | flagged | held-flag |
+    |--------------------------|---------|---------|-----------|
+    | whitelisted handle       | yes     | no      | —         |
+    | blacklisted handle       | no      | no      | false     |
+    | unknown, normal group    | yes     | yes     | —         |
+    | unknown, quieted group   | no      | no      | false     |
+    | unknown, ignored group   | no      | no      | true      |
 
     Whitelist/blacklist are sender-level and win over the group's quieted/ignored
     flag; quieted/ignored bite only for unknown senders — matching the user's
-    model ("new senders in quieted or ignored groups").
+    model ("new senders in quieted or ignored groups"). Note that whitelisted
+    and unknown now answer the same on every column: on messenger the whitelist
+    no longer changes anything the default does not already do.
 
     ``enabled=False`` forwards everything (the gate turned off). May raise if the
     policy file is present but unreadable; the caller decides fail-open.

@@ -387,12 +387,15 @@ and what a model turn is *for*:
      that could not be opened — and the gateway forwards to triage exactly as
      it always has. The switch degrades to the old path, never to a message
      nothing looks at, and it is reversible without a revert.
-   - **Every arrival is answered, but not every arrival is a turn.** Messages
-     landing while a chat's turn runs are folded into one follow-up turn: a
-     turn reads the chat as it stands, so a second one would re-read the
-     first's messages and the two would fight over the draft. Each arrival
-     still gets its own job handle and the covering turn resolves all of them,
-     so `delivered` is never set for a message no turn saw.
+   - **Every arrival is accepted; only a VIP's is a turn.** Acceptance is the
+     answer to *do I still have to do something with this?* — no, the chat
+     has it — and it is what the gateway marks delivered on. A job handle
+     comes with it only for a VIP, and only then does the gateway wait for the
+     job. Messages landing while a chat's turn runs are folded into one
+     follow-up turn: a turn reads the chat as it stands, so a second one would
+     re-read the first's messages and the two would fight over the draft. Each
+     of those still gets its own handle and the covering turn resolves all of
+     them, so `delivered` is never set for a VIP's message no turn saw.
    - **What the message carried travels with it.** Attachments ride the rail in
      the `POST /message` shape and are materialized in the retinue container,
      so a turn opens the photo rather than answering one it never saw.
