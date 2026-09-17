@@ -239,11 +239,28 @@ credits):
    answers on still reaches triage.
 3. Dedup by message-id against the existing triage status (same sanitized
    id-scheme triage already uses). A message that already has a status record
-   is **not new work** and does not arm the gate — whatever its status. Triage
-   never marks mail read (`unread ≠ unhandled`), so a classified message stays
-   unread in the INBOX until its disposition is executed, which for an omnibus
-   batch means waiting on the user; without this step every tick would re-spawn
-   a session over the same settled stack.
+   is **not new work** and does not arm the gate. Triage never marks mail read
+   (`unread ≠ unhandled`), so a classified message stays unread in the INBOX
+   until its disposition is executed, which for an omnibus batch means waiting
+   on the user; without this step every tick would re-spawn a session over the
+   same settled stack. Two exceptions, both because the gate is the *only*
+   thing that spawns a triage session — a state nothing else revisits is a
+   state nothing else can ever finish:
+   - **Stalled** (`_stalled`): a record on a non-terminal status untouched for
+     `TRIAGE_STALL_DAYS` (default 7) is abandoned rather than in progress, and
+     re-arming it is the only way its mail ever leaves the INBOX.
+   - **A due omnibus digest** (`omnibus_due`): the skill accrues
+     archive/delete candidates on `omnibus_pending` and sends one digest per
+     `EMAIL_PROCESSING_INTERVAL` — that accrual is what keeps the user from
+     being pinged several times a day. Since accrued mail sits on an open
+     status, the gate arms on the *bundle* instead: it reads `omnibus_pending`
+     records off the unread listing (not by walking the status store — on a
+     30-minute tick that is not free) and, when the interval since
+     `.last-omnibus` has elapsed, spawns a run told to send the digest. A
+     missing or unparseable marker counts as due: the cost is one digest, the
+     alternative is bundled mail nobody sees. Due-ness is read across the whole
+     unread listing rather than the whitelisted subset, since a bundle accrued
+     by a daily run can hold mail the frequent pass does not whitelist.
 4. Keep only whitelisted senders → spawn the model for those. The spawn payload
    still carries every routed message, recorded ones included, so the session
    reconciles and nudges over the same set as before — only the *decision to
