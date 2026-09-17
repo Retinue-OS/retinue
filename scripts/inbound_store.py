@@ -13,31 +13,34 @@ out of that single act:
    or another gateway.
 
 2. **A delivery ledger.** Each message carries a ``kb:delivered`` flag. This is
-   **not** "read" — it records only whether the message has yet been *handed to
-   triage*. The flag is owned solely by the gateway and flipped ``false → true``
-   by exactly two operations, both here: :func:`undelivered`, which returns the
-   held messages **and marks them delivered as a side effect** (the daily drain),
-   and :func:`mark_delivered`, which flips one already-written message the gateway
-   persisted up front (the persist-before-forward path — see below). Nothing else
-   — no SPARQL query, no ad-hoc read — ever touches it, so browsing history never
-   silently "consumes" a message. The daily triage skill drains the backlog by
-   calling the gateway's ``/undelivered`` endpoint (which calls this), so a
-   message that arrived while its sender was not yet whitelisted is caught the
-   next day instead of being lost.
+   **not** "read" — it records only whether the message has reached the user at
+   all: the chat surface shows it, or a turn put it in front of them. The flag is
+   owned solely by the gateway and flipped ``false → true`` by exactly two
+   operations, both here: :func:`undelivered`, which returns the held messages
+   **and marks them delivered as a side effect**, and :func:`mark_delivered`,
+   which flips one already-written message the gateway persisted up front (the
+   persist-before-forward path — see below). Nothing else — no SPARQL query, no
+   ad-hoc read — ever touches it, so browsing history never silently "consumes" a
+   message.
+
+   Since the chat surface shows every arrival the moment it lands, an
+   ``undelivered`` backlog is now an **exception**, not a daily inbox: a message
+   sits there only when the handover to the chats rail could not be completed.
+   The gateway's ``/undelivered`` endpoint is the recovery path for exactly those
+   — not a sweep anyone runs on a schedule to see their mail.
 
 The delivered flag lets a gateway persist a message it deliberately did **not**
-forward — a blacklisted or no-action-class sender is written straight to
-``delivered: true`` (already accounted for, never drained). A message that *is*
-forwarded takes the never-drop path: the gateway writes it ``delivered: false``
-the instant it arrives (before the gate, before the forward — so a crash or a
-throwing forward cannot lose it), then calls :func:`mark_delivered` once the
-triage turn has actually **run**. That last part is the whole point: the forward
-POST answers 202 (accepted), not "handled", so the flip waits on the job's
-``status: done`` (see ``job_delivery.py``). Any message that was persisted but
-never reached a completed turn — a failed forward, a job that errored or
+hand over — one from an ignored group is written straight to ``delivered: true``
+(already accounted for, never re-surfaced). A message that *does* go out takes
+the never-drop path: the gateway writes it ``delivered: false`` the instant it
+arrives (before the gate, before the forward — so a crash or a throwing forward
+cannot lose it), then calls :func:`mark_delivered` once the rail has taken it,
+or once a turn it bought has actually **run**. That last part is the whole
+point: a forward POST answers 202 (accepted), not "handled", so the flip waits
+on the job's ``status: done`` (see ``job_delivery.py``). Any message that was
+persisted but never got that far — a failed forward, a job that errored or
 expired, a gateway that died mid-dispatch — stays ``delivered: false`` and is
-picked up by the daily drain (at-least-once: a rare duplicate surface beats a
-silent loss).
+recoverable (at-least-once: a rare duplicate surface beats a silent loss).
 
 Inbound is only half the ledger. The store also holds **outbound** messages
 (``kb:OutboundMessage``, :func:`write_outbound`) in the same ``messages/``
@@ -49,7 +52,7 @@ whole conversation as a single timeline (filenames sort by epoch millis
 regardless of direction). It takes **both**: a chat key identifies a peer within
 one account, and a channel's message volume is shared by every account on it, so
 the pair is the conversation's real identity. Outbound records have **no**
-delivered flag and are invisible to :func:`undelivered` — the drain is triage
+delivered flag and are invisible to :func:`undelivered` — the ledger is
 bookkeeping for inbound mail only.
 
 Only **inbox**-mode gateways write here at all, in either direction: a control
@@ -203,9 +206,9 @@ def thread_key(channel: str, account: str, chat: str | None,
     Opening a thread is a side effect, and the same inbound can legitimately be
     handled twice — an escalation re-runs the turn's prompt, a channel
     redelivers a stanza after a reconnect, a live turn dies before finishing and
-    the daily drain picks the record up again. All of those must land on one
+    a recovery sweep picks the record up again. All of those must land on one
     thread, so the key has to name the *message*, identically on the live path
-    and at the drain.
+    and on recovery.
 
     A channel-native message id alone will not do that. Telegram numbers
     messages per chat, Signal identifies one by (source, sent timestamp), and a
@@ -491,9 +494,9 @@ def write_message(
     """Persist one inbound message as a deterministic N-Triples file.
 
     Returns ``(subject_uri, path)``. ``delivered=False`` (the default) marks the
-    message as still owed to triage; pass ``delivered=True`` for a message the
-    gateway is deliberately *not* forwarding (blacklisted, group-blocked or
-    no-action-class) so the daily drain never re-surfaces it.
+    message as not yet in front of the user; pass ``delivered=True`` for a
+    message the gateway is deliberately *not* handing over (an ignored group) so
+    a recovery sweep never re-surfaces it.
 
     ``chat`` is the chat key (see :data:`P_CHAT`): the exact recipient string
     this channel's own send path accepts, computed by the gateway and persisted
@@ -867,14 +870,14 @@ def undelivered(
     store_dir: str | Path,
     since: str | float | None = None,
 ) -> list[dict]:
-    """Return messages still owed to triage, **marking each delivered**.
+    """Return messages that never reached the user, **marking each delivered**.
 
     This is the sole mutator of the ``delivered`` flag. It scans the message
     files oldest-first, selects those with ``delivered == false`` (and, when
     ``since`` is given, ``receivedAt >= since``), rewrites each of those files
     with ``delivered = true``, and returns the selected messages as dicts. A
     plain SPARQL read never calls this, so browsing history does not consume
-    anything; only the daily triage drain does.
+    anything; only the recovery sweep behind ``/undelivered`` does.
 
     Each returned dict has: ``subject``, ``channel``, ``sender``, ``group``,
     ``chat``, ``message_id``, ``received_at`` (ISO-8601), ``text``,

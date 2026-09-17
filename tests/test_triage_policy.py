@@ -172,7 +172,7 @@ def test_missing_file_is_empty():
     got_addr, got_wild = tp.load_email_whitelist(Path("/nonexistent/x.nt"))
     assert got_addr == set() and got_wild == set()
     pol = tp.load_messenger_policy("signal", Path("/nonexistent/x.nt"))
-    assert pol.whitelist == set() and pol.blacklist == set()
+    assert pol.vip == set() and pol.news == set()
     assert pol.ignored == set() and pol.quieted == set() and pol.news == set()
 
 
@@ -183,8 +183,6 @@ def test_missing_file_is_empty():
 def _policy_file(tmp: Path, **kw) -> Path:
     """Render a policy .nt into tmp and return its path."""
     pol = tp.MessengerPolicy(
-        whitelist=set(kw.get("whitelist", [])),
-        blacklist=set(kw.get("blacklist", [])),
         ignored=set(kw.get("ignored", [])),
         quieted=set(kw.get("quieted", [])),
         news=set(kw.get("news", [])),
@@ -199,15 +197,14 @@ def _gate(path, sender, group=None):
     return tp.gate_decision(CH, sender, group, path=path)
 
 
-def test_messenger_policy_roundtrip_and_classify():
+def test_messenger_policy_roundtrip():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "signal" / "policy.nt"
         pol = tp.MessengerPolicy(
-            whitelist={"+41791112233"},
-            blacklist={"+41790000000"},
             ignored={"group.ign=="},
             quieted={"group.qui=="},
             news={"group.news=="},
+            vip={"+41791112233"},
         )
         content = tp.render_messenger_policy("signal", pol)
         lines = [l for l in content.splitlines() if l]
@@ -215,12 +212,32 @@ def test_messenger_policy_roundtrip_and_classify():
         tp.write_if_changed(content, path)
         got = tp.load_messenger_policy("signal", path)
         assert got == pol, got
-        # Classification, with blacklist winning over whitelist.
-        assert tp.handle_status("+41791112233", got.whitelist, got.blacklist) == "whitelisted"
-        assert tp.handle_status("+41790000000", got.whitelist, got.blacklist) == "blacklisted"
-        assert tp.handle_status("+41799999999", got.whitelist, got.blacklist) == "unknown"
-        both_wl, both_bl = {"x"}, {"x"}
-        assert tp.handle_status("x", both_wl, both_bl) == "blacklisted"
+
+
+def test_a_retired_whitelist_entry_is_simply_not_read():
+    """The messenger whitelist and blacklist are gone; old files still load.
+
+    They decided whose message was worth a session to notify about, and the
+    chat surface notifies for free. Nothing reads their triples any more, and
+    a policy file written before they were retired must load as if they were
+    not there rather than raise — it drops them on the next write."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "policy.nt"
+        subj = tp._channel_subject("signal")
+        legacy = "".join(line + "\n" for line in [
+            tp._triple(subj, tp.KB + "triageWhitelistHandle", "+41791112233"),
+            tp._triple(subj, tp.KB + "triageBlacklistHandle", "+41790000000"),
+            tp._triple(subj, tp.P_VIP_HANDLE, "+41795555555"),
+            tp._triple(subj, tp.P_NEWS_GROUP, GROUP),
+        ])
+        path.write_text(legacy, encoding="utf-8")
+        pol = tp.load_messenger_policy("signal", path)
+        assert pol.vip == {"+41795555555"} and pol.news == {GROUP}, pol
+        # The blacklisted handle is nobody special now — and nor is the
+        # whitelisted one, which is the point.
+        for handle in ("+41791112233", "+41790000000"):
+            g = tp.gate_decision("signal", handle, None, path=path)
+            assert g["forward"] is True and g["vip"] is False, (handle, g)
 
 
 def test_literal_escaping_roundtrip():
@@ -228,10 +245,10 @@ def test_literal_escaping_roundtrip():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "p.nt"
         weird = 'odd"name\\x'
-        pol = tp.MessengerPolicy({weird}, set(), set(), set(), set())
+        pol = tp.MessengerPolicy(set(), set(), set(), {weird})
         path.write_text(tp.render_messenger_policy("signal", pol), encoding="utf-8")
         got = tp.load_messenger_policy("signal", path)
-        assert got.whitelist == {weird.lower()}
+        assert got.vip == {weird.lower()}
 
 
 # --------------------------------------------------------------------------- #
@@ -259,15 +276,13 @@ def test_vip_follows_the_sender_and_only_the_sender():
         assert _gate(path, "+41799999999", GROUP)["vip"] is False
         assert _gate(path, GROUP, GROUP)["vip"] is False
 
-        # Independent of the attention axes in both directions: a whitelisted
-        # or blacklisted sender is not thereby a VIP, and a VIP is not thereby
-        # whitelisted.
-        path = _policy_file(tmp, whitelist=["+41791112233"],
-                            blacklist=["+41790000000"], vip=["+41795555555"])
-        assert _gate(path, "+41791112233", None)["vip"] is False
-        assert _gate(path, "+41790000000", None)["vip"] is False
-        vip = _gate(path, "+41795555555", None)
-        assert vip["vip"] is True and vip["reason"] == "unknown", vip
+        # Independent of the group's own flags in both directions: being a VIP
+        # does not make the room loud, and a quiet room does not make the VIP
+        # ordinary.
+        path = _policy_file(tmp, vip=["+41795555555"], quieted=[GROUP])
+        quiet = _gate(path, "+41795555555", GROUP)
+        assert quiet["vip"] is True and quiet["forward"] is False, quiet
+        assert _gate(path, "+41799999999", GROUP)["vip"] is False
 
         # Case- and whitespace-insensitive, like every other handle here, and
         # it survives a render/load round trip.
@@ -288,39 +303,37 @@ def test_vip_follows_the_sender_and_only_the_sender():
 
 
 def test_routing_matrix():
+    """What is left of the attention axis: the group, and nothing else.
+
+    No sender is special here any more. Not wanting to hear from a person is a
+    chat one mutes — on the chat, in the interface — and the policy file has no
+    opinion about people except which of them are VIPs."""
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
 
-        # Whitelisted handle → immediate forward, regardless of group flags.
-        path = _policy_file(tmp, whitelist=["+41791112233"],
-                            ignored=[GROUP], quieted=[GROUP])
-        g = _gate(path, "+41791112233", GROUP)
-        assert g["forward"] and not g["flagged_unknown"], g
-        assert g["reason"] == "whitelisted", g
-
-        # Blacklisted handle → held, drained daily (delivered False).
-        path = _policy_file(tmp, blacklist=["+41790000000"])
-        g = _gate(path, "+41790000000", None)
-        assert not g["forward"] and g["delivered_if_held"] is False, g
-        assert g["reason"] == "blacklisted", g
-
-        # Unknown, no group → forward + flagged for the whitelist ask-flow.
+        # No flags at all → the arrival is worth the user's attention.
         path = _policy_file(tmp)
         g = _gate(path, "+41795555555", None)
-        assert g["forward"] and g["flagged_unknown"], g
-        assert g["reason"] == "unknown", g
+        assert g["forward"] and g["reason"] == "open", g
 
-        # Unknown, quieted group → held but drained daily (delivered False).
+        # …and a sender is never the reason it is not.
+        path = _policy_file(tmp, vip=["+41791112233"])
+        assert _gate(path, "+41791112233", None)["forward"] is True
+
+        # Quieted group → silent, and left for the fallback drain.
         path = _policy_file(tmp, quieted=[GROUP])
         g = _gate(path, "+41795555555", GROUP)
-        assert not g["forward"] and not g["flagged_unknown"], g
+        assert not g["forward"], g
         assert g["delivered_if_held"] is False and g["reason"] == "group-quieted", g
 
-        # Unknown, ignored group → held, never drained (delivered True).
+        # Ignored group → silent, and accounted for.
         path = _policy_file(tmp, ignored=[GROUP])
         g = _gate(path, "+41795555555", GROUP)
         assert not g["forward"], g
         assert g["delivered_if_held"] is True and g["reason"] == "group-ignored", g
+
+        # A group's flags reach only messages sent in it.
+        assert _gate(path, "+41795555555", None)["forward"] is True
 
 
 def test_news_flag_is_orthogonal():
@@ -340,10 +353,10 @@ def test_news_flag_is_orthogonal():
         assert g["news"] is True and not g["forward"], g
         assert g["delivered_if_held"] is False, g
 
-        # news alone (no quiet/ignore): unknown sender still forwards to triage.
+        # news alone (no quiet/ignore): the arrival still reaches the user.
         path = _policy_file(tmp, news=[GROUP])
         g = _gate(path, "+41795555555", GROUP)
-        assert g["news"] is True and g["forward"] and g["flagged_unknown"], g
+        assert g["news"] is True and g["forward"], g
 
         # A group not flagged news never sets the news flag.
         path = _policy_file(tmp, quieted=[GROUP])
@@ -409,48 +422,6 @@ def test_mutate_quiet_and_ignore_are_exclusive():
             tp.messenger_policy_path(CH).unlink(missing_ok=True)
             del os.environ["TRIAGE_MESSENGER_DIR"]
 
-
-def test_auto_whitelist_on_send():
-    """Outbound send promotes the recipient to a known sender — and nothing else.
-
-    Regression guard: this used to unpack `load_messenger_policy()` into three
-    names and call `render_messenger_policy()` with four arguments, both of which
-    raise against the three-axis `MessengerPolicy`. The only caller wraps it in a
-    broad `except`, so every WhatsApp send silently failed to whitelist its
-    recipient. Exercising it end-to-end is what catches that class of drift.
-    """
-    with tempfile.TemporaryDirectory() as d:
-        os.environ["TRIAGE_MESSENGER_DIR"] = d
-        try:
-            tp._mutate_messenger(CH, wl_add=["41791112233"], bl_add=["41790000000"],
-                                 ig_add=[GROUP], news_add=[GROUP])
-
-            # The gateway hands over bare JID users — a phone number and its LID
-            # counterpart — so both identities of one contact become known.
-            added = tp.auto_whitelist_on_send(CH, ["41791234567", "100000000000001"])
-            assert added == ["100000000000001", "41791234567"], added
-
-            pol = tp.load_messenger_policy(CH)
-            assert {"41791234567", "100000000000001"} <= pol.whitelist, pol
-            # Every other axis survives the write untouched.
-            assert pol.blacklist == {"41790000000"}, pol
-            assert pol.ignored == {GROUP} and pol.news == {GROUP}, pol
-
-            # Idempotent: a known handle adds nothing.
-            assert tp.auto_whitelist_on_send(CH, ["41791234567"]) == []
-            # An explicit block survives an outbound send.
-            assert tp.auto_whitelist_on_send(CH, ["41790000000"]) == []
-            assert "41790000000" not in tp.load_messenger_policy(CH).whitelist
-            # Nothing to do is not an error.
-            assert tp.auto_whitelist_on_send(CH, ["", None]) == []
-        finally:
-            tp.messenger_policy_path(CH).unlink(missing_ok=True)
-            del os.environ["TRIAGE_MESSENGER_DIR"]
-
-
-# --------------------------------------------------------------------------- #
-# E-mail groups — List-Id normalisation, the two axes, the decision table     #
-# --------------------------------------------------------------------------- #
 
 def test_email_list_id_normalisation():
     # The RFC shape, bracketed and not, case-folded.

@@ -237,7 +237,7 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         # Fails open on both axes. `vip` is what the chat rail reads to decide
         # a turn, so leaving it out would have an unreadable policy silently
         # demote everyone to no-turn — the opposite of failing open.
-        return {"forward": True, "flagged_unknown": False, "vip": True,
+        return {"forward": True, "vip": True,
                 "delivered_if_held": True, "reason": "policy-error"}
 
 
@@ -862,7 +862,7 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
     ``sender`` is for people to read — a username where there is one — while
     ``sender_key`` is the poster's id, which is what the policy matches and what
     the ledger records. A username can be changed by the person who holds it;
-    an id cannot, and it is what whitelist entries already carry.
+    an id cannot, and it is what policy entries already carry.
     """
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
     # A message that is only its media — a video, a sticker — is still the
@@ -1405,14 +1405,14 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # Where the message is (the chat, also the reply address) and who wrote it
     # are two different facts, and the delivery gate reads them on two different
     # axes. Keying both on the chat_id — as this did — collapses them in exactly
-    # the place it matters: **a group is never whitelisted, only a sender is**,
-    # so in a group every message looked like one from an unknown handle whose
-    # id happened to be the room's, and a whitelisted correspondent writing
-    # there was never recognised as one. The group's quieted/ignored flag then
-    # decided a message the sender axis should have won.
+    # the place it matters: **a group is never a person, only a sender is**, so
+    # in a group every message looked like one from a handle whose id happened
+    # to be the room's, and a VIP correspondent writing there was never
+    # recognised as one. The group's quieted/ignored flag then decided a message
+    # the sender axis should have won.
     #
-    # In a 1:1 Telethon reports the same id for both, so whitelist entries
-    # written while this keyed on the chat go on matching unchanged. A broadcast
+    # In a 1:1 Telethon reports the same id for both, so policy entries written
+    # while this keyed on the chat go on matching unchanged. A broadcast
     # channel has no individual sender, and falls back to the channel itself —
     # which is the only identity such a post has.
     chat_key = str(chat_id) if chat_id else "unknown"
@@ -1437,7 +1437,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
                                       attachment_urls=attachment_urls,
                                       chat=chat_key, message_id=message_id)
 
-    # Delivery gate: only whitelisted / unknown senders get a model turn now.
+    # Delivery gate: what the chat rail is told, and whose message earns a turn.
     gate = _inbound_gate_decision(handle, group_id)
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
@@ -1516,9 +1516,9 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # From here down: the rail declined, so this is the pre-chat-surface path,
     # unchanged.
     if not gate["forward"]:
-        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
-        # the drain must never re-surface. One held merely for a not-yet-
-        # whitelisted sender stays delivered=False for the daily drain.
+        # Mark delivered only for a fully-accounted class (an ignored group)
+        # the drain must never re-surface. One held from a quieted group stays
+        # delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -1553,18 +1553,6 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
          f"thread invisibly to the user and is replayed to every later agent "
          f"session in it.\n")
         if reply_token else ""
-    )
-    # The sender being unknown is context, not a question. Whether a
-    # correspondent is worth anything is the user's VIP list now, and this
-    # path is a fallback for when the chat surface could not take the
-    # message — the one moment least suited to asking them to rule on a
-    # stranger. The ask-flow is gone everywhere, including here.
-    unknown_line = (
-        (f"\nThis sender ({handle}) is not one the user has said anything "
-         f"about — no reason to treat the message differently, and no "
-         f"reason to ask them about the sender. Do not open a conversation "
-         f"proposing to whitelist or blacklist anybody.\n")
-        if gate["flagged_unknown"] else ""
     )
     attachment_line = (
         (f"\nThe message includes {len(files)} attachment(s) — a voice note's "
@@ -1607,7 +1595,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"Telegram, sender: {sender_label}). Triage it as the user's incoming "

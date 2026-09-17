@@ -421,12 +421,12 @@ class ChatStateStore:
 
         The check and the write are one operation under the lock because they
         are one decision. Taken apart, a flag write landing between them is
-        read back stale and half-undone: the dashboard's Hide sets archived
-        AND muted, and an arrival deciding from a snapshot taken before it
-        would clear `archived` while `muted` stayed, putting a chat the user
-        just hid back in the active list. Nothing wrote these flags
-        concurrently with the rail until the dashboard could, which is why the
-        split version stood for as long as it did.
+        read back stale and half-undone: a mute sets `muted` AND `archived`,
+        and an arrival deciding from a snapshot taken before it would clear
+        `archived` while `muted` stayed, putting a chat the user just muted
+        back in the active list. Nothing wrote these flags concurrently with
+        the rail until the dashboard could, which is why the split version
+        stood for as long as it did.
         """
         with self._lock:
             doc = self._read(chat_id)
@@ -437,16 +437,29 @@ class ChatStateStore:
 
     def set_flags(self, chat_id: str, *, archived: bool | None = None,
                   muted: bool | None = None) -> dict:
-        """Set a chat's user-facing flags — both about where the user wants the
-        chat on their screen. Whether a message is *worked* is not here: that
-        follows the sender (their VIP status, in the triage policy), because a
-        chat is a place and the user's interest is in a person."""
+        """Set a chat's two user-facing flags, which say where the user wants
+        the chat on their screen and nothing else. (Whether a message is
+        *worked* follows the sender's VIP status in the triage policy: a chat
+        is a place, and the user's interest is in a person.)
+
+        **Muting archives.** The two are not independent settings to combine:
+        archiving is "out of my way until it speaks again", and muting is "out
+        of my way, and do not let it speak" — which only means anything if the
+        chat is out of the way to begin with. So setting `muted` sets
+        `archived` too, and a caller passing both never has to think about the
+        order. Unmuting deliberately leaves the chat archived: it stays put
+        until the next message brings it back, which is what un-muting is for.
+
+        The inverse rule lives in :meth:`unarchive_unless_muted`, which an
+        arrival calls: a new message un-archives an unmuted chat."""
         with self._lock:
             doc = self._read(chat_id)
             if archived is not None:
                 doc["archived"] = bool(archived)
             if muted is not None:
                 doc["muted"] = bool(muted)
+                if muted:
+                    doc["archived"] = True
             self._write(doc)
             return doc
 

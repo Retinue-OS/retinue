@@ -30,8 +30,8 @@ dashboard conversations, and that shape fights the medium:
   thread → Ara's model turn executes `signal-push.py --reply-to` → `verify`
   policy queues it at `/sends` → user approves *again* → sent. Two model turns
   and two approvals for a message the user could have typed in five seconds.
-- **Notification costs a model turn.** A whitelisted sender's message spends a
-  full triage session just to tell the user it arrived.
+- **Notification costs a model turn.** A message from a sender on the triage
+  whitelist spends a full triage session just to tell the user it arrived.
 - **The user cannot simply write.** There is no way to compose and send a
   messenger message from the dashboard at all — everything is mediated through
   an agent turn and the send-approval machinery, even when no agent input was
@@ -364,6 +364,15 @@ and what a model turn is *for*:
    **dealt with** — and there is no unknown-sender ask-flow any more, because
    nothing needs the answer.
 
+   The **blacklist** went the same way, for the mirror-image reason: it said
+   "do not bother me about this person", which is muting their chat. That is a
+   button in the dashboard now, on the chat the user is looking at — **Archive**
+   (out of the list until it speaks again) and **Mute** (out of the list, and
+   the next message does not bring it back; muting archives too), exactly as a
+   conversation behaves. Ara can set either on request; the user never has to
+   go through her. A blacklist entry that mattered should be re-stated as a
+   muted chat — the old triples are inert.
+
    For a VIP the turn starts in that chat's companion thread instead of a fresh
    `claude -p` triage session, and its job is wider than a draft: read the
    message in context, **file what it changes** (link and update a project,
@@ -544,9 +553,10 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
    group costs exactly as many turns as it has VIPs writing in it — usually
    none. And a VIP is worked in a group precisely as in a 1:1, which is the
    point: the user's interest is in a person, and a chat is only a place. That
-   retires the messenger sender whitelist — see *Inbound flow*, step 4 — and
-   with it the unknown-sender ask-flow. The group flags stay: the news rail
-   reads them, and `quieted` / `ignored` still keep a group's arrivals quiet.
+   retires the messenger sender whitelist and blacklist — see *Inbound flow*,
+   step 4 — and with them the unknown-sender ask-flow. The group flags stay:
+   the news rail reads them, and `quieted` / `ignored` still keep a group's
+   arrivals quiet.
 2. **Draft staging threshold.** "Stage a draft when a reply is plausibly
    wanted" is the companion's judgement; if it over-stages, a per-chat or
    per-sender preference belongs in the summary/style memory, not in code.

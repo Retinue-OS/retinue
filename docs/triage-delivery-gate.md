@@ -24,36 +24,53 @@ are untouched.
 Messenger routing is decided on **two independent axes**, so the classes below
 are a *combination* of a sender status and a group's flags, not a single ladder:
 
-- **Sender** — a handle is **whitelisted**, **blacklisted**, or **unknown**,
-  and independently of that it is or is not a **VIP** (messenger only; see
-  *The VIP axis* below).
+- **Sender** — a handle is or is not a **VIP** (messenger only; see *The VIP
+  axis* below). There is **no sender whitelist or blacklist on messenger**: see
+  *Why messenger has no whitelist* below.
 - **Group** — three independent flags: **news** (its messages are also forwarded
-  to the news feed / Herald), and at most one of **quieted** or **ignored**
-  (which govern *unknown* senders in that group).
+  to the news feed / Herald), and at most one of **quieted** or **ignored**.
 
-The sender axis wins for a known handle: a **whitelisted** handle is always
-forwarded live and a **blacklisted** handle is never forwarded live, regardless
-of the group. The group's quieted/ignored flag only bites for an **unknown**
-sender — matching the user's model, "new senders in quieted or ignored groups".
-The **news** flag is orthogonal to all of it: a message can go to the news feed
-whether or not it also earns a triage turn.
+The **news** flag is orthogonal to everything else: a message can go to the news
+feed whether or not it also earns a model turn. And VIP is orthogonal in the
+other direction — it is not about attention (every message reaches the chat
+surface anyway) but about *handling*: whether a model works the message as it
+arrives.
 
-| Class | Fast loop (frequent) | Daily catch-all |
+| Class | On arrival | Owed afterwards |
 |---|---|---|
-| **Whitelisted handle** | model runs now | (already handled) |
-| **Unknown handle**, normal group | model runs now, flagged *unknown* → asks user to whitelist/blacklist | — |
-| **Blacklisted handle** | held, no prompt | model runs |
-| **Unknown handle**, **quieted** group | held, no prompt | model runs (drained) |
-| **Unknown handle**, **ignored** group | never triggers | never drained (see below) |
+| **VIP sender**, any group | the chat shows it, pushes, **and** a model turn runs | nothing |
+| anyone else, normal group | the chat shows it and pushes | nothing |
+| **quieted** group | the chat shows it, silently | held `delivered:false` — a recovery sweep can find it |
+| **ignored** group | the chat shows it, silently | nothing, ever |
 
-E-mail has the **same two axes**, with one channel-specific twist: a mail's
-"group" is its **mailing list** (`List-Id`), and a mail that carries no usable
-list header is its own group of one, keyed on the sender address. See *E-mail
-groups* below.
+E-mail keeps **both** axes, including its own whitelist, with one
+channel-specific twist: a mail's "group" is its **mailing list** (`List-Id`),
+and a mail that carries no usable list header is its own group of one, keyed on
+the sender address. See *E-mail groups* below.
 
-The tradeoff the user accepts: cold senders (blacklisted or in a quieted group)
-wait up to 24 h for a model turn. The daily run bounds that latency; nothing is
-dropped. Only an **ignored** group is deliberately never drained.
+### Why messenger has no whitelist
+
+The whitelist decided whose message was worth a *session to notify about*. With
+the chat surface every arrival is already in front of the user, within seconds,
+pushed, for no model turn at all — so the whitelist was answering a question
+that no longer gets asked, and whitelisted and unknown came out identical on
+every column.
+
+The blacklist said "do not bother me about this person". That is **muting their
+chat**, which the user does in the interface, on the chat they are looking at,
+rather than through a policy file only Ara can edit. A chat can be **archived**
+(out of the list until it speaks again) or **muted** (out of the list, and the
+next message does not bring it back; muting archives too) — the same two
+gestures a dashboard conversation takes, and Ara can apply either on request as
+well. See `webapp/README.md`, *Messenger chats*.
+
+Existing `triageWhitelistHandle` / `triageBlacklistHandle` triples are simply
+no longer read: they are inert and drop out on the next policy write. A
+blacklist entry that mattered should be re-stated as a **muted chat**.
+
+E-mail is unaffected — there the whitelist still decides something real
+(frequent versus daily triage on a pull channel, where nothing arrives on a
+screen by itself).
 
 ### Whitelist — exact addresses by default, wildcards by hand
 
@@ -79,7 +96,8 @@ does not, and it is the list one has an opinion about ("read-only", "I answer on
 this one"). So e-mail is routed on the same two axes as messenger:
 
 - the **sender** decides *how urgently* a mail is triaged — whitelisted means the
-  frequent run, anything else waits for the daily sweep;
+  frequent run, anything else waits for the daily sweep (this axis is e-mail's
+  alone; messenger retired it, see above);
 - the **group** decides *where else it goes* — the same `news` / `quieted` /
   `ignored` flags PR #114 introduced for messenger groups.
 
@@ -106,10 +124,10 @@ the distinction between a list one only reads and one one also writes to:
 
 - a read-only newsletter → **`news` + `ignored`** (filed to the feed, never a
   model turn). On messenger, that still leaves the chat in the dashboard's
-  list: whether a chat is *shown* is a separate flag the user sets there
-  (Hide, on the full chats page — `POST /chats/<id>/flags`), deliberately not
-  implied by anything here. A group can be a news source and still be a chat
-  one reads and answers in, which is what the next line is;
+  list: whether a chat is *shown* is a separate pair of flags the user sets
+  there (Archive / Mute, on the full chats page — `POST /chats/<id>/flags`),
+  deliberately not implied by anything here. A group can be a news source and
+  still be a chat one reads and answers in, which is what the next line is;
 - a list one both reads and answers on → **`news` + `quieted`** (filed to the
   feed *and* still triaged).
 
@@ -150,26 +168,21 @@ Address-level `news` entries written before list detection existed keep working:
 news is matched against the group **and** the bare sender address, so a
 newsletter that turns out to carry a `List-Id` is not silently un-filed.
 
-### Messenger sender axis: whitelist / blacklist / vip
+### Messenger sender axis: vip
 
 Messenger identity is a **handle**, not a domain — no aliasing problem, so no
-wildcards needed there.
+wildcards needed there. One flag lives on it:
+
+- **VIP** — a person whose messages are worked by a model on arrival, wherever
+  they arrive. Independent of every group flag — see *The VIP axis* below.
 
 The handle is **the person who wrote**, which in a shared chat is the poster and
 never the room: a group is matched on the group axis, and only there. Each
 gateway must therefore hand the two facts over separately — Telegram keyed both
-on the chat id until this was fixed, which made a whitelisted correspondent
-writing in a group look like an unknown handle whose id happened to be the
-room's. Where a post genuinely has no individual sender — a broadcast channel —
-the channel itself is the only identity there is, and it stands in for one.
-
-- **Whitelist:** handles the user has replied to / contacts, seeded from the
-  gateway's contact directory + recent chats, extended by the ask-flow below.
-- **Blacklist:** an unknown sender the user declines to whitelist goes here so
-  the user is **never asked again**. Permanent until hand-edited.
-- **VIP:** a person whose messages are worked by a model on arrival, wherever
-  they arrive. Independent of the two above and of every group flag — see *The
-  VIP axis* above, which is where this now matters.
+on the chat id until this was fixed, which made a VIP correspondent writing in a
+group look like a handle whose id happened to be the room's. Where a post
+genuinely has no individual sender — a broadcast channel — the channel itself is
+the only identity there is, and it stands in for one.
 
 ### Messenger group axis: news / quieted / ignored
 
@@ -178,11 +191,15 @@ A group carries up to three flags, all set through Ara's policy editor:
 - **news** — the group is a broadcast source worth keeping in the news feed. Its
   messages are forwarded to the Herald in addition to (and independently of) any
   triage decision. See *The news rail* below.
-- **quieted** — an *unknown* sender in this group is not forwarded live, but the
-  message is held for the daily drain, so it still reaches triage within a day.
-- **ignored** — an *unknown* sender in this group never reaches triage at all
-  (accounted for, never drained). This is the strong "don't bother me" flag,
-  seeded with known no-action groups from day one.
+- **quieted** — the chat shows the message but nothing else happens: no push, no
+  turn. The record stays `delivered: false`, so a recovery sweep can still find
+  it.
+- **ignored** — the same, and the message is accounted for on arrival: nothing
+  is ever owed for it. This is the strong "don't bother me" flag, seeded with
+  known no-action groups from day one.
+
+Neither says anything about whether the chat is *in the list* — that is the
+user's Archive / Mute, set in the dashboard (`webapp/README.md`).
 
 "Group" here means **any shared chat**, not only a group proper: a Telegram
 broadcast channel is one too, and is the typical `news` source. The gateway has
@@ -197,18 +214,18 @@ neither); `news` is independent and combines with either. The legacy
 before this split keeps its old "never reaches triage" behaviour and is migrated
 to the `ignored` predicate on the next write.
 
-### Unknown-sender ask-flow (messenger only)
+### The unknown-sender ask-flow is gone (messenger)
 
-An inbound message from an unknown handle in a **normal group (or no group)** —
-not whitelisted, not blacklisted, not in a quieted or ignored group — **does**
-get a model turn, flagged as coming from an unknown sender. The model opens a
-dashboard thread asking whether to whitelist the sender. On "no", the handle is
-added to the blacklist. An unknown handle in a **quieted** group is held for the
-daily drain instead; in an **ignored** group it is never asked about.
+There used to be one: an unknown handle in a normal group got a model turn
+flagged *unknown*, and the model opened a dashboard thread asking whether to
+whitelist or blacklist the sender. Nothing asks that any more — the question
+belonged to the whitelist, and went with it. A message from a stranger simply
+shows up in the chat, like every other message, and the user decides what to do
+with the chat.
 
 ## State
 
-Whitelist, blacklist and the group flags are **emitted as `.nt`** — the same pattern
+The VIP flag, the e-mail whitelist and the group flags are **emitted as `.nt`** — the same pattern
 as the existing `_generated` registries (`agents.nt`, `conversation-models.nt`).
 That choice does three jobs at once: it indexes natively in qlever (no
 converter), it is trivial for a gateway to parse off disk, and it retires any
@@ -223,7 +240,7 @@ e-mail whitelist has no gateway, so it lives on the retinue side under
 `_generated` purely so it is queryable over SPARQL.
 
 **Why the gateway reads a raw file, never SPARQL.** Classification happens on the
-inbound hot path, in-process. If the gateway resolved whitelist/blacklist over
+inbound hot path, in-process. If the gateway resolved the policy over
 SPARQL it would inherit the ~15 s reindex lag and a network dependency there —
 exactly what this design avoids. So the gateway reads the policy `.nt` **straight
 off the mounted volume** (fresh, no lag), while qlever indexes the very same file
@@ -231,12 +248,14 @@ for the *query* path. Same file, two readers, different freshness needs, both
 satisfied.
 
 **The model is the normal editor of this state, not the user with a text
-editor.** Every change flows through Ara: the unknown-sender ask-flow writes a
-whitelist or blacklist entry from the user's yes/no, and instructions like "trust
-everyone at `*@epfl.ch`" or "block that group" are conversational — Ara emits the
-wildcard or the group id and confirms. The files stay plain, readable `.nt`, so
-they *can* be corrected by hand, but that is a fallback. Ara also reads them (over
-SPARQL) to answer "who's whitelisted?".
+editor.** Every change flows through Ara: instructions like "trust everyone at
+`*@epfl.ch`", "block that group" or "Mara's messages should be handled the
+moment they arrive" are conversational — Ara emits the wildcard, the group id or
+the VIP handle and confirms. The files stay plain, readable `.nt`, so they *can*
+be corrected by hand, but that is a fallback. Ara also reads them (over SPARQL)
+to answer "who is a VIP?". The one thing that is **not** hers alone is where a
+chat sits on the user's screen: Archive and Mute are buttons in the dashboard,
+and Ara can press them on request but is never in the way.
 
 ## The two channels need the gate in different places
 
@@ -304,7 +323,7 @@ messages never touch WhatsApp's volume. It has **three mounters**:
 | Mounter | Mode | Writes | Reads |
 |---|---|---|---|
 | the gateway | RW | `messages/` (one `.nt` per inbound) | `policy/` (to classify) |
-| the retinue container (Ara) | RW | `policy/` (whitelist/blacklist/group-flags `.nt`) | — |
+| the retinue container (Ara) | RW | `policy/` (vip + group-flags `.nt`) | — |
 | qlever-life | RO | — | both, to index |
 
 Both writing containers mount RW; **separation is by folder-ownership
@@ -349,17 +368,18 @@ see *The VIP axis* below for what does buy a model turn.
 
 | Class | notifies? | what happens |
 |---|---|---|
-| whitelisted handle | yes | accepted by the chat; delivered |
-| unknown, normal group | yes | the same — the whitelist changes nothing here any more |
-| blacklisted handle | no | accepted silently; delivered |
-| unknown, quieted group | no | accepted silently; delivered |
-| unknown, ignored group | no | accepted silently; delivered |
+| any sender, normal group | yes | accepted by the chat; delivered |
+| quieted group | no | accepted silently; delivered |
+| ignored group | no | accepted silently; delivered |
+
+A muted chat does not push either — but that is the chat state's doing, on the
+web-gateway side, not the gate's.
 
 The `delivered_if_held` flag the gate also returns belongs to the **fallback**
 path, where the rail refused and the old behaviour runs whole: `false` means
-"held, the drain picks it up" (blacklisted handle, quieted group); `true` means
-"accounted for, never drained" (ignored group). On the normal path nothing
-reads it, because the chat's acceptance is what sets the flag.
+"held, a recovery sweep picks it up" (quieted group); `true` means "accounted
+for, never drained" (ignored group). On the normal path nothing reads it,
+because the chat's acceptance is what sets the flag.
 
 ### The VIP axis, and what became of `delivered` on messenger
 
@@ -371,10 +391,12 @@ marks it `delivered`. That is the delivery, and it costs no model turn.
 
 Two consequences, both deliberate:
 
-- **The messenger whitelist is retired**, and with it the unknown-sender
-  ask-flow. Both existed to decide whose message was worth a session to
-  *notify* about; notification is free now. What is left of the sender axis is
-  the blacklist, which still keeps an arrival silent.
+- **The messenger whitelist and blacklist are retired**, and with them the
+  unknown-sender ask-flow. The whitelist existed to decide whose message was
+  worth a session to *notify* about, and notification is free now; the
+  blacklist said "do not bother me about this person", which is muting their
+  chat — a button, in front of the user. See *Why messenger has no whitelist*
+  above. All that is left on the sender axis is **VIP**.
 - **Nothing is left undelivered on the normal path, so there is no daily
   drain on messenger.** `delivered` used to mean "a model turn accounted for
   this"; it now means "the user has this", which the chat surface makes true

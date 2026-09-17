@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Triage delivery-gate policy: sender whitelist/blacklist + group flags as N-Triples.
+"""Triage delivery-gate policy: e-mail whitelist, VIP senders, group flags as N-Triples.
 
 This is the single source of truth for *who is worth a model turn* in the triage
 delivery gate (see `docs/triage-delivery-gate.md`). It is deliberately
@@ -36,28 +36,31 @@ Two kinds of policy live here:
         is the explicit opposite of ``ignored``, worth stating on a ``news``
         group to record that this list is read *and* answered.
 
-    The whitelist is the sender-level axis and wins over the group flags, exactly
-    as a whitelisted handle wins over its group on the messenger side: mail from
-    a whitelisted address is triaged immediately whatever list it arrived on.
+    The whitelist is the sender-level axis and wins over the group flags, the
+    way the messenger side's VIP axis wins over its group: mail from a
+    whitelisted address is triaged immediately whatever list it arrived on.
     ``news`` membership is checked against the group id *and* the sender address,
     so address-level entries written before list detection keep working.
-  * **Messenger policy** — per channel, on two orthogonal axes:
-      - **Sender** (a handle): whitelisted / blacklisted / unknown. A whitelisted
-        handle is forwarded to triage immediately regardless of its group; a
-        blacklisted handle is never forwarded live (the daily drain still picks
-        it up); an unknown handle is governed by its group (below).
+  * **Messenger policy** — per channel, on two orthogonal axes. There is no
+    sender whitelist or blacklist here: every message reaches the user through
+    the chat surface, and a chat they want off their screen is archived or muted
+    in the dashboard, not decided by a policy file.
+      - **Sender** (a handle): VIP or not. A VIP's message is worked by a model
+        the moment it arrives — filed, linked to a project, remembered, answered
+        in draft — wherever it arrives, a group included. Anyone else's message
+        simply shows up in the chat, which is delivery enough.
       - **Group** (three independent flags): ``news`` — its messages are also
-        forwarded to the news feed (Herald), a rail parallel to triage;
-        ``quieted`` — an *unknown* sender in it is not forwarded live but is
-        drained daily; ``ignored`` — an unknown sender in it never reaches triage
-        at all (accounted for, never drained). ``quieted`` and ``ignored`` bite
-        only for unknown senders; ``news`` is independent of all of it. The
-        legacy ``triageBlockedGroup`` predicate is read as ``ignored``.
+        forwarded to the news feed (Herald), a rail parallel to the chat;
+        ``quieted`` — the message is stored and shown but nothing is owed to a
+        model, and the record stays ``delivered: false``; ``ignored`` — the
+        message is accounted for on arrival and never re-surfaced. ``news`` is
+        independent of both. The legacy ``triageBlockedGroup`` predicate is read
+        as ``ignored``.
 
 Everything is emitted as sorted, deterministic N-Triples with the same
 write-if-changed discipline as `discover-agents.py`, so an unchanged policy never
 triggers a qlever-dir rebuild, and the very same file the gateway reads raw is
-indexed in the life store for `who is whitelisted?` queries.
+indexed in the life store for `who is a VIP?` queries.
 
 Retinue (Ara) is the sole writer; the gateways are readers. The `_generated`
 paths are framework-owned, in no chamber's git repo.
@@ -85,8 +88,14 @@ P_WILDCARD = KB + "triageWhitelistWildcard"
 # stated about the e-mail subject — plus a wildcard twin each.
 P_NEWS_ADDRESS = KB + "triageNewsAddress"
 P_NEWS_WILDCARD = KB + "triageNewsWildcard"
-P_HANDLE = KB + "triageWhitelistHandle"
-P_BLOCKED_HANDLE = KB + "triageBlacklistHandle"
+# Retired on messenger (2026-09): triageWhitelistHandle / triageBlacklistHandle.
+# The whitelist decided whose message was worth a session to *notify* about, and
+# the chat surface notifies for free, so it ended up answering the same as no
+# entry at all. The blacklist said "do not bother me about this person", which is
+# muting their chat — a thing the user does in the interface, on the chat, where
+# they are looking at it. Both are simply no longer read; existing triples in a
+# policy file are inert and drop out on the next write. E-mail keeps its own
+# whitelist (P_ADDRESS / P_WILDCARD), which still decides frequent-vs-daily.
 # The VIP axis: a person whose message is worked by a model the moment it
 # arrives, wherever it arrives. Keyed on the sender and only on the sender, so
 # it holds in a group exactly as in a 1:1 — being one of forty people in a room
@@ -121,12 +130,9 @@ EmailPolicy = namedtuple(
     defaults=(frozenset(),) * 6,
 )
 
-# The loaded messenger policy: the sender sets plus the three group-flag sets.
-# `vip` defaults to empty so a caller that predates the axis still constructs.
-MessengerPolicy = namedtuple(
-    "MessengerPolicy", "whitelist blacklist ignored quieted news vip",
-    defaults=(frozenset(),),
-)
+# The loaded messenger policy: the three group-flag sets plus the one sender set
+# that still decides anything.
+MessengerPolicy = namedtuple("MessengerPolicy", "ignored quieted news vip")
 
 
 def _channel_subject(channel: str) -> str:
@@ -505,8 +511,6 @@ def load_messenger_policy(
     behaviour (blocked == never reaches triage).
     """
     path = path or messenger_policy_path(channel)
-    whitelist: set[str] = set()
-    blacklist: set[str] = set()
     ignored: set[str] = set()
     quieted: set[str] = set()
     news: set[str] = set()
@@ -515,11 +519,7 @@ def load_messenger_policy(
         val = lit.strip()
         if not val:
             continue
-        if pred == P_HANDLE:
-            whitelist.add(_norm_handle(val))
-        elif pred == P_BLOCKED_HANDLE:
-            blacklist.add(_norm_handle(val))
-        elif pred == P_VIP_HANDLE:
+        if pred == P_VIP_HANDLE:
             vip.add(_norm_handle(val))
         elif pred in (P_IGNORED_GROUP, P_BLOCKED_GROUP):
             ignored.add(val)
@@ -527,29 +527,17 @@ def load_messenger_policy(
             quieted.add(val)
         elif pred == P_NEWS_GROUP:
             news.add(val)
-    return MessengerPolicy(whitelist, blacklist, ignored, quieted, news, vip)
+    return MessengerPolicy(ignored, quieted, news, vip)
 
 
 def render_messenger_policy(channel: str, pol: MessengerPolicy) -> str:
     subj = _channel_subject(channel)
-    lines = [_triple(subj, P_HANDLE, h) for h in pol.whitelist]
-    lines += [_triple(subj, P_BLOCKED_HANDLE, h) for h in pol.blacklist]
-    lines += [_triple(subj, P_VIP_HANDLE, h) for h in pol.vip]
+    lines = [_triple(subj, P_VIP_HANDLE, h) for h in pol.vip]
     lines += [_triple(subj, P_IGNORED_GROUP, g) for g in pol.ignored]
     lines += [_triple(subj, P_QUIETED_GROUP, g) for g in pol.quieted]
     lines += [_triple(subj, P_NEWS_GROUP, g) for g in pol.news]
     lines.sort()
     return "".join(line + "\n" for line in lines)
-
-
-def handle_status(handle: str, whitelist: set[str], blacklist: set[str]) -> str:
-    """'blacklisted' | 'whitelisted' | 'unknown'. Blacklist wins over whitelist."""
-    norm = _norm_handle(handle)
-    if norm in blacklist:
-        return "blacklisted"
-    if norm in whitelist:
-        return "whitelisted"
-    return "unknown"
 
 
 def gate_decision(
@@ -566,19 +554,17 @@ def gate_decision(
     docs/triage-delivery-gate.md); all three gateways call it so they can never
     drift. Returns a dict with:
 
-    - ``forward`` — worth the user's attention. On messenger this decides
-      whether the arrival notifies (a held class updates the chat silently) and
-      nothing else; it stopped deciding a model turn when the chat surface took
-      over delivery, and ``vip`` decides that now. On the gateways' fallback
-      path — the rail refusing — it still means what it always did.
-    - ``flagged_unknown`` — nobody has said anything about this sender. It is
-      context for a fallback turn, **not** a question to put to the user: the
-      unknown-sender ask-flow is gone, on every path.
+    - ``forward`` — worth the user's attention: whether the arrival notifies, or
+      updates the chat silently. Read off the **group** alone now, since the
+      sender-level whitelist and blacklist are retired — a person one does not
+      want to hear from is a chat one mutes, which the user does in the
+      interface. On the gateways' fallback path — the rail refusing — `forward`
+      still also decides the triage forward, as it always did.
     - ``delivered_if_held`` — the ``delivered`` flag to persist when NOT
       forwarding *and* the chat did not take the message either: ``True`` means
       "accounted for, never drained" (ignored group), ``False`` means "held,
-      the drain picks it up" (blacklisted handle or quieted group). On the
-      normal path the chat's acceptance sets the flag and this is unused.
+      a recovery sweep picks it up" (quieted group). On the normal path the
+      chat's acceptance sets the flag and this is unused.
     - ``news`` — the message's group is a news source: forward it to the news
       feed (Herald) too. This rail is *independent* of the triage decision above
       (a message can be both, either, or neither).
@@ -593,19 +579,16 @@ def gate_decision(
     Attention rail (news and vip are orthogonal — news is driven only by
     group ∈ news, vip only by sender ∈ vip):
 
-    | class                    | forward | flagged | held-flag |
-    |--------------------------|---------|---------|-----------|
-    | whitelisted handle       | yes     | no      | —         |
-    | blacklisted handle       | no      | no      | false     |
-    | unknown, normal group    | yes     | yes     | —         |
-    | unknown, quieted group   | no      | no      | false     |
-    | unknown, ignored group   | no      | no      | true      |
+    | class          | forward | held-flag |
+    |----------------|---------|-----------|
+    | quieted group  | no      | false     |
+    | ignored group  | no      | true      |
+    | anything else  | yes     | —         |
 
-    Whitelist/blacklist are sender-level and win over the group's quieted/ignored
-    flag; quieted/ignored bite only for unknown senders — matching the user's
-    model ("new senders in quieted or ignored groups"). Note that whitelisted
-    and unknown now answer the same on every column: on messenger the whitelist
-    no longer changes anything the default does not already do.
+    One chat's messages can be quieted without muting the chat and the other way
+    round; the group flags are the policy's way of saying it for a room, `muted`
+    is the user's way of saying it for a chat, and both end at the same place —
+    the arrival updates the mirror without interrupting anybody.
 
     ``enabled=False`` forwards everything (the gate turned off). May raise if the
     policy file is present but unreadable; the caller decides fail-open.
@@ -616,67 +599,26 @@ def gate_decision(
         # to decide that, the translation is that the switch treats everyone as
         # a VIP — otherwise turning the gate off would quietly turn *off* the
         # handling it exists to force on.
-        return {"forward": True, "flagged_unknown": False,
-                "delivered_if_held": True, "news": False, "vip": True,
-                "reason": "gate-disabled"}
+        return {"forward": True, "delivered_if_held": True, "news": False,
+                "vip": True, "reason": "gate-disabled"}
     pol = load_messenger_policy(channel, path=path)
     grp = group_id.strip() if group_id else None
     news = bool(grp and grp in pol.news)
     vip = _norm_handle(sender) in pol.vip
-    status = handle_status(sender, pol.whitelist, pol.blacklist)
 
-    if status == "whitelisted":
-        dec = {"forward": True, "flagged_unknown": False,
-               "delivered_if_held": True, "reason": "whitelisted"}
-    elif status == "blacklisted":
-        dec = {"forward": False, "flagged_unknown": False,
-               "delivered_if_held": False, "reason": "blacklisted"}
-    elif grp and grp in pol.ignored:
-        dec = {"forward": False, "flagged_unknown": False,
-               "delivered_if_held": True, "reason": "group-ignored"}
+    if grp and grp in pol.ignored:
+        dec = {"forward": False, "delivered_if_held": True,
+               "reason": "group-ignored"}
     elif grp and grp in pol.quieted:
-        dec = {"forward": False, "flagged_unknown": False,
-               "delivered_if_held": False, "reason": "group-quieted"}
+        dec = {"forward": False, "delivered_if_held": False,
+               "reason": "group-quieted"}
     else:
-        dec = {"forward": True, "flagged_unknown": True,
-               "delivered_if_held": True, "reason": "unknown"}
+        dec = {"forward": True, "delivered_if_held": True, "reason": "open"}
 
     dec["news"] = news
     dec["vip"] = vip
     return dec
 
-
-def auto_whitelist_on_send(channel: str, handles) -> list[str]:
-    """Whitelist recipient handle(s) after an outbound 1:1 messenger send.
-
-    This is the messenger analogue of the e-mail Sent-folder auto-whitelist
-    (see ``load_email_whitelist``): sending to someone is standing proof they
-    are a wanted correspondent, so their reply must count as a *known* sender
-    rather than resurface as an "unknown sender" prompt. Each gateway calls this
-    from its send choke point once a send has actually gone out.
-
-    Idempotent and write-if-changed (an already-known handle is a no-op, so no
-    qlever rebuild churn). A handle currently on the *blacklist* is never
-    re-whitelisted — an explicit block must survive an outbound send. Returns the
-    handles newly added (empty when all were already known or blocked).
-    """
-    norm = {_norm_handle(h) for h in handles if h and str(h).strip()}
-    if not norm:
-        return []
-    pol = load_messenger_policy(channel)
-    added = sorted(norm - pol.whitelist - pol.blacklist)
-    if not added:
-        return []
-    write_if_changed(
-        render_messenger_policy(channel, pol._replace(whitelist=pol.whitelist | set(added))),
-        messenger_policy_path(channel),
-    )
-    return added
-
-
-# --------------------------------------------------------------------------- #
-# CLI — the deterministic editor Ara and the gate use                         #
-# --------------------------------------------------------------------------- #
 
 def _mutate_email(add_addresses=(), add_wildcards=(), remove=(),
                   news_add=(), news_remove=(),
@@ -721,22 +663,15 @@ def _mutate_email(add_addresses=(), add_wildcards=(), remove=(),
     save_email_policy(EmailPolicy(**sets))
 
 
-def _mutate_messenger(channel, *, wl_add=(), wl_del=(), bl_add=(), bl_del=(),
-                      ig_add=(), ig_del=(), q_add=(), q_del=(),
+def _mutate_messenger(channel, *, ig_add=(), ig_del=(), q_add=(), q_del=(),
                       news_add=(), news_del=(), vip_add=(), vip_del=()) -> None:
     pol = load_messenger_policy(channel)
-    whitelist = set(pol.whitelist)
-    blacklist = set(pol.blacklist)
     ignored = set(pol.ignored)
     quieted = set(pol.quieted)
     news = set(pol.news)
     vip = set(pol.vip)
     vip |= {_norm_handle(h) for h in vip_add if h.strip()}
     vip -= {_norm_handle(h) for h in vip_del}
-    whitelist |= {_norm_handle(h) for h in wl_add if h.strip()}
-    whitelist -= {_norm_handle(h) for h in wl_del}
-    blacklist |= {_norm_handle(h) for h in bl_add if h.strip()}
-    blacklist -= {_norm_handle(h) for h in bl_del}
     ignored |= {g.strip() for g in ig_add if g.strip()}
     ignored -= {g.strip() for g in ig_del}
     quieted |= {g.strip() for g in q_add if g.strip()}
@@ -749,8 +684,7 @@ def _mutate_messenger(channel, *, wl_add=(), wl_del=(), bl_add=(), bl_del=(),
     quieted -= {g.strip() for g in ig_add if g.strip()}
     write_if_changed(
         render_messenger_policy(
-            channel,
-            MessengerPolicy(whitelist, blacklist, ignored, quieted, news, vip)
+            channel, MessengerPolicy(ignored, quieted, news, vip)
         ),
         messenger_policy_path(channel),
     )
@@ -777,9 +711,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Handle commands take --handle; group commands take --group. `groupblock-*`
     # is kept as a legacy alias of `ignore-*`.
-    handle_cmds = ("whitelist-add", "whitelist-remove",
-                   "blacklist-add", "blacklist-remove",
-                   "vip-add", "vip-remove")
+    handle_cmds = ("vip-add", "vip-remove")
     group_cmds = ("ignore-add", "ignore-remove", "quiet-add", "quiet-remove",
                   "news-add", "news-remove", "groupblock-add", "groupblock-remove")
     for name in ("show",) + handle_cmds + group_cmds:
@@ -834,10 +766,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if dec["triage_now"] else 3
     elif args.cmd == "show":
         pol = load_messenger_policy(args.channel)
-        for h in sorted(pol.whitelist):
-            print(f"whitelist\t{h}")
-        for h in sorted(pol.blacklist):
-            print(f"blacklist\t{h}")
         for h in sorted(pol.vip):
             print(f"vip\t{h}")
         for g in sorted(pol.ignored):
@@ -846,18 +774,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"quiet\t{g}")
         for g in sorted(pol.news):
             print(f"news\t{g}")
-    elif args.cmd == "whitelist-add":
-        _mutate_messenger(args.channel, wl_add=args.handle)
-    elif args.cmd == "whitelist-remove":
-        _mutate_messenger(args.channel, wl_del=args.handle)
     elif args.cmd == "vip-add":
         _mutate_messenger(args.channel, vip_add=args.handle)
     elif args.cmd == "vip-remove":
         _mutate_messenger(args.channel, vip_del=args.handle)
-    elif args.cmd == "blacklist-add":
-        _mutate_messenger(args.channel, bl_add=args.handle)
-    elif args.cmd == "blacklist-remove":
-        _mutate_messenger(args.channel, bl_del=args.handle)
     elif args.cmd in ("ignore-add", "groupblock-add"):
         _mutate_messenger(args.channel, ig_add=args.group)
     elif args.cmd in ("ignore-remove", "groupblock-remove"):
@@ -871,14 +791,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "news-remove":
         _mutate_messenger(args.channel, news_del=args.group)
     elif args.cmd == "check-handle":
+        # One question left about a sender: does a model work their messages?
         pol = load_messenger_policy(args.channel)
-        status = handle_status(args.handle, pol.whitelist, pol.blacklist)
-        print(status)
-        # Two independent answers, printed as two lines: the sender's status on
-        # the old attention axis, and whether they are a VIP — which is what
-        # now decides that a model works their message on arrival.
-        print("vip" if _norm_handle(args.handle) in pol.vip else "not-vip")
-        return 0 if status == "whitelisted" else 3
+        vip = _norm_handle(args.handle) in pol.vip
+        print("vip" if vip else "not-vip")
+        return 0 if vip else 3
     return 0
 
 

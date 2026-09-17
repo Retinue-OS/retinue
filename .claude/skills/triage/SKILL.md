@@ -87,7 +87,9 @@ messenger is **push**:
   chat's shared draft for the user's send press. The VIP flag follows the
   person, so it holds in a group exactly as in a 1:1. **No messenger message
   asks the user to whitelist or blacklist anyone any more**; that ask-flow is
-  gone with the whitelist it served. *Normally*, because the
+  gone, along with the messenger whitelist and blacklist themselves — a chat
+  the user wants off their screen is archived or muted in the dashboard, and
+  e-mail keeps its own whitelist. *Normally*, because the
   rail can decline — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or
   unable to open the companion thread — and the gateway then forwards to triage
   exactly as it always did, so a triage run must still expect messenger
@@ -117,7 +119,8 @@ messenger is **push**:
   |---|---|---|
   | **VIP sender** | no | a turn in that chat's companion thread files it and stages any reply |
   | anyone else | no | the chat shows it; the user reads and answers there |
-  | **blacklisted / `ignored` / `quieted`** | no | the chat shows it, silently — no push |
+  | **`ignored` / `quieted`** group | no | the chat shows it, silently — no push |
+  | a chat the user **muted** | no | the chat shows it, silently — no push, and it stays archived |
   | **no-action-class** (status/echo/news/note-to-self) | no | as before: on record, nobody prompted |
 
   A messenger message reaches **this skill** only when the rail did not take
@@ -252,10 +255,10 @@ only proposes via the dashboard.
 
 An **unknown**-sender push is tagged as such, and that is all it is — a note
 that nobody has said anything about this sender. **Do not propose whitelisting
-or blacklisting them.** That ask-flow is gone: the whitelist no longer decides
-anything on messenger, and who is worth a model turn is the user's VIP list,
-which they set by telling Ara — never by being asked about a stranger who just
-wrote to them.
+or blacklisting them.** Neither list exists on messenger any more: who is worth
+a model turn is the user's VIP list, which they set by telling Ara, and who they
+would rather not hear from is a chat they mute in the dashboard — never a
+question put to them about a stranger who just wrote.
 
 ### Status updates (broadcast posts) — filed silently by default
 
@@ -746,7 +749,7 @@ ledger's flag, not an INBOX move, closes the loop.
   VIP's message waits for its turn's job to report done first. Undelivered is
   the exception set: the rail refused, its answer was lost, or a VIP's turn
   failed.
-- **Policy** (vip/whitelist/blacklist/group-block) is `.nt` on the same per-gateway
+- **Policy** (vip + group flags) is `.nt` on the same per-gateway
   volume, in a `policy/` subdirectory Ara writes and the gateway reads raw. Edit
   it by instructing Ara (the `triage_policy.py` CLI), never by hand-typing
   identifiers.

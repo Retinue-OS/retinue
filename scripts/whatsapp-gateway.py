@@ -256,7 +256,7 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         # Fails open on both axes. `vip` is what the chat rail reads to decide
         # a turn, so leaving it out would have an unreadable policy silently
         # demote everyone to no-turn — the opposite of failing open.
-        return {"forward": True, "flagged_unknown": False, "vip": True,
+        return {"forward": True, "vip": True,
                 "delivered_if_held": True, "reason": "policy-error"}
 
 
@@ -1930,7 +1930,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
                                       attachment_urls=attachment_urls,
                                       chat=origin, message_id=message_id)
 
-    # Delivery gate: only whitelisted / unknown senders get a model turn now.
+    # Delivery gate: what the chat rail is told, and whose message earns a turn.
     gate = _inbound_gate_decision(sender, group_id)
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
@@ -2004,9 +2004,9 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # From here down: the rail declined, so this is the pre-chat-surface path,
     # unchanged.
     if not gate["forward"]:
-        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
-        # the drain must never re-surface. One held merely for a not-yet-
-        # whitelisted sender stays delivered=False for the daily drain.
+        # Mark delivered only for a fully-accounted class (an ignored group)
+        # the drain must never re-surface. One held from a quieted group stays
+        # delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -2036,18 +2036,6 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"thread invisibly to the user and is replayed to every later agent "
          f"session in it.\n")
         if reply_token else ""
-    )
-    # The sender being unknown is context, not a question. Whether a
-    # correspondent is worth anything is the user's VIP list now, and this
-    # path is a fallback for when the chat surface could not take the
-    # message — the one moment least suited to asking them to rule on a
-    # stranger. The ask-flow is gone everywhere, including here.
-    unknown_line = (
-        (f"\nThis sender ({sender}) is not one the user has said anything "
-         f"about — no reason to treat the message differently, and no "
-         f"reason to ask them about the sender. Do not open a conversation "
-         f"proposing to whitelist or blacklist anybody.\n")
-        if gate["flagged_unknown"] else ""
     )
     attachment_line = (
         (f"\nThe message includes {len(files)} attached file(s) (image(s) and/or "
@@ -2090,7 +2078,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"WhatsApp, sender: {sender_label}). Triage it as the user's incoming "
@@ -2583,55 +2571,6 @@ def _decode_image(image: dict) -> Path:
     return Path(out)
 
 
-def _autowhitelist_recipient(recipient: str) -> None:
-    """After a successful outbound 1:1 send, add the recipient to the inbound
-    whitelist — so a reply from someone the user just messaged is a *known*
-    sender, not an "unknown sender" prompt. The messenger analogue of the
-    e-mail Sent-folder auto-whitelist (see triage_policy.auto_whitelist_on_send).
-
-    Best-effort: it must never break a send, so every failure is swallowed.
-    Group and broadcast recipients are skipped — a group is not a 1:1 handle.
-
-    Identity forms: inbound is gated on the bare user of its sender JID
-    (``_jid_user``), so the handle whitelisted is the recipient *as addressed*
-    — a reply routes back to the inbound's exact origin (LID or PN), which then
-    matches. WhatsApp's LID<->PN split means the two identities differ, so the
-    counterpart is whitelisted too when the bridge's LID store knows it
-    (``_lid_to_pn`` / ``_pn_to_lid``): a later inbound arriving under either
-    identity is then recognised. A true first-contact number the store has no
-    mapping for whitelists only the sent form — the counterpart is learned once
-    that contact's inbound populates the store.
-    """
-    try:
-        r = (recipient or "").strip()
-        if not r:
-            return
-        user, _, server = r.partition("@")
-        user = user.lstrip("+").strip()
-        server = server.split(":", 1)[0]
-        if server.endswith("g.us") or server == WA_BROADCAST_SERVER:
-            return
-        if not user:
-            return
-        handles = {user}
-        # Whitelist the LID<->PN counterpart too, so an inbound under either
-        # identity is recognised. A bare id (no server) is treated as a possible
-        # LID-only contact first (speculative — an ordinary number just misses).
-        if server == WA_LID_SERVER:
-            counterpart = _lid_to_pn(user, speculative=True)
-        elif server == WA_PN_SERVER:
-            counterpart = _pn_to_lid(user)
-        else:
-            counterpart = _lid_to_pn(user, speculative=True) or _pn_to_lid(user)
-        if counterpart:
-            handles.add(counterpart)
-        added = _triage.auto_whitelist_on_send(INBOUND_CHANNEL, handles)
-        if added:
-            print(f"[whatsapp-gateway] auto-whitelisted recipient handle(s): {', '.join(added)}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - auto-whitelist must never break a send
-        print(f"[whatsapp-gateway] auto-whitelist skipped for {recipient!r}: {exc}", flush=True)
-
-
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
           author: str = "agent") -> tuple[str | None, float | None, list[str]]:
@@ -2664,7 +2603,6 @@ def _push(recipient: str, message: str, lang: str | None = None,
                     media_refs.append(ref)
         msg_id, ts = _wa_send(recipient, message or None, media_paths=temp_paths,
                               author=author, attachment_urls=media_refs)
-        _autowhitelist_recipient(recipient)
         return msg_id, ts, media_refs
     finally:
         for path in temp_paths:

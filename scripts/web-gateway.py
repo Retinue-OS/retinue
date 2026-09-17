@@ -5442,8 +5442,8 @@ def _chat_arrival_worker(chat_id: str, cid: str) -> None:
     Loops rather than returning after one turn so that messages arriving while
     a turn runs are covered by a single follow-up instead of starting a turn
     each. Whatever the batch's turn reports is reported to every job in it: a
-    turn that failed leaves its messages `delivered=False` at the gateway, and
-    the daily drain picks them up — at-least-once, as everywhere else here."""
+    turn that failed leaves its messages `delivered=False` at the gateway, where
+    the recovery sweep finds them — at-least-once, as everywhere else here."""
     while True:
         with _chat_turns_lock:
             state = _CHAT_TURNS.get(chat_id)
@@ -6665,8 +6665,9 @@ class Handler(BaseHTTPRequestHandler):
         The two carry the dashboard-conversation semantics verbatim (see
         chat_state): archived leaves the active list, and a new inbound message
         brings it back *unless* the chat is muted. So archiving alone is "out
-        of the way until it speaks again", and hiding a chat for good is both
-        together — which is what the dashboard's Hide sends.
+        of the way until it speaks again", while muting is "out of the way, and
+        do not let it speak" — which is why muting archives too, here as there,
+        and a caller sending `muted` alone never has to send both.
 
         Deliberately independent of the triage delivery gate. Whether a group
         is a news source, and whether its messages are worth a model turn, is
@@ -6699,8 +6700,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "archived and/or muted (boolean) is required"})
             return
         doc = _CHAT_STATE.set_flags(chat_id, **flags)
-        # The list is cached; a hidden chat must leave it now, not on the next
-        # refresh window.
+        # The list is cached; a chat just archived must leave it now, not on
+        # the next refresh window.
         _chats_cache_invalidate()
         self._send_json(200, {"id": chat_id,
                               "archived": bool(doc.get("archived")),
@@ -7050,13 +7051,13 @@ class Handler(BaseHTTPRequestHandler):
             # muted is the explicit "keep it archived" opt-out. Decided inside
             # the state lock (see ChatState.unarchive_unless_muted): the
             # dashboard can set these flags concurrently now, and deciding
-            # from a snapshot read a moment earlier would undo half of a Hide.
+            # from a snapshot read a moment earlier would undo half of a mute.
             doc = _CHAT_STATE.unarchive_unless_muted(chat_id)
             gate = payload.get("gate") if isinstance(payload.get("gate"), dict) else None
-            # Held/no-action classes (blacklisted, ignored-group, quieted, …)
-            # update the mirror silently — the gate already decided they are
-            # not worth the user's attention; absent gate info an arrival is
-            # treated as notify-worthy (fail open, like the gate itself).
+            # Held classes (an ignored or quieted group) update the mirror
+            # silently — the gate already decided they are not worth the user's
+            # attention; absent gate info an arrival is treated as
+            # notify-worthy (fail open, like the gate itself).
             held = gate is not None and not gate.get("forward", True)
             if not doc.get("muted") and not held:
                 _chat_push_notification(chat_id, doc, entry, had_unread)
@@ -7067,9 +7068,9 @@ class Handler(BaseHTTPRequestHandler):
             # belongs to, pushed, within seconds, for no model turn at all.
             # Every message, from anyone, held classes included: the mirror
             # shows them all, so there is nothing left for a drain to sweep.
-            # Which is also why the old sender whitelist had nothing left to
-            # decide — it said whose message was worth a session to *notify*
-            # about, and notification is free now.
+            # Which is also why the sender whitelist was retired here — it
+            # said whose message was worth a session to *notify* about, and
+            # notification is free now.
             #
             # A turn is a separate question, and the answer is the **sender**:
             # `vip` on the gate verdict, which the user sets per person in the

@@ -185,21 +185,23 @@ def _attach_reply_tokens(messages: list) -> None:
             subject=msg.get("subject"))
 
 # ── Inbound triage delivery gate ──────────────────────────────────────────────
-# The gateway spends model credits only on senders that matter (see
-# docs/triage-delivery-gate.md). Every inbound inbox message is persisted as one
-# `.nt` file on this gateway's own volume (browsable history + a delivered
-# ledger); routing is decided by a policy `.nt` Ara maintains on the same volume,
-# read RAW off disk here so the classify hot path sees no qlever reindex lag.
+# Every inbound inbox message is persisted as one `.nt` file on this gateway's
+# own volume (browsable history + a delivered ledger), then handed to the chats
+# rail. What the gate still decides (see docs/triage-delivery-gate.md) is read
+# RAW off a policy `.nt` Ara maintains on the same volume, so the classify hot
+# path sees no qlever reindex lag:
 #
-#   whitelisted → forward to a model turn now, marked delivered
-#   unknown     → forward now flagged as an unknown sender (ask to whitelist),
-#                 marked delivered
-#   blacklisted → held (delivered:false), no turn now → the daily drain picks it
-#                 up via GET /undelivered
-#   group-blocked → stored delivered:true, never a turn and never drained
+#   open         → hand to the rail; the chat is the delivery
+#   VIP sender   → the rail runs an arrival turn, whatever chat it came from
+#   group-quieted → held (delivered:false), no turn → GET /undelivered has it
+#   group-ignored → stored delivered:true, never a turn and never drained
 #
-# The gate is on by default for an inbox account; INBOUND_GATE=0 restores the
-# always-forward behaviour (every inbound spawns a turn).
+# There is no sender whitelist or blacklist on messenger any more: a chat the
+# user wants off their screen is archived or muted in the dashboard, which is
+# the same gesture a conversation takes.
+#
+# The gate is on by default for an inbox account; INBOUND_GATE=0 treats every
+# sender as a VIP (every inbound gets a turn).
 INBOUND_CHANNEL = "signal"
 INBOUND_GATE_ENABLED = os.environ.get("INBOUND_GATE", "1").strip().lower() not in ("0", "false", "no", "")
 # Where the per-message store lives (gateway RW, qlever RO). Defaults onto the
@@ -214,9 +216,10 @@ INBOUND_POLICY_PATH = Path(
 def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
     """Classify an inbound message against the policy read raw off the volume.
 
-    Returns a dict: ``forward`` (spend a model turn now), ``flagged_unknown``
-    (annotate the turn as an unknown sender), ``delivered_if_held`` (the flag to
-    persist when we do NOT forward), and ``reason`` (for the log).
+    Returns a dict: ``forward`` (worth interrupting the user for), ``vip``
+    (this sender's messages are worked by a model on arrival),
+    ``delivered_if_held`` (the flag to persist on the fallback path when we do
+    NOT forward), ``news``, and ``reason`` (for the log).
     """
     try:
         return _triage.gate_decision(
@@ -228,7 +231,7 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         # Fails open on both axes. `vip` is what the chat rail reads to decide
         # a turn, so leaving it out would have an unreadable policy silently
         # demote everyone to no-turn — the opposite of failing open.
-        return {"forward": True, "flagged_unknown": False, "vip": True,
+        return {"forward": True, "vip": True,
                 "delivered_if_held": True, "reason": "policy-error"}
 
 
@@ -1710,10 +1713,9 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     # From here down: the rail declined, so this is the pre-chat-surface path,
     # unchanged.
     if not gate["forward"]:
-        # Mark delivered only for a message that is fully accounted for (a
-        # blacklisted/no-action class the drain must never re-surface). One held
-        # merely because the sender is not yet whitelisted stays delivered=False
-        # so the daily drain still picks it up.
+        # Mark delivered only for a message that is fully accounted for (an
+        # ignored group, which the drain must never re-surface). One held from a
+        # quieted group stays delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -1746,21 +1748,6 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"thread invisibly to the user and is replayed to every later agent "
          f"session in it.\n")
         if reply_token else ""
-    )
-    # An unknown sender (not whitelisted, not blacklisted, not in a blocked
-    # group) still gets a turn, but flagged: triage asks whether to whitelist or
-    # blacklist the handle so this decision is made once.
-    # The sender being unknown is context, not a question. Whether a
-    # correspondent is worth anything is the user's VIP list now, and this
-    # path is a fallback for when the chat surface could not take the
-    # message — the one moment least suited to asking them to rule on a
-    # stranger. The ask-flow is gone everywhere, including here.
-    unknown_line = (
-        (f"\nThis sender ({sender}) is not one the user has said anything "
-         f"about — no reason to treat the message differently, and no "
-         f"reason to ask them about the sender. Do not open a conversation "
-         f"proposing to whitelist or blacklist anybody.\n")
-        if gate["flagged_unknown"] else ""
     )
     attachment_line = (
         (f"\nThe message includes {len(files)} attached file(s) (image(s) and/or "
@@ -1803,7 +1790,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"Signal, sender: {sender_label}). Triage it as the user's incoming "
