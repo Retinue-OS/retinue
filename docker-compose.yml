@@ -307,6 +307,9 @@ services:
       - CONVERSATION_BACKEND_TOKEN
       - CONVERSATION_BASE_URL
       - SEND_APPROVAL_BASE_URL
+      # Zone the approval pages render event times in; the containers run on
+      # UTC, so without it a mis-zoned calendar entry reads as correct there.
+      - RETINUE_DISPLAY_TZ
       # The owner's actor URI (urn:retinue:actor:<slug>), driving the projects
       # card's "your move" vs "waiting on <them>" split (.env.example has the
       # full rationale).

@@ -203,11 +203,72 @@ def test_overlap_rules():
         assert clashes("2026-09-03T14:10:00", "2026-09-03T14:20:00")      # inside it
         assert not clashes("2026-09-03T13:00:00", "2026-09-03T14:00:00")  # ends as it starts
         assert not clashes("2026-09-03T14:30:00", "2026-09-03T15:00:00")  # starts as it ends
-        # An offset on the other side is the same calendar's wall clock.
-        assert clashes("2026-09-03T14:15:00+02:00", "2026-09-03T15:00:00+02:00")
+        # An offset is converted into the display zone, not dropped: with no
+        # zone configured that is UTC, so 14:15+02:00 is 12:15 and misses the
+        # proposed 14:00-14:30 entirely, while 16:15+02:00 lands inside it.
+        assert not clashes("2026-09-03T14:15:00+02:00", "2026-09-03T15:00:00+02:00")
+        assert clashes("2026-09-03T16:15:00+02:00", "2026-09-03T17:00:00+02:00")
         # An all-day event covers the whole day, an unparsable one nothing.
         assert clashes("2026-09-03", "2026-09-04", all_day=True)
         assert not clashes("whenever", "whenever")
+
+
+def test_offsets_are_read_in_the_configured_display_zone():
+    """The bug this guards: 16:00+00:00 and 16:00+02:00 rendering alike.
+
+    An event stored in UTC is two hours off the Zurich wall clock its owner
+    reads. Rendering both as a bare "16:00" made a mis-zoned calendar entry
+    look correct on its own approval page, and hid the clash between the two.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        previous = os.environ.get("RETINUE_DISPLAY_TZ")
+        os.environ["RETINUE_DISPLAY_TZ"] = "Europe/Zurich"
+        try:
+            in_utc = wg._format_event_when("2026-09-18T16:00:00+00:00",
+                                           "2026-09-18T16:45:00+00:00", False)
+            local = wg._format_event_when("2026-09-18T16:00:00+02:00",
+                                          "2026-09-18T16:45:00+02:00", False)
+            assert in_utc != local
+            assert "18:00" in in_utc and "CEST" in in_utc
+            assert "16:00" in local and "CEST" in local
+            # Same day on both ends: the date is not repeated after the dash.
+            assert local == "Fri 18 Sep 2026, 16:00 CEST – 16:45 CEST"
+            # A naive time has no offset to convert from and names no zone.
+            naive = wg._format_event_when("2026-09-18T16:00:00",
+                                          "2026-09-18T16:45:00", False)
+            assert naive == "Fri 18 Sep 2026, 16:00 – 16:45"
+            # Converting across midnight still reads as two days.
+            crossing = wg._format_event_when("2026-09-18T23:30:00+00:00",
+                                             "2026-09-19T00:15:00+00:00", False)
+            assert "Sat 19 Sep 2026, 01:30" in crossing
+            # The two now genuinely clash: 16:00 UTC is 18:00 Zurich.
+            proposed = wg._event_interval({"start": "2026-09-18T18:00:00",
+                                           "end": "2026-09-18T18:45:00"})
+            assert wg._events_overlap(proposed, wg._event_interval(
+                {"start": "2026-09-18T16:00:00+00:00", "end": "2026-09-18T16:45:00+00:00"}))
+        finally:
+            if previous is None:
+                os.environ.pop("RETINUE_DISPLAY_TZ", None)
+            else:
+                os.environ["RETINUE_DISPLAY_TZ"] = previous
+
+
+def test_an_unknown_display_zone_falls_back_to_utc():
+    """A typo in the setting must not take the approval page down."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        previous = os.environ.get("RETINUE_DISPLAY_TZ")
+        os.environ["RETINUE_DISPLAY_TZ"] = "Europe/Nowhere"
+        try:
+            assert wg._format_event_when("2026-09-18T16:00:00+02:00",
+                                         "2026-09-18T16:45:00+02:00", False).startswith(
+                                             "Fri 18 Sep 2026, 14:00")
+        finally:
+            if previous is None:
+                os.environ.pop("RETINUE_DISPLAY_TZ", None)
+            else:
+                os.environ["RETINUE_DISPLAY_TZ"] = previous
 
 
 def test_agenda_window_covers_only_the_days_the_event_touches():
@@ -412,6 +473,8 @@ def main() -> int:
              test_agenda_lists_the_day_and_flags_the_clash,
              test_agenda_says_when_the_days_are_empty_or_unreadable,
              test_overlap_rules,
+             test_offsets_are_read_in_the_configured_display_zone,
+             test_an_unknown_display_zone_falls_back_to_utc,
              test_a_span_never_runs_backwards,
              test_agenda_window_covers_only_the_days_the_event_touches,
              test_agenda_read_is_bounded_in_time_and_size,
