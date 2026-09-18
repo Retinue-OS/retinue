@@ -43,6 +43,15 @@ to a model while letting the deployment override it via one env var — without
 naming the chamber in this framework file. Example:
   {"id": "triage", "prompt": "...", "model": "${RETINUE_TRIAGE_MODEL:-sonnet}"}
 
+A job may pin its own wall-clock budget with an optional `"timeout_seconds"`,
+overriding the global SCHEDULER_JOB_TIMEOUT for that job alone. One global
+default cannot fit both a 10-second health check and a catch-all that has to
+work through a whole mailbox: the long job is killed mid-flight every run, and
+because it never finishes it never reduces its own backlog, so the next run is
+slower still. Give such a job the budget its work actually needs. Example:
+  {"id": "triage-daily", "command": "...", "interval_seconds": 86400,
+   "timeout_seconds": 3600}
+
 A job may also carry an optional `"retry_after_seconds"`, consulted only when
 the last recorded run did not end in `"success"`: the job is then due as soon
 as that many seconds have passed, instead of waiting out the full
@@ -315,6 +324,17 @@ def run_job(job: dict) -> None:
     model_note = f", model={model}" if model else ""
     log(f"[run] {jid} ({kind}{model_note}) from {Path(job['_source']).parent.name}")
     started = now()
+    # A job may buy itself more wall clock than the global default; see the
+    # module docstring on "timeout_seconds". A non-positive or unparseable
+    # value falls back rather than disabling the timeout — an un-killable job
+    # would wedge the whole single-threaded tick loop.
+    try:
+        timeout = int(job.get("timeout_seconds") or 0) or JOB_TIMEOUT
+    except (TypeError, ValueError):
+        log(f"[warn] job {jid!r} has an unusable timeout_seconds, using {JOB_TIMEOUT}s")
+        timeout = JOB_TIMEOUT
+    if timeout <= 0:
+        timeout = JOB_TIMEOUT
     try:
         # A `claude` started on an access token about to expire refreshes it
         # at once, racing every other claude process for the one rotation
@@ -345,16 +365,16 @@ def run_job(job: dict) -> None:
             start_new_session=True,
         )
         try:
-            out, err = proc.communicate(timeout=JOB_TIMEOUT)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_group(proc.pid, signal.SIGTERM)
             try:
                 proc.communicate(timeout=KILL_GRACE_SECONDS)
-                log(f"[timeout] {jid} exceeded {JOB_TIMEOUT}s -- group terminated")
+                log(f"[timeout] {jid} exceeded {timeout}s -- group terminated")
             except subprocess.TimeoutExpired:
                 _kill_group(proc.pid, signal.SIGKILL)
                 proc.communicate()
-                log(f"[timeout] {jid} exceeded {JOB_TIMEOUT}s -- group killed")
+                log(f"[timeout] {jid} exceeded {timeout}s -- group killed")
             write_state(jid, "timeout")
             return
         dur = now() - started
