@@ -99,8 +99,16 @@ SCAN_UNREAD_ONLY = os.environ.get("TRIAGE_SCAN_UNREAD_ONLY", "0").strip() == "1"
 # Sent folder. Credit-free, and the one check that keeps "answered" and "still
 # in the INBOX" from drifting apart. See `reconcile_answered`.
 SENT_RECONCILE = os.environ.get("TRIAGE_SENT_RECONCILE", "1").strip() != "0"
-# Where an answered mail goes. Archive, never delete: the reconciliation infers
-# the reply from a subject match, so it must not be able to destroy anything.
+# How many Sent messages the reconciliation *prefilter* lists. Deliberately its
+# own bound rather than SENT_DERIVE_LIMIT, which exists for whitelist
+# derivation: the two answer different questions and should not move together.
+# A reply older than this window is simply not prefiltered, which costs a mail
+# one more appearance in the proposal — never a wrong archive — because the
+# prefilter only nominates and `email_client answered` decides (see
+# `reconcile_answered`).
+RECONCILE_SCAN_LIMIT = int(os.environ.get("TRIAGE_RECONCILE_SCAN_LIMIT", "500"))
+# Where an answered mail goes. Archive, never delete: no inference about a
+# reply, however well grounded, should be able to destroy a message.
 ANSWERED_FOLDER = os.environ.get("TRIAGE_ANSWERED_FOLDER", "Archive").strip()
 # How many messages the spawn prompt enumerates. Only the prompt is capped —
 # the gate itself scans the whole backlog, and the prompt says so, so a long
@@ -123,13 +131,18 @@ CLAUDE_MODEL = os.environ.get(
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 
 
-def _email_client(*args: str) -> dict | None:
-    """Run email_client.py and parse its JSON stdout. None on any failure.
+def _email_client_rc(*args: str) -> tuple[int, dict | None]:
+    """Run email_client.py; return its exit code and parsed JSON stdout.
 
-    Under the scheduler this process holds no mailbox credentials; email_client.py
-    proxies through EMAIL_BACKEND_URL, which job_env() already sets. A failure
-    here (backend down, timeout) must degrade to "gate found nothing", never
-    crash the scheduler tick.
+    Most subcommands answer "did it work?", and for those `_email_client` below
+    is the right wrapper. A few answer a *question* in the exit code instead —
+    `answered` exits 3 for "no reply found", which is a real answer and not a
+    failure — and collapsing that to None would make "nobody replied" and "the
+    backend is down" indistinguishable. Hence the raw code.
+
+    Under the scheduler this process holds no mailbox credentials;
+    email_client.py proxies through EMAIL_BACKEND_URL, which job_env() already
+    sets. An invocation that never ran at all reports -1.
     """
     cmd = ["python3", EMAIL_CLIENT, *args]
     try:
@@ -138,18 +151,30 @@ def _email_client(*args: str) -> dict | None:
         )
     except Exception as e:  # noqa: BLE001 — any failure means "skip this tick"
         print(f"[triage-gate] email_client invocation failed: {e}", file=sys.stderr)
-        return None
-    if out.returncode != 0:
-        print(
-            f"[triage-gate] email_client rc={out.returncode}: {out.stderr.strip()}",
-            file=sys.stderr,
-        )
-        return None
+        return -1, None
     try:
-        return json.loads(out.stdout)
-    except json.JSONDecodeError as e:
-        print(f"[triage-gate] non-JSON from email_client: {e}", file=sys.stderr)
+        payload = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        payload = None
+    return out.returncode, payload
+
+
+def _email_client(*args: str) -> dict | None:
+    """Run email_client.py and parse its JSON stdout. None on any failure.
+
+    A failure here (backend down, timeout, non-JSON) must degrade to "gate
+    found nothing", never crash the scheduler tick.
+    """
+    rc, payload = _email_client_rc(*args)
+    if rc != 0:
+        if rc != -1:
+            print(f"[triage-gate] email_client rc={rc} for {args[0]!r}",
+                  file=sys.stderr)
         return None
+    if payload is None:
+        print(f"[triage-gate] non-JSON from email_client {args[0]!r}",
+              file=sys.stderr)
+    return payload
 
 
 def _sender_address(msg: dict) -> str:
@@ -250,9 +275,9 @@ _SUBJECT_PREFIX = re.compile(
 
 def _thread_key(subject: str) -> str:
     """A subject stripped of reply/forward prefixes, for pairing a mail with its
-    answer. Deliberately crude — prefixes vary by client and locale, and a
-    subject alone is far too weak to settle anything, so the recipient check in
-    `reconcile_answered` carries the real weight."""
+    answer. Deliberately crude, and deliberately only ever used to *nominate* a
+    candidate: prefixes vary by client and locale, and a subject alone is far
+    too weak to settle anything. `email_client answered` does the deciding."""
     return re.sub(r"\s+", " ", _SUBJECT_PREFIX.sub("", subject or "")).strip().lower()
 
 
@@ -265,14 +290,59 @@ def _parse_when(value: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _confirm_answered(msg: dict) -> bool:
+    """Ask the mailbox, exactly, whether this message has been replied to.
+
+    `email_client answered` is the purpose-built check and is strictly stronger
+    than anything this script can do over a listing: it runs *server-side IMAP
+    SEARCH* over the Sent folder for messages citing this Message-ID in
+    In-Reply-To/References, plus — for replies that do not thread at all — an
+    exact `TO` search for the sender since the message's own date, under the
+    same base subject. Three things follow, each of which the listing-based
+    matching this replaced got wrong:
+
+      * **Address comparison is exact.** A Python `sender in recipients`
+        substring test over a listing treats `ann@example.com` as answered by a
+        reply to `joann@example.com`.
+      * **No window.** A server-side SEARCH sees the whole Sent folder, so a
+        reply older than any listing limit still counts.
+      * **Cc/Bcc are moot.** A listing summary carries `To` only, so a reply-all
+        that reaches the sender via Cc is invisible to it; the header search
+        does not care which field carried the address.
+
+    Exit 0 means answered, 3 means genuinely unanswered, anything else means the
+    state is unknown — and unknown must read as *not* answered, so an IMAP
+    hiccup can never archive a mail nobody replied to.
+    """
+    mid = (msg.get("message_id") or "").strip()
+    if not mid:
+        return False
+    rc, payload = _email_client_rc(
+        "answered", "--message-id", mid, "--folder", SENT_FOLDER,
+        "--in-folder", "INBOX",
+    )
+    if rc not in (0, 3):
+        print(f"[triage-gate] sent-reconcile: answered-check inconclusive for "
+              f"{mid} (rc={rc}); leaving it to triage", file=sys.stderr)
+        return False
+    return rc == 0 and bool((payload or {}).get("answered"))
+
+
 def _settle_answered(msg: dict) -> bool:
     """Move one answered mail out of the INBOX and record it resolved."""
     uid = str(msg.get("uid") or "")
     if not (uid and ANSWERED_FOLDER):
         return False
-    if _email_client(
+    moved = _email_client(
         "move", "--uid", uid, "--from", "INBOX", "--to", ANSWERED_FOLDER
-    ) is None:
+    )
+    # Insist on the move's own receipt, not merely "the command exited 0": the
+    # status record about to be written says the mail has left the INBOX, and
+    # bookkeeping that outruns the mailbox is how a message becomes invisible
+    # to triage while still sitting in it.
+    if not (moved and str(moved.get("moved") or "") == uid):
+        print(f"[triage-gate] sent-reconcile: move of uid {uid} not confirmed; "
+              f"leaving it to triage", file=sys.stderr)
         return False
     path = _status_path(msg.get("message_id") or "")
     if path is None:
@@ -288,7 +358,7 @@ def _settle_answered(msg: dict) -> bool:
         "subject": msg.get("subject") or "",
         "project": "unlinked",
         "note": (
-            "A reply to this thread, addressed to the sender, is in "
+            f"`email_client answered` found a reply to this message in "
             f"{SENT_FOLDER}; settled by the credit-free triage gate and moved "
             f"INBOX->{ANSWERED_FOLDER}."
         ),
@@ -312,53 +382,60 @@ def _settle_answered(msg: dict) -> bool:
 def reconcile_answered(messages: list[dict]) -> list[dict]:
     """Archive INBOX mail the user has already answered; return what is left.
 
-    A mail whose thread carries a later reply in the Sent folder is settled by
-    definition — the user has dealt with it — yet nothing in triage noticed, so
-    it kept sitting in the INBOX and kept being re-proposed. This is the
-    cheapest check there is (one IMAP listing, no model turn) and it is what
-    keeps the INBOX meaning *still open* rather than *everything that ever
-    arrived*.
+    A mail the user has already replied to is settled by definition, yet
+    nothing in triage noticed, so it kept sitting in the INBOX and kept being
+    re-proposed on every sweep. This is what keeps the INBOX meaning *still
+    open* rather than *everything that ever arrived*, and it costs no model
+    turn.
 
-    Matching is conservative on purpose, because it acts without asking: the
-    reply must carry the same thread subject **and** be addressed to the
-    original sender **and** postdate the mail — and the action is a move to
-    ANSWERED_FOLDER, never a delete, so a false positive costs an archive
-    rather than a message.
+    Two steps, because the cheap check and the correct check are different
+    checks:
+
+      1. **Nominate** — one Sent listing, bounded by RECONCILE_SCAN_LIMIT.
+         A candidate is a mail whose thread subject appears in that listing
+         with a later timestamp. Loose on purpose: it exists only to keep step
+         2 off the ~99% of the INBOX nobody has answered.
+      2. **Decide** — `_confirm_answered`, one exact server-side check per
+         candidate. Nothing is archived on the strength of step 1.
+
+    Both failure directions are therefore safe. A miss in step 1 (a reply
+    outside the listing window, a subject rewritten past recognition) costs the
+    mail one more appearance in the proposal. A loose match in step 1 costs one
+    extra IMAP round-trip and is then rejected in step 2. And the action is a
+    move to ANSWERED_FOLDER, never a delete, so even a false positive that got
+    through both costs an archive rather than a message.
     """
     if not (SENT_RECONCILE and messages):
         return messages
     res = _email_client(
-        "search", "--folder", SENT_FOLDER, "--limit", str(SENT_DERIVE_LIMIT)
+        "search", "--folder", SENT_FOLDER, "--limit", str(RECONCILE_SCAN_LIMIT)
     )
     if not res:
         return messages
-    index: dict[str, list[tuple[datetime, str]]] = {}
+    sent_index: dict[str, list[datetime]] = {}
     for sent in res.get("messages", []):
         key = _thread_key(sent.get("subject"))
         when = _parse_when(sent.get("date"))
-        if not key or when is None:
-            continue
-        recipients = " ".join(
-            str(sent.get(field) or "") for field in ("to", "cc", "bcc")
-        ).lower()
-        index.setdefault(key, []).append((when, recipients))
+        if key and when is not None:
+            sent_index.setdefault(key, []).append(when)
 
-    keep, settled = [], 0
+    keep, settled, checked = [], 0, 0
     for msg in messages:
         key = _thread_key(msg.get("subject"))
         when = _parse_when(msg.get("date"))
-        sender = _sender_address(msg)
-        answered = bool(key and when and sender) and any(
-            sent_at > when and sender in recipients
-            for sent_at, recipients in index.get(key, [])
+        nominated = bool(key and when is not None) and any(
+            sent_at > when for sent_at in sent_index.get(key, [])
         )
-        if answered and _settle_answered(msg):
+        if nominated:
+            checked += 1
+        if nominated and _confirm_answered(msg) and _settle_answered(msg):
             settled += 1
         else:
             keep.append(msg)
-    if settled:
-        print(f"[triage-gate] sent-reconcile: {settled} answered mail(s) moved "
-              f"INBOX->{ANSWERED_FOLDER}", file=sys.stderr)
+    if checked:
+        print(f"[triage-gate] sent-reconcile: {checked} candidate(s) confirmed "
+              f"against {SENT_FOLDER}, {settled} moved INBOX->{ANSWERED_FOLDER}",
+              file=sys.stderr)
     return keep
 
 

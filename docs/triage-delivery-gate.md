@@ -243,24 +243,34 @@ not.
 IMAP has a queryable backlog. The gate is a scheduler `command` job (zero Claude
 credits):
 
-1. List new INBOX mail since last run.
-2. **Route both rails in one pass** (`route()`, below): each message is asked for
+1. List **the INBOX** — all of it, not the unread subset. `unread` is a mailbox
+   flag the user can flip from any mail client; the status store (step 4) is
+   what decides whether a message is handled.
+2. **Settle what has already been answered.** Each message whose thread subject
+   appears in a Sent listing with a later date is *nominated*, then confirmed
+   exactly by `email_client answered` — a server-side IMAP SEARCH for replies
+   citing its Message-ID, plus an exact `TO` search for untracked replies that
+   carry no In-Reply-To. A confirmed one is moved to `Archive` and recorded
+   `resolved`, so it never reaches a proposal again. Nomination is loose and
+   bounded; only the exact check ever archives, and the action is a move, never
+   a delete.
+3. **Route both rails in one pass** (`route()`, below): each message is asked for
    a decision on its sender *and* its group. A `news` group is filed to the feed;
    whether the mail is *also* left for triage is the group's `ignored`/`quieted`
    flag, so a read-only newsletter can never buy a model turn while a list one
    answers on still reaches triage.
-3. Dedup by message-id against the existing triage status (same sanitized
+4. Dedup by message-id against the existing triage status (same sanitized
    id-scheme triage already uses). A message that already has a status record
    is **not new work** and does not arm the gate — whatever its status. Triage
    never marks mail read (`unread ≠ unhandled`), so a classified message stays
    unread in the INBOX until its disposition is executed, which for an omnibus
    batch means waiting on the user; without this step every tick would re-spawn
    a session over the same settled stack.
-4. Keep only whitelisted senders → spawn the model for those. The spawn payload
+5. Keep only whitelisted senders → spawn the model for those. The spawn payload
    still carries every routed message, recorded ones included, so the session
    reconciles and nudges over the same set as before — only the *decision to
    spawn* is narrowed.
-5. The **daily** job runs for **any** sender (fixed morning hour, before the
+6. The **daily** job runs for **any** sender (fixed morning hour, before the
    briefing).
 
 ### Messenger — gateway-owned store + delivery flag (push)

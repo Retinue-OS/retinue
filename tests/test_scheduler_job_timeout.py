@@ -112,6 +112,27 @@ def test_a_nonsense_value_falls_back_and_says_so():
     print("  ok   an unparseable value falls back to the default, with a warning")
 
 
+def test_an_omitted_field_is_silent_but_a_present_bad_one_is_not():
+    # The two cases fall back to the same number and must not read the same in
+    # the log. Omitting timeout_seconds is the normal shape of a manifest and
+    # says nothing; writing `""` or `0` is a malformed manifest whose author
+    # believes they set a budget, and a silent fallback leaves them believing
+    # it for as long as the job keeps being killed at the wrong time.
+    for value, expected in (("", "unusable"), (0, "non-positive")):
+        with tempfile.TemporaryDirectory() as tmp:
+            sched = _load_scheduler(Path(tmp))
+            seen, logged = _run(sched, {"command": "true",
+                                        "timeout_seconds": value})
+            assert seen == [900], f"{value!r} produced {seen}, not the default"
+            warns = [m for m in logged if "timeout_seconds" in m]
+            assert any(expected in m for m in warns), f"{value!r}: {warns}"
+    with tempfile.TemporaryDirectory() as tmp:
+        sched = _load_scheduler(Path(tmp))
+        _, logged = _run(sched, {"command": "true"})
+        assert not [m for m in logged if "timeout_seconds" in m], logged
+    print("  ok   an absent field warns nothing, a present unusable one warns")
+
+
 def test_zero_and_negative_never_disable_the_timeout():
     # The loop is single-threaded: a job that cannot be killed wedges every
     # other job behind it, so "no timeout" must not be expressible.
@@ -165,6 +186,7 @@ if __name__ == "__main__":
     test_a_job_can_also_ask_for_less()
     test_a_string_value_from_json_is_accepted()
     test_a_nonsense_value_falls_back_and_says_so()
+    test_an_omitted_field_is_silent_but_a_present_bad_one_is_not()
     test_zero_and_negative_never_disable_the_timeout()
     test_the_kill_log_reports_the_budget_that_was_actually_applied()
     print("all scheduler job-timeout tests passed")

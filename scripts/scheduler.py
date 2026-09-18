@@ -327,14 +327,23 @@ def run_job(job: dict) -> None:
     # A job may buy itself more wall clock than the global default; see the
     # module docstring on "timeout_seconds". A non-positive or unparseable
     # value falls back rather than disabling the timeout — an un-killable job
-    # would wedge the whole single-threaded tick loop.
-    try:
-        timeout = int(job.get("timeout_seconds") or 0) or JOB_TIMEOUT
-    except (TypeError, ValueError):
-        log(f"[warn] job {jid!r} has an unusable timeout_seconds, using {JOB_TIMEOUT}s")
-        timeout = JOB_TIMEOUT
-    if timeout <= 0:
-        timeout = JOB_TIMEOUT
+    # would wedge the whole single-threaded tick loop. An omitted or null
+    # field is not a mistake and says nothing; a field that is present but
+    # unusable is a malformed manifest and must be visible, rather than
+    # falling back as quietly as an absent one would.
+    raw_timeout = job.get("timeout_seconds")
+    timeout = JOB_TIMEOUT
+    if raw_timeout is not None:
+        try:
+            timeout = int(raw_timeout)
+        except (TypeError, ValueError):
+            log(f"[warn] job {jid!r} has an unusable timeout_seconds "
+                f"({raw_timeout!r}), using {JOB_TIMEOUT}s")
+            timeout = JOB_TIMEOUT
+        if timeout <= 0:
+            log(f"[warn] job {jid!r} has a non-positive timeout_seconds "
+                f"({raw_timeout!r}), using {JOB_TIMEOUT}s")
+            timeout = JOB_TIMEOUT
     try:
         # A `claude` started on an access token about to expire refreshes it
         # at once, racing every other claude process for the one rotation

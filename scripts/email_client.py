@@ -936,8 +936,18 @@ def cmd_move(cfg, args):
         typ, data = M.uid("copy", uid, _quote(args.to))
         if typ != "OK":
             die(f"copy to {args.to} failed: {data}")
-        M.uid("store", uid, "+FLAGS", "(\\Deleted)")
-        M.expunge()
+        # COPY alone is a *duplicate*, not a move. Report success only once the
+        # source copy is actually gone: a caller that records "this left the
+        # INBOX" on the strength of the COPY leaves the message sitting there,
+        # invisible to whatever bookkeeping now says it was filed.
+        typ, data = M.uid("store", uid, "+FLAGS", "(\\Deleted)")
+        if typ != "OK":
+            die(f"copied to {args.to} but marking the source deleted failed: "
+                f"{data} (the message is now in both folders)")
+        typ, data = M.expunge()
+        if typ != "OK":
+            die(f"copied to {args.to} and flagged, but expunge failed: {data} "
+                f"(the message is now in both folders)")
         moved_via = "COPY+EXPUNGE"
     M.logout()
     print(json.dumps({"moved": uid, "from": args.from_, "to": args.to, "method": moved_via}))
