@@ -186,10 +186,15 @@ thread is appended by the gateway *after* her session ends and carries no
 attachments, so a file must be pushed as its own message this way.
 
 Attachments go **both ways**: the user can attach files to their own messages
-from the composer (a paperclip button on the input row). These upload with the
+from the composer (a paperclip button on the input row), or **paste** them into
+the text box — a screenshot from the clipboard, an image copied off a page, a
+file copied in a file manager — which stages exactly what the paperclip would
+(`webapp/components/clipboard.js`; a pasted screenshot's generic `image.png`
+becomes `pasted-<date>-<time>.png`, a real filename is kept). These upload with the
 message, are stored the same way, and their on-disk paths are handed to Ara in
 her engage prompt — so she can actually open a file the user sends (a PDF, a
 CSV) rather than only knowing one exists. A message may be text, files, or both.
+The chat page's composer takes pasted images the same way (see `webapp/README.md`).
 
 ## Push notifications
 
