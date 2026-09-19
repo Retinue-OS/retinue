@@ -12,8 +12,9 @@ a Progressive Web App on the phone home screen.
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
   buttons on quotes and code, click-to-fill chips, attachments, model and
   cost meta), the pending state while Ara answers, the composer with text,
-  file attachments and voice dictation, the model picker, and the read-aloud
-  player (`<retinue-read-aloud>`, its bar, placeable by any host). Given a
+  file attachments (picked or pasted) and voice dictation, the model picker,
+  and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
+  any host). Given a
   `conversation-id` it reads, polls and replies; given `for-project` and no
   id it is the composer whose first message opens the thread, then goes on
   as it. It reports outward with events (`retinue-back`,
@@ -148,7 +149,8 @@ docstring). Pieces:
   author on every outbound bubble (you / Ara / your phone), inline media
   (images with a lightbox, voice-note and video players — see the Message
   contract below), a live composer (send, shared draft, one-tap clear ✕,
-  dictation, image attach with client-side downscale), quick-pattern chips,
+  dictation, image attach — picked or pasted — with client-side downscale),
+  quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
   splitter on a wide screen. The composer row is the conversation composer's
   row: mic on the left, send on the right, both always there, and the paperclip
@@ -275,8 +277,11 @@ The API, as the components consume it:
   attachments with proxied URLs and their sniffed dimensions. The client
   downscales picked photos before upload — longest edge 1600 px, JPEG — as
   the native clients do; animated GIFs pass through unchanged under the size
-  cap. A failed image send keeps the staged previews (and the text) in the
-  composer for retry.
+  cap. An image pasted into the text box (a screenshot, a picture copied off
+  a page) is staged exactly as a picked one, through the shared
+  `components/clipboard.js`, and the words of a paste that also carries text
+  still land in the box. A failed image send keeps the staged previews (and
+  the text) in the composer for retry.
 
   **The send honours the account's send policy rather than skipping it.** The
   message goes to the gateway as author `user` — provenance, nothing more —
