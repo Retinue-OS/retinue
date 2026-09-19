@@ -272,18 +272,32 @@ not.
 IMAP has a queryable backlog. The gate is a scheduler `command` job (zero Claude
 credits):
 
-1. List new INBOX mail since last run.
-2. **Route both rails in one pass** (`route()`, below): each message is asked for
+1. List **the INBOX** — all of it, not the unread subset. `unread` is a mailbox
+   flag the user can flip from any mail client; the status store (step 4) is
+   what decides whether a message is handled.
+2. **Settle what has already been answered.** Each message whose thread subject
+   appears in a Sent listing with a later date is *nominated*, then confirmed
+   exactly by `email_client answered` — a server-side IMAP SEARCH for replies
+   citing its Message-ID, filtered back down to the same correspondent, the
+   same base subject and a strictly later timestamp; untracked replies go
+   through the same filter after an exact recipient search. If the Sent listing
+   fills its prefilter window, the gate skips the nomination shortcut and
+   exact-checks every INBOX message that tick, so the bound never becomes a
+   permanent blind spot. A confirmed one is moved to `Archive` and recorded
+   `resolved`, so it never reaches a proposal again. Only the exact check ever
+   archives, and the action is a move, never a delete.
+3. **Route both rails in one pass** (`route()`, below): each message is asked for
    a decision on its sender *and* its group. A `news` group is filed to the feed;
    whether the mail is *also* left for triage is the group's `ignored`/`quieted`
    flag, so a read-only newsletter can never buy a model turn while a list one
    answers on still reaches triage.
-3. Dedup by message-id against the existing triage status (same sanitized
+4. Dedup by message-id against the existing triage status (same sanitized
    id-scheme triage already uses). A message that already has a status record
-   is **not new work** and does not arm the gate. Triage never marks mail read
-   (`unread ≠ unhandled`), so a classified message stays unread in the INBOX
-   until its disposition is executed, which for an omnibus batch means waiting
-   on the user; without this step every tick would re-spawn a session over the
+   is **not new work** and does not arm the gate — whatever its status. Triage
+   never marks mail read (`unread ≠ unhandled`), so a classified message stays
+   unread in the INBOX until its disposition is executed, which for an omnibus
+   batch means waiting on the user; without this step every tick would re-spawn
+   a session over the same settled stack.
    same settled stack. Two exceptions, both because the gate is the *only*
    thing that spawns a triage session — a state nothing else revisits is a
    state nothing else can ever finish:
@@ -294,19 +308,20 @@ credits):
      archive/delete candidates on `omnibus_pending` and sends one digest per
      `EMAIL_PROCESSING_INTERVAL` — that accrual is what keeps the user from
      being pinged several times a day. Since accrued mail sits on an open
-     status, the gate arms on the *bundle* instead: it reads `omnibus_pending`
-     records off the unread listing (not by walking the status store — on a
-     30-minute tick that is not free) and, when the interval since
-     `.last-omnibus` has elapsed, spawns a run told to send the digest. A
-     missing or unparseable marker counts as due: the cost is one digest, the
-     alternative is bundled mail nobody sees. Due-ness is read across the whole
-     unread listing rather than the whitelisted subset, since a bundle accrued
-     by a daily run can hold mail the frequent pass does not whitelist.
-4. Keep only whitelisted senders → spawn the model for those. The spawn payload
+     status, the gate arms on the *bundle* instead: it reads
+     `omnibus_pending` records off the INBOX listing (not by walking the
+     status store — on a 30-minute tick that is not free) and, when the
+     interval since `.last-omnibus` has elapsed, spawns a run told to send the
+     digest. A missing or unparseable marker counts as due: the cost is one
+     digest, the alternative is bundled mail nobody sees. Due-ness is read
+     across the whole INBOX listing rather than the whitelisted subset, since
+     a bundle accrued by a daily run can hold mail the frequent pass does not
+     whitelist.
+5. Keep only whitelisted senders → spawn the model for those. The spawn payload
    still carries every routed message, recorded ones included, so the session
    reconciles and nudges over the same set as before — only the *decision to
    spawn* is narrowed.
-5. The **daily** job runs for **any** sender (fixed morning hour, before the
+6. The **daily** job runs for **any** sender (fixed morning hour, before the
    briefing).
 
 ### Messenger — gateway-owned store + delivery flag (push)

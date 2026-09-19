@@ -90,6 +90,24 @@ isn't burned on one bad run:
 }
 ```
 
+A job may also declare an optional `"timeout_seconds"` to override the global
+`SCHEDULER_JOB_TIMEOUT` for that one job:
+
+```json
+{
+  "id": "triage-daily",
+  "command": "python3 /workspace/scripts/triage-gate.py daily",
+  "interval_seconds": 86400,
+  "timeout_seconds": 3600
+}
+```
+
+The value must be a **positive** integer. An omitted or `null` field simply
+uses `SCHEDULER_JOB_TIMEOUT`. A present-but-unparseable or non-positive value
+is treated as a malformed manifest: the scheduler logs a warning and falls back
+to the global timeout rather than disabling the kill, because one un-killable
+job would wedge the single-threaded tick loop behind it.
+
 Besides the per-chamber manifests, the scheduler always loads a **framework base
 manifest** at `/workspace/.schedule.json` for cross-cutting jobs that belong to
 the framework itself rather than any single chamber. A chamber manifest cannot

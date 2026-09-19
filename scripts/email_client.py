@@ -70,7 +70,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import (formataddr, getaddresses, make_msgid, parseaddr,
                          parsedate_to_datetime)
@@ -651,6 +651,65 @@ def _search_sent_to(M, address, since_iso):
     return data[0].split() if typ == "OK" else []
 
 
+def _reply_summary(M, uid):
+    """The minimal reply detail `answered` needs to validate a match."""
+    typ, data = M.uid(
+        "fetch", uid,
+        "(BODY.PEEK[HEADER.FIELDS (TO CC BCC SUBJECT DATE)])",
+    )
+    if typ != "OK" or not data or data[0] is None:
+        return None
+    header_bytes = b""
+    for item in data:
+        if isinstance(item, tuple):
+            header_bytes = item[1]
+    hdr = _parse_message(header_bytes)
+    date = hdr.get("Date")
+    try:
+        iso = parsedate_to_datetime(date).isoformat() if date else None
+    except Exception:
+        iso = date
+    return {
+        "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
+        "to": _decode(hdr.get("To")),
+        "cc": _decode(hdr.get("Cc")),
+        "bcc": _decode(hdr.get("Bcc")),
+        "subject": _decode(hdr.get("Subject")),
+        "date": iso,
+    }
+
+
+def _parsed_summary_date(value):
+    """An ISO timestamp from `_summary`/`_reply_summary`, always tz-aware."""
+    try:
+        parsed = datetime.fromisoformat((value or "").strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _reply_recipients(reply):
+    recipients = set()
+    for field in ("to", "cc", "bcc"):
+        for chunk in str(reply.get(field) or "").split(","):
+            addr = parseaddr(chunk)[1].strip().casefold()
+            if addr:
+                recipients.add(addr)
+    return recipients
+
+
+def _reply_matches_anchor(reply, anchor):
+    """Whether one sent message safely counts as a reply to the anchor mail."""
+    addr = parseaddr(anchor.get("from") or "")[1].casefold()
+    anchor_when = _parsed_summary_date(anchor.get("date"))
+    reply_when = _parsed_summary_date(reply.get("date"))
+    if not addr or anchor_when is None or reply_when is None or reply_when <= anchor_when:
+        return False
+    if _base_subject(reply.get("subject")) != _base_subject(anchor.get("subject")):
+        return False
+    return addr in _reply_recipients(reply)
+
+
 # --------------------------------------------------------------------------- #
 # commands
 # --------------------------------------------------------------------------- #
@@ -722,25 +781,28 @@ def cmd_answered(cfg, args):
     sent = args.folder or cfg.sent_folder
     M = imap_connect(cfg)
 
-    # The anchor gives us the correspondent and the date; without it only the
-    # header test can run.
+    # The anchor gives us the correspondent, the base subject and the exact
+    # timestamp; without it the conservative answer is "not confirmed answered",
+    # because threading alone is too weak to move or suppress mail safely.
     imap_select(M, args.in_folder, readonly=True)
     anchor = next((s for u in _search_by_message_id(M, args.message_id)
                    if (s := _summary(M, u))), None)
 
     imap_select(M, sent, readonly=True)
-    threaded = [s for u in _search_replies_to(M, args.message_id)
-                if (s := _summary(M, u))]
+    threaded = []
+    if anchor:
+        for uid in _search_replies_to(M, args.message_id):
+            if (s := _reply_summary(M, uid)) and _reply_matches_anchor(s, anchor):
+                threaded.append(s)
 
     untracked = []
     if anchor:
         addr = parseaddr(anchor.get("from") or "")[1]
-        base = _base_subject(anchor.get("subject"))
         if addr:
             seen = {m["uid"] for m in threaded}
             for uid in _search_sent_to(M, addr, anchor.get("date")):
-                s = _summary(M, uid)
-                if s and s["uid"] not in seen and _base_subject(s.get("subject")) == base:
+                s = _reply_summary(M, uid)
+                if s and s["uid"] not in seen and _reply_matches_anchor(s, anchor):
                     untracked.append(s)
     M.logout()
 
@@ -936,8 +998,18 @@ def cmd_move(cfg, args):
         typ, data = M.uid("copy", uid, _quote(args.to))
         if typ != "OK":
             die(f"copy to {args.to} failed: {data}")
-        M.uid("store", uid, "+FLAGS", "(\\Deleted)")
-        M.expunge()
+        # COPY alone is a *duplicate*, not a move. Report success only once the
+        # source copy is actually gone: a caller that records "this left the
+        # INBOX" on the strength of the COPY leaves the message sitting there,
+        # invisible to whatever bookkeeping now says it was filed.
+        typ, data = M.uid("store", uid, "+FLAGS", "(\\Deleted)")
+        if typ != "OK":
+            die(f"copied to {args.to} but marking the source deleted failed: "
+                f"{data} (the message is now in both folders)")
+        typ, data = M.expunge()
+        if typ != "OK":
+            die(f"copied to {args.to} and flagged, but expunge failed: {data} "
+                f"(the message is now in both folders)")
         moved_via = "COPY+EXPUNGE"
     M.logout()
     print(json.dumps({"moved": uid, "from": args.from_, "to": args.to, "method": moved_via}))

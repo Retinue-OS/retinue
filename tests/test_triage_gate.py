@@ -32,12 +32,41 @@ def _load(name, path):
     return mod
 
 
-def _fresh(tmp):
-    """Load a fresh gate module bound to temp policy/status paths."""
+def _no_backend(*args):
+    """Default backend for a freshly loaded gate: refuse to do anything.
+
+    These tests run in a live container, where the real backend reaches a real
+    mailbox. Every test is *supposed* to stub either a wrapper or the
+    collection function above it, but a stub is attached by name — so renaming
+    the function under test silently un-stubs it and the suite starts issuing
+    IMAP moves against the owner's INBOX. (This is not hypothetical: it is how
+    `unread_inbox` -> `inbox_messages` was caught.) Failing loudly here turns
+    that whole class of accident into an ordinary test failure.
+
+    It is installed on `_email_client_rc` because that is the single choke
+    point: `_email_client` is a thin wrapper over it, so a call through either
+    one lands here. Installing it on the wrapper instead would leave the gate's
+    one deliberate rc-level caller — the `answered` confirmation, which needs
+    exit code 3 distinguishable from failure — reaching the live mailbox.
+    """
+    raise AssertionError(
+        f"_email_client_rc{args!r} reached the real backend -- the test must "
+        "stub gate._email_client_rc, gate._email_client or gate.inbox_messages")
+
+
+def _fresh(tmp, *, sent_reconcile=False):
+    """Load a fresh gate module bound to temp policy/status paths.
+
+    Sent reconciliation is off unless a test asks for it: it is a second,
+    independent behaviour with its own tests below, and leaving it armed would
+    make every unrelated spawn test depend on a Sent listing it never set up.
+    """
     os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(Path(tmp) / "email-whitelist.nt")
     os.environ["CHAMBERS_DIR"] = tmp
     os.environ["TRIAGE_STATE_DIR"] = str(Path(tmp) / "triage")
+    os.environ["TRIAGE_SENT_RECONCILE"] = "1" if sent_reconcile else "0"
     gate = _load("triage_gate", REPO_ROOT / "scripts" / "triage-gate.py")
+    gate._email_client_rc = _no_backend
     return gate
 
 
@@ -109,7 +138,7 @@ def test_frequent_spawns_only_for_whitelisted():
             {"from": "spam@random.io", "subject": "sale", "message_id": "<2>"},
             {"from": "Reto <reto@factsmission.com>", "subject": "re", "message_id": "<3>"},
         ]
-        gate.unread_inbox = lambda: inbox
+        gate.inbox_messages = lambda: inbox
         rec = Recorder()
         gate.spawn = rec
         rc = gate.run_frequent()
@@ -126,7 +155,7 @@ def test_frequent_no_whitelisted_no_spawn():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         # Empty whitelist → nothing is trusted.
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "a@x.com", "subject": "s", "message_id": "<9>"}
         ]
         rec = Recorder()
@@ -140,7 +169,7 @@ def test_frequent_no_whitelisted_no_spawn():
 def test_frequent_empty_inbox_no_spawn():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
-        gate.unread_inbox = lambda: []
+        gate.inbox_messages = lambda: []
         rec = Recorder()
         gate.spawn = rec
         assert gate.run_frequent() == 0
@@ -165,7 +194,7 @@ def test_daily_spawns_for_any_sender_and_refreshes():
             return len(addrs)
 
         gate.refresh_whitelist_from_sent = fake_refresh
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "stranger@nowhere.com", "subject": "hello", "message_id": "<7>"}
         ]
         rec = Recorder()
@@ -183,7 +212,7 @@ def test_daily_empty_inbox_no_spawn():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         gate.refresh_whitelist_from_sent = lambda: 0
-        gate.unread_inbox = lambda: []
+        gate.inbox_messages = lambda: []
         rec = Recorder()
         gate.spawn = rec
         assert gate.run_daily() == 0
@@ -237,7 +266,7 @@ def test_news_sender_is_filed_and_never_spawns():
                 "archived_at": "<https://example.org/archive/42>",
             },
         )
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"uid": "10", "from": "info@newsletter.example",
              "subject": "Herbstprogramm 2026", "message_id": "<news-1@newsletter.example>"},
         ]
@@ -283,7 +312,7 @@ def test_news_rail_leaves_other_mail_to_triage():
                     "message_id": "<n@news.example>", "body": "text"},
         )
         gate.tp._mutate_email(add_addresses=["boss@work.com"])
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"uid": "1", "from": "bulletin@news.example", "subject": "Weekly",
              "message_id": "<n@news.example>"},
             {"uid": "2", "from": "Boss <boss@work.com>", "subject": "hi",
@@ -308,7 +337,7 @@ def test_news_filing_failure_falls_back_to_triage():
                     "message_id": "<n@news.example>", "body": "text"},
         )
         gate.refresh_whitelist_from_sent = lambda: 0
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"uid": "1", "from": "bulletin@news.example", "subject": "Weekly",
              "message_id": "<n@news.example>"},
         ]
@@ -331,12 +360,12 @@ def test_news_move_failure_stays_non_terminal():
             detail={"subject": "Weekly", "from": "bulletin@news.example",
                     "message_id": "<n@news.example>", "body": "text"},
         )
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"uid": "1", "from": "bulletin@news.example", "subject": "Weekly",
              "message_id": "<n@news.example>"},
         ]
         gate.spawn = Recorder()
-        gate.route(gate.unread_inbox(), "news")
+        gate.route(gate.inbox_messages(), "news")
         assert len(rail.calls) == 1, "item should still reach the feed"
         # Filed but still in the INBOX → not terminal, or Phase 1 would never
         # repair the missing move.
@@ -378,7 +407,7 @@ def test_news_and_quieted_is_filed_but_left_for_triage():
         inbox = [{"uid": "1", "from": "peer@example.org", "subject": "Re: agenda",
                   "message_id": "<d1@example.org>",
                   "list_id": "Discuss <discuss.example.org>"}]
-        gate.unread_inbox = lambda: inbox
+        gate.inbox_messages = lambda: inbox
         rec = Recorder()
         gate.spawn = rec
 
@@ -411,7 +440,7 @@ def test_wildcard_covers_the_lists_under_a_platform_domain():
                     "from": "Author <author@substack.com>",
                     "message_id": "<s1@substack.com>", "body": "essay"},
         )
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             # The sender address is the publication's, not the platform's; only
             # the List-Id ties it to substack.com.
             {"uid": "1", "from": "Author <author@sgcarney.substack.com>",
@@ -436,7 +465,7 @@ def test_whitelisted_sender_beats_an_ignored_list():
                               ignore_add=["announce.example.org"])
         gate._email_client = lambda *a: {"ok": True}
         gate.news_ingest.news_enabled = lambda: False
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"uid": "1", "from": "Boss <boss@work.com>", "subject": "read this",
              "message_id": "<b1@work.com>",
              "list_id": "<announce.example.org>"},
@@ -483,7 +512,7 @@ def test_recorded_mail_does_not_arm_the_gate():
                 gate.tp.render_email_whitelist(set(), {"*@work.com"}),
                 gate.tp.email_whitelist_path(),
             )
-            gate.unread_inbox = lambda: [
+            gate.inbox_messages = lambda: [
                 {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
             ]
             _record(gate, "<a@work.com>", status)
@@ -509,7 +538,7 @@ def test_a_due_omnibus_digest_arms_the_gate_on_its_own():
         gate = _fresh(tmp)
         _whitelist_all(gate)
         msg = {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
-        gate.unread_inbox = lambda: [msg]
+        gate.inbox_messages = lambda: [msg]
         _record(gate, "<a@work.com>", "omnibus_pending")
         _omnibus_sent(gate, ago_seconds=gate.OMNIBUS_INTERVAL + 60)
         rec = Recorder()
@@ -529,7 +558,7 @@ def test_a_pending_omnibus_stays_quiet_inside_its_interval():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         _whitelist_all(gate)
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
         ]
         _record(gate, "<a@work.com>", "omnibus_pending")
@@ -547,7 +576,7 @@ def test_a_missing_omnibus_marker_counts_as_due():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         _whitelist_all(gate)
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
         ]
         _record(gate, "<a@work.com>", "omnibus_pending")
@@ -562,10 +591,10 @@ def test_a_missing_omnibus_marker_counts_as_due():
 def test_a_due_digest_arms_even_when_its_sender_is_not_whitelisted():
     # A bundle accrued by a daily run holds mail from senders the frequent pass
     # does not trust. The digest is still owed on time, so due-ness is read off
-    # the whole unread listing rather than off the whitelisted subset.
+    # the whole INBOX listing rather than off the whitelisted subset.
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)  # no whitelist at all
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "stranger@random.io", "subject": "s", "message_id": "<a@x.io>"}
         ]
         _record(gate, "<a@x.io>", "omnibus_pending")
@@ -603,7 +632,7 @@ def test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones():
             gate.tp.render_email_whitelist(set(), {"*@work.com"}),
             gate.tp.email_whitelist_path(),
         )
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "boss@work.com", "subject": "old", "message_id": "<a@work.com>"},
             {"from": "boss@work.com", "subject": "new", "message_id": "<b@work.com>"},
         ]
@@ -626,7 +655,7 @@ def test_message_without_an_id_always_arms():
             gate.tp.render_email_whitelist(set(), {"*@work.com"}),
             gate.tp.email_whitelist_path(),
         )
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "boss@work.com", "subject": "s", "message_id": ""}
         ]
         rec = Recorder()
@@ -660,7 +689,7 @@ def test_stalled_non_terminal_mail_re_arms_the_gate():
         with tempfile.TemporaryDirectory() as tmp:
             gate = _fresh(tmp)
             _whitelist_all(gate)
-            gate.unread_inbox = lambda: [
+            gate.inbox_messages = lambda: [
                 {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
             ]
             _record_at(gate, "<a@work.com>", status, "2020-01-01T00:00:00Z")
@@ -679,7 +708,7 @@ def test_a_settled_status_never_re_arms_however_old():
         with tempfile.TemporaryDirectory() as tmp:
             gate = _fresh(tmp)
             _whitelist_all(gate)
-            gate.unread_inbox = lambda: [
+            gate.inbox_messages = lambda: [
                 {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
             ]
             _record_at(gate, "<a@work.com>", status, "2020-01-01T00:00:00Z")
@@ -696,7 +725,7 @@ def test_a_recent_non_terminal_item_is_left_alone():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         _whitelist_all(gate)
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
         ]
         from datetime import datetime, timezone
@@ -716,7 +745,7 @@ def test_an_unreadable_record_re_arms_rather_than_hiding_the_mail():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         _whitelist_all(gate)
-        gate.unread_inbox = lambda: [
+        gate.inbox_messages = lambda: [
             {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
         ]
         path = gate._status_path("<a@work.com>")
@@ -737,7 +766,7 @@ def test_a_corrupt_record_re_arms_instead_of_crashing_the_tick():
         with tempfile.TemporaryDirectory() as tmp:
             gate = _fresh(tmp)
             _whitelist_all(gate)
-            gate.unread_inbox = lambda: [
+            gate.inbox_messages = lambda: [
                 {"from": "boss@work.com", "subject": "s", "message_id": "<a@work.com>"}
             ]
             path = gate._status_path("<a@work.com>")
@@ -767,7 +796,7 @@ def test_a_saturated_scan_window_widens_instead_of_hiding_old_mail():
             return {"messages": everything[:limit]}
 
         gate._email_client = fake_client
-        got = gate.unread_inbox()
+        got = gate.inbox_messages()
         assert limits == [3, 10], f"expected a widened re-scan, got limits {limits}"
         assert len(got) == 7, f"widened scan returned {len(got)} of 7"
     print("PASS test_a_saturated_scan_window_widens_instead_of_hiding_old_mail")
@@ -785,7 +814,7 @@ def test_an_unsaturated_scan_does_not_pay_for_a_second_listing():
             return {"messages": [{"message_id": "<a@work.com>"}]}
 
         gate._email_client = fake_client
-        assert len(gate.unread_inbox()) == 1
+        assert len(gate.inbox_messages()) == 1
         assert limits == [3], f"unsaturated scan should list once, got {limits}"
     print("PASS test_an_unsaturated_scan_does_not_pay_for_a_second_listing")
 
@@ -805,7 +834,7 @@ def test_a_failed_widened_rescan_keeps_the_narrow_result():
             return None
 
         gate._email_client = fake_client
-        got = gate.unread_inbox()
+        got = gate.inbox_messages()
         assert len(got) == 2, f"narrow result should survive a failed re-scan: {got}"
     print("PASS test_a_failed_widened_rescan_keeps_the_narrow_result")
 
@@ -825,6 +854,358 @@ def test_the_prompt_listing_is_capped_and_says_so():
         assert "and 7 more" in prompt, "truncation must be stated"
         assert "work from the mailbox" in prompt
     print("PASS test_the_prompt_listing_is_capped_and_says_so")
+
+
+# --------------------------------------------------------------------------- #
+# Scan scope: the INBOX, not the unread subset                                 #
+# --------------------------------------------------------------------------- #
+
+
+def _scope_of(gate, **stub):
+    """Run inbox_messages() against a recording client; return the search args."""
+    calls = []
+
+    def fake_client(*args):
+        calls.append(args)
+        return {"messages": stub.get("messages", [])}
+
+    gate._email_client = fake_client
+    gate.inbox_messages()
+    return calls
+
+
+def test_the_scan_covers_the_inbox_not_just_the_unread():
+    # The defect this fixes: scope was keyed on the `unread` flag, so any mail
+    # merely *opened* — by the user in a mail client, or by a triage session
+    # reading it to classify it — left the gate's view while still sitting in
+    # the INBOX, and was never proposed again. Presence is the mailbox's call;
+    # handled-state is the status store's.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        calls = _scope_of(gate)
+        assert len(calls) == 1
+        assert "--unseen" not in calls[0], f"scan still flag-keyed: {calls[0]}"
+        assert calls[0][:3] == ("search", "--folder", "INBOX")
+    print("PASS test_the_scan_covers_the_inbox_not_just_the_unread")
+
+
+def test_the_old_unread_scope_is_still_reachable_by_env():
+    # An escape hatch, not a default: a deployment that genuinely wants the
+    # flag-keyed scope back should not have to patch the script.
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TRIAGE_SCAN_UNREAD_ONLY"] = "1"
+        try:
+            gate = _fresh(tmp)
+            calls = _scope_of(gate)
+        finally:
+            os.environ.pop("TRIAGE_SCAN_UNREAD_ONLY", None)
+        assert "--unseen" in calls[0], f"env override ignored: {calls[0]}"
+    print("PASS test_the_old_unread_scope_is_still_reachable_by_env")
+
+
+# --------------------------------------------------------------------------- #
+# Sent reconciliation: a mail already answered leaves the INBOX                #
+# --------------------------------------------------------------------------- #
+
+
+def _arm_sent(gate, sent_messages, *, moves_ok=True, answered=0, receipt=True):
+    """Stub the backend with a Sent listing; record every call.
+
+    The stub sits on `_email_client_rc`, beneath both wrappers, so the two-step
+    flow is covered end to end: the nominating Sent listing goes through
+    `_email_client`, the confirming `answered` check goes through the rc form
+    directly, and the real wrapper stays in play for the former.
+
+    `answered` is the exit code the confirmation reports — 0 answered, 3
+    genuinely unanswered, anything else inconclusive. `receipt` controls
+    whether a successful move returns the uid it claims to have moved.
+    """
+    calls = []
+
+    def fake_rc(*args):
+        calls.append(args)
+        if args[0] == "search":
+            return 0, {"messages": list(sent_messages)}
+        if args[0] == "answered":
+            return answered, {"answered": answered == 0}
+        if args[0] == "move":
+            if not moves_ok:
+                return 1, None
+            uid = args[args.index("--uid") + 1]
+            return 0, {"moved": uid if receipt else ""}
+        return 0, {"ok": True}
+
+    gate._email_client_rc = fake_rc
+    return calls
+
+
+def test_an_answered_mail_is_archived_and_recorded_resolved():
+    # The invariant the owner asked for: after the daily omnibus, the INBOX
+    # holds only what is still open. A mail they have replied to is not open,
+    # so it must leave — and leave a status record, so nothing re-proposes it.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        calls = _arm_sent(gate, [
+            {"subject": "Re: Meeting Thursday", "to": "Donat <donat@example.org>",
+             "date": "2026-09-17T10:12:00+02:00"},
+        ])
+        left = gate.reconcile_answered([
+            {"uid": "41", "from": "Donat <donat@example.org>",
+             "subject": "Meeting Thursday", "message_id": "<m1@example.org>",
+             "date": "2026-09-16T08:00:00+02:00"},
+        ])
+        assert left == [], "the answered mail should not remain to triage"
+        checks = [c for c in calls if c[0] == "answered"]
+        assert len(checks) == 1 and "<m1@example.org>" in checks[0], (
+            f"the exact check was not consulted: {checks}")
+        moves = [c for c in calls if c[0] == "move"]
+        assert moves == [("move", "--uid", "41", "--from", "INBOX",
+                          "--to", "Archive")], f"wrong move: {moves}"
+        record = json.loads(gate._status_path("<m1@example.org>").read_text())
+        assert record["status"] == "resolved"
+        assert record["disposition"] == "answered"
+        assert record["folder"] == "Archive"
+    print("PASS test_an_answered_mail_is_archived_and_recorded_resolved")
+
+
+def test_a_reply_to_someone_else_does_not_settle_the_mail():
+    # Subject alone is far too weak: two people can write about "Invoice 2026"
+    # in unrelated threads. Answering one must not archive the other's.
+    # The subject match is exactly what the prefilter keys on, so this mail is
+    # *nominated* — and the exact check is what refuses it. That division is
+    # the design: nomination is allowed to be wrong, the decision is not.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        calls = _arm_sent(gate, [
+            {"subject": "Re: Invoice 2026", "to": "other@elsewhere.com",
+             "date": "2026-09-17T10:00:00+00:00"},
+        ], answered=3)
+        inbox = [{"uid": "7", "from": "billing@vendor.com",
+                  "subject": "Invoice 2026", "message_id": "<inv@vendor.com>",
+                  "date": "2026-09-16T09:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+        assert [c[0] for c in calls if c[0] == "answered"] == ["answered"]
+        assert not [c for c in calls if c[0] == "move"], "archived a stranger's mail"
+    print("PASS test_a_reply_to_someone_else_does_not_settle_the_mail")
+
+
+def test_an_inconclusive_answered_check_settles_nothing():
+    # Exit 3 is an answer ("nobody replied"); any other non-zero code is the
+    # backend failing to say. Unknown must read as *not* answered, or an IMAP
+    # hiccup archives mail nobody has touched.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        calls = _arm_sent(gate, [
+            {"subject": "Re: Contract", "to": "legal@work.com",
+             "date": "2026-09-17T10:00:00+00:00"},
+        ], answered=1)
+        inbox = [{"uid": "12", "from": "legal@work.com", "subject": "Contract",
+                  "message_id": "<c@work.com>",
+                  "date": "2026-09-16T10:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+        assert not [c for c in calls if c[0] == "move"]
+        assert gate._status_path("<c@work.com>").exists() is False
+    print("PASS test_an_inconclusive_answered_check_settles_nothing")
+
+
+def test_only_nominated_mail_pays_for_an_exact_check():
+    # The prefilter's whole reason to exist: the exact check is an IMAP
+    # round-trip per message, and the overwhelming majority of an INBOX has
+    # never been replied to. Mail with no matching Sent subject must not
+    # reach it at all.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        calls = _arm_sent(gate, [
+            {"subject": "Re: Budget", "to": "cfo@work.com",
+             "date": "2026-09-17T10:00:00+00:00"},
+        ])
+        inbox = [
+            {"uid": "1", "from": "cfo@work.com", "subject": "Budget",
+             "message_id": "<b@work.com>", "date": "2026-09-16T10:00:00+00:00"},
+            {"uid": "2", "from": "news@list.com", "subject": "Weekly digest",
+             "message_id": "<d@list.com>", "date": "2026-09-16T10:00:00+00:00"},
+        ]
+        left = gate.reconcile_answered(inbox)
+        assert [m["uid"] for m in left] == ["2"]
+        checks = [c for c in calls if c[0] == "answered"]
+        assert len(checks) == 1, f"the unanswered mail paid for a check: {checks}"
+        assert "<b@work.com>" in checks[0]
+    print("PASS test_only_nominated_mail_pays_for_an_exact_check")
+
+
+def test_a_saturated_prefilter_exact_checks_everything():
+    # The listing bound is only an optimisation: once it saturates, older Sent
+    # replies may be out of view, so every INBOX mail must pay for the exact
+    # check rather than living in a permanent false-negative window.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        gate.RECONCILE_SCAN_LIMIT = 2
+        calls = _arm_sent(gate, [
+            {"subject": "Re: Something else", "to": "a@b.com",
+             "date": "2026-09-17T10:00:00+00:00"},
+            {"subject": "Re: Another thread", "to": "c@d.com",
+             "date": "2026-09-17T11:00:00+00:00"},
+        ], answered=3)
+        inbox = [{"uid": "11", "from": "ops@work.com", "subject": "Renewal",
+                  "message_id": "<r2@work.com>",
+                  "date": "2026-09-16T10:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+        checks = [c for c in calls if c[0] == "answered"]
+        assert len(checks) == 1 and "<r2@work.com>" in checks[0], checks
+    print("PASS test_a_saturated_prefilter_exact_checks_everything")
+
+
+def test_a_reply_that_predates_the_mail_does_not_settle_it():
+    # The common real shape: a correspondence where the latest word is theirs.
+    # An older reply of ours in the same thread does not answer a newer mail.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        calls = _arm_sent(gate, [
+            {"subject": "Re: Offer", "to": "sales@vendor.com",
+             "date": "2026-09-10T09:00:00+00:00"},
+        ])
+        inbox = [{"uid": "8", "from": "sales@vendor.com", "subject": "Re: Offer",
+                  "message_id": "<o2@vendor.com>",
+                  "date": "2026-09-15T09:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+        # Not even nominated, so it never reaches the exact check — which on
+        # its own would say "answered", the reply being in the same thread.
+        assert not [c for c in calls if c[0] == "answered"]
+    print("PASS test_a_reply_that_predates_the_mail_does_not_settle_it")
+
+
+def test_a_failed_move_leaves_the_mail_in_the_triage_set():
+    # Bookkeeping must never outrun the mailbox: if the move did not happen,
+    # the mail is still in the INBOX and still has to be proposed.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        _arm_sent(gate, [
+            {"subject": "Re: Thanks", "to": "peer@work.com",
+             "date": "2026-09-17T10:00:00+00:00"},
+        ], moves_ok=False)
+        inbox = [{"uid": "9", "from": "peer@work.com", "subject": "Thanks",
+                  "message_id": "<t@work.com>",
+                  "date": "2026-09-16T10:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+        assert gate._status_path("<t@work.com>").exists() is False
+    print("PASS test_a_failed_move_leaves_the_mail_in_the_triage_set")
+
+
+def test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set():
+    # Exit 0 is not the same claim as "uid 10 is now in Archive". A backend
+    # that answers cheerfully without moving anything would otherwise earn a
+    # `resolved` record for a mail still sitting in the INBOX — invisible to
+    # triage from then on, because the store is what decides handled-state.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        _arm_sent(gate, [
+            {"subject": "Re: Renewal", "to": "ops@work.com",
+             "date": "2026-09-17T10:00:00+00:00"},
+        ], receipt=False)
+        inbox = [{"uid": "10", "from": "ops@work.com", "subject": "Renewal",
+                  "message_id": "<r@work.com>",
+                  "date": "2026-09-16T10:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+        assert gate._status_path("<r@work.com>").exists() is False
+    print("PASS test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set")
+
+
+def test_reconciliation_can_be_switched_off():
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=False)
+        inbox = [{"uid": "1", "from": "a@b.com", "subject": "x",
+                  "message_id": "<x@b.com>", "date": "2026-09-16T10:00:00+00:00"}]
+        # The backend is the raising stub: proof no listing is even fetched.
+        assert gate.reconcile_answered(inbox) == inbox
+    print("PASS test_reconciliation_can_be_switched_off")
+
+
+def test_a_backend_failure_during_reconciliation_settles_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        gate._email_client_rc = lambda *a: (-1, None)  # backend unavailable
+        inbox = [{"uid": "1", "from": "a@b.com", "subject": "x",
+                  "message_id": "<x@b.com>", "date": "2026-09-16T10:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+    print("PASS test_a_backend_failure_during_reconciliation_settles_nothing")
+
+
+def test_reply_prefixes_of_several_locales_pair_with_their_original():
+    for prefix in ("Re:", "AW:", "Fwd:", "WG:", "Antw:", "RE[2]:", "Re: Re:"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = _fresh(tmp, sent_reconcile=True)
+            _arm_sent(gate, [
+                {"subject": f"{prefix} Budget", "to": "cfo@work.com",
+                 "date": "2026-09-17T10:00:00+00:00"},
+            ])
+            left = gate.reconcile_answered([
+                {"uid": "3", "from": "CFO <cfo@work.com>", "subject": "Budget",
+                 "message_id": f"<{prefix}@work.com>",
+                 "date": "2026-09-16T10:00:00+00:00"},
+            ])
+            assert left == [], f"{prefix!r} did not pair with its original"
+    print("PASS test_reply_prefixes_of_several_locales_pair_with_their_original")
+
+
+def test_a_naive_timestamp_is_read_as_utc_rather_than_crashing():
+    # Backends are inconsistent about offsets; a missing one must not throw.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        _arm_sent(gate, [
+            {"subject": "Re: Ping", "to": "p@q.com", "date": "2026-09-17T10:00:00"},
+        ])
+        left = gate.reconcile_answered([
+            {"uid": "4", "from": "p@q.com", "subject": "Ping",
+             "message_id": "<p@q.com>", "date": "2026-09-16T10:00:00"},
+        ])
+        assert left == []
+    print("PASS test_a_naive_timestamp_is_read_as_utc_rather_than_crashing")
+
+
+def test_an_undated_mail_is_never_settled():
+    # No timestamp means the "reply postdates it" test cannot be made; without
+    # it a subject match alone would be enough to archive, which it must not be.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        _arm_sent(gate, [
+            {"subject": "Re: Hi", "to": "z@z.com", "date": "2026-09-17T10:00:00Z"},
+        ])
+        inbox = [{"uid": "5", "from": "z@z.com", "subject": "Hi",
+                  "message_id": "<z@z.com>"}]
+        assert gate.reconcile_answered(inbox) == inbox
+    print("PASS test_an_undated_mail_is_never_settled")
+
+
+def test_both_modes_reconcile_before_they_route():
+    # The wiring, not the function. Everything above calls reconcile_answered()
+    # directly, so a mode that forgot to call it at all would pass every one of
+    # those tests and still re-propose answered mail on every sweep — which is
+    # precisely the complaint this whole mechanism answers.
+    for mode in ("frequent", "daily"):
+        with tempfile.TemporaryDirectory() as tmp:
+            gate = _fresh(tmp, sent_reconcile=True)
+            gate.tp.write_if_changed(
+                gate.tp.render_email_whitelist({"donat@example.org"}, set()),
+                gate.tp.email_whitelist_path(),
+            )
+            # daily refreshes from Sent first; that is not what is under test.
+            gate.refresh_whitelist_from_sent = lambda: 1
+            gate.inbox_messages = lambda: [
+                {"uid": "41", "from": "Donat <donat@example.org>",
+                 "subject": "Meeting Thursday", "message_id": "<m1@example.org>",
+                 "date": "2026-09-16T08:00:00+02:00"},
+            ]
+            calls = _arm_sent(gate, [
+                {"subject": "Re: Meeting Thursday", "to": "donat@example.org",
+                 "date": "2026-09-17T10:12:00+02:00"},
+            ])
+            rec = Recorder()
+            gate.spawn = rec
+            assert getattr(gate, f"run_{mode}")() == 0
+            # A whitelisted sender: without reconciliation this spawns.
+            assert rec.calls == [], f"{mode} spawned over an answered mail"
+            assert [c for c in calls if c[0] == "move"], f"{mode} did not archive it"
+    print("PASS test_both_modes_reconcile_before_they_route")
 
 
 if __name__ == "__main__":
@@ -860,4 +1241,20 @@ if __name__ == "__main__":
     test_an_unsaturated_scan_does_not_pay_for_a_second_listing()
     test_a_failed_widened_rescan_keeps_the_narrow_result()
     test_the_prompt_listing_is_capped_and_says_so()
+    test_the_scan_covers_the_inbox_not_just_the_unread()
+    test_the_old_unread_scope_is_still_reachable_by_env()
+    test_an_answered_mail_is_archived_and_recorded_resolved()
+    test_a_reply_to_someone_else_does_not_settle_the_mail()
+    test_an_inconclusive_answered_check_settles_nothing()
+    test_only_nominated_mail_pays_for_an_exact_check()
+    test_a_saturated_prefilter_exact_checks_everything()
+    test_a_reply_that_predates_the_mail_does_not_settle_it()
+    test_a_failed_move_leaves_the_mail_in_the_triage_set()
+    test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set()
+    test_reconciliation_can_be_switched_off()
+    test_a_backend_failure_during_reconciliation_settles_nothing()
+    test_reply_prefixes_of_several_locales_pair_with_their_original()
+    test_a_naive_timestamp_is_read_as_utc_rather_than_crashing()
+    test_an_undated_mail_is_never_settled()
+    test_both_modes_reconcile_before_they_route()
     print("all triage-gate tests passed")
