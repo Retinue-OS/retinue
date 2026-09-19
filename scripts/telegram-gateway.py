@@ -234,7 +234,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         )
     except Exception as exc:
         print(f"[telegram-gateway] triage policy unreadable ({exc}); forwarding", flush=True)
-        return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
+        # Fails open on both axes. `vip` is what the chat rail reads to decide
+        # a turn, so leaving it out would have an unreadable policy silently
+        # demote everyone to no-turn — the opposite of failing open.
+        return {"forward": True, "vip": True,
+                "delivered_if_held": True, "reason": "policy-error"}
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
@@ -858,7 +862,7 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
     ``sender`` is for people to read — a username where there is one — while
     ``sender_key`` is the poster's id, which is what the policy matches and what
     the ledger records. A username can be changed by the person who holds it;
-    an id cannot, and it is what whitelist entries already carry.
+    an id cannot, and it is what policy entries already carry.
     """
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
     # A message that is only its media — a video, a sticker — is still the
@@ -1401,14 +1405,14 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     # Where the message is (the chat, also the reply address) and who wrote it
     # are two different facts, and the delivery gate reads them on two different
     # axes. Keying both on the chat_id — as this did — collapses them in exactly
-    # the place it matters: **a group is never whitelisted, only a sender is**,
-    # so in a group every message looked like one from an unknown handle whose
-    # id happened to be the room's, and a whitelisted correspondent writing
-    # there was never recognised as one. The group's quieted/ignored flag then
-    # decided a message the sender axis should have won.
+    # the place it matters: **a group is never a person, only a sender is**, so
+    # in a group every message looked like one from a handle whose id happened
+    # to be the room's, and a VIP correspondent writing there was never
+    # recognised as one. The group's quieted/ignored flag then decided a message
+    # the sender axis should have won.
     #
-    # In a 1:1 Telethon reports the same id for both, so whitelist entries
-    # written while this keyed on the chat go on matching unchanged. A broadcast
+    # In a 1:1 Telethon reports the same id for both, so policy entries written
+    # while this keyed on the chat go on matching unchanged. A broadcast
     # channel has no individual sender, and falls back to the channel itself —
     # which is the only identity such a post has.
     chat_key = str(chat_id) if chat_id else "unknown"
@@ -1433,7 +1437,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
                                       attachment_urls=attachment_urls,
                                       chat=chat_key, message_id=message_id)
 
-    # Delivery gate: only whitelisted / unknown senders get a model turn now.
+    # Delivery gate: what the chat rail is told, and whose message earns a turn.
     gate = _inbound_gate_decision(handle, group_id)
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
@@ -1458,17 +1462,69 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
-              "flagged_unknown": bool(gate.get("flagged_unknown")),
+              "vip": bool(gate.get("vip")),
               "reason": str(gate.get("reason") or "")},
     )
-    if not gate["forward"]:
-        # Held classes want the mirror updated and nothing else, so the rail
-        # stays fire-and-forget for them: it must never delay or reorder the
-        # persist → gate → forward path.
-        _chats.notify_chat_event_async(**rail_event)
-        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
-        # the drain must never re-surface. One held merely for a not-yet-
-        # whitelisted sender stays delivered=False for the daily drain.
+
+    # The chat surface is where an inbound message is delivered now — whatever
+    # the gate made of it. The mirror shows it, the user is pushed unless the
+    # gate says to stay quiet, and the record says delivered. So every message
+    # is offered to the rail, not only the ones that used to buy a triage
+    # session: that is what empties the undelivered backlog the daily drain
+    # existed to sweep, because there is no longer anything left un-handled.
+    #
+    # The call is synchronous because its answer decides what happens next, and
+    # this path has always made a synchronous POST here anyway. A job handle
+    # means a VIP's message is being worked in its chat's companion thread; a
+    # plain acceptance means the chat has it and nothing more is owed. Neither
+    # — the rail switched off, unreachable, or an older web-gateway — falls
+    # through to everything this gateway did before the chat surface existed.
+    rail = _chats.notify_chat_event(**rail_event, handover=True,
+                                    files=files if gate.get("vip") else None,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Handling it here as well would be the one outcome worse than
+        # waiting: two turns racing over the same draft, plus the dashboard
+        # conversation this replaced. It stays delivered=False.
+        print(f"[telegram-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered rather than handled twice",
+              flush=True)
+        return
+    # Only an explicit acceptance is a handover — a job handle on its own is
+    # not. A web-gateway built before this contract ignores `handover` and will
+    # hand back a job it started on its own rules, for a non-VIP among others;
+    # treating that as ours would apply the old policy under the new one's name
+    # for as long as the images are out of step.
+    if rail is not None and rail.get("accepted") is True:
+        rail_job = (rail.get("job_url") or "").strip() or None
+        if rail_job:
+            print(f"[telegram-gateway] the chat's companion turn took the message "
+                  f"from {sender_label} (vip)", flush=True)
+            _confirm_delivery(rail_job, store_path, sender_label,
+                              base=_chats.CHATS_INGEST_URL)
+            return
+        # Accepted with no turn: the chat has the message and the user has been
+        # pushed, and that is the delivery. Nothing is owed a model — this
+        # sender is not a VIP — so the record says delivered and nothing ever
+        # re-surfaces it.
+        _mark_delivered(store_path)
+        print(f"[telegram-gateway] the chat took the message from {sender_label} "
+              f"({gate['reason']}); no turn asked for", flush=True)
+        return
+
+    # From here down: the rail declined, so this is the pre-chat-surface path,
+    # unchanged.
+    # A VIP is never held here: the two axes are independent, so `forward` is
+    # about the group's noise and `vip` about the person, and the fallback
+    # reading `forward` alone let the group override the sender the whole
+    # design says it never does — for an `ignored` group, silently, by marking
+    # the message delivered with nothing left to recover it. The rail could not
+    # work this VIP's message, so the pre-chat-surface forward does.
+    if not gate["forward"] and not gate.get("vip"):
+        # Mark delivered only for a fully-accounted class (an ignored group)
+        # the drain must never re-surface. One held from a quieted group stays
+        # delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -1476,35 +1532,6 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
             f"({gate['reason']}); no model turn",
             flush=True,
         )
-        return
-
-    # The forward class is worked in the chat it arrived in. The rail call is
-    # synchronous here because its answer decides what happens next, and the
-    # forward below has always been a synchronous POST on this path anyway. A
-    # job handle means the chat's companion turn has taken the message: it reads
-    # the chat, stages any reply into that chat's shared draft for the user's
-    # send press, and opens a dashboard conversation only for a decision that is
-    # not "send this reply" — so nothing here opens one per message any more. No
-    # handle (the rail switched off, unreachable, or unable to open the
-    # companion thread) falls through to the triage forward below, unchanged.
-    rail = _chats.notify_chat_event(**rail_event, files=files,
-                                    timeout=RETINUE_POST_TIMEOUT)
-    if rail is not None and rail.get("uncertain"):
-        # The rail's answer was lost, so whether the chat took this message is
-        # unknown. Forwarding it here as well would be the one outcome worse
-        # than waiting: two turns racing over the same draft, plus the
-        # dashboard conversation this replaced. It stays delivered=False, which
-        # is exactly what the daily drain reads.
-        print(f"[telegram-gateway] the chats rail did not answer for the message "
-              f"from {sender_label}; left undelivered for the daily drain "
-              f"rather than handled twice", flush=True)
-        return
-    rail_job = ((rail or {}).get("job_url") or "").strip() or None
-    if rail_job:
-        print(f"[telegram-gateway] the chat's companion turn took the message "
-              f"from {sender_label} ({gate['reason']})", flush=True)
-        _confirm_delivery(rail_job, store_path, sender_label,
-                          base=_chats.CHATS_INGEST_URL)
         return
 
     # The Telegram reply address is the chat_id itself, which _resolve_entity
@@ -1532,15 +1559,6 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
          f"thread invisibly to the user and is replayed to every later agent "
          f"session in it.\n")
         if reply_token else ""
-    )
-    unknown_line = (
-        (f"\nThis sender ({handle}) is UNKNOWN — not on the triage whitelist. "
-         f"After triaging, open a dashboard conversation asking whether to "
-         f"whitelist this sender (so future messages trigger a turn on arrival) "
-         f"or blacklist them (so they are never asked about again). Apply the "
-         f"user's answer with: python3 /workspace/scripts/triage_policy.py "
-         f"whitelist-add --channel telegram --handle {handle}  (or blacklist-add).\n")
-        if gate["flagged_unknown"] else ""
     )
     attachment_line = (
         (f"\nThe message includes {len(files)} attachment(s) — a voice note's "
@@ -1583,7 +1601,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"Telegram, sender: {sender_label}). Triage it as the user's incoming "

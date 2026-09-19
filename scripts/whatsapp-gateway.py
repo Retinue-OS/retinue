@@ -253,7 +253,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         )
     except Exception as exc:
         print(f"[whatsapp-gateway] triage policy unreadable ({exc}); forwarding", flush=True)
-        return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
+        # Fails open on both axes. `vip` is what the chat rail reads to decide
+        # a turn, so leaving it out would have an unreadable policy silently
+        # demote everyone to no-turn — the opposite of failing open.
+        return {"forward": True, "vip": True,
+                "delivered_if_held": True, "reason": "policy-error"}
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
@@ -1926,7 +1930,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
                                       attachment_urls=attachment_urls,
                                       chat=origin, message_id=message_id)
 
-    # Delivery gate: only whitelisted / unknown senders get a model turn now.
+    # Delivery gate: what the chat rail is told, and whose message earns a turn.
     gate = _inbound_gate_decision(sender, group_id)
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
@@ -1946,17 +1950,69 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
-              "flagged_unknown": bool(gate.get("flagged_unknown")),
+              "vip": bool(gate.get("vip")),
               "reason": str(gate.get("reason") or "")},
     )
-    if not gate["forward"]:
-        # Held classes want the mirror updated and nothing else, so the rail
-        # stays fire-and-forget for them: it must never delay or reorder the
-        # persist → gate → forward path.
-        _chats.notify_chat_event_async(**rail_event)
-        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
-        # the drain must never re-surface. One held merely for a not-yet-
-        # whitelisted sender stays delivered=False for the daily drain.
+
+    # The chat surface is where an inbound message is delivered now — whatever
+    # the gate made of it. The mirror shows it, the user is pushed unless the
+    # gate says to stay quiet, and the record says delivered. So every message
+    # is offered to the rail, not only the ones that used to buy a triage
+    # session: that is what empties the undelivered backlog the daily drain
+    # existed to sweep, because there is no longer anything left un-handled.
+    #
+    # The call is synchronous because its answer decides what happens next, and
+    # this path has always made a synchronous POST here anyway. A job handle
+    # means a VIP's message is being worked in its chat's companion thread; a
+    # plain acceptance means the chat has it and nothing more is owed. Neither
+    # — the rail switched off, unreachable, or an older web-gateway — falls
+    # through to everything this gateway did before the chat surface existed.
+    rail = _chats.notify_chat_event(**rail_event, handover=True,
+                                    files=files if gate.get("vip") else None,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Handling it here as well would be the one outcome worse than
+        # waiting: two turns racing over the same draft, plus the dashboard
+        # conversation this replaced. It stays delivered=False.
+        print(f"[whatsapp-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered rather than handled twice",
+              flush=True)
+        return
+    # Only an explicit acceptance is a handover — a job handle on its own is
+    # not. A web-gateway built before this contract ignores `handover` and will
+    # hand back a job it started on its own rules, for a non-VIP among others;
+    # treating that as ours would apply the old policy under the new one's name
+    # for as long as the images are out of step.
+    if rail is not None and rail.get("accepted") is True:
+        rail_job = (rail.get("job_url") or "").strip() or None
+        if rail_job:
+            print(f"[whatsapp-gateway] the chat's companion turn took the message "
+                  f"from {sender_label} (vip)", flush=True)
+            _confirm_delivery(rail_job, store_path, sender_label,
+                              base=_chats.CHATS_INGEST_URL)
+            return
+        # Accepted with no turn: the chat has the message and the user has been
+        # pushed, and that is the delivery. Nothing is owed a model — this
+        # sender is not a VIP — so the record says delivered and nothing ever
+        # re-surfaces it.
+        _mark_delivered(store_path)
+        print(f"[whatsapp-gateway] the chat took the message from {sender_label} "
+              f"({gate['reason']}); no turn asked for", flush=True)
+        return
+
+    # From here down: the rail declined, so this is the pre-chat-surface path,
+    # unchanged.
+    # A VIP is never held here: the two axes are independent, so `forward` is
+    # about the group's noise and `vip` about the person, and the fallback
+    # reading `forward` alone let the group override the sender the whole
+    # design says it never does — for an `ignored` group, silently, by marking
+    # the message delivered with nothing left to recover it. The rail could not
+    # work this VIP's message, so the pre-chat-surface forward does.
+    if not gate["forward"] and not gate.get("vip"):
+        # Mark delivered only for a fully-accounted class (an ignored group)
+        # the drain must never re-surface. One held from a quieted group stays
+        # delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -1964,35 +2020,6 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
             f"({gate['reason']}); no model turn",
             flush=True,
         )
-        return
-
-    # The forward class is worked in the chat it arrived in. The rail call is
-    # synchronous here because its answer decides what happens next, and the
-    # forward below has always been a synchronous POST on this path anyway. A
-    # job handle means the chat's companion turn has taken the message: it reads
-    # the chat, stages any reply into that chat's shared draft for the user's
-    # send press, and opens a dashboard conversation only for a decision that is
-    # not "send this reply" — so nothing here opens one per message any more. No
-    # handle (the rail switched off, unreachable, or unable to open the
-    # companion thread) falls through to the triage forward below, unchanged.
-    rail = _chats.notify_chat_event(**rail_event, files=files,
-                                    timeout=RETINUE_POST_TIMEOUT)
-    if rail is not None and rail.get("uncertain"):
-        # The rail's answer was lost, so whether the chat took this message is
-        # unknown. Forwarding it here as well would be the one outcome worse
-        # than waiting: two turns racing over the same draft, plus the
-        # dashboard conversation this replaced. It stays delivered=False, which
-        # is exactly what the daily drain reads.
-        print(f"[whatsapp-gateway] the chats rail did not answer for the message "
-              f"from {sender_label}; left undelivered for the daily drain "
-              f"rather than handled twice", flush=True)
-        return
-    rail_job = ((rail or {}).get("job_url") or "").strip() or None
-    if rail_job:
-        print(f"[whatsapp-gateway] the chat's companion turn took the message "
-              f"from {sender_label} ({gate['reason']})", flush=True)
-        _confirm_delivery(rail_job, store_path, sender_label,
-                          base=_chats.CHATS_INGEST_URL)
         return
 
     reply_token = None
@@ -2015,15 +2042,6 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"thread invisibly to the user and is replayed to every later agent "
          f"session in it.\n")
         if reply_token else ""
-    )
-    unknown_line = (
-        (f"\nThis sender ({sender}) is UNKNOWN — not on the triage whitelist. "
-         f"After triaging, open a dashboard conversation asking whether to "
-         f"whitelist this sender (so future messages trigger a turn on arrival) "
-         f"or blacklist them (so they are never asked about again). Apply the "
-         f"user's answer with: python3 /workspace/scripts/triage_policy.py "
-         f"whitelist-add --channel whatsapp --handle {sender}  (or blacklist-add).\n")
-        if gate["flagged_unknown"] else ""
     )
     attachment_line = (
         (f"\nThe message includes {len(files)} attached file(s) (image(s) and/or "
@@ -2066,7 +2084,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"WhatsApp, sender: {sender_label}). Triage it as the user's incoming "
@@ -2559,55 +2577,6 @@ def _decode_image(image: dict) -> Path:
     return Path(out)
 
 
-def _autowhitelist_recipient(recipient: str) -> None:
-    """After a successful outbound 1:1 send, add the recipient to the inbound
-    whitelist — so a reply from someone the user just messaged is a *known*
-    sender, not an "unknown sender" prompt. The messenger analogue of the
-    e-mail Sent-folder auto-whitelist (see triage_policy.auto_whitelist_on_send).
-
-    Best-effort: it must never break a send, so every failure is swallowed.
-    Group and broadcast recipients are skipped — a group is not a 1:1 handle.
-
-    Identity forms: inbound is gated on the bare user of its sender JID
-    (``_jid_user``), so the handle whitelisted is the recipient *as addressed*
-    — a reply routes back to the inbound's exact origin (LID or PN), which then
-    matches. WhatsApp's LID<->PN split means the two identities differ, so the
-    counterpart is whitelisted too when the bridge's LID store knows it
-    (``_lid_to_pn`` / ``_pn_to_lid``): a later inbound arriving under either
-    identity is then recognised. A true first-contact number the store has no
-    mapping for whitelists only the sent form — the counterpart is learned once
-    that contact's inbound populates the store.
-    """
-    try:
-        r = (recipient or "").strip()
-        if not r:
-            return
-        user, _, server = r.partition("@")
-        user = user.lstrip("+").strip()
-        server = server.split(":", 1)[0]
-        if server.endswith("g.us") or server == WA_BROADCAST_SERVER:
-            return
-        if not user:
-            return
-        handles = {user}
-        # Whitelist the LID<->PN counterpart too, so an inbound under either
-        # identity is recognised. A bare id (no server) is treated as a possible
-        # LID-only contact first (speculative — an ordinary number just misses).
-        if server == WA_LID_SERVER:
-            counterpart = _lid_to_pn(user, speculative=True)
-        elif server == WA_PN_SERVER:
-            counterpart = _pn_to_lid(user)
-        else:
-            counterpart = _lid_to_pn(user, speculative=True) or _pn_to_lid(user)
-        if counterpart:
-            handles.add(counterpart)
-        added = _triage.auto_whitelist_on_send(INBOUND_CHANNEL, handles)
-        if added:
-            print(f"[whatsapp-gateway] auto-whitelisted recipient handle(s): {', '.join(added)}", flush=True)
-    except Exception as exc:  # noqa: BLE001 - auto-whitelist must never break a send
-        print(f"[whatsapp-gateway] auto-whitelist skipped for {recipient!r}: {exc}", flush=True)
-
-
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
           author: str = "agent") -> tuple[str | None, float | None, list[str]]:
@@ -2640,7 +2609,6 @@ def _push(recipient: str, message: str, lang: str | None = None,
                     media_refs.append(ref)
         msg_id, ts = _wa_send(recipient, message or None, media_paths=temp_paths,
                               author=author, attachment_urls=media_refs)
-        _autowhitelist_recipient(recipient)
         return msg_id, ts, media_refs
     finally:
         for path in temp_paths:

@@ -5,8 +5,10 @@ description: >
   the user wants to "triage", "go through the inbox", "clear messages", "was ist
   reingekommen", when the scheduled triage job runs, or when an inbound message
   triggers triage. A credit-free **delivery gate** decides before any model turn
-  whether a message deserves one: whitelisted (and first-time unknown) senders
-  are handled live; everything else waits for the once-a-day catch-all. Triage
+  whether a message deserves one: on e-mail, whitelisted senders are handled
+  live and everything else waits for the once-a-day catch-all; on messenger the
+  chat surface takes every message and only a **VIP sender** buys a turn, so
+  triage sees a messenger message only when that rail could not take it. Triage
   collects the messages in scope, links each to a project, then proposes
   dispositions as dashboard conversations — one thread per reply/action (every
   run), one periodic omnibus for archivals and deletions. Handled-state lives in
@@ -31,15 +33,17 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
 - **Spend model turns only where they earn their keep.** The delivery gate
   (below) classifies every inbound *before* a model session is spawned — a plain
   script for e-mail, the gateway inbound handler for messenger, both credit-free.
-  On frequent runs only whitelisted senders (plus first-time unknowns) cost a
-  turn; everything else waits for the single daily catch-all.
+  On e-mail's frequent runs only whitelisted senders cost a turn and everything
+  else waits for the single daily catch-all. On messenger nothing costs a turn
+  by default at all: the chat surface delivers every message for free, and only
+  a **VIP sender** earns one.
 - **Handled-state lives outside the mailbox.** E-mail: `TRIAGE_STATE_DIR` holds
   **one file per message** — filename = the RFC Message-ID, content = triage
   status plus bookkeeping (disposition, conversation id,
   proposed/omnibus/nudge/resolved timestamps). Messenger: the gateway persists
   **one `kb:InboundMessage` `.nt` per message** on its own volume with a
-  `kb:delivered` flag; "delivered" means *a model turn has already accounted for
-  this message*, and only the gateway's `GET /undelivered` drain flips it.
+  `kb:delivered` flag; since the chat surface, "delivered" means *the user has
+  this message*, and the chats rail's acceptance is what flips it.
   Neither is touched by reading or replying in a client, and the mechanism works
   for **every channel**.
 - **The mailbox / delivery ledger is authoritative for what is present; the store
@@ -75,16 +79,24 @@ runs in two places, one policy but two mechanisms, because e-mail is **pull** an
 messenger is **push**:
 
 - **Messenger (push), since the chat surface.** A message the gate forwards is
-  normally not triaged: the gateway hands it to the web-gateway's chats rail,
-  which runs a turn in that chat's companion thread — it stages any reply into
-  the chat's shared draft for the user's send press, and opens a dashboard
-  conversation only for a decision that is not "send this reply". *Normally*,
-  because the rail can decline — switched off with `CHAT_ARRIVAL_TURNS=0`,
-  unreachable, or unable to open the companion thread — and the gateway then
-  forwards to triage exactly as it always did, so a triage run must still
-  expect messenger messages. Triage also keeps the **daily drain** (everything
-  the gate held back, plus anything whose turn failed) and every channel with
-  no chat surface. See `docs/messenger-chats.md`.
+  normally not triaged at all: the gateway hands it to the web-gateway's chats
+  rail, which accepts it — the user sees it in the chat, pushed, for no model
+  turn — and the gateway marks it delivered. For a sender the user marked a
+  **VIP**, the rail also runs a turn in that chat's companion thread: it files
+  what the message changes (a project, a memory) and stages any reply into the
+  chat's shared draft for the user's send press. The VIP flag follows the
+  person, so it holds in a group exactly as in a 1:1. **No messenger message
+  asks the user to whitelist or blacklist anyone any more**; that ask-flow is
+  gone, along with the messenger whitelist and blacklist themselves — a chat
+  the user wants off their screen is archived or muted in the dashboard, and
+  e-mail keeps its own whitelist. *Normally*, because the
+  rail can decline — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or
+  unable to open the companion thread — and the gateway then forwards to triage
+  exactly as it always did, so a triage run must still expect messenger
+  messages. Triage keeps the e-mail channel, and every channel with no chat
+  surface. There is no standing messenger backlog to sweep any more — every
+  message is delivered by the chat's acceptance — but `GET /undelivered` is
+  still how the exceptions are recovered. See `docs/messenger-chats.md`.
 - **E-mail (pull).** `scripts/triage-gate.py`, a scheduler `command` job.
   **Frequent** tick: list new INBOX mail, keep only whitelisted senders, spawn
   the model *only* if any survive. **Daily** tick: refresh the whitelist from the
@@ -98,27 +110,38 @@ messenger is **push**:
   `triage_policy.gate_decision(channel, sender, group_id)` in its inbound
   handler, reading the per-channel policy `.nt` **raw off its mounted volume**
   (no ~15 s SPARQL reindex lag on the hot path). Every inbound is persisted as
-  one `kb:InboundMessage`; the class decides forward-vs-hold:
+  one `kb:InboundMessage`, and then offered to the chats rail, which **accepts**
+  it: the chat has the message, the user is pushed unless the gate says to stay
+  quiet, and the gateway marks it `delivered`. **That is where a messenger
+  message is handled now, and triage is not in that path at all.**
 
-  | class | forwarded live? | held-flag written | swept by daily drain? |
-  |---|---|---|---|
-  | **whitelisted** | yes (`delivered:true`) | — | — |
-  | **unknown** | yes, flagged "unknown sender" (`delivered:true`) | — | — |
-  | **blacklisted** | no | `delivered:false` | **yes** |
-  | **group-blocked** | no | `delivered:true` | no |
-  | **no-action-class** (status/echo/news/note-to-self) | no | `delivered:true` | no |
+  | class | reaches triage? | what happens instead |
+  |---|---|---|
+  | **VIP sender**, any group | no | a turn in that chat's companion thread files it and stages any reply |
+  | anyone else | no | the chat shows it; the user reads and answers there |
+  | a **non-VIP** in an `ignored` / `quieted` group | no | the chat shows it, silently — no push |
+  | a **non-VIP** in a chat the user **muted** | no | the chat shows it, silently — no push, and it stays archived |
+  | **no-action-class** (status/echo/news/note-to-self) | no | as before: on record, nobody prompted |
 
-  An **unknown** sender's live turn asks the user whether to whitelist: yes →
-  whitelist; no → blacklist (never asked again, held-only from then on). A group
-  can be added to the blocked set so it stops triggering unknown-sender prompts.
-  All three lists are edited by **talking to Ara** — "trust everyone at
-  `*@epfl.ch`" or "block that group" is an instruction Ara carries out via the
+  The group flags and the chat's own mute suppress the **push**, never a VIP's
+  turn: `vip` is sender-only and group-independent, so a VIP writing into a
+  quieted group is still worked — quietly.
+
+  A messenger message reaches **this skill** only when the rail did not take
+  it — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or unable to open
+  a VIP's companion thread — and when a VIP's turn failed. Those stay
+  `delivered=false`, and `GET /undelivered` is how they are recovered. There is
+  no standing backlog to sweep and **no unknown-sender ask-flow**: nothing asks
+  the user to rule on a stranger, because nothing needs the answer.
+
+  The lists are edited by **talking to Ara** — "trust everyone at `*@epfl.ch`",
+  "block that group", "Nina is a VIP" are instructions Ara carries out via the
   `triage_policy.py` CLI and confirms. The raw `.nt` format is only a
   look-under-the-hood fallback.
 
-The gate never changes what triage *does* with a message — only whether the turn
-is spent live or at the daily drain. Cold senders wait at most ~24 h, bounded by
-the daily run.
+The gate never changes what triage *does* with a message it is handed. On
+e-mail it still decides only whether the turn is spent live or at the daily
+drain, so a cold sender waits at most ~24 h.
 
 ---
 
@@ -185,17 +208,22 @@ status. Reconcile in both directions:
    timestamp; one that leaves it untouched re-arms the item on every tick.
 
 **Messaging** — messenger has **no live listing** (Signal/WhatsApp/Telegram are
-push-only). The held backlog lives in each gateway's delivery ledger, so the
-daily catch-all **drains the gateway** instead of listing chats:
+push-only), and since the chat surface there is normally nothing here to
+collect: the chat took every message and the gateway recorded it delivered.
+What is left undelivered is the exceptions — the rail refused, its answer was
+lost in flight, or a VIP's turn failed — and those are drained from the
+gateway's ledger rather than listed:
 
-    # ONLY the daily triage skill calls this — it drains AND marks delivered.
+    # ONLY this skill calls this — it drains AND marks delivered.
     curl -s -H "Authorization: Bearer $INBOUND_GATE_TOKEN" \
       "http://signal-gateway:8090/undelivered?since=<ISO-8601-of-last-drain>"
     # likewise whatsapp-gateway / telegram-gateway for every inbox-mode channel
 
-`GET /undelivered` returns the held messages **and flips each to
-`delivered:true` in the same pass**. It is the only operation that mutates the
-flag, so the drain is idempotent — a re-run returns only what arrived since.
+`GET /undelivered` returns the undelivered messages **and flips each to
+`delivered:true` in the same pass**, so the drain is idempotent — a re-run
+returns only what has arrived since. It is one of two things that set the flag:
+the other, and now the usual one, is the gateway marking a message delivered
+when the chats rail accepts it.
 Process the returned messages through Phases 2–4 exactly like e-mail. Each
 drained message carries a **`thread_key`** as well: pass it as `--key` when you
 open its dashboard conversation, exactly as you would the live prompt's
@@ -213,7 +241,7 @@ token, never by resolving the sender's name.
 **Never call `/undelivered` to browse.** It drains as it reads. Any ad-hoc
 question ("what came in on Signal?", "what did X say last Tuesday?") goes
 through **plain SPARQL** against the life store (`kb:InboundMessage`) — a pure
-read that touches no flag. Only the daily drain may consume the queue.
+read that touches no flag. Only the drain may consume the queue.
 
 When invoked for a single channel or a single message, collect only that.
 
@@ -221,10 +249,12 @@ When invoked for a single channel or a single message, collect only that.
 
 An **inbox-mode** messaging gateway (e.g. `signal-gateway.py` with
 `SIGNAL_GATEWAY_MODE=inbox`) monitors one of the user's own message sources.
-Each inbound first passes the delivery gate: a **whitelisted** or **unknown**
-sender is dispatched straight to Ara via the web-gateway; blacklisted /
-group-blocked / no-action-class messages are persisted `delivered` and never
-pushed.
+Each inbound first passes the delivery gate and is then taken by the chats
+rail, which is where messenger messages are handled now — so **this path is a
+fallback**, reached only when that rail could not take the message. It arrives
+here exactly as it always did. One thing has changed and it is absolute: **do
+not ask the user to whitelist or blacklist a sender.** The prompt may say a
+sender is unknown; that is context, not a question, and the ask-flow is gone.
 The account's **mode** — not the content, not triage — already established that
 this is the user's incoming mail; **triage never has to decide whether a message
 is an instruction or user mail.** The prompt contains the message and sender, so
@@ -236,9 +266,12 @@ So every push-triggered triage message is the user's own inbound mail, processed
 under the owner's session, and **never replied to on the source channel** — Ara
 only proposes via the dashboard.
 
-An **unknown**-sender push is tagged as such: Ara's proposal asks whether to
-whitelist the handle (yes → whitelist, no → blacklist), alongside the normal
-disposition. This is the one path by which a new handle enters the policy.
+An **unknown**-sender push is tagged as such, and that is all it is — a note
+that nobody has said anything about this sender. **Do not propose whitelisting
+or blacklisting them.** Neither list exists on messenger any more: who is worth
+a model turn is the user's VIP list, which they set by telling Ara, and who they
+would rather not hear from is a chat they mute in the dashboard — never a
+question put to them about a stranger who just wrote.
 
 ### Status updates (broadcast posts) — filed silently by default
 
@@ -733,9 +766,12 @@ reply queued at `/sends` is not resolved until it is sent **and** the source
 mail has left the INBOX.
 
 For **messenger** there is no mailbox to empty: a message leaves the backlog
-when the gateway marks it `delivered` (on live forward or daily drain).
-Approval-side execution (sending an approved reply) still runs here; the
-ledger's flag, not an INBOX move, closes the loop.
+when the gateway marks it `delivered`. That is normally the chats rail's
+acceptance, within seconds of arrival and with no model turn — so there is no
+standing backlog; `GET /undelivered` and a confirmed forward are what close the
+loop for the exceptions that reach this skill at all. Approval-side execution
+(sending an approved reply) still runs here; the ledger's flag, not an INBOX
+move, closes the loop.
 
 ---
 
@@ -797,13 +833,16 @@ ledger's flag, not an INBOX move, closes the loop.
   on its own volume (`INBOUND_STORE_DIR`): `kb:channel`, `kb:sender`, `kb:group`,
   the text, a receipt timestamp, and the `kb:delivered` flag. qlever indexes the
   same files, so the whole stream is queryable over SPARQL.
-- **`delivered` is single-writer, owned by the gateway.** Only `GET /undelivered`
-  (drain) flips it, and only the daily triage skill calls that. A SPARQL read
-  never mutates it, so browsing messenger history is always safe.
-- Live-forwarded (whitelisted/unknown) → `delivered:true`; blacklisted →
-  `delivered:false` (awaits the drain); group-blocked and no-action-class →
-  `delivered:true` (complete history, never drained).
-- **Policy** (whitelist/blacklist/group-block) is `.nt` on the same per-gateway
+- **`delivered` is single-writer, owned by the gateway.** It sets the flag when
+  the chats rail accepts a message — the usual path, and what makes "delivered"
+  mean *the user has this* — and `GET /undelivered` flips it for the
+  exceptions, which only this skill drains. A SPARQL read never mutates it, so
+  browsing messenger history is always safe.
+- Accepted by the chat → `delivered:true`, whatever the gate made of it; a
+  VIP's message waits for its turn's job to report done first. Undelivered is
+  the exception set: the rail refused, its answer was lost, or a VIP's turn
+  failed.
+- **Policy** (vip + group flags) is `.nt` on the same per-gateway
   volume, in a `policy/` subdirectory Ara writes and the gateway reads raw. Edit
   it by instructing Ara (the `triage_policy.py` CLI), never by hand-typing
   identifiers.

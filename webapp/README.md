@@ -136,10 +136,13 @@ docstring). Pieces:
 - `components/chats.js` — the Chats card on the dashboard and, with `full`,
   the whole `chats.html` page: avatar, channel mark, last-message preview,
   unread badge, non-archived chats ordered by last activity; the full page
-  adds an Active/Hidden filter like the conversations page, and a **Hide**
-  beside each row (`POST /chats/<id>/flags`) — the dashboard card stays a
-  glance and carries none. Hide sets `archived` *and* `muted`, which is what
-  makes it stick: archived alone is undone by the next message. In the wide
+  adds an Active/Archived filter like the conversations page and, beside each
+  row (`POST /chats/<id>/flags`), the two things one does to a chat that is in
+  the way: **Archive** (out of the list until it speaks again) and **Mute**
+  (out of the list, and the next message does not bring it back). Muting
+  archives — the server's rule — so both land under *Archived*, where
+  **Restore** undoes either. The dashboard card stays a glance and carries
+  none of it. In the wide
   layout the card has its own fixed-height region above the conversations
   (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
   (`data-splitter="chats"`). The card refreshes on an ambient cadence and
@@ -210,27 +213,39 @@ The API, as the components consume it:
 
   `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
-  is the shared draft `{text, author, agent?, ts, version}` or null,
+  is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
-  until one exists), and
+  until one exists).
+
+  Nothing here says whether Ara works a message on arrival: that follows the
+  **sender** (their VIP flag in the triage policy), not the chat, so it holds
+  wherever that person writes. See `docs/triage-delivery-gate.md`.
+
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
   dashboard-conversation semantics verbatim: an archived chat leaves the card
   and the Active list (the full page's Archived filter keeps it reachable),
   and a new inbound message **un-archives** an archived chat unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
-  that chat's Web Push and keeps an archived chat archived. The full page's
-  **Hide** sets both at once through `POST /chats/<id>/flags` (body
-  `{archived?, muted?}`, either or both), which is why the tab that holds
-  them says *Hidden*: the pair is the only way into it from the dashboard, so
-  nothing lands there that a new message would bring back.
+  that chat's Web Push and keeps an archived chat archived; setting it also
+  sets `archived`, so a caller never has to send both. `POST
+  /chats/<id>/flags` (body `{archived?, muted?}`, either or both) is the one
+  way in, and the answer carries the flags as they ended up — a client reads
+  them back rather than assuming what it asked for.
 
-  Hiding is **independent of the triage delivery gate**, on purpose. Whether a
+  These two flags replaced the messenger **sender blacklist**: not wanting to
+  hear from someone is a chat one mutes, in the interface, on the chat one is
+  looking at — not an entry in a policy file only Ara can edit. (E-mail keeps
+  its own whitelist, which decides something else: frequent versus daily
+  triage on a pull channel.) Ara can set either flag too, through the same
+  endpoint, but the user never has to go through her.
+
+  Both are **independent of the triage delivery gate**, on purpose. Whether a
   group's messages are filed to the news feed for the Herald, and whether they
   are worth a model turn, is the policy's business (`scripts/triage_policy.py`
   `news-add` / `ignore-add`, see `docs/triage-delivery-gate.md`); whether the
   user wants the chat in their list is this flag's. A subscribed channel one
-  keeps only for its content is `news` + `ignored` **and** hidden — three
+  keeps only for its content is `news` + `ignored` **and** muted — three
   separate statements, because a list one both reads as news and answers in is
   `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
   be a later `pinned` flag, deliberately deferred. A store outage is answered
