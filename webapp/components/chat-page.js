@@ -935,7 +935,7 @@ class RetinueChatPage extends HTMLElement {
   // among its sources, so a separate camera button buys a shortcut at the price
   // of a whole control's width.
   _clipHtml() {
-    return `<label class="clip" title="Attach images (or paste one into the box)" aria-label="Attach images">` +
+    return `<label class="clip" title="Attach images (or paste one into the box)" aria-label="Attach images (or paste one into the box)">` +
       `<input type="file" hidden multiple accept="image/*" data-attach>` +
       `<span aria-hidden="true">&#128206;</span></label>`;
   }

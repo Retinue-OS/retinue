@@ -1229,7 +1229,7 @@ class RetinueConversation extends HTMLElement {
       `<div class="field">` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" ${disabled}>` +
       `${esc(d.text)}</textarea>` +
-      `<label class="clip" title="Attach a file (or paste one into the box)" aria-label="Attach a file">` +
+      `<label class="clip" title="Attach a file (or paste one into the box)" aria-label="Attach a file (or paste one into the box)">` +
       `<input type="file" multiple hidden data-file ${disabled}>` +
       `<span aria-hidden="true">\u{1F4CE}</span></label>` +
       `</div>` +
