@@ -4,11 +4,11 @@
 // bubbles (Markdown via the shared renderer, blockquote/code copy buttons,
 // click-to-fill chips that land in THIS composer, attachments, the model and
 // cost meta), the pending state while Ara answers, the composer with its
-// text, file attachments and voice dictation, the model picker, and the
-// read-aloud player over Ara's replies. Every surface that shows a
-// conversation embeds this element: the conversations card for an open
-// thread and the new-thread composer, and (next) the chat page's companion
-// pane. What a host adds is only where the element sits and what "back"
+// text, file attachments (picked or pasted) and voice dictation, the model
+// picker, and the read-aloud player over Ara's replies. Every surface that
+// shows a conversation embeds this element: the conversations card for an
+// open thread and the new-thread composer, and (next) the chat page's
+// companion pane. What a host adds is only where the element sits and what "back"
 // means there — so the two surfaces render identically because they are the
 // same code, not because one copies the other.
 //
@@ -80,6 +80,7 @@
 import { esc, fmtAge } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
 
 const LIST_URL = '/conversations';
@@ -1228,7 +1229,7 @@ class RetinueConversation extends HTMLElement {
       `<div class="field">` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" ${disabled}>` +
       `${esc(d.text)}</textarea>` +
-      `<label class="clip" title="Attach a file" aria-label="Attach a file">` +
+      `<label class="clip" title="Attach a file (or paste one into the box)" aria-label="Attach a file (or paste one into the box)">` +
       `<input type="file" multiple hidden data-file ${disabled}>` +
       `<span aria-hidden="true">\u{1F4CE}</span></label>` +
       `</div>` +
@@ -1864,6 +1865,18 @@ class RetinueConversation extends HTMLElement {
           e.preventDefault();
           form.requestSubmit();
         }
+      });
+      // A pasted image (a screenshot, a picture copied off a page) or file is
+      // staged exactly as a picked one. The browser's own paste still runs
+      // when the clipboard also carries words; a bare image is swallowed, or
+      // an empty paste would land in the box. Staging waits a tick so that
+      // text paste — and the input event that copies it into the draft — has
+      // happened before an outcome re-renders the field from the draft.
+      form.addEventListener('paste', (e) => {
+        const files = pastedFiles(e.clipboardData);
+        if (!files.length) return;
+        if (!pastedText(e.clipboardData)) e.preventDefault();
+        setTimeout(() => this._addFiles(files), 0);
       });
       grow();
       form.addEventListener('submit', (e) => {

@@ -30,8 +30,8 @@ dashboard conversations, and that shape fights the medium:
   thread → Ara's model turn executes `signal-push.py --reply-to` → `verify`
   policy queues it at `/sends` → user approves *again* → sent. Two model turns
   and two approvals for a message the user could have typed in five seconds.
-- **Notification costs a model turn.** A whitelisted sender's message spends a
-  full triage session just to tell the user it arrived.
+- **Notification costs a model turn.** A message from a sender on the triage
+  whitelist spends a full triage session just to tell the user it arrived.
 - **The user cannot simply write.** There is no way to compose and send a
   messenger message from the dashboard at all — everything is mediated through
   an agent turn and the send-approval machinery, even when no agent input was
@@ -137,10 +137,13 @@ plumbing. Reactions, once received (#130), decorate the mirrored message they
 target — which answers that epic's open "surfacing shape" question: the chat
 page is where a reaction is seen.
 
-The ledger semantics are untouched: `kb:delivered` remains triage bookkeeping,
-owned by the gateway, flipped only by the drain and the forward-confirmation
-path. The chat view is a **pure read** and never touches the flag — the same
-rule the SPARQL browse path already follows.
+The flag stays the gateway's alone, and the chat view is a **pure read** that
+never touches it — the same rule the SPARQL browse path already follows. What
+*does* flip it changed in phase 4: the usual writer is now the gateway acting
+on the rail's acceptance, within seconds of arrival, and the drain and the
+forward-confirmation path are what remain for the exceptions. `delivered`
+changed meaning with it, from "a model turn accounted for this" to "the user
+has this" — see *Inbound flow* below.
 
 ### Serving — raw files or the triple store?
 
@@ -203,9 +206,12 @@ both.
 There is deliberately **no second read path**. A raw-scan fallback would be a
 second, growing reader of the same records — exactly the duplication choosing
 the store avoids — and it would mask store trouble instead of surfacing it.
-If `qlever-life` is unreachable, the chat API answers with an error, and the
-dashboard components do what they already do offline: show their last cached
-state, which covers a restart or a brief blip with no new code. A store that
+If `qlever-life` cannot answer, the chat list serves its last good skeleton
+for a bounded while (`CHAT_LIST_STALE_SECONDS`, logged each time) and then
+answers with an error — the same last-known-state the dashboard components
+already show offline, held one hop earlier so a blip during a poll does not
+blank the list; no record is ever read another way. That covers a restart or
+a brief blip with no new code. A store that
 turns out to be frequently down or behind is an infrastructure defect to fix
 at the store (it ships a healthcheck and supervision since the #150 bump),
 not something each consumer works around — the same stance the framework
@@ -214,9 +220,10 @@ no ad-hoc per-consumer liveness workarounds.
 
 None of this touches the paths that must stay off SPARQL: the gateways'
 classify hot path keeps reading `policy/` raw off their own volumes, and the
-`delivered` flag is still mutated only through the gateway drain — the
-delivery-gate doc's freshness reasoning was always about those, not about
-serving reads. Folder ownership is likewise preserved: gateways own
+`delivered` flag is still mutated by the gateway alone — on the rail's
+acceptance since phase 4, on a confirmed forward, or through the drain — never
+by a serving read. The delivery-gate doc's freshness reasoning was always about
+those paths, not about serving reads. Folder ownership is likewise preserved: gateways own
 `messages/` (and the new outbound records), retinue owns `policy/` and the
 chat state; the chat API adds no writer to any of it.
 
@@ -347,19 +354,45 @@ and what a model turn is *for*:
    preview, tap-through = the chat — honouring the per-chat `muted` flag
    and the gate class (an `ignored`-group or no-action-class message updates
    the mirror silently). **Notification no longer costs a model turn.**
-4. **Forward — as a companion turn.** Where the gate says `forward`, the same
-   web-gateway call starts a turn in that chat's companion thread instead of a
-   fresh `claude -p` triage session opening a new dashboard conversation. The
-   turn runs warm (per-chat session, summary + tail — the generalization of
-   the `a95b19c` fix from "the thread's own appends" to "the channel
-   itself"). Its job, in order: read the message in context; stage a draft
-   reply *when a reply is plausibly wanted* (a bare "thanks!" stages nothing);
-   link the message to a project if substantive; and only when something
-   needs a decision that is not "send this reply" — the unknown-sender
-   ask-flow, an action item, a scheduling conflict — **fork** it into a
-   normal dashboard conversation. The job-status contract (`202` + `job_url`)
-   is kept so the gateway's `confirm_delivery` / never-drop machinery works
-   unchanged.
+4. **Accepted by the chat — and, where the user asked for it, worked.** The
+   same web-gateway call now *accepts* the message: the chat has it, the user
+   is pushed, and the gateway forwards it nowhere else. That is the delivery,
+   and it costs no model turn at all.
+
+   Whether a **turn** also runs is one question, and the answer is the
+   **sender**: their `vip` flag in the triage policy. Sender-only and
+   group-independent — a VIP writing in a room of forty is still the person the
+   user wanted to hear from, so the same message gets the same handling
+   wherever it arrives. Nothing about a chat grants it.
+
+   This replaced the sender whitelist, and the reason is worth stating plainly:
+   the whitelist decided whose message was worth a session to *notify* about,
+   and notification is free now. What a turn buys is that the message is
+   **dealt with** — and there is no unknown-sender ask-flow any more, because
+   nothing needs the answer.
+
+   The **blacklist** went the same way, for the mirror-image reason: it said
+   "do not bother me about this person", which is muting their chat. That is a
+   button in the dashboard now, on the chat the user is looking at — **Archive**
+   (out of the list until it speaks again) and **Mute** (out of the list, and
+   the next message does not bring it back; muting archives too), exactly as a
+   conversation behaves. Ara can set either on request; the user never has to
+   go through her. A blacklist entry that mattered should be re-stated as a
+   muted chat — the old triples are inert.
+
+   For a VIP the turn starts in that chat's companion thread instead of a fresh
+   `claude -p` triage session, and its job is wider than a draft: read the
+   message in context, **file what it changes** (link and update a project,
+   store a memory where the rest of the system should know what the user was
+   just told), stage a reply when one is wanted, and fork to a dashboard
+   conversation only for a decision that is not "send this reply". Filing is
+   worth doing even when no reply is, and a bare "thanks!" earns no draft: an
+   unwanted one costs the user more than a missing one, since they have to
+   read it to discard it. The turn runs warm (per-chat session, summary +
+   tail — the generalization of the `a95b19c` fix from "the thread's own
+   appends" to "the channel itself"), and the job-status contract (`202` +
+   `job_url`) is kept so the gateway's `confirm_delivery` / never-drop
+   machinery works unchanged.
 
    As built, five things are worth naming:
 
@@ -370,12 +403,15 @@ and what a model turn is *for*:
      that could not be opened — and the gateway forwards to triage exactly as
      it always has. The switch degrades to the old path, never to a message
      nothing looks at, and it is reversible without a revert.
-   - **Every arrival is answered, but not every arrival is a turn.** Messages
-     landing while a chat's turn runs are folded into one follow-up turn: a
-     turn reads the chat as it stands, so a second one would re-read the
-     first's messages and the two would fight over the draft. Each arrival
-     still gets its own job handle and the covering turn resolves all of them,
-     so `delivered` is never set for a message no turn saw.
+   - **Every arrival is accepted; only a VIP's is a turn.** Acceptance is the
+     answer to *do I still have to do something with this?* — no, the chat
+     has it — and it is what the gateway marks delivered on. A job handle
+     comes with it only for a VIP, and only then does the gateway wait for the
+     job. Messages landing while a chat's turn runs are folded into one
+     follow-up turn: a turn reads the chat as it stands, so a second one would
+     re-read the first's messages and the two would fight over the draft. Each
+     of those still gets its own handle and the covering turn resolves all of
+     them, so `delivered` is never set for a VIP's message no turn saw.
    - **What the message carried travels with it.** Attachments ride the rail in
      the `POST /message` shape and are materialized in the retinue container,
      so a turn opens the photo rather than answering one it never saw.
@@ -386,12 +422,16 @@ and what a model turn is *for*:
      wants a chat on their screen; the gate says what a message is worth. The
      two are independent on purpose, and hiding a chat must not quietly stop
      its messages being worked.
-5. **Daily drain** — unchanged, and still triage: `GET /undelivered` hands the
-   held and the failed messages to the triage skill, which proposes in
-   dashboard conversations as it always has. The drained messages are already
-   in their chats' mirrors, so having the drain turn walk the affected
-   companions instead is the obvious next step — but it is **not built**, and
-   nothing in phase 4 changed it.
+5. **The drain is a recovery path, not a daily sweep.** Nothing is left
+   undelivered on the normal path any more: the chat's acceptance is what
+   marks a message delivered, and every message is offered. What still leaves
+   `delivered=false` is the handful of cases where this rail did *not* take
+   the message — a refusal, an answer lost in flight, a VIP's turn that failed
+   — and `GET /undelivered` is how those are re-surfaced, into triage as
+   before. So the endpoint stays and matters; it is simply no longer a daily
+   pass over a backlog that exists by design. Having it walk the affected
+   companions instead of opening dashboard conversations is the obvious next
+   step, and is **not built**.
 
 The simple case end-to-end: message arrives → push notification → open the
 chat → read it *in the conversation it belongs to* → type (or touch up the
@@ -514,15 +554,16 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
 
 ## Open questions
 
-1. ~~**Companion turns for groups.**~~ **Settled: gate parity, groups
-   included.** Everything the gate forwards gets a companion turn, 1:1 and
-   group alike — the same messages that used to buy a triage session, so the
-   switch costs no more turns than it replaced. What quiets a busy group is
-   what always did: the group's own `quieted` / `ignored` flags, which hold its
-   unknown senders back from a turn entirely. Worth remembering while reading
-   the gate's table — **a group is never whitelisted; only a sender is.** A
-   per-chat `assist` setting (phase 6) can still turn an individual chat down
-   later.
+1. ~~**Companion turns for groups.**~~ **Moot: it follows the sender.**
+   The question assumed turns happen by default and asked which chats to spare.
+   They do not: a turn runs for a **VIP sender** and nobody else, so a busy
+   group costs exactly as many turns as it has VIPs writing in it — usually
+   none. And a VIP is worked in a group precisely as in a 1:1, which is the
+   point: the user's interest is in a person, and a chat is only a place. That
+   retires the messenger sender whitelist and blacklist — see *Inbound flow*,
+   step 4 — and with them the unknown-sender ask-flow. The group flags stay:
+   the news rail reads them, and `quieted` / `ignored` still keep a group's
+   arrivals quiet.
 2. **Draft staging threshold.** "Stage a draft when a reply is plausibly
    wanted" is the companion's judgement; if it over-stages, a per-chat or
    per-sender preference belongs in the summary/style memory, not in code.

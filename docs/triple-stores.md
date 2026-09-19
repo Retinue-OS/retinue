@@ -446,6 +446,18 @@ the chat media references (`kb:attachment`) were invisible for weeks this way.
 Relatedly, `BIND` on a variable already in scope is an error: `FILTER` on it,
 or `BIND` inside a subquery where nothing binds it yet.
 
+**Planning cost** — QLever plans a query before running it, and the planning
+time grows steeply with the number of triple patterns joined in one group; a
+subquery joined to a chain of `OPTIONAL`s is the worst shape. The dashboard's
+chat list once ran one such query: it *executed* in about a millisecond and
+took 6–9 s to *plan* on a loaded host — past the gateway's timeout, shown on
+the phone as "message store unreachable". The `time_query_planning` field of
+the runtime information (`Accept: application/qlever-results+json`) tells the
+two apart. The remedy is shape, not data volume: fetch the identifiers with a
+lean query, then everything about them with one VALUES-bounded pattern —
+`VALUES ?m { … } ?m ?p ?o` — and fold the rows in code (the chat list in
+`scripts/web-gateway.py` does exactly this).
+
 **Troubleshooting** — if a file's triples are missing, look for the diagnostic
 quad the build emits instead of failing:
 
