@@ -116,6 +116,44 @@ def test_an_unreadable_head_leaves_the_build_unstamped_and_still_runs():
     print("PASS test_an_unreadable_head_leaves_the_build_unstamped_and_still_runs")
 
 
+def test_an_inherited_stale_sha_is_cleared_not_kept():
+    """The updater loads `.env`; a sha sitting there must not survive a failure.
+
+    `_step_env()` copies the process environment, and the updater service takes
+    `env_file: .env` — so a `RETINUE_BUILD_SHA` an operator once put there is
+    already in the environment of every step. Leaving it when HEAD cannot be
+    read stamps the image with an unrelated commit, which is the one outcome
+    worse than no stamp: the label then actively lies about what the image
+    contains. The built-in recipe therefore *owns* the variable — set from the
+    freshly read HEAD, or removed.
+    """
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        mod = _load(tmp, None)
+        os.environ["RETINUE_BUILD_SHA"] = PREVIOUS   # as if inherited from .env
+        try:
+            steps = _record(mod, None)               # `git rev-parse` fails
+            mod._run_update(run_id=1)
+        finally:
+            os.environ.pop("RETINUE_BUILD_SHA", None)
+        assert all(sha is None for _, sha in steps), \
+            f"a stale inherited sha reached the build: {steps}"
+
+    # And when HEAD *can* be read, the fresh value wins over the inherited one.
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        mod = _load(tmp, None)
+        os.environ["RETINUE_BUILD_SHA"] = PREVIOUS
+        try:
+            steps = _record(mod, SHA)
+            mod._run_update(run_id=1)
+        finally:
+            os.environ.pop("RETINUE_BUILD_SHA", None)
+        build = next(sha for shown, sha in steps if "build" in shown)
+        assert build == SHA, f"the freshly read HEAD must win: {steps}"
+    print("PASS test_an_inherited_stale_sha_is_cleared_not_kept")
+
+
 def test_an_operator_recipe_is_left_alone():
     """Only the recipe knows where its pull ends, so the updater does not guess.
 
@@ -136,6 +174,7 @@ def test_an_operator_recipe_is_left_alone():
 def main():
     test_the_build_step_is_stamped_and_the_pull_is_not()
     test_an_unreadable_head_leaves_the_build_unstamped_and_still_runs()
+    test_an_inherited_stale_sha_is_cleared_not_kept()
     test_an_operator_recipe_is_left_alone()
     print("all updater build-sha tests passed")
 

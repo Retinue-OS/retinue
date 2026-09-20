@@ -3735,9 +3735,10 @@ def _stale_build_note(health: dict) -> str | None:
     the same shared modules (scripts/build_stamp.py).
 
     Only an *actual disagreement* is reported. Either side missing a digest
-    means "cannot say" — an older gateway that predates this field, or the
-    CalDAV gateway, which copies none of those modules — and a silent card is
-    the right answer there rather than a warning nobody can act on.
+    means "cannot say" — a gateway built before this field existed, or an
+    extra gateway a deployment registered that bakes none of these modules —
+    and a silent card is the right answer there rather than a warning nobody
+    can act on.
     """
     mine = build_stamp.framework_stamp()
     theirs = (health.get("build") or {}).get("framework")

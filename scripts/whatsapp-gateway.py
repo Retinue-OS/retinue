@@ -644,7 +644,7 @@ def _health_snapshot() -> dict:
         "recipient_lookup_error": rl_error if rl_ok is False else None,
         "error": None if connected else error,
         # Which build this is. `framework` is a digest of the shared modules
-        # baked into this image; the retinue container carries the same seven,
+        # baked into this image; the retinue container carries the same set,
         # so the /gateways page can tell a stale gateway from a current one
         # without anyone shelling in. `sha` is the commit, when the build
         # passed one. See scripts/build_stamp.py.

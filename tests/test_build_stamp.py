@@ -28,6 +28,7 @@ What these pin down:
     python3 tests/test_build_stamp.py
 """
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -230,6 +231,63 @@ def test_the_repo_itself_stamps():
     print("PASS test_the_repo_itself_stamps")
 
 
+def _load_gateway(name: str, tmp: Path):
+    """Load one messenger gateway module, with just enough stubbed to import.
+
+    langdetect is a real dependency of the Signal gateway and is not installed
+    everywhere this suite runs; the health snapshot does not use it.
+    """
+    if "langdetect" not in sys.modules:
+        try:
+            import langdetect  # noqa: F401,PLC0415
+        except ImportError:
+            stub = types.ModuleType("langdetect")
+            stub.detect = lambda text: "en"
+            stub.detect_langs = lambda text: []
+            stub.LangDetectException = type("LangDetectException", (Exception,), {})
+            sys.modules["langdetect"] = stub
+    upper = name.upper()
+    os.environ[f"{upper}_SEND_POLICY"] = "[]"
+    os.environ[f"{upper}_ACCOUNT"] = "+15551234567"
+    os.environ[f"{upper}_PENDING_SENDS_DIR"] = str(tmp / "pending")
+    os.environ[f"{upper}_DATA_DIR"] = str(tmp / "data")
+    os.environ[f"{upper}_TMP_DIR"] = str(tmp / "tmp")
+    if str(SCRIPTS_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS_DIR))
+    spec = importlib.util.spec_from_file_location(
+        f"{name}_gateway_build_stamp_under_test", SCRIPTS_DIR / f"{name}-gateway.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_every_messenger_gateway_publishes_its_build_on_health():
+    """The wiring, not just the helper.
+
+    `build_stamp` can be perfect and the mechanism still dead: all it takes is
+    one gateway whose `_health_snapshot()` does not carry the block. Nothing
+    else would fail — the digest would simply never be reported, which is the
+    silence this whole change exists to end. So load each gateway for real and
+    read what it would actually serve.
+    """
+    stamps = {}
+    for name in ("signal", "telegram", "whatsapp"):
+        with tempfile.TemporaryDirectory() as raw:
+            gw = _load_gateway(name, Path(raw))
+            snapshot = gw._health_snapshot()
+            assert "build" in snapshot, \
+                f"{name}-gateway's /health carries no build block"
+            build = snapshot["build"]
+            assert set(build) == {"sha", "framework"}, (name, build)
+            assert build["framework"], \
+                f"{name}-gateway reports no framework digest from a full checkout"
+            json.dumps(snapshot)  # it has to survive being a JSON body
+            stamps[name] = build["framework"]
+    assert len(set(stamps.values())) == 1, \
+        f"the gateways bake the same modules and must agree: {stamps}"
+    print("PASS test_every_messenger_gateway_publishes_its_build_on_health")
+
+
 def test_the_gateways_page_names_a_stale_gateway():
     """The five-second check: a connected gateway on older code says so.
 
@@ -290,6 +348,7 @@ def main():
     test_every_image_turns_the_build_arg_into_an_environment_variable()
     test_compose_forwards_the_sha_to_every_stamped_image()
     test_the_repo_itself_stamps()
+    test_every_messenger_gateway_publishes_its_build_on_health()
     test_the_gateways_page_names_a_stale_gateway()
     test_the_dashboard_publishes_its_own_build()
     print("all build-stamp tests passed")

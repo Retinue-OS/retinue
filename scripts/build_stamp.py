@@ -20,7 +20,7 @@ Two identifiers, and they answer different questions:
   actually baked in*, computed at runtime from the files on disk. It needs no
   cooperation from the build pipeline at all, so it is always there, and it is
   the one that catches the failure above: the retinue container and the three
-  messenger gateways copy the **same** seven modules, so if their digests
+  messenger gateways copy the **same** modules, so if their digests
   differ, one of those images is older than the other. The web-gateway compares
   them on the ``/gateways`` page.
 
@@ -32,8 +32,11 @@ same file either way.
 A missing or unreadable module makes the digest ``None`` rather than a hash of
 whatever was found. A partial set would hash to *something*, and that something
 would read as "different code" — a false alarm every time a container legitimately
-carries a subset. ``None`` means "cannot say", which is what it is: the CalDAV
-gateway copies none of these modules and simply has no framework digest.
+carries a subset. ``None`` means "cannot say", which is what it is: a container that
+carries none of these modules — the CalDAV gateway, say — simply has no
+framework digest. (That one never reaches the ``/gateways`` page, which lists
+the messenger channels; the page's own "cannot say" case is a gateway built
+before this field existed.)
 """
 from __future__ import annotations
 
@@ -47,6 +50,10 @@ from pathlib import Path
 # None — tests/test_build_stamp.py fails the build for exactly that, so the
 # list and the COPY lines cannot drift apart silently.
 FRAMEWORK_MODULES: tuple[str, ...] = (
+    # This module is one of them: it is copied into every gateway like the
+    # rest, so a build in which *it* changed is a different build, and a digest
+    # that left itself out would call those two images identical.
+    "build_stamp.py",
     "chat_ingest.py",
     "inbound_store.py",
     "job_delivery.py",

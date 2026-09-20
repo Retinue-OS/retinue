@@ -208,6 +208,16 @@ def _run_update(run_id: int):
                           "against a private remote\n")
             log.flush()
             step_env = _step_env()
+            if stamp_after_pull:
+                # Own the variable outright rather than only adding to it. This
+                # process inherits the environment, and the updater service
+                # takes `env_file: .env` — so a RETINUE_BUILD_SHA an operator
+                # once put there is already set, and leaving it when HEAD
+                # cannot be read would stamp the image with an unrelated
+                # commit. A label that lies about what an image contains is
+                # worse than no label: the whole point is to be able to trust
+                # it. Removed here, and set below only from a HEAD just read.
+                step_env.pop("RETINUE_BUILD_SHA", None)
             for index, (cmd, shell, shown) in enumerate(steps):
                 if stamp_after_pull and index == 1:
                     sha = _head_sha()
