@@ -82,6 +82,16 @@ COPY docs/           /workspace/docs/
 COPY webapp/         /workspace/webapp/
 RUN chmod +x /workspace/scripts/*.sh && mkdir -p /workspace/chambers
 
+# The commit this image was built from, when the build passes one (compose
+# forwards $RETINUE_BUILD_SHA; the updater's default recipe sets it after the
+# pull). Unset is fine and honest — /health then reports sha: null, and the
+# framework digest identifies the build either way. See scripts/build_stamp.py.
+#
+# Last, deliberately: the sha changes on every commit, so an earlier ENV would
+# invalidate the COPY layers above for a change that touches none of them.
+ARG RETINUE_BUILD_SHA=""
+ENV RETINUE_BUILD_SHA=${RETINUE_BUILD_SHA}
+
 # ── Entrypoint ──────────────────────────────────────────────────────
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

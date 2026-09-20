@@ -191,6 +191,13 @@ seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
 intentional, not broken.
 
+**A channel that answers but behaves like an older build** is the other thing
+to look for there, and it is not an outage: each `/health` carries a `build`
+block, and `/gateways` flags any gateway whose shared-module digest differs
+from the dashboard's — that one was not rebuilt, and the remedy is
+`scripts/self-update.py`, not a QR scan. See *Which build is actually running*
+in `docs/contributing.md`.
+
 **A deployment that doesn't use a given channel at all** — never runs its
 container, not even unpaired — must say so explicitly, or the monitor has no
 way to tell that apart from a real outage. The base `docker-compose.yml`

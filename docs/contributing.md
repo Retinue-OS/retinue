@@ -116,6 +116,45 @@ updates via its own `start.sh update`) injects its recipe by setting
 `UPDATE_COMMAND` in its override/`.env`; config flows deployment → framework.
 The HTTP caller can never supply the command — only the operator's environment.
 
+### Which build is actually running
+
+A merge is not a deployment. Until `self-update.py` runs, every container keeps
+serving whatever was built last time — and that reads as a logic bug, because
+behaviour the code no longer contains goes on happening. It has cost a
+debugging session twice.
+
+So every image says what it is, on its `/health`:
+
+```json
+"build": {"sha": "b5ff537…", "framework": "1dc85ea6d5e5"}
+```
+
+- **`sha`** — the commit the image was built from, when the build passed one.
+  The built-in recipe reads `HEAD` after the pull and hands it to
+  `docker compose build` as `RETINUE_BUILD_SHA`; compose forwards it to each
+  image's `ARG`. `null` means nobody stamped this build, which is reported
+  rather than guessed at.
+- **`framework`** — a digest of the shared modules *as baked in*, computed at
+  runtime by `scripts/build_stamp.py`. It needs nothing from the build
+  pipeline, so it is always there. The retinue container and all three
+  messenger gateways copy the same seven modules, so **a gateway whose digest
+  differs from the dashboard's was not rebuilt** — which the `/gateways` page
+  says on the card, in as many words, even while the gateway is connected and
+  otherwise looks well.
+
+To check a deployment: open `/gateways`, or compare by hand —
+
+```bash
+python3 scripts/build_stamp.py              # what this checkout bakes
+curl -s "$GATEWAY/health" | jq .build       # what is running
+```
+
+**A deployment with its own `UPDATE_COMMAND` stamps its own builds**, because
+only that recipe knows where its pull ends: put `RETINUE_BUILD_SHA=$(git
+rev-parse HEAD)` in front of the build command. Skipping it costs only the
+`sha` — the framework digest, and with it the stale-gateway check, keeps
+working regardless.
+
 ### Upgrading the Claude Code CLI
 
 A deployment may disable Claude Code's in-container auto-updater
