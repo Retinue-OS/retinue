@@ -51,6 +51,12 @@ STAMPED_DOCKERFILES = dict(GATEWAY_DOCKERFILES, retinue=REPO_ROOT / "Dockerfile"
 # still report sha: null — silently, and exactly when someone went to the
 # trouble of stamping it.
 ENV_FROM_ARG = "ENV RETINUE_BUILD_SHA=${RETINUE_BUILD_SHA}"
+# Absolute paths the gateways create at *import* time unless redirected. A test
+# that forgets one writes outside its temp dir: on a CI runner that fails
+# outright (`/models` is not creatable there), while as root it silently
+# succeeds — so the suite goes green locally and red in CI, which is how this
+# got pushed once already.
+IMPORT_TIME_DEFAULT_DIRS = (Path("/models"), Path("/tmp/signal-attachments"))
 
 
 def _load_web_gateway(tmp: Path):
@@ -252,6 +258,14 @@ def _load_gateway(name: str, tmp: Path):
     os.environ[f"{upper}_PENDING_SENDS_DIR"] = str(tmp / "pending")
     os.environ[f"{upper}_DATA_DIR"] = str(tmp / "data")
     os.environ[f"{upper}_TMP_DIR"] = str(tmp / "tmp")
+    # These two default to absolute paths (`/models`, `/tmp/signal-attachments`)
+    # and are created at *import* time, so they must be redirected before the
+    # module is loaded or the import writes outside the temp dir — which fails
+    # outright on a CI runner that may not create `/models`, and silently
+    # succeeds as root, hiding the problem locally. They do not follow the
+    # `{CHANNEL}_` naming the loop above covers, so they are set by name.
+    os.environ["PIPER_DATA_DIR"] = str(tmp / "models")
+    os.environ["SIGNAL_ATTACHMENTS_DIR"] = str(tmp / "attachments")
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
     spec = importlib.util.spec_from_file_location(
@@ -270,6 +284,7 @@ def test_every_messenger_gateway_publishes_its_build_on_health():
     silence this whole change exists to end. So load each gateway for real and
     read what it would actually serve.
     """
+    escaped_before = {d for d in IMPORT_TIME_DEFAULT_DIRS if d.exists()}
     stamps = {}
     for name in ("signal", "telegram", "whatsapp"):
         with tempfile.TemporaryDirectory() as raw:
@@ -285,6 +300,11 @@ def test_every_messenger_gateway_publishes_its_build_on_health():
             stamps[name] = build["framework"]
     assert len(set(stamps.values())) == 1, \
         f"the gateways bake the same modules and must agree: {stamps}"
+    escaped = {d for d in IMPORT_TIME_DEFAULT_DIRS if d.exists()} - escaped_before
+    assert not escaped, (
+        f"loading a gateway created {sorted(map(str, escaped))} outside the temp "
+        f"dir — redirect it in _load_gateway. Running as root this only leaves a "
+        f"stray directory; on a CI runner it is a PermissionError and a red suite")
     print("PASS test_every_messenger_gateway_publishes_its_build_on_health")
 
 
