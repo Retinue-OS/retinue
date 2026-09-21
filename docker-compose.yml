@@ -29,7 +29,13 @@ name: retinue
 
 services:
   retinue:
-    build: .
+    build:
+      context: .
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       qlever-life:
         condition: service_started
@@ -550,6 +556,11 @@ services:
       # line: without it the service builds the main image and boots into
       # remote-control, never opening :8090. (This regressed once before — do not "simplify" it away.)
       dockerfile: signal-gateway/Dockerfile
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       - retinue
       - stt
@@ -645,6 +656,11 @@ services:
     build:
       context: .
       dockerfile: whatsapp-gateway/Dockerfile
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       - retinue
       - stt
@@ -737,6 +753,11 @@ services:
     build:
       context: .
       dockerfile: telegram-gateway/Dockerfile
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       - retinue
       - stt

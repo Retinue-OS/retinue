@@ -61,6 +61,7 @@ import triage_policy as _triage
 import news_ingest as _news
 import chat_ingest as _chats
 import job_delivery as _jobs
+import build_stamp as _build
 
 # What this messaging account is for. Fixed by configuration — never inferred
 # from message content. Mirrors SIGNAL_GATEWAY_MODE / WHATSAPP_GATEWAY_MODE.
@@ -516,6 +517,12 @@ def _health_snapshot() -> dict:
         # heals by reconnecting, so the /gateways page shows the error, not a QR.
         "needs_repair": configured and not state["authorized"],
         "error": None if connected else error,
+        # Which build this is. `framework` is a digest of the shared modules
+        # baked into this image; the retinue container carries the same set,
+        # so the /gateways page can tell a stale gateway from a current one
+        # without anyone shelling in. `sha` is the commit, when the build
+        # passed one. See scripts/build_stamp.py.
+        "build": _build.build_info(),
     }
 
 

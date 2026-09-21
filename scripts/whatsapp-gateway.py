@@ -57,6 +57,7 @@ import triage_policy as _triage
 import news_ingest as _news
 import chat_ingest as _chats
 import job_delivery as _jobs
+import build_stamp as _build
 from requester_identity import normalize_requester_identity
 
 # What this messaging account is for. Fixed by configuration — never inferred
@@ -642,6 +643,12 @@ def _health_snapshot() -> dict:
         "recipient_lookup_ok": rl_ok,
         "recipient_lookup_error": rl_error if rl_ok is False else None,
         "error": None if connected else error,
+        # Which build this is. `framework` is a digest of the shared modules
+        # baked into this image; the retinue container carries the same set,
+        # so the /gateways page can tell a stale gateway from a current one
+        # without anyone shelling in. `sha` is the commit, when the build
+        # passed one. See scripts/build_stamp.py.
+        "build": _build.build_info(),
     }
 
 WHITELIST_BLOCK_MESSAGE = (

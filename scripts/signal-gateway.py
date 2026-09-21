@@ -30,6 +30,7 @@ import triage_policy as _triage
 import news_ingest as _news
 import chat_ingest as _chats
 import job_delivery as _jobs
+import build_stamp as _build
 
 SIGNAL_ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "").strip()
 
@@ -580,6 +581,12 @@ def _health_snapshot() -> dict:
         # account from a transient receive failure, so any sustained down state
         # offers the QR — scanning is a deliberate user action either way.
         "needs_repair": bool(SIGNAL_ACCOUNT) and not connected,
+        # Which build this is. `framework` is a digest of the shared modules
+        # baked into this image; the retinue container carries the same set,
+        # so the /gateways page can tell a stale gateway from a current one
+        # without anyone shelling in. `sha` is the commit, when the build
+        # passed one. See scripts/build_stamp.py.
+        "build": _build.build_info(),
     }
     if not SIGNAL_ACCOUNT:
         body["error"] = "SIGNAL_ACCOUNT is not set"

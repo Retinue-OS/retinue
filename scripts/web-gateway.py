@@ -207,6 +207,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from markdown_it import MarkdownIt
 from requester_identity import normalize_requester_identity
+import build_stamp
 import claude_auth
 import chat_state as chat_state_mod
 import email_client as ec
@@ -3723,6 +3724,31 @@ def _fetch_gateway_health(gw: dict) -> dict:
         return {"connected": False, "reachable": False, "error": f"gateway unreachable: {exc}"}
 
 
+def _stale_build_note(health: dict) -> str | None:
+    """Say that a gateway is running older code than the dashboard — or None.
+
+    A merge is not a deployment: `self-update.py` rebuilds all the images, and
+    until it runs a gateway keeps serving whatever was built last time. That
+    reads as a logic bug, because the behaviour the code no longer contains
+    goes on happening; it has cost a debugging session twice. The digests make
+    it visible, since the retinue container and every messenger gateway bake
+    the same shared modules (scripts/build_stamp.py).
+
+    Only an *actual disagreement* is reported. Either side missing a digest
+    means "cannot say" — a gateway built before this field existed, or an
+    extra gateway a deployment registered that bakes none of these modules —
+    and a silent card is the right answer there rather than a warning nobody
+    can act on.
+    """
+    mine = build_stamp.framework_stamp()
+    theirs = (health.get("build") or {}).get("framework")
+    if not mine or not theirs or mine == theirs:
+        return None
+    return (f"⚠ This gateway is running a different build of the shared framework "
+            f"modules than the dashboard ({theirs} vs {mine}). One of the images "
+            f"was not rebuilt — run scripts/self-update.py.")
+
+
 def _pairing_hint(slug: str) -> str:
     for family, hint in _PAIRING_HINTS.items():
         if slug == family or slug.startswith(family + "-"):
@@ -3747,6 +3773,12 @@ def _render_gateways_html(statuses: list[dict]) -> str:
         else:
             badge = '<span class="gw-badge gw-down">disconnected</span>'
         rows = [f"<h2>{label_e} {badge}</h2>"]
+        # Before the link state: a stale image is worth seeing on a gateway
+        # that is connected and looks perfectly well, which is exactly the
+        # case that misleads.
+        stale = _stale_build_note(h)
+        if stale:
+            rows.append(f'<p class="meta gw-stale">{html.escape(stale)}</p>')
         error = h.get("error")
         if error and configured and not connected:
             rows.append(f'<p class="meta">{html.escape(str(error))}</p>')
@@ -3817,12 +3849,15 @@ def _render_gateways_html(statuses: list[dict]) -> str:
           "  .gw-card h2{font-size:1.05rem;margin:.1rem 0 .4rem}\n"
           "  .qr-wrap{margin-top:.6rem}\n"
           "  .qr-wrap img.qr{max-width:min(320px,100%);border-radius:8px;background:#fff;display:block}\n"
+          "  .gw-stale{color:var(--high)}\n"
         "</style>\n"
         + "<body>\n"
         + "<h1>Messenger gateways</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/claude-auth">Claude sign-in</a></nav>\n'
         + '<p class="meta">Connection state of each messaging channel. A disconnected gateway shows '
-          "its pairing QR code here — scan it from the phone to re-link.</p>\n"
+          "its pairing QR code here — scan it from the phone to re-link. A gateway still running "
+          "an older build than the dashboard says so too: that one is fixed by rebuilding, not "
+          "by scanning.</p>\n"
         + "\n".join(cards) + "\n"
         + refresh_js
         + "</body>\n</html>\n"
@@ -8030,6 +8065,11 @@ class Handler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "max_concurrency": MAX_CONCURRENCY,
                 "sessions": sessions,
+                # This container's build, in the same shape the gateways
+                # report. `framework` is the digest the gateways are compared
+                # against on /gateways; publishing it here lets anything
+                # outside make the same comparison (build_stamp.py).
+                "build": build_stamp.build_info(),
             })
             return
         job_match = _JOB_RE.match(self.path)
