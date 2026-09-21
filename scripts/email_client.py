@@ -608,7 +608,12 @@ def _search_by_message_id(M, message_id):
     return data[0].split() if typ == "OK" else []
 
 
-_RE_PREFIX = re.compile(r"^\s*(re|aw|fwd?|wg)\s*(\[\d+\])?\s*:\s*", re.I)
+# Reply/forward prefixes across the locales this mailbox sees. The triage
+# gate's nomination (scripts/triage-gate.py, _SUBJECT_PREFIX) strips the same
+# set: a prefix that nominates a mail there but does not strip here would
+# make the exact check reject every reply written in that locale.
+_RE_PREFIX = re.compile(
+    r"^\s*(re|aw|fwd?|wg|tr|antw|sv|vs)\s*(\[\d+\])?\s*:\s*", re.I)
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
@@ -633,14 +638,18 @@ def _imap_date(iso):
 
 
 def _search_sent_to(M, address, since_iso):
-    """UIDs of messages sent TO *address* on or after *since_iso*.
+    """UIDs of messages sent to *address* (To, Cc or Bcc) on or after *since_iso*.
 
     The second dedup signal, and the one that actually matters: Ari's runaway
     replies to Mara carried no In-Reply-To at all, so a header-only test
     declares her message unanswered and would answer it an 82nd time. A reply
-    that does not thread is still a reply.
+    that does not thread is still a reply. All three recipient headers, since
+    a reply-all that reaches the sender via Cc is no less an answer -- and
+    `_reply_matches_anchor` checks the address exactly afterwards, so the
+    wider search only ever adds candidates for it to judge.
     """
-    criteria = ["TO", '"%s"' % address.replace('"', "")]
+    addr = '"%s"' % address.replace('"', "")
+    criteria = ["OR", "TO", addr, "OR", "CC", addr, "BCC", addr]
     day = _imap_date(since_iso) if since_iso else None
     if day:
         criteria += ["SINCE", day]

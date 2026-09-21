@@ -319,8 +319,8 @@ def _confirm_answered(msg: dict) -> bool:
     than anything this script can do over a listing: it runs *server-side IMAP
     SEARCH* over the Sent folder for messages citing this Message-ID in
     In-Reply-To/References, plus — for replies that do not thread at all — an
-    exact `TO` search for the sender since the message's own date, under the
-    same base subject. Three things follow, each of which the listing-based
+    exact To/Cc/Bcc search for the sender since the message's own date, under
+    the same base subject. Three things follow, each of which the listing-based
     matching this replaced got wrong:
 
       * **Address comparison is exact.** A Python `sender in recipients`
@@ -328,9 +328,9 @@ def _confirm_answered(msg: dict) -> bool:
         reply to `joann@example.com`.
       * **No window.** A server-side SEARCH sees the whole Sent folder, so a
         reply older than any listing limit still counts.
-      * **Cc/Bcc are moot.** A listing summary carries `To` only, so a reply-all
+      * **Cc/Bcc count.** A listing summary carries `To` only, so a reply-all
         that reaches the sender via Cc is invisible to it; the header search
-        does not care which field carried the address.
+        covers all three recipient fields.
 
     Exit 0 means answered, 3 means genuinely unanswered, anything else means the
     state is unknown — and unknown must read as *not* answered, so an IMAP

@@ -140,11 +140,45 @@ def test_without_the_anchor_mail_the_answer_is_conservatively_unanswered(ec):
     print("PASS missing anchor yields a conservative unanswered result")
 
 
+def test_base_subject_strips_the_same_prefixes_the_gate_nominates_on(ec):
+    # The gate nominates on this prefix set; a reply the gate nominates but
+    # this check cannot pair (`Antw: Budget` vs `Budget`) would be rejected
+    # here every time, and answered mail would stay in the INBOX.
+    for prefix in ("Re:", "AW:", "Fwd:", "WG:", "TR:", "Antw:", "SV:", "VS:",
+                   "RE[2]:", "Re: AW:"):
+        assert ec._base_subject(f"{prefix} Budget") == "budget", prefix
+    print("PASS base subject strips every prefix the gate nominates on")
+
+
+def test_untracked_search_covers_cc_and_bcc(ec):
+    # A reply-all that reaches the sender only via Cc is no less an answer;
+    # a TO-only search would never return it, so the exact check never sees
+    # it, so the mail is proposed again on every sweep.
+    class _M:
+        def __init__(self):
+            self.criteria = None
+
+        def uid(self, verb, charset, *criteria):
+            self.criteria = criteria
+            return "OK", [b"7 8"]
+
+    ec = _load_email_client()  # earlier cases stub _search_sent_to on the module
+    m = _M()
+    assert ec._search_sent_to(m, "sender@example.com", "2026-09-16T10:00:00+00:00") == [b"7", b"8"]
+    crit = list(m.criteria)
+    for header in ("TO", "CC", "BCC"):
+        assert header in crit and crit[crit.index(header) + 1] == '"sender@example.com"', crit
+    assert crit.count("OR") == 2 and "SINCE" in crit, crit
+    print("PASS untracked search covers To, Cc and Bcc")
+
+
 def main():
     ec = _load_email_client()
     test_threaded_replies_still_need_same_correspondent_subject_and_later_time(ec)
     test_untracked_replies_apply_the_exact_timestamp_check(ec)
     test_without_the_anchor_mail_the_answer_is_conservatively_unanswered(ec)
+    test_base_subject_strips_the_same_prefixes_the_gate_nominates_on(ec)
+    test_untracked_search_covers_cc_and_bcc(ec)
     print("all email answered tests passed")
     return 0
 

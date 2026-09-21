@@ -137,6 +137,32 @@ def test_without_either_knob_a_partial_run_waits_its_interval():
     print("  ok   without a knob a partial run waits its interval")
 
 
+def test_a_malformed_resume_or_retry_value_never_breaks_the_tick():
+    # is_due runs for every job inside the loop's one try/except: a value that
+    # raised would skip every job after this one, on every tick. Unusable
+    # reads as unset -- the job waits its interval -- and warns once.
+    for field in ("resume_after_seconds", "retry_after_seconds"):
+        for bad in ("soon", "", 0, -5, [1]):
+            with tempfile.TemporaryDirectory() as tmp:
+                sched = _load_scheduler(Path(tmp))
+                logged = []
+                sched.log = lambda msg: logged.append(msg)
+                job = {"id": "j", "_source": "/x/.schedule.json", "command": "true",
+                       "interval_seconds": 86400, field: bad}
+                _run(sched, sched.EXIT_PARTIAL, job)
+                sched.log = lambda msg: logged.append(msg)
+                real_now = sched.now
+                sched.now = lambda: real_now() + 3600
+                try:
+                    assert not sched.is_due(job), (field, bad)
+                    assert not sched.is_due(job), (field, bad)
+                finally:
+                    sched.now = real_now
+                warns = [m for m in logged if "unusable " + field in m]
+                assert len(warns) == 1, (field, bad, warns)
+    print("  ok   a malformed resume/retry value is ignored, warned once, never raises")
+
+
 def test_any_other_nonzero_exit_is_still_a_failure():
     with tempfile.TemporaryDirectory() as tmp:
         sched = _load_scheduler(Path(tmp))
@@ -152,5 +178,6 @@ if __name__ == "__main__":
     test_resume_after_never_applies_to_a_failed_run()
     test_retry_after_still_covers_a_partial_run()
     test_without_either_knob_a_partial_run_waits_its_interval()
+    test_a_malformed_resume_or_retry_value_never_breaks_the_tick()
     test_any_other_nonzero_exit_is_still_a_failure()
     print("all scheduler partial-run tests passed")

@@ -267,6 +267,34 @@ def load_jobs() -> list[dict]:
     return jobs
 
 
+_warned_fields: set[tuple[str, str]] = set()
+
+
+def _seconds_field(job: dict, name: str) -> int | None:
+    """A job's optional positive-seconds field, or None when absent or unusable.
+
+    is_due() runs for every job on every tick inside one try/except, so a
+    value that raised here (`"soon"`) would not just misconfigure its own
+    job: the loop's catch would skip every job after it, on every tick, until
+    the manifest was fixed. Unusable reads as unset, with one warning per
+    process rather than one per tick.
+    """
+    raw = job.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        key = (job.get("id", "?"), name)
+        if key not in _warned_fields:
+            _warned_fields.add(key)
+            log(f"[warn] job {key[0]!r} has an unusable {name} ({raw!r}), ignoring it")
+        return None
+    return value
+
+
 def is_due(job: dict) -> bool:
     if not job.get("enabled", True):
         return False
@@ -299,12 +327,12 @@ def is_due(job: dict) -> bool:
     last_status = read_last_status(job["id"])
     # A partial run (see the module docstring) resumes on its own, shorter
     # clock, and only a partial one: a failure never rides this knob.
-    resume_after = job.get("resume_after_seconds")
-    if resume_after and last_status == "partial" and elapsed >= int(resume_after):
+    resume_after = _seconds_field(job, "resume_after_seconds")
+    if resume_after and last_status == "partial" and elapsed >= resume_after:
         return True
-    retry_after = job.get("retry_after_seconds")
+    retry_after = _seconds_field(job, "retry_after_seconds")
     if retry_after and last_status not in ("success", "scheduled"):
-        return elapsed >= int(retry_after)
+        return elapsed >= retry_after
     return False
 
 
