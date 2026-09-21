@@ -285,11 +285,14 @@ credits):
    INBOX message, because nothing sent earlier can answer anything still
    open — so it is complete by construction and small in proportion to the
    backlog's age. A residual cap guards against one very old open mail
-   dragging in years of Sent; when it bites the listing is incomplete, so
-   every INBOX message is exact-checked that tick and the log names the mail
-   whose age caused it. (No date read off a capped listing is a safe
-   boundary: the cap keeps the newest UIDs, and UID order need not be date
-   order.)
+   dragging in years of Sent; when it bites the listing is incomplete, so the
+   gate nominates from what it listed, says so, and a reply older than the
+   window is not settled that tick — the mail stays in the INBOX and is
+   proposed, where the skill's own already-answered check sees it. It never
+   widens to an exact check of the whole INBOX, which would put unbounded
+   work in front of the bounded slice. (No date read off a capped listing is
+   a safe boundary either: the cap keeps the newest UIDs, and UID order need
+   not be date order.)
    A confirmed one is moved to `TRIAGE_ANSWERED_FOLDER` and recorded
    `resolved`, so it never reaches a proposal again. Only the exact check ever
    archives, and the action is a move, never a delete.

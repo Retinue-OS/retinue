@@ -1176,31 +1176,36 @@ def test_the_sent_listing_is_bounded_by_the_oldest_inbox_date():
     print("PASS test_the_sent_listing_is_bounded_by_the_oldest_inbox_date")
 
 
-def test_a_capped_listing_exact_checks_everything():
+def test_a_capped_listing_stays_bounded_and_nominates_from_what_it_has():
     # The residual cap can bite when one very old mail is still open. Past it
-    # the listing is incomplete, and no date read off it is a safe boundary:
-    # the cap keeps the newest UIDs, and UID order need not be date order. So
-    # every INBOX message pays for the exact check that tick — the cap biting
-    # is the anomaly, and the log says which mail to settle to end it.
+    # the listing is incomplete — but the fix is not to exact-check the whole
+    # INBOX: that is an IMAP login per message in front of the bounded slice,
+    # the never-finishes failure again. Nomination runs over what was listed;
+    # a reply beyond the window is not settled this tick, which is the safe
+    # direction (the mail is proposed, and the skill's own check sees it).
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp, sent_reconcile=True)
         gate.RECONCILE_LISTING_CAP = 2
         calls = _arm_sent(gate, [
-            {"subject": "Re: Something else", "to": "a@b.com",
+            {"subject": "Re: Renewal", "to": "ops@work.com",
              "date": "2026-09-17T10:00:00+00:00"},
             {"subject": "Re: Another thread", "to": "c@d.com",
              "date": "2026-09-12T11:00:00+00:00"},
-        ], answered=3)
+        ])
         inbox = [
             {"uid": "11", "from": "ops@work.com", "subject": "Renewal",
-             "message_id": "<old@work.com>", "date": "2026-06-01T10:00:00+00:00"},
-            {"uid": "12", "from": "ops@work.com", "subject": "Renewal",
-             "message_id": "<new@work.com>", "date": "2026-09-16T10:00:00+00:00"},
+             "message_id": "<r@work.com>", "date": "2026-09-16T10:00:00+00:00"},
+            {"uid": "12", "from": "x@y.com", "subject": "Unrelated",
+             "message_id": "<u@y.com>", "date": "2026-06-01T10:00:00+00:00"},
+            {"uid": "13", "from": "z@y.com", "subject": "Also unrelated",
+             "message_id": "<v@y.com>", "date": "2026-07-01T10:00:00+00:00"},
         ]
-        assert gate.reconcile_answered(inbox) == inbox
+        left = gate.reconcile_answered(inbox)
+        # The listed reply still settles its mail; nothing else paid a check.
+        assert [m["uid"] for m in left] == ["12", "13"], left
         checks = [c for c in calls if c[0] == "answered"]
-        assert len(checks) == 2, checks
-    print("PASS test_a_capped_listing_exact_checks_everything")
+        assert len(checks) == 1 and "<r@work.com>" in checks[0], checks
+    print("PASS test_a_capped_listing_stays_bounded_and_nominates_from_what_it_has")
 
 
 def test_a_reply_that_predates_the_mail_does_not_settle_it():
@@ -1401,7 +1406,7 @@ if __name__ == "__main__":
     test_an_inconclusive_answered_check_settles_nothing()
     test_only_nominated_mail_pays_for_an_exact_check()
     test_the_sent_listing_is_bounded_by_the_oldest_inbox_date()
-    test_a_capped_listing_exact_checks_everything()
+    test_a_capped_listing_stays_bounded_and_nominates_from_what_it_has()
     test_a_reply_that_predates_the_mail_does_not_settle_it()
     test_a_failed_move_leaves_the_mail_in_the_triage_set()
     test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set()

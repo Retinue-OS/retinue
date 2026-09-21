@@ -58,9 +58,11 @@ unread in the INBOX until its disposition is executed, which for an omnibus
 batch means waiting on the user's approval. Keying the spawn on "is anything
 unread" therefore re-spawns a session on every tick over the same settled stack,
 and each of those sessions is a fresh chance for a stray Phase-5 nudge. So the
-gate honours the rule it writes: only messages with **no status record** arm it.
-Once armed, the payload still carries every routed message, recorded ones
-included, so reconciliation and Phase 5 see the same set as before.
+gate honours the rule it writes: only messages with **no status record** arm it
+(plus stalled ones, see ``_stalled``). Once armed, the payload is the bounded
+slice of exactly those messages and nothing else — recorded mail is not handed
+over, and the passes that revisit it (Phase 1's repairs, Phase 5) run off the
+status store on the run that drains the backlog. See ``build_prompt``.
 
 Sender whitelist and group policy both live in ``triage_policy.py``, persisted as
 N-Triples the life store indexes. The gate reads them off disk; only the daily
@@ -106,8 +108,9 @@ SENT_RECONCILE = os.environ.get("TRIAGE_SENT_RECONCILE", "1").strip() != "0"
 # Safety cap on the reconciliation's Sent listing. The listing is bounded by
 # *date* (nothing older than the oldest INBOX mail can answer it), so in the
 # normal case it is far smaller than this; the cap only matters when one very
-# old mail is still open, and then `reconcile_answered` stops trusting the
-# listing and exact-checks every message. Not an env knob: it is not a scope
+# old mail is still open. Past it the listing is incomplete, and the gate says
+# so and nominates from what it has rather than exact-checking the whole
+# INBOX (see `reconcile_answered`). Not an env knob: it is not a scope
 # decision, only a guard against a pathological listing.
 RECONCILE_LISTING_CAP = 1000
 # How many never-seen (or stalled) messages one run hands the model, oldest
@@ -438,12 +441,17 @@ def reconcile_answered(messages: list[dict]) -> list[dict]:
          login per message, half-hourly. The one residual cap
          (RECONCILE_LISTING_CAP) guards against a single very old open mail
          dragging in years of Sent. When it bites, the listing is no longer
-         complete and every message is exact-checked instead. Not a
-         date-horizon shortcut: the cap keeps the newest *UIDs*, and UID
-         order is append order, which need not be date order (an import, a
-         delayed append), so no date from the listing is a safe boundary.
-         The cap biting at all is the anomaly, and the log says which mail
-         to settle to stop it.
+         complete: nomination still runs over what was listed, and a reply
+         beyond the window is simply not found this tick. That is the safe
+         direction — the mail stays in the INBOX and is proposed, where the
+         skill's own already-answered check sees it — and it keeps the
+         gate's work bounded, where exact-checking the whole INBOX would
+         hand the scheduler's budget to reconciliation and starve the slice
+         (the never-finishes failure this whole change exists to end). No
+         date-horizon shortcut either: the cap keeps the newest *UIDs*, and
+         UID order need not be date order, so no date read off the listing
+         is a safe boundary. The cap biting at all is the anomaly, and the
+         log says which mail to settle to stop it.
       2. **Decide** — `_confirm_answered`, one exact server-side check per
          candidate. Nothing is archived on the strength of step 1.
 
@@ -477,24 +485,24 @@ def reconcile_answered(messages: list[dict]) -> list[dict]:
         when = _parse_when(sent.get("date"))
         if key and when is not None:
             sent_index.setdefault(key, []).append(when)
-    # Past the cap the listing is incomplete, and no date read off it is a
-    # safe boundary (see the docstring): every message pays for the exact
-    # check this tick, and the log names the mail whose age caused it.
-    saturated = len(listed) >= RECONCILE_LISTING_CAP
-    if saturated:
+    # Past the cap the listing is incomplete (see the docstring): nominate
+    # from what was listed, say so, and leave the rest to the proposal. Never
+    # widen to an exact check of the whole INBOX — that is unbounded work in
+    # front of the bounded slice.
+    if len(listed) >= RECONCILE_LISTING_CAP:
         print(f"[triage-gate] sent-reconcile: {SENT_FOLDER} since "
               f"{min(dated).date()} exceeds the {RECONCILE_LISTING_CAP}-message "
-              f"cap; exact-checking all {len(messages)} INBOX message(s). "
-              "Settling the oldest open INBOX mail ends this.",
-              file=sys.stderr)
+              "cap; nominating from the newest listed only, so a reply older "
+              "than the window is not settled this tick. Settling the oldest "
+              "open INBOX mail ends this.", file=sys.stderr)
 
     keep, settled, checked = [], 0, 0
     for msg in messages:
         key = _thread_key(msg.get("subject"))
         when = _parse_when(msg.get("date"))
-        nominated = saturated or (bool(key and when is not None) and any(
+        nominated = bool(key and when is not None) and any(
             sent_at > when for sent_at in sent_index.get(key, [])
-        ))
+        )
         if nominated:
             checked += 1
         if nominated and _confirm_answered(msg) and _settle_answered(msg):
