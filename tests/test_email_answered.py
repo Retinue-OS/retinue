@@ -39,7 +39,7 @@ class _FakeMailbox:
 def _run_case(ec, *, anchor, threaded=(), untracked=(), rivals=()):
     mailbox = _FakeMailbox()
     ec.imap_connect = lambda cfg: mailbox
-    ec._same_thread_rivals = lambda M, anchor, addr: sorted(
+    ec._same_thread_rivals = lambda M, anchor, *a: sorted(
         ec._parsed_summary_date(r) for r in rivals)
     ec.imap_select = lambda M, folder, readonly=True: M.selected.append(folder)
     ec._search_by_message_id = lambda M, mid: [b"anchor"] if anchor else []
@@ -217,14 +217,28 @@ def test_rivals_are_found_by_correspondent_subject_and_order(ec):
     }
 
     class _M:
+        criteria = None
+
         def uid(self, verb, charset, *criteria):
+            _M.criteria = list(criteria)
             assert "FROM" in criteria and "SINCE" in criteria, criteria
             return "OK", [b" ".join(folder)]
 
     ec._summary = lambda M, uid: dict(folder[uid])
-    rivals = ec._same_thread_rivals(_M(), anchor, "sender@example.com")
+    rivals = ec._same_thread_rivals(_M(), anchor)
     assert [r.isoformat() for r in rivals] == ["2026-09-16T11:00:00+00:00"], rivals
-    print("PASS rivals are found by correspondent, subject and order")
+    assert _M.criteria.count("FROM") == 1 and "OR" not in _M.criteria, _M.criteria
+
+    # With a Reply-To, a later mail from *that* party is a rival too: the
+    # reply went there, so that is where the next mail in the thread comes
+    # from. The search asks for both addresses.
+    anchor_rt = dict(anchor, reply_to="Person <person@example.com>")
+    ec._same_thread_rivals(_M(), anchor_rt)
+    crit = _M.criteria
+    froms = [crit[i + 1] for i, c in enumerate(crit) if c == "FROM"]
+    assert sorted(froms) == ['"person@example.com"', '"sender@example.com"'], crit
+    assert crit.count("OR") == 1, crit
+    print("PASS rivals are found by correspondent (From and Reply-To), subject and order")
 
 
 def test_a_reply_sent_to_the_reply_to_address_counts(ec):

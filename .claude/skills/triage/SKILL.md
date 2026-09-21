@@ -161,10 +161,13 @@ message's status record the moment its disposition is settled** — `proposed`
 once its thread is open, `omnibus_pending` at classification, `resolved` when
 it is answered elsewhere — before starting on the next one, never as one
 batch at the end: the scheduler stops a run at its budget, and the only
-progress that survives is what is on disk by then. The prompt also says
-whether this slice drains the backlog. When it does **not**, skip passes 2–4
-below and Phase 5: they need the whole picture and belong to the draining run.
-When it does, run them as written. A due omnibus digest is announced as a
+progress that survives is what is on disk by then. Phases 2–4 (classify, link,
+propose) run for every listed message on **every** slice — that is the work
+a slice exists to do. The prompt also says whether this slice drains the
+backlog. When it does **not**, defer only the whole-picture work: the *Phase 1
+reconciliation passes* numbered 2–4 below (store→INBOX, done-but-still-there,
+stalled) and Phase 5's reminders belong to the draining run. When it does,
+run those as written. A due omnibus digest is announced as a
 count, not a listing: compose it from the `omnibus_pending` records in the
 status store (Phase 4b). The listing below is for a run that is *not* handed
 a slice (a manual invocation, an ad-hoc triage).

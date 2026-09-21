@@ -274,7 +274,11 @@ credits):
 
 1. List **the INBOX** — all of it, not the unread subset. `unread` is a mailbox
    flag the user can flip from any mail client; the status store (step 4) is
-   what decides whether a message is handled.
+   what decides whether a message is handled. "All of it" is literal: the
+   first listing is a small newest-first window, widened once when it
+   saturates, and a mailbox larger than the wide window is walked to the end
+   in pages by UID cursor (`search --uid-max`), so the oldest mail — the mail
+   the oldest-first slice wants — is never out of view behind a cap.
 2. **Settle what has already been answered.** Each message whose thread subject
    appears in a Sent listing with a later date is *nominated*, then confirmed
    exactly by `email_client answered` — a server-side IMAP SEARCH for replies

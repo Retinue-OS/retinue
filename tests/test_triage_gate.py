@@ -810,6 +810,54 @@ def test_a_saturated_scan_window_widens_instead_of_hiding_old_mail():
     print("PASS test_a_saturated_scan_window_widens_instead_of_hiding_old_mail")
 
 
+def test_a_saturated_wide_scan_pages_down_by_uid_until_short():
+    # A mailbox larger than INBOX_SCAN_MAX is not a mailbox the gate may
+    # treat as "the newest INBOX_SCAN_MAX": with the slice taken oldest-first,
+    # the mail behind a cap is exactly the mail the next run wants. So the
+    # gate walks down by UID cursor until a page comes back short, and the
+    # listing is complete.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 3
+        gate.INBOX_SCAN_MAX = 10
+        everything = [{"uid": str(u), "message_id": f"<{u}@work.com>"}
+                      for u in range(25, 0, -1)]
+        calls = []
+
+        def fake_client(*args):
+            calls.append(args)
+            limit = int(args[args.index("--limit") + 1])
+            pool = everything
+            if "--uid-max" in args:
+                cap = int(args[args.index("--uid-max") + 1])
+                pool = [m for m in everything if int(m["uid"]) <= cap]
+            return {"messages": pool[:limit]}
+
+        gate._email_client = fake_client
+        got = gate.inbox_messages()
+        assert [m["uid"] for m in got] == [str(u) for u in range(25, 0, -1)], got
+        cursors = [a[a.index("--uid-max") + 1] for a in calls if "--uid-max" in a]
+        assert cursors == ["15", "5"], f"expected two pages below 15 and 5: {cursors}"
+    print("PASS test_a_saturated_wide_scan_pages_down_by_uid_until_short")
+
+
+def test_a_failed_page_keeps_what_was_listed():
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 2
+        gate.INBOX_SCAN_MAX = 4
+        everything = [{"uid": str(u), "message_id": f"<{u}>"} for u in range(9, 0, -1)]
+
+        def fake_client(*args):
+            if "--uid-max" in args:
+                return None
+            return {"messages": everything[:int(args[args.index("--limit") + 1])]}
+
+        gate._email_client = fake_client
+        assert len(gate.inbox_messages()) == 4
+    print("PASS test_a_failed_page_keeps_what_was_listed")
+
+
 def test_an_unsaturated_scan_does_not_pay_for_a_second_listing():
     # The common case is a near-empty INBOX; it must stay one round trip.
     with tempfile.TemporaryDirectory() as tmp:
@@ -1391,6 +1439,8 @@ if __name__ == "__main__":
     test_an_unreadable_record_re_arms_rather_than_hiding_the_mail()
     test_a_corrupt_record_re_arms_instead_of_crashing_the_tick()
     test_a_saturated_scan_window_widens_instead_of_hiding_old_mail()
+    test_a_saturated_wide_scan_pages_down_by_uid_until_short()
+    test_a_failed_page_keeps_what_was_listed()
     test_an_unsaturated_scan_does_not_pay_for_a_second_listing()
     test_a_failed_widened_rescan_keeps_the_narrow_result()
     test_the_prompt_lists_the_whole_slice_and_owns_the_scope()

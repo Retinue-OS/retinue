@@ -101,6 +101,12 @@ INBOX_SCAN_LIMIT = int(os.environ.get("TRIAGE_INBOX_SCAN_LIMIT", "100"))
 # worse the longer it lasts. Raise only if a mailbox legitimately holds more
 # unread mail than this.
 INBOX_SCAN_MAX = int(os.environ.get("TRIAGE_INBOX_SCAN_MAX", "2000"))
+# A mailbox larger than INBOX_SCAN_MAX is walked to the end in pages of that
+# size, by UID cursor (see `inbox_messages`), so the listing is complete
+# whatever the size. This is a sanity stop on that walk, not a scope: at
+# INBOX_SCAN_MAX * INBOX_SCAN_PAGES messages something other than triage has
+# gone wrong with the mailbox, and the log says so.
+INBOX_SCAN_PAGES = 25
 # Settle INBOX mail that has already been answered, by matching it against the
 # Sent folder. Credit-free, and the one check that keeps "answered" and "still
 # in the INBOX" from drifting apart. See `reconcile_answered`.
@@ -229,9 +235,14 @@ def inbox_messages() -> list[dict]:
     The listing is newest-first, so a plain `--limit INBOX_SCAN_LIMIT` does not
     merely sample the mailbox — it hides its *oldest* mail, permanently and
     silently, from the moment the backlog outgrows the window. The mail hidden
-    that way is exactly the mail that most needs triaging. So when the first
-    pass comes back saturated, widen it once, up to INBOX_SCAN_MAX, and say so
-    on stderr either way.
+    that way is exactly the mail that most needs triaging, and with the slice
+    taken oldest-first it is exactly the mail the next run wants. So when the
+    first pass comes back saturated, widen it to INBOX_SCAN_MAX, and when that
+    saturates too, keep walking: page downward by UID cursor (`--uid-max`,
+    the smallest UID seen less one) in INBOX_SCAN_MAX-sized pages until a page
+    comes back short. The listing is then complete whatever the mailbox holds
+    — bounded by the mailbox, which is the only honest bound for "what is in
+    the INBOX" — and the common near-empty case still costs one round-trip.
     """
     res = _email_client(
         "search", "--folder", "INBOX", "--limit", str(INBOX_SCAN_LIMIT)
@@ -254,14 +265,32 @@ def inbox_messages() -> list[dict]:
         # The widened scan failed; the narrow result is still real mail, and
         # triaging its newest INBOX_SCAN_LIMIT beats triaging nothing.
         return messages
-    messages = wide.get("messages", [])
-    if len(messages) >= INBOX_SCAN_MAX:
-        print(
-            f"[triage-gate] INBOX also filled the {INBOX_SCAN_MAX}-message "
-            f"ceiling — older mail is still out of view. Raise "
-            f"TRIAGE_INBOX_SCAN_MAX.",
-            file=sys.stderr,
+    messages = list(wide.get("messages", []))
+    page, pages = messages, 0
+    while len(page) >= INBOX_SCAN_MAX and pages < INBOX_SCAN_PAGES:
+        uids = [int(m["uid"]) for m in page
+                if str(m.get("uid") or "").isdigit()]
+        if not uids or min(uids) <= 1:
+            break
+        cursor = min(uids) - 1
+        more = _email_client(
+            "search", "--folder", "INBOX", "--limit", str(INBOX_SCAN_MAX),
+            "--uid-max", str(cursor),
         )
+        if not more:
+            print(f"[triage-gate] INBOX page below uid {cursor} failed; "
+                  f"continuing with the {len(messages)} listed so far",
+                  file=sys.stderr)
+            break
+        page = list(more.get("messages", []))
+        messages.extend(page)
+        pages += 1
+        print(f"[triage-gate] INBOX exceeds {INBOX_SCAN_MAX}; paged below uid "
+              f"{cursor}: +{len(page)}, {len(messages)} so far", file=sys.stderr)
+    if len(page) >= INBOX_SCAN_MAX and pages >= INBOX_SCAN_PAGES:
+        print(f"[triage-gate] INBOX walk stopped after {INBOX_SCAN_PAGES} pages "
+              f"({len(messages)} messages) — a mailbox this size needs a look; "
+              "older mail is out of view until it shrinks", file=sys.stderr)
     return messages
 
 

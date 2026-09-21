@@ -730,9 +730,12 @@ def _reply_recipients(reply):
     return recipients
 
 
-def _same_thread_rivals(M, anchor, addr):
+def _same_thread_rivals(M, anchor):
     """Dates of *other* mail from the anchor's correspondent, under the same
     base subject, newer than the anchor -- in the currently selected folder.
+    The correspondent is every address a reply may have gone to
+    (`_anchor_addresses`: Reply-To and From), since a later mail from the
+    Reply-To party is as much a rival as one from the From.
 
     The untracked fallback pairs a reply with a mail by correspondent, subject
     and order alone. When the correspondent has since sent another mail under
@@ -744,9 +747,14 @@ def _same_thread_rivals(M, anchor, addr):
     anchor_when = _parsed_summary_date(anchor.get("date"))
     base = _base_subject(anchor.get("subject"))
     day = _imap_date(anchor.get("date"))
-    if anchor_when is None or not day:
+    addrs = sorted(_anchor_addresses(anchor))
+    if anchor_when is None or not day or not addrs:
         return []
-    criteria = ["FROM", '"%s"' % addr.replace('"', ""), "SINCE", day]
+    # OR-chain over every address: `OR FROM a OR FROM b FROM c`.
+    criteria = []
+    for addr in addrs[:-1]:
+        criteria += ["OR", "FROM", '"%s"' % addr.replace('"', "")]
+    criteria += ["FROM", '"%s"' % addrs[-1].replace('"', ""), "SINCE", day]
     try:
         typ, data = M.uid("search", None, *criteria)
     except imaplib.IMAP4.error:
@@ -823,6 +831,14 @@ def cmd_search(cfg, args):
         criteria += ["SINCE", args.since]  # DD-Mon-YYYY
     if args.unseen:
         criteria += ["UNSEEN"]
+    if args.uid_max:
+        # A cursor for paging a large folder newest-first: only UIDs at or
+        # below this one, so a caller that saw the newest `limit` can ask for
+        # the `limit` before them (`--uid-max <smallest uid seen - 1>`) until
+        # a page comes back short. UID order is append order, which is what
+        # a complete walk needs; it is not date order, so callers must not
+        # read a date boundary off a page.
+        criteria += ["UID", f"1:{args.uid_max}"]
     if not criteria:
         criteria = ["ALL"]
     # IMAP SEARCH only needs a CHARSET when a criterion carries non-ASCII text.
@@ -890,14 +906,13 @@ def cmd_answered(cfg, args):
                         and _reply_matches_anchor(s, anchor)):
                     seen.add(s["uid"])
                     untracked.append(s)
-        addr = parseaddr(anchor.get("from") or "")[1]
-        if untracked and addr:
+        if untracked:
             # An unthreaded reply can be paired only by correspondent,
             # subject and order. If the correspondent sent another mail
             # under that subject before the reply, the reply may be to that
             # one instead -- and ambiguous must read as unanswered.
             imap_select(M, args.in_folder, readonly=True)
-            rivals = _same_thread_rivals(M, anchor, addr)
+            rivals = _same_thread_rivals(M, anchor)
             untracked = [s for s in untracked if not _ambiguous(s, rivals)]
     M.logout()
 
@@ -1751,6 +1766,8 @@ def main():
     sp.add_argument("--since", help="date DD-Mon-YYYY, e.g. 01-Jun-2026")
     sp.add_argument("--unseen", action="store_true", help="only unread")
     sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--uid-max", dest="uid_max", type=int,
+                    help="paging cursor: only messages with UID <= this")
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("answered",
