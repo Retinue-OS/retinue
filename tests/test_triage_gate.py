@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Focused checks for the credit-free e-mail triage gate.
 
-`scripts/triage-gate.py` decides — for free — whether unread INBOX mail warrants
+`scripts/triage-gate.py` decides — for free — whether INBOX mail warrants
 a `claude -p` triage spawn: in `frequent` mode only for whitelisted senders, in
 `daily` mode for any sender (after refreshing the whitelist from Sent). Before
 either decides, the news rail diverts mail from declared news senders into the
@@ -115,14 +115,17 @@ def _arm_news(gate, tmp, entries, *, ok=True, detail=None, moves=None,
 class Recorder:
     """Stand-in for spawn(); records calls instead of launching claude."""
 
-    def __init__(self):
+    def __init__(self, rc=0):
         self.calls = []
         self.due = []
+        self.remaining = []
+        self.rc = rc
 
-    def __call__(self, mode, messages, due=0):
+    def __call__(self, mode, messages, due=0, remaining=0):
         self.calls.append((mode, list(messages)))
         self.due.append(due)
-        return 0
+        self.remaining.append(remaining)
+        return self.rc
 
 
 def test_frequent_spawns_only_for_whitelisted():
@@ -623,9 +626,13 @@ def test_the_prompt_tells_a_due_run_to_send_the_digest():
     print("PASS test_the_prompt_tells_a_due_run_to_send_the_digest")
 
 
-def test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones():
-    # Narrowing what *arms* the gate must not narrow what the session sees:
-    # reconciliation and Phase 5 still need the whole routed set.
+def test_the_payload_is_the_slice_not_the_whole_stack():
+    # The session is handed what armed the run and nothing else. A recorded
+    # message is settled as far as this run is concerned; the passes that
+    # revisit recorded mail run on the draining run, off the status store,
+    # not off the payload. Handing the whole stack over would put the
+    # session back to enumerating the mailbox, which is what a bounded slice
+    # exists to stop.
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         gate.tp.write_if_changed(
@@ -642,8 +649,9 @@ def test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones():
         assert gate.run_frequent() == 0
         assert len(rec.calls) == 1, "one new message should have armed the gate"
         ids = {m["message_id"] for m in rec.calls[0][1]}
-        assert ids == {"<a@work.com>", "<b@work.com>"}, f"payload narrowed: {ids}"
-    print("PASS test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones")
+        assert ids == {"<b@work.com>"}, f"recorded mail leaked into the slice: {ids}"
+        assert rec.remaining == [0], rec.remaining
+    print("PASS test_the_payload_is_the_slice_not_the_whole_stack")
 
 
 def test_message_without_an_id_always_arms():
@@ -839,21 +847,138 @@ def test_a_failed_widened_rescan_keeps_the_narrow_result():
     print("PASS test_a_failed_widened_rescan_keeps_the_narrow_result")
 
 
-def test_the_prompt_listing_is_capped_and_says_so():
-    # A long backlog must cost a truncated listing, never unseen mail: the
-    # prompt has to admit the truncation so the session works from the mailbox.
+def test_the_prompt_lists_the_whole_slice_and_owns_the_scope():
+    # The list is the scope: every message in the slice is listed, the session
+    # is told not to enumerate the mailbox for more, and to record each item
+    # as it settles it. A partial run is told to leave the whole-picture
+    # passes to the draining run; the draining run is told to do them.
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
-        gate.PROMPT_LIST_LIMIT = 5
         messages = [
             {"from": "a@work.com", "subject": f"s{i}", "message_id": f"<{i}@work.com>"}
             for i in range(12)
         ]
-        prompt = gate.build_prompt("daily", messages)
-        assert prompt.count("\n  - ") == 5, "listing should stop at the cap"
-        assert "and 7 more" in prompt, "truncation must be stated"
-        assert "work from the mailbox" in prompt
-    print("PASS test_the_prompt_listing_is_capped_and_says_so")
+        partial = gate.build_prompt("daily", messages, remaining=30)
+        assert partial.count("\n  - ") == 12, "every message in the slice is listed"
+        assert "Do not list the INBOX for more" in partial
+        assert "the moment its disposition is settled" in partial
+        assert "30 more message(s) wait" in partial
+        assert "Skip Phase 1's reconciliation passes" in partial
+        assert "work from the mailbox" not in partial
+        draining = gate.build_prompt("daily", messages)
+        assert "This slice drains the backlog" in draining
+        assert "Skip Phase 1" not in draining
+    print("PASS test_the_prompt_lists_the_whole_slice_and_owns_the_scope")
+
+
+# --------------------------------------------------------------------------- #
+# Bounded slices: a run that finishes beats one that is killed at the wall     #
+# --------------------------------------------------------------------------- #
+
+
+def _dated(i, day):
+    return {"from": "boss@work.com", "subject": f"s{i}",
+            "message_id": f"<{i}@work.com>", "date": f"2026-09-{day:02d}T10:00:00Z"}
+
+
+def test_a_run_takes_the_oldest_slice_and_exits_partial():
+    # The listing is newest-first; a run that starts from the top spends its
+    # budget on what arrived last and cuts what has waited longest. The slice
+    # is therefore the *oldest* BATCH_SIZE, and a run that leaves mail behind
+    # says so with EXIT_PARTIAL so the scheduler comes back for the rest.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.BATCH_SIZE = 2
+        gate.inbox_messages = lambda: [
+            _dated(1, 20), _dated(2, 3), _dated(3, 15), _dated(4, 1), _dated(5, 9),
+        ]
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == gate.EXIT_PARTIAL
+        assert [m["message_id"] for m in rec.calls[0][1]] == ["<4@work.com>", "<2@work.com>"]
+        assert rec.remaining == [3], rec.remaining
+    print("PASS test_a_run_takes_the_oldest_slice_and_exits_partial")
+
+
+def test_the_next_run_continues_where_the_last_left_off():
+    # The whole point: what the session recorded stays recorded, so the next
+    # slice is the next oldest, and the run that takes the last of it exits 0.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.BATCH_SIZE = 2
+        gate.inbox_messages = lambda: [_dated(1, 3), _dated(2, 1), _dated(3, 2)]
+        for mid in ("<2@work.com>", "<3@work.com>"):  # the previous slice, recorded
+            _record(gate, mid, "proposed")
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == 0
+        assert [m["message_id"] for m in rec.calls[0][1]] == ["<1@work.com>"]
+        assert rec.remaining == [0]
+    print("PASS test_the_next_run_continues_where_the_last_left_off")
+
+
+def test_undated_mail_goes_last_in_a_slice():
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.BATCH_SIZE = 2
+        undated = {"from": "boss@work.com", "subject": "?", "message_id": "<u@work.com>"}
+        gate.inbox_messages = lambda: [undated, _dated(1, 5), _dated(2, 4)]
+        rec = Recorder()
+        gate.spawn = rec
+        assert gate.run_frequent() == gate.EXIT_PARTIAL
+        assert [m["message_id"] for m in rec.calls[0][1]] == ["<2@work.com>", "<1@work.com>"]
+    print("PASS test_undated_mail_goes_last_in_a_slice")
+
+
+def test_a_failed_session_is_reported_as_such_not_as_partial():
+    # The session's own failure outranks "more to do": the scheduler must see
+    # rc=1 and its error text, not a cheerful partial.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.BATCH_SIZE = 1
+        gate.inbox_messages = lambda: [_dated(1, 1), _dated(2, 2)]
+        gate.spawn = Recorder(rc=1)
+        assert gate.run_frequent() == 1
+    print("PASS test_a_failed_session_is_reported_as_such_not_as_partial")
+
+
+def test_a_due_digest_rides_along_with_the_slice():
+    # The bundle is owed on time whatever slice is being worked; it is merged
+    # into the payload and does not count against the slice.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        _whitelist_all(gate)
+        gate.BATCH_SIZE = 1
+        bundled = {"from": "boss@work.com", "subject": "b", "message_id": "<b@work.com>"}
+        gate.inbox_messages = lambda: [_dated(1, 2), _dated(2, 1), bundled]
+        _record(gate, "<b@work.com>", "omnibus_pending")
+        rec = Recorder()
+        gate.spawn = rec
+        gate.refresh_whitelist_from_sent = lambda: 0
+        assert gate.run_daily() == gate.EXIT_PARTIAL
+        ids = [m["message_id"] for m in rec.calls[0][1]]
+        assert ids == ["<2@work.com>", "<b@work.com>"], ids
+        assert rec.due == [1] and rec.remaining == [1]
+    print("PASS test_a_due_digest_rides_along_with_the_slice")
+
+
+def test_the_slice_never_exceeds_what_the_prompt_can_list():
+    # A non-positive BATCH_SIZE means "as many as the prompt lists", never
+    # "unbounded": the list is the session's scope, so an unlisted message
+    # would be one it was told not to go looking for.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.PROMPT_LIST_LIMIT = 3
+        fresh = [_dated(i, i) for i in range(1, 8)]
+        for size in (0, -1, 50):
+            gate.BATCH_SIZE = size
+            batch, remaining = gate.take_batch(fresh)
+            assert len(batch) == 3 and remaining == 4, (size, len(batch), remaining)
+    print("PASS test_the_slice_never_exceeds_what_the_prompt_can_list")
 
 
 # --------------------------------------------------------------------------- #
@@ -887,20 +1012,6 @@ def test_the_scan_covers_the_inbox_not_just_the_unread():
         assert "--unseen" not in calls[0], f"scan still flag-keyed: {calls[0]}"
         assert calls[0][:3] == ("search", "--folder", "INBOX")
     print("PASS test_the_scan_covers_the_inbox_not_just_the_unread")
-
-
-def test_the_old_unread_scope_is_still_reachable_by_env():
-    # An escape hatch, not a default: a deployment that genuinely wants the
-    # flag-keyed scope back should not have to patch the script.
-    with tempfile.TemporaryDirectory() as tmp:
-        os.environ["TRIAGE_SCAN_UNREAD_ONLY"] = "1"
-        try:
-            gate = _fresh(tmp)
-            calls = _scope_of(gate)
-        finally:
-            os.environ.pop("TRIAGE_SCAN_UNREAD_ONLY", None)
-        assert "--unseen" in calls[0], f"env override ignored: {calls[0]}"
-    print("PASS test_the_old_unread_scope_is_still_reachable_by_env")
 
 
 # --------------------------------------------------------------------------- #
@@ -1033,26 +1144,57 @@ def test_only_nominated_mail_pays_for_an_exact_check():
     print("PASS test_only_nominated_mail_pays_for_an_exact_check")
 
 
-def test_a_saturated_prefilter_exact_checks_everything():
-    # The listing bound is only an optimisation: once it saturates, older Sent
-    # replies may be out of view, so every INBOX mail must pay for the exact
-    # check rather than living in a permanent false-negative window.
+def test_the_sent_listing_is_bounded_by_the_oldest_inbox_date():
+    # A reply postdates the mail it answers, so Sent mail older than the oldest
+    # INBOX message can settle nothing: `--since` that date (less a day of
+    # clock slack) is a complete window, however much older Sent mail exists.
+    # A count bound would be permanently saturated on any mailbox with a year
+    # of Sent behind it, and "saturated" would mean an IMAP login per INBOX
+    # message on every tick.
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp, sent_reconcile=True)
-        gate.RECONCILE_SCAN_LIMIT = 2
+        calls = _arm_sent(gate, [])
+        gate.reconcile_answered([
+            {"uid": "1", "from": "a@b.com", "subject": "x", "message_id": "<x>",
+             "date": "2026-09-16T10:00:00+00:00"},
+            {"uid": "2", "from": "a@b.com", "subject": "y", "message_id": "<y>",
+             "date": "2026-03-01T00:30:00+02:00"},
+            {"uid": "3", "from": "a@b.com", "subject": "z", "message_id": "<z>"},
+        ])
+        listing = [c for c in calls if c[0] == "search"]
+        assert len(listing) == 1, listing
+        since = listing[0][listing[0].index("--since") + 1]
+        assert since == "28-Feb-2026", f"expected the day before the oldest mail: {since}"
+        assert "--limit" in listing[0] and "--unseen" not in listing[0]
+    print("PASS test_the_sent_listing_is_bounded_by_the_oldest_inbox_date")
+
+
+def test_a_capped_listing_exact_checks_only_mail_older_than_its_horizon():
+    # The residual cap can bite when one very old mail is still open. Past it,
+    # the listing is the newest CAP messages, so a reply to anything older than
+    # the oldest one listed may lie beyond it — those messages, and only those,
+    # are exact-checked without a nomination. Everything newer still goes
+    # through the subject index, so the cap never turns into a login per
+    # message.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        gate.RECONCILE_LISTING_CAP = 2
         calls = _arm_sent(gate, [
             {"subject": "Re: Something else", "to": "a@b.com",
              "date": "2026-09-17T10:00:00+00:00"},
             {"subject": "Re: Another thread", "to": "c@d.com",
-             "date": "2026-09-17T11:00:00+00:00"},
+             "date": "2026-09-12T11:00:00+00:00"},
         ], answered=3)
-        inbox = [{"uid": "11", "from": "ops@work.com", "subject": "Renewal",
-                  "message_id": "<r2@work.com>",
-                  "date": "2026-09-16T10:00:00+00:00"}]
+        inbox = [
+            {"uid": "11", "from": "ops@work.com", "subject": "Renewal",
+             "message_id": "<old@work.com>", "date": "2026-06-01T10:00:00+00:00"},
+            {"uid": "12", "from": "ops@work.com", "subject": "Renewal",
+             "message_id": "<new@work.com>", "date": "2026-09-16T10:00:00+00:00"},
+        ]
         assert gate.reconcile_answered(inbox) == inbox
         checks = [c for c in calls if c[0] == "answered"]
-        assert len(checks) == 1 and "<r2@work.com>" in checks[0], checks
-    print("PASS test_a_saturated_prefilter_exact_checks_everything")
+        assert len(checks) == 1 and "<old@work.com>" in checks[0], checks
+    print("PASS test_a_capped_listing_exact_checks_only_mail_older_than_its_horizon")
 
 
 def test_a_reply_that_predates_the_mail_does_not_settle_it():
@@ -1230,7 +1372,7 @@ if __name__ == "__main__":
     test_a_missing_omnibus_marker_counts_as_due()
     test_a_due_digest_arms_even_when_its_sender_is_not_whitelisted()
     test_the_prompt_tells_a_due_run_to_send_the_digest()
-    test_new_mail_arms_and_the_payload_still_carries_the_recorded_ones()
+    test_the_payload_is_the_slice_not_the_whole_stack()
     test_message_without_an_id_always_arms()
     test_stalled_non_terminal_mail_re_arms_the_gate()
     test_a_settled_status_never_re_arms_however_old()
@@ -1240,14 +1382,20 @@ if __name__ == "__main__":
     test_a_saturated_scan_window_widens_instead_of_hiding_old_mail()
     test_an_unsaturated_scan_does_not_pay_for_a_second_listing()
     test_a_failed_widened_rescan_keeps_the_narrow_result()
-    test_the_prompt_listing_is_capped_and_says_so()
+    test_the_prompt_lists_the_whole_slice_and_owns_the_scope()
+    test_a_run_takes_the_oldest_slice_and_exits_partial()
+    test_the_next_run_continues_where_the_last_left_off()
+    test_undated_mail_goes_last_in_a_slice()
+    test_a_failed_session_is_reported_as_such_not_as_partial()
+    test_a_due_digest_rides_along_with_the_slice()
+    test_the_slice_never_exceeds_what_the_prompt_can_list()
     test_the_scan_covers_the_inbox_not_just_the_unread()
-    test_the_old_unread_scope_is_still_reachable_by_env()
     test_an_answered_mail_is_archived_and_recorded_resolved()
     test_a_reply_to_someone_else_does_not_settle_the_mail()
     test_an_inconclusive_answered_check_settles_nothing()
     test_only_nominated_mail_pays_for_an_exact_check()
-    test_a_saturated_prefilter_exact_checks_everything()
+    test_the_sent_listing_is_bounded_by_the_oldest_inbox_date()
+    test_a_capped_listing_exact_checks_only_mail_older_than_its_horizon()
     test_a_reply_that_predates_the_mail_does_not_settle_it()
     test_a_failed_move_leaves_the_mail_in_the_triage_set()
     test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set()

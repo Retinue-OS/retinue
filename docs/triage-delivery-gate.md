@@ -280,10 +280,14 @@ credits):
    exactly by `email_client answered` — a server-side IMAP SEARCH for replies
    citing its Message-ID, filtered back down to the same correspondent, the
    same base subject and a strictly later timestamp; untracked replies go
-   through the same filter after an exact recipient search. If the Sent listing
-   fills its prefilter window, the gate skips the nomination shortcut and
-   exact-checks every INBOX message that tick, so the bound never becomes a
-   permanent blind spot. A confirmed one is moved to `Archive` and recorded
+   through the same filter after an exact recipient search. The Sent listing
+   is bounded by **date**, not by count — `--since` the day before the oldest
+   INBOX message, because nothing sent earlier can answer anything still
+   open — so it is complete by construction and small in proportion to the
+   backlog's age. A residual cap guards against one very old open mail
+   dragging in years of Sent; when it bites, only the INBOX messages older
+   than the oldest Sent mail listed are exact-checked without a nomination.
+   A confirmed one is moved to `TRIAGE_ANSWERED_FOLDER` and recorded
    `resolved`, so it never reaches a proposal again. Only the exact check ever
    archives, and the action is a move, never a delete.
 3. **Route both rails in one pass** (`route()`, below): each message is asked for
@@ -317,12 +321,26 @@ credits):
      across the whole INBOX listing rather than the whitelisted subset, since
      a bundle accrued by a daily run can hold mail the frequent pass does not
      whitelist.
-5. Keep only whitelisted senders → spawn the model for those. The spawn payload
-   still carries every routed message, recorded ones included, so the session
-   reconciles and nudges over the same set as before — only the *decision to
-   spawn* is narrowed.
+5. Keep only whitelisted senders → spawn the model for those.
 6. The **daily** job runs for **any** sender (fixed morning hour, before the
    briefing).
+7. **Hand over a bounded slice, oldest first.** The spawn payload is the
+   oldest `TRIAGE_BATCH_SIZE` (default 25) of the messages that armed the run
+   — never-seen and stalled ones — plus a due omnibus bundle if there is one;
+   recorded mail is not handed over. The prompt lists the slice in full and
+   says it is the whole scope: the session does not enumerate the INBOX for
+   more, records each message the moment its disposition is settled, and runs
+   the whole-picture passes (Phase 1's store→INBOX, done-but-still-there and
+   stalled repairs, Phase 5's reminders) only on the run told it drains the
+   backlog. When more is left, the gate exits **75** and the scheduler records
+   a `partial` run, so a job with `retry_after_seconds` comes back for the
+   next slice after minutes rather than after its interval
+   (`docs/scheduling.md`). The point is that the model's progress is durable
+   only per message — its status record — so a run that takes a slice it can
+   finish, and records it, beats one that takes the whole backlog and is
+   killed at its budget with nothing recorded. That was the failure mode: a
+   sweep that never finished never reduced its own backlog, so every run had
+   more to do than the last.
 
 ### Messenger — gateway-owned store + delivery flag (push)
 
@@ -599,7 +617,16 @@ Tier-3 across both the framework and the gateway services:
   the shared state files, and this doc. The e-mail news rail adds two tunables on
   the `retinue` service: `TRIAGE_NEWS_FOLDER` (default `Archive`; empty leaves the
   mail in the INBOX) and `TRIAGE_NEWS_EXCERPT_CHARS` (default 600). It needs
-  `NEWS_INGEST_URL` like the gateways do.
+  `NEWS_INGEST_URL` like the gateways do. The sweep adds three more:
+  `TRIAGE_BATCH_SIZE` (default 25; how many never-seen or stalled messages one
+  run hands the model, oldest first — non-positive means as many as the
+  prompt lists, `TRIAGE_PROMPT_LIST_LIMIT`), `TRIAGE_SENT_RECONCILE` (default
+  `1`; `0` switches off the credit-free archiving of already-answered mail,
+  the one thing the gate does to the mailbox on its own) and
+  `TRIAGE_ANSWERED_FOLDER` (where answered mail goes; defaults to
+  `TRIAGE_NEWS_FOLDER`, so a deployment names its archive once). The scan
+  scope has no knob: the gate scans the INBOX, since `unread` is a mailbox
+  flag and the status store is what decides handled-state.
 - **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` each
   get the shared volume mounted RW, per-message `.nt` writing, the
   classification gate on inbound, and `GET /undelivered?since=…`. For the news

@@ -90,8 +90,32 @@ isn't burned on one bad run:
 }
 ```
 
+A command job that works through a backlog in **bounded slices** exits with
+code **75** (sysexits' `EX_TEMPFAIL`) to say "this slice is done, more remains".
+The scheduler records that as `status: "partial"` — logged as `[partial]`, not
+`[fail]` — which is not `success`, so a job that pairs it with
+`retry_after_seconds` is due again after that short wait rather than after its
+full interval. That is how the e-mail triage sweep drains a backlog: each run
+takes the oldest `TRIAGE_BATCH_SIZE` messages, records what it did, and comes
+back for the rest, so no single run has to fit the whole backlog into one
+budget. A job that exits 75 without `retry_after_seconds` simply waits its
+interval, like any other run. The job the framework ships this for:
+
+```json
+{
+  "id": "triage-daily",
+  "command": "python3 /workspace/scripts/triage-gate.py daily",
+  "interval_seconds": 86400,
+  "retry_after_seconds": 600
+}
+```
+
 A job may also declare an optional `"timeout_seconds"` to override the global
-`SCHEDULER_JOB_TIMEOUT` for that one job:
+`SCHEDULER_JOB_TIMEOUT` for that one job. This is a backstop for a job whose
+*single* unit of work is long, not a way to fit a backlog into one run — a run
+that must finish everything is killed the moment the backlog outgrows any
+budget, and a killed run persists nothing it had not already written. Prefer
+slices and `retry_after_seconds` where the work divides.
 
 ```json
 {

@@ -62,6 +62,14 @@ failures are usually transient (a rate limit, a flaky upstream):
   {"id": "herald-fetch", "command": "...", "interval_seconds": 86400,
    "retry_after_seconds": 900}
 
+A command job that works through a backlog in bounded slices exits with
+EXIT_PARTIAL (75, sysexits' EX_TEMPFAIL) to say "this slice is done and there
+is more". That is recorded as status "partial" -- not a failure, but not
+"success" either, so a job that pairs it with `retry_after_seconds` is picked
+up again after that short wait instead of after its full interval, and a
+backlog drains in successive runs rather than in one run that has to fit a
+single budget. A job without `retry_after_seconds` simply waits its interval.
+
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
 
@@ -101,6 +109,10 @@ CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 BASE_SCHEDULE = Path(os.environ.get("BASE_SCHEDULE") or "/workspace/.schedule.json")
 TICK = int(os.environ.get("SCHEDULER_TICK_SECONDS", "30"))
 JOB_TIMEOUT = int(os.environ.get("SCHEDULER_JOB_TIMEOUT", "900"))
+# The exit code a command job uses for "done with this slice, more remains";
+# see the module docstring. sysexits' EX_TEMPFAIL, chosen because it already
+# means "try again later" to everything else on a Unix box.
+EXIT_PARTIAL = 75
 # Grace period between SIGTERM and SIGKILL when a timed-out job's process
 # group has to be killed outright.
 KILL_GRACE_SECONDS = int(os.environ.get("SCHEDULER_KILL_GRACE_SECONDS", "10"))
@@ -390,6 +402,13 @@ def run_job(job: dict) -> None:
         if proc.returncode == 0:
             log(f"[ok] {jid} in {dur:.0f}s")
             write_state(jid, "success")
+        elif proc.returncode == EXIT_PARTIAL:
+            # A slice finished and the job says more is waiting: not a
+            # failure, so no error text -- but not "success" either, so a
+            # retry_after_seconds on the job brings the next slice forward.
+            log(f"[partial] {jid} in {dur:.0f}s -- more to do, due again after "
+                f"{job.get('retry_after_seconds') or job.get('interval_seconds')}s")
+            write_state(jid, "partial")
         else:
             errtxt = (err or out or "").strip().replace("\n", " ")
             log(f"[fail] {jid} rc={proc.returncode} in {dur:.0f}s: {errtxt[:300]}")
