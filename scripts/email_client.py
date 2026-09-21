@@ -712,13 +712,58 @@ def _parsed_summary_date(value):
 
 
 def _reply_recipients(reply):
+    """Every address in To/Cc/Bcc, parsed as RFC address lists.
+
+    Not a comma split: `"Doe, John" <john@example.com>` is one address with a
+    comma in its display name, and splitting it yields two bogus names and
+    loses the one address that matters.
+    """
     recipients = set()
     for field in ("to", "cc", "bcc"):
-        for chunk in str(reply.get(field) or "").split(","):
-            addr = parseaddr(chunk)[1].strip().casefold()
+        for _name, addr in getaddresses([str(reply.get(field) or "")]):
+            addr = addr.strip().casefold()
             if addr:
                 recipients.add(addr)
     return recipients
+
+
+def _same_thread_rivals(M, anchor, addr):
+    """Dates of *other* mail from the anchor's correspondent, under the same
+    base subject, newer than the anchor -- in the currently selected folder.
+
+    The untracked fallback pairs a reply with a mail by correspondent, subject
+    and order alone. When the correspondent has since sent another mail under
+    that subject, one unthreaded reply satisfies those tests for both, and
+    cannot have answered both. A rival that arrived between the anchor and
+    the reply makes the pairing ambiguous, and ambiguous must read as *not*
+    answered: the caller moves mail on this answer.
+    """
+    anchor_when = _parsed_summary_date(anchor.get("date"))
+    base = _base_subject(anchor.get("subject"))
+    day = _imap_date(anchor.get("date"))
+    if anchor_when is None or not day:
+        return []
+    criteria = ["FROM", '"%s"' % addr.replace('"', ""), "SINCE", day]
+    try:
+        typ, data = M.uid("search", None, *criteria)
+    except imaplib.IMAP4.error:
+        return []
+    rivals = []
+    for uid in (data[0].split() if typ == "OK" else []):
+        s = _summary(M, uid)
+        if not s or s["uid"] == anchor.get("uid"):
+            continue
+        when = _parsed_summary_date(s.get("date"))
+        if (when is not None and when > anchor_when
+                and _base_subject(s.get("subject")) == base):
+            rivals.append(when)
+    return sorted(rivals)
+
+
+def _ambiguous(reply, rivals):
+    """Whether a rival mail arrived between the anchor and this reply."""
+    when = _parsed_summary_date(reply.get("date"))
+    return when is None or any(r < when for r in rivals)
 
 
 def _reply_matches_anchor(reply, anchor):
@@ -828,6 +873,14 @@ def cmd_answered(cfg, args):
                 if (s and s["uid"] not in seen and not _threads_elsewhere(s)
                         and _reply_matches_anchor(s, anchor)):
                     untracked.append(s)
+        if untracked:
+            # An unthreaded reply can be paired only by correspondent,
+            # subject and order. If the correspondent sent another mail
+            # under that subject before the reply, the reply may be to that
+            # one instead -- and ambiguous must read as unanswered.
+            imap_select(M, args.in_folder, readonly=True)
+            rivals = _same_thread_rivals(M, anchor, addr)
+            untracked = [s for s in untracked if not _ambiguous(s, rivals)]
     M.logout()
 
     replies = sorted(threaded + untracked, key=lambda m: m.get("date") or "")

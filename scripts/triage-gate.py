@@ -877,25 +877,6 @@ def omnibus_due(messages: list[dict]) -> list[dict]:
     return []
 
 
-def _merge(*groups: list[dict]) -> list[dict]:
-    """The groups concatenated, deduplicated on Message-ID, order preserved.
-
-    Messages without an id are kept as they come: there is nothing to dedupe
-    them on, and dropping them would hide mail.
-    """
-    seen: set[str] = set()
-    merged: list[dict] = []
-    for group in groups:
-        for msg in group:
-            mid = (msg.get("message_id") or "").strip()
-            if mid:
-                if mid in seen:
-                    continue
-                seen.add(mid)
-            merged.append(msg)
-    return merged
-
-
 def _report_arming(
     mode: str, hits: list[dict], fresh: list[dict], due: list[dict],
     batch: list[dict] | None = None,
@@ -1024,19 +1005,25 @@ def build_prompt(
     if due:
         lines += [
             "",
-            f"{due} of these are already bundled on `omnibus_pending` and their "
-            "digest is now due: send the omnibus this run (Phase 4b), even if "
-            "nothing else here is worth proposing — that bundle is the reason "
-            "this run was armed at all. What is in the bundle is what the status "
-            "store says is in it: reconcile from the store, never from this "
-            "listing or from a thread's prose.",
+            f"A digest of {due} message(s) bundled on `omnibus_pending` is now "
+            "due: send the omnibus this run (Phase 4b), even if nothing listed "
+            "below is worth proposing — that bundle is the reason this run was "
+            "armed at all. The bundled messages are deliberately not listed "
+            "here: what is in the bundle is what the status store says is in "
+            "it, so reconcile from the store, never from a listing or from a "
+            "thread's prose. The digest is one unit of work whatever its size.",
         ]
-    lines += ["", "The messages for this run, oldest first:"]
+    if messages:
+        lines += ["", "The messages for this run, oldest first (uid for "
+                  "`email_client.py read/flag/move --uid`):"]
+    else:
+        lines += ["", "No messages to triage this run beyond the digest."]
     for m in messages:
         frm = m.get("from") or "(unknown)"
         subj = (m.get("subject") or "").strip() or "(no subject)"
         mid = m.get("message_id") or "(no id)"
-        lines.append(f"  - {frm} — {subj} [{mid}]")
+        uid = m.get("uid") or "?"
+        lines.append(f"  - uid {uid}: {frm} — {subj} [{mid}]")
     return "\n".join(lines)
 
 
@@ -1045,7 +1032,7 @@ def spawn(
 ) -> int:
     print(
         f"[triage-gate] {mode}: {len(messages)} message(s) to triage"
-        + (f", {due} of them a due omnibus digest" if due else "")
+        + (f", plus a due omnibus digest of {due}" if due else "")
         + (f", {remaining} more waiting" if remaining else "")
         + "; spawning session",
         file=sys.stderr,
@@ -1092,10 +1079,13 @@ def run_frequent() -> int:
         return 0
     batch, remaining = take_batch(fresh)
     _report_arming("frequent", hits, fresh, due, batch)
-    # The slice plus whatever the digest needs. Recorded mail is not handed
-    # over: it is settled as far as this run is concerned, and the passes
-    # that revisit it run on the draining run (see build_prompt).
-    rc = spawn("frequent", _merge(batch, due), due=len(due), remaining=remaining)
+    # The slice, and the digest as a count. Recorded mail is not handed over:
+    # it is settled as far as this run is concerned, and the passes that
+    # revisit it run on the draining run (see build_prompt). The bundled mail
+    # is not listed either -- the digest is composed from the status store
+    # and is one unit of work whatever its size, so listing it would only
+    # unbound the prompt the slice exists to bound.
+    rc = spawn("frequent", batch, due=len(due), remaining=remaining)
     return _outcome("frequent", rc, remaining)
 
 
@@ -1117,7 +1107,7 @@ def run_daily() -> int:
         return 0
     batch, remaining = take_batch(fresh)
     _report_arming("daily", hits, fresh, due, batch)
-    rc = spawn("daily", _merge(batch, due), due=len(due), remaining=remaining)
+    rc = spawn("daily", batch, due=len(due), remaining=remaining)
     return _outcome("daily", rc, remaining)
 
 

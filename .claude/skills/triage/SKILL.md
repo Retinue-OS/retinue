@@ -152,8 +152,9 @@ drain, so a cold sender waits at most ~24 h.
 ## Phase 1 — Collect & reconcile (within scope)
 
 **Gate-spawned slices.** A run the e-mail gate spawns carries its scope in the
-prompt: a list of messages, oldest first, that is the whole scope of the run.
-Work that list and nothing else — do **not** list the INBOX for more; what is
+prompt: a list of messages, oldest first, each with its UID, that is the whole
+scope of the run. Work that list and nothing else — do **not** list the INBOX
+for more; what is
 not listed is either already recorded or waits for a later run, and the gate
 comes back for it. Take the messages in the order given. **Write each
 message's status record the moment its disposition is settled** — `proposed`
@@ -163,8 +164,10 @@ batch at the end: the scheduler stops a run at its budget, and the only
 progress that survives is what is on disk by then. The prompt also says
 whether this slice drains the backlog. When it does **not**, skip passes 2–4
 below and Phase 5: they need the whole picture and belong to the draining run.
-When it does, run them as written. The listing below is for a run that is
-*not* handed a slice (a manual invocation, an ad-hoc triage).
+When it does, run them as written. A due omnibus digest is announced as a
+count, not a listing: compose it from the `omnibus_pending` records in the
+status store (Phase 4b). The listing below is for a run that is *not* handed
+a slice (a manual invocation, an ad-hoc triage).
 
 **E-mail** — list the current INBOX and diff it against the status store:
 

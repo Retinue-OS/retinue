@@ -301,8 +301,7 @@ credits):
    never marks mail read (`unread ≠ unhandled`), so a classified message stays
    unread in the INBOX until its disposition is executed, which for an omnibus
    batch means waiting on the user; without this step every tick would re-spawn
-   a session over the same settled stack.
-   same settled stack. Two exceptions, both because the gate is the *only*
+   a session over the same settled stack. Two exceptions, both because the gate is the *only*
    thing that spawns a triage session — a state nothing else revisits is a
    state nothing else can ever finish:
    - **Stalled** (`_stalled`): a record on a non-terminal status untouched for
@@ -326,9 +325,13 @@ credits):
    briefing).
 7. **Hand over a bounded slice, oldest first.** The spawn payload is the
    oldest `TRIAGE_BATCH_SIZE` (default 25) of the messages that armed the run
-   — never-seen and stalled ones — plus a due omnibus bundle if there is one;
-   recorded mail is not handed over. The prompt lists the slice in full and
-   says it is the whole scope: the session does not enumerate the INBOX for
+   — never-seen and stalled ones — with each message's UID, so the session
+   can read, flag and move it without a listing of its own; recorded mail is
+   not handed over. A due omnibus bundle rides along as a *count*, not a
+   listing: the digest is composed from the status store and is one unit of
+   work whatever its size, so listing it would only unbound the prompt. The
+   prompt lists the slice in full and says it is the whole scope: the
+   session does not enumerate the INBOX for
    more, records each message the moment its disposition is settled, and runs
    the whole-picture passes (Phase 1's store→INBOX, done-but-still-there and
    stalled repairs, Phase 5's reminders) only on the run told it drains the

@@ -36,9 +36,11 @@ class _FakeMailbox:
         return None
 
 
-def _run_case(ec, *, anchor, threaded=(), untracked=()):
+def _run_case(ec, *, anchor, threaded=(), untracked=(), rivals=()):
     mailbox = _FakeMailbox()
     ec.imap_connect = lambda cfg: mailbox
+    ec._same_thread_rivals = lambda M, anchor, addr: sorted(
+        ec._parsed_summary_date(r) for r in rivals)
     ec.imap_select = lambda M, folder, readonly=True: M.selected.append(folder)
     ec._search_by_message_id = lambda M, mid: [b"anchor"] if anchor else []
     ec._search_replies_to = lambda M, mid: [f"thr{i}".encode() for i, _ in enumerate(threaded, 1)]
@@ -175,6 +177,67 @@ def test_an_untracked_candidate_that_threads_elsewhere_does_not_count(ec):
     print("PASS an untracked candidate threaded to another message does not count")
 
 
+def test_an_untracked_reply_with_a_rival_in_between_is_ambiguous(ec):
+    # Two mails from the same correspondent under the same subject, at 10:00
+    # and 11:00, and one unthreaded reply at 12:00: it satisfies the checks
+    # for both anchors and cannot have answered both. For the 10:00 anchor
+    # the 11:00 mail is a rival that arrived before the reply, so the reply
+    # does not count. A rival that arrives *after* the reply changes nothing.
+    anchor = {
+        "uid": "a1",
+        "from": "Sender <sender@example.com>",
+        "subject": "Project status",
+        "date": "2026-09-16T10:00:00+00:00",
+    }
+    reply = {"to": "sender@example.com", "subject": "Re: Project status",
+             "date": "2026-09-16T12:00:00+00:00"}
+    rc, payload = _run_case(ec, anchor=anchor, untracked=[reply],
+                            rivals=["2026-09-16T11:00:00+00:00"])
+    assert rc == 3 and payload["answered"] is False, payload
+    rc, payload = _run_case(ec, anchor=anchor, untracked=[reply],
+                            rivals=["2026-09-16T13:00:00+00:00"])
+    assert rc == 0 and payload["answered"] is True, payload
+    print("PASS an untracked reply with a rival mail in between is ambiguous")
+
+
+def test_rivals_are_found_by_correspondent_subject_and_order(ec):
+    # The real helper against a fake folder: same sender and base subject,
+    # newer than the anchor, not the anchor itself.
+    ec = _load_email_client()
+    anchor = {"uid": "1", "from": "Sender <sender@example.com>",
+              "subject": "Project status", "date": "2026-09-16T10:00:00+00:00"}
+    folder = {
+        b"1": anchor,
+        b"2": {"uid": "2", "subject": "AW: Project status",
+               "date": "2026-09-16T11:00:00+00:00"},
+        b"3": {"uid": "3", "subject": "Other matter",
+               "date": "2026-09-16T11:30:00+00:00"},
+        b"4": {"uid": "4", "subject": "Project status",
+               "date": "2026-09-15T09:00:00+00:00"},
+    }
+
+    class _M:
+        def uid(self, verb, charset, *criteria):
+            assert "FROM" in criteria and "SINCE" in criteria, criteria
+            return "OK", [b" ".join(folder)]
+
+    ec._summary = lambda M, uid: dict(folder[uid])
+    rivals = ec._same_thread_rivals(_M(), anchor, "sender@example.com")
+    assert [r.isoformat() for r in rivals] == ["2026-09-16T11:00:00+00:00"], rivals
+    print("PASS rivals are found by correspondent, subject and order")
+
+
+def test_recipients_are_parsed_as_rfc_address_lists(ec):
+    # A display name with a comma is one address, not two.
+    got = ec._reply_recipients({
+        "to": '"Doe, John" <john@example.com>, Ann <ann@example.com>',
+        "cc": "Cc Person <cc@example.com>",
+        "bcc": "",
+    })
+    assert got == {"john@example.com", "ann@example.com", "cc@example.com"}, got
+    print("PASS recipients are parsed as RFC address lists")
+
+
 def test_without_the_anchor_mail_the_answer_is_conservatively_unanswered(ec):
     rc, payload = _run_case(
         ec,
@@ -225,6 +288,9 @@ def main():
     test_untracked_replies_apply_the_exact_timestamp_check(ec)
     test_without_the_anchor_mail_the_answer_is_conservatively_unanswered(ec)
     test_an_untracked_candidate_that_threads_elsewhere_does_not_count(ec)
+    test_an_untracked_reply_with_a_rival_in_between_is_ambiguous(ec)
+    test_rivals_are_found_by_correspondent_subject_and_order(ec)
+    test_recipients_are_parsed_as_rfc_address_lists(ec)
     test_base_subject_strips_the_same_prefixes_the_gate_nominates_on(ec)
     test_untracked_search_covers_cc_and_bcc(ec)
     print("all email answered tests passed")

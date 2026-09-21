@@ -549,8 +549,9 @@ def test_a_due_omnibus_digest_arms_the_gate_on_its_own():
         assert gate.run_frequent() == 0
         assert len(rec.calls) == 1, "a due omnibus digest must arm the gate"
         assert rec.due == [1], f"the spawn was not told the digest is due: {rec.due}"
-        ids = {m["message_id"] for m in rec.calls[0][1]}
-        assert ids == {"<a@work.com>"}, f"the bundled mail was not handed over: {ids}"
+        # The bundle rides along as a count: the digest is composed from the
+        # status store, and listing bundled mail would unbound the prompt.
+        assert rec.calls[0][1] == [], f"bundled mail listed in the payload: {rec.calls[0][1]}"
     print("PASS test_a_due_omnibus_digest_arms_the_gate_on_its_own")
 
 
@@ -606,8 +607,7 @@ def test_a_due_digest_arms_even_when_its_sender_is_not_whitelisted():
         assert gate.run_frequent() == 0
         assert len(rec.calls) == 1, "a due digest must arm regardless of sender"
         assert rec.due == [1]
-        ids = {m["message_id"] for m in rec.calls[0][1]}
-        assert ids == {"<a@x.io>"}, f"the bundled mail was not handed over: {ids}"
+        assert rec.calls[0][1] == []
     print("PASS test_a_due_digest_arms_even_when_its_sender_is_not_whitelisted")
 
 
@@ -855,11 +855,15 @@ def test_the_prompt_lists_the_whole_slice_and_owns_the_scope():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         messages = [
-            {"from": "a@work.com", "subject": f"s{i}", "message_id": f"<{i}@work.com>"}
+            {"uid": str(100 + i), "from": "a@work.com", "subject": f"s{i}",
+             "message_id": f"<{i}@work.com>"}
             for i in range(12)
         ]
         partial = gate.build_prompt("daily", messages, remaining=30)
         assert partial.count("\n  - ") == 12, "every message in the slice is listed"
+        # The skill reads, flags and moves by UID, and the session may not
+        # list the INBOX to find one: every entry carries it.
+        assert all(f"uid {100 + i}:" in partial for i in range(12)), partial
         assert "Do not list the INBOX for more" in partial
         assert "the moment its disposition is settled" in partial
         assert "30 more message(s) wait" in partial
@@ -947,8 +951,9 @@ def test_a_failed_session_is_reported_as_such_not_as_partial():
 
 
 def test_a_due_digest_rides_along_with_the_slice():
-    # The bundle is owed on time whatever slice is being worked; it is merged
-    # into the payload and does not count against the slice.
+    # The bundle is owed on time whatever slice is being worked; it rides
+    # along as a count, never listed, and does not count against the slice --
+    # a large bundle must not turn the bounded run back into an unbounded one.
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
         _whitelist_all(gate)
@@ -961,8 +966,10 @@ def test_a_due_digest_rides_along_with_the_slice():
         gate.refresh_whitelist_from_sent = lambda: 0
         assert gate.run_daily() == gate.EXIT_PARTIAL
         ids = [m["message_id"] for m in rec.calls[0][1]]
-        assert ids == ["<2@work.com>", "<b@work.com>"], ids
+        assert ids == ["<2@work.com>"], ids
         assert rec.due == [1] and rec.remaining == [1]
+        prompt = gate.build_prompt("daily", rec.calls[0][1], due=1, remaining=1)
+        assert "digest of 1 message(s)" in prompt and "<b@work.com>" not in prompt
     print("PASS test_a_due_digest_rides_along_with_the_slice")
 
 
