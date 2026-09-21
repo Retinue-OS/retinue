@@ -535,7 +535,7 @@ def _select_body_and_links(plain, html):
 def _summary(M, uid):
     typ, data = M.uid(
         "fetch", uid,
-        "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID LIST-ID)] FLAGS)")
+        "(BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO SUBJECT DATE MESSAGE-ID LIST-ID)] FLAGS)")
     if typ != "OK" or not data or data[0] is None:
         return None
     header_bytes = b""
@@ -553,6 +553,9 @@ def _summary(M, uid):
     return {
         "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
         "from": _decode(hdr.get("From")),
+        # Where a reply to this message actually goes (`cmd_reply` honours
+        # it), so `answered` can recognise a reply sent there.
+        "reply_to": _decode(hdr.get("Reply-To")) or None,
         "to": _decode(hdr.get("To")),
         "subject": _decode(hdr.get("Subject")),
         "date": iso,
@@ -766,16 +769,28 @@ def _ambiguous(reply, rivals):
     return when is None or any(r < when for r in rivals)
 
 
+def _anchor_addresses(anchor):
+    """Where a reply to the anchor may have gone: its Reply-To if it carries
+    one (that is where `cmd_reply` sends), and its From either way."""
+    addrs = set()
+    for field in ("reply_to", "from"):
+        for _name, addr in getaddresses([str(anchor.get(field) or "")]):
+            addr = addr.strip().casefold()
+            if addr:
+                addrs.add(addr)
+    return addrs
+
+
 def _reply_matches_anchor(reply, anchor):
     """Whether one sent message safely counts as a reply to the anchor mail."""
-    addr = parseaddr(anchor.get("from") or "")[1].casefold()
+    addrs = _anchor_addresses(anchor)
     anchor_when = _parsed_summary_date(anchor.get("date"))
     reply_when = _parsed_summary_date(reply.get("date"))
-    if not addr or anchor_when is None or reply_when is None or reply_when <= anchor_when:
+    if not addrs or anchor_when is None or reply_when is None or reply_when <= anchor_when:
         return False
     if _base_subject(reply.get("subject")) != _base_subject(anchor.get("subject")):
         return False
-    return addr in _reply_recipients(reply)
+    return bool(addrs & _reply_recipients(reply))
 
 
 # --------------------------------------------------------------------------- #
@@ -865,15 +880,18 @@ def cmd_answered(cfg, args):
 
     untracked = []
     if anchor:
-        addr = parseaddr(anchor.get("from") or "")[1]
-        if addr:
-            seen = {m["uid"] for m in threaded}
+        seen = {m["uid"] for m in threaded}
+        # Sent to the Reply-To, if any, or to the From: either is where a
+        # reply may have gone.
+        for addr in sorted(_anchor_addresses(anchor)):
             for uid in _search_sent_to(M, addr, anchor.get("date")):
                 s = _reply_summary(M, uid)
                 if (s and s["uid"] not in seen and not _threads_elsewhere(s)
                         and _reply_matches_anchor(s, anchor)):
+                    seen.add(s["uid"])
                     untracked.append(s)
-        if untracked:
+        addr = parseaddr(anchor.get("from") or "")[1]
+        if untracked and addr:
             # An unthreaded reply can be paired only by correspondent,
             # subject and order. If the correspondent sent another mail
             # under that subject before the reply, the reply may be to that

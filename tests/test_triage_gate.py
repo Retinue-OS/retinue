@@ -1176,13 +1176,12 @@ def test_the_sent_listing_is_bounded_by_the_oldest_inbox_date():
     print("PASS test_the_sent_listing_is_bounded_by_the_oldest_inbox_date")
 
 
-def test_a_capped_listing_exact_checks_only_mail_older_than_its_horizon():
-    # The residual cap can bite when one very old mail is still open. Past it,
-    # the listing is the newest CAP messages, so a reply to anything older than
-    # the oldest one listed may lie beyond it — those messages, and only those,
-    # are exact-checked without a nomination. Everything newer still goes
-    # through the subject index, so the cap never turns into a login per
-    # message.
+def test_a_capped_listing_exact_checks_everything():
+    # The residual cap can bite when one very old mail is still open. Past it
+    # the listing is incomplete, and no date read off it is a safe boundary:
+    # the cap keeps the newest UIDs, and UID order need not be date order. So
+    # every INBOX message pays for the exact check that tick — the cap biting
+    # is the anomaly, and the log says which mail to settle to end it.
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp, sent_reconcile=True)
         gate.RECONCILE_LISTING_CAP = 2
@@ -1200,8 +1199,8 @@ def test_a_capped_listing_exact_checks_only_mail_older_than_its_horizon():
         ]
         assert gate.reconcile_answered(inbox) == inbox
         checks = [c for c in calls if c[0] == "answered"]
-        assert len(checks) == 1 and "<old@work.com>" in checks[0], checks
-    print("PASS test_a_capped_listing_exact_checks_only_mail_older_than_its_horizon")
+        assert len(checks) == 2, checks
+    print("PASS test_a_capped_listing_exact_checks_everything")
 
 
 def test_a_reply_that_predates_the_mail_does_not_settle_it():
@@ -1402,7 +1401,7 @@ if __name__ == "__main__":
     test_an_inconclusive_answered_check_settles_nothing()
     test_only_nominated_mail_pays_for_an_exact_check()
     test_the_sent_listing_is_bounded_by_the_oldest_inbox_date()
-    test_a_capped_listing_exact_checks_only_mail_older_than_its_horizon()
+    test_a_capped_listing_exact_checks_everything()
     test_a_reply_that_predates_the_mail_does_not_settle_it()
     test_a_failed_move_leaves_the_mail_in_the_triage_set()
     test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set()

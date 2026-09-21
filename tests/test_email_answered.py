@@ -227,6 +227,36 @@ def test_rivals_are_found_by_correspondent_subject_and_order(ec):
     print("PASS rivals are found by correspondent, subject and order")
 
 
+def test_a_reply_sent_to_the_reply_to_address_counts(ec):
+    # `cmd_reply` sends to Reply-To when the mail carries one, so that is
+    # where a real reply went; judging the correspondent by From alone
+    # rejects every such reply and leaves the mail in the INBOX.
+    anchor = {
+        "uid": "a1",
+        "from": "Notifier <noreply@example.com>",
+        "reply_to": "Real Person <person@example.com>",
+        "subject": "Project status",
+        "date": "2026-09-16T10:00:00+00:00",
+    }
+    rc, payload = _run_case(
+        ec,
+        anchor=anchor,
+        threaded=[{"to": "person@example.com", "subject": "Re: Project status",
+                   "date": "2026-09-16T11:00:00+00:00"}],
+    )
+    assert rc == 0 and payload["answered"] is True, payload
+    # The untracked search asks for both addresses, once each. The stubs
+    # from the case above are still installed; only the search is replaced.
+    asked = []
+    ec._search_sent_to = lambda M, addr, since: asked.append(addr) or []
+    with redirect_stdout(io.StringIO()):
+        ec.cmd_answered(SimpleNamespace(sent_folder="Sent"),
+                        SimpleNamespace(message_id="<m@example.com>",
+                                        folder="Sent", in_folder="INBOX"))
+    assert sorted(asked) == ["noreply@example.com", "person@example.com"], asked
+    print("PASS a reply sent to the Reply-To address counts")
+
+
 def test_recipients_are_parsed_as_rfc_address_lists(ec):
     # A display name with a comma is one address, not two.
     got = ec._reply_recipients({
@@ -290,6 +320,7 @@ def main():
     test_an_untracked_candidate_that_threads_elsewhere_does_not_count(ec)
     test_an_untracked_reply_with_a_rival_in_between_is_ambiguous(ec)
     test_rivals_are_found_by_correspondent_subject_and_order(ec)
+    test_a_reply_sent_to_the_reply_to_address_counts(ec)
     test_recipients_are_parsed_as_rfc_address_lists(ec)
     test_base_subject_strips_the_same_prefixes_the_gate_nominates_on(ec)
     test_untracked_search_covers_cc_and_bcc(ec)

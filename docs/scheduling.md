@@ -104,7 +104,8 @@ re-spawned every few minutes on a knob meant for resuming honest work, and a
 day of ten-minute retries of a failing session is a lot of credits. (A
 `partial` run is still "not success", so `retry_after_seconds` alone also
 brings it forward, for a job that wants one knob for both.) A job with neither
-simply waits its interval. The job the framework ships this for:
+simply waits its interval. The framework's own base manifest carries no such
+job; a chamber opts its e-mail sweep in, for example:
 
 ```json
 {

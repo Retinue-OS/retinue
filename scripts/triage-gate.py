@@ -106,9 +106,9 @@ SENT_RECONCILE = os.environ.get("TRIAGE_SENT_RECONCILE", "1").strip() != "0"
 # Safety cap on the reconciliation's Sent listing. The listing is bounded by
 # *date* (nothing older than the oldest INBOX mail can answer it), so in the
 # normal case it is far smaller than this; the cap only matters when one very
-# old mail is still open, and then `reconcile_answered` knows exactly which
-# messages the cap could hide and exact-checks just those. Not an env knob: it
-# is not a scope decision, only a guard against a pathological listing.
+# old mail is still open, and then `reconcile_answered` stops trusting the
+# listing and exact-checks every message. Not an env knob: it is not a scope
+# decision, only a guard against a pathological listing.
 RECONCILE_LISTING_CAP = 1000
 # How many never-seen (or stalled) messages one run hands the model, oldest
 # first. The lever that makes a sweep incremental: the model's work on each
@@ -437,9 +437,13 @@ def reconcile_answered(messages: list[dict]) -> list[dict]:
          or an exact check on every INBOX message on every tick — an IMAP
          login per message, half-hourly. The one residual cap
          (RECONCILE_LISTING_CAP) guards against a single very old open mail
-         dragging in years of Sent; when it bites, the gate knows the
-         listing's oldest date, and only the messages older than that — the
-         ones whose reply could be past the cap — pay for the exact check.
+         dragging in years of Sent. When it bites, the listing is no longer
+         complete and every message is exact-checked instead. Not a
+         date-horizon shortcut: the cap keeps the newest *UIDs*, and UID
+         order is append order, which need not be date order (an import, a
+         delayed append), so no date from the listing is a safe boundary.
+         The cap biting at all is the anomaly, and the log says which mail
+         to settle to stop it.
       2. **Decide** — `_confirm_answered`, one exact server-side check per
          candidate. Nothing is archived on the strength of step 1.
 
@@ -468,29 +472,27 @@ def reconcile_answered(messages: list[dict]) -> list[dict]:
         return messages
     listed = list(res.get("messages", []))
     sent_index: dict[str, list[datetime]] = {}
-    sent_dates: list[datetime] = []
     for sent in listed:
         key = _thread_key(sent.get("subject"))
         when = _parse_when(sent.get("date"))
-        if when is not None:
-            sent_dates.append(when)
         if key and when is not None:
             sent_index.setdefault(key, []).append(when)
-    # Past the cap, the listing is the *newest* CAP messages since `since`;
-    # a reply to anything older than the oldest one listed may lie beyond it.
-    horizon = min(sent_dates) if len(listed) >= RECONCILE_LISTING_CAP and sent_dates else None
-    if horizon is not None:
-        print(f"[triage-gate] sent-reconcile: {SENT_FOLDER} listing hit the "
-              f"{RECONCILE_LISTING_CAP}-message cap; mail older than "
-              f"{horizon.date()} is exact-checked without nomination",
+    # Past the cap the listing is incomplete, and no date read off it is a
+    # safe boundary (see the docstring): every message pays for the exact
+    # check this tick, and the log names the mail whose age caused it.
+    saturated = len(listed) >= RECONCILE_LISTING_CAP
+    if saturated:
+        print(f"[triage-gate] sent-reconcile: {SENT_FOLDER} since "
+              f"{min(dated).date()} exceeds the {RECONCILE_LISTING_CAP}-message "
+              f"cap; exact-checking all {len(messages)} INBOX message(s). "
+              "Settling the oldest open INBOX mail ends this.",
               file=sys.stderr)
 
     keep, settled, checked = [], 0, 0
     for msg in messages:
         key = _thread_key(msg.get("subject"))
         when = _parse_when(msg.get("date"))
-        beyond_horizon = horizon is not None and when is not None and when < horizon
-        nominated = beyond_horizon or (bool(key and when is not None) and any(
+        nominated = saturated or (bool(key and when is not None) and any(
             sent_at > when for sent_at in sent_index.get(key, [])
         ))
         if nominated:
