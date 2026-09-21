@@ -865,6 +865,32 @@ def test_the_walk_has_no_page_ceiling_and_stops_on_a_short_page():
     print("PASS test_the_walk_has_no_page_ceiling_and_stops_on_a_short_page")
 
 
+def test_a_page_short_on_summaries_but_full_on_the_server_keeps_walking():
+    # One unreadable header in an otherwise full page must not end the walk:
+    # fullness and the next cursor are read off `scanned` / `min_uid`.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 2
+        gate.INBOX_SCAN_MAX = 4
+        everything = [{"uid": str(u), "message_id": f"<{u}>"} for u in range(10, 0, -1)]
+
+        def fake_client(*args):
+            limit = int(args[args.index("--limit") + 1])
+            pool = everything
+            if "--uid-max" in args:
+                cap = int(args[args.index("--uid-max") + 1])
+                pool = [m for m in everything if int(m["uid"]) <= cap]
+            page = pool[:limit]
+            readable = [m for m in page if m["uid"] != "8"]  # one bad header
+            return {"messages": readable, "scanned": len(page),
+                    "min_uid": min(int(m["uid"]) for m in page) if page else None}
+
+        gate._email_client = fake_client
+        got = gate.inbox_messages()
+        assert [m["uid"] for m in got] == [str(u) for u in range(10, 0, -1) if u != 8], got
+    print("PASS test_a_page_short_on_summaries_but_full_on_the_server_keeps_walking")
+
+
 def test_a_walk_that_does_not_advance_stops_rather_than_looping():
     # A backend that ignores the cursor would hand back the same full page
     # forever; the walk must notice the cursor not moving and stop.
@@ -1336,6 +1362,53 @@ def test_a_capped_listing_stays_bounded_and_nominates_from_what_it_has():
     print("PASS test_a_capped_listing_stays_bounded_and_nominates_from_what_it_has")
 
 
+def test_exact_checks_are_capped_per_run_oldest_first():
+    # Each exact check is an IMAP session; the number per run is bounded like
+    # the slice is, oldest mail first, and the rest wait for the next run.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        gate.RECONCILE_CHECKS_PER_RUN = 2
+        calls = _arm_sent(gate, [
+            {"subject": "Re: Budget", "to": "cfo@work.com",
+             "date": "2026-09-18T10:00:00+00:00"},
+        ], answered=3)
+        inbox = [
+            {"uid": str(i), "from": "cfo@work.com", "subject": "Budget",
+             "message_id": f"<b{i}@work.com>", "date": f"2026-09-{10 + i:02d}T10:00:00+00:00"}
+            for i in (3, 1, 4, 2)
+        ]
+        left = gate.reconcile_answered(inbox)
+        assert len(left) == 4
+        checks = [c for c in calls if c[0] == "answered"]
+        checked = [c[c.index("--message-id") + 1] for c in checks]
+        assert checked == ["<b1@work.com>", "<b2@work.com>"], checked
+    print("PASS test_exact_checks_are_capped_per_run_oldest_first")
+
+
+def test_a_negative_check_is_remembered_until_sent_changes():
+    # A negative can only change when a newer reply appears, so it is not
+    # re-bought every tick -- and the cap goes to candidates not yet checked.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        sent = [{"subject": "Re: Budget", "to": "cfo@work.com",
+                 "date": "2026-09-18T10:00:00+00:00"}]
+        calls = _arm_sent(gate, sent, answered=3)
+        inbox = [{"uid": "1", "from": "cfo@work.com", "subject": "Budget",
+                  "message_id": "<b@work.com>", "date": "2026-09-16T10:00:00+00:00"}]
+        assert gate.reconcile_answered(inbox) == inbox
+        assert gate.reconcile_answered(inbox) == inbox
+        assert len([c for c in calls if c[0] == "answered"]) == 1, "re-checked unchanged Sent state"
+        # A newer reply changes the nomination: checked again.
+        sent.append({"subject": "Re: Budget", "to": "cfo@work.com",
+                     "date": "2026-09-19T10:00:00+00:00"})
+        assert gate.reconcile_answered(inbox) == inbox
+        assert len([c for c in calls if c[0] == "answered"]) == 2
+        # The memo is pruned to mail still present.
+        memo = json.loads((gate.TRIAGE_STATE_DIR / ".answered-checks.json").read_text())
+        assert set(memo) == {"<b@work.com>"}, memo
+    print("PASS test_a_negative_check_is_remembered_until_sent_changes")
+
+
 def test_a_reply_that_predates_the_mail_does_not_settle_it():
     # The common real shape: a correspondence where the latest word is theirs.
     # An older reply of ours in the same thread does not answer a newer mail.
@@ -1521,6 +1594,7 @@ if __name__ == "__main__":
     test_a_saturated_scan_window_widens_instead_of_hiding_old_mail()
     test_a_saturated_wide_scan_pages_down_by_uid_until_short()
     test_the_walk_has_no_page_ceiling_and_stops_on_a_short_page()
+    test_a_page_short_on_summaries_but_full_on_the_server_keeps_walking()
     test_a_walk_that_does_not_advance_stops_rather_than_looping()
     test_a_failed_page_keeps_what_was_listed()
     test_an_unsaturated_scan_does_not_pay_for_a_second_listing()
@@ -1540,6 +1614,8 @@ if __name__ == "__main__":
     test_only_nominated_mail_pays_for_an_exact_check()
     test_the_sent_listing_is_bounded_by_the_oldest_inbox_date()
     test_a_capped_listing_stays_bounded_and_nominates_from_what_it_has()
+    test_exact_checks_are_capped_per_run_oldest_first()
+    test_a_negative_check_is_remembered_until_sent_changes()
     test_a_reply_that_predates_the_mail_does_not_settle_it()
     test_a_failed_move_leaves_the_mail_in_the_triage_set()
     test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set()

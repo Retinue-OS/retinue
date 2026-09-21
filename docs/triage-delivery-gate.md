@@ -278,7 +278,11 @@ credits):
    first listing is a small newest-first window, widened once when it
    saturates, and a mailbox larger than the wide window is walked to the end
    in pages by UID cursor (`search --uid-max`), so the oldest mail — the mail
-   the oldest-first slice wants — is never out of view behind a cap.
+   the oldest-first slice wants — is never out of view behind a cap. A page
+   is one bulk header FETCH, not one per message, and whether it was full
+   is read off what the server matched (`scanned`), not off how many
+   summaries came back, so the walk is cheap and an unreadable header cannot
+   end it early.
 2. **Settle what has already been answered.** Each message whose thread subject
    appears in a Sent listing with a later date is *nominated*, then confirmed
    exactly by `email_client answered` — a server-side IMAP SEARCH for replies
@@ -292,7 +296,12 @@ credits):
    dragging in years of Sent; when it bites the listing is incomplete, so the
    gate nominates from what it listed, says so, and a reply older than the
    window is not settled that tick — the mail stays in the INBOX and is
-   proposed, where the skill's own already-answered check sees it. It never
+   proposed, where the skill's own already-answered check sees it. The exact
+   checks themselves are bounded per run (oldest mail first; the rest wait
+   for the next run), and a negative is remembered under the Sent state it
+   was checked against (`.answered-checks.json` in the status dir), so the
+   cap is spent on candidates not yet checked rather than on the same ones
+   every tick. It never
    widens to an exact check of the whole INBOX, which would put unbounded
    work in front of the bounded slice. (No date read off a capped listing is
    a safe boundary either: the cap keeps the newest UIDs, and UID order need

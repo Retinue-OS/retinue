@@ -105,6 +105,11 @@ INBOX_SCAN_MAX = int(os.environ.get("TRIAGE_INBOX_SCAN_MAX", "2000"))
 # Sent folder. Credit-free, and the one check that keeps "answered" and "still
 # in the INBOX" from drifting apart. See `reconcile_answered`.
 SENT_RECONCILE = os.environ.get("TRIAGE_SENT_RECONCILE", "1").strip() != "0"
+# How many exact `answered` checks one run makes, oldest mail first. Each is
+# an IMAP session of its own, so the number must be bounded per run the same
+# way the model's slice is; what does not fit waits for the next run. The
+# memo below keeps the cap from being spent on the same negatives every tick.
+RECONCILE_CHECKS_PER_RUN = 50
 # Safety cap on the reconciliation's Sent listing. The listing is bounded by
 # *date* (nothing older than the oldest INBOX mail can answer it), so in the
 # normal case it is far smaller than this; the cap only matters when one very
@@ -244,7 +249,7 @@ def inbox_messages() -> list[dict]:
     if not res:
         return []
     messages = res.get("messages", [])
-    if len(messages) < INBOX_SCAN_LIMIT:
+    if _page_size(res) < INBOX_SCAN_LIMIT:
         return messages
 
     print(
@@ -265,14 +270,15 @@ def inbox_messages() -> list[dict]:
     # for, and the cursor must move, so the walk ends with the mailbox. A
     # page that fails or does not advance ends it early, loudly, with what
     # was listed so far -- a partial listing the log names, never a quiet
-    # ceiling.
-    page, cursor = messages, None
-    while len(page) >= INBOX_SCAN_MAX:
-        uids = [int(m["uid"]) for m in page
-                if str(m.get("uid") or "").isdigit()]
-        if not uids or min(uids) <= 1:
+    # ceiling. "Full" and "where next" are read off the page as the server
+    # matched it (`scanned`, `min_uid`), not off how many summaries came
+    # back, so an unreadable header cannot end the walk early.
+    res, cursor = wide, None
+    while _page_size(res) >= INBOX_SCAN_MAX:
+        low = _page_min_uid(res)
+        if low is None or low <= 1:
             break
-        nxt = min(uids) - 1
+        nxt = low - 1
         if cursor is not None and nxt >= cursor:
             print(f"[triage-gate] INBOX walk did not advance below uid {cursor}; "
                   f"stopping with the {len(messages)} listed so far",
@@ -288,11 +294,31 @@ def inbox_messages() -> list[dict]:
                   f"continuing with the {len(messages)} listed so far — older "
                   "mail is out of view this tick", file=sys.stderr)
             break
+        res = more
         page = list(more.get("messages", []))
         messages.extend(page)
         print(f"[triage-gate] INBOX exceeds {INBOX_SCAN_MAX}; paged below uid "
               f"{cursor}: +{len(page)}, {len(messages)} so far", file=sys.stderr)
     return messages
+
+
+def _page_size(res: dict) -> int:
+    """How many messages the server matched for this page — `scanned` from a
+    client that reports it, else the summaries returned."""
+    scanned = res.get("scanned")
+    if isinstance(scanned, int):
+        return scanned
+    return len(res.get("messages", []))
+
+
+def _page_min_uid(res: dict) -> int | None:
+    """The smallest UID the server matched for this page, for the next cursor."""
+    low = res.get("min_uid")
+    if isinstance(low, int):
+        return low
+    uids = [int(m["uid"]) for m in res.get("messages", [])
+            if str(m.get("uid") or "").isdigit()]
+    return min(uids) if uids else None
 
 
 def refresh_whitelist_from_sent() -> int:
@@ -534,24 +560,83 @@ def reconcile_answered(messages: list[dict]) -> list[dict]:
               "than the window is not settled this tick. Settling the oldest "
               "open INBOX mail ends this.", file=sys.stderr)
 
-    keep, settled, checked = [], 0, 0
+    # A nomination is keyed by the newest Sent message that nominates it. The
+    # exact check's answer can only change when that key changes (a newer
+    # reply appears), so a negative is remembered under its key and not
+    # re-bought every tick -- the cap below then goes to candidates that have
+    # not been checked yet, and a large mailbox's candidates are worked
+    # through across runs instead of the same oldest ones every time.
+    memo = _load_check_memo()
+    candidates: list[tuple[datetime, str, dict]] = []
+    keep: list[dict] = []
     for msg in messages:
         key = _thread_key(msg.get("subject"))
         when = _parse_when(msg.get("date"))
-        nominated = bool(key and when is not None) and any(
-            sent_at > when for sent_at in sent_index.get(key, [])
-        )
-        if nominated:
-            checked += 1
-        if nominated and _confirm_answered(msg) and _settle_answered(msg):
-            settled += 1
+        later = [sent_at for sent_at in sent_index.get(key, [])
+                 if when is not None and sent_at > when] if key else []
+        mid = (msg.get("message_id") or "").strip()
+        if later and mid:
+            nomination = max(later).isoformat()
+            if memo.get(mid) == nomination:
+                keep.append(msg)  # checked against this very Sent state: no
+                continue
+            candidates.append((when, nomination, msg))
         else:
             keep.append(msg)
-    if checked:
-        print(f"[triage-gate] sent-reconcile: {checked} candidate(s) confirmed "
-              f"against {SENT_FOLDER}, {settled} moved INBOX->{ANSWERED_FOLDER}",
+    candidates.sort(key=lambda c: c[0])
+    checked = candidates[:RECONCILE_CHECKS_PER_RUN]
+    deferred = candidates[RECONCILE_CHECKS_PER_RUN:]
+    settled = 0
+    for _when, nomination, msg in checked:
+        mid = msg["message_id"].strip()
+        if _confirm_answered(msg) and _settle_answered(msg):
+            settled += 1
+            memo.pop(mid, None)
+        else:
+            keep.append(msg)
+            memo[mid] = nomination
+    for _when, _nomination, msg in deferred:
+        keep.append(msg)
+    if checked or deferred:
+        print(f"[triage-gate] sent-reconcile: {len(checked)} candidate(s) "
+              f"confirmed against {SENT_FOLDER}, {settled} moved "
+              f"INBOX->{ANSWERED_FOLDER}"
+              + (f", {len(deferred)} wait for a later run" if deferred else ""),
               file=sys.stderr)
+        _save_check_memo(memo, {(m.get("message_id") or "").strip()
+                                for m in messages})
     return keep
+
+
+_CHECK_MEMO = ".answered-checks.json"
+
+
+def _load_check_memo() -> dict[str, str]:
+    """message_id -> the nomination (newest nominating Sent timestamp) it was
+    last exact-checked against and found unanswered."""
+    try:
+        data = json.loads((TRIAGE_STATE_DIR / _CHECK_MEMO).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, str)} \
+        if isinstance(data, dict) else {}
+
+
+def _save_check_memo(memo: dict[str, str], present: set[str]) -> None:
+    """Persist the memo, dropping entries for mail no longer in the INBOX so
+    it never outgrows the mailbox. Best effort: a memo that could not be
+    written costs a repeated check, nothing worse."""
+    pruned = {k: v for k, v in memo.items() if k in present}
+    try:
+        TRIAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path = TRIAGE_STATE_DIR / _CHECK_MEMO
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pruned, ensure_ascii=False, indent=0),
+                       encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:  # noqa: BLE001
+        print(f"[triage-gate] sent-reconcile: could not write check memo: {exc}",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -1048,7 +1133,12 @@ def build_prompt(
             "",
             "This slice drains the backlog: after the list, run Phase 1's "
             "reconciliation passes (store->INBOX, done-but-still-there, "
-            "stalled) and Phase 5 as the skill describes.",
+            "stalled) and Phase 5 as the skill describes. Those passes diff "
+            "the INBOX against the status store, so for them — and only for "
+            "them — list the INBOX as the skill says; the scope rule above is "
+            "about not taking on more triage work, not about the repairs. Any "
+            "unrecorded mail the listing turns up is a later run's, not this "
+            "one's.",
         ]
     if due:
         lines += [

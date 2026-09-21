@@ -167,7 +167,10 @@ a slice exists to do. The prompt also says whether this slice drains the
 backlog. When it does **not**, defer only the whole-picture work: the *Phase 1
 reconciliation passes* numbered 2–4 below (store→INBOX, done-but-still-there,
 stalled) and Phase 5's reminders belong to the draining run. When it does,
-run those as written. A due omnibus digest is announced as a
+run those as written — they diff the INBOX against the status store, so for
+them, and only for them, list the INBOX as described below; any unrecorded
+mail that listing turns up belongs to a later run's slice, not to this one.
+A due omnibus digest is announced as a
 count, not a listing: compose it from the `omnibus_pending` records in the
 status store (Phase 4b). The listing below is for a run that is *not* handed
 a slice (a manual invocation, an ad-hoc triage).

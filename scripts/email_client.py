@@ -532,10 +532,13 @@ def _select_body_and_links(plain, html):
     return body, links
 
 
+_SUMMARY_ITEMS = ("(BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO SUBJECT DATE "
+                  "MESSAGE-ID LIST-ID)] FLAGS)")
+_UID_IN_FETCH = re.compile(rb"\bUID (\d+)")
+
+
 def _summary(M, uid):
-    typ, data = M.uid(
-        "fetch", uid,
-        "(BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO SUBJECT DATE MESSAGE-ID LIST-ID)] FLAGS)")
+    typ, data = M.uid("fetch", uid, _SUMMARY_ITEMS)
     if typ != "OK" or not data or data[0] is None:
         return None
     header_bytes = b""
@@ -544,6 +547,61 @@ def _summary(M, uid):
         if isinstance(item, tuple):
             header_bytes = item[1]
             flags = imaplib.ParseFlags(item[0]) if item[0] else ()
+        elif isinstance(item, bytes) and b"FLAGS" in item:
+            # Some servers put FLAGS after the header literal.
+            flags = imaplib.ParseFlags(item)
+    return _summary_from_headers(uid, header_bytes, flags)
+
+
+def _summaries(M, uids):
+    """Summaries for many UIDs: one FETCH per chunk, not one per message.
+
+    A listing's cost is round-trips, and a per-message fetch makes a
+    2000-message page 2000 of them; one bulk FETCH makes it a handful. The
+    bulk reply is a stream of (envelope, literal) tuples, each carrying its
+    own `UID n`, sometimes followed by a bare `FLAGS (...)` item -- messages
+    come back in the server's order, so they are matched by UID, never by
+    position. Whatever the bulk reply did not yield (a server that answers
+    oddly, a message that vanished mid-fetch) is fetched singly, so the
+    result is exactly what a per-message loop would have produced.
+    """
+    want = [u.decode() if isinstance(u, bytes) else str(u) for u in uids]
+    got = {}
+    chunk_size = 500
+    for i in range(0, len(want), chunk_size):
+        chunk = want[i:i + chunk_size]
+        try:
+            typ, data = M.uid("fetch", ",".join(chunk), _SUMMARY_ITEMS)
+        except imaplib.IMAP4.error:
+            typ, data = "NO", []
+        if typ != "OK" or not data:
+            continue
+        current = None
+        for item in data:
+            if isinstance(item, tuple):
+                m = _UID_IN_FETCH.search(item[0] or b"")
+                if not m:
+                    current = None
+                    continue
+                current = m.group(1).decode()
+                flags = imaplib.ParseFlags(item[0]) if item[0] else ()
+                got[current] = _summary_from_headers(current, item[1], flags)
+            elif isinstance(item, bytes) and current and b"FLAGS" in item:
+                flags = imaplib.ParseFlags(item)
+                got[current]["flags"] = [
+                    f.decode() if isinstance(f, bytes) else f for f in flags]
+                got[current]["unread"] = b"\\Seen" not in flags
+    out = []
+    for u in want:
+        s = got.get(u)
+        if s is None:
+            s = _summary(M, u.encode())
+        if s:
+            out.append(s)
+    return out
+
+
+def _summary_from_headers(uid, header_bytes, flags):
     hdr = _parse_message(header_bytes)
     date = hdr.get("Date")
     try:
@@ -872,9 +930,20 @@ def cmd_search(cfg, args):
         die(f"search failed: {data}")
     uids = data[0].split()
     uids = uids[-args.limit:][::-1]
-    messages = [s for u in uids if (s := _summary(M, u))]
+    messages = _summaries(M, uids)
     M.logout()
-    print(json.dumps({"folder": args.folder, "count": len(messages), "messages": messages}, ensure_ascii=False, indent=2))
+    # `scanned` and `min_uid` describe the page as the server matched it,
+    # before any summary could fail: a caller paging by `--uid-max` reads
+    # "was this page full?" and "where does the next one start?" off these,
+    # never off the count of summaries, so one unreadable header cannot end
+    # a walk early and hide everything older.
+    print(json.dumps({
+        "folder": args.folder,
+        "count": len(messages),
+        "scanned": len(uids),
+        "min_uid": min(int(u) for u in uids) if uids else None,
+        "messages": messages,
+    }, ensure_ascii=False, indent=2))
 
 
 def cmd_answered(cfg, args):
