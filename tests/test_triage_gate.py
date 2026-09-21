@@ -841,6 +841,51 @@ def test_a_saturated_wide_scan_pages_down_by_uid_until_short():
     print("PASS test_a_saturated_wide_scan_pages_down_by_uid_until_short")
 
 
+def test_the_walk_has_no_page_ceiling_and_stops_on_a_short_page():
+    # The only bound on the walk is the mailbox: it ends when a page comes
+    # back short, however many pages that takes. A ceiling would be exactly
+    # the silent cap this replaced, one level up.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 2
+        gate.INBOX_SCAN_MAX = 3
+        total = 100  # 34 pages at 3 per page
+        everything = [{"uid": str(u), "message_id": f"<{u}>"} for u in range(total, 0, -1)]
+
+        def fake_client(*args):
+            limit = int(args[args.index("--limit") + 1])
+            pool = everything
+            if "--uid-max" in args:
+                cap = int(args[args.index("--uid-max") + 1])
+                pool = [m for m in everything if int(m["uid"]) <= cap]
+            return {"messages": pool[:limit]}
+
+        gate._email_client = fake_client
+        assert len(gate.inbox_messages()) == total
+    print("PASS test_the_walk_has_no_page_ceiling_and_stops_on_a_short_page")
+
+
+def test_a_walk_that_does_not_advance_stops_rather_than_looping():
+    # A backend that ignores the cursor would hand back the same full page
+    # forever; the walk must notice the cursor not moving and stop.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp)
+        gate.INBOX_SCAN_LIMIT = 2
+        gate.INBOX_SCAN_MAX = 3
+        same = [{"uid": str(u), "message_id": f"<{u}>"} for u in (9, 8, 7)]
+        calls = []
+
+        def fake_client(*args):
+            calls.append(args)
+            return {"messages": list(same)}
+
+        gate._email_client = fake_client
+        got = gate.inbox_messages()
+        assert len(calls) == 3, f"expected narrow, wide, one page: {len(calls)}"
+        assert len(got) == 6
+    print("PASS test_a_walk_that_does_not_advance_stops_rather_than_looping")
+
+
 def test_a_failed_page_keeps_what_was_listed():
     with tempfile.TemporaryDirectory() as tmp:
         gate = _fresh(tmp)
@@ -1132,6 +1177,41 @@ def test_an_answered_mail_is_archived_and_recorded_resolved():
         assert record["disposition"] == "answered"
         assert record["folder"] == "Archive"
     print("PASS test_an_answered_mail_is_archived_and_recorded_resolved")
+
+
+def test_settling_merges_into_an_existing_record_instead_of_replacing_it():
+    # A mail already `proposed` carries the thread id, the project link and
+    # whatever Phase 6 will need; settling it as answered must keep all of
+    # that and change only the resolution.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        _arm_sent(gate, [
+            {"subject": "Re: Meeting Thursday", "to": "donat@example.org",
+             "date": "2026-09-17T10:12:00+02:00"},
+        ])
+        path = gate._status_path("<m1@example.org>")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "status": "proposed", "disposition": "reply", "channel": "email",
+            "conversation_id": "conv-42", "project": "ops/meetings",
+            "proposed": "2026-09-16T09:00Z", "classified": "2026-09-16T08:30Z",
+            "message_id": "<m1@example.org>", "uid": "41",
+        }))
+        left = gate.reconcile_answered([
+            {"uid": "41", "from": "Donat <donat@example.org>",
+             "subject": "Meeting Thursday", "message_id": "<m1@example.org>",
+             "date": "2026-09-16T08:00:00+02:00"},
+        ])
+        assert left == []
+        record = json.loads(path.read_text())
+        assert record["status"] == "resolved" and record["disposition"] == "answered"
+        assert record["conversation_id"] == "conv-42", record
+        assert record["project"] == "ops/meetings", record
+        assert record["proposed"] == "2026-09-16T09:00Z", record
+        assert record["classified"] == "2026-09-16T08:30Z", record
+        assert record["superseded_status"] == "proposed", record
+        assert record["folder"] == "Archive" and "resolved_at" in record
+    print("PASS test_settling_merges_into_an_existing_record_instead_of_replacing_it")
 
 
 def test_a_reply_to_someone_else_does_not_settle_the_mail():
@@ -1440,6 +1520,8 @@ if __name__ == "__main__":
     test_a_corrupt_record_re_arms_instead_of_crashing_the_tick()
     test_a_saturated_scan_window_widens_instead_of_hiding_old_mail()
     test_a_saturated_wide_scan_pages_down_by_uid_until_short()
+    test_the_walk_has_no_page_ceiling_and_stops_on_a_short_page()
+    test_a_walk_that_does_not_advance_stops_rather_than_looping()
     test_a_failed_page_keeps_what_was_listed()
     test_an_unsaturated_scan_does_not_pay_for_a_second_listing()
     test_a_failed_widened_rescan_keeps_the_narrow_result()
@@ -1452,6 +1534,7 @@ if __name__ == "__main__":
     test_the_slice_never_exceeds_what_the_prompt_can_list()
     test_the_scan_covers_the_inbox_not_just_the_unread()
     test_an_answered_mail_is_archived_and_recorded_resolved()
+    test_settling_merges_into_an_existing_record_instead_of_replacing_it()
     test_a_reply_to_someone_else_does_not_settle_the_mail()
     test_an_inconclusive_answered_check_settles_nothing()
     test_only_nominated_mail_pays_for_an_exact_check()

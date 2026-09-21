@@ -200,6 +200,52 @@ def test_an_untracked_reply_with_a_rival_in_between_is_ambiguous(ec):
     print("PASS an untracked reply with a rival mail in between is ambiguous")
 
 
+def test_a_failed_rival_search_fails_closed(ec):
+    # "No rivals found" and "could not look" are different answers. When the
+    # ambiguity check cannot be made, an untracked candidate stays unconfirmed
+    # -- the caller moves mail on this answer.
+    anchor = {
+        "uid": "a1",
+        "from": "Sender <sender@example.com>",
+        "subject": "Project status",
+        "date": "2026-09-16T10:00:00+00:00",
+    }
+    reply = {"to": "sender@example.com", "subject": "Re: Project status",
+             "date": "2026-09-16T12:00:00+00:00"}
+    rc, payload = _run_case(ec, anchor=anchor, untracked=[reply])
+    assert rc == 0, payload  # sanity: with a working check it counts
+    ec._same_thread_rivals = lambda M, anchor, *a: None
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = ec.cmd_answered(SimpleNamespace(sent_folder="Sent"),
+                             SimpleNamespace(message_id="<m@example.com>",
+                                             folder="Sent", in_folder="INBOX"))
+    payload = json.loads(out.getvalue())
+    assert rc == 3 and payload["answered"] is False, payload
+
+    # And the helper itself reports failure as None, not as an empty list:
+    # an IMAP error, a non-OK reply, or a rival it could not read.
+    ec = _load_email_client()
+
+    class _Err:
+        def uid(self, *a):
+            raise ec.imaplib.IMAP4.error("boom")
+
+    class _No:
+        def uid(self, *a):
+            return "NO", [b""]
+
+    class _Unreadable:
+        def uid(self, *a):
+            return "OK", [b"7"]
+
+    assert ec._same_thread_rivals(_Err(), anchor) is None
+    assert ec._same_thread_rivals(_No(), anchor) is None
+    ec._summary = lambda M, uid: None
+    assert ec._same_thread_rivals(_Unreadable(), anchor) is None
+    print("PASS a failed rival search fails closed")
+
+
 def test_rivals_are_found_by_correspondent_subject_and_order(ec):
     # The real helper against a fake folder: same sender and base subject,
     # newer than the anchor, not the anchor itself.
@@ -333,6 +379,7 @@ def main():
     test_without_the_anchor_mail_the_answer_is_conservatively_unanswered(ec)
     test_an_untracked_candidate_that_threads_elsewhere_does_not_count(ec)
     test_an_untracked_reply_with_a_rival_in_between_is_ambiguous(ec)
+    test_a_failed_rival_search_fails_closed(ec)
     test_rivals_are_found_by_correspondent_subject_and_order(ec)
     test_a_reply_sent_to_the_reply_to_address_counts(ec)
     test_recipients_are_parsed_as_rfc_address_lists(ec)

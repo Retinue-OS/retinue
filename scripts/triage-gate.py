@@ -101,12 +101,6 @@ INBOX_SCAN_LIMIT = int(os.environ.get("TRIAGE_INBOX_SCAN_LIMIT", "100"))
 # worse the longer it lasts. Raise only if a mailbox legitimately holds more
 # unread mail than this.
 INBOX_SCAN_MAX = int(os.environ.get("TRIAGE_INBOX_SCAN_MAX", "2000"))
-# A mailbox larger than INBOX_SCAN_MAX is walked to the end in pages of that
-# size, by UID cursor (see `inbox_messages`), so the listing is complete
-# whatever the size. This is a sanity stop on that walk, not a scope: at
-# INBOX_SCAN_MAX * INBOX_SCAN_PAGES messages something other than triage has
-# gone wrong with the mailbox, and the log says so.
-INBOX_SCAN_PAGES = 25
 # Settle INBOX mail that has already been answered, by matching it against the
 # Sent folder. Credit-free, and the one check that keeps "answered" and "still
 # in the INBOX" from drifting apart. See `reconcile_answered`.
@@ -266,31 +260,38 @@ def inbox_messages() -> list[dict]:
         # triaging its newest INBOX_SCAN_LIMIT beats triaging nothing.
         return messages
     messages = list(wide.get("messages", []))
-    page, pages = messages, 0
-    while len(page) >= INBOX_SCAN_MAX and pages < INBOX_SCAN_PAGES:
+    # Walk down by UID cursor until a page comes back short. The only bound
+    # is the mailbox itself: each page must be full for the next to be asked
+    # for, and the cursor must move, so the walk ends with the mailbox. A
+    # page that fails or does not advance ends it early, loudly, with what
+    # was listed so far -- a partial listing the log names, never a quiet
+    # ceiling.
+    page, cursor = messages, None
+    while len(page) >= INBOX_SCAN_MAX:
         uids = [int(m["uid"]) for m in page
                 if str(m.get("uid") or "").isdigit()]
         if not uids or min(uids) <= 1:
             break
-        cursor = min(uids) - 1
+        nxt = min(uids) - 1
+        if cursor is not None and nxt >= cursor:
+            print(f"[triage-gate] INBOX walk did not advance below uid {cursor}; "
+                  f"stopping with the {len(messages)} listed so far",
+                  file=sys.stderr)
+            break
+        cursor = nxt
         more = _email_client(
             "search", "--folder", "INBOX", "--limit", str(INBOX_SCAN_MAX),
             "--uid-max", str(cursor),
         )
         if not more:
             print(f"[triage-gate] INBOX page below uid {cursor} failed; "
-                  f"continuing with the {len(messages)} listed so far",
-                  file=sys.stderr)
+                  f"continuing with the {len(messages)} listed so far — older "
+                  "mail is out of view this tick", file=sys.stderr)
             break
         page = list(more.get("messages", []))
         messages.extend(page)
-        pages += 1
         print(f"[triage-gate] INBOX exceeds {INBOX_SCAN_MAX}; paged below uid "
               f"{cursor}: +{len(page)}, {len(messages)} so far", file=sys.stderr)
-    if len(page) >= INBOX_SCAN_MAX and pages >= INBOX_SCAN_PAGES:
-        print(f"[triage-gate] INBOX walk stopped after {INBOX_SCAN_PAGES} pages "
-              f"({len(messages)} messages) — a mailbox this size needs a look; "
-              "older mail is out of view until it shrinks", file=sys.stderr)
     return messages
 
 
@@ -402,25 +403,33 @@ def _settle_answered(msg: dict) -> bool:
     if path is None:
         return True
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-    record = {
+    # Merge into whatever record exists rather than replacing it: the mail
+    # may already be `proposed`, `omnibus` or `engaged`, and the thread ids,
+    # project link and send bookkeeping on that record are what Phase 6 and
+    # any later audit read. Only the resolution changes here.
+    existing = _read_record(path) if path.exists() else None
+    record = dict(existing or {})
+    record.setdefault("channel", "email")
+    record.setdefault("uid", uid)
+    record.setdefault("message_id", msg.get("message_id") or "")
+    record.setdefault("from", msg.get("from") or "")
+    record.setdefault("subject", msg.get("subject") or "")
+    record.setdefault("project", "unlinked")
+    record.setdefault("classified", stamp)
+    if existing and existing.get("status") not in (None, "resolved"):
+        record["superseded_status"] = existing.get("status")
+    record.update({
         "status": "resolved",
         "disposition": "answered",
-        "channel": "email",
-        "uid": uid,
-        "message_id": msg.get("message_id") or "",
-        "from": msg.get("from") or "",
-        "subject": msg.get("subject") or "",
-        "project": "unlinked",
         "note": (
             f"`email_client answered` found a reply to this message in "
             f"{SENT_FOLDER}; settled by the credit-free triage gate and moved "
             f"INBOX->{ANSWERED_FOLDER}."
         ),
         "folder": ANSWERED_FOLDER,
-        "classified": stamp,
         "updated": stamp,
         "resolved_at": stamp,
-    }
+    })
     try:
         TRIAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(path.suffix + ".tmp")

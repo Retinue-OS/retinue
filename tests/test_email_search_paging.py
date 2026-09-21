@@ -68,8 +68,21 @@ def test_a_cursor_lists_the_newest_limit_at_or_below_it():
     print("PASS a cursor -> newest `limit` with UID <= cursor")
 
 
+def test_a_non_positive_cursor_is_an_error_not_an_unbounded_search():
+    ec = _load()
+    for bad in (0, -3):
+        try:
+            _search(ec, uid_max=bad)
+        except ec.EmailError as exc:
+            assert "positive UID" in str(exc), exc
+        else:
+            raise AssertionError(f"uid_max={bad} was accepted")
+    print("PASS a non-positive cursor is refused rather than scanning ALL")
+
+
 if __name__ == "__main__":
     test_without_a_cursor_the_newest_limit_is_listed()
     test_a_cursor_lists_the_newest_limit_at_or_below_it()
+    test_a_non_positive_cursor_is_an_error_not_an_unbounded_search()
     print("all email search paging tests passed")
     sys.exit(0)

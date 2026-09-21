@@ -743,13 +743,18 @@ def _same_thread_rivals(M, anchor):
     cannot have answered both. A rival that arrived between the anchor and
     the reply makes the pairing ambiguous, and ambiguous must read as *not*
     answered: the caller moves mail on this answer.
+
+    Returns None when the search could not be made (an IMAP error, a non-OK
+    reply, a hit that could not be read): "no rivals found" and "could not
+    look" are different answers, and the caller moves mail on this one, so an
+    unanswerable check must not read as "unambiguous".
     """
     anchor_when = _parsed_summary_date(anchor.get("date"))
     base = _base_subject(anchor.get("subject"))
     day = _imap_date(anchor.get("date"))
     addrs = sorted(_anchor_addresses(anchor))
     if anchor_when is None or not day or not addrs:
-        return []
+        return None
     # OR-chain over every address: `OR FROM a OR FROM b FROM c`.
     criteria = []
     for addr in addrs[:-1]:
@@ -758,11 +763,15 @@ def _same_thread_rivals(M, anchor):
     try:
         typ, data = M.uid("search", None, *criteria)
     except imaplib.IMAP4.error:
-        return []
+        return None
+    if typ != "OK":
+        return None
     rivals = []
-    for uid in (data[0].split() if typ == "OK" else []):
+    for uid in data[0].split():
         s = _summary(M, uid)
-        if not s or s["uid"] == anchor.get("uid"):
+        if s is None:
+            return None  # a rival we could not read may be the one that matters
+        if s["uid"] == anchor.get("uid"):
             continue
         when = _parsed_summary_date(s.get("date"))
         if (when is not None and when > anchor_when
@@ -831,13 +840,16 @@ def cmd_search(cfg, args):
         criteria += ["SINCE", args.since]  # DD-Mon-YYYY
     if args.unseen:
         criteria += ["UNSEEN"]
-    if args.uid_max:
+    if args.uid_max is not None:
         # A cursor for paging a large folder newest-first: only UIDs at or
         # below this one, so a caller that saw the newest `limit` can ask for
         # the `limit` before them (`--uid-max <smallest uid seen - 1>`) until
         # a page comes back short. UID order is append order, which is what
         # a complete walk needs; it is not date order, so callers must not
-        # read a date boundary off a page.
+        # read a date boundary off a page. UIDs start at 1, so a cursor below
+        # that is a caller error, never a silent fall-through to ALL.
+        if args.uid_max < 1:
+            die(f"--uid-max must be a positive UID, got {args.uid_max}")
         criteria += ["UID", f"1:{args.uid_max}"]
     if not criteria:
         criteria = ["ALL"]
@@ -913,7 +925,12 @@ def cmd_answered(cfg, args):
             # one instead -- and ambiguous must read as unanswered.
             imap_select(M, args.in_folder, readonly=True)
             rivals = _same_thread_rivals(M, anchor)
-            untracked = [s for s in untracked if not _ambiguous(s, rivals)]
+            if rivals is None:
+                # The ambiguity check could not be made: fail closed. These
+                # candidates stay unconfirmed, and the mail stays where it is.
+                untracked = []
+            else:
+                untracked = [s for s in untracked if not _ambiguous(s, rivals)]
     M.logout()
 
     replies = sorted(threaded + untracked, key=lambda m: m.get("date") or "")
