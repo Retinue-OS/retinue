@@ -371,7 +371,7 @@ def _parse_when(value: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _confirm_answered(msg: dict) -> bool:
+def _confirm_answered(msg: dict) -> bool | None:
     """Ask the mailbox, exactly, whether this message has been replied to.
 
     `email_client answered` is the purpose-built check and is strictly stronger
@@ -391,13 +391,15 @@ def _confirm_answered(msg: dict) -> bool:
         that reaches the sender via Cc is invisible to it; the header search
         covers all three recipient fields.
 
-    Exit 0 means answered, 3 means genuinely unanswered, anything else means the
-    state is unknown — and unknown must read as *not* answered, so an IMAP
-    hiccup can never archive a mail nobody replied to.
+    Exit 0 means answered (True), 3 means genuinely unanswered (False), and
+    anything else means the state is unknown (None). Unknown must never
+    archive a mail — the caller treats it like "not answered" for this tick
+    — but it is not a *finding* either, so the caller must not remember it
+    the way it remembers a definitive negative.
     """
     mid = (msg.get("message_id") or "").strip()
     if not mid:
-        return False
+        return None
     rc, payload = _email_client_rc(
         "answered", "--message-id", mid, "--folder", SENT_FOLDER,
         "--in-folder", "INBOX",
@@ -405,8 +407,10 @@ def _confirm_answered(msg: dict) -> bool:
     if rc not in (0, 3):
         print(f"[triage-gate] sent-reconcile: answered-check inconclusive for "
               f"{mid} (rc={rc}); leaving it to triage", file=sys.stderr)
+        return None
+    if rc == 3:
         return False
-    return rc == 0 and bool((payload or {}).get("answered"))
+    return True if (payload or {}).get("answered") else None
 
 
 def _settle_answered(msg: dict) -> bool:
@@ -589,12 +593,20 @@ def reconcile_answered(messages: list[dict]) -> list[dict]:
     settled = 0
     for _when, nomination, msg in checked:
         mid = msg["message_id"].strip()
-        if _confirm_answered(msg) and _settle_answered(msg):
+        verdict = _confirm_answered(msg)
+        if verdict is True and _settle_answered(msg):
             settled += 1
             memo.pop(mid, None)
-        else:
-            keep.append(msg)
+            continue
+        keep.append(msg)
+        # Only a definitive "unanswered" is worth remembering. An inconclusive
+        # check (None) or a confirmed reply whose move failed must stay
+        # eligible for the next run, or a transient failure would hide the
+        # mail from reconciliation until the Sent state happens to change.
+        if verdict is False:
             memo[mid] = nomination
+        else:
+            memo.pop(mid, None)
     for _when, _nomination, msg in deferred:
         keep.append(msg)
     if checked or deferred:

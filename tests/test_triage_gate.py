@@ -1409,6 +1409,32 @@ def test_a_negative_check_is_remembered_until_sent_changes():
     print("PASS test_a_negative_check_is_remembered_until_sent_changes")
 
 
+def test_only_a_definitive_negative_is_memoized():
+    # An inconclusive check, or a confirmed reply whose move failed, must be
+    # retried on the next run; only a genuine exit-3 "unanswered" is kept.
+    inbox = [{"uid": "1", "from": "cfo@work.com", "subject": "Budget",
+              "message_id": "<b@work.com>", "date": "2026-09-16T10:00:00+00:00"}]
+    sent = [{"subject": "Re: Budget", "to": "cfo@work.com",
+             "date": "2026-09-18T10:00:00+00:00"}]
+    # Inconclusive backend answer: checked again on the next run.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        calls = _arm_sent(gate, sent, answered=1)
+        assert gate.reconcile_answered(inbox) == inbox
+        assert gate.reconcile_answered(inbox) == inbox
+        assert len([c for c in calls if c[0] == "answered"]) == 2
+        memo_path = gate.TRIAGE_STATE_DIR / ".answered-checks.json"
+        assert not memo_path.exists() or json.loads(memo_path.read_text()) == {}
+    # Answered, but the move failed: checked (and moved) again next run.
+    with tempfile.TemporaryDirectory() as tmp:
+        gate = _fresh(tmp, sent_reconcile=True)
+        calls = _arm_sent(gate, sent, moves_ok=False)
+        assert gate.reconcile_answered(inbox) == inbox
+        assert gate.reconcile_answered(inbox) == inbox
+        assert len([c for c in calls if c[0] == "move"]) == 2
+    print("PASS test_only_a_definitive_negative_is_memoized")
+
+
 def test_a_reply_that_predates_the_mail_does_not_settle_it():
     # The common real shape: a correspondence where the latest word is theirs.
     # An older reply of ours in the same thread does not answer a newer mail.
@@ -1616,6 +1642,7 @@ if __name__ == "__main__":
     test_a_capped_listing_stays_bounded_and_nominates_from_what_it_has()
     test_exact_checks_are_capped_per_run_oldest_first()
     test_a_negative_check_is_remembered_until_sent_changes()
+    test_only_a_definitive_negative_is_memoized()
     test_a_reply_that_predates_the_mail_does_not_settle_it()
     test_a_failed_move_leaves_the_mail_in_the_triage_set()
     test_a_move_without_its_receipt_leaves_the_mail_in_the_triage_set()
