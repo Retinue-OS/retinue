@@ -67,6 +67,8 @@ def _run_case(ec, *, anchor, threaded=(), untracked=()):
             "bcc": "",
             "subject": "",
             "date": "",
+            "in_reply_to": "",
+            "references": "",
             **msg,
         }
 
@@ -128,6 +130,51 @@ def test_untracked_replies_apply_the_exact_timestamp_check(ec):
     print("PASS untracked replies must postdate the anchor exactly")
 
 
+def test_an_untracked_candidate_that_threads_elsewhere_does_not_count(ec):
+    # Same correspondent, same subject, two distinct mails: a reply to the
+    # first, sent after the second arrived, passes the recipient, subject and
+    # time checks for the second. It cites the first, though -- and a reply
+    # that cites a message and was not found by the threaded search cites a
+    # different one, so it must not settle this anchor. A reply with no
+    # threading headers at all is what the fallback exists for, and counts.
+    anchor = {
+        "uid": "b",
+        "from": "Sender <sender@example.com>",
+        "subject": "Project status",
+        "date": "2026-09-16T10:00:00+00:00",
+    }
+    rc, payload = _run_case(
+        ec,
+        anchor=anchor,
+        untracked=[
+            {"to": "sender@example.com", "subject": "Re: Project status",
+             "date": "2026-09-16T12:00:00+00:00",
+             "in_reply_to": "<a@example.com>"},
+        ],
+    )
+    assert rc == 3 and payload["answered"] is False, payload
+    rc, payload = _run_case(
+        ec,
+        anchor=anchor,
+        untracked=[
+            {"to": "sender@example.com", "subject": "Re: Project status",
+             "date": "2026-09-16T12:00:00+00:00",
+             "references": "<a@example.com> <x@example.com>"},
+        ],
+    )
+    assert rc == 3 and payload["answered"] is False, payload
+    rc, payload = _run_case(
+        ec,
+        anchor=anchor,
+        untracked=[
+            {"to": "sender@example.com", "subject": "Re: Project status",
+             "date": "2026-09-16T12:00:00+00:00"},
+        ],
+    )
+    assert rc == 0 and payload["answered"] is True, payload
+    print("PASS an untracked candidate threaded to another message does not count")
+
+
 def test_without_the_anchor_mail_the_answer_is_conservatively_unanswered(ec):
     rc, payload = _run_case(
         ec,
@@ -177,6 +224,7 @@ def main():
     test_threaded_replies_still_need_same_correspondent_subject_and_later_time(ec)
     test_untracked_replies_apply_the_exact_timestamp_check(ec)
     test_without_the_anchor_mail_the_answer_is_conservatively_unanswered(ec)
+    test_an_untracked_candidate_that_threads_elsewhere_does_not_count(ec)
     test_base_subject_strips_the_same_prefixes_the_gate_nominates_on(ec)
     test_untracked_search_covers_cc_and_bcc(ec)
     print("all email answered tests passed")

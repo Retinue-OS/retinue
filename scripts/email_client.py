@@ -664,7 +664,7 @@ def _reply_summary(M, uid):
     """The minimal reply detail `answered` needs to validate a match."""
     typ, data = M.uid(
         "fetch", uid,
-        "(BODY.PEEK[HEADER.FIELDS (TO CC BCC SUBJECT DATE)])",
+        "(BODY.PEEK[HEADER.FIELDS (TO CC BCC SUBJECT DATE IN-REPLY-TO REFERENCES)])",
     )
     if typ != "OK" or not data or data[0] is None:
         return None
@@ -685,7 +685,21 @@ def _reply_summary(M, uid):
         "bcc": _decode(hdr.get("Bcc")),
         "subject": _decode(hdr.get("Subject")),
         "date": iso,
+        "in_reply_to": (hdr.get("In-Reply-To") or "").strip(),
+        "references": (hdr.get("References") or "").strip(),
     }
+
+
+def _threads_elsewhere(reply):
+    """Whether a sent message cites *some* message it is a reply to.
+
+    Used by the untracked fallback, which exists for replies that carry no
+    threading headers at all. A reply that does cite a message and was not
+    found by the threaded search cites a *different* one -- typically an
+    older mail from the same correspondent under the same subject -- and
+    counting it for this anchor would archive a mail nobody has answered.
+    """
+    return bool(reply.get("in_reply_to") or reply.get("references"))
 
 
 def _parsed_summary_date(value):
@@ -811,7 +825,8 @@ def cmd_answered(cfg, args):
             seen = {m["uid"] for m in threaded}
             for uid in _search_sent_to(M, addr, anchor.get("date")):
                 s = _reply_summary(M, uid)
-                if s and s["uid"] not in seen and _reply_matches_anchor(s, anchor):
+                if (s and s["uid"] not in seen and not _threads_elsewhere(s)
+                        and _reply_matches_anchor(s, anchor)):
                     untracked.append(s)
     M.logout()
 

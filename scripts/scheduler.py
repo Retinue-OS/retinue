@@ -446,8 +446,13 @@ def run_job(job: dict) -> None:
             # A slice finished and the job says more is waiting: not a
             # failure, so no error text -- but not "success" either, so a
             # resume_after_seconds on the job brings the next slice forward.
-            wait = (job.get("resume_after_seconds") or job.get("retry_after_seconds")
-                    or job.get("interval_seconds"))
+            # Report the clock is_due() will actually apply: the shorter of
+            # the two opt-in waits (both cover a partial run), else the
+            # interval -- and only usable values, as is_due() reads them.
+            clocks = [c for c in (_seconds_field(job, "resume_after_seconds"),
+                                  _seconds_field(job, "retry_after_seconds"))
+                      if c]
+            wait = min(clocks) if clocks else job.get("interval_seconds")
             log(f"[partial] {jid} in {dur:.0f}s -- more to do, due again after "
                 f"{wait}s")
             write_state(jid, "partial")

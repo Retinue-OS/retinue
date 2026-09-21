@@ -145,11 +145,11 @@ def test_a_malformed_resume_or_retry_value_never_breaks_the_tick():
         for bad in ("soon", "", 0, -5, [1]):
             with tempfile.TemporaryDirectory() as tmp:
                 sched = _load_scheduler(Path(tmp))
-                logged = []
-                sched.log = lambda msg: logged.append(msg)
                 job = {"id": "j", "_source": "/x/.schedule.json", "command": "true",
                        "interval_seconds": 86400, field: bad}
-                _run(sched, sched.EXIT_PARTIAL, job)
+                # The run's own log (the [partial] line reads the field too)
+                # and the due checks' log are one list: warned once overall.
+                logged = _run(sched, sched.EXIT_PARTIAL, job)
                 sched.log = lambda msg: logged.append(msg)
                 real_now = sched.now
                 sched.now = lambda: real_now() + 3600
@@ -161,6 +161,25 @@ def test_a_malformed_resume_or_retry_value_never_breaks_the_tick():
                 warns = [m for m in logged if "unusable " + field in m]
                 assert len(warns) == 1, (field, bad, warns)
     print("  ok   a malformed resume/retry value is ignored, warned once, never raises")
+
+
+def test_the_partial_log_line_names_the_clock_that_actually_applies():
+    # Both opt-in waits cover a partial run, so the shorter one wins in
+    # is_due(); the log must say that one, and never echo an unusable value.
+    cases = (
+        ({"resume_after_seconds": 600, "retry_after_seconds": 300}, "300s"),
+        ({"resume_after_seconds": 300, "retry_after_seconds": 600}, "300s"),
+        ({"resume_after_seconds": "soon"}, "86400s"),
+        ({}, "86400s"),
+    )
+    for fields, expected in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            sched = _load_scheduler(Path(tmp))
+            logged = _run(sched, sched.EXIT_PARTIAL,
+                          {"command": "true", "interval_seconds": 86400, **fields})
+            parts = [m for m in logged if m.startswith("[partial]")]
+            assert parts and expected in parts[0] and "soons" not in parts[0], (fields, parts)
+    print("  ok   the partial log line reports the clock is_due applies")
 
 
 def test_any_other_nonzero_exit_is_still_a_failure():
@@ -179,5 +198,6 @@ if __name__ == "__main__":
     test_retry_after_still_covers_a_partial_run()
     test_without_either_knob_a_partial_run_waits_its_interval()
     test_a_malformed_resume_or_retry_value_never_breaks_the_tick()
+    test_the_partial_log_line_names_the_clock_that_actually_applies()
     test_any_other_nonzero_exit_is_still_a_failure()
     print("all scheduler partial-run tests passed")
