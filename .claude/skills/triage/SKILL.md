@@ -98,9 +98,13 @@ messenger is **push**:
   message is delivered by the chat's acceptance — but `GET /undelivered` is
   still how the exceptions are recovered. See `docs/messenger-chats.md`.
 - **E-mail (pull).** `scripts/triage-gate.py`, a scheduler `command` job.
-  **Frequent** tick: list new INBOX mail, keep only whitelisted senders, spawn
-  the model *only* if any survive. **Daily** tick: refresh the whitelist from the
-  Sent folder first, then spawn for **any** new sender. The whitelist
+  **Frequent** tick: list the INBOX, archive what the Sent folder proves is
+  already answered, keep only whitelisted senders, spawn the model *only* if
+  any survive. **Daily** tick: refresh the whitelist from the Sent folder
+  first, then spawn for **any** sender. Either tick hands the session a
+  **bounded slice, oldest first** (`TRIAGE_BATCH_SIZE`), never the whole
+  backlog, and comes back for the rest — see *Gate-spawned slices* under
+  Phase 1. The whitelist
   (`scripts/triage_policy.py`) matches an **exact address** (auto-added from
   Sent) **or** a hand-added `*@domain` / `*@*.domain` wildcard. Nothing auto-adds
   a domain, so one reply to `alice@gmail.com` whitelists *only* that address,
@@ -146,6 +150,30 @@ drain, so a cold sender waits at most ~24 h.
 ---
 
 ## Phase 1 — Collect & reconcile (within scope)
+
+**Gate-spawned slices.** A run the e-mail gate spawns carries its scope in the
+prompt: a list of messages, oldest first, each with its UID, that is the whole
+scope of the run. Work that list and nothing else — do **not** list the INBOX
+for more; what is
+not listed is either already recorded or waits for a later run, and the gate
+comes back for it. Take the messages in the order given. **Write each
+message's status record the moment its disposition is settled** — `proposed`
+once its thread is open, `omnibus_pending` at classification, `resolved` when
+it is answered elsewhere — before starting on the next one, never as one
+batch at the end: the scheduler stops a run at its budget, and the only
+progress that survives is what is on disk by then. Phases 2–4 (classify, link,
+propose) run for every listed message on **every** slice — that is the work
+a slice exists to do. The prompt also says whether this slice drains the
+backlog. When it does **not**, defer only the whole-picture work: the *Phase 1
+reconciliation passes* numbered 2–4 below (store→INBOX, done-but-still-there,
+stalled) and Phase 5's reminders belong to the draining run. When it does,
+run those as written — they diff the INBOX against the status store, so for
+them, and only for them, list the INBOX as described below; any unrecorded
+mail that listing turns up belongs to a later run's slice, not to this one.
+A due omnibus digest is announced as a
+count, not a listing: compose it from the `omnibus_pending` records in the
+status store (Phase 4b). The listing below is for a run that is *not* handed
+a slice (a manual invocation, an ad-hoc triage).
 
 **E-mail** — list the current INBOX and diff it against the status store:
 
@@ -786,7 +814,10 @@ move, closes the loop.
   `omnibus`, `last_nudge`, `resolved`). For a sent reply also record `sent_uid` +
   `sent_message_id` so the send is verifiable against the Sent folder, not
   merely asserted. Write a status only once a message has actually been
-  proposed, bundled, or resolved — never on mere reading. The single exception
+  proposed, bundled, or resolved — never on mere reading — and write it
+  *then*, before moving to the next message, never as a batch at the end of
+  the run: a run stopped at its budget keeps only what was already on disk,
+  and a run that recorded nothing has to start over. The single exception
   is `omnibus_pending` (Phase 4b), which is written at classification time
   precisely because the item is *not* being shown yet: it records a deliberate
   hold, and without it an accrued item is invisible both to the next run and to
@@ -861,6 +892,9 @@ interruptions into a pile of identical threads.
 | Variable | Meaning | Default |
 |---|---|---|
 | `TRIAGE_STATE_DIR` | The e-mail triage status store: one file per message (id → status + bookkeeping). Persist on the pinned `/root` volume so it survives container recreation. | `/root/.retinue/triage` |
+| `TRIAGE_BATCH_SIZE` | How many never-seen or stalled messages one gate-spawned run is handed, oldest first. The lever that keeps a sweep incremental: the run finishes and records its slice; the gate exits `75` when more waits and the scheduler comes back for it (`resume_after_seconds` on the job). Non-positive: as many as the prompt lists (`TRIAGE_PROMPT_LIST_LIMIT`). | `25` |
+| `TRIAGE_SENT_RECONCILE` | `0` switches off the gate's credit-free archiving of INBOX mail the Sent folder proves already answered (`email_client answered` is the authority; move, never delete). | `1` |
+| `TRIAGE_ANSWERED_FOLDER` | Where the gate moves answered mail. | `TRIAGE_NEWS_FOLDER`, i.e. `Archive` |
 | `EMAIL_PROCESSING_INTERVAL` | Seconds; **only** the gap between omnibus proposals and the grace period before the first reminder. **Not** the triage run frequency (that is the scheduler's). | `86400` (24 h) |
 | `TRIAGE_EMAIL_WHITELIST_PATH` | The e-mail whitelist `.nt` (exact addresses + `*@domain` wildcards) the frequent gate reads. Retinue writes it; qlever indexes it. | `<chambers>/_generated/triage/email-whitelist.nt` |
 | `TRIAGE_MESSENGER_DIR` | Retinue-side root under which each channel's `policy/policy.nt` is written. Mirrors what the gateway reads via `INBOUND_POLICY_PATH`. | `<chambers>/_generated/messenger` |

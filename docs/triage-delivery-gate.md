@@ -272,19 +272,55 @@ not.
 IMAP has a queryable backlog. The gate is a scheduler `command` job (zero Claude
 credits):
 
-1. List new INBOX mail since last run.
-2. **Route both rails in one pass** (`route()`, below): each message is asked for
+1. List **the INBOX** — all of it, not the unread subset. `unread` is a mailbox
+   flag the user can flip from any mail client; the status store (step 4) is
+   what decides whether a message is handled. "All of it" is literal: the
+   first listing is a small newest-first window, widened once when it
+   saturates, and a mailbox larger than the wide window is walked to the end
+   in pages by UID cursor (`search --uid-max`), so the oldest mail — the mail
+   the oldest-first slice wants — is never out of view behind a cap. A page
+   is one bulk header FETCH, not one per message, and whether it was full
+   is read off what the server matched (`scanned`), not off how many
+   summaries came back, so the walk is cheap and an unreadable header cannot
+   end it early.
+2. **Settle what has already been answered.** Each message whose thread subject
+   appears in a Sent listing with a later date is *nominated*, then confirmed
+   exactly by `email_client answered` — a server-side IMAP SEARCH for replies
+   citing its Message-ID, filtered back down to the same correspondent, the
+   same base subject and a strictly later timestamp; untracked replies go
+   through the same filter after an exact recipient search. The Sent listing
+   is bounded by **date**, not by count — `--since` the day before the oldest
+   INBOX message, because nothing sent earlier can answer anything still
+   open — so it is complete by construction and small in proportion to the
+   backlog's age. A residual cap guards against one very old open mail
+   dragging in years of Sent; when it bites the listing is incomplete, so the
+   gate nominates from what it listed, says so, and a reply older than the
+   window is not settled that tick — the mail stays in the INBOX and is
+   proposed, where the skill's own already-answered check sees it. The exact
+   checks themselves are bounded per run (oldest mail first; the rest wait
+   for the next run), and a negative is remembered under the Sent state it
+   was checked against (`.answered-checks.json` in the status dir), so the
+   cap is spent on candidates not yet checked rather than on the same ones
+   every tick. It never
+   widens to an exact check of the whole INBOX, which would put unbounded
+   work in front of the bounded slice. (No date read off a capped listing is
+   a safe boundary either: the cap keeps the newest UIDs, and UID order need
+   not be date order.)
+   A confirmed one is moved to `TRIAGE_ANSWERED_FOLDER` and recorded
+   `resolved`, so it never reaches a proposal again. Only the exact check ever
+   archives, and the action is a move, never a delete.
+3. **Route both rails in one pass** (`route()`, below): each message is asked for
    a decision on its sender *and* its group. A `news` group is filed to the feed;
    whether the mail is *also* left for triage is the group's `ignored`/`quieted`
    flag, so a read-only newsletter can never buy a model turn while a list one
    answers on still reaches triage.
-3. Dedup by message-id against the existing triage status (same sanitized
+4. Dedup by message-id against the existing triage status (same sanitized
    id-scheme triage already uses). A message that already has a status record
-   is **not new work** and does not arm the gate. Triage never marks mail read
-   (`unread ≠ unhandled`), so a classified message stays unread in the INBOX
-   until its disposition is executed, which for an omnibus batch means waiting
-   on the user; without this step every tick would re-spawn a session over the
-   same settled stack. Two exceptions, both because the gate is the *only*
+   is **not new work** and does not arm the gate — whatever its status. Triage
+   never marks mail read (`unread ≠ unhandled`), so a classified message stays
+   unread in the INBOX until its disposition is executed, which for an omnibus
+   batch means waiting on the user; without this step every tick would re-spawn
+   a session over the same settled stack. Two exceptions, both because the gate is the *only*
    thing that spawns a triage session — a state nothing else revisits is a
    state nothing else can ever finish:
    - **Stalled** (`_stalled`): a record on a non-terminal status untouched for
@@ -294,20 +330,39 @@ credits):
      archive/delete candidates on `omnibus_pending` and sends one digest per
      `EMAIL_PROCESSING_INTERVAL` — that accrual is what keeps the user from
      being pinged several times a day. Since accrued mail sits on an open
-     status, the gate arms on the *bundle* instead: it reads `omnibus_pending`
-     records off the unread listing (not by walking the status store — on a
-     30-minute tick that is not free) and, when the interval since
-     `.last-omnibus` has elapsed, spawns a run told to send the digest. A
-     missing or unparseable marker counts as due: the cost is one digest, the
-     alternative is bundled mail nobody sees. Due-ness is read across the whole
-     unread listing rather than the whitelisted subset, since a bundle accrued
-     by a daily run can hold mail the frequent pass does not whitelist.
-4. Keep only whitelisted senders → spawn the model for those. The spawn payload
-   still carries every routed message, recorded ones included, so the session
-   reconciles and nudges over the same set as before — only the *decision to
-   spawn* is narrowed.
-5. The **daily** job runs for **any** sender (fixed morning hour, before the
+     status, the gate arms on the *bundle* instead: it reads
+     `omnibus_pending` records off the INBOX listing (not by walking the
+     status store — on a 30-minute tick that is not free) and, when the
+     interval since `.last-omnibus` has elapsed, spawns a run told to send the
+     digest. A missing or unparseable marker counts as due: the cost is one
+     digest, the alternative is bundled mail nobody sees. Due-ness is read
+     across the whole INBOX listing rather than the whitelisted subset, since
+     a bundle accrued by a daily run can hold mail the frequent pass does not
+     whitelist.
+5. Keep only whitelisted senders → spawn the model for those.
+6. The **daily** job runs for **any** sender (fixed morning hour, before the
    briefing).
+7. **Hand over a bounded slice, oldest first.** The spawn payload is the
+   oldest `TRIAGE_BATCH_SIZE` (default 25) of the messages that armed the run
+   — never-seen and stalled ones — with each message's UID, so the session
+   can read, flag and move it without a listing of its own; recorded mail is
+   not handed over. A due omnibus bundle rides along as a *count*, not a
+   listing: the digest is composed from the status store and is one unit of
+   work whatever its size, so listing it would only unbound the prompt. The
+   prompt lists the slice in full and says it is the whole scope: the
+   session does not enumerate the INBOX for
+   more, records each message the moment its disposition is settled, and runs
+   the whole-picture passes (Phase 1's store→INBOX, done-but-still-there and
+   stalled repairs, Phase 5's reminders) only on the run told it drains the
+   backlog. When more is left, the gate exits **75** and the scheduler records
+   a `partial` run, so a job with `resume_after_seconds` comes back for the
+   next slice after minutes rather than after its interval
+   (`docs/scheduling.md`). The point is that the model's progress is durable
+   only per message — its status record — so a run that takes a slice it can
+   finish, and records it, beats one that takes the whole backlog and is
+   killed at its budget with nothing recorded. That was the failure mode: a
+   sweep that never finished never reduced its own backlog, so every run had
+   more to do than the last.
 
 ### Messenger — gateway-owned store + delivery flag (push)
 
@@ -584,7 +639,16 @@ Tier-3 across both the framework and the gateway services:
   the shared state files, and this doc. The e-mail news rail adds two tunables on
   the `retinue` service: `TRIAGE_NEWS_FOLDER` (default `Archive`; empty leaves the
   mail in the INBOX) and `TRIAGE_NEWS_EXCERPT_CHARS` (default 600). It needs
-  `NEWS_INGEST_URL` like the gateways do.
+  `NEWS_INGEST_URL` like the gateways do. The sweep adds three more:
+  `TRIAGE_BATCH_SIZE` (default 25; how many never-seen or stalled messages one
+  run hands the model, oldest first — non-positive means as many as the
+  prompt lists, `TRIAGE_PROMPT_LIST_LIMIT`), `TRIAGE_SENT_RECONCILE` (default
+  `1`; `0` switches off the credit-free archiving of already-answered mail,
+  the one thing the gate does to the mailbox on its own) and
+  `TRIAGE_ANSWERED_FOLDER` (where answered mail goes; defaults to
+  `TRIAGE_NEWS_FOLDER`, so a deployment names its archive once). The scan
+  scope has no knob: the gate scans the INBOX, since `unread` is a mailbox
+  flag and the status store is what decides handled-state.
 - **gateways:** `signal-gateway` / `whatsapp-gateway` / `telegram-gateway` each
   get the shared volume mounted RW, per-message `.nt` writing, the
   classification gate on inbound, and `GET /undelivered?since=…`. For the news

@@ -9,14 +9,26 @@ more.
 
 Two modes:
 
-  * ``frequent`` — spawn the model only for unread INBOX mail from a **whitelisted
+  * ``frequent`` — spawn the model only for INBOX mail from a **whitelisted
     sender** (an exact address, or a hand-added ``*@domain`` / ``*@*.domain``
     wildcard). This is what runs on the fast cadence (~30 min). Mail from any
     other sender waits, untouched, for the daily run.
   * ``daily`` — first refresh the whitelist from the Sent folder (so addresses we
     have written to become trusted automatically), then spawn the model for
-    unread INBOX mail from **any** sender, so nothing a narrow whitelist skipped
-    is ever lost.
+    INBOX mail from **any** sender, so nothing a narrow whitelist skipped is
+    ever lost.
+
+Both modes scan **the INBOX**, not the unread subset, and both first run the
+Sent reconciliation (``reconcile_answered``), which archives any mail whose
+thread the user has already replied to. See those two functions for why.
+
+Both modes also hand the model a **bounded batch**, oldest first, never the
+whole backlog (``TRIAGE_BATCH_SIZE``): a run that must finish everything in
+one budget is killed mid-flight the moment the backlog outgrows it, and a
+killed run persists nothing it had not already written, so the backlog never
+shrinks. A bounded run finishes, records what it did, and exits with
+``EXIT_PARTIAL`` when more is waiting, so the scheduler (``resume_after_seconds``
+on the job) comes back for the next slice. See ``run_daily``.
 
 Which of the two a message qualifies for is not the whole story, because a mail
 belongs to two things at once: a **sender** and a **group** (its mailing list,
@@ -46,9 +58,11 @@ unread in the INBOX until its disposition is executed, which for an omnibus
 batch means waiting on the user's approval. Keying the spawn on "is anything
 unread" therefore re-spawns a session on every tick over the same settled stack,
 and each of those sessions is a fresh chance for a stray Phase-5 nudge. So the
-gate honours the rule it writes: only messages with **no status record** arm it.
-Once armed, the payload still carries every routed message, recorded ones
-included, so reconciliation and Phase 5 see the same set as before.
+gate honours the rule it writes: only messages with **no status record** arm it
+(plus stalled ones, see ``_stalled``). Once armed, the payload is the bounded
+slice of exactly those messages and nothing else — recorded mail is not handed
+over, and the passes that revisit it (Phase 1's repairs, Phase 5) run off the
+status store on the run that drains the backlog. See ``build_prompt``.
 
 Sender whitelist and group policy both live in ``triage_policy.py``, persisted as
 N-Triples the life store indexes. The gate reads them off disk; only the daily
@@ -87,10 +101,40 @@ INBOX_SCAN_LIMIT = int(os.environ.get("TRIAGE_INBOX_SCAN_LIMIT", "100"))
 # worse the longer it lasts. Raise only if a mailbox legitimately holds more
 # unread mail than this.
 INBOX_SCAN_MAX = int(os.environ.get("TRIAGE_INBOX_SCAN_MAX", "2000"))
-# How many messages the spawn prompt enumerates. Only the prompt is capped —
-# the gate itself scans the whole backlog, and the prompt says so, so a long
-# backlog costs a truncated listing rather than unseen mail.
+# Settle INBOX mail that has already been answered, by matching it against the
+# Sent folder. Credit-free, and the one check that keeps "answered" and "still
+# in the INBOX" from drifting apart. See `reconcile_answered`.
+SENT_RECONCILE = os.environ.get("TRIAGE_SENT_RECONCILE", "1").strip() != "0"
+# How many exact `answered` checks one run makes, oldest mail first. Each is
+# an IMAP session of its own, so the number must be bounded per run the same
+# way the model's slice is; what does not fit waits for the next run. The
+# memo below keeps the cap from being spent on the same negatives every tick.
+RECONCILE_CHECKS_PER_RUN = 50
+# Safety cap on the reconciliation's Sent listing. The listing is bounded by
+# *date* (nothing older than the oldest INBOX mail can answer it), so in the
+# normal case it is far smaller than this; the cap only matters when one very
+# old mail is still open. Past it the listing is incomplete, and the gate says
+# so and nominates from what it has rather than exact-checking the whole
+# INBOX (see `reconcile_answered`). Not an env knob: it is not a scope
+# decision, only a guard against a pathological listing.
+RECONCILE_LISTING_CAP = 1000
+# How many never-seen (or stalled) messages one run hands the model, oldest
+# first. The lever that makes a sweep incremental: the model's work on each
+# message is durable the moment its status record is written, so a run that
+# takes a bounded slice and finishes beats one that takes everything and is
+# killed at the wall having recorded nothing. A non-positive value means "as
+# many as the prompt can list" (PROMPT_LIST_LIMIT). See `run_daily`.
+BATCH_SIZE = int(os.environ.get("TRIAGE_BATCH_SIZE", "25"))
+# How many messages the spawn prompt enumerates. The batch is always listed
+# in full — the session is told to work this list and nothing else, so a
+# listing it cannot see is a message it cannot work — which makes this the
+# ceiling on BATCH_SIZE as well.
 PROMPT_LIST_LIMIT = int(os.environ.get("TRIAGE_PROMPT_LIST_LIMIT", "150"))
+# What the gate exits with when the run went fine but the backlog is not yet
+# drained: the scheduler records it as "partial" and, if the job carries
+# resume_after_seconds, comes back for the next slice after that short wait
+# instead of after the full interval (scripts/scheduler.py).
+EXIT_PARTIAL = 75
 # How long a message may sit in the INBOX on a non-terminal status before the
 # gate treats it as stalled and re-arms it. Longer than the nudge cycle
 # (EMAIL_PROCESSING_INTERVAL), so an item merely awaiting the user is not
@@ -106,6 +150,12 @@ OMNIBUS_INTERVAL = float(os.environ.get("EMAIL_PROCESSING_INTERVAL", "86400"))
 # a *reference* into the feed, so the mail itself is archived, never deleted.
 # Set empty to leave it in the INBOX (triage's Phase-1 backstop then moves it).
 NEWS_FOLDER = os.environ.get("TRIAGE_NEWS_FOLDER", "Archive").strip()
+# Where an answered mail goes. Archive, never delete: no inference about a
+# reply, however well grounded, should be able to destroy a message. Defaults
+# to the news rail's folder so a deployment names its archive once; set it
+# only when answered mail should land somewhere else.
+ANSWERED_FOLDER = os.environ.get(
+    "TRIAGE_ANSWERED_FOLDER", NEWS_FOLDER or "Archive").strip()
 NEWS_EXCERPT_CHARS = int(os.environ.get("TRIAGE_NEWS_EXCERPT_CHARS", "600"))
 TRIAGE_STATE_DIR = Path(os.environ.get("TRIAGE_STATE_DIR", "/root/.retinue/triage"))
 CLAUDE_MODEL = os.environ.get(
@@ -114,13 +164,18 @@ CLAUDE_MODEL = os.environ.get(
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 
 
-def _email_client(*args: str) -> dict | None:
-    """Run email_client.py and parse its JSON stdout. None on any failure.
+def _email_client_rc(*args: str) -> tuple[int, dict | None]:
+    """Run email_client.py; return its exit code and parsed JSON stdout.
 
-    Under the scheduler this process holds no mailbox credentials; email_client.py
-    proxies through EMAIL_BACKEND_URL, which job_env() already sets. A failure
-    here (backend down, timeout) must degrade to "gate found nothing", never
-    crash the scheduler tick.
+    Most subcommands answer "did it work?", and for those `_email_client` below
+    is the right wrapper. A few answer a *question* in the exit code instead —
+    `answered` exits 3 for "no reply found", which is a real answer and not a
+    failure — and collapsing that to None would make "nobody replied" and "the
+    backend is down" indistinguishable. Hence the raw code.
+
+    Under the scheduler this process holds no mailbox credentials;
+    email_client.py proxies through EMAIL_BACKEND_URL, which job_env() already
+    sets. An invocation that never ran at all reports -1.
     """
     cmd = ["python3", EMAIL_CLIENT, *args]
     try:
@@ -129,18 +184,30 @@ def _email_client(*args: str) -> dict | None:
         )
     except Exception as e:  # noqa: BLE001 — any failure means "skip this tick"
         print(f"[triage-gate] email_client invocation failed: {e}", file=sys.stderr)
-        return None
-    if out.returncode != 0:
-        print(
-            f"[triage-gate] email_client rc={out.returncode}: {out.stderr.strip()}",
-            file=sys.stderr,
-        )
-        return None
+        return -1, None
     try:
-        return json.loads(out.stdout)
-    except json.JSONDecodeError as e:
-        print(f"[triage-gate] non-JSON from email_client: {e}", file=sys.stderr)
+        payload = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        payload = None
+    return out.returncode, payload
+
+
+def _email_client(*args: str) -> dict | None:
+    """Run email_client.py and parse its JSON stdout. None on any failure.
+
+    A failure here (backend down, timeout, non-JSON) must degrade to "gate
+    found nothing", never crash the scheduler tick.
+    """
+    rc, payload = _email_client_rc(*args)
+    if rc != 0:
+        if rc != -1:
+            print(f"[triage-gate] email_client rc={rc} for {args[0]!r}",
+                  file=sys.stderr)
         return None
+    if payload is None:
+        print(f"[triage-gate] non-JSON from email_client {args[0]!r}",
+              file=sys.stderr)
+    return payload
 
 
 def _sender_address(msg: dict) -> str:
@@ -153,46 +220,105 @@ def _list_id(msg: dict) -> str:
     return (msg.get("list_id") or "").strip()
 
 
-def unread_inbox() -> list[dict]:
-    """Unread INBOX messages, newest first (or [] on failure).
+def inbox_messages() -> list[dict]:
+    """INBOX messages, newest first (or [] on failure).
+
+    Scope is **what is in the INBOX**, not what is unread. The module docstring
+    already states the rule — ``unread ≠ unhandled``, the status store is the
+    single source of handled-state — but the scan itself used to contradict it
+    by passing `--unseen`: a mail anyone merely *opened*, in any client or in a
+    triage session that read it to classify it, dropped out of the gate's view
+    permanently while still sitting in the INBOX. The mailbox is authoritative
+    for what is present; the store decides what is handled.
 
     The listing is newest-first, so a plain `--limit INBOX_SCAN_LIMIT` does not
-    merely sample the mailbox — it hides its *oldest* unread mail, permanently
-    and silently, from the moment the backlog outgrows the window. The mail
-    hidden that way is exactly the mail that most needs triaging. So when the
-    first pass comes back saturated, widen it once, up to INBOX_SCAN_MAX, and
-    say so on stderr either way.
+    merely sample the mailbox — it hides its *oldest* mail, permanently and
+    silently, from the moment the backlog outgrows the window. The mail hidden
+    that way is exactly the mail that most needs triaging, and with the slice
+    taken oldest-first it is exactly the mail the next run wants. So when the
+    first pass comes back saturated, widen it to INBOX_SCAN_MAX, and when that
+    saturates too, keep walking: page downward by UID cursor (`--uid-max`,
+    the smallest UID seen less one) in INBOX_SCAN_MAX-sized pages until a page
+    comes back short. The listing is then complete whatever the mailbox holds
+    — bounded by the mailbox, which is the only honest bound for "what is in
+    the INBOX" — and the common near-empty case still costs one round-trip.
     """
     res = _email_client(
-        "search", "--folder", "INBOX", "--unseen", "--limit", str(INBOX_SCAN_LIMIT)
+        "search", "--folder", "INBOX", "--limit", str(INBOX_SCAN_LIMIT)
     )
     if not res:
         return []
     messages = res.get("messages", [])
-    if len(messages) < INBOX_SCAN_LIMIT:
+    if _page_size(res) < INBOX_SCAN_LIMIT:
         return messages
 
     print(
-        f"[triage-gate] unread INBOX saturated the {INBOX_SCAN_LIMIT}-message scan "
+        f"[triage-gate] INBOX saturated the {INBOX_SCAN_LIMIT}-message scan "
         f"window; re-scanning up to {INBOX_SCAN_MAX}",
         file=sys.stderr,
     )
     wide = _email_client(
-        "search", "--folder", "INBOX", "--unseen", "--limit", str(INBOX_SCAN_MAX)
+        "search", "--folder", "INBOX", "--limit", str(INBOX_SCAN_MAX)
     )
     if not wide:
         # The widened scan failed; the narrow result is still real mail, and
         # triaging its newest INBOX_SCAN_LIMIT beats triaging nothing.
         return messages
-    messages = wide.get("messages", [])
-    if len(messages) >= INBOX_SCAN_MAX:
-        print(
-            f"[triage-gate] unread INBOX also filled the {INBOX_SCAN_MAX}-message "
-            f"ceiling — older unread mail is still out of view. Raise "
-            f"TRIAGE_INBOX_SCAN_MAX.",
-            file=sys.stderr,
+    messages = list(wide.get("messages", []))
+    # Walk down by UID cursor until a page comes back short. The only bound
+    # is the mailbox itself: each page must be full for the next to be asked
+    # for, and the cursor must move, so the walk ends with the mailbox. A
+    # page that fails or does not advance ends it early, loudly, with what
+    # was listed so far -- a partial listing the log names, never a quiet
+    # ceiling. "Full" and "where next" are read off the page as the server
+    # matched it (`scanned`, `min_uid`), not off how many summaries came
+    # back, so an unreadable header cannot end the walk early.
+    res, cursor = wide, None
+    while _page_size(res) >= INBOX_SCAN_MAX:
+        low = _page_min_uid(res)
+        if low is None or low <= 1:
+            break
+        nxt = low - 1
+        if cursor is not None and nxt >= cursor:
+            print(f"[triage-gate] INBOX walk did not advance below uid {cursor}; "
+                  f"stopping with the {len(messages)} listed so far",
+                  file=sys.stderr)
+            break
+        cursor = nxt
+        more = _email_client(
+            "search", "--folder", "INBOX", "--limit", str(INBOX_SCAN_MAX),
+            "--uid-max", str(cursor),
         )
+        if not more:
+            print(f"[triage-gate] INBOX page below uid {cursor} failed; "
+                  f"continuing with the {len(messages)} listed so far — older "
+                  "mail is out of view this tick", file=sys.stderr)
+            break
+        res = more
+        page = list(more.get("messages", []))
+        messages.extend(page)
+        print(f"[triage-gate] INBOX exceeds {INBOX_SCAN_MAX}; paged below uid "
+              f"{cursor}: +{len(page)}, {len(messages)} so far", file=sys.stderr)
     return messages
+
+
+def _page_size(res: dict) -> int:
+    """How many messages the server matched for this page — `scanned` from a
+    client that reports it, else the summaries returned."""
+    scanned = res.get("scanned")
+    if isinstance(scanned, int):
+        return scanned
+    return len(res.get("messages", []))
+
+
+def _page_min_uid(res: dict) -> int | None:
+    """The smallest UID the server matched for this page, for the next cursor."""
+    low = res.get("min_uid")
+    if isinstance(low, int):
+        return low
+    uids = [int(m["uid"]) for m in res.get("messages", [])
+            if str(m.get("uid") or "").isdigit()]
+    return min(uids) if uids else None
 
 
 def refresh_whitelist_from_sent() -> int:
@@ -215,6 +341,314 @@ def refresh_whitelist_from_sent() -> int:
         # rendering only the whitelist would silently drop them.
         tp.save_email_policy(pol._replace(addresses=merged))
     return len(merged)
+
+
+# --------------------------------------------------------------------------- #
+# Sent reconciliation — settle mail the user has already answered              #
+# --------------------------------------------------------------------------- #
+
+# Reply/forward prefixes, in the locales this mailbox actually sees. Repeated
+# and bracketed forms ("Re: AW: ", "Re[2]: ") are stripped as one run.
+_SUBJECT_PREFIX = re.compile(
+    r"^\s*(?:(?:re|aw|fw|fwd|wg|tr|antw|sv|vs)\s*(?:\[\d+\])?\s*:\s*)+", re.I
+)
+
+
+def _thread_key(subject: str) -> str:
+    """A subject stripped of reply/forward prefixes, for pairing a mail with its
+    answer. Deliberately crude, and deliberately only ever used to *nominate* a
+    candidate: prefixes vary by client and locale, and a subject alone is far
+    too weak to settle anything. `email_client answered` does the deciding."""
+    return re.sub(r"\s+", " ", _SUBJECT_PREFIX.sub("", subject or "")).strip().lower()
+
+
+def _parse_when(value: str) -> datetime | None:
+    """A listing's ISO timestamp, always tz-aware (naive is read as UTC)."""
+    try:
+        parsed = datetime.fromisoformat((value or "").strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _confirm_answered(msg: dict) -> bool | None:
+    """Ask the mailbox, exactly, whether this message has been replied to.
+
+    `email_client answered` is the purpose-built check and is strictly stronger
+    than anything this script can do over a listing: it runs *server-side IMAP
+    SEARCH* over the Sent folder for messages citing this Message-ID in
+    In-Reply-To/References, plus — for replies that do not thread at all — an
+    exact To/Cc/Bcc search for the sender since the message's own date, under
+    the same base subject. Three things follow, each of which the listing-based
+    matching this replaced got wrong:
+
+      * **Address comparison is exact.** A Python `sender in recipients`
+        substring test over a listing treats `ann@example.com` as answered by a
+        reply to `joann@example.com`.
+      * **No window.** A server-side SEARCH sees the whole Sent folder, so a
+        reply older than any listing limit still counts.
+      * **Cc/Bcc count.** A listing summary carries `To` only, so a reply-all
+        that reaches the sender via Cc is invisible to it; the header search
+        covers all three recipient fields.
+
+    Exit 0 means answered (True), 3 means genuinely unanswered (False), and
+    anything else means the state is unknown (None). Unknown must never
+    archive a mail — the caller treats it like "not answered" for this tick
+    — but it is not a *finding* either, so the caller must not remember it
+    the way it remembers a definitive negative.
+    """
+    mid = (msg.get("message_id") or "").strip()
+    if not mid:
+        return None
+    rc, payload = _email_client_rc(
+        "answered", "--message-id", mid, "--folder", SENT_FOLDER,
+        "--in-folder", "INBOX",
+    )
+    if rc not in (0, 3):
+        print(f"[triage-gate] sent-reconcile: answered-check inconclusive for "
+              f"{mid} (rc={rc}); leaving it to triage", file=sys.stderr)
+        return None
+    if rc == 3:
+        return False
+    return True if (payload or {}).get("answered") else None
+
+
+def _settle_answered(msg: dict) -> bool:
+    """Move one answered mail out of the INBOX and record it resolved."""
+    uid = str(msg.get("uid") or "")
+    if not (uid and ANSWERED_FOLDER):
+        return False
+    moved = _email_client(
+        "move", "--uid", uid, "--from", "INBOX", "--to", ANSWERED_FOLDER
+    )
+    # Insist on the move's own receipt, not merely "the command exited 0": the
+    # status record about to be written says the mail has left the INBOX, and
+    # bookkeeping that outruns the mailbox is how a message becomes invisible
+    # to triage while still sitting in it.
+    if not (moved and str(moved.get("moved") or "") == uid):
+        print(f"[triage-gate] sent-reconcile: move of uid {uid} not confirmed; "
+              f"leaving it to triage", file=sys.stderr)
+        return False
+    path = _status_path(msg.get("message_id") or "")
+    if path is None:
+        return True
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    # Merge into whatever record exists rather than replacing it: the mail
+    # may already be `proposed`, `omnibus` or `engaged`, and the thread ids,
+    # project link and send bookkeeping on that record are what Phase 6 and
+    # any later audit read. Only the resolution changes here.
+    existing = _read_record(path) if path.exists() else None
+    record = dict(existing or {})
+    record.setdefault("channel", "email")
+    record.setdefault("uid", uid)
+    record.setdefault("message_id", msg.get("message_id") or "")
+    record.setdefault("from", msg.get("from") or "")
+    record.setdefault("subject", msg.get("subject") or "")
+    record.setdefault("project", "unlinked")
+    record.setdefault("classified", stamp)
+    if existing and existing.get("status") not in (None, "resolved"):
+        record["superseded_status"] = existing.get("status")
+    record.update({
+        "status": "resolved",
+        "disposition": "answered",
+        "note": (
+            f"`email_client answered` found a reply to this message in "
+            f"{SENT_FOLDER}; settled by the credit-free triage gate and moved "
+            f"INBOX->{ANSWERED_FOLDER}."
+        ),
+        "folder": ANSWERED_FOLDER,
+        "updated": stamp,
+        "resolved_at": stamp,
+    })
+    try:
+        TRIAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+                       encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:  # noqa: BLE001 — bookkeeping must not break the tick
+        print(f"[triage-gate] sent-reconcile: could not write status file: {exc}",
+              file=sys.stderr)
+    return True
+
+
+_IMAP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def _imap_date(when: datetime) -> str:
+    """`DD-Mon-YYYY` for an IMAP SINCE — spelled out, since strftime's `%b`
+    follows the locale and IMAP wants the English abbreviation."""
+    return f"{when.day:02d}-{_IMAP_MONTHS[when.month - 1]}-{when.year}"
+
+
+def reconcile_answered(messages: list[dict]) -> list[dict]:
+    """Archive INBOX mail the user has already answered; return what is left.
+
+    A mail the user has already replied to is settled by definition, yet
+    nothing in triage noticed, so it kept sitting in the INBOX and kept being
+    re-proposed on every sweep. This is what keeps the INBOX meaning *still
+    open* rather than *everything that ever arrived*, and it costs no model
+    turn.
+
+    Two steps, because the cheap check and the correct check are different
+    checks:
+
+      1. **Nominate** — one Sent listing. A candidate is a mail whose thread
+         subject appears in that listing with a later timestamp. Loose on
+         purpose: it exists only to keep step 2 off the ~99% of the INBOX
+         nobody has answered.
+
+         The listing is bounded by **date**, not by count: a reply postdates
+         the mail it answers, so nothing sent before the oldest INBOX mail
+         can settle anything, and `--since` that date is a complete window
+         by construction. A count bound instead would be permanently
+         saturated on any mailbox with a year of Sent mail behind it, and
+         "saturated" would then mean either a blind spot for older replies
+         or an exact check on every INBOX message on every tick — an IMAP
+         login per message, half-hourly. The one residual cap
+         (RECONCILE_LISTING_CAP) guards against a single very old open mail
+         dragging in years of Sent. When it bites, the listing is no longer
+         complete: nomination still runs over what was listed, and a reply
+         beyond the window is simply not found this tick. That is the safe
+         direction — the mail stays in the INBOX and is proposed, where the
+         skill's own already-answered check sees it — and it keeps the
+         gate's work bounded, where exact-checking the whole INBOX would
+         hand the scheduler's budget to reconciliation and starve the slice
+         (the never-finishes failure this whole change exists to end). No
+         date-horizon shortcut either: the cap keeps the newest *UIDs*, and
+         UID order need not be date order, so no date read off the listing
+         is a safe boundary. The cap biting at all is the anomaly, and the
+         log says which mail to settle to stop it.
+      2. **Decide** — `_confirm_answered`, one exact server-side check per
+         candidate. Nothing is archived on the strength of step 1.
+
+    Both failure directions are therefore safe. A miss in step 1 (for example,
+    a subject rewritten past recognition) costs the mail one more appearance in
+    the proposal. A loose match in step 1 costs one extra IMAP round-trip and
+    is then rejected in step 2. And the action is a move to ANSWERED_FOLDER,
+    never a delete, so even a false positive that got through both costs an
+    archive rather than a message.
+    """
+    if not (SENT_RECONCILE and messages):
+        return messages
+    dated = [w for m in messages if (w := _parse_when(m.get("date"))) is not None]
+    if not dated:
+        # Undated mail is never settled (the "reply postdates it" test cannot
+        # be made), so with nothing dated there is nothing to nominate.
+        return messages
+    # A day of slack under the oldest mail: IMAP SINCE is a calendar date in
+    # the server's view, and the two clocks need not agree on where midnight is.
+    since = min(dated) - timedelta(days=1)
+    res = _email_client(
+        "search", "--folder", SENT_FOLDER, "--since", _imap_date(since),
+        "--limit", str(RECONCILE_LISTING_CAP),
+    )
+    if not res:
+        return messages
+    listed = list(res.get("messages", []))
+    sent_index: dict[str, list[datetime]] = {}
+    for sent in listed:
+        key = _thread_key(sent.get("subject"))
+        when = _parse_when(sent.get("date"))
+        if key and when is not None:
+            sent_index.setdefault(key, []).append(when)
+    # Past the cap the listing is incomplete (see the docstring): nominate
+    # from what was listed, say so, and leave the rest to the proposal. Never
+    # widen to an exact check of the whole INBOX — that is unbounded work in
+    # front of the bounded slice.
+    if len(listed) >= RECONCILE_LISTING_CAP:
+        print(f"[triage-gate] sent-reconcile: {SENT_FOLDER} since "
+              f"{min(dated).date()} exceeds the {RECONCILE_LISTING_CAP}-message "
+              "cap; nominating from the newest listed only, so a reply older "
+              "than the window is not settled this tick. Settling the oldest "
+              "open INBOX mail ends this.", file=sys.stderr)
+
+    # A nomination is keyed by the newest Sent message that nominates it. The
+    # exact check's answer can only change when that key changes (a newer
+    # reply appears), so a negative is remembered under its key and not
+    # re-bought every tick -- the cap below then goes to candidates that have
+    # not been checked yet, and a large mailbox's candidates are worked
+    # through across runs instead of the same oldest ones every time.
+    memo = _load_check_memo()
+    candidates: list[tuple[datetime, str, dict]] = []
+    keep: list[dict] = []
+    for msg in messages:
+        key = _thread_key(msg.get("subject"))
+        when = _parse_when(msg.get("date"))
+        later = [sent_at for sent_at in sent_index.get(key, [])
+                 if when is not None and sent_at > when] if key else []
+        mid = (msg.get("message_id") or "").strip()
+        if later and mid:
+            nomination = max(later).isoformat()
+            if memo.get(mid) == nomination:
+                keep.append(msg)  # checked against this very Sent state: no
+                continue
+            candidates.append((when, nomination, msg))
+        else:
+            keep.append(msg)
+    candidates.sort(key=lambda c: c[0])
+    checked = candidates[:RECONCILE_CHECKS_PER_RUN]
+    deferred = candidates[RECONCILE_CHECKS_PER_RUN:]
+    settled = 0
+    for _when, nomination, msg in checked:
+        mid = msg["message_id"].strip()
+        verdict = _confirm_answered(msg)
+        if verdict is True and _settle_answered(msg):
+            settled += 1
+            memo.pop(mid, None)
+            continue
+        keep.append(msg)
+        # Only a definitive "unanswered" is worth remembering. An inconclusive
+        # check (None) or a confirmed reply whose move failed must stay
+        # eligible for the next run, or a transient failure would hide the
+        # mail from reconciliation until the Sent state happens to change.
+        if verdict is False:
+            memo[mid] = nomination
+        else:
+            memo.pop(mid, None)
+    for _when, _nomination, msg in deferred:
+        keep.append(msg)
+    if checked or deferred:
+        print(f"[triage-gate] sent-reconcile: {len(checked)} candidate(s) "
+              f"confirmed against {SENT_FOLDER}, {settled} moved "
+              f"INBOX->{ANSWERED_FOLDER}"
+              + (f", {len(deferred)} wait for a later run" if deferred else ""),
+              file=sys.stderr)
+        _save_check_memo(memo, {(m.get("message_id") or "").strip()
+                                for m in messages})
+    return keep
+
+
+_CHECK_MEMO = ".answered-checks.json"
+
+
+def _load_check_memo() -> dict[str, str]:
+    """message_id -> the nomination (newest nominating Sent timestamp) it was
+    last exact-checked against and found unanswered."""
+    try:
+        data = json.loads((TRIAGE_STATE_DIR / _CHECK_MEMO).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, str)} \
+        if isinstance(data, dict) else {}
+
+
+def _save_check_memo(memo: dict[str, str], present: set[str]) -> None:
+    """Persist the memo, dropping entries for mail no longer in the INBOX so
+    it never outgrows the mailbox. Best effort: a memo that could not be
+    written costs a repeated check, nothing worse."""
+    pruned = {k: v for k, v in memo.items() if k in present}
+    try:
+        TRIAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        path = TRIAGE_STATE_DIR / _CHECK_MEMO
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pruned, ensure_ascii=False, indent=0),
+                       encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:  # noqa: BLE001
+        print(f"[triage-gate] sent-reconcile: could not write check memo: {exc}",
+              file=sys.stderr)
 
 
 # --------------------------------------------------------------------------- #
@@ -362,8 +796,8 @@ def _record_news_status(msg: dict, detail: dict, source: str, moved_to: str) -> 
               file=sys.stderr)
 
 
-def route(unread: list[dict], mode: str) -> list[dict]:
-    """Run both rails over the unread set; return what `mode` owes a model turn.
+def route(present: list[dict], mode: str) -> list[dict]:
+    """Run both rails over the INBOX set; return what `mode` owes a model turn.
 
     One pass decides everything, because the two rails are not exclusive: the
     news rail is driven by the message's group, the triage rail by its sender
@@ -379,7 +813,7 @@ def route(unread: list[dict], mode: str) -> list[dict]:
     news_ready = news_ingest.news_enabled()
     warned = False
     keep, filed, held = [], 0, 0
-    for msg in unread:
+    for msg in present:
         dec = tp.email_gate_decision(_sender_address(msg), _list_id(msg), pol=pol)
         triaged = dec["daily"]
         if dec["news"]:
@@ -588,33 +1022,17 @@ def omnibus_due(messages: list[dict]) -> list[dict]:
     return []
 
 
-def _merge(*groups: list[dict]) -> list[dict]:
-    """The groups concatenated, deduplicated on Message-ID, order preserved.
-
-    Messages without an id are kept as they come: there is nothing to dedupe
-    them on, and dropping them would hide mail.
-    """
-    seen: set[str] = set()
-    merged: list[dict] = []
-    for group in groups:
-        for msg in group:
-            mid = (msg.get("message_id") or "").strip()
-            if mid:
-                if mid in seen:
-                    continue
-                seen.add(mid)
-            merged.append(msg)
-    return merged
-
-
 def _report_arming(
-    mode: str, hits: list[dict], fresh: list[dict], due: list[dict]
+    mode: str, hits: list[dict], fresh: list[dict], due: list[dict],
+    batch: list[dict] | None = None,
 ) -> None:
     """Log why the gate armed: never-seen mail, stalled mail, a due digest.
 
     A rising stalled count is the signature of the inbox-zero backstop failing,
     and it is otherwise invisible: all three kinds look identical in the spawn
     line. A run armed only by a due digest is likewise worth seeing as such.
+    With a batch, also say how much of the arming set this run takes on, so a
+    backlog draining over several runs reads as one in the log.
     """
     stalled = sum(
         1
@@ -633,63 +1051,145 @@ def _report_arming(
         f"({', '.join(parts)}); {len(hits)} message(s) in scope",
         file=sys.stderr,
     )
+    if batch is not None and len(batch) < len(fresh):
+        print(
+            f"[triage-gate] {mode}: handing over the oldest {len(batch)} of "
+            f"{len(fresh)}; {len(fresh) - len(batch)} wait for a later run",
+            file=sys.stderr,
+        )
 
 
-def build_prompt(mode: str, messages: list[dict], due: int = 0) -> str:
+def _batch_key(msg: dict) -> tuple[bool, datetime]:
+    """Oldest first; undated mail last, since it cannot be placed."""
+    when = _parse_when(msg.get("date"))
+    return (when is None, when or datetime.min.replace(tzinfo=timezone.utc))
+
+
+def take_batch(fresh: list[dict]) -> tuple[list[dict], int]:
+    """The slice of `fresh` this run hands the model, and how many are left.
+
+    Oldest first, because the listing is newest-first and a run that starts
+    from the top spends its budget on the mail that arrived last while the
+    mail that has waited longest — the mail most in need of triage — is the
+    part that gets cut. Bounded, because the model's progress is durable only
+    per message (its status record), so the run must be one that *finishes*:
+    a slice the budget comfortably fits, recorded in full, beats the whole
+    backlog attempted and killed at the wall with nothing recorded.
+    """
+    ordered = sorted(fresh, key=_batch_key)
+    cap = BATCH_SIZE if BATCH_SIZE > 0 else PROMPT_LIST_LIMIT
+    cap = max(1, min(cap, PROMPT_LIST_LIMIT))
+    return ordered[:cap], max(0, len(ordered) - cap)
+
+
+def _outcome(mode: str, rc: int, remaining: int) -> int:
+    """The gate's exit code after a spawn: the session's own failure first,
+    then EXIT_PARTIAL if the backlog is not drained, else 0."""
+    if rc != 0:
+        return rc
+    if remaining:
+        print(
+            f"[triage-gate] {mode}: {remaining} message(s) still wait; exiting "
+            f"{EXIT_PARTIAL} so the scheduler comes back for the next slice",
+            file=sys.stderr,
+        )
+        return EXIT_PARTIAL
+    return 0
+
+
+def build_prompt(
+    mode: str, messages: list[dict], due: int = 0, remaining: int = 0
+) -> str:
+    """The spawn prompt: a bounded, fully listed slice, and what to do with it.
+
+    The list *is* the scope. The session is told not to enumerate the mailbox
+    for more (what is not listed is either recorded already or waits for a
+    later run), to record each message as it settles it, and — only on the
+    run that drains the backlog — to do the reconciliation passes and the
+    reminders that need the whole picture. Everything the batching buys
+    depends on the session honouring that, so the prompt says it plainly.
+    """
     scope = (
         "from a whitelisted sender"
         if mode == "frequent"
         else "from any sender (daily catch-all)"
     )
     lines = [
-        "The credit-free triage gate found unread INBOX e-mail worth handling "
+        "The credit-free triage gate found INBOX e-mail worth handling "
         f"({scope}).",
         "",
         "Invoke the triage skill scoped to e-mail. Follow the skill exactly: "
-        "reconcile against the triage status store, link each message to a "
-        "project, and propose replies/actions as individual dashboard "
-        "conversations with archivals/deletions bundled into the omnibus. Do not "
-        "answer in chat and do not push results via Signal. A run with nothing to "
-        "propose ends silently.",
+        "link each message to a project, and propose replies/actions as "
+        "individual dashboard conversations with archivals/deletions bundled "
+        "into the omnibus. Do not answer in chat and do not push results via "
+        "Signal. A run with nothing to propose ends silently.",
+        "",
+        "The scope of this run is the list below and nothing else: a bounded "
+        "slice of the backlog, oldest first. Do not list the INBOX for more — "
+        "whatever is not here is already in the status store or waits for a "
+        "later run. Write each message's status record the moment its "
+        "disposition is settled (proposed, bundled or resolved), before "
+        "starting on the next one: the run is stopped at its budget, and only "
+        "what is on disk by then survives.",
     ]
+    if remaining:
+        lines += [
+            "",
+            f"{remaining} more message(s) wait beyond this slice; the gate comes "
+            "back for them. Skip Phase 1's reconciliation passes (store->INBOX, "
+            "done-but-still-there, stalled) and Phase 5 this run — they belong "
+            "to the run that drains the backlog.",
+        ]
+    else:
+        lines += [
+            "",
+            "This slice drains the backlog: after the list, run Phase 1's "
+            "reconciliation passes (store->INBOX, done-but-still-there, "
+            "stalled) and Phase 5 as the skill describes. Those passes diff "
+            "the INBOX against the status store, so for them — and only for "
+            "them — list the INBOX as the skill says; the scope rule above is "
+            "about not taking on more triage work, not about the repairs. Any "
+            "unrecorded mail the listing turns up is a later run's, not this "
+            "one's.",
+        ]
     if due:
         lines += [
             "",
-            f"{due} of these are already bundled on `omnibus_pending` and their "
-            "digest is now due: send the omnibus this run (Phase 4b), even if "
-            "nothing else here is worth proposing — that bundle is the reason "
-            "this run was armed at all. What is in the bundle is what the status "
-            "store says is in it: reconcile from the store, never from this "
-            "listing or from a thread's prose.",
+            f"A digest of {due} message(s) bundled on `omnibus_pending` is now "
+            "due: send the omnibus this run (Phase 4b), even if nothing listed "
+            "below is worth proposing — that bundle is the reason this run was "
+            "armed at all. The bundled messages are deliberately not listed "
+            "here: what is in the bundle is what the status store says is in "
+            "it, so reconcile from the store, never from a listing or from a "
+            "thread's prose. The digest is one unit of work whatever its size.",
         ]
-    lines += [
-        "",
-        "The messages the gate saw (the mailbox listing remains authoritative — "
-        "reconcile, do not assume this list is complete):",
-    ]
-    for m in messages[:PROMPT_LIST_LIMIT]:
+    if messages:
+        lines += ["", "The messages for this run, oldest first (uid for "
+                  "`email_client.py read/flag/move --uid`):"]
+    else:
+        lines += ["", "No messages to triage this run beyond the digest."]
+    for m in messages:
         frm = m.get("from") or "(unknown)"
         subj = (m.get("subject") or "").strip() or "(no subject)"
         mid = m.get("message_id") or "(no id)"
-        lines.append(f"  - {frm} — {subj} [{mid}]")
-    if len(messages) > PROMPT_LIST_LIMIT:
-        lines.append(
-            f"  … and {len(messages) - PROMPT_LIST_LIMIT} more the gate saw but did "
-            "not list here. This listing is truncated, the mailbox is not: work "
-            "from the mailbox."
-        )
+        uid = m.get("uid") or "?"
+        lines.append(f"  - uid {uid}: {frm} — {subj} [{mid}]")
     return "\n".join(lines)
 
 
-def spawn(mode: str, messages: list[dict], due: int = 0) -> int:
+def spawn(
+    mode: str, messages: list[dict], due: int = 0, remaining: int = 0
+) -> int:
     print(
         f"[triage-gate] {mode}: {len(messages)} message(s) to triage"
-        + (f", {due} of them a due omnibus digest" if due else "")
+        + (f", plus a due omnibus digest of {due}" if due else "")
+        + (f", {remaining} more waiting" if remaining else "")
         + "; spawning session",
         file=sys.stderr,
     )
     cmd = ["claude", "-p", "--output-format=json",
-           "--permission-mode", PERMISSION_MODE, build_prompt(mode, messages, due)]
+           "--permission-mode", PERMISSION_MODE,
+           build_prompt(mode, messages, due, remaining)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
     # Refresh an access token about to expire before the session starts —
@@ -705,18 +1205,18 @@ def spawn(mode: str, messages: list[dict], due: int = 0) -> int:
 
 
 def run_frequent() -> int:
-    unread = unread_inbox()
-    hits = route(unread, "frequent")
-    # A due digest is looked for across the whole unread listing, not just the
+    present = reconcile_answered(inbox_messages())
+    hits = route(present, "frequent")
+    # A due digest is looked for across the whole INBOX listing, not just the
     # whitelisted `hits`: a bundle accrued by a daily run may well hold mail
     # from senders this pass does not whitelist, and the user is owed that
     # digest on time regardless of who sent what is in it.
-    due = omnibus_due(unread)
+    due = omnibus_due(present)
     fresh = arming(hits)
     if not fresh and not due:
         if not hits:
             print(
-                f"[triage-gate] frequent: {len(unread)} unread, none whitelisted; "
+                f"[triage-gate] frequent: {len(present)} in INBOX, none whitelisted; "
                 "nothing spawned",
                 file=sys.stderr,
             )
@@ -727,30 +1227,38 @@ def run_frequent() -> int:
                 file=sys.stderr,
             )
         return 0
-    _report_arming("frequent", hits, fresh, due)
-    # The routed set plus whatever the digest needs: narrowing the payload to
-    # what armed the run would hide the rest of the stack from reconciliation.
-    return spawn("frequent", _merge(hits, due), due=len(due))
+    batch, remaining = take_batch(fresh)
+    _report_arming("frequent", hits, fresh, due, batch)
+    # The slice, and the digest as a count. Recorded mail is not handed over:
+    # it is settled as far as this run is concerned, and the passes that
+    # revisit it run on the draining run (see build_prompt). The bundled mail
+    # is not listed either -- the digest is composed from the status store
+    # and is one unit of work whatever its size, so listing it would only
+    # unbound the prompt the slice exists to bound.
+    rc = spawn("frequent", batch, due=len(due), remaining=remaining)
+    return _outcome("frequent", rc, remaining)
 
 
 def run_daily() -> int:
     n = refresh_whitelist_from_sent()
     if n >= 0:
         print(f"[triage-gate] daily: whitelist now {n} address(es)", file=sys.stderr)
-    unread = unread_inbox()
-    hits = route(unread, "daily")
-    due = omnibus_due(unread)
+    present = reconcile_answered(inbox_messages())
+    hits = route(present, "daily")
+    due = omnibus_due(present)
     fresh = arming(hits)
     if not fresh and not due:
         if not hits:
-            print("[triage-gate] daily: nothing unread that triage owes a look; "
-                  "nothing spawned", file=sys.stderr)
+            print("[triage-gate] daily: nothing in the INBOX that triage owes a "
+                  "look; nothing spawned", file=sys.stderr)
         else:
-            print(f"[triage-gate] daily: {len(hits)} unread, all already in the "
+            print(f"[triage-gate] daily: {len(hits)} in INBOX, all already in the "
                   "status store; nothing spawned", file=sys.stderr)
         return 0
-    _report_arming("daily", hits, fresh, due)
-    return spawn("daily", _merge(hits, due), due=len(due))
+    batch, remaining = take_batch(fresh)
+    _report_arming("daily", hits, fresh, due, batch)
+    rc = spawn("daily", batch, due=len(due), remaining=remaining)
+    return _outcome("daily", rc, remaining)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -766,7 +1274,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "daily":
         return run_daily()
     if args.mode == "news":
-        route(unread_inbox(), "news")
+        route(inbox_messages(), "news")
         return 0
     if args.mode == "derive-whitelist":
         n = refresh_whitelist_from_sent()

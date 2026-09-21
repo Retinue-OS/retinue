@@ -43,6 +43,15 @@ to a model while letting the deployment override it via one env var — without
 naming the chamber in this framework file. Example:
   {"id": "triage", "prompt": "...", "model": "${RETINUE_TRIAGE_MODEL:-sonnet}"}
 
+A job may pin its own wall-clock budget with an optional `"timeout_seconds"`,
+overriding the global SCHEDULER_JOB_TIMEOUT for that job alone. One global
+default cannot fit both a 10-second health check and a catch-all that has to
+work through a whole mailbox: the long job is killed mid-flight every run, and
+because it never finishes it never reduces its own backlog, so the next run is
+slower still. Give such a job the budget its work actually needs. Example:
+  {"id": "triage-daily", "command": "...", "interval_seconds": 86400,
+   "timeout_seconds": 3600}
+
 A job may also carry an optional `"retry_after_seconds"`, consulted only when
 the last recorded run did not end in `"success"`: the job is then due as soon
 as that many seconds have passed, instead of waiting out the full
@@ -52,6 +61,21 @@ a look before a bare retry, not a tight retry loop). Example, for a job whose
 failures are usually transient (a rate limit, a flaky upstream):
   {"id": "herald-fetch", "command": "...", "interval_seconds": 86400,
    "retry_after_seconds": 900}
+
+A command job that works through a backlog in bounded slices exits with
+EXIT_PARTIAL (75, sysexits' EX_TEMPFAIL) to say "this slice is done and there
+is more". That is recorded as status "partial" -- not a failure, not
+"success". A job pairs it with `"resume_after_seconds"`: after a partial run
+it is due again after that many seconds instead of its full interval, so a
+backlog drains in successive runs rather than in one run that has to fit a
+single budget. `resume_after_seconds` is consulted for "partial" *only* -- a
+job whose model session fails must not be re-spawned every few minutes on
+the strength of a knob meant for resuming honest work, which is why this is
+not simply `retry_after_seconds` (that one still covers "partial" too, as any
+non-success, for a job that wants one knob for both). Without either, a
+partial run waits its interval like any other. Example:
+  {"id": "triage-daily", "command": "...", "interval_seconds": 86400,
+   "resume_after_seconds": 600}
 
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
@@ -92,6 +116,10 @@ CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 BASE_SCHEDULE = Path(os.environ.get("BASE_SCHEDULE") or "/workspace/.schedule.json")
 TICK = int(os.environ.get("SCHEDULER_TICK_SECONDS", "30"))
 JOB_TIMEOUT = int(os.environ.get("SCHEDULER_JOB_TIMEOUT", "900"))
+# The exit code a command job uses for "done with this slice, more remains";
+# see the module docstring. sysexits' EX_TEMPFAIL, chosen because it already
+# means "try again later" to everything else on a Unix box.
+EXIT_PARTIAL = 75
 # Grace period between SIGTERM and SIGKILL when a timed-out job's process
 # group has to be killed outright.
 KILL_GRACE_SECONDS = int(os.environ.get("SCHEDULER_KILL_GRACE_SECONDS", "10"))
@@ -239,6 +267,34 @@ def load_jobs() -> list[dict]:
     return jobs
 
 
+_warned_fields: set[tuple[str, str]] = set()
+
+
+def _seconds_field(job: dict, name: str) -> int | None:
+    """A job's optional positive-seconds field, or None when absent or unusable.
+
+    is_due() runs for every job on every tick inside one try/except, so a
+    value that raised here (`"soon"`) would not just misconfigure its own
+    job: the loop's catch would skip every job after it, on every tick, until
+    the manifest was fixed. Unusable reads as unset, with one warning per
+    process rather than one per tick.
+    """
+    raw = job.get(name)
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 0
+    if value <= 0:
+        key = (job.get("id", "?"), name)
+        if key not in _warned_fields:
+            _warned_fields.add(key)
+            log(f"[warn] job {key[0]!r} has an unusable {name} ({raw!r}), ignoring it")
+        return None
+    return value
+
+
 def is_due(job: dict) -> bool:
     if not job.get("enabled", True):
         return False
@@ -268,10 +324,15 @@ def is_due(job: dict) -> bool:
     # non-success "last run" on the very next tick, so a job with
     # retry_after_seconds set would fire after that short delay instead of
     # ever waiting out its documented full interval_seconds for its first run.
-    retry_after = job.get("retry_after_seconds")
     last_status = read_last_status(job["id"])
+    # A partial run (see the module docstring) resumes on its own, shorter
+    # clock, and only a partial one: a failure never rides this knob.
+    resume_after = _seconds_field(job, "resume_after_seconds")
+    if resume_after and last_status == "partial" and elapsed >= resume_after:
+        return True
+    retry_after = _seconds_field(job, "retry_after_seconds")
     if retry_after and last_status not in ("success", "scheduled"):
-        return elapsed >= int(retry_after)
+        return elapsed >= retry_after
     return False
 
 
@@ -315,6 +376,26 @@ def run_job(job: dict) -> None:
     model_note = f", model={model}" if model else ""
     log(f"[run] {jid} ({kind}{model_note}) from {Path(job['_source']).parent.name}")
     started = now()
+    # A job may buy itself more wall clock than the global default; see the
+    # module docstring on "timeout_seconds". A non-positive or unparseable
+    # value falls back rather than disabling the timeout — an un-killable job
+    # would wedge the whole single-threaded tick loop. An omitted or null
+    # field is not a mistake and says nothing; a field that is present but
+    # unusable is a malformed manifest and must be visible, rather than
+    # falling back as quietly as an absent one would.
+    raw_timeout = job.get("timeout_seconds")
+    timeout = JOB_TIMEOUT
+    if raw_timeout is not None:
+        try:
+            timeout = int(raw_timeout)
+        except (TypeError, ValueError):
+            log(f"[warn] job {jid!r} has an unusable timeout_seconds "
+                f"({raw_timeout!r}), using {JOB_TIMEOUT}s")
+            timeout = JOB_TIMEOUT
+        if timeout <= 0:
+            log(f"[warn] job {jid!r} has a non-positive timeout_seconds "
+                f"({raw_timeout!r}), using {JOB_TIMEOUT}s")
+            timeout = JOB_TIMEOUT
     try:
         # A `claude` started on an access token about to expire refreshes it
         # at once, racing every other claude process for the one rotation
@@ -345,22 +426,36 @@ def run_job(job: dict) -> None:
             start_new_session=True,
         )
         try:
-            out, err = proc.communicate(timeout=JOB_TIMEOUT)
+            out, err = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_group(proc.pid, signal.SIGTERM)
             try:
                 proc.communicate(timeout=KILL_GRACE_SECONDS)
-                log(f"[timeout] {jid} exceeded {JOB_TIMEOUT}s -- group terminated")
+                log(f"[timeout] {jid} exceeded {timeout}s -- group terminated")
             except subprocess.TimeoutExpired:
                 _kill_group(proc.pid, signal.SIGKILL)
                 proc.communicate()
-                log(f"[timeout] {jid} exceeded {JOB_TIMEOUT}s -- group killed")
+                log(f"[timeout] {jid} exceeded {timeout}s -- group killed")
             write_state(jid, "timeout")
             return
         dur = now() - started
         if proc.returncode == 0:
             log(f"[ok] {jid} in {dur:.0f}s")
             write_state(jid, "success")
+        elif proc.returncode == EXIT_PARTIAL:
+            # A slice finished and the job says more is waiting: not a
+            # failure, so no error text -- but not "success" either, so a
+            # resume_after_seconds on the job brings the next slice forward.
+            # Report the clock is_due() will actually apply: the shorter of
+            # the two opt-in waits (both cover a partial run), else the
+            # interval -- and only usable values, as is_due() reads them.
+            clocks = [c for c in (_seconds_field(job, "resume_after_seconds"),
+                                  _seconds_field(job, "retry_after_seconds"))
+                      if c]
+            wait = min(clocks) if clocks else job.get("interval_seconds")
+            log(f"[partial] {jid} in {dur:.0f}s -- more to do, due again after "
+                f"{wait}s")
+            write_state(jid, "partial")
         else:
             errtxt = (err or out or "").strip().replace("\n", " ")
             log(f"[fail] {jid} rc={proc.returncode} in {dur:.0f}s: {errtxt[:300]}")
