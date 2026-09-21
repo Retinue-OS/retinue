@@ -27,7 +27,7 @@ whole backlog (``TRIAGE_BATCH_SIZE``): a run that must finish everything in
 one budget is killed mid-flight the moment the backlog outgrows it, and a
 killed run persists nothing it had not already written, so the backlog never
 shrinks. A bounded run finishes, records what it did, and exits with
-``EXIT_PARTIAL`` when more is waiting, so the scheduler (``retry_after_seconds``
+``EXIT_PARTIAL`` when more is waiting, so the scheduler (``resume_after_seconds``
 on the job) comes back for the next slice. See ``run_daily``.
 
 Which of the two a message qualifies for is not the whole story, because a mail
@@ -124,7 +124,7 @@ BATCH_SIZE = int(os.environ.get("TRIAGE_BATCH_SIZE", "25"))
 PROMPT_LIST_LIMIT = int(os.environ.get("TRIAGE_PROMPT_LIST_LIMIT", "150"))
 # What the gate exits with when the run went fine but the backlog is not yet
 # drained: the scheduler records it as "partial" and, if the job carries
-# retry_after_seconds, comes back for the next slice after that short wait
+# resume_after_seconds, comes back for the next slice after that short wait
 # instead of after the full interval (scripts/scheduler.py).
 EXIT_PARTIAL = 75
 # How long a message may sit in the INBOX on a non-terminal status before the

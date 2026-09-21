@@ -333,7 +333,7 @@ credits):
    the whole-picture passes (Phase 1's store→INBOX, done-but-still-there and
    stalled repairs, Phase 5's reminders) only on the run told it drains the
    backlog. When more is left, the gate exits **75** and the scheduler records
-   a `partial` run, so a job with `retry_after_seconds` comes back for the
+   a `partial` run, so a job with `resume_after_seconds` comes back for the
    next slice after minutes rather than after its interval
    (`docs/scheduling.md`). The point is that the model's progress is durable
    only per message — its status record — so a run that takes a slice it can

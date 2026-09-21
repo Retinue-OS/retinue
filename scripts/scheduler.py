@@ -64,11 +64,18 @@ failures are usually transient (a rate limit, a flaky upstream):
 
 A command job that works through a backlog in bounded slices exits with
 EXIT_PARTIAL (75, sysexits' EX_TEMPFAIL) to say "this slice is done and there
-is more". That is recorded as status "partial" -- not a failure, but not
-"success" either, so a job that pairs it with `retry_after_seconds` is picked
-up again after that short wait instead of after its full interval, and a
+is more". That is recorded as status "partial" -- not a failure, not
+"success". A job pairs it with `"resume_after_seconds"`: after a partial run
+it is due again after that many seconds instead of its full interval, so a
 backlog drains in successive runs rather than in one run that has to fit a
-single budget. A job without `retry_after_seconds` simply waits its interval.
+single budget. `resume_after_seconds` is consulted for "partial" *only* -- a
+job whose model session fails must not be re-spawned every few minutes on
+the strength of a knob meant for resuming honest work, which is why this is
+not simply `retry_after_seconds` (that one still covers "partial" too, as any
+non-success, for a job that wants one knob for both). Without either, a
+partial run waits its interval like any other. Example:
+  {"id": "triage-daily", "command": "...", "interval_seconds": 86400,
+   "resume_after_seconds": 600}
 
 State files  (`$SCHEDULER_STATE_DIR/<job-id>.json`):
   {"last_run": "2026-06-14T16:00:00+00:00", "status": "success"}
@@ -289,8 +296,13 @@ def is_due(job: dict) -> bool:
     # non-success "last run" on the very next tick, so a job with
     # retry_after_seconds set would fire after that short delay instead of
     # ever waiting out its documented full interval_seconds for its first run.
-    retry_after = job.get("retry_after_seconds")
     last_status = read_last_status(job["id"])
+    # A partial run (see the module docstring) resumes on its own, shorter
+    # clock, and only a partial one: a failure never rides this knob.
+    resume_after = job.get("resume_after_seconds")
+    if resume_after and last_status == "partial" and elapsed >= int(resume_after):
+        return True
+    retry_after = job.get("retry_after_seconds")
     if retry_after and last_status not in ("success", "scheduled"):
         return elapsed >= int(retry_after)
     return False
@@ -405,9 +417,11 @@ def run_job(job: dict) -> None:
         elif proc.returncode == EXIT_PARTIAL:
             # A slice finished and the job says more is waiting: not a
             # failure, so no error text -- but not "success" either, so a
-            # retry_after_seconds on the job brings the next slice forward.
+            # resume_after_seconds on the job brings the next slice forward.
+            wait = (job.get("resume_after_seconds") or job.get("retry_after_seconds")
+                    or job.get("interval_seconds"))
             log(f"[partial] {jid} in {dur:.0f}s -- more to do, due again after "
-                f"{job.get('retry_after_seconds') or job.get('interval_seconds')}s")
+                f"{wait}s")
             write_state(jid, "partial")
         else:
             errtxt = (err or out or "").strip().replace("\n", " ")

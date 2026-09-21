@@ -883,7 +883,7 @@ interruptions into a pile of identical threads.
 | Variable | Meaning | Default |
 |---|---|---|
 | `TRIAGE_STATE_DIR` | The e-mail triage status store: one file per message (id → status + bookkeeping). Persist on the pinned `/root` volume so it survives container recreation. | `/root/.retinue/triage` |
-| `TRIAGE_BATCH_SIZE` | How many never-seen or stalled messages one gate-spawned run is handed, oldest first. The lever that keeps a sweep incremental: the run finishes and records its slice; the gate exits `75` when more waits and the scheduler comes back for it (`retry_after_seconds` on the job). Non-positive: as many as the prompt lists (`TRIAGE_PROMPT_LIST_LIMIT`). | `25` |
+| `TRIAGE_BATCH_SIZE` | How many never-seen or stalled messages one gate-spawned run is handed, oldest first. The lever that keeps a sweep incremental: the run finishes and records its slice; the gate exits `75` when more waits and the scheduler comes back for it (`resume_after_seconds` on the job). Non-positive: as many as the prompt lists (`TRIAGE_PROMPT_LIST_LIMIT`). | `25` |
 | `TRIAGE_SENT_RECONCILE` | `0` switches off the gate's credit-free archiving of INBOX mail the Sent folder proves already answered (`email_client answered` is the authority; move, never delete). | `1` |
 | `TRIAGE_ANSWERED_FOLDER` | Where the gate moves answered mail. | `TRIAGE_NEWS_FOLDER`, i.e. `Archive` |
 | `EMAIL_PROCESSING_INTERVAL` | Seconds; **only** the gap between omnibus proposals and the grace period before the first reminder. **Not** the triage run frequency (that is the scheduler's). | `86400` (24 h) |
