@@ -136,13 +136,17 @@ docstring). Pieces:
 - `components/chats.js` — the Chats card on the dashboard and, with `full`,
   the whole `chats.html` page: avatar, channel mark, last-message preview,
   unread badge, non-archived chats ordered by last activity; the full page
-  adds an Active/Archived filter like the conversations page and, beside each
-  row (`POST /chats/<id>/flags`), the two things one does to a chat that is in
-  the way: **Archive** (out of the list until it speaks again) and **Mute**
-  (out of the list, and the next message does not bring it back). Muting
-  archives — the server's rule — so both land under *Archived*, where
-  **Restore** undoes either. The dashboard card stays a glance and carries
-  none of it. In the wide
+  adds an Active/Archived filter like the conversations page, and rows that
+  swipe (pointer events, so touch, pen and mouse drag alike; a long press,
+  right-click or the context-menu key opens the same shelf). On *Active*, a
+  swipe right archives at once and a swipe left uncovers **Archive** (out of
+  the list until it speaks again) and **Mute** (out of the list, and the next
+  message does not bring it back), both `POST /chats/<id>/flags`. Muting
+  archives — the server's rule — so both land under *Archived*, where a swipe
+  right restores at once and a swipe left uncovers **Restore**, **Mute** /
+  **Unmute** (stays archived) and **Delete** (`POST /chats/<id>/delete`,
+  armed by a first tap, done by a second). The dashboard card stays a glance
+  and carries none of it. In the wide
   layout the card has its own fixed-height region above the conversations
   (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
   (`data-splitter="chats"`). The card refreshes on an ambient cadence and
@@ -232,6 +236,20 @@ The API, as the components consume it:
   /chats/<id>/flags` (body `{archived?, muted?}`, either or both) is the one
   way in, and the answer carries the flags as they ended up — a client reads
   them back rather than assuming what it asked for.
+
+  `POST /chats/<id>/delete` (no body) is not a flag but an erasure: every
+  inbox gateway of the channel is asked to erase the chat (its own
+  token-gated `POST /chats/delete` `{chat, account}`) — the ledger records of
+  both directions and the media only they reference, plus that gateway's
+  pending-send files and recent-senders entry for the peer — and then the
+  chat's state document, live overlay entries and companion thread (with its
+  attachments and Claude session transcript) go. No trace stays beyond a
+  minutes-long in-memory tombstone that hides the store's not-yet-reindexed
+  copy; the next message from the peer starts a new chat. When no gateway
+  can erase the messages the answer is 502 and nothing is touched.
+  Deliberately out of reach: what agents derived from the chat elsewhere
+  (memories, news-feed items, project notes), notifications already
+  delivered, and the messenger app's own copy on the phone.
 
   These two flags replaced the messenger **sender blacklist**: not wanting to
   hear from someone is a chat one mutes, in the interface, on the chat one is

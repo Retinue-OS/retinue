@@ -373,6 +373,70 @@ def test_since_epoch_and_iso_equivalent():
     print("PASS test_since_epoch_and_iso_equivalent")
 
 
+def test_delete_chat_erases_exactly_one_chat():
+    """A chat is (chat key, account): both directions of it go, with the blobs
+    they reference and a pending voice note's retained audio; the same peer on
+    another account, and the account-less legacy history, stay."""
+    import json
+    with tempfile.TemporaryDirectory() as tmp:
+        peer, acct, other = "+41790000001", "+41790000009", "+41790000008"
+        pic = ist.store_media(tmp, b"\x89PNG\r\n\x1a\n" + b"0" * 32, "image/png", "p.png")
+        spool = ist.media_dir(tmp) / "abcd1234.ogg"
+        spool.write_bytes(b"audio")
+        ist.write_message(tmp, channel="signal", sender=peer, chat=peer, account=acct,
+                          text="in", attachment_urls=[f"urn:retinue:media:signal:{pic}"],
+                          timestamp=100.0)
+        ist.write_message(tmp, channel="signal", sender=peer, chat=peer, account=acct,
+                          text="", media=str(spool), timestamp=101.0)
+        ist.write_outbound(tmp, channel="signal", chat=peer, account=acct,
+                           text="out", author="user", timestamp=102.0)
+        kept_other = ist.write_message(tmp, channel="signal", sender=peer, chat=peer,
+                                       account=other, text="other account",
+                                       timestamp=103.0)[1]
+        kept_legacy = ist.write_message(tmp, channel="signal", sender=peer, chat=peer,
+                                        text="legacy", timestamp=104.0)[1]
+        kept_peer = ist.write_message(tmp, channel="signal", sender="+4179", chat="+4179",
+                                      account=acct, text="someone else",
+                                      timestamp=105.0)[1]
+
+        got = ist.delete_chat(tmp, peer, acct)
+        assert got == {"messages": 3, "media": 1, "errors": 0}, got
+        left = sorted(p.name for p in ist.messages_dir(tmp).glob("*.nt"))
+        assert left == sorted(p.name for p in (kept_other, kept_legacy, kept_peer)), left
+        assert not any(ist.media_dir(tmp).glob(pic + "*")), "blob and sidecars go"
+        assert not spool.exists(), "the retained voice-note audio goes"
+
+        # The account-less chat id names exactly the legacy records.
+        got = ist.delete_chat(tmp, peer, None)
+        assert got["messages"] == 1 and not kept_legacy.exists()
+        assert kept_other.exists() and kept_peer.exists()
+        # Idempotent, and an empty key erases nothing.
+        assert ist.delete_chat(tmp, peer, acct)["messages"] == 0
+        assert ist.delete_chat(tmp, "", acct)["messages"] == 0
+
+        # The gateway's own bookkeeping: pending sends (not one mid-send) and
+        # recent senders, each by the gateway's matcher.
+        pend = Path(tmp) / "pending"
+        pend.mkdir()
+        for rid, recipient, status in (("a" * 32, peer, "pending"),
+                                       ("b" * 32, peer, "sent"),
+                                       ("c" * 32, peer, "sending"),
+                                       ("d" * 32, "+4179", "pending")):
+            (pend / f"{rid}.json").write_text(json.dumps(
+                {"id": rid, "recipient": recipient, "status": status}))
+        (pend / "recent-chats.json").write_text("[]")
+        removed = ist.purge_pending_sends(pend, lambda e: e["recipient"] == peer)
+        assert sorted(removed) == ["a" * 32, "b" * 32], removed
+        assert sorted(p.stem for p in pend.glob("*.json")) == ["c" * 32, "d" * 32,
+                                                                "recent-chats"]
+        recent = Path(tmp) / "recent.json"
+        recent.write_text(json.dumps([{"number": peer}, {"number": "+4179"}]))
+        assert ist.purge_recent_chats(recent, lambda e: e.get("number") == peer) == 1
+        assert json.loads(recent.read_text()) == [{"number": "+4179"}]
+        assert ist.purge_recent_chats(Path(tmp) / "missing.json", lambda e: True) == 0
+    print("PASS test_delete_chat_erases_exactly_one_chat")
+
+
 if __name__ == "__main__":
     test_write_and_roundtrip()
     test_account_marks_who_received_it()
@@ -389,4 +453,5 @@ if __name__ == "__main__":
     test_backfill_states_metadata_on_older_records()
     test_missing_dir_is_empty()
     test_since_epoch_and_iso_equivalent()
+    test_delete_chat_erases_exactly_one_chat()
     print("all inbound_store tests passed")

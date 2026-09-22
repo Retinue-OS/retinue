@@ -318,6 +318,14 @@ class _MockGateway(BaseHTTPRequestHandler):
         payload = json.loads(raw) if raw else {}
         STATE["gw_requests"].append(("POST", self.path,
                                      self.headers.get("Authorization", "")))
+        if self.path.rstrip("/") == "/chats/delete":
+            STATE.setdefault("deleted", []).append(payload)
+            if STATE.get("gw_delete_fail"):
+                self._json(500, {"error": "store volume unwritable"})
+            else:
+                self._json(200, {"status": "deleted", "messages": 3, "media": 1,
+                                 "errors": 0, "pending_sends": 0, "recent": 1})
+            return
         if self.path.rstrip("/") == "/send":
             STATE["sent"].append(payload)
             outcome = {"message_id": str(776 + len(STATE["sent"])),
@@ -1573,6 +1581,79 @@ def test_archive_and_mute(base, wg):
     print("PASS test_archive_and_mute")
 
 
+def test_delete_chat(base, wg):
+    """Delete erases a chat from the system, and the peer can start over.
+
+    The ledger is the gateways' to erase, so the web-gateway asks them (with
+    their token) and drops only its own traces once one has: the chat state,
+    the companion thread, the live overlay. A gateway that cannot erase
+    leaves everything as it was — a half-deleted chat is worse than none.
+    Afterwards the next message from the same peer is a new chat: no archive
+    flag, no companion, nothing carried over."""
+    key = "+41790007777"
+    cid = "signal:" + key
+    rail = "/internal/chats/inbound"
+    event = {"direction": "in", "channel": "signal", "chat": key,
+             "sender": key, "sender_name": "Old acquaintance",
+             "message_id": "d1", "text": "Remember me?",
+             "gateway": "127.0.0.1", "gate": {"forward": True, "reason": "open"}}
+    _http(base, "POST", rail, event)
+    status, body = _http(base, "POST", "/chats/" + _quote(cid) + "/companion")
+    assert status in (200, 201), body
+    conv_id = body["id"]
+    assert (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists()
+    _http(base, "POST", "/chats/" + _quote(cid) + "/flags", {"muted": True})
+    delete_path = "/chats/" + _quote(cid) + "/delete"
+
+    # A gateway that cannot erase the messages: nothing else is touched.
+    STATE["gw_delete_fail"] = True
+    try:
+        status, body = _http(base, "POST", delete_path)
+    finally:
+        STATE["gw_delete_fail"] = False
+    assert status == 502, (status, body)
+    status, body = _http(base, "GET", "/chats")
+    assert any(c["id"] == cid for c in body["chats"]), "a failed delete keeps the chat"
+    assert (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists()
+
+    STATE["deleted"] = []
+    STATE["gw_requests"].clear()
+    status, body = _http(base, "POST", delete_path)
+    assert status == 200 and body.get("deleted") is True, body
+    assert STATE["deleted"] == [{"chat": key, "account": ""}], STATE["deleted"]
+    auth = [a for m, p, a in STATE["gw_requests"] if p == "/chats/delete"]
+    assert auth and auth[0].startswith("Bearer "), "the gateway hop carries its token"
+    assert body.get("companion") is True, body
+
+    status, body = _http(base, "GET", "/chats")
+    assert not any(c["id"] == cid for c in body["chats"]), "a deleted chat is gone"
+    assert cid not in wg._CHAT_STATE.all(), "its state document is gone"
+    assert not (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists(), \
+        "its companion thread is gone"
+    status, body = _http(base, "GET", "/chats/" + _quote(cid) + "/messages")
+    assert status == 200 and not [m for m in body["messages"]
+                                  if m.get("text") == "Remember me?"], body
+
+    # The store may still serve the erased rows for a moment; the tombstone
+    # hides exactly those — nothing sent after the deletion.
+    assert not wg._chat_after_tombstone(cid, "2000-01-01T00:00:00Z")
+    assert wg._chat_after_tombstone(cid, "2999-01-01T00:00:00Z")
+    assert wg._chat_after_tombstone("signal:+41790000000", "2000-01-01T00:00:00Z")
+
+    # The same peer writing again is a new chat, with nothing carried over.
+    time.sleep(1.1)  # the rail stamps seconds; stay clear of the deletion's
+    _http(base, "POST", rail, dict(event, message_id="d2", text="Hello again"))
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is False and c["muted"] is False, c
+    assert c["companion"] is None, c
+    assert c["last"]["text"] == "Hello again", c
+
+    status, _ = _http(base, "POST", "/chats/not-a-chat/delete")
+    assert status == 404
+    print("PASS test_delete_chat")
+
+
 def test_mute_races_an_arrival(base, wg):
     """A Mute landing while a message arrives is never half-applied.
 
@@ -1870,6 +1951,7 @@ def main():
         test_arrival_starts_a_companion_turn(base, wg)
         test_archive_and_mute(base, wg)
         test_mute_races_an_arrival(base, wg)
+        test_delete_chat(base, wg)
         test_store_down_serves_recent_list(base, wg)
         test_write_during_rebuild_is_not_lost(base, wg)
         test_empty_store_is_an_empty_list(base, wg)

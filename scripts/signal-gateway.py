@@ -2341,6 +2341,46 @@ def _relink_qr_response() -> tuple[int, bytes | dict, str]:
 _PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
 
 
+def _erase_chat(chat: str, account: str | None) -> dict:
+    """Erase one chat from everything this gateway keeps (POST /chats/delete).
+
+    The ledger records and their media go through inbound_store.delete_chat,
+    which matches the (chat, account) pair exactly — the message volume is
+    shared by every account of the channel, so whichever gateway is asked can
+    erase it. The pending-send files and the recent-senders list are this
+    container's own, so they are purged only when the chat is this account's
+    (or an account-less legacy chat): the same peer on another account is
+    another chat, whose traces are that gateway's to erase.
+    """
+    result = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, account)
+    result["pending_sends"] = 0
+    result["recent"] = 0
+    if account and account != SIGNAL_ACCOUNT:
+        return result
+
+    def _pending_hit(entry: dict) -> bool:
+        return str(entry.get("recipient") or "").strip() == chat
+
+    def _recent_hit(entry: dict) -> bool:
+        return (not chat.startswith(SIGNAL_GROUP_PREFIX)
+                and chat in (entry.get("number"), entry.get("uuid")))
+
+    with _pending_sends_lock:
+        removed = _ibstore.purge_pending_sends(SIGNAL_PENDING_SENDS_DIR, _pending_hit)
+        for request_id in removed:
+            _pending_sends.pop(request_id, None)
+    result["pending_sends"] = len(removed)
+    with _RECENT_CHATS_LOCK:
+        try:
+            result["recent"] = _ibstore.purge_recent_chats(SIGNAL_RECENT_CHATS_PATH, _recent_hit)
+        except OSError as exc:
+            print(f"[signal-gateway] could not rewrite recent chats: {exc}", flush=True)
+            result["errors"] += 1
+    print(f"[signal-gateway] erased chat {chat!r} (account {account or '-'}): "
+          f"{result}", flush=True)
+    return result
+
+
 class _PushHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log noise
         return
@@ -2478,6 +2518,26 @@ class _PushHandler(BaseHTTPRequestHandler):
                 self._reply(404, {"error": "pending send not found"})
                 return
             self._reply(200, {k: v for k, v in entry.items() if k != "images"})
+            return
+
+        if self.path.rstrip("/") == "/chats/delete":
+            # Erase one chat — its ledger records, media and this gateway's
+            # own traces of it. Token-gated: the web-gateway calls it on the
+            # user's delete, adding the token, and nothing else should.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else None
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            chat = str((body or {}).get("chat") or "").strip() if isinstance(body, dict) else ""
+            if not chat:
+                self._reply(400, {"error": "chat (the chat key) is required"})
+                return
+            account = str(body.get("account") or "").strip() or None
+            self._reply(200, {"status": "deleted", **_erase_chat(chat, account)})
             return
 
         if self.path.rstrip("/") != "/send":

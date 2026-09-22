@@ -115,6 +115,14 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          of the triage delivery gate: whether a
                                          group is a news source, or costs a
                                          model turn, is that policy's business.
+  POST /chats/<id>/delete             -> erase the chat for good: its ledger
+                                         records and media (via every inbox
+                                         gateway of the channel), the gateways'
+                                         pending-send and recent-sender traces,
+                                         the chat state and the companion
+                                         thread. A later message from the peer
+                                         starts a new chat. 502 if no gateway
+                                         could erase the messages.
   POST /chats/<id>/draft              -> write the shared draft (body {text,
                                          version}); 409 + current state on a
                                          stale version; empty text clears it.
@@ -192,6 +200,7 @@ import mimetypes
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -1042,6 +1051,14 @@ CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "30"))
 # answer a rebuild: a list from a few minutes ago beats a 502 on the phone.
 # Beyond this the 502 is honest — the view would be fiction.
 CHAT_LIST_STALE_SECONDS = float(os.environ.get("CHAT_LIST_STALE_SECONDS", "600"))
+# How long a deleted chat's messages stay filtered out of the views. The
+# gateways erase the ledger files at once, but the life store drops their
+# graphs only on its next pass, and the list may be answered from its last good
+# skeleton for up to CHAT_LIST_STALE_SECONDS — so without this the chat would
+# flash back for a moment after it is gone. Only messages at or before the
+# deletion are hidden: a new message from the same peer is a new chat at once.
+CHAT_DELETE_TOMBSTONE_SECONDS = float(
+    os.environ.get("CHAT_DELETE_TOMBSTONE_SECONDS", str(CHAT_LIST_STALE_SECONDS + 300)))
 # The whole of one list rebuild — heads, records, unread counts, several
 # store round trips — shares this budget, so a store that accepts requests
 # and then stalls holds a handler for at most this long before the fallback
@@ -4873,6 +4890,7 @@ _CHAT_ID_MAX_LEN = 512
 _CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
 _CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
 _CHAT_FLAGS_RE = re.compile(r"^/chats/([^/]+)/flags/?$")
+_CHAT_DELETE_RE = re.compile(r"^/chats/([^/]+)/delete/?$")
 _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
 _CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
@@ -5484,6 +5502,37 @@ def _fetch_unread_counts(cutoffs: dict[str, str | None],
     return counts
 
 
+# chat id -> (epoch of the deletion, epoch the filter lapses). In memory on
+# purpose: it names only a chat id, lives minutes, and a restart loses nothing
+# the store has not already caught up on by the time the process is back.
+_chat_tombstones: dict[str, tuple[float, float]] = {}
+_chat_tombstones_lock = threading.Lock()
+
+
+def _chat_tombstone(chat_id: str, at: float) -> None:
+    with _chat_tombstones_lock:
+        _chat_tombstones[chat_id] = (at, at + CHAT_DELETE_TOMBSTONE_SECONDS)
+
+
+def _chat_after_tombstone(chat_id: str, ts: str | None) -> bool:
+    """False for a message of a deleted chat the store may still be serving:
+    one at or before the chat's deletion, within the tombstone window."""
+    with _chat_tombstones_lock:
+        stone = _chat_tombstones.get(chat_id)
+        if stone is None:
+            return True
+        if time.time() > stone[1]:
+            _chat_tombstones.pop(chat_id, None)
+            return True
+    try:
+        when = datetime.fromisoformat(str(ts or "").replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return when.timestamp() > stone[0]
+
+
 def _chats_payload() -> dict:
     """The GET /chats body: store skeleton ∪ overlay, merged with chat state.
 
@@ -5548,7 +5597,7 @@ def _chats_payload() -> dict:
                     author=entry.get("author"),
                     has_attachments=bool(entry.get("attachments")),
                     roster=roster)
-        if last is None:
+        if last is None or not _chat_after_tombstone(chat_id, last_ts):
             continue
         group = doc.get("group")
         if group is None:
@@ -5884,6 +5933,129 @@ def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
             return exc.code, {"error": raw}
 
 
+# A Claude Code session id, as the state file records it: a UUID. Validated
+# before it becomes part of a transcript path.
+_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def _forget_claude_session(session_id: str) -> int:
+    """Delete one Claude Code session's transcript(s); returns the count.
+
+    The CLI keeps each session as ``<config>/projects/<cwd-slug>/<id>.jsonl``
+    (plus a same-named directory for subagent transcripts), where ``<config>``
+    is CLAUDE_CONFIG_DIR or ~/.claude. A companion turn's transcript holds the
+    chat's messages verbatim, so a deleted chat takes it along."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        return 0
+    roots = {Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")}
+    roots.add(Path.home() / ".claude")
+    removed = 0
+    for root in roots:
+        for path in (root / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        for path in (root / "projects").glob(f"*/{session_id}"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+    return removed
+
+
+def _delete_conversation(cid: str) -> bool:
+    """Erase one conversation thread: its file, attachments, idempotency-key
+    bindings and Claude session. Returns whether the thread existed.
+
+    Used for a deleted chat's companion thread, which quotes the chat and so
+    is part of what "no traces" covers. A turn still running for it finds the
+    thread gone and has nowhere to write (``_conv_add_message`` answers None
+    for a missing thread)."""
+    if not _CONV_ID_RE.fullmatch(cid or ""):
+        return False
+    with _conversations_lock:
+        path = CONVERSATIONS_DIR / f"{cid}.json"
+        existed = path.exists()
+        path.unlink(missing_ok=True)
+    shutil.rmtree(CONVERSATION_ATTACHMENTS_DIR / cid, ignore_errors=True)
+    with _conv_keys_lock:
+        try:
+            bindings = [p for p in _CONV_KEYS_DIR.iterdir() if p.is_file()]
+        except OSError:
+            bindings = []
+        for binding in bindings:
+            try:
+                if binding.read_text(encoding="utf-8").strip() == cid:
+                    binding.unlink()
+            except OSError:
+                continue
+    session_key = CONV_SESSION_KEY_PREFIX + cid
+    with _state_lock:
+        state = _load_state()
+        entry = state.pop(session_key, None)
+        if entry is not None:
+            _save_state(state)
+    session_id = str((entry or {}).get("session_id") or "")
+    if session_id:
+        _forget_claude_session(session_id)
+    return existed
+
+
+def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
+    """Erase a chat from the whole system; ``(report, error)``.
+
+    Deletion, not a flag. Every inbox gateway of the chat's channel is asked to
+    erase it (POST /chats/delete): the message volume is shared per channel, so
+    whichever answers first takes the ledger records and their media, and each
+    one also drops its own traces — queued/sent pending-send files and the
+    recent-senders entry. Here the chat's state document (flags, draft, read
+    watermark, roster), its live overlay entries and its companion thread go.
+    Nothing remembers the chat was there beyond a minutes-long tombstone that
+    hides the store's not-yet-reindexed copy; the next message from the same
+    peer starts a new chat.
+
+    The ledger erasure is the part that must happen: if no gateway could be
+    reached, nothing else is touched and an error is returned, so the user
+    sees the chat still there and can retry rather than half of it vanishing.
+    """
+    ref = chat_state_mod.split_chat_ref(chat_id)
+    if ref is None:
+        return {}, "not a chat id"
+    channel, account, key = ref
+    doc = _CHAT_STATE.get(chat_id)
+    report: dict = {"id": chat_id, "gateways": {}, "companion": False}
+    erased = False
+    failures = []
+    for slug, gw in _media_gateways(channel, account, doc):
+        try:
+            status, answer = _gateway_hop(gw, "/chats/delete",
+                                          {"chat": key, "account": account or ""})
+        except Exception as exc:  # noqa: BLE001 — transport failure
+            failures.append(f"{slug}: {exc}")
+            continue
+        if status == 200 and isinstance(answer, dict):
+            report["gateways"][slug] = {k: answer.get(k) for k in
+                                        ("messages", "media", "pending_sends",
+                                         "recent", "errors")}
+            erased = True
+        else:
+            failures.append(f"{slug}: HTTP {status}")
+    if not erased:
+        return report, ("no gateway could erase the chat's messages"
+                        + (" (" + "; ".join(failures) + ")" if failures else ""))
+    if failures:
+        report["partial"] = failures
+    _chat_tombstone(chat_id, time.time())
+    _CHAT_OVERLAY.forget(chat_id)
+    removed = _CHAT_STATE.delete(chat_id) or doc
+    companion = (removed or {}).get("companion")
+    if companion:
+        report["companion"] = _delete_conversation(str(companion))
+    _chats_cache_invalidate()
+    print(f"[web-gateway] deleted chat {chat_id!r}: {json.dumps(report)}", flush=True)
+    return report, None
+
+
 def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
     """Put one chat message on the wire; ({message_id, ts, attachments}, error).
 
@@ -5983,7 +6155,8 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     # Outbound rows as (ts, text), for matching sends whose identity we never
     # learned — see the unconfirmed branch in the overlay merge below.
     store_out: list[tuple] = []
-    rows = [b for b in _sparql_bindings(query) if _bval(b, "ts")]
+    rows = [b for b in _sparql_bindings(query)
+            if _bval(b, "ts") and _chat_after_tombstone(chat_id, _bval(b, "ts"))]
     overlay = list(_CHAT_OVERLAY.entries(chat_id)) if before is None else []
     # What the gateways stated about this page's blobs, one lookup for the
     # rows and the overlay together.
@@ -6582,6 +6755,10 @@ class Handler(BaseHTTPRequestHandler):
         if chat_flags_match:
             self._handle_chat_flags(chat_flags_match.group(1))
             return
+        chat_delete_match = _CHAT_DELETE_RE.match(self.path)
+        if chat_delete_match:
+            self._handle_chat_delete(chat_delete_match.group(1))
+            return
         chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
         if chat_draft_undo_match:
             self._handle_chat_draft_undo(chat_draft_undo_match.group(1))
@@ -7080,6 +7257,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"id": chat_id,
                               "archived": bool(doc.get("archived")),
                               "muted": bool(doc.get("muted"))})
+
+    def _handle_chat_delete(self, raw_id: str) -> None:
+        """Erase a chat for good (no body): every message and blob in the
+        ledger, the gateways' own traces, the chat state and the companion
+        thread — see _delete_chat. 502 when no gateway could erase the
+        messages, in which case nothing was touched."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        report, error = _delete_chat(chat_id)
+        if error:
+            self._send_json(502, {"error": error, **report})
+            return
+        self._send_json(200, {"deleted": True, **report})
 
     def _handle_chat_draft(self, raw_id: str) -> None:
         """The user writes the shared draft (body {text, version}).
