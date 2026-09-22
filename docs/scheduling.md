@@ -251,3 +251,62 @@ optimisation, not the guarantee.
 
 The reminder wording lives in the project frontmatter, not in framework code —
 this public repo carries no chamber-specific or personal text.
+
+## Draining chamber inboxes (`.inbox.json`)
+
+An inbox is a letterbox, not a shelf: the user drops a file in, an agent takes
+it out. The Archivist's `inbox/ processing` rules say exactly *how* a dropped
+file is filed and *where* it goes, and a chamber's `.inbox.json` declares the
+paths — but for a long time nothing said *when*, so a chamber inbox only ever
+emptied when a human happened to ask, and one quietly accumulated months of
+files. The **`inbox-sweep`** base job is the missing trigger.
+
+Like the other two base jobs it is a scheduler `command` job (so the scheduler
+spends **no Claude credits**), running `scripts/inbox-sweep.py`. Its gate is a
+filesystem scan rather than a SPARQL SELECT — an unfiled document is by
+definition not yet in the store, so the store cannot be asked about it. **All
+inboxes empty spawns nothing.** Only when a declared inbox holds files does it
+start a single `claude -p` session, handed the listing it already scanned, which
+dispatches the Archivist per chamber. It runs on the **router tier**
+(`RETINUE_ROUTER_MODEL`): the session's whole job is to route files to the
+Archivist, which is inside junior's whitelist, unlike self-review's judgement
+work.
+
+Any chamber may declare inboxes in an **`.inbox.json`** at its root; a chamber
+without one is simply never swept. The `inboxes` array is what this job reads:
+
+```json
+{
+  "inboxes": [
+    {
+      "id": "observations",
+      "path": "observations/inbox",
+      "description": "Raw health data awaiting review, …"
+    }
+  ],
+  "destinations": [
+    {
+      "path": "observations/clinical/sensors/cgm/",
+      "description": "Continuous glucose monitor exports.",
+      "source": "manifest"
+    }
+  ]
+}
+```
+
+`destinations` is the filing side of the contract, read by the Archivist (and
+by a chamber's own extraction guidance), not by the sweep. A malformed
+`.inbox.json` skips that one chamber with a warning rather than failing the
+sweep — the other chambers' letterboxes are still worth emptying.
+
+**The re-spawn guard.** Step 4 of `inbox/ processing` tells the Archivist to
+*leave* a file it cannot classify in the inbox and flag it. That is correct
+behaviour, but it means a naive gate would find the same file every hour and
+spawn a session every hour, forever — a slow credit leak with no end state. So
+the sweep records the listing it last spawned for (name, size and mtime per
+file, in `/root/.retinue/inbox-sweep/state.json`, outside the chambers like the
+scheduler's own state) and stays quiet while that listing is unchanged. Adding,
+removing, or overwriting a file makes the inbox due again; so does draining it
+completely, which clears the guard so a stuck file gets a fresh attempt the next
+time anything arrives. The signature is recorded whatever the session made of
+the files, so a session that fails outright does not re-spawn every tick either.
