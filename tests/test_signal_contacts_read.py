@@ -80,6 +80,48 @@ def test_list_groups_normalizes_fields():
     print("ok: list groups normalizes fields")
 
 
+def test_group_name_resolution_is_cached():
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(tmp)
+        calls = []
+
+        def _fake(args):
+            calls.append(args)
+            return [{"id": "g-1", "name": "Family"}]
+
+        sg._signal_cli_json = _fake
+        assert sg._resolve_group_name("g-1") == "Family"
+        assert sg._resolve_group_name("g-1") == "Family"
+        # An unknown id right after a refresh does not re-run signal-cli.
+        assert sg._resolve_group_name("g-unknown") is None
+        assert len(calls) == 1, calls
+        # Once the miss window has passed, a miss refreshes the roster.
+        sg._group_names_at -= sg._GROUP_NAMES_MISS_RETRY + 1
+        assert sg._resolve_group_name("g-unknown") is None
+        assert len(calls) == 2, calls
+    print("ok: group names resolved from a cached roster")
+
+
+def test_chat_event_carries_group_name():
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(tmp)
+        sg._signal_cli_json = lambda args: [{"id": "g-1", "name": "Family"}]
+        sent = []
+        sg._chats.chats_enabled = lambda: True
+        sg._chats.notify_chat_event = lambda **kw: sent.append(kw)
+        started = []
+        # Run the rail thread inline (replacing the module's reference only).
+        sg.threading = types.SimpleNamespace(
+            Thread=lambda target, **kw: types.SimpleNamespace(
+                start=lambda: (started.append(1), target())))
+        sg._notify_chat_event_async(group_id="g-1", direction="in", chat="group:g-1")
+        sg._notify_chat_event_async(direction="in", chat="+15551112222")
+        assert started == [1, 1], started
+        assert sent[0]["chat_name"] == "Family", sent
+        assert sent[1]["chat_name"] is None, sent
+    print("ok: chats-rail events carry the group's display name")
+
+
 def test_signal_cli_json_nonzero_raises():
     with tempfile.TemporaryDirectory() as tmp:
         sg = _load_signal_gateway(tmp)
@@ -161,6 +203,8 @@ def test_recent_chats_cap_enforced():
 def main():
     test_list_contacts_normalizes_fields()
     test_list_groups_normalizes_fields()
+    test_group_name_resolution_is_cached()
+    test_chat_event_carries_group_name()
     test_signal_cli_json_nonzero_raises()
     test_recent_senders_recorded_most_recent_first()
     test_recent_sender_dedups_and_moves_to_front()
