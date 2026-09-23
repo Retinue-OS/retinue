@@ -195,6 +195,11 @@ services:
       # can spend a model turn, though still nothing that reaches a
       # correspondent — only the user's send press does that.
       - CHATS_INGEST_TOKEN
+      # Required for deleting a chat (POST /chats/<id>/delete): the capability
+      # the gateways demand before erasing a chat's messages. Set the same
+      # value here and on the messenger gateways; unset, deletion is refused.
+      # Not a *_GATEWAY_TOKEN on purpose — agent sessions inherit those.
+      - CHAT_ERASE_TOKEN
       # The chat surface's ownership of inbound messages: "1" (the default)
       # has the chat take every arrival — the user sees it there, pushed, for
       # no model turn, and the gateway marks it delivered — and run a companion
@@ -602,6 +607,10 @@ services:
       # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
+      # Required by POST /chats/delete (a chat's erasure, relayed by the
+      # web-gateway); the same value as on the retinue service. Unset, this
+      # gateway refuses to erase anything.
+      - CHAT_ERASE_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -703,6 +712,10 @@ services:
       # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
+      # Required by POST /chats/delete (a chat's erasure, relayed by the
+      # web-gateway); the same value as on the retinue service. Unset, this
+      # gateway refuses to erase anything.
+      - CHAT_ERASE_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -805,6 +818,10 @@ services:
       # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
+      # Required by POST /chats/delete (a chat's erasure, relayed by the
+      # web-gateway); the same value as on the retinue service. Unset, this
+      # gateway refuses to erase anything.
+      - CHAT_ERASE_TOKEN
       # Voice notes are transcribed by the shared STT service.
       - STT_SERVICE_URL=http://stt:8100/transcribe
       - STT_TOKEN

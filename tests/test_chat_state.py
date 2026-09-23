@@ -315,6 +315,27 @@ def test_iso_z_normalizes():
     print("PASS test_iso_z_normalizes")
 
 
+def test_delete_forgets_the_chat():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "signal:+41790000001"
+        assert store.delete(cid) is None, "nothing stored, nothing to delete"
+        store.set_flags(cid, muted=True)
+        store.set_companion(cid, "f" * 32)
+        gone = store.delete(cid)
+        assert gone["muted"] is True and gone["companion"] == "f" * 32
+        assert cid not in store.all(), "a deleted chat is not listed"
+        fresh = store.get(cid)
+        assert fresh["muted"] is False and fresh["companion"] is None
+    ov = cs.ChatOverlay(ttl=60)
+    ov.insert({"chat_id": "a", "message_id": "1", "ts": "t"})
+    ov.insert({"chat_id": "a", "message_id": "2", "ts": "t"})
+    ov.insert({"chat_id": "b", "message_id": "3", "ts": "t"})
+    assert ov.forget("a") == 2
+    assert [e["chat_id"] for e in ov.entries()] == ["b"]
+    print("PASS test_delete_forgets_the_chat")
+
+
 if __name__ == "__main__":
     test_split_and_filename_safety()
     test_account_is_half_the_identity()
@@ -327,4 +348,5 @@ if __name__ == "__main__":
     test_companion_link()
     test_overlay_merge_dedup_expiry()
     test_iso_z_normalizes()
+    test_delete_forgets_the_chat()
     print("all chat-state tests passed")

@@ -997,6 +997,189 @@ def update_message(path: str | Path, *, text: str | None = None,
     return prev_media
 
 
+def _unlink_blob(store_dir: str | Path, media_id: str) -> tuple[bool, int]:
+    """Remove one media blob and its sidecars.
+
+    Returns ``(removed, errors)``: whether the blob itself was there and went,
+    and how many of the four files exist but could not be removed — an absent
+    sidecar is normal, a stuck one is a trace the caller must report."""
+    if not _MEDIA_ID_RE.match(media_id or ""):
+        return False, 0
+    d = media_dir(store_dir)
+    removed, errors = False, 0
+    for name in (media_id, media_id + ".type", media_id + ".name", media_id + ".meta"):
+        try:
+            (d / name).unlink()
+            removed = removed or name == media_id
+        except FileNotFoundError:
+            continue
+        except OSError:
+            errors += 1
+    return removed, errors
+
+
+def delete_chat(store_dir: str | Path, chat: str,
+                account: str | None) -> dict:
+    """Erase one chat from this store: every record of it, in both
+    directions, and every blob only those records referenced.
+
+    A chat is the pair (``kb:chat``, ``kb:account``) — see :data:`P_ACCOUNT` —
+    so ``account`` is compared exactly, and ``None`` or ``""`` selects the
+    records carrying no account (history written before the predicate
+    existed), which is what an account-less chat id names. The same peer on
+    another account is another chat and is left alone.
+
+    This is a deletion, not a flag: the files go, the life store drops their
+    graphs when it next sees the directory, and a later message from the same
+    peer starts a chat with no history. A blob is kept if a record outside the
+    chat still references it (never the case for blobs this store minted, but
+    a reference is only a string and costs nothing to honour). The retained
+    raw audio of a voice note still awaiting its transcript (``kb:media``, a
+    path inside the media directory) goes too.
+
+    Never raises on a single unreadable or undeletable file — it is skipped
+    and counted in ``errors``, so the caller can tell the erasure was partial
+    and must not treat the chat as gone. That includes a file that cannot be
+    read at all (it may be one of this chat's), and one that cannot be parsed
+    but names this chat key: failing closed there is the point.
+
+    Returns ``{"messages", "media", "errors", "subjects", "message_ids"}`` —
+    the last two identify what was erased, so a reader still serving an older
+    index can hide exactly those records and nothing that arrives afterwards.
+    """
+    wanted_chat = (chat or "").strip()
+    wanted_account = (account or "").strip()
+    result: dict = {"messages": 0, "media": 0, "errors": 0,
+                    "subjects": [], "message_ids": []}
+    if not wanted_chat:
+        return result
+    # How this chat key appears in a record, for recognising one that no
+    # longer parses (see _lit: the key is an escaped plain literal).
+    chat_marker = f'<{P_CHAT}> "{_esc(wanted_chat)}"'
+    doomed: list[tuple[Path, dict]] = []
+    kept_refs: set[str] = set()
+    try:
+        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+    except OSError:
+        return result
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            result["errors"] += 1
+            continue
+        fields = _parse(text)
+        if not fields:
+            if chat_marker in text:
+                result["errors"] += 1
+            continue
+        mine = (fields.get("chat") == wanted_chat
+                and (fields.get("account") or "") == wanted_account)
+        if mine:
+            doomed.append((path, fields))
+        else:
+            kept_refs.update(filter(None, map(media_id_of, fields["attachments"])))
+    media_root = media_dir(store_dir).resolve()
+    for path, fields in doomed:
+        try:
+            path.unlink()
+            result["messages"] += 1
+            result["subjects"].append(fields["subject"])
+            if fields.get("message_id"):
+                result["message_ids"].append(fields["message_id"])
+        except FileNotFoundError:
+            continue
+        except OSError:
+            result["errors"] += 1
+            continue
+        for ref in fields["attachments"]:
+            mid = media_id_of(ref)
+            if mid and mid not in kept_refs:
+                removed, errors = _unlink_blob(store_dir, mid)
+                result["media"] += int(removed)
+                result["errors"] += errors
+        spool = fields.get("media")
+        if spool:
+            try:
+                spool_path = Path(spool).resolve()
+                if spool_path.parent == media_root:
+                    spool_path.unlink(missing_ok=True)
+            except OSError:
+                result["errors"] += 1
+    return result
+
+
+# The rest of a chat's erasure is the gateway's own bookkeeping, not the
+# ledger's — but every gateway keeps the same two files, so the walk over them
+# lives here once and each gateway supplies only its own notion of "this chat"
+# (and holds its own lock around the call).
+
+_PENDING_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def purge_pending_sends(pending_dir: str | Path, matches) -> list[str]:
+    """Delete the pending-send files ``matches(entry)`` claims; returns their ids.
+
+    Covers every state a file is kept in (queued, sent, rejected, failed) —
+    each holds the message text — except ``sending``: that one is on the wire
+    right now, and its outcome is written back by the sender thread. Only
+    ``<32 hex>.json`` files holding a dict are considered, so a stray foreign
+    file in the directory is never touched."""
+    removed: list[str] = []
+    try:
+        paths = sorted(Path(pending_dir).glob("*.json"))
+    except OSError:
+        return removed
+    for path in paths:
+        if not _PENDING_ID_RE.match(path.stem):
+            continue
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entry, dict) or entry.get("status") == "sending":
+            continue
+        try:
+            hit = bool(matches(entry))
+        except Exception:  # noqa: BLE001 — a matcher bug must not abort the erasure
+            hit = False
+        if not hit:
+            continue
+        try:
+            path.unlink()
+            removed.append(path.stem)
+        except OSError:
+            continue
+    return removed
+
+
+def purge_recent_chats(path: str | Path, matches) -> int:
+    """Drop the recent-senders entries ``matches(entry)`` claims; returns the count.
+
+    The file is a JSON list rewritten atomically, the shape every gateway's
+    ``_record_recent_sender`` keeps."""
+    p = Path(path)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, list):
+        return 0
+    kept, dropped = [], 0
+    for entry in data:
+        try:
+            hit = isinstance(entry, dict) and bool(matches(entry))
+        except Exception:  # noqa: BLE001
+            hit = False
+        if hit:
+            dropped += 1
+        else:
+            kept.append(entry)
+    if dropped:
+        _atomic_write(json.dumps(kept, ensure_ascii=False), p)
+    return dropped
+
+
 # -- echo dedup for outbound recording ----------------------------------------
 
 class RecentSends:

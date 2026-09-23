@@ -261,6 +261,27 @@ persistent volume — high-churn disposable data, the news-store precedent):
 Single-writer: only the web-gateway writes chat state (user edits and the
 token-gated agent endpoints both go through it).
 
+**Deleting a chat** is the one operation that ends it, and it is an erasure,
+not a third flag. The ledger stays single-writer: the web-gateway asks every
+inbox gateway of the channel to erase the chat (`POST /chats/delete`
+`{chat, account}`, token-gated). Each removes the matching records of both
+directions from the shared message volume, together with the blobs only those
+records reference (`inbound_store.delete_chat`). It also drops its own
+traces of the peer: pending-send files and the recent-senders entry. Only
+then does the web-gateway delete the state document, the overlay entries and
+the companion thread. A gateway that reports anything it could not erase
+fails the whole delete, and nothing else is touched. The life store drops the
+erased graphs on its next pass, and a short in-memory tombstone hides them
+until it has. The tombstone lists the records the gateways erased, by subject
+and message id; it is not a time cut-off. A later message from the same peer
+finds nothing and starts a new chat, even in the same second. Like a send, a
+delete is the user's own act and is accepted only through the reverse proxy.
+The gateways' erase endpoint also requires `CHAT_ERASE_TOKEN`, a capability
+that agent sessions do not inherit (unlike the `*_GATEWAY_TOKEN`s they send
+with). Without it configured, deletion is refused. The
+dashboard's Archived tab is where the action lives (swipe left → Delete, two
+taps).
+
 ## The chat surface (UI)
 
 - A **Chats card** on the dashboard (finally replacing the static

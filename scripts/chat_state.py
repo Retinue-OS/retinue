@@ -307,6 +307,10 @@ class ChatStateStore:
         with self._lock:
             return self._read(chat_id)
 
+    def exists(self, chat_id: str) -> bool:
+        """Whether a document is stored for this chat (a default is not)."""
+        return self._path(chat_id).exists()
+
     def all(self) -> dict[str, dict]:
         """Every stored chat doc, keyed by chat id."""
         out: dict[str, dict] = {}
@@ -327,6 +331,21 @@ class ChatStateStore:
         return out
 
     # -- writes ---------------------------------------------------------------
+
+    def delete(self, chat_id: str) -> dict | None:
+        """Forget a chat entirely; returns the document it had, or None.
+
+        Not a reset to defaults: the file goes, so ``all()`` no longer lists
+        the chat and a later message about the same peer starts from a fresh
+        document — the chat-delete contract (see web-gateway's chat delete).
+        """
+        with self._lock:
+            path = self._path(chat_id)
+            if not path.exists():
+                return None
+            doc = self._read(chat_id)
+            path.unlink(missing_ok=True)
+            return doc
 
     def note_message(self, chat_id: str, *, name: str | None = None,
                      group: bool | None = None, gateway: str | None = None,
@@ -625,6 +644,14 @@ class ChatOverlay:
                    if now - e["_inserted"] > self._ttl]
         for k in expired:
             self._entries.pop(k, None)
+
+    def forget(self, chat_id: str) -> int:
+        """Drop every live entry of one chat (a deleted chat); returns the count."""
+        with self._lock:
+            doomed = [k for k, e in self._entries.items() if e.get("chat_id") == chat_id]
+            for k in doomed:
+                self._entries.pop(k, None)
+        return len(doomed)
 
     def entries(self, chat_id: str | None = None) -> list[dict]:
         """Live entries (optionally one chat's), ascending by ts — insertion

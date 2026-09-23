@@ -115,6 +115,17 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          of the triage delivery gate: whether a
                                          group is a news source, or costs a
                                          model turn, is that policy's business.
+  POST /chats/<id>/delete             -> erase the chat for good: its ledger
+                                         records and media (via every inbox
+                                         gateway of the channel), the gateways'
+                                         pending-send and recent-sender traces,
+                                         the chat state and the companion
+                                         thread. A later message from the peer
+                                         starts a new chat. Accepted only
+                                         through the reverse proxy (403
+                                         otherwise, like /send); 503 without
+                                         CHAT_ERASE_TOKEN; 502 if the messages
+                                         were not completely erased.
   POST /chats/<id>/draft              -> write the shared draft (body {text,
                                          version}); 409 + current state on a
                                          stale version; empty text clears it.
@@ -192,6 +203,7 @@ import mimetypes
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -1042,6 +1054,23 @@ CHAT_LIST_CACHE_SECONDS = float(os.environ.get("CHAT_LIST_CACHE_SECONDS", "30"))
 # answer a rebuild: a list from a few minutes ago beats a 502 on the phone.
 # Beyond this the 502 is honest — the view would be fiction.
 CHAT_LIST_STALE_SECONDS = float(os.environ.get("CHAT_LIST_STALE_SECONDS", "600"))
+# How long a deleted chat's messages stay filtered out of the views. The
+# gateways erase the ledger files at once, but the life store drops their
+# graphs only on its next pass, and the list may be answered from its last good
+# skeleton for up to CHAT_LIST_STALE_SECONDS — so without this the chat would
+# flash back for a moment after it is gone. Only the erased records are hidden,
+# named by the gateways' own report: a new message from the same peer is a new
+# chat at once, however close to the deletion it lands.
+# The capability a gateway requires to erase a chat (POST /chats/delete), sent
+# as X-Chat-Erase-Token beside the ordinary gateway token. Deliberately not a
+# *_GATEWAY_TOKEN: those are handed to every agent session (session_env.py) so
+# agents can send, and erasure is the user's own act — this name matches none
+# of the session allowlist's prefixes or suffixes, so only this process and
+# the gateways hold it. Unset, deletion is refused (503) rather than falling
+# back to the send token.
+CHAT_ERASE_TOKEN = os.environ.get("CHAT_ERASE_TOKEN", "").strip()
+CHAT_DELETE_TOMBSTONE_SECONDS = float(
+    os.environ.get("CHAT_DELETE_TOMBSTONE_SECONDS", str(CHAT_LIST_STALE_SECONDS + 300)))
 # The whole of one list rebuild — heads, records, unread counts, several
 # store round trips — shares this budget, so a store that accepts requests
 # and then stalls holds a handler for at most this long before the fallback
@@ -1572,11 +1601,25 @@ def _get_session_entry(session_key: str) -> dict:
         return dict(_load_state().get(session_key, {}))
 
 
+# Session keys whose conversation was erased (a deleted chat's companion). A
+# turn already running when the thread was deleted still ends by recording
+# its session here — which would bring back the entry and, through it, the
+# transcript the deletion removed. Such a late write is refused and its
+# transcript erased instead. Conversation ids are random and never reused, so
+# a key needs no expiry; the map is only capped.
+_erased_session_keys: dict[str, float] = {}
+_ERASED_SESSION_KEYS_MAX = 1000
+
+
 def _update_session_entry(session_key: str, entry: dict) -> None:
     with _state_lock:
-        state = _load_state()
-        state[session_key] = entry
-        _save_state(state)
+        erased = session_key in _erased_session_keys
+        if not erased:
+            state = _load_state()
+            state[session_key] = entry
+            _save_state(state)
+    if erased:
+        _forget_claude_session(str((entry or {}).get("session_id") or ""))
 
 
 def _session_lock_for(session_key: str) -> threading.Lock:
@@ -4873,6 +4916,7 @@ _CHAT_ID_MAX_LEN = 512
 _CHAT_MSGS_RE = re.compile(r"^/chats/([^/]+)/messages/?$")
 _CHAT_READ_RE = re.compile(r"^/chats/([^/]+)/read/?$")
 _CHAT_FLAGS_RE = re.compile(r"^/chats/([^/]+)/flags/?$")
+_CHAT_DELETE_RE = re.compile(r"^/chats/([^/]+)/delete/?$")
 _CHAT_DRAFT_RE = re.compile(r"^/chats/([^/]+)/draft/?$")
 _CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
@@ -5432,6 +5476,7 @@ def _fetch_chats_skeleton(deadline: float | None = None) -> dict[str, dict]:
         if chat_id in skeleton:
             continue
         skeleton[chat_id] = {
+            "m": m,
             "channel": channel,
             "key": key,
             "account": account,
@@ -5484,6 +5529,49 @@ def _fetch_unread_counts(cutoffs: dict[str, str | None],
     return counts
 
 
+# chat id -> (epoch the filter lapses, erased record subjects, erased channel
+# message ids), as the gateways reported them. Identities rather than a time
+# cut-off: the ledger's timestamps are whole seconds, so a cut-off would
+# either hide a new message landing in the deletion's second or show an erased
+# one. In memory on purpose: it lives minutes, and a restart loses nothing the
+# store has not caught up on by the time the process is back.
+_chat_tombstones: dict[str, tuple[float, frozenset, frozenset]] = {}
+_chat_tombstones_lock = threading.Lock()
+
+
+def _chat_tombstone(chat_id: str, subjects, message_ids) -> None:
+    with _chat_tombstones_lock:
+        _chat_tombstones[chat_id] = (time.time() + CHAT_DELETE_TOMBSTONE_SECONDS,
+                                     frozenset(subjects), frozenset(message_ids))
+
+
+def _chat_tombstoned(chat_id: str) -> bool:
+    """Whether this chat was deleted within the tombstone window."""
+    with _chat_tombstones_lock:
+        stone = _chat_tombstones.get(chat_id)
+        if stone is None:
+            return False
+        if time.time() > stone[0]:
+            _chat_tombstones.pop(chat_id, None)
+            return False
+    return True
+
+
+def _chat_record_erased(chat_id: str, subject: str | None = None,
+                        message_id: str | None = None) -> bool:
+    """True for a record of a deleted chat that a view may still be serving —
+    the store not yet reindexed, or a late rail event for an erased message."""
+    with _chat_tombstones_lock:
+        stone = _chat_tombstones.get(chat_id)
+        if stone is None:
+            return False
+        if time.time() > stone[0]:
+            _chat_tombstones.pop(chat_id, None)
+            return False
+    return bool((subject and subject in stone[1])
+                or (message_id and str(message_id) in stone[2]))
+
+
 def _chats_payload() -> dict:
     """The GET /chats body: store skeleton ∪ overlay, merged with chat state.
 
@@ -5499,7 +5587,7 @@ def _chats_payload() -> dict:
     overlay_by_chat: dict[str, list[dict]] = {}
     for entry in _CHAT_OVERLAY.entries():
         cid = entry.get("chat_id")
-        if cid:
+        if cid and not _chat_record_erased(cid, message_id=entry.get("message_id")):
             overlay_by_chat.setdefault(cid, []).append(entry)
 
     chats = []
@@ -5511,6 +5599,10 @@ def _chats_payload() -> dict:
         doc = docs.get(chat_id) or _CHAT_STATE.get(chat_id)
         roster = doc.get("roster") or {}
         row = skeleton.get(chat_id)
+        if row is not None and _chat_record_erased(chat_id, row.get("m"), row.get("mid")):
+            # The store's head for a deleted chat, not yet reindexed away. Any
+            # message since is in the overlay, so the chat shows only if one is.
+            row = None
         last = None
         last_ts = ""
         if row is not None:
@@ -5614,6 +5706,13 @@ def _chat_companion(chat_id: str) -> tuple[str, bool]:
     nothing, always says the same thing, and is what tells the user that Ara
     drafts into the chat's composer instead of sending."""
     with _companion_lock:
+        # A request left over from before the chat was deleted (a pane still
+        # open, a retry) must not bring it back with a fresh thread. Deletion
+        # runs under this same lock, and a genuinely new message recreates the
+        # state document first — so "tombstoned and no document" is exactly a
+        # chat that is gone.
+        if _chat_tombstoned(chat_id) and not _CHAT_STATE.exists(chat_id):
+            raise LookupError(f"chat {chat_id} was deleted")
         doc = _CHAT_STATE.get(chat_id)
         existing = doc.get("companion")
         if existing and _load_conv(str(existing)) is not None:
@@ -5863,12 +5962,14 @@ CHAT_UNCONFIRMED_SKEW_SECONDS = 60.0
 
 
 def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
-                 method: str = "POST") -> tuple[int, dict]:
+                 method: str = "POST",
+                 extra_headers: dict | None = None) -> tuple[int, dict]:
     """One authenticated request to a channel gateway; (status, parsed body).
 
     Raises on a transport failure, which the caller turns into a 502."""
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
+    headers.update(extra_headers or {})
     if gw.get("token"):
         headers["Authorization"] = "Bearer " + gw["token"]
     req = urllib.request.Request(gw["base_url"] + path, data=data,
@@ -5882,6 +5983,158 @@ def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
             return exc.code, json.loads(raw)
         except ValueError:
             return exc.code, {"error": raw}
+
+
+# A Claude Code session id, as the state file records it: a UUID. Validated
+# before it becomes part of a transcript path.
+_SESSION_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+
+
+def _forget_claude_session(session_id: str) -> int:
+    """Delete one Claude Code session's transcript(s); returns the count.
+
+    The CLI keeps each session as ``<config>/projects/<cwd-slug>/<id>.jsonl``
+    (plus a same-named directory for subagent transcripts), where ``<config>``
+    is CLAUDE_CONFIG_DIR or ~/.claude. A companion turn's transcript holds the
+    chat's messages verbatim, so a deleted chat takes it along."""
+    if not _SESSION_ID_RE.match(session_id or ""):
+        return 0
+    roots = {Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")}
+    roots.add(Path.home() / ".claude")
+    removed = 0
+    for root in roots:
+        for path in (root / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                continue
+        for path in (root / "projects").glob(f"*/{session_id}"):
+            if path.is_dir():
+                shutil.rmtree(path, ignore_errors=True)
+    return removed
+
+
+def _delete_conversation(cid: str) -> bool:
+    """Erase one conversation thread: its file, attachments, idempotency-key
+    bindings and Claude session. Returns whether the thread existed.
+
+    Used for a deleted chat's companion thread, which quotes the chat and so
+    is part of what "no traces" covers. A turn still running for it finds the
+    thread gone and has nowhere to write (``_conv_add_message`` answers None
+    for a missing thread)."""
+    if not _CONV_ID_RE.fullmatch(cid or ""):
+        return False
+    with _conversations_lock:
+        path = CONVERSATIONS_DIR / f"{cid}.json"
+        existed = path.exists()
+        path.unlink(missing_ok=True)
+    shutil.rmtree(CONVERSATION_ATTACHMENTS_DIR / cid, ignore_errors=True)
+    with _conv_keys_lock:
+        try:
+            bindings = [p for p in _CONV_KEYS_DIR.iterdir() if p.is_file()]
+        except OSError:
+            bindings = []
+        for binding in bindings:
+            try:
+                if binding.read_text(encoding="utf-8").strip() == cid:
+                    binding.unlink()
+            except OSError:
+                continue
+    session_key = CONV_SESSION_KEY_PREFIX + cid
+    with _state_lock:
+        # Marked before the entry goes, under the same lock the late write
+        # takes, so no in-flight turn can slip its record in between.
+        _erased_session_keys[session_key] = time.time()
+        while len(_erased_session_keys) > _ERASED_SESSION_KEYS_MAX:
+            _erased_session_keys.pop(next(iter(_erased_session_keys)))
+        state = _load_state()
+        entry = state.pop(session_key, None)
+        if entry is not None:
+            _save_state(state)
+    session_id = str((entry or {}).get("session_id") or "")
+    if session_id:
+        _forget_claude_session(session_id)
+    return existed
+
+
+def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
+    """Erase a chat from the whole system; ``(report, error)``.
+
+    Deletion, not a flag. Every inbox gateway of the chat's channel is asked to
+    erase it (POST /chats/delete): the message volume is shared per channel, so
+    whichever answers first takes the ledger records and their media, and each
+    one also drops its own traces — queued/sent pending-send files and the
+    recent-senders entry. Here the chat's state document (flags, draft, read
+    watermark, roster), its live overlay entries and its companion thread go.
+    Nothing remembers the chat was there beyond a minutes-long tombstone that
+    hides the store's not-yet-reindexed copy of exactly the erased records;
+    the next message from the same peer starts a new chat.
+
+    The ledger erasure is the part that must happen, and it must be complete:
+    if no gateway answered, or one reported a file it could not erase, nothing
+    here is touched and an error is returned, so the user sees the chat still
+    there and can retry (every step is idempotent) rather than the chat
+    vanishing from view while part of it stays on disk.
+    """
+    ref = chat_state_mod.split_chat_ref(chat_id)
+    if ref is None:
+        return {}, "not a chat id"
+    if not CHAT_ERASE_TOKEN:
+        return {"id": chat_id, "unconfigured": True}, (
+            "chat deletion is not configured: set CHAT_ERASE_TOKEN (the same "
+            "value) on the retinue service and on the messenger gateways")
+    channel, account, key = ref
+    doc = _CHAT_STATE.get(chat_id)
+    report: dict = {"id": chat_id, "gateways": {}, "companion": False}
+    erased = False
+    incomplete = []
+    failures = []
+    subjects: set = set()
+    message_ids: set = set()
+    for slug, gw in _media_gateways(channel, account, doc):
+        try:
+            status, answer = _gateway_hop(
+                gw, "/chats/delete", {"chat": key, "account": account or ""},
+                extra_headers={"X-Chat-Erase-Token": CHAT_ERASE_TOKEN})
+        except Exception as exc:  # noqa: BLE001 — transport failure
+            failures.append(f"{slug}: {exc}")
+            continue
+        if status != 200 or not isinstance(answer, dict):
+            failures.append(f"{slug}: HTTP {status}")
+            continue
+        report["gateways"][slug] = {k: answer.get(k) for k in
+                                    ("messages", "media", "pending_sends",
+                                     "recent", "errors")}
+        subjects.update(str(x) for x in answer.get("subjects") or [])
+        message_ids.update(str(x) for x in answer.get("message_ids") or [])
+        errors = answer.get("errors")
+        if not isinstance(errors, int) or errors:
+            # A 200 that says something stayed behind is not an erasure.
+            incomplete.append(f"{slug}: {errors!r} file(s) could not be erased")
+        else:
+            erased = True
+    if incomplete or not erased:
+        # Fail closed: the chat stays as it is, and a retry is safe — every
+        # step is idempotent, and what was already erased stays erased.
+        reasons = incomplete + failures
+        return report, ("the chat's messages could not be completely erased"
+                        + (" (" + "; ".join(reasons) + ")" if reasons else ""))
+    if failures:
+        report["partial"] = failures
+    _chat_tombstone(chat_id, subjects, message_ids)
+    _CHAT_OVERLAY.forget(chat_id)
+    # Under the companion lock: a companion request racing this delete either
+    # finishes first (and its thread is deleted here) or runs after and is
+    # refused as a deleted chat — never a fresh thread for an erased chat.
+    with _companion_lock:
+        removed = _CHAT_STATE.delete(chat_id) or doc
+        companion = (removed or {}).get("companion")
+        if companion:
+            report["companion"] = _delete_conversation(str(companion))
+    _chats_cache_invalidate()
+    print(f"[web-gateway] deleted chat {chat_id!r}: {json.dumps(report)}", flush=True)
+    return report, None
 
 
 def _chat_send_via_gateway(gw: dict, send_payload: dict) -> tuple[dict, str]:
@@ -5983,8 +6236,12 @@ def _chat_messages_payload(chat_id: str, before: str | None = None) -> dict:
     # Outbound rows as (ts, text), for matching sends whose identity we never
     # learned — see the unconfirmed branch in the overlay merge below.
     store_out: list[tuple] = []
-    rows = [b for b in _sparql_bindings(query) if _bval(b, "ts")]
-    overlay = list(_CHAT_OVERLAY.entries(chat_id)) if before is None else []
+    rows = [b for b in _sparql_bindings(query)
+            if _bval(b, "ts")
+            and not _chat_record_erased(chat_id, _bval(b, "m"), _bval(b, "mid"))]
+    overlay = ([e for e in _CHAT_OVERLAY.entries(chat_id)
+                if not _chat_record_erased(chat_id, message_id=e.get("message_id"))]
+               if before is None else [])
     # What the gateways stated about this page's blobs, one lookup for the
     # rows and the overlay together.
     media_meta = _chat_media_meta_lookup(
@@ -6582,6 +6839,10 @@ class Handler(BaseHTTPRequestHandler):
         if chat_flags_match:
             self._handle_chat_flags(chat_flags_match.group(1))
             return
+        chat_delete_match = _CHAT_DELETE_RE.match(self.path)
+        if chat_delete_match:
+            self._handle_chat_delete(chat_delete_match.group(1))
+            return
         chat_draft_undo_match = _CHAT_DRAFT_UNDO_RE.match(self.path)
         if chat_draft_undo_match:
             self._handle_chat_draft_undo(chat_draft_undo_match.group(1))
@@ -7081,6 +7342,32 @@ class Handler(BaseHTTPRequestHandler):
                               "archived": bool(doc.get("archived")),
                               "muted": bool(doc.get("muted"))})
 
+    def _handle_chat_delete(self, raw_id: str) -> None:
+        """Erase a chat for good (no body): every message and blob in the
+        ledger, the gateways' own traces, the chat state and the companion
+        thread — see _delete_chat. 403 unless it came through the reverse
+        proxy; 502 when the messages could not be completely erased, in which
+        case the chat, its state and its companion stay for a retry."""
+        chat_id = self._chat_id_or_404(raw_id)
+        if chat_id is None:
+            return
+        # Erasure is the user's own act, like a send: an agent can archive or
+        # mute, never destroy. Same edge-origin gate as POST /chats/<id>/send.
+        ok, reason = self._request_from_edge(f"chat delete of {chat_id}")
+        if not ok:
+            self._send_json(403, {
+                "error": "deleting a chat is the user's own action and is "
+                         "accepted only from the dashboard through the reverse proxy",
+                "detail": reason,
+            })
+            return
+        report, error = _delete_chat(chat_id)
+        if error:
+            self._send_json(503 if report.get("unconfigured") else 502,
+                            {"error": error, **report})
+            return
+        self._send_json(200, {"deleted": True, **report})
+
     def _handle_chat_draft(self, raw_id: str) -> None:
         """The user writes the shared draft (body {text, version}).
 
@@ -7171,6 +7458,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             cid, created = _chat_companion(chat_id)
+        except LookupError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
         except OSError as exc:
             self._send_json(500, {"error": "could not open the companion thread",
                                   "detail": str(exc)})
@@ -7400,6 +7690,18 @@ class Handler(BaseHTTPRequestHandler):
             "text": str(payload.get("text") or ""),
             "attachments": [u for u in (payload.get("attachments") or []) if u],
         }
+        if _chat_record_erased(chat_id, message_id=entry["message_id"]):
+            # A late or repeated event for a message the user just erased —
+            # a retried POST, a redelivered stanza. It must not recreate the
+            # chat's state, push, or buy a turn. Where the caller offers the
+            # handover it is accepted, so the gateway neither forwards it to
+            # triage nor holds it for a drain: the user's answer to this
+            # message was to delete it.
+            body = {"ok": True, "id": chat_id, "pushed": False, "erased": True}
+            if payload.get("handover") is True and CHAT_ARRIVAL_TURNS:
+                body["accepted"] = True
+            self._send_json(200, body)
+            return
         _CHAT_OVERLAY.insert(entry)
         group = payload.get("group")
         # Which account this arrived on, resolved from the account the gateway

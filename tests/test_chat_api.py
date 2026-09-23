@@ -318,6 +318,21 @@ class _MockGateway(BaseHTTPRequestHandler):
         payload = json.loads(raw) if raw else {}
         STATE["gw_requests"].append(("POST", self.path,
                                      self.headers.get("Authorization", "")))
+        if self.path.rstrip("/") == "/chats/delete":
+            STATE.setdefault("erase_tokens", []).append(
+                self.headers.get("X-Chat-Erase-Token", ""))
+            STATE.setdefault("deleted", []).append(payload)
+            fail = STATE.get("gw_delete_fail")
+            if fail == "http":
+                self._json(500, {"error": "store volume unwritable"})
+            else:
+                # "partial": the gateway answers, but says a file stayed behind.
+                self._json(200, {"status": "deleted", "messages": 3, "media": 1,
+                                 "errors": 1 if fail == "partial" else 0,
+                                 "pending_sends": 0, "recent": 1,
+                                 "subjects": ["urn:retinue:inbound:signal:erased1"],
+                                 "message_ids": ["d1"]})
+            return
         if self.path.rstrip("/") == "/send":
             STATE["sent"].append(payload)
             outcome = {"message_id": str(776 + len(STATE["sent"])),
@@ -1573,6 +1588,131 @@ def test_archive_and_mute(base, wg):
     print("PASS test_archive_and_mute")
 
 
+def test_delete_chat(base, wg):
+    """Delete erases a chat from the system, and the peer can start over.
+
+    The ledger is the gateways' to erase, so the web-gateway asks them (with
+    their token) and drops only its own traces once one has: the chat state,
+    the companion thread, the live overlay. A gateway that cannot erase
+    leaves everything as it was — a half-deleted chat is worse than none.
+    Afterwards the next message from the same peer is a new chat: no archive
+    flag, no companion, nothing carried over."""
+    key = "+41790007777"
+    cid = "signal:" + key
+    rail = "/internal/chats/inbound"
+    event = {"direction": "in", "channel": "signal", "chat": key,
+             "sender": key, "sender_name": "Old acquaintance",
+             "message_id": "d1", "text": "Remember me?",
+             "gateway": "127.0.0.1", "gate": {"forward": True, "reason": "open"}}
+    _http(base, "POST", rail, event)
+    status, body = _http(base, "POST", "/chats/" + _quote(cid) + "/companion")
+    assert status in (200, 201), body
+    conv_id = body["id"]
+    assert (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists()
+    _http(base, "POST", "/chats/" + _quote(cid) + "/flags", {"muted": True})
+    delete_path = "/chats/" + _quote(cid) + "/delete"
+
+    # Without the erase capability configured, nothing is attempted.
+    wg.CHAT_ERASE_TOKEN = ""
+    STATE["deleted"] = []
+    status, body = _http(base, "POST", delete_path)
+    assert status == 503 and "CHAT_ERASE_TOKEN" in body["error"], (status, body)
+    assert STATE["deleted"] == [], "a gateway was asked without the capability"
+    wg.CHAT_ERASE_TOKEN = "erase-cap"
+
+    # A gateway that cannot erase the messages — failing outright, or
+    # answering 200 but reporting a file it could not remove: nothing else is
+    # touched, so the chat stays whole enough to retry.
+    for mode in ("http", "partial"):
+        STATE["gw_delete_fail"] = mode
+        try:
+            status, body = _http(base, "POST", delete_path)
+        finally:
+            STATE["gw_delete_fail"] = None
+        assert status == 502, (mode, status, body)
+        status, body = _http(base, "GET", "/chats")
+        assert any(c["id"] == cid for c in body["chats"]), (mode, "the chat stays")
+        assert (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists(), mode
+        assert wg._CHAT_STATE.get(cid)["muted"] is True, mode
+
+    STATE["deleted"] = []
+    STATE["gw_requests"].clear()
+    status, body = _http(base, "POST", delete_path)
+    assert status == 200 and body.get("deleted") is True, body
+    assert STATE["deleted"] == [{"chat": key, "account": ""}], STATE["deleted"]
+    auth = [a for m, p, a in STATE["gw_requests"] if p == "/chats/delete"]
+    assert auth and auth[0].startswith("Bearer "), "the gateway hop carries its token"
+    assert STATE["erase_tokens"][-1] == "erase-cap", "and the erase capability"
+    assert body.get("companion") is True, body
+
+    status, body = _http(base, "GET", "/chats")
+    assert not any(c["id"] == cid for c in body["chats"]), "a deleted chat is gone"
+    assert cid not in wg._CHAT_STATE.all(), "its state document is gone"
+    assert not (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists(), \
+        "its companion thread is gone"
+    status, body = _http(base, "GET", "/chats/" + _quote(cid) + "/messages")
+    assert status == 200 and not [m for m in body["messages"]
+                                  if m.get("text") == "Remember me?"], body
+
+    # The store may still serve the erased rows for a moment; the tombstone
+    # hides exactly those records, by the identities the gateway reported —
+    # not by time, so nothing that arrives afterwards is caught by it.
+    assert wg._chat_record_erased(cid, "urn:retinue:inbound:signal:erased1")
+    assert wg._chat_record_erased(cid, message_id="d1")
+    assert not wg._chat_record_erased(cid, "urn:retinue:inbound:signal:new", "d2")
+    assert not wg._chat_record_erased("signal:+41790000000", message_id="d1")
+    # A late rail event for an erased message does not bring it back, nor
+    # recreate any state: it is accepted (the gateway must not forward it to
+    # triage) and dropped.
+    status, body = _http(base, "POST", rail, dict(event, handover=True))
+    assert status == 200 and body.get("erased") and body.get("accepted"), body
+    status, body = _http(base, "GET", "/chats")
+    assert not any(c["id"] == cid for c in body["chats"]), "an erased message came back"
+    assert cid not in wg._CHAT_STATE.all(), "a late event recreated the chat state"
+
+    # A companion request left over from before the delete is refused, not
+    # answered with a fresh thread for the erased chat.
+    status, body = _http(base, "POST", "/chats/" + _quote(cid) + "/companion")
+    assert status == 404, (status, body)
+    assert cid not in wg._CHAT_STATE.all()
+
+    # The same peer writing again — in the same second, even — is a new chat,
+    # with nothing carried over.
+    _http(base, "POST", rail, dict(event, message_id="d2", text="Hello again"))
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is False and c["muted"] is False, c
+    assert c["companion"] is None, c
+    assert c["last"]["text"] == "Hello again", c
+    status, body = _http(base, "POST", "/chats/" + _quote(cid) + "/companion")
+    assert status == 201, "the new chat may have a companion of its own"
+
+    # A companion turn still running when the chat was deleted ends by
+    # recording its session: that write is refused and its transcript erased,
+    # so the deleted chat's Claude history cannot come back.
+    sid = "0f0e0d0c-0b0a-4908-8706-050403020100"
+    with tempfile.TemporaryDirectory() as cfg:
+        transcript = Path(cfg) / "projects" / "-workspace" / f"{sid}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}")
+        old_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        try:
+            wg._update_session_entry(wg.CONV_SESSION_KEY_PREFIX + conv_id,
+                                     {"session_id": sid, "last_activity": 0})
+        finally:
+            if old_cfg is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
+        assert (wg.CONV_SESSION_KEY_PREFIX + conv_id) not in wg._load_state()
+        assert not transcript.exists(), "the late turn's transcript is erased"
+
+    status, _ = _http(base, "POST", "/chats/not-a-chat/delete")
+    assert status == 404
+    print("PASS test_delete_chat")
+
+
 def test_mute_races_an_arrival(base, wg):
     """A Mute landing while a message arrives is never half-applied.
 
@@ -1870,6 +2010,7 @@ def main():
         test_arrival_starts_a_companion_turn(base, wg)
         test_archive_and_mute(base, wg)
         test_mute_races_an_arrival(base, wg)
+        test_delete_chat(base, wg)
         test_store_down_serves_recent_list(base, wg)
         test_write_during_rebuild_is_not_lost(base, wg)
         test_empty_store_is_an_empty_list(base, wg)

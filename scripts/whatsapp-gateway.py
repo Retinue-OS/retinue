@@ -147,6 +147,11 @@ DEFAULT_LANGUAGE = SUPPORTED_LANGUAGES[0] if SUPPORTED_LANGUAGES else "en"
 HTTP_PORT = int(os.environ.get("WHATSAPP_GATEWAY_HTTP_PORT", "8092"))
 DEFAULT_RECIPIENT = os.environ.get("WHATSAPP_DEFAULT_RECIPIENT", "").strip()
 GATEWAY_TOKEN = os.environ.get("WHATSAPP_GATEWAY_TOKEN", "").strip()
+# The separate capability POST /chats/delete requires (X-Chat-Erase-Token).
+# Not the gateway token: that one is handed to every agent session so agents
+# can send, and erasing a chat is the user's own act, relayed only by the
+# web-gateway. Unset, the endpoint refuses — there is no fallback.
+CHAT_ERASE_TOKEN = os.environ.get("CHAT_ERASE_TOKEN", "").strip()
 MAX_PUSH_BODY_BYTES = int(os.environ.get("WHATSAPP_GATEWAY_MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 
 # Outbound send-control policy — the messenger analogue of EMAIL_SEND_POLICY.
@@ -2622,6 +2627,47 @@ def _push(recipient: str, message: str, lang: str | None = None,
             path.unlink(missing_ok=True)
 
 
+def _erase_chat(chat: str, account: str | None) -> dict:
+    """Erase one chat from everything this gateway keeps (POST /chats/delete).
+
+    The ledger records and their media go through inbound_store.delete_chat,
+    which matches the (chat, account) pair exactly — the message volume is
+    shared by every account of the channel, so whichever gateway is asked can
+    erase it. The pending-send files and the recent-senders list are this
+    container's own, so they are purged only when the chat is this account's
+    (or an account-less legacy chat): the same peer on another account is
+    another chat, whose traces are that gateway's to erase.
+    """
+    result = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, account)
+    result["pending_sends"] = 0
+    result["recent"] = 0
+    if account and account != WHATSAPP_ACCOUNT:
+        return result
+
+    def _pending_hit(entry: dict) -> bool:
+        return _wa_chat_key(str(entry.get("recipient") or "")) == chat
+
+    def _recent_hit(entry: dict) -> bool:
+        return (not chat.endswith("@g.us")
+                and (entry.get("jid") == chat
+                     or entry.get("number") == chat.partition("@")[0]))
+
+    with _pending_sends_lock:
+        removed = _ibstore.purge_pending_sends(WHATSAPP_PENDING_SENDS_DIR, _pending_hit)
+        for request_id in removed:
+            _pending_sends.pop(request_id, None)
+    result["pending_sends"] = len(removed)
+    with _RECENT_CHATS_LOCK:
+        try:
+            result["recent"] = _ibstore.purge_recent_chats(WHATSAPP_RECENT_CHATS_PATH, _recent_hit)
+        except OSError as exc:
+            print(f"[whatsapp-gateway] could not rewrite recent chats: {exc}", flush=True)
+            result["errors"] += 1
+    print(f"[whatsapp-gateway] erased chat {chat!r} (account {account or '-'}): "
+          f"{result}", flush=True)
+    return result
+
+
 # ── HTTP API ──────────────────────────────────────────────────────────────────
 
 _PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
@@ -2766,6 +2812,36 @@ class _PushHandler(BaseHTTPRequestHandler):
                 self._reply(404, {"error": "pending send not found"})
                 return
             self._reply(200, {k: v for k, v in entry.items() if k != "images"})
+            return
+
+        if self.path.rstrip("/") == "/chats/delete":
+            # Erase one chat — its ledger records, media and this gateway's
+            # own traces of it. The web-gateway calls it on the user's delete
+            # and nothing else should: besides the gateway token it requires
+            # CHAT_ERASE_TOKEN, which agent sessions do not inherit.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            if not CHAT_ERASE_TOKEN:
+                self._reply(503, {"error": "chat erasure is not configured "
+                                           "(CHAT_ERASE_TOKEN is unset)"})
+                return
+            if not hmac.compare_digest(
+                    (self.headers.get("X-Chat-Erase-Token") or "").strip(),
+                    CHAT_ERASE_TOKEN):
+                self._reply(403, {"error": "chat erasure needs X-Chat-Erase-Token"})
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else None
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            chat = str((body or {}).get("chat") or "").strip() if isinstance(body, dict) else ""
+            if not chat:
+                self._reply(400, {"error": "chat (the chat key) is required"})
+                return
+            account = str(body.get("account") or "").strip() or None
+            self._reply(200, {"status": "deleted", **_erase_chat(chat, account)})
             return
 
         if self.path.rstrip("/") != "/send":

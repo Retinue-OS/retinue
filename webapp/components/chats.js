@@ -8,13 +8,24 @@
 // badge treatment here (its real meaning — no Web Push, and no un-archive on a
 // new inbound message — is the server's).
 //
-// Each row on the full page carries the two things one does to a chat that is
-// in the way, which are not the same thing: **Archive** puts it away until it
+// On the full page each row is swiped, messenger-style, rather than carrying
+// buttons that eat a third of a phone's width. Two things one does to a chat
+// that is in the way are not the same thing: **Archive** puts it away until it
 // speaks again, **Mute** puts it away and keeps it there. Muting archives, so
 // both land in the Archived tab, and **Restore** undoes either. That is the
 // dashboard-conversation model verbatim, and it is what replaced a sender
 // blacklist: not wanting to hear from someone is a chat one mutes, on the chat,
 // in front of the user — not a list only Ara can edit.
+//
+//   Active tab    swipe right  archive at once
+//                 swipe left   reveal Archive · Mute
+//   Archived tab  swipe right  restore at once
+//                 swipe left   reveal Restore · Mute (Unmute) · Delete
+//
+// **Delete** erases the chat from the whole system — every message and file in
+// the ledger, its companion thread — and a later message from the peer starts
+// a new chat; it asks for a second tap. A long press, a right-click or the
+// context-menu key opens the same shelf without swiping.
 //
 // The list comes from the gateway's GET /chats (the default `src`, still
 // overridable by attribute) — SPARQL over the message ledgers merged with the
@@ -116,6 +127,8 @@ class RetinueChats extends RetinueCard {
     // put the row back and flip the button to the wrong inverse until the next
     // poll. The epoch is how such an answer is recognised and dropped.
     this._epoch = 0;
+    this._openId = null;     // the row whose action shelf is open, if any
+    this._confirmId = null;  // the row whose Delete awaits its second tap
     // Crossing the layout breakpoint changes how many rows fit (cap vs all).
     this._offFrame = onFrameChange(() => {
       if (this._data) this.renderState({ state: 'ok', data: this._data });
@@ -151,6 +164,9 @@ class RetinueChats extends RetinueCard {
       // the region's scroll and the filter wiring for nothing.
       const sig = JSON.stringify(data.chats || []);
       if (sig === this._sig) { this._data = data; return; }
+      // A rebuild under a finger mid-swipe would drop the row it is dragging;
+      // the next tick picks the change up.
+      if (this._drag) return;
       this._sig = sig;
       this.renderState({ state: 'ok', data });
     } catch (_err) {
@@ -167,11 +183,246 @@ class RetinueChats extends RetinueCard {
         const scope = el.getAttribute('data-scope');
         if (scope === this._scope) return;
         this._scope = scope;
+        this._openId = null;
+        this._confirmId = null;
         if (this._data) this.renderState({ state: 'ok', data: this._data });
       }));
     this.shadowRoot.querySelectorAll('[data-flag]').forEach((el) =>
-      el.addEventListener('click', () => this._setFlags(
-        el.getAttribute('data-flag'), el.getAttribute('data-set'))));
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const id = el.getAttribute('data-flag');
+        const action = el.getAttribute('data-set');
+        if (action === 'delete') this._confirmDelete(id, el);
+        else this._setFlags(id, action);
+      }));
+    if (this._full) this._wireSwipe();
+  }
+
+  // ── Swipe ────────────────────────────────────────────────────────────────
+  // Pointer events, so a finger, a pen and a mouse drag all work. The row
+  // declares `touch-action: pan-y`: the browser keeps vertical scrolling and
+  // hands horizontal movement to us. A gesture is claimed as a swipe only
+  // once it is clearly horizontal, so a scroll that starts on a row is still
+  // a scroll.
+  _wireSwipe() {
+    const root = this.shadowRoot;
+    const rows = root.querySelectorAll('li.swipe');
+    rows.forEach((li) => {
+      const row = li.querySelector('.row');
+      if (!row) return;
+      row.addEventListener('pointerdown', (e) => this._dragStart(e, li, row));
+      row.addEventListener('pointermove', (e) => this._dragMove(e));
+      row.addEventListener('pointerup', (e) => this._dragEnd(e));
+      row.addEventListener('pointercancel', () => this._dragCancel());
+      // A swipe ends on the row, and the browser then clicks it: swallow that
+      // click, and a tap on an open row closes it rather than navigating.
+      row.addEventListener('click', (e) => {
+        const swiped = performance.now() < (this._suppressUntil || 0);
+        if (swiped || this._openId === li.dataset.id) {
+          e.preventDefault();
+          this._suppressUntil = 0;
+          if (!swiped) this._close();
+        } else if (this._openId) {
+          e.preventDefault();
+          this._close();
+        }
+      });
+      // Long press, right-click, the context-menu key: the shelf, for
+      // whoever cannot or would rather not swipe. From the keyboard, focus
+      // lands on its first button.
+      row.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        this._drag = null;
+        this._open(li);
+        if (!e.pointerType || e.pointerType === 'mouse') {
+          const first = li.querySelector('.shelf button');
+          if (first && e.button !== 2) first.focus();
+        }
+      });
+    });
+    // Re-open the shelf a refresh rebuilt, without replaying the slide, and
+    // keep an armed Delete armed.
+    if (this._openId) {
+      const li = [...rows].find((el) => el.dataset.id === this._openId);
+      if (li) {
+        const del = li.querySelector('[data-set="delete"]');
+        if (del && this._confirmId === this._openId) this._arm(del);
+        this._open(li, false);
+      } else {
+        this._openId = null;
+        this._confirmId = null;
+      }
+    }
+    if (!this._outsideWired) {
+      this._outsideWired = true;
+      document.addEventListener('pointerdown', (e) => {
+        if (this._openId && !e.composedPath().includes(this)) this._close();
+      });
+    }
+  }
+
+  _shelfWidth(li) {
+    const shelf = li.querySelector('.shelf');
+    return shelf ? shelf.offsetWidth : 0;
+  }
+
+  _slide(li, x, animate = true) {
+    const row = li.querySelector('.row');
+    row.style.transition = animate ? 'transform .18s ease-out' : 'none';
+    row.style.transform = x ? `translateX(${x}px)` : '';
+    // Only the side being uncovered shows, so its colour never bleeds through
+    // the other edge while a row slides back.
+    li.classList.toggle('show-quick', x > 0);
+    li.classList.toggle('show-shelf', x < 0);
+  }
+
+  _open(li, animate = true) {
+    if (this._openId && this._openId !== li.dataset.id) this._close();
+    this._openId = li.dataset.id;
+    this._slide(li, -this._shelfWidth(li), animate);
+  }
+
+  _close() {
+    const li = this._rowEl(this._openId);
+    this._openId = null;
+    this._confirmId = null;
+    if (li) {
+      this._slide(li, 0);
+      li.querySelectorAll('.confirm').forEach((b) => this._unconfirm(b));
+    }
+  }
+
+  _rowEl(id) {
+    if (!id) return null;
+    return [...this.shadowRoot.querySelectorAll('li.swipe')].find((el) => el.dataset.id === id) || null;
+  }
+
+  _dragStart(e, li, row) {
+    if (e.button !== 0 || this._flagging) return;
+    const base = this._openId === li.dataset.id ? -this._shelfWidth(li) : 0;
+    this._drag = { li, row, id: e.pointerId, x0: e.clientX, y0: e.clientY, base, dx: 0, axis: null };
+  }
+
+  _dragMove(e) {
+    const d = this._drag;
+    if (!d || e.pointerId !== d.id) return;
+    const dx = e.clientX - d.x0;
+    const dy = e.clientY - d.y0;
+    if (!d.axis) {
+      if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+      d.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+      if (d.axis === 'y') { this._drag = null; return; }
+      if (this._openId && this._openId !== d.li.dataset.id) this._close();
+      try { d.row.setPointerCapture(d.id); } catch (_e) { /* already released */ }
+    }
+    e.preventDefault();
+    const width = d.li.offsetWidth;
+    const shelf = this._shelfWidth(d.li);
+    // Past the shelf's edge the row resists instead of stopping dead, so the
+    // limit is felt; the quick side runs to most of the row's width.
+    let x = d.base + dx;
+    if (x < -shelf) x = -shelf + (x + shelf) / 4;
+    if (x > width * 0.8) x = width * 0.8;
+    d.dx = x;
+    this._slide(d.li, x, false);
+  }
+
+  _dragEnd(e) {
+    const d = this._drag;
+    if (!d || e.pointerId !== d.id) return;
+    this._drag = null;
+    if (d.axis !== 'x') return;
+    // The click a mouse drag ends in must not open the chat. A touch pan
+    // produces no click, so this lapses rather than eating the next tap.
+    this._suppressUntil = performance.now() + 400;
+    const width = d.li.offsetWidth;
+    const shelf = this._shelfWidth(d.li);
+    if (d.dx > Math.min(120, width * 0.35)) {
+      // Committed: slide the row out and act. The quick action is the one
+      // the tab is about — out of the list, or back into it.
+      this._openId = null;
+      this._slide(d.li, width);
+      const action = d.li.dataset.quick;
+      setTimeout(() => this._setFlags(d.li.dataset.id, action, d.li), 160);
+    } else if (d.dx < -shelf / 2) {
+      this._open(d.li);
+    } else {
+      if (this._openId === d.li.dataset.id) this._openId = null;
+      this._slide(d.li, 0);
+    }
+  }
+
+  _dragCancel() {
+    const d = this._drag;
+    this._drag = null;
+    if (d && d.axis === 'x') {
+      if (this._openId === d.li.dataset.id) this._open(d.li);
+      else this._slide(d.li, 0);
+    }
+  }
+
+  // Delete cannot be undone, so the first tap only arms it: the button says
+  // what a second tap will do, and anything else disarms it.
+  _confirmDelete(id, btn) {
+    if (this._confirmId !== id) {
+      this._confirmId = id;
+      this._arm(btn);
+      // The shelf grew; keep the row flush with its new edge.
+      const li = this._rowEl(id);
+      if (li) this._slide(li, -this._shelfWidth(li));
+      return;
+    }
+    this._confirmId = null;
+    this._deleteChat(id);
+  }
+
+  _arm(btn) {
+    btn.classList.add('confirm');
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = 'Delete for good?';
+  }
+
+  _unconfirm(btn) {
+    btn.classList.remove('confirm');
+    if (btn.dataset.label) btn.textContent = btn.dataset.label;
+  }
+
+  async _deleteChat(id) {
+    if (!id || this._flagging) return;
+    this._flagging = true;
+    const busy = this._rowEl(id);
+    if (busy) busy.classList.add('busy');
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(id)}/delete`, { method: 'POST' });
+      if (!res.ok) throw new Error(res.status === 503 ? 'unconfigured' : String(res.status));
+      if (this._data && Array.isArray(this._data.chats)) {
+        this._data.chats = this._data.chats.filter((c) => c.id !== id);
+      }
+      this._openId = null;
+      this._sig = '';
+      this._epoch += 1;
+      if (this._data) this.renderState({ state: 'ok', data: this._data });
+    } catch (err) {
+      // The chat stays whole enough to retry (the gateway answers 502 and
+      // touches none of its own state when the messages cannot all go). A 503
+      // is a deployment without the erase capability: retrying will not help,
+      // and the button says so.
+      const li = this._rowEl(id);
+      if (li) {
+        li.classList.remove('busy');
+        li.classList.add('failed');
+        const btn = li.querySelector('[data-set="delete"]');
+        if (btn) {
+          this._unconfirm(btn);
+          const off = err && err.message === 'unconfigured';
+          btn.textContent = off ? 'Delete not set up' : 'Retry delete';
+          if (off) btn.title = 'Chat deletion needs CHAT_ERASE_TOKEN on retinue and the messenger gateways';
+        }
+      }
+    } finally {
+      this._flagging = false;
+    }
   }
 
   // Three actions over the same two flags, exactly as a conversation has:
@@ -185,10 +436,12 @@ class RetinueChats extends RetinueCard {
   // also reaches the Herald is the triage policy's business and not this
   // button's: the two are independent, so a chat can be a news source and
   // still sit in the list.
-  async _setFlags(id, action) {
+  async _setFlags(id, action, li = null) {
     const FLAGS = {
       archive: { archived: true },
       mute: { muted: true },
+      // Stays archived — it only lets the next message bring the chat back.
+      unmute: { muted: false },
       restore: { archived: false, muted: false },
     };
     const flags = FLAGS[action];
@@ -206,12 +459,16 @@ class RetinueChats extends RetinueCard {
       const doc = await res.json();
       const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
       if (chat) { chat.archived = !!doc.archived; chat.muted = !!doc.muted; }
+      this._openId = null;
+      this._confirmId = null;
       this._sig = '';
       // Any refresh already on the wire answers from before this write.
       this._epoch += 1;
       if (this._data) this.renderState({ state: 'ok', data: this._data });
     } catch (_err) {
-      // Left as it was; the row stays where it is and the next tap can retry.
+      // Left as it was; a row swiped out slides back, and the next swipe or
+      // tap can retry.
+      if (li) this._slide(li, 0);
     } finally {
       this._flagging = false;
     }
@@ -221,16 +478,36 @@ class RetinueChats extends RetinueCard {
     return `
       ul.list { gap: 4px; }
       li { margin: 0; }
-      /* A row with an action beside it: the link keeps the whole width it had,
-         the button takes its own. */
-      li.actionable { display: flex; align-items: center; gap: 2px; }
-      li.actionable .row { flex: 1; min-width: 0; }
-      .row-act { flex: none; border: 0; border-radius: 999px; padding: 6px 9px;
-                 background: transparent; color: var(--muted, #8b93a3); cursor: pointer;
-                 font: inherit; font-size: .74rem; white-space: nowrap;
-                 -webkit-tap-highlight-color: transparent; }
-      .row-act:hover { background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
-      .row-act:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 1px; }
+      /* A swipeable row: the link slides over two layers underneath — the
+         quick action on the left (uncovered by a swipe right) and the shelf
+         of buttons on the right (uncovered by a swipe left). The row needs
+         an opaque background of its own to hide them while it rests. */
+      li.swipe { position: relative; overflow: hidden; border-radius: 12px; }
+      li.swipe .row { position: relative; z-index: 1; background: var(--card, #151922);
+                      touch-action: pan-y; user-select: none; -webkit-user-select: none;
+                      -webkit-touch-callout: none; }
+      li.swipe .row:hover { background: var(--card-2, #1c2230); }
+      li.swipe.busy .row { opacity: .5; }
+      /* visibility, not just the row on top: a hidden shelf's buttons also
+         leave the tab order, and an open one's are all reachable by Tab. */
+      .quick, .shelf { position: absolute; top: 0; bottom: 0; display: flex;
+                       align-items: stretch; visibility: hidden; }
+      li.show-quick .quick, li.show-shelf .shelf { visibility: visible; }
+      .quick { left: 0; right: 0; padding-left: 18px; align-items: center;
+               font-size: .8rem; font-weight: 600; color: #0b0d12; }
+      .quick.archive { background: var(--accent, #6ea8fe); }
+      .quick.restore { background: #4f9e63; }
+      .shelf { right: 0; }
+      .shelf button { border: 0; margin: 0; padding: 0 14px; min-width: 68px; cursor: pointer;
+                      font: inherit; font-size: .76rem; font-weight: 600; color: #0b0d12;
+                      white-space: nowrap; -webkit-tap-highlight-color: transparent; }
+      .shelf button:focus-visible { outline: 2px solid var(--fg, #e7ebf2); outline-offset: -3px; }
+      .shelf .archive { background: var(--accent, #6ea8fe); }
+      .shelf .restore { background: #4f9e63; }
+      .shelf .mute, .shelf .unmute { background: #c9a13f; }
+      .shelf .delete { background: #d0564f; color: #fff; }
+      .shelf .delete.confirm { background: #a8322c; }
+      li.failed .shelf .delete { outline: 2px solid #fff; outline-offset: -4px; }
       .row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
              grid-template-rows: auto auto; align-items: center; column-gap: 10px; row-gap: 1px;
              padding: 8px 10px; border-radius: 12px; text-decoration: none; color: var(--fg, #e7ebf2);
@@ -324,22 +601,31 @@ class RetinueChats extends RetinueCard {
         ? `<span class="pv-draft">${c.draft.author === 'agent'
           ? `Draft by ${esc(c.draft.agent || 'Ara')}` : 'Draft'}:</span> ${esc(c.draft.text)}`
         : previewHtml(c);
-      // The action sits BESIDE the row, never inside it: a row is a link, and
+      // The actions sit UNDER the row, never inside it: a row is a link, and
       // a button within a link is not a button. Only on the full page — the
       // dashboard card is a glance, not a place to curate.
       const act = (label, set, title) =>
-        `<button class="row-act" data-flag="${esc(c.id)}" data-set="${set}" ` +
+        `<button type="button" class="${set}" data-flag="${esc(c.id)}" data-set="${set}" ` +
         `title="${title}">${label}</button>`;
-      const acts = !this._full ? ''
-        : archived
-          ? act('Restore', 'restore', 'Put this chat back in the list') +
-            (c.muted ? '' : act('Mute', 'mute',
-                                'Keep it out of the list, even when it speaks'))
-          : act('Archive', 'archive', 'Out of the list until the next message') +
-            act('Mute', 'mute',
-                'Out of the list, and the next message does not bring it back');
-      return `<li${this._full ? ' class="actionable"' : ''}>` +
-        `<a class="row${c.unread ? ' has-unread' : ''}" ` +
+      const shelf = archived
+        ? act('Restore', 'restore', 'Put this chat back in the list') +
+          (c.muted
+            ? act('Unmute', 'unmute', 'Stay archived, but come back when it speaks')
+            : act('Mute', 'mute', 'Keep it out of the list, even when it speaks')) +
+          act('Delete', 'delete',
+              'Erase this chat and all its messages from the system')
+        : act('Archive', 'archive', 'Out of the list until the next message') +
+          act('Mute', 'mute',
+              'Out of the list, and the next message does not bring it back');
+      const quick = archived ? 'restore' : 'archive';
+      const under = !this._full ? ''
+        : `<div class="quick ${quick}" aria-hidden="true">${archived ? 'Restore' : 'Archive'}</div>` +
+          `<div class="shelf">${shelf}</div>`;
+      return (this._full
+        ? `<li class="swipe" data-id="${esc(c.id)}" data-quick="${quick}">`
+        : '<li>') + under +
+        `<a class="row${c.unread ? ' has-unread' : ''}"` +
+        (this._full ? ' draggable="false" ' : ' ') +
         `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
         `${avatarHtml(c)}` +
         `<span class="name">${esc(c.name)}` +
@@ -353,7 +639,7 @@ class RetinueChats extends RetinueCard {
         `<span class="when">${esc(fmtAge((c.last || {}).ts))}</span>` +
         `<span class="prev">${prev}</span>` +
         badge +
-        `</a>${acts}</li>`;
+        '</a></li>';
     }).join('');
     return `${this._filterHtml()}<ul class="list">${rows}</ul>${this._footHtml()}`;
   }
