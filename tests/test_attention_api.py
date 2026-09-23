@@ -522,7 +522,6 @@ def test_unknown_sender_screened_then_named(base, wg):
     assert "<https://w3id.org/retinue/kb#sphere> <urn:retinue:sphere:customers>" in card, card
     assert "<urn:retinue:sphere:friends>" in card and f"<tel:{nadia}>" in card, card
     assert '<https://w3id.org/retinue/kb#channel> "signal"' in card and "foaf/0.1/OnlineAccount" in card, card
-    assert "Nadia Brunner" in wg._contact_names()
     # The address book knows her by her number, on any channel.
     status, book = _http(base, "GET", f"/contacts?channel=signal&handle={urllib.parse.quote(nadia)}")
     assert status == 200 and [c["name"] for c in book["contacts"]] == ["Nadia Brunner"], book

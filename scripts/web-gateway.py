@@ -286,6 +286,7 @@ import claude_auth
 import agent_models
 import chat_state as chat_state_mod
 import contacts as contacts_mod
+import dictation_vocabulary
 import email_client as ec
 import send_origin
 import inbound_store
@@ -5015,46 +5016,18 @@ def send_message(message: str, display_question: str | None = None,
             return out
 
 
+# ── Dictation vocabulary ──────────────────────────────────────────────────────
+
+# Whole names from the life store, as spelling hints for the transcript-repair
+# model. The same module biases the decoder itself inside the STT service, from
+# its own cache — see scripts/dictation_vocabulary.py.
+
+
+def _dictation_names() -> list[str]:
+    return dictation_vocabulary.vocabulary("web-gateway")[0]
+
+
 # ── Transcript cleanup ────────────────────────────────────────────────────────
-
-# The names in the address book — the people the user is likely to dictate
-# about, and the words Whisper most often mangles: every contact's name, plus
-# the literal objects of any *name predicate in a hand-kept Turtle file beside
-# them (`…name "X"` covers foaf/schema/kb spellings, `:fn "X"` the vCard one).
-# Cached against the source files' mtimes.
-_NAME_LITERAL_RE = re.compile(r'(?:[Nn]ame|:fn)\s+"([^"\n]{2,80})"')
-_contact_names_cache: tuple[float, list[str]] | None = None
-_contact_names_lock = threading.Lock()
-
-
-def _contact_names(limit: int = 200) -> list[str]:
-    global _contact_names_cache
-    try:
-        dirs = [loc["dir"] for loc in _CONTACTS.locations()]
-        turtle = sorted(p for d in dirs for p in d.glob("*.ttl"))
-        stamp = sum(p.stat().st_mtime for d in dirs for p in list(d.glob("*.nt")) + list(d.glob("*.ttl")))
-    except OSError:
-        return []
-    with _contact_names_lock:
-        if _contact_names_cache and _contact_names_cache[0] == stamp:
-            return _contact_names_cache[1]
-        names: list[str] = []
-        seen: set[str] = set()
-        found = [r["name"] for r in _CONTACTS.all() if r.get("name")]
-        for path in turtle:
-            try:
-                found += _NAME_LITERAL_RE.findall(path.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                continue
-        for name in found:
-            key = name.casefold()
-            if key not in seen:
-                seen.add(key)
-                names.append(name)
-        names = names[:limit]
-        _contact_names_cache = (stamp, names)
-        return names
-
 
 _CLEANUP_SYSTEM_PROMPT = (
     "You repair speech-recognition transcripts. The user dictated a message; a "
@@ -5090,7 +5063,7 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     if not TRANSCRIPT_CLEANUP or not raw.strip():
         return raw
     parts = []
-    names = _contact_names()
+    names = _dictation_names()
     if names:
         parts.append("Names the user may have dictated (use the exact spelling):\n"
                      + ", ".join(names))
@@ -11595,7 +11568,13 @@ class Handler(BaseHTTPRequestHandler):
         composer, `raw_text` what Whisper actually heard. A `?thread=<id>` query
         param gives the cleanup pass the thread as context; `?cleanup=0` skips
         the pass. Access is the dashboard's own edge auth; the hop to the STT
-        service carries the shared Bearer token."""
+        service carries the shared Bearer token.
+
+        Nothing about the deployment's vocabulary travels on this hop: the STT
+        service reads the same life store this gateway does and biases its own
+        decode (scripts/dictation_vocabulary.py). Sending the names with every
+        clip would repeat a list that changes daily, and would leave the voice
+        notes the messenger gateways transcribe without any bias at all."""
         if not STT_SERVICE_URL:
             self._send_json(503, {"error": "transcription not configured"})
             return
