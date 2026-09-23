@@ -12,5 +12,8 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir faster-whisper
 
 WORKDIR /app
 COPY scripts/stt-service.py /app/stt-service.py
+# The deployment's dictation vocabulary (life-store query, stdlib only). The
+# service reads the store itself rather than having names pushed at it per clip.
+COPY scripts/dictation_vocabulary.py /app/dictation_vocabulary.py
 
 CMD ["python3", "/app/stt-service.py"]

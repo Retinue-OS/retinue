@@ -920,9 +920,24 @@ services:
       - WHISPER_MODEL=base
       - STT_HTTP_PORT=8100
       - STT_TOKEN
-      # Constrain voice-note language detection to the languages actually spoken;
-      # reuses the same deployment setting the Signal gateway uses for text.
-      - STT_SUPPORTED_LANGUAGES=${SIGNAL_SUPPORTED_LANGUAGES:-}
+      # Constrain language detection to the languages actually spoken. Set
+      # STT_SUPPORTED_LANGUAGES to say it outright; left empty, the service takes
+      # the union of the channels' own settings below, since it transcribes for
+      # all of them and no single channel speaks for the deployment.
+      - STT_SUPPORTED_LANGUAGES
+      - SIGNAL_SUPPORTED_LANGUAGES
+      - WHATSAPP_SUPPORTED_LANGUAGES
+      - TELEGRAM_SUPPORTED_LANGUAGES
+      # The names the deployment dictates — people, organisations, medications —
+      # come from the life store on the same network (scripts/dictation_vocabulary.py)
+      # and bias every decode, for dashboard dictation and voice notes alike.
+      # Fail-open: an unreachable store costs the bias, not the transcription.
+      - QLEVER_LIFE_URL=http://qlever-life:7001
+      - STT_HOTWORDS=${STT_HOTWORDS:-1}
+      - DICTATION_HOTWORD_CHARS=${DICTATION_HOTWORD_CHARS:-600}
+      # Voice-activity filtering is on by default (silence is what makes Whisper
+      # invent text); set STT_VAD_FILTER=0 in .env to decode the raw audio instead.
+      - STT_VAD_FILTER=${STT_VAD_FILTER:-1}
     volumes:
       # Persist downloaded Whisper model weights across container recreation.
       - stt-models:/root/.cache/huggingface
