@@ -997,12 +997,16 @@ def update_message(path: str | Path, *, text: str | None = None,
     return prev_media
 
 
-def _unlink_blob(store_dir: str | Path, media_id: str) -> bool:
-    """Remove one media blob and its sidecars; True if the blob was there."""
+def _unlink_blob(store_dir: str | Path, media_id: str) -> tuple[bool, int]:
+    """Remove one media blob and its sidecars.
+
+    Returns ``(removed, errors)``: whether the blob itself was there and went,
+    and how many of the four files exist but could not be removed — an absent
+    sidecar is normal, a stuck one is a trace the caller must report."""
     if not _MEDIA_ID_RE.match(media_id or ""):
-        return False
+        return False, 0
     d = media_dir(store_dir)
-    removed = False
+    removed, errors = False, 0
     for name in (media_id, media_id + ".type", media_id + ".name", media_id + ".meta"):
         try:
             (d / name).unlink()
@@ -1010,8 +1014,8 @@ def _unlink_blob(store_dir: str | Path, media_id: str) -> bool:
         except FileNotFoundError:
             continue
         except OSError:
-            continue
-    return removed
+            errors += 1
+    return removed, errors
 
 
 def delete_chat(store_dir: str | Path, chat: str,
@@ -1073,8 +1077,10 @@ def delete_chat(store_dir: str | Path, chat: str,
             continue
         for ref in fields["attachments"]:
             mid = media_id_of(ref)
-            if mid and mid not in kept_refs and _unlink_blob(store_dir, mid):
-                result["media"] += 1
+            if mid and mid not in kept_refs:
+                removed, errors = _unlink_blob(store_dir, mid)
+                result["media"] += int(removed)
+                result["errors"] += errors
         spool = fields.get("media")
         if spool:
             try:

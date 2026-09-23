@@ -410,6 +410,16 @@ def test_delete_chat_erases_exactly_one_chat():
         got = ist.delete_chat(tmp, peer, None)
         assert got["messages"] == 1 and not kept_legacy.exists()
         assert kept_other.exists() and kept_peer.exists()
+        # A blob file that cannot be removed is an error, not a quiet success.
+        stuck = ist.store_media(tmp, b"x", "text/plain")
+        (ist.media_dir(tmp) / (stuck + ".meta")).mkdir()
+        (ist.media_dir(tmp) / (stuck + ".meta") / "f").write_text("x")
+        ist.write_message(tmp, channel="signal", sender=peer, chat=peer, account=acct,
+                          text="stuck", attachment_urls=[f"urn:retinue:media:signal:{stuck}"],
+                          timestamp=106.0)
+        got = ist.delete_chat(tmp, peer, acct)
+        assert got == {"messages": 1, "media": 1, "errors": 1}, got
+
         # Idempotent, and an empty key erases nothing.
         assert ist.delete_chat(tmp, peer, acct)["messages"] == 0
         assert ist.delete_chat(tmp, "", acct)["messages"] == 0

@@ -1649,6 +1649,27 @@ def test_delete_chat(base, wg):
     assert c["companion"] is None, c
     assert c["last"]["text"] == "Hello again", c
 
+    # A companion turn still running when the chat was deleted ends by
+    # recording its session: that write is refused and its transcript erased,
+    # so the deleted chat's Claude history cannot come back.
+    sid = "0f0e0d0c-0b0a-4908-8706-050403020100"
+    with tempfile.TemporaryDirectory() as cfg:
+        transcript = Path(cfg) / "projects" / "-workspace" / f"{sid}.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}")
+        old_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = cfg
+        try:
+            wg._update_session_entry(wg.CONV_SESSION_KEY_PREFIX + conv_id,
+                                     {"session_id": sid, "last_activity": 0})
+        finally:
+            if old_cfg is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old_cfg
+        assert (wg.CONV_SESSION_KEY_PREFIX + conv_id) not in wg._load_state()
+        assert not transcript.exists(), "the late turn's transcript is erased"
+
     status, _ = _http(base, "POST", "/chats/not-a-chat/delete")
     assert status == 404
     print("PASS test_delete_chat")

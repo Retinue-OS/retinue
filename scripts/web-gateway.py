@@ -1589,11 +1589,25 @@ def _get_session_entry(session_key: str) -> dict:
         return dict(_load_state().get(session_key, {}))
 
 
+# Session keys whose conversation was erased (a deleted chat's companion). A
+# turn already running when the thread was deleted still ends by recording
+# its session here — which would bring back the entry and, through it, the
+# transcript the deletion removed. Such a late write is refused and its
+# transcript erased instead. Conversation ids are random and never reused, so
+# a key needs no expiry; the map is only capped.
+_erased_session_keys: dict[str, float] = {}
+_ERASED_SESSION_KEYS_MAX = 1000
+
+
 def _update_session_entry(session_key: str, entry: dict) -> None:
     with _state_lock:
-        state = _load_state()
-        state[session_key] = entry
-        _save_state(state)
+        erased = session_key in _erased_session_keys
+        if not erased:
+            state = _load_state()
+            state[session_key] = entry
+            _save_state(state)
+    if erased:
+        _forget_claude_session(str((entry or {}).get("session_id") or ""))
 
 
 def _session_lock_for(session_key: str) -> threading.Lock:
@@ -5991,6 +6005,11 @@ def _delete_conversation(cid: str) -> bool:
                 continue
     session_key = CONV_SESSION_KEY_PREFIX + cid
     with _state_lock:
+        # Marked before the entry goes, under the same lock the late write
+        # takes, so no in-flight turn can slip its record in between.
+        _erased_session_keys[session_key] = time.time()
+        while len(_erased_session_keys) > _ERASED_SESSION_KEYS_MAX:
+            _erased_session_keys.pop(next(iter(_erased_session_keys)))
         state = _load_state()
         entry = state.pop(session_key, None)
         if entry is not None:

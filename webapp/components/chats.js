@@ -481,6 +481,8 @@ class RetinueChats extends RetinueCard {
                       -webkit-touch-callout: none; }
       li.swipe .row:hover { background: var(--card-2, #1c2230); }
       li.swipe.busy .row { opacity: .5; }
+      /* visibility, not just the row on top: a hidden shelf's buttons also
+         leave the tab order, and an open one's are all reachable by Tab. */
       .quick, .shelf { position: absolute; top: 0; bottom: 0; display: flex;
                        align-items: stretch; visibility: hidden; }
       li.show-quick .quick, li.show-shelf .shelf { visibility: visible; }
@@ -597,7 +599,7 @@ class RetinueChats extends RetinueCard {
       // dashboard card is a glance, not a place to curate.
       const act = (label, set, title) =>
         `<button type="button" class="${set}" data-flag="${esc(c.id)}" data-set="${set}" ` +
-        `title="${title}" tabindex="-1">${label}</button>`;
+        `title="${title}">${label}</button>`;
       const shelf = archived
         ? act('Restore', 'restore', 'Put this chat back in the list') +
           (c.muted
