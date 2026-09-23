@@ -1265,19 +1265,54 @@ def _list_groups() -> list[dict]:
     return groups
 
 
+# Group id → display name, refreshed from the roster at most every
+# _GROUP_NAMES_TTL seconds (a rename shows up within that window), and on a
+# miss at most every _GROUP_NAMES_MISS_RETRY seconds (a freshly joined group
+# gets its name quickly without a signal-cli call per message from an id the
+# roster does not know).
+_GROUP_NAMES_TTL = 600.0
+_GROUP_NAMES_MISS_RETRY = 60.0
+_group_names: dict[str, str] = {}
+_group_names_at = float("-inf")  # never refreshed: the first lookup always fetches
+_group_names_lock = threading.Lock()
+
+
 def _resolve_group_name(group_id: str) -> str | None:
     """Look up a group's display name from the account's groups roster.
 
     Returns None on a miss (a stale id, or the roster call itself failing) so
     callers can fall back to the raw id rather than erroring.
     """
-    try:
-        for group in _list_groups():
-            if group.get("id") == group_id:
-                return group.get("name") or None
-    except Exception as exc:
-        print(f"[signal-gateway] could not resolve group name for {group_id}: {exc}", flush=True)
-    return None
+    global _group_names, _group_names_at
+    with _group_names_lock:
+        age = time.monotonic() - _group_names_at
+        if age < _GROUP_NAMES_TTL and (group_id in _group_names
+                                       or age < _GROUP_NAMES_MISS_RETRY):
+            return _group_names.get(group_id)
+        # Stamp the attempt, not the success: a failing signal-cli is then
+        # retried on the same throttle as a miss, and the last good map stays.
+        _group_names_at = time.monotonic()
+        try:
+            _group_names = {g["id"]: g["name"] for g in _list_groups() if g.get("name")}
+        except Exception as exc:
+            print(f"[signal-gateway] could not resolve group name for {group_id}: {exc}", flush=True)
+        return _group_names.get(group_id)
+
+
+def _notify_chat_event_async(group_id: str | None = None, **kwargs) -> None:
+    """Chats-rail POST with the group's display name, off the hot path.
+
+    The name lookup may shell out to signal-cli (and wait on its lock), so it
+    runs on the rail's own daemon thread together with the POST — the gateway's
+    persist → gate → forward path is never delayed by it."""
+    if not _chats.chats_enabled():
+        return
+
+    def _send() -> None:
+        name = _resolve_group_name(group_id) if group_id else None
+        _chats.notify_chat_event(chat_name=name, **kwargs)
+
+    threading.Thread(target=_send, name="chats-rail", daemon=True).start()
 
 
 # --- Recent-senders store ----------------------------------------------------
@@ -1463,7 +1498,8 @@ def _record_sync_sent(sent: dict) -> None:
     if SIGNAL_GATEWAY_MODE == "inbox":
         # Chats rail: an own-device send advances the chat's read watermark on
         # the dashboard (the user was visibly in that chat on their phone).
-        _chats.notify_chat_event_async(
+        _notify_chat_event_async(
+            group_id=str(group_id) if group_id else None,
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
             account=SIGNAL_ACCOUNT, author="device", message_id=msg_id,
             ts=(int(ts) / 1000.0) if ts else None, text=text,
@@ -1669,6 +1705,10 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         sender=sender, sender_name=sender_name, group=is_group,
         message_id=message_id,
         ts=(int(message_id) / 1000.0) if (message_id or "").isdigit() else None,
+        # The group's own name, so the chat is titled as on the user's phone
+        # (cached roster; see _resolve_group_name).
+        chat_name=(_resolve_group_name(group_id)
+                   if is_group and _chats.chats_enabled() else None),
         text=question, attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
               "vip": bool(gate.get("vip")),
