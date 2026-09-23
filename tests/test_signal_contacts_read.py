@@ -113,6 +113,31 @@ def test_group_name_first_lookup_right_after_boot():
     print("ok: first group-name lookup fetches even right after boot")
 
 
+def test_group_name_failed_refresh_is_throttled():
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(tmp)
+        roster = [{"id": "g-1", "name": "Family"}]
+        calls = []
+
+        def _fake(args):
+            calls.append(args)
+            if roster is None:
+                raise RuntimeError("signal-cli down")
+            return roster
+
+        sg._signal_cli_json = _fake
+        assert sg._resolve_group_name("g-1") == "Family"
+        # The TTL expires and signal-cli is failing: one attempt, then the
+        # attempt itself throttles further calls and the last map is kept.
+        sg._group_names_at -= sg._GROUP_NAMES_TTL + 1
+        roster = None
+        assert sg._resolve_group_name("g-1") == "Family"
+        assert sg._resolve_group_name("g-1") == "Family"
+        assert sg._resolve_group_name("g-other") is None
+        assert len(calls) == 2, calls
+    print("ok: a failing roster refresh is throttled and keeps the last names")
+
+
 def test_chat_event_carries_group_name():
     with tempfile.TemporaryDirectory() as tmp:
         sg = _load_signal_gateway(tmp)
@@ -216,6 +241,7 @@ def main():
     test_list_groups_normalizes_fields()
     test_group_name_resolution_is_cached()
     test_group_name_first_lookup_right_after_boot()
+    test_group_name_failed_refresh_is_throttled()
     test_chat_event_carries_group_name()
     test_signal_cli_json_nonzero_raises()
     test_recent_senders_recorded_most_recent_first()

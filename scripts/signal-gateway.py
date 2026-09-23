@@ -1284,9 +1284,11 @@ def _resolve_group_name(group_id: str) -> str | None:
         if age < _GROUP_NAMES_TTL and (group_id in _group_names
                                        or age < _GROUP_NAMES_MISS_RETRY):
             return _group_names.get(group_id)
+        # Stamp the attempt, not the success: a failing signal-cli is then
+        # retried on the same throttle as a miss, and the last good map stays.
+        _group_names_at = time.monotonic()
         try:
             _group_names = {g["id"]: g["name"] for g in _list_groups() if g.get("name")}
-            _group_names_at = time.monotonic()
         except Exception as exc:
             print(f"[signal-gateway] could not resolve group name for {group_id}: {exc}", flush=True)
         return _group_names.get(group_id)
@@ -1700,7 +1702,8 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         ts=(int(message_id) / 1000.0) if (message_id or "").isdigit() else None,
         # The group's own name, so the chat is titled as on the user's phone
         # (cached roster; see _resolve_group_name).
-        chat_name=_resolve_group_name(group_id) if is_group else None,
+        chat_name=(_resolve_group_name(group_id)
+                   if is_group and _chats.chats_enabled() else None),
         text=question, attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
               "vip": bool(gate.get("vip")),
