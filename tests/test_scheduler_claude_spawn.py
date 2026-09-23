@@ -4,10 +4,11 @@
 A prompt job spawns a fresh `claude -p`. Before it does, the scheduler
 refreshes an access token about to expire under the lock every framework
 spawner shares (scripts/claude_auth.py) — once, ahead of the spawn — so the
-session never starts with a refresh that races the gateway's turns or the
-remote-control session for the token rotation. A command job runs a shell
-command, which refreshes for itself if it spawns `claude` (the base-job
-scripts do), so the scheduler must not do it there.
+session never starts with a refresh that races the gateway's turns or another
+job for the token rotation. A command job gets the same refresh: its script
+may spawn `claude` itself, and when that script belongs to a chamber it cannot
+be required to know about claude_auth — one unguarded spawn near expiry is
+enough to sign the deployment out.
 
 Every job — prompt or command — gets the allowlisted environment from
 scripts/session_env.py rather than a copy of the daemon's, which is forked
@@ -132,11 +133,13 @@ def test_prompt_job_refreshes_once_before_spawning(sched, tmp):
     assert "[auth] ask: access token refreshed before spawn" in log, log
 
 
-def test_command_job_does_not_refresh(sched, tmp):
+def test_command_job_refreshes_too(sched, tmp):
     events, _ = _install_fakes(sched)
     sched.run_job({"id": "fetch", "command": "true", "interval_seconds": 60,
                    "_source": str(tmp / "chambers" / "x" / ".schedule.json")})
-    assert events == [("spawn", "true")], events
+    assert events == [("refresh",), ("spawn", "true")], events
+    log = (tmp / "state" / "scheduler.log").read_text()
+    assert "[auth] fetch: access token refreshed before spawn" in log, log
 
 
 def test_job_env_is_the_allowlist(sched):
@@ -169,7 +172,7 @@ def main():
         tmp = Path(td)
         sched = _load_scheduler(tmp)
         test_prompt_job_refreshes_once_before_spawning(sched, tmp)
-        test_command_job_does_not_refresh(sched, tmp)
+        test_command_job_refreshes_too(sched, tmp)
         test_job_env_is_the_allowlist(sched)
         test_every_job_is_spawned_with_the_allowlisted_env(sched, tmp)
     print("all scheduler claude-spawn tests passed")

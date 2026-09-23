@@ -25,6 +25,7 @@ class FakeNotifier:
         self.fail = fail
         self.opened = []    # (title, message)
         self.appended = []  # (thread_id, message)
+        self.quiet_flags = []  # one per append, in order
 
     def open_thread(self, title, message):
         if self.fail:
@@ -32,10 +33,11 @@ class FakeNotifier:
         self.opened.append((title, message))
         return f"thread-{len(self.opened)}"
 
-    def append(self, thread_id, message):
+    def append(self, thread_id, message, quiet=False):
         if self.fail:
             return False
         self.appended.append((thread_id, message))
+        self.quiet_flags.append(quiet)
         return True
 
 
@@ -106,6 +108,7 @@ def test_escalation_appends_immediately():
     assert len(n.appended) == 1 and "escalated" in n.appended[0][1]
     e.step(BROKEN, now=600 + 7 * 3600)
     assert len(n.appended) == 2 and "Reminder" in n.appended[1][1]
+    assert n.quiet_flags == [False, False]
 
 
 def test_recovery_reports_in_same_thread_and_resets():
@@ -115,6 +118,9 @@ def test_recovery_reports_in_same_thread_and_resets():
     e.step(BROKEN, now=300)
     e.step(OK, now=600)
     assert len(n.appended) == 1 and "healthy again" in n.appended[0][1]
+    # The all-clear is a record, not news: it must not wake an archived
+    # thread or push the user who just fixed it.
+    assert n.quiet_flags == [True]
     # A later incident is a new thread with fresh debounce.
     e.step(BROKEN, now=1000)
     assert len(n.opened) == 1

@@ -6,7 +6,15 @@
 // the dashboard cap and adds an Active/Archived filter, like the conversations
 // page. Archived chats are excluded everywhere else; `muted` only changes the
 // badge treatment here (its real meaning — no Web Push, and no un-archive on a
-// new inbound message — is the server's, once the live chat API exists).
+// new inbound message — is the server's).
+//
+// Each row on the full page carries the two things one does to a chat that is
+// in the way, which are not the same thing: **Archive** puts it away until it
+// speaks again, **Mute** puts it away and keeps it there. Muting archives, so
+// both land in the Archived tab, and **Restore** undoes either. That is the
+// dashboard-conversation model verbatim, and it is what replaced a sender
+// blacklist: not wanting to hear from someone is a chat one mutes, on the chat,
+// in front of the user — not a list only Ara can edit.
 //
 // The list comes from the gateway's GET /chats (the default `src`, still
 // overridable by attribute) — SPARQL over the message ledgers merged with the
@@ -103,6 +111,11 @@ class RetinueChats extends RetinueCard {
   connectedCallback() {
     this._full = this.hasAttribute('full');
     this._scope = 'active';  // full-mode filter: active | archived
+    // Bumped by a flag write. A refresh that began before one is stale by the
+    // time it answers — it carries the pre-hide list — and rendering it would
+    // put the row back and flip the button to the wrong inverse until the next
+    // poll. The epoch is how such an answer is recognised and dropped.
+    this._epoch = 0;
     // Crossing the layout breakpoint changes how many rows fit (cap vs all).
     this._offFrame = onFrameChange(() => {
       if (this._data) this.renderState({ state: 'ok', data: this._data });
@@ -125,10 +138,15 @@ class RetinueChats extends RetinueCard {
   // reconcile. Only a failure with nothing rendered yet shows the offline
   // state.
   async load() {
+    const epoch = this._epoch;
     try {
       const res = await fetch(this.dataUrl, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
+      // A hide or unhide landed while this was in flight: this answer predates
+      // it and would undo it on screen. The write already re-rendered, and the
+      // next tick fetches the list as it now is.
+      if (epoch !== this._epoch) return;
       // Re-render only when the list actually changed — a rebuild would reset
       // the region's scroll and the filter wiring for nothing.
       const sig = JSON.stringify(data.chats || []);
@@ -140,8 +158,8 @@ class RetinueChats extends RetinueCard {
     }
   }
 
-  // RetinueCard renders static content; the full page's scope filter is the
-  // one interactive control, wired after each render.
+  // RetinueCard renders static content; the full page's scope filter and its
+  // per-row shelf buttons are the interactive parts, wired after each render.
   renderState(s) {
     super.renderState(s);
     this.shadowRoot.querySelectorAll('[data-scope]').forEach((el) =>
@@ -151,12 +169,68 @@ class RetinueChats extends RetinueCard {
         this._scope = scope;
         if (this._data) this.renderState({ state: 'ok', data: this._data });
       }));
+    this.shadowRoot.querySelectorAll('[data-flag]').forEach((el) =>
+      el.addEventListener('click', () => this._setFlags(
+        el.getAttribute('data-flag'), el.getAttribute('data-set'))));
+  }
+
+  // Three actions over the same two flags, exactly as a conversation has:
+  //
+  //   Archive  out of the list, until the chat speaks again
+  //   Mute     out of the list, and the next message does not bring it back
+  //   Restore  back in the list, and speaking again
+  //
+  // Muting archives — the server's rule, not this button's — so both ways out
+  // land in the same place and either is undone the same way. Whether a chat
+  // also reaches the Herald is the triage policy's business and not this
+  // button's: the two are independent, so a chat can be a news source and
+  // still sit in the list.
+  async _setFlags(id, action) {
+    const FLAGS = {
+      archive: { archived: true },
+      mute: { muted: true },
+      restore: { archived: false, muted: false },
+    };
+    const flags = FLAGS[action];
+    if (!id || !flags || this._flagging) return;
+    this._flagging = true;
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(id)}/flags`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(flags),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      // Take the flags back from the answer rather than assuming them: muting
+      // archives server-side, and this way the rule lives in one place.
+      const doc = await res.json();
+      const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
+      if (chat) { chat.archived = !!doc.archived; chat.muted = !!doc.muted; }
+      this._sig = '';
+      // Any refresh already on the wire answers from before this write.
+      this._epoch += 1;
+      if (this._data) this.renderState({ state: 'ok', data: this._data });
+    } catch (_err) {
+      // Left as it was; the row stays where it is and the next tap can retry.
+    } finally {
+      this._flagging = false;
+    }
   }
 
   css() {
     return `
       ul.list { gap: 4px; }
       li { margin: 0; }
+      /* A row with an action beside it: the link keeps the whole width it had,
+         the button takes its own. */
+      li.actionable { display: flex; align-items: center; gap: 2px; }
+      li.actionable .row { flex: 1; min-width: 0; }
+      .row-act { flex: none; border: 0; border-radius: 999px; padding: 6px 9px;
+                 background: transparent; color: var(--muted, #8b93a3); cursor: pointer;
+                 font: inherit; font-size: .74rem; white-space: nowrap;
+                 -webkit-tap-highlight-color: transparent; }
+      .row-act:hover { background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
+      .row-act:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 1px; }
       .row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
              grid-template-rows: auto auto; align-items: center; column-gap: 10px; row-gap: 1px;
              padding: 8px 10px; border-radius: 12px; text-decoration: none; color: var(--fg, #e7ebf2);
@@ -219,7 +293,8 @@ class RetinueChats extends RetinueCard {
     // guarantee client-side too, so a hand-edited fixture cannot scramble it.
     all.sort((a, b) => String((b.last || {}).ts || '').localeCompare(String((a.last || {}).ts || '')));
     // Archived chats leave the card and the Active list; the full page's
-    // Archived filter is where they remain reachable.
+    // Archived filter is where they remain reachable — and where Restore puts
+    // them back.
     const archived = this._full && this._scope === 'archived';
     const chats = all.filter((c) => !!c.archived === archived);
     if (!chats.length) {
@@ -249,7 +324,22 @@ class RetinueChats extends RetinueCard {
         ? `<span class="pv-draft">${c.draft.author === 'agent'
           ? `Draft by ${esc(c.draft.agent || 'Ara')}` : 'Draft'}:</span> ${esc(c.draft.text)}`
         : previewHtml(c);
-      return `<li><a class="row${c.unread ? ' has-unread' : ''}" ` +
+      // The action sits BESIDE the row, never inside it: a row is a link, and
+      // a button within a link is not a button. Only on the full page — the
+      // dashboard card is a glance, not a place to curate.
+      const act = (label, set, title) =>
+        `<button class="row-act" data-flag="${esc(c.id)}" data-set="${set}" ` +
+        `title="${title}">${label}</button>`;
+      const acts = !this._full ? ''
+        : archived
+          ? act('Restore', 'restore', 'Put this chat back in the list') +
+            (c.muted ? '' : act('Mute', 'mute',
+                                'Keep it out of the list, even when it speaks'))
+          : act('Archive', 'archive', 'Out of the list until the next message') +
+            act('Mute', 'mute',
+                'Out of the list, and the next message does not bring it back');
+      return `<li${this._full ? ' class="actionable"' : ''}>` +
+        `<a class="row${c.unread ? ' has-unread' : ''}" ` +
         `href="/chat.html?id=${encodeURIComponent(c.id)}">` +
         `${avatarHtml(c)}` +
         `<span class="name">${esc(c.name)}` +
@@ -263,7 +353,7 @@ class RetinueChats extends RetinueCard {
         `<span class="when">${esc(fmtAge((c.last || {}).ts))}</span>` +
         `<span class="prev">${prev}</span>` +
         badge +
-        `</a></li>`;
+        `</a>${acts}</li>`;
     }).join('');
     return `${this._filterHtml()}<ul class="list">${rows}</ul>${this._footHtml()}`;
   }

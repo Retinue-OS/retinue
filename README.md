@@ -529,8 +529,9 @@ that gap:
   minute. After two consecutive failures it notifies the user through the
   existing inbound-message mechanism — a dashboard conversation, which Web-
   Pushes the user's devices like any incoming message — linking to the
-  re-pairing page. It reminds every 6 h while the outage lasts and reports the
-  recovery in the same thread. Tunables (all optional):
+  re-pairing page. It reminds every 6 h while the outage lasts and records the
+  recovery in the same thread quietly (no push, no unread badge; an archived
+  thread stays archived). Tunables (all optional):
   `GATEWAY_MONITOR_INTERVAL`, `GATEWAY_MONITOR_FAILURES`,
   `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
   slugs to skip, e.g. a deliberately unlinked channel). It watches the same
@@ -579,6 +580,19 @@ CALDAV_READ_DEFAULT_DAYS=30 # optional: window a read covers when it names no en
 CALDAV_READ_MAX_EVENTS=500  # optional: cap on events per read response (not per query)
 ```
 
+The containers run on UTC, so a deployment whose owner does not should name its
+zone — the approval page and the `/sends` index render every event time in it:
+
+```bash
+RETINUE_DISPLAY_TZ=Europe/Zurich   # optional; falls back to TZ, then UTC
+```
+
+This is presentation only: it changes how a stored time is *shown*, never what
+is written. An event that carries a UTC offset is converted into this zone and
+labelled with it ("Fri 18 Sep 2026, 18:00 CEST"); a time written without an
+offset is taken as already local and labelled with none. An unknown zone name
+falls back to UTC rather than failing the page.
+
 Like the messenger gateways, `CALDAV_ACCOUNT` is a property of the *gateway
 instance*, not of any request — one service writes to one calendar. A
 deployment wanting a second calendar (say, a dedicated "agenda reminders"
@@ -611,6 +625,19 @@ scripts/caldav-push.py "Dentist" --start 2026-09-03T14:00:00 --end 2026-09-03T14
 scripts/caldav-push.py "Conference" --start 2026-09-10 --end 2026-09-12 --all-day \
     --description "Keynote at 9am"
 ```
+
+The approval card describes the **event**, not a message: its title, when it
+runs (a same-day event as `Thu 03 Sep 2026, 14:00 – 14:30`, an all-day one as a
+span of days through its last covered day), which calendar it would land in,
+and its description — a pending write is only approvable if the user can see
+what would be written — naming the calendar the write would actually land in
+(the request's own target, else the configured `CALDAV_CALENDAR_ID`). Under it
+the card reads back **what is already in the calendar** on those days through
+the same `GET /events` endpoint, account-wide (`calendar_id=*`, since "am I
+free?" is not a single calendar's answer), with anything sharing time with the
+proposal marked `overlaps`, so a double booking is visible without leaving the
+page. The read is bounded in time and size and a calendar that cannot be read
+says so, with the write still approvable or deniable.
 
 Approval is **asynchronous**, same as the messenger gateways: the gateway
 answers `status: sending` immediately and writes in the background, so a slow

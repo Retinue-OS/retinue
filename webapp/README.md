@@ -12,8 +12,9 @@ a Progressive Web App on the phone home screen.
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
   buttons on quotes and code, click-to-fill chips, attachments, model and
   cost meta), the pending state while Ara answers, the composer with text,
-  file attachments and voice dictation, the model picker, and the read-aloud
-  player (`<retinue-read-aloud>`, its bar, placeable by any host). Given a
+  file attachments (picked or pasted) and voice dictation, the model picker,
+  and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
+  any host). Given a
   `conversation-id` it reads, polls and replies; given `for-project` and no
   id it is the composer whose first message opens the thread, then goes on
   as it. It reports outward with events (`retinue-back`,
@@ -22,7 +23,10 @@ a Progressive Web App on the phone home screen.
   instance, so a thread left and reopened has its text, and a reading goes
   on. A host can shape the frame without forking the thread: `bar="none"` or
   `bar="actions"` for a header of its own, `stamp="clock"` beside a
-  clock-stamped timeline, and `create-url` where the thread belongs to
+  clock-stamped timeline, `no-autofocus` where the host keeps it mounted
+  whether or not it is on screen (taking focus scrolls the element into view,
+  which on the chat page's phone strip is a tab switch), and `create-url`
+  where the thread belongs to
   something else and is minted by that thing's endpoint rather than opened by
   the first message. It takes `fill(text)` (into the composer, for the user to
   send) and `ask(text)` (send now, for a host whose control is the send
@@ -132,7 +136,13 @@ docstring). Pieces:
 - `components/chats.js` — the Chats card on the dashboard and, with `full`,
   the whole `chats.html` page: avatar, channel mark, last-message preview,
   unread badge, non-archived chats ordered by last activity; the full page
-  adds an Active/Archived filter like the conversations page. In the wide
+  adds an Active/Archived filter like the conversations page and, beside each
+  row (`POST /chats/<id>/flags`), the two things one does to a chat that is in
+  the way: **Archive** (out of the list until it speaks again) and **Mute**
+  (out of the list, and the next message does not bring it back). Muting
+  archives — the server's rule — so both land under *Archived*, where
+  **Restore** undoes either. The dashboard card stays a glance and carries
+  none of it. In the wide
   layout the card has its own fixed-height region above the conversations
   (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
   (`data-splitter="chats"`). The card refreshes on an ambient cadence and
@@ -142,7 +152,8 @@ docstring). Pieces:
   author on every outbound bubble (you / Ara / your phone), inline media
   (images with a lightbox, voice-note and video players — see the Message
   contract below), a live composer (send, shared draft, one-tap clear ✕,
-  dictation, image attach with client-side downscale), quick-pattern chips,
+  dictation, image attach — picked or pasted — with client-side downscale),
+  quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
   splitter on a wide screen. The composer row is the conversation composer's
   row: mic on the left, send on the right, both always there, and the paperclip
@@ -175,7 +186,9 @@ docstring). Pieces:
   dropping the title (the bar above names the pane) and Archive (a companion
   is not filed away separately from its chat); `stamp="clock"` matches the
   mirror beside it. A chip is a canned turn the page hands the element
-  (`ask`), exactly as if the user had typed it. The two rails meet in the shared draft — Ara
+  (`ask`), exactly as if the user had typed it — **Propose** being the manual
+  form of what a forwarded arrival now runs by itself, so the pane may already
+  carry Ara's note on a message before the user asks anything. The two rails meet in the shared draft — Ara
   stages a reply, the chat poll adopts it into the composer marked as hers
   — into an empty box, or over the text she was asked to rework, whenever
   nothing unsaved is in it (unsaved keystrokes meet the newer draft at
@@ -200,20 +213,45 @@ The API, as the components consume it:
 
   `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
-  is the shared draft `{text, author, agent?, ts, version}` or null,
+  is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
-  until one exists), and
+  until one exists).
+
+  Nothing here says whether Ara works a message on arrival: that follows the
+  **sender** (their VIP flag in the triage policy), not the chat, so it holds
+  wherever that person writes. See `docs/triage-delivery-gate.md`.
+
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
   dashboard-conversation semantics verbatim: an archived chat leaves the card
   and the Active list (the full page's Archived filter keeps it reachable),
   and a new inbound message **un-archives** an archived chat unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
-  that chat's Web Push and keeps an archived chat archived; as with
-  conversations, the Archive button leaves `muted` untouched, while "archive
-  this chat" said to Ara sets both. No pinning yet: favourites-on-top would
-  be a later `pinned` flag, deliberately deferred. A store outage answers an
-  honest 502 (the page shows it; the card keeps its last state).
+  that chat's Web Push and keeps an archived chat archived; setting it also
+  sets `archived`, so a caller never has to send both. `POST
+  /chats/<id>/flags` (body `{archived?, muted?}`, either or both) is the one
+  way in, and the answer carries the flags as they ended up — a client reads
+  them back rather than assuming what it asked for.
+
+  These two flags replaced the messenger **sender blacklist**: not wanting to
+  hear from someone is a chat one mutes, in the interface, on the chat one is
+  looking at — not an entry in a policy file only Ara can edit. (E-mail keeps
+  its own whitelist, which decides something else: frequent versus daily
+  triage on a pull channel.) Ara can set either flag too, through the same
+  endpoint, but the user never has to go through her.
+
+  Both are **independent of the triage delivery gate**, on purpose. Whether a
+  group's messages are filed to the news feed for the Herald, and whether they
+  are worth a model turn, is the policy's business (`scripts/triage_policy.py`
+  `news-add` / `ignore-add`, see `docs/triage-delivery-gate.md`); whether the
+  user wants the chat in their list is this flag's. A subscribed channel one
+  keeps only for its content is `news` + `ignored` **and** muted — three
+  separate statements, because a list one both reads as news and answers in is
+  `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
+  be a later `pinned` flag, deliberately deferred. A store outage is answered
+  from the last good list for up to `CHAT_LIST_STALE_SECONDS` (10 min by
+  default), then with an honest 502 (the page shows it; the card keeps its
+  last state).
 - `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
   [Message]}`, ascending by `ts`, the newest page by default;
   `?before=<ISO ts>` pages older history (the page renders the newest page —
@@ -254,8 +292,11 @@ The API, as the components consume it:
   attachments with proxied URLs and their sniffed dimensions. The client
   downscales picked photos before upload — longest edge 1600 px, JPEG — as
   the native clients do; animated GIFs pass through unchanged under the size
-  cap. A failed image send keeps the staged previews (and the text) in the
-  composer for retry.
+  cap. An image pasted into the text box (a screenshot, a picture copied off
+  a page) is staged exactly as a picked one, through the shared
+  `components/clipboard.js`, and the words of a paste that also carries text
+  still land in the box. A failed image send keeps the staged previews (and
+  the text) in the composer for retry.
 
   **The send honours the account's send policy rather than skipping it.** The
   message goes to the gateway as author `user` — provenance, nothing more —

@@ -12,7 +12,26 @@ direct user-send contract and serving token-gated media). Covers:
 - the notify rail (POST /internal/chats/inbound): open-vs-token auth, the
   un-archive-unless-muted rule, held-gate and muted silence, push mode
   new-vs-reply, and echoes advancing the read watermark;
+- the forward path landing in the chat, not in triage: an arrival whose caller
+  offers to hand it over is accepted — the chat has it, the gateway stops, held
+  classes included — and a turn runs on top of that only for a **VIP sender**,
+  which is a fact about the person and holds in a group exactly as in a 1:1;
+  the turn's prompt carries the arrival's own text (delimited as data) and the
+  chat note, asks for the message to be filed as well as answered, and never
+  asks the user to rule on a correspondent, while a non-VIP, an event with no
+  handover and a switched-off rail run no turn (and the last answers nothing at
+  all, so the gateway keeps its own forward), the same
+  message id is only ever worked once however often the rail delivers it,
+  arrivals during a turn fold into one follow-up without losing a job, a reply
+  that could not be stored fails its job rather than reporting delivery, and
+  the turn pushes nothing the arrival has already pushed;
 - the read watermark, the version-guarded draft (409), agent staging;
+- POST /chats/<id>/flags: archiving takes a chat out of the list and an
+  arrival brings it back, muting archives it in the same breath and keeps it
+  out however busy it gets, un-muting leaves it archived, restoring clears
+  both, and a non-boolean is refused; and a mute racing an arrival never
+  half-applies (the server is threaded, so the un-archive decides under the
+  state lock rather than from a snapshot);
 - POST /chats/<id>/companion: idempotent create-or-get, the id surfacing on the
   ChatSummary, and the thread staying out of the default conversation list;
 - POST /chats/<id>/send: the message reaches the gateway as author "user"
@@ -21,12 +40,15 @@ direct user-send contract and serving token-gated media). Covers:
   draft clears,
   the watermark advances, and the sent message is returned and visible in the
   merged view before the store knows it (the overlay);
-- honest 502 when the life store is down — no raw fallback.
+- the life store down: the last good list is served for a bounded while
+  (reads made meanwhile still clear badges), then an honest 502 — never a raw
+  fallback.
 
 Standalone (stdlib + the gateway module's own deps):
 
     python3 tests/test_chat_api.py
 """
+import base64
 import importlib.util
 import json
 import os
@@ -58,6 +80,9 @@ ACCT_A = "+41791112233"   # the mock gateway's own account
 ACCT_B = "+41764445566"   # a second, unregistered account of the same channel
 # Its own peer, untouched by the other tests' sends and overlay entries.
 MERGE_PEER = "+41791230000"
+# A peer of the store-outage test alone, so its unread count is never read
+# down by another test first (see test_store_down_serves_recent_list).
+STALE_PEER = "+41791239999"
 MID_ATT = "ab" * 16   # recorded as a host-free urn:retinue:media:… (today's shape)
 MID_ATT2 = "cd" * 16  # the blob the mock gateway "stores" for an images send
 MID_ATT3 = "ef" * 16  # a legacy http://<service>/media/<id> record on disk
@@ -123,7 +148,9 @@ class _MockSparql(BaseHTTPRequestHandler):
         if "VALUES (?chat ?account ?cut)" in query:
             bindings = self._unread(query)
         elif "MAX(?ts0)" in query:
-            bindings = self._chat_list()
+            bindings = self._chat_heads()
+        elif "VALUES ?m {" in query:
+            bindings = self._records(query)
         elif "VALUES ?att" in query:
             bindings = self._media_meta(query)
         else:
@@ -143,6 +170,11 @@ class _MockSparql(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    # The canned chat list: one row per chat with its latest message, in the
+    # flat shape the tests author (and override via STATE["list_rows"]). The
+    # gateway reads the list in two queries — the head message per chat, then
+    # the heads' records as (m, p, o) rows — so both are derived from here:
+    # row i heads the mock message IRI urn:mock:head:<i>.
     def _chat_list(self):
         if STATE.get("list_rows") is not None:
             return STATE["list_rows"]
@@ -153,6 +185,43 @@ class _MockSparql(BaseHTTPRequestHandler):
             _lit_row(chat=WA_KEY, channel="whatsapp", ts=W_TS, type=T_IN,
                      text="Letzter Aufruf", sender="4176", atts=""),
         ]
+
+    @staticmethod
+    def _head_iri(index):
+        return f"urn:mock:head:{index}"
+
+    def _chat_heads(self):
+        return [_lit_row(m=self._head_iri(i), chat=row["chat"]["value"],
+                         account=(row.get("account") or {"value": ""})["value"],
+                         ts=row["ts"]["value"])
+                for i, row in enumerate(self._chat_list())]
+
+    def _records(self, query):
+        """The (m, p, o) rows of the asked-for head messages, from the flat
+        canned rows — one attachment row per URL, as the ledger holds them."""
+        import re
+        asked = set(re.findall(r"<([^>]+)>", query.split("VALUES ?m {", 1)[1].split("}", 1)[0]))
+        rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+        flat = {"channel": KB + "channel", "text": KB + "text",
+                "sender": KB + "sender", "author": KB + "author",
+                "mid": KB + "messageId", "type": rdf_type}
+        out = []
+        for i, row in enumerate(self._chat_list()):
+            m = self._head_iri(i)
+            if m not in asked:
+                continue
+            for key, predicate in flat.items():
+                if key in row:
+                    out.append(_lit_row(m=m, p=predicate, o=row[key]["value"]))
+            ts_pred = KB + ("sentAt" if row.get("type", {}).get("value") == T_OUT
+                            else "receivedAt")
+            out.append(_lit_row(m=m, p=ts_pred, o=row["ts"]["value"]))
+            if (row.get("account") or {}).get("value"):
+                out.append(_lit_row(m=m, p=KB + "account", o=row["account"]["value"]))
+            for url in (row.get("atts") or {"value": ""})["value"].split(" "):
+                if url:
+                    out.append(_lit_row(m=m, p=KB + "attachment", o=url))
+        return out
 
     def _media_meta(self, query):
         # What the gateways stated about their blobs, on the media IRIs: the
@@ -174,7 +243,8 @@ class _MockSparql(BaseHTTPRequestHandler):
         rows = re.findall(
             r'\("((?:[^"\\]|\\.)*)"\s+"((?:[^"\\]|\\.)*)"\s+"([^"]+)"\^\^', query)
         counts = {(MARA, ""): "2", (WA_KEY, ""): "1",
-                  (MERGE_PEER, ACCT_A): "2", (MERGE_PEER, ACCT_B): "1"}
+                  (MERGE_PEER, ACCT_A): "2", (MERGE_PEER, ACCT_B): "1",
+                  (STALE_PEER, ""): "3"}
         return [_lit_row(chat=key, account=acct, n=counts[(key, acct)])
                 for key, acct, cut in rows
                 if (key, acct) in counts and cut.startswith("1970-")]
@@ -367,6 +437,12 @@ def _load_gateway(tmp: Path, sparql_port: int, gw_port: int):
     os.environ["CHAMBERS_DIR"] = str(tmp / "chambers")
     os.environ["WEB_GATEWAY_STATE"] = str(tmp / "state.json")
     os.environ["PUSH_DIR"] = str(tmp / "push")
+    os.environ["MESSAGE_FILES_DIR"] = str(tmp / "message-files")
+    # The lint shells out to `claude`; a companion turn now runs on every
+    # forwarded arrival, so leaving it on would have this suite spawning
+    # sessions. Its own behaviour is covered in
+    # tests/test_presentation_lint_deadlock.py.
+    os.environ["PRESENTATION_LINT"] = "0"
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
     if "markdown_it" not in sys.modules:
         try:
@@ -404,6 +480,44 @@ def _quote(chat_id):
 
 
 PUSHES: list = []
+# Model turns the gateway asked for, captured instead of spawning `claude`.
+# Every forwarded arrival now runs one, so without this the suite would try to
+# start sessions.
+TURNS: list = []
+# A test sets "hold" to an Event to stall turns inside send_message, which is
+# what lets the coalescing case observe a turn that is still running.
+TURN_GATE: dict = {"hold": None}
+
+
+def _stub_send_message(prompt, display_question=None, session_key=None,
+                       model=None, restart_message=None):
+    TURNS.append({"prompt": prompt, "question": display_question,
+                  "session": session_key})
+    hold = TURN_GATE.get("hold")
+    if hold is not None:
+        hold.wait(20)
+    return {"response": "Read it and staged a reply in the composer.",
+            "model_name": "stub-model", "cost_usd": 0.0}
+
+
+def _await_job(base, job_url, timeout=20):
+    """Poll a job handle the way the messenger gateways' job_delivery does."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, body = _http(base, "GET", job_url)
+        if status == 200 and body.get("status") != "pending":
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_url} never resolved")
+
+
+def _wait_for(pred, what, timeout=20):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"never happened: {what}")
 
 
 def test_chat_list_contract(base, wg):
@@ -446,9 +560,10 @@ def test_chat_list_contract(base, wg):
 def test_chat_list_shows_media_preview(base, wg):
     """A picture-only last message previews as an image in the chat list.
 
-    Pins the list query's STR(?att) (see _MockSparql.do_POST): with the
-    aggregate unbound the preview reads as empty text, which is how every
-    chat with a last picture looked."""
+    The head message's attachments reach the skeleton as one records row each
+    (see _MockSparql._records) — when the list still read them through a
+    GROUP_CONCAT over IRIs, the aggregate came back unbound and every chat
+    with a last picture previewed as empty text."""
     STATE["list_rows"] = [
         _lit_row(chat=MARA, channel="signal", ts=TS3, type=T_IN, text="",
                  sender=MARA, atts=f"urn:retinue:media:signal:{MID_ATT}"),
@@ -610,6 +725,9 @@ def test_rail_auth_and_notifications(base, wg):
              "message_id": "e1", "text": "ciao!", "gateway": "127.0.0.1",
              "gate": {"forward": True, "reason": "whitelisted"}}
     status, body = _http(base, "POST", rail, event)
+    # No `handover`, so no turn: these events are about notification, and a
+    # caller that has not offered to hand the message over keeps it (see
+    # test_arrival_starts_a_companion_turn).
     assert status == 200 and body["pushed"] is True
     # First unread → mode "new"; the push targets the chat page.
     assert len(PUSHES) == 1
@@ -634,6 +752,7 @@ def test_rail_auth_and_notifications(base, wg):
                 gate={"forward": False, "reason": "blacklisted"})
     status, body = _http(base, "POST", rail, held)
     assert status == 200 and body["pushed"] is False and len(PUSHES) == n
+    assert "job_url" not in body, "a held message must not buy a model turn"
 
     # Muted silences; archived+muted stays archived. Archived alone un-archives.
     wg._CHAT_STATE.set_flags(cid, archived=True, muted=True)
@@ -954,6 +1073,11 @@ def test_unconfirmed_send_is_not_rendered_twice(base, wg):
 def test_companion_endpoint(base, wg):
     """The chat's linked conversation: created once, returned forever after."""
     path = "/chats/" + _quote(CHAT2) + "/companion"
+    # Chats that have had a forwarded arrival already have a companion of their
+    # own by now — the arrival turn opens one. What must hold is that opening
+    # this one changes nothing about them.
+    status, before = _http(base, "GET", "/chats")
+    others = {c["id"]: c["companion"] for c in before["chats"] if c["id"] != CHAT2}
     status, body = _http(base, "POST", path, {})
     assert status == 201, body
     cid = body["id"]
@@ -967,9 +1091,10 @@ def test_companion_endpoint(base, wg):
     status, chats = _http(base, "GET", "/chats")
     summary = next(c for c in chats["chats"] if c["id"] == CHAT2)
     assert summary["companion"] == cid
-    # Every other chat is unaffected.
-    other = next(c for c in chats["chats"] if c["id"] == CHAT1)
-    assert other["companion"] is None
+    # Every other chat is unaffected, and none of them was handed this thread.
+    after = {c["id"]: c["companion"] for c in chats["chats"] if c["id"] != CHAT2}
+    assert after == others, "opening one companion touched another chat"
+    assert cid not in others.values()
 
     # It is an ordinary conversation the dashboard drives through
     # /conversations — no second read API for companion threads.
@@ -989,6 +1114,270 @@ def test_companion_endpoint(base, wg):
     status, body = _http(base, "POST", "/chats/nothing/companion", {})
     assert status == 404, body
     print("PASS test_companion_endpoint")
+
+
+def test_arrival_starts_a_companion_turn(base, wg):
+    """The delivery gate's forward path: worked in the chat, not in triage.
+
+    A forwarded arrival used to leave the gateway to spawn a triage session
+    whose job was to open a dashboard conversation *about* the message. It now
+    starts a turn in the chat's own companion thread, and the rail answers 202
+    with that turn's job handle — the same contract POST /message answers with,
+    because it is what the gateway's never-drop machinery polls before it dares
+    flip the message's `delivered` flag.
+    """
+    rail = "/internal/chats/inbound"
+    chat = "telegram:777001"
+    PUSHES.clear()
+    TURNS.clear()
+    event = {"direction": "in", "channel": "telegram", "chat": "777001",
+             "sender": "777001", "sender_name": "Nina", "group": False,
+             "message_id": "a1", "text": "Passt Samstag 15 Uhr?",
+             "handover": True,
+             "gate": {"forward": True, "vip": False, "reason": "unknown"}}
+    # The same message from the same person, once the user has said they want
+    # to hear from them. Nothing else about it differs.
+    vip = lambda **kw: dict(event, gate=dict(event["gate"], vip=True), **kw)
+    # Not a VIP: the chat has the message and the user was pushed, both for no
+    # model turn at all. `accepted` is what tells the gateway to stop — the
+    # message is delivered, and it goes nowhere else.
+    status, body = _http(base, "POST", rail, event)
+    assert status == 200, body
+    assert body["accepted"] is True and "job_url" not in body, body
+    assert body["pushed"] is True
+    assert TURNS == [], "a message from nobody in particular bought a turn"
+
+    # A VIP's message is worked the moment it lands.
+    status, body = _http(base, "POST", rail, vip(message_id="a1b"))
+    assert status == 202, body
+    assert body["job_url"].startswith("/jobs/") and body["accepted"] is True, body
+
+    done = _await_job(base, body["job_url"])
+    assert done["status"] == "done", done
+    assert done["chat"] == chat
+
+    # Exactly one turn, and it ran in this chat's companion thread — the same
+    # thread the user types into when they ask Ara about the chat themselves.
+    assert len(TURNS) == 1, TURNS
+    status, chats = _http(base, "GET", "/chats")
+    summary = next(c for c in chats["chats"] if c["id"] == chat)
+    comp = summary["companion"]
+    assert "assist" not in summary, "a chat does not carry this; a sender does"
+    assert comp, "the arrival turn had nowhere to run"
+    assert TURNS[0]["session"] == f"conv:{comp}"
+
+    prompt = TURNS[0]["prompt"]
+    assert "A new message has arrived in this chat" in prompt
+    assert "Nina" in prompt
+    # The chat note rides along, so the turn reads the message in its
+    # conversation, sees the draft, and is told where its answer goes and who
+    # writes it — none of which the arrival head restates.
+    assert "Passt Samstag 15 Uhr?" in prompt
+    assert "chat-draft.py" in prompt and "secretary" in prompt
+    # And when a dashboard conversation is warranted, and when it is not.
+    assert "conversation-push.py" in prompt
+    # Answering is only part of it: what the user gets from a VIP turn is that
+    # the system knows what they were just told.
+    assert "memory.py store" in prompt and "project" in prompt
+
+    # Ara's note lands in the companion thread and notifies nobody a second
+    # time: the arrival already pushed, and one message is one notification.
+    status, conv = _http(base, "GET", f"/conversations/{comp}")
+    assert conv["messages"][-1]["role"] == "assistant"
+    assert "staged" in conv["messages"][-1]["text"]
+    # Two arrivals so far, two pushes: the turn added none of its own.
+    assert len(PUSHES) == 2, "the companion turn pushed on top of the arrivals"
+
+    # And it never asks the user to rule on a correspondent. Who is worth a
+    # turn was settled by the switch above; a thread asking it would be the
+    # per-message dashboard conversation this replaced, in a hat.
+    low = prompt.lower()
+    assert "whitelist" not in low and "blacklist" not in low, prompt
+
+    # The message itself is in the instruction, not only in the chat note the
+    # store builds: a store outage must not leave a turn answering about a
+    # message it never saw while its job still reports done.
+    assert "<external_message>" in prompt and "Passt Samstag 15 Uhr?" in prompt
+
+    # A held class is accepted like everything else — the mirror has it, so
+    # there is nothing left for a drain to sweep — but it notifies nobody and
+    # buys no turn.
+    TURNS.clear()
+    n = len(PUSHES)
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="a3", text="spam",
+                              gate={"forward": False, "vip": False,
+                                    "reason": "blacklisted"}))
+    assert status == 200 and body["accepted"] is True, body
+    assert "job_url" not in body and body["pushed"] is False
+    assert len(PUSHES) == n and TURNS == []
+
+    # It follows the person, not the room: the same VIP writing in a group is
+    # worked exactly as in a 1:1, and a non-VIP in that group is not.
+    TURNS.clear()
+    grp = {"direction": "in", "channel": "telegram", "chat": "-100777",
+           "group": True, "handover": True, "sender": "777001",
+           "sender_name": "Nina", "message_id": "g1", "text": "wer kommt mit?",
+           "gate": {"forward": True, "vip": True, "reason": "vip"}}
+    status, body = _http(base, "POST", rail, grp)
+    assert status == 202 and body["accepted"] is True, body
+    assert _await_job(base, body["job_url"])["status"] == "done"
+    assert len(TURNS) == 1, TURNS
+    TURNS.clear()
+    status, body = _http(base, "POST", rail,
+                         dict(grp, sender="777002", sender_name="Someone",
+                              message_id="g2",
+                              gate={"forward": True, "vip": False,
+                                    "reason": "unknown"}))
+    assert status == 200 and body["accepted"] is True and "job_url" not in body
+    assert TURNS == [], "the room is not the VIP; the person is"
+
+    # Nor does a forward from a caller that did not offer to hand the message
+    # over. That caller forwards it to triage itself whatever its gate says —
+    # every gateway built before this contract does, which is what a deployment
+    # runs between rebuilding the web-gateway and rebuilding the gateways — so
+    # a turn here would be the second handling of one message.
+    TURNS.clear()
+    no_handover = {k: v for k, v in event.items() if k != "handover"}
+    status, body = _http(base, "POST", rail, dict(no_handover, message_id="a3c"))
+    assert status == 200 and "job_url" not in body, body
+    assert body["pushed"] is True, "notification is not what is being withheld"
+    assert TURNS == []
+
+    # Both opt-ins are read strictly, because this is a JSON boundary and both
+    # are documented booleans. A truthy stand-in must not pass for either: the
+    # first would reintroduce the double handling the handover prevents, the
+    # second would spend a turn on somebody nobody named a VIP.
+    TURNS.clear()
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="s1", handover="true"))
+    assert status == 200 and "accepted" not in body, body
+    status, body = _http(base, "POST", rail,
+                         dict(event, message_id="s2",
+                              gate={"forward": True, "vip": 1,
+                                    "reason": "unknown"}))
+    assert status == 200 and body["accepted"] is True, body
+    assert "job_url" not in body, body
+    assert TURNS == []
+
+    # An event with no verdict at all is still taken — notification fails open
+    # — but nobody is a VIP by default, so no turn runs.
+    TURNS.clear()
+    no_gate = {k: v for k, v in event.items() if k != "gate"}
+    status, body = _http(base, "POST", rail, dict(no_gate, message_id="a3b"))
+    assert status == 200 and body["accepted"] is True, body
+    assert "job_url" not in body and body["pushed"] is True
+    assert TURNS == []
+
+    # One message, one turn — however often the rail delivers it. A gateway
+    # retries a POST whose answer was lost, and a ledger can redeliver a
+    # stanza; both must get the handle the first call minted back.
+    TURNS.clear()
+    status, first_delivery = _http(base, "POST", rail,
+                                   vip(message_id="dup1", text="hoi"))
+    status, again = _http(base, "POST", rail,
+                          vip(message_id="dup1", text="hoi"))
+    assert again["job_url"] == first_delivery["job_url"], (first_delivery, again)
+    assert _await_job(base, first_delivery["job_url"])["status"] == "done"
+    assert len(TURNS) == 1, TURNS
+
+    # What the message carried travels with it, so the turn can open it rather
+    # than answer a photo it never saw.
+    TURNS.clear()
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"0" * 32).decode()
+    status, body = _http(base, "POST", rail,
+                         vip(message_id="a4", text="schau mal",
+                              files=[{"filename": "x.png",
+                                      "content_type": "image/png",
+                                      "data": png}]))
+    assert _await_job(base, body["job_url"])["status"] == "done"
+    assert "image/png" in TURNS[0]["prompt"], TURNS[0]["prompt"][-400:]
+
+    # Messages arriving while a turn runs fold into one follow-up turn — a turn
+    # reads the chat as it stands, so a second one would re-read the first's
+    # messages and the two would overwrite each other's draft. Every arrival
+    # still gets its own handle, and the turn that covers it answers all of
+    # them: no message is ever reported delivered that no turn has seen.
+    TURNS.clear()
+    hold = threading.Event()
+    TURN_GATE["hold"] = hold
+    try:
+        first = _http(base, "POST", rail,
+                      vip(message_id="b1", text="eins"))[1]
+        _wait_for(lambda: len(TURNS) == 1, "the first turn to start")
+        rest = [_http(base, "POST", rail,
+                      vip(message_id=f"b{i}", text=str(i)))[1]
+                for i in (2, 3)]
+        assert all(r.get("job_url") for r in rest), rest
+        assert len(TURNS) == 1, "a second turn started while one was running"
+    finally:
+        hold.set()
+        TURN_GATE["hold"] = None
+    for handle in [first] + rest:
+        assert _await_job(base, handle["job_url"])["status"] == "done", handle
+    assert len(TURNS) == 2, TURNS
+
+    # A turn that fails resolves its jobs as errors, which is what leaves the
+    # message undelivered at the gateway for the daily drain to retry.
+    TURNS.clear()
+    wg.send_message = lambda *a, **k: {"error": "upstream is down"}
+    try:
+        status, body = _http(base, "POST", rail,
+                             vip(message_id="d1", text="hallo?"))
+        failed = _await_job(base, body["job_url"])
+        assert failed["status"] == "error", failed
+    finally:
+        wg.send_message = _stub_send_message
+
+    # So does a turn whose reply could not be stored. "Delivered" means a model
+    # turn accounted for the message; a reply that reached no thread accounts
+    # for nothing, however well the model answered.
+    TURNS.clear()
+    real_add = wg._conv_add_message
+    wg._conv_add_message = lambda *a, **k: None
+    try:
+        status, body = _http(base, "POST", rail,
+                             vip(message_id="d2", text="und jetzt?"))
+        lost = _await_job(base, body["job_url"])
+        assert lost["status"] == "error", lost
+    finally:
+        wg._conv_add_message = real_add
+
+    # A VIP is owed work, so a VIP's message is accepted only once the turn is
+    # actually running. With no companion thread to be had this rail cannot do
+    # it, and saying "I have this" anyway would have the gateway record it
+    # delivered and skip the forward that would still have got it done.
+    TURNS.clear()
+    real_companion = wg._chat_companion
+
+    def _no_companion(_chat_id):
+        raise RuntimeError("the store is down")
+
+    wg._chat_companion = _no_companion
+    try:
+        status, body = _http(base, "POST", rail, vip(message_id="c0"))
+        assert status == 200, body
+        assert "accepted" not in body and "job_url" not in body, body
+        assert TURNS == []
+        # A non-VIP in the same state is still accepted: nothing was owed.
+        status, body = _http(base, "POST", rail, dict(event, message_id="c0b"))
+        assert status == 200 and body["accepted"] is True, body
+    finally:
+        wg._chat_companion = real_companion
+
+    # And the switch is reversible without a revert: off, the rail takes
+    # nothing at all — no acceptance and no handle — so every gateway falls
+    # back to the held/forward path it had before the chat surface existed.
+    wg.CHAT_ARRIVAL_TURNS = False
+    try:
+        TURNS.clear()
+        status, body = _http(base, "POST", rail, vip(message_id="c1"))
+        assert status == 200, body
+        assert "accepted" not in body and "job_url" not in body, body
+        assert TURNS == []
+    finally:
+        wg.CHAT_ARRIVAL_TURNS = True
+    print("PASS test_arrival_starts_a_companion_turn")
 
 
 def test_media_proxy(base, wg):
@@ -1101,15 +1490,269 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
     print("PASS test_media_is_asked_for_not_guessed")
 
 
+def test_archive_and_mute(base, wg):
+    """The two shelf flags, and what an arrival does to each.
+
+    A chat behaves like a dashboard conversation: archiving is "out of my way
+    until it speaks again", so the next inbound message brings it back. Muting
+    is the stronger wish — "out of my way, and do not let it speak" — so it
+    archives in the same breath and the chat stays gone however busy it gets.
+    Un-muting deliberately leaves it archived: quiet was the ask, not
+    attention, and the next message is what returns it.
+
+    On a chat of its own: this test posts arrivals, which reorder the list, and
+    the rail test asserts what sorts first."""
+    cid = "telegram:900900"
+    rail = "/internal/chats/inbound"
+    event = {"direction": "in", "channel": "telegram", "chat": "900900",
+             "sender": "900900", "sender_name": "Neighbourhood association",
+             "group": True, "message_id": "h1", "text": "Summer party on the 30th.",
+             "gateway": "127.0.0.1", "gate": {"forward": True, "reason": "open"}}
+    _http(base, "POST", rail, event)
+    flags_path = "/chats/" + _quote(cid) + "/flags"
+
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert not c.get("archived"), "a new chat starts visible"
+
+    # Archive alone: the chat leaves the list, and stays a place that can speak.
+    status, body = _http(base, "POST", flags_path, {"archived": True})
+    assert status == 200 and body["archived"] is True and body["muted"] is False, body
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is True and c["muted"] is False, c
+
+    # ... and an arrival undoes it. That is the whole point of archiving.
+    _http(base, "POST", rail, dict(event, message_id="h2", text="one more thing"))
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is False, "archived alone is undone by an arrival"
+
+    # Mute archives too — the user never has to ask for both.
+    status, body = _http(base, "POST", flags_path, {"muted": True})
+    assert status == 200 and body["muted"] is True and body["archived"] is True, body
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is True and c["muted"] is True, c
+
+    # ... and it holds: a muted chat does not come back on a new message.
+    _http(base, "POST", rail, dict(event, message_id="h3", text="and another"))
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is True, "a muted chat must not return on a new message"
+
+    # Un-muting lets it speak again without pulling it back by itself: it is
+    # still archived, and the next message is what returns it.
+    status, body = _http(base, "POST", flags_path, {"muted": False})
+    assert status == 200 and body["muted"] is False and body["archived"] is True, body
+    _http(base, "POST", rail, dict(event, message_id="h4", text="still here"))
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is False, "un-muted, the next arrival restores the chat"
+
+    # Restore clears both at once — the dashboard's Restore button, which a
+    # muted chat needs because no arrival will ever return it.
+    _http(base, "POST", flags_path, {"muted": True})
+    status, body = _http(base, "POST", flags_path, {"archived": False, "muted": False})
+    assert status == 200 and body["archived"] is False and body["muted"] is False, body
+    status, body = _http(base, "GET", "/chats")
+    c = next(c for c in body["chats"] if c["id"] == cid)
+    assert c["archived"] is False and c["muted"] is False, c
+
+    # Either flag alone is a legitimate body; neither of them is not.
+    status, _ = _http(base, "POST", flags_path, {"muted": True})
+    assert status == 200
+    status, _ = _http(base, "POST", flags_path, {"muted": False})
+    assert status == 200
+    status, _ = _http(base, "POST", flags_path, {"archived": False})
+    assert status == 200
+    status, _ = _http(base, "POST", flags_path, {})
+    assert status == 400, "a body with no flag is refused"
+    status, _ = _http(base, "POST", flags_path, {"archived": "yes"})
+    assert status == 400, "a non-boolean flag is refused"
+    print("PASS test_archive_and_mute")
+
+
+def test_mute_races_an_arrival(base, wg):
+    """A Mute landing while a message arrives is never half-applied.
+
+    The rail brings an archived chat back unless it is muted. Decided from a
+    snapshot read a moment earlier, a Mute (which archives too) landing in
+    between is read back stale: the arrival clears `archived` from what it saw
+    while `muted` stays, and a chat the user just muted is in the active list
+    again. The decision belongs under the state lock.
+
+    The precondition is a chat archived but NOT muted, which is the ordinary
+    soft state; the bad end state is archived=False with muted=True, which no
+    ordering of the two requests can legitimately produce."""
+    cid = "telegram:900901"
+    rail = "/internal/chats/inbound"
+    flags_path = "/chats/" + _quote(cid) + "/flags"
+    event = {"direction": "in", "channel": "telegram", "chat": "900901",
+             "sender": "900901", "sender_name": "Club", "group": True,
+             "message_id": "r0", "text": "hello", "gateway": "127.0.0.1",
+             "gate": {"forward": True, "reason": "open"}}
+    _http(base, "POST", rail, event)
+
+    for i in range(40):
+        # Archived but unmuted: what the arrival would legitimately undo.
+        _http(base, "POST", flags_path, {"archived": True, "muted": False})
+        out = []
+        def mute():
+            out.append(_http(base, "POST", flags_path, {"muted": True}))
+        def arrive():
+            out.append(_http(base, "POST", rail, dict(event, message_id=f"r{i}")))
+        threads = [threading.Thread(target=mute), threading.Thread(target=arrive)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        _, body = _http(base, "GET", "/chats")
+        c = next(c for c in body["chats"] if c["id"] == cid)
+        assert not (c["archived"] is False and c["muted"] is True), (
+            f"round {i}: a mute was half-applied — archived cleared from a stale "
+            f"read while muted stayed: {c}")
+    print("PASS test_mute_races_an_arrival")
+
+
+def test_store_down_serves_recent_list(base, wg):
+    """A store that cannot answer a rebuild does not blank the phone: the last
+    good skeleton is served while it is recent. Expiry (what every rail event,
+    read and send does) keeps it as the fallback; the fallback then counts as
+    fresh for one cache window, so the polls behind it do not each wait out a
+    store timeout; a read made meanwhile still clears the badge; and only age
+    beyond CHAT_LIST_STALE_SECONDS makes the failure a 502 again."""
+    STATE["list_rows"] = [
+        _lit_row(chat=STALE_PEER, channel="signal", ts=TS3, type=T_IN,
+                 text="noch ungelesen", sender=STALE_PEER, atts=""),
+    ]
+    chat_id = "signal:" + STALE_PEER
+    wg._chats_cache_clear()
+    try:
+        status, before = _http(base, "GET", "/chats")
+        assert status == 200, before
+        assert next(c for c in before["chats"] if c["id"] == chat_id)["unread"] == 3
+        wg._chats_cache_invalidate()
+        STATE["fail"] = True
+        wg.CHAT_LIST_CACHE_SECONDS = 30.0
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert [c["id"] for c in body["chats"]] == [c["id"] for c in before["chats"]]
+        assert next(c for c in body["chats"] if c["id"] == chat_id)["unread"] == 3
+        # The polls behind it reuse the fallback: nothing reaches the store.
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200 and len(STATE["queries"]) == seen
+        # A read while the store is down still clears the badge.
+        status, _ = _http(base, "POST", "/chats/" + _quote(chat_id) + "/read",
+                          {"ts": TS3})
+        assert status == 200
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert next(c for c in body["chats"] if c["id"] == chat_id)["unread"] == 0
+        # Too old to be honest: the same failure is a 502 again.
+        wg._chats_cache_invalidate()
+        wg._chats_cache["built"] -= wg.CHAT_LIST_STALE_SECONDS + 1
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and "life store" in body["error"]
+    finally:
+        STATE["fail"] = False
+        STATE["list_rows"] = None
+        wg.CHAT_LIST_CACHE_SECONDS = 0.0
+        wg._chats_cache_clear()
+    print("PASS test_store_down_serves_recent_list")
+
+
+def test_write_during_rebuild_is_not_lost(base, wg):
+    """A write that expires the cache while a rebuild is querying the store is
+    not in that rebuild's result — so the result is published already expired
+    (kept as the fallback, rebuilt on the next poll) rather than served as
+    fresh for a whole window."""
+    fetch = wg._fetch_chats_skeleton
+
+    def fetch_and_race(deadline=None):
+        skeleton = fetch(deadline)
+        wg._chats_cache_invalidate()  # a rail event landing mid-flight
+        return skeleton
+
+    wg.CHAT_LIST_CACHE_SECONDS = 30.0
+    wg._fetch_chats_skeleton = fetch_and_race
+    try:
+        wg._chats_cache_clear()
+        wg._chats_skeleton_and_unread()
+        assert wg._chats_cache["skeleton"] is not None
+        assert wg._chats_cache["at"] == 0.0, "raced result published as fresh"
+        wg._fetch_chats_skeleton = fetch
+        wg._chats_skeleton_and_unread()
+        assert wg._chats_cache["at"] > 0.0
+    finally:
+        wg._fetch_chats_skeleton = fetch
+        wg.CHAT_LIST_CACHE_SECONDS = 0.0
+        wg._chats_cache_clear()
+    print("PASS test_write_during_rebuild_is_not_lost")
+
+
+def test_empty_store_is_an_empty_list(base, wg):
+    """No messages at all is an empty list, not an error: the heads query
+    returns nothing and no records query is sent (an empty VALUES block is
+    not a query)."""
+    STATE["list_rows"] = []
+    wg._chats_cache_clear()
+    try:
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert not any("VALUES ?m {" in q for q in STATE["queries"][seen:])
+        # Every chat left comes from the overlay, none from the store.
+        assert all(c["last"]["ts"] for c in body["chats"])
+    finally:
+        STATE["list_rows"] = None
+        wg._chats_cache_clear()
+    print("PASS test_empty_store_is_an_empty_list")
+
+
+def test_rebuild_deadline_bounds_a_stalling_store(base, wg):
+    """One rebuild works to a total deadline across its round trips: once it
+    has passed, no further store call is made and the fallback is served.
+    (The store here is fine — the budget is set to zero, so the very first
+    call is already over the deadline.)"""
+    status, before = _http(base, "GET", "/chats")
+    assert status == 200, before
+    wg._chats_cache_invalidate()
+    wg.CHAT_LIST_REBUILD_TIMEOUT = 0.0
+    try:
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 200, body
+        assert len(STATE["queries"]) == seen, "deadline passed but the store was queried"
+        assert [c["id"] for c in body["chats"]] == [c["id"] for c in before["chats"]]
+    finally:
+        wg.CHAT_LIST_REBUILD_TIMEOUT = 20.0
+        wg._chats_cache_clear()
+    print("PASS test_rebuild_deadline_bounds_a_stalling_store")
+
+
 def test_store_down_is_502(base, wg):
+    """With nothing cached to fall back on, a store failure is an honest 502 —
+    and the requests that follow within CHAT_LIST_FAILURE_BACKOFF share that
+    verdict without asking the store again; past it, the store is retried."""
+    wg._chats_cache_clear()
     STATE["fail"] = True
     try:
         status, body = _http(base, "GET", "/chats")
         assert status == 502 and "life store" in body["error"]
+        seen = len(STATE["queries"])
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and "not retried" in body["detail"], body
+        assert len(STATE["queries"]) == seen, "store asked again inside the backoff"
+        wg._chats_cache["failed_at"] -= wg.CHAT_LIST_FAILURE_BACKOFF + 1
+        status, body = _http(base, "GET", "/chats")
+        assert status == 502 and len(STATE["queries"]) > seen, body
         status, body = _http(base, "GET", "/chats/" + _quote(CHAT1) + "/messages")
         assert status == 502
     finally:
         STATE["fail"] = False
+        wg._chats_cache_clear()
     print("PASS test_store_down_is_502")
 
 
@@ -1190,6 +1833,9 @@ def main():
         # Capture pushes instead of talking to a push service.
         wg.push_notify.enabled = lambda: True
         wg.push_notify.notify_async = lambda *a, **k: PUSHES.append((a, k))
+        # A forwarded arrival runs a companion turn (see
+        # test_arrival_starts_a_companion_turn); no test may spawn `claude`.
+        wg.send_message = _stub_send_message
         server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -1221,6 +1867,13 @@ def main():
         test_accounts_do_not_merge(base, wg)
         test_media_proxy(base, wg)
         test_media_is_asked_for_not_guessed(base, wg, sib.server_address[1])
+        test_arrival_starts_a_companion_turn(base, wg)
+        test_archive_and_mute(base, wg)
+        test_mute_races_an_arrival(base, wg)
+        test_store_down_serves_recent_list(base, wg)
+        test_write_during_rebuild_is_not_lost(base, wg)
+        test_empty_store_is_an_empty_list(base, wg)
+        test_rebuild_deadline_bounds_a_stalling_store(base, wg)
         test_store_down_is_502(base, wg)
         server.shutdown()
     sparql.shutdown()

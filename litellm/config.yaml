@@ -14,7 +14,7 @@ model_list:
       model: os.environ/LITELLM_FALLBACK_MODEL
   # Dashboard picker entries. The web gateway builds the conversation-model
   # picker from GET /model/info, offering every route whose model_info sets
-  # `retinue_picker: true`, labeled by `retinue_label`. These three seed the
+  # `retinue_picker: true`, labeled by `retinue_label`. These seed the
   # picker with the Claude defaults; models added at runtime through the
   # LiteLLM admin UI join it the same way — set the same two model_info keys.
   # Routes without the flag (the plumbing above) never reach the picker.
@@ -40,6 +40,12 @@ model_list:
     model_info:
       retinue_picker: true
       retinue_label: Haiku (fastest)
+  - model_name: claude-fable-5-1
+    litellm_params:
+      model: anthropic/claude-fable-5-1
+    model_info:
+      retinue_picker: true
+      retinue_label: Fable
 
 general_settings:
   # master_key is read from general_settings (proxy_server.load_config). Under

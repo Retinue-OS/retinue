@@ -45,6 +45,35 @@ behaves exactly as before:
 - **`RETINUE_FRONTIER_MODEL`** — the strong model for supervision, escalation,
   and system work (Ara senior).
 
+A third, optional variable splits one entry point off the router tier:
+
+- **`RETINUE_DASHBOARD_MODEL`** — the model an unpinned **dashboard thread**
+  defaults to, overriding the router tier there and nowhere else. The router
+  tier is shared by the scheduler's prompt jobs, `news-curate.py`, `ask_ara`
+  and the presentation lint's default, so without this a deployment cannot
+  have cheap dispatch turns and a strong model at the dashboard door at the
+  same time. Unset, the dashboard follows `RETINUE_ROUTER_MODEL` exactly as
+  before.
+
+  The scope is threads, not the gateway: `POST /message` — where the messenger
+  channels deliver their inbound turns, and the async jobs they spawn — keeps
+  resolving the router tier inside `send_message()`, so chat traffic is not
+  swept up in a dashboard upgrade. In the code the split is one function,
+  `_default_thread_model()`, used by `_conv_worker` and by the picker's
+  `(default)` flag so the dropdown always names the model unpinned threads
+  actually run (and flags nothing, rather than another row, when that model is
+  not in the offered list).
+
+  Precedence inside a thread is unchanged: an explicit pick in the model
+  picker wins, and a thread Ara junior escalated stays with senior. Setting
+  the variable to the frontier model makes dashboard escalation a no-op by
+  construction — senior answers directly, at senior's price for every turn,
+  routing-shaped ones included; that is the trade the variable exists to let
+  an operator make. Unpinned threads move to the new default on their next
+  turn (unlike the tiers' introduction, this is an operator setting a
+  variable, not a deploy silently redefining stored state — hence no
+  migration, see `materialise_pre_tier_model_pins`).
+
 Difficulty is decided by **entry point first**, because most sessions know
 their difficulty before any model runs:
 
@@ -54,7 +83,7 @@ their difficulty before any model runs:
 | `news-curate.py` spawn | router | The turn only dispatches the Herald. |
 | `agent-self-review.py` spawn | frontier | Supervision by construction, and rare — the free SPARQL gate means it usually spawns nothing. |
 | Main remote-control session | frontier | Interactive system administration and development — Ara senior's desk. |
-| Dashboard turns, `ask_ara` | phase 2 | Difficulty unknown before a model reads the message; needs the escalation flow below. |
+| Dashboard threads, messenger inbound (`POST /message`), `ask_ara` | phase 2 | Difficulty unknown before a model reads the message; needs the escalation flow below. Dashboard threads take `RETINUE_DASHBOARD_MODEL` when the deployment sets one; the other two stay on the router tier. |
 
 A job manifest can still pin any prompt job explicitly
 (`"model": "${RETINUE_TRIAGE_MODEL:-sonnet}"`); the per-job field always wins
@@ -109,7 +138,9 @@ workflow; the model stamp (phase 2) is the ground truth beneath both.
 
 - **Escalation flow** for the unknown-difficulty entry points. A gateway turn
   with no per-thread model choice now runs on the router tier
-  (`RETINUE_ROUTER_MODEL`, falling back to the gateway default). When a
+  (`RETINUE_ROUTER_MODEL`, falling back to the gateway default — or
+  `RETINUE_DASHBOARD_MODEL` for dashboard threads, where the deployment gives
+  that door its own tier). When a
   frontier tier is configured and the turn runs below it, the session is
   handed **`RETINUE_ESCALATE_FILE`**: creating that file is junior's signal
   (CLAUDE.md tells her how and when), the junior reply is discarded, and
@@ -206,6 +237,20 @@ delivers the original text unchanged. `PRESENTATION_LINT=0` disables it. The
 first live tier deployment is what motivated shipping this early: a
 router-tier model reliably forgot chips and composed bullet lists, which no
 amount of prompt discipline fixed.
+
+Lints run on their **own** concurrency bound (`PRESENTATION_LINT_CONCURRENCY`,
+default 1) and wait at most `PRESENTATION_LINT_WAIT` seconds (default 20) for a
+slot, after which the message is delivered unlinted. That separation is a
+correctness requirement, not a tuning knob. The lint runs inside a request, and
+that request's caller is regularly a spawned session already holding one of the
+`WEB_GATEWAY_MAX_CONCURRENCY` session slots — every `conversation-push.py` from
+an agent session is that case. While the lint shared the session pool, such a
+caller waited for a slot it was itself holding: with the default bound of 2, one
+other busy session hung the push forever, the client timed out, the gateway
+thread stayed queued on the semaphore, and the thread never reached the
+dashboard at all. Total `claude` processes are now bounded by the sum of the two
+pools rather than by `WEB_GATEWAY_MAX_CONCURRENCY` alone — a deliberate, small
+increase, since a lint is tool-less, MCP-less and context-less.
 
 The field test also showed the flag-file escalation failing on the weakest
 models — junior *echoed* `touch "$RETINUE_ESCALATE_FILE"` into her reply

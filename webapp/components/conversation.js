@@ -4,11 +4,11 @@
 // bubbles (Markdown via the shared renderer, blockquote/code copy buttons,
 // click-to-fill chips that land in THIS composer, attachments, the model and
 // cost meta), the pending state while Ara answers, the composer with its
-// text, file attachments and voice dictation, the model picker, and the
-// read-aloud player over Ara's replies. Every surface that shows a
-// conversation embeds this element: the conversations card for an open
-// thread and the new-thread composer, and (next) the chat page's companion
-// pane. What a host adds is only where the element sits and what "back"
+// text, file attachments (picked or pasted) and voice dictation, the model
+// picker, and the read-aloud player over Ara's replies. Every surface that
+// shows a conversation embeds this element: the conversations card for an
+// open thread and the new-thread composer, and (next) the chat page's
+// companion pane. What a host adds is only where the element sits and what "back"
 // means there — so the two surfaces render identically because they are the
 // same code, not because one copies the other.
 //
@@ -27,6 +27,13 @@
 //                     for a host that sits beside a clock-stamped timeline.
 //   placeholder       what the composer's box is called, where the host's own
 //                     framing names it better than "Reply".
+//   no-autofocus      do not take focus when connected. The default suits a
+//                     host that mounts the element BECAUSE the user just asked
+//                     for this conversation (the card opening a thread), where
+//                     the composer is what they came for. A host that keeps it
+//                     mounted whether or not it is on screen must set this:
+//                     taking focus scrolls the element into view, which on the
+//                     chat page's phone strip is a tab switch nobody asked for.
 //   create-url        no thread yet, and the HOST owns creating it: the first
 //                     turn POSTs here (no body) for a {id}, then goes in as an
 //                     ordinary reply to that thread. For a thread that belongs
@@ -73,6 +80,7 @@
 import { esc, fmtAge } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
 
 const LIST_URL = '/conversations';
@@ -618,7 +626,7 @@ class RetinueConversation extends HTMLElement {
     this._id = this.getAttribute('conversation-id') || '';
     LIVE.set(this._key(), this);
     loadModels().then(() => this._syncPicker());
-    this._focusNext = true;
+    this._focusOnOpen();
     this.render();
     if (this._id) {
       this._load().then(() => this.render());
@@ -653,12 +661,26 @@ class RetinueConversation extends HTMLElement {
     this._attachError = '';
     this._missing = false;
     LIVE.set(this._key(), this);
-    this._focusNext = true;
+    this._focusOnOpen();
     this.render();
     if (this._id) {
       this._load().then(() => this.render());
       this._schedulePoll();
     }
+  }
+
+  // Opening a conversation focuses its composer: a host that connects the
+  // element, or points it at another thread, has been asked for that
+  // conversation, and the composer is what the user came for. A host that
+  // keeps the element mounted whether or not it is on screen has been asked
+  // for nothing, and says so with `no-autofocus` — taking focus scrolls the
+  // element into view, which on the chat page's phone strip is a switch to
+  // the Ara tab nobody asked for. Both openings go through here, because the
+  // one that does not is the one that gets missed: the attribute path fires
+  // at upgrade too, before the element is ever "re-pointed" at anything.
+  _focusOnOpen() {
+    if (this.hasAttribute('no-autofocus')) return;
+    this._focusNext = true;
   }
 
   get conversationId() { return this._id; }
@@ -1207,7 +1229,7 @@ class RetinueConversation extends HTMLElement {
       `<div class="field">` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" ${disabled}>` +
       `${esc(d.text)}</textarea>` +
-      `<label class="clip" title="Attach a file" aria-label="Attach a file">` +
+      `<label class="clip" title="Attach a file (or paste one into the box)" aria-label="Attach a file (or paste one into the box)">` +
       `<input type="file" multiple hidden data-file ${disabled}>` +
       `<span aria-hidden="true">\u{1F4CE}</span></label>` +
       `</div>` +
@@ -1843,6 +1865,18 @@ class RetinueConversation extends HTMLElement {
           e.preventDefault();
           form.requestSubmit();
         }
+      });
+      // A pasted image (a screenshot, a picture copied off a page) or file is
+      // staged exactly as a picked one. The browser's own paste still runs
+      // when the clipboard also carries words; a bare image is swallowed, or
+      // an empty paste would land in the box. Staging waits a tick so that
+      // text paste — and the input event that copies it into the draft — has
+      // happened before an outcome re-renders the field from the draft.
+      form.addEventListener('paste', (e) => {
+        const files = pastedFiles(e.clipboardData);
+        if (!files.length) return;
+        if (!pastedText(e.clipboardData)) e.preventDefault();
+        setTimeout(() => this._addFiles(files), 0);
       });
       grow();
       form.addEventListener('submit', (e) => {

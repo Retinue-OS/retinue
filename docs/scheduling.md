@@ -59,6 +59,10 @@ to a subagent) or runs a shell `command`.
 }
 ```
 
+`interval_seconds` is measured **completion to next start**, not start to
+start: the scheduler writes a job's state once it has finished running, so a
+job's own run time is extra spacing on top of the interval, not part of it.
+
 A prompt job may pin its model with an optional `"model"` field, which
 supports `${VAR:-default}` expansion and overrides the tier default (see
 `docs/model-routing.md`). Per-job state lives outside the chambers (default
@@ -66,6 +70,73 @@ supports `${VAR:-default}` expansion and overrides the tier default (see
 noise. The manifest is re-read every tick, so adding or editing a
 `.schedule.json` takes effect without a restart. Tunables:
 `SCHEDULER_TICK_SECONDS`, `SCHEDULER_JOB_TIMEOUT`, `SCHEDULER_STATE_DIR`.
+
+A job may also declare an optional `"retry_after_seconds"`: when the last
+recorded run did **not** end in `status: "success"` (a failure, a timeout, an
+internal error), the job becomes due after that many seconds instead of the
+full `interval_seconds`. Leaving it unset is the safe default — a failed run
+stays due at exactly the same point a successful one would have been, so one
+bad run costs at most its own interval rather than turning into a retry storm.
+Set it on a job whose failures tend to be transient (a rate-limited API, a
+flaky upstream) so a whole `interval_seconds` slot (a day, for a daily job)
+isn't burned on one bad run:
+
+```json
+{
+  "id": "herald-fetch",
+  "command": "python3 /workspace/scripts/herald-fetch.py",
+  "interval_seconds": 86400,
+  "retry_after_seconds": 900
+}
+```
+
+A command job that works through a backlog in **bounded slices** exits with
+code **75** (sysexits' `EX_TEMPFAIL`) to say "this slice is done, more remains".
+The scheduler records that as `status: "partial"` — logged as `[partial]`, not
+`[fail]`. A job pairs it with `"resume_after_seconds"`: after a partial run it
+is due again after that many seconds rather than after its full interval. That
+is how the e-mail triage sweep drains a backlog: each run takes the oldest
+`TRIAGE_BATCH_SIZE` messages, records what it did, and comes back for the rest,
+so no single run has to fit the whole backlog into one budget.
+`resume_after_seconds` is consulted for `partial` **only**. It is deliberately
+not `retry_after_seconds`: a run whose model session *fails* must not be
+re-spawned every few minutes on a knob meant for resuming honest work, and a
+day of ten-minute retries of a failing session is a lot of credits. (A
+`partial` run is still "not success", so `retry_after_seconds` alone also
+brings it forward, for a job that wants one knob for both.) A job with neither
+simply waits its interval. The framework's own base manifest carries no such
+job; a chamber opts its e-mail sweep in, for example:
+
+```json
+{
+  "id": "triage-daily",
+  "command": "python3 /workspace/scripts/triage-gate.py daily",
+  "interval_seconds": 86400,
+  "resume_after_seconds": 600
+}
+```
+
+A job may also declare an optional `"timeout_seconds"` to override the global
+`SCHEDULER_JOB_TIMEOUT` for that one job. This is a backstop for a job whose
+*single* unit of work is long, not a way to fit a backlog into one run — a run
+that must finish everything is killed the moment the backlog outgrows any
+budget, and a killed run persists nothing it had not already written. Prefer
+slices and `resume_after_seconds` where the work divides.
+
+```json
+{
+  "id": "triage-daily",
+  "command": "python3 /workspace/scripts/triage-gate.py daily",
+  "interval_seconds": 86400,
+  "timeout_seconds": 3600
+}
+```
+
+The value must be a **positive** integer. An omitted or `null` field simply
+uses `SCHEDULER_JOB_TIMEOUT`. A present-but-unparseable or non-positive value
+is treated as a malformed manifest: the scheduler logs a warning and falls back
+to the global timeout rather than disabling the kill, because one un-killable
+job would wedge the single-threaded tick loop behind it.
 
 Besides the per-chamber manifests, the scheduler always loads a **framework base
 manifest** at `/workspace/.schedule.json` for cross-cutting jobs that belong to

@@ -639,12 +639,28 @@ def _search_calendar(cal, window_start, window_end) -> list:
     which is what a reader wants ("is Thursday taken?"). Servers and caldav
     releases differ in how well they support it, so a failure retries the plain
     time-range query once rather than failing the whole read.
+
+    An EMPTY expanded answer is retried the same way. A server (or a library
+    release) that cannot expand may answer with an empty result instead of an
+    error, and an empty read is indistinguishable from a free calendar — the
+    one wrong answer a reader cannot detect. So an empty expansion is trusted
+    only when the plain query agrees; when it does not, its objects are served
+    unexpanded (a recurring series then arrives as its master, not its
+    instances) and the disagreement is logged. A genuinely free window costs
+    one extra query.
     """
     try:
-        return list(cal.search(start=window_start, end=window_end, event=True, expand=True))
+        expanded = list(cal.search(start=window_start, end=window_end, event=True, expand=True))
     except Exception as exc:
         print(f"[caldav-gateway] expanded search failed ({exc}); retrying unexpanded", flush=True)
         return list(cal.search(start=window_start, end=window_end, event=True))
+    if expanded:
+        return expanded
+    plain = list(cal.search(start=window_start, end=window_end, event=True))
+    if plain:
+        print(f"[caldav-gateway] expanded search returned nothing but the unexpanded one "
+              f"found {len(plain)} object(s); serving those unexpanded", flush=True)
+    return plain
 
 
 def _list_events_on_server(window_start, window_end, calendar_id: str | None = None) -> list:
@@ -830,6 +846,10 @@ def _new_pending_send(summary: str, start: str, end: str, all_day: bool,
     request_id = uuid.uuid4().hex
     entry = {
         "id": request_id,
+        # The approval page renders an event as an event (title, time, target
+        # calendar) rather than as a message with an empty body — "kind" is how
+        # it tells the two apart without guessing from the fields present.
+        "kind": "event",
         "to": CALDAV_ACCOUNT,
         "subject": summary,
         "summary": summary,
@@ -838,6 +858,12 @@ def _new_pending_send(summary: str, start: str, end: str, all_day: bool,
         "all_day": all_day,
         "description": description,
         "calendar_id": calendar_id,
+        # Where the write would actually land: the request's own target, or
+        # else this gateway's configured calendar (_resolve_calendar falls back
+        # to CALDAV_CALENDAR_ID). Kept beside calendar_id rather than folded
+        # into it, so the write path still sees what the request asked for and
+        # the approval card can name the effective target without guessing.
+        "calendar_target": calendar_id or CALDAV_CALENDAR_ID or "",
         "body": _format_pending_body(start, end, all_day, description),
         "category": category,
         "created": int(time.time()),

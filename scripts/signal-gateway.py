@@ -30,6 +30,7 @@ import triage_policy as _triage
 import news_ingest as _news
 import chat_ingest as _chats
 import job_delivery as _jobs
+import build_stamp as _build
 
 SIGNAL_ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "").strip()
 
@@ -185,21 +186,23 @@ def _attach_reply_tokens(messages: list) -> None:
             subject=msg.get("subject"))
 
 # ── Inbound triage delivery gate ──────────────────────────────────────────────
-# The gateway spends model credits only on senders that matter (see
-# docs/triage-delivery-gate.md). Every inbound inbox message is persisted as one
-# `.nt` file on this gateway's own volume (browsable history + a delivered
-# ledger); routing is decided by a policy `.nt` Ara maintains on the same volume,
-# read RAW off disk here so the classify hot path sees no qlever reindex lag.
+# Every inbound inbox message is persisted as one `.nt` file on this gateway's
+# own volume (browsable history + a delivered ledger), then handed to the chats
+# rail. What the gate still decides (see docs/triage-delivery-gate.md) is read
+# RAW off a policy `.nt` Ara maintains on the same volume, so the classify hot
+# path sees no qlever reindex lag:
 #
-#   whitelisted → forward to a model turn now, marked delivered
-#   unknown     → forward now flagged as an unknown sender (ask to whitelist),
-#                 marked delivered
-#   blacklisted → held (delivered:false), no turn now → the daily drain picks it
-#                 up via GET /undelivered
-#   group-blocked → stored delivered:true, never a turn and never drained
+#   open         → hand to the rail; the chat is the delivery
+#   VIP sender   → the rail runs an arrival turn, whatever chat it came from
+#   group-quieted → held (delivered:false), no turn → GET /undelivered has it
+#   group-ignored → stored delivered:true, never a turn and never drained
 #
-# The gate is on by default for an inbox account; INBOUND_GATE=0 restores the
-# always-forward behaviour (every inbound spawns a turn).
+# There is no sender whitelist or blacklist on messenger any more: a chat the
+# user wants off their screen is archived or muted in the dashboard, which is
+# the same gesture a conversation takes.
+#
+# The gate is on by default for an inbox account; INBOUND_GATE=0 treats every
+# sender as a VIP (every inbound gets a turn).
 INBOUND_CHANNEL = "signal"
 INBOUND_GATE_ENABLED = os.environ.get("INBOUND_GATE", "1").strip().lower() not in ("0", "false", "no", "")
 # Where the per-message store lives (gateway RW, qlever RO). Defaults onto the
@@ -214,9 +217,10 @@ INBOUND_POLICY_PATH = Path(
 def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
     """Classify an inbound message against the policy read raw off the volume.
 
-    Returns a dict: ``forward`` (spend a model turn now), ``flagged_unknown``
-    (annotate the turn as an unknown sender), ``delivered_if_held`` (the flag to
-    persist when we do NOT forward), and ``reason`` (for the log).
+    Returns a dict: ``forward`` (worth interrupting the user for), ``vip``
+    (this sender's messages are worked by a model on arrival),
+    ``delivered_if_held`` (the flag to persist on the fallback path when we do
+    NOT forward), ``news``, and ``reason`` (for the log).
     """
     try:
         return _triage.gate_decision(
@@ -225,7 +229,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         )
     except Exception as exc:  # policy unreadable → fail OPEN (forward), never drop
         print(f"[signal-gateway] triage policy unreadable ({exc}); forwarding", flush=True)
-        return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
+        # Fails open on both axes. `vip` is what the chat rail reads to decide
+        # a turn, so leaving it out would have an unreadable policy silently
+        # demote everyone to no-turn — the opposite of failing open.
+        return {"forward": True, "vip": True,
+                "delivered_if_held": True, "reason": "policy-error"}
 
 
 def _chat_key(sender: str | None, group_id: str | None) -> str:
@@ -315,8 +323,14 @@ def _mark_delivered(store_path) -> None:
         print(f"[signal-gateway] could not mark inbound delivered: {exc}", flush=True)
 
 
-def _confirm_delivery(job_path: str, store_path, label: str) -> None:
-    """Mark a forwarded inbound delivered once its triage job reports success.
+def _confirm_delivery(job_path: str, store_path, label: str,
+                      base: str | None = None) -> None:
+    """Mark a forwarded inbound delivered once the job that took it succeeds.
+
+    That job is either the triage forward's or the chats rail's companion
+    turn, so ``base`` names the service whose handle this is; it defaults to
+    the retinue gateway, where every handle came from until the chat surface
+    started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
     never finishes leaves delivered=False, so the daily drain retries it.
@@ -324,7 +338,7 @@ def _confirm_delivery(job_path: str, store_path, label: str) -> None:
     if store_path is None:
         return
     _jobs.confirm_delivery(
-        urljoin(RETINUE_GATEWAY_URL, job_path),
+        urljoin(base or RETINUE_GATEWAY_URL, job_path),
         lambda: _mark_delivered(store_path),
         log=lambda msg: print(f"[signal-gateway] {label}: {msg}", flush=True),
         timeout=RETINUE_GATEWAY_TIMEOUT,
@@ -567,6 +581,12 @@ def _health_snapshot() -> dict:
         # account from a transient receive failure, so any sustained down state
         # offers the QR — scanning is a deliberate user action either way.
         "needs_repair": bool(SIGNAL_ACCOUNT) and not connected,
+        # Which build this is. `framework` is a digest of the shared modules
+        # baked into this image; the retinue container carries the same set,
+        # so the /gateways page can tell a stale gateway from a current one
+        # without anyone shelling in. `sha` is the commit, when the build
+        # passed one. See scripts/build_stamp.py.
+        "build": _build.build_info(),
     }
     if not SIGNAL_ACCOUNT:
         body["error"] = "SIGNAL_ACCOUNT is not set"
@@ -1664,27 +1684,88 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     if gate.get("news"):
         source = (_resolve_group_name(group_id) or group_id) if is_group else sender
         _forward_news(question, source, group_id, lang)
-    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
-    # surface lights up (and the user is Web-Pushed) with no model turn.
-    # Fire-and-forget on its own thread — it must never delay or reorder the
-    # persist → gate → forward path below. Held classes go too (the mirror
-    # updates silently); the gate verdict rides along so they stay quiet.
-    _notify_chat_event_async(
-        group_id=group_id,
+    # Chats rail. Every arrival's metadata goes to the web-gateway so the chat
+    # surface lights up and the user is Web-Pushed, with no model turn spent on
+    # the notification. For a message the gate forwards the same call does one
+    # thing more: it starts a turn in that chat's companion thread and answers
+    # with its job handle, which is what replaces the triage session this
+    # gateway used to spawn (docs/messenger-chats.md, phase 4). Held classes go
+    # too — the mirror updates silently — and the gate verdict rides along so
+    # they stay quiet.
+    rail_event = dict(
         direction="in", channel=INBOUND_CHANNEL,
         chat=_chat_key(sender, group_id), account=SIGNAL_ACCOUNT,
         sender=sender, sender_name=sender_name, group=is_group,
         message_id=message_id,
         ts=(int(message_id) / 1000.0) if (message_id or "").isdigit() else None,
+        # The group's own name, so the chat is titled as on the user's phone
+        # (cached roster; see _resolve_group_name).
+        chat_name=_resolve_group_name(group_id) if is_group else None,
         text=question, attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
+              "vip": bool(gate.get("vip")),
               "reason": str(gate.get("reason") or "")},
     )
-    if not gate["forward"]:
-        # Mark delivered only for a message that is fully accounted for (a
-        # blacklisted/no-action class the drain must never re-surface). One held
-        # merely because the sender is not yet whitelisted stays delivered=False
-        # so the daily drain still picks it up.
+
+    # The chat surface is where an inbound message is delivered now — whatever
+    # the gate made of it. The mirror shows it, the user is pushed unless the
+    # gate says to stay quiet, and the record says delivered. So every message
+    # is offered to the rail, not only the ones that used to buy a triage
+    # session: that is what empties the undelivered backlog the daily drain
+    # existed to sweep, because there is no longer anything left un-handled.
+    #
+    # The call is synchronous because its answer decides what happens next, and
+    # this path has always made a synchronous POST here anyway. A job handle
+    # means a VIP's message is being worked in its chat's companion thread; a
+    # plain acceptance means the chat has it and nothing more is owed. Neither
+    # — the rail switched off, unreachable, or an older web-gateway — falls
+    # through to everything this gateway did before the chat surface existed.
+    rail = _chats.notify_chat_event(**rail_event, handover=True,
+                                    files=files if gate.get("vip") else None,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Handling it here as well would be the one outcome worse than
+        # waiting: two turns racing over the same draft, plus the dashboard
+        # conversation this replaced. It stays delivered=False.
+        print(f"[signal-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered rather than handled twice",
+              flush=True)
+        return
+    # Only an explicit acceptance is a handover — a job handle on its own is
+    # not. A web-gateway built before this contract ignores `handover` and will
+    # hand back a job it started on its own rules, for a non-VIP among others;
+    # treating that as ours would apply the old policy under the new one's name
+    # for as long as the images are out of step.
+    if rail is not None and rail.get("accepted") is True:
+        rail_job = (rail.get("job_url") or "").strip() or None
+        if rail_job:
+            print(f"[signal-gateway] the chat's companion turn took the message "
+                  f"from {sender_label} (vip)", flush=True)
+            _confirm_delivery(rail_job, store_path, sender_label,
+                              base=_chats.CHATS_INGEST_URL)
+            return
+        # Accepted with no turn: the chat has the message and the user has been
+        # pushed, and that is the delivery. Nothing is owed a model — this
+        # sender is not a VIP — so the record says delivered and nothing ever
+        # re-surfaces it.
+        _mark_delivered(store_path)
+        print(f"[signal-gateway] the chat took the message from {sender_label} "
+              f"({gate['reason']}); no turn asked for", flush=True)
+        return
+
+    # From here down: the rail declined, so this is the pre-chat-surface path,
+    # unchanged.
+    # A VIP is never held here: the two axes are independent, so `forward` is
+    # about the group's noise and `vip` about the person, and the fallback
+    # reading `forward` alone let the group override the sender the whole
+    # design says it never does — for an `ignored` group, silently, by marking
+    # the message delivered with nothing left to recover it. The rail could not
+    # work this VIP's message, so the pre-chat-surface forward does.
+    if not gate["forward"] and not gate.get("vip"):
+        # Mark delivered only for a message that is fully accounted for (an
+        # ignored group, which the drain must never re-surface). One held from a
+        # quieted group stays delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -1717,18 +1798,6 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"thread invisibly to the user and is replayed to every later agent "
          f"session in it.\n")
         if reply_token else ""
-    )
-    # An unknown sender (not whitelisted, not blacklisted, not in a blocked
-    # group) still gets a turn, but flagged: triage asks whether to whitelist or
-    # blacklist the handle so this decision is made once.
-    unknown_line = (
-        (f"\nThis sender ({sender}) is UNKNOWN — not on the triage whitelist. "
-         f"After triaging, open a dashboard conversation asking whether to "
-         f"whitelist this sender (so future messages trigger a turn on arrival) "
-         f"or blacklist them (so they are never asked about again). Apply the "
-         f"user's answer with: python3 /workspace/scripts/triage_policy.py "
-         f"whitelist-add --channel signal --handle {sender}  (or blacklist-add).\n")
-        if gate["flagged_unknown"] else ""
     )
     attachment_line = (
         (f"\nThe message includes {len(files)} attached file(s) (image(s) and/or "
@@ -1771,7 +1840,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"Signal, sender: {sender_label}). Triage it as the user's incoming "
@@ -1929,6 +1998,33 @@ _pending_sends_lock = threading.Lock()
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def _write_pending_send(path: Path, entry: dict) -> None:
+    """Persist a pending-send entry so a concurrent GET never observes a torn file.
+
+    ``Path.write_text`` truncates the file and then writes, in place; a GET
+    that lands mid-write (or between those two steps) can read a partial file,
+    fail to parse it, and — since the status transition has already dropped
+    the entry from the in-memory ``_pending_sends`` map by the time the
+    background sender writes the terminal state — read back as "not found"
+    (a body with no "status" key at all) rather than as the entry's actual
+    state. A poll tight enough to catch that window turned "sending" into a
+    KeyError instead of "approved". Writing to a same-directory temp file and
+    renaming into place is atomic on POSIX, so a reader always sees either the
+    previous full content or the new one, never a mix.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _lookup_existing_path(request_id: str) -> Path | None:
     """Find the on-disk file for a request id by scanning the pending directory.
 
@@ -1974,7 +2070,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
     path = SIGNAL_PENDING_SENDS_DIR / f"{request_id}.json"
     try:
         _ensure_pending_sends_dir()
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[signal-gateway] warning: could not persist pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -2061,7 +2157,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
         entry.pop("error", None)
         print(f"[signal-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[signal-gateway] warning: could not update pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -2094,7 +2190,7 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return entry
         entry["status"] = "sending" if approved else "rejected"
         try:
-            path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+            _write_pending_send(path, entry)
         except OSError as exc:
             print(f"[signal-gateway] warning: could not update pending send: {exc}", flush=True)
         _pending_sends.pop(request_id, None)

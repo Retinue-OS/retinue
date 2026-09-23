@@ -7,8 +7,11 @@ seconds are exactly the two this rail carries: an arrival that should light up
 the chat surface (and Web-Push the user) *now*, and an own-device echo that
 should advance the read watermark *now*. The gateway POSTs the event's
 metadata to the web-gateway's ``POST /internal/chats/inbound``, which updates
-the chat's state and the in-memory live overlay — the deterministic,
-credit-free notification path (no model turn).
+the chat's state and the in-memory live overlay. Notification itself stays
+deterministic and credit-free — no model turn is spent telling the user a
+message arrived — but the rail is no longer only that: it **takes** the
+message (see ``handover`` below), and for a VIP sender it also starts a turn
+in that chat's companion thread.
 
 An event asserts *which account* sent it and nothing about where that account
 lives: a gateway's address is configured on the reader's side (the
@@ -17,11 +20,18 @@ also declared its own address would be a second source of truth free to drift
 from the first — which is exactly what once attributed one account's chats to
 another.
 
-Fire-and-forget by contract: :func:`notify_chat_event_async` runs the POST on
-a daemon thread with a short timeout, never raises, and never blocks or
-reorders the gateway's own hot path (persist → gate → triage forward). A lost
-rail event costs a notification and a few seconds of freshness, never a
-message — the ledger already holds it and the store catches up on its own.
+**Inbound events are synchronous, because the caller needs the answer.** An
+arrival is offered to the rail with ``handover``, and what comes back decides
+what the gateway does next: an acceptance means the chat has the message and
+the gateway marks it delivered; a job handle with it means a VIP's message is
+also being worked, and the gateway waits for that job first; neither means the
+rail could not take it — switched off, unreachable, an older web-gateway — and
+the caller falls back to everything it did before the chat surface existed.
+
+:func:`notify_chat_event_async` remains for the events with no answer worth
+waiting for — the own-device echoes that advance a read watermark. It runs the
+POST on a daemon thread, never raises, and never blocks the gateway's hot
+path; a lost one costs a few seconds of freshness, never a message.
 
 ``CHATS_INGEST_URL`` defaults to the in-network web-gateway address in the
 base compose file, so the rail works with no deployment configuration; with it
@@ -68,20 +78,57 @@ def notify_chat_event(
     attachments: list[str] | None = None,
     author: str | None = None,
     gate: dict | None = None,
+    files: list[dict] | None = None,
+    handover: bool = False,
     timeout: float = 3.0,
-) -> bool:
-    """Synchronous rail POST; returns True when the web-gateway accepted it.
+) -> dict | None:
+    """Synchronous rail POST; returns the answer body, or None if it failed.
+
+    An accepted event answers with a JSON object. ``{"accepted": true}`` means
+    the chat has the message and the caller must not forward it anywhere else —
+    the user sees it in the conversation it belongs to, and that is the
+    delivery. ``job_url`` comes with it when a companion turn was started too,
+    because that one is not finished yet and the caller waits for the job
+    before flipping ``delivered``; a plain ``accepted`` is already final.
+    Neither key means the rail took nothing, which is the caller's cue to fall
+    back. None means the event did not land at all — no endpoint configured, a
+    refusal, a connection that never got there.
+
+    ``{"uncertain": True}`` is the third answer, and the one that matters for a
+    forwarded message: the request timed out twice, so whether the event landed
+    is **unknown**. The handler may well have accepted it and started a turn
+    before the answer was lost, and treating that as "did not land" would have
+    the caller forward the same message to triage as well — two turns racing
+    over one draft, and a dashboard conversation the switch exists to stop. The
+    caller must neither confirm delivery nor fall back on it: leaving the
+    message undelivered hands it to the daily drain, which is where an unknown
+    outcome belongs.
 
     ``direction`` is ``in`` for an arrival, ``out`` for an outbound echo (the
     user's own send from another device). ``account`` is this gateway's own
     ``*_ACCOUNT`` — how the web-gateway identifies which registry gateway sent
     the event, matched against the accounts the gateways it already knows
     report for themselves. ``gate`` carries the delivery-gate
-    verdict for inbound events (``{"forward": bool, "reason": str}``) so the
-    web-gateway can keep held/no-action classes silent. Never raises.
+    verdict for inbound events (``{"forward": bool, "vip": bool, "reason":
+    str}``) so the web-gateway can keep held/no-action classes silent and can
+    see whose message the user asked to have worked on arrival. ``forward`` no
+    longer decides a turn — ``vip`` does, and it is a fact about the sender
+    alone, true in a group exactly as in a 1:1. ``files``
+    are the message's attachments in the ``POST /message`` shape
+    (``{"filename", "content_type", "data"}``, base64) so a turn started there
+    can open them; they ride along only for a forwarded message.
+
+    ``handover`` is the caller's offer: *if you take this message, I will not
+    forward it to triage myself.* Only a call that makes that offer is accepted
+    or can buy a companion turn, and that is deliberate — a gateway built before this
+    contract existed fires the rail and forwards to triage regardless, so
+    starting a turn on its event would have the message handled twice. During
+    a rollout where the web-gateway is rebuilt before the gateways, the absent
+    offer is what keeps the old behaviour whole instead of doubling it.
+    Never raises.
     """
     if not CHATS_INGEST_URL:
-        return False
+        return None
     payload = {
         "direction": direction,
         "channel": channel,
@@ -101,6 +148,8 @@ def notify_chat_event(
         "attachments": [u for u in (attachments or []) if u],
         "author": author or None,
         "gate": gate or None,
+        "files": files or None,
+        "handover": True if handover else None,
     }
     body = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -112,17 +161,48 @@ def notify_chat_event(
             "X-Conversation-Backend-Token": CHATS_INGEST_TOKEN,
         },
     )
+    # One retry, and only for a timeout. The web-gateway mints one handle per
+    # message id and hands the same one back for a repeat, so re-sending an
+    # event that may already have been accepted cannot start a second turn —
+    # which is what makes retrying the right move rather than a risk.
+    raw = None
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if not 200 <= resp.status < 300:
+                    return None
+                raw = resp.read().decode("utf-8", errors="replace")
+            break
+        except Exception as exc:  # noqa: BLE001 — best-effort, never propagates
+            reason = getattr(exc, "reason", None)
+            timed_out = isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError)
+            if not timed_out:
+                print(f"[chat_ingest] notify failed ({exc})", file=sys.stderr,
+                      flush=True)
+                return None
+            if attempt == 1:
+                print(f"[chat_ingest] notify timed out ({exc}); retrying once",
+                      file=sys.stderr, flush=True)
+                continue
+            print(f"[chat_ingest] notify timed out twice ({exc}); whether it "
+                  "landed is unknown", file=sys.stderr, flush=True)
+            return {"uncertain": True}
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
-    except Exception as exc:  # noqa: BLE001 — best-effort, must never propagate
-        print(f"[chat_ingest] notify failed ({exc})", file=sys.stderr, flush=True)
-        return False
+        body = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        body = {}
+    # An accepted event whose body is not an object is still accepted; it just
+    # carries no handle.
+    return body if isinstance(body, dict) else {}
 
 
 def notify_chat_event_async(**kwargs) -> None:
-    """Fire the rail POST on a daemon thread so the gateway hot path — persist,
-    gate, triage forward — is never delayed or reordered by it."""
+    """Fire the rail POST on a daemon thread and discard its answer.
+
+    For the classes the gate holds back, which want the mirror updated and
+    nothing more: the gateway's hot path — persist, gate, forward — is never
+    delayed or reordered by it. A forwarded message calls the synchronous
+    :func:`notify_chat_event` instead, because it needs the answer."""
     if not CHATS_INGEST_URL:
         return
     threading.Thread(

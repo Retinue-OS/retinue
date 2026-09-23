@@ -51,11 +51,12 @@ nothing new.
   turns, scheduled jobs, triage, Ask-Ara answers — gets its environment from
   the allowlist in `scripts/session_env.py` (capability tokens and the
   framework's own settings) and never inherits the spawning daemon's, so
-  mailbox passwords, the LiteLLM and model-gateway keys, the repo token and
+  mailbox passwords, the LiteLLM master and picker keys, the repo token and
   any secret added to `.env` later are absent by construction, and e-mail
   reaches the mailbox only through the web gateway's backend, where the send
   policy is applied. Two credentials pass on purpose, and a session can read
-  them: the model credential (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`),
+  them: the model credential (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
+  and `ANTHROPIC_CUSTOM_HEADERS` when it carries a LiteLLM virtual key),
   without which a spawned session cannot run at all, and — until the fetch
   moves into a sidecar — the Garmin login (`GARMIN_EMAIL` /
   `GARMIN_PASSWORD`), because `refresh.py --ensure` runs `sync-garmin.py`
@@ -63,7 +64,8 @@ nothing new.
   `.env` wholesale, so a secret meant for another service never enters the
   agent container at all. The remote-control main session is not spawned
   this way and keeps the entrypoint's narrower scrub (mail credentials and
-  the API key), so it still sees the model-gateway keys and the repo token.
+  the API key), so it still sees the LiteLLM master and picker keys and the
+  repo token.
   What the allowlist does *not* do: every process in the container runs as
   the same user, so a session can still read a daemon's `/proc/<pid>/environ`
   (the web gateway's, for one, holds the mailbox credentials for its e-mail

@@ -33,6 +33,20 @@ services:
       # Uncomment when running the optional qlever-genomics service below:
       # - SPARQL_ENDPOINT_GENOMICS=http://qlever-genomics:7001
       # - SPARQL_ENDPOINT_GENOMICS_DESC=whole-genome variants (large, static; Sequence Ontology)
+      # The base file loads no env_file into this service — it lists what the
+      # container's processes read (see docker-compose.yml). Anything the
+      # base file cannot know goes here: a named e-mail account's suffixed
+      # variables, a chamber script's own settings. Names that a spawned agent
+      # session should ALSO receive go into RETINUE_SESSION_ENV_EXTRA
+      # (scripts/session_env.py; `PREFIX_*` admits a family); the e-mail ones
+      # must not — the gateway's backend keeps the mailbox credentials on the
+      # agent's behalf.
+      # - EMAIL_USER_ARI
+      # - EMAIL_PASS_ARI
+      # - IMAP_HOST_ARI
+      # - SMTP_HOST_ARI
+      # - MY_CHAMBER_API_KEY
+      # - RETINUE_SESSION_ENV_EXTRA=MY_CHAMBER_API_KEY
     networks:
       - agents
       - web
@@ -113,13 +127,18 @@ services:
   # router; the updater's own UPDATER_TOKEN (see .env.example) is a second,
   # independent layer of auth beneath that, since a fixed rebuild recipe run
   # with docker-socket access is a high-blast-radius endpoint.
+  #
+  # The PathPrefix also publishes GET /status (the outcome of the last/current
+  # run) -- without it, a caller outside the container has no way to learn
+  # whether a dispatched update actually succeeded. It is safe to publish
+  # alongside /update because it carries the same UPDATER_TOKEN gate.
   # updater:
   #   networks:
   #     - agents
   #     - web
   #   labels:
   #     - "traefik.enable=true"
-  #     - "traefik.http.routers.updater.rule=Host(`agents.example.com`) && PathPrefix(`/update`)"
+  #     - "traefik.http.routers.updater.rule=Host(`agents.example.com`) && PathPrefix(`/update`, `/status`)"
   #     - "traefik.http.routers.updater.entrypoints=web,websecure"
   #     - "traefik.http.routers.updater.middlewares=agents-clientcert,agents-auth"
   #     - "traefik.http.services.updater.loadbalancer.server.port=9000"

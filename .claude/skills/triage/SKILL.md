@@ -5,8 +5,10 @@ description: >
   the user wants to "triage", "go through the inbox", "clear messages", "was ist
   reingekommen", when the scheduled triage job runs, or when an inbound message
   triggers triage. A credit-free **delivery gate** decides before any model turn
-  whether a message deserves one: whitelisted (and first-time unknown) senders
-  are handled live; everything else waits for the once-a-day catch-all. Triage
+  whether a message deserves one: on e-mail, whitelisted senders are handled
+  live and everything else waits for the once-a-day catch-all; on messenger the
+  chat surface takes every message and only a **VIP sender** buys a turn, so
+  triage sees a messenger message only when that rail could not take it. Triage
   collects the messages in scope, links each to a project, then proposes
   dispositions as dashboard conversations — one thread per reply/action (every
   run), one periodic omnibus for archivals and deletions. Handled-state lives in
@@ -31,15 +33,17 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
 - **Spend model turns only where they earn their keep.** The delivery gate
   (below) classifies every inbound *before* a model session is spawned — a plain
   script for e-mail, the gateway inbound handler for messenger, both credit-free.
-  On frequent runs only whitelisted senders (plus first-time unknowns) cost a
-  turn; everything else waits for the single daily catch-all.
+  On e-mail's frequent runs only whitelisted senders cost a turn and everything
+  else waits for the single daily catch-all. On messenger nothing costs a turn
+  by default at all: the chat surface delivers every message for free, and only
+  a **VIP sender** earns one.
 - **Handled-state lives outside the mailbox.** E-mail: `TRIAGE_STATE_DIR` holds
   **one file per message** — filename = the RFC Message-ID, content = triage
   status plus bookkeeping (disposition, conversation id,
   proposed/omnibus/nudge/resolved timestamps). Messenger: the gateway persists
   **one `kb:InboundMessage` `.nt` per message** on its own volume with a
-  `kb:delivered` flag; "delivered" means *a model turn has already accounted for
-  this message*, and only the gateway's `GET /undelivered` drain flips it.
+  `kb:delivered` flag; since the chat surface, "delivered" means *the user has
+  this message*, and the chats rail's acceptance is what flips it.
   Neither is touched by reading or replying in a client, and the mechanism works
   for **every channel**.
 - **The mailbox / delivery ledger is authoritative for what is present; the store
@@ -57,12 +61,15 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
 - **A silent run is the normal outcome.** The only conversations triage may open
   are Phase 4's two kinds — an individual proposal or the omnibus. A run never
   reports on itself. See **4c** below.
-- **An archived conversation is a user decision.** Archiving means the user is
-  not pursuing the topic at this stage. Never un-archive a thread — or post into
-  it, which un-archives it as a side effect — just to remind the user. Only
-  genuinely new external content (a new inbound message on the subject) may bring
-  an archived thread back, and that happens through Phases 1–4, never through a
-  reminder.
+- **An archived conversation is not a decision on the message.** Archiving means
+  the user is not pursuing the topic at this stage. Never un-archive a thread —
+  or post into it, which un-archives it as a side effect — just to remind the
+  user. What may bring the subject back is genuinely new external content (a new
+  inbound message) or a **stalled** item re-collected by Phase 1's fourth pass,
+  and either way through Phases 1–4 in a *new* thread, never through a reminder.
+  Only **`muted`** (with `archived`) is the user saying the topic is done for
+  good — per CLAUDE.md, the one decidable signal — and only that stops triage
+  from asking again.
 
 ### The delivery gate
 
@@ -71,10 +78,33 @@ the same "check for free, spend only on a hit" shape as `agent-self-review`. It
 runs in two places, one policy but two mechanisms, because e-mail is **pull** and
 messenger is **push**:
 
+- **Messenger (push), since the chat surface.** A message the gate forwards is
+  normally not triaged at all: the gateway hands it to the web-gateway's chats
+  rail, which accepts it — the user sees it in the chat, pushed, for no model
+  turn — and the gateway marks it delivered. For a sender the user marked a
+  **VIP**, the rail also runs a turn in that chat's companion thread: it files
+  what the message changes (a project, a memory) and stages any reply into the
+  chat's shared draft for the user's send press. The VIP flag follows the
+  person, so it holds in a group exactly as in a 1:1. **No messenger message
+  asks the user to whitelist or blacklist anyone any more**; that ask-flow is
+  gone, along with the messenger whitelist and blacklist themselves — a chat
+  the user wants off their screen is archived or muted in the dashboard, and
+  e-mail keeps its own whitelist. *Normally*, because the
+  rail can decline — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or
+  unable to open the companion thread — and the gateway then forwards to triage
+  exactly as it always did, so a triage run must still expect messenger
+  messages. Triage keeps the e-mail channel, and every channel with no chat
+  surface. There is no standing messenger backlog to sweep any more — every
+  message is delivered by the chat's acceptance — but `GET /undelivered` is
+  still how the exceptions are recovered. See `docs/messenger-chats.md`.
 - **E-mail (pull).** `scripts/triage-gate.py`, a scheduler `command` job.
-  **Frequent** tick: list new INBOX mail, keep only whitelisted senders, spawn
-  the model *only* if any survive. **Daily** tick: refresh the whitelist from the
-  Sent folder first, then spawn for **any** new sender. The whitelist
+  **Frequent** tick: list the INBOX, archive what the Sent folder proves is
+  already answered, keep only whitelisted senders, spawn the model *only* if
+  any survive. **Daily** tick: refresh the whitelist from the Sent folder
+  first, then spawn for **any** sender. Either tick hands the session a
+  **bounded slice, oldest first** (`TRIAGE_BATCH_SIZE`), never the whole
+  backlog, and comes back for the rest — see *Gate-spawned slices* under
+  Phase 1. The whitelist
   (`scripts/triage_policy.py`) matches an **exact address** (auto-added from
   Sent) **or** a hand-added `*@domain` / `*@*.domain` wildcard. Nothing auto-adds
   a domain, so one reply to `alice@gmail.com` whitelists *only* that address,
@@ -84,31 +114,66 @@ messenger is **push**:
   `triage_policy.gate_decision(channel, sender, group_id)` in its inbound
   handler, reading the per-channel policy `.nt` **raw off its mounted volume**
   (no ~15 s SPARQL reindex lag on the hot path). Every inbound is persisted as
-  one `kb:InboundMessage`; the class decides forward-vs-hold:
+  one `kb:InboundMessage`, and then offered to the chats rail, which **accepts**
+  it: the chat has the message, the user is pushed unless the gate says to stay
+  quiet, and the gateway marks it `delivered`. **That is where a messenger
+  message is handled now, and triage is not in that path at all.**
 
-  | class | forwarded live? | held-flag written | swept by daily drain? |
-  |---|---|---|---|
-  | **whitelisted** | yes (`delivered:true`) | — | — |
-  | **unknown** | yes, flagged "unknown sender" (`delivered:true`) | — | — |
-  | **blacklisted** | no | `delivered:false` | **yes** |
-  | **group-blocked** | no | `delivered:true` | no |
-  | **no-action-class** (status/echo/news/note-to-self) | no | `delivered:true` | no |
+  | class | reaches triage? | what happens instead |
+  |---|---|---|
+  | **VIP sender**, any group | no | a turn in that chat's companion thread files it and stages any reply |
+  | anyone else | no | the chat shows it; the user reads and answers there |
+  | a **non-VIP** in an `ignored` / `quieted` group | no | the chat shows it, silently — no push |
+  | a **non-VIP** in a chat the user **muted** | no | the chat shows it, silently — no push, and it stays archived |
+  | **no-action-class** (status/echo/news/note-to-self) | no | as before: on record, nobody prompted |
 
-  An **unknown** sender's live turn asks the user whether to whitelist: yes →
-  whitelist; no → blacklist (never asked again, held-only from then on). A group
-  can be added to the blocked set so it stops triggering unknown-sender prompts.
-  All three lists are edited by **talking to Ara** — "trust everyone at
-  `*@epfl.ch`" or "block that group" is an instruction Ara carries out via the
+  The group flags and the chat's own mute suppress the **push**, never a VIP's
+  turn: `vip` is sender-only and group-independent, so a VIP writing into a
+  quieted group is still worked — quietly.
+
+  A messenger message reaches **this skill** only when the rail did not take
+  it — switched off with `CHAT_ARRIVAL_TURNS=0`, unreachable, or unable to open
+  a VIP's companion thread — and when a VIP's turn failed. Those stay
+  `delivered=false`, and `GET /undelivered` is how they are recovered. There is
+  no standing backlog to sweep and **no unknown-sender ask-flow**: nothing asks
+  the user to rule on a stranger, because nothing needs the answer.
+
+  The lists are edited by **talking to Ara** — "trust everyone at `*@epfl.ch`",
+  "block that group", "Nina is a VIP" are instructions Ara carries out via the
   `triage_policy.py` CLI and confirms. The raw `.nt` format is only a
   look-under-the-hood fallback.
 
-The gate never changes what triage *does* with a message — only whether the turn
-is spent live or at the daily drain. Cold senders wait at most ~24 h, bounded by
-the daily run.
+The gate never changes what triage *does* with a message it is handed. On
+e-mail it still decides only whether the turn is spent live or at the daily
+drain, so a cold sender waits at most ~24 h.
 
 ---
 
 ## Phase 1 — Collect & reconcile (within scope)
+
+**Gate-spawned slices.** A run the e-mail gate spawns carries its scope in the
+prompt: a list of messages, oldest first, each with its UID, that is the whole
+scope of the run. Work that list and nothing else — do **not** list the INBOX
+for more; what is
+not listed is either already recorded or waits for a later run, and the gate
+comes back for it. Take the messages in the order given. **Write each
+message's status record the moment its disposition is settled** — `proposed`
+once its thread is open, `omnibus_pending` at classification, `resolved` when
+it is answered elsewhere — before starting on the next one, never as one
+batch at the end: the scheduler stops a run at its budget, and the only
+progress that survives is what is on disk by then. Phases 2–4 (classify, link,
+propose) run for every listed message on **every** slice — that is the work
+a slice exists to do. The prompt also says whether this slice drains the
+backlog. When it does **not**, defer only the whole-picture work: the *Phase 1
+reconciliation passes* numbered 2–4 below (store→INBOX, done-but-still-there,
+stalled) and Phase 5's reminders belong to the draining run. When it does,
+run those as written — they diff the INBOX against the status store, so for
+them, and only for them, list the INBOX as described below; any unrecorded
+mail that listing turns up belongs to a later run's slice, not to this one.
+A due omnibus digest is announced as a
+count, not a listing: compose it from the `omnibus_pending` records in the
+status store (Phase 4b). The listing below is for a run that is *not* handed
+a slice (a manual invocation, an ad-hoc triage).
 
 **E-mail** — list the current INBOX and diff it against the status store:
 
@@ -133,21 +198,60 @@ status. Reconcile in both directions:
    Phase 6 would. This catches e.g. the already-answered path (which proposes no
    reply, so never reaches Phase 6's move) and verify-queued sends (deferred
    until approval, then forgotten). Only genuinely non-terminal states
-   (`proposed`, `omnibus_pending`, `deferred`, an `engaged` item still awaiting
-   *user* input) legitimately stay in the INBOX.
+   (`proposed`, `omnibus_pending`, `omnibus`, `deferred`, an `engaged` item
+   still awaiting *user* input) legitimately stay in the INBOX.
+   **`omnibus_pending` is not drift**: it is an item deliberately held back
+   until its digest is due, so the user has not seen it yet — never dispose of
+   one under this pass.
+4. **Re-collect `stalled`** — the same backstop for the *non-terminal* states.
+   An item whose proposal was never engaged and whose thread was archived or
+   deleted stays in the INBOX forever: nothing revisits it. The gate therefore
+   re-arms any INBOX message on a non-terminal status untouched for
+   `TRIAGE_STALL_DAYS` (default 7, `triage-gate.py`) — but re-arming only buys
+   this turn; without this pass the item is re-armed again on every later tick
+   and still never leaves. For each such message, look its thread up in
+   `GET /conversations?all=1` — under `conversation_id` for an individually
+   proposed item, under `omnibus_conversation_id` for one an omnibus already
+   carried (two distinct fields; see *State & idempotency*) — and take one of
+   the three branches below. An `omnibus_pending` record carries **neither**:
+   it was never shown to the user, so there is no thread to judge and no
+   decision to read off one. Treat it as the "thread gone" branch — re-collect
+   it into the next due digest, never resolve it.
+   - **Thread archived *and* muted** → that is the user's decision on the
+     message (per CLAUDE.md `muted` is the only decidable signal of "archive
+     this for good"). Do not re-propose: resolve it out of the INBOX exactly as
+     pass 3 does — `flag --read` + `move` to its disposition folder — and write
+     `resolved`, recording the muted thread as the reason.
+   - **Thread gone, or archived and not muted** → the proposal never landed.
+     Re-collect the message as if it were untracked: it goes through Phases 2–4
+     and gets a **new** proposal thread (or a place in the omnibus), reusing the
+     status file. Never post into the archived thread and never un-archive it —
+     a quiet or archived thread is not a decision, so the new thread is the only
+     way to ask again.
+   - **Thread alive** → the proposal is intact and merely old; leave the
+     decision to the user and let Phase 5 nudge it, but **stamp `updated` on the
+     status record** so the gate stops counting it as stalled.
+
+   Every branch must leave the record with either a new status or a fresh
+   timestamp; one that leaves it untouched re-arms the item on every tick.
 
 **Messaging** — messenger has **no live listing** (Signal/WhatsApp/Telegram are
-push-only). The held backlog lives in each gateway's delivery ledger, so the
-daily catch-all **drains the gateway** instead of listing chats:
+push-only), and since the chat surface there is normally nothing here to
+collect: the chat took every message and the gateway recorded it delivered.
+What is left undelivered is the exceptions — the rail refused, its answer was
+lost in flight, or a VIP's turn failed — and those are drained from the
+gateway's ledger rather than listed:
 
-    # ONLY the daily triage skill calls this — it drains AND marks delivered.
+    # ONLY this skill calls this — it drains AND marks delivered.
     curl -s -H "Authorization: Bearer $INBOUND_GATE_TOKEN" \
       "http://signal-gateway:8090/undelivered?since=<ISO-8601-of-last-drain>"
     # likewise whatsapp-gateway / telegram-gateway for every inbox-mode channel
 
-`GET /undelivered` returns the held messages **and flips each to
-`delivered:true` in the same pass**. It is the only operation that mutates the
-flag, so the drain is idempotent — a re-run returns only what arrived since.
+`GET /undelivered` returns the undelivered messages **and flips each to
+`delivered:true` in the same pass**, so the drain is idempotent — a re-run
+returns only what has arrived since. It is one of two things that set the flag:
+the other, and now the usual one, is the gateway marking a message delivered
+when the chats rail accepts it.
 Process the returned messages through Phases 2–4 exactly like e-mail. Each
 drained message carries a **`thread_key`** as well: pass it as `--key` when you
 open its dashboard conversation, exactly as you would the live prompt's
@@ -165,7 +269,7 @@ token, never by resolving the sender's name.
 **Never call `/undelivered` to browse.** It drains as it reads. Any ad-hoc
 question ("what came in on Signal?", "what did X say last Tuesday?") goes
 through **plain SPARQL** against the life store (`kb:InboundMessage`) — a pure
-read that touches no flag. Only the daily drain may consume the queue.
+read that touches no flag. Only the drain may consume the queue.
 
 When invoked for a single channel or a single message, collect only that.
 
@@ -173,10 +277,12 @@ When invoked for a single channel or a single message, collect only that.
 
 An **inbox-mode** messaging gateway (e.g. `signal-gateway.py` with
 `SIGNAL_GATEWAY_MODE=inbox`) monitors one of the user's own message sources.
-Each inbound first passes the delivery gate: a **whitelisted** or **unknown**
-sender is dispatched straight to Ara via the web-gateway; blacklisted /
-group-blocked / no-action-class messages are persisted `delivered` and never
-pushed.
+Each inbound first passes the delivery gate and is then taken by the chats
+rail, which is where messenger messages are handled now — so **this path is a
+fallback**, reached only when that rail could not take the message. It arrives
+here exactly as it always did. One thing has changed and it is absolute: **do
+not ask the user to whitelist or blacklist a sender.** The prompt may say a
+sender is unknown; that is context, not a question, and the ask-flow is gone.
 The account's **mode** — not the content, not triage — already established that
 this is the user's incoming mail; **triage never has to decide whether a message
 is an instruction or user mail.** The prompt contains the message and sender, so
@@ -188,9 +294,12 @@ So every push-triggered triage message is the user's own inbound mail, processed
 under the owner's session, and **never replied to on the source channel** — Ara
 only proposes via the dashboard.
 
-An **unknown**-sender push is tagged as such: Ara's proposal asks whether to
-whitelist the handle (yes → whitelist, no → blacklist), alongside the normal
-disposition. This is the one path by which a new handle enters the policy.
+An **unknown**-sender push is tagged as such, and that is all it is — a note
+that nobody has said anything about this sender. **Do not propose whitelisting
+or blacklisting them.** Neither list exists on messenger any more: who is worth
+a model turn is the user's VIP list, which they set by telling Ara, and who they
+would rather not hear from is a chat they mute in the dashboard — never a
+question put to them about a stranger who just wrote.
 
 ### Status updates (broadcast posts) — filed silently by default
 
@@ -479,26 +588,67 @@ messages and record the last-omnibus timestamp in
 **`$TRIAGE_STATE_DIR/.last-omnibus`** (that exact name — see *State &
 idempotency*).
 
-**The omnibus push always carries `--key`.** "At most once per interval" is
-enforced by the gateway, not by trusting the bookkeeping below to be reached:
-the key names the interval window, so every attempt inside one window collapses
-onto the first thread instead of raising another. Derive it mechanically —
-never from a timestamp of "now", which differs on every attempt:
+**"Accumulate" means touch the status store only — never the dashboard.**
+Check `$TRIAGE_STATE_DIR/.last-omnibus` before doing anything else in this
+phase. If less than `EMAIL_PROCESSING_INTERVAL` has elapsed since it, the
+omnibus is **not due**, full stop — regardless of whether an omnibus thread
+from earlier in the window is still open, unread, or awaiting the user's
+approval. An unresolved thread is not an invitation to add to it: write status
+`omnibus_pending` for each newly classified `archive`/`delete` item (the
+status the rest of this skill and `triage-gate.py` both already treat as
+open-but-not-yet-proposed) and stop — **no `conversation-push.py` call of any
+kind for these items**, new thread or append. The existing thread, if any, is
+left exactly as the user last saw it until the next `4b` emission gathers
+every `omnibus_pending` item — the ones just accumulated together with any
+from earlier passes — into that one fresh conversation. Do not reach for
+`--thread <existing-omnibus-id>` here: that flag exists to add material to a
+conversation the user is already looking at (an attachment, a Phase 5 nudge on
+a *proposed* item), not to slip more omnibus content into a batch the user has
+not approved yet — every append fires its own unread badge and Web Push, which
+is exactly the per-item noise the single-digest design exists to prevent. A
+run that finds new archive/delete items mid-interval ends silently on this
+front, same as Phase 4c.
+
+**The omnibus push always carries `--key`, and only fires when due.** "At most
+once per interval" is enforced by the gateway, not by trusting the bookkeeping
+below to be reached: the key names the interval window, so every attempt
+inside one window collapses onto the first thread instead of raising another.
+Derive it mechanically — never from a timestamp of "now", which differs on
+every attempt:
 
     OMNIBUS_KEY="triage-omnibus:$(python3 -c 'import os,time; print(int(time.time()//int(os.environ.get("EMAIL_PROCESSING_INTERVAL","86400"))))')"
     python3 /workspace/scripts/conversation-push.py --title "Triage: archive & delete" \
     --key "$OMNIBUS_KEY" \
     "...grouped ARCHIVE / DELETE, one line per message, each ARCHIVE line with its reason...\n<approve-all chip>"
 
-This key is what makes emit-then-record safe. The bookkeeping is written
-*after* the push on purpose — writing it first would mark messages `omnibus`
-that the user never saw, had the push failed — so a run that dies in between
-leaves the items untracked and a later run re-proposes them, correctly, since
-nothing recorded that they were proposed. Without the key that re-proposal
-opens a **second thread**; with it, the user's existing thread is reused and
-nothing duplicates. A response carrying `deduplicated` means this window's
-omnibus is already up: write the bookkeeping and stop — never re-push, and
-never "try again" because a push looked unconfirmed.
+This key protects a *due* emission from raising two threads when it is
+attempted more than once inside the same window (a retried run, an
+escalation) — it is not what decides whether to emit at all; the
+`.last-omnibus` check above is. This key is also what makes emit-then-record
+safe. The bookkeeping is written *after* the push on purpose — writing it
+first would mark messages `omnibus` that the user never saw, had the push
+failed — so a run that dies in between leaves the items untracked and a later
+run re-proposes them, correctly, since nothing recorded that they were
+proposed. Without the key that re-proposal opens a **second thread**; with it,
+the user's existing thread is reused and nothing duplicates. A response
+carrying `deduplicated` means this window's omnibus is already up: write the
+bookkeeping and stop — never re-push, and never "try again" because a push
+looked unconfirmed.
+
+**Reuse is byte-exact, or it is an append.** The key guarantees one *thread*,
+not one *message*. The gateway compares the incoming text with what the thread
+already says, and on any difference it **appends** the new text and fires its
+own unread badge and Web Push — while still answering `deduplicated: true`.
+Digest prose is composed fresh in each run, so a re-render essentially never
+matches byte-for-byte, which means a naive retry delivers the user a second
+digest under a key that was supposed to prevent exactly that. So **snapshot
+the exact string you pushed** — write it beside the bookkeeping, in
+`$TRIAGE_STATE_DIR/.last-omnibus-text` — and on any retry inside the same
+window re-push that snapshot verbatim instead of re-composing. Read the
+response accordingly: `deduplicated` on its own does **not** prove nothing was
+delivered. A response that also carries `appended` means a message did go out,
+so write the bookkeeping and stop; only a `deduplicated` response *without*
+`appended` means the push collapsed silently onto the existing thread.
 
 ### 4c. No status-report conversations — a silent run is the normal outcome
 
@@ -546,8 +696,8 @@ remind — scaled by urgency and importance:
 have decided not to pursue the topic for now — respect that. Send no nudge and
 no push for it, and never un-archive it as a reminder (posting into it would
 un-archive it as a side effect, so don't post either). Only a **new external
-message on the subject** — arriving through Phases 1–4 — may bring an archived
-thread back.
+message on the subject**, or Phase 1's re-collection of a stalled item — both
+arriving through Phases 1–4, in a new thread — may raise the subject again.
 
 **Urgency scaling:** Signal/WhatsApp/SMS escalate **sooner** and prefer the
 Signal push; e-mail defaults to the in-thread nudge. Record `last_nudge` in the
@@ -581,7 +731,26 @@ until the cause is fixed; a second dispatch would only return it again.
 Then carry out the disposition:
 
 - **Archive / delete** → apply per channel (e-mail `move`/delete; messaging
-  archive), honouring named exceptions.
+  archive), honouring named exceptions. **Resolve each omnibus line to its
+  message via the status store, never via the line's own text.** The
+  executing session is very often a different `claude -p` run than the one
+  that composed the omnibus, so it cannot rely on remembering which message a
+  line meant — and a support ticket's replies routinely share one subject
+  line verbatim ("Re: Re: <original subject>") across weeks of back-and-forth,
+  so re-deriving identity from subject/sender text can match more than one
+  message, some of them with a live, unrelated disposition. Every item an
+  omnibus ever carried is stamped in its status file with
+  `omnibus_conversation_id` set to that thread's id (see *State &
+  idempotency*) — grep the store for that id to get the exact, unambiguous
+  set this thread's approval covers, then act on each by its `uid`/
+  `message_id`, not by re-matching text. A line whose message cannot be found
+  this way is left non-terminal and flagged rather than guessed at. The lookup
+  spans **every** channel an omnibus can bundle, not e-mail alone: a messenger
+  item's record may still sit under the legacy `whatsapp_<jid>_<epoch>` scheme
+  beside the canonical `whatsapp:<jid>:<ISO-timestamp>` one, so grep the store
+  for the thread id rather than assuming a filename shape — and a bundled
+  messenger line with no record at all *is* the "cannot be found" case: flag
+  it, never match it back by its text.
 - **Reply** → for e-mail use `email_client.py reply --uid <UID>`, which derives
   the threading headers (`In-Reply-To`/`References`) from the source — an
   unthreaded reply defeats the already-answered check and gets re-proposed as a
@@ -625,9 +794,12 @@ reply queued at `/sends` is not resolved until it is sent **and** the source
 mail has left the INBOX.
 
 For **messenger** there is no mailbox to empty: a message leaves the backlog
-when the gateway marks it `delivered` (on live forward or daily drain).
-Approval-side execution (sending an approved reply) still runs here; the
-ledger's flag, not an INBOX move, closes the loop.
+when the gateway marks it `delivered`. That is normally the chats rail's
+acceptance, within seconds of arrival and with no model turn — so there is no
+standing backlog; `GET /undelivered` and a confirmed forward are what close the
+loop for the exceptions that reach this skill at all. Approval-side execution
+(sending an approved reply) still runs here; the ledger's flag, not an INBOX
+move, closes the loop.
 
 ---
 
@@ -642,7 +814,27 @@ ledger's flag, not an INBOX move, closes the loop.
   `omnibus`, `last_nudge`, `resolved`). For a sent reply also record `sent_uid` +
   `sent_message_id` so the send is verifiable against the Sent folder, not
   merely asserted. Write a status only once a message has actually been
-  proposed, bundled, or resolved — never on mere reading.
+  proposed, bundled, or resolved — never on mere reading — and write it
+  *then*, before moving to the next message, never as a batch at the end of
+  the run: a run stopped at its budget keeps only what was already on disk,
+  and a run that recorded nothing has to start over. The single exception
+  is `omnibus_pending` (Phase 4b), which is written at classification time
+  precisely because the item is *not* being shown yet: it records a deliberate
+  hold, and without it an accrued item is invisible both to the next run and to
+  the gate's due-digest check, so its digest would never be armed.
+- **`omnibus_pending` vs `omnibus`, `conversation_id` vs `omnibus_conversation_id`.**
+  An item accrued between omnibus emissions (Phase 4b) carries `status:
+  omnibus_pending` and no conversation reference yet — it has been classified
+  but not shown to the user. Once actually bundled into an emitted thread, it
+  becomes `status: omnibus` and records that thread's id under
+  **`omnibus_conversation_id`** — a distinct field from `conversation_id`,
+  which is reserved for an individually-proposed `reply`/`action` item's own
+  thread (Phase 4a). Keeping the two fields separate is what lets a later
+  session — Phase 6 executing an omnibus approval, or anyone auditing the
+  store — recover exactly which messages one omnibus thread covers by
+  querying the field (`grep -l '"omnibus_conversation_id": "<id>"'`), a lookup
+  that stays correct even when several messages in the same thread (a support
+  ticket's reply chain, e.g.) share an identical subject and sender.
 - **Diff on the sanitized id, never the raw Message-ID** — the filename scheme
   is `message_id.strip('<>')` with `/` → `_`, exactly `triage-gate.py`'s
   `_status_path()`. An id containing a slash (GitHub notifications) otherwise
@@ -672,13 +864,16 @@ ledger's flag, not an INBOX move, closes the loop.
   on its own volume (`INBOUND_STORE_DIR`): `kb:channel`, `kb:sender`, `kb:group`,
   the text, a receipt timestamp, and the `kb:delivered` flag. qlever indexes the
   same files, so the whole stream is queryable over SPARQL.
-- **`delivered` is single-writer, owned by the gateway.** Only `GET /undelivered`
-  (drain) flips it, and only the daily triage skill calls that. A SPARQL read
-  never mutates it, so browsing messenger history is always safe.
-- Live-forwarded (whitelisted/unknown) → `delivered:true`; blacklisted →
-  `delivered:false` (awaits the drain); group-blocked and no-action-class →
-  `delivered:true` (complete history, never drained).
-- **Policy** (whitelist/blacklist/group-block) is `.nt` on the same per-gateway
+- **`delivered` is single-writer, owned by the gateway.** It sets the flag when
+  the chats rail accepts a message — the usual path, and what makes "delivered"
+  mean *the user has this* — and `GET /undelivered` flips it for the
+  exceptions, which only this skill drains. A SPARQL read never mutates it, so
+  browsing messenger history is always safe.
+- Accepted by the chat → `delivered:true`, whatever the gate made of it; a
+  VIP's message waits for its turn's job to report done first. Undelivered is
+  the exception set: the rail refused, its answer was lost, or a VIP's turn
+  failed.
+- **Policy** (vip + group flags) is `.nt` on the same per-gateway
   volume, in a `policy/` subdirectory Ara writes and the gateway reads raw. Edit
   it by instructing Ara (the `triage_policy.py` CLI), never by hand-typing
   identifiers.
@@ -697,6 +892,9 @@ interruptions into a pile of identical threads.
 | Variable | Meaning | Default |
 |---|---|---|
 | `TRIAGE_STATE_DIR` | The e-mail triage status store: one file per message (id → status + bookkeeping). Persist on the pinned `/root` volume so it survives container recreation. | `/root/.retinue/triage` |
+| `TRIAGE_BATCH_SIZE` | How many never-seen or stalled messages one gate-spawned run is handed, oldest first. The lever that keeps a sweep incremental: the run finishes and records its slice; the gate exits `75` when more waits and the scheduler comes back for it (`resume_after_seconds` on the job). Non-positive: as many as the prompt lists (`TRIAGE_PROMPT_LIST_LIMIT`). | `25` |
+| `TRIAGE_SENT_RECONCILE` | `0` switches off the gate's credit-free archiving of INBOX mail the Sent folder proves already answered (`email_client answered` is the authority; move, never delete). | `1` |
+| `TRIAGE_ANSWERED_FOLDER` | Where the gate moves answered mail. | `TRIAGE_NEWS_FOLDER`, i.e. `Archive` |
 | `EMAIL_PROCESSING_INTERVAL` | Seconds; **only** the gap between omnibus proposals and the grace period before the first reminder. **Not** the triage run frequency (that is the scheduler's). | `86400` (24 h) |
 | `TRIAGE_EMAIL_WHITELIST_PATH` | The e-mail whitelist `.nt` (exact addresses + `*@domain` wildcards) the frequent gate reads. Retinue writes it; qlever indexes it. | `<chambers>/_generated/triage/email-whitelist.nt` |
 | `TRIAGE_MESSENGER_DIR` | Retinue-side root under which each channel's `policy/policy.nt` is written. Mirrors what the gateway reads via `INBOUND_POLICY_PATH`. | `<chambers>/_generated/messenger` |
