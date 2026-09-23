@@ -1038,14 +1038,24 @@ def delete_chat(store_dir: str | Path, chat: str,
     path inside the media directory) goes too.
 
     Never raises on a single unreadable or undeletable file — it is skipped
-    and counted in ``errors``, so the caller can say the erasure was partial.
-    Returns ``{"messages", "media", "errors"}``.
+    and counted in ``errors``, so the caller can tell the erasure was partial
+    and must not treat the chat as gone. That includes a file that cannot be
+    read at all (it may be one of this chat's), and one that cannot be parsed
+    but names this chat key: failing closed there is the point.
+
+    Returns ``{"messages", "media", "errors", "subjects", "message_ids"}`` —
+    the last two identify what was erased, so a reader still serving an older
+    index can hide exactly those records and nothing that arrives afterwards.
     """
     wanted_chat = (chat or "").strip()
     wanted_account = (account or "").strip()
-    result = {"messages": 0, "media": 0, "errors": 0}
+    result: dict = {"messages": 0, "media": 0, "errors": 0,
+                    "subjects": [], "message_ids": []}
     if not wanted_chat:
         return result
+    # How this chat key appears in a record, for recognising one that no
+    # longer parses (see _lit: the key is an escaped plain literal).
+    chat_marker = f'<{P_CHAT}> "{_esc(wanted_chat)}"'
     doomed: list[tuple[Path, dict]] = []
     kept_refs: set[str] = set()
     try:
@@ -1054,10 +1064,14 @@ def delete_chat(store_dir: str | Path, chat: str,
         return result
     for path in paths:
         try:
-            fields = _parse(path.read_text(encoding="utf-8"))
-        except OSError:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            result["errors"] += 1
             continue
+        fields = _parse(text)
         if not fields:
+            if chat_marker in text:
+                result["errors"] += 1
             continue
         mine = (fields.get("chat") == wanted_chat
                 and (fields.get("account") or "") == wanted_account)
@@ -1070,6 +1084,9 @@ def delete_chat(store_dir: str | Path, chat: str,
         try:
             path.unlink()
             result["messages"] += 1
+            result["subjects"].append(fields["subject"])
+            if fields.get("message_id"):
+                result["message_ids"].append(fields["message_id"])
         except FileNotFoundError:
             continue
         except OSError:

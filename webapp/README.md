@@ -244,9 +244,14 @@ The API, as the components consume it:
   pending-send files and recent-senders entry for the peer — and then the
   chat's state document, live overlay entries and companion thread (with its
   attachments and Claude session transcript) go. No trace stays beyond a
-  minutes-long in-memory tombstone that hides the store's not-yet-reindexed
-  copy; the next message from the peer starts a new chat. When no gateway
-  can erase the messages the answer is 502 and nothing is touched.
+  minutes-long in-memory tombstone naming exactly the erased records (as the
+  gateways report them), which hides the store's not-yet-reindexed copy; the
+  next message from the peer starts a new chat, however soon it lands. The
+  answer is 502, and the chat, its state and companion stay for a retry,
+  when no gateway could erase or one reports a file it could not remove
+  (an unreadable record, or one that names the chat but no longer parses,
+  counts). Like a send, a delete is accepted only through the reverse proxy
+  (403 otherwise): an agent may archive or mute a chat, never erase it.
   Deliberately out of reach: what agents derived from the chat elsewhere
   (memories, news-feed items, project notes), notifications already
   delivered, and the messenger app's own copy on the phone.

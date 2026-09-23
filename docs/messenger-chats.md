@@ -269,9 +269,13 @@ directions from the shared message volume, together with the blobs only those
 records reference (`inbound_store.delete_chat`). It also drops its own
 traces of the peer: pending-send files and the recent-senders entry. Only
 then does the web-gateway delete the state document, the overlay entries and
-the companion thread. The life store drops the erased graphs on its next
-pass, and a short in-memory tombstone hides them until it has. A later
-message from the same peer finds nothing and starts a new chat. The
+the companion thread. A gateway that reports anything it could not erase
+fails the whole delete, and nothing else is touched. The life store drops the
+erased graphs on its next pass, and a short in-memory tombstone hides them
+until it has. The tombstone lists the records the gateways erased, by subject
+and message id; it is not a time cut-off. A later message from the same peer
+finds nothing and starts a new chat, even in the same second. Like a send, a
+delete is the user's own act and is accepted only through the reverse proxy. The
 dashboard's Archived tab is where the action lives (swipe left → Delete, two
 taps).
 

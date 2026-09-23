@@ -320,11 +320,16 @@ class _MockGateway(BaseHTTPRequestHandler):
                                      self.headers.get("Authorization", "")))
         if self.path.rstrip("/") == "/chats/delete":
             STATE.setdefault("deleted", []).append(payload)
-            if STATE.get("gw_delete_fail"):
+            fail = STATE.get("gw_delete_fail")
+            if fail == "http":
                 self._json(500, {"error": "store volume unwritable"})
             else:
+                # "partial": the gateway answers, but says a file stayed behind.
                 self._json(200, {"status": "deleted", "messages": 3, "media": 1,
-                                 "errors": 0, "pending_sends": 0, "recent": 1})
+                                 "errors": 1 if fail == "partial" else 0,
+                                 "pending_sends": 0, "recent": 1,
+                                 "subjects": ["urn:retinue:inbound:signal:erased1"],
+                                 "message_ids": ["d1"]})
             return
         if self.path.rstrip("/") == "/send":
             STATE["sent"].append(payload)
@@ -1605,16 +1610,20 @@ def test_delete_chat(base, wg):
     _http(base, "POST", "/chats/" + _quote(cid) + "/flags", {"muted": True})
     delete_path = "/chats/" + _quote(cid) + "/delete"
 
-    # A gateway that cannot erase the messages: nothing else is touched.
-    STATE["gw_delete_fail"] = True
-    try:
-        status, body = _http(base, "POST", delete_path)
-    finally:
-        STATE["gw_delete_fail"] = False
-    assert status == 502, (status, body)
-    status, body = _http(base, "GET", "/chats")
-    assert any(c["id"] == cid for c in body["chats"]), "a failed delete keeps the chat"
-    assert (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists()
+    # A gateway that cannot erase the messages — failing outright, or
+    # answering 200 but reporting a file it could not remove: nothing else is
+    # touched, so the chat stays whole enough to retry.
+    for mode in ("http", "partial"):
+        STATE["gw_delete_fail"] = mode
+        try:
+            status, body = _http(base, "POST", delete_path)
+        finally:
+            STATE["gw_delete_fail"] = None
+        assert status == 502, (mode, status, body)
+        status, body = _http(base, "GET", "/chats")
+        assert any(c["id"] == cid for c in body["chats"]), (mode, "the chat stays")
+        assert (wg.CONVERSATIONS_DIR / f"{conv_id}.json").exists(), mode
+        assert wg._CHAT_STATE.get(cid)["muted"] is True, mode
 
     STATE["deleted"] = []
     STATE["gw_requests"].clear()
@@ -1635,13 +1644,19 @@ def test_delete_chat(base, wg):
                                   if m.get("text") == "Remember me?"], body
 
     # The store may still serve the erased rows for a moment; the tombstone
-    # hides exactly those — nothing sent after the deletion.
-    assert not wg._chat_after_tombstone(cid, "2000-01-01T00:00:00Z")
-    assert wg._chat_after_tombstone(cid, "2999-01-01T00:00:00Z")
-    assert wg._chat_after_tombstone("signal:+41790000000", "2000-01-01T00:00:00Z")
+    # hides exactly those records, by the identities the gateway reported —
+    # not by time, so nothing that arrives afterwards is caught by it.
+    assert wg._chat_record_erased(cid, "urn:retinue:inbound:signal:erased1")
+    assert wg._chat_record_erased(cid, message_id="d1")
+    assert not wg._chat_record_erased(cid, "urn:retinue:inbound:signal:new", "d2")
+    assert not wg._chat_record_erased("signal:+41790000000", message_id="d1")
+    # A late rail event for an erased message does not bring it back.
+    _http(base, "POST", rail, event)
+    status, body = _http(base, "GET", "/chats")
+    assert not any(c["id"] == cid for c in body["chats"]), "an erased message came back"
 
-    # The same peer writing again is a new chat, with nothing carried over.
-    time.sleep(1.1)  # the rail stamps seconds; stay clear of the deletion's
+    # The same peer writing again — in the same second, even — is a new chat,
+    # with nothing carried over.
     _http(base, "POST", rail, dict(event, message_id="d2", text="Hello again"))
     status, body = _http(base, "GET", "/chats")
     c = next(c for c in body["chats"] if c["id"] == cid)

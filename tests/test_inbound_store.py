@@ -400,7 +400,8 @@ def test_delete_chat_erases_exactly_one_chat():
                                       timestamp=105.0)[1]
 
         got = ist.delete_chat(tmp, peer, acct)
-        assert got == {"messages": 3, "media": 1, "errors": 0}, got
+        assert (got["messages"], got["media"], got["errors"]) == (3, 1, 0), got
+        assert len(got["subjects"]) == 3, got
         left = sorted(p.name for p in ist.messages_dir(tmp).glob("*.nt"))
         assert left == sorted(p.name for p in (kept_other, kept_legacy, kept_peer)), left
         assert not any(ist.media_dir(tmp).glob(pic + "*")), "blob and sidecars go"
@@ -418,7 +419,25 @@ def test_delete_chat_erases_exactly_one_chat():
                           text="stuck", attachment_urls=[f"urn:retinue:media:signal:{stuck}"],
                           timestamp=106.0)
         got = ist.delete_chat(tmp, peer, acct)
-        assert got == {"messages": 1, "media": 1, "errors": 1}, got
+        assert (got["messages"], got["media"], got["errors"]) == (1, 1, 1), got
+
+        # What was erased is reported by identity, for readers still serving
+        # an older index.
+        mid_rec = ist.write_message(tmp, channel="signal", sender=peer, chat=peer,
+                                    account=acct, text="with id", message_id="m-9",
+                                    timestamp=107.0)
+        got = ist.delete_chat(tmp, peer, acct)
+        assert got["subjects"] == [mid_rec[0]] and got["message_ids"] == ["m-9"], got
+
+        # A record that no longer parses fails the erasure closed when it names
+        # this chat, and is none of its business when it does not.
+        (ist.messages_dir(tmp) / "0000000000000999-broken.nt").write_text(
+            f'garbage\n<urn:x> <{ist.P_CHAT}> "{peer}" .\n')
+        (ist.messages_dir(tmp) / "0000000000000998-other.nt").write_text("garbage\n")
+        assert ist.delete_chat(tmp, peer, acct)["errors"] == 1
+        assert ist.delete_chat(tmp, "+4179", acct)["errors"] == 0
+        for junk in ist.messages_dir(tmp).glob("00000000000009*.nt"):
+            junk.unlink()
 
         # Idempotent, and an empty key erases nothing.
         assert ist.delete_chat(tmp, peer, acct)["messages"] == 0
