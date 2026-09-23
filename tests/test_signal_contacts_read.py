@@ -102,6 +102,17 @@ def test_group_name_resolution_is_cached():
     print("ok: group names resolved from a cached roster")
 
 
+def test_group_name_first_lookup_right_after_boot():
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(tmp)
+        sg._signal_cli_json = lambda args: [{"id": "g-1", "name": "Family"}]
+        # A monotonic clock still below the miss window (fresh host boot) must
+        # not make the never-filled cache look fresh.
+        sg.time = types.SimpleNamespace(monotonic=lambda: 5.0)
+        assert sg._resolve_group_name("g-1") == "Family"
+    print("ok: first group-name lookup fetches even right after boot")
+
+
 def test_chat_event_carries_group_name():
     with tempfile.TemporaryDirectory() as tmp:
         sg = _load_signal_gateway(tmp)
@@ -204,6 +215,7 @@ def main():
     test_list_contacts_normalizes_fields()
     test_list_groups_normalizes_fields()
     test_group_name_resolution_is_cached()
+    test_group_name_first_lookup_right_after_boot()
     test_chat_event_carries_group_name()
     test_signal_cli_json_nonzero_raises()
     test_recent_senders_recorded_most_recent_first()

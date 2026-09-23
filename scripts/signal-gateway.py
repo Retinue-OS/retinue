@@ -1248,7 +1248,7 @@ def _list_groups() -> list[dict]:
 _GROUP_NAMES_TTL = 600.0
 _GROUP_NAMES_MISS_RETRY = 60.0
 _group_names: dict[str, str] = {}
-_group_names_at = 0.0
+_group_names_at = float("-inf")  # never refreshed: the first lookup always fetches
 _group_names_lock = threading.Lock()
 
 
