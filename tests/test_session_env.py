@@ -30,6 +30,8 @@ spec.loader.exec_module(se)
 # What a deployment's .env puts into the container next to what the framework
 # sets itself — the secrets a session must never see …
 SECRETS = {
+    # The chat-erase capability: the user's delete, never an agent's.
+    "CHAT_ERASE_TOKEN": "erase-cap",
     "EMAIL_PASS": "mail-pw",
     "EMAIL_PASS_ARI": "ari-pw",
     "CALDAV_PASSWORD": "caldav-pw",

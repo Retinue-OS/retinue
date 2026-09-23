@@ -307,6 +307,10 @@ class ChatStateStore:
         with self._lock:
             return self._read(chat_id)
 
+    def exists(self, chat_id: str) -> bool:
+        """Whether a document is stored for this chat (a default is not)."""
+        return self._path(chat_id).exists()
+
     def all(self) -> dict[str, dict]:
         """Every stored chat doc, keyed by chat id."""
         out: dict[str, dict] = {}

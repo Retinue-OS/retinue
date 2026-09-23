@@ -123,8 +123,9 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          thread. A later message from the peer
                                          starts a new chat. Accepted only
                                          through the reverse proxy (403
-                                         otherwise, like /send); 502 if the
-                                         messages were not completely erased.
+                                         otherwise, like /send); 503 without
+                                         CHAT_ERASE_TOKEN; 502 if the messages
+                                         were not completely erased.
   POST /chats/<id>/draft              -> write the shared draft (body {text,
                                          version}); 409 + current state on a
                                          stale version; empty text clears it.
@@ -1060,6 +1061,14 @@ CHAT_LIST_STALE_SECONDS = float(os.environ.get("CHAT_LIST_STALE_SECONDS", "600")
 # flash back for a moment after it is gone. Only the erased records are hidden,
 # named by the gateways' own report: a new message from the same peer is a new
 # chat at once, however close to the deletion it lands.
+# The capability a gateway requires to erase a chat (POST /chats/delete), sent
+# as X-Chat-Erase-Token beside the ordinary gateway token. Deliberately not a
+# *_GATEWAY_TOKEN: those are handed to every agent session (session_env.py) so
+# agents can send, and erasure is the user's own act — this name matches none
+# of the session allowlist's prefixes or suffixes, so only this process and
+# the gateways hold it. Unset, deletion is refused (503) rather than falling
+# back to the send token.
+CHAT_ERASE_TOKEN = os.environ.get("CHAT_ERASE_TOKEN", "").strip()
 CHAT_DELETE_TOMBSTONE_SECONDS = float(
     os.environ.get("CHAT_DELETE_TOMBSTONE_SECONDS", str(CHAT_LIST_STALE_SECONDS + 300)))
 # The whole of one list rebuild — heads, records, unread counts, several
@@ -5536,6 +5545,18 @@ def _chat_tombstone(chat_id: str, subjects, message_ids) -> None:
                                      frozenset(subjects), frozenset(message_ids))
 
 
+def _chat_tombstoned(chat_id: str) -> bool:
+    """Whether this chat was deleted within the tombstone window."""
+    with _chat_tombstones_lock:
+        stone = _chat_tombstones.get(chat_id)
+        if stone is None:
+            return False
+        if time.time() > stone[0]:
+            _chat_tombstones.pop(chat_id, None)
+            return False
+    return True
+
+
 def _chat_record_erased(chat_id: str, subject: str | None = None,
                         message_id: str | None = None) -> bool:
     """True for a record of a deleted chat that a view may still be serving —
@@ -5685,6 +5706,13 @@ def _chat_companion(chat_id: str) -> tuple[str, bool]:
     nothing, always says the same thing, and is what tells the user that Ara
     drafts into the chat's composer instead of sending."""
     with _companion_lock:
+        # A request left over from before the chat was deleted (a pane still
+        # open, a retry) must not bring it back with a fresh thread. Deletion
+        # runs under this same lock, and a genuinely new message recreates the
+        # state document first — so "tombstoned and no document" is exactly a
+        # chat that is gone.
+        if _chat_tombstoned(chat_id) and not _CHAT_STATE.exists(chat_id):
+            raise LookupError(f"chat {chat_id} was deleted")
         doc = _CHAT_STATE.get(chat_id)
         existing = doc.get("companion")
         if existing and _load_conv(str(existing)) is not None:
@@ -5934,12 +5962,14 @@ CHAT_UNCONFIRMED_SKEW_SECONDS = 60.0
 
 
 def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
-                 method: str = "POST") -> tuple[int, dict]:
+                 method: str = "POST",
+                 extra_headers: dict | None = None) -> tuple[int, dict]:
     """One authenticated request to a channel gateway; (status, parsed body).
 
     Raises on a transport failure, which the caller turns into a 502."""
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
+    headers.update(extra_headers or {})
     if gw.get("token"):
         headers["Authorization"] = "Bearer " + gw["token"]
     req = urllib.request.Request(gw["base_url"] + path, data=data,
@@ -6050,6 +6080,10 @@ def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
     ref = chat_state_mod.split_chat_ref(chat_id)
     if ref is None:
         return {}, "not a chat id"
+    if not CHAT_ERASE_TOKEN:
+        return {"id": chat_id, "unconfigured": True}, (
+            "chat deletion is not configured: set CHAT_ERASE_TOKEN (the same "
+            "value) on the retinue service and on the messenger gateways")
     channel, account, key = ref
     doc = _CHAT_STATE.get(chat_id)
     report: dict = {"id": chat_id, "gateways": {}, "companion": False}
@@ -6060,8 +6094,9 @@ def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
     message_ids: set = set()
     for slug, gw in _media_gateways(channel, account, doc):
         try:
-            status, answer = _gateway_hop(gw, "/chats/delete",
-                                          {"chat": key, "account": account or ""})
+            status, answer = _gateway_hop(
+                gw, "/chats/delete", {"chat": key, "account": account or ""},
+                extra_headers={"X-Chat-Erase-Token": CHAT_ERASE_TOKEN})
         except Exception as exc:  # noqa: BLE001 — transport failure
             failures.append(f"{slug}: {exc}")
             continue
@@ -6089,10 +6124,14 @@ def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
         report["partial"] = failures
     _chat_tombstone(chat_id, subjects, message_ids)
     _CHAT_OVERLAY.forget(chat_id)
-    removed = _CHAT_STATE.delete(chat_id) or doc
-    companion = (removed or {}).get("companion")
-    if companion:
-        report["companion"] = _delete_conversation(str(companion))
+    # Under the companion lock: a companion request racing this delete either
+    # finishes first (and its thread is deleted here) or runs after and is
+    # refused as a deleted chat — never a fresh thread for an erased chat.
+    with _companion_lock:
+        removed = _CHAT_STATE.delete(chat_id) or doc
+        companion = (removed or {}).get("companion")
+        if companion:
+            report["companion"] = _delete_conversation(str(companion))
     _chats_cache_invalidate()
     print(f"[web-gateway] deleted chat {chat_id!r}: {json.dumps(report)}", flush=True)
     return report, None
@@ -7324,7 +7363,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         report, error = _delete_chat(chat_id)
         if error:
-            self._send_json(502, {"error": error, **report})
+            self._send_json(503 if report.get("unconfigured") else 502,
+                            {"error": error, **report})
             return
         self._send_json(200, {"deleted": True, **report})
 
@@ -7418,6 +7458,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             cid, created = _chat_companion(chat_id)
+        except LookupError as exc:
+            self._send_json(404, {"error": str(exc)})
+            return
         except OSError as exc:
             self._send_json(500, {"error": "could not open the companion thread",
                                   "detail": str(exc)})
@@ -7647,6 +7690,18 @@ class Handler(BaseHTTPRequestHandler):
             "text": str(payload.get("text") or ""),
             "attachments": [u for u in (payload.get("attachments") or []) if u],
         }
+        if _chat_record_erased(chat_id, message_id=entry["message_id"]):
+            # A late or repeated event for a message the user just erased —
+            # a retried POST, a redelivered stanza. It must not recreate the
+            # chat's state, push, or buy a turn. Where the caller offers the
+            # handover it is accepted, so the gateway neither forwards it to
+            # triage nor holds it for a drain: the user's answer to this
+            # message was to delete it.
+            body = {"ok": True, "id": chat_id, "pushed": False, "erased": True}
+            if payload.get("handover") is True and CHAT_ARRIVAL_TURNS:
+                body["accepted"] = True
+            self._send_json(200, body)
+            return
         _CHAT_OVERLAY.insert(entry)
         group = payload.get("group")
         # Which account this arrived on, resolved from the account the gateway

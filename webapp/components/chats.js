@@ -395,7 +395,7 @@ class RetinueChats extends RetinueCard {
     if (busy) busy.classList.add('busy');
     try {
       const res = await fetch(`/chats/${encodeURIComponent(id)}/delete`, { method: 'POST' });
-      if (!res.ok) throw new Error(String(res.status));
+      if (!res.ok) throw new Error(res.status === 503 ? 'unconfigured' : String(res.status));
       if (this._data && Array.isArray(this._data.chats)) {
         this._data.chats = this._data.chats.filter((c) => c.id !== id);
       }
@@ -403,15 +403,22 @@ class RetinueChats extends RetinueCard {
       this._sig = '';
       this._epoch += 1;
       if (this._data) this.renderState({ state: 'ok', data: this._data });
-    } catch (_err) {
-      // Nothing was erased (the gateway answers 502 before touching anything
-      // when the messages cannot go); the row stays for another try.
+    } catch (err) {
+      // The chat stays whole enough to retry (the gateway answers 502 and
+      // touches none of its own state when the messages cannot all go). A 503
+      // is a deployment without the erase capability: retrying will not help,
+      // and the button says so.
       const li = this._rowEl(id);
       if (li) {
         li.classList.remove('busy');
         li.classList.add('failed');
         const btn = li.querySelector('[data-set="delete"]');
-        if (btn) { this._unconfirm(btn); btn.textContent = 'Retry delete'; }
+        if (btn) {
+          this._unconfirm(btn);
+          const off = err && err.message === 'unconfigured';
+          btn.textContent = off ? 'Delete not set up' : 'Retry delete';
+          if (off) btn.title = 'Chat deletion needs CHAT_ERASE_TOKEN on retinue and the messenger gateways';
+        }
       }
     } finally {
       this._flagging = false;

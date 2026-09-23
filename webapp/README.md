@@ -251,7 +251,14 @@ The API, as the components consume it:
   when no gateway could erase or one reports a file it could not remove
   (an unreadable record, or one that names the chat but no longer parses,
   counts). Like a send, a delete is accepted only through the reverse proxy
-  (403 otherwise): an agent may archive or mute a chat, never erase it.
+  (403 otherwise): an agent may archive or mute a chat, never erase it. The
+  gateway hop carries, beside the ordinary gateway token (which agent
+  sessions hold, to send), `X-Chat-Erase-Token`: the `CHAT_ERASE_TOKEN` set
+  on retinue and the gateways, which no session inherits. Without it the
+  answer is 503 and the Delete button says it is not set up. For the
+  tombstone window, a late rail event for an erased message is accepted and
+  dropped (no state, no push, no turn), and a leftover companion request for
+  the deleted chat answers 404 until a new message recreates the chat.
   Deliberately out of reach: what agents derived from the chat elsewhere
   (memories, news-feed items, project notes), notifications already
   delivered, and the messenger app's own copy on the phone.

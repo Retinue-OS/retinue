@@ -319,6 +319,8 @@ class _MockGateway(BaseHTTPRequestHandler):
         STATE["gw_requests"].append(("POST", self.path,
                                      self.headers.get("Authorization", "")))
         if self.path.rstrip("/") == "/chats/delete":
+            STATE.setdefault("erase_tokens", []).append(
+                self.headers.get("X-Chat-Erase-Token", ""))
             STATE.setdefault("deleted", []).append(payload)
             fail = STATE.get("gw_delete_fail")
             if fail == "http":
@@ -1610,6 +1612,14 @@ def test_delete_chat(base, wg):
     _http(base, "POST", "/chats/" + _quote(cid) + "/flags", {"muted": True})
     delete_path = "/chats/" + _quote(cid) + "/delete"
 
+    # Without the erase capability configured, nothing is attempted.
+    wg.CHAT_ERASE_TOKEN = ""
+    STATE["deleted"] = []
+    status, body = _http(base, "POST", delete_path)
+    assert status == 503 and "CHAT_ERASE_TOKEN" in body["error"], (status, body)
+    assert STATE["deleted"] == [], "a gateway was asked without the capability"
+    wg.CHAT_ERASE_TOKEN = "erase-cap"
+
     # A gateway that cannot erase the messages — failing outright, or
     # answering 200 but reporting a file it could not remove: nothing else is
     # touched, so the chat stays whole enough to retry.
@@ -1632,6 +1642,7 @@ def test_delete_chat(base, wg):
     assert STATE["deleted"] == [{"chat": key, "account": ""}], STATE["deleted"]
     auth = [a for m, p, a in STATE["gw_requests"] if p == "/chats/delete"]
     assert auth and auth[0].startswith("Bearer "), "the gateway hop carries its token"
+    assert STATE["erase_tokens"][-1] == "erase-cap", "and the erase capability"
     assert body.get("companion") is True, body
 
     status, body = _http(base, "GET", "/chats")
@@ -1650,10 +1661,20 @@ def test_delete_chat(base, wg):
     assert wg._chat_record_erased(cid, message_id="d1")
     assert not wg._chat_record_erased(cid, "urn:retinue:inbound:signal:new", "d2")
     assert not wg._chat_record_erased("signal:+41790000000", message_id="d1")
-    # A late rail event for an erased message does not bring it back.
-    _http(base, "POST", rail, event)
+    # A late rail event for an erased message does not bring it back, nor
+    # recreate any state: it is accepted (the gateway must not forward it to
+    # triage) and dropped.
+    status, body = _http(base, "POST", rail, dict(event, handover=True))
+    assert status == 200 and body.get("erased") and body.get("accepted"), body
     status, body = _http(base, "GET", "/chats")
     assert not any(c["id"] == cid for c in body["chats"]), "an erased message came back"
+    assert cid not in wg._CHAT_STATE.all(), "a late event recreated the chat state"
+
+    # A companion request left over from before the delete is refused, not
+    # answered with a fresh thread for the erased chat.
+    status, body = _http(base, "POST", "/chats/" + _quote(cid) + "/companion")
+    assert status == 404, (status, body)
+    assert cid not in wg._CHAT_STATE.all()
 
     # The same peer writing again — in the same second, even — is a new chat,
     # with nothing carried over.
@@ -1663,6 +1684,8 @@ def test_delete_chat(base, wg):
     assert c["archived"] is False and c["muted"] is False, c
     assert c["companion"] is None, c
     assert c["last"]["text"] == "Hello again", c
+    status, body = _http(base, "POST", "/chats/" + _quote(cid) + "/companion")
+    assert status == 201, "the new chat may have a companion of its own"
 
     # A companion turn still running when the chat was deleted ends by
     # recording its session: that write is refused and its transcript erased,

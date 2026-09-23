@@ -275,7 +275,10 @@ erased graphs on its next pass, and a short in-memory tombstone hides them
 until it has. The tombstone lists the records the gateways erased, by subject
 and message id; it is not a time cut-off. A later message from the same peer
 finds nothing and starts a new chat, even in the same second. Like a send, a
-delete is the user's own act and is accepted only through the reverse proxy. The
+delete is the user's own act and is accepted only through the reverse proxy.
+The gateways' erase endpoint also requires `CHAT_ERASE_TOKEN`, a capability
+that agent sessions do not inherit (unlike the `*_GATEWAY_TOKEN`s they send
+with). Without it configured, deletion is refused. The
 dashboard's Archived tab is where the action lives (swipe left → Delete, two
 taps).
 

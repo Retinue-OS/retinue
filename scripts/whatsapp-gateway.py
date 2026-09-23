@@ -147,6 +147,11 @@ DEFAULT_LANGUAGE = SUPPORTED_LANGUAGES[0] if SUPPORTED_LANGUAGES else "en"
 HTTP_PORT = int(os.environ.get("WHATSAPP_GATEWAY_HTTP_PORT", "8092"))
 DEFAULT_RECIPIENT = os.environ.get("WHATSAPP_DEFAULT_RECIPIENT", "").strip()
 GATEWAY_TOKEN = os.environ.get("WHATSAPP_GATEWAY_TOKEN", "").strip()
+# The separate capability POST /chats/delete requires (X-Chat-Erase-Token).
+# Not the gateway token: that one is handed to every agent session so agents
+# can send, and erasing a chat is the user's own act, relayed only by the
+# web-gateway. Unset, the endpoint refuses — there is no fallback.
+CHAT_ERASE_TOKEN = os.environ.get("CHAT_ERASE_TOKEN", "").strip()
 MAX_PUSH_BODY_BYTES = int(os.environ.get("WHATSAPP_GATEWAY_MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 
 # Outbound send-control policy — the messenger analogue of EMAIL_SEND_POLICY.
@@ -2811,10 +2816,20 @@ class _PushHandler(BaseHTTPRequestHandler):
 
         if self.path.rstrip("/") == "/chats/delete":
             # Erase one chat — its ledger records, media and this gateway's
-            # own traces of it. Token-gated: the web-gateway calls it on the
-            # user's delete, adding the token, and nothing else should.
+            # own traces of it. The web-gateway calls it on the user's delete
+            # and nothing else should: besides the gateway token it requires
+            # CHAT_ERASE_TOKEN, which agent sessions do not inherit.
             if not self._authorized():
                 self._reply(401, {"error": "unauthorized"})
+                return
+            if not CHAT_ERASE_TOKEN:
+                self._reply(503, {"error": "chat erasure is not configured "
+                                           "(CHAT_ERASE_TOKEN is unset)"})
+                return
+            if not hmac.compare_digest(
+                    (self.headers.get("X-Chat-Erase-Token") or "").strip(),
+                    CHAT_ERASE_TOKEN):
+                self._reply(403, {"error": "chat erasure needs X-Chat-Erase-Token"})
                 return
             length = int(self.headers.get("Content-Length", "0") or "0")
             try:

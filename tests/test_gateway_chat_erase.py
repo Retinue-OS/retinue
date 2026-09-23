@@ -107,8 +107,59 @@ def test_telegram():
     print("PASS test_telegram")
 
 
+def test_endpoint_needs_the_erase_capability():
+    """POST /chats/delete refuses the gateway token alone.
+
+    Agent sessions hold every *_GATEWAY_TOKEN (they send with them), so the
+    erase endpoint also demands CHAT_ERASE_TOKEN, which sessions never
+    inherit — and with none configured it refuses outright."""
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+    loaders = (("test_signal_send_policy", "_load_signal_gateway"),
+               ("test_whatsapp_send_policy", "_load_whatsapp_gateway"),
+               ("test_telegram_send_policy", "_load_telegram_gateway"))
+    for mod, fn in loaders:
+        with tempfile.TemporaryDirectory() as tmp:
+            gw = _loader(mod, fn)([], Path(tmp) / "pending", account=ACCOUNT)
+            gw.INBOUND_STORE_DIR = Path(tmp) / "inbound"
+            gw.GATEWAY_TOKEN = "send-cap"
+            erased = []
+            gw._erase_chat = lambda chat, account: erased.append(chat) or {
+                "messages": 0, "media": 0, "errors": 0}
+            server = ThreadingHTTPServer(("127.0.0.1", 0), gw._PushHandler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            url = f"http://127.0.0.1:{server.server_address[1]}/chats/delete"
+
+            def post(headers):
+                req = urllib.request.Request(
+                    url, data=json.dumps({"chat": "c1"}).encode(), method="POST",
+                    headers={"Content-Type": "application/json", **headers})
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        return resp.status
+                except urllib.error.HTTPError as exc:
+                    return exc.code
+            try:
+                send = {"Authorization": "Bearer send-cap"}
+                gw.CHAT_ERASE_TOKEN = ""
+                assert post(send) == 503, mod
+                gw.CHAT_ERASE_TOKEN = "erase-cap"
+                assert post(send) == 403, "the send token alone must not erase"
+                assert post({**send, "X-Chat-Erase-Token": "wrong"}) == 403
+                assert post({"X-Chat-Erase-Token": "erase-cap"}) == 401
+                assert erased == [], erased
+                assert post({**send, "X-Chat-Erase-Token": "erase-cap"}) == 200
+                assert erased == ["c1"], erased
+            finally:
+                server.shutdown()
+    print("PASS test_endpoint_needs_the_erase_capability")
+
+
 if __name__ == "__main__":
     test_signal()
     test_whatsapp()
     test_telegram()
+    test_endpoint_needs_the_erase_capability()
     print("all gateway chat-erase tests passed")
