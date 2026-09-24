@@ -19,6 +19,20 @@ commits, or edits anything: an outside client can learn what Retinue knows, not
 act as it. The one thing that leaves a mark is ``tell_ara``, which drops a note
 into the dashboard for the user to read.
 
+What a client *states* is a different matter from what it asks. A cowork session
+that has just filed a tax return, and says so, carries a fact Retinue should
+keep — but an answering session that recorded it would let any holder of the
+connector's credential write into the memory every agent reads. So the session
+records nothing; when it judges that something the client stated is new and
+worth keeping, it appends a confirmation block to its reply, and the server
+lifts that block out and opens a dashboard thread of its own asking the user to
+confirm it. The user's reply there is an ordinary turn, with an ordinary
+session's write access — that is where the fact gets stored. The same review
+runs, in the background, over every ``tell_ara`` note, and appends its question
+to the note's own thread. Nothing is recorded without the user's say-so, and
+the quiet cowork audit thread, which the user rarely reads, is never where the
+question lands.
+
 That intent is enforced in depth, not by hope: ``Write``/``Edit``/``NotebookEdit``
 are removed from the answering session outright, and it runs in the CLI's default
 (ask) permission mode, where ``claude -p`` auto-denies anything the settings
@@ -116,7 +130,7 @@ CONVERSATION_BASE_URL = os.environ.get("CONVERSATION_BASE_URL", "").rstrip("/")
 
 PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
 DEFAULT_PROTOCOL = PROTOCOL_VERSIONS[0]
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def _slug(name: str) -> str:
@@ -175,6 +189,12 @@ def _instructions(identity: str | None = None, scope: str | None = None) -> str:
         "already know which project you mean. `tell_ara` leaves the user a note "
         "in their dashboard; use it to report something worth their attention "
         "rather than to ask a question.",
+
+        "When something has happened in your work that the user's records "
+        "should reflect — a form filed, a decision taken, a date moved — say "
+        "so plainly, in the `ask_ara` context or a `tell_ara` note. "
+        f"{name} records nothing on a client's word, but puts such facts to "
+        "the user to confirm, and keeps them once they do.",
     ]
     # Wrapped on render, not in the source: the identity is substituted in, so
     # hand-wrapped lines would go ragged for any name but the default.
@@ -329,6 +349,93 @@ def _finish_job(job_id: str, status: str, answer: str) -> None:
             job["event"].set()
 
 
+# ── Facts put to the user for confirmation ────────────────────────────────────
+# The answering session may not record anything, so a fact the client states is
+# lost unless someone who may write picks it up. The session marks such facts in
+# a delimited block at the end of its reply; the server strips the block from
+# what the client sees and opens a dashboard thread with it. Whether there is
+# anything worth recording is the session's judgement, not the server's — the
+# server only moves text.
+
+CONFIRM_OPEN = "<<<confirm"
+CONFIRM_CLOSE = "confirm>>>"
+_CONFIRM_RE = re.compile(
+    rf"^[ \t]*{re.escape(CONFIRM_OPEN)}[ \t]*\n(.*?)\n[ \t]*{re.escape(CONFIRM_CLOSE)}[ \t]*$",
+    re.MULTILINE | re.DOTALL,
+)
+_TITLE_RE = re.compile(r"^\s*Title:\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def _confirm_instructions(own_thread: bool) -> list[str]:
+    """How the session asks the user to confirm stated facts.
+
+    ``own_thread``: the block becomes a new thread (ask_ara), so it needs a
+    title and must stand alone; otherwise it is appended under the note that
+    carried the facts (tell_ara), which the user reads right above it.
+    """
+    where = (
+        "It opens a dashboard thread of its own, so it must stand alone: the "
+        "user reads it without this exchange."
+        if own_thread else
+        "It is appended to the thread that already shows the note, right "
+        "below it, so it need not repeat the note."
+    )
+    title = ["Title: <short thread title, in the user's language>"] if own_thread else []
+    return [
+        "You must not record anything yourself. But you can ask the user to "
+        "confirm what the client stated, so that it is recorded once they do. "
+        "Only if the client stated something about the user's situation that "
+        "is new to Retinue and worth keeping — a step done, a decision taken, "
+        "a date or amount changed; not the client's working notes, not what "
+        "the records already say, not your own answer — add, on lines of "
+        "their own:",
+        "",
+        CONFIRM_OPEN,
+        *title,
+        "<message to the user>",
+        CONFIRM_CLOSE,
+        "",
+        "The message is addressed to the user in their language. It names the "
+        "outside client as the source, lists each fact as the client stated "
+        "it, says where each would be recorded (a memory; which project file "
+        "and field), and ends with dashboard reply chips — "
+        "`[[chip: Label | prefill]]` — to confirm all, to correct, and to "
+        f"discard. {where} It is removed before the client sees your reply. "
+        "Leave it out entirely when there is nothing worth recording, which is "
+        "the usual case.",
+    ]
+
+
+def _split_confirmation(text: str) -> tuple[str, str | None, str | None]:
+    """Lift the confirmation block out of a reply: ``(rest, title, message)``.
+
+    ``title`` and ``message`` are None when there is no block, or when the
+    block is empty; ``rest`` is the reply without it either way.
+    """
+    m = _CONFIRM_RE.search(text or "")
+    if not m:
+        return text, None, None
+    rest = (text[:m.start()] + text[m.end():]).strip()
+    lines = m.group(1).strip().splitlines()
+    title = None
+    if lines:
+        t = _TITLE_RE.match(lines[0])
+        if t:
+            title, lines = t.group(1), lines[1:]
+    message = "\n".join(lines).strip() or None
+    return rest, (title if message else None), message
+
+
+def _confirmation_thread(title: str | None, message: str) -> dict:
+    """Open a confirmation thread — never quiet: it wants an answer."""
+    try:
+        return _gateway_post("/internal/conversations",
+                             {"title": title, "message": message}) or {}
+    except Exception as exc:  # noqa: BLE001 — the answer must still reach the client
+        log(f"confirm: could not open the thread: {exc}")
+        return {}
+
+
 # ── The answering session ─────────────────────────────────────────────────────
 
 def _build_prompt(question: str, context: str, identity: str | None = None,
@@ -356,8 +463,11 @@ def _build_prompt(question: str, context: str, identity: str | None = None,
         ]
     parts += [
         "This is an advisory, read-only query. Do not send messages, do not "
-        "commit, do not modify any file. If something needs doing, say what and "
-        "by whom — the client or the user will carry it out.",
+        "commit, do not modify any file, do not store memories. If something "
+        "needs doing, say what and by whom — the client or the user will carry "
+        "it out.",
+        "",
+        *_confirm_instructions(own_thread=True),
         "",
         "Answer in prose, directly and concretely, and cite the file or source "
         "you took each fact from. If you do not know, say so plainly in one "
@@ -438,8 +548,54 @@ def _run_claude(prompt: str) -> tuple[str, str]:
 def _answer_worker(job_id: str, question: str, context: str) -> None:
     with _worker_pool:
         status, text = _run_claude(_build_prompt(question, context))
+    title = message = None
+    if status == "done":
+        text, title, message = _split_confirmation(text)
+    # The thread is opened before the job is published: "done" promises the
+    # client that everything this answer set in motion has happened.
+    confirm = _confirmation_thread(title, message) if message else {}
     _finish_job(job_id, status, text)
-    _audit(question, context, status, text)
+    _audit(question, context, status, text, confirm)
+
+
+# ── Reviewing tell_ara notes ──────────────────────────────────────────────────
+# A note is delivered verbatim and at once — the client asked for exactly that.
+# The review runs afterwards, in the background, and only speaks up when the
+# note carries facts worth recording.
+
+def _build_note_prompt(note: str) -> str:
+    return "\n".join([
+        "An outside Claude client working with the user has left them a note "
+        "through the Ask-Ara MCP connector. It is already in their dashboard, "
+        "verbatim. Check it against what Retinue knows: the chambers, the life "
+        "store, the project files, the memories.",
+        "",
+        "This is a read-only review. Do not send messages, do not commit, do "
+        "not modify any file, do not store memories.",
+        "",
+        *_confirm_instructions(own_thread=False),
+        "",
+        "Reply with the block and nothing else, or with the single word "
+        "`none`.",
+        "",
+        f"The note: {note}",
+    ])
+
+
+def _review_note(thread_id: str, note: str) -> None:
+    with _worker_pool:
+        status, text = _run_claude(_build_note_prompt(note))
+    if status != "done":
+        log(f"review: session failed for thread {thread_id}: {text[:200]}")
+        return
+    _, _, message = _split_confirmation(text)
+    if not message:
+        return
+    try:
+        _gateway_post(f"/internal/conversations/{thread_id}/messages",
+                      {"message": message})
+    except Exception as exc:  # noqa: BLE001
+        log(f"review: could not append to thread {thread_id}: {exc}")
 
 
 # ── Audit trail ───────────────────────────────────────────────────────────────
@@ -493,7 +649,8 @@ def _audit_thread_id() -> str | None:
         return cid
 
 
-def _audit(question: str, context: str, status: str, answer: str) -> None:
+def _audit(question: str, context: str, status: str, answer: str,
+           confirm: dict | None = None) -> None:
     if not AUDIT:
         return
     try:
@@ -505,6 +662,10 @@ def _audit(question: str, context: str, status: str, answer: str) -> None:
             lines.append(f"*Context:* {context}")
         label = "Answered" if status == "done" else "Failed"
         lines += ["", f"**{label}:**", answer]
+        if confirm and confirm.get("id"):
+            target = (f"[a thread of its own]({confirm['url']})"
+                      if confirm.get("url") else f"thread `{confirm['id']}`")
+            lines += ["", f"*Stated facts put to the user to confirm in {target}.*"]
         _gateway_post(f"/internal/conversations/{cid}/messages",
                       {"message": "\n".join(lines), "quiet": True})
     except Exception as exc:  # noqa: BLE001 — auditing must never break answering
@@ -590,7 +751,13 @@ def _tool_tell_ara(args: dict) -> dict:
                              {"message": note, "title": title}) or {}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"could not open the thread: {exc}"}
-    return {"status": "delivered", "thread_id": body.get("id"),
+    thread_id = body.get("id")
+    # The review costs a session, so it counts against the same bucket as a
+    # question; over the limit the note still stands, just unreviewed.
+    if thread_id and _rate_ok():
+        threading.Thread(target=_review_note, args=(thread_id, note),
+                         daemon=True).start()
+    return {"status": "delivered", "thread_id": thread_id,
             "url": body.get("url", "")}
 
 
