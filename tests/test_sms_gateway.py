@@ -394,6 +394,8 @@ class _FakeSmsServer:
                 if method == "GET" and self.path == "/api/3rdparty/v1/webhooks":
                     return self._answer(200, list(fake.webhooks))
                 if method == "POST" and self.path == "/api/3rdparty/v1/webhooks":
+                    # Upsert by id, as the server does.
+                    fake.webhooks[:] = [w for w in fake.webhooks if w.get("id") != body.get("id")]
                     fake.webhooks.append(body)
                     return self._answer(201, body)
                 return self._answer(404, {"message": "not found"})
@@ -431,7 +433,19 @@ def test_server_adapter_http_contract():
             gw._ensure_webhook()
             assert fake.webhooks == [{"id": "retinue-sms-received",
                                       "url": "https://sms.example.com/webhook",
-                                      "event": "sms:received"}], fake.webhooks
+                                      "event": "sms:received", "deviceId": None}], fake.webhooks
+            posts = sum(1 for r in fake.requests if r[:2] == ("POST", "/api/3rdparty/v1/webhooks"))
+            assert posts == 1, posts
+            # Pinning a device afterwards re-upserts the registration …
+            gw.SMS_DEVICE_ID = "dev1"
+            gw._ensure_webhook()
+            assert fake.webhooks[0]["deviceId"] == "dev1" and len(fake.webhooks) == 1
+            # … and clearing the pin reaches the server too.
+            gw.SMS_DEVICE_ID = ""
+            gw._ensure_webhook()
+            assert fake.webhooks[0]["deviceId"] is None
+            gw.SMS_DEVICE_ID = "dev1"
+            gw._refresh_link_state()
             # Wrong credentials surface as an unhealthy server, not a crash.
             gw.SMS_SERVER_PASSWORD = "wrong"
             gw._refresh_link_state()

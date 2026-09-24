@@ -608,13 +608,18 @@ def _ensure_webhook() -> None:
         hooks = _server("GET", "/webhooks") or []
         _set_state(webhook_registered=False)
         for hook in hooks if isinstance(hooks, list) else []:
+            # The device pin is part of the registration: a changed (or newly
+            # set, or cleared) SMS_DEVICE_ID must re-upsert, or the server keeps
+            # delivering from the device it was registered for.
             if (hook.get("id") == SMS_WEBHOOK_ID and hook.get("url") == SMS_WEBHOOK_URL
-                    and hook.get("event") == "sms:received"):
+                    and hook.get("event") == "sms:received"
+                    and (hook.get("deviceId") or "") == SMS_DEVICE_ID):
                 _set_state(webhook_registered=True)
                 return
-        body = {"id": SMS_WEBHOOK_ID, "url": SMS_WEBHOOK_URL, "event": "sms:received"}
-        if SMS_DEVICE_ID:
-            body["deviceId"] = SMS_DEVICE_ID
+        # deviceId always travels (null when unpinned), so clearing the pin
+        # also reaches the server instead of leaving the old device in place.
+        body = {"id": SMS_WEBHOOK_ID, "url": SMS_WEBHOOK_URL, "event": "sms:received",
+                "deviceId": SMS_DEVICE_ID or None}
         _server("POST", "/webhooks", json=body)
     except Exception as exc:  # noqa: BLE001 - retried on the next poll
         _set_state(webhook_registered=False)
