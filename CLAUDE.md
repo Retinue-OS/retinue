@@ -177,6 +177,12 @@ resting projects when their date comes. The rules that make them work:
   (`expected_by:`, optional `remind_before: 10d/2w/3m`). `next_due` advances
   only when the user marks the cadence done — via you.
 
+A third, `inbox-sweep`, empties letterboxes: it dispatches the Archivist for
+every chamber whose `.inbox.json` declares an inbox that is not empty. **An
+inbox is a letterbox, not a shelf** — a file the user drops in is taken out,
+filed and deleted; the only file left lying there is one the Archivist could
+not classify and has flagged for the user.
+
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 
 ## Messaging (Signal, WhatsApp, Telegram, SMS, e-mail)
@@ -335,7 +341,7 @@ variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
 | non-trivial SPARQL, new data design, a new endpoint | `docs/triple-stores.md` |
 | model tiers, escalation, memory design | `docs/model-routing.md` |
 | chamber mounting, plugins, INSTRUCTIONS.md contract | `docs/chambers.md` |
-| editing `.refresh.json`/`.schedule.json`, project wake semantics | `docs/scheduling.md` |
+| editing `.refresh.json`/`.schedule.json`/`.inbox.json`, project wake semantics | `docs/scheduling.md` |
 | unfamiliar messaging accounts, send policies, gateway config | `docs/messaging.md` |
 | webapp/gateway changes, attachments, push, voice input | `docs/dashboard.md` |
 | importance, urgency, focus modes, the digest — the attention model | `docs/attention-model.md`, `docs/attention-migration.md` |

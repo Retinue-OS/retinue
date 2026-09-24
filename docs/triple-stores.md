@@ -216,10 +216,11 @@ CSV with tens of thousands of rows. They are hopeless as context — you cannot
 paste a year of five-minute CGM readings into a prompt, and you shouldn't want
 to.
 
-The pipeline is: `scripts/sync-garmin.py` (or a manual export) drops a CSV in
-`observations/inbox/` → the **archivist** subagent files it into the right
-folder → `scripts/ingest-sensors.py` writes a sibling `.nt` → qlever-life picks
-it up.
+The pipeline is: a refresh job (or a manual export) drops a CSV in a chamber
+inbox declared in `.inbox.json` → the **archivist** subagent files it into the
+right folder → the converter declared for that folder in
+`.qlever/converters.json` turns it into triples at index time → qlever-life
+picks it up. No `.nt` sibling is written for a file a converter covers.
 
 Readings are modelled in **SOSA** (`http://www.w3.org/ns/sosa/`), the W3C
 sensor-observation vocabulary — five triples per observation:
@@ -430,10 +431,9 @@ files are in the store and how much each contributes.
 
 **Writing data** — write `.nt` files into a chamber. Triples, not quads; the
 graph IRI is synthesized at index time, so never write one into the file. Follow
-the archivist's ontology conventions: SOSA for observations, LOINC for lab
-identifiers, UCUM for units, SNOMED CT for findings and diagnoses, RxNorm for
-medications, FoodOn for nutrition, Sequence Ontology for variants, schema.org as
-a fallback. In a deployment with a separate static store (like the genomics
+the system-wide vocabulary defaults in `docs/ontology.md` (SOSA for
+observations, UCUM for units, schema.org as the fallback), extended by a
+chamber's own domain vocabularies where it declares them. In a deployment with a separate static store (like the genomics
 example above), all data for that store goes into the single file it indexes —
 e.g. `genetics.nt` at the chamber root, without exception.
 
