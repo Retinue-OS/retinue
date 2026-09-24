@@ -649,7 +649,8 @@ def _poll_loop() -> None:
 # ── Inbound handling ──────────────────────────────────────────────────────────
 
 def _forward_to_inbox(text: str, sender: str, store_path,
-                      message_id: str | None = None) -> None:
+                      message_id: str | None = None,
+                      received_at: float | None = None) -> None:
     """Hand one persisted inbound SMS on: chats rail first, triage as fallback.
 
     Same shape as telegram-gateway.py's, minus groups and news (SMS has
@@ -659,6 +660,10 @@ def _forward_to_inbox(text: str, sender: str, store_path,
     rail = _chats.notify_chat_event(
         direction="in", channel=INBOUND_CHANNEL, chat=sender, account=SMS_ACCOUNT,
         sender=sender, group=False, message_id=message_id, text=text,
+        # When the phone received it, not when this ran: a retried or delayed
+        # webhook must land at its place in the conversation, the same instant
+        # the ledger record carries.
+        ts=received_at,
         gate={"forward": bool(gate.get("forward")),
               "vip": bool(gate.get("vip")),
               "reason": str(gate.get("reason") or "")},
@@ -780,7 +785,8 @@ def _accept_webhook(body: bytes, signature: str | None, timestamp: str | None) -
     _commit(key)
     _record_recent_sender(sender)
     threading.Thread(
-        target=_forward_safely, args=(parsed["text"], sender, store_path, parsed["message_id"]),
+        target=_forward_safely,
+        args=(parsed["text"], sender, store_path, parsed["message_id"], parsed["received_at"]),
         name="sms-inbound", daemon=True,
     ).start()
     return 200, {"status": "accepted"}

@@ -995,8 +995,10 @@ services:
     depends_on:
       - retinue
       - sms-server
-    env_file:
-      - .env
+    # No env_file: this is the one publicly routed gateway process (its POST
+    # /webhook), so it gets exactly the variables it reads, named below —
+    # never the server's registration token or database password, which also
+    # live in .env. Value-less entries take their value from .env as usual.
     environment:
       # The server's 3rd-party API and the app-issued credentials. These live
       # only in this container.
@@ -1016,7 +1018,11 @@ services:
       # key, no inbound: unsigned webhooks are always refused.
       - SMS_WEBHOOK_URL
       - SMS_WEBHOOK_SIGNING_KEY
+      # Optional tunables (see scripts/sms-gateway.py for the defaults).
+      - SMS_WEBHOOK_MAX_AGE_SECONDS
       - SMS_DEVICE_STALE_SECONDS
+      - SMS_POLL_SECONDS
+      - SMS_SERVER_TIMEOUT
       - RETINUE_GATEWAY_URL=http://retinue:8080/message
       - RETINUE_GATEWAY_TIMEOUT=600
       # Chats rail and chat erasure — as on telegram-gateway above.
