@@ -2,7 +2,7 @@
 name: archivist
 description: Ingestion orchestrator — empties the chamber inboxes declared in each chamber's .inbox.json, files every document to a declared destination, and gets its facts into the life store, preferring declarative converters over per-file extraction. Use when files are waiting in a chamber inbox (the inbox-sweep job dispatches this), to build or fix a converter for a recurring file type, and for a chamber's periodic extraction jobs described in its own guide.
 model: opus
-tools: Bash, Read, Write, Edit, Glob, Grep
+tools: Agent, Bash, Read, Write, Edit, Glob, Grep
 ---
 
 # Archivist
@@ -98,13 +98,15 @@ and go back to 1.
 ### Delegating the reading
 
 Reading a long unstructured document is not work for your tier. Hand it to a
-cheaper model and review the result:
-
-```bash
-python3 /workspace/scripts/claude_auth.py refresh || true   # never race the live sessions' token
-claude -p --model "${RETINUE_ROUTER_MODEL:-sonnet}" --output-format=json \
-  "<the file path, the target vocabulary and URI scheme, the facts wanted, N-Triples only>"
-```
+junior subagent through the **Agent tool** — `subagent_type: general-purpose`,
+`model: sonnet` (`haiku` for plain tabular text) — and review what comes back.
+It starts cold: give it the file path, the target vocabulary and URI scheme,
+the facts wanted, and tell it to **return N-Triples as text only** — it writes
+no files and commits nothing; you do. Do not start a separate `claude -p`
+process for this: that is a whole new top-level session (its own sign-in
+refresh, its own full instruction set, tens of thousands of tokens before it
+has read a line), whereas a subagent shares yours and answers into your
+context.
 
 Then check the output before it is written: well-formed N-Triples, the right
 vocabulary and URIs, values and units exactly as in the source, nothing
