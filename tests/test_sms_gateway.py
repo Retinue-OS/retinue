@@ -29,7 +29,7 @@ KEY = "test-signing-key"
 
 
 def _load(tmp: str, *, signing_key: str = KEY, policy=None, account: str = "+41790000000",
-          token: str = ""):
+          token: str = "", webhook_url: str = "https://sms.example.com/webhook"):
     if str(SCRIPTS_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPTS_DIR))
     root = Path(tmp)
@@ -39,6 +39,7 @@ def _load(tmp: str, *, signing_key: str = KEY, policy=None, account: str = "+417
         "SMS_TMP_DIR": str(root / "tmp"),
         "INBOUND_STORE_DIR": str(root / "inbound"),
         "SMS_WEBHOOK_SIGNING_KEY": signing_key,
+        "SMS_WEBHOOK_URL": webhook_url,
         "SMS_SEND_POLICY": json.dumps(policy) if policy is not None else "",
         "SMS_ACCOUNT": account,
         "SMS_GATEWAY_TOKEN": token,
@@ -310,6 +311,10 @@ def test_health_reports_link_state():
         assert snap["configured"] and not snap["connected"] and snap["mode"] == "inbox"
         assert snap["needs_repair"] is False and snap["account"] == "+41790000000"
         gw._set_state(server_ok=True, devices=1, device_last_seen=time.time() - 60)
+        # A live phone with no registered webhook still cannot deliver inbound.
+        snap = gw._health_snapshot()
+        assert snap["connected"] is False and "not registered" in snap["error"], snap
+        gw._set_state(webhook_registered=True)
         assert gw._health_snapshot()["connected"] is True
         gw._set_state(device_last_seen=time.time() - 7 * 3600)
         snap = gw._health_snapshot()
@@ -325,6 +330,12 @@ def test_health_reports_link_state():
         snap = gw._health_snapshot()
         assert snap["connected"] is False and snap["webhook_signing"] is False
         assert "SMS_WEBHOOK_SIGNING_KEY" in snap["error"]
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp, webhook_url="")
+        gw._set_state(server_ok=True, devices=1, device_last_seen=time.time(),
+                      webhook_registered=True)
+        snap = gw._health_snapshot()
+        assert snap["connected"] is False and "SMS_WEBHOOK_URL" in snap["error"], snap
     print("ok: health reports the phone's link state")
 
 

@@ -107,4 +107,4 @@ Sobald der JID / die Empfänger-ID gefunden ist, Nachricht senden mit dem entspr
 - ✅ Letzten Nachrichtentext als Kontext nutzen (Firma, Inhalt) um richtigen Kontakt zu identifizieren
 - ✅ Bei unklaren Namen immer Klankvarianten mitdenken
 - ✅ Gilt für **WhatsApp, Signal und Telegram** gleichermassen
-- ✅ **SMS** (wo das `sms`-Profil läuft): Das Gateway kennt nur Nummern, die schon geschrieben haben oder angeschrieben wurden (`GET http://sms-gateway:8095/recent-chats`), und hat kein Adressbuch — bei einem Namen die Nummer aus den Kontakten der Chambers (Life-Store) holen, dann `sms-push.py --recipient <Nummer>`
+- ✅ **SMS** (where the `sms` profile runs): the gateway only knows numbers that have written in or been written to (`GET http://sms-gateway:8095/recent-chats`) and has no address book — for a name, look the number up in the chambers' contacts (life store), then `sms-push.py --recipient <number>`

@@ -321,14 +321,21 @@ def _health_snapshot() -> dict:
     # Without the signing key every inbound webhook is refused, so a healthy
     # phone link with no key is still a dead inbox — reported as down, with
     # the cause, rather than as a green channel that silently drops SMS.
+    # Likewise without a registered webhook: the phone has nowhere to post.
     signing = bool(SMS_WEBHOOK_SIGNING_KEY)
-    connected = configured and signing and state["server_ok"] and fresh
+    registered = bool(SMS_WEBHOOK_URL) and state["webhook_registered"]
+    connected = configured and signing and registered and state["server_ok"] and fresh
     error = state["error"]
     if not configured:
         error = "SMS_SERVER_USERNAME / SMS_SERVER_PASSWORD are not set"
     elif not signing:
         error = ("SMS_WEBHOOK_SIGNING_KEY is not set — every inbound SMS is refused; "
                  "copy the key from the app (Settings → Webhooks → Signing Key)")
+    elif not SMS_WEBHOOK_URL:
+        error = ("SMS_WEBHOOK_URL is not set — the phone has nowhere to deliver "
+                 "inbound SMS; set it to the public URL routed to POST /webhook")
+    elif state["server_ok"] and not state["webhook_registered"] and not error:
+        error = "the sms:received webhook is not registered with the SMS server yet"
     elif not state["server_ok"] and not error:
         error = "the SMS server has not answered yet"
     elif not state["devices"] and not error:
