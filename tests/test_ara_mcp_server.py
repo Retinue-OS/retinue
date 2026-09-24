@@ -449,6 +449,10 @@ def test_ask_ara_opens_a_confirmation_thread_and_hides_the_block():
     assert threads[0]["title"] == "Steuererklärung eingereicht?"
     # Never quiet, and never the cowork audit thread.
     assert not threads[0].get("quiet") and threads[0].get("kind") != "cowork"
+    # It declares how much it matters: undeclared, the attention model would
+    # list it as passive and never push it.
+    assert threads[0].get("attention") == mcp.CONFIRM_ATTENTION, threads[0]
+    assert threads[0]["attention"]["importance"] >= 3.5, "active needs importance 3.5+"
     print("ok: stated facts open a thread of their own; the client never sees the block")
 
 
@@ -517,7 +521,8 @@ def test_tell_ara_review_appends_to_the_note_thread():
     assert posts[0] == ("/internal/conversations",
                         {"message": "Filed the return today.", "title": None}), posts
     assert posts[1] == ("/internal/conversations/t-1/messages",
-                        {"message": "Bitte bestätigen."}), posts
+                        {"message": "Bitte bestätigen.",
+                         "attention": mcp.CONFIRM_ATTENTION}), posts
     assert len(posts) == 2
     print("ok: a tell_ara note is delivered at once and its review lands in the same thread")
 
