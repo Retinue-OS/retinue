@@ -866,7 +866,9 @@ services:
       - agents
 
   # SMS — opt-in, behind the `sms` compose profile (`docker compose --profile
-  # sms up -d`, or COMPOSE_PROFILES=sms in .env). Four services, all needed:
+  # sms up -d`, or COMPOSE_PROFILES=sms in .env). Four services, all needed,
+  # plus sms-config-check, which refuses to let them start without their
+  # secrets:
   #
   #   sms-db      MariaDB for the server (it requires MySQL/MariaDB).
   #   sms-server  the self-hosted android-sms-gateway private server (plus
@@ -889,9 +891,37 @@ services:
   # certificate nor the basic-auth password — so each is authenticated by its
   # own secret (the private token; the webhook signing key). Full setup:
   # docs/messaging.md, "SMS".
+  # Fail-closed guard. Private mode compares a registering phone's token to
+  # GATEWAY__PRIVATE_TOKEN verbatim, so an empty token would let anyone who
+  # reaches the public mobile API register a device. A `${VAR:?}` in this file
+  # cannot express that — compose interpolates profile-disabled services too,
+  # so it would break every deployment that never runs SMS — hence this
+  # profile-scoped check, which the server and its database wait on.
+  sms-config-check:
+    image: python:3.12-slim
+    profiles: ["sms"]
+    environment:
+      - SMS_SERVER_PRIVATE_TOKEN=${SMS_SERVER_PRIVATE_TOKEN:-}
+      - SMS_DB_PASSWORD=${SMS_DB_PASSWORD:-}
+    command:
+      - python3
+      - -c
+      - |
+        import os, sys
+        bad = [n for n in ("SMS_SERVER_PRIVATE_TOKEN", "SMS_DB_PASSWORD")
+               if len(os.environ.get(n, "")) < 16]
+        if bad:
+            sys.exit("sms profile refused to start: set " + ", ".join(bad)
+                     + " in .env to a random value of at least 16 characters")
+    network_mode: none
+    restart: "no"
+
   sms-db:
     image: mariadb:11.4
     profiles: ["sms"]
+    depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
     environment:
       - MARIADB_DATABASE=sms
       - MARIADB_USER=sms
@@ -912,6 +942,8 @@ services:
     image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:v1.47.3}
     profiles: ["sms"]
     depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
       sms-db:
         condition: service_healthy
     environment: &sms-server-env
@@ -944,6 +976,8 @@ services:
     profiles: ["sms"]
     command: ["/app/app", "worker"]
     depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
       sms-db:
         condition: service_healthy
     environment: *sms-server-env

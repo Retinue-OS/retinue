@@ -950,10 +950,11 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
         if entry.get("status") != "pending":
             return entry
         entry["status"] = "sending" if approved else "rejected"
-        try:
-            _atomic_json(path, entry)
-        except OSError as exc:
-            print(f"[sms-gateway] warning: could not update pending send: {exc}", flush=True)
+        # The transition must be on disk before anything acts on it: a file
+        # still saying "pending" could be approved a second time after the
+        # first SMS went out. A failed write raises to the handler (a
+        # retryable error) and nothing is sent.
+        _atomic_json(path, entry)
         _pending_sends.pop(request_id, None)
         snapshot = dict(entry)
     if approved:
@@ -1103,7 +1104,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         m = _PENDING_SEND_RE.match(self.path)
         if m and m.group(2):
-            entry = _complete_pending_send(m.group(1), approved=(m.group(2) == "approve"))
+            try:
+                entry = _complete_pending_send(m.group(1), approved=(m.group(2) == "approve"))
+            except OSError as exc:
+                print(f"[sms-gateway] could not record the approval decision: {exc}", flush=True)
+                self._reply(503, {"error": "could not record the decision; retry later"})
+                return
             if entry is None:
                 self._reply(404, {"error": "pending send not found"})
             else:
@@ -1163,11 +1169,15 @@ class _Handler(BaseHTTPRequestHandler):
         if not recipient:
             self._reply(400, {"error": "no recipient given and SMS_DEFAULT_RECIPIENT is unset"})
             return
-        # Checked before queueing, so no approval is ever asked for a send that
-        # could only fail: SMS goes to phone numbers, never to a sender id.
-        if not _is_phone_number(_normalize_sender(recipient)):
+        # Checked and normalized before queueing: no approval is ever asked
+        # for a send that could only fail (SMS goes to phone numbers, never to
+        # a sender id), and the pending record carries the same chat key the
+        # ledger does, so erasing the chat finds it.
+        normalized = _normalize_sender(recipient)
+        if not _is_phone_number(normalized):
             self._reply(400, {"error": f"not a phone number: {recipient!r}"})
             return
+        recipient = normalized
         message = str(payload.get("message") or payload.get("text") or "").strip()
         if not message:
             self._reply(400, {"error": "an SMS needs a non-empty message"})

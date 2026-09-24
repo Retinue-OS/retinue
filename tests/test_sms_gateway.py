@@ -308,6 +308,140 @@ def test_webhook_registration_is_reconciled():
     print("ok: webhook registration is reconciled against the server")
 
 
+def test_approval_is_durable_before_the_send():
+    """If the 'sending' transition cannot be written, nothing is sent and the
+    caller is told to retry — a file still saying 'pending' could otherwise be
+    approved twice and the SMS sent twice."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp, token="t")
+        sent = []
+        gw._push = lambda *a, **kw: (sent.append(a) or ("id", 1.0))
+        rid = gw._new_pending_send("+41791112233", "Hi", "verify")
+        real = gw._atomic_json
+
+        def _fail(*a, **kw):
+            raise OSError("read-only")
+        gw._atomic_json = _fail
+        server, base = _serve(gw)
+        try:
+            status, _ = _post(f"{base}/pending-sends/{rid}/approve", b"{}",
+                              {"Authorization": "Bearer t"})
+            assert status == 503, status
+            time.sleep(0.2)
+            assert sent == []
+            gw._atomic_json = real
+            assert gw._get_pending_send_detail(rid)["status"] == "pending"
+        finally:
+            server.shutdown()
+    print("ok: an approval is on disk before its SMS is sent")
+
+
+def test_pending_recipient_is_the_normalized_chat_key():
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp, token="t")
+        server, base = _serve(gw)
+        try:
+            send = json.dumps({"recipient": "+41 79 111 22 33", "message": "x"}).encode()
+            status, answer = _post(f"{base}/send", send, {"Authorization": "Bearer t"})
+            assert status == 202, answer
+            [entry] = gw._list_pending_sends_store()
+            assert entry["recipient"] == "+41791112233", entry
+            gw.CHAT_ERASE_TOKEN = "e"
+            gw._erase_chat("+41791112233", None)
+            assert gw._list_pending_sends_store() == []
+        finally:
+            server.shutdown()
+    print("ok: a pending send is stored under the chat key erasure matches")
+
+
+class _FakeSmsServer:
+    """Just enough of the android-sms-gateway 3rd-party API to pin the
+    adapter's contract: Basic auth, paths, payloads and response parsing."""
+
+    def __init__(self):
+        from http.server import BaseHTTPRequestHandler
+        import base64
+        self.requests = []
+        self.webhooks = []
+        fake = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                return
+
+            def _answer(self, status, body):
+                raw = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def _handle(self, method):
+                length = int(self.headers.get("Content-Length", "0") or "0")
+                body = json.loads(self.rfile.read(length)) if length else None
+                fake.requests.append((method, self.path, self.headers.get("Authorization"), body))
+                if self.headers.get("Authorization") != "Basic " + base64.b64encode(b"u:p").decode():
+                    return self._answer(401, {"message": "unauthorized"})
+                if method == "GET" and self.path == "/api/3rdparty/v1/devices":
+                    return self._answer(200, [
+                        {"id": "dev1", "name": "Phone", "lastSeen": "2026-09-24T10:00:00Z",
+                         "simCards": [{"slotIndex": 0, "simNumber": 1,
+                                       "phoneNumber": "+41790000001"}]}])
+                if method == "POST" and self.path == "/api/3rdparty/v1/messages":
+                    return self._answer(202, {"id": "srv-1", "state": "Pending",
+                                              "recipients": []})
+                if method == "GET" and self.path == "/api/3rdparty/v1/webhooks":
+                    return self._answer(200, list(fake.webhooks))
+                if method == "POST" and self.path == "/api/3rdparty/v1/webhooks":
+                    fake.webhooks.append(body)
+                    return self._answer(201, body)
+                return self._answer(404, {"message": "not found"})
+
+            def do_GET(self):
+                self._handle("GET")
+
+            def do_POST(self):
+                self._handle("POST")
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.api = f"http://127.0.0.1:{self.server.server_address[1]}/api/3rdparty/v1"
+
+
+def test_server_adapter_http_contract():
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = _FakeSmsServer()
+        try:
+            os.environ["SMS_SERVER_API_URL"] = fake.api
+            gw = _load(tmp, account="")
+            # Link state: devices parsed, lastSeen read, account learned from the SIM.
+            gw._refresh_link_state()
+            assert gw._state["server_ok"] and gw._state["devices"] == 1
+            assert abs(gw._state["device_last_seen"] - 1790244000.0) < 1
+            assert gw.SMS_ACCOUNT == "+41790000001"
+            # Send: the documented textMessage/phoneNumbers payload, the id read back.
+            message_id, _ = gw._push("+41 79 111 22 33", "Hello")
+            method, path, auth, body = fake.requests[-1]
+            assert (method, path) == ("POST", "/api/3rdparty/v1/messages")
+            assert body == {"textMessage": {"text": "Hello"}, "phoneNumbers": ["+41791112233"]}
+            assert message_id == "srv-1"
+            # Webhook: registered once under the fixed id, then left alone.
+            gw._ensure_webhook()
+            gw._ensure_webhook()
+            assert fake.webhooks == [{"id": "retinue-sms-received",
+                                      "url": "https://sms.example.com/webhook",
+                                      "event": "sms:received"}], fake.webhooks
+            # Wrong credentials surface as an unhealthy server, not a crash.
+            gw.SMS_SERVER_PASSWORD = "wrong"
+            gw._refresh_link_state()
+            assert gw._state["server_ok"] is False and "401" in gw._state["error"]
+        finally:
+            fake.server.shutdown()
+            os.environ.pop("SMS_SERVER_API_URL", None)
+    print("ok: the server adapter speaks the 3rd-party API contract")
+
+
 def test_send_policy_and_pending_store():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load(tmp, policy=[{"number": "+41 79 000 00 00", "category": "allow"}])

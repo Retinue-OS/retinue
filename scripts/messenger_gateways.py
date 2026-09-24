@@ -6,16 +6,16 @@ One registry, two consumers: the web-gateway (which aggregates pending sends on
 polls each gateway's /health). Both must see exactly the same set of gateways,
 so the discovery lives here instead of being duplicated.
 
-The three built-in channels enrol when their ``*_GATEWAY_BASE_URL`` is set
+The built-in channels enrol when their ``*_GATEWAY_BASE_URL`` is set
 **and** their name is listed in ``MESSENGER_BUILTIN_CHANNELS`` (comma-separated
-subset of ``signal``, ``whatsapp``, ``telegram`` — defaults to all three, i.e.
-today's behaviour, unchanged). ``docker-compose.yml`` wires all three
-``*_GATEWAY_BASE_URL`` vars unconditionally, so a deployment that never runs
+subset of ``signal``, ``whatsapp``, ``telegram``, ``sms`` — defaults to all of
+them; SMS then still needs its base URL, see below). ``docker-compose.yml``
+wires the first three ``*_GATEWAY_BASE_URL`` vars unconditionally, so a deployment that never runs
 one of the built-in gateway containers at all (not even unpaired) would
 otherwise still enrol a gateway pointed at a host that doesn't exist —
 indistinguishable, by URL alone, from that same container having crashed. Such
 a deployment names only the channels it actually runs, e.g.
-``MESSENGER_BUILTIN_CHANNELS=signal``, and the other two drop out of the
+``MESSENGER_BUILTIN_CHANNELS=signal``, and the others drop out of the
 registry entirely — same as a chamber that was never mounted — with no need to
 separately blank their base URLs. A deployment adds any further gateways
 (extra accounts, extra channels) via ``MESSENGER_GATEWAYS`` — a JSON array of
@@ -81,7 +81,7 @@ def resolve(registry: dict, slug: str):
 
 
 def _extra_channel_gateways(log_prefix: str) -> dict:
-    """Deployment-declared channel gateways beyond the three built-ins.
+    """Deployment-declared channel gateways beyond the built-ins.
 
     Malformed entries are skipped with a log line rather than crashing boot.
     """

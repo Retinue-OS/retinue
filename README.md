@@ -536,7 +536,8 @@ that gap:
   `GATEWAY_MONITOR_REMIND_SECONDS`, `GATEWAY_MONITOR_IGNORE` (comma-separated
   slugs to skip, e.g. a deliberately unlinked channel). It watches the same
   registry `/sends` uses — the built-in channels named in
-  `MESSENGER_BUILTIN_CHANNELS` (default: all three) plus any
+  `MESSENGER_BUILTIN_CHANNELS` (default: all four — SMS only where
+  `SMS_GATEWAY_BASE_URL` is set) plus any
   `MESSENGER_GATEWAYS` extras.
 - **Re-pairing from the phone.** The dashboard page **`/gateways`** (behind the
   same edge auth as the rest) shows each gateway's live state and, for a
