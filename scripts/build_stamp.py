@@ -46,7 +46,7 @@ from pathlib import Path
 
 # The modules every messenger gateway's Dockerfile copies, and which the
 # retinue container carries under /workspace/scripts. Adding one here without
-# adding it to all three gateway Dockerfiles turns every gateway's digest into
+# adding it to every gateway Dockerfile turns every gateway's digest into
 # None — tests/test_build_stamp.py fails the build for exactly that, so the
 # list and the COPY lines cannot drift apart silently.
 FRAMEWORK_MODULES: tuple[str, ...] = (

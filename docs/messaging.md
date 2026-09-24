@@ -1,4 +1,4 @@
-# Outbound messaging — Signal, WhatsApp, Telegram
+# Outbound messaging — Signal, WhatsApp, Telegram, SMS
 
 *Reference depth for the "Messaging" digest in `CLAUDE.md`. Read this before
 sending on an unfamiliar channel or account, changing send policies, enrolling
@@ -158,6 +158,72 @@ both). Outbound is gated by `TELEGRAM_SEND_POLICY`, keyed — like
 the fail-safe default means every send needs approval unless a policy entry grants
 it. Pending Telegram sends appear on `/sends` with the others. Text plus optional
 image attachments only.
+
+## SMS (the same model, opt-in)
+
+SMS runs through the user's own Android phone: the
+[SMS Gateway for Android](https://github.com/capcom6/android-sms-gateway) app,
+paired with a **self-hosted**
+[android-sms-gateway server](https://github.com/android-sms-gateway/server), so
+no third-party relay sees the messages. Three services under the `sms` compose
+profile: `sms-db` (the server's MariaDB), `sms-server` (the private server) and
+`sms-gateway` (`scripts/sms-gateway.py`, the channel gateway — same `/send`,
+`/pending-sends`, `/undelivered`, `/health` contract as the others, same
+ledger, delivery gate and chat surface). Send with the thin CLI — text only:
+
+```bash
+python3 /workspace/scripts/sms-push.py --recipient +41791234567 "Running ten minutes late"
+python3 /workspace/scripts/sms-push.py --reply-to <token> "Thanks, see you then"
+```
+
+Outbound is gated by `SMS_SEND_POLICY`, keyed by the phone's own number
+(`SMS_ACCOUNT`), default `verify`. "Sent" means the server accepted the message
+for the phone; the phone transmits it on its next contact with the server.
+There is no contact directory: `/contacts` and `/recent-chats` both answer from
+the numbers that wrote in or were written to, so name lookup for SMS goes
+through the chambers' own contacts.
+
+Two deliberate differences from the other channels:
+
+- **Inbox mode only.** SMS sender ids are trivially forged, so an
+  accepted-requesters allowlist keyed on one would authenticate nothing; an SMS
+  account is never a `control` channel. Every inbound SMS is untrusted
+  external data — on the triage fallback path it reaches the model only
+  HTML-escaped inside `<external_message>`, framed as data, never as
+  instructions, and nothing ever replies to a sender by itself.
+- **Inbound is a signed webhook.** The phone POSTs each received SMS to
+  `SMS_WEBHOOK_URL`, which the deployment routes to `sms-gateway`'s
+  `POST /webhook` — outside the dashboard's edge auth, since the app can present
+  neither a client certificate nor the basic-auth password. The app signs every
+  webhook (HMAC-SHA256 over body + `X-Timestamp`) under its signing key; the
+  gateway refuses anything unsigned, wrongly signed or older than three days
+  (the app's retry window), and refuses everything while
+  `SMS_WEBHOOK_SIGNING_KEY` is unset. Redeliveries are deduplicated by message
+  id. The gateway registers the webhook with the server itself at startup.
+
+**Setup.**
+
+1. In `.env`: `COMPOSE_PROFILES=sms`, `SMS_GATEWAY_BASE_URL=http://sms-gateway:8095`
+   (this is what enrols the channel on `/sends`, `/gateways`, the chat surface
+   and the monitor), `SMS_DB_PASSWORD`, `SMS_SERVER_PRIVATE_TOKEN`,
+   `SMS_GATEWAY_TOKEN` and `SMS_ACCOUNT` (see `.env.example`).
+2. Route `sms.<domain>` in `docker-compose.override.yml`: `PathPrefix(/api/mobile/)`
+   to `sms-server:3000` and exactly `POST /webhook` to `sms-gateway:8095`, both
+   over HTTPS and without the dashboard's auth middlewares (example in
+   `docker-compose.override.example.yml`).
+3. In the app: Settings → Cloud Server → API URL
+   `https://sms.<domain>/api/mobile/v1`, Private Token =
+   `SMS_SERVER_PRIVATE_TOKEN`. Once registered, the app shows a username and
+   password: put them in `SMS_SERVER_USERNAME` / `SMS_SERVER_PASSWORD`.
+4. In the app: Settings → Webhooks → Signing Key → copy it into
+   `SMS_WEBHOOK_SIGNING_KEY`; set `SMS_WEBHOOK_URL=https://sms.<domain>/webhook`.
+   Restart `sms-gateway`; `/gateways` shows it connected once the phone checks in.
+
+By default `SMS_SERVER_UPSTREAM_URL` is empty, keeping the server off the
+vendor's push relay (`api.sms-gate.app`); the phone then finds queued sends on
+its own polling, so outbound SMS can lag. Set it to trade that privacy for
+speed. There is no QR re-pairing: a "not seen recently" on `/gateways` is fixed
+on the phone (is the app running, allowed in the background, online?).
 
 ## What an agent session can see
 

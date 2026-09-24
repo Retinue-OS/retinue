@@ -29,6 +29,14 @@ on either side — any account a deployment adds gets a working ``verify`` flow
 by construction. Config flows deployment → framework: the framework never
 names a specific deployment's services.
 
+SMS is the fourth built-in channel and the one exception to "wired by
+default": it runs only under the ``sms`` compose profile, so the base compose
+leaves ``SMS_GATEWAY_BASE_URL`` unset and the channel enrols only in a
+deployment that sets it — an unset base URL keeps it out of the registry the
+same way for every channel. ``MESSENGER_BUILTIN_CHANNELS``, when set, still
+has the final say: a deployment that names its channels explicitly names
+``sms`` among them to enrol it.
+
 Older links used shortened slugs (``signal``, ``signal-personal`` — the
 hostname with the redundant ``-gateway`` infix dropped); ``resolve()`` still
 accepts those as aliases so pre-upgrade approval links keep working.
@@ -112,12 +120,13 @@ def _extra_channel_gateways(log_prefix: str) -> dict:
 
 
 # The built-in channels this deployment actually runs. Comma-separated subset
-# of "signal", "whatsapp", "telegram"; unset means all three (today's
-# behaviour). Lets a deployment that never starts one of the built-in gateway
+# of "signal", "whatsapp", "telegram", "sms"; unset means all of them (and SMS
+# then enrols exactly when SMS_GATEWAY_BASE_URL is set, which the base compose
+# does not do). Lets a deployment that never starts one of the built-in gateway
 # containers drop it from the registry with one variable, instead of having to
 # blank that channel's *_GATEWAY_BASE_URL to the same effect. The full tuple
 # is also the set of channel names a registry slug is read against.
-BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram")
+BUILTIN_CHANNELS = ("signal", "whatsapp", "telegram", "sms")
 
 
 def _enabled_builtin_channels() -> set:
@@ -149,6 +158,9 @@ def channel_gateways(log_prefix: str = "[messenger-gateways]") -> dict:
             ("telegram", os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "").rstrip("/"),
              os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip(),
              "Telegram"),
+            ("sms", os.environ.get("SMS_GATEWAY_BASE_URL", "").rstrip("/"),
+             os.environ.get("SMS_GATEWAY_TOKEN", "").strip(),
+             "SMS"),
         )
         if name in enabled and base_url and slug_from_base_url(base_url)
     }

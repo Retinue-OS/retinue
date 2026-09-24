@@ -594,6 +594,6 @@ serving logic, `webapp/`, `scripts/`). Phases 1–4 have shipped.
    chat is invisible on the chat page until approved; showing it as a
    pending bubble (approvable in place) would fold `/sends` into the chat for
    those too. Deferred to phase 6.
-5. **SMS.** The triage skill names SMS as a channel; no SMS gateway exists.
-   The design is channel-agnostic (a future gateway that writes the same store
-   shape gets a chat page for free), but SMS itself stays out of scope.
+5. **SMS.** Resolved: `sms-gateway` (opt-in, `sms` compose profile) writes
+   the same store shape, so SMS chats appear here with no serving-code change —
+   as this design predicted. See `docs/messaging.md`, "SMS".

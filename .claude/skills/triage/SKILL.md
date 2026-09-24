@@ -245,7 +245,8 @@ gateway's ledger rather than listed:
     # ONLY this skill calls this — it drains AND marks delivered.
     curl -s -H "Authorization: Bearer $INBOUND_GATE_TOKEN" \
       "http://signal-gateway:8090/undelivered?since=<ISO-8601-of-last-drain>"
-    # likewise whatsapp-gateway / telegram-gateway for every inbox-mode channel
+    # likewise whatsapp-gateway / telegram-gateway / sms-gateway (port 8095,
+    # where the SMS profile runs) for every inbox-mode channel
 
 `GET /undelivered` returns the undelivered messages **and flips each to
 `delivered:true` in the same pass**, so the drain is idempotent — a re-run
