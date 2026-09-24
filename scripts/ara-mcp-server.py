@@ -551,8 +551,10 @@ def _answer_worker(job_id: str, question: str, context: str) -> None:
     title = message = None
     if status == "done":
         text, title, message = _split_confirmation(text)
-    _finish_job(job_id, status, text)
+    # The thread is opened before the job is published: "done" promises the
+    # client that everything this answer set in motion has happened.
     confirm = _confirmation_thread(title, message) if message else {}
+    _finish_job(job_id, status, text)
     _audit(question, context, status, text, confirm)
 
 

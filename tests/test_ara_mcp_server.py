@@ -452,6 +452,28 @@ def test_ask_ara_opens_a_confirmation_thread_and_hides_the_block():
     print("ok: stated facts open a thread of their own; the client never sees the block")
 
 
+def test_ask_ara_opens_the_thread_before_answering():
+    """A slow gateway must not let "done" overtake the confirmation thread."""
+    import time
+    posts = []
+
+    def slow_post(path, payload):
+        time.sleep(0.3)
+        posts.append((path, payload))
+        return {"id": "t-1", "url": "https://dash/c/t-1"}
+    real_run, real_post = mcp._run_claude, mcp._gateway_post
+    mcp._run_claude = lambda prompt: ("done", REPLY_WITH_FACTS)
+    mcp._gateway_post = slow_post
+    try:
+        payload, _ = tool("ask_ara", {"question": "Is it filed?"})
+        opened = [pl for path, pl in posts if path == "/internal/conversations"]
+    finally:
+        mcp._run_claude, mcp._gateway_post = real_run, real_post
+    assert payload["status"] == "done", payload
+    assert len(opened) == 1, posts
+    print("ok: the confirmation thread exists by the time the answer is done")
+
+
 def test_ask_ara_without_facts_opens_nothing():
     posts, fake_post = _capture_gateway()
     real_run, real_post = mcp._run_claude, mcp._gateway_post
@@ -548,6 +570,7 @@ def main():
     test_the_prompts_ask_for_confirmation_instead_of_recording()
     test_split_confirmation()
     test_ask_ara_opens_a_confirmation_thread_and_hides_the_block()
+    test_ask_ara_opens_the_thread_before_answering()
     test_ask_ara_without_facts_opens_nothing()
     test_tell_ara_review_appends_to_the_note_thread()
     test_tell_ara_review_that_finds_nothing_stays_silent()
