@@ -634,9 +634,10 @@ class RetinueConversations extends HTMLElement {
     return `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span><p>${msg}</p></div>`;
   }
 
-  // The card links out to the full page; the full page links back home.
+  // The card links out to the full page; the full page's way home is the
+  // navigation row at the top of conversations.html (components/nav.js).
   _footerHtml() {
-    if (this._full) return '<a class="all-link" href="/">&larr; Back to dashboard</a>';
+    if (this._full) return '';
     return `<a class="all-link" href="/conversations.html">${this._allLinkLabel()}</a>`;
   }
 
@@ -1602,13 +1603,18 @@ const CSS = `
                        max-width: 9.5rem; cursor: pointer; -webkit-appearance: none;
                        appearance: none; }
   .model-pick select:hover { border-color: var(--accent, #6ea8fe); }
-  /* A phone's thread bar holds the back button, the picker, the attention
-     ⓘ, the speaker toggle and Archive beside the title: the picker yields
-     first, so the title keeps a few words instead of its first letter. */
+  /* A phone's thread bar cannot hold the back button, the picker, the
+     attention ⓘ, the speaker toggle and Archive beside the title — squeezed
+     into one row the title kept its first four letters. So on a phone the
+     title keeps the row with the back button (two lines before it cuts, as
+     in the list) and the controls wrap to a row under it, the way the chat
+     page's Archive and Mute switches sit under its header. */
   @media (max-width: 480px) {
-    .model-pick select { max-width: 5.5rem; }
-    .pill { padding: 6px 9px; }
-    .bar-title { min-width: 5ch; }
+    .thread-bar { flex-wrap: wrap; row-gap: 8px; }
+    .bar-title { white-space: normal; overflow-wrap: anywhere; display: -webkit-box;
+                 -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.3; }
+    .bar-actions { flex: 1 0 100%; padding-left: 44px; }
+    .bar-actions:empty { display: none; }
   }
   /* The composer's roomy form: a captioned, untruncated picker centered under
      the "Ask Ara anything" hint, so the model choice is plainly offered before

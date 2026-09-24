@@ -178,7 +178,9 @@ transcript cleanup does.
    (the sphere vocabulary included) or, later, drives it from the calendar.
 2. The news card stays on the home below the attention list, in its own
    resizable region; the chats, conversations and projects cards are gone,
-   their pages linked from the list's footer.
+   their pages linked from the navigation row at the top of every page
+   (first from the list's footer, which put them — and each page's way back
+   — at the end of a list).
 3. The per-device notification modes stay as the second filter behind the
    model until a later slice retires them.
 4. What a message is worth before anyone has judged it: a person writing

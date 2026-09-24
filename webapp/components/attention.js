@@ -75,8 +75,6 @@ const CSS = `
   .caret { font-size: .7rem; color: var(--muted, #8b93a3); flex: none; }
   .head-right { display: inline-flex; align-items: baseline; gap: 12px; flex: none; }
   .head-right .date { color: var(--muted, #8b93a3); font-size: .8rem; white-space: nowrap; }
-  .gear { color: var(--muted, #8b93a3); text-decoration: none; font-size: .95rem; }
-  .gear:hover { color: var(--accent, #6ea8fe); }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; flex: none;
          align-self: center; }
   .content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
@@ -122,9 +120,6 @@ const CSS = `
   .foot { flex: none; display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
   .new { width: 100%; padding: 12px; border-radius: 14px; border: 0; cursor: pointer;
          background: var(--accent, #6ea8fe); color: #0b0d12; font-weight: 600; }
-  .links { display: flex; justify-content: center; gap: 14px; flex-wrap: wrap; font-size: .85rem; }
-  .links a { color: var(--accent, #6ea8fe); text-decoration: none; }
-  .links a:hover { text-decoration: underline; }
   /* The mode menu: a fixed overlay so it floats over the whole page. */
   .overlay { position: fixed; inset: 0; z-index: 40; background: rgba(0, 0, 0, .55);
              display: flex; align-items: flex-end; justify-content: center; }
@@ -319,7 +314,8 @@ class RetinueAttention extends HTMLElement {
 
   // The home's whole header: the mode in force as the page's title — the
   // state the user is in, which is what the space above a list of what wants
-  // attention is worth spending on — plus the date and the way to settings.
+  // attention is worth spending on — plus the date. The way to settings and
+  // to the other pages is the navigation row above it (components/nav.js).
   // The date comes from the gateway's clock (`now`), not the browser's: it is
   // the clock every deadline on the list is read against.
   _headHtml(d) {
@@ -327,8 +323,7 @@ class RetinueAttention extends HTMLElement {
     const date = new Date((d && d.now) || Date.now());
     const dateText = Number.isNaN(date.getTime()) ? ''
       : date.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
-    const right = `<span class="head-right"><span class="date">${esc(dateText)}</span>` +
-      `<a class="gear" href="/settings.html" title="Settings" aria-label="Settings">&#9881;</a></span>`;
+    const right = `<span class="head-right"><span class="date">${esc(dateText)}</span></span>`;
     if (!mode) {
       return `<header><span class="mode-head"><span class="mode-when">` +
         `${this._state === 'offline' ? 'Offline' : '&#8230;'}</span></span>${right}</header>`;
@@ -413,9 +408,9 @@ class RetinueAttention extends HTMLElement {
         (total ? '' : '<div class="empty">Nothing wants your attention.</div>') +
         `</div>`;
     }
-    const foot = `<div class="foot"><button class="new" data-act="new">+ Ask Ara</button>` +
-      `<div class="links"><a href="/conversations.html">Conversations</a><a href="/chats.html">Chats</a>` +
-      `<a href="/projects.html">Projects</a><a href="/news.html">News</a></div></div>`;
+    // The one action the home offers beside the rows, within thumb reach;
+    // the pages beside the home are in the navigation row at the top.
+    const foot = `<div class="foot"><button class="new" data-act="new">+ Ask Ara</button></div>`;
     root.innerHTML = `<style>${CSS}</style><section class="card" aria-label="${esc(this.heading)}">${head}<div class="content">${body}${foot}</div></section>` +
       (this._menu ? this._menuHtml() : '');
   }

@@ -66,6 +66,7 @@ import { openAttentionSheet } from './attention-sheet.js';
 const LIST_URL = '/chats';
 // Where the back control lands a visitor who has no app history behind them.
 const CHATS_URL = '/chats.html';
+const HOME_URL = '/';
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
 const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
@@ -274,11 +275,12 @@ class RetinueChatPage extends HTMLElement {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = new URLSearchParams(location.search).get('id') || '';
     // Where "back" leads. A same-origin referrer means the chat was opened
-    // from inside the app (the dashboard card, the chats list, another chat),
+    // from inside the app (a row on the home, the chats list, another chat),
     // so there is an entry to return to and the user expects the place they
     // came from — not a list they then have to scroll to escape. Opened cold
     // (a push notification, a bookmark, the home-screen icon) there is no such
-    // entry, and the chats list is the honest landing place.
+    // entry, and the home — the attention list the chat is a row of, with
+    // the navigation to everything else — is the honest landing place.
     this._fromApp = this._openedFromApp();
     // Pane arrangement differs across the breakpoint; re-render on a flip
     // (drafts survive — they live in fields, mirrored on every input event).
@@ -660,7 +662,7 @@ class RetinueChatPage extends HTMLElement {
         ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
         : `${ch} &middot; ${esc(key)}`);
     return `<header class="chat-head">` +
-      `<a class="back" href="${CHATS_URL}" data-back title="Back" aria-label="Back">&#8249;</a>` +
+      `<a class="back" href="${HOME_URL}" data-back title="Back" aria-label="Back">&#8249;</a>` +
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
@@ -830,7 +832,7 @@ class RetinueChatPage extends HTMLElement {
   _goBack() {
     if (this._lightbox) { this._closeLightbox(); return; }
     if (this._fromApp && history.length > 1) { history.back(); return; }
-    location.href = CHATS_URL;
+    location.href = HOME_URL;
   }
 
   // ── Lightbox ───────────────────────────────────────────────────────────────
@@ -1248,7 +1250,7 @@ class RetinueChatPage extends HTMLElement {
   _wire() {
     const root = this.shadowRoot;
     // Back: a real link (its href is the fallback destination, and it still
-    // opens the chats list in a new tab on a modified click) whose plain press
+    // opens the home in a new tab on a modified click) whose plain press
     // honours where the user actually came from — see _goBack.
     const back = root.querySelector('[data-back]');
     if (back) {

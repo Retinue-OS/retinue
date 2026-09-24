@@ -14,6 +14,9 @@
 
   <!-- Web components. Each is a standalone custom element that fetches its
        own data document. Edit this file to add, remove or reorder cards. -->
+  <!-- The navigation row every top-level page opens with: the home and the
+       chats, threads, projects and news pages beside it, plus settings. -->
+  <script type="module" src="/components/nav.js"></script>
   <!-- The home: one list of what wants attention — threads, chats and projects
        alike, each with its importance, urgency and delivery — over the
        gateway's GET /attention (docs/attention-model.md). -->
@@ -47,6 +50,12 @@
 </head>
 <body>
   <main>
+    <!-- The way across: the same row as on every other page, with Home as
+         the place you are. Where the chats, threads, projects and news pages
+         used to be linked from — the foot of the list, and each of them led
+         back from its own tail. -->
+    <retinue-nav current="home"></retinue-nav>
+
     <!-- No page header here: the home's first line is the attention list's
          own, where the focus mode is the title (components/attention.js).
          The state the user is in is the one thing worth the space above a
@@ -95,13 +104,13 @@
          a normal link: tel: / sms: / mailto: / geo: work in every browser;
          intent:// works in Chromium browsers and can launch arbitrary installed
          apps (these local OS actions work offline). Plain paths like /sends
-         navigate within the PWA. -->
+         navigate within the PWA; the dashboard's own pages are in the
+         navigation row at the top, so the dock does not repeat them. -->
     <retinue-app-launcher>
       <a href="tel:"><span class="ico">&#128222;</span><span class="lbl">Phone</span></a>
       <a href="sms:"><span class="ico">&#128172;</span><span class="lbl">SMS</span></a>
       <a href="mailto:"><span class="ico">&#9993;&#65039;</span><span class="lbl">Mail</span></a>
       <a href="geo:0,0?q="><span class="ico">&#128506;&#65039;</span><span class="lbl">Map</span></a>
-      <a href="/news.html"><span class="ico">&#128240;</span><span class="lbl">News</span></a>
       <a href="/sends"><span class="ico">&#128228;</span><span class="lbl">Sends</span></a>
     </retinue-app-launcher>
   </main>

@@ -25,9 +25,11 @@
        GET /chats, no cap, with an Active/Archived filter. Each row opens that
        chat's own page (chat.html) with the mirror and the companion pane. -->
   <script type="module" src="/components/chats.js"></script>
+  <script type="module" src="/components/nav.js"></script>
 </head>
 <body>
   <main>
+    <retinue-nav current="chats"></retinue-nav>
     <retinue-chats full heading="Chats"></retinue-chats>
   </main>
 

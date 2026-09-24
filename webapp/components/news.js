@@ -296,8 +296,8 @@ class RetinueNews extends HTMLElement {
     const { state, data } = this._state;
     // A deployment with no news sources declared has nothing to say here, and an
     // empty card is pure noise on a phone screen — so the card takes itself off
-    // the dashboard until there is something in the feed. The dock button and
-    // /news.html stay, so the page is still discoverable.
+    // the dashboard until there is something in the feed. /news.html stays in
+    // the navigation row, so the page is still discoverable.
     if (!this.full) {
       this.hidden = state === 'ok' && !this.items.length;
       if (this.hidden) { this.shadowRoot.innerHTML = ''; return; }
@@ -312,13 +312,13 @@ class RetinueNews extends HTMLElement {
       inner = this.full ? this.bodyFull() : this.bodyCard();
       if (data && data.generated) stamp = `<time>${esc(fmtAge(data.generated))}</time>`;
     }
-    const home = this.full
-      ? '<a class="more" href="/">&larr; Back to dashboard</a>' : '';
+    // The dedicated page's way home is the navigation row above the
+    // component (components/nav.js).
     this.shadowRoot.innerHTML =
       `<style>${CSS}${VIEW_TOGGLE_CSS}</style>` +
       `<section class="card"><header><h2>${esc(this.heading)}</h2>` +
       `${viewToggleHtml(this._view)}${stamp}</header>` +
-      `<div class="content">${inner}</div>${home}</section>`;
+      `<div class="content">${inner}</div></section>`;
   }
 
   get _ulOpen() { return this._view === 'list' ? '<ul class="as-list">' : '<ul>'; }

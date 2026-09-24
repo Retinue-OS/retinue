@@ -93,12 +93,10 @@ under `CONVERSATIONS_DIR`, one file each — the deployment points this at the
 persistent `/root` volume (`/root/.retinue/conversations`); the
 `/tmp/web-tab-conversations` default is only for ad-hoc runs.
 
-On a phone the dashboard card stays compact (the five most recent active
-threads); in the wide layout it fills its resizable region and shows every
-active thread. Either way an **All conversations →** link leads to
-`conversations.html`, a dedicated page that lists every thread with an
-Active/Archived filter (the same `retinue-conversations` element with the
-`full` attribute). Archiving is done from inside a thread; archived threads
+On the home the element is a `viewer` only — threads open from the attention
+list's rows. *Threads* in the navigation row leads to `conversations.html`, a
+dedicated page that lists every thread with an Active/Archived filter (the
+same `retinue-conversations` element with the `full` attribute). Archiving is done from inside a thread; archived threads
 leave the active list but remain on that page and via
 `GET /conversations?archived=1`.
 
@@ -106,9 +104,11 @@ The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
 splitters — double-click resets one, dragging news fully down closes it — and
 each card's header toggles between list and card view. Both preferences
-persist per device in localStorage. Device-level settings (notifications, the
-running shell version with a manual update check) live on `settings.html`,
-reached via the gear in the dashboard header.
+persist per device in localStorage. Every top-level page opens with the
+navigation row (`components/nav.js`: Home · Chats · Threads · Projects · News
+and the settings gear), pinned while a list page scrolls. Device-level
+settings (notifications, the running shell version with a manual update
+check) live on `settings.html`, reached via that gear.
 
 Shell updates apply themselves (`components/update.js`): when a new service
 worker activates, controlled pages reload once — never while a thread or the

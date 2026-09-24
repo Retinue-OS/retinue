@@ -1,14 +1,19 @@
 /* Retinue dashboard shell. Minimalist, dark, app-like on small displays.
  *
  * Layout model:
+ *  - Every top-level page (the home, the chats, threads, projects and news
+ *    pages, settings) opens with the navigation row, <retinue-nav>: the way
+ *    home and across, pinned to the top while a list page scrolls, so leaving
+ *    a page never means scrolling to its end first.
  *  - Dashboard (list mode): main is a flex column locked to the visible
  *    height (--frame-h from viewport.js, else 100dvh). The .deck / .col
  *    wrappers in index.html are display:contents here, so the cards stack in
- *    main's column: header, the attention list, news, the dock. The page
- *    never scrolls — the attention list scrolls inside its own region and
- *    the news inside a capped share of the column, so the header and the
- *    dock always stay in view. The full list pages (chats, conversations,
- *    news, projects) keep a scrolling document on the phone.
+ *    main's column: the navigation, the attention list (whose first line is
+ *    the mode), news, the dock. The page never scrolls — the attention list
+ *    scrolls inside its own region and the news inside a capped share of the
+ *    column, so the navigation and the dock always stay in view. The full
+ *    list pages (chats, conversations, news, projects) keep a scrolling
+ *    document on the phone, under the pinned navigation.
  *  - Thread/composer open: the frame locks to exactly 100dvh and everything
  *    else hides, so the chat is immersive with an internally scrolled thread
  *    and a pinned composer. The thread viewer on the home is otherwise
@@ -63,11 +68,22 @@ main {
   padding: 2px 4px 0;
 }
 .top h1 { font-size: 1.3rem; font-weight: 650; letter-spacing: -.01em; margin: 0; }
-.top .top-right { display: inline-flex; align-items: baseline; gap: 12px; }
-.top .date { color: var(--muted); font-size: .8rem; }
-/* Discrete settings link — a quiet glyph, not a button. */
-.top .gear { color: var(--muted); text-decoration: none; font-size: .95rem; }
-.top .gear:hover { color: var(--accent); }
+
+/* The navigation row (components/nav.js) heads every top-level page and stays
+   pinned while a list page scrolls. Pinned at the very top it would slide
+   under a phone's status bar (viewport-fit=cover), so it reaches up over
+   main's top padding — the safe-area inset plus the 10px — and pads itself
+   back down by the same amount: at rest it sits exactly where it did, and
+   pinned it covers the inset with the page's own background. */
+retinue-nav {
+  flex: none;
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  background: var(--bg);
+  margin-top: calc(-1 * (env(safe-area-inset-top, 0px) + 10px));
+  padding-top: calc(env(safe-area-inset-top, 0px) + 10px);
+}
 
 /* Phone layout: the deck wrappers dissolve, cards join main's flex column
    directly, and the splitters (a wide-layout affordance) do not exist. The
@@ -135,9 +151,9 @@ main:has(retinue-conversations[data-view="composer"]) {
   overflow: hidden;
 }
 main:has(retinue-conversations[data-view="thread"])
-  :is(.top, .splitter, .col-side, retinue-app-launcher),
+  :is(.top, retinue-nav, .splitter, .col-side, retinue-app-launcher),
 main:has(retinue-conversations[data-view="composer"])
-  :is(.top, .splitter, .col-side, retinue-app-launcher),
+  :is(.top, retinue-nav, .splitter, .col-side, retinue-app-launcher),
 /* …and every other card sharing the main column. Matched by position rather
    than named one by one: the enumeration silently stopped covering the column
    the moment a card was added to it, which is how the chats list stayed on

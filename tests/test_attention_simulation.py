@@ -44,7 +44,9 @@ def main():
     # known sender by the time she writes again (docs/attention-model.md,
     # docs/triage-delivery-gate.md).
     system = [f["text"] for f in sim.feed if f["who"] == "system"]
-    assert any("held until Sun 17:00 — Focused on customers — this is not" in x and "+41791000042" in x for x in system), system
+    # The day is today's date, so the digest's weekday is whatever today is.
+    held = f"held until {sim.clock.at(17 * 60):%a} 17:00 — Focused on customers — this is not"
+    assert any(held in x and "+41791000042" in x for x in system), system
     assert any("+41791000042 — unknown" in x and "flagged as an unknown sender" in x
                for x in system), system
     assert any("+41791000042 — whitelisted" in x for x in system), system

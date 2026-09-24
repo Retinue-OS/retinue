@@ -137,6 +137,29 @@ def sender_name(m: dict) -> str | None:
     return None if story.CONTACTS[m["chat"]].get("unknown") else m["chat"]
 
 
+def project_path(p: dict) -> str:
+    """Where a story project's file lives, relative to CHAMBERS_DIR."""
+    return f"story/projects/{p['id'].rsplit(':', 1)[-1]}.md"
+
+
+def project_markdown(p: dict, clock: "Clock") -> str:
+    """A story project as the chamber file the project page opens: the
+    frontmatter the store's rows come from, and its next step as the note."""
+    actor = "you" if p["actor"] == "you" else p["actor"].rsplit(":", 1)[-1]
+    lines = ["---", f"id: {p['id']}", f"title: {p['title']}", f"current_actor: {actor}",
+             f"importance: {p['importance']}", f"sphere: {p['sphere']}", f"kind: {p['kind']}"]
+    if p.get("tags"):
+        lines += ["tags:"] + [f"  - {t}" for t in p["tags"]]
+    if p.get("expected") is not None:
+        lines.append(f"expected_by: {clock.date(p['expected'])}")
+    if p.get("remind_before"):
+        lines.append(f"remind_before: {p['remind_before']}")
+    if p.get("since") is not None:
+        lines.append(f"since: {clock.date(p['since'])}")
+    lines += ["---", "", f"**Next:** {p.get('next', '')}", ""]
+    return "\n".join(lines)
+
+
 class MockStore(BaseHTTPRequestHandler):
     sim: "Simulation"
 
@@ -160,6 +183,13 @@ class MockStore(BaseHTTPRequestHandler):
                     latest[r["chat"]] = r
             for r in latest.values():
                 rows.append(self._row(r, with_chat=True))
+        elif "GRAPH ?g" in query and "k:Project" in query:
+            # The project page's lookup: which chamber file holds this
+            # project — the one the runner wrote at midnight.
+            m = re.search(r"GRAPH \?g \{ <([^>]+)> rdf:type k:Project", query)
+            p = next((p for p in story.PROJECTS if m and p["id"] == m.group(1)), None)
+            if p is not None:
+                rows = [{"g": cell(self.sim.wg.QLEVER_GRAPH_BASE + project_path(p)), "title": cell(p["title"])}]
         elif "k:Project" in query:
             rows = self._projects()
         elif "k:chat " in query:
@@ -399,9 +429,15 @@ class Simulation:
             # — so midnight has to wipe it too, or yesterday's contact card
             # would make today's stranger a known sender.
             for d in (wg.CONVERSATIONS_DIR, wg.CHAT_STATE_DIR, wg.ATTENTION_DIR,
-                      wg.CHAMBERS_DIR / "_generated"):
+                      wg.CHAMBERS_DIR / "_generated", wg.CHAMBERS_DIR / "story"):
                 shutil.rmtree(d, ignore_errors=True)
                 Path(d).mkdir(parents=True, exist_ok=True)
+            # The projects' own files, so a project row opens its page (an
+            # edit there lasts until the next jump, like everything else).
+            for p in story.PROJECTS:
+                f = wg.CHAMBERS_DIR / project_path(p)
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(project_markdown(p, self.clock), encoding="utf-8")
             wg.CONVERSATION_ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
             wg._CHAT_OVERLAY = wg.chat_state_mod.ChatOverlay(ttl=wg.CHAT_OVERLAY_TTL_SECONDS)
             wg._chats_cache_invalidate()

@@ -100,6 +100,15 @@ class RetinueProjectPage extends HTMLElement {
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    // Where "back" leads, as on the chat page: opened from inside the app (a
+    // row on the home, the projects list) there is an entry to return to;
+    // opened cold (a push, a bookmark) the home is the landing place.
+    this._fromApp = (() => {
+      try {
+        const ref = document.referrer;
+        return !!ref && new URL(ref, location.href).origin === location.origin;
+      } catch (_e) { return false; }
+    })();
     this.render();
     this.load();
     // Content may be changed elsewhere (Ara, another device) while the page
@@ -397,7 +406,7 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   _backHtml() {
-    return '<a class="back" href="/projects.html" aria-label="All projects">&#8249;</a>';
+    return '<a class="back" href="/" data-back title="Back" aria-label="Back">&#8249;</a>';
   }
 
   _micHtml() {
@@ -502,6 +511,14 @@ class RetinueProjectPage extends HTMLElement {
   _wire() {
     const root = this.shadowRoot;
     const on = (sel, fn) => { const el = root.querySelector(sel); if (el) el.addEventListener('click', fn); };
+    // Back: a real link to the home (the fallback, and what a modified click
+    // opens) whose plain press returns to wherever the project was opened from.
+    on('[data-back]', (e) => {
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
+      if (!this._fromApp || history.length <= 1) return;
+      e.preventDefault();
+      history.back();
+    });
     on('[data-edit]', () => this._startEdit());
     on('[data-cancel]', () => this._cancelEdit());
     on('[data-save]', () => this._save());

@@ -50,6 +50,7 @@ const SHELL_ASSETS = [
   '/components/push.js',
   '/components/update.js',
   '/components/app-launcher.js',
+  '/components/nav.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];

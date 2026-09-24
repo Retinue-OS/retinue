@@ -25,24 +25,27 @@ lives in `webapp/` (baked into the image):
 - `webapp/sw.js` caches the shell so the dashboard and its local app-launch
   buttons (notably the dialer) keep working with no connectivity.
 
-The dashboard sizes itself to the layout. On a phone the page scrolls: the
-conversations card stays compact at the five most recent active threads,
-projects and news keep their own caps, and there is nothing to resize. In the
-wide layout (`isWideFrame` in `webapp/components/base.js`) the frame is fixed
-and the cards drop their caps: conversations sit above news on the left,
-projects fill the right column top to bottom, each region scrolling internally
-— and every boundary is a draggable splitter (`webapp/layout.js`), VS Code
-style: drag to resize, double-click to reset, drag news all the way down to
-close it; sizes persist per device in localStorage. Each list card's header
-also carries a list/cards toggle (tiles that reflow vs a single column — also
-per-device, hidden on phones where only one column fits anyway). Either way an
-**All conversations →** link leads to the dedicated `conversations.html` page,
-which lists every thread with an Active/Archived/Edits/Cowork filter — the
-last two being where the otherwise hidden kinds (project edit commands, and
-the Ask-Ara connector's cowork audit threads) are reachable. Threads can be
-archived from inside a thread (`POST /conversations/<id>/archive`,
-`…/unarchive`); archived threads drop off the active list but stay on that
-page.
+**Navigation is one row at the top of every top-level page**
+(`webapp/components/nav.js`): *Home · Chats · Threads · Projects · News* and
+the settings gear, with the page you are on underlined. It is the first thing
+on the home, the list pages and settings, and it stays pinned while a list
+page scrolls, so leaving a page never means scrolling to its end — the list
+pages used to end in a "← Back to dashboard" link, and the home linked to
+them from the foot of the list. The drill-downs — a chat (`chat.html`), a
+project (`project.html`), an open thread — are immersive and carry no row;
+their bar's back button returns to where they were opened from, or, opened
+cold (a push, a bookmark), to the home. On a phone the home never scrolls as
+a page (the attention list scrolls inside a locked frame, between the
+navigation and the dock); in the wide layout (`isWideFrame` in
+`webapp/components/base.js`) the list sits above the news, the boundary a
+draggable splitter (`webapp/layout.js`), VS Code style: drag to resize,
+double-click to reset, drag news all the way down to close it; sizes persist
+per device in localStorage. *Threads* is `conversations.html`, which lists
+every thread with an Active/Archived/Edits/Cowork filter — the last two being
+where the otherwise hidden kinds (project edit commands, and the Ask-Ara
+connector's cowork audit threads) are reachable. Threads can be archived from
+inside a thread (`POST /conversations/<id>/archive`, `…/unarchive`); archived
+threads drop off the active list but stay on that page.
 
 Shell updates apply themselves: the service worker versions itself from a
 content hash the gateway stamps into `/sw.js`, and
@@ -94,13 +97,13 @@ puts the sender back into screening. Rows open where the item lives: a thread in
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone
-from the home; their pages remain, linked from the list's footer.
+from the home; their pages remain, one tap away in the navigation row.
 
 **The mode is the home's title.** The first line of the page is the mode in
 force, in the largest type on the screen — *● Focused · customers · until
 17:00 ▾* — with the
-date and the way to settings on the right, and it opens the mode menu; the
-home has no page header of its own above it. The state the user is in is what
+date on the right, and it opens the mode menu; above it there is only the
+navigation row the home shares with every page. The state the user is in is what
 governs everything below, so it says it plainly, where a greeting used to sit
 saying nothing (and saying it in the browser's own clock, unchanged from page
 load, which is how it came to wish you good evening at breakfast). Modes are
@@ -349,7 +352,7 @@ device subscription, both persisted under `PUSH_DIR` — by default a sibling of
 `CONVERSATIONS_DIR`, so it inherits the persistent `/root` volume) and three
 gateway endpoints: `GET /push/config`, `POST /push/subscribe`,
 `POST /push/unsubscribe`. The user manages the opt-in from the **settings
-page** (`settings.html`, reached via the gear in the dashboard header), where
+page** (`settings.html`, reached via the gear in the navigation row), where
 `webapp/components/push.js` in `manage` mode shows this device's state —
 unsupported, blocked, off, or enabled with the delivery preferences and a
 disable button. The module also runs a silent re-registration on every
