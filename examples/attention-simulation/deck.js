@@ -124,7 +124,7 @@ class Deck {
   renderFeed() {
     const feed = this.snap.feed || []; const sig = feed.length + ':' + (feed.length ? feed[feed.length - 1].t : '');
     if (sig === this.feedSig) return; this.feedSig = sig;
-    this.feedEl.innerHTML = feed.length ? feed.map((f, i) => `<div class="entry ${f.who}${f.skipped ? ' skipped' : ''}${f.summary ? ' summary' : ''}${i === feed.length - 1 ? ' latest' : ''}"><span class="t">${hhmm(f.t)}</span><span class="tag">${WHO[f.who] || f.who}</span><span class="txt">${esc(f.text)}</span></div>`).join('') : '<div class="entry"><span class="txt">Press Play, or click on the timeline.</span></div>';
+    this.feedEl.innerHTML = feed.length ? feed.map((f, i) => `<div class="entry ${f.who}${f.skipped ? ' skipped' : ''}${f.summary ? ' summary' : ''}${i === feed.length - 1 ? ' latest' : ''}"><span class="t">${hhmm(f.t)}</span><span class="tag">${WHO[f.who] || f.who}</span><span class="txt">${esc(f.text)}${f.url && f.digest ? ` <a class="open" href="#" data-act="phone" data-url="${esc(f.url)}">open in the phone ›</a>` : ''}</span></div>`).join('') : '<div class="entry"><span class="txt" style="grid-column:1/-1">Press Play, or click on the timeline.</span></div>';
     this.feedEl.scrollTop = this.feedEl.scrollHeight;
   }
   renderState() {
@@ -160,6 +160,8 @@ class Deck {
     if (act === 'step') { this.post('step'); return; }
     if (act === 'restart') { this.lastView = null; this.post('restart').then(() => this.navigatePhone('/')); return; }
     if (act === 'resume') { this.post('resume'); return; }
+    // A digest in the feed opens in the phone as tapping the push would.
+    if (act === 'phone') { ev.preventDefault(); this.lastView = el.dataset.url; this.navigatePhone(el.dataset.url); return; }
   }
   onChange(ev) {
     const el = ev.target.closest('[data-act]'); if (!el) return;

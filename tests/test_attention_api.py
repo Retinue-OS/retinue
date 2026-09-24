@@ -647,9 +647,17 @@ def test_tick_digest_and_sweep(base, wg):
     assert set(report["events"]) >= {"digest", "mode", "sweep"}, report
     digests = [p for p in PUSHES if p[1].get("topic") == "digest"]
     assert len(digests) == 1 and report["digest"] >= 2, (PUSHES, report)
+    # The push: one line per item with why it is there, the most pressing
+    # first, and a link that opens the home on what it released.
+    (title, text), kw = digests[0]
+    assert title.startswith("Digest 12:00 · ") and "\n" in text and " — due " in text, (title, text)
+    assert kw["url"].startswith("/?digest=2026-09-07T12%3A00%3A00"), kw["url"]
     _clock(wg, monday.replace(hour=12, minute=1))
-    where, row = _find(_sections(base), tid)
+    home = _sections(base)
+    where, row = _find(home, tid)
     assert where == "now", (where, row)
+    assert row["digest_at"] == "2026-09-07T12:00:00+00:00" and home["last_digest"]["at"] == row["digest_at"], (row, home["last_digest"])
+    assert home["last_digest"]["count"] == report["digest"], home["last_digest"]
     emitted = Path(os.environ["CHAMBERS_DIR"]) / "_generated" / "attention" / "items.nt"
     text = emitted.read_text()
     assert f"<urn:retinue:thread:{body['id']}> <https://w3id.org/retinue/kb#sphere> <urn:retinue:sphere:customers> ." in text

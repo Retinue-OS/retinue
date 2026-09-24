@@ -5735,15 +5735,16 @@ def _attention_push_item(item: dict, reason: str = "") -> int:
 
 
 def _attention_push_digest(digest: dict, now: datetime) -> int:
-    """The breakpoint's one push: what waited, collapsed on the ``digest``
-    topic so an undelivered digest is replaced rather than stacked."""
-    items = digest["items"]
-    n = len(items)
-    if not push_notify.enabled() or not n:
+    """The breakpoint's one push: what waited, most pressing first, a line
+    each with why it is there (attention.digest_text), collapsed on the
+    ``digest`` topic so an undelivered digest is replaced rather than
+    stacked. Tapping it opens the home on what this digest released
+    (``/?digest=<its time>``, matched against each row's ``digest_at``)."""
+    if not push_notify.enabled() or not digest["items"]:
         return 0
-    title = f"Digest {now.strftime('%H:%M')} · {n} thing{'s' if n != 1 else ''} waited"
-    body = "; ".join(i["title"] for i in items[:5]) + (" …" if n > 5 else "")
-    push_notify.notify_async(title, body, url="/", tag="attention-digest", mode="new",
+    title, body = attention_policy.digest_text(digest, now)
+    url = "/?" + urllib.parse.urlencode({"digest": digest["at"].isoformat()})
+    push_notify.notify_async(title, body, url=url, tag="attention-digest", mode="new",
                              urgency="normal", topic="digest")
     return push_notify.subscription_count()
 
@@ -5845,6 +5846,7 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "project": item.get("project"), "project_title": item.get("project_title"),
         "project_href": item.get("project_href"),
         "pushed": [iso(p) for p in item.get("pushed") or []],
+        "digest_at": iso(item.get("digest_at")),
         "permit": bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or []),
         "admits_sphere": item["sphere"] in mode["admits"],
     }
@@ -5879,6 +5881,16 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
     }
 
 
+def _attention_last_digest(items: list[dict], now: datetime) -> dict | None:
+    stamps = [i["digest_at"] for i in items
+              if i.get("digest_at") and i["digest_at"] <= now
+              and i.get("state", "open") == "open" and i.get("released")]
+    if not stamps:
+        return None
+    at = max(stamps)
+    return {"at": at.isoformat(), "count": sum(1 for s in stamps if s == at)}
+
+
 def _attention_payload(items: list[dict], degraded: list[str], focus: dict, profile: dict,
                        now: datetime) -> dict:
     s = attention_policy.sections(items, focus, profile, now)
@@ -5906,6 +5918,9 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
                      "held": [row(i) for i in s["held"]], "waiting": [row(i) for i in s["waiting"]],
                      "not_now": [row(i) for i in s["not_now"]]},
         "counts": {k: len(s[k]) for k in ("now", "next", "held", "waiting", "not_now")},
+        # The latest digest that released something still open: what the
+        # home marks as "from the 12:00 digest".
+        "last_digest": _attention_last_digest(items, now),
         "degraded": degraded,
         "learned": (profile.get("learned") or [])[-5:],
     }

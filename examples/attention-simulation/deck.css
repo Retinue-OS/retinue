@@ -60,3 +60,4 @@ details summary{cursor:pointer;font-size:.78rem;text-transform:uppercase;letter-
 code{font-family:"Source Code Pro","DejaVu Sans Mono",Menlo,monospace;font-size:.85em;background:var(--code-bg);padding:.05em .3em;border-radius:3px}
 .phone{width:420px;max-width:100%;margin:0 auto;background:#0b0d12;border:2px solid #2a323b;border-radius:34px;padding:10px;box-sizing:border-box;box-shadow:0 20px 50px rgba(0,0,0,.35);position:sticky;top:12px}
 .screen{display:block;width:100%;height:min(800px,calc(100vh - 60px));min-height:560px;border:0;border-radius:26px;background:#0b0d12}
+.entry .open{color:var(--push);text-decoration:none;white-space:nowrap}.entry .open:hover{text-decoration:underline}

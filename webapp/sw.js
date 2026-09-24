@@ -163,9 +163,10 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // The project and chat pages carry their subject id in the query string;
-  // match the cached shell regardless so they open offline too.
-  if (url.pathname === '/project.html' || url.pathname === '/chat.html') {
+  // The project and chat pages carry their subject id in the query string,
+  // and the home its deep links (?item=, the digest's ?digest=); match the
+  // cached shell regardless so they open offline too.
+  if (url.pathname === '/project.html' || url.pathname === '/chat.html' || url.pathname === '/') {
     e.respondWith(caches.match(url.pathname).then((res) => res || fetch(e.request)));
     return;
   }

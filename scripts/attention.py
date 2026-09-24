@@ -235,6 +235,7 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "last_level": a.get("last_level"),
         "pushed": [parse_dt(x) for x in a.get("pushed") or []],
         "pulled": bool(a.get("pulled", False)),
+        "digest_at": parse_dt(a.get("digest_at")),
         "done_at": a.get("done_at"),
         "done_how": a.get("done_how"),
         "project": a.get("project") or doc.get("project") or None,
@@ -252,6 +253,7 @@ def item_to_attention(item: dict) -> dict:
         "critical": bool(item.get("critical")), "state": item.get("state", "open"), "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "boost": int(item.get("boost", 0)), "last_level": item.get("last_level"),
         "pushed": [iso(x) for x in item.get("pushed") or []], "pulled": bool(item.get("pulled", False)),
+        "digest_at": iso(item.get("digest_at")),
         "done_at": item.get("done_at"), "done_how": item.get("done_how"),
         "project": item.get("project") or None,
     }
@@ -624,6 +626,7 @@ def on_arrival(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
     lvl = level(item, now)
     item["last_level"] = lvl
     item["pulled"] = False
+    item["digest_at"] = None
     if item.get("actor", "you") != "you":
         item["released"] = True
         return {"deliver": "waiting", "level": lvl, "reason": f"parked on {item['actor']}"}
@@ -639,19 +642,72 @@ def on_arrival(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
 
 
 def breakpoint(items: list[dict], focus: dict, now: datetime) -> dict:
-    """Release what was held and say what the digest carries. In Rest nothing
-    is released and no digest goes out; the morning digest carries it."""
+    """Release what was held and say what the digest carries — ranked as the
+    list ranks (level, importance, the nearest deadline), and each item
+    stamped ``digest_at`` so the home can show what this digest brought. In
+    Rest nothing is released and no digest goes out; the morning digest
+    carries it."""
     mode = mode_at(focus, now)
     due = [i for i in items if i.get("state", "open") == "open" and not i.get("released") and i.get("actor", "you") == "you"
            and (i.get("snoozed_until") is None or i["snoozed_until"] <= now)]
     if mode["id"] == "rest":
         return {"digest": None, "held": due, "reason": "Rest has no digest"}
+    stamp = now.replace(second=0, microsecond=0)
     for i in due:
         i["released"] = True
         i["snoozed_until"] = None
+        i["digest_at"] = stamp
     if not due:
         return {"digest": None, "held": [], "reason": "nothing was held"}
-    return {"digest": {"at": now, "items": due, "urgency": "normal", "topic": "digest"}, "held": [], "reason": "breakpoint"}
+    due.sort(key=lambda i: rank_key(i, now))
+    return {"digest": {"at": stamp, "items": due, "urgency": "normal", "topic": "digest"}, "held": [], "reason": "breakpoint"}
+
+
+def fmt_when(when: datetime, now: datetime) -> str:
+    """A moment as a notification says it, from ``now``: 17:00, tomorrow
+    12:00, Fri 12:00, 3 Oct."""
+    when = when.astimezone(now.tzinfo) if when.tzinfo and now.tzinfo else when
+    days = (when.date() - now.date()).days
+    if days == 0:
+        return when.strftime("%H:%M")
+    if days == 1:
+        return when.strftime("tomorrow %H:%M")
+    if 1 < days < 7:
+        return when.strftime("%a %H:%M")
+    return f"{when.day} {when:%b}"
+
+
+def digest_line(item: dict, now: datetime) -> str:
+    """One item of a digest push: its title, and why it is there — critical,
+    overdue, its deadline, else the start of what it says."""
+    title = item.get("title") or "Untitled"
+    due = item.get("due")
+    if item.get("critical"):
+        why = "critical"
+    elif due is not None:
+        why = f"overdue since {fmt_when(due, now)}" if due <= now else f"due {fmt_when(due, now)}"
+    else:
+        preview = " ".join(str(item.get("preview") or "").split())
+        if len(preview) > 60:
+            cut = preview[:59]
+            preview = (cut.rsplit(" ", 1)[0] if " " in cut else cut).rstrip(" ,;:—-") + "…"
+        why = preview
+    return f"{title} — {why}" if why else title
+
+
+DIGEST_LINES = 5
+
+
+def digest_text(digest: dict, now: datetime) -> tuple[str, str]:
+    """The digest push: a title that says when and how much, and one line per
+    item, most pressing first; past DIGEST_LINES, how many more."""
+    items = digest["items"]
+    n = len(items)
+    title = f"Digest {digest['at'].strftime('%H:%M')} · {n} thing{'s' if n != 1 else ''} waited"
+    lines = [digest_line(i, now) for i in items[:DIGEST_LINES]]
+    if n > DIGEST_LINES:
+        lines.append(f"… and {n - DIGEST_LINES} more")
+    return title, "\n".join(lines)
 
 
 def sweep(items: list[dict], focus: dict, profile: dict, now: datetime) -> list[dict]:
@@ -1157,6 +1213,7 @@ def snooze(item: dict, focus: dict, now: datetime, when: str) -> datetime:
     item["released"] = False
     item["snoozed_until"] = until
     item["pulled"] = False
+    item["digest_at"] = None
     return until
 
 
@@ -1169,6 +1226,7 @@ def pull(item: dict) -> bool:
     item["released"] = True
     item["snoozed_until"] = None
     item["pulled"] = True
+    item["digest_at"] = None
     return True
 
 
@@ -1178,6 +1236,7 @@ def reopen(item: dict) -> None:
     item["released"] = True
     item["snoozed_until"] = None
     item["pulled"] = True
+    item["digest_at"] = None
     item["done_at"] = None
     item["done_how"] = None
 
@@ -1230,6 +1289,14 @@ def explain(item: dict, focus: dict, profile: dict, now: datetime) -> dict:
     }
 
 
+def rank_key(item: dict, now: datetime) -> tuple:
+    """How the list and the digest order items: level, then importance, then
+    the nearest deadline, then the title."""
+    due = item.get("due")
+    return (-RANK[level(item, now)], -item["importance"], (due - now).total_seconds() if due else float("inf"),
+            item.get("title") or "")
+
+
 def sections(items: list[dict], focus: dict, profile: dict, now: datetime) -> dict:
     """Now · Next · Held · Waiting — and, in a mode that lists only what it
     admits (``only_admitted``), Not now: the released items the mode does not
@@ -1252,12 +1319,8 @@ def sections(items: list[dict], focus: dict, profile: dict, now: datetime) -> di
         else:
             next_l.append(i)
 
-    def key(i):
-        due = i.get("due")
-        return (-RANK[level(i, now)], -i["importance"], (due - now).total_seconds() if due else float("inf"), i.get("title") or "")
-
     for lst in (now_l, next_l, held, not_now):
-        lst.sort(key=key)
+        lst.sort(key=lambda i: rank_key(i, now))
     waiting.sort(key=lambda i: (i.get("waiting_since") or now).timestamp())
     return {"now": now_l, "next": next_l, "held": held, "waiting": waiting, "not_now": not_now,
             "mode": mode, "next_breakpoint": next_breakpoint(focus, now)}

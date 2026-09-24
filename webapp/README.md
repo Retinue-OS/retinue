@@ -56,11 +56,13 @@ every action on the sheet (`retinue-attention-change` on `window`).
 threshold, admits, admit_tags, manual, scheduled: {id, name, until}, day: {plan,
 days, holiday}}, modes, schedule and digest_times (today's, by today's day
 plan), week, holidays, spheres, next_breakpoint, sections: {now, next, held,
-waiting}, counts, degraded, learned}`; a row is `{id, kind: thread|chat|project,
+waiting}, counts, last_digest: {at, count}, degraded, learned}`; a row is `{id, kind: thread|chat|project,
 title, preview, href, sphere, tags, sender, channel, group, agent, count,
 unread, pending, level, critical, importance, importance_from, importance_text,
 due, lead (minutes), lead_from, kind_label, urgency, delivery, reason, actor,
-waiting_since, state, released, snoozed_until, pushed, permit, admits_sphere}`.
+waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere}`.
+`/?digest=<time>` — the digest push's link — shows what that digest released
+first, until *Done*.
 The actions: `POST /attention/items/later|pull|done|reopen|correct` with the
 id in the body, `POST /attention/permits`, `POST /attention/admit`,
 `GET|POST /attention/profile`.

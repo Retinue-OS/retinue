@@ -166,6 +166,19 @@ filter behind the model. `ATTENTION_PUSH_GATE=0` is the rollback: every
 arrival pushes as before the model, while the list, the digest and the sweep
 keep working.
 
+**The digest** is that one push, and it is ranked as the list is — level,
+importance, the nearest deadline (`attention.rank_key`) — with a line per
+item saying why it is there: *Backup failed — critical*, *Beat Frei — due
+tomorrow 12:00*, *Card renewal — overdue since 07:00*, or the start of what it
+says when it has no deadline; five lines, then "… and 3 more"
+(`attention.digest_text`). Each released item is stamped `digest_at`, and the
+push opens `/?digest=<its time>`: the home shows what that digest brought
+first, in a framed section of its own, until *Done*. Afterwards the rows the
+latest digest released keep a quiet *digest 12:00* marker (`last_digest` in
+`GET /attention`); a new arrival, *Later* or *Pull* takes it off. Nothing held
+means no digest, and Rest sends none: what waited goes out with the first
+digest after it.
+
 **The two documents** live under `ATTENTION_DIR` (default a sibling of
 `CONVERSATIONS_DIR`, so the persistent volume): `focus.json` — the modes
 (admitted spheres, admitting tags, threshold, blurb), the week, the holidays,

@@ -121,9 +121,10 @@ def test_arrival_breakpoint_sweep():
     # Rest: a breakpoint releases nothing
     rest = A.breakpoint([mum], focus, at(6, 50))
     assert rest["digest"] is None and not mum["released"]
-    # the morning digest carries it
+    # the morning digest carries it, stamped with the digest it came in
     bp = A.breakpoint([mum, alert, newsletter], focus, at(8, 0))
     assert bp["digest"] and [i["id"] for i in bp["digest"]["items"]] == ["chat:Mum"] and mum["released"]
+    assert mum["digest_at"] == at(8) and A.item_to_attention(mum)["digest_at"] == at(8).isoformat()
     # the sweep escalates a released appointment into the next band and pushes it in Work
     physio = item(id="thr-physio", sphere="health", importance=4, kind_label="appointment", lead=timedelta(hours=2), due=at(15, 30), released=True, last_level="active")
     assert A.sweep([physio], focus, profile, at(13, 0)) == []
@@ -272,6 +273,33 @@ def test_week():
     old = A.upgrade_focus({"schedule": [[0, "rest"], [480, "chores"]]})
     assert old["week"] == [{"name": "Every day", "days": ["mon-sun", "holiday"], "schedule": [[0, "rest"], [480, "chores"]]}]
     assert A.mode_at({**A.default_focus(), **old}, at(10, d=2))["id"] == "chores"
+
+
+def test_digest():
+    """The digest is ranked as the list is, and says in one line per item
+    why it is there; past five lines it counts the rest."""
+    focus = A.default_focus()
+    quiet = item(id="q", title="Newsletter", importance=2, preview="  Autumn   issue: what is new in the workshop programme this year and next  ")
+    invite = item(id="i", title="Anna Keller", sphere="friends", importance=4, due=at(19), lead=timedelta(days=2))
+    clause = item(id="c", title="Beat Frei", importance=4, due=at(12, d=1), lead=timedelta(hours=6))
+    late = item(id="l", title="Card renewal", importance=3, due=at(7), lead=timedelta(days=3))
+    alert = item(id="a", title="Backup failed", critical=True, importance=5)
+    bp = A.breakpoint([quiet, invite, clause, late, alert], focus, at(12, 0, ) + timedelta(seconds=30))
+    ranked = [i["id"] for i in bp["digest"]["items"]]
+    assert ranked == ["a", "i", "c", "l", "q"], ranked                     # critical, time-sensitive, active by importance, passive
+    assert bp["digest"]["at"] == at(12) and quiet["digest_at"] == at(12)   # to the minute: the link matches the rows
+    title, body = A.digest_text(bp["digest"], at(12))
+    assert title == "Digest 12:00 · 5 things waited"
+    assert body.split("\n") == ["Backup failed — critical", "Anna Keller — due 19:00", "Beat Frei — due tomorrow 12:00",
+                                "Card renewal — overdue since 07:00",
+                                "Newsletter — Autumn issue: what is new in the workshop programme this…"], body
+    many = {"at": at(12), "items": [item(id=str(k), title=f"T{k}") for k in range(7)]}
+    assert A.digest_text(many, at(12))[1].split("\n")[-1] == "… and 2 more"
+    assert A.fmt_when(at(9, d=3), at(12)) == at(9, d=3).strftime("%a 09:00") and A.fmt_when(at(9, d=30), at(12)) == f"{at(9, d=30).day} {at(9, d=30):%b}"
+    # Judged again — a new arrival, a snooze, a pull — it is no longer the digest's.
+    A.on_arrival(invite, focus, A.default_profile(), at(12, 5))
+    A.snooze(clause, focus, at(12, 5), "next")
+    assert invite["digest_at"] is None and clause["digest_at"] is None
 
 
 def test_docs_and_emit():

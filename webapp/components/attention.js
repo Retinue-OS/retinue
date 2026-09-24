@@ -15,6 +15,11 @@
 // conversations viewer on the same page answers the #conversation-<id> hash),
 // a chat on its page, a project on its page. The list polls on the
 // conversations cadence and refreshes at once after any action on the sheet.
+//
+// A digest push opens the home as /?digest=<its time>: what that digest
+// released comes first, in a section of its own, most pressing first, until
+// Done; afterwards the rows the latest digest brought keep a quiet marker
+// (each row's `digest_at` against the payload's `last_digest`).
 
 import { esc, fmtAge } from './base.js';
 import {
@@ -102,7 +107,10 @@ const CSS = `
   .chip { display: inline-flex; align-items: center; gap: 5px; background: var(--bg, #0b0d12);
           color: #cbd3dd; border-radius: 8px; padding: 1px 8px; font-size: .72rem; }
   .chip i { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
-  .count { color: var(--muted, #8b93a3); }
+  /* The small facts beside the sphere never wrap; the meta on the right
+     gives way instead (ellipsis), so a row's first line stays one line. */
+  .count { color: var(--muted, #8b93a3); white-space: nowrap; flex: none; }
+  .row-top .meta { min-width: 0; }
   .row-title { font-size: .95rem; font-weight: 600; margin-top: 5px; display: flex; gap: 8px;
                align-items: baseline; }
   .row-title .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
@@ -115,6 +123,16 @@ const CSS = `
   .unread .row-title .t { color: var(--fg, #e7ebf2); }
   .pending .row-why::before { content: "Ara is working · "; color: var(--accent, #6ea8fe); }
   .empty { color: var(--muted, #8b93a3); text-align: center; padding: 40px 20px; }
+  /* What the digest just released: first, framed, and dismissed with Done. */
+  .sec.digest { background: color-mix(in srgb, var(--accent, #6ea8fe) 9%, transparent);
+                border: 1px solid color-mix(in srgb, var(--accent, #6ea8fe) 35%, transparent);
+                border-radius: 14px; padding: 2px 8px 8px; }
+  .digest-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .digest-head h4 { color: var(--accent, #6ea8fe); }
+  .digest-done { font-size: .78rem; padding: 4px 12px; border-radius: 999px; cursor: pointer;
+                 border: 1px solid var(--accent, #6ea8fe); background: none; color: var(--accent, #6ea8fe); }
+  .digest-empty { color: var(--muted, #8b93a3); font-size: .85rem; margin: 2px 4px 6px; }
+  .from-digest { color: var(--accent, #6ea8fe); }
   .muted { color: var(--muted, #8b93a3); margin: 4px 0; }
   .degraded { color: var(--muted, #8b93a3); font-size: .78rem; margin: 2px 4px 6px; }
   .foot { flex: none; display: flex; flex-direction: column; gap: 10px; padding-top: 12px; }
@@ -164,11 +182,14 @@ class RetinueAttention extends HTMLElement {
     this.render();
     this.load();
     this._timer = setInterval(() => this.load(), POLL_MS);
-    // A deep link straight to one item's sheet (?item=<id>) — what a digest
-    // push can point at, and the way to look at a held item's reasons.
+    // A deep link straight to one item's sheet (?item=<id>) — the way to
+    // look at a held item's reasons — or to what a digest released
+    // (?digest=<its time>, the digest push's link).
     try {
-      const item = new URLSearchParams(location.search).get('item');
+      const params = new URLSearchParams(location.search);
+      const item = params.get('item');
       if (item) openAttentionSheet(item);
+      this._digest = params.get('digest') || null;
     } catch (_e) { /* no query */ }
   }
 
@@ -189,7 +210,7 @@ class RetinueAttention extends HTMLElement {
       const res = await fetch(SRC, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
-      const sig = JSON.stringify([data.sections, data.mode, data.next_breakpoint, data.degraded]);
+      const sig = JSON.stringify([data.sections, data.mode, data.next_breakpoint, data.degraded, data.last_digest]);
       this._data = data;
       this._state = 'ok';
       if (sig === this._sig && !this._menu) return;
@@ -258,6 +279,7 @@ class RetinueAttention extends HTMLElement {
       case 'toggle-not_now': this._notNowOpen = !this._notNowOpen; prefSet('not_now', this._notNowOpen); this.render(); break;
       case 'fold': this._setFold(el.getAttribute('data-mode'), el.getAttribute('data-on') === '1'); break;
       case 'new': location.hash = '#new'; break;
+      case 'digest-done': this._closeDigest(); break;
       default: break;
     }
   }
@@ -278,7 +300,7 @@ class RetinueAttention extends HTMLElement {
     return [].concat(s.now || [], s.next || [], s.held || [], s.waiting || [], s.not_now || []);
   }
 
-  _rowHtml(r, section) {
+  _rowHtml(r, section, inDigest = false) {
     const lvl = r.level;
     const meta = r.actor !== 'you'
       ? `waiting${r.waiting_since ? ` ${fmtAge(r.waiting_since).replace(' ago', '')}` : ''}`
@@ -291,11 +313,54 @@ class RetinueAttention extends HTMLElement {
       `<div class="row-top"><span class="chip"><i style="background:${sphereColor(r.sphere)}"></i>${esc(r.sphere)}</span>` +
       (r.unknown_sender ? '<span class="count">new number</span>' : '') +
       (r.count > 1 ? `<span class="count">${r.count} msgs</span>` : '') +
+      (!inDigest && this._fromLastDigest(r)
+        ? `<span class="count from-digest" title="Released by the ${esc(fmtWhen(r.digest_at))} digest">digest ${esc(fmtWhen(r.digest_at))}</span>` : '') +
       `<span class="meta">${esc(meta)}</span></div>` +
       `<div class="row-title"><span class="t">${esc(r.title)}</span>` +
       `<span class="info" role="button" tabindex="0" data-act="info" data-id="${esc(r.id)}" title="Importance, urgency, delivery — and their corrections" aria-label="Details">ⓘ</span></div>` +
       (r.preview ? `<div class="row-preview">${esc(r.preview)}</div>` : '') +
       `<div class="row-why">${why}</div></button>`;
+  }
+
+  _fromLastDigest(r) {
+    const last = this._data && this._data.last_digest;
+    return !!(last && r.digest_at && r.digest_at === last.at);
+  }
+
+  // Leaving the digest view: the rows go back to their sections, and the
+  // link's ?digest= goes from the address so a reload shows the plain home.
+  _closeDigest() {
+    this._digest = null;
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('digest');
+      history.replaceState(history.state, '', url.pathname + url.search + url.hash);
+    } catch (_e) { /* the view closes anyway */ }
+    this.render();
+  }
+
+  // What the digest of `at` released and is still open, most pressing first
+  // (the gateway's own order: level, importance, the nearest deadline), each
+  // row with the section it would otherwise sit in — for its reason line.
+  _digestRows(s, at) {
+    const LEVEL = { critical: 0, 'time-sensitive': 1, active: 2, passive: 3 };
+    const out = [];
+    for (const key of ['now', 'next', 'not_now', 'held']) {
+      for (const r of s[key] || []) if (r.digest_at === at) out.push({ r, key });
+    }
+    const due = (r) => (r.due ? Date.parse(r.due) : Infinity);
+    out.sort((a, b) => (LEVEL[a.r.level] ?? 9) - (LEVEL[b.r.level] ?? 9)
+      || b.r.importance - a.r.importance || due(a.r) - due(b.r));
+    return out;
+  }
+
+  _digestHtml(rows) {
+    const when = fmtWhen(this._digest);
+    const inner = rows.length
+      ? `<div class="rows">${rows.map(({ r, key }) => this._rowHtml(r, key, true)).join('')}</div>`
+      : `<div class="digest-empty">Everything the ${esc(when)} digest brought is handled.</div>`;
+    return `<section class="sec digest"><div class="digest-head"><h4>Digest ${esc(when)} · ${rows.length}</h4>` +
+      `<button class="digest-done" data-act="digest-done">Done</button></div>${inner}</section>`;
   }
 
   _sectionHtml(label, items, key) {
@@ -400,20 +465,28 @@ class RetinueAttention extends HTMLElement {
       body = '<p class="muted">Offline &ndash; no current data.</p>';
     } else {
       const d = this._data;
-      const s = d.sections || {};
+      let s = d.sections || {};
       const mode = d.mode || {};
       head = this._headHtml(d);
+      // Opened from a digest push: what it released first, and not twice.
+      let digest = '';
+      if (this._digest) {
+        const rows = this._digestRows(s, this._digest);
+        const ids = new Set(rows.map(({ r }) => r.id));
+        s = Object.fromEntries(Object.entries(s).map(([k, v]) => [k, (v || []).filter((r) => !ids.has(r.id))]));
+        digest = this._digestHtml(rows);
+      }
       const total = (s.now || []).length + (s.next || []).length + (s.held || []).length + (s.waiting || []).length + (s.not_now || []).length;
       const nb = fmtWhen(d.next_breakpoint);
       const degraded = (d.degraded || []).length
         ? `<div class="degraded">${esc(d.degraded.join(' and '))} unavailable right now — the life store is not answering.</div>` : '';
-      body = `<div class="list">${degraded}` +
+      body = `<div class="list">${degraded}${digest}` +
         this._sectionHtml('Now', s.now || [], 'now') +
         this._sectionHtml('Next', s.next || [], 'next') +
         this._collapsibleHtml(`Held until ${nb}`, s.held || [], 'held', this._heldOpen) +
         this._collapsibleHtml('Waiting on others', s.waiting || [], 'waiting', this._waitingOpen) +
         this._collapsibleHtml('Not now', s.not_now || [], 'not_now', this._notNowOpen) +
-        (total ? '' : '<div class="empty">Nothing wants your attention.</div>') +
+        (total || digest ? '' : '<div class="empty">Nothing wants your attention.</div>') +
         `</div>`;
     }
     // The one action the home offers beside the rows, within thumb reach;

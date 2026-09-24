@@ -506,7 +506,7 @@ class Simulation:
     def _on_push(self, title, body, url="/", tag=None, mode=None, archived=False, urgency=None, topic=None):
         if topic == "digest":
             self.stats["digests"] += 1
-            self.say("push", f"{title}: {body}", urgency=urgency or "normal", digest=True)
+            self.say("push", f"{title}: {body.replace(chr(10), '; ')}", urgency=urgency or "normal", digest=True, url=url)
         elif mode == "reply" and urgency is None:
             self.stats["replies"] += 1
             self.say("reply", f"Ara replied in “{title}” (pushed as a reply).")
