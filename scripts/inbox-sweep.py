@@ -154,7 +154,7 @@ def build_prompt(scan: list[dict]) -> str:
         "A file the Archivist cannot classify stays in the inbox and is "
         "flagged -- that is correct, not a failure. Report what was filed and "
         "what was left behind; only open a dashboard conversation if "
-        "something needs Reto's decision.",
+        "something needs the user's decision.",
         "",
         "Pending inboxes:",
     ]

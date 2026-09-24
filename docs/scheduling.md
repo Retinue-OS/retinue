@@ -279,15 +279,15 @@ without one is simply never swept. The `inboxes` array is what this job reads:
 {
   "inboxes": [
     {
-      "id": "observations",
-      "path": "observations/inbox",
-      "description": "Raw health data awaiting review, …"
+      "id": "documents",
+      "path": "documents/inbox",
+      "description": "Scanned letters and exports awaiting filing, …"
     }
   ],
   "destinations": [
     {
-      "path": "observations/clinical/sensors/cgm/",
-      "description": "Continuous glucose monitor exports.",
+      "path": "documents/invoices/",
+      "description": "Invoices, one file per invoice.",
       "source": "manifest"
     }
   ]
