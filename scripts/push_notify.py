@@ -130,6 +130,22 @@ _MODE_EVENTS = {
     "stalled_only": {"stalled"},
     "new_and_stalled": {"new", "stalled"},
 }
+# What a device stores when its owner takes the opt-in's defaults
+# (webapp/components/push.js, DEFAULT_MODE): new and stalled conversations,
+# archived ones included. The attention simulation's phone is such a device.
+DEFAULT_PREFERENCES = {"notification_mode": "new_and_stalled", "notify_archived": True}
+
+
+def device_wants(sub: dict, mode: str | None, archived: bool = False) -> bool:
+    """Does a device with these stored preferences get a push of this event
+    kind? (See notify for the kinds.)"""
+    user_mode = sub.get("notification_mode", "all")
+    if user_mode == "off":
+        return False
+    if archived and not sub.get("notify_archived", True):
+        return False
+    wanted = _MODE_EVENTS.get(user_mode)  # None: "all" or legacy → everything
+    return wanted is None or mode is None or mode in wanted
 
 
 def subscribe(payload: dict) -> bool:
@@ -222,13 +238,7 @@ def notify(title: str, body: str, url: str = "/", tag: str | None = None,
         headers["Topic"] = str(topic)[:32]
     sent = 0
     for sub in _all_subscriptions():
-        user_mode = sub.get("notification_mode", "all")
-        if user_mode == "off":
-            continue
-        if archived and not sub.get("notify_archived", True):
-            continue
-        wanted = _MODE_EVENTS.get(user_mode)  # None: "all" or legacy → everything
-        if wanted is not None and mode is not None and mode not in wanted:
+        if not device_wants(sub, mode, archived):
             continue
         try:
             webpush(

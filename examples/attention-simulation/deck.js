@@ -2,6 +2,10 @@
 // system state, polled from GET /simulation — beside the phone, whose iframe
 // is the real dashboard served by the same gateway. A click inside the phone
 // pauses the story ("you are driving"); Resume plays on from where you are.
+// The phone's status bar carries the notification bell: the tray is what a
+// device with the push opt-in's default setting would show (the runner's
+// `phone`), a new notification drops a heads-up banner, and tapping one opens
+// its link in the phone as the service worker would.
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const DAY = 1440;
@@ -12,6 +16,10 @@ const pad = (n) => String(n).padStart(2, '0');
 const hhmm = (m) => { const x = ((Math.round(m) % DAY) + DAY) % DAY; return `${pad(Math.floor(x / 60))}:${pad(x % 60)}`; };
 const nice = (v) => (Math.abs(v - Math.round(v)) < 0.05 ? String(Math.round(v)) : v.toFixed(1));
 const dur = (min) => { min = Math.round(min); if (min < 60) return `${min} min`; if (min < DAY) return `${nice(min / 60)} h`; return `${nice(min / DAY)} d`; };
+const noteHtml = (n, dismiss) => `<div class="note" data-act="open-note" data-id="${n.id}" data-url="${esc(n.url)}">` +
+  `<div class="note-top"><img src="/icons/icon-192.png" alt="">Retinue · ${hhmm(n.t)}</div>` +
+  `<b>${esc(n.title)}</b><div class="note-body">${esc(n.body)}</div>` +
+  (dismiss ? `<button class="note-x" data-act="dismiss-note" data-id="${n.id}" aria-label="Dismiss" title="Dismiss">✕</button>` : '') + '</div>';
 const whenText = (iso, base) => { if (!iso) return ''; const d = new Date(iso); const m = (d - base) / 60000; return m < DAY ? hhmm(m) : `tomorrow ${hhmm(m)}`; };
 
 class Deck {
@@ -109,7 +117,8 @@ class Deck {
     $('#driving').hidden = !s.driving; $('#ended').hidden = !s.ended; $('#minibar').hidden = false;
     const sel = $('#speed'); if (!sel.options.length) sel.innerHTML = s.speeds.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
     if (Number(sel.value) !== s.speed) sel.value = String(s.speed);
-    this.renderTimeline(); this.renderFeed(); this.renderState();
+    $('#sb-time').textContent = s.time;
+    this.renderTimeline(); this.renderFeed(); this.renderState(); this.renderPhone();
   }
   renderTimeline() {
     const s = this.snap; const att = s.attention || {}; const W = 680, X0 = 20; const x = (m) => X0 + (Math.max(0, Math.min(m, DAY)) / DAY) * W;
@@ -121,10 +130,45 @@ class Deck {
     const hours = [0, 3, 6, 9, 12, 15, 18, 21, 24].map((hh) => `<text x="${x(hh * 60)}" y="60" class="tl-hour">${pad(hh)}</text>`).join('');
     $('#timeline').innerHTML = `<svg viewBox="0 0 720 66" class="timeline" data-act="seek" role="img" aria-label="Timeline of the day">${bands}${labels}${digests}${beats}${hours}<g transform="translate(${x(s.minute)} 0)"><line x1="0" y1="4" x2="0" y2="48" class="tl-head"/><text x="0" y="52" class="tl-head-t">${s.time}</text></g></svg>`;
   }
+  renderPhone() {
+    const ph = this.snap.phone || { tray: [], epoch: 0, seq: 0 };
+    const tray = ph.tray || [];
+    const badge = $('#bell-badge');
+    badge.hidden = !tray.length; badge.textContent = tray.length > 9 ? '9+' : String(tray.length);
+    // A new notification rings the bell and drops a heads-up — not a replay
+    // (a jump or a restart starts a new epoch) and not the first load.
+    if (this.noteSeq == null || this.phoneEpoch !== ph.epoch) { this.phoneEpoch = ph.epoch; this.noteSeq = ph.seq; }
+    else if (ph.seq > this.noteSeq) {
+      this.noteSeq = ph.seq;
+      const newest = tray.find((n) => n.id === ph.seq);
+      if (newest) this.headsUp(newest);
+    }
+    if (this.shadeOpen) this.renderShade(tray, ph.setting);
+  }
+  headsUp(n) {
+    const el = $('#headsup'); el.innerHTML = noteHtml(n, false); el.hidden = false;
+    const bell = $('#bell'); bell.classList.remove('ring'); void bell.offsetWidth; bell.classList.add('ring');
+    clearTimeout(this.headsUpTimer); this.headsUpTimer = setTimeout(() => { el.hidden = true; }, 4500);
+  }
+  renderShade(tray, setting, force) {
+    const sig = JSON.stringify(tray.map((n) => n.id));
+    if (!force && sig === this.shadeSig) return;
+    this.shadeSig = sig;
+    $('#shade').innerHTML = `<div class="shade-head"><b>Notifications</b><span class="muted">this phone: ${esc(setting || '')}</span>` +
+      `${tray.length ? '<button data-act="clear-notes">Clear all</button>' : ''}</div><div class="notes">` +
+      (tray.length ? tray.map((n) => noteHtml(n, true)).join('')
+        : '<div class="notes-empty">No notifications. The phone shows what the gateway pushes, through its default setting: new and stalled conversations.</div>') +
+      '</div>';
+  }
+  toggleShade(open) {
+    this.shadeOpen = open;
+    $('#shade').hidden = !open; $('#bell').setAttribute('aria-expanded', String(open));
+    if (open) { $('#headsup').hidden = true; const ph = this.snap.phone || {}; this.renderShade(ph.tray || [], ph.setting, true); }
+  }
   renderFeed() {
     const feed = this.snap.feed || []; const sig = feed.length + ':' + (feed.length ? feed[feed.length - 1].t : '');
     if (sig === this.feedSig) return; this.feedSig = sig;
-    this.feedEl.innerHTML = feed.length ? feed.map((f, i) => `<div class="entry ${f.who}${f.skipped ? ' skipped' : ''}${f.summary ? ' summary' : ''}${i === feed.length - 1 ? ' latest' : ''}"><span class="t">${hhmm(f.t)}</span><span class="tag">${WHO[f.who] || f.who}</span><span class="txt">${esc(f.text)}${f.url && f.digest ? ` <a class="open" href="#" data-act="phone" data-url="${esc(f.url)}">open in the phone ›</a>` : ''}</span></div>`).join('') : '<div class="entry"><span class="txt" style="grid-column:1/-1">Press Play, or click on the timeline.</span></div>';
+    this.feedEl.innerHTML = feed.length ? feed.map((f, i) => `<div class="entry ${f.who}${f.phone === false ? ' off' : ''}${f.skipped ? ' skipped' : ''}${f.summary ? ' summary' : ''}${i === feed.length - 1 ? ' latest' : ''}"><span class="t">${hhmm(f.t)}</span><span class="tag">${WHO[f.who] || f.who}</span><span class="txt">${esc(f.text)}${f.url && f.digest ? ` <a class="open" href="#" data-act="phone" data-url="${esc(f.url)}">open in the phone ›</a>` : ''}</span></div>`).join('') : '<div class="entry"><span class="txt" style="grid-column:1/-1">Press Play, or click on the timeline.</span></div>';
     this.feedEl.scrollTop = this.feedEl.scrollHeight;
   }
   renderState() {
@@ -141,7 +185,7 @@ class Deck {
         <div class="kv"><span>permits</span><div>${chips(permits)}</div></div>
         <div class="kv"><span>breaks through</span><div>${esc(mode.threshold || '')} and above</div></div>
         <div class="kv"><span>next breakpoint</span><div>${whenText(att.next_breakpoint, base)}</div></div></div>
-      <div class="nums">${num(st.pushes || 0, 'pushes')}${num(st.digests || 0, 'digests')}${num(st.held || 0, 'held')}${num(st.handled || 0, 'handled')}${num(st.corrections || 0, 'corrections')}${num(st.replies || 0, 'Ara replies')}</div>
+      <div class="nums">${num(st.pushes || 0, 'pushes')}${num(st.digests || 0, 'digests')}${num(st.notified || 0, 'on the phone')}${num(st.held || 0, 'held')}${num(st.handled || 0, 'handled')}${num(st.corrections || 0, 'corrections')}${num(st.replies || 0, 'Ara replies')}</div>
       <details class="profile" open><summary>Attention profile</summary>
         <div class="kv"><span>importance priors</span><div>${Object.entries(att.priors || {}).map(([k, v]) => `<span class="pill">${esc(k)} <b>${v}</b></span>`).join('')}</div></div>
         <div class="kv"><span>lead times</span><div>${Object.entries(att.leads || {}).filter(([k]) => k !== 'default').map(([k, v]) => `<span class="pill">${esc(k)} <b>${dur(v)}</b></span>`).join('')}</div></div>
@@ -162,6 +206,19 @@ class Deck {
     if (act === 'resume') { this.post('resume'); return; }
     // A digest in the feed opens in the phone as tapping the push would.
     if (act === 'phone') { ev.preventDefault(); this.lastView = el.dataset.url; this.navigatePhone(el.dataset.url); return; }
+    // The phone's bell: the shade, and a notification tapped (opens its link,
+    // as the service worker's notificationclick does — and, like any touch on
+    // the phone, pauses the story) or dismissed.
+    if (act === 'shade') { this.toggleShade(!this.shadeOpen); return; }
+    if (act === 'shade-close') { this.toggleShade(false); return; }
+    if (act === 'open-note') {
+      this.toggleShade(false); $('#headsup').hidden = true;
+      if (this.snap && this.snap.playing) this.post('acted');
+      this.post('notification', { action: 'open', id: Number(el.dataset.id) });
+      this.lastView = el.dataset.url; this.navigatePhone(el.dataset.url); return;
+    }
+    if (act === 'dismiss-note') { this.post('notification', { action: 'dismiss', id: Number(el.dataset.id) }); return; }
+    if (act === 'clear-notes') { this.post('notification', { action: 'clear' }); return; }
   }
   onChange(ev) {
     const el = ev.target.closest('[data-act]'); if (!el) return;

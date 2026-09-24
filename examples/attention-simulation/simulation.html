@@ -21,7 +21,24 @@
       <button class="btn primary" data-act="toggle-play" id="mini-play">▶</button>
     </div>
     <div class="grid">
-      <div class="phone"><iframe id="phone" class="screen" src="/" title="The dashboard"></iframe></div>
+      <div class="phone">
+        <!-- The phone's own chrome: the clock and the notification bell. What
+             reaches it is what a device with the push opt-in's default setting
+             would show — the gateway's pushes through that device's filter,
+             collapsed by tag as the service worker does. -->
+        <div class="statusbar">
+          <span class="sb-time" id="sb-time">00:00</span>
+          <button class="bell" data-act="shade" id="bell" aria-label="Notifications" aria-expanded="false" title="Notifications on this phone">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5.5-6.84V3.5a1.5 1.5 0 0 0-3 0v.66A7 7 0 0 0 5 11v5l-2 2v1h18v-1l-2-2Z"/></svg>
+            <span class="badge" id="bell-badge" hidden>0</span>
+          </button>
+        </div>
+        <div class="screen-wrap">
+          <iframe id="phone" class="screen" src="/" title="The dashboard"></iframe>
+          <div class="headsup" id="headsup" hidden></div>
+          <div class="shade" id="shade" data-act="shade-close" hidden></div>
+        </div>
+      </div>
       <div id="deck"></div>
     </div>
   </div>

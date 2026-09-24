@@ -36,6 +36,17 @@ carries on from what you changed when you resume; a beat whose precondition
 you removed is skipped, not forced. Click the timeline to jump; a jump replays
 the day from midnight to that minute on a clean state.
 
+The phone's status bar carries a notification bell: what the phone would
+actually show. The gateway's pushes go through the filter a device stores
+when its owner takes the push opt-in's defaults — new and stalled
+conversations (`push_notify.DEFAULT_PREFERENCES`), so Ara's replies in a
+thread already under way do not reach it — and a notification replaces one
+with the same tag still in the tray, as the service worker's does: each digest
+replaces the last. A new one drops a heads-up banner; the bell opens the
+shade, and tapping a notification opens its link in the phone (a digest opens
+on what it released) and, like any touch on the phone, pauses the story. The
+feed says of every push whether it reached the phone and, if not, why.
+
 `record.py` runs the day headlessly, screenshots the dashboard after every
 beat with Chromium, and writes `dist/replay.html` — one self-contained page
 to watch where nothing can run:

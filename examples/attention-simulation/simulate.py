@@ -56,6 +56,15 @@ KB = "https://w3id.org/retinue/kb#"
 T_IN, T_OUT = KB + "InboundMessage", KB + "OutboundMessage"
 BEAT_HOLD_SECONDS = 3.2
 SPEEDS = [(2.0, "×1 — the day in 12 min"), (4.8, "×2 — 5 min"), (12.0, "×5 — 2 min"), (24.0, "×10 — 1 min")]
+# How the phone in the frame names its notification setting: the push
+# opt-in's default (push_notify.DEFAULT_PREFERENCES, webapp/components/push.js).
+PHONE_SETTING = "new & stalled conversations"
+EVENT_WORDS = {"reply": "a reply in an exchange already under way", "stalled": "a stalled conversation",
+               "new": "something new"}
+
+
+def zero_stats() -> dict:
+    return {"pushes": 0, "digests": 0, "handled": 0, "corrections": 0, "replies": 0, "notified": 0}
 
 
 # ── the clock ───────────────────────────────────────────────────────────────
@@ -353,9 +362,15 @@ class Simulation:
         self.woken: set[str] = set()
         self.threads: dict[str, str] = {}      # story id → conversation id
         self.by_cid: dict[str, str] = {}       # conversation id → story id
-        self.stats = {"pushes": 0, "digests": 0, "handled": 0, "corrections": 0, "replies": 0}
+        self.stats = zero_stats()
         self.beats_done: list[dict] = []
         self.last_view: str | None = None
+        # The phone's notification tray: what a device with the default
+        # setting shows, newest first, until opened or dismissed. `epoch`
+        # changes on every reset, so the deck can tell a replay from news.
+        self.tray: list[dict] = []
+        self.note_seq = 0
+        self.epoch = 0
         self.events = sorted(
             [{"kind": "message", "at": m["at"], "n": i, **m} for i, m in enumerate(story.MESSAGES)]
             + [{"kind": "thread", **x} for x in story.THREADS]
@@ -421,7 +436,9 @@ class Simulation:
             self.by_cid = {}
             self.beats_done = []
             self.last_view = None
-            self.stats = {"pushes": 0, "digests": 0, "handled": 0, "corrections": 0, "replies": 0}
+            self.stats = zero_stats()
+            self.tray = []
+            self.epoch += 1
             self.ledger.reset()
             wg = self.wg
             # The generated chamber holds what outlives a session — the
@@ -459,7 +476,8 @@ class Simulation:
             self.clock.minute = 0.0
             self.quiet = False
             self.feed = []
-            self.stats = {"pushes": 0, "digests": 0, "handled": 0, "corrections": 0, "replies": 0}
+            self.tray = []
+            self.stats = zero_stats()
             self.wg._attention_tick(self.clock.now())
 
     def _story_focus(self) -> dict:
@@ -504,15 +522,44 @@ class Simulation:
         self.feed.append(entry)
 
     def _on_push(self, title, body, url="/", tag=None, mode=None, archived=False, urgency=None, topic=None):
+        # What the gateway sends, then what the phone makes of it: the filter
+        # a device that took the opt-in's defaults stores (push_notify), and
+        # the service worker's tag — a notification replaces one still in the
+        # tray with the same tag (webapp/sw.js).
+        shown = self.wg.push_notify.device_wants(self.wg.push_notify.DEFAULT_PREFERENCES, mode, archived)
+        if shown:
+            self._notify_phone(title, body, url, tag or url, urgency, topic == "digest")
+        off = "" if shown else (f" Not on the phone: {EVENT_WORDS.get(mode, mode)}, "
+                                f"and the phone notifies on {PHONE_SETTING}.")
         if topic == "digest":
             self.stats["digests"] += 1
-            self.say("push", f"{title}: {body.replace(chr(10), '; ')}", urgency=urgency or "normal", digest=True, url=url)
+            self.say("push", f"{title}: {body.replace(chr(10), '; ')}{off}", urgency=urgency or "normal",
+                     digest=True, url=url, phone=shown)
         elif mode == "reply" and urgency is None:
             self.stats["replies"] += 1
-            self.say("reply", f"Ara replied in “{title}” (pushed as a reply).")
+            self.say("reply", f"Ara replied in “{title}” (pushed as a reply).{off}", phone=shown)
         else:
             self.stats["pushes"] += 1
-            self.say("push", f"{title} — {body}", urgency=urgency or "high")
+            self.say("push", f"{title} — {body}{off}", urgency=urgency or "high", phone=shown)
+
+    def _notify_phone(self, title, body, url, tag, urgency, digest):
+        # No lock: this runs on the gateway's request thread while the story
+        # thread may hold the lock waiting for that very request. Each change
+        # is one list assignment.
+        if self.quiet:
+            return
+        self.note_seq += 1
+        note = {"id": self.note_seq, "tag": tag, "title": title, "body": body, "url": url,
+                "t": self.clock.minute, "urgency": urgency or "", "digest": digest}
+        self.tray = [note] + [n for n in self.tray if n["tag"] != tag]
+        self.stats["notified"] += 1
+
+    def notification(self, action: str, note_id=None):
+        """The viewer's hand on the tray: open or dismiss one, clear all."""
+        if action == "clear":
+            self.tray = []
+        elif action in ("open", "dismiss"):
+            self.tray = [n for n in self.tray if n["id"] != note_id]
 
     # -- ids -------------------------------------------------------------------------------
 
@@ -924,6 +971,7 @@ class Simulation:
                 "driving": self.driving, "ended": self.ended, "index": self.index,
                 "beats": [{"at": b["at"], "who": b["who"], "action": bool(b.get("action"))} for b in story.SCRIPT],
                 "feed": self.feed[-400:], "stats": {**self.stats, "held": held},
+                "phone": {"tray": list(self.tray), "epoch": self.epoch, "seq": self.note_seq, "setting": PHONE_SETTING},
                 "attention": {"mode": att.get("mode"), "next_breakpoint": att.get("next_breakpoint"),
                               "counts": att.get("counts"), "learned": att.get("learned"),
                               "schedule": att.get("schedule") or [], "digest_times": att.get("digest_times") or [],
@@ -971,6 +1019,12 @@ def make_handler(sim: Simulation):
                     sim.seek(float(payload.get("minute", 0)))
                 elif cmd == "speed":
                     sim.speed = float(payload.get("speed", sim.speed))
+                elif cmd == "notification":
+                    try:
+                        note_id = int(payload["id"]) if payload.get("id") is not None else None
+                    except (TypeError, ValueError):
+                        note_id = None
+                    sim.notification(str(payload.get("action") or ""), note_id)
                 else:
                     self._send_json(404, {"error": "unknown command"})
                     return

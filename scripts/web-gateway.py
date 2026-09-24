@@ -2728,7 +2728,10 @@ def _conv_event_mode(conv: dict) -> str:
         if ts.tzinfo is not None:
             anchors.append(ts)
     if anchors:
-        idle = (datetime.now(timezone.utc) - max(anchors)).total_seconds()
+        # The attention clock where one is set (a simulated day, a test), so
+        # "stalled" is measured on the same clock the thread's times were.
+        now = ATTENTION_CLOCK() if ATTENTION_CLOCK is not None else datetime.now(timezone.utc)
+        idle = (now - max(anchors)).total_seconds()
         if idle > _STALLED_AFTER_SECONDS:
             return "stalled"
     return "reply"

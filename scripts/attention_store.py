@@ -28,6 +28,7 @@ Stdlib only.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import urllib.parse
 from datetime import datetime, timezone
@@ -153,6 +154,11 @@ def _last_message(conv: dict) -> dict:
     return msgs[-1] if msgs else {}
 
 
+# A thread's reply chips belong to the thread; a one-line preview — the row,
+# the push, the digest line — shows the words ([[chip: Send it]] · [[chip: …]]).
+_CHIP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
+
+
 def _one_line(text: str, limit: int = 160) -> str:
     line = " ".join(str(text or "").split())
     return line if len(line) <= limit else line[:limit - 1].rstrip() + "…"
@@ -204,7 +210,8 @@ def thread_item(conv: dict, profile: dict) -> dict:
         "project": project,
         "project_title": conv.get("project_title") if project else None,
         "project_href": ("/project.html?" + urllib.parse.urlencode({"id": project})) if project else None,
-        "preview": _one_line(preview_msg.get("text") or ("Sent you a file" if preview_msg.get("attachments") else "")),
+        "preview": _one_line(_CHIP_RE.sub("", preview_msg.get("text") or "")
+                             or ("Sent you a file" if preview_msg.get("attachments") else "")),
         "agent": agent,
         "unread": bool(conv.get("unread")),
         "pending": bool(conv.get("pending")),
