@@ -234,7 +234,8 @@ Open one from any agent:
 python3 /workspace/scripts/conversation-push.py --title "Party RSVP" \
   --importance 3 --due 2026-09-12 --kind invitation --sphere friends \
   "You've got an invite to Mara's party. Confirm and add to agenda, or decline?"
-# --attach PATH delivers files; --thread <id> appends to an existing thread
+# --attach PATH delivers files; --thread <id> appends to an existing thread;
+# --reply-attach PATH (alone) attaches a file to your own reply in this thread turn
 ```
 
 **Say how much it matters.** The dashboard's home is an attention list

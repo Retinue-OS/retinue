@@ -24,6 +24,17 @@ one — so a file lands in the conversation the user is already reading:
     conversation-push.py --thread 42ecb0113a3d48ac87be514cfaf99a7c \
         --attach /tmp/termine.ics "Here are the appointments as an .ics file."
 
+Inside a dashboard thread's own turn, attach a file to the reply you are
+writing instead — it lands at the end of that same message, not as a separate
+one (no message text, no --thread: the gateway knows the turn):
+
+    conversation-push.py --reply-attach /tmp/chart.png
+
+This lists the file in the turn's manifest (RETINUE_REPLY_ATTACHMENTS_FILE, set
+by the gateway for dashboard-thread turns only); the gateway stores it when the
+turn ends. Outside such a turn the variable is unset and the call fails — use
+--thread <id> --attach there. A reply may be text, files, or both.
+
 Appending this way un-archives the thread, so news filed into an archived thread
 is actually seen — unless the thread is *muted*, which is how "archive this and
 keep it archived" is expressed. Set the flags (no message) with:
@@ -103,6 +114,47 @@ DEFAULT_TIMEOUT = float(os.environ.get("CONVERSATION_BACKEND_TIMEOUT", "30"))
 _THREAD_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
+REPLY_MANIFEST_VAR = "RETINUE_REPLY_ATTACHMENTS_FILE"
+
+
+def _reply_attach(args) -> int:
+    """List files for the current turn's reply in the gateway's manifest.
+
+    No request is made: the gateway reads the manifest once the session ends
+    and attaches the files to the reply it appends — so nothing is posted if
+    the turn's reply is discarded (an escalated junior turn). Paths are made
+    absolute here, since the gateway does not share this process's cwd, and
+    checked here too, so a typo fails now rather than silently at turn end."""
+    others = [args.message.strip(), args.title, args.thread, args.archived,
+              args.muted, args.on_behalf_of, args.agent, args.key,
+              args.context, args.attach, args.url]
+    if any(v not in (None, "", []) for v in others):
+        print("conversation-push: --reply-attach takes only file paths; your reply's "
+              "text is your answer itself", file=sys.stderr)
+        return 2
+    manifest = os.environ.get(REPLY_MANIFEST_VAR, "").strip()
+    if not manifest:
+        print(f"conversation-push: {REPLY_MANIFEST_VAR} is not set — this is not a "
+              "dashboard thread turn; use --thread <id> --attach PATH instead",
+              file=sys.stderr)
+        return 2
+    paths = []
+    for spec in args.reply_attach:
+        path = Path(spec).expanduser().resolve()
+        if not path.is_file():
+            print(f"conversation-push: attachment not found: {spec}", file=sys.stderr)
+            return 2
+        if "\n" in str(path) or "\r" in str(path):
+            print(f"conversation-push: unsupported file name: {spec!r}", file=sys.stderr)
+            return 2
+        paths.append(str(path))
+    with open(manifest, "a", encoding="utf-8") as fh:
+        fh.write("".join(p + "\n" for p in paths))
+    for p in paths:
+        print(f"conversation-push: {p} will be attached to your reply")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Open a dashboard conversation tab with the user."
@@ -177,9 +229,17 @@ def main() -> int:
                           "and Ara's turns in the thread know the project. New threads only.")
     att.add_argument("--project-title", dest="project_title", metavar="TEXT",
                      help="the project's title, shown with --project")
+    parser.add_argument("--reply-attach", dest="reply_attach", action="append",
+                        default=[], metavar="PATH",
+                        help="attach a file to your own reply in the dashboard thread "
+                             "this turn answers (repeatable); only inside such a turn, "
+                             "and not combinable with any other option")
     parser.add_argument("--url", default=None, help=f"endpoint URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()
+
+    if args.reply_attach:
+        return _reply_attach(args)
 
     message = args.message.strip()
     flags_only = args.archived is not None or args.muted is not None

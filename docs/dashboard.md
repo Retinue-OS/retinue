@@ -412,18 +412,45 @@ the dashboard — e.g. an e-mail attachment (a PDF invoice) forwarded into a
 thread, so it's reachable without an e-mail client. Pass `--attach PATH`
 (repeatable) to `conversation-push.py`; the file is stored beside the thread
 (under `CONVERSATIONS_DIR/attachments/<id>/`, keyed by a server-generated id so
-untrusted filenames never touch the filesystem) and rendered as a download link
-in the message bubble, served by `GET /conversations/<id>/attachments/<att-id>`
-behind the dashboard's own auth. Prefer this over pushing a document via Signal
-when the user is already working in the dashboard.
+untrusted filenames never touch the filesystem) and rendered as a link in the
+message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
+the dashboard's own auth. Prefer this over pushing a document via Signal when
+the user is already working in the dashboard.
+
+Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
+AVIF — never SVG, which is script in the dashboard's origin) also **preview in
+the bubble**: a lazy-loaded `<img>` at its true aspect ratio, capped in width
+and height, linking to the full view (`?inline=1`), with the name row and the
+↓ save link beneath. The gateway records an image's intrinsic size when it
+stores it, so the preview's box is reserved before the bytes arrive and a
+thread never jumps while it loads (older records without a size get a fixed
+frame). This is the thread's own same-origin attachment, not a remote fetch:
+the Markdown renderer's no-remote-images rule is unaffected.
 
 To deliver a file into a thread that **already exists** — rather than stranding
 it in a fresh tab the user has to go find — pass `--thread <id>` (the thread id
 from the conversation URL). It posts to the token-gated
 `POST /internal/conversations/<id>/messages`, appending an agent message with
-the attachments and marking the thread unread. Note that Ara's own reply to a
-thread is appended by the gateway *after* her session ends and carries no
-attachments, so a file must be pushed as its own message this way.
+the attachments and marking the thread unread. Use this to post into *another*
+thread, or from a session that is not answering one.
+
+To attach a file to **Ara's own reply** in the thread her turn is answering,
+use `conversation-push.py --reply-attach PATH` (repeatable, nothing else on the
+line). That reply is appended by the gateway *after* her session ends, so the
+CLI makes no request: for every dashboard-thread turn the gateway hands the
+session a fresh manifest path in `RETINUE_REPLY_ATTACHMENTS_FILE` (a per-spawn
+value in `scripts/session_env.py`, never inherited), the CLI appends absolute
+paths to it, and when the turn ends the gateway reads the manifest, copies
+each file into the thread's attachment store through the same function every
+other attachment goes through, and puts them on the reply message — rendered
+at its end, like any attachment. Each entry must be an absolute path to a
+non-empty regular file within the attachment size limit (at most 20 per
+reply); anything else is logged and skipped, never costing the reply itself.
+A reply may be files only — it is then stored without text. The manifest is
+fresh per spawn and read only for the run whose reply is kept, so when Ara
+junior escalates, the files her discarded run listed are discarded with it.
+Outside a thread turn the variable is unset and the CLI refuses, pointing at
+`--thread <id> --attach`.
 
 Attachments go **both ways**: the user can attach files to their own messages
 from the composer (a paperclip button on the input row), or **paste** them into
