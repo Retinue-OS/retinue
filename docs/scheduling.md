@@ -308,5 +308,15 @@ file, in `/root/.retinue/inbox-sweep/state.json`, outside the chambers like the
 scheduler's own state) and stays quiet while that listing is unchanged. Adding,
 removing, or overwriting a file makes the inbox due again; so does draining it
 completely, which clears the guard so a stuck file gets a fresh attempt the next
-time anything arrives. The signature is recorded whatever the session made of
-the files, so a session that fails outright does not re-spawn every tick either.
+time anything arrives. The guard only settles after a session that exited
+cleanly: a session that fails outright (an API or sign-in hiccup) has not looked
+at the files, so the same listing is retried with exponential backoff — the next
+tick, then after two, four, … hours, capped at a day. The job has a
+`timeout_seconds` of an hour, since one session may work through dozens of
+files; a run killed by it counts as failed, and whatever it already filed is
+gone from the listing on the retry.
+
+The manifest is treated as untrusted: an inbox `path` must be relative and stay
+inside the chamber after resolution (absolute paths, `..` and symlinks leading
+out are ignored with a warning), a manifest of the wrong shape skips its
+chamber, and symlinks inside an inbox are never handed on as documents.

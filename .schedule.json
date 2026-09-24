@@ -21,6 +21,7 @@
       "id": "inbox-sweep",
       "command": "python3 /workspace/scripts/inbox-sweep.py",
       "interval_seconds": 3600,
+      "timeout_seconds": 3600,
       "enabled": true,
       "run_at_start": false
     },

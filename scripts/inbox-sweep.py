@@ -21,7 +21,12 @@ Re-spawn guard: the Archivist deliberately leaves a file it cannot classify in
 the inbox and flags it (archivist.md, `inbox/ processing`, step 4). Without a
 guard that one file would spawn a session on every tick forever. So the sweep
 records the listing it last spawned for and stays quiet while the inbox is
-unchanged -- any added, removed or modified file makes it due again.
+unchanged -- any added, removed or modified file makes it due again. The
+guard only settles after a session that exited cleanly; a failed one is
+retried with exponential backoff instead of being written off.
+
+The manifest is untrusted input: an inbox path must stay inside its chamber,
+and symlinks are never handed on as documents.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +60,32 @@ PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 # A chamber's own bookkeeping, not mail: never work the agent should be doing.
 IGNORED_NAMES = {".gitkeep", ".DS_Store"}
 
+# Backoff after a failed session: the first retry comes a tick later, then the
+# wait doubles up to a day, so a persistent failure costs a few sessions a day
+# rather than one an hour.
+RETRY_BASE_SECONDS = 3600
+RETRY_MAX_SECONDS = 24 * 3600
+
+
+def resolve_inbox(chamber: Path, rel) -> Path | None:
+    """The inbox directory for a manifest path, or None if it leaves the chamber.
+
+    The contract is a path relative to the chamber. An absolute path or a `..`
+    would make `chamber / rel` point anywhere, and a symlinked directory could
+    do the same after resolution -- so both the syntax and the resolved
+    location are checked.
+    """
+    if not isinstance(rel, str) or not rel.strip():
+        return None
+    p = Path(rel)
+    if p.is_absolute() or ".." in p.parts:
+        return None
+    root = chamber.resolve()
+    target = (chamber / p).resolve()
+    if target != root and root not in target.parents:
+        return None
+    return chamber / p
+
 
 def declared_inboxes() -> list[dict]:
     """Every inbox declared by every mounted chamber, in a stable order."""
@@ -72,36 +104,66 @@ def declared_inboxes() -> list[dict]:
             print(f"[inbox-sweep] {chamber.name}: unreadable .inbox.json "
                   f"({e}); skipping chamber", file=sys.stderr)
             continue
-        for entry in data.get("inboxes", []):
-            rel = (entry or {}).get("path")
-            if not rel:
+        # Valid JSON is not yet a valid manifest; a wrong shape skips this
+        # chamber like a parse error would, instead of aborting the sweep.
+        inboxes = data.get("inboxes", []) if isinstance(data, dict) else None
+        if not isinstance(inboxes, list):
+            print(f"[inbox-sweep] {chamber.name}: .inbox.json has no "
+                  "'inboxes' list; skipping chamber", file=sys.stderr)
+            continue
+        for entry in inboxes:
+            if not isinstance(entry, dict):
+                print(f"[inbox-sweep] {chamber.name}: ignoring non-object "
+                      "inbox entry", file=sys.stderr)
+                continue
+            rel = entry.get("path")
+            path = resolve_inbox(chamber, rel)
+            if path is None:
+                if rel:
+                    print(f"[inbox-sweep] {chamber.name}: inbox path {rel!r} "
+                          "is not inside the chamber; ignoring",
+                          file=sys.stderr)
                 continue
             found.append({
                 "chamber": chamber.name,
-                "id": entry.get("id") or rel,
-                "path": chamber / rel,
+                "id": str(entry.get("id") or rel),
+                "path": path,
                 "rel": rel,
-                "description": entry.get("description") or "",
+                "description": str(entry.get("description") or ""),
             })
     return found
 
 
 def pending_files(inbox_path: Path) -> list[Path]:
-    """Files awaiting filing, deepest-first order irrelevant -- just stable."""
-    if not inbox_path.is_dir():
+    """Files awaiting filing, in a stable order.
+
+    Symlinks are skipped, file or directory: whatever they point at is not
+    something the user dropped into the letterbox, and following one would
+    hand the Archivist a file from outside the inbox.
+    """
+    if inbox_path.is_symlink() or not inbox_path.is_dir():
         return []
-    return sorted(
-        p for p in inbox_path.rglob("*")
-        if p.is_file() and p.name not in IGNORED_NAMES
-        and not p.name.startswith(".")
-    )
+    found = []
+    for dirpath, dirnames, filenames in os.walk(inbox_path, followlinks=False):
+        dirnames[:] = [d for d in dirnames
+                       if not os.path.islink(os.path.join(dirpath, d))]
+        for name in filenames:
+            if name in IGNORED_NAMES or name.startswith("."):
+                continue
+            p = Path(dirpath) / name
+            if p.is_symlink() or not p.is_file():
+                continue
+            found.append(p)
+    return sorted(found)
 
 
 def signature(scan: list[dict]) -> dict:
     """What the sweep last acted on: path -> (size, mtime), per inbox.
 
     Size and mtime, not just the name, so a file that was edited in place
-    (a corrected export dropped over the old one) counts as new work.
+    (a corrected export dropped over the old one) counts as new work. The
+    mtime is in nanoseconds: whole seconds would miss a same-size overwrite
+    within the same second.
     """
     sig: dict[str, dict[str, list]] = {}
     for item in scan:
@@ -113,7 +175,7 @@ def signature(scan: list[dict]) -> dict:
             except OSError:
                 continue
             entry[str(f.relative_to(item["path"]))] = [st.st_size,
-                                                       int(st.st_mtime)]
+                                                       st.st_mtime_ns]
         sig[key] = entry
     return sig
 
@@ -133,6 +195,16 @@ def save_state(state: dict) -> None:
     except OSError as e:
         # Losing the guard costs a duplicate session next tick, not correctness.
         print(f"[inbox-sweep] could not write state ({e})", file=sys.stderr)
+
+
+def retry_due(state: dict, now: float) -> bool:
+    """Whether a failed run's backoff has elapsed."""
+    failures = int(state.get("failures") or 0)
+    wait = min(RETRY_BASE_SECONDS * 2 ** max(failures - 1, 0),
+               RETRY_MAX_SECONDS)
+    # A little slack so an hourly tick that lands a few seconds early still
+    # counts as a full interval.
+    return now - float(state.get("attempted_at") or 0) >= wait - 60
 
 
 def build_prompt(scan: list[dict]) -> str:
@@ -186,12 +258,18 @@ def main() -> int:
         return 0
 
     current = signature(scan)
-    previous = load_state().get("signature")
-    if previous == current:
-        print("[inbox-sweep] inbox contents unchanged since last sweep "
-              "(likely files the Archivist could not classify); "
-              "nothing spawned", file=sys.stderr)
-        return 0
+    state = load_state()
+    now = time.time()
+    if state.get("signature") == current:
+        if not state.get("failures"):
+            print("[inbox-sweep] inbox contents unchanged since last sweep "
+                  "(likely files the Archivist could not classify); "
+                  "nothing spawned", file=sys.stderr)
+            return 0
+        if not retry_due(state, now):
+            print(f"[inbox-sweep] last session failed "
+                  f"({state['failures']}x); backing off", file=sys.stderr)
+            return 0
 
     total = sum(len(i["files"]) for i in scan)
     print(f"[inbox-sweep] {total} file(s) pending across {len(scan)} inbox(es); "
@@ -206,9 +284,19 @@ def main() -> int:
         log=lambda msg: print(f"[inbox-sweep] {msg}", file=sys.stderr))
     result = subprocess.run(cmd, cwd="/workspace", env=env)
 
-    # Record what this run was handed, whatever the session made of it: a
-    # session that failed outright should not re-spawn every tick either.
-    save_state({"signature": current})
+    if result.returncode == 0:
+        # Settled: whatever is still lying there was left on purpose.
+        save_state({"signature": current})
+    else:
+        # A failed session (API or auth hiccup) has not looked at the files;
+        # retry the same listing later, backing off so it cannot burn a
+        # session every tick.
+        failures = (int(state.get("failures") or 0) + 1
+                    if state.get("signature") == current else 1)
+        save_state({"signature": current, "failures": failures,
+                    "attempted_at": now})
+        print(f"[inbox-sweep] session exited {result.returncode}; will retry "
+              f"with backoff (failure {failures})", file=sys.stderr)
     return result.returncode
 
 

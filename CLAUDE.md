@@ -180,7 +180,8 @@ resting projects when their date comes. The rules that make them work:
 A third, `inbox-sweep`, empties letterboxes: it dispatches the Archivist for
 every chamber whose `.inbox.json` declares an inbox that is not empty. **An
 inbox is a letterbox, not a shelf** — a file the user drops in is taken out,
-filed and deleted, never left lying there.
+filed and deleted; the only file left lying there is one the Archivist could
+not classify and has flagged for the user.
 
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 
