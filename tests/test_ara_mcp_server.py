@@ -381,6 +381,149 @@ def test_job_pruning_keeps_pending_work():
     print("ok: finished jobs expire, pending ones survive")
 
 
+REPLY_WITH_FACTS = """The declaration is due on 21 September.
+
+<<<confirm
+Title: Steuererklärung eingereicht?
+Die Cowork-Sitzung meldet: eingereicht am 20.09.
+[[chip: Stimmt | Ja, übernehmen.]] · [[chip: Verwerfen | Nein, verwerfen.]]
+confirm>>>
+"""
+
+
+def test_the_prompts_ask_for_confirmation_instead_of_recording():
+    """Stated facts are put to the user, never stored by the session."""
+    for prompt in (mcp._build_prompt("Is it filed?", "I just filed it"),
+                   mcp._build_note_prompt("Filed the return today.")):
+        low = prompt.lower()
+        assert "do not store memories" in low
+        assert mcp.CONFIRM_OPEN in prompt and mcp.CONFIRM_CLOSE in prompt
+        assert "[[chip:" in prompt
+    assert "Title:" in mcp._build_prompt("q", "c")
+    assert "Title:" not in mcp._build_note_prompt("n")
+    print("ok: both prompts ask for a confirmation block, not a recording")
+
+
+def test_split_confirmation():
+    rest, title, message = mcp._split_confirmation(REPLY_WITH_FACTS)
+    assert rest == "The declaration is due on 21 September.", rest
+    assert title == "Steuererklärung eingereicht?"
+    assert message.startswith("Die Cowork-Sitzung meldet")
+    assert "[[chip: Stimmt" in message and mcp.CONFIRM_CLOSE not in message
+    # No block: the reply passes through untouched.
+    assert mcp._split_confirmation("Just an answer.") == ("Just an answer.", None, None)
+    # An empty block is stripped but opens nothing.
+    rest, title, message = mcp._split_confirmation(
+        f"Answer.\n{mcp.CONFIRM_OPEN}\nTitle: x\n{mcp.CONFIRM_CLOSE}")
+    assert (rest, title, message) == ("Answer.", None, None)
+    # A note review answers the block alone, without a title.
+    rest, title, message = mcp._split_confirmation(
+        f"{mcp.CONFIRM_OPEN}\nBitte bestätigen.\n{mcp.CONFIRM_CLOSE}")
+    assert (rest, title, message) == ("", None, "Bitte bestätigen.")
+    print("ok: the confirmation block is lifted out cleanly")
+
+
+def _capture_gateway():
+    posts = []
+
+    def fake_post(path, payload):
+        posts.append((path, payload))
+        return {"id": "t-%d" % len(posts), "url": "https://dash/c/t-%d" % len(posts)}
+    return posts, fake_post
+
+
+def test_ask_ara_opens_a_confirmation_thread_and_hides_the_block():
+    posts, fake_post = _capture_gateway()
+    real_run, real_post = mcp._run_claude, mcp._gateway_post
+    mcp._run_claude = lambda prompt: ("done", REPLY_WITH_FACTS)
+    mcp._gateway_post = fake_post
+    try:
+        payload, _ = tool("ask_ara", {"question": "Is it filed?",
+                                      "context": "I filed it yesterday"})
+    finally:
+        mcp._run_claude, mcp._gateway_post = real_run, real_post
+    assert payload["answer"] == "The declaration is due on 21 September."
+    assert mcp.CONFIRM_OPEN not in payload["answer"]
+    threads = [pl for path, pl in posts if path == "/internal/conversations"]
+    assert len(threads) == 1, posts
+    assert threads[0]["title"] == "Steuererklärung eingereicht?"
+    # Never quiet, and never the cowork audit thread.
+    assert not threads[0].get("quiet") and threads[0].get("kind") != "cowork"
+    print("ok: stated facts open a thread of their own; the client never sees the block")
+
+
+def test_ask_ara_without_facts_opens_nothing():
+    posts, fake_post = _capture_gateway()
+    real_run, real_post = mcp._run_claude, mcp._gateway_post
+    mcp._run_claude = lambda prompt: ("done", "Nothing new here.")
+    mcp._gateway_post = fake_post
+    try:
+        payload, _ = tool("ask_ara", {"question": "When is the GV?"})
+    finally:
+        mcp._run_claude, mcp._gateway_post = real_run, real_post
+    assert payload["answer"] == "Nothing new here." and posts == [], posts
+    print("ok: an answer without stated facts opens no thread")
+
+
+def test_tell_ara_review_appends_to_the_note_thread():
+    import threading
+    posts, fake_post = _capture_gateway()
+    reviewed = threading.Event()
+    block = f"{mcp.CONFIRM_OPEN}\nBitte bestätigen.\n{mcp.CONFIRM_CLOSE}"
+
+    def fake_run(prompt):
+        assert "Filed the return today." in prompt
+        return "done", block
+
+    real_run, real_post, real_token = mcp._run_claude, mcp._gateway_post, mcp.CONVERSATION_TOKEN
+    real_review = mcp._review_note
+
+    def review(thread_id, note):
+        try:
+            real_review(thread_id, note)
+        finally:
+            reviewed.set()
+    mcp._run_claude, mcp._gateway_post = fake_run, fake_post
+    mcp.CONVERSATION_TOKEN, mcp._review_note = "test-token", review
+    try:
+        payload, _ = tool("tell_ara", {"note": "Filed the return today."})
+        assert payload["status"] == "delivered" and payload["thread_id"] == "t-1"
+        assert reviewed.wait(10)
+    finally:
+        mcp._run_claude, mcp._gateway_post = real_run, real_post
+        mcp.CONVERSATION_TOKEN, mcp._review_note = real_token, real_review
+    assert posts[0] == ("/internal/conversations",
+                        {"message": "Filed the return today.", "title": None}), posts
+    assert posts[1] == ("/internal/conversations/t-1/messages",
+                        {"message": "Bitte bestätigen."}), posts
+    assert len(posts) == 2
+    print("ok: a tell_ara note is delivered at once and its review lands in the same thread")
+
+
+def test_tell_ara_review_that_finds_nothing_stays_silent():
+    import threading
+    posts, fake_post = _capture_gateway()
+    reviewed = threading.Event()
+    real_run, real_post, real_token = mcp._run_claude, mcp._gateway_post, mcp.CONVERSATION_TOKEN
+    real_review = mcp._review_note
+
+    def review(thread_id, note):
+        try:
+            real_review(thread_id, note)
+        finally:
+            reviewed.set()
+    mcp._run_claude, mcp._gateway_post = (lambda prompt: ("done", "none")), fake_post
+    mcp.CONVERSATION_TOKEN, mcp._review_note = "test-token", review
+    try:
+        tool("tell_ara", {"note": "FYI, the build is green."})
+        assert reviewed.wait(10)
+    finally:
+        mcp._run_claude, mcp._gateway_post = real_run, real_post
+        mcp.CONVERSATION_TOKEN, mcp._review_note = real_token, real_review
+    assert len(posts) == 1, posts
+    print("ok: a note with nothing to record gets no follow-up")
+
+
 def main():
     test_initialize_carries_instructions()
     test_identity_defaults_to_ara_and_is_configurable()
@@ -402,6 +545,12 @@ def main():
     test_a_raising_tool_does_not_break_the_protocol()
     test_rate_limit_refuses_and_points_at_the_user()
     test_job_pruning_keeps_pending_work()
+    test_the_prompts_ask_for_confirmation_instead_of_recording()
+    test_split_confirmation()
+    test_ask_ara_opens_a_confirmation_thread_and_hides_the_block()
+    test_ask_ara_without_facts_opens_nothing()
+    test_tell_ara_review_appends_to_the_note_thread()
+    test_tell_ara_review_that_finds_nothing_stays_silent()
     print("\nAll Ask-Ara MCP server checks passed.")
 
 
