@@ -84,7 +84,7 @@ persistent volume) holds:
 |---|---|
 | `GET /attention` | the union of open threads, chats and projects as sections Now · Next · Held · Waiting, each row with its three fields explained, plus the mode in force, the next breakpoint, the counts and `degraded` (a source the store could not answer for) |
 | `GET /attention/item?id=…` | one item, explained, with the mode and the sphere vocabulary — what the sheet shows |
-| `POST /attention/mode` `{mode, subject?, project?}` / `{mode: null}` | set the mode by hand — Focused with a sphere (`subject`) or a project URI from the list (`project`) as its scope — or release it to the schedule; a change is a breakpoint |
+| `POST /attention/mode` `{mode, subject?, project?, minutes? \| until?, breaks?}` / `{mode: null}` | set the mode by hand — Focused with a sphere (`subject`) or a project URI from the list (`project`) as its scope, for `minutes` or `until` a time, past an hour with a breakpoint every 55 minutes unless `breaks: false` — or release it to the schedule; a change is a breakpoint, except a switch into Focused, and so is a timed mode's end |
 | `POST /attention/items/later` `{id, when: next\|tomorrow}` | snooze |
 | `POST /attention/items/pull` `{id}` | pull out of Held ahead of the digest |
 | `POST /attention/items/done` `{id}` / `…/reopen` | mark handled (a sent reply does this on chats) / put it back |

@@ -725,6 +725,58 @@ def test_payload_shape(base, wg):
     print("ok test_payload_shape")
 
 
+def test_hand_set_focus_and_breaks(base, wg):
+    """Switching into Focused by hand sends no digest; a timed mode keeps its
+    own breakpoints — a break every 55 minutes past an hour, and its end —
+    and gives way to the schedule when its time is up."""
+    monday = datetime(2026, 9, 7, 13, 58, tzinfo=timezone.utc)
+    _clock(wg, monday)
+    _mode(base, "social")                         # customers are held in Social
+    body = _open(base, "Invoice question", "Which account?",
+                 {"importance": 4, "sphere": "customers", "due": (monday + timedelta(hours=30)).isoformat(),
+                  "kind": "customer request"})
+    tid = "thread:" + body["id"]
+    assert body["attention"]["delivery"] == "hold", body["attention"]
+    _clock(wg, monday.replace(minute=0, hour=14))
+    PUSHES.clear()
+    status, out = _http(base, "POST", "/attention/mode", {"mode": "focused", "minutes": 120})
+    assert status == 200 and not PUSHES, PUSHES                        # no digest into Focused
+    assert _find(out, tid)[0] == "held", _find(out, tid)
+    assert out["mode"]["manual_until"] == "2026-09-07T16:00:00+00:00" and out["mode"]["breaks"] == ["2026-09-07T14:55:00+00:00"], out["mode"]
+    assert out["next_breakpoint"] == "2026-09-07T14:55:00+00:00", out["next_breakpoint"]
+    # 14:55: the suggested breakpoint releases what waited, as a break.
+    report = wg._attention_tick(monday.replace(hour=14, minute=55))
+    assert "break" in report["events"] and report["digest"] == 1, report
+    digests = [p for p in PUSHES if p[1].get("topic") == "digest"]
+    assert len(digests) == 1 and digests[0][0][0] == "Break 14:55 · 1 thing waited", digests
+    # 16:00: its time is up — back to the schedule (Focused on customers).
+    PUSHES.clear()
+    report = wg._attention_tick(monday.replace(hour=16, minute=0))
+    assert "end" in report["events"], report
+    _clock(wg, monday.replace(hour=16, minute=1))
+    home = _sections(base)
+    assert home["mode"]["manual"] is False and home["mode"]["manual_until"] is None and home["mode"]["label"] == "Focused on customers", home["mode"]
+    # Focused on a sphere by hand: what it lets through rings at once, alone.
+    _mode(base, "social")
+    other = _open(base, "Contract deadline", "Sign by 18:00",
+                  {"importance": 4, "sphere": "customers", "due": monday.replace(hour=17, minute=0).isoformat(),
+                   "kind": "customer request"})
+    assert other["attention"]["delivery"] == "hold", other["attention"]
+    PUSHES.clear()
+    status, out = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers", "until": "18:00"})
+    assert status == 200 and out["mode"]["manual_until"] == "2026-09-07T18:00:00+00:00", out["mode"]
+    # Pushes, not a digest: the new deadline, and anything held or released
+    # before that Focused on customers now lets through and never rang.
+    assert "Contract deadline" in [p[0][0] for p in PUSHES] and not any(p[1].get("topic") for p in PUSHES), PUSHES
+    assert _find(out, "thread:" + other["id"])[0] == "now"
+    for bad in ({"mode": "chores", "minutes": -5}, {"mode": "chores", "minutes": 2000}, {"mode": "chores", "until": "noon"}):
+        status, out = _http(base, "POST", "/attention/mode", bad)
+        assert status == 400, (bad, out)
+    _mode(base, None)
+    _clock(wg, None)
+    print("ok test_hand_set_focus_and_breaks")
+
+
 def test_week_and_holidays(base, wg):
     """A day plan rules the days it names; a holiday follows the plan that
     claims holidays, whatever its weekday; the patch keeps every weekday in
@@ -798,6 +850,7 @@ def main():
         test_project_from_store(base, wg)
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)
+        test_hand_set_focus_and_breaks(base, wg)
         test_week_and_holidays(base, wg)
         server.shutdown()
     sparql.shutdown()

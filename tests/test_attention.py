@@ -302,6 +302,33 @@ def test_digest():
     assert invite["digest_at"] is None and clause["digest_at"] is None
 
 
+def test_hand_set_modes():
+    """Into Focused by hand is no breakpoint; any other change is. A timed
+    mode brings its own breakpoints — every 55 minutes past an hour, and its
+    end — and holds the day's digest times back while it runs."""
+    focus = A.default_focus()
+    assert A.set_manual(focus, "focused", None, at(14)) is False
+    assert A.set_manual(focus, "chores", None, at(14)) is True and A.set_manual(focus, None, None, at(14)) is True
+    A.set_manual(focus, "focused", None, at(14, 0) + timedelta(seconds=40), minutes=180)
+    assert focus["manual_until"] == at(17).isoformat() and focus["breaks"] == [at(14, 55).isoformat(), at(15, 50).isoformat()]
+    assert A.next_breakpoint(focus, at(14, 10)) == at(14, 55) and A.next_breakpoint(focus, at(16)) == at(17)
+    assert A.due_events(focus, at(14, 55)) == {"break"} and A.due_events(focus, at(15, 0)) == {"sweep"}
+    assert not A.manual_expired(focus, at(16, 59)) and A.manual_expired(focus, at(17))
+    for minutes, breaks, mode, want in ((60, None, "focused", []), (120, False, "focused", []), (120, None, "rest", []),
+                                       (70, None, "social", [at(14, 55)])):
+        A.set_manual(focus, mode, None, at(14), minutes=minutes, breaks=breaks)
+        assert focus["breaks"] == [b.isoformat() for b in want], (minutes, breaks, mode, focus["breaks"])
+    # Across a digest time: 11:30 for an hour keeps 12:00 back; its end is the breakpoint.
+    A.set_manual(focus, "focused", None, at(11, 30), minutes=60)
+    assert A.next_breakpoint(focus, at(11, 40)) == at(12, 30) and "digest" not in A.due_events(focus, at(12))
+    A.set_manual(focus, "focused", None, at(11, 30))                 # open-ended: the day's digest times count
+    assert A.next_breakpoint(focus, at(11, 40)) == at(12) and "digest" in A.due_events(focus, at(12))
+    assert A.minutes_until("17:00", at(15)) == 120 and A.minutes_until("08:00", at(15)) == 17 * 60
+    assert A.minutes_until(at(16).isoformat(), at(15)) == 60 and A.minutes_until("noon", at(15)) is None
+    digest = {"at": at(14, 55), "items": [item(title="Q")], "label": "Break 14:55"}
+    assert A.digest_text(digest, at(14, 55))[0] == "Break 14:55 · 1 thing waited"
+
+
 def test_docs_and_emit():
     profile = A.default_profile()
     doc = {"id": "8f2c", "title": "Quote for Müller AG", "attention": {"importance": 4, "due": "2026-09-03T17:00:00+02:00", "sphere": "customers", "tags": ["finance"], "kind": "customer request", "released": True}}

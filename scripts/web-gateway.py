@@ -5752,10 +5752,13 @@ def _attention_push_digest(digest: dict, now: datetime) -> int:
     return push_notify.subscription_count()
 
 
-def _attention_breakpoint(items: list[dict], focus: dict, now: datetime, why: str) -> dict | None:
+def _attention_breakpoint(items: list[dict], focus: dict, now: datetime, why: str,
+                          label: str | None = None) -> dict | None:
     bp = attention_policy.breakpoint(items, focus, now)
     digest = bp.get("digest")
     if digest:
+        if label:
+            digest["label"] = label
         for item in digest["items"]:
             _attention_persist(item)
         _attention_push_digest(digest, now)
@@ -5784,13 +5787,22 @@ def _attention_tick(now: datetime | None = None) -> dict:
     with _attention_lock:
         focus = _ATTENTION.focus()
         profile = _ATTENTION.profile()
-        events = attention_policy.due_events(focus, now)
+        ended = None
+        if attention_policy.manual_expired(focus, now):
+            # A timed hand-set mode ran out: back to the schedule, and that
+            # is a breakpoint like any change.
+            ended = focus["modes"][focus["manual"]]["name"]
+            attention_policy.set_manual(focus, None, None, now)
+            _ATTENTION.save_focus(focus)
+        events = attention_policy.due_events(focus, now) | ({"end"} if ended else set())
         if not events and _attention_tick_state["emitted"]:
             return {}
         items, _degraded = _attention_items(profile, now)
         report: dict = {"at": key, "events": sorted(events), "pushed": [], "digest": 0}
-        if "digest" in events or "mode" in events:
-            digest = _attention_breakpoint(items, focus, now, "the breakpoint")
+        if events & {"digest", "mode", "break", "end"}:
+            label = (f"{ended} ended {now:%H:%M}" if ended
+                     else f"Break {now:%H:%M}" if "break" in events else None)
+            digest = _attention_breakpoint(items, focus, now, "the breakpoint", label=label)
             report["digest"] = len(digest["items"]) if digest else 0
         if "sweep" in events:
             before = {i["id"]: attention_store.block_for(i) for i in items}
@@ -5878,6 +5890,8 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
         "subject": mode.get("subject"),
         "label": attention_policy.mode_label(mode),
         "manual": bool(focus.get("manual")),
+        "manual_until": focus.get("manual_until") if focus.get("manual") else None,
+        "breaks": [b for b in (focus.get("breaks") or []) if focus.get("manual")],
         "scheduled": {"id": scheduled["id"], "name": scheduled["name"],
                       "until": until.isoformat() if until else None},
         "day": _attention_day(focus, now.date()),
@@ -7241,13 +7255,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, body)
 
     def _attention_set_mode(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
-        """Set the mode by hand — with a subject, for a mode that takes one —
-        or release it to the schedule. Either is a breakpoint: what was held
-        is released, and the digest goes out."""
+        """Set the mode by hand — with a subject, for a mode that takes one,
+        and for a while (``minutes``, or ``until`` a time) with the suggested
+        breakpoints of a long one (``breaks``) — or release it to the
+        schedule. Each is a breakpoint — what was held is released, and the
+        digest goes out — except a switch into Focused: that holds on to
+        what waits, and only what the focus lets through rings."""
         mode_id = payload.get("mode")
         if mode_id is not None and mode_id != "" and mode_id not in focus["modes"]:
             self._send_json(400, {"error": "unknown mode"})
             return
+        minutes = None
+        if mode_id and (payload.get("minutes") or payload.get("until")):
+            try:
+                minutes = int(payload["minutes"]) if payload.get("minutes") else \
+                    attention_policy.minutes_until(payload["until"], now)
+            except (TypeError, ValueError):
+                minutes = None
+            if not minutes or not 0 < minutes <= 24 * 60:
+                self._send_json(400, {"error": "a duration is 1 minute to 24 hours, or until a time ahead"})
+                return
         # The scope: a sphere (``subject``) or a project (``project``, a URI
         # the list knows, so its title can be shown). It belongs to the
         # override — gone when the mode is — and a mode without a scope
@@ -7268,11 +7295,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "unknown sphere"})
                 return
             scope = {"kind": "sphere", "id": sid, "title": sid}
-        focus["manual"] = mode_id or None
-        focus["subject"] = scope if (mode_id and focus["modes"][mode_id].get("with_subject")) else None
+        breaks = payload.get("breaks")
+        is_breakpoint = attention_policy.set_manual(focus, mode_id or None, scope, now, minutes=minutes,
+                                                    breaks=None if breaks is None else bool(breaks))
         _ATTENTION.save_focus(focus)
-        items, degraded = _attention_items(profile, now)
-        _attention_breakpoint(items, focus, now, "the mode change")
+        if is_breakpoint:
+            items, degraded = _attention_items(profile, now)
+            _attention_breakpoint(items, focus, now, "the mode change")
+        else:
+            # Into Focused: no digest. What the focus lets through rings; the
+            # rest stays held for the focus's breaks, its end, or a change.
+            self._handle_reevaluate(focus, profile, now, "the mode change")
+            items, degraded = _attention_items(profile, now)
         self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
 
     def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str) -> list[str]:

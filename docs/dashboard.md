@@ -110,8 +110,21 @@ load, which is how it came to wish you good evening at breakfast). Modes are
 moods — *Rest & relax*, *Focused*, *Chores*, *Social* — and *Focused* takes a
 scope from the menu: nothing, a sphere ("all clients") or one of the projects
 on the list ("this one"); only what is about the scope may ring, and the rest
-folds under *Not now*. **A change by hand is a breakpoint**: what was held is
-released and the digest goes out. The policy
+folds under *Not now*. **A change by hand is a breakpoint** — what was held is
+released and the digest goes out — **except a switch into Focused**: a
+decision to focus on something right now is not to be met with a reminder
+of everything else, so what waits keeps waiting, and only what the focus lets
+through rings (at once, on its own). The schedule's switch into Focused — and
+"Follow the schedule" into it — stays a breakpoint: that stretch was planned,
+and the digest at its start clears the deck before it. **A mode set by hand can run for a while** — the menu offers 30 min, 1
+h, 2 h and 3 h before the mode is tapped, and `POST /attention/mode` takes
+`minutes` or `until` ("17:00") — after which the schedule takes over again,
+and that return is a breakpoint (*Focused ended 16:00 · 3 things waited*). Past
+an hour the menu suggests **a breakpoint every 55 minutes** (the first after
+55, none in the last 20 minutes; untick to decline): a digest titled *Break
+14:55*, the moment to look up. While a timed mode runs, its breaks and its
+end are its breakpoints and the day's digest times wait; an open-ended one
+keeps the digest times, since nothing else would end it. The policy
 is `scripts/attention.py` (pure, tested in `tests/test_attention.py`); the
 gateway's part — assembling the items, storing each decision on the item's
 own document, the endpoints, the tick — is the attention section of
@@ -223,7 +236,8 @@ plan, and the holiday when there is one.
 **The API** (behind the dashboard's auth like the rest): `GET /attention`
 (the sections, the mode, the next breakpoint, `degraded` naming a source the
 store could not answer for), `GET /attention/item?id=…`, `POST
-/attention/mode {mode}` (`null` follows the schedule), `POST
+/attention/mode {mode, subject?, project?, minutes? | until?, breaks?}` (`null`
+follows the schedule), `POST
 /attention/items/later {id, when: next|tomorrow}`, `…/pull`, `…/done`,
 `…/reopen`, `…/correct {id, importance?, due?, lead?, sphere?, tags?,
 critical?}`, `POST /attention/permits {sender, mode?, on}`, `POST

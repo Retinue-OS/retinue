@@ -99,8 +99,10 @@ DEFAULT_WEEK = [
 def default_focus() -> dict:
     """The focus document the gateway keeps (focus.json): modes, the week of
     day plans, the holidays, the default digest times, the manual override
-    and its subject."""
-    return {"manual": None, "subject": None, "modes": json.loads(json.dumps(DEFAULT_MODES)),
+    with its subject, its end (``manual_until``) and its suggested
+    breakpoints (``breaks``)."""
+    return {"manual": None, "subject": None, "manual_until": None, "breaks": [],
+            "modes": json.loads(json.dumps(DEFAULT_MODES)),
             "week": json.loads(json.dumps(DEFAULT_WEEK)), "holidays": [],
             "digest_times": list(DEFAULT_DIGEST_TIMES)}
 
@@ -481,6 +483,96 @@ def scheduled_id(focus: dict, now: datetime) -> str:
     return scheduled_entry(focus, now)[1]
 
 
+# ---- the mode set by hand -------------------------------------------------------------
+#
+# A mode set by hand may run for a while (``manual_until``) and then give way
+# to the schedule again. A long one — over an hour — gets a suggested
+# breakpoint every BREAK_EVERY minutes: a digest of what waited, and the
+# natural moment to look up. While a timed mode runs, its breaks and its end
+# are its breakpoints and the day's digest times wait: a stretch set aside by
+# hand keeps its own rhythm. Switching into Focused by hand is no breakpoint
+# at all: it is a decision to focus on something right now, which a reminder
+# of everything else would only get in the way of. The schedule's own switch
+# into Focused stays one — that stretch was planned, and the digest at its
+# start clears the deck before it.
+
+BREAK_EVERY = 55        # minutes between suggested breakpoints in a long hand-set mode
+BREAK_MARGIN = 20       # after the first, none this close to the end: the end is a breakpoint itself
+QUIET_ENTRY = {"focused"}   # modes whose entry by hand is no breakpoint
+
+
+def suggests_breaks(mode_id: str, minutes: int | None) -> bool:
+    """Whether a hand-set mode of this length is offered breakpoints: over an
+    hour, and not Rest, where a breakpoint releases nothing."""
+    return bool(minutes) and minutes > 60 and mode_id != "rest"
+
+
+def minutes_until(value, now: datetime) -> int | None:
+    """``"17:00"`` (today, or tomorrow once past) or an ISO moment, as minutes
+    from ``now``; None when it is neither or not ahead."""
+    minute = parse_minute(value)
+    if minute is not None:
+        at = now.replace(hour=minute // 60, minute=minute % 60, second=0, microsecond=0)
+        if at <= now:
+            at += timedelta(days=1)
+    else:
+        try:
+            at = parse_dt(value)
+        except (TypeError, ValueError):
+            return None
+        if at is None or at.tzinfo is None:
+            return None
+    left = int(round((at - now).total_seconds() / 60))
+    return left if left > 0 else None
+
+
+def set_manual(focus: dict, mode_id: str | None, subject: dict | None, now: datetime,
+               minutes: int | None = None, breaks: bool | None = None) -> bool:
+    """Set the mode by hand — for ``minutes``, or until released — or, with
+    ``mode_id`` None, release it to the schedule. ``breaks`` takes the
+    suggested breakpoints of a long one (by default, as suggested). Returns
+    whether the change is a breakpoint: every change is, except a switch
+    into Focused."""
+    focus["manual_until"] = None
+    focus["breaks"] = []
+    if not mode_id:
+        focus["manual"] = None
+        focus["subject"] = None
+        return True
+    mode = focus["modes"][mode_id]
+    focus["manual"] = mode_id
+    focus["subject"] = subject if mode.get("with_subject") else None
+    if minutes:
+        start = now.replace(second=0, microsecond=0)
+        until = start + timedelta(minutes=int(minutes))
+        focus["manual_until"] = until.isoformat()
+        if suggests_breaks(mode_id, minutes) and breaks is not False:
+            # The first after 55 minutes, then every 55 while the end is not near.
+            k = 1
+            while True:
+                at = start + timedelta(minutes=k * BREAK_EVERY)
+                if at >= until or (k > 1 and at > until - timedelta(minutes=BREAK_MARGIN)):
+                    break
+                focus["breaks"].append(at.isoformat())
+                k += 1
+    return mode_id not in QUIET_ENTRY
+
+
+def manual_until(focus: dict) -> datetime | None:
+    return parse_dt(focus.get("manual_until")) if focus.get("manual") else None
+
+
+def manual_breaks(focus: dict) -> list[datetime]:
+    return [parse_dt(b) for b in focus.get("breaks") or []] if focus.get("manual") else []
+
+
+def manual_expired(focus: dict, now: datetime) -> bool:
+    """A timed hand-set mode whose time is up: the tick hands it back to the
+    schedule, and that is a breakpoint."""
+    until = manual_until(focus)
+    return until is not None and now >= until
+
+
 def scope_of(focus: dict, now: datetime) -> dict | None:
     """What Focused is on: by hand, the override's subject — a sphere
     (``{"kind": "sphere", "id": …}``) or a project (``{"kind": "project",
@@ -585,7 +677,13 @@ def next_breakpoint(focus: dict, now: datetime) -> datetime:
     """The next digest time or scheduled mode change, on whichever day of the
     week it falls — each day by its own plan. A scheduled step out of Rest is
     not a breakpoint (the morning digest opens the day); a manual override
-    suspends the schedule, so only digest times count until it is released."""
+    suspends the schedule, so only digest times count until it is released —
+    and a timed one brings its own: its suggested breaks and its end."""
+    until = manual_until(focus)
+    if until is not None:
+        ahead = [b for b in manual_breaks(focus) + [until] if b > now]
+        if ahead:
+            return min(ahead)
     m = minute_of_day(now)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     for offset in range(8):
@@ -603,13 +701,23 @@ def next_breakpoint(focus: dict, now: datetime) -> datetime:
 def due_events(focus: dict, now: datetime) -> set[str]:
     """What this minute is due for: ``digest`` at a digest time of the day's
     plan, ``mode`` at a scheduled change that counts as a breakpoint (see
-    next_breakpoint), and ``sweep`` every SWEEP_EVERY_MINUTES."""
+    next_breakpoint), ``break`` at a suggested breakpoint of a timed
+    hand-set mode (which holds the other two back), and ``sweep`` every
+    SWEEP_EVERY_MINUTES. The end of a timed mode is the tick's to notice
+    (manual_expired)."""
     m = minute_of_day(now)
     events = set()
-    if m in digest_times_on(focus, now.date()):
-        events.add("digest")
-    if not focus.get("manual") and m in _mode_changes(focus, now.date()):
-        events.add("mode")
+    until = manual_until(focus)
+    if until is not None and now < until:
+        # A timed hand-set mode: its suggested breaks, not the day's digests.
+        stamp = now.replace(second=0, microsecond=0)
+        if any(b.replace(second=0, microsecond=0) == stamp for b in manual_breaks(focus)):
+            events.add("break")
+    else:
+        if m in digest_times_on(focus, now.date()):
+            events.add("digest")
+        if not focus.get("manual") and m in _mode_changes(focus, now.date()):
+            events.add("mode")
     if m % SWEEP_EVERY_MINUTES == 0:
         events.add("sweep")
     return events
@@ -699,11 +807,13 @@ DIGEST_LINES = 5
 
 
 def digest_text(digest: dict, now: datetime) -> tuple[str, str]:
-    """The digest push: a title that says when and how much, and one line per
-    item, most pressing first; past DIGEST_LINES, how many more."""
+    """The digest push: a title that says when and how much — or, at a break
+    or the end of a hand-set mode, which (``label``) — and one line per item,
+    most pressing first; past DIGEST_LINES, how many more."""
     items = digest["items"]
     n = len(items)
-    title = f"Digest {digest['at'].strftime('%H:%M')} · {n} thing{'s' if n != 1 else ''} waited"
+    label = digest.get("label") or f"Digest {digest['at'].strftime('%H:%M')}"
+    title = f"{label} · {n} thing{'s' if n != 1 else ''} waited"
     lines = [digest_line(i, now) for i in items[:DIGEST_LINES]]
     if n > DIGEST_LINES:
         lines.append(f"… and {n - DIGEST_LINES} more")

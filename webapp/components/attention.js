@@ -41,6 +41,16 @@ function prefGet(key, fallback) {
 function prefSet(key, on) {
   try { localStorage.setItem(`retinue.attention.${key}`, on ? '1' : '0'); } catch (_e) { /* private mode */ }
 }
+// How long a mode set by hand runs: the menu's last choice on this device.
+const DURATIONS = [[0, 'until I change it'], [30, '30 min'], [60, '1 h'], [120, '2 h'], [180, '3 h']];
+const BREAK_EVERY = 55;   // attention.BREAK_EVERY: the suggested breakpoint rhythm past an hour
+function durGet() {
+  try { const v = Number(localStorage.getItem('retinue.attention.duration')); return DURATIONS.some(([m]) => m === v) ? v : 0; }
+  catch (_e) { return 0; }
+}
+function durSet(minutes) {
+  try { localStorage.setItem('retinue.attention.duration', String(minutes)); } catch (_e) { /* private mode */ }
+}
 
 const CSS = `
   :host { display: flex; flex-direction: column; min-height: 0; }
@@ -69,7 +79,8 @@ const CSS = `
   .subjects { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: -2px 0 10px 32px; }
   .scope-k { flex-basis: 100%; font-size: .68rem; letter-spacing: .08em; text-transform: uppercase;
              color: var(--muted, #8b93a3); margin: 2px 0 -2px; }
-  /* A scope makes the title long; on a phone the date yields to it. */
+  /* A scope, or a hand-set mode's end, makes the title long; on a phone the
+     date yields to it. */
   @media (max-width: 480px) { header.scoped .head-right .date { display: none; } }
   .subject { font-size: 12px; padding: 3px 9px; border-radius: 8px; cursor: pointer;
              border: 1px solid var(--line, rgba(231, 235, 242, .12));
@@ -161,6 +172,10 @@ const CSS = `
   .menu-fold { display: flex; gap: 10px; align-items: flex-start; margin: 14px 4px 0; cursor: pointer;
                padding-top: 12px; border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
   .menu-fold input { margin: 3px 0 0; accent-color: var(--accent, #6ea8fe); flex: none; }
+  /* How long a mode set by hand runs, chosen before the mode is tapped. */
+  .dur { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 0 4px 10px; }
+  .dur .scope-k { flex-basis: auto; margin: 0 4px 0 0; }
+  .dur-break { margin: -2px 4px 12px; padding-top: 0; border-top: 0; }
   .menu-fold b { display: block; font-size: .9rem; font-weight: 600; }
   .menu-fold small { color: var(--muted, #8b93a3); font-size: .78rem; }
 `;
@@ -174,6 +189,8 @@ class RetinueAttention extends HTMLElement {
     this._heldOpen = prefGet('held', false);
     this._waitingOpen = prefGet('waiting', false);
     this._notNowOpen = prefGet('not_now', false);
+    this._dur = durGet();
+    this._breaks = prefGet('breaks', true);
     this.shadowRoot.addEventListener('click', (e) => this._onClick(e));
     this._onChange = () => this.load();
     window.addEventListener('retinue-attention-change', this._onChange);
@@ -248,9 +265,12 @@ class RetinueAttention extends HTMLElement {
   async _setMode(mode, subject, project) {
     this._menu = false;
     try {
+      // A mode set by hand runs for the chosen while (and a long one with
+      // the suggested breakpoints, unless declined); the schedule takes none.
+      const timed = mode && this._dur ? { minutes: this._dur, breaks: this._dur > 60 ? this._breaks : null } : {};
       const res = await fetch('/attention/mode', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode: mode || null, subject: subject || null, project: project || null }),
+        body: JSON.stringify({ mode: mode || null, subject: subject || null, project: project || null, ...timed }),
       });
       if (!res.ok) throw new Error(String(res.status));
       this._data = await res.json();
@@ -278,6 +298,8 @@ class RetinueAttention extends HTMLElement {
       case 'toggle-waiting': this._waitingOpen = !this._waitingOpen; prefSet('waiting', this._waitingOpen); this.render(); break;
       case 'toggle-not_now': this._notNowOpen = !this._notNowOpen; prefSet('not_now', this._notNowOpen); this.render(); break;
       case 'fold': this._setFold(el.getAttribute('data-mode'), el.getAttribute('data-on') === '1'); break;
+      case 'dur': this._dur = Number(el.getAttribute('data-min')) || 0; durSet(this._dur); this.render(); break;
+      case 'breaks': this._breaks = !this._breaks; prefSet('breaks', this._breaks); this.render(); break;
       case 'new': location.hash = '#new'; break;
       case 'digest-done': this._closeDigest(); break;
       default: break;
@@ -394,12 +416,13 @@ class RetinueAttention extends HTMLElement {
         `${this._state === 'offline' ? 'Offline' : '&#8230;'}</span></span>${right}</header>`;
     }
     const schedUntil = (mode.scheduled || {}).until;
-    const until = mode.manual ? 'set by hand'
+    const until = mode.manual
+      ? (mode.manual_until ? `by hand until ${esc(fmtWhen(mode.manual_until))}` : 'set by hand')
       : (schedUntil ? `until ${esc(fmtWhen(schedUntil))}` : '');
     const scope = mode.subject || null;
     const subject = scope
       ? ` <span class="mode-subject" style="color:${scope.kind === 'project' ? 'inherit' : sphereColor(scope.id)}">· ${esc(scope.title || scope.id)}</span>` : '';
-    return `<header${scope ? ' class="scoped"' : ''}>` +
+    return `<header${scope || (mode.manual && mode.manual_until) ? ' class="scoped"' : ''}>` +
       `<button class="mode-head" data-act="mode-menu" aria-haspopup="dialog" ` +
       `title="${esc(mode.blurb || '')}">` +
       `<span class="dot" style="background:${modeColor(mode.id)}"></span>` +
@@ -443,12 +466,24 @@ class RetinueAttention extends HTMLElement {
       return row;
     }).join('');
     const sch = cur.scheduled || {};
+    // For how long, before which mode: a stretch set aside by hand ends by
+    // itself; past an hour, a breakpoint every 55 minutes is suggested.
+    const dur = `<div class="dur"><span class="scope-k">for</span>` +
+      DURATIONS.map(([m, label]) => `<button class="subject${this._dur === m ? ' on' : ''}" data-act="dur" data-min="${m}">${esc(label)}</button>`).join('') +
+      `</div>`;
+    const firstBreak = new Date(Date.parse(d.now || '') + BREAK_EVERY * 60000);
+    const breakAt = Number.isNaN(firstBreak.getTime()) ? '' : fmtWhen(firstBreak.toISOString());
+    const breaks = this._dur > 60
+      ? `<label class="menu-fold dur-break"><input type="checkbox" data-act="breaks"${this._breaks ? ' checked' : ''}>` +
+        `<span><b>A breakpoint every ${BREAK_EVERY} minutes</b><small>What waited arrives as one digest — the first at ${esc(breakAt)} — the moment to look up, then back to it.</small></span></label>` : '';
+    const endNote = cur.manual && cur.manual_until ? ` Now: ${esc(cur.name)} until ${esc(fmtWhen(cur.manual_until))}` +
+      `${(cur.breaks || []).length ? `, breakpoints ${cur.breaks.map((b) => esc(fmtWhen(b))).join(', ')}` : ''}.` : '';
     return `<div class="overlay" data-act="close-menu"><div class="menu" role="dialog" aria-label="Focus mode">` +
-      `<div class="menu-head">Focus mode</div>${rows}` +
+      `<div class="menu-head">Focus mode</div>${dur}${breaks}${rows}` +
       `<button class="menu-row follow${cur.manual ? '' : ' on'}" data-act="set-mode" data-mode="">` +
       `<span class="dot" style="background:${modeColor(sch.id)}"></span><span><b>Follow the schedule</b>` +
       `<small>${this._dayHtml(cur.day)}${esc(sch.name || '')}${sch.until ? ` until ${esc(fmtWhen(sch.until))}` : ''}</small></span></button>` +
-      `<div class="menu-note">A change by hand is a breakpoint: what was held is released, and the digest goes out.</div>` +
+      `<div class="menu-note">A change by hand is a breakpoint — what was held arrives as one digest — except into Focused, which keeps it for its breakpoints and its end; only what the focus lets through rings.${endNote}</div>` +
       `<label class="menu-fold"><input type="checkbox" data-act="fold" data-mode="${esc(cur.id)}" data-on="${cur.only_admitted ? '0' : '1'}"${cur.only_admitted ? ' checked' : ''}>` +
       `<span><b>In ${esc(cur.name)}, list only what it admits</b><small>The rest folds into “Not now”. Critical, permitted and pulled items stay.</small></span></label>` +
       `</div></div>`;
