@@ -13,7 +13,8 @@ the plumbing around it that the web-gateway and the boot emitter share:
   is kept here). Single-writer, one lock, atomic writes: the chat-state
   precedent.
 - **The clock.** Modes are a schedule over the local day, so the model needs
-  a zone: ``ATTENTION_TZ``, else ``TZ``, else the container's local zone.
+  a zone: ``ATTENTION_TZ``, else ``RETINUE_DISPLAY_TZ``, else ``TZ``, else
+  the container's local zone.
 - **The adapters** from a thread, a chat and a project row to a policy item,
   each carrying the display fields the home screen renders beside the three
   attention fields, and the way back (``block_for``) to the ``attention``
@@ -64,8 +65,15 @@ DEFAULT_SPHERES = ["customers", "admin", "health", "friends", "family", "system"
 
 
 def zone():
-    """The zone the schedule is read in (see the module docstring)."""
-    name = (os.environ.get("ATTENTION_TZ") or os.environ.get("TZ") or "").strip()
+    """The zone the schedule is read in (see the module docstring).
+
+    The containers run on UTC and the retinue service takes no env_file, so a
+    deployment that sets nothing here would switch modes and send digests on
+    UTC. RETINUE_DISPLAY_TZ — the zone the owner lives in, which the compose
+    file already passes for the approval pages — is therefore the fallback
+    before TZ; ATTENTION_TZ is only for a schedule that keeps another zone."""
+    name = (os.environ.get("ATTENTION_TZ") or os.environ.get("RETINUE_DISPLAY_TZ")
+            or os.environ.get("TZ") or "").strip()
     if name:
         try:
             from zoneinfo import ZoneInfo

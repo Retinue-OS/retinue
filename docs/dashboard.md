@@ -178,7 +178,9 @@ release what was held with one `Topic: digest` push (`Urgency: normal`), and a
 half-hourly sweep re-evaluates: an item that crossed into the next urgency
 band climbs, and one the mode now admits is pushed. Both run on the gateway's
 own tick (`ATTENTION_TICK_SECONDS`, default 20 s), with no browser open, in
-the deployment's zone (`ATTENTION_TZ`, else `TZ`, else the container's).
+the deployment's zone (`ATTENTION_TZ`, else `RETINUE_DISPLAY_TZ`, else `TZ`,
+else the container's, which is UTC — so a deployment sets
+`RETINUE_DISPLAY_TZ`, which the compose file already passes).
 Repeats are a per-class policy: a family sender writing again while held in
 *Rest* breaks through; anyone else waits with their first message. The
 per-device notification modes of the settings page keep working as a second

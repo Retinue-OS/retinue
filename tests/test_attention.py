@@ -350,6 +350,31 @@ def test_repeat_policy():
     assert not A.repeat_policy(item(sphere="family"), A.mode_at(focus, at(10)))["escalate"]
 
 
+def test_zone():
+    """The schedule's zone: ATTENTION_TZ, else RETINUE_DISPLAY_TZ (what the
+    compose file passes), else TZ — never UTC by accident when the owner's
+    zone is known."""
+    import os
+    import attention_store
+    names = ("ATTENTION_TZ", "RETINUE_DISPLAY_TZ", "TZ")
+    saved = {n: os.environ.get(n) for n in names}
+    try:
+        for n in names:
+            os.environ.pop(n, None)
+        os.environ["TZ"] = "America/New_York"
+        assert str(attention_store.zone()) == "America/New_York"
+        os.environ["RETINUE_DISPLAY_TZ"] = "Europe/Zurich"
+        assert str(attention_store.zone()) == "Europe/Zurich"
+        os.environ["ATTENTION_TZ"] = "Asia/Tokyo"
+        assert str(attention_store.zone()) == "Asia/Tokyo"
+    finally:
+        for n, v in saved.items():
+            if v is None:
+                os.environ.pop(n, None)
+            else:
+                os.environ[n] = v
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
