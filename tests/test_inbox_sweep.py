@@ -109,6 +109,32 @@ def test_gate(mod, tmp: Path):
           json.loads(mod.STATE_PATH.read_text()), {})
 
 
+def test_duplicate_ids(mod, tmp: Path):
+    print("inboxes sharing an id keep separate guards")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", {"inboxes": [{"id": "in", "path": "a"},
+                                       {"id": "in", "path": "b"}]})
+    (c / "a").mkdir()
+    (c / "b").mkdir()
+    (c / "a" / "one.pdf").write_text("1")
+    (c / "b" / "two.pdf").write_text("2")
+    check("first sweep spawns", h.tick(), True)
+    (c / "a" / "three.pdf").write_text("3")
+    check("a change in the first inbox spawns again", h.tick(), True)
+
+
+def test_state_write(mod, tmp: Path):
+    print("state is replaced atomically")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", inbox_manifest())
+    (c / "inbox").mkdir()
+    (c / "inbox" / "a.csv").write_text("1")
+    h.tick()
+    check("no temp file left behind",
+          sorted(p.name for p in mod.STATE_PATH.parent.iterdir()),
+          ["state.json"])
+
+
 def test_failed_session(mod, tmp: Path):
     print("failed session is retried with backoff")
     h = Harness(mod, tmp)
@@ -238,7 +264,8 @@ def test_hidden(mod, tmp: Path):
 
 
 def main():
-    for test in (test_gate, test_failed_session, test_killed_session,
+    for test in (test_gate, test_duplicate_ids, test_state_write,
+                 test_failed_session, test_killed_session,
                  test_manifests, test_symlinks, test_hidden):
         with tempfile.TemporaryDirectory() as d:
             test(load(), Path(d))

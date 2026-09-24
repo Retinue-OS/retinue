@@ -203,7 +203,10 @@ def signature(scan: list[dict]) -> dict:
     """
     sig: dict[str, dict[str, list]] = {}
     for item in scan:
-        key = f"{item['chamber']}:{item['id']}"
+        # Keyed by the inbox's path, not its manifest `id`: ids are free
+        # text and need not be unique, and two inboxes sharing one key would
+        # overwrite each other here and hide a change in the first.
+        key = f"{item['chamber']}:{Path(item['rel']).as_posix()}"
         entry: dict[str, list] = {}
         for f in item["files"]:
             try:
@@ -224,10 +227,15 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    # Written to a sibling and renamed into place, so a kill mid-write leaves
+    # the previous state rather than truncated JSON that loads as {} and
+    # drops the backoff.
+    tmp = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
     try:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True),
-                              encoding="utf-8")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True),
+                       encoding="utf-8")
+        os.replace(tmp, STATE_PATH)
     except OSError as e:
         # Losing the guard costs a duplicate session next tick, not correctness.
         print(f"[inbox-sweep] could not write state ({e})", file=sys.stderr)
