@@ -1,7 +1,7 @@
 ---
 name: archivist
 description: Ingestion orchestrator — empties the chamber inboxes declared in each chamber's .inbox.json, files every document to a declared destination, and gets its facts into the life store, preferring declarative converters over per-file extraction. Use when files are waiting in a chamber inbox (the inbox-sweep job dispatches this), to build or fix a converter for a recurring file type, and for a chamber's periodic extraction jobs described in its own guide.
-model: opus
+model: claude-fable-5-1
 tools: Agent, Bash, Read, Write, Edit, Glob, Grep
 ---
 
