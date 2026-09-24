@@ -1010,7 +1010,8 @@ services:
       - SMS_SIM_NUMBER
       # The phone's own number — this account's sending identity for
       # SMS_SEND_POLICY and the chat surface. Learned from the SIM when unset
-      # and the phone reports it; set it explicitly to be sure.
+      # and the phone reports it (many do not); until it is known, inbound SMS
+      # are held back (the phone retries) and sends refused. Set it explicitly.
       - SMS_ACCOUNT
       # Inbound: the public HTTPS URL the phone posts sms:received to (routed
       # to this service's POST /webhook), registered with the server at

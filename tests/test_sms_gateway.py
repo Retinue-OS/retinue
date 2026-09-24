@@ -193,6 +193,36 @@ def test_unpersisted_webhook_is_retryable():
     print("ok: a webhook that could not be persisted is refused retryably")
 
 
+def test_unknown_account_holds_inbound_and_outbound():
+    """Without SMS_ACCOUNT every record would lack kb:account, and one number
+    would become two chats once the account is learned. So nothing is
+    recorded, sent or reported healthy until the identity is known."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp, account="")
+        gw._forward_to_inbox = lambda *a: None
+        body, ts = _event(), str(int(time.time()))
+        status, _ = gw._accept_webhook(body, _sign(body, ts), ts)
+        assert status == 503, status
+        assert not list((Path(tmp) / "inbound").rglob("*.nt"))
+        try:
+            gw._push("+41791112233", "hi")
+        except RuntimeError as exc:
+            assert "SMS_ACCOUNT" in str(exc)
+        else:
+            raise AssertionError("sent without a sending identity")
+        gw._set_state(server_ok=True, devices=1, device_last_seen=time.time(),
+                      webhook_registered=True)
+        snap = gw._health_snapshot()
+        assert snap["connected"] is False and "SMS_ACCOUNT" in snap["error"], snap
+        # Once known (set, or learned from the SIM), the retry is taken.
+        gw.SMS_ACCOUNT = "+41790000000"
+        ts = str(int(time.time()))
+        status, _ = gw._accept_webhook(body, _sign(body, ts), ts)
+        assert status == 200, status
+        assert gw._health_snapshot()["connected"] is True
+    print("ok: an unknown sending identity holds inbound and outbound")
+
+
 def test_other_events_are_acknowledged_and_ignored():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load(tmp)

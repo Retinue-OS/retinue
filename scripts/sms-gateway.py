@@ -326,13 +326,20 @@ def _health_snapshot() -> dict:
     # Likewise without a registered webhook: the phone has nowhere to post.
     signing = bool(SMS_WEBHOOK_SIGNING_KEY)
     registered = bool(SMS_WEBHOOK_URL) and state["webhook_registered"]
-    connected = configured and signing and registered and state["server_ok"] and fresh
+    # And without a known sending identity: every record's kb:account, and so
+    # every chat's identity, is SMS_ACCOUNT — nothing is accepted until it is.
+    identified = bool(SMS_ACCOUNT)
+    connected = (configured and signing and registered and identified
+                 and state["server_ok"] and fresh)
     error = state["error"]
     if not configured:
         error = "SMS_SERVER_USERNAME / SMS_SERVER_PASSWORD are not set"
     elif not signing:
         error = ("SMS_WEBHOOK_SIGNING_KEY is not set — every inbound SMS is refused; "
                  "copy the key from the app (Settings → Webhooks → Signing Key)")
+    elif not identified and state["server_ok"] and not error:
+        error = ("the phone's own number is unknown (the phone does not report its "
+                 "SIM number) — set SMS_ACCOUNT; inbound SMS wait until it is")
     elif not SMS_WEBHOOK_URL:
         error = ("SMS_WEBHOOK_URL is not set — the phone has nowhere to deliver "
                  "inbound SMS; set it to the public URL routed to POST /webhook")
@@ -763,6 +770,11 @@ def _accept_webhook(body: bytes, signature: str | None, timestamp: str | None) -
         return 400, {"error": "body must be a JSON object"}
     _set_state(last_webhook=time.time())
     kind = str(event.get("event") or "")
+    if kind == "sms:received" and not SMS_ACCOUNT:
+        # Recording it now would write a record with no kb:account, and the
+        # same number would become a second chat once the account is known.
+        # The app retries with backoff, so the SMS waits rather than splits.
+        return 503, {"error": "sending identity not known yet (SMS_ACCOUNT); retry later"}
     if kind != "sms:received":
         # Acknowledged so the app does not retry an event this gateway never
         # asked for; nothing else happens.
@@ -994,6 +1006,8 @@ def _push(recipient: str, message: str, author: str = "agent") -> tuple[str | No
     recipient = normalized
     if not _configured():
         raise RuntimeError("the SMS server credentials are not configured")
+    if not SMS_ACCOUNT:
+        raise RuntimeError("the sending identity is unknown; set SMS_ACCOUNT")
     message_id = _server_send(recipient, message)
     sent_at = time.time()
     _record_outbound(recipient, message, author, message_id=message_id, timestamp=sent_at)
