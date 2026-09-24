@@ -866,10 +866,11 @@ services:
       - agents
 
   # SMS — opt-in, behind the `sms` compose profile (`docker compose --profile
-  # sms up -d`, or COMPOSE_PROFILES=sms in .env). Three services, all needed:
+  # sms up -d`, or COMPOSE_PROFILES=sms in .env). Four services, all needed:
   #
   #   sms-db      MariaDB for the server (it requires MySQL/MariaDB).
-  #   sms-server  the self-hosted android-sms-gateway private server
+  #   sms-server  the self-hosted android-sms-gateway private server (plus
+  #               sms-server-worker, its background tasks)
   #               (https://github.com/android-sms-gateway/server). The user's
   #               Android phone, running the SMS Gateway for Android app,
   #               registers with it under Settings → Cloud Server using the
@@ -913,20 +914,39 @@ services:
     depends_on:
       sms-db:
         condition: service_healthy
-    environment:
+    environment: &sms-server-env
       - GATEWAY__MODE=private
       - GATEWAY__PRIVATE_TOKEN=${SMS_SERVER_PRIVATE_TOKEN:-}
-      # Private mode wakes the phone through the vendor's upstream push relay
-      # (api.sms-gate.app) by default. Empty keeps every byte on this host; the
-      # phone then learns of queued sends on its own polling, so outbound SMS
-      # can take a little longer. Set it to use the relay.
-      - GATEWAY__UPSTREAM_URL=${SMS_SERVER_UPSTREAM_URL:-}
+      # How the server wakes the phone for a queued send depends on the phone,
+      # not on this file: a device registered with a push token is woken through
+      # the vendor's relay (api.sms-gate.app — the server's built-in default,
+      # which an empty value does NOT disable), and one registered without a
+      # token is sent the event over its own server-sent-events connection to
+      # this host. To keep every byte here, set the app's Cloud Server
+      # notification channel to SSE only before registering (docs/messaging.md).
       - HTTP__LISTEN=0.0.0.0:3000
       - DATABASE__HOST=sms-db
       - DATABASE__PORT=3306
       - DATABASE__USER=sms
       - DATABASE__PASSWORD=${SMS_DB_PASSWORD:-}
       - DATABASE__DATABASE=sms
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # The server's background tasks, run as a second process from the same image
+  # as upstream's own compose does: message hashing (the server replaces a
+  # processed message's content with a hash) and the cleanup of old messages,
+  # devices and tokens. Not on the send path, but without it SMS content would
+  # stay in the server's database indefinitely.
+  sms-server-worker:
+    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:latest}
+    profiles: ["sms"]
+    command: ["/app/app", "worker"]
+    depends_on:
+      sms-db:
+        condition: service_healthy
+    environment: *sms-server-env
     restart: unless-stopped
     networks:
       - agents

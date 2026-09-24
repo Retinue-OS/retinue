@@ -317,10 +317,17 @@ def _health_snapshot() -> dict:
     seen = max((t for t in (state["device_last_seen"], state["last_webhook"]) if t),
                default=None)
     fresh = seen is not None and (time.time() - seen) <= SMS_DEVICE_STALE_SECONDS
-    connected = configured and state["server_ok"] and fresh
+    # Without the signing key every inbound webhook is refused, so a healthy
+    # phone link with no key is still a dead inbox — reported as down, with
+    # the cause, rather than as a green channel that silently drops SMS.
+    signing = bool(SMS_WEBHOOK_SIGNING_KEY)
+    connected = configured and signing and state["server_ok"] and fresh
     error = state["error"]
     if not configured:
         error = "SMS_SERVER_USERNAME / SMS_SERVER_PASSWORD are not set"
+    elif not signing:
+        error = ("SMS_WEBHOOK_SIGNING_KEY is not set — every inbound SMS is refused; "
+                 "copy the key from the app (Settings → Webhooks → Signing Key)")
     elif not state["server_ok"] and not error:
         error = "the SMS server has not answered yet"
     elif not state["devices"] and not error:
@@ -339,7 +346,7 @@ def _health_snapshot() -> dict:
         "webhook_registered": state["webhook_registered"],
         # Signing is what authenticates the public webhook; without a key every
         # inbound SMS is refused, which the /gateways page should say.
-        "webhook_signing": bool(SMS_WEBHOOK_SIGNING_KEY),
+        "webhook_signing": signing,
         # There is no QR: the phone pairs by entering the server URL and the
         # private token in the app, and a stale phone is fixed on the phone.
         "needs_repair": False,
@@ -454,6 +461,21 @@ def _claim(key: str | None) -> bool:
         except OSError as exc:
             print(f"[sms-gateway] could not persist seen webhooks: {exc}", flush=True)
         return True
+
+
+def _unclaim(key: str | None) -> None:
+    """Undo a claim whose delivery could not be recorded, so its retry counts."""
+    if not key:
+        return
+    with _SEEN_LOCK:
+        seen = _load_seen()
+        if key not in seen:
+            return
+        seen.remove(key)
+        try:
+            _atomic_json(SMS_SEEN_WEBHOOKS_PATH, seen)
+        except OSError as exc:
+            print(f"[sms-gateway] could not persist seen webhooks: {exc}", flush=True)
 
 
 def _atomic_json(path: Path, data) -> None:
@@ -673,12 +695,19 @@ def _accept_webhook(body: bytes, signature: str | None, timestamp: str | None) -
     parsed = _parse_sms_received(event)
     if parsed is None:
         return 400, {"error": "sms:received without a sender"}
-    if not _claim(_dedup_key(parsed)):
+    key = _dedup_key(parsed)
+    if not _claim(key):
         return 200, {"status": "duplicate"}
     sender = parsed["sender"]
-    _record_recent_sender(sender)
     store_path = _persist_inbound(parsed["text"], sender, parsed["message_id"],
                                   parsed["received_at"])
+    if store_path is None:
+        # Not on disk means not delivered: release the claim and answer with a
+        # retryable error, so the app's backoff tries again instead of the
+        # message being acknowledged into nowhere.
+        _unclaim(key)
+        return 503, {"error": "could not persist the message; retry later"}
+    _record_recent_sender(sender)
     threading.Thread(
         target=_forward_safely, args=(parsed["text"], sender, store_path, parsed["message_id"]),
         name="sms-inbound", daemon=True,

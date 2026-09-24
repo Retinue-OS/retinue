@@ -134,6 +134,26 @@ def test_webhook_persists_once_and_hands_on():
     print("ok: a webhook is recorded once, redeliveries are deduplicated")
 
 
+def test_unpersisted_webhook_is_retryable():
+    """A message that did not reach the ledger must not be acknowledged: the
+    app stops retrying on a 2xx, so a 2xx here would lose the SMS for good."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp)
+        gw._forward_to_inbox = lambda *a: (_ for _ in ()).throw(AssertionError("handed on"))
+        real = gw._persist_inbound
+        gw._persist_inbound = lambda *a: None
+        body, ts = _event(), str(int(time.time()))
+        status, _ = gw._accept_webhook(body, _sign(body, ts), ts)
+        assert status == 503, status
+        # The claim was released, so the app's retry is taken, not deduplicated.
+        gw._persist_inbound = real
+        gw._forward_to_inbox = lambda *a: None
+        status, answer = gw._accept_webhook(body, _sign(body, ts), ts)
+        assert (status, answer) == (200, {"status": "accepted"}), (status, answer)
+        assert len(list((Path(tmp) / "inbound").rglob("*.nt"))) == 1
+    print("ok: a webhook that could not be persisted is refused retryably")
+
+
 def test_other_events_are_acknowledged_and_ignored():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load(tmp)
@@ -238,6 +258,10 @@ def test_http_webhook_is_signed_not_token_gated():
                                  "images": [{"data": "AA=="}]}).encode()
             status, answer = _post(f"{base}/send", images, {"Authorization": "Bearer gateway-token"})
             assert status == 400 and "text only" in answer["error"]
+            # Chat erasure needs the gateway token before the erase capability.
+            erase = json.dumps({"chat": "+41791112233"}).encode()
+            assert _post(f"{base}/chats/delete", erase,
+                         {"X-Chat-Erase-Token": "whatever"})[0] == 401
         finally:
             server.shutdown()
     print("ok: /webhook is authenticated by signature; everything else by token")
@@ -258,6 +282,13 @@ def test_health_reports_link_state():
         gw._set_state(last_webhook=time.time())
         assert gw._health_snapshot()["connected"] is True
         json.dumps(snap)
+    with tempfile.TemporaryDirectory() as tmp:
+        # A healthy phone link with no signing key is still a dead inbox.
+        gw = _load(tmp, signing_key="")
+        gw._set_state(server_ok=True, devices=1, device_last_seen=time.time())
+        snap = gw._health_snapshot()
+        assert snap["connected"] is False and snap["webhook_signing"] is False
+        assert "SMS_WEBHOOK_SIGNING_KEY" in snap["error"]
     print("ok: health reports the phone's link state")
 
 

@@ -164,9 +164,10 @@ image attachments only.
 SMS runs through the user's own Android phone: the
 [SMS Gateway for Android](https://github.com/capcom6/android-sms-gateway) app,
 paired with a **self-hosted**
-[android-sms-gateway server](https://github.com/android-sms-gateway/server), so
-no third-party relay sees the messages. Three services under the `sms` compose
-profile: `sms-db` (the server's MariaDB), `sms-server` (the private server) and
+[android-sms-gateway server](https://github.com/android-sms-gateway/server).
+Four services under the `sms` compose profile: `sms-db` (the server's MariaDB),
+`sms-server` (the private server), `sms-server-worker` (its background tasks —
+hashing processed message content and cleaning up old records) and
 `sms-gateway` (`scripts/sms-gateway.py`, the channel gateway — same `/send`,
 `/pending-sends`, `/undelivered`, `/health` contract as the others, same
 ledger, delivery gate and chat surface). Send with the thin CLI — text only:
@@ -213,16 +214,22 @@ Two deliberate differences from the other channels:
    `docker-compose.override.example.yml`).
 3. In the app: Settings → Cloud Server → API URL
    `https://sms.<domain>/api/mobile/v1`, Private Token =
-   `SMS_SERVER_PRIVATE_TOKEN`. Once registered, the app shows a username and
+   `SMS_SERVER_PRIVATE_TOKEN`, and — to keep the vendor out entirely (below) —
+   the notification channel set to SSE only. Once registered, the app shows a username and
    password: put them in `SMS_SERVER_USERNAME` / `SMS_SERVER_PASSWORD`.
 4. In the app: Settings → Webhooks → Signing Key → copy it into
    `SMS_WEBHOOK_SIGNING_KEY`; set `SMS_WEBHOOK_URL=https://sms.<domain>/webhook`.
    Restart `sms-gateway`; `/gateways` shows it connected once the phone checks in.
 
-By default `SMS_SERVER_UPSTREAM_URL` is empty, keeping the server off the
-vendor's push relay (`api.sms-gate.app`); the phone then finds queued sends on
-its own polling, so outbound SMS can lag. Set it to trade that privacy for
-speed. There is no QR re-pairing: a "not seen recently" on `/gateways` is fixed
+**Keeping the vendor out.** Messages never pass through a third party, but
+*wake-ups* can: the server tells the phone about a queued send through the
+vendor's push relay (`api.sms-gate.app`) whenever the phone registered with a
+push token, and that relay is the server's built-in default — it cannot be
+switched off from the server side. A phone registered with the app's
+notification channel set to SSE only has no push token, and the server then
+sends the event over the phone's own server-sent-events connection to
+`sms-server` instead, so nothing leaves this host. Choose it before
+registering (or re-register after switching). There is no QR re-pairing: a "not seen recently" on `/gateways` is fixed
 on the phone (is the app running, allowed in the background, online?).
 
 ## What an agent session can see
