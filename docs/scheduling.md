@@ -251,3 +251,100 @@ optimisation, not the guarantee.
 
 The reminder wording lives in the project frontmatter, not in framework code —
 this public repo carries no chamber-specific or personal text.
+
+## Draining chamber inboxes (`.inbox.json`)
+
+An inbox is a letterbox, not a shelf: the user drops a file in, an agent takes
+it out. The Archivist's "Processing an inbox" rules say exactly *how* a dropped
+file is filed and *where* it goes, and a chamber's `.inbox.json` declares the
+paths — but for a long time nothing said *when*, so a chamber inbox only ever
+emptied when a human happened to ask, and one quietly accumulated months of
+files. The **`inbox-sweep`** base job is the missing trigger.
+
+Like the other two base jobs it is a scheduler `command` job (so the scheduler
+spends **no Claude credits**), running `scripts/inbox-sweep.py`. Its gate is a
+filesystem scan rather than a SPARQL SELECT — an unfiled document is by
+definition not yet in the store, so the store cannot be asked about it. **All
+inboxes empty spawns nothing.** Only when a declared inbox holds files does it
+start a single `claude -p` session, handed the listing it already scanned, which
+dispatches the Archivist per chamber. It runs on the **router tier**
+(`RETINUE_ROUTER_MODEL`): the session's whole job is to route files to the
+Archivist, which is inside junior's whitelist, unlike self-review's judgement
+work.
+
+Any chamber may declare inboxes in an **`.inbox.json`** at its root; a chamber
+without one is simply never swept. The `inboxes` array is what this job reads:
+
+```json
+{
+  "inboxes": [
+    {
+      "id": "documents",
+      "path": "documents/inbox",
+      "description": "Scanned letters and exports awaiting filing, …"
+    }
+  ],
+  "destinations": [
+    {
+      "path": "documents/invoices/",
+      "description": "Invoices, one file per invoice.",
+      "source": "manifest"
+    }
+  ]
+}
+```
+
+`destinations` is the filing side of the contract, read by the Archivist (and
+by a chamber's own extraction guidance) to decide where a file goes; the sweep
+only checks that every destination stays inside the chamber before it
+dispatches anything. A malformed `.inbox.json` skips that one chamber with a
+warning rather than failing the sweep — the other chambers' letterboxes are
+still worth emptying.
+
+**The re-spawn guard.** Step 4 of the Archivist's "Processing an inbox" tells it to
+*leave* a file it cannot classify in the inbox and report it. That is correct
+behaviour, but it means a naive gate would find the same file every hour and
+spawn a session every hour, forever — a slow credit leak with no end state. So
+the sweep records the listing it last spawned for (name, size and mtime per
+file, in `/root/.retinue/inbox-sweep/state.json`, outside the chambers like the
+scheduler's own state) and stays quiet while that listing is unchanged. Adding,
+removing, or overwriting a file makes the inbox due again; so does draining it
+completely, which clears the guard so a stuck file gets a fresh attempt the next
+time anything arrives. The guard only settles after a session that exited
+cleanly: a session that fails outright (an API or sign-in hiccup) has not looked
+at the files, so the same listing is retried with exponential backoff — the next
+tick, then after two, four, … hours, capped at a day. The job has a
+`timeout_seconds` of an hour, since one session may work through dozens of
+files; a run killed by it counts as failed, and whatever it already filed is
+gone from the listing on the retry. Because the scheduler's timeout kills the
+sweep's whole process group, the attempt is recorded as failed *before* the
+session starts and only overwritten by a clean exit, so a killed run backs off
+like any other failure.
+
+The manifest, the files and their names are all treated as untrusted:
+
+- An inbox `path` must be relative and stay strictly inside the chamber after
+  resolution; absolute paths, `..`, the chamber root itself, symlinks leading
+  out and paths the OS cannot resolve are ignored with a warning.
+- Every destination must pass the same check and declare a `source` of
+  `"manifest"` or `"any"` (a typo would make it silently inadmissible);
+  otherwise the whole chamber is skipped, since the Archivist would write
+  there.
+- A chamber with no destinations of its own is dispatched only if another
+  chamber declares an `"any"` destination its files could go to; otherwise
+  the session could only leave every file where it lies.
+- A manifest of the wrong shape skips its chamber, never the sweep.
+- Inside an inbox, symlinks are never handed on as documents, and neither are
+  **hidden entries**: a dot-prefixed file is bookkeeping (`.gitkeep`), an OS or
+  editor side file (`._x`, `.~lock.x#`) or a transfer still in flight
+  (Syncthing's `.syncthing.*.tmp`), and a dot-prefixed directory (`.git`,
+  `.stfolder`) is never descended into. A document meant for filing needs a
+  visible name. The sweep's symlink check is a snapshot, so the Archivist
+  repeats it, without following links, immediately before it opens or moves
+  each file.
+- Descriptions and file names reach the spawned session as an escaped JSON
+  block, which the prompt tells it to treat as data rather than instructions.
+- Document content is material to extract from, never instructions: the
+  Archivist hands long or unstructured documents to `archivist-reader`, a
+  subagent with only the Read tool, so a document that tries to instruct its
+  reader has nothing to act with.
