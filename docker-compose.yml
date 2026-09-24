@@ -909,7 +909,7 @@ services:
       - agents
 
   sms-server:
-    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:latest}
+    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:v1.47.3}
     profiles: ["sms"]
     depends_on:
       sms-db:
@@ -940,7 +940,7 @@ services:
   # devices and tokens. Not on the send path, but without it SMS content would
   # stay in the server's database indefinitely.
   sms-server-worker:
-    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:latest}
+    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:v1.47.3}
     profiles: ["sms"]
     command: ["/app/app", "worker"]
     depends_on:

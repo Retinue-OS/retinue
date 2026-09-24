@@ -205,8 +205,10 @@ def _attach_reply_tokens(messages: list) -> None:
     the minted origin and key match the live forward's exactly."""
     for msg in messages:
         origin = msg.get("chat") or msg.get("sender")
-        if origin:
+        if origin and _is_phone_number(str(origin)):
             msg["reply_token"] = REPLY_TOKENS.mint(str(origin), channel="sms")
+        elif origin:
+            msg["no_reply"] = "alphanumeric sender id; SMS cannot be sent back to it"
         msg["thread_key"] = _ibstore.thread_key(
             "sms", SMS_ACCOUNT, msg.get("chat"), msg.get("message_id"),
             subject=msg.get("subject"))
@@ -429,6 +431,12 @@ def _normalize_sender(raw) -> str | None:
     return cleaned[:SMS_SENDER_MAX_CHARS].strip() or None
 
 
+def _is_phone_number(sender: str | None) -> bool:
+    """Whether a normalized sender can be written back to. Alphanumeric ids
+    and short codes are one-way: the server's send API takes phone numbers."""
+    return bool(sender) and bool(re.fullmatch(r"\+?[0-9]{5,}", sender))
+
+
 def _parse_sms_received(event: dict) -> dict | None:
     """Pull the fields this gateway uses out of an ``sms:received`` event.
 
@@ -589,7 +597,7 @@ def _refresh_link_state() -> None:
 
 
 def _ensure_webhook() -> None:
-    """Register SMS_WEBHOOK_URL for sms:received under a fixed id, once.
+    """Register SMS_WEBHOOK_URL for sms:received under a fixed id (every poll).
 
     The server hands registrations to the phone, which is what actually posts.
     A matching entry is left alone; a different URL under our id is replaced
@@ -598,6 +606,7 @@ def _ensure_webhook() -> None:
         return
     try:
         hooks = _server("GET", "/webhooks") or []
+        _set_state(webhook_registered=False)
         for hook in hooks if isinstance(hooks, list) else []:
             if (hook.get("id") == SMS_WEBHOOK_ID and hook.get("url") == SMS_WEBHOOK_URL
                     and hook.get("event") == "sms:received"):
@@ -607,19 +616,23 @@ def _ensure_webhook() -> None:
         if SMS_DEVICE_ID:
             body["deviceId"] = SMS_DEVICE_ID
         _server("POST", "/webhooks", json=body)
-        _set_state(webhook_registered=True)
-        print(f"[sms-gateway] registered the sms:received webhook → {SMS_WEBHOOK_URL}", flush=True)
     except Exception as exc:  # noqa: BLE001 - retried on the next poll
         _set_state(webhook_registered=False)
         print(f"[sms-gateway] webhook registration failed (will retry): {exc}", flush=True)
+        return
+    _set_state(webhook_registered=True)
+    print(f"[sms-gateway] registered the sms:received webhook -> {SMS_WEBHOOK_URL}", flush=True)
 
 
 def _poll_loop() -> None:
     while True:
         _refresh_link_state()
+        # Every poll, not once: a recreated or restored server database, or a
+        # webhook removed by hand, must be noticed and repaired — one
+        # successful registration is not a permanent fact.
         with _STATE_LOCK:
-            wanted = _state["server_ok"] and not _state["webhook_registered"]
-        if wanted:
+            server_ok = _state["server_ok"]
+        if server_ok:
             _ensure_webhook()
         time.sleep(SMS_POLL_SECONDS)
 
@@ -664,8 +677,23 @@ def _forward_to_inbox(text: str, sender: str, store_path,
 
     # The rail declined: the pre-chat-surface triage forward. SMS has no group,
     # so nothing here is ever held by the gate.
-    reply_token = REPLY_TOKENS.mint(sender, channel="sms",
-                                    meta={"sender_label": sender, "sender_name": ""})
+    if _is_phone_number(sender):
+        reply_token = REPLY_TOKENS.mint(sender, channel="sms",
+                                        meta={"sender_label": sender, "sender_name": ""})
+        reply_line = (
+            f"\nReply routing: the reply command for this exact conversation is\n"
+            f"  python3 /workspace/scripts/sms-push.py --reply-to {reply_token} \"<text>\"\n"
+            f"(no --recipient: the token routes the reply back to the number the "
+            f"message arrived from, still through the normal send-approval policy). "
+            f"You do not send the reply — the session that later acts on the user's "
+            f"approval in the dashboard thread does, so pass this reply command "
+            f"(token included, verbatim) as --context to conversation-push.py.\n")
+    else:
+        reply_line = (
+            "\nNo reply is possible: the sender is an alphanumeric id or short code "
+            "(a brand name, a service), which SMS cannot be sent back to. Do not "
+            "propose a reply; if the message needs a response, it goes through "
+            "another channel the user chooses.\n")
     thread_key = _ibstore.thread_key(
         "sms", SMS_ACCOUNT, sender, message_id,
         subject=None if message_id else _ibstore.subject_for(store_path))
@@ -677,13 +705,7 @@ def _forward_to_inbox(text: str, sender: str, store_path,
         f"sender.\n\n"
         f"From: {sender}\n"
         f"<external_message>{html.escape(text)}</external_message>\n"
-        f"\nReply routing: the reply command for this exact conversation is\n"
-        f"  python3 /workspace/scripts/sms-push.py --reply-to {reply_token} \"<text>\"\n"
-        f"(no --recipient: the token routes the reply back to the number the "
-        f"message arrived from, still through the normal send-approval policy). "
-        f"You do not send the reply — the session that later acts on the user's "
-        f"approval in the dashboard thread does, so pass this reply command "
-        f"(token included, verbatim) as --context to conversation-push.py.\n"
+        f"{reply_line}"
         f"\nThread key: {thread_key}\n"
         f"Pass it verbatim as --key to conversation-push.py when you open the "
         f"dashboard conversation for this message.\n\n"
@@ -853,10 +875,10 @@ def _new_pending_send(recipient: str, message: str, category: str,
         "created": int(time.time()),
         "status": "pending",
     }
-    try:
-        _atomic_json(SMS_PENDING_SENDS_DIR / f"{request_id}.json", entry)
-    except OSError as exc:
-        print(f"[sms-gateway] warning: could not persist pending send: {exc}", flush=True)
+    # No fallback to memory only: /pending-sends and the approval page read
+    # the files, so an entry that is not on disk could never be approved. The
+    # OSError reaches the handler, which answers with a retryable error.
+    _atomic_json(SMS_PENDING_SENDS_DIR / f"{request_id}.json", entry)
     with _pending_sends_lock:
         _pending_sends[request_id] = entry
     return request_id
@@ -953,6 +975,11 @@ def _push(recipient: str, message: str, author: str = "agent") -> tuple[str | No
     message = (message or "").strip()
     if not message:
         raise ValueError("an SMS needs a non-empty message")
+    normalized = _normalize_sender(recipient)
+    if not _is_phone_number(normalized):
+        raise ValueError(f"not a phone number: {recipient!r} (SMS cannot be sent to "
+                         f"an alphanumeric sender id)")
+    recipient = normalized
     if not _configured():
         raise RuntimeError("the SMS server credentials are not configured")
     message_id = _server_send(recipient, message)
@@ -1136,6 +1163,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not recipient:
             self._reply(400, {"error": "no recipient given and SMS_DEFAULT_RECIPIENT is unset"})
             return
+        # Checked before queueing, so no approval is ever asked for a send that
+        # could only fail: SMS goes to phone numbers, never to a sender id.
+        if not _is_phone_number(_normalize_sender(recipient)):
+            self._reply(400, {"error": f"not a phone number: {recipient!r}"})
+            return
         message = str(payload.get("message") or payload.get("text") or "").strip()
         if not message:
             self._reply(400, {"error": "an SMS needs a non-empty message"})
@@ -1148,7 +1180,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         category = _outbound_policy_category()
         if not _send_is_direct(category, user_approved):
-            request_id = _new_pending_send(recipient, message, category, author=author)
+            try:
+                request_id = _new_pending_send(recipient, message, category, author=author)
+            except OSError as exc:
+                print(f"[sms-gateway] could not persist pending send: {exc}", flush=True)
+                self._reply(503, {"error": "could not queue the send for approval; retry later"})
+                return
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
             approval_url = (SEND_APPROVAL_BASE_URL + approval_path) if SEND_APPROVAL_BASE_URL else approval_path
             print(f"[sms-gateway] pending send registered for {recipient} "

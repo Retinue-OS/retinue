@@ -232,6 +232,82 @@ def test_triage_prompt_frames_sms_as_untrusted_data():
     print("ok: the triage prompt carries the SMS only as escaped external data")
 
 
+def test_alphanumeric_senders_get_no_reply_route():
+    """A brand-name sender cannot be written back to, so neither the live
+    prompt nor the drain may hand triage a reply command for it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp)
+        posted = []
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {}
+        gw._chats.notify_chat_event = lambda **kw: None
+        gw.requests.post = lambda url, json=None, timeout=None: (posted.append(json), _Resp())[1]
+        path = gw._persist_inbound("Your parcel arrives today", "DHL", "m7", None)
+        gw._forward_to_inbox("Your parcel arrives today", "DHL", path, "m7")
+        prompt = posted[0]["message"]
+        assert "--reply-to" not in prompt and "No reply is possible" in prompt, prompt
+        drained = [{"chat": "DHL", "sender": "DHL"}, {"chat": "+41791112233"}]
+        gw._attach_reply_tokens(drained)
+        assert "reply_token" not in drained[0] and drained[0]["no_reply"]
+        assert drained[1]["reply_token"]
+        try:
+            gw._push("DHL", "hi")
+        except ValueError as exc:
+            assert "not a phone number" in str(exc)
+        else:
+            raise AssertionError("an alphanumeric recipient was accepted")
+    print("ok: alphanumeric senders get no reply route and cannot be sent to")
+
+
+def test_pending_send_not_on_disk_is_refused():
+    """The approval page reads the files: a queued send that could not be
+    written would be unapprovable, so /send must fail retryably instead."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp, token="t")
+
+        def _fail(*a, **kw):
+            raise OSError("disk full")
+        gw._atomic_json = _fail
+        server, base = _serve(gw)
+        try:
+            send = json.dumps({"recipient": "+41791112233", "message": "x"}).encode()
+            status, answer = _post(f"{base}/send", send, {"Authorization": "Bearer t"})
+            assert status == 503, (status, answer)
+            assert gw._list_pending_sends_store() == [] and gw._pending_sends == {}
+        finally:
+            server.shutdown()
+    print("ok: a pending send that cannot be persisted is refused retryably")
+
+
+def test_webhook_registration_is_reconciled():
+    """A webhook that vanished from the server (DB restored, removed by hand)
+    is noticed and registered again, not trusted forever."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp)
+        hooks, posts = [], []
+
+        def _server(method, path, **kw):
+            if method == "GET":
+                return list(hooks)
+            posts.append(kw["json"])
+            hooks.append(kw["json"])
+            return kw["json"]
+        gw._server = _server
+        gw._ensure_webhook()
+        assert len(posts) == 1 and gw._state["webhook_registered"] is True
+        gw._ensure_webhook()                     # still there → nothing to do
+        assert len(posts) == 1
+        hooks.clear()                            # the server lost it
+        gw._ensure_webhook()
+        assert len(posts) == 2 and gw._state["webhook_registered"] is True
+    print("ok: webhook registration is reconciled against the server")
+
+
 def test_send_policy_and_pending_store():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load(tmp, policy=[{"number": "+41 79 000 00 00", "category": "allow"}])
