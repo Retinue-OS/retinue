@@ -325,7 +325,11 @@ The manifest is treated as untrusted: an inbox `path` must be relative and stay
 strictly inside the chamber after resolution (absolute paths, `..`, the chamber
 root itself and symlinks leading out are ignored with a warning); a destination
 `path` that fails the same check skips the whole chamber, since the Archivist
-would write there; a manifest of the wrong shape skips its chamber. Inside an
+would write there, and so does a destination whose `source` is not one of
+`"manifest"` or `"any"` (a typo would make it silently inadmissible); a
+manifest of the wrong shape skips its chamber. Descriptions and file names
+reach the spawned session as an escaped JSON block, which the prompt tells it
+to treat as data rather than instructions. Inside an
 inbox, symlinks are never handed on as documents, and neither are **hidden
 entries**: a dot-prefixed file is bookkeeping (`.gitkeep`), an OS or editor
 side file (`._x`, `.~lock.x#`) or a transfer still in flight (Syncthing's

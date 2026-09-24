@@ -60,9 +60,10 @@ in it.
 - Route by **description**: read what each destination says it holds and
   decide where the file belongs. There are no globs or match rules — the
   chamber's extraction guide may add source-specific hints.
-- The destination carries the acceptance policy. `"source": "manifest"` takes
-  only files from an inbox declared in the *same* manifest; `"source": "any"`
-  also takes files routed from another chamber's inbox. A file may cross
+- The destination carries the acceptance policy, and `source` is required.
+  `"source": "manifest"` takes only files from an inbox declared in the
+  *same* manifest; `"source": "any"` also takes files routed from another
+  chamber's inbox. A file may cross
   chambers only into an `"any"` destination of the receiving chamber.
 - You never fetch. You work on files already sitting in an inbox; retrieving
   external data is `scripts/refresh.py`'s job.
