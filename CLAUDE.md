@@ -179,11 +179,12 @@ resting projects when their date comes. The rules that make them work:
 
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 
-## Messaging (Signal, WhatsApp, Telegram, e-mail)
+## Messaging (Signal, WhatsApp, Telegram, SMS, e-mail)
 
 Outbound pushes go through the thin CLIs — `scripts/signal-push.py`,
 `whatsapp-push.py`, `telegram-push.py` (text, `--image`; Signal also speaks a
-voice rendering; `--url` picks the account's gateway). The message text for a
+voice rendering; `--url` picks the account's gateway) and, where the opt-in
+SMS channel runs, `sms-push.py` (text only). The message text for a
 human comes from the `secretary` subagent (see **Routing**) — dispatch, then
 send its text verbatim. **Before any send to a
 named person, apply the `messaging-contact-lookup` skill** (recent chats

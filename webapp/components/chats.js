@@ -53,6 +53,7 @@ export const CHANNELS = {
   signal: { label: 'Signal', mark: 'S', color: '#3a76f0' },
   whatsapp: { label: 'WhatsApp', mark: 'W', color: '#25d366' },
   telegram: { label: 'Telegram', mark: 'T', color: '#2aabee' },
+  sms: { label: 'SMS', mark: 'M', color: '#8e7cc3' },
 };
 
 export function channelMarkHtml(channel) {

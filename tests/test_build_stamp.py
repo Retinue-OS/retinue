@@ -42,6 +42,7 @@ GATEWAY_DOCKERFILES = {
     "signal": REPO_ROOT / "signal-gateway" / "Dockerfile",
     "telegram": REPO_ROOT / "telegram-gateway" / "Dockerfile",
     "whatsapp": REPO_ROOT / "whatsapp-gateway" / "Dockerfile",
+    "sms": REPO_ROOT / "sms-gateway" / "Dockerfile",
 }
 # Every image that reports a build, including the main one.
 STAMPED_DOCKERFILES = dict(GATEWAY_DOCKERFILES, retinue=REPO_ROOT / "Dockerfile")
@@ -214,12 +215,13 @@ def test_compose_forwards_the_sha_to_every_stamped_image():
     try:
         import yaml  # noqa: PLC0415 - optional; the check degrades to a text scan
     except ImportError:
-        assert compose.count("RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}") == 4, \
-            "all four stamped services must forward the build arg"
+        assert compose.count("RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}") == 5, \
+            "all five stamped services must forward the build arg"
         print("PASS test_compose_forwards_the_sha_to_every_stamped_image (text scan)")
         return
     services = yaml.safe_load(compose)["services"]
-    for service in ("retinue", "signal-gateway", "telegram-gateway", "whatsapp-gateway"):
+    for service in ("retinue", "signal-gateway", "telegram-gateway", "whatsapp-gateway",
+                    "sms-gateway"):
         build = services[service].get("build")
         assert isinstance(build, dict), f"{service}: build must be a mapping to carry args"
         assert build.get("args", {}).get("RETINUE_BUILD_SHA") == "${RETINUE_BUILD_SHA:-}", \
@@ -286,7 +288,7 @@ def test_every_messenger_gateway_publishes_its_build_on_health():
     """
     escaped_before = {d for d in IMPORT_TIME_DEFAULT_DIRS if d.exists()}
     stamps = {}
-    for name in ("signal", "telegram", "whatsapp"):
+    for name in ("signal", "telegram", "whatsapp", "sms"):
         with tempfile.TemporaryDirectory() as raw:
             gw = _load_gateway(name, Path(raw))
             snapshot = gw._health_snapshot()

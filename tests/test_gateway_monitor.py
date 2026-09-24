@@ -219,6 +219,36 @@ def test_builtin_channels_filter():
             os.environ.pop(key, None)
 
 
+def test_sms_enrols_only_with_its_base_url():
+    """SMS is opt-in: the base compose never sets SMS_GATEWAY_BASE_URL, so an
+    unset channel list must not drag a never-started sms-gateway into the
+    monitor (which would report it as an outage on every boot)."""
+    import messenger_gateways
+    keys = ("SIGNAL_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_BASE_URL",
+            "TELEGRAM_GATEWAY_BASE_URL", "SMS_GATEWAY_BASE_URL",
+            "SMS_GATEWAY_TOKEN", "MESSENGER_GATEWAYS", "MESSENGER_BUILTIN_CHANNELS")
+    for key in keys:
+        os.environ.pop(key, None)
+    os.environ["SIGNAL_GATEWAY_BASE_URL"] = "http://signal-gateway:8090"
+    try:
+        assert set(messenger_gateways.channel_gateways("[test]")) == {"signal-gateway"}
+        os.environ["SMS_GATEWAY_BASE_URL"] = "http://sms-gateway:8095"
+        os.environ["SMS_GATEWAY_TOKEN"] = "t"
+        registry = messenger_gateways.channel_gateways("[test]")
+        assert set(registry) == {"signal-gateway", "sms-gateway"}
+        assert registry["sms-gateway"] == {
+            "base_url": "http://sms-gateway:8095", "token": "t", "label": "SMS"}
+        # An explicit channel list still has the final say.
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal"
+        assert set(messenger_gateways.channel_gateways("[test]")) == {"signal-gateway"}
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal,sms"
+        assert set(messenger_gateways.channel_gateways("[test]")) == {
+            "signal-gateway", "sms-gateway"}
+    finally:
+        for key in keys:
+            os.environ.pop(key, None)
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failures = 0

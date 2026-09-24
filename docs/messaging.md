@@ -1,4 +1,4 @@
-# Outbound messaging — Signal, WhatsApp, Telegram
+# Outbound messaging — Signal, WhatsApp, Telegram, SMS
 
 *Reference depth for the "Messaging" digest in `CLAUDE.md`. Read this before
 sending on an unfamiliar channel or account, changing send policies, enrolling
@@ -82,10 +82,11 @@ themselves — and a queued send nobody approves is a message never sent.
 
 ## Multiple gateways per channel
 
-The `/sends` page enrols the three built-in
+The `/sends` page enrols the built-in
 gateways when their `*_GATEWAY_BASE_URL` is set and their name is included in
-`MESSENGER_BUILTIN_CHANNELS` (default: all three — see "Gateway connection
-monitoring" below), but a deployment often runs
+`MESSENGER_BUILTIN_CHANNELS` (default: all four — `signal`, `whatsapp`,
+`telegram`, `sms`; SMS additionally needs `SMS_GATEWAY_BASE_URL`, which the base
+compose leaves unset — see "Gateway connection monitoring" below), but a deployment often runs
 *more than one* gateway on a channel — most commonly a second Signal identity,
 the user's **personal** account (`signal-gateway-personal`) alongside the
 system one. Those extra gateways are enrolled by the deployment via
@@ -159,6 +160,79 @@ the fail-safe default means every send needs approval unless a policy entry gran
 it. Pending Telegram sends appear on `/sends` with the others. Text plus optional
 image attachments only.
 
+## SMS (the same model, opt-in)
+
+SMS runs through the user's own Android phone: the
+[SMS Gateway for Android](https://github.com/capcom6/android-sms-gateway) app,
+paired with a **self-hosted**
+[android-sms-gateway server](https://github.com/android-sms-gateway/server).
+Four services under the `sms` compose profile: `sms-db` (the server's MariaDB),
+`sms-server` (the private server), `sms-server-worker` (its background tasks —
+hashing processed message content and cleaning up old records) and
+`sms-gateway` (`scripts/sms-gateway.py`, the channel gateway — same `/send`,
+`/pending-sends`, `/undelivered`, `/health` contract as the others, same
+ledger, delivery gate and chat surface). Send with the thin CLI — text only:
+
+```bash
+python3 /workspace/scripts/sms-push.py --recipient +41791234567 "Running ten minutes late"
+python3 /workspace/scripts/sms-push.py --reply-to <token> "Thanks, see you then"
+```
+
+Outbound is gated by `SMS_SEND_POLICY`, keyed by the phone's own number
+(`SMS_ACCOUNT`), default `verify`. "Sent" means the server accepted the message
+for the phone; the phone transmits it on its next contact with the server.
+There is no contact directory: `/contacts` and `/recent-chats` both answer from
+the numbers that wrote in or were written to, so name lookup for SMS goes
+through the chambers' own contacts.
+
+Two deliberate differences from the other channels:
+
+- **Inbox mode only.** SMS sender ids are trivially forged, so an
+  accepted-requesters allowlist keyed on one would authenticate nothing; an SMS
+  account is never a `control` channel. Every inbound SMS is untrusted
+  external data — on the triage fallback path it reaches the model only
+  HTML-escaped inside `<external_message>`, framed as data, never as
+  instructions, and nothing ever replies to a sender by itself.
+- **Inbound is a signed webhook.** The phone POSTs each received SMS to
+  `SMS_WEBHOOK_URL`, which the deployment routes to `sms-gateway`'s
+  `POST /webhook` — outside the dashboard's edge auth, since the app can present
+  neither a client certificate nor the basic-auth password. The app signs every
+  webhook (HMAC-SHA256 over body + `X-Timestamp`) under its signing key; the
+  gateway refuses anything unsigned, wrongly signed or older than three days
+  (the app's retry window), and refuses everything while
+  `SMS_WEBHOOK_SIGNING_KEY` is unset. Redeliveries are deduplicated by message
+  id. The gateway registers the webhook with the server itself at startup.
+
+**Setup.**
+
+1. In `.env`: `COMPOSE_PROFILES=sms`, `SMS_GATEWAY_BASE_URL=http://sms-gateway:8095`
+   (this is what enrols the channel on `/sends`, `/gateways`, the chat surface
+   and the monitor), `SMS_DB_PASSWORD`, `SMS_SERVER_PRIVATE_TOKEN`,
+   `SMS_GATEWAY_TOKEN` and `SMS_ACCOUNT` (see `.env.example`).
+2. Route `sms.<domain>` in `docker-compose.override.yml`: `PathPrefix(/api/mobile/)`
+   to `sms-server:3000` and exactly `POST /webhook` to `sms-gateway:8095`, both
+   over HTTPS and without the dashboard's auth middlewares (example in
+   `docker-compose.override.example.yml`).
+3. In the app: Settings → Cloud Server → API URL
+   `https://sms.<domain>/api/mobile/v1`, Private Token =
+   `SMS_SERVER_PRIVATE_TOKEN`, and — to keep the vendor out entirely (below) —
+   the notification channel set to SSE only. Once registered, the app shows a username and
+   password: put them in `SMS_SERVER_USERNAME` / `SMS_SERVER_PASSWORD`.
+4. In the app: Settings → Webhooks → Signing Key → copy it into
+   `SMS_WEBHOOK_SIGNING_KEY`; set `SMS_WEBHOOK_URL=https://sms.<domain>/webhook`.
+   Restart `sms-gateway`; `/gateways` shows it connected once the phone checks in.
+
+**Keeping the vendor out.** Messages never pass through a third party, but
+*wake-ups* can: the server tells the phone about a queued send through the
+vendor's push relay (`api.sms-gate.app`) whenever the phone registered with a
+push token, and that relay is the server's built-in default — it cannot be
+switched off from the server side. A phone registered with the app's
+notification channel set to SSE only has no push token, and the server then
+sends the event over the phone's own server-sent-events connection to
+`sms-server` instead, so nothing leaves this host. Choose it before
+registering (or re-register after switching). There is no QR re-pairing: a "not seen recently" on `/gateways` is fixed
+on the phone (is the app running, allowed in the background, online?).
+
 ## What an agent session can see
 
 The gateways are sidecars for credential isolation: the Signal keys, the
@@ -201,7 +275,7 @@ in `docs/contributing.md`.
 **A deployment that doesn't use a given channel at all** — never runs its
 container, not even unpaired — must say so explicitly, or the monitor has no
 way to tell that apart from a real outage. The base `docker-compose.yml`
-always points the `retinue` service at all three built-in gateways via
+always points the `retinue` service at the three always-on built-in gateways via
 `SIGNAL_GATEWAY_BASE_URL` / `WHATSAPP_GATEWAY_BASE_URL` /
 `TELEGRAM_GATEWAY_BASE_URL`; if the matching container is never started, the
 monitor's health check fails DNS resolution — indistinguishable, from inside
@@ -217,15 +291,15 @@ to avoid that, and they mean different things:
 - **Never run the container at all.** Then set `MESSENGER_BUILTIN_CHANNELS` on
   the `retinue` service in the deployment's `docker-compose.override.yml` (see
   `scripts/messenger_gateways.py` and the example there) to the comma-separated
-  subset of `signal`, `whatsapp`, `telegram` this deployment actually runs —
-  e.g. `MESSENGER_BUILTIN_CHANNELS=signal` for a Signal-only deployment, or
-  set it explicitly **empty** for none — *unset* means all three, today's
-  default. Naming a channel there is what enrols it into the
+  subset of `signal`, `whatsapp`, `telegram`, `sms` this deployment actually
+  runs — e.g. `MESSENGER_BUILTIN_CHANNELS=signal` for a Signal-only deployment,
+  or set it explicitly **empty** for none — *unset* means all of them (SMS
+  still enrolling only where `SMS_GATEWAY_BASE_URL` is set). Naming a channel there is what enrols it into the
   shared registry `/sends`, `/gateways` and the monitor all read from
   regardless of what `*_GATEWAY_BASE_URL` happens to be wired to; leaving a
   channel out drops it from all three at once, same as a chamber that was
   never mounted. One variable states the deployment's whole channel set, so it
-  reads as a deliberate choice rather than three easy-to-forget blanks.
+  reads as a deliberate choice rather than a row of easy-to-forget blanks.
 
 `GATEWAY_MONITOR_IGNORE` (comma-separated slugs) is the narrower tool: it
 silences the monitor alone while leaving the channel enrolled everywhere else

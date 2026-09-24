@@ -66,6 +66,7 @@ services:
       - messenger-signal:/workspace/chambers/_generated/messenger/signal
       - messenger-whatsapp:/workspace/chambers/_generated/messenger/whatsapp
       - messenger-telegram:/workspace/chambers/_generated/messenger/telegram
+      - messenger-sms:/workspace/chambers/_generated/messenger/sms
       # RW mount of the project tree itself. Agents can branch/commit/push
       # infra changes (Tier 3 in CLAUDE.md) straight from this live checkout
       # instead of `git clone … /tmp` — the container already carries the
@@ -127,6 +128,15 @@ services:
       - TELEGRAM_GATEWAY_SEND_URL=http://telegram-gateway:8093/send
       - TELEGRAM_GATEWAY_BASE_URL=http://telegram-gateway:8093
       - TELEGRAM_GATEWAY_TOKEN
+      # Outbound SMS: where scripts/sms-push.py reaches the gateway and the
+      # shared token. SMS is opt-in (the `sms` compose profile), so its base
+      # URL — what enrols the channel on /sends, /gateways, the chat surface
+      # and the connection monitor — is NOT defaulted here: a deployment that
+      # runs the profile sets SMS_GATEWAY_BASE_URL=http://sms-gateway:8095 in
+      # .env (docs/messaging.md, "SMS").
+      - SMS_GATEWAY_SEND_URL=http://sms-gateway:8095/send
+      - SMS_GATEWAY_BASE_URL
+      - SMS_GATEWAY_TOKEN
       # Voice input for the dashboard: the web gateway proxies recorded audio to
       # the shared STT service for transcription. Unset STT_SERVICE_URL to disable
       # (the dashboard then hides its microphone button).
@@ -228,7 +238,7 @@ services:
       # by scripts/gen-egress-ca.sh and trusted by clients.
       - HTTP_PROXY=http://egress-audit:8080
       - HTTPS_PROXY=http://egress-audit:8080
-      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,host.docker.internal,${SPARQL_NO_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,sms-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,host.docker.internal,${SPARQL_NO_PROXY:-}
       - NODE_EXTRA_CA_CERTS=/etc/egress-audit/certs/egress-ca-cert.pem
       - SSL_CERT_FILE=/etc/egress-audit/certs/egress-ca-cert.pem
       - REQUESTS_CA_BUNDLE=/etc/egress-audit/certs/egress-ca-cert.pem
@@ -381,6 +391,8 @@ services:
       - WHATSAPP_GATEWAY_TIMEOUT
       - TELEGRAM_DEFAULT_RECIPIENT
       - TELEGRAM_GATEWAY_TIMEOUT
+      - SMS_DEFAULT_RECIPIENT
+      - SMS_GATEWAY_TIMEOUT
       - MESSENGER_GATEWAYS
       - MESSENGER_BUILTIN_CHANNELS
       - GATEWAY_MONITOR_IGNORE
@@ -853,6 +865,189 @@ services:
     networks:
       - agents
 
+  # SMS — opt-in, behind the `sms` compose profile (`docker compose --profile
+  # sms up -d`, or COMPOSE_PROFILES=sms in .env). Four services, all needed,
+  # plus sms-config-check, which refuses to let them start without their
+  # secrets:
+  #
+  #   sms-db      MariaDB for the server (it requires MySQL/MariaDB).
+  #   sms-server  the self-hosted android-sms-gateway private server (plus
+  #               sms-server-worker, its background tasks)
+  #               (https://github.com/android-sms-gateway/server). The user's
+  #               Android phone, running the SMS Gateway for Android app,
+  #               registers with it under Settings → Cloud Server using the
+  #               public API URL https://sms.<domain>/api/mobile/v1 and
+  #               SMS_SERVER_PRIVATE_TOKEN; the app then shows the username and
+  #               password this deployment puts in SMS_SERVER_USERNAME/PASSWORD.
+  #   sms-gateway the channel gateway (scripts/sms-gateway.py): the same /send,
+  #               /pending-sends, /undelivered, /health contract as the other
+  #               messengers, plus the POST /webhook the phone delivers each
+  #               received SMS to, verified by its HMAC signature.
+  #
+  # Two routes must be public, over HTTPS, and are the deployment's to add in
+  # docker-compose.override.yml (see the example there): sms-server's
+  # /api/mobile/ for the phone, and sms-gateway's /webhook. Neither goes behind
+  # the dashboard's edge auth — the phone can present neither a client
+  # certificate nor the basic-auth password — so each is authenticated by its
+  # own secret (the private token; the webhook signing key). Full setup:
+  # docs/messaging.md, "SMS".
+  # Fail-closed guard. Private mode compares a registering phone's token to
+  # GATEWAY__PRIVATE_TOKEN verbatim, so an empty token would let anyone who
+  # reaches the public mobile API register a device. A `${VAR:?}` in this file
+  # cannot express that — compose interpolates profile-disabled services too,
+  # so it would break every deployment that never runs SMS — hence this
+  # profile-scoped check, which the server and its database wait on.
+  sms-config-check:
+    image: python:3.12-slim
+    profiles: ["sms"]
+    environment:
+      - SMS_SERVER_PRIVATE_TOKEN=${SMS_SERVER_PRIVATE_TOKEN:-}
+      - SMS_DB_PASSWORD=${SMS_DB_PASSWORD:-}
+    command:
+      - python3
+      - -c
+      - |
+        import os, sys
+        bad = [n for n in ("SMS_SERVER_PRIVATE_TOKEN", "SMS_DB_PASSWORD")
+               if len(os.environ.get(n, "")) < 16]
+        if bad:
+            sys.exit("sms profile refused to start: set " + ", ".join(bad)
+                     + " in .env to a random value of at least 16 characters")
+    network_mode: none
+    restart: "no"
+
+  sms-db:
+    image: mariadb:11.4
+    profiles: ["sms"]
+    depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
+    environment:
+      - MARIADB_DATABASE=sms
+      - MARIADB_USER=sms
+      - MARIADB_PASSWORD=${SMS_DB_PASSWORD:-}
+      - MARIADB_RANDOM_ROOT_PASSWORD=1
+    volumes:
+      - sms-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    restart: unless-stopped
+    networks:
+      - agents
+
+  sms-server:
+    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:v1.47.3}
+    profiles: ["sms"]
+    depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
+      sms-db:
+        condition: service_healthy
+    environment: &sms-server-env
+      - GATEWAY__MODE=private
+      - GATEWAY__PRIVATE_TOKEN=${SMS_SERVER_PRIVATE_TOKEN:-}
+      # How the server wakes the phone for a queued send depends on the phone,
+      # not on this file: a device registered with a push token is woken through
+      # the vendor's relay (api.sms-gate.app — the server's built-in default,
+      # which an empty value does NOT disable), and one registered without a
+      # token is sent the event over its own server-sent-events connection to
+      # this host. To keep every byte here, set the app's Cloud Server
+      # notification channel to SSE only before registering (docs/messaging.md).
+      - HTTP__LISTEN=0.0.0.0:3000
+      - DATABASE__HOST=sms-db
+      - DATABASE__PORT=3306
+      - DATABASE__USER=sms
+      - DATABASE__PASSWORD=${SMS_DB_PASSWORD:-}
+      - DATABASE__DATABASE=sms
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # The server's background tasks, run as a second process from the same image
+  # as upstream's own compose does: message hashing (the server replaces a
+  # processed message's content with a hash) and the cleanup of old messages,
+  # devices and tokens. Not on the send path, but without it SMS content would
+  # stay in the server's database indefinitely.
+  sms-server-worker:
+    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:v1.47.3}
+    profiles: ["sms"]
+    command: ["/app/app", "worker"]
+    depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
+      sms-db:
+        condition: service_healthy
+    environment: *sms-server-env
+    restart: unless-stopped
+    networks:
+      - agents
+
+  sms-gateway:
+    build:
+      context: .
+      dockerfile: sms-gateway/Dockerfile
+      args:
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
+    profiles: ["sms"]
+    depends_on:
+      - retinue
+      - sms-server
+    # No env_file: this is the one publicly routed gateway process (its POST
+    # /webhook), so it gets exactly the variables it reads, named below —
+    # never the server's registration token or database password, which also
+    # live in .env. Value-less entries take their value from .env as usual.
+    environment:
+      # The server's 3rd-party API and the app-issued credentials. These live
+      # only in this container.
+      - SMS_SERVER_API_URL=http://sms-server:3000/api/3rdparty/v1
+      - SMS_SERVER_USERNAME
+      - SMS_SERVER_PASSWORD
+      # Optional: pin the sending device / SIM slot (1-3).
+      - SMS_DEVICE_ID
+      - SMS_SIM_NUMBER
+      # The phone's own number — this account's sending identity for
+      # SMS_SEND_POLICY and the chat surface. Learned from the SIM when unset
+      # and the phone reports it (many do not); until it is known, inbound SMS
+      # are held back (the phone retries) and sends refused. Set it explicitly.
+      - SMS_ACCOUNT
+      # Inbound: the public HTTPS URL the phone posts sms:received to (routed
+      # to this service's POST /webhook), registered with the server at
+      # startup, and the app's webhook signing key (Settings → Webhooks). No
+      # key, no inbound: unsigned webhooks are always refused.
+      - SMS_WEBHOOK_URL
+      - SMS_WEBHOOK_SIGNING_KEY
+      # Optional tunables (see scripts/sms-gateway.py for the defaults).
+      - SMS_WEBHOOK_MAX_AGE_SECONDS
+      - SMS_DEVICE_STALE_SECONDS
+      - SMS_POLL_SECONDS
+      - SMS_SERVER_TIMEOUT
+      - RETINUE_GATEWAY_URL=http://retinue:8080/message
+      - RETINUE_GATEWAY_TIMEOUT=600
+      # Chats rail and chat erasure — as on telegram-gateway above.
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
+      - CHAT_ERASE_TOKEN
+      # Outbound send-control (JSON array, like TELEGRAM_SEND_POLICY), keyed by
+      # the SENDING number (SMS_ACCOUNT). Unmatched → verify (fail-safe).
+      - SMS_SEND_POLICY
+      - SEND_APPROVAL_BASE_URL
+      - SMS_GATEWAY_HTTP_PORT=8095
+      - SMS_DEFAULT_RECIPIENT
+      - SMS_GATEWAY_TOKEN
+      # Triage delivery gate — as on the other gateways.
+      - INBOUND_STORE_DIR=/inbound
+      - INBOUND_GATE
+    volumes:
+      # Pending sends + recent chats + reply tokens + seen webhook ids.
+      - sms-data:/root/.local/share/sms
+      - messenger-sms:/inbound
+    restart: unless-stopped
+    networks:
+      - agents
+
   # CalDAV gateway — reads and writes the user's real calendar (see
   # scripts/caldav-gateway.py). Provider-agnostic by design (issue #13): the
   # backend is selected purely by configuration (CALDAV_SERVER_URL/USERNAME/
@@ -980,6 +1175,7 @@ services:
       - /chambers/_generated/messenger/signal
       - /chambers/_generated/messenger/whatsapp
       - /chambers/_generated/messenger/telegram
+      - /chambers/_generated/messenger/sms
     volumes:
       - chambers:/chambers
     network_mode: none
@@ -1002,6 +1198,7 @@ services:
       - messenger-signal:/data/_generated/messenger/signal:ro
       - messenger-whatsapp:/data/_generated/messenger/whatsapp:ro
       - messenger-telegram:/data/_generated/messenger/telegram:ro
+      - messenger-sms:/data/_generated/messenger/sms:ro
       # Persist both blue-green index slots so a restart resumes serving the
       # last completed build immediately instead of 502ing for the whole
       # duration of a fresh rebuild (qlever-dir still always rebuilds on
@@ -1089,6 +1286,8 @@ volumes:
   signal-data:
   whatsapp-data:
   telegram-data:
+  sms-data:
+  sms-db:
   # Triage delivery-gate stores — one per inbox-mode messenger gateway. Each holds
   # the gateway-written per-message `.nt` files (messages/) and the Ara-written
   # policy `.nt` (policy/policy.nt). The owning gateway mounts it RW at /inbound,
@@ -1098,6 +1297,7 @@ volumes:
   messenger-signal:
   messenger-whatsapp:
   messenger-telegram:
+  messenger-sms:
   # qlever-life's two blue-green index slots — see the qlever-life service
   # above for why these are persisted.
   life-index-a:

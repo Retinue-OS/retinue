@@ -235,6 +235,38 @@ services:
   # values replace rather than merge, so declare all extras together:
   #     - 'MESSENGER_GATEWAYS=[{"base_url":"http://signal-gateway-personal:8090","token":"${SIGNAL_GATEWAY_TOKEN}","label":"Signal (personal)"},{"base_url":"http://caldav-gateway:8094","token":"${CALDAV_GATEWAY_TOKEN}","label":"Calendar"}]'
 
+  # ── Optional: SMS (the `sms` compose profile) ──────────────────────────────
+  # The phone reaches two things over public HTTPS, both on one hostname:
+  # sms-server's mobile API (where the app registers and fetches queued sends)
+  # and sms-gateway's POST /webhook (where it delivers each received SMS).
+  # Neither router gets the dashboard's edge-auth middlewares or its mTLS
+  # option: the app can present neither, and each route has its own secret —
+  # the private token for registration, the HMAC signing key for the webhook.
+  # Keep the webhook router to the exact path: the gateway's other routes are
+  # internal. In the app: Settings → Cloud Server → API URL
+  # https://sms.example.com/api/mobile/v1; in .env:
+  # SMS_WEBHOOK_URL=https://sms.example.com/webhook. See docs/messaging.md.
+  # sms-server:
+  #   networks:
+  #     - agents
+  #     - web
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.sms-mobile.rule=Host(`sms.example.com`) && PathPrefix(`/api/mobile/`)"
+  #     - "traefik.http.routers.sms-mobile.entrypoints=websecure"
+  #     - "traefik.http.routers.sms-mobile.tls.certresolver=myresolver"
+  #     - "traefik.http.services.sms-mobile.loadbalancer.server.port=3000"
+  # sms-gateway:
+  #   networks:
+  #     - agents
+  #     - web
+  #   labels:
+  #     - "traefik.enable=true"
+  #     - "traefik.http.routers.sms-webhook.rule=Host(`sms.example.com`) && Path(`/webhook`) && Method(`POST`)"
+  #     - "traefik.http.routers.sms-webhook.entrypoints=websecure"
+  #     - "traefik.http.routers.sms-webhook.tls.certresolver=myresolver"
+  #     - "traefik.http.services.sms-webhook.loadbalancer.server.port=8095"
+
   # Opting a built-in gateway channel OUT entirely — a deployment that never
   # runs signal-gateway/whatsapp-gateway/telegram-gateway at all (not even
   # unpaired). docker-compose.yml unconditionally points the retinue service
