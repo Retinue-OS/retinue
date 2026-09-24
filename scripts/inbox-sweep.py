@@ -25,8 +25,10 @@ unchanged -- any added, removed or modified file makes it due again. The
 guard only settles after a session that exited cleanly; a failed one is
 retried with exponential backoff instead of being written off.
 
-The manifest is untrusted input: an inbox path must stay inside its chamber,
-and symlinks are never handed on as documents.
+The manifest is untrusted input: every inbox and destination path must stay
+inside its chamber (a chamber with one bad path is skipped whole), an inbox
+may not be the chamber root, and symlinks and hidden entries are never handed
+on as documents.
 """
 
 from __future__ import annotations
@@ -57,8 +59,14 @@ CLAUDE_MODEL = (
 )
 PERMISSION_MODE = os.environ.get("CLAUDE_PERMISSION_MODE", "acceptEdits")
 
-# A chamber's own bookkeeping, not mail: never work the agent should be doing.
-IGNORED_NAMES = {".gitkeep", ".DS_Store"}
+# Hidden entries are never documents: a dot-prefixed name is bookkeeping
+# (`.gitkeep`, `.DS_Store`), an OS or editor side file (`._x` AppleDouble,
+# `.~lock.x#`), or a transfer still in flight (Syncthing's `.syncthing.*.tmp`,
+# rsync's `.x.AbCdEf`). Handing any of those to the Archivist would at best
+# waste a session and at worst file half a document. Hidden directories are
+# pruned for the same reason -- `.git` above all.
+def is_hidden(name: str) -> bool:
+    return name.startswith(".")
 
 # Backoff after a failed session: the first retry comes a tick later, then the
 # wait doubles up to a day, so a persistent failure costs a few sessions a day
@@ -67,13 +75,15 @@ RETRY_BASE_SECONDS = 3600
 RETRY_MAX_SECONDS = 24 * 3600
 
 
-def resolve_inbox(chamber: Path, rel) -> Path | None:
-    """The inbox directory for a manifest path, or None if it leaves the chamber.
+def resolve_in_chamber(chamber: Path, rel) -> Path | None:
+    """The directory a manifest path names, or None unless strictly inside.
 
     The contract is a path relative to the chamber. An absolute path or a `..`
     would make `chamber / rel` point anywhere, and a symlinked directory could
     do the same after resolution -- so both the syntax and the resolved
-    location are checked.
+    location are checked. The chamber root itself is refused too: as an inbox
+    it would hand over the whole worktree, as a destination it has no
+    description worth routing by.
     """
     if not isinstance(rel, str) or not rel.strip():
         return None
@@ -82,9 +92,31 @@ def resolve_inbox(chamber: Path, rel) -> Path | None:
         return None
     root = chamber.resolve()
     target = (chamber / p).resolve()
-    if target != root and root not in target.parents:
+    if root not in target.parents:
         return None
     return chamber / p
+
+
+def destinations_ok(chamber: Path, data: dict) -> bool:
+    """Whether every declared destination stays inside the chamber.
+
+    The sweep never writes to a destination, but the Archivist it dispatches
+    does, from the same manifest. A chamber whose manifest points a
+    destination out of the chamber is not dispatched at all: one bad entry
+    says the whole file is not to be trusted.
+    """
+    dests = data.get("destinations", [])
+    if not isinstance(dests, list):
+        print(f"[inbox-sweep] {chamber.name}: .inbox.json 'destinations' is "
+              "not a list; skipping chamber", file=sys.stderr)
+        return False
+    for entry in dests:
+        rel = entry.get("path") if isinstance(entry, dict) else None
+        if resolve_in_chamber(chamber, rel) is None:
+            print(f"[inbox-sweep] {chamber.name}: destination {rel!r} is not "
+                  "inside the chamber; skipping chamber", file=sys.stderr)
+            return False
+    return True
 
 
 def declared_inboxes() -> list[dict]:
@@ -111,13 +143,15 @@ def declared_inboxes() -> list[dict]:
             print(f"[inbox-sweep] {chamber.name}: .inbox.json has no "
                   "'inboxes' list; skipping chamber", file=sys.stderr)
             continue
+        if not destinations_ok(chamber, data):
+            continue
         for entry in inboxes:
             if not isinstance(entry, dict):
                 print(f"[inbox-sweep] {chamber.name}: ignoring non-object "
                       "inbox entry", file=sys.stderr)
                 continue
             rel = entry.get("path")
-            path = resolve_inbox(chamber, rel)
+            path = resolve_in_chamber(chamber, rel)
             if path is None:
                 if rel:
                     print(f"[inbox-sweep] {chamber.name}: inbox path {rel!r} "
@@ -139,16 +173,18 @@ def pending_files(inbox_path: Path) -> list[Path]:
 
     Symlinks are skipped, file or directory: whatever they point at is not
     something the user dropped into the letterbox, and following one would
-    hand the Archivist a file from outside the inbox.
+    hand the Archivist a file from outside the inbox. Hidden files and
+    directories are skipped too (see `is_hidden`).
     """
     if inbox_path.is_symlink() or not inbox_path.is_dir():
         return []
     found = []
     for dirpath, dirnames, filenames in os.walk(inbox_path, followlinks=False):
         dirnames[:] = [d for d in dirnames
-                       if not os.path.islink(os.path.join(dirpath, d))]
+                       if not is_hidden(d)
+                       and not os.path.islink(os.path.join(dirpath, d))]
         for name in filenames:
-            if name in IGNORED_NAMES or name.startswith("."):
+            if is_hidden(name):
                 continue
             p = Path(dirpath) / name
             if p.is_symlink() or not p.is_file():
@@ -283,6 +319,15 @@ def main() -> int:
     env = session_env.build(model=CLAUDE_MODEL)
     claude_auth.ensure_fresh_credentials(
         log=lambda msg: print(f"[inbox-sweep] {msg}", file=sys.stderr))
+
+    # Record the attempt as failed *before* spawning. On a timeout the
+    # scheduler kills this whole process group, so nothing after
+    # subprocess.run() would get to write it -- and the next tick would spawn
+    # again at once instead of backing off. A clean exit overwrites it below.
+    failures = (int(state.get("failures") or 0) + 1
+                if state.get("signature") == current else 1)
+    save_state({"signature": current, "failures": failures,
+                "attempted_at": now})
     result = subprocess.run(cmd, cwd="/workspace", env=env)
 
     if result.returncode == 0:
@@ -290,12 +335,8 @@ def main() -> int:
         save_state({"signature": current})
     else:
         # A failed session (API or auth hiccup) has not looked at the files;
-        # retry the same listing later, backing off so it cannot burn a
-        # session every tick.
-        failures = (int(state.get("failures") or 0) + 1
-                    if state.get("signature") == current else 1)
-        save_state({"signature": current, "failures": failures,
-                    "attempted_at": now})
+        # the pre-recorded failure retries the same listing later, backing
+        # off so it cannot burn a session every tick.
         print(f"[inbox-sweep] session exited {result.returncode}; will retry "
               f"with backoff (failure {failures})", file=sys.stderr)
     return result.returncode

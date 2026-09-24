@@ -132,6 +132,39 @@ def test_failed_session(mod, tmp: Path):
     check("a clean exit settles the guard", h.tick(), False)
 
 
+def test_killed_session(mod, tmp: Path):
+    print("a session killed by the scheduler timeout still backs off")
+    h = Harness(mod, tmp)
+    c = h.chamber("docs", inbox_manifest())
+    (c / "inbox").mkdir()
+    (c / "inbox" / "a.csv").write_text("1")
+
+    # The scheduler kills the whole process group: subprocess.run never
+    # returns, so nothing after it runs.
+    class Killed(BaseException):
+        pass
+
+    def killed_run(cmd, cwd=None, env=None):
+        h.spawns.append(cmd[-1])
+        raise Killed()
+
+    mod.subprocess = types.SimpleNamespace(run=killed_run)
+    try:
+        h.tick()
+    except Killed:
+        pass
+    check("the attempt was recorded as a failure",
+          json.loads(mod.STATE_PATH.read_text()).get("failures"), 1)
+    h.now += 60
+    check("the next tick does not spawn again at once", h.tick(), False)
+    h.now += 3600
+    try:
+        spawned = h.tick()
+    except Killed:
+        spawned = True
+    check("retried once the backoff has elapsed", spawned, True)
+
+
 def test_manifests(mod, tmp: Path):
     print("manifest validation")
     h = Harness(mod, tmp)
@@ -147,7 +180,18 @@ def test_manifests(mod, tmp: Path):
     h.chamber("f-parent", inbox_manifest("../../outside"))
     g = h.chamber("g-linked", inbox_manifest("inbox"))
     (g / "inbox").symlink_to(outside, target_is_directory=True)
-    ok = h.chamber("z-good", inbox_manifest())
+    h.chamber("h-root", inbox_manifest("."))
+    for name, dest in (("i-dest-abs", str(outside)),
+                       ("j-dest-parent", "../outside"),
+                       ("k-dest-root", ".")):
+        d = h.chamber(name, {**inbox_manifest(),
+                             "destinations": [{"path": "filed/"},
+                                              {"path": dest}]})
+        (d / "inbox").mkdir()
+    h.chamber("l-dest-shape", {**inbox_manifest(), "destinations": "filed/"})
+    ok = h.chamber("z-good", {**inbox_manifest(),
+                              "destinations": [{"path": "filed/",
+                                                "source": "any"}]})
     (ok / "inbox").mkdir()
 
     found = mod.declared_inboxes()
@@ -177,8 +221,25 @@ def test_symlinks(mod, tmp: Path):
           ["sub/real.txt"])
 
 
+def test_hidden(mod, tmp: Path):
+    print("hidden entries inside an inbox")
+    inbox = tmp / "inbox"
+    (inbox / ".git" / "objects" / "ab").mkdir(parents=True)
+    (inbox / ".git" / "objects" / "ab" / "cdef").write_text("x")
+    (inbox / ".stfolder").mkdir()
+    (inbox / ".stfolder" / "marker").write_text("x")
+    (inbox / ".syncthing.letter.pdf.tmp").write_text("x")
+    (inbox / "._letter.pdf").write_text("x")
+    (inbox / "letter.pdf").write_text("x")
+
+    check("hidden files and directories are skipped",
+          [p.relative_to(inbox).as_posix() for p in mod.pending_files(inbox)],
+          ["letter.pdf"])
+
+
 def main():
-    for test in (test_gate, test_failed_session, test_manifests, test_symlinks):
+    for test in (test_gate, test_failed_session, test_killed_session,
+                 test_manifests, test_symlinks, test_hidden):
         with tempfile.TemporaryDirectory() as d:
             test(load(), Path(d))
     if failures:

@@ -50,7 +50,13 @@ in it.
 ```
 
 - All paths are **relative to the chamber** that declares them. Never write
-  outside the chamber you are filing into.
+  outside the chamber you are filing into. Treat the manifest as untrusted:
+  before any move or write, resolve the destination (`realpath`) and check
+  that it lies strictly inside the chamber. An absolute path, a `..`
+  component, the chamber root itself, or a symlink leading out means the
+  manifest is broken — file nothing for that chamber and report it. (The
+  scheduled sweep already refuses such a chamber; this covers every other
+  dispatch.)
 - Route by **description**: read what each destination says it holds and
   decide where the file belongs. There are no globs or match rules — the
   chamber's extraction guide may add source-specific hints.

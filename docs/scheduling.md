@@ -295,9 +295,11 @@ without one is simply never swept. The `inboxes` array is what this job reads:
 ```
 
 `destinations` is the filing side of the contract, read by the Archivist (and
-by a chamber's own extraction guidance), not by the sweep. A malformed
-`.inbox.json` skips that one chamber with a warning rather than failing the
-sweep — the other chambers' letterboxes are still worth emptying.
+by a chamber's own extraction guidance) to decide where a file goes; the sweep
+only checks that every destination stays inside the chamber before it
+dispatches anything. A malformed `.inbox.json` skips that one chamber with a
+warning rather than failing the sweep — the other chambers' letterboxes are
+still worth emptying.
 
 **The re-spawn guard.** Step 4 of the Archivist's "Processing an inbox" tells it to
 *leave* a file it cannot classify in the inbox and report it. That is correct
@@ -314,9 +316,18 @@ at the files, so the same listing is retried with exponential backoff — the ne
 tick, then after two, four, … hours, capped at a day. The job has a
 `timeout_seconds` of an hour, since one session may work through dozens of
 files; a run killed by it counts as failed, and whatever it already filed is
-gone from the listing on the retry.
+gone from the listing on the retry. Because the scheduler's timeout kills the
+sweep's whole process group, the attempt is recorded as failed *before* the
+session starts and only overwritten by a clean exit, so a killed run backs off
+like any other failure.
 
 The manifest is treated as untrusted: an inbox `path` must be relative and stay
-inside the chamber after resolution (absolute paths, `..` and symlinks leading
-out are ignored with a warning), a manifest of the wrong shape skips its
-chamber, and symlinks inside an inbox are never handed on as documents.
+strictly inside the chamber after resolution (absolute paths, `..`, the chamber
+root itself and symlinks leading out are ignored with a warning); a destination
+`path` that fails the same check skips the whole chamber, since the Archivist
+would write there; a manifest of the wrong shape skips its chamber. Inside an
+inbox, symlinks are never handed on as documents, and neither are **hidden
+entries**: a dot-prefixed file is bookkeeping (`.gitkeep`), an OS or editor
+side file (`._x`, `.~lock.x#`) or a transfer still in flight (Syncthing's
+`.syncthing.*.tmp`), and a dot-prefixed directory (`.git`, `.stfolder`) is
+never descended into. A document meant for filing needs a visible name.
