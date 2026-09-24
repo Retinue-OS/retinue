@@ -108,8 +108,8 @@ def resolve_in_chamber(chamber: Path, rel) -> Path | None:
     return chamber / p
 
 
-def destinations_ok(chamber: Path, data: dict) -> bool:
-    """Whether every declared destination is inside the chamber and valid.
+def valid_destinations(chamber: Path, data: dict) -> list[dict] | None:
+    """The chamber's declared destinations, or None if any is invalid.
 
     The sweep never writes to a destination, but the Archivist it dispatches
     does, from the same manifest. A chamber whose manifest points a
@@ -120,13 +120,13 @@ def destinations_ok(chamber: Path, data: dict) -> bool:
     if not isinstance(dests, list):
         print(f"[inbox-sweep] {chamber.name}: .inbox.json 'destinations' is "
               "not a list; skipping chamber", file=sys.stderr)
-        return False
+        return None
     for entry in dests:
         rel = entry.get("path") if isinstance(entry, dict) else None
         if resolve_in_chamber(chamber, rel) is None:
             print(f"[inbox-sweep] {chamber.name}: destination {rel!r} is not "
                   "inside the chamber; skipping chamber", file=sys.stderr)
-            return False
+            return None
         source = entry.get("source")
         # isinstance first: a list or object is unhashable and would raise
         # in the set lookup instead of skipping the chamber.
@@ -135,15 +135,40 @@ def destinations_ok(chamber: Path, data: dict) -> bool:
                   f"source {source!r}, expected one of "
                   f"{sorted(SOURCE_POLICIES)}; skipping chamber",
                   file=sys.stderr)
-            return False
-    return True
+            return None
+    return dests
 
 
 def declared_inboxes() -> list[dict]:
-    """Every inbox declared by every mounted chamber, in a stable order."""
+    """Every inbox declared by every mounted chamber, in a stable order.
+
+    An inbox is only worth a session if its files have somewhere to go: a
+    destination of its own chamber, or an `"any"` destination another
+    chamber opens to cross-chamber filing. A chamber with neither is skipped
+    with a warning rather than dispatching an Archivist that can only leave
+    every file where it lies.
+    """
+    manifests = load_manifests()
+    # Chambers that accept files routed from another chamber's inbox.
+    open_to_others = {chamber for chamber, _, dests in manifests
+                      if any(d["source"] == "any" for d in dests)}
     found: list[dict] = []
+    for chamber, data, dests in manifests:
+        if not dests and not (open_to_others - {chamber}):
+            if data["inboxes"]:
+                print(f"[inbox-sweep] {chamber.name}: no destination to file "
+                      "into (none declared here, no \"any\" destination "
+                      "elsewhere); skipping chamber", file=sys.stderr)
+            continue
+        found.extend(chamber_inboxes(chamber, data["inboxes"]))
+    return found
+
+
+def load_manifests() -> list[tuple[Path, dict, list[dict]]]:
+    """(chamber, manifest, destinations) for every well-formed manifest."""
+    loaded: list[tuple[Path, dict, list[dict]]] = []
     if not CHAMBERS_DIR.is_dir():
-        return found
+        return loaded
     for chamber in sorted(CHAMBERS_DIR.iterdir()):
         manifest = chamber / ".inbox.json"
         if not manifest.is_file():
@@ -163,28 +188,36 @@ def declared_inboxes() -> list[dict]:
             print(f"[inbox-sweep] {chamber.name}: .inbox.json has no "
                   "'inboxes' list; skipping chamber", file=sys.stderr)
             continue
-        if not destinations_ok(chamber, data):
+        dests = valid_destinations(chamber, data)
+        if dests is None:
             continue
-        for entry in inboxes:
-            if not isinstance(entry, dict):
-                print(f"[inbox-sweep] {chamber.name}: ignoring non-object "
-                      "inbox entry", file=sys.stderr)
-                continue
-            rel = entry.get("path")
-            path = resolve_in_chamber(chamber, rel)
-            if path is None:
-                if rel:
-                    print(f"[inbox-sweep] {chamber.name}: inbox path {rel!r} "
-                          "is not inside the chamber; ignoring",
-                          file=sys.stderr)
-                continue
-            found.append({
-                "chamber": chamber.name,
-                "id": str(entry.get("id") or rel),
-                "path": path,
-                "rel": rel,
-                "description": str(entry.get("description") or ""),
-            })
+        loaded.append((chamber, {**data, "inboxes": inboxes}, dests))
+    return loaded
+
+
+def chamber_inboxes(chamber: Path, inboxes: list) -> list[dict]:
+    """The contained, well-formed inbox entries of one manifest."""
+    found: list[dict] = []
+    for entry in inboxes:
+        if not isinstance(entry, dict):
+            print(f"[inbox-sweep] {chamber.name}: ignoring non-object "
+                  "inbox entry", file=sys.stderr)
+            continue
+        rel = entry.get("path")
+        path = resolve_in_chamber(chamber, rel)
+        if path is None:
+            if rel:
+                print(f"[inbox-sweep] {chamber.name}: inbox path {rel!r} "
+                      "is not inside the chamber; ignoring",
+                      file=sys.stderr)
+            continue
+        found.append({
+            "chamber": chamber.name,
+            "id": str(entry.get("id") or rel),
+            "path": path,
+            "rel": rel,
+            "description": str(entry.get("description") or ""),
+        })
     return found
 
 

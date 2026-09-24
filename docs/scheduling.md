@@ -321,21 +321,30 @@ sweep's whole process group, the attempt is recorded as failed *before* the
 session starts and only overwritten by a clean exit, so a killed run backs off
 like any other failure.
 
-The manifest is treated as untrusted: an inbox `path` must be relative and stay
-strictly inside the chamber after resolution (absolute paths, `..`, the chamber
-root itself and symlinks leading out are ignored with a warning); a destination
-`path` that fails the same check skips the whole chamber, since the Archivist
-would write there, and so does a destination whose `source` is not one of
-`"manifest"` or `"any"` (a typo would make it silently inadmissible); a
-manifest of the wrong shape skips its chamber. Descriptions and file names
-reach the spawned session as an escaped JSON block, which the prompt tells it
-to treat as data rather than instructions. The documents themselves are untrusted too:
-the Archivist treats their content as material to extract from, never as
-instructions, and hands long or unstructured ones to `archivist-reader`, a
-subagent with only the Read tool, so a document that tries to instruct its
-reader has nothing to act with. Inside an
-inbox, symlinks are never handed on as documents, and neither are **hidden
-entries**: a dot-prefixed file is bookkeeping (`.gitkeep`), an OS or editor
-side file (`._x`, `.~lock.x#`) or a transfer still in flight (Syncthing's
-`.syncthing.*.tmp`), and a dot-prefixed directory (`.git`, `.stfolder`) is
-never descended into. A document meant for filing needs a visible name.
+The manifest, the files and their names are all treated as untrusted:
+
+- An inbox `path` must be relative and stay strictly inside the chamber after
+  resolution; absolute paths, `..`, the chamber root itself, symlinks leading
+  out and paths the OS cannot resolve are ignored with a warning.
+- Every destination must pass the same check and declare a `source` of
+  `"manifest"` or `"any"` (a typo would make it silently inadmissible);
+  otherwise the whole chamber is skipped, since the Archivist would write
+  there.
+- A chamber with no destinations of its own is dispatched only if another
+  chamber declares an `"any"` destination its files could go to; otherwise
+  the session could only leave every file where it lies.
+- A manifest of the wrong shape skips its chamber, never the sweep.
+- Inside an inbox, symlinks are never handed on as documents, and neither are
+  **hidden entries**: a dot-prefixed file is bookkeeping (`.gitkeep`), an OS or
+  editor side file (`._x`, `.~lock.x#`) or a transfer still in flight
+  (Syncthing's `.syncthing.*.tmp`), and a dot-prefixed directory (`.git`,
+  `.stfolder`) is never descended into. A document meant for filing needs a
+  visible name. The sweep's symlink check is a snapshot, so the Archivist
+  repeats it, without following links, immediately before it opens or moves
+  each file.
+- Descriptions and file names reach the spawned session as an escaped JSON
+  block, which the prompt tells it to treat as data rather than instructions.
+- Document content is material to extract from, never instructions: the
+  Archivist hands long or unstructured documents to `archivist-reader`, a
+  subagent with only the Read tool, so a document that tries to instruct its
+  reader has nothing to act with.

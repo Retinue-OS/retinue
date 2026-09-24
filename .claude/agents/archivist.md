@@ -164,6 +164,19 @@ file's own graph.
 
 For each file in a declared inbox:
 
+0. **Re-check it before anything opens it.** The listing you were handed is a
+   snapshot; a file can have been swapped for a symlink since. Immediately
+   before reading, delegating or moving a file, confirm it is still a regular
+   file and not a link, without following links, and that it still lies
+   inside the inbox:
+
+   ```bash
+   [ -f "$f" ] && [ ! -L "$f" ] &&
+     case "$(realpath -e -- "$f")" in "$(realpath -e -- "$inbox")"/*) ;; *) false;; esac
+   ```
+
+   If the check fails, do not read, delegate or move it: leave it and report
+   it as in step 4. Never hand the reader a path you have not just checked.
 1. Identify what it is (the chamber's extraction guide helps) and choose a
    destination from `.inbox.json` whose description fits and whose `source`
    policy admits it.
