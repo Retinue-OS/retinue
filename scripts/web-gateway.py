@@ -5850,15 +5850,20 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
     }
 
 
+def _attention_day(focus: dict, day) -> dict:
+    """Which day plan rules a date, and the holiday that put it there."""
+    plan = attention_policy.day_plan(focus, day)
+    holiday = attention_policy.holiday_on(focus, day)
+    return {"plan": plan["name"], "days": list(plan.get("days") or []),
+            "holiday": (holiday.get("name") or "holiday") if holiday
+            and attention_policy.HOLIDAY in attention_policy.plan_days(plan) else None}
+
+
 def _attention_mode_summary(focus: dict, now: datetime) -> dict:
     mode = attention_policy.mode_at(focus, now)
     scheduled_id = attention_policy.scheduled_id(focus, now)
     scheduled = focus["modes"][scheduled_id]
-    m = attention_policy.minute_of_day(now)
-    until = next((entry[0] for entry in focus["schedule"] if entry[0] > m), None)
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    until_dt = (start_of_day + timedelta(minutes=until)) if until is not None \
-        else start_of_day + timedelta(days=1, minutes=focus["schedule"][0][0])
+    until = attention_policy.scheduled_until(focus, now)
     return {
         "id": mode["id"], "name": mode["name"], "blurb": mode.get("blurb", ""),
         "threshold": mode["threshold"], "admits": list(mode["admits"]),
@@ -5868,7 +5873,9 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
         "subject": mode.get("subject"),
         "label": attention_policy.mode_label(mode),
         "manual": bool(focus.get("manual")),
-        "scheduled": {"id": scheduled["id"], "name": scheduled["name"], "until": until_dt.isoformat()},
+        "scheduled": {"id": scheduled["id"], "name": scheduled["name"],
+                      "until": until.isoformat() if until else None},
+        "day": _attention_day(focus, now.date()),
     }
 
 
@@ -5887,8 +5894,12 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
                    "only_admitted": bool(m.get("only_admitted")),
                    "with_subject": bool(m.get("with_subject"))}
                   for m in focus["modes"].values()],
-        "schedule": [list(x) for x in focus["schedule"]],
-        "digest_times": list(focus["digest_times"]),
+        # Today's schedule and digests, from midnight, by today's plan; the
+        # week and the holidays they come from beside them.
+        "schedule": attention_policy.day_schedule(focus, now.date()),
+        "digest_times": attention_policy.digest_times_on(focus, now.date()),
+        "week": attention_policy.week_of(focus),
+        "holidays": list(focus.get("holidays") or []),
         "spheres": list(focus.get("spheres") or attention_store.DEFAULT_SPHERES),
         "next_breakpoint": s["next_breakpoint"].isoformat(),
         "sections": {"now": [row(i) for i in s["now"]], "next": [row(i) for i in s["next"]],
@@ -7288,10 +7299,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _attention_set_rules(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
         """Change the Focus rules from one patch (attention.apply_rules): a
-        mode's list fold, threshold, admitted spheres and tags, the schedule,
-        the digest times. What a widened rule now admits is pushed."""
+        mode's list fold, threshold, admitted spheres and tags, the week's
+        day plans, the holidays, the digest times. What a widened rule now
+        admits is pushed."""
         try:
-            changes = attention_policy.apply_rules(focus, payload, list(focus.get("spheres") or attention_store.DEFAULT_SPHERES))
+            changes = attention_policy.apply_rules(focus, payload, list(focus.get("spheres") or attention_store.DEFAULT_SPHERES),
+                                                   today=now.date())
         except (ValueError, TypeError) as exc:
             self._send_json(400, {"error": str(exc)})
             return
@@ -7342,7 +7355,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "focus must carry its modes"})
                 return
             base = attention_policy.default_focus()
-            base.update({k: v for k, v in focus.items() if v is not None})
+            base.update({k: v for k, v in attention_policy.upgrade_focus(focus).items() if v is not None})
+            try:
+                # The week and holidays are held to the rules a patch is:
+                # each weekday in one plan, a plan that takes the holidays.
+                attention_policy.apply_rules(
+                    base, {"week": attention_policy.week_of(base), "holidays": base.get("holidays") or []},
+                    list(base.get("spheres") or attention_store.DEFAULT_SPHERES))
+            except (ValueError, TypeError) as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
             _ATTENTION.save_focus(base)
         self._send_json(200, {"profile": _ATTENTION.profile(), "focus": _ATTENTION.focus()})
 

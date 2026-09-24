@@ -446,7 +446,7 @@ class Simulation:
             profile["priors"].update(story.PRIORS)
             profile["spheres"].update(story.SPHERES)
             wg._ATTENTION.save_profile(profile)
-            wg._ATTENTION.save_focus(wg.attention_policy.default_focus())
+            wg._ATTENTION.save_focus(self._story_focus())
             # Yesterday: what is open when the day begins, arriving at its
             # own hour — the model judged it then, and released it since.
             self.quiet = True
@@ -461,6 +461,21 @@ class Simulation:
             self.feed = []
             self.stats = {"pushes": 0, "digests": 0, "handled": 0, "corrections": 0, "replies": 0}
             self.wg._attention_tick(self.clock.now())
+
+    def _story_focus(self) -> dict:
+        """The shipped focus rules, with the story's day and the days either
+        side of it on the Workday plan: the day is a working one, what is open
+        at midnight was judged on one yesterday afternoon, and "tomorrow
+        morning" is the 08:00 digest. Run near a weekend, those days move into
+        Workday — the week's own way of saying this Saturday is one."""
+        policy = self.wg.attention_policy
+        focus = policy.default_focus()
+        today = self.clock.base.date()
+        workday = next(p for p in focus["week"] if p["name"] == "Workday")
+        days = policy.plan_days(workday) | {policy.WEEKDAYS[(today + timedelta(days=k)).weekday()] for k in (-1, 0, 1)}
+        if days != policy.plan_days(workday):
+            policy.apply_rules(focus, {"plan": "Workday", "days": sorted(days)}, list(self.wg.attention_store.DEFAULT_SPHERES))
+        return focus
 
     # -- the API, as the dashboard and the agents use it ------------------------------
 
@@ -911,7 +926,7 @@ class Simulation:
                 "feed": self.feed[-400:], "stats": {**self.stats, "held": held},
                 "attention": {"mode": att.get("mode"), "next_breakpoint": att.get("next_breakpoint"),
                               "counts": att.get("counts"), "learned": att.get("learned"),
-                              "schedule": focus["schedule"], "digest_times": focus["digest_times"],
+                              "schedule": att.get("schedule") or [], "digest_times": att.get("digest_times") or [],
                               "modes": {m["id"]: {"name": m["name"], "admits": m["admits"], "admit_tags": m.get("admit_tags", []), "threshold": m["threshold"]} for m in focus["modes"].values()},
                               "permits": profile.get("permits"), "priors": profile.get("priors"), "leads": profile.get("leads")},
                 "last_view": self.last_view,

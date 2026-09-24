@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 LEVELS = ["passive", "active", "time-sensitive", "critical"]
@@ -71,17 +71,53 @@ DEFAULT_MODES = {
     "chores":  {"id": "chores",  "name": "Chores",       "admits": ["customers", "admin", "health", "friends", "family", "system"], "admit_tags": [], "threshold": "time-sensitive", "only_admitted": False, "blurb": "interruptions welcome: anything urgent rings"},
     "social":  {"id": "social",  "name": "Social",       "admits": ["friends", "family"],                                 "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": False, "blurb": "people, not subjects: friends and family may break through"},
 }
-# minute of the local day → mode id, optionally the sphere Focused is on
+# A day's schedule: minute of the local day → mode id, optionally the sphere
+# Focused is on.
 DEFAULT_SCHEDULE = [[0, "rest"], [7 * 60, "chores"], [8 * 60, "focused"], [12 * 60, "chores"], [13 * 60, "focused", "customers"], [17 * 60, "chores"], [18 * 60, "social"], [22 * 60, "rest"]]
 DEFAULT_DIGEST_TIMES = [8 * 60, 12 * 60, 17 * 60, 21 * 60]
 SWEEP_EVERY_MINUTES = 30
 
+# The week is a few *day plans*, not seven schedules: each plan is one day's
+# schedule with the days it rules, written compactly — ``mon-fri``, ``sat,
+# sun`` — and every weekday belongs to exactly one plan. One plan may also
+# claim ``holiday``: the dates in the document's ``holidays`` then follow it,
+# whatever weekday they fall on, so a week off is a date range told to the
+# system, not a new schedule. A plan may carry its own digest times (a day off
+# that starts at nine wants its first digest at nine); without them it uses
+# the document's. See day_plan and apply_rules.
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+_WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+HOLIDAY = "holiday"
+DAY_ALIASES = {"weekdays": "mon-fri", "weekend": "sat-sun", "daily": "mon-sun", "holidays": HOLIDAY}
+DEFAULT_DAY_OFF = [[0, "rest"], [9 * 60, "social"], [22 * 60, "rest"]]
+DEFAULT_WEEK = [
+    {"name": "Workday", "days": ["mon-fri"], "schedule": DEFAULT_SCHEDULE},
+    {"name": "Day off", "days": ["sat", "sun", HOLIDAY], "schedule": DEFAULT_DAY_OFF, "digest_times": [9 * 60, 18 * 60]},
+]
+
 
 def default_focus() -> dict:
-    """The focus document the gateway keeps (focus.json): modes, schedule,
-    the manual override and its subject."""
+    """The focus document the gateway keeps (focus.json): modes, the week of
+    day plans, the holidays, the default digest times, the manual override
+    and its subject."""
     return {"manual": None, "subject": None, "modes": json.loads(json.dumps(DEFAULT_MODES)),
-            "schedule": [list(x) for x in DEFAULT_SCHEDULE], "digest_times": list(DEFAULT_DIGEST_TIMES)}
+            "week": json.loads(json.dumps(DEFAULT_WEEK)), "holidays": [],
+            "digest_times": list(DEFAULT_DIGEST_TIMES)}
+
+
+def upgrade_focus(doc: dict) -> dict:
+    """A focus document from before the week had one ``schedule`` for every
+    day. A deployment that had chosen its own keeps it for every day,
+    holidays included, as a one-plan week; one still on the shipped default
+    never chose, so it gets the shipped week. A document carrying both drops
+    the stale schedule."""
+    doc = dict(doc)
+    if "schedule" in doc:
+        legacy = doc.pop("schedule")
+        if not doc.get("week") and legacy and [list(x) for x in legacy] != DEFAULT_SCHEDULE:
+            doc["week"] = [{"name": "Every day", "days": ["mon-sun", HOLIDAY],
+                            "schedule": [list(x) for x in legacy]}]
+    return doc
 
 
 def default_profile() -> dict:
@@ -277,11 +313,163 @@ def minute_of_day(now: datetime) -> int:
     return now.hour * 60 + now.minute
 
 
+# ---- the week -----------------------------------------------------------------------
+
+def _weekday(token: str) -> int:
+    """mon / monday / tues → 0 / 0 / 1; ValueError when it is not a weekday."""
+    tok = token.strip().lower().rstrip(".")
+    for i, name in enumerate(_WEEKDAY_NAMES):
+        if len(tok) >= 3 and name.startswith(tok):
+            return i
+    raise ValueError(f"not a day: {token!r} (mon … sun, a range like mon-fri, or holiday)")
+
+
+def parse_days(spec) -> set[str]:
+    """Days as written — ``"mon-fri"``, ``"sat, sun, holiday"``, ``"weekend"``,
+    or a list of those — as a set of tokens (``mon`` … ``sun``, ``holiday``).
+    A range may wrap: ``fri-mon`` is Friday to Monday. ValueError on a word
+    that is not a day."""
+    parts = spec if isinstance(spec, (list, tuple, set)) else [spec]
+    out: set[str] = set()
+    for part in parts:
+        text = re.sub(r"\s*[-–—]\s*", "-", str(part or "").strip().lower())
+        for tok in re.split(r"[,;\s]+", text):
+            if not tok:
+                continue
+            tok = DAY_ALIASES.get(tok, tok)
+            if tok == HOLIDAY:
+                out.add(HOLIDAY)
+            elif "-" in tok:
+                a, _, b = tok.partition("-")
+                i, j = _weekday(a), _weekday(b)
+                while True:
+                    out.add(WEEKDAYS[i])
+                    if i == j:
+                        break
+                    i = (i + 1) % 7
+            else:
+                out.add(WEEKDAYS[_weekday(tok)])
+    return out
+
+
+def fmt_days(days: set[str]) -> list[str]:
+    """The compact form of a set of days: runs of three or more weekdays as a
+    range (``mon-fri``), the rest one by one, ``holiday`` last."""
+    idx = sorted(WEEKDAYS.index(d) for d in days if d in WEEKDAYS)
+    out: list[str] = []
+    run: list[int] = []
+    for i in idx + [None]:
+        if i is not None and run and i == run[-1] + 1:
+            run.append(i)
+            continue
+        if len(run) >= 3:
+            out.append(f"{WEEKDAYS[run[0]]}-{WEEKDAYS[run[-1]]}")
+        else:
+            out.extend(WEEKDAYS[k] for k in run)
+        run = [i] if i is not None else []
+    if HOLIDAY in days:
+        out.append(HOLIDAY)
+    return out
+
+
+def week_of(focus: dict) -> list[dict]:
+    """The day plans; a document from before the week reads as one plan."""
+    week = focus.get("week")
+    if isinstance(week, list) and week:
+        return week
+    return [{"name": "Every day", "days": ["mon-sun", HOLIDAY],
+             "schedule": focus.get("schedule") or DEFAULT_SCHEDULE}]
+
+
+def plan_days(plan: dict) -> set[str]:
+    try:
+        return parse_days(plan.get("days") or [])
+    except ValueError:
+        return set()
+
+
+def holiday_on(focus: dict, day: date) -> dict | None:
+    """The holiday entry the date falls in, if any."""
+    iso = day.isoformat()
+    for h in focus.get("holidays") or []:
+        start = str(h.get("from") or "")
+        if start and start <= iso <= str(h.get("to") or start):
+            return h
+    return None
+
+
+def day_plan(focus: dict, day: date) -> dict:
+    """The plan that rules a date: the holiday plan on a holiday (where one
+    claims holidays), else the plan that claims its weekday. Lenient about a
+    hand-edited file — an unclaimed weekday falls to the first plan — since
+    apply_rules is where a week is held to covering each day exactly once."""
+    week = week_of(focus)
+    if holiday_on(focus, day):
+        plan = next((p for p in week if HOLIDAY in plan_days(p)), None)
+        if plan is not None:
+            return plan
+    weekday = WEEKDAYS[day.weekday()]
+    return next((p for p in week if weekday in plan_days(p)), week[0])
+
+
+def _entries(plan: dict) -> list[list]:
+    entries = sorted(list(e) for e in plan.get("schedule") or [] if isinstance(e, (list, tuple)) and len(e) >= 2)
+    return entries or [[0, "rest"]]
+
+
+def day_schedule(focus: dict, day: date) -> list[list]:
+    """A date's schedule from midnight: its plan's entries, led — where the
+    plan's first entry comes after 00:00 — by the mode the evening before
+    ended in. The day starts where the night left off, and which night that
+    is depends on the date, not on the plan."""
+    entries = _entries(day_plan(focus, day))
+    if entries[0][0] > 0:
+        before = _entries(day_plan(focus, day - timedelta(days=1)))[-1]
+        entries = [[0, *before[1:]]] + entries
+    return entries
+
+
+def digest_times_on(focus: dict, day: date) -> list[int]:
+    """A date's digest times: its plan's own, else the document's."""
+    plan = day_plan(focus, day)
+    return sorted(plan.get("digest_times") or focus.get("digest_times") or DEFAULT_DIGEST_TIMES)
+
+
+def _mode_changes(focus: dict, day: date) -> list[int]:
+    """The minutes of a date at which the scheduled mode changes in a way that
+    is a breakpoint: the entry differs from the one before it (at midnight,
+    from the evening before), and the one before is not Rest — the step out
+    of Rest is not a breakpoint, the morning digest opens the day."""
+    before = _entries(day_plan(focus, day - timedelta(days=1)))[-1]
+    out = []
+    for entry in day_schedule(focus, day):
+        if list(entry[1:]) != list(before[1:]) and before[1] != "rest":
+            out.append(entry[0])
+        before = entry
+    return out
+
+
+def scheduled_until(focus: dict, now: datetime) -> datetime | None:
+    """When the schedule next puts a different mode (or scope) in force —
+    looking past midnight, since an evening's Rest runs into the next
+    day's; None when the week never changes it."""
+    current = scheduled_entry(focus, now)[1:]
+    m = minute_of_day(now)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    for offset in range(8):
+        for entry in day_schedule(focus, now.date() + timedelta(days=offset)):
+            if offset == 0 and entry[0] <= m:
+                continue
+            if list(entry[1:]) != list(current):
+                return start + timedelta(days=offset, minutes=entry[0])
+    return None
+
+
 def scheduled_entry(focus: dict, now: datetime) -> list:
     """The schedule entry in force: ``[minute, mode]`` or ``[minute, mode, sphere]``."""
     m = minute_of_day(now)
-    current = focus["schedule"][0]
-    for entry in focus["schedule"]:
+    current = None
+    for entry in day_schedule(focus, now.date()):
         if m >= entry[0]:
             current = entry
     return list(current)
@@ -392,38 +580,34 @@ def breaks_through(item: dict, mode: dict, profile: dict, now: datetime) -> bool
 
 
 def next_breakpoint(focus: dict, now: datetime) -> datetime:
-    """The next digest time or scheduled mode change. A scheduled step out of
-    Rest is not a breakpoint (the morning digest opens the day); a manual
-    override suspends the schedule, so only digest times count until it is
-    released."""
+    """The next digest time or scheduled mode change, on whichever day of the
+    week it falls — each day by its own plan. A scheduled step out of Rest is
+    not a breakpoint (the morning digest opens the day); a manual override
+    suspends the schedule, so only digest times count until it is released."""
     m = minute_of_day(now)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    candidates = [t for t in focus["digest_times"] if t > m]
-    if not focus.get("manual"):
-        schedule = focus["schedule"]
-        for k, entry in enumerate(schedule):
-            start = entry[0]
-            if start > m and (k == 0 or schedule[k - 1][1] != "rest"):
-                candidates.append(start)
-    if candidates:
-        return start_of_day + timedelta(minutes=min(candidates))
-    return start_of_day + timedelta(days=1, minutes=min(focus["digest_times"]))
+    for offset in range(8):
+        day = now.date() + timedelta(days=offset)
+        candidates = list(digest_times_on(focus, day))
+        if not focus.get("manual"):
+            candidates += _mode_changes(focus, day)
+        if offset == 0:
+            candidates = [t for t in candidates if t > m]
+        if candidates:
+            return start_of_day + timedelta(days=offset, minutes=min(candidates))
+    return start_of_day + timedelta(days=1)  # unreachable: every day has a digest time
 
 
 def due_events(focus: dict, now: datetime) -> set[str]:
-    """What this minute is due for: ``digest`` at a digest time, ``mode`` at a
-    scheduled change that counts as a breakpoint (see next_breakpoint), and
-    ``sweep`` every SWEEP_EVERY_MINUTES."""
+    """What this minute is due for: ``digest`` at a digest time of the day's
+    plan, ``mode`` at a scheduled change that counts as a breakpoint (see
+    next_breakpoint), and ``sweep`` every SWEEP_EVERY_MINUTES."""
     m = minute_of_day(now)
     events = set()
-    if m in focus["digest_times"]:
+    if m in digest_times_on(focus, now.date()):
         events.add("digest")
-    if not focus.get("manual"):
-        schedule = focus["schedule"]
-        for k, entry in enumerate(schedule):
-            start = entry[0]
-            if start == m and (k == 0 or schedule[k - 1][1] != "rest"):
-                events.add("mode")
+    if not focus.get("manual") and m in _mode_changes(focus, now.date()):
+        events.add("mode")
     if m % SWEEP_EVERY_MINUTES == 0:
         events.add("sweep")
     return events
@@ -594,17 +778,38 @@ def parse_minute(value) -> int | None:
     return minute if 0 <= minute < DAY else None
 
 
-def apply_rules(focus: dict, patch: dict, spheres: list[str]) -> list[str]:
+def apply_rules(focus: dict, patch: dict, spheres: list[str], today: date | None = None) -> list[str]:
     """Change the focus rules from one patch — what the mode menu, the
     settings page and Ara all write. Returns what changed, in words; an
     empty list means nothing did. Unknown keys are ignored; a value that is
-    not valid raises ValueError with the reason.
+    not valid raises ValueError with the reason, and the week and the
+    holidays are left as they were.
 
     Per mode (``{"mode": id, ...}``): ``only_admitted`` (bool), ``threshold``
     (a level), ``admits`` (the whole sphere list) or ``admit`` / ``deny``
     (spheres to add / remove), ``admit_tags`` or ``tag_on`` / ``tag_off``.
-    Whole document: ``schedule`` (a list of ``[time, mode]``; a time is
-    ``"HH:MM"`` or a minute) and ``digest_times`` (a list of times).
+
+    The week: ``week`` replaces the whole list of day plans (``{name, days,
+    schedule, digest_times?}``); ``{"plan": name, ...}`` changes one —
+    ``days`` (the days move to it from whichever plan had them; a plan left
+    with none is gone), ``schedule``, ``digest_times`` (``[]`` or null: the
+    default again), ``rename`` — or adds it, given its days and schedule.
+    Days are ``mon``…``sun``, ranges like ``mon-fri``, ``weekdays``,
+    ``weekend``, ``daily`` and ``holiday``; a schedule is a list of ``[time,
+    mode]`` / ``[time, mode, sphere]`` or the compact ``"07:00 chores, 08:00
+    focused, 13:00 focused customers"``; a time is ``"HH:MM"`` or a minute.
+    ``schedule`` without ``plan`` is the one plan's, while there is one.
+    Every weekday must end up in exactly one plan.
+
+    Holidays: ``holidays`` replaces the list, ``holiday_add`` and
+    ``holiday_remove`` change it — a holiday is ``"2026-12-24"``,
+    ``"2026-12-24..2027-01-02 Christmas"`` or ``{from, to?, name?}``; a
+    removal names it or a date inside it. Holidays that are over (before
+    ``today``) are dropped whenever the list changes. They follow the plan
+    that claims ``holiday``, so one must.
+
+    ``digest_times`` without ``plan``: the default digest times, for plans
+    that name none.
     """
     changes: list[str] = []
     mode_id = patch.get("mode")
@@ -648,40 +853,241 @@ def apply_rules(focus: dict, patch: dict, spheres: list[str]) -> list[str]:
                 for x in current:
                     if x not in wanted:
                         changes.append(f"{mode['name']} no longer {label} {x}")
-    if patch.get("schedule") is not None:
-        schedule = []
-        for entry in patch["schedule"]:
-            if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
-                raise ValueError("a schedule entry is [time, mode] or [time, mode, sphere]")
-            minute = parse_minute(entry[0])
-            if minute is None or str(entry[1]) not in focus["modes"]:
-                raise ValueError(f"bad schedule entry {entry!r}")
-            row = [minute, str(entry[1])]
-            if len(entry) == 3 and entry[2]:
-                scope = sphere_id(entry[2])
-                if scope is None or scope not in spheres:
-                    raise ValueError(f"unknown sphere in schedule entry {entry!r}")
-                if not focus["modes"][row[1]].get("with_subject"):
-                    raise ValueError(f"{focus['modes'][row[1]]['name']} takes no scope")
-                row.append(scope)
-            schedule.append(row)
-        schedule.sort()
-        if not schedule:
-            raise ValueError("the schedule needs at least one entry")
-        if schedule[0][0] != 0:
-            # The day starts in whatever mode the evening ends in.
-            schedule.insert(0, [0, schedule[-1][1]])
-        if schedule != [list(x) for x in focus["schedule"]]:
-            focus["schedule"] = schedule
-            changes.append("the schedule changed")
-    if patch.get("digest_times") is not None:
-        times = sorted({parse_minute(t) for t in patch["digest_times"]})
-        if None in times or not times:
-            raise ValueError("digest times are HH:MM")
+    week = json.loads(json.dumps(week_of(focus)))
+    if patch.get("week") is not None:
+        if not isinstance(patch["week"], list) or not patch["week"]:
+            raise ValueError("the week is a list of day plans")
+        week = [_parse_plan(raw, focus, spheres) for raw in patch["week"]]
+        _check_week(week)
+        if week != week_of(focus):
+            changes.append("the week: " + " · ".join(f"{p['name']} {', '.join(p['days'])}" for p in week))
+    plan_name = patch.get("plan")
+    own_digests = plan_name is not None
+    if plan_name is None and patch.get("schedule") is not None:
+        # Before the week there was one schedule; while there is one plan,
+        # that is what a bare schedule means.
+        if len(week) != 1:
+            raise ValueError("the week has several day plans — say which: " + ", ".join(p["name"] for p in week))
+        plan_name = week[0]["name"]
+    if plan_name is not None:
+        changes += _patch_plan(week, str(plan_name), patch, focus, spheres, own_digests)
+        _check_week(week)
+
+    holidays = [dict(h) for h in focus.get("holidays") or []]
+    touched = any(patch.get(k) is not None for k in ("holidays", "holiday_add", "holiday_remove"))
+    if patch.get("holidays") is not None:
+        holidays = [parse_holiday(h) for h in _as_list(patch["holidays"])]
+        changes.append("holidays: " + (", ".join(fmt_holiday(h) for h in holidays) or "none"))
+    for raw in _as_list(patch.get("holiday_add")):
+        h = parse_holiday(raw)
+        holidays = [x for x in holidays if (x["from"], x["to"]) != (h["from"], h["to"])] + [h]
+        changes.append(f"holiday {fmt_holiday(h)}")
+    for raw in _as_list(patch.get("holiday_remove")):
+        key = str(raw).strip()
+        try:
+            iso = date.fromisoformat(key).isoformat()
+            gone = [x for x in holidays if x["from"] <= iso <= x["to"]]
+        except ValueError:
+            gone = [x for x in holidays if str(x.get("name") or "").casefold() == key.casefold()]
+        if not gone:
+            raise ValueError(f"no holiday {key}")
+        holidays = [x for x in holidays if x not in gone]
+        changes += [f"holiday {fmt_holiday(x)} removed" for x in gone]
+    if touched and today is not None:
+        holidays = [x for x in holidays if x["to"] >= today.isoformat()]
+    holidays.sort(key=lambda x: (x["from"], x["to"]))
+    if (touched or week != week_of(focus)) and holidays and not any(HOLIDAY in plan_days(p) for p in week):
+        raise ValueError("no day plan takes holidays — give one the day “holiday” first")
+
+    if week != week_of(focus):
+        focus["week"] = week
+        focus.pop("schedule", None)
+    if touched and holidays != (focus.get("holidays") or []):
+        focus["holidays"] = holidays
+    if patch.get("digest_times") is not None and not own_digests:
+        times = _parse_times(patch["digest_times"])
         if times != sorted(focus["digest_times"]):
             focus["digest_times"] = times
-            changes.append("digest times → " + ", ".join(f"{t // 60:02d}:{t % 60:02d}" for t in times))
+            changes.append("digest times → " + _fmt_times(times))
     return changes
+
+
+def _as_list(value) -> list:
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _fmt_times(times: list[int]) -> str:
+    return ", ".join(f"{t // 60:02d}:{t % 60:02d}" for t in times)
+
+
+def _parse_times(value) -> list[int]:
+    raw = re.split(r"[,;\s]+", value.strip()) if isinstance(value, str) else _as_list(value)
+    times = [parse_minute(t) for t in raw if str(t).strip()]
+    if not times or None in times:
+        raise ValueError("digest times are HH:MM")
+    return sorted(set(times))
+
+
+def _plan_name(value) -> str:
+    name = str(value or "").strip()
+    if not name or len(name) > 40:
+        raise ValueError("a day plan needs a name of at most 40 characters")
+    return name
+
+
+def parse_schedule(value, focus: dict, spheres: list[str]) -> list[list]:
+    """A day's schedule as written — ``[[time, mode], [time, mode, sphere]]``
+    or ``"07:00 chores, 08:00 focused, 13:00 focused customers"`` — sorted,
+    each time once. It need not start at 00:00: the day then begins in the
+    mode the evening before ended in (see day_schedule)."""
+    if isinstance(value, str):
+        value = [part.split() for part in value.split(",") if part.strip()]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("a schedule is a list of [time, mode] entries")
+    schedule = []
+    for entry in value:
+        if not isinstance(entry, (list, tuple)) or len(entry) not in (2, 3):
+            raise ValueError("a schedule entry is [time, mode] or [time, mode, sphere]")
+        minute = parse_minute(entry[0])
+        if minute is None or str(entry[1]) not in focus["modes"]:
+            raise ValueError(f"bad schedule entry {list(entry)!r}")
+        row = [minute, str(entry[1])]
+        if len(entry) == 3 and entry[2]:
+            scope = sphere_id(entry[2])
+            if scope is None or scope not in spheres:
+                raise ValueError(f"unknown sphere in schedule entry {list(entry)!r}")
+            if not focus["modes"][row[1]].get("with_subject"):
+                raise ValueError(f"{focus['modes'][row[1]]['name']} takes no scope")
+            row.append(scope)
+        schedule.append(row)
+    schedule.sort()
+    if not schedule:
+        raise ValueError("the schedule needs at least one entry")
+    for a, b in zip(schedule, schedule[1:]):
+        if a[0] == b[0]:
+            raise ValueError(f"two entries at {_fmt_times([a[0]])}")
+    return schedule
+
+
+def _parse_plan(raw, focus: dict, spheres: list[str]) -> dict:
+    if not isinstance(raw, dict):
+        raise ValueError("a day plan is {name, days, schedule, digest_times?}")
+    name = _plan_name(raw.get("name"))
+    days = parse_days(raw.get("days") or [])
+    if not days:
+        raise ValueError(f"{name} names no days")
+    plan = {"name": name, "days": fmt_days(days), "schedule": parse_schedule(raw.get("schedule"), focus, spheres)}
+    if raw.get("digest_times"):
+        plan["digest_times"] = _parse_times(raw["digest_times"])
+    return plan
+
+
+def _check_week(week: list[dict]) -> None:
+    """Every weekday in exactly one plan, ``holiday`` in at most one, no two
+    plans of one name."""
+    owner: dict[str, str] = {}
+    names: set[str] = set()
+    for plan in week:
+        if plan["name"].casefold() in names:
+            raise ValueError(f"two day plans are called {plan['name']}")
+        names.add(plan["name"].casefold())
+        for day in plan_days(plan):
+            if day in owner:
+                raise ValueError(f"{day} is in both {owner[day]} and {plan['name']}")
+            owner[day] = plan["name"]
+    missing = [d for d in WEEKDAYS if d not in owner]
+    if missing:
+        raise ValueError("no day plan for " + ", ".join(missing) + " — give it to one")
+
+
+def _patch_plan(week: list[dict], name: str, patch: dict, focus: dict, spheres: list[str],
+                own_digests: bool) -> list[str]:
+    """Change (or add) one day plan of the working week in place."""
+    changes: list[str] = []
+    plan = next((p for p in week if p["name"].casefold() == name.strip().casefold()), None)
+    created = plan is None
+    if created:
+        if patch.get("days") is None or patch.get("schedule") is None:
+            raise ValueError(f"there is no day plan {name} — a new one needs its days and its schedule")
+        plan = {"name": _plan_name(name), "days": [], "schedule": []}
+        week.append(plan)
+    if patch.get("schedule") is not None:
+        schedule = parse_schedule(patch["schedule"], focus, spheres)
+        if schedule != plan["schedule"]:
+            plan["schedule"] = schedule
+            if not created:
+                changes.append(f"{plan['name']}: the schedule changed")
+    if own_digests and "digest_times" in patch:
+        value = patch["digest_times"]
+        if value in (None, [], ""):
+            if plan.pop("digest_times", None) is not None:
+                changes.append(f"{plan['name']}: the default digest times")
+        else:
+            times = _parse_times(value)
+            if times != plan.get("digest_times"):
+                plan["digest_times"] = times
+                changes.append(f"{plan['name']}: digests {_fmt_times(times)}")
+    if patch.get("days") is not None:
+        days = parse_days(patch["days"])
+        if not days:
+            raise ValueError(f"{plan['name']} needs at least one day")
+        if days != plan_days(plan):
+            # The days move here: whichever plan had them loses them, and a
+            # plan left with no days is gone.
+            gone = []
+            for other in week:
+                if other is not plan and plan_days(other) & days:
+                    left = plan_days(other) - days
+                    other["days"] = fmt_days(left)
+                    if not left:
+                        gone.append(other["name"])
+            week[:] = [p for p in week if p is plan or p["name"] not in gone]
+            plan["days"] = fmt_days(days)
+            if not created:
+                changes.append(f"{plan['name']}: {', '.join(plan['days'])}")
+            changes += [f"{g} is gone — no days left" for g in gone]
+    if patch.get("rename"):
+        new = _plan_name(patch["rename"])
+        if new != plan["name"]:
+            changes.append(f"{plan['name']} → {new}")
+            plan["name"] = new
+    if created:
+        changes.insert(0, f"new day plan {plan['name']}: {', '.join(plan['days'])}")
+    return changes
+
+
+def parse_holiday(value) -> dict:
+    """``"2026-12-24"``, ``"2026-12-24..2027-01-02 Christmas"`` (``/`` or
+    ``to`` also separate the dates), ``[from, to?, name?]`` or ``{from, to?,
+    name?}`` as ``{"from", "to", "name"?}`` with ISO dates, ``to`` inclusive."""
+    if isinstance(value, dict):
+        start, end, name = value.get("from") or value.get("date"), value.get("to"), value.get("name")
+    elif isinstance(value, (list, tuple)) and value:
+        start, end, name = (list(value) + [None, None])[:3]
+    else:
+        m = re.match(r"^\s*(\d{4}-\d{2}-\d{2})(?:\s*(?:\.\.|/|–|—|\bto\b)\s*(\d{4}-\d{2}-\d{2}))?(?:\s+(.+?))?\s*$",
+                     str(value or ""))
+        if not m:
+            raise ValueError(f"not a holiday: {value!r} (YYYY-MM-DD, or YYYY-MM-DD..YYYY-MM-DD and a name)")
+        start, end, name = m.groups()
+    try:
+        first = date.fromisoformat(str(start))
+        last = date.fromisoformat(str(end)) if end else first
+    except ValueError:
+        raise ValueError(f"not a holiday: {value!r} (dates are YYYY-MM-DD)") from None
+    if last < first or (last - first).days > 366:
+        raise ValueError(f"not a holiday: {value!r} (the end is before the start, or a year away)")
+    out = {"from": first.isoformat(), "to": last.isoformat()}
+    if name and str(name).strip():
+        out["name"] = str(name).strip()[:60]
+    return out
+
+
+def fmt_holiday(h: dict) -> str:
+    span = h["from"] if h["to"] == h["from"] else f"{h['from']} – {h['to']}"
+    return f"{h['name']}, {span}" if h.get("name") else span
 
 
 # A word in any script: letters and digits (Unicode), hyphens between them.
@@ -743,7 +1149,9 @@ def set_admission(focus: dict, sphere: str, mode_id: str, on: bool) -> bool:
 
 def snooze(item: dict, focus: dict, now: datetime, when: str) -> datetime:
     if when == "tomorrow":
-        until = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1, minutes=min(focus["digest_times"]))
+        # Tomorrow's first digest, by tomorrow's plan.
+        tomorrow = now.date() + timedelta(days=1)
+        until = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1, minutes=digest_times_on(focus, tomorrow)[0])
     else:
         until = next_breakpoint(focus, now)
     item["released"] = False

@@ -64,9 +64,12 @@ outbound send already performs.
 persistent volume) holds:
 
 - **`focus.json`** — the modes (admitted spheres, admitting tags, threshold,
-  blurb, `with_subject` for a mode that takes a scope), the schedule as
-  `[minute, mode]` or `[minute, mode, sphere]` (the sphere Focused is on), the
-  digest times, the manual override and its `subject` — a sphere id, or
+  blurb, `with_subject` for a mode that takes a scope), the week — day plans,
+  each a schedule of `[minute, mode]` or `[minute, mode, sphere]` (the sphere
+  Focused is on) with the days it rules (`mon-fri`, `sat, sun, holiday`) and
+  optionally its own digest times — the holidays that follow the plan
+  claiming `holiday`, the default digest times, the manual override and its
+  `subject` — a sphere id, or
   `{kind: "project", id, title}`. `attention.default_focus()` is the shipped
   default: Rest & relax · Focused · Chores · Social, named for how
   interruptible the user is; a deployment edits the file or, later, drives it

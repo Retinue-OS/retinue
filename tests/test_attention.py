@@ -5,6 +5,7 @@ sweep, corrections feeding the profile, and the life-store emit.
 
     python3 tests/test_attention.py
 """
+import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -193,18 +194,84 @@ def test_fold_and_rules():
     assert focus["modes"]["chores"]["admits"] == ["customers", "health", "friends", "family", "system"] and focus["modes"]["chores"]["admit_tags"] == ["finance"]
     assert A.apply_rules(focus, {"mode": "social", "threshold": "active", "admits": ["family"]}, spheres) == ["Social rings from active", "Social no longer admits friends"]
     for bad in ({"mode": "nope"}, {"mode": "focused", "threshold": "passive"}, {"mode": "focused", "admit": ["pets"]},
-                {"schedule": [["25:00", "focused"]]}, {"schedule": [["09:00", "focused", "pets"]]},
-                {"schedule": [["09:00", "chores", "customers"]]}, {"digest_times": ["noon"]}):
+                {"plan": "Workday", "schedule": [["25:00", "focused"]]}, {"plan": "Workday", "schedule": [["09:00", "focused", "pets"]]},
+                {"plan": "Workday", "schedule": [["09:00", "chores", "customers"]]}, {"digest_times": ["noon"]},
+                {"schedule": [["09:00", "chores"]]}):                 # two plans: say which
         try:
             A.apply_rules(focus, bad, spheres)
             raise AssertionError(f"accepted {bad}")
         except ValueError:
             pass
-    assert A.apply_rules(focus, {"schedule": [["07:30", "chores"], [540, "focused", "Customers"], ["22:00", "rest"]], "digest_times": ["08:00", "12:30", 1260]}, spheres) \
-        == ["the schedule changed", "digest times → 08:00, 12:30, 21:00"]
-    assert focus["schedule"] == [[0, "rest"], [450, "chores"], [540, "focused", "customers"], [1320, "rest"]] and focus["digest_times"] == [480, 750, 1260]
+    assert A.apply_rules(focus, {"plan": "Workday", "schedule": [["07:30", "chores"], [540, "focused", "Customers"], ["22:00", "rest"]]}, spheres) \
+        == ["Workday: the schedule changed"]
+    assert A.apply_rules(focus, {"digest_times": ["08:00", "12:30", 1260]}, spheres) == ["digest times → 08:00, 12:30, 21:00"]
+    assert focus["week"][0]["schedule"] == [[450, "chores"], [540, "focused", "customers"], [1320, "rest"]] and focus["digest_times"] == [480, 750, 1260]
+    # No 00:00 entry: the day starts where the night before left off.
+    assert A.day_schedule(focus, at(0).date())[0] == [0, "rest"]
     assert A.mode_at(focus, at(10))["admits"] == ["customers"]
     assert A.parse_minute("8") == 480 and A.parse_minute(True) is None
+
+
+def test_week():
+    """Day plans rule the days they name — ranges, lists, holidays — and
+    every schedule question (the mode, the breakpoints, until when) is asked
+    of the date's own plan, across midnight."""
+    assert A.parse_days("mon-fri") == {"mon", "tue", "wed", "thu", "fri"}
+    assert A.fmt_days(A.parse_days("fri-mon")) == ["mon", "fri-sun"]
+    assert A.fmt_days(A.parse_days(["Monday", "tues", "Wed", "holidays"])) == ["mon-wed", "holiday"]
+    assert A.fmt_days(A.parse_days("weekend")) == ["sat", "sun"] and A.parse_days("daily") == set(A.WEEKDAYS)
+    for bad in ("funday", "mo-fr"):
+        try:
+            A.parse_days(bad)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+    focus, spheres = A.default_focus(), ["customers", "admin", "health", "friends", "family", "system"]
+    fri, sat, mon = at(0, d=1), at(0, d=2), at(0, d=4)      # DAY0 is a Thursday
+    assert A.day_plan(focus, sat.date())["name"] == "Day off" and A.day_plan(focus, fri.date())["name"] == "Workday"
+    assert A.mode_at(focus, at(10, d=2))["id"] == "social" and A.mode_at(focus, at(10, d=1))["id"] == "focused"
+    # Friday night runs into Saturday's plan: its first digest, its Social.
+    assert A.next_breakpoint(focus, at(22, 30, d=1)) == at(9, d=2)
+    assert A.scheduled_until(focus, at(22, 30, d=1)) == at(9, d=2)
+    assert A.next_breakpoint(focus, at(22, 30, d=3)) == at(8, d=4)       # Sunday night: Monday's 08:00
+    assert A.due_events(focus, at(9, d=2)) == {"digest", "sweep"} and A.due_events(focus, at(8, d=2)) == {"sweep"}   # the workday digest is not Saturday's
+    assert A.due_events(focus, at(0, d=4)) == {"sweep"}                  # Rest into Rest at midnight: no change
+    item_ = item(id="h", sphere="customers")
+    assert A.snooze(item_, focus, at(20, d=1), "tomorrow") == at(9, d=2)
+    # Holidays follow the plan that claims them, whatever the weekday.
+    assert A.apply_rules(focus, {"holiday_add": [f"{mon.date()}..{at(0, d=8).date()} Autumn break"]}, spheres, today=DAY0.date()) \
+        == [f"holiday Autumn break, {mon.date()} – {at(0, d=8).date()}"]
+    assert A.day_plan(focus, at(0, d=6).date())["name"] == "Day off" and A.mode_at(focus, at(10, d=6))["id"] == "social"
+    assert A.next_breakpoint(focus, at(22, 30, d=3)) == at(9, d=4)       # the break starts on Monday
+    # A plan of its own takes its days from the plan that had them; given
+    # back, the emptied plan is gone. Every weekday stays in one plan.
+    assert A.apply_rules(focus, {"plan": "Friday", "days": "fri", "schedule": "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"}, spheres) \
+        == ["new day plan Friday: fri"]
+    assert [p["days"] for p in focus["week"]] == [["mon-thu"], ["sat", "sun", "holiday"], ["fri"]]
+    assert A.mode_at(focus, at(15, d=1))["id"] == "social"
+    for bad in ({"plan": "Workday", "days": "mon-wed"}, {"plan": "Weekend", "days": "sat"},
+                {"plan": "Friday", "rename": "workday"}, {"plan": "Friday", "schedule": "08:00 chores, 8:00 rest"},
+                {"week": [{"name": "Only", "days": "daily", "schedule": "00:00 rest"}], "holiday_add": "2026-12-24"},
+                {"holiday_add": "2026-12-24..2026-12-01"}, {"holiday_remove": "Easter"}):
+        before = json.dumps(focus, sort_keys=True, default=str)
+        try:
+            A.apply_rules(focus, bad, spheres)
+            raise AssertionError(f"accepted {bad}")
+        except ValueError:
+            pass
+        assert json.dumps(focus, sort_keys=True, default=str) == before, f"{bad} changed the rules before it was refused"
+    assert A.apply_rules(focus, {"plan": "workday", "days": "weekdays", "holiday_remove": str(at(0, d=5).date())}, spheres) \
+        == ["Workday: mon-fri", "Friday is gone — no days left", f"holiday Autumn break, {mon.date()} – {at(0, d=8).date()} removed"]
+    assert [p["name"] for p in focus["week"]] == ["Workday", "Day off"] and focus["holidays"] == []
+    # Holidays that are over go when the list changes.
+    A.apply_rules(focus, {"holidays": ["2026-01-01 New Year", "2026-12-25"]}, spheres, today=DAY0.date())
+    assert focus["holidays"] == [{"from": "2026-12-25", "to": "2026-12-25"}]
+    # Before the week: a chosen schedule rules every day; the shipped one
+    # gives way to the shipped week.
+    assert A.upgrade_focus({"schedule": A.DEFAULT_SCHEDULE}) == {}
+    old = A.upgrade_focus({"schedule": [[0, "rest"], [480, "chores"]]})
+    assert old["week"] == [{"name": "Every day", "days": ["mon-sun", "holiday"], "schedule": [[0, "rest"], [480, "chores"]]}]
+    assert A.mode_at({**A.default_focus(), **old}, at(10, d=2))["id"] == "chores"
 
 
 def test_docs_and_emit():

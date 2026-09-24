@@ -53,8 +53,9 @@ to an item's sheet. The list refreshes on the conversations cadence and after
 every action on the sheet (`retinue-attention-change` on `window`).
 
 `GET /attention` returns `{generated, now, timezone, mode: {id, name, blurb,
-threshold, admits, admit_tags, manual, scheduled: {id, name, until}}, modes,
-schedule, digest_times, spheres, next_breakpoint, sections: {now, next, held,
+threshold, admits, admit_tags, manual, scheduled: {id, name, until}, day: {plan,
+days, holiday}}, modes, schedule and digest_times (today's, by today's day
+plan), week, holidays, spheres, next_breakpoint, sections: {now, next, held,
 waiting}, counts, degraded, learned}`; a row is `{id, kind: thread|chat|project,
 title, preview, href, sphere, tags, sender, channel, group, agent, count,
 unread, pending, level, critical, importance, importance_from, importance_text,

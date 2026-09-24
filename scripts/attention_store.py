@@ -5,7 +5,7 @@ The policy (scripts/attention.py) decides over plain items; this module is
 the plumbing around it that the web-gateway and the boot emitter share:
 
 - **The two small documents** under ``ATTENTION_DIR`` — ``focus.json`` (modes,
-  schedule, digest times, the manual override) and ``profile.json``
+  the week of day plans, holidays, digest times, the manual override) and ``profile.json``
   (importance and sphere priors per sender or kind, lead times per kind,
   permits per mode, the learned log) — plus ``projects.json``, the delivery
   state of projects, which have no document of their own in the gateway (their
@@ -88,7 +88,11 @@ class AttentionStore:
 
     def focus(self) -> dict:
         with self.lock:
-            focus = policy.load_json(self.dir / "focus.json", policy.default_focus())
+            # A document from before the week is read as one (upgrade_focus)
+            # before the shipped defaults fill in what it does not say.
+            stored = policy.upgrade_focus(policy.load_json(self.dir / "focus.json", {}))
+            focus = policy.default_focus()
+            focus.update(stored)
             focus.setdefault("spheres", list(DEFAULT_SPHERES))
             if UNKNOWN_SPHERE not in focus["spheres"]:
                 # Structural, not a matter of taste: the model itself puts a

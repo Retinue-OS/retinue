@@ -698,9 +698,12 @@ def test_internal_set(base, wg):
 
 
 def test_payload_shape(base, wg):
+    _clock(wg, datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc))      # a Monday: the Workday plan
     body = _sections(base)
     assert body["timezone"] == "UTC" and body["mode"]["id"] in {m["id"] for m in body["modes"]}
     assert len(body["schedule"]) == 8 and body["digest_times"] == [480, 720, 1020, 1260]
+    assert body["mode"]["day"] == {"plan": "Workday", "days": ["mon-fri"], "holiday": None}, body["mode"]["day"]
+    assert [p["name"] for p in body["week"]] == ["Workday", "Day off"] and body["holidays"] == []
     assert set(body["counts"]) == {"now", "next", "held", "waiting", "not_now"}
     assert all("only_admitted" in m for m in body["modes"]) and body["mode"]["only_admitted"] in (True, False)
     assert body["spheres"] == ["customers", "admin", "health", "friends", "family", "system",
@@ -710,7 +713,57 @@ def test_payload_shape(base, wg):
     assert status == 404
     status, out = _http(base, "POST", "/attention/mode", {"mode": "nope"})
     assert status == 400
+    _clock(wg, None)
     print("ok test_payload_shape")
+
+
+def test_week_and_holidays(base, wg):
+    """A day plan rules the days it names; a holiday follows the plan that
+    claims holidays, whatever its weekday; the patch keeps every weekday in
+    exactly one plan."""
+    saturday = datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc)
+    _clock(wg, saturday)
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": None})    # follow the schedule
+    assert status == 200
+    body = _sections(base)
+    assert body["mode"]["day"]["plan"] == "Day off" and body["mode"]["id"] == "social", body["mode"]
+    assert body["digest_times"] == [540, 1080] and body["schedule"][0] == [0, "rest"]
+    # A week off: told as a date range, not a new schedule.
+    status, out = _http(base, "POST", "/attention/modes", {"holiday_add": "2026-10-05..2026-10-09 Autumn break"})
+    assert status == 200 and out["changed"] == ["holiday Autumn break, 2026-10-05 – 2026-10-09"], out
+    _clock(wg, datetime(2026, 10, 7, 10, 0, tzinfo=timezone.utc))      # a Wednesday in it
+    body = _sections(base)
+    assert body["mode"]["day"] == {"plan": "Day off", "days": ["sat", "sun", "holiday"], "holiday": "Autumn break"}, body["mode"]["day"]
+    assert body["mode"]["id"] == "social"
+    # A plan of its own for Fridays: the day moves out of Workday.
+    _clock(wg, saturday)
+    status, out = _http(base, "POST", "/attention/modes", {"plan": "Friday", "days": "fri",
+                                                            "schedule": "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"})
+    assert status == 200 and out["changed"] == ["new day plan Friday: fri"], out
+    assert [(p["name"], p["days"]) for p in out["focus"]["week"]] == [("Workday", ["mon-thu"]), ("Day off", ["sat", "sun", "holiday"]), ("Friday", ["fri"])]
+    _clock(wg, datetime(2026, 9, 11, 15, 0, tzinfo=timezone.utc))      # Friday afternoon
+    assert _sections(base)["mode"]["id"] == "social"
+    for bad in ({"plan": "Workday", "days": "mon-wed"}, {"holiday_add": "2026-02-30"},
+                {"schedule": "08:00 chores"}, {"holiday_remove": "Easter"}):
+        status, out = _http(base, "POST", "/attention/modes", bad)
+        assert status == 400 and out["error"], (bad, out)
+    status, out = _http(base, "POST", "/attention/modes", {"plan": "Workday", "days": "mon-fri", "holiday_remove": "Autumn break"})
+    assert status == 200 and "Friday is gone — no days left" in out["changed"] and out["focus"]["holidays"] == [], out
+    # A document from before the week: its one schedule rules every day.
+    status, out = _http(base, "GET", "/attention/profile")
+    legacy = {k: v for k, v in out["focus"].items() if k not in ("week", "holidays")}
+    legacy["schedule"] = [[0, "rest"], [480, "chores"], [1320, "rest"]]
+    status, out = _http(base, "POST", "/attention/profile", {"focus": legacy})
+    assert status == 200 and [(p["name"], p["days"]) for p in out["focus"]["week"]] == [("Every day", ["mon-sun", "holiday"])], out["focus"]
+    assert _sections(base)["mode"]["id"] == "chores"
+    status, out = _http(base, "POST", "/attention/profile", {"focus": {**legacy, "week": [{"name": "A", "days": "mon-fri", "schedule": [[0, "rest"]]}]}})
+    assert status == 400 and "sat" in out["error"], out
+    status, out = _http(base, "POST", "/attention/modes", {"week": [
+        {"name": "Workday", "days": "weekdays", "schedule": [[0, "rest"], [420, "chores"], [480, "focused"], [720, "chores"], [780, "focused", "customers"], [1020, "chores"], [1080, "social"], [1320, "rest"]]},
+        {"name": "Day off", "days": "weekend, holiday", "schedule": "00:00 rest, 09:00 social, 22:00 rest", "digest_times": ["09:00", "18:00"]}]})
+    assert status == 200 and out["changed"][0].startswith("the week: Workday mon-fri · Day off sat, sun, holiday"), out
+    _clock(wg, None)
+    print("ok test_week_and_holidays")
 
 
 def main():
@@ -737,6 +790,7 @@ def main():
         test_project_from_store(base, wg)
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)
+        test_week_and_holidays(base, wg)
         server.shutdown()
     sparql.shutdown()
     print("all attention API checks passed")

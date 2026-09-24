@@ -151,8 +151,9 @@ alert).
 `_push_conv_notification` and `_chat_push_notification` are called only when
 the decision is *push* (`Urgency: high`); a held item badges the dashboard but
 stays quiet. The user's own threads with Ara are never gated — they asked.
-Breakpoints — the digest times 08:00, 12:00, 17:00, 21:00 and the scheduled
-mode changes (leaving *Rest* excepted: the morning digest opens the day) —
+Breakpoints — the day plan's digest times (08:00, 12:00, 17:00, 21:00 on a
+shipped workday, 09:00 and 18:00 on a day off) and the scheduled mode changes
+(leaving *Rest* excepted: the morning digest opens the day) —
 release what was held with one `Topic: digest` push (`Urgency: normal`), and a
 half-hourly sweep re-evaluates: an item that crossed into the next urgency
 band climbs, and one the mode now admits is pushed. Both run on the gateway's
@@ -167,19 +168,44 @@ keep working.
 
 **The two documents** live under `ATTENTION_DIR` (default a sibling of
 `CONVERSATIONS_DIR`, so the persistent volume): `focus.json` — the modes
-(admitted spheres, admitting tags, threshold, blurb), the schedule as
-minute-of-day → mode, the digest times, the sphere vocabulary and the manual
-override — and `profile.json` — importance and sphere priors per sender or
+(admitted spheres, admitting tags, threshold, blurb), the week, the holidays,
+the default digest times, the sphere vocabulary and the manual override — and
+`profile.json` — importance and sphere priors per sender or
 kind, lead times per kind, permits per mode, and the learned log; plus
 `projects.json` with the delivery state of projects. `GET /attention/profile`
 returns both, `POST /attention/profile` replaces them, and `POST
 /attention/modes` changes the rules by patch (`attention.apply_rules`: a
 mode's `only_admitted`, `threshold`, `admits` or `admit`/`deny`,
-`admit_tags` or `tag_on`/`tag_off`; the `schedule` as `[time, mode]` pairs
-and the `digest_times`, times as `HH:MM` or minutes) — what the mode menu,
-the settings page and Ara write; a deployment edits the files or drives the
-mode from the menu. The shipped defaults are the brief's
-(`attention.default_focus()`, `default_profile()`).
+`admit_tags` or `tag_on`/`tag_off`; the `week`, one day plan by `plan`, the
+`holidays` or `holiday_add`/`holiday_remove`; the default `digest_times`,
+times as `HH:MM` or minutes) — what the mode menu, the settings page and Ara
+write; a deployment edits the files or drives the mode from the menu. The
+shipped defaults are the brief's (`attention.default_focus()`,
+`default_profile()`).
+
+**The week.** The schedule is not one day repeated, and not seven: it is a
+few **day plans**, each a day's schedule (`[minute, mode]` or `[minute,
+mode, sphere]`) with the days it rules, written compactly — `mon-fri`, `sat,
+sun`, `weekend`, a wrapping `fri-mon` — and optionally its own digest times.
+Every weekday belongs to exactly one plan. One plan may also claim
+`holiday`: the dates in `holidays` (single days or ranges, with a name) then
+follow it whatever weekday they fall on, so a week off is told to the system
+as a date range, not built as a new schedule. The shipped week is *Workday*
+(`mon-fri`, the schedule above) and *Day off* (`sat, sun, holiday`: Rest,
+Social from 09:00, Rest from 22:00; digests 09:00 and 18:00). A plan without
+a 00:00 entry starts the day in the mode the night before ended in, so the
+answer to "what mode is it" and "when is the next breakpoint" is always the
+date's own plan, across midnight (`attention.day_plan`, `day_schedule`,
+`next_breakpoint`). Changing a plan's days moves them from whichever plan had
+them — a plan left with none is gone — and the patch is refused while a
+weekday would be in no plan or two. Ara makes these changes when asked, with
+`scripts/attention-week.py` (the week and today's plan; `holiday add
+2026-12-24..2027-01-02 --name Christmas`; `plan Friday --days fri
+--schedule "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"`). A
+`focus.json` from before the week keeps its one schedule for every day, as an
+*Every day* plan — unless it was the shipped schedule, which gives way to
+the shipped week. The mode menu's *Follow the schedule* row names today's
+plan, and the holiday when there is one.
 
 **The API** (behind the dashboard's auth like the rest): `GET /attention`
 (the sections, the mode, the next breakpoint, `degraded` naming a source the

@@ -103,7 +103,7 @@ class Deck {
     $('#date').textContent = new Date(s.date + 'T12:00:00').toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'long' });
     const att = s.attention || {}; const mode = att.mode || {};
     const base = new Date(s.date + 'T00:00:00');
-    const modeLine = `<span class="dot" style="background:${MODE_COLORS[mode.id] || '#6ea8fe'}"></span>${esc(mode.name || '')}${mode.manual ? ' · set by hand' : (mode.scheduled ? ` · until ${whenText(mode.scheduled.until, base)}` : '')}`;
+    const modeLine = `<span class="dot" style="background:${MODE_COLORS[mode.id] || '#6ea8fe'}"></span>${esc(mode.name || '')}${mode.manual ? ' · set by hand' : (mode.scheduled && mode.scheduled.until ? ` · until ${whenText(mode.scheduled.until, base)}` : '')}`;
     $('#mode-line').innerHTML = modeLine; $('#mini-mode').innerHTML = modeLine;
     $('#btn-play').textContent = s.playing ? '⏸ Pause' : '▶ Play the day'; $('#mini-play').textContent = s.playing ? '⏸' : '▶';
     $('#driving').hidden = !s.driving; $('#ended').hidden = !s.ended; $('#minibar').hidden = false;
@@ -135,7 +135,8 @@ class Deck {
     const permits = (att.permits || {})[mode.id] || [];
     $('#state').innerHTML = `
       <h3>System state</h3>
-      <div class="mode-card" style="border-left-color:${MODE_COLORS[mode.id] || '#6ea8fe'}"><div class="mode-name">${esc(mode.name || '')} <small>${mode.manual ? 'set by hand' : (mode.scheduled ? `scheduled until ${whenText(mode.scheduled.until, base)}` : '')}</small></div>
+      <div class="mode-card" style="border-left-color:${MODE_COLORS[mode.id] || '#6ea8fe'}"><div class="mode-name">${esc(mode.name || '')} <small>${mode.manual ? 'set by hand' : (mode.scheduled && mode.scheduled.until ? `scheduled until ${whenText(mode.scheduled.until, base)}` : '')}</small></div>
+        <div class="kv"><span>day plan</span><div>${mode.day ? `${esc(mode.day.plan)} <span class="muted">${esc((mode.day.days || []).join(', '))}</span>${mode.day.holiday ? ` · ${esc(mode.day.holiday)}` : ''}` : ''}</div></div>
         <div class="kv"><span>admits</span><div>${chips(mode.admits, (x) => SPHERE_COLORS[x])}${(mode.admit_tags || []).length ? ` <span class="muted">+ tag</span> ${chips(mode.admit_tags, (x) => SPHERE_COLORS[x])}` : ''}</div></div>
         <div class="kv"><span>permits</span><div>${chips(permits)}</div></div>
         <div class="kv"><span>breaks through</span><div>${esc(mode.threshold || '')} and above</div></div>

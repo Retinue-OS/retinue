@@ -6,7 +6,9 @@ on the deployment's own code: the web-gateway with the attention model
 Only what needs the outside world is stood in for — a mock life store with the
 example day's message ledger and projects, three mock messenger gateways that
 accept your sends, and a canned Ara whose turns follow scripted dialogues.
-Everyone in the story is fictional.
+Everyone in the story is fictional. The day is a workday — today's date,
+on the shipped week's *Workday* plan; run on or next to a weekend, the
+runner moves the story's days into that plan, so the day plays the same.
 
 ```bash
 python3 examples/attention-simulation/simulate.py --open     # http://localhost:8766/simulation.html

@@ -328,8 +328,9 @@ class RetinueAttention extends HTMLElement {
       return `<header><span class="mode-head"><span class="mode-when">` +
         `${this._state === 'offline' ? 'Offline' : '&#8230;'}</span></span>${right}</header>`;
     }
+    const schedUntil = (mode.scheduled || {}).until;
     const until = mode.manual ? 'set by hand'
-      : `until ${esc(fmtWhen((mode.scheduled || {}).until))}`;
+      : (schedUntil ? `until ${esc(fmtWhen(schedUntil))}` : '');
     const scope = mode.subject || null;
     const subject = scope
       ? ` <span class="mode-subject" style="color:${scope.kind === 'project' ? 'inherit' : sphereColor(scope.id)}">· ${esc(scope.title || scope.id)}</span>` : '';
@@ -340,6 +341,13 @@ class RetinueAttention extends HTMLElement {
       `<span class="mode-name">${esc(mode.name)}${subject}</span>` +
       `<span class="mode-when">${until}</span><span class="caret">&#9662;</span>` +
       `</button>${right}</header>`;
+  }
+
+  // Which day plan the schedule follows today — "Workday: ", or on a
+  // holiday "Christmas · Day off: " — so the row says why it is what it is.
+  _dayHtml(day) {
+    if (!day || !day.plan) return '';
+    return `${day.holiday ? `${esc(day.holiday)} · ` : ''}${esc(day.plan)}: `;
   }
 
   _menuHtml() {
@@ -374,7 +382,7 @@ class RetinueAttention extends HTMLElement {
       `<div class="menu-head">Focus mode</div>${rows}` +
       `<button class="menu-row follow${cur.manual ? '' : ' on'}" data-act="set-mode" data-mode="">` +
       `<span class="dot" style="background:${modeColor(sch.id)}"></span><span><b>Follow the schedule</b>` +
-      `<small>${esc(sch.name || '')}${sch.until ? ` until ${esc(fmtWhen(sch.until))}` : ''}</small></span></button>` +
+      `<small>${this._dayHtml(cur.day)}${esc(sch.name || '')}${sch.until ? ` until ${esc(fmtWhen(sch.until))}` : ''}</small></span></button>` +
       `<div class="menu-note">A change by hand is a breakpoint: what was held is released, and the digest goes out.</div>` +
       `<label class="menu-fold"><input type="checkbox" data-act="fold" data-mode="${esc(cur.id)}" data-on="${cur.only_admitted ? '0' : '1'}"${cur.only_admitted ? ' checked' : ''}>` +
       `<span><b>In ${esc(cur.name)}, list only what it admits</b><small>The rest folds into “Not now”. Critical, permitted and pulled items stay.</small></span></label>` +
