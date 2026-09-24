@@ -232,6 +232,19 @@ def test_send_from_inside_the_container_is_refused(base, wg):
     print("PASS test_send_from_inside_the_container_is_refused")
 
 
+def test_delete_from_inside_the_container_is_refused(base, wg):
+    """Erasing a chat is the user's act too: an agent may archive or mute a
+    chat through /flags, but a delete from inside the container is refused
+    before any gateway is asked to erase anything."""
+    GW_SEEN.clear()
+    status, body = _http(base, "POST", f"/chats/{_quote(CHAT)}/delete")
+    assert status == 403, (status, body)
+    answer = json.loads(body)
+    assert "reverse proxy" in answer["error"] and "loopback" in answer["detail"], answer
+    assert GW_SEEN == [], "a gateway was asked to erase anyway"
+    print("PASS test_delete_from_inside_the_container_is_refused")
+
+
 def test_approving_a_pending_send_is_refused(base, wg):
     """Otherwise an agent queues its own send and approves it."""
     status, body = _http(base, "POST", "/sends/signal-gateway/deadbeef/approve")
@@ -282,6 +295,7 @@ def main():
         base = f"http://127.0.0.1:{server.server_address[1]}"
         try:
             test_send_from_inside_the_container_is_refused(base, wg)
+            test_delete_from_inside_the_container_is_refused(base, wg)
             test_approving_a_pending_send_is_refused(base, wg)
             test_dashboard_send_still_works(base, wg)
         finally:

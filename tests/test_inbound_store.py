@@ -229,6 +229,133 @@ def test_write_without_media_has_no_media_predicate():
     print("PASS test_write_without_media_has_no_media_predicate")
 
 
+def _png(w, h):
+    """The smallest thing the store's sniffer reads as a PNG of w x h."""
+    return (b"\x89PNG\r\n\x1a\n" + (13).to_bytes(4, "big") + b"IHDR"
+            + w.to_bytes(4, "big") + h.to_bytes(4, "big") + b"\x08\x06\x00\x00\x00")
+
+
+def test_attachment_metadata_is_stated_in_the_record():
+    """What the gateway knows about a blob it stored is in the record itself.
+
+    A reader needs the content type before fetching (an image and a voice note
+    are different elements) and the pixel size to reserve the box. Those are
+    facts about the gateway's own store, so the gateway states them — on the
+    media IRI, in the message's record — and no reader has to look at another
+    service's files. The record's own subject stays the message."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pic = ist.store_media(tmp, _png(320, 420), "image/png")
+        note = ist.store_media(tmp, b"OggS" + b"\0" * 100, "audio/ogg")
+        doc = ist.store_media(tmp, b"%PDF-1.7 x", "application/pdf",
+                              file_name="../Rechnung\t2026.pdf")
+        refs = [f"urn:retinue:media:signal:{pic}",
+                f"urn:retinue:media:signal:{note}",
+                f"urn:retinue:media:signal:{'ab' * 16}",  # not in this store
+                f"urn:retinue:media:signal:{doc}"]
+        subj, path = ist.write_message(
+            tmp, channel="signal", sender="+41790000000", text="",
+            timestamp=1000.0, attachment_urls=refs, media="/tmp/retained")
+        text = path.read_text(encoding="utf-8")
+        lines = [l for l in text.splitlines() if l]
+        assert lines == sorted(lines), "still deterministic"
+        assert f"<{refs[0]}> <{ist.P_CONTENT_TYPE}> \"image/png\" ." in text
+        assert f"<{refs[0]}> <{ist.P_WIDTH}> \"320\"^^<{ist.XSD_INTEGER}> ." in text
+        assert f"<{refs[0]}> <{ist.P_HEIGHT}> \"420\"^^<{ist.XSD_INTEGER}> ." in text
+        assert f"<{refs[0]}> <{ist.P_BYTE_SIZE}> \"{len(_png(320, 420))}\"^^" in text
+        assert f"<{refs[1]}> <{ist.P_CONTENT_TYPE}> \"audio/ogg\" ." in text
+        assert f"<{refs[1]}> <{ist.P_WIDTH}>" not in text, "no guessed pixel size for audio"
+        assert refs[2] in text and f"<{refs[2]}> <{ist.P_CONTENT_TYPE}>" not in text, \
+            "a blob this store does not hold gets no statement — nothing is invented"
+        # A document carries the name the sender gave it, made safe: base name
+        # only, control characters gone; a photo has none.
+        assert f"<{refs[3]}> <{ist.P_FILE_NAME}> \"Rechnung2026.pdf\" ." in text
+        assert f"<{refs[0]}> <{ist.P_FILE_NAME}>" not in text
+        # The parse keeps the message as the subject, whatever sorts last.
+        fields = ist._parse(text)
+        assert fields["subject"] == subj
+        assert sorted(fields["attachments"]) == sorted(refs)  # the record is sorted
+        assert fields["attachment_meta"][refs[0]] == {
+            "content_type": "image/png", "size": len(_png(320, 420)),
+            "width": 320, "height": 420}
+        assert fields["attachment_meta"][refs[1]] == {"content_type": "audio/ogg", "size": 104}
+        assert refs[2] not in fields["attachment_meta"]
+        assert fields["attachment_meta"][refs[3]] == {
+            "content_type": "application/pdf", "size": 10, "file_name": "Rechnung2026.pdf"}
+        # What a sender may call a file, reduced to what is safe to show.
+        assert ist.safe_file_name("C:\\Users\\x\\Bericht.docx") == "Bericht.docx"
+        assert ist.safe_file_name("..") is None and ist.safe_file_name("  ") is None
+        long = ist.safe_file_name("a" * 300 + ".pdf")
+        assert len(long) == 200 and long.endswith(".pdf")
+        # The statements survive every in-place rewrite of the record.
+        ist.update_message(path, text="transcript", clear_media=True)
+        assert ist.mark_delivered(path)
+        again = ist._parse(path.read_text(encoding="utf-8"))
+        assert again["text"] == "transcript" and again["delivered"] is True
+        assert again["attachment_meta"] == fields["attachment_meta"]
+        assert again["media"] is None
+        # Outbound records state the same about the blobs they reference.
+        _subj, opath = ist.write_outbound(
+            tmp, channel="signal", chat="+41790000000", text="", author="device",
+            timestamp=1001.0, attachment_urls=[refs[0]])
+        assert f"<{refs[0]}> <{ist.P_CONTENT_TYPE}> \"image/png\" ." in opath.read_text()
+    print("PASS test_attachment_metadata_is_stated_in_the_record")
+
+
+def test_backfill_states_metadata_on_older_records():
+    """Records written before the metadata existed get it from the same store.
+
+    Each gateway backfills its own store at startup: a record that references
+    a blob the store holds but says less about it than the store knows is
+    rewritten; everything else is left alone. Idempotent, so a restart costs
+    nothing. Legacy ``http://<service>/media/<id>`` references name the same
+    blobs and get the same statements."""
+    with tempfile.TemporaryDirectory() as tmp:
+        pic = ist.store_media(tmp, _png(8, 6), "image/png")
+        note = ist.store_media(tmp, b"OggS" + b"\0" * 10, "audio/ogg",
+                               file_name="memo.ogg")
+        urn = f"urn:retinue:media:signal:{pic}"
+        legacy = f"http://signal-gateway:8090/media/{note}"
+        gone = f"urn:retinue:media:signal:{'cd' * 16}"
+
+        def old_record(ts, **kw):
+            # A record as an older gateway wrote it: the reference, no statements.
+            _s, path = ist.write_message(tmp, channel="signal", sender="+4179",
+                                         text="x", timestamp=ts, **kw)
+            fields = ist._parse(path.read_text(encoding="utf-8"))
+            fields["attachment_meta"] = {}
+            path.write_text(ist._render(fields), encoding="utf-8")
+            return path
+
+        p_urn = old_record(1000.0, attachment_urls=[urn])
+        p_legacy = old_record(1001.0, attachment_urls=[legacy])
+        p_gone = old_record(1002.0, attachment_urls=[gone])
+        p_plain = old_record(1003.0)
+        before = {p.name: p.read_text() for p in (p_urn, p_legacy, p_gone, p_plain)}
+        assert ist.P_CONTENT_TYPE not in before[p_urn.name]
+
+        assert ist.backfill_media_meta(tmp) == 2
+        assert f"<{urn}> <{ist.P_CONTENT_TYPE}> \"image/png\" ." in p_urn.read_text()
+        assert f"<{urn}> <{ist.P_WIDTH}> \"8\"^^" in p_urn.read_text()
+        assert f"<{legacy}> <{ist.P_CONTENT_TYPE}> \"audio/ogg\" ." in p_legacy.read_text()
+        assert f"<{legacy}> <{ist.P_FILE_NAME}> \"memo.ogg\" ." in p_legacy.read_text()
+        assert p_gone.read_text() == before[p_gone.name], "nothing to state, untouched"
+        assert p_plain.read_text() == before[p_plain.name]
+        # Idempotent: the second pass rewrites nothing.
+        assert ist.backfill_media_meta(tmp) == 0
+        # A record that already states everything is not rewritten either.
+        _s, fresh = ist.write_message(tmp, channel="signal", sender="+4179", text="y",
+                                      timestamp=1004.0, attachment_urls=[urn])
+        stamp = fresh.stat().st_mtime_ns
+        assert ist.backfill_media_meta(tmp) == 0 and fresh.stat().st_mtime_ns == stamp
+        # No store at all: nothing to do, no error.
+        assert ist.backfill_media_meta(Path(tmp) / "nope") == 0
+        # The reference reader behind it all.
+        assert ist.media_id_of(urn) == pic and ist.media_id_of(legacy) == note
+        assert ist.media_id_of("https://example.org/pic.jpg") is None
+        assert ist.media_id_of("") is None
+    print("PASS test_backfill_states_metadata_on_older_records")
+
+
 def test_missing_dir_is_empty():
     with tempfile.TemporaryDirectory() as tmp:
         assert ist.undelivered(Path(tmp) / "nope") == []
@@ -246,6 +373,99 @@ def test_since_epoch_and_iso_equivalent():
     print("PASS test_since_epoch_and_iso_equivalent")
 
 
+def test_delete_chat_erases_exactly_one_chat():
+    """A chat is (chat key, account): both directions of it go, with the blobs
+    they reference and a pending voice note's retained audio; the same peer on
+    another account, and the account-less legacy history, stay."""
+    import json
+    with tempfile.TemporaryDirectory() as tmp:
+        peer, acct, other = "+41790000001", "+41790000009", "+41790000008"
+        pic = ist.store_media(tmp, b"\x89PNG\r\n\x1a\n" + b"0" * 32, "image/png", "p.png")
+        spool = ist.media_dir(tmp) / "abcd1234.ogg"
+        spool.write_bytes(b"audio")
+        ist.write_message(tmp, channel="signal", sender=peer, chat=peer, account=acct,
+                          text="in", attachment_urls=[f"urn:retinue:media:signal:{pic}"],
+                          timestamp=100.0)
+        ist.write_message(tmp, channel="signal", sender=peer, chat=peer, account=acct,
+                          text="", media=str(spool), timestamp=101.0)
+        ist.write_outbound(tmp, channel="signal", chat=peer, account=acct,
+                           text="out", author="user", timestamp=102.0)
+        kept_other = ist.write_message(tmp, channel="signal", sender=peer, chat=peer,
+                                       account=other, text="other account",
+                                       timestamp=103.0)[1]
+        kept_legacy = ist.write_message(tmp, channel="signal", sender=peer, chat=peer,
+                                        text="legacy", timestamp=104.0)[1]
+        kept_peer = ist.write_message(tmp, channel="signal", sender="+4179", chat="+4179",
+                                      account=acct, text="someone else",
+                                      timestamp=105.0)[1]
+
+        got = ist.delete_chat(tmp, peer, acct)
+        assert (got["messages"], got["media"], got["errors"]) == (3, 1, 0), got
+        assert len(got["subjects"]) == 3, got
+        left = sorted(p.name for p in ist.messages_dir(tmp).glob("*.nt"))
+        assert left == sorted(p.name for p in (kept_other, kept_legacy, kept_peer)), left
+        assert not any(ist.media_dir(tmp).glob(pic + "*")), "blob and sidecars go"
+        assert not spool.exists(), "the retained voice-note audio goes"
+
+        # The account-less chat id names exactly the legacy records.
+        got = ist.delete_chat(tmp, peer, None)
+        assert got["messages"] == 1 and not kept_legacy.exists()
+        assert kept_other.exists() and kept_peer.exists()
+        # A blob file that cannot be removed is an error, not a quiet success.
+        stuck = ist.store_media(tmp, b"x", "text/plain")
+        (ist.media_dir(tmp) / (stuck + ".meta")).mkdir()
+        (ist.media_dir(tmp) / (stuck + ".meta") / "f").write_text("x")
+        ist.write_message(tmp, channel="signal", sender=peer, chat=peer, account=acct,
+                          text="stuck", attachment_urls=[f"urn:retinue:media:signal:{stuck}"],
+                          timestamp=106.0)
+        got = ist.delete_chat(tmp, peer, acct)
+        assert (got["messages"], got["media"], got["errors"]) == (1, 1, 1), got
+
+        # What was erased is reported by identity, for readers still serving
+        # an older index.
+        mid_rec = ist.write_message(tmp, channel="signal", sender=peer, chat=peer,
+                                    account=acct, text="with id", message_id="m-9",
+                                    timestamp=107.0)
+        got = ist.delete_chat(tmp, peer, acct)
+        assert got["subjects"] == [mid_rec[0]] and got["message_ids"] == ["m-9"], got
+
+        # A record that no longer parses fails the erasure closed when it names
+        # this chat, and is none of its business when it does not.
+        (ist.messages_dir(tmp) / "0000000000000999-broken.nt").write_text(
+            f'garbage\n<urn:x> <{ist.P_CHAT}> "{peer}" .\n')
+        (ist.messages_dir(tmp) / "0000000000000998-other.nt").write_text("garbage\n")
+        assert ist.delete_chat(tmp, peer, acct)["errors"] == 1
+        assert ist.delete_chat(tmp, "+4179", acct)["errors"] == 0
+        for junk in ist.messages_dir(tmp).glob("00000000000009*.nt"):
+            junk.unlink()
+
+        # Idempotent, and an empty key erases nothing.
+        assert ist.delete_chat(tmp, peer, acct)["messages"] == 0
+        assert ist.delete_chat(tmp, "", acct)["messages"] == 0
+
+        # The gateway's own bookkeeping: pending sends (not one mid-send) and
+        # recent senders, each by the gateway's matcher.
+        pend = Path(tmp) / "pending"
+        pend.mkdir()
+        for rid, recipient, status in (("a" * 32, peer, "pending"),
+                                       ("b" * 32, peer, "sent"),
+                                       ("c" * 32, peer, "sending"),
+                                       ("d" * 32, "+4179", "pending")):
+            (pend / f"{rid}.json").write_text(json.dumps(
+                {"id": rid, "recipient": recipient, "status": status}))
+        (pend / "recent-chats.json").write_text("[]")
+        removed = ist.purge_pending_sends(pend, lambda e: e["recipient"] == peer)
+        assert sorted(removed) == ["a" * 32, "b" * 32], removed
+        assert sorted(p.stem for p in pend.glob("*.json")) == ["c" * 32, "d" * 32,
+                                                                "recent-chats"]
+        recent = Path(tmp) / "recent.json"
+        recent.write_text(json.dumps([{"number": peer}, {"number": "+4179"}]))
+        assert ist.purge_recent_chats(recent, lambda e: e.get("number") == peer) == 1
+        assert json.loads(recent.read_text()) == [{"number": "+4179"}]
+        assert ist.purge_recent_chats(Path(tmp) / "missing.json", lambda e: True) == 0
+    print("PASS test_delete_chat_erases_exactly_one_chat")
+
+
 if __name__ == "__main__":
     test_write_and_roundtrip()
     test_account_marks_who_received_it()
@@ -258,6 +478,9 @@ if __name__ == "__main__":
     test_update_message_fills_transcript_and_clears_media()
     test_update_message_missing_file_returns_none()
     test_write_without_media_has_no_media_predicate()
+    test_attachment_metadata_is_stated_in_the_record()
+    test_backfill_states_metadata_on_older_records()
     test_missing_dir_is_empty()
     test_since_epoch_and_iso_equivalent()
+    test_delete_chat_erases_exactly_one_chat()
     print("all inbound_store tests passed")

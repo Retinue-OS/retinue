@@ -61,6 +61,7 @@ import triage_policy as _triage
 import news_ingest as _news
 import chat_ingest as _chats
 import job_delivery as _jobs
+import build_stamp as _build
 
 # What this messaging account is for. Fixed by configuration — never inferred
 # from message content. Mirrors SIGNAL_GATEWAY_MODE / WHATSAPP_GATEWAY_MODE.
@@ -117,11 +118,23 @@ DEFAULT_LANGUAGE = SUPPORTED_LANGUAGES[0] if SUPPORTED_LANGUAGES else "en"
 HTTP_PORT = int(os.environ.get("TELEGRAM_GATEWAY_HTTP_PORT", "8093"))
 DEFAULT_RECIPIENT = os.environ.get("TELEGRAM_DEFAULT_RECIPIENT", "").strip()
 GATEWAY_TOKEN = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
+# The separate capability POST /chats/delete requires (X-Chat-Erase-Token).
+# Not the gateway token: that one is handed to every agent session so agents
+# can send, and erasing a chat is the user's own act, relayed only by the
+# web-gateway. Unset, the endpoint refuses — there is no fallback.
+CHAT_ERASE_TOKEN = os.environ.get("CHAT_ERASE_TOKEN", "").strip()
 MAX_PUSH_BODY_BYTES = int(os.environ.get("TELEGRAM_GATEWAY_MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 # Cap the decoded size of an inbound image forwarded to the agent (it travels
 # base64-encoded inside the POST /message JSON). Matches the retinue gateway's
 # own per-file attachment cap.
 MAX_INBOUND_FILE_BYTES = int(os.environ.get("TELEGRAM_MAX_INBOUND_FILE_BYTES", str(25 * 1024 * 1024)))
+# Cap on what the ledger's media store takes from one inbound file. The
+# forwarding cap above bounds what travels base64 through a triage POST; this
+# one bounds what is written to the volume at all, since the channels allow
+# files far larger than a chat archive should hold. A file over it is noted
+# in the log and the message is recorded without it.
+INBOUND_MEDIA_STORE_MAX_BYTES = int(os.environ.get("INBOUND_MEDIA_STORE_MAX_BYTES",
+                                                   str(100 * 1024 * 1024)))
 # How long an outbound send (bridged onto the asyncio loop) may take.
 TELEGRAM_SEND_TIMEOUT = float(os.environ.get("TELEGRAM_SEND_TIMEOUT", "60"))
 # How many recent dialogs to expose via /recent-chats when the store is empty.
@@ -227,7 +240,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         )
     except Exception as exc:
         print(f"[telegram-gateway] triage policy unreadable ({exc}); forwarding", flush=True)
-        return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
+        # Fails open on both axes. `vip` is what the chat rail reads to decide
+        # a turn, so leaving it out would have an unreadable policy silently
+        # demote everyone to no-turn — the opposite of failing open.
+        return {"forward": True, "vip": True,
+                "delivered_if_held": True, "reason": "policy-error"}
 
 
 def _persist_inbound(question: str, sender: str, group_id: str | None,
@@ -303,8 +320,14 @@ def _mark_delivered(store_path) -> None:
         print(f"[telegram-gateway] could not mark inbound delivered: {exc}", flush=True)
 
 
-def _confirm_delivery(job_path: str, store_path, label: str) -> None:
-    """Mark a forwarded inbound delivered once its triage job reports success.
+def _confirm_delivery(job_path: str, store_path, label: str,
+                      base: str | None = None) -> None:
+    """Mark a forwarded inbound delivered once the job that took it succeeds.
+
+    That job is either the triage forward's or the chats rail's companion
+    turn, so ``base`` names the service whose handle this is; it defaults to
+    the retinue gateway, where every handle came from until the chat surface
+    started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
     never finishes leaves delivered=False, so the daily drain retries it.
@@ -313,7 +336,7 @@ def _confirm_delivery(job_path: str, store_path, label: str) -> None:
         return
     from urllib.parse import urljoin
     _jobs.confirm_delivery(
-        urljoin(RETINUE_GATEWAY_URL, job_path),
+        urljoin(base or RETINUE_GATEWAY_URL, job_path),
         lambda: _mark_delivered(store_path),
         log=lambda msg: print(f"[telegram-gateway] {label}: {msg}", flush=True),
         timeout=RETINUE_GATEWAY_TIMEOUT,
@@ -367,7 +390,8 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
         print(f"[telegram-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
-def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+def _store_media_ref(data: bytes, content_type: str | None,
+                     file_name: str | None = None) -> str | None:
     """Persist inbound media durably and return its store reference.
 
     The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
@@ -387,7 +411,8 @@ def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
     if not data:
         return None
     try:
-        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type,
+                                        file_name=file_name)
         return f"urn:retinue:media:{INBOUND_CHANNEL}:{media_id}"
     except Exception as exc:
         print(f"[telegram-gateway] could not store inbound media: {exc}", flush=True)
@@ -497,6 +522,12 @@ def _health_snapshot() -> dict:
         # heals by reconnecting, so the /gateways page shows the error, not a QR.
         "needs_repair": configured and not state["authorized"],
         "error": None if connected else error,
+        # Which build this is. `framework` is a digest of the shared modules
+        # baked into this image; the retinue container carries the same set,
+        # so the /gateways page can tell a stale gateway from a current one
+        # without anyone shelling in. `sha` is the commit, when the build
+        # passed one. See scripts/build_stamp.py.
+        "build": _build.build_info(),
     }
 
 
@@ -775,66 +806,87 @@ def _list_contacts() -> list:
     return fut.result(timeout=30)
 
 
-def _inbound_image_files(image_path, image_mime: str | None) -> tuple[list[dict], list[str]]:
-    """Read a downloaded inbound image as forward-ready files + a durable ref.
+def _inbound_media_files(path, mime: str | None, name: str | None = None) -> tuple[list[dict], list[str]]:
+    """Read a downloaded inbound medium as a durable ref + forward-ready files.
 
     Returns ``(files, attachment_urls)`` where ``files`` is
     ``[{"filename", "content_type", "data"(base64)}, ...]`` — the shape the
-    retinue gateway's POST /message accepts — and ``attachment_urls`` are
-    HTTP-resolvable references stored on this gateway's volume (never inlined in
-    RDF). Best-effort: any failure forwards the message without its image rather
-    than dropping it. The durable reference is stored regardless of size (it is a
-    plain on-disk blob); only the forwarded ``files`` payload honours the size
-    cap, since that one travels base64-encoded through the triage POST. The temp
+    retinue gateway's POST /message accepts — and ``attachment_urls`` are the
+    durable references stored on this gateway's volume (never inlined in RDF),
+    with the name the sender gave the file. Every kind is stored, so the chat
+    shows the message as the native client does; what is also *forwarded* to
+    the agent is an image or a document that fits the forwarding cap — a video
+    or an audio file is kept for the chat only. Best-effort: any failure
+    forwards the message without its medium rather than dropping it. The temp
     file is always removed."""
-    if not image_path:
+    if not path:
         return [], []
-    path = Path(image_path)
+    p = Path(path)
     try:
-        data = path.read_bytes()
+        data = p.read_bytes()
     except OSError as exc:
-        print(f"[telegram-gateway] could not read inbound image {path}: {exc}", flush=True)
+        print(f"[telegram-gateway] could not read inbound media {p}: {exc}", flush=True)
         return [], []
     finally:
-        path.unlink(missing_ok=True)
+        p.unlink(missing_ok=True)
     if not data:
         return [], []
-    mime = image_mime or "image/jpeg"
-    ref = _store_media_ref(data, mime)
+    if len(data) > INBOUND_MEDIA_STORE_MAX_BYTES:
+        print(f"[telegram-gateway] inbound media over {INBOUND_MEDIA_STORE_MAX_BYTES} bytes; "
+              f"not stored ({len(data)} bytes)", flush=True)
+        return [], []
+    mime = mime or mimetypes.guess_type(str(p))[0] or "application/octet-stream"
+    kind = _ibstore.media_kind(mime)
+    ref = _store_media_ref(data, mime, name)
     attachment_urls = [ref] if ref else []
-    if len(data) > MAX_INBOUND_FILE_BYTES:
-        print(f"[telegram-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
+    if kind in ("video", "audio"):
         return [], attachment_urls
-    suffix = path.suffix or mimetypes.guess_extension(mime) or ".jpg"
+    if len(data) > MAX_INBOUND_FILE_BYTES:
+        print(f"[telegram-gateway] inbound {kind} too large to forward ({len(data)} bytes)", flush=True)
+        return [], attachment_urls
+    suffix = p.suffix or mimetypes.guess_extension(mime) or (".jpg" if kind == "image" else "")
     files = [{
-        "filename": f"telegram-image{suffix}",
+        "filename": f"telegram-{kind}{suffix}",
         "content_type": mime,
         "data": base64.b64encode(data).decode("ascii"),
     }]
     return files, attachment_urls
 
 
+def _inbound_image_files(image_path, image_mime: str | None) -> tuple[list[dict], list[str]]:
+    """An image: :func:`_inbound_media_files` with the photo default."""
+    return _inbound_media_files(image_path, image_mime or "image/jpeg")
+
+
 def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
                     is_group: bool, sender_name: str | None,
                     files: list[dict] | None = None,
                     attachment_urls: list[str] | None = None,
-                    store_path=None, message_id: str | None = None) -> None:
+                    store_path=None, message_id: str | None = None,
+                    sender_key: str | None = None) -> None:
     """Blocking dispatch — runs in a worker thread, off the asyncio loop.
 
     ``store_path`` is set when the caller already persisted this message before
     transcription (the never-drop voice-note path): it is threaded to
     :func:`_forward_to_inbox` so the forward reuses that record instead of
     writing a second one.
+
+    ``sender`` is for people to read — a username where there is one — while
+    ``sender_key`` is the poster's id, which is what the policy matches and what
+    the ledger records. A username can be changed by the person who holds it;
+    an id cannot, and it is what policy entries already carry.
     """
     _record_recent_sender(str(chat_id), sender_name, None, is_group)
-    if not text and not files:
+    # A message that is only its media — a video, a sticker — is still the
+    # message: it is recorded and shown, and the prompt says what it carries.
+    if not text and not files and not attachment_urls:
         if store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
             # (delivered=False, audio retained) for the daily drain / a re-transcribe.
             print(f"[telegram-gateway] voice note from {sender} not transcribed; "
                   f"retained for retry (not dropped)", flush=True)
         else:
-            print(f"[telegram-gateway] skipping message from {sender} (no text/audio/image content)", flush=True)
+            print(f"[telegram-gateway] skipping message from {sender} (no text or media)", flush=True)
         return
     if text and lang == DEFAULT_LANGUAGE:
         lang = _detect_text_language(text)
@@ -842,7 +894,8 @@ def _handle_inbound(text: str, lang: str, chat_id: str, sender: str,
         _forward_to_inbox(text, lang, str(chat_id), is_group=is_group,
                           sender_name=sender_name, files=files,
                           attachment_urls=attachment_urls,
-                          store_path=store_path, message_id=message_id)
+                          store_path=store_path, message_id=message_id,
+                          sender_handle=sender_key)
     else:
         _handle_control_message(text, lang, str(chat_id), sender, files=files)
 
@@ -891,7 +944,8 @@ async def _on_new_message(event) -> None:
         text = (event.raw_text or "").strip()
         lang = DEFAULT_LANGUAGE
         media_path = None
-        if not text and (getattr(message, "voice", None) or getattr(message, "audio", None)):
+        wants_voice = not text and (getattr(message, "voice", None) or getattr(message, "audio", None))
+        if wants_voice:
             try:
                 fd, out = tempfile.mkstemp(prefix="tg-inbound-", dir=str(TELEGRAM_TMP_DIR))
                 os.close(fd)
@@ -908,8 +962,11 @@ async def _on_new_message(event) -> None:
         image_path = None
         image_mime = None
         media = getattr(message, "media", None)
-        doc_mime = str(getattr(getattr(media, "document", None), "mime_type", "") or "")
-        if getattr(media, "photo", None) is not None or doc_mime.startswith("image/"):
+        is_preview = type(media).__name__ == "MessageMediaWebPage"
+        document = None if is_preview else getattr(media, "document", None)
+        doc_mime = str(getattr(document, "mime_type", "") or "")
+        is_image = getattr(media, "photo", None) is not None or doc_mime.startswith("image/")
+        if is_image:
             image_mime = doc_mime or "image/jpeg"
             try:
                 fd, out = tempfile.mkstemp(prefix="tg-inbound-img-", dir=str(TELEGRAM_TMP_DIR))
@@ -917,6 +974,30 @@ async def _on_new_message(event) -> None:
                 image_path = await message.download_media(file=out)
             except Exception as exc:  # noqa: BLE001 - media download is best-effort
                 print(f"[telegram-gateway] image download failed: {exc}", flush=True)
+
+        # Anything else the message carries as a file — a video, a document, a
+        # sticker, an audio file under a caption — is downloaded to be kept
+        # with the message, as the native client shows it. The declared size
+        # is checked first: Telegram allows files far larger than this store
+        # should take. A link preview is not the message's medium.
+        file_path = None
+        file_mime = None
+        file_name = None
+        if document is not None and not is_image and not wants_voice:
+            file_info = getattr(message, "file", None)
+            declared = getattr(file_info, "size", None)
+            file_mime = doc_mime or str(getattr(file_info, "mime_type", "") or "") or None
+            file_name = getattr(file_info, "name", None) or None
+            if isinstance(declared, int) and declared > INBOUND_MEDIA_STORE_MAX_BYTES:
+                print(f"[telegram-gateway] media from {sender} over "
+                      f"{INBOUND_MEDIA_STORE_MAX_BYTES} bytes; not stored", flush=True)
+            else:
+                try:
+                    fd, out = tempfile.mkstemp(prefix="tg-inbound-file-", dir=str(TELEGRAM_TMP_DIR))
+                    os.close(fd)
+                    file_path = await message.download_media(file=out)
+                except Exception as exc:  # noqa: BLE001 - media download is best-effort
+                    print(f"[telegram-gateway] media download failed: {exc}", flush=True)
 
         def _work():
             nonlocal text, lang
@@ -926,7 +1007,8 @@ async def _on_new_message(event) -> None:
             # in practice only one of the two ever fires — this just makes the
             # record complete whichever it is).
             image_files, image_urls = _inbound_image_files(image_path, image_mime)
-            attachment_urls: list[str] = list(image_urls)
+            file_files, file_urls = _inbound_media_files(file_path, file_mime, file_name)
+            attachment_urls: list[str] = list(image_urls) + list(file_urls)
             voice_files: list[dict] = []
             # A voice note is persisted BEFORE transcription (never-drop): if the
             # pre-persist happened, this holds its store Path so the forward reuses
@@ -971,7 +1053,7 @@ async def _on_new_message(event) -> None:
                     durable = _retain_media(media_path) or media_path
                     grp = str(chat_id) if is_group else None
                     voice_store_path = _persist_inbound(
-                        "", sender, grp, delivered=False, media=str(durable),
+                        "", str(sender_id), grp, delivered=False, media=str(durable),
                         attachment_urls=attachment_urls,
                         chat=str(chat_id), message_id=msg_id,
                     )
@@ -996,10 +1078,11 @@ async def _on_new_message(event) -> None:
                         print(f"[telegram-gateway] transcription failed: {exc}", flush=True)
                     finally:
                         vpath.unlink(missing_ok=True)
-            files = voice_files + image_files
+            files = voice_files + image_files + file_files
             _handle_inbound(text, lang, str(chat_id), sender, is_group, sender_name,
                             files=files, attachment_urls=attachment_urls,
-                            store_path=voice_store_path, message_id=msg_id)
+                            store_path=voice_store_path, message_id=msg_id,
+                            sender_key=str(sender_id))
 
         _LOOP.run_in_executor(None, _work)
     except Exception as exc:  # noqa: BLE001 - one bad message must not stall the loop
@@ -1045,10 +1128,12 @@ async def _on_outgoing_message(event) -> None:
         # degrades to recording the caption; the text is never lost to media.
         media_path = None
         mime = None
+        file_name = None
         if has_media:
             file_info = getattr(message, "file", None)
             size = getattr(file_info, "size", None)
             mime = getattr(file_info, "mime_type", None)
+            file_name = getattr(file_info, "name", None) or None
             if isinstance(size, int) and size > CHAT_ECHO_MEDIA_MAX_BYTES:
                 print(f"[telegram-gateway] own-device media over "
                       f"{CHAT_ECHO_MEDIA_MAX_BYTES} bytes; recording without it",
@@ -1082,7 +1167,7 @@ async def _on_outgoing_message(event) -> None:
                           flush=True)
                 elif data:
                     ref = _store_media_ref(
-                        data, mime or mimetypes.guess_type(str(p))[0])
+                        data, mime or mimetypes.guess_type(str(p))[0], file_name)
                     if ref:
                         refs.append(ref)
             if not text and not refs:
@@ -1318,24 +1403,39 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
                       files: list[dict] | None = None,
                       attachment_urls: list[str] | None = None,
                       store_path=None,
-                      message_id: str | None = None) -> None:
+                      message_id: str | None = None,
+                      sender_handle: str | None = None) -> None:
     """Hand an inbox-account message to the user's triage, notifying the user.
 
     ``store_path`` is set when the caller already persisted this message before
     transcription (the never-drop voice-note path): the persist-first step below
     is then skipped so the same record is reused instead of a second one written.
-    """
-    sender_label = sender_name or chat_id
-    if sender_name:
-        sender_label = f"{sender_name} ({chat_id})"
-    if is_group:
-        sender_label += " [group]"
 
-    # The gate matches on the stable chat identity (the chat_id, also the reply
-    # address). For a group that chat_id *is* the group, so it is what the
-    # group-block policy matches on; a 1:1 has no group.
-    handle = str(chat_id) if chat_id else "unknown"
-    group_id = handle if is_group else None
+    ``sender_handle`` is who wrote, as an id (Telethon's ``sender_id``);
+    ``chat_id`` is where. They differ only in a shared chat — see below.
+    """
+    # Where the message is (the chat, also the reply address) and who wrote it
+    # are two different facts, and the delivery gate reads them on two different
+    # axes. Keying both on the chat_id — as this did — collapses them in exactly
+    # the place it matters: **a group is never a person, only a sender is**, so
+    # in a group every message looked like one from a handle whose id happened
+    # to be the room's, and a VIP correspondent writing there was never
+    # recognised as one. The group's quieted/ignored flag then decided a message
+    # the sender axis should have won.
+    #
+    # In a 1:1 Telethon reports the same id for both, so policy entries written
+    # while this keyed on the chat go on matching unchanged. A broadcast
+    # channel has no individual sender, and falls back to the channel itself —
+    # which is the only identity such a post has.
+    chat_key = str(chat_id) if chat_id else "unknown"
+    group_id = chat_key if is_group else None
+    handle = str(sender_handle or chat_key)
+
+    sender_label = sender_name or handle
+    if sender_name:
+        sender_label = f"{sender_name} ({handle})"
+    if is_group:
+        sender_label += f" [group {chat_key}]"
 
     # Persist FIRST, before any routing decision — the never-drop invariant. The
     # inbound event has already been consumed from the Telegram session, so if it
@@ -1347,34 +1447,96 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
     if store_path is None:
         store_path = _persist_inbound(question, handle, group_id, delivered=False,
                                       attachment_urls=attachment_urls,
-                                      chat=handle, message_id=message_id)
+                                      chat=chat_key, message_id=message_id)
 
-    # Delivery gate: only whitelisted / unknown senders get a model turn now.
+    # Delivery gate: what the chat rail is told, and whose message earns a turn.
     gate = _inbound_gate_decision(handle, group_id)
     # News rail is independent of the triage decision: a message from a group
     # flagged `news` goes to the feed whether or not it earns a model turn.
     if gate.get("news"):
-        _forward_news(question, sender_name or handle, group_id, lang)
-    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
-    # surface lights up (and the user is Web-Pushed) with no model turn.
-    # Fire-and-forget on its own thread — it must never delay or reorder the
-    # persist → gate → forward path below. Held classes go too (the mirror
-    # updates silently); the gate verdict rides along so they stay quiet.
-    _chats.notify_chat_event_async(
-        direction="in", channel=INBOUND_CHANNEL, chat=handle,
+        # The feed's source is the channel or group a post came from, never
+        # whoever posted in it — one source per broadcast source, as on the
+        # other gateways. (Unchanged by the sender/chat split above: this is
+        # the exact value it resolved to before.)
+        _forward_news(question, sender_name or (chat_key if is_group else handle),
+                      group_id, lang)
+    # Chats rail. Every arrival's metadata goes to the web-gateway so the chat
+    # surface lights up and the user is Web-Pushed, with no model turn spent on
+    # the notification. For a message the gate forwards the same call does one
+    # thing more: it starts a turn in that chat's companion thread and answers
+    # with its job handle, which is what replaces the triage session this
+    # gateway used to spawn (docs/messenger-chats.md, phase 4). Held classes go
+    # too — the mirror updates silently — and the gate verdict rides along so
+    # they stay quiet.
+    rail_event = dict(
+        direction="in", channel=INBOUND_CHANNEL, chat=chat_key,
         account=TELEGRAM_ACCOUNT, sender=handle, sender_name=sender_name,
         group=is_group, message_id=message_id, text=question,
         attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
-              "reason": str(gate.get("reason") or ""),
-              # The sender the gate did not recognise: the dashboard screens
-              # their message instead of ranking them like a known contact.
-              "unknown": bool(gate.get("flagged_unknown"))},
+              "vip": bool(gate.get("vip")),
+              "reason": str(gate.get("reason") or "")},
     )
-    if not gate["forward"]:
-        # Mark delivered only for a fully-accounted class (blacklisted/no-action)
-        # the drain must never re-surface. One held merely for a not-yet-
-        # whitelisted sender stays delivered=False for the daily drain.
+
+    # The chat surface is where an inbound message is delivered now — whatever
+    # the gate made of it. The mirror shows it, the user is pushed unless the
+    # gate says to stay quiet, and the record says delivered. So every message
+    # is offered to the rail, not only the ones that used to buy a triage
+    # session: that is what empties the undelivered backlog the daily drain
+    # existed to sweep, because there is no longer anything left un-handled.
+    #
+    # The call is synchronous because its answer decides what happens next, and
+    # this path has always made a synchronous POST here anyway. A job handle
+    # means a VIP's message is being worked in its chat's companion thread; a
+    # plain acceptance means the chat has it and nothing more is owed. Neither
+    # — the rail switched off, unreachable, or an older web-gateway — falls
+    # through to everything this gateway did before the chat surface existed.
+    rail = _chats.notify_chat_event(**rail_event, handover=True,
+                                    files=files if gate.get("vip") else None,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Handling it here as well would be the one outcome worse than
+        # waiting: two turns racing over the same draft, plus the dashboard
+        # conversation this replaced. It stays delivered=False.
+        print(f"[telegram-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered rather than handled twice",
+              flush=True)
+        return
+    # Only an explicit acceptance is a handover — a job handle on its own is
+    # not. A web-gateway built before this contract ignores `handover` and will
+    # hand back a job it started on its own rules, for a non-VIP among others;
+    # treating that as ours would apply the old policy under the new one's name
+    # for as long as the images are out of step.
+    if rail is not None and rail.get("accepted") is True:
+        rail_job = (rail.get("job_url") or "").strip() or None
+        if rail_job:
+            print(f"[telegram-gateway] the chat's companion turn took the message "
+                  f"from {sender_label} (vip)", flush=True)
+            _confirm_delivery(rail_job, store_path, sender_label,
+                              base=_chats.CHATS_INGEST_URL)
+            return
+        # Accepted with no turn: the chat has the message and the user has been
+        # pushed, and that is the delivery. Nothing is owed a model — this
+        # sender is not a VIP — so the record says delivered and nothing ever
+        # re-surfaces it.
+        _mark_delivered(store_path)
+        print(f"[telegram-gateway] the chat took the message from {sender_label} "
+              f"({gate['reason']}); no turn asked for", flush=True)
+        return
+
+    # From here down: the rail declined, so this is the pre-chat-surface path,
+    # unchanged.
+    # A VIP is never held here: the two axes are independent, so `forward` is
+    # about the group's noise and `vip` about the person, and the fallback
+    # reading `forward` alone let the group override the sender the whole
+    # design says it never does — for an `ignored` group, silently, by marking
+    # the message delivered with nothing left to recover it. The rail could not
+    # work this VIP's message, so the pre-chat-surface forward does.
+    if not gate["forward"] and not gate.get("vip"):
+        # Mark delivered only for a fully-accounted class (an ignored group)
+        # the drain must never re-surface. One held from a quieted group stays
+        # delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -1410,15 +1572,6 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
          f"session in it.\n")
         if reply_token else ""
     )
-    unknown_line = (
-        (f"\nThis sender ({handle}) is UNKNOWN — not on the triage whitelist. "
-         f"After triaging, open a dashboard conversation asking whether to "
-         f"whitelist this sender (so future messages trigger a turn on arrival) "
-         f"or blacklist them (so they are never asked about again). Apply the "
-         f"user's answer with: python3 /workspace/scripts/triage_policy.py "
-         f"whitelist-add --channel telegram --handle {handle}  (or blacklist-add).\n")
-        if gate["flagged_unknown"] else ""
-    )
     attachment_line = (
         (f"\nThe message includes {len(files)} attachment(s) — a voice note's "
          f"audio and/or image(s) — forwarded with this prompt; their saved "
@@ -1427,6 +1580,15 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
          f"transcript), so the user can listen to or view the original.\n")
         if files else ""
     )
+    # Media kept with the message but not attached to the prompt: a video,
+    # a sticker, or anything over the forwarding cap. The agent should know
+    # the message is that medium, without it weighing on the turn.
+    kept = max(0, len(attachment_urls or []) - len(files or []))
+    if kept:
+        attachment_line += (
+            f"\nThe message also carries {kept} media file(s) — a video, a document, "
+            f"a sticker, or an image over the forwarding size — kept with the message "
+            f"in the chat and not attached to this prompt.\n")
     # The canonical idempotency key for this message's dashboard thread —
     # account and chat included, because a channel-native id alone is not
     # unique (see inbound_store.thread_key). The drain decorates its rows with
@@ -1451,7 +1613,7 @@ def _forward_to_inbox(question: str, lang: str, chat_id: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"Telegram, sender: {sender_label}). Triage it as the user's incoming "
@@ -1628,6 +1790,33 @@ _pending_sends_lock = threading.Lock()
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def _write_pending_send(path: Path, entry: dict) -> None:
+    """Persist a pending-send entry so a concurrent GET never observes a torn file.
+
+    ``Path.write_text`` truncates the file and then writes, in place; a GET
+    that lands mid-write (or between those two steps) can read a partial file,
+    fail to parse it, and — since the status transition has already dropped
+    the entry from the in-memory ``_pending_sends`` map by the time the
+    background sender writes the terminal state — read back as "not found"
+    (a body with no "status" key at all) rather than as the entry's actual
+    state. Writing to a same-directory temp file and renaming into place is
+    atomic on POSIX, so a reader always sees either the previous full content
+    or the new one, never a mix. Same fix as signal-gateway.py (88dbbf0),
+    where a tight polling test caught the race in CI.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _lookup_existing_path(request_id: str) -> Path | None:
     """Find the on-disk file for a request id by scanning the pending directory.
 
@@ -1671,7 +1860,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
     }
     path = TELEGRAM_PENDING_SENDS_DIR / f"{request_id}.json"
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[telegram-gateway] warning: could not persist pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -1755,7 +1944,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
         entry.pop("error", None)
         print(f"[telegram-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[telegram-gateway] warning: could not update pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -1788,7 +1977,7 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return entry
         entry["status"] = "sending" if approved else "rejected"
         try:
-            path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+            _write_pending_send(path, entry)
         except OSError as exc:
             print(f"[telegram-gateway] warning: could not update pending send: {exc}", flush=True)
         _pending_sends.pop(request_id, None)
@@ -1859,6 +2048,45 @@ def _push(recipient: str, message: str, lang: str | None = None,
     finally:
         for path in temp_paths:
             path.unlink(missing_ok=True)
+
+
+def _erase_chat(chat: str, account: str | None) -> dict:
+    """Erase one chat from everything this gateway keeps (POST /chats/delete).
+
+    The ledger records and their media go through inbound_store.delete_chat,
+    which matches the (chat, account) pair exactly — the message volume is
+    shared by every account of the channel, so whichever gateway is asked can
+    erase it. The pending-send files and the recent-senders list are this
+    container's own, so they are purged only when the chat is this account's
+    (or an account-less legacy chat): the same peer on another account is
+    another chat, whose traces are that gateway's to erase.
+    """
+    result = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, account)
+    result["pending_sends"] = 0
+    result["recent"] = 0
+    if account and account != TELEGRAM_ACCOUNT:
+        return result
+
+    def _pending_hit(entry: dict) -> bool:
+        return str(entry.get("recipient") or "").strip() == chat
+
+    def _recent_hit(entry: dict) -> bool:
+        return str(entry.get("chat_id")) == chat
+
+    with _pending_sends_lock:
+        removed = _ibstore.purge_pending_sends(TELEGRAM_PENDING_SENDS_DIR, _pending_hit)
+        for request_id in removed:
+            _pending_sends.pop(request_id, None)
+    result["pending_sends"] = len(removed)
+    with _RECENT_CHATS_LOCK:
+        try:
+            result["recent"] = _ibstore.purge_recent_chats(TELEGRAM_RECENT_CHATS_PATH, _recent_hit)
+        except OSError as exc:
+            print(f"[telegram-gateway] could not rewrite recent chats: {exc}", flush=True)
+            result["errors"] += 1
+    print(f"[telegram-gateway] erased chat {chat!r} (account {account or '-'}): "
+          f"{result}", flush=True)
+    return result
 
 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
@@ -1999,6 +2227,36 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(200, {k: v for k, v in entry.items() if k != "images"})
             return
 
+        if self.path.rstrip("/") == "/chats/delete":
+            # Erase one chat — its ledger records, media and this gateway's
+            # own traces of it. The web-gateway calls it on the user's delete
+            # and nothing else should: besides the gateway token it requires
+            # CHAT_ERASE_TOKEN, which agent sessions do not inherit.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            if not CHAT_ERASE_TOKEN:
+                self._reply(503, {"error": "chat erasure is not configured "
+                                           "(CHAT_ERASE_TOKEN is unset)"})
+                return
+            if not hmac.compare_digest(
+                    (self.headers.get("X-Chat-Erase-Token") or "").strip(),
+                    CHAT_ERASE_TOKEN):
+                self._reply(403, {"error": "chat erasure needs X-Chat-Erase-Token"})
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else None
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            chat = str((body or {}).get("chat") or "").strip() if isinstance(body, dict) else ""
+            if not chat:
+                self._reply(400, {"error": "chat (the chat key) is required"})
+                return
+            account = str(body.get("account") or "").strip() or None
+            self._reply(200, {"status": "deleted", **_erase_chat(chat, account)})
+            return
+
         if self.path.rstrip("/") != "/send":
             self._reply(404, {"error": "not found"})
             return
@@ -2128,6 +2386,12 @@ def main() -> None:
     asyncio.set_event_loop(_LOOP)
     _client = _build_client()
     print(f"[telegram-gateway] starting (mode={TELEGRAM_GATEWAY_MODE})", flush=True)
+    # Records written before the store stated what it knows about a blob
+    # (type, size, pixel size) get that statement now, from this store's own
+    # sidecars — so no reader ever has to look at this gateway's files.
+    stated = _ibstore.backfill_media_meta(INBOUND_STORE_DIR)
+    if stated:
+        print(f"[telegram-gateway] stated media metadata on {stated} earlier record(s)", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
     # _run_client keeps running through disconnects and unauthorised sessions —
     # the HTTP API (health, QR re-pairing, pending sends) must outlive both.

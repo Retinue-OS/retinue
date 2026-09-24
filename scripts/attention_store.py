@@ -40,10 +40,11 @@ import attention as policy
 # to the user are friends until the profile, a triage turn or a correction
 # says otherwise. Threads and projects default to admin (item_from_doc).
 DEFAULT_CHAT_SPHERE = "friends"
-# …except a sender the delivery gate did not recognise (docs/triage-delivery-
-# gate.md). A stranger who has the user's number is not a friend and not a
-# customer; nobody has said which, and guessing "friends" would let anyone who
-# learns the number ring during Social. So an unnamed sender gets a sphere of
+# …except a sender nothing vouches for: not a VIP (docs/triage-delivery-
+# gate.md), no contact card, no sphere the user taught the profile. A stranger
+# who has the user's number is not a friend and not a customer; nobody has
+# said which, and guessing "friends" would let anyone who learns the number
+# ring during Social. So an unnamed sender gets a sphere of
 # their own that no mode admits by default: the message is *screened* — listed
 # and carried by the next digest, never rung — until the user files a contact
 # card and says which sphere they belong to. Hey's Screener, in one word.
@@ -236,10 +237,20 @@ def chat_wants_attention(chat: dict, state: dict) -> bool:
 
 
 def chat_is_unknown(state: dict) -> bool:
-    """Is this chat's peer a stranger? — the gate said so about the last
-    arrival and no contact card has since named them."""
+    """Is this chat's peer a stranger? — nothing on the rail vouched for the
+    last arrival's sender (they are not a VIP; see the web-gateway's
+    _rail_unknown_sender) and no contact card has since named them. A sphere
+    the user taught the profile for them still wins in `chat_item`."""
     state = state or {}
     return bool(state.get("unknown_sender")) and not state.get("contact")
+
+
+def chat_screened(item: dict) -> bool:
+    """Is this chat item screened — nothing vouches for its sender *and*
+    nothing has placed them either, so its sphere is still ``unknown``?
+    Read off the item's current sphere, so a correction that moves it answers
+    at once."""
+    return bool(item.get("stranger")) and item.get("sphere") == UNKNOWN_SPHERE
 
 
 def chat_item(chat: dict, state: dict, profile: dict) -> dict:
@@ -250,7 +261,7 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     thinks of them."""
     block = dict((state or {}).get("attention") or {})
     name = chat.get("name") or chat.get("key") or chat.get("id") or "Chat"
-    unknown = chat_is_unknown(state)
+    stranger = chat_is_unknown(state)
     priors = profile.get("priors") or {}
     if "importance" not in block:
         if name in priors:
@@ -262,7 +273,7 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     # A stranger keeps the importance of a human writing to a human — someone
     # took the trouble — and loses only the guess about *where they belong*.
     sphere = (block.get("sphere") or (profile.get("spheres") or {}).get(name)
-              or (UNKNOWN_SPHERE if unknown else DEFAULT_CHAT_SPHERE))
+              or (UNKNOWN_SPHERE if stranger else DEFAULT_CHAT_SPHERE))
     doc = {"id": f"chat:{chat['id']}", "title": name, "attention": block, "sphere": sphere,
            "sender": name, "archived": bool(chat.get("archived"))}
     item = policy.item_from_doc(doc, "chat", profile)
@@ -280,7 +291,11 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         # and sphere are keyed on the name the user sees.
         "sender": name,
         "handle": chat.get("key") or "",
-        "unknown_sender": unknown,
+        # Screened is where that lands (see chat_screened): a sender the
+        # profile or an earlier judgement on this chat already placed is not a
+        # stranger, whatever the rail said.
+        "stranger": stranger,
+        "unknown_sender": chat_screened({"stranger": stranger, "sphere": sphere}),
         "contact": (state or {}).get("contact") or None,
         "group": bool(chat.get("group")),
         "count": int(chat.get("unread") or 0),
@@ -414,6 +429,7 @@ def default_emit_path(chambers_dir: Path) -> Path:
 __all__ = [
     "AttentionStore", "DEFAULT_CHAT_SPHERE", "DEFAULT_SPHERES", "DEFAULT_DIRECT_IMPORTANCE",
     "DEFAULT_GROUP_IMPORTANCE", "zone",
-    "thread_wants_attention", "thread_item", "chat_wants_attention", "chat_item",
+    "thread_wants_attention", "thread_item", "chat_wants_attention", "chat_is_unknown",
+    "chat_screened", "chat_item",
     "project_item", "fold_projects", "block_for", "subject_iri", "emit", "default_emit_path",
 ]

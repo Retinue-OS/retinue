@@ -15,9 +15,10 @@ covers, end to end through HTTP:
   times; a permit granted in Focused releases the sender's held chat;
 - the chats rail: an inbound is held or pushed by the mode, the family repeat
   breaks through in Off, the user's own reply settles the chat's item;
-- a sender the delivery gate did not recognise is screened into the `unknown`
-  sphere, and the contact card names them, teaches the profile, whitelists the
-  handle, writes the address book and lets their next message through;
+- a direct sender nothing vouches for (no VIP flag, no card) is screened into
+  the `unknown` sphere, and the contact card names them, teaches the profile,
+  writes the address book and lets their next message through; a VIP rings
+  in any mode, unless their chat is muted;
 - a project from the store carries its frontmatter's importance and deadline;
 - the tick: the 12:00 digest releases what Focused held, the sweep pushes
   what crossed into the next urgency band; the life-store emit is written;
@@ -62,7 +63,7 @@ class _MockSparql(BaseHTTPRequestHandler):
         if "k:Project" in query and STATE["projects"]:
             cell = lambda v: {"value": v}  # noqa: E731
             bindings = [{"p": cell(PROJECT), "title": cell("VAT return Q3"),
-                         "actor": cell("urn:retinue:actor:reto"), "expected": cell("2026-09-30"),
+                         "actor": cell("urn:retinue:actor:owner"), "expected": cell("2026-09-30"),
                          "importance": cell("4"), "sphere": cell("admin"), "tag": cell("finance"),
                          "kind": cell("tax filing"), "next": cell("Collect the receipts")}]
         payload = json.dumps({"results": {"bindings": bindings}}).encode("utf-8")
@@ -433,19 +434,17 @@ def test_chat_inbound_gated_and_settled(base, wg):
 
 def test_unknown_sender_screened_then_named(base, wg):
     """A stranger with the user's number: screened until the contact card."""
-    import triage_policy
-
     nadia = "+41791000042"
     chat = "signal:" + nadia
     cid = "chat:" + chat
     status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
     assert status == 200
     PUSHES.clear()
-    # The gate forwarded it and said it recognised nobody, so no name rides
-    # along either — the chat is a bare number.
+    # The gate let it through and she is no VIP; no name rides along either —
+    # the chat is a bare number.
     body = _inbound(base, nadia, None, "Hi, Nadia from the workshop yesterday.",
                     "2026-09-05T14:05:00Z",
-                    gate={"forward": True, "reason": "unknown", "unknown": True})
+                    gate={"forward": True, "vip": False, "reason": "open"})
     assert body["pushed"] is False and not PUSHES, PUSHES
     where, row = _find(_sections(base), cid)
     assert where == "held", (where, row)
@@ -466,7 +465,7 @@ def test_unknown_sender_screened_then_named(base, wg):
     assert status == 200, out
     assert out["contact"]["name"] == "Nadia Brunner" and out["contact"]["sphere"] == "customers"
     assert out["contact"]["tags"] == ["friends"] and out["name"] == "Nadia Brunner"
-    assert out["whitelisted"] == [nadia], out
+    assert "whitelisted" not in out, out
     row = out["item"]
     assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
     assert row["unknown_sender"] is False and row["title"] == "Nadia Brunner", row
@@ -474,38 +473,59 @@ def test_unknown_sender_screened_then_named(base, wg):
     # What the card taught, where each half of it lives.
     profile = wg._ATTENTION.profile()
     assert profile["spheres"]["Nadia Brunner"] == "customers"
-    assert triage_policy.handle_status(nadia, *(lambda pol: (pol.whitelist, pol.blacklist))(
-        triage_policy.load_messenger_policy("signal"))) == "whitelisted"
     card = wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
     assert 'vcard:fn "Nadia Brunner"' in card and "kb:sphere sphere:customers" in card
     assert "kb:tag sphere:friends" in card and f"<tel:{nadia}>" in card
     assert "Nadia Brunner" in wg._contact_names()
 
-    # Her next message is a known sender with a deadline: time-sensitive, and
-    # customers is the scope — it rings, where the first one was screened.
+    # Her next message comes from a named contact with a deadline:
+    # time-sensitive, and customers is the scope — it rings, where the first
+    # one was screened. The gate says what it said before; the card decides.
     PUSHES.clear()
     body = _inbound(base, nadia, "Nadia Brunner", "Can you send the studio address before 18:00?",
                     "2026-09-05T16:40:00Z",
-                    gate={"forward": True, "reason": "whitelisted", "unknown": False},
+                    gate={"forward": True, "vip": False, "reason": "open"},
                     attention={"importance": 4, "due": _due(1), "kind": "customer request"})
     assert body["pushed"] is True and PUSHES, PUSHES
     where, row = _find(_sections(base), cid)
     assert where == "now" and row["sphere"] == "customers" and row["level"] == "time-sensitive", row
 
-    # Removing the card takes the name off and the item back to `unknown` —
-    # but not the whitelist entry: unfiling someone is not asking the gate to
-    # stop hearing from them.
+    # Removing the card takes the name off and the item back to `unknown`.
     status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
                         {"name": ""})
     assert status == 200 and out["contact"] is None and out["name"] is None, out
     # The item is back in the screening sphere; the title falls back to the
     # roster, which learned her name from the channel's own second message.
     assert out["item"]["sphere"] == "unknown" and out["item"]["contact"] is None, out["item"]
-    # The gate still knows the handle, so the chat is not screened again here.
-    assert out["item"]["unknown_sender"] is False, out["item"]
+    # Nothing vouches for her any more: no card, and she is no VIP.
+    assert out["item"]["unknown_sender"] is True, out["item"]
     assert "vcard:fn" not in wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
-    assert nadia in triage_policy.load_messenger_policy("signal").whitelist
     print("ok test_unknown_sender_screened_then_named")
+
+
+def test_vip_always_rings(base, wg):
+    """A VIP rings whatever the mode; a muted chat keeps even a VIP quiet."""
+    lena = "+41791000077"
+    cid = "chat:signal:" + lena
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
+    assert status == 200
+    PUSHES.clear()
+    body = _inbound(base, lena, "Lena", "Landed — can you pick me up?", "2026-09-05T14:30:00Z",
+                    gate={"forward": True, "vip": True, "reason": "open"})
+    assert body["pushed"] is True and PUSHES, PUSHES
+    where, row = _find(_sections(base), cid)
+    # Known by being a VIP: never screened, whatever the card says (none here).
+    assert where == "now" and row["unknown_sender"] is False and row["sphere"] != "unknown", (where, row)
+    assert "VIP" in row["delivery"], row["delivery"]
+    # The same person in a chat the user muted: the mirror has it, nobody rings.
+    status, _ = _http(base, "POST", f"/chats/{urllib.parse.quote('signal:' + lena, safe='')}/flags",
+                      {"muted": True})
+    assert status == 200
+    PUSHES.clear()
+    body = _inbound(base, lena, "Lena", "Never mind, got a taxi.", "2026-09-05T14:40:00Z",
+                    gate={"forward": True, "vip": True, "reason": "open"})
+    assert body["pushed"] is False and not PUSHES, PUSHES
+    print("ok test_vip_always_rings")
 
 
 def test_focused_takes_a_scope(base, wg):
@@ -845,6 +865,7 @@ def main():
         test_corrections_learn(base, wg)
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
+        test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
         test_focused_takes_a_scope(base, wg)
         test_project_from_store(base, wg)

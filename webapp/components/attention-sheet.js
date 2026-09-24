@@ -434,11 +434,15 @@ class RetinueAttentionSheet extends HTMLElement {
       const label = card
         ? `<div class="f-value">${esc(card.name)}${card.sphere ? ` · <span style="color:${sphereColor(card.sphere)}">${esc(card.sphere)}</span>` : ''}` +
           `${(card.tags || []).length ? ` <span class="f-note">+ ${card.tags.map(esc).join(', ')}</span>` : ''}</div>`
-        : `<div class="f-value">${esc(item.handle || item.sender || '')} — nobody has this number yet.</div>` +
-          `<div class="f-note">Screened: their message is listed and carried by the next digest, but no mode admits ` +
-          `<span style="color:${sphereColor('unknown')}">unknown</span>, so it never rings.</div>`;
+        : item.unknown_sender
+          ? `<div class="f-value">${esc(item.handle || item.sender || '')} — nobody has this number yet.</div>` +
+            `<div class="f-note">Screened: their message is listed and carried by the next digest, but no mode admits ` +
+            `<span style="color:${sphereColor('unknown')}">unknown</span>, so it never rings.</div>`
+          // Placed without a card — a VIP, or a sphere the profile already
+          // knows for them: nothing is screened, the card only names them.
+          : `<div class="f-value">${esc(item.handle || item.sender || '')} — no contact card yet.</div>`;
       return `<div class="field${item.unknown_sender ? ' screened' : ''}">` +
-        `<div class="f-label">${card ? 'Contact' : 'New number'}</div>${label}` +
+        `<div class="f-label">${card || !item.unknown_sender ? 'Contact' : 'New number'}</div>${label}` +
         `<div class="f-ctl" style="margin-top:6px"><button class="btn tiny" data-act="contact-edit"${busy}>` +
         `${card ? 'Edit the contact' : 'Add a contact'}</button>` +
         (card ? `<button class="btn tiny" data-act="contact-remove"${busy}>Remove</button>` : '') +

@@ -23,7 +23,9 @@ closes both gaps:
     the refresh token expired) does the same at a higher cadence, since every
     scheduled job and dashboard turn is failing while it lasts.
   * Recovery (a re-login through the page, the console, or `claude` itself)
-    is reported in the same thread.
+    is recorded in the same thread *quietly*: no push, no unread badge, and
+    an archived thread stays archived. The user who just re-logged in knows
+    already; the message is for whoever reads the thread later.
 
 Deployments that authenticate through a Claude-compatible gateway instead of
 OAuth (ANTHROPIC_BASE_URL set, RETINUE_GATEWAY_USES_CLAUDE_OAUTH unset) have
@@ -103,7 +105,7 @@ def level_of(status: dict) -> str:
 def broken_message(reason: str) -> str:
     return (
         "The Claude sign-in of the agent system is broken — scheduled jobs, "
-        "dashboard conversations and the remote-control session cannot "
+        "dashboard conversations and every agent session cannot "
         "authenticate until it is renewed.\n\n"
         f"{reason}\n\n"
         f"Open {signin_link()} to sign in again from this browser (no console "
@@ -176,7 +178,7 @@ class AuthMonitorEngine:
         if level == "ok":
             if entry.get("level") in ("warn", "broken"):
                 if entry.get("notified") and entry.get("thread_id"):
-                    self.notifier.append(entry["thread_id"], recovery_message())
+                    self.notifier.append(entry["thread_id"], recovery_message(), quiet=True)
                 print(f"{LOG} sign-in recovered", flush=True)
             entry.clear()
             entry["level"] = "ok"

@@ -38,6 +38,7 @@ class FakeNotifier:
         self.fail = fail
         self.opened = []    # (title, message)
         self.appended = []  # (thread_id, message)
+        self.quiet_flags = []  # one per append, in order
         self._next_id = 0
 
     def open_thread(self, title, message, attention=None):
@@ -47,10 +48,11 @@ class FakeNotifier:
         self._next_id += 1
         return f"thread{self._next_id}"
 
-    def append(self, thread_id, message, attention=None):
+    def append(self, thread_id, message, attention=None, quiet=False):
         if self.fail:
             return False
         self.appended.append((thread_id, message))
+        self.quiet_flags.append(quiet)
         return True
 
 
@@ -111,6 +113,9 @@ def test_recovery_reports_in_same_thread():
     assert len(n.appended) == 1
     thread_id, message = n.appended[0]
     assert thread_id == "thread1" and "connected again" in message
+    # The all-clear is a record, not news: no push, and an archived thread
+    # stays archived.
+    assert n.quiet_flags == [True]
     assert e.state["telegram"]["status"] == "up"
 
 
@@ -125,6 +130,7 @@ def test_reminder_cadence():
     e.step("signal", "Signal", "down", "x", now=1000 + 3700)
     assert len(n.appended) == 1
     assert n.appended[0][0] == "thread1" and "still disconnected" in n.appended[0][1]
+    assert n.quiet_flags == [False]
     # And not again right away.
     e.step("signal", "Signal", "down", "x", now=1000 + 3760)
     assert len(n.appended) == 1
@@ -208,6 +214,36 @@ def test_builtin_channels_filter():
         # Empty string: none of the built-ins enrol.
         os.environ["MESSENGER_BUILTIN_CHANNELS"] = ""
         assert messenger_gateways.channel_gateways("[test]") == {}
+    finally:
+        for key in keys:
+            os.environ.pop(key, None)
+
+
+def test_sms_enrols_only_with_its_base_url():
+    """SMS is opt-in: the base compose never sets SMS_GATEWAY_BASE_URL, so an
+    unset channel list must not drag a never-started sms-gateway into the
+    monitor (which would report it as an outage on every boot)."""
+    import messenger_gateways
+    keys = ("SIGNAL_GATEWAY_BASE_URL", "WHATSAPP_GATEWAY_BASE_URL",
+            "TELEGRAM_GATEWAY_BASE_URL", "SMS_GATEWAY_BASE_URL",
+            "SMS_GATEWAY_TOKEN", "MESSENGER_GATEWAYS", "MESSENGER_BUILTIN_CHANNELS")
+    for key in keys:
+        os.environ.pop(key, None)
+    os.environ["SIGNAL_GATEWAY_BASE_URL"] = "http://signal-gateway:8090"
+    try:
+        assert set(messenger_gateways.channel_gateways("[test]")) == {"signal-gateway"}
+        os.environ["SMS_GATEWAY_BASE_URL"] = "http://sms-gateway:8095"
+        os.environ["SMS_GATEWAY_TOKEN"] = "t"
+        registry = messenger_gateways.channel_gateways("[test]")
+        assert set(registry) == {"signal-gateway", "sms-gateway"}
+        assert registry["sms-gateway"] == {
+            "base_url": "http://sms-gateway:8095", "token": "t", "label": "SMS"}
+        # An explicit channel list still has the final say.
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal"
+        assert set(messenger_gateways.channel_gateways("[test]")) == {"signal-gateway"}
+        os.environ["MESSENGER_BUILTIN_CHANNELS"] = "signal,sms"
+        assert set(messenger_gateways.channel_gateways("[test]")) == {
+            "signal-gateway", "sms-gateway"}
     finally:
         for key in keys:
             os.environ.pop(key, None)

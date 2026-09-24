@@ -230,6 +230,7 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "waiting_since": parse_dt(a.get("waiting_since")),
         "sender": a.get("sender") or doc.get("sender"),
         "critical": bool(a.get("critical")),
+        "vip": bool(a.get("vip")),
         "state": a.get("state") or ("done" if doc.get("archived") else "open"),
         "released": bool(a.get("released", False)),
         "snoozed_until": parse_dt(a.get("snoozed_until")),
@@ -252,7 +253,8 @@ def item_to_attention(item: dict) -> dict:
         "due": iso(item.get("due")), "lead": item["lead"].total_seconds() / 60, "lead_from": item.get("lead_from"),
         "sphere": item["sphere"], "tags": list(item.get("tags") or []), "kind": item.get("kind_label"),
         "actor": item.get("actor"), "waiting_since": iso(item.get("waiting_since")), "sender": item.get("sender"),
-        "critical": bool(item.get("critical")), "state": item.get("state", "open"), "released": bool(item.get("released")),
+        "critical": bool(item.get("critical")), "vip": bool(item.get("vip")),
+        "state": item.get("state", "open"), "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "boost": int(item.get("boost", 0)), "last_level": item.get("last_level"),
         "pushed": [iso(x) for x in item.get("pushed") or []], "pulled": bool(item.get("pulled", False)),
         "digest_at": iso(item.get("digest_at")),
@@ -615,7 +617,10 @@ def admitted(item: dict, mode: dict, profile: dict) -> bool:
     """A sphere in ``admits`` gets through; so does one in ``admit_tags``,
     whether the item carries it as its sphere or as a tag — "health may
     reach me" is about the subject, not about which slot it sits in — and,
-    with Focused on a project, whatever is about that project."""
+    with Focused on a project, whatever is about that project. A VIP's
+    message is admitted everywhere (see breaks_through)."""
+    if item.get("vip"):
+        return True
     tags = mode.get("admit_tags", [])
     if item["sphere"] in mode["admits"] or item["sphere"] in tags:
         return True
@@ -636,6 +641,8 @@ def mode_label(mode: dict) -> str:
 def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> str:
     if level(item, now) == "critical":
         return "critical rings in every mode"
+    if item.get("vip"):
+        return f"{item.get('sender') or 'the sender'} is a VIP"
     if about_project(item, mode.get("project")):
         return f"{mode_label(mode)}: this is about it"
     if item["sphere"] in mode["admits"]:
@@ -664,9 +671,15 @@ def breaks_through(item: dict, mode: dict, profile: dict, now: datetime) -> bool
     the mode's threshold when its sphere or a tag is admitted — or, holding a
     permit, at *active* already: a permit admits the sender and lowers the bar
     for them (the brief), while importance still decides the level, so a
-    trivial note from a permitted sender stays in the digest."""
+    trivial note from a permitted sender stays in the digest.
+
+    A VIP rings in every mode, at every level, like critical: the delivery
+    gate's sender flag (docs/triage-delivery-gate.md) is the user saying *I
+    want to hear from this person the moment they write*. What keeps a VIP
+    quiet is decided before an item exists — a muted chat, a quieted or
+    ignored group."""
     lvl = level(item, now)
-    if lvl == "critical":
+    if lvl == "critical" or item.get("vip"):
         return True
     if has_permit(item, mode, profile):
         return RANK[lvl] >= RANK["active"]

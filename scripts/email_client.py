@@ -45,6 +45,8 @@ Examples
     email_client.py list --folder INBOX --limit 20
     email_client.py search --folder INBOX --from schaerer --subject rezept
     email_client.py read --uid 1234 --folder INBOX
+    email_client.py read --uid 1234 --html   # + the raw text/html part
+    email_client.py read --uid 1234 --raw    # + the original MIME, base64
     email_client.py fetch-attachment --uid 1234 --part 1 --out /tmp/rezept.pdf
     email_client.py move --uid 1234 --from INBOX --to "Archiv/Apotheke"
     email_client.py flag --uid 1234 --folder INBOX --read
@@ -68,7 +70,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from email.message import EmailMessage
 from email.utils import (formataddr, getaddresses, make_msgid, parseaddr,
                          parsedate_to_datetime)
@@ -326,9 +328,59 @@ def _iter_attachments(msg):
             yield idx, part
 
 
+def _link_target_worth_noting(href, text):
+    """Should an <a href> target be carried into the rendered text?
+
+    Returns the stripped href to emit, or None when doing so would just be
+    clutter: no href (or a bare fragment/JS pseudo-link), an anchor with no
+    visible text to hang the target on, a mailto:/tel: whose target merely
+    repeats the visible text (a "click to email jane@x.com" link that already
+    says "jane@x.com") and carries no query string beyond the address, or
+    visible text that already contains the URL. A mailto: with a query
+    (?subject=/body=/cc=, ...) is never redundant even when the address is
+    repeated, since the query is part of the action and not visible anywhere
+    in the text. Everything else is the case the issue is about — a
+    call-to-action link ("Rechnungskopie einsehen") whose only trace of the
+    actual target is the href — so it is worth noting.
+    """
+    if not href:
+        return None
+    href = href.strip()
+    if not href or href.startswith("#") or href.lower().startswith("javascript:"):
+        return None
+    text = (text or "").strip()
+    if not text:
+        return None
+    if href.lower() in text.lower():
+        return None
+    if href.lower().startswith("mailto:"):
+        # The query string is part of the action, not decoration: a mailto
+        # can carry ?subject=/body=/cc= that composes the draft, so an
+        # address that merely repeats the visible text is only redundant
+        # when there is no such query left to lose.
+        address, _, query = href[len("mailto:"):].partition("?")
+        if address and not query and address.lower() in text.lower():
+            return None
+    elif href.lower().startswith("tel:"):
+        digits_href = re.sub(r"\D", "", href[len("tel:"):])
+        digits_text = re.sub(r"\D", "", text)
+        if digits_href and digits_href in digits_text:
+            return None
+    return href
+
+
 class _HTMLTextExtractor(HTMLParser):
     """Collapse HTML into readable plain text: drop tags, keep text, turn
-    block-level elements and <br> into newlines. Stdlib-only, no dependency."""
+    block-level elements and <br> into newlines. Stdlib-only, no dependency.
+
+    <a href> targets are folded into the text inline, as ``label <url>``,
+    right after the anchor's own text — so "Rechnungskopie einsehen" becomes
+    "Rechnungskopie einsehen <https://…>" instead of silently losing the only
+    call to action the mail had. See _link_target_worth_noting() for when a
+    target is skipped as redundant rather than noted. The same targets are
+    also collected separately (get_links()) for callers that want them as
+    structured data rather than folded into the prose.
+    """
 
     _BLOCK = {
         "p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6",
@@ -341,14 +393,25 @@ class _HTMLTextExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self._parts = []
         self._skip_depth = 0
+        self._link_stack = []  # open <a> tags: (href, start index into _parts)
+        self._links = []
 
     def handle_starttag(self, tag, attrs):
         if tag in self._SKIP:
             self._skip_depth += 1
         elif tag in self._BLOCK:
             self._parts.append("\n")
+        if tag == "a" and not self._skip_depth:
+            self._link_stack.append((dict(attrs).get("href"), len(self._parts)))
 
     def handle_endtag(self, tag):
+        if tag == "a" and self._link_stack:
+            href, start = self._link_stack.pop()
+            text = "".join(self._parts[start:]).strip()
+            target = _link_target_worth_noting(href, text)
+            if target:
+                self._links.append({"text": text, "url": target})
+                self._parts.append(f" <{target}>")
         if tag in self._SKIP and self._skip_depth:
             self._skip_depth -= 1
         elif tag in self._BLOCK:
@@ -374,21 +437,40 @@ class _HTMLTextExtractor(HTMLParser):
                 blank = True
         return "\n".join(out).strip()
 
+    def get_links(self):
+        """The <a href> targets folded into get_text(), as structured data
+        (in document order, duplicates included) — for callers (e.g. the
+        `read` command's `links` field) that want them without re-parsing."""
+        return list(self._links)
 
-def _html_to_text(html):
-    """Best-effort readable plain text from an HTML string."""
+
+def _render_html(html):
+    """Parse an HTML string into (text, links): the readable rendering from
+    _HTMLTextExtractor.get_text() and its get_links() in one pass, so callers
+    that want both (e.g. `read`) don't parse twice. On a malformed document
+    that trips the parser, falls back to the raw markup as text with no
+    links — better than losing the message body entirely."""
     parser = _HTMLTextExtractor()
     try:
         parser.feed(html)
         parser.close()
     except Exception:
-        return html
-    return parser.get_text()
+        return html, []
+    return parser.get_text(), parser.get_links()
 
 
-def _body_text(msg):
-    """Best-effort plain-text body. Prefer a genuine text/plain part; fall back
-    to a *rendered* text version of an HTML-only body rather than raw markup."""
+def _html_to_text(html):
+    """Best-effort readable plain text from an HTML string, with <a href>
+    targets folded in inline (see _HTMLTextExtractor)."""
+    return _render_html(html)[0]
+
+
+def _body_parts(msg):
+    """Return (plain, html): the raw text/plain and text/html part contents,
+    whichever exist (either may be None). Neither is rendered — that split is
+    what lets `read` offer the raw text/html part (--html) and the links
+    extracted from it independently of which one _body_text() picks to show
+    as the body."""
     if msg.is_multipart():
         plain = None
         html = None
@@ -402,24 +484,61 @@ def _body_text(msg):
                 plain = part.get_content()
             elif ctype == "text/html" and html is None:
                 html = part.get_content()
-        if plain is not None:
-            return plain
-        if html is not None:
-            return _html_to_text(html)
-        return ""
+        return plain, html
     try:
         content = msg.get_content()
     except Exception:
         content = msg.get_payload(decode=True).decode("utf-8", errors="replace")
     if (msg.get_content_type() or "").lower() == "text/html":
-        return _html_to_text(content)
-    return content
+        return None, content
+    return content, None
+
+
+def _body_text(msg):
+    """Best-effort plain-text body. Prefer a genuine text/plain part; fall back
+    to a *rendered* text version of an HTML-only body rather than raw markup."""
+    plain, html = _body_parts(msg)
+    if plain is not None:
+        return plain
+    if html is not None:
+        return _html_to_text(html)
+    return ""
+
+
+def _select_body_and_links(plain, html):
+    """(body, links) for `read`, given the (plain, html) pair from _body_parts().
+
+    `body` follows the same preference as _body_text() — a genuine text/plain
+    part over a rendered HTML one. Link extraction does NOT follow that
+    preference, per _body_parts()'s own docstring: a multipart/alternative
+    message — the single most common shape for transactional mail — carries
+    both a plain and an HTML part, and the plain part never has hrefs to lose
+    in the first place, so the HTML part is rendered for its links whenever
+    one is present, regardless of which part wins for `body`. Skipping that
+    render whenever a plain part existed used to silently drop the links
+    `read` exists to surface (issue #174), for exactly the common case the
+    issue was filed about.
+    """
+    links = []
+    html_text = None
+    if html is not None:
+        html_text, links = _render_html(html)
+    if plain is not None:
+        body = plain
+    elif html_text is not None:
+        body = html_text
+    else:
+        body = ""
+    return body, links
+
+
+_SUMMARY_ITEMS = ("(BODY.PEEK[HEADER.FIELDS (FROM REPLY-TO TO SUBJECT DATE "
+                  "MESSAGE-ID LIST-ID)] FLAGS)")
+_UID_IN_FETCH = re.compile(rb"\bUID (\d+)")
 
 
 def _summary(M, uid):
-    typ, data = M.uid(
-        "fetch", uid,
-        "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID LIST-ID)] FLAGS)")
+    typ, data = M.uid("fetch", uid, _SUMMARY_ITEMS)
     if typ != "OK" or not data or data[0] is None:
         return None
     header_bytes = b""
@@ -428,6 +547,61 @@ def _summary(M, uid):
         if isinstance(item, tuple):
             header_bytes = item[1]
             flags = imaplib.ParseFlags(item[0]) if item[0] else ()
+        elif isinstance(item, bytes) and b"FLAGS" in item:
+            # Some servers put FLAGS after the header literal.
+            flags = imaplib.ParseFlags(item)
+    return _summary_from_headers(uid, header_bytes, flags)
+
+
+def _summaries(M, uids):
+    """Summaries for many UIDs: one FETCH per chunk, not one per message.
+
+    A listing's cost is round-trips, and a per-message fetch makes a
+    2000-message page 2000 of them; one bulk FETCH makes it a handful. The
+    bulk reply is a stream of (envelope, literal) tuples, each carrying its
+    own `UID n`, sometimes followed by a bare `FLAGS (...)` item -- messages
+    come back in the server's order, so they are matched by UID, never by
+    position. Whatever the bulk reply did not yield (a server that answers
+    oddly, a message that vanished mid-fetch) is fetched singly, so the
+    result is exactly what a per-message loop would have produced.
+    """
+    want = [u.decode() if isinstance(u, bytes) else str(u) for u in uids]
+    got = {}
+    chunk_size = 500
+    for i in range(0, len(want), chunk_size):
+        chunk = want[i:i + chunk_size]
+        try:
+            typ, data = M.uid("fetch", ",".join(chunk), _SUMMARY_ITEMS)
+        except imaplib.IMAP4.error:
+            typ, data = "NO", []
+        if typ != "OK" or not data:
+            continue
+        current = None
+        for item in data:
+            if isinstance(item, tuple):
+                m = _UID_IN_FETCH.search(item[0] or b"")
+                if not m:
+                    current = None
+                    continue
+                current = m.group(1).decode()
+                flags = imaplib.ParseFlags(item[0]) if item[0] else ()
+                got[current] = _summary_from_headers(current, item[1], flags)
+            elif isinstance(item, bytes) and current and b"FLAGS" in item:
+                flags = imaplib.ParseFlags(item)
+                got[current]["flags"] = [
+                    f.decode() if isinstance(f, bytes) else f for f in flags]
+                got[current]["unread"] = b"\\Seen" not in flags
+    out = []
+    for u in want:
+        s = got.get(u)
+        if s is None:
+            s = _summary(M, u.encode())
+        if s:
+            out.append(s)
+    return out
+
+
+def _summary_from_headers(uid, header_bytes, flags):
     hdr = _parse_message(header_bytes)
     date = hdr.get("Date")
     try:
@@ -437,6 +611,9 @@ def _summary(M, uid):
     return {
         "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
         "from": _decode(hdr.get("From")),
+        # Where a reply to this message actually goes (`cmd_reply` honours
+        # it), so `answered` can recognise a reply sent there.
+        "reply_to": _decode(hdr.get("Reply-To")) or None,
         "to": _decode(hdr.get("To")),
         "subject": _decode(hdr.get("Subject")),
         "date": iso,
@@ -492,7 +669,12 @@ def _search_by_message_id(M, message_id):
     return data[0].split() if typ == "OK" else []
 
 
-_RE_PREFIX = re.compile(r"^\s*(re|aw|fwd?|wg)\s*(\[\d+\])?\s*:\s*", re.I)
+# Reply/forward prefixes across the locales this mailbox sees. The triage
+# gate's nomination (scripts/triage-gate.py, _SUBJECT_PREFIX) strips the same
+# set: a prefix that nominates a mail there but does not strip here would
+# make the exact check reject every reply written in that locale.
+_RE_PREFIX = re.compile(
+    r"^\s*(re|aw|fwd?|wg|tr|antw|sv|vs)\s*(\[\d+\])?\s*:\s*", re.I)
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
@@ -517,14 +699,18 @@ def _imap_date(iso):
 
 
 def _search_sent_to(M, address, since_iso):
-    """UIDs of messages sent TO *address* on or after *since_iso*.
+    """UIDs of messages sent to *address* (To, Cc or Bcc) on or after *since_iso*.
 
     The second dedup signal, and the one that actually matters: Ari's runaway
     replies to Mara carried no In-Reply-To at all, so a header-only test
     declares her message unanswered and would answer it an 82nd time. A reply
-    that does not thread is still a reply.
+    that does not thread is still a reply. All three recipient headers, since
+    a reply-all that reaches the sender via Cc is no less an answer -- and
+    `_reply_matches_anchor` checks the address exactly afterwards, so the
+    wider search only ever adds candidates for it to judge.
     """
-    criteria = ["TO", '"%s"' % address.replace('"', "")]
+    addr = '"%s"' % address.replace('"', "")
+    criteria = ["OR", "TO", addr, "OR", "CC", addr, "BCC", addr]
     day = _imap_date(since_iso) if since_iso else None
     if day:
         criteria += ["SINCE", day]
@@ -533,6 +719,153 @@ def _search_sent_to(M, address, since_iso):
     except imaplib.IMAP4.error:
         return []
     return data[0].split() if typ == "OK" else []
+
+
+def _reply_summary(M, uid):
+    """The minimal reply detail `answered` needs to validate a match."""
+    typ, data = M.uid(
+        "fetch", uid,
+        "(BODY.PEEK[HEADER.FIELDS (TO CC BCC SUBJECT DATE IN-REPLY-TO REFERENCES)])",
+    )
+    if typ != "OK" or not data or data[0] is None:
+        return None
+    header_bytes = b""
+    for item in data:
+        if isinstance(item, tuple):
+            header_bytes = item[1]
+    hdr = _parse_message(header_bytes)
+    date = hdr.get("Date")
+    try:
+        iso = parsedate_to_datetime(date).isoformat() if date else None
+    except Exception:
+        iso = date
+    return {
+        "uid": uid.decode() if isinstance(uid, bytes) else str(uid),
+        "to": _decode(hdr.get("To")),
+        "cc": _decode(hdr.get("Cc")),
+        "bcc": _decode(hdr.get("Bcc")),
+        "subject": _decode(hdr.get("Subject")),
+        "date": iso,
+        "in_reply_to": (hdr.get("In-Reply-To") or "").strip(),
+        "references": (hdr.get("References") or "").strip(),
+    }
+
+
+def _threads_elsewhere(reply):
+    """Whether a sent message cites *some* message it is a reply to.
+
+    Used by the untracked fallback, which exists for replies that carry no
+    threading headers at all. A reply that does cite a message and was not
+    found by the threaded search cites a *different* one -- typically an
+    older mail from the same correspondent under the same subject -- and
+    counting it for this anchor would archive a mail nobody has answered.
+    """
+    return bool(reply.get("in_reply_to") or reply.get("references"))
+
+
+def _parsed_summary_date(value):
+    """An ISO timestamp from `_summary`/`_reply_summary`, always tz-aware."""
+    try:
+        parsed = datetime.fromisoformat((value or "").strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _reply_recipients(reply):
+    """Every address in To/Cc/Bcc, parsed as RFC address lists.
+
+    Not a comma split: `"Doe, John" <john@example.com>` is one address with a
+    comma in its display name, and splitting it yields two bogus names and
+    loses the one address that matters.
+    """
+    recipients = set()
+    for field in ("to", "cc", "bcc"):
+        for _name, addr in getaddresses([str(reply.get(field) or "")]):
+            addr = addr.strip().casefold()
+            if addr:
+                recipients.add(addr)
+    return recipients
+
+
+def _same_thread_rivals(M, anchor):
+    """Dates of *other* mail from the anchor's correspondent, under the same
+    base subject, newer than the anchor -- in the currently selected folder.
+    The correspondent is every address a reply may have gone to
+    (`_anchor_addresses`: Reply-To and From), since a later mail from the
+    Reply-To party is as much a rival as one from the From.
+
+    The untracked fallback pairs a reply with a mail by correspondent, subject
+    and order alone. When the correspondent has since sent another mail under
+    that subject, one unthreaded reply satisfies those tests for both, and
+    cannot have answered both. A rival that arrived between the anchor and
+    the reply makes the pairing ambiguous, and ambiguous must read as *not*
+    answered: the caller moves mail on this answer.
+
+    Returns None when the search could not be made (an IMAP error, a non-OK
+    reply, a hit that could not be read): "no rivals found" and "could not
+    look" are different answers, and the caller moves mail on this one, so an
+    unanswerable check must not read as "unambiguous".
+    """
+    anchor_when = _parsed_summary_date(anchor.get("date"))
+    base = _base_subject(anchor.get("subject"))
+    day = _imap_date(anchor.get("date"))
+    addrs = sorted(_anchor_addresses(anchor))
+    if anchor_when is None or not day or not addrs:
+        return None
+    # OR-chain over every address: `OR FROM a OR FROM b FROM c`.
+    criteria = []
+    for addr in addrs[:-1]:
+        criteria += ["OR", "FROM", '"%s"' % addr.replace('"', "")]
+    criteria += ["FROM", '"%s"' % addrs[-1].replace('"', ""), "SINCE", day]
+    try:
+        typ, data = M.uid("search", None, *criteria)
+    except imaplib.IMAP4.error:
+        return None
+    if typ != "OK":
+        return None
+    rivals = []
+    for uid in data[0].split():
+        s = _summary(M, uid)
+        if s is None:
+            return None  # a rival we could not read may be the one that matters
+        if s["uid"] == anchor.get("uid"):
+            continue
+        when = _parsed_summary_date(s.get("date"))
+        if (when is not None and when > anchor_when
+                and _base_subject(s.get("subject")) == base):
+            rivals.append(when)
+    return sorted(rivals)
+
+
+def _ambiguous(reply, rivals):
+    """Whether a rival mail arrived between the anchor and this reply."""
+    when = _parsed_summary_date(reply.get("date"))
+    return when is None or any(r < when for r in rivals)
+
+
+def _anchor_addresses(anchor):
+    """Where a reply to the anchor may have gone: its Reply-To if it carries
+    one (that is where `cmd_reply` sends), and its From either way."""
+    addrs = set()
+    for field in ("reply_to", "from"):
+        for _name, addr in getaddresses([str(anchor.get(field) or "")]):
+            addr = addr.strip().casefold()
+            if addr:
+                addrs.add(addr)
+    return addrs
+
+
+def _reply_matches_anchor(reply, anchor):
+    """Whether one sent message safely counts as a reply to the anchor mail."""
+    addrs = _anchor_addresses(anchor)
+    anchor_when = _parsed_summary_date(anchor.get("date"))
+    reply_when = _parsed_summary_date(reply.get("date"))
+    if not addrs or anchor_when is None or reply_when is None or reply_when <= anchor_when:
+        return False
+    if _base_subject(reply.get("subject")) != _base_subject(anchor.get("subject")):
+        return False
+    return bool(addrs & _reply_recipients(reply))
 
 
 # --------------------------------------------------------------------------- #
@@ -565,6 +898,17 @@ def cmd_search(cfg, args):
         criteria += ["SINCE", args.since]  # DD-Mon-YYYY
     if args.unseen:
         criteria += ["UNSEEN"]
+    if args.uid_max is not None:
+        # A cursor for paging a large folder newest-first: only UIDs at or
+        # below this one, so a caller that saw the newest `limit` can ask for
+        # the `limit` before them (`--uid-max <smallest uid seen - 1>`) until
+        # a page comes back short. UID order is append order, which is what
+        # a complete walk needs; it is not date order, so callers must not
+        # read a date boundary off a page. UIDs start at 1, so a cursor below
+        # that is a caller error, never a silent fall-through to ALL.
+        if args.uid_max < 1:
+            die(f"--uid-max must be a positive UID, got {args.uid_max}")
+        criteria += ["UID", f"1:{args.uid_max}"]
     if not criteria:
         criteria = ["ALL"]
     # IMAP SEARCH only needs a CHARSET when a criterion carries non-ASCII text.
@@ -586,9 +930,20 @@ def cmd_search(cfg, args):
         die(f"search failed: {data}")
     uids = data[0].split()
     uids = uids[-args.limit:][::-1]
-    messages = [s for u in uids if (s := _summary(M, u))]
+    messages = _summaries(M, uids)
     M.logout()
-    print(json.dumps({"folder": args.folder, "count": len(messages), "messages": messages}, ensure_ascii=False, indent=2))
+    # `scanned` and `min_uid` describe the page as the server matched it,
+    # before any summary could fail: a caller paging by `--uid-max` reads
+    # "was this page full?" and "where does the next one start?" off these,
+    # never off the count of summaries, so one unreadable header cannot end
+    # a walk early and hide everything older.
+    print(json.dumps({
+        "folder": args.folder,
+        "count": len(messages),
+        "scanned": len(uids),
+        "min_uid": min(int(u) for u in uids) if uids else None,
+        "messages": messages,
+    }, ensure_ascii=False, indent=2))
 
 
 def cmd_answered(cfg, args):
@@ -606,26 +961,45 @@ def cmd_answered(cfg, args):
     sent = args.folder or cfg.sent_folder
     M = imap_connect(cfg)
 
-    # The anchor gives us the correspondent and the date; without it only the
-    # header test can run.
+    # The anchor gives us the correspondent, the base subject and the exact
+    # timestamp; without it the conservative answer is "not confirmed answered",
+    # because threading alone is too weak to move or suppress mail safely.
     imap_select(M, args.in_folder, readonly=True)
     anchor = next((s for u in _search_by_message_id(M, args.message_id)
                    if (s := _summary(M, u))), None)
 
     imap_select(M, sent, readonly=True)
-    threaded = [s for u in _search_replies_to(M, args.message_id)
-                if (s := _summary(M, u))]
+    threaded = []
+    if anchor:
+        for uid in _search_replies_to(M, args.message_id):
+            if (s := _reply_summary(M, uid)) and _reply_matches_anchor(s, anchor):
+                threaded.append(s)
 
     untracked = []
     if anchor:
-        addr = parseaddr(anchor.get("from") or "")[1]
-        base = _base_subject(anchor.get("subject"))
-        if addr:
-            seen = {m["uid"] for m in threaded}
+        seen = {m["uid"] for m in threaded}
+        # Sent to the Reply-To, if any, or to the From: either is where a
+        # reply may have gone.
+        for addr in sorted(_anchor_addresses(anchor)):
             for uid in _search_sent_to(M, addr, anchor.get("date")):
-                s = _summary(M, uid)
-                if s and s["uid"] not in seen and _base_subject(s.get("subject")) == base:
+                s = _reply_summary(M, uid)
+                if (s and s["uid"] not in seen and not _threads_elsewhere(s)
+                        and _reply_matches_anchor(s, anchor)):
+                    seen.add(s["uid"])
                     untracked.append(s)
+        if untracked:
+            # An unthreaded reply can be paired only by correspondent,
+            # subject and order. If the correspondent sent another mail
+            # under that subject before the reply, the reply may be to that
+            # one instead -- and ambiguous must read as unanswered.
+            imap_select(M, args.in_folder, readonly=True)
+            rivals = _same_thread_rivals(M, anchor)
+            if rivals is None:
+                # The ambiguity check could not be made: fail closed. These
+                # candidates stay unconfirmed, and the mail stays where it is.
+                untracked = []
+            else:
+                untracked = [s for s in untracked if not _ambiguous(s, rivals)]
     M.logout()
 
     replies = sorted(threaded + untracked, key=lambda m: m.get("date") or "")
@@ -730,6 +1104,13 @@ def cmd_read(cfg, args):
         iso = parsedate_to_datetime(date).isoformat() if date else None
     except Exception:
         iso = date
+    # Render the body ourselves (rather than call _body_text) so we get the
+    # extracted links in the same pass instead of re-parsing the HTML part;
+    # `html` (the raw part, unrendered) also feeds --html below. See
+    # _select_body_and_links()'s docstring for why link extraction does not
+    # follow `body`'s plain-over-HTML preference.
+    plain, html = _body_parts(msg)
+    body, links = _select_body_and_links(plain, html)
     out = {
         "uid": str(args.uid),
         "folder": args.folder,
@@ -749,9 +1130,24 @@ def cmd_read(cfg, args):
         # identity the triage gate groups a mailing list by.
         "list_id": _decode(msg.get("List-Id")),
         "flags": [f.decode() if isinstance(f, bytes) else f for f in flags],
-        "body": _body_text(msg),
+        "body": body,
+        # <a href> targets folded into `body` (see _HTMLTextExtractor), also
+        # surfaced as structured data — regardless of --html/--raw — so a
+        # caller never has to guess whether a link was lost in rendering.
+        "links": links,
         "attachments": attachments,
     }
+    if args.html:
+        # The text/html part verbatim, for a caller that wants to render it
+        # itself (or double-check `body`/`links`) rather than trust our
+        # best-effort text extraction. None when the message has no HTML part.
+        out["html"] = html
+    if args.raw:
+        # The original MIME source, byte for byte, base64-encoded because it
+        # may carry binary attachments that don't survive JSON as text. The
+        # last-resort escape hatch when even --html isn't enough.
+        out["raw"] = base64.b64encode(raw).decode("ascii")
+        out["raw_encoding"] = "base64"
     M.logout()
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
@@ -798,8 +1194,18 @@ def cmd_move(cfg, args):
         typ, data = M.uid("copy", uid, _quote(args.to))
         if typ != "OK":
             die(f"copy to {args.to} failed: {data}")
-        M.uid("store", uid, "+FLAGS", "(\\Deleted)")
-        M.expunge()
+        # COPY alone is a *duplicate*, not a move. Report success only once the
+        # source copy is actually gone: a caller that records "this left the
+        # INBOX" on the strength of the COPY leaves the message sitting there,
+        # invisible to whatever bookkeeping now says it was filed.
+        typ, data = M.uid("store", uid, "+FLAGS", "(\\Deleted)")
+        if typ != "OK":
+            die(f"copied to {args.to} but marking the source deleted failed: "
+                f"{data} (the message is now in both folders)")
+        typ, data = M.expunge()
+        if typ != "OK":
+            die(f"copied to {args.to} and flagged, but expunge failed: {data} "
+                f"(the message is now in both folders)")
         moved_via = "COPY+EXPUNGE"
     M.logout()
     print(json.dumps({"moved": uid, "from": args.from_, "to": args.to, "method": moved_via}))
@@ -1446,6 +1852,8 @@ def main():
     sp.add_argument("--since", help="date DD-Mon-YYYY, e.g. 01-Jun-2026")
     sp.add_argument("--unseen", action="store_true", help="only unread")
     sp.add_argument("--limit", type=int, default=20)
+    sp.add_argument("--uid-max", dest="uid_max", type=int,
+                    help="paging cursor: only messages with UID <= this")
     sp.set_defaults(func=cmd_search)
 
     sp = sub.add_parser("answered",
@@ -1469,6 +1877,11 @@ def main():
     sp = sub.add_parser("read", help="read one message by UID")
     sp.add_argument("--uid", required=True)
     sp.add_argument("--folder", default="INBOX")
+    sp.add_argument("--html", action="store_true",
+                    help="also include the text/html part verbatim (null if none)")
+    sp.add_argument("--raw", action="store_true",
+                    help="also include the original MIME source, base64-encoded "
+                         "(escape hatch when --html still isn't enough)")
     sp.set_defaults(func=cmd_read)
 
     sp = sub.add_parser("fetch-attachment", help="download an attachment by part number")

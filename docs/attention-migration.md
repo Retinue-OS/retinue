@@ -24,7 +24,7 @@ effects, and never sends or saves anything itself (tests:
 | Entity | Store today | Gains | Set by |
 |---|---|---|---|
 | Thread | one JSON per thread under `CONVERSATIONS_DIR` | an `attention` block: `importance`, `due`, `lead`, `sphere`, `tags`, `kind`, plus the delivery state (`released`, `snoozed_until`, `boost`, `last_level`, `pushed`) | `conversation-push.py --importance --due --lead --sphere --tag --kind` → `POST /internal/conversations`; the Secretary's triage sets them on the threads it opens |
-| Chat | one JSON per chat under `CHAT_STATE_DIR` | the same block, plus `unknown_sender` and the `contact` card | the gateways' notify rail, from the triage classification of a whitelisted sender (importance, deadline, kind) and the contact's sphere; a sender prior from the profile otherwise; the sphere `unknown` for a sender the gate did not recognise (below) |
+| Chat | one JSON per chat under `CHAT_STATE_DIR` | the same block, plus `unknown_sender` and the `contact` card | the gateways' notify rail — the delivery gate's `vip` flag, and any classification that rides along (importance, deadline, kind) — and the contact card's sphere; a sender prior or sphere from the profile otherwise; the sphere `unknown` for a sender nothing vouches for (below) |
 | Project | frontmatter in the chamber | `importance:`, `sphere:`, `tags:`, `kind:`; `expected_by` / `next_due` are the deadline, `remind_before` the lead | the chamber's author; `recurring-projects.py` passes them when it opens the wake-up thread |
 
 `attention.item_from_doc` reads that block with the brief's fallbacks
@@ -39,24 +39,39 @@ alike, projects included through their own converters.
 ## Screening a stranger
 
 The rail carries the delivery gate's verdict about the sender
-(`docs/triage-delivery-gate.md`), and the model uses the half of it the gate
-was already computing and nobody read: **unknown**. A chat whose last arrival
-came from a handle on no whitelist, and whom no contact card names, is put in
-the sphere `unknown` — one no mode admits. The message keeps the importance of
+(`docs/triage-delivery-gate.md`), and since the messenger whitelist was
+retired, all it can say about a person is whether they are a **VIP**. The rest
+is what the dashboard itself knows about them. A direct message decides by
+that, in order:
+
+- **muted chat** — nothing rings, whoever wrote;
+- **VIP** — rings in every mode (the gate's sender flag, carried into the
+  item as `vip`; `attention.breaks_through`), and is never screened;
+- **known** — a contact card, a sphere the profile was taught for the sender,
+  or a sphere an earlier judgement already put on this chat: ranked by that
+  sphere as usual;
+- **nothing** — the sender is a stranger.
+
+A stranger's chat is put in the sphere `unknown` — one no mode admits. The message keeps the importance of
 a direct message (4: a person took the trouble), so it is *active*, which
 means held for the next digest and listed under Held meanwhile. Nothing is
 hidden and nothing rings: Hey's Screener, in the vocabulary the model already
 has. Guessing `friends` instead — the default for a known peer — would let
 anyone who learns the number through during Social.
 
-The way out is the contact card, and it is deliberately one gesture with five
+The chat document records the rail's half as `unknown_sender` (true for a
+direct message from anyone who is not a VIP); `attention_store.chat_screened`
+combines it with the item's resolved sphere, so a stranger the profile already
+places is not screened.
+
+The way out is the contact card, and it is deliberately one gesture with four
 consequences (the chat's name, the profile's sphere, the item's re-judgement,
-the gate's whitelist, the life store's address book), because the user is
-answering one question: *who is this?* The card is stored on the chat document
-(`contact`), the address book it emits lives at `CONTACTS_EMIT_PATH` as
-vCard individuals with `kb:sphere` / `kb:tag`, and the whitelist write is
-`triage_policy.whitelist_on_contact` — the sibling of the auto-whitelist an
-outbound send already performs.
+the life store's address book), because the user is answering one question:
+*who is this?* The card is stored on the chat document (`contact`), and the
+address book it emits lives at `CONTACTS_EMIT_PATH` as vCard individuals with
+`kb:sphere` / `kb:tag`. It says nothing to the delivery gate: whether a
+message is worked by a model on arrival is the sender's VIP flag, set per
+person in the triage policy.
 
 ## Two small documents the gateway keeps
 
@@ -92,7 +107,7 @@ persistent volume) holds:
 | `POST /attention/permits` `{sender, mode?, on}` | let a sender interrupt in a mode (the mode in force by default) |
 | `POST /attention/admit` `{sphere, mode?, on}` | change a Focus rule |
 | `POST /attention/spheres` `{add}` / `{remove}` | grow or prune the sphere vocabulary — a word, normalised to an id (`Board Games` → `board-games`, any script); removal is refused while a mode admits it |
-| `POST /chats/<id>/contact` `{name, sphere?, tags?, permit?, whitelist?}` | the contact card for a screened stranger: names the chat, moves the bare handle's priors and permits onto the name, sets the sphere and tags on the item, whitelists the handle for the delivery gate and writes the address book. An empty name removes the card |
+| `POST /chats/<id>/contact` `{name, sphere?, tags?, permit?}` | the contact card for a screened stranger: names the chat, moves the bare handle's priors and permits onto the name, sets the sphere and tags on the item and writes the address book. An empty name removes the card |
 | `GET /attention/profile`, `POST /attention/profile` | read and replace the profile and the focus rules |
 | `POST /internal/attention/set` `{id, …}` | an agent declares or revises an item's properties (token-gated; `scripts/attention-set.py`) |
 

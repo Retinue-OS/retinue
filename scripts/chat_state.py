@@ -268,12 +268,14 @@ class ChatStateStore:
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
             "unread_since": None,
-            # What the delivery gate made of the last arrival's sender: True
-            # when it recognised nobody (the "unknown sender" class of
-            # docs/triage-delivery-gate.md), False when the handle is known,
-            # None for a chat whose events carried no gate verdict. The
-            # attention model screens an unknown sender instead of ranking
-            # them like a contact; `contact` below is how that ends.
+            # Whether the last arrival's sender is one the dashboard knows
+            # nothing about from the rail: True for a direct message from
+            # anyone who is not a VIP, False for a VIP, None for a group or
+            # a chat no gated message has arrived in yet. (The delivery gate no longer
+            # tells strangers from acquaintances — the messenger whitelist is
+            # retired, docs/triage-delivery-gate.md.) The attention model
+            # screens such a sender unless something else says where they
+            # belong: a sphere the user taught the profile, or `contact` below.
             "unknown_sender": None,
             # The contact card the user filled in for this chat, once they
             # have: {"name", "sphere", "tags", "at"}. None while the chat is
@@ -325,6 +327,10 @@ class ChatStateStore:
         with self._lock:
             return self._read(chat_id)
 
+    def exists(self, chat_id: str) -> bool:
+        """Whether a document is stored for this chat (a default is not)."""
+        return self._path(chat_id).exists()
+
     def all(self) -> dict[str, dict]:
         """Every stored chat doc, keyed by chat id."""
         out: dict[str, dict] = {}
@@ -345,6 +351,21 @@ class ChatStateStore:
         return out
 
     # -- writes ---------------------------------------------------------------
+
+    def delete(self, chat_id: str) -> dict | None:
+        """Forget a chat entirely; returns the document it had, or None.
+
+        Not a reset to defaults: the file goes, so ``all()`` no longer lists
+        the chat and a later message about the same peer starts from a fresh
+        document — the chat-delete contract (see web-gateway's chat delete).
+        """
+        with self._lock:
+            path = self._path(chat_id)
+            if not path.exists():
+                return None
+            doc = self._read(chat_id)
+            path.unlink(missing_ok=True)
+            return doc
 
     def note_message(self, chat_id: str, *, name: str | None = None,
                      group: bool | None = None, gateway: str | None = None,
@@ -375,10 +396,10 @@ class ChatStateStore:
                     doc["roster"] = roster
                     doc["roster_refreshed"] = time.time()
             if unknown_sender is not None:
-                # A contact the user filed themselves outranks the gate: the
-                # whitelist write and the next arrival can race, and the
-                # address book is the more recent judgement either way.
-                doc["unknown_sender"] = bool(unknown_sender) and not doc.get("contact")
+                # Stored as the rail said it, card or no card: a contact the
+                # user filed outranks it where it is read (attention_store.
+                # chat_is_unknown), so removing the card falls back on this.
+                doc["unknown_sender"] = bool(unknown_sender)
             self._write(doc)
             return doc
 
@@ -407,15 +428,14 @@ class ChatStateStore:
         One write for what naming someone means to this store: the chat is
         called by their name from now on, and the card records which spheres
         they belong to. The rest of what the card does — the attention
-        profile, the delivery-gate whitelist, the life-store record — is the
-        web-gateway's business; this is only what a chat document knows about
-        it.
+        profile, the life-store record — is the web-gateway's business; this
+        is only what a chat document knows about it.
 
-        ``unknown_sender`` is deliberately left alone: it is the *gate's*
-        verdict about the handle, and the card is the *user's* about the
-        person. A named chat is not screened because a card exists (see
-        `chat_is_unknown`), so removing the card restores exactly what the
-        gate last said rather than a guess made here."""
+        ``unknown_sender`` is deliberately left alone: it is what the rail
+        last said about the sender, and the card is the *user's* word about
+        the person. A named chat is not screened because a card exists (see
+        `chat_is_unknown`), so removing the card falls back on what the rail
+        said rather than a guess made here."""
         with self._lock:
             doc = self._read(chat_id)
             clean = " ".join(str(name or "").split())
@@ -485,14 +505,50 @@ class ChatStateStore:
                 self._write(doc)
             return doc, had_unread
 
+    def unarchive_unless_muted(self, chat_id: str) -> dict:
+        """Bring an archived chat back for a new message — unless it is muted.
+
+        The check and the write are one operation under the lock because they
+        are one decision. Taken apart, a flag write landing between them is
+        read back stale and half-undone: a mute sets `muted` AND `archived`,
+        and an arrival deciding from a snapshot taken before it would clear
+        `archived` while `muted` stayed, putting a chat the user just muted
+        back in the active list. Nothing wrote these flags concurrently with
+        the rail until the dashboard could, which is why the split version
+        stood for as long as it did.
+        """
+        with self._lock:
+            doc = self._read(chat_id)
+            if doc.get("archived") and not doc.get("muted"):
+                doc["archived"] = False
+                self._write(doc)
+            return doc
+
     def set_flags(self, chat_id: str, *, archived: bool | None = None,
                   muted: bool | None = None) -> dict:
+        """Set a chat's two user-facing flags, which say where the user wants
+        the chat on their screen and nothing else. (Whether a message is
+        *worked* follows the sender's VIP status in the triage policy: a chat
+        is a place, and the user's interest is in a person.)
+
+        **Muting archives.** The two are not independent settings to combine:
+        archiving is "out of my way until it speaks again", and muting is "out
+        of my way, and do not let it speak" — which only means anything if the
+        chat is out of the way to begin with. So setting `muted` sets
+        `archived` too, and a caller passing both never has to think about the
+        order. Unmuting deliberately leaves the chat archived: it stays put
+        until the next message brings it back, which is what un-muting is for.
+
+        The inverse rule lives in :meth:`unarchive_unless_muted`, which an
+        arrival calls: a new message un-archives an unmuted chat."""
         with self._lock:
             doc = self._read(chat_id)
             if archived is not None:
                 doc["archived"] = bool(archived)
             if muted is not None:
                 doc["muted"] = bool(muted)
+                if muted:
+                    doc["archived"] = True
             self._write(doc)
             return doc
 
@@ -658,6 +714,14 @@ class ChatOverlay:
                    if now - e["_inserted"] > self._ttl]
         for k in expired:
             self._entries.pop(k, None)
+
+    def forget(self, chat_id: str) -> int:
+        """Drop every live entry of one chat (a deleted chat); returns the count."""
+        with self._lock:
+            doomed = [k for k, e in self._entries.items() if e.get("chat_id") == chat_id]
+            for k in doomed:
+                self._entries.pop(k, None)
+        return len(doomed)
 
     def entries(self, chat_id: str | None = None) -> list[dict]:
         """Live entries (optionally one chat's), ascending by ts — insertion

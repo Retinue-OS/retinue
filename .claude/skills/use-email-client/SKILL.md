@@ -42,6 +42,18 @@ python3 /workspace/scripts/email_client.py search --folder INBOX --from user@exa
 # Read a message (does NOT automatically mark it as read)
 python3 /workspace/scripts/email_client.py read --uid <UID>
 
+# Read: `body` is a rendered plain-text version; an HTML-only sender's
+# <a href> targets that aren't already implied by their visible text are
+# folded in as `label <url>` right there in the text, and the same targets
+# are always listed separately in the `links` array — so a link-only call to
+# action (a "Rechnungskopie einsehen" button with no other clue to the URL)
+# never gets lost in rendering, and losing one would show up as an empty
+# `links` array. Add --html for the text/html part verbatim (null if the
+# message has none) or --raw for the original MIME source, base64-encoded,
+# when even that isn't enough:
+python3 /workspace/scripts/email_client.py read --uid <UID> --html
+python3 /workspace/scripts/email_client.py read --uid <UID> --raw
+
 # Mark as read
 python3 /workspace/scripts/email_client.py flag --uid <UID> --read
 
@@ -141,8 +153,12 @@ credentials and runs the real IMAP/SMTP. (This is gated by `EMAIL_BACKEND_TOKEN`
 which the entrypoint auto-generates when not supplied, so the isolation is always
 on.) You don't need to do anything differently — all commands above work
 unchanged — but you cannot read `EMAIL_PASS*` or talk to SMTP/IMAP directly to
-bypass the send-control policy. The one exception is a mailbox loaded via
-`--env-file`, whose credentials sit on disk and are therefore not isolated.
+bypass the send-control policy. This holds in every session alike — dashboard
+turns, scheduled jobs, triage, Ask-Ara answers — because each is spawned with
+the allowlisted environment of `scripts/session_env.py`, which carries the
+backend token and URL but never a mailbox credential. The one exception is a
+mailbox loaded via `--env-file`, whose credentials sit on disk and are
+therefore not isolated.
 
 ---
 

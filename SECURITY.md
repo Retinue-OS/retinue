@@ -43,15 +43,40 @@ nothing new.
   process can unset them, use a raw socket, or speak a non-HTTP protocol. The
   layer is telemetry. Making it a boundary requires an `internal: true` network
   or in-container firewall rules, and is tracked as a roadmap item.
-- **The main session runs with broad tool permissions while processing
-  untrusted input.** A hostile message cannot read messaging or mailbox
-  credentials out of the agent's environment (other credentials the container
-  holds, such as a repo token or model-gateway keys, are not scrubbed the same
-  way), and an outbound send still has to clear the sending identity's policy
-  — but nothing authenticates who completes a pending `verify` approval, so
-  treat that as a workflow gate rather than a hard boundary. It can still
+- **Sessions run with broad tool permissions while processing untrusted
+  input.** The messenger credentials (Signal keys, the WhatsApp and Telegram
+  sessions) live in their own containers, so a hostile message cannot read
+  them. Nor can it read a mailbox, gateway or service credential out of a
+  session's environment: every `claude -p` the framework spawns — dashboard
+  turns, scheduled jobs, triage, Ask-Ara answers — gets its environment from
+  the allowlist in `scripts/session_env.py` (capability tokens and the
+  framework's own settings) and never inherits the spawning daemon's, so
+  mailbox passwords, the LiteLLM master and picker keys, the repo token and
+  any secret added to `.env` later are absent by construction, and e-mail
+  reaches the mailbox only through the web gateway's backend, where the send
+  policy is applied. Two credentials pass on purpose, and a session can read
+  them: the model credential (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
+  and `ANTHROPIC_CUSTOM_HEADERS` when it carries a LiteLLM virtual key),
+  without which a spawned session cannot run at all, and — until the fetch
+  moves into a sidecar — the Garmin login (`GARMIN_EMAIL` /
+  `GARMIN_PASSWORD`), because `refresh.py --ensure` runs `sync-garmin.py`
+  inside the agent's own process. The `retinue` service also no longer loads
+  `.env` wholesale, so a secret meant for another service never enters the
+  agent container at all. The remote-control main session is not spawned
+  this way and keeps the entrypoint's narrower scrub (mail credentials and
+  the API key), so it still sees the LiteLLM master and picker keys and the
+  repo token.
+  What the allowlist does *not* do: every process in the container runs as
+  the same user, so a session can still read a daemon's `/proc/<pid>/environ`
+  (the web gateway's, for one, holds the mailbox credentials for its e-mail
+  backend), and the repository token sits in `~/.git-credentials`. Closing
+  that means holding each secret in its own sidecar or under a separate uid,
+  which is a separate roadmap item. An outbound send still has to clear the
+  sending identity's policy, but a pending `verify` approval is not bound to
+  the requester or a distinct authorization identity, so treat send approval
+  as a workflow gate rather than a hard boundary. A hostile message can also
   induce the agent to read across mounted chambers or write to them.
-  Reduced-privilege triage is a roadmap item.
+  Reduced-privilege triage is another roadmap item.
 - **Chambers are not compartmentalized from each other within a session.**
 - **The updater's Docker socket is root-equivalent on the host.** This is
   inherent to what the updater does and is documented in `docker-compose.yml`.

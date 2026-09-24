@@ -128,7 +128,7 @@ id: proj-thermostat-bluetooth
 title: "Understand the smart thermostat Bluetooth protocol"
 goal: "The thermostat control protocol is documented and reproducibly tested."
 current_next_action: "Wait for the manufacturer's response."
-current_actor: actor-manufacturer
+current_actor: manufacturer
 waiting_since: 2026-06-20
 expected_by: 2026-07-05
 paused: false
@@ -145,11 +145,31 @@ LLM *wanted*: this part must be deterministic. The prose body stays prose, left
 to on-demand extraction if and when something there is worth promoting to a
 fact.
 
+**The actor-URI convention.** `current_actor` names a bare slug, and a
+converter turns it into `<urn:retinue:actor:SLUG>` — never anything looser,
+such as concatenating the raw value onto a prefix. A naive `"urn:retinue:" +
+value` mapping would turn `manufacturer` into `urn:retinue:manufacturer`, not
+`urn:retinue:actor:manufacturer` — the colon before the slug is part of the
+convention, not punctuation to drop. This is not a free choice: it is exactly
+the shape `scripts/discover-agents.py` assigns every AI agent, derived from
+its agent definition's basename (`coach.md` -> `urn:retinue:actor:coach`), and
+every consumer that reads `currentActor` — the projects card below,
+`scripts/agent-self-review.py`, `scripts/recurring-projects.py` — expects a
+human or external actor's slug (`manufacturer`, `reto`) to land in the same
+shape, so it can compare or join against it. The reference converter,
+[`scripts/md2ttl.py`](../scripts/md2ttl.py), implements exactly this mapping;
+a chamber's own converter must produce the same shape or its projects vanish
+from every one of those consumers — this doc's own example carried the bug
+until [retinue-os/retinue#1](https://github.com/Retinue-OS/retinue/issues/1)
+(a chamber converter had emitted `urn:retinue:actor-aros`, one dash away from
+the correct shape).
+
 The dashboard's projects card is then a single SPARQL query over every project
 file in every chamber ([`scripts/web-gateway.py`](../scripts/web-gateway.py)):
 
 ```sparql
 PREFIX k: <https://w3id.org/retinue/kb#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 SELECT ?p ?title ?actor ?next ?since ?expected ?status WHERE {
   ?p rdf:type k:Project .
   OPTIONAL { ?p k:title ?title }
@@ -416,6 +436,27 @@ medications, FoodOn for nutrition, Sequence Ontology for variants, schema.org as
 a fallback. In a deployment with a separate static store (like the genomics
 example above), all data for that store goes into the single file it indexes —
 e.g. `genetics.nt` at the chamber root, without exception.
+
+**QLever quirks** — `GROUP_CONCAT` over a variable bound to *IRIs* comes back
+unbound (the cell is simply absent from the row, not an empty string), while
+the same aggregate over literals works. Wrap the variable in `STR()` —
+`GROUP_CONCAT(STR(?att); separator=" ")` — whenever the values may be IRIs.
+Because an absent cell reads exactly like "no values", this fails silently;
+the chat media references (`kb:attachment`) were invisible for weeks this way.
+Relatedly, `BIND` on a variable already in scope is an error: `FILTER` on it,
+or `BIND` inside a subquery where nothing binds it yet.
+
+**Planning cost** — QLever plans a query before running it, and the planning
+time grows steeply with the number of triple patterns joined in one group; a
+subquery joined to a chain of `OPTIONAL`s is the worst shape. The dashboard's
+chat list once ran one such query: it *executed* in about a millisecond and
+took 6–9 s to *plan* on a loaded host — past the gateway's timeout, shown on
+the phone as "message store unreachable". The `time_query_planning` field of
+the runtime information (`Accept: application/qlever-results+json`) tells the
+two apart. The remedy is shape, not data volume: fetch the identifiers with a
+lean query, then everything about them with one VALUES-bounded pattern —
+`VALUES ?m { … } ?m ?p ?o` — and fold the rows in code (the chat list in
+`scripts/web-gateway.py` does exactly this).
 
 **Troubleshooting** — if a file's triples are missing, look for the diagnostic
 quad the build emits instead of failing:

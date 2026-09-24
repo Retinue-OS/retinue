@@ -333,6 +333,101 @@ elif _cred_has_token "$CRED_BAK"; then
   echo "[oauth] Credentials restored from backup (were cleared by a previous token rotation)."
 fi
 
+# Background credential watcher: captures every non-empty write to the
+# credentials file (updated backup), then restores + restarts when the file
+# is cleared mid-session by a concurrent token rotation.  The restart
+# (SIGTERM to PID 1 — the claude session, or the keep-alive where no session
+# runs) causes Docker to restart the container; the new processes start with
+# the restored credentials and re-authenticate cleanly.  Started wherever the
+# deployment holds an OAuth sign-in at all, with or without a remote-control
+# session.
+#
+# Guards against infinite restart loops when the backup itself holds an
+# already-invalidated refresh token (HTTP 400 from Anthropic):
+#   • A persistent marker file records the expiresAt of the last backup
+#     we restored from.  If the backup's expiresAt matches the marker, the
+#     same credentials have already been tried and rejected — don't restore.
+#   • The marker is cleared when Claude itself writes new (different)
+#     credentials, proving the current tokens work.
+#
+# Debounce: require 5 consecutive 3-second polls of empty credentials
+# (~15 s) before triggering — avoids false-positives from Claude's own
+# atomic token-refresh writes.
+CRED_MARKER="${CRED_FILE}.restored-expiry"
+_start_credential_watcher() {
+  {
+    last_seen_expiry=""
+    if _cred_has_token "$CRED_FILE"; then
+      last_seen_expiry=$(jq -r '.claudeAiOauth.expiresAt // "0"' "$CRED_FILE" 2>/dev/null)
+      if [[ -z "$last_seen_expiry" || "$last_seen_expiry" == "0" ]]; then
+        last_seen_expiry=""
+      fi
+    fi
+    empty_count=0
+    while true; do
+      sleep 3
+      if _cred_has_token "$CRED_FILE"; then
+        cp "$CRED_FILE" "$CRED_BAK"
+        cur_expiry=$(jq -r '.claudeAiOauth.expiresAt // "0"' "$CRED_FILE" 2>/dev/null)
+        if [[ -n "$cur_expiry" && "$cur_expiry" != "0" ]]; then
+          # Claude wrote valid credentials; clear the "already-tried" marker
+          # if the expiry is new (tokens were refreshed successfully).
+          if [[ "$cur_expiry" != "$last_seen_expiry" ]]; then
+            rm -f "$CRED_MARKER"
+            last_seen_expiry="$cur_expiry"
+          fi
+        fi
+        empty_count=0
+      else
+        (( empty_count++ )) || true
+        if [[ $empty_count -ge 5 ]] && _cred_has_token "$CRED_BAK"; then
+          bak_expiry=$(jq -r '.claudeAiOauth.expiresAt // "0"' "$CRED_BAK" 2>/dev/null)
+          tried_expiry=$(cat "$CRED_MARKER" 2>/dev/null || echo "")
+          if [[ "$bak_expiry" == "$tried_expiry" ]]; then
+            # These exact credentials were already restored and rejected —
+            # stop looping; a fresh sign-in is required. The claude-auth
+            # monitor notifies the user's devices about this state; the
+            # /claude-auth dashboard page performs the re-login from any
+            # browser. Console fallbacks, in order of invasiveness:
+            echo "[oauth] Backup credentials rejected by server. Sign in again:" >&2
+            echo "  → open /claude-auth on the dashboard (browser re-login), or" >&2
+            echo "  → docker exec -it <retinue> python3 /workspace/scripts/claude_auth.py login, or" >&2
+            echo "  → docker compose stop retinue && docker compose run --rm retinue interactive → claude" >&2
+            break  # exit watcher loop without restarting
+          fi
+          cp "$CRED_BAK" "$CRED_FILE"
+          echo "$bak_expiry" > "$CRED_MARKER"
+          echo "[oauth] Token rotation detected — credentials restored, restarting session." >&2
+          kill -TERM 1 2>/dev/null
+          break
+        fi
+      fi
+    done
+  } &
+  disown
+}
+
+# Host of a base URL, without scheme, port or path:
+# "https://api.anthropic.com/v1" → "api.anthropic.com".
+_url_host() {
+  local h="${1#*://}"
+  h="${h%%/*}"
+  h="${h%%\?*}"
+  h="${h%%:*}"
+  h="${h,,}"
+  printf '%s' "$h"
+}
+
+# Whether a Claude.ai remote-control session can work in this deployment.
+# Claude Code serves remote control from api.anthropic.com only: with
+# ANTHROPIC_BASE_URL pointing anywhere else it prints "Remote Control is only
+# available when using Claude via api.anthropic.com … --rc flag ignored" and
+# starts an ordinary session instead.
+_remote_control_reachable() {
+  [[ -z "${ANTHROPIC_BASE_URL:-}" ]] && return 0
+  [[ "$(_url_host "$ANTHROPIC_BASE_URL")" == "api.anthropic.com" ]]
+}
+
 # ── Refresh external data sources (background, non-blocking) ────────
 # Any chamber may declare refreshable sources in its .refresh.json.
 for dir in "$CHAMBERS_DIR"/*/; do
@@ -424,74 +519,38 @@ case "$MODE" in
     # fresh `claude -p`, which picks up a resynced plugin on its next run.
     echo "[claude] Starting chamber plugin watcher..."
     python3 /workspace/scripts/sync-plugins.py --watch &
-    if [[ -n "${ANTHROPIC_BASE_URL:-}" && "${RETINUE_GATEWAY_USES_CLAUDE_OAUTH:-}" != "true" ]]; then
-      echo "[claude] Claude-compatible gateway mode: dashboard and scheduled jobs use the gateway; Claude.ai remote-control is disabled."
+    # Start the Claude.ai session only where it can actually connect. With a
+    # base URL configured that takes two things: the deployment must hold a
+    # Claude.ai sign-in at all (RETINUE_GATEWAY_USES_CLAUDE_OAUTH, as before),
+    # and the endpoint must be the one that serves remote control (see
+    # _remote_control_reachable).
+    #
+    # Keeping the session alive where it cannot connect is not merely useless —
+    # it is what kills the shared sign-in: the session holds the token pair it
+    # started with, every spawned `claude -p` rotates that pair on disk under
+    # the shared lock (docs/claude-auth.md), and hours later the idle session
+    # refreshes with a token that has since been rotated away. Anthropic
+    # answers 400 and the whole token family dies, the entrypoint's backup
+    # included, so the watcher's restore is rejected too and the deployment is
+    # signed out. Idle instead, exactly as a gateway deployment without an
+    # OAuth sign-in does — but with the credential watcher running, since this
+    # deployment does hold one.
+    start_remote_control=1
+    if [[ -n "${ANTHROPIC_BASE_URL:-}" ]]; then
+      [[ "${RETINUE_GATEWAY_USES_CLAUDE_OAUTH:-}" == "true" ]] || start_remote_control=0
+      _remote_control_reachable || start_remote_control=0
+    fi
+    if [[ $start_remote_control -eq 0 ]]; then
+      if [[ "${RETINUE_GATEWAY_USES_CLAUDE_OAUTH:-}" == "true" ]]; then
+        echo "[claude] Gateway carries the Claude.ai sign-in: dashboard and scheduled jobs use it; no remote-control session is started (it is served by api.anthropic.com only, and an idle one rotates the shared OAuth tokens out from under itself)."
+        _start_credential_watcher
+      else
+        echo "[claude] Claude-compatible gateway mode: dashboard and scheduled jobs use the gateway; Claude.ai remote-control is disabled."
+      fi
       exec tail -f /dev/null
     fi
     echo "[claude] Starting remote-control mode (session: $SESSION_NAME)..."
-    # Background credential watcher: captures every non-empty write to the
-    # credentials file (updated backup), then restores + restarts when the
-    # file is cleared mid-session by a concurrent --resume token rotation.
-    # The restart (SIGTERM to PID 1 = the claude process after exec) causes
-    # Docker to restart the container; the new session starts with the
-    # restored credentials and re-authenticates cleanly.
-    #
-    # Guards against infinite restart loops when the backup itself holds an
-    # already-invalidated refresh token (HTTP 400 from Anthropic):
-    #   • A persistent marker file records the expiresAt of the last backup
-    #     we restored from.  If the backup's expiresAt matches the marker, the
-    #     same credentials have already been tried and rejected — don't restore.
-    #   • The marker is cleared when Claude itself writes new (different)
-    #     credentials, proving the current tokens work.
-    #
-    # Debounce: require 5 consecutive 3-second polls of empty credentials
-    # (~15 s) before triggering — avoids false-positives from Claude's own
-    # atomic token-refresh writes.
-    CRED_MARKER="${CRED_FILE}.restored-expiry"
-    {
-      last_seen_expiry=""
-      empty_count=0
-      while true; do
-        sleep 3
-        if _cred_has_token "$CRED_FILE"; then
-          cp "$CRED_FILE" "$CRED_BAK"
-          cur_expiry=$(jq -r '.claudeAiOauth.expiresAt // "0"' "$CRED_FILE" 2>/dev/null)
-          if [[ -n "$cur_expiry" && "$cur_expiry" != "0" ]]; then
-            # Claude wrote valid credentials; clear the "already-tried" marker
-            # if the expiry is new (tokens were refreshed successfully).
-            if [[ "$cur_expiry" != "$last_seen_expiry" ]]; then
-              rm -f "$CRED_MARKER"
-              last_seen_expiry="$cur_expiry"
-            fi
-          fi
-          empty_count=0
-        else
-          (( empty_count++ )) || true
-          if [[ $empty_count -ge 5 ]] && _cred_has_token "$CRED_BAK"; then
-            bak_expiry=$(jq -r '.claudeAiOauth.expiresAt // "0"' "$CRED_BAK" 2>/dev/null)
-            tried_expiry=$(cat "$CRED_MARKER" 2>/dev/null || echo "")
-            if [[ "$bak_expiry" == "$tried_expiry" ]]; then
-              # These exact credentials were already restored and rejected —
-              # stop looping; a fresh sign-in is required. The claude-auth
-              # monitor notifies the user's devices about this state; the
-              # /claude-auth dashboard page performs the re-login from any
-              # browser. Console fallbacks, in order of invasiveness:
-              echo "[oauth] Backup credentials rejected by server. Sign in again:" >&2
-              echo "  → open /claude-auth on the dashboard (browser re-login), or" >&2
-              echo "  → docker exec -it <retinue> python3 /workspace/scripts/claude_auth.py login, or" >&2
-              echo "  → docker compose stop retinue && docker compose run --rm retinue interactive → claude" >&2
-              break  # exit watcher loop without restarting
-            fi
-            cp "$CRED_BAK" "$CRED_FILE"
-            echo "$bak_expiry" > "$CRED_MARKER"
-            echo "[oauth] Token rotation detected — credentials restored, restarting session." >&2
-            kill -TERM 1 2>/dev/null
-            break
-          fi
-        fi
-      done
-    } &
-    disown
+    _start_credential_watcher
     # Warn if starting without valid credentials (the backup restore above
     # already attempted recovery; this fires only when no backup existed).
     if ! _cred_has_token "$CRED_FILE"; then
@@ -542,6 +601,13 @@ case "$MODE" in
       echo "[claude] Claude Code executable not found at $CLAUDE_BIN" >&2
       exit 127
     fi
+    # Start the session on a fresh access token: the same pre-spawn refresh
+    # the scheduler and the gateway perform before every `claude -p`, under
+    # the lock all of them share (scripts/claude_auth.py, docs/claude-auth.md),
+    # so the session never begins with a refresh that races theirs for the
+    # token rotation. Best-effort: if it fails, the session refreshes for
+    # itself, as before.
+    python3 /workspace/scripts/claude_auth.py refresh || true
     exec "$CLAUDE_BIN" --remote-control "$SESSION_NAME" --name "$SESSION_NAME" \
       "${CLAUDE_MODEL_ARGS[@]}" \
       --permission-mode "${CLAUDE_PERMISSION_MODE:-acceptEdits}" \

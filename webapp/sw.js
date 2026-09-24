@@ -40,6 +40,8 @@ const SHELL_ASSETS = [
   '/components/attention-sheet.js',
   '/components/markdown.js',
   '/components/voice.js',
+  '/components/clipboard.js',
+  '/components/conversation.js',
   '/components/conversations.js',
   '/components/projects.js',
   '/components/project-page.js',

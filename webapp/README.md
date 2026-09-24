@@ -8,10 +8,35 @@ a Progressive Web App on the phone home screen.
 
 - **Static shell, no server rendering.** `index.html` is the hand-editable
   configuration: it declares the active cards and app-launch buttons.
+- **A conversation** (`components/conversation.js`) is one element,
+  `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
+  buttons on quotes and code, click-to-fill chips, attachments, model and
+  cost meta), the pending state while Ara answers, the composer with text,
+  file attachments (picked or pasted) and voice dictation, the model picker,
+  and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
+  any host). Given a
+  `conversation-id` it reads, polls and replies; given `for-project` and no
+  id it is the composer whose first message opens the thread, then goes on
+  as it. It reports outward with events (`retinue-back`,
+  `retinue-created`, `retinue-sent`, `retinue-archived`, `retinue-open`,
+  `retinue-thread`); drafts, dictation jobs and the reader outlive one
+  instance, so a thread left and reopened has its text, and a reading goes
+  on. A host can shape the frame without forking the thread: `bar="none"` or
+  `bar="actions"` for a header of its own, `stamp="clock"` beside a
+  clock-stamped timeline, `no-autofocus` where the host keeps it mounted
+  whether or not it is on screen (taking focus scrolls the element into view,
+  which on the chat page's phone strip is a tab switch), and `create-url`
+  where the thread belongs to
+  something else and is minted by that thing's endpoint rather than opened by
+  the first message. It takes `fill(text)` (into the composer, for the user to
+  send) and `ask(text)` (send now, for a host whose control is the send
+  press). Every surface that shows a conversation embeds this element.
 - **Conversation tabs** (`components/conversations.js`) are the active
-  interactive card: standalone chat threads with Ara. The user can open a
-  thread, and a retinue agent can open one when it needs a decision (e.g. an
-  RSVP). It talks to the gateway's `/conversations` API rather than a static data
+  interactive card: the list of threads with Ara, the Active/Archived filter
+  and the location-hash routing, with the open thread (or the new-thread
+  composer) being a `<retinue-conversation>`. The user can open a thread,
+  and a retinue agent can open one when it needs a decision (e.g. an RSVP).
+  It talks to the gateway's `/conversations` API rather than a static data
   file.
 - **App launcher** (`components/app-launcher.js`) provides local OS launch
   buttons.
@@ -90,7 +115,8 @@ The same gateway also backs the conversation-tabs card with a small JSON API
 - `POST /conversations/<id>/archive`  — archive a thread (drop from active list).
 - `POST /conversations/<id>/unarchive`— restore an archived thread.
 
-Ara answers asynchronously, so the card polls the thread until the reply lands.
+Ara answers asynchronously, so the open conversation polls itself until the
+reply lands (faster while a turn is pending), and the card polls the list.
 Each thread maps to its own Claude session (key `conv:<id>`). Threads persist
 under `CONVERSATIONS_DIR`, one file each — the deployment points this at the
 persistent `/root` volume (`/root/.retinue/conversations`); the
@@ -144,7 +170,17 @@ docstring). Pieces:
 - `components/chats.js` — the Chats card on the dashboard and, with `full`,
   the whole `chats.html` page: avatar, channel mark, last-message preview,
   unread badge, non-archived chats ordered by last activity; the full page
-  adds an Active/Archived filter like the conversations page. In the wide
+  adds an Active/Archived filter like the conversations page, and rows that
+  swipe (pointer events, so touch, pen and mouse drag alike; a long press,
+  right-click or the context-menu key opens the same shelf). On *Active*, a
+  swipe right archives at once and a swipe left uncovers **Archive** (out of
+  the list until it speaks again) and **Mute** (out of the list, and the next
+  message does not bring it back), both `POST /chats/<id>/flags`. Muting
+  archives — the server's rule — so both land under *Archived*, where a swipe
+  right restores at once and a swipe left uncovers **Restore**, **Mute** /
+  **Unmute** (stays archived) and **Delete** (`POST /chats/<id>/delete`,
+  armed by a first tap, done by a second). The dashboard card stays a glance
+  and carries none of it. In the wide
   layout the card has its own fixed-height region above the conversations
   (`--chats-h`), resizable and snap-closable at a third `layout.js` splitter
   (`data-splitter="chats"`). The card refreshes on an ambient cadence and
@@ -154,7 +190,8 @@ docstring). Pieces:
   author on every outbound bubble (you / Ara / your phone), inline media
   (images with a lightbox, voice-note and video players — see the Message
   contract below), a live composer (send, shared draft, one-tap clear ✕,
-  dictation, image attach with client-side downscale), quick-pattern chips,
+  dictation, image attach — picked or pasted — with client-side downscale),
+  quick-pattern chips,
   and the companion pane — swipe between panes on a phone, a draggable
   splitter on a wide screen. The composer row is the conversation composer's
   row: mic on the left, send on the right, both always there, and the paperclip
@@ -170,27 +207,33 @@ docstring). Pieces:
   only safe if the tap can be taken back, and a staged draft is not something
   the user can retype.
   Back goes back where the chat was opened from within the
-  app, and to the chats list for a chat opened cold (a notification, a
-  bookmark). The open chat polls on the conversations cadence,
+  app, and to the home — the attention list the chat is a row of — for a chat
+  opened cold (a notification, a bookmark). The header's ⓘ opens the chat's
+  attention sheet (with the contact card), and **Archive** / **Mute** switches
+  sit under it — the same `POST /chats/<id>/flags` the list's swipe actions
+  use. The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the
-  `companion` field below): her turns render in the conversation thread's
-  visual language — including its `model_name` / `cost_usd` meta, so which
-  model answered and what that turn cost are as visible here as on the
-  conversations card — `pending` shows as her writing, and a chip is that same
-  turn with a canned prompt. The pane's bar carries the same per-thread model
-  picker as the conversation thread bar (`GET /conversation-models` for the
-  list, `POST /conversations/<id>/model` to switch; hidden below two offered
-  models, and until an existing thread's document has been read once, so a
-  pinned or escalated thread is never shown as the default): a choice made
-  before the thread exists is pinned right after the lazy creation, ahead
-  of the first turn. An unpinned thread that Ara junior
-  escalated (`escalated` on the document; the gateway keeps it with Ara
-  senior) shows as "Ara senior (escalated)" rather than as the default, and
-  any pick — the default included — is the change that clears it. The two rails meet in the shared draft — Ara
-  stages a reply, the chat poll adopts it into an empty composer marked as
-  hers, and the send press stays the user's.
+  `companion` field below), and it *is* `<retinue-conversation>` — the same
+  element the conversations card embeds, so the two surfaces cannot drift
+  apart. It therefore has everything that element has, the model picker with
+  its escalated state and the read-aloud player included, rather than the
+  subset a hand-written copy happened to carry. What this page supplies is
+  where the pane sits and how its thread comes to exist: a companion belongs
+  to its chat, so the chat mints it (`create-url` → `POST
+  /chats/<id>/companion`) on the first turn and never on merely opening a
+  chat. `bar="actions"` keeps the picker and the speak-replies toggle while
+  dropping the title (the bar above names the pane) and Archive (a companion
+  is not filed away separately from its chat); `stamp="clock"` matches the
+  mirror beside it. A chip is a canned turn the page hands the element
+  (`ask`), exactly as if the user had typed it — **Propose** being the manual
+  form of what a forwarded arrival now runs by itself, so the pane may already
+  carry Ara's note on a message before the user asks anything. The two rails meet in the shared draft — Ara
+  stages a reply, the chat poll adopts it into the composer marked as hers
+  — into an empty box, or over the text she was asked to rework, whenever
+  nothing unsaved is in it (unsaved keystrokes meet the newer draft at
+  their own save, as a conflict) — and the send press stays the user's.
 
 The API, as the components consume it:
 
@@ -211,29 +254,81 @@ The API, as the components consume it:
 
   `unread` derives from the user's `last_read` watermark, `last` is
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
-  is the shared draft `{text, author, agent?, ts, version}` or null,
+  is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
-  until one exists), and
+  until one exists).
+
+  Nothing here says whether Ara works a message on arrival: that follows the
+  **sender** (their VIP flag in the triage policy), not the chat, so it holds
+  wherever that person writes. See `docs/triage-delivery-gate.md`.
+
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the
   dashboard-conversation semantics verbatim: an archived chat leaves the card
   and the Active list (the full page's Archived filter keeps it reachable),
   and a new inbound message **un-archives** an archived chat unless it is
   muted — the server's rule, applied on the notify rail. `muted` silences
-  that chat's Web Push and keeps an archived chat archived; as with
-  conversations, the Archive button leaves `muted` untouched, while "archive
-  this chat" said to Ara sets both. No pinning yet: favourites-on-top would
-  be a later `pinned` flag, deliberately deferred. A store outage answers an
-  honest 502 (the page shows it; the card keeps its last state).
+  that chat's Web Push and keeps an archived chat archived; setting it also
+  sets `archived`, so a caller never has to send both. `POST
+  /chats/<id>/flags` (body `{archived?, muted?}`, either or both) is the one
+  way in, and the answer carries the flags as they ended up — a client reads
+  them back rather than assuming what it asked for.
+
+  `POST /chats/<id>/delete` (no body) is not a flag but an erasure: every
+  inbox gateway of the channel is asked to erase the chat (its own
+  token-gated `POST /chats/delete` `{chat, account}`) — the ledger records of
+  both directions and the media only they reference, plus that gateway's
+  pending-send files and recent-senders entry for the peer — and then the
+  chat's state document, live overlay entries and companion thread (with its
+  attachments and Claude session transcript) go. No trace stays beyond a
+  minutes-long in-memory tombstone naming exactly the erased records (as the
+  gateways report them), which hides the store's not-yet-reindexed copy; the
+  next message from the peer starts a new chat, however soon it lands. The
+  answer is 502, and the chat, its state and companion stay for a retry,
+  when no gateway could erase or one reports a file it could not remove
+  (an unreadable record, or one that names the chat but no longer parses,
+  counts). Like a send, a delete is accepted only through the reverse proxy
+  (403 otherwise): an agent may archive or mute a chat, never erase it. The
+  gateway hop carries, beside the ordinary gateway token (which agent
+  sessions hold, to send), `X-Chat-Erase-Token`: the `CHAT_ERASE_TOKEN` set
+  on retinue and the gateways, which no session inherits. Without it the
+  answer is 503 and the Delete button says it is not set up. For the
+  tombstone window, a late rail event for an erased message is accepted and
+  dropped (no state, no push, no turn), and a leftover companion request for
+  the deleted chat answers 404 until a new message recreates the chat.
+  Deliberately out of reach: what agents derived from the chat elsewhere
+  (memories, news-feed items, project notes), notifications already
+  delivered, and the messenger app's own copy on the phone.
+
+  These two flags replaced the messenger **sender blacklist**: not wanting to
+  hear from someone is a chat one mutes, in the interface, on the chat one is
+  looking at — not an entry in a policy file only Ara can edit. (E-mail keeps
+  its own whitelist, which decides something else: frequent versus daily
+  triage on a pull channel.) Ara can set either flag too, through the same
+  endpoint, but the user never has to go through her.
+
+  Both are **independent of the triage delivery gate**, on purpose. Whether a
+  group's messages are filed to the news feed for the Herald, and whether they
+  are worth a model turn, is the policy's business (`scripts/triage_policy.py`
+  `news-add` / `ignore-add`, see `docs/triage-delivery-gate.md`); whether the
+  user wants the chat in their list is this flag's. A subscribed channel one
+  keeps only for its content is `news` + `ignored` **and** muted — three
+  separate statements, because a list one both reads as news and answers in is
+  `news` + `quieted` and stays visible. No pinning yet: favourites-on-top would
+  be a later `pinned` flag, deliberately deferred. A store outage is answered
+  from the last good list for up to `CHAT_LIST_STALE_SECONDS` (10 min by
+  default), then with an honest 502 (the page shows it; the card keeps its
+  last state).
 - `GET /chats/<id>/messages` — `{generated, chat: ChatSummary, messages:
   [Message]}`, ascending by `ts`, the newest page by default;
   `?before=<ISO ts>` pages older history (the page renders the newest page —
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
   sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
-  type?, size?, width?, height?}]}`. Attachment URLs are the web-gateway's
-  authenticated media proxy (`/chats/media/…`); type and size are
-  best-effort. `width`/`height` are the medium's real intrinsic size, sniffed
+  type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
+  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  the storing gateway stated about the blob in its ledger record (absent on
+  records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
   bytes arrive, when absent (older records) it reserves a fixed placeholder
   frame; either way a lazy load can never shift the thread's scroll. By type:
@@ -242,7 +337,8 @@ The API, as the components consume it:
   closes, one history entry deep); `audio/*` is a voice note — the player
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
-  else stays a file row. Reactions and quoted replies (issue #130) will
+  else (a document, an animated sticker) is a file row showing the stated
+  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
   decorate these records later. The companion thread is not in this payload:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
@@ -263,8 +359,11 @@ The API, as the components consume it:
   attachments with proxied URLs and their sniffed dimensions. The client
   downscales picked photos before upload — longest edge 1600 px, JPEG — as
   the native clients do; animated GIFs pass through unchanged under the size
-  cap. A failed image send keeps the staged previews (and the text) in the
-  composer for retry.
+  cap. An image pasted into the text box (a screenshot, a picture copied off
+  a page) is staged exactly as a picked one, through the shared
+  `components/clipboard.js`, and the words of a paste that also carries text
+  still land in the box. A failed image send keeps the staged previews (and
+  the text) in the composer for retry.
 
   **The send honours the account's send policy rather than skipping it.** The
   message goes to the gateway as author `user` — provenance, nothing more —
@@ -391,7 +490,8 @@ user's half of the learning loop:
   Markdown, shown at the bottom of the page and editable by hand.
 
 Read-aloud (`components/speech.js`) walks the ranked feed with the browser's own
-`speechSynthesis` — ▶ Listen, ⏭ skip, ⏹ stop, current item highlighted, each
+`speechSynthesis` — ▶ Listen, ⏭ skip, ⏹ stop (▶ Resume after an interruption),
+current item highlighted, each
 item spoken in the language it declares. See `docs/news.md` for the collector,
 the manifest format and the agent.
 
@@ -418,12 +518,27 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `docker-compose.yml`); when unset the endpoint returns 503 and the mic button
   is hidden. The mic is also hidden where `MediaRecorder`/`getUserMedia` are
   unavailable.
-- **Output (play replies).** Each of Ara's messages has a 🔊 play button that
+- **Output (play replies).** Each of Ara's messages has a 🔊 button that
   reads it aloud with the browser's built-in `speechSynthesis` — no server work,
-  works offline. A per-thread **Auto** toggle (persisted in `localStorage`)
-  speaks replies automatically as they arrive; the browser's own voice is used,
-  so quality varies by platform, and iOS may require a tap (the play button) to
-  start speech. The controls are hidden where `speechSynthesis` is unavailable.
+  works offline. The player behind it is `components/speech.js` (shared with
+  the news page): the text is spoken in sentence-sized pieces, because the
+  engines fail on long utterances (Chrome goes silent after ~15 s, Android
+  rejects a few thousand characters outright — the reason a tap used to do
+  nothing on long replies), and a **player bar** above the composer shows what
+  is being read and how far: a position slider to drag, ⏮/⏭ a passage back or
+  forward (a sentence or two, about ten seconds of speech — the unit the text
+  is spoken in), play/pause, and ✕ to stop. Pausing and seeking restart at a
+  passage boundary. The bar follows into the thread list, so going back does
+  not end the reading; leaving the *page* does (the browser silences its
+  engine), but the position is remembered per passage in `localStorage`
+  (`retinue-voice-position`, kept for a week) and the next time that thread
+  opens the bar is back, paused right there — ▶ on the message or on the bar
+  carries on from that passage, ✕ forgets it. A per-thread **Auto** toggle
+  (persisted in `localStorage`) speaks replies automatically as they arrive;
+  the browser's own voice is used, so quality varies by platform, and iOS may
+  require a tap (the play button) to start speech — the bar says so when the
+  engine refuses. The controls are hidden where `speechSynthesis` is
+  unavailable.
 
 ## Installing on Android
 

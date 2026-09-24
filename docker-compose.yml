@@ -29,14 +29,23 @@ name: retinue
 
 services:
   retinue:
-    build: .
+    build:
+      context: .
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       qlever-life:
         condition: service_started
       litellm:
         condition: service_healthy
-    env_file:
-      - .env
+    # Deliberately no env_file: this container runs the agent sessions, and
+    # `env_file: .env` handed it every secret in the deployment — the LiteLLM
+    # database password and salt, the OpenRouter key, the calendar password —
+    # none of which any process in it reads. Every variable it does read is
+    # named under `environment:` below (retinue-os/retinue#15).
     volumes:
       # Persistent storage for /root (Claude login, config, scheduler state).
       - retinue-root:/root
@@ -57,6 +66,7 @@ services:
       - messenger-signal:/workspace/chambers/_generated/messenger/signal
       - messenger-whatsapp:/workspace/chambers/_generated/messenger/whatsapp
       - messenger-telegram:/workspace/chambers/_generated/messenger/telegram
+      - messenger-sms:/workspace/chambers/_generated/messenger/sms
       # RW mount of the project tree itself. Agents can branch/commit/push
       # infra changes (Tier 3 in CLAUDE.md) straight from this live checkout
       # instead of `git clone … /tmp` — the container already carries the
@@ -118,6 +128,15 @@ services:
       - TELEGRAM_GATEWAY_SEND_URL=http://telegram-gateway:8093/send
       - TELEGRAM_GATEWAY_BASE_URL=http://telegram-gateway:8093
       - TELEGRAM_GATEWAY_TOKEN
+      # Outbound SMS: where scripts/sms-push.py reaches the gateway and the
+      # shared token. SMS is opt-in (the `sms` compose profile), so its base
+      # URL — what enrols the channel on /sends, /gateways, the chat surface
+      # and the connection monitor — is NOT defaulted here: a deployment that
+      # runs the profile sets SMS_GATEWAY_BASE_URL=http://sms-gateway:8095 in
+      # .env (docs/messaging.md, "SMS").
+      - SMS_GATEWAY_SEND_URL=http://sms-gateway:8095/send
+      - SMS_GATEWAY_BASE_URL
+      - SMS_GATEWAY_TOKEN
       # Voice input for the dashboard: the web gateway proxies recorded audio to
       # the shared STT service for transcription. Unset STT_SERVICE_URL to disable
       # (the dashboard then hides its microphone button).
@@ -181,8 +200,24 @@ services:
       - CHAT_STATE_DIR=/root/.retinue/chats
       # Optional shared secret for the gateways' chats notify rail
       # (POST /internal/chats/inbound). Open when unset — the news-rail model;
-      # set it here and on the gateways to lock the endpoint down.
+      # set it here and on the gateways to lock the endpoint down. Worth a
+      # thought now that the rail also starts companion turns: an open endpoint
+      # can spend a model turn, though still nothing that reaches a
+      # correspondent — only the user's send press does that.
       - CHATS_INGEST_TOKEN
+      # Required for deleting a chat (POST /chats/<id>/delete): the capability
+      # the gateways demand before erasing a chat's messages. Set the same
+      # value here and on the messenger gateways; unset, deletion is refused.
+      # Not a *_GATEWAY_TOKEN on purpose — agent sessions inherit those.
+      - CHAT_ERASE_TOKEN
+      # The chat surface's ownership of inbound messages: "1" (the default)
+      # has the chat take every arrival — the user sees it there, pushed, for
+      # no model turn, and the gateway marks it delivered — and run a companion
+      # turn on top only for a sender the user marked a VIP in the triage
+      # policy. Set it to "0" and the rail accepts nothing, so each gateway
+      # falls back to the held/forward path it had before: the switch off,
+      # without a revert (docs/messenger-chats.md, phase 4).
+      - CHAT_ARRIVAL_TURNS=1
       # Which TCP peers count as "arrived through the reverse proxy" for the
       # endpoints that act with the user's own authority: the chat send press
       # and approving a pending send. Defence in depth only — no send skips an
@@ -203,10 +238,251 @@ services:
       # by scripts/gen-egress-ca.sh and trusted by clients.
       - HTTP_PROXY=http://egress-audit:8080
       - HTTPS_PROXY=http://egress-audit:8080
-      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,host.docker.internal,${SPARQL_NO_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1,retinue,litellm,signal-gateway,whatsapp-gateway,telegram-gateway,sms-gateway,stt,qlever-life,updater,egress-audit,egress-log-viewer,egress-anomaly-agent,host.docker.internal,${SPARQL_NO_PROXY:-}
       - NODE_EXTRA_CA_CERTS=/etc/egress-audit/certs/egress-ca-cert.pem
       - SSL_CERT_FILE=/etc/egress-audit/certs/egress-ca-cert.pem
       - REQUESTS_CA_BUNDLE=/etc/egress-audit/certs/egress-ca-cert.pem
+      # ── Everything below used to arrive through `env_file: .env` ─────────
+      # A variable enters this container only if it is named here: a bare name
+      # passes the value from .env (or the shell) when set and nothing when
+      # unset. That is what keeps secrets meant for other services out of the
+      # agent container altogether, on top of the per-session allowlist
+      # (scripts/session_env.py) that keeps what IS here out of the spawned
+      # sessions. Grouped by the process that reads each variable. A
+      # deployment whose scripts read further names lists them in its
+      # override's `environment:` (and, for session-side ones, in
+      # RETINUE_SESSION_ENV_EXTRA). The list is the audit: every name a
+      # process in this container reads is here, the paths and endpoints
+      # that default to this image's layout included (the last group).
+      #
+      # Model tiers and routing (docs/model-routing.md), the per-job model
+      # overrides expanded in .schedule.json manifests, and the dashboard's
+      # model-picker sources (web-gateway.py: LiteLLM's /model/info, Ollama's
+      # live tags). LITELLM_MASTER_KEY is the picker's auth fallback and
+      # RETINUE_LITELLM_KEY its override; only the gateway reads them, and the
+      # session allowlist withholds both by default (RETINUE_SESSION_ENV_EXTRA
+      # can name either — the operator's explicit decision).
+      - RETINUE_ROUTER_MODEL
+      - RETINUE_FRONTIER_MODEL
+      # Overrides the router tier for unpinned dashboard threads only, so the
+      # door in front of the user can be strong while dispatch stays cheap.
+      - RETINUE_DASHBOARD_MODEL
+      - RETINUE_TRIAGE_MODEL
+      - RETINUE_CONVERSATION_MODELS
+      - RETINUE_CONVERSATION_MODELS_FILE
+      - RETINUE_LITELLM_URL
+      - RETINUE_LITELLM_KEY
+      - RETINUE_MODELS_CACHE_SECONDS
+      - RETINUE_OLLAMA_URL
+      - OLLAMA_API_BASE
+      - OLLAMA_HOST
+      - LITELLM_MASTER_KEY
+      - LITELLM_PRIMARY_MODEL
+      # Session environment escape hatch (scripts/session_env.py): names a
+      # deployment's chamber scripts read that the framework allowlist does
+      # not know, comma-separated, `PREFIX_*` for a family.
+      - RETINUE_SESSION_ENV_EXTRA
+      # Memory (scripts/memory.py): RETINUE_MEMORY=0 disables the store.
+      - RETINUE_MEMORY
+      # Claude Code: the permission mode for every `claude` the framework
+      # starts, the pre-spawn token refresh and the monitor's remaining
+      # tunables (docs/claude-auth.md), the in-container auto-updater switch
+      # (docs/contributing.md).
+      - CLAUDE_PERMISSION_MODE
+      - CLAUDE_AUTH_REFRESH_AHEAD_SECONDS
+      - CLAUDE_AUTH_LOCK_WAIT_SECONDS
+      - CLAUDE_AUTH_MONITOR_FAILURES
+      - CLAUDE_AUTH_MONITOR_REMIND_SECONDS
+      - CLAUDE_AUTH_MONITOR_WARN_REMIND_SECONDS
+      - CLAUDE_AUTH_MONITOR_STATE_DIR
+      - CLAUDE_AUTH_PUBLIC_BASE_URL
+      - CLAUDE_OAUTH_HTTP_TIMEOUT
+      - CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS
+      - DISABLE_AUTOUPDATER
+      # Scheduler tunables (scripts/scheduler.py).
+      - SCHEDULER_TICK_SECONDS
+      - SCHEDULER_JOB_TIMEOUT
+      - SCHEDULER_KILL_GRACE_SECONDS
+      - SCHEDULER_STATE_DIR
+      # E-mail: the default account for the web gateway's IMAP/SMTP backend
+      # (scripts/email_client.py, which the gateway runs on the agents'
+      # behalf — the credentials never reach a session), the send policy, and
+      # the backend token (auto-generated by the entrypoint when unset). A
+      # NAMED account (EMAIL_USER_ARI, EMAIL_PASS_ARI, IMAP_HOST_ARI, …) is
+      # deployment content: list its variables in the override.
+      - EMAIL_USER
+      - EMAIL_FROM_NAME
+      - EMAIL_PASS
+      - IMAP_HOST
+      - IMAP_PORT
+      - SMTP_HOST
+      - SMTP_PORT
+      - SENT_FOLDER
+      - DRAFTS_FOLDER
+      - SMTP_SAVE_SENT
+      - EMAIL_SEND_POLICY
+      - SEND_STRIP_HEADERS
+      - EMAIL_BACKEND_TOKEN
+      - EMAIL_ENV_FILE
+      - EMAIL_PROCESSING_INTERVAL
+      # Dashboard: the conversation backend token (auto-generated when unset),
+      # the public base URLs links are built with, Web Push (the VAPID key
+      # pair itself is a file on the /root volume, never an env var), the
+      # accepted-requesters allowlist, and the gateway's session, helper and
+      # chat-surface tunables (all optional, documented in web-gateway.py).
+      - CONVERSATION_BACKEND_TOKEN
+      - CONVERSATION_BASE_URL
+      - SEND_APPROVAL_BASE_URL
+      # Zone the approval pages render event times in; the containers run on
+      # UTC, so without it a mis-zoned calendar entry reads as correct there.
+      - RETINUE_DISPLAY_TZ
+      # The owner's actor URI (urn:retinue:actor:<slug>), driving the projects
+      # card's "your move" vs "waiting on <them>" split (.env.example has the
+      # full rationale).
+      - RETINUE_OWNER_ACTOR
+      - VAPID_SUBJECT
+      - PUSH_TTL
+      - ACCEPTED_REQUESTERS_PATH
+      - SESSION_MAX_IDLE_SECONDS
+      - CONV_SESSION_MAX_IDLE_SECONDS
+      - WEB_GATEWAY_MAX_CONCURRENCY
+      - JOB_RETENTION_SECONDS
+      - CONVERSATION_MAX_ATTACHMENT_BYTES
+      - MESSAGE_FILES_TTL_SECONDS
+      - MAX_PROJECT_FILE_BYTES
+      - QLEVER_TIMEOUT
+      - TRANSCRIPT_CLEANUP
+      - TRANSCRIPT_CLEANUP_MODEL
+      - TRANSCRIPT_CLEANUP_TIMEOUT
+      - TRANSCRIBE_TIMEOUT
+      - PRESENTATION_LINT
+      - PRESENTATION_LINT_MODEL
+      - PRESENTATION_LINT_TIMEOUT
+      - PRESENTATION_LINT_CONCURRENCY
+      - PRESENTATION_LINT_WAIT
+      - CHAT_COMPANION_CONTEXT_MESSAGES
+      - CHAT_GATEWAY_IDENTITY_TTL
+      - CHAT_GATEWAY_IDENTITY_TTL_FAIL
+      - CHAT_LIST_CACHE_SECONDS
+      - CHAT_LIST_STALE_SECONDS
+      - CHAT_LIST_REBUILD_TIMEOUT
+      - CHAT_LIST_FAILURE_BACKOFF
+      - CHAT_OVERLAY_TTL_SECONDS
+      - CHAT_PAGE_MESSAGES
+      - CHAT_SEND_CONFIRM_TIMEOUT
+      - CHAT_SEND_MAX_IMAGES
+      - CHAT_SEND_TIMEOUT
+      - GATEWAY_HEALTH_TIMEOUT
+      # Gateway auth (scripts/gateway_auth.py) beyond the three above.
+      - GATEWAY_BASIC_AUTH_USERS
+      - GATEWAY_AUTH_REALM
+      - GATEWAY_CLIENT_CERT_HEADER
+      - GATEWAY_CLIENT_CERT_INFO_HEADER
+      - GATEWAY_FORWARDED_HOST_HEADER
+      # Messengers, client side: default push recipients (scripts/*-push.py),
+      # per-call timeouts, extra gateways enrolled on /sends and the built-in
+      # channel set (scripts/messenger_gateways.py), the connection monitor's
+      # tunables (scripts/gateway-monitor.py), and the CalDAV gateway's client
+      # side (scripts/caldav-push.py writes, scripts/caldav-read.py reads; the
+      # calendar credentials stay in caldav-gateway).
+      - SIGNAL_DEFAULT_RECIPIENT
+      - SIGNAL_GATEWAY_TIMEOUT
+      - WHATSAPP_DEFAULT_RECIPIENT
+      - WHATSAPP_GATEWAY_TIMEOUT
+      - TELEGRAM_DEFAULT_RECIPIENT
+      - TELEGRAM_GATEWAY_TIMEOUT
+      - SMS_DEFAULT_RECIPIENT
+      - SMS_GATEWAY_TIMEOUT
+      - MESSENGER_GATEWAYS
+      - MESSENGER_BUILTIN_CHANNELS
+      - GATEWAY_MONITOR_IGNORE
+      - GATEWAY_MONITOR_INTERVAL
+      - GATEWAY_MONITOR_FAILURES
+      - GATEWAY_MONITOR_HEALTH_TIMEOUT
+      - GATEWAY_MONITOR_REMIND_SECONDS
+      - GATEWAY_MONITOR_STATE_DIR
+      - GATEWAY_MONITOR_PUBLIC_BASE_URL
+      - CALDAV_GATEWAY_CREATE_URL=http://caldav-gateway:8094/create-event
+      # Base URL for the read side (scripts/caldav-read.py: /calendars, /events,
+      # /event) — same gateway, same token, no approval flow: a read changes
+      # nothing in the calendar.
+      - CALDAV_GATEWAY_BASE_URL=http://caldav-gateway:8094
+      - CALDAV_GATEWAY_TOKEN
+      - CALDAV_GATEWAY_TIMEOUT
+      # Ask-Ara connector tunables (scripts/ara-mcp-server.py) beyond the
+      # identity block above.
+      - ARA_MCP_AUDIT
+      - ARA_MCP_TIMEOUT
+      - ARA_MCP_SYNC_WAIT
+      - ARA_MCP_MAX_CONCURRENCY
+      - ARA_MCP_RATE_LIMIT
+      - ARA_MCP_RATE_WINDOW
+      - ARA_MCP_JOB_RETENTION
+      # Data refresh: Garmin (scripts/sync-garmin.py, run synchronously in the
+      # agent's own process by refresh.py --ensure, so this credential does
+      # reach sessions — until the fetch moves into a sidecar).
+      - GARMIN_EMAIL
+      - GARMIN_PASSWORD
+      # News feed and triage tunables (scripts/news_store.py, news-fetch.py,
+      # news-curate.py, triage-gate.py), the project-deadline lead
+      # (scripts/recurring-projects.py), the self-update call timeout
+      # (scripts/self-update.py), the chamber plugin watcher's interval
+      # (scripts/sync-plugins.py) and the session-side scripts' backend
+      # timeouts (scripts/conversation-push.py, chat-draft.py).
+      - NEWS_HALF_LIFE_HOURS
+      - NEWS_MAX_AGE_DAYS
+      - NEWS_MAX_ITEMS
+      - NEWS_FETCH_TIMEOUT
+      - NEWS_CURATE_BATCH
+      - TRIAGE_STATE_DIR
+      - TRIAGE_INBOX_SCAN_LIMIT
+      - TRIAGE_INBOX_SCAN_MAX
+      - TRIAGE_PROMPT_LIST_LIMIT
+      - TRIAGE_STALL_DAYS
+      - TRIAGE_SENT_DERIVE_LIMIT
+      - TRIAGE_BATCH_SIZE
+      - TRIAGE_SENT_RECONCILE
+      - TRIAGE_ANSWERED_FOLDER
+      - TRIAGE_NEWS_FOLDER
+      - TRIAGE_NEWS_EXCERPT_CHARS
+      - PROJECT_DEADLINE_LEAD_DAYS
+      - UPDATER_TIMEOUT
+      - PLUGIN_SYNC_INTERVAL
+      - CONVERSATION_BACKEND_TIMEOUT
+      # Paths and endpoints that default to this image's layout — where the
+      # workspace, the chambers, the credential file and the in-container
+      # backends are (scripts/entrypoint.sh, scheduler.py, memory.py,
+      # claude_auth.py, ara-mcp-server.py, conversation-push.py,
+      # chat-draft.py, recurring-projects.py, triage-gate.py,
+      # triage_policy.py, discover-agents.py, emit-conversation-models.py,
+      # web-gateway.py, git-serialize.sh). A deployment rarely sets one;
+      # listed so that the audit above holds without exception.
+      - CHAMBERS_DIR
+      - CHAMBERS_MANIFEST
+      - CHAMBERS_ROOT
+      - BASE_SCHEDULE
+      - RETINUE_WORKSPACE
+      - AGENTS_TTL_PATH
+      - CONVERSATION_MODELS_NT_PATH
+      - RETINUE_MEMORY_DIR
+      - RETINUE_MEMORY_ACTOR
+      - RETINUE_MEMORY_SESSION
+      - CLAUDE_CRED_FILE
+      - CLAUDE_BIN
+      - ARA_MCP_WORKDIR
+      - ARA_MCP_GATEWAY_URL
+      - CONVERSATION_BACKEND_URL
+      - CHAT_DRAFT_BACKEND_URL
+      - CONVERSATION_PUSH
+      - EMAIL_CLIENT_PATH
+      - TRIAGE_MESSENGER_DIR
+      - TRIAGE_EMAIL_WHITELIST_PATH
+      - WEBAPP_DIR
+      - DASHBOARD_DATA_DIR
+      - PUSH_DIR
+      - MESSAGE_FILES_DIR
+      - QLEVER_GRAPH_BASE
+      - GIT_SERIALIZE_LOCK_DIR
     command: remote-control
     stdin_open: true
     tty: true
@@ -300,6 +576,11 @@ services:
       # line: without it the service builds the main image and boots into
       # remote-control, never opening :8090. (This regressed once before — do not "simplify" it away.)
       dockerfile: signal-gateway/Dockerfile
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       - retinue
       - stt
@@ -321,13 +602,27 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
-      # Chats notify rail: on every arrival (and own-device echo) the gateway
-      # POSTs the message's metadata here so the dashboard's chat surface
-      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
-      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
-      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      # Chats rail: on every arrival the gateway hands the message's metadata
+      # over here, synchronously, and the answer says whether the chat took it.
+      # It normally does — for every class, a quieted or ignored group
+      # included — so the dashboard's chat surface has the message, the user is
+      # Web-Pushed unless the gate says to stay quiet, and this gateway marks it
+      # delivered and forwards nothing to triage. For a sender the user marked
+      # a **VIP** the same call also starts a turn in that chat's companion
+      # thread and answers with its job handle, which this gateway waits on
+      # (docs/messenger-chats.md, phase 4; CHAT_ARRIVAL_TURNS on the retinue
+      # service switches all of it off, and each gateway then falls back to the
+      # held/forward path it had before). Own-device echoes are the one
+      # fire-and-forget call left: nothing is being handed over. Empty to
+      # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
+      # sides — worth setting now that an unauthenticated caller could spend a
+      # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
+      # Required by POST /chats/delete (a chat's erasure, relayed by the
+      # web-gateway); the same value as on the retinue service. Unset, this
+      # gateway refuses to erase anything.
+      - CHAT_ERASE_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -385,6 +680,11 @@ services:
     build:
       context: .
       dockerfile: whatsapp-gateway/Dockerfile
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       - retinue
       - stt
@@ -407,13 +707,27 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
-      # Chats notify rail: on every arrival (and own-device echo) the gateway
-      # POSTs the message's metadata here so the dashboard's chat surface
-      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
-      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
-      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      # Chats rail: on every arrival the gateway hands the message's metadata
+      # over here, synchronously, and the answer says whether the chat took it.
+      # It normally does — for every class, a quieted or ignored group
+      # included — so the dashboard's chat surface has the message, the user is
+      # Web-Pushed unless the gate says to stay quiet, and this gateway marks it
+      # delivered and forwards nothing to triage. For a sender the user marked
+      # a **VIP** the same call also starts a turn in that chat's companion
+      # thread and answers with its job handle, which this gateway waits on
+      # (docs/messenger-chats.md, phase 4; CHAT_ARRIVAL_TURNS on the retinue
+      # service switches all of it off, and each gateway then falls back to the
+      # held/forward path it had before). Own-device echoes are the one
+      # fire-and-forget call left: nothing is being handed over. Empty to
+      # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
+      # sides — worth setting now that an unauthenticated caller could spend a
+      # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
+      # Required by POST /chats/delete (a chat's erasure, relayed by the
+      # web-gateway); the same value as on the retinue service. Unset, this
+      # gateway refuses to erase anything.
+      - CHAT_ERASE_TOKEN
       # Voice notes are transcribed by the shared STT service (no ASR model is
       # loaded in this container).
       - STT_SERVICE_URL=http://stt:8100/transcribe
@@ -467,6 +781,11 @@ services:
     build:
       context: .
       dockerfile: telegram-gateway/Dockerfile
+      args:
+        # Forwarded to the image so /health can name the commit it was built
+        # from. Empty is fine: unstamped builds report sha: null and are still
+        # identified by their framework digest (scripts/build_stamp.py).
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
     depends_on:
       - retinue
       - stt
@@ -494,13 +813,27 @@ services:
       # rail. The endpoint is open unless NEWS_INGEST_TOKEN is set on both sides.
       - NEWS_INGEST_URL=http://retinue:8080/internal/news
       - NEWS_INGEST_TOKEN
-      # Chats notify rail: on every arrival (and own-device echo) the gateway
-      # POSTs the message's metadata here so the dashboard's chat surface
-      # updates and the user is Web-Pushed with no model turn. Fire-and-forget
-      # with a short timeout; empty to disable. Open unless CHATS_INGEST_TOKEN
-      # is set on both sides (the NEWS_INGEST_URL pattern exactly).
+      # Chats rail: on every arrival the gateway hands the message's metadata
+      # over here, synchronously, and the answer says whether the chat took it.
+      # It normally does — for every class, a quieted or ignored group
+      # included — so the dashboard's chat surface has the message, the user is
+      # Web-Pushed unless the gate says to stay quiet, and this gateway marks it
+      # delivered and forwards nothing to triage. For a sender the user marked
+      # a **VIP** the same call also starts a turn in that chat's companion
+      # thread and answers with its job handle, which this gateway waits on
+      # (docs/messenger-chats.md, phase 4; CHAT_ARRIVAL_TURNS on the retinue
+      # service switches all of it off, and each gateway then falls back to the
+      # held/forward path it had before). Own-device echoes are the one
+      # fire-and-forget call left: nothing is being handed over. Empty to
+      # disable the rail entirely. Open unless CHATS_INGEST_TOKEN is set on both
+      # sides — worth setting now that an unauthenticated caller could spend a
+      # model turn and stage a draft.
       - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
       - CHATS_INGEST_TOKEN
+      # Required by POST /chats/delete (a chat's erasure, relayed by the
+      # web-gateway); the same value as on the retinue service. Unset, this
+      # gateway refuses to erase anything.
+      - CHAT_ERASE_TOKEN
       # Voice notes are transcribed by the shared STT service.
       - STT_SERVICE_URL=http://stt:8100/transcribe
       - STT_TOKEN
@@ -532,7 +865,190 @@ services:
     networks:
       - agents
 
-  # CalDAV gateway — writes calendar events into the user's real calendar (see
+  # SMS — opt-in, behind the `sms` compose profile (`docker compose --profile
+  # sms up -d`, or COMPOSE_PROFILES=sms in .env). Four services, all needed,
+  # plus sms-config-check, which refuses to let them start without their
+  # secrets:
+  #
+  #   sms-db      MariaDB for the server (it requires MySQL/MariaDB).
+  #   sms-server  the self-hosted android-sms-gateway private server (plus
+  #               sms-server-worker, its background tasks)
+  #               (https://github.com/android-sms-gateway/server). The user's
+  #               Android phone, running the SMS Gateway for Android app,
+  #               registers with it under Settings → Cloud Server using the
+  #               public API URL https://sms.<domain>/api/mobile/v1 and
+  #               SMS_SERVER_PRIVATE_TOKEN; the app then shows the username and
+  #               password this deployment puts in SMS_SERVER_USERNAME/PASSWORD.
+  #   sms-gateway the channel gateway (scripts/sms-gateway.py): the same /send,
+  #               /pending-sends, /undelivered, /health contract as the other
+  #               messengers, plus the POST /webhook the phone delivers each
+  #               received SMS to, verified by its HMAC signature.
+  #
+  # Two routes must be public, over HTTPS, and are the deployment's to add in
+  # docker-compose.override.yml (see the example there): sms-server's
+  # /api/mobile/ for the phone, and sms-gateway's /webhook. Neither goes behind
+  # the dashboard's edge auth — the phone can present neither a client
+  # certificate nor the basic-auth password — so each is authenticated by its
+  # own secret (the private token; the webhook signing key). Full setup:
+  # docs/messaging.md, "SMS".
+  # Fail-closed guard. Private mode compares a registering phone's token to
+  # GATEWAY__PRIVATE_TOKEN verbatim, so an empty token would let anyone who
+  # reaches the public mobile API register a device. A `${VAR:?}` in this file
+  # cannot express that — compose interpolates profile-disabled services too,
+  # so it would break every deployment that never runs SMS — hence this
+  # profile-scoped check, which the server and its database wait on.
+  sms-config-check:
+    image: python:3.12-slim
+    profiles: ["sms"]
+    environment:
+      - SMS_SERVER_PRIVATE_TOKEN=${SMS_SERVER_PRIVATE_TOKEN:-}
+      - SMS_DB_PASSWORD=${SMS_DB_PASSWORD:-}
+    command:
+      - python3
+      - -c
+      - |
+        import os, sys
+        bad = [n for n in ("SMS_SERVER_PRIVATE_TOKEN", "SMS_DB_PASSWORD")
+               if len(os.environ.get(n, "")) < 16]
+        if bad:
+            sys.exit("sms profile refused to start: set " + ", ".join(bad)
+                     + " in .env to a random value of at least 16 characters")
+    network_mode: none
+    restart: "no"
+
+  sms-db:
+    image: mariadb:11.4
+    profiles: ["sms"]
+    depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
+    environment:
+      - MARIADB_DATABASE=sms
+      - MARIADB_USER=sms
+      - MARIADB_PASSWORD=${SMS_DB_PASSWORD:-}
+      - MARIADB_RANDOM_ROOT_PASSWORD=1
+    volumes:
+      - sms-db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+    restart: unless-stopped
+    networks:
+      - agents
+
+  sms-server:
+    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:v1.47.3}
+    profiles: ["sms"]
+    depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
+      sms-db:
+        condition: service_healthy
+    environment: &sms-server-env
+      - GATEWAY__MODE=private
+      - GATEWAY__PRIVATE_TOKEN=${SMS_SERVER_PRIVATE_TOKEN:-}
+      # How the server wakes the phone for a queued send depends on the phone,
+      # not on this file: a device registered with a push token is woken through
+      # the vendor's relay (api.sms-gate.app — the server's built-in default,
+      # which an empty value does NOT disable), and one registered without a
+      # token is sent the event over its own server-sent-events connection to
+      # this host. To keep every byte here, set the app's Cloud Server
+      # notification channel to SSE only before registering (docs/messaging.md).
+      - HTTP__LISTEN=0.0.0.0:3000
+      - DATABASE__HOST=sms-db
+      - DATABASE__PORT=3306
+      - DATABASE__USER=sms
+      - DATABASE__PASSWORD=${SMS_DB_PASSWORD:-}
+      - DATABASE__DATABASE=sms
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # The server's background tasks, run as a second process from the same image
+  # as upstream's own compose does: message hashing (the server replaces a
+  # processed message's content with a hash) and the cleanup of old messages,
+  # devices and tokens. Not on the send path, but without it SMS content would
+  # stay in the server's database indefinitely.
+  sms-server-worker:
+    image: ${SMS_SERVER_IMAGE:-ghcr.io/android-sms-gateway/server:v1.47.3}
+    profiles: ["sms"]
+    command: ["/app/app", "worker"]
+    depends_on:
+      sms-config-check:
+        condition: service_completed_successfully
+      sms-db:
+        condition: service_healthy
+    environment: *sms-server-env
+    restart: unless-stopped
+    networks:
+      - agents
+
+  sms-gateway:
+    build:
+      context: .
+      dockerfile: sms-gateway/Dockerfile
+      args:
+        RETINUE_BUILD_SHA: ${RETINUE_BUILD_SHA:-}
+    profiles: ["sms"]
+    depends_on:
+      - retinue
+      - sms-server
+    # No env_file: this is the one publicly routed gateway process (its POST
+    # /webhook), so it gets exactly the variables it reads, named below —
+    # never the server's registration token or database password, which also
+    # live in .env. Value-less entries take their value from .env as usual.
+    environment:
+      # The server's 3rd-party API and the app-issued credentials. These live
+      # only in this container.
+      - SMS_SERVER_API_URL=http://sms-server:3000/api/3rdparty/v1
+      - SMS_SERVER_USERNAME
+      - SMS_SERVER_PASSWORD
+      # Optional: pin the sending device / SIM slot (1-3).
+      - SMS_DEVICE_ID
+      - SMS_SIM_NUMBER
+      # The phone's own number — this account's sending identity for
+      # SMS_SEND_POLICY and the chat surface. Learned from the SIM when unset
+      # and the phone reports it (many do not); until it is known, inbound SMS
+      # are held back (the phone retries) and sends refused. Set it explicitly.
+      - SMS_ACCOUNT
+      # Inbound: the public HTTPS URL the phone posts sms:received to (routed
+      # to this service's POST /webhook), registered with the server at
+      # startup, and the app's webhook signing key (Settings → Webhooks). No
+      # key, no inbound: unsigned webhooks are always refused.
+      - SMS_WEBHOOK_URL
+      - SMS_WEBHOOK_SIGNING_KEY
+      # Optional tunables (see scripts/sms-gateway.py for the defaults).
+      - SMS_WEBHOOK_MAX_AGE_SECONDS
+      - SMS_DEVICE_STALE_SECONDS
+      - SMS_POLL_SECONDS
+      - SMS_SERVER_TIMEOUT
+      - RETINUE_GATEWAY_URL=http://retinue:8080/message
+      - RETINUE_GATEWAY_TIMEOUT=600
+      # Chats rail and chat erasure — as on telegram-gateway above.
+      - CHATS_INGEST_URL=http://retinue:8080/internal/chats/inbound
+      - CHATS_INGEST_TOKEN
+      - CHAT_ERASE_TOKEN
+      # Outbound send-control (JSON array, like TELEGRAM_SEND_POLICY), keyed by
+      # the SENDING number (SMS_ACCOUNT). Unmatched → verify (fail-safe).
+      - SMS_SEND_POLICY
+      - SEND_APPROVAL_BASE_URL
+      - SMS_GATEWAY_HTTP_PORT=8095
+      - SMS_DEFAULT_RECIPIENT
+      - SMS_GATEWAY_TOKEN
+      # Triage delivery gate — as on the other gateways.
+      - INBOUND_STORE_DIR=/inbound
+      - INBOUND_GATE
+    volumes:
+      # Pending sends + recent chats + reply tokens + seen webhook ids.
+      - sms-data:/root/.local/share/sms
+      - messenger-sms:/inbound
+    restart: unless-stopped
+    networks:
+      - agents
+
+  # CalDAV gateway — reads and writes the user's real calendar (see
   # scripts/caldav-gateway.py). Provider-agnostic by design (issue #13): the
   # backend is selected purely by configuration (CALDAV_SERVER_URL/USERNAME/
   # PASSWORD/CALENDAR_ID) via a generic RFC 4791 client library — no
@@ -567,9 +1083,16 @@ services:
       # Outbound send-control policy (JSON array, like EMAIL_SEND_POLICY). Keyed
       # by the SENDING identity (CALDAV_ACCOUNT above), not any per-request
       # field. Categories: allow / trust / verify. An account matching no entry
-      # and no "*" wildcard defaults to verify (fail-safe).
-      # [{"account":"default","category":"verify"},{"account":"agent","category":"allow"}]
+      # and no "*" wildcard defaults to verify (fail-safe). Reads (/calendars,
+      # /events, /event) are not governed by it — the policy guards what an
+      # agent may change, and a read changes nothing.
       - CALDAV_SEND_POLICY
+      # Read side: the window a range read covers when the caller names no end
+      # (this is what bounds the work), and the cap on how many events one
+      # response may carry. Both must be positive and finite, or the gateway
+      # warns and uses its default.
+      - CALDAV_READ_DEFAULT_DAYS
+      - CALDAV_READ_MAX_EVENTS
       # Public base URL for approval links returned by the verify/trust flow.
       - SEND_APPROVAL_BASE_URL
       # Outbound HTTP API (internal to the agents network; not published).
@@ -652,6 +1175,7 @@ services:
       - /chambers/_generated/messenger/signal
       - /chambers/_generated/messenger/whatsapp
       - /chambers/_generated/messenger/telegram
+      - /chambers/_generated/messenger/sms
     volumes:
       - chambers:/chambers
     network_mode: none
@@ -674,6 +1198,7 @@ services:
       - messenger-signal:/data/_generated/messenger/signal:ro
       - messenger-whatsapp:/data/_generated/messenger/whatsapp:ro
       - messenger-telegram:/data/_generated/messenger/telegram:ro
+      - messenger-sms:/data/_generated/messenger/sms:ro
       # Persist both blue-green index slots so a restart resumes serving the
       # last completed build immediately instead of 502ing for the whole
       # duration of a fresh rebuild (qlever-dir still always rebuilds on
@@ -761,6 +1286,8 @@ volumes:
   signal-data:
   whatsapp-data:
   telegram-data:
+  sms-data:
+  sms-db:
   # Triage delivery-gate stores — one per inbox-mode messenger gateway. Each holds
   # the gateway-written per-message `.nt` files (messages/) and the Ara-written
   # policy `.nt` (policy/policy.nt). The owning gateway mounts it RW at /inbound,
@@ -770,6 +1297,7 @@ volumes:
   messenger-signal:
   messenger-whatsapp:
   messenger-telegram:
+  messenger-sms:
   # qlever-life's two blue-green index slots — see the qlever-life service
   # above for why these are persisted.
   life-index-a:

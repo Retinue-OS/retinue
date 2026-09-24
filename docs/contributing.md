@@ -116,6 +116,45 @@ updates via its own `start.sh update`) injects its recipe by setting
 `UPDATE_COMMAND` in its override/`.env`; config flows deployment → framework.
 The HTTP caller can never supply the command — only the operator's environment.
 
+### Which build is actually running
+
+A merge is not a deployment. Until `self-update.py` runs, every container keeps
+serving whatever was built last time — and that reads as a logic bug, because
+behaviour the code no longer contains goes on happening. It has cost a
+debugging session twice.
+
+So every image says what it is, on its `/health`:
+
+```json
+"build": {"sha": "b5ff537e3237b00d…", "framework": "701e3b415854"}
+```
+
+- **`sha`** — the commit the image was built from, when the build passed one.
+  The built-in recipe reads `HEAD` after the pull and hands it to
+  `docker compose build` as `RETINUE_BUILD_SHA`; compose forwards it to each
+  image's `ARG`. `null` means nobody stamped this build, which is reported
+  rather than guessed at.
+- **`framework`** — a digest of the shared modules *as baked in*, computed at
+  runtime by `scripts/build_stamp.py`. It needs nothing from the build
+  pipeline, so it is always there. The retinue container and all three
+  messenger gateways copy the same modules, so **a gateway whose digest
+  differs from the dashboard's was not rebuilt** — which the `/gateways` page
+  says on the card, in as many words, even while the gateway is connected and
+  otherwise looks well.
+
+To check a deployment: open `/gateways`, or compare by hand —
+
+```bash
+python3 scripts/build_stamp.py              # what this checkout bakes
+curl -s "$GATEWAY/health" | jq .build       # what is running
+```
+
+**A deployment with its own `UPDATE_COMMAND` stamps its own builds**, because
+only that recipe knows where its pull ends: put `RETINUE_BUILD_SHA=$(git
+rev-parse HEAD)` in front of the build command. Skipping it costs only the
+`sha` — the framework digest, and with it the stale-gateway check, keeps
+working regardless.
+
 ### Upgrading the Claude Code CLI
 
 A deployment may disable Claude Code's in-container auto-updater
@@ -155,5 +194,57 @@ the Claude login or agents failing to authenticate, check
 `python3 /workspace/scripts/claude_auth.py status` and point them at
 `/claude-auth` (that script's `login` subcommand is the console fallback —
 prefer it over running `claude` via `docker exec`, which rotates tokens under
-the live session and is itself a cause of early sign-outs). Details:
+the live session and is itself a cause of early sign-outs). Every `claude` the
+framework starts first runs that script's pre-spawn refresh under a lock all
+spawners share, so its own processes never race for the rotation; before
+starting one by hand beside the live system, run
+`python3 /workspace/scripts/claude_auth.py refresh`. Details:
 `/workspace/docs/claude-auth.md`.
+
+## Session environment — the allowlist
+
+Every `claude -p` the framework spawns — dashboard turns, the transcript
+cleanup and the presentation lint (`scripts/web-gateway.py`), scheduler jobs
+and the sessions the base-job scripts start themselves (`scripts/scheduler.py`,
+`agent-self-review.py`, `news-curate.py`, `triage-gate.py`), Ask-Ara answers
+(`scripts/ara-mcp-server.py`) — gets its environment from
+`scripts/session_env.py`, never from a copy of the spawning daemon's. The
+daemons are forked before the entrypoint's scrub and hold whatever `.env` put
+into the container, mailbox passwords included; a copied environment inherits
+all of it (retinue-os/retinue#15). The module is an allowlist, not a denylist,
+because a denylist rots: a new secret leaks until someone extends the list and
+nothing fails when they forget, whereas a forgotten *non*-secret fails loudly
+in the script that reads it.
+
+What passes: process basics (`PATH`, `HOME`, locale, `TZ`), the egress-proxy
+and CA variables, `ANTHROPIC_*` (the model credential and endpoint —
+gateway-spawned sessions run in API-key mode), `CLAUDE_*`, `RETINUE_*` (minus
+`RETINUE_LITELLM_KEY`), `SPARQL_ENDPOINT_*`, `NEWS_*`, `TRIAGE_*`, the
+capability tokens with their service URLs (`EMAIL_BACKEND_*`,
+`CONVERSATION_BACKEND_*`, `NEWS_INGEST_*`, `CHATS_INGEST_*`, `UPDATER_*`), the
+messenger and calendar gateways' client side (`*_GATEWAY_TOKEN`,
+`*_GATEWAY_BASE_URL`, `*_GATEWAY_SEND_URL`, `*_DEFAULT_RECIPIENT`, …) and, for
+now, `GARMIN_EMAIL`/`GARMIN_PASSWORD` (`refresh.py --ensure` runs the fetch in
+the agent's own process). Everything else is dropped — `EMAIL_PASS*`,
+`LITELLM_*`, `OPENROUTER_API_KEY`, `TRAEFIK_BASIC_AUTH_USERS`, `GITHUB_TOKEN`
+(`git` keeps working through the credential helper the entrypoint configures;
+`gh` is unauthenticated in a spawned session, while the remote-control main
+session still carries the token) and any secret nobody has named yet. Two
+credentials pass on purpose: the model credential in `ANTHROPIC_*`, without
+which a spawned session cannot run, and Garmin's. `RETINUE_SESSION_MODEL`
+and `RETINUE_ESCALATE_FILE` are set per spawn, never inherited, and
+`EMAIL_BACKEND_URL` is pointed at the gateway's backend whenever the spawner
+holds the token, so `email_client.py` proxies in every session.
+
+A deployment whose chamber scripts read variables the framework does not know
+names them in `RETINUE_SESSION_ENV_EXTRA` (comma- or space-separated; a
+trailing `*` admits a prefix, `MYCHAMBER_*`) — on the `retinue` service in its
+override, where the variables themselves must be listed too, since the service
+no longer loads `.env` wholesale (`docker-compose.yml`, the `retinue` service,
+names what it passes). `python3 /workspace/scripts/session_env.py` prints the
+names the current environment would pass, `--dropped` the names it withholds
+— names only, never a value. The remote-control main session is not spawned
+this way: it keeps the entrypoint's own scrub (mail credentials and the API
+key, for OAuth). What the allowlist cannot do is stop a session from reading a
+daemon's `/proc/<pid>/environ`, since everything runs as one uid; that is the
+sidecar work tracked separately (`SECURITY.md`, "Known limitations").

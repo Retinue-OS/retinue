@@ -61,9 +61,13 @@ class ConversationNotifier:
         return (body or {}).get("id")
 
     def append(self, thread_id: str, message: str,
-               attention: dict | None = None) -> bool:
-        payload = {"message": message}
+               attention: dict | None = None, quiet: bool = False) -> bool:
+        # quiet: a record, not a request for attention — no unread badge, no
+        # Web Push, and the thread stays archived if the user put it there.
+        payload: dict = {"message": message}
         if attention:
             payload["attention"] = dict(attention)
+        if quiet:
+            payload["quiet"] = True
         body = self._post(f"{self.base_url}/{thread_id}/messages", payload)
         return body is not None

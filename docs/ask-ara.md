@@ -34,6 +34,27 @@ escalates to the frontier tier like any door turn (`docs/model-routing.md`);
 dashboard thread of kind `cowork`, quietly (no unread badge, no Web Push), as an
 audit trail the user reads when curious.
 
+**Stated facts go to the user, not into memory.** A client often *tells* as
+much as it asks — "I just filed the return", "the meeting moved to Friday". The
+answering session records none of it: storing a memory would let any holder of
+the connector's credential write into what every agent reads. Instead, when the
+session judges that the client stated something new to Retinue and worth
+keeping, it ends its reply with a block between `<<<confirm` and `confirm>>>`
+lines (a `Title:` line, then a message to the user with reply chips). The server
+strips the block from what the client receives and opens a **separate, non-quiet
+dashboard thread** with it — never the cowork audit thread, which the user
+rarely reads; the audit entry only links to it. The user's reply there is an
+ordinary turn with an ordinary session's write access, and that is where the
+memory is stored and the project file updated. No block, no thread: most
+answers open nothing.
+
+`tell_ara` notes get the same review after the fact. The note is delivered
+verbatim and at once, as before; then a background session (counted against
+the rate limit — over it, the note simply stays unreviewed) checks it against
+the records and, if it carries facts worth keeping, appends the confirmation
+question to the note's own thread. A note with nothing to record gets no
+follow-up.
+
 **Auth is Traefik's**, as for the dashboard: no credential of its own, because a
 client can send only one `Authorization` header and the edge already claims it.
 The one thing that matters is that the connector's password is handed to a

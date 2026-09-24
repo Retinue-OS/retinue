@@ -17,6 +17,14 @@ reinstalls the ones that drifted.  Content is compared file by file rather than
 by version or git SHA: that catches uncommitted edits, and it does not reinstall
 on every unrelated commit to the chamber.
 
+The comparison happens in plain Python, and nothing starts the `claude` CLI
+until it finds actual drift.  That ordering is what keeps the watch loop out of
+the OAuth token race: every `claude` invocation reads the shared credential
+file and refreshes an access token near expiry, so a loop that ran the CLI on
+every pass would be 1440 chances a day to perform — and to lose — the one
+rotation (docs/claude-auth.md).  When there is drift to install, the refresh
+happens once, deliberately, under the lock every framework spawner shares.
+
 Usage:
   python3 scripts/sync-plugins.py                  # reinstall drifted plugins, once
   python3 scripts/sync-plugins.py --force          # reinstall all, unconditionally
@@ -31,6 +39,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import claude_auth  # noqa: E402
 
 MARKETPLACE_NAME = "retinue"
 MARKETPLACE = Path("/workspace/.claude-plugin/marketplace.json")
@@ -113,15 +124,28 @@ def sync(force=False):
     plugins = marketplace_plugins(MARKETPLACE)
     if not plugins:
         return 0
-    # Pick up marketplace.json edits (a chamber added or removed) before installing.
-    run(["claude", "plugin", "marketplace", "update", MARKETPLACE_NAME])
-    changed = 0
+    stale = []
     for name, source in plugins:
         if not source.is_dir():
             log(f"[warn] {name}: source {source} missing, skipping")
             continue
         if force or trees_differ(source, install_path(name)):
-            changed += reinstall(name)
+            stale.append(name)
+    # The comparison above is plain file I/O. A pass that found nothing starts
+    # no `claude` at all — on the watch loop's cadence that is the difference
+    # between holding the shared credentials once in a while and holding them
+    # every minute, forever.
+    if not stale:
+        return 0
+    # From here on every command is a `claude` process on the shared
+    # credentials, so refresh an access token about to expire once, ahead of
+    # them, under the lock all framework spawners share (docs/claude-auth.md).
+    claude_auth.ensure_fresh_credentials(log=lambda msg: log(f"[auth] {msg}"))
+    # Pick up marketplace.json edits (a chamber added or removed) before installing.
+    run(["claude", "plugin", "marketplace", "update", MARKETPLACE_NAME])
+    changed = 0
+    for name in stale:
+        changed += reinstall(name)
     return changed
 
 

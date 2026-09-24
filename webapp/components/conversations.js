@@ -1,19 +1,24 @@
-// Conversation tabs: standalone chat threads with Ara.
+// Conversation tabs: the list of threads with Ara, and the one that is open.
 //
 // Unlike the other cards (which render one static JSON document), this card is
 // interactive and talks to the gateway's conversation API:
 //   GET  /conversations                 list of active threads (tabs)
 //   GET  /conversations?archived=1      list of archived threads
-//   GET  /conversations/<id>            one thread with its messages
-//   POST /conversations                 open a new thread ({message})
-//   POST /conversations/<id>/messages   reply in a thread ({message})
-//   POST /conversations/<id>/read       clear a thread's unread badge
-//   POST /conversations/<id>/archive    archive a thread (hide from active list)
-//   POST /conversations/<id>/unarchive  restore an archived thread
+//   GET  /conversations?all=1&kind=…    the normally hidden kinds (full page)
 //
 // A thread can also be opened by a retinue agent that needs a decision (via the
 // gateway's token-gated /internal/conversations endpoint); such threads simply
 // appear here with an unread badge and Ara engages once the user replies.
+//
+// The conversation itself — thread, composer, dictation, attachments, chips
+// and copy buttons, model picker, read-aloud — is <retinue-conversation>
+// (components/conversation.js). This card owns what is around it: the list,
+// the Active/Archived/… filter, the location-hash routing that makes threads
+// and the composer addressable, and the `data-view` attribute the page's
+// styles key on. An open thread is that element with a `conversation-id`; the
+// "+ New" composer is the same element with no id yet (and, coming from a
+// project page, the project it is about) — its first message opens the thread
+// and the element goes on as it.
 //
 // The element runs in two modes. By default it is a compact dashboard card that
 // shows the most recent active threads (capped at MAX_CARD_THREADS) plus a link
@@ -23,17 +28,14 @@
 // whose list is the attention list) it renders nothing at all until a thread
 // or the composer is opened by hash, and then only that view.
 //
-// Ara answers asynchronously: a reply marks the thread `pending`, so this card
-// polls until the answer arrives. Everything degrades gracefully offline (the
-// list/threads just fail to refresh; the last rendered state stays on screen).
+// Everything degrades gracefully offline (the list just fails to refresh; the
+// last rendered state stays on screen).
 
 import {
   esc, fmtAge, isWideFrame, onFrameChange,
   viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
 } from './base.js';
-import { renderMarkdown, MD_CSS } from './markdown.js';
-import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
-import { openAttentionSheet } from './attention-sheet.js';
+import { hasUnsentInput } from './conversation.js';
 
 const LIST_URL = '/conversations';
 // Views are addressable by location hash, so opening a thread or the composer
@@ -51,82 +53,29 @@ const COMPOSER_HASH_RE = /^#new(?:\?(.*))?$/;
 // its own column, so it is lifted there (see _shownThreads).
 const MAX_CARD_THREADS = 5;
 const POLL_MS = 4000;
-const PENDING_WARN_SECONDS = 2 * 60;
-const PENDING_STALE_SECONDS = 10 * 60;
-const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
-// Keep the client cap in step with the gateway's CONVERSATION_MAX_ATTACHMENT_BYTES
-// (default 25 MiB) so oversized files are rejected before a doomed upload.
-const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
-// Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
-// browser shows in place instead of saving. Mirrors _INLINE_SAFE_TYPES in
-// web-gateway.py — offering "view" for anything else would just download it.
-const INLINE_SAFE_TYPES = new Set([
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
-  'application/pdf', 'text/plain',
-]);
 
 class RetinueConversations extends HTMLElement {
   constructor() {
     super();
     this._threads = [];     // list summaries
     this._active = null;    // id of the open thread, or null for the list view
-    this._thread = null;    // full active thread
     this._composing = false; // true while the "new thread" composer is open
     this._timer = null;
-    this._busy = false;
-    this._drafts = {};       // map of conversation id to draft text. 'composer' is used for the new thread composer.
-    this._outFiles = {};     // map of conversation id to pending outgoing attachments
-    this._attachError = '';  // last attach error (e.g. file too big), shown by the composer
-    this._focusNext = false; // focus the input after the next render (view opened)
-    this._hadFocus = false;  // input had focus before the current re-render
     this._listSig = '';
-    this._threadSig = '';
+    this._lastMode = '';
     this._full = false;      // full mode: dedicated all-conversations page
     this._scope = 'active';  // full-mode thread filter: active|archived|edits|cowork
     this._composeProject = null;      // project URI the composer is about, if any
     this._composeProjectTitle = '';   // its display title (for the chip)
     this._pushDepth = 0;     // history entries we pushed and have not unwound
-    // Model picker: which model answers a thread. The offered list comes from
-    // the gateway (single source of truth); '' means the gateway default. The
-    // choice is per-thread — pickable at creation and switchable mid-thread,
-    // effective next turn (each turn is a fresh `claude -p`). _composeModel holds
-    // the pending choice for the new-thread composer.
-    this._models = [];
-    this._composeModel = '';
-    // Voice: record a message (server transcribes) and speak replies back.
-    this._recState = 'idle'; // idle | recording | transcribing
-    this._recChunks = [];
-    this._mediaRecorder = null;
-    this._recStream = null;
-    this._recTarget = null;  // thread pinned at record-start (dictation target)
-    this._recIntent = null;  // what to do with the transcript: 'review' | 'send'
-    this._recAborted = false; // recording was discarded via the abort button
-    // In-flight dictation jobs, keyed like _drafts (a thread id, or 'composer'
-    // for the new-thread composer). Each value is {sending, phase} and owns
-    // that one view's input row until the job completes — every other
-    // conversation keeps its normal row, so text and voice stay usable there
-    // while a transcription runs in the background.
-    this._voiceJobs = {};
-    // Transcription errors per target view, surfaced by that view's composer —
-    // a background job's failure must not pop up in whatever view is open.
-    this._voiceErrors = {};
-    // Live waveform on the recording row's canvas (shared renderer, voice.js).
-    this._wave = new Waveform(this);
-    this._autoplay = false;  // speak Ara's replies as they arrive
-    try { this._autoplay = localStorage.getItem('retinue-voice-autoplay') === '1'; } catch (_e) { /* ignore */ }
-    this._spoken = {};       // per-thread set of message ts already voiced/seen
-    this._autoReady = {};    // per-thread: initial history marked, future msgs autoplay
-    this._speakingTs = null; // ts of the message currently being spoken, if any
-    // getVoices() is empty until the engine loads its list; warm it up so a
-    // German voice is available by the time the user taps play.
-    try {
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.getVoices();
-        window.speechSynthesis.addEventListener('voiceschanged', () => {
-          try { window.speechSynthesis.getVoices(); } catch (_e) { /* ignore */ }
-        });
-      }
-    } catch (_e) { /* ignore */ }
+    // Bumped whenever the list is changed from this side — an archive, a
+    // scope switch, a thread created or written to. A refresh that began
+    // before the bump answers with the list as it was, and rendering that
+    // would put an archived thread back in the list (with its button reading
+    // Unarchive when opened), or hide a just-created one, until the next
+    // poll. The epoch is how such an answer is recognised and dropped: every
+    // local change goes through _changed(), never a bare refresh().
+    this._epoch = 0;
   }
 
   connectedCallback() {
@@ -148,31 +97,28 @@ class RetinueConversations extends HTMLElement {
     // for that fragment change is implementation-dependent.
     window.addEventListener('hashchange', this._onPop);
     // Crossing the layout breakpoint changes how many threads fit (see
-    // _shownThreads), so re-render when it flips.
-    this._offFrame = onFrameChange(() => { if (!this._full) this.render(); });
+    // _shownThreads), so re-render when it flips — the list only: an open
+    // thread or composer is torn down by a render, which would finish a
+    // dictation under way as if the user had left.
+    this._offFrame = onFrameChange(() => { if (!this._full && !this._active && !this._composing) this.render(); });
+    // What the open conversation tells this card. The events bubble out of
+    // the element (and out of the read-aloud bar in the list), so one set of
+    // listeners on the host covers every render — and every connection:
+    // listeners on the host outlive a disconnect, so they go on once.
+    if (!this._listening) {
+      this._listening = true;
+      this.addEventListener('retinue-back', () => this._openList());
+      this.addEventListener('retinue-created', (e) => this._onCreated(e.detail || {}));
+      this.addEventListener('retinue-archived', (e) => this._onArchived(e.detail || {}));
+      this.addEventListener('retinue-sent', () => this._changed());
+      this.addEventListener('retinue-open', (e) => {
+        const id = e.detail && e.detail.id;
+        if (id) this._openThread(id);
+      });
+    }
     this.render();
     this.refresh();
-    this._loadModels();
     this._timer = setInterval(() => this.refresh(), POLL_MS);
-  }
-
-  // Fetch the offered model list once. A failure (or a single-model list) simply
-  // leaves the picker hidden — conversations work exactly as before.
-  async _loadModels() {
-    try {
-      const res = await fetch('/conversation-models', { cache: 'no-store' });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (Array.isArray(data.models)) {
-        this._models = data.models;
-        this.render();
-      }
-    } catch (_err) { /* picker stays hidden */ }
-  }
-
-  _modelLabel(id) {
-    const m = (this._models || []).find((x) => x.id === (id || ''));
-    return m ? m.label : '';
   }
 
   disconnectedCallback() {
@@ -185,10 +131,6 @@ class RetinueConversations extends HTMLElement {
     this._onPop = null;
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
-    this._stopRecording();
-    this._wave.stop();
-    this._stopStream();
-    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
   }
 
   // Bring the view in line with the address bar after the browser has already
@@ -206,8 +148,13 @@ class RetinueConversations extends HTMLElement {
     }
     const cm = COMPOSER_HASH_RE.exec(hash);
     if (cm) {
+      // The project context is snapshotted into the element's attributes at
+      // render time, so a change of context while composing re-renders.
+      const was = `${this._composeProject || ''}\n${this._composeProjectTitle}`;
       this._setComposeProject(cm[1]);
+      const now = `${this._composeProject || ''}\n${this._composeProjectTitle}`;
       if (!this._composing) this._showComposer();
+      else if (now !== was) this.render();
       return;
     }
     if (this._active || this._composing) this._showList();
@@ -228,14 +175,12 @@ class RetinueConversations extends HTMLElement {
 
   get heading() { return this.getAttribute('heading') || 'Conversations'; }
 
-  // True while a page reload would lose in-memory user input — a composer or
-  // reply draft (kept per thread in _drafts even after leaving the view) or
-  // files picked for upload. components/update.js consults this before
-  // auto-reloading into a freshly activated shell version.
+  // True while a page reload would lose in-memory user input — a draft kept
+  // for any thread (or the composer) even after leaving it, or files picked
+  // for upload. components/update.js consults this before auto-reloading into
+  // a freshly activated shell version.
   get dirty() {
-    const hasDraft = Object.values(this._drafts || {}).some((t) => t && t.trim());
-    const hasFiles = Object.values(this._outFiles || {}).some((fs) => fs && fs.length);
-    return hasDraft || hasFiles;
+    return hasUnsentInput();
   }
 
   // In full mode the filter can request the archived scope or either of the
@@ -258,39 +203,36 @@ class RetinueConversations extends HTMLElement {
       ? this._threads : this._threads.slice(0, MAX_CARD_THREADS);
   }
 
+  // The list changed on the server because of something done here (a send, an
+  // archive, a new thread): fetch it again, and let no answer from before the
+  // change land after this one was asked for.
+  _changed() {
+    this._epoch += 1;
+    this.refresh();
+  }
+
   async refresh() {
     // The viewer has no list of its own to keep fresh: only an open thread.
     if (this._viewer && !this._active && !this._composing) return;
+    const epoch = this._epoch;
     try {
       const res = await fetch(this._listUrl(), { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
+      // An archive or a scope switch landed while this was on the wire: the
+      // answer predates it. The change already showed itself, and the next
+      // tick fetches the list as it now is.
+      if (epoch !== this._epoch) return;
       this._threads = Array.isArray(data.conversations) ? data.conversations : [];
-      if (this._active) await this._loadThread(this._active);
-      // Partial update only: never replace the input form (would cancel the
-      // browser dictation session) or the scroll container (would jump to top).
+      // In place: a full render would tear down the open conversation.
       this._partialUpdate();
     } catch (_err) {
       // Offline or gateway down: keep the last rendered state.
     }
   }
 
-  async _loadThread(id) {
-    try {
-      const res = await fetch(`/conversations/${id}`, { cache: 'no-store' });
-      if (!res.ok) throw new Error(String(res.status));
-      this._thread = await res.json();
-      if (this._thread.unread) this._markRead(id);
-      this._maybeAutoplay(this._thread);
-    } catch (_err) {
-      // keep previous thread state
-    }
-  }
-
-  // Apply server-driven updates (new messages, badge counts, thread list)
-  // without rebuilding the entire shadow DOM. This keeps the input element
-  // alive so dictation, IME composition, focus, and selection survive a poll,
-  // and keeps the thread's scroll position stable.
+  // Apply a list refresh (badge counts, previews, new threads) without
+  // rebuilding the shadow DOM. The open conversation keeps itself current.
   _partialUpdate() {
     const root = this.shadowRoot;
     if (!root) return;
@@ -298,6 +240,7 @@ class RetinueConversations extends HTMLElement {
     // back to a full render so the right widgets exist to update in place.
     const mode = this._active ? 'thread' : (this._composing ? 'composer' : 'list');
     if (mode !== this._lastMode) { this.render(); return; }
+    if (mode !== 'list') return;
 
     // Header badge
     const hdr = root.querySelector('header');
@@ -314,71 +257,17 @@ class RetinueConversations extends HTMLElement {
         badge.remove();
       }
     }
-
-    if (mode === 'list') {
-      const tabsEl = root.querySelector('.tabs');
-      if (tabsEl) {
-        const sig = this._listSignature();
-        if (sig !== this._listSig) {
-          tabsEl.innerHTML = this._tabsHtml() + this._emptyHtml();
-          this._listSig = sig;
-          const allLink = root.querySelector('.all-link');
-          if (allLink && !this._full) allLink.innerHTML = this._allLinkLabel();
-          tabsEl.querySelectorAll('[data-open]').forEach((el) =>
-            el.addEventListener('click', () => this._openThread(el.getAttribute('data-open'))));
-        }
+    const tabsEl = root.querySelector('.tabs');
+    if (tabsEl) {
+      const sig = this._listSignature();
+      if (sig !== this._listSig) {
+        tabsEl.innerHTML = this._tabsHtml() + this._emptyHtml();
+        this._listSig = sig;
+        const allLink = root.querySelector('.all-link');
+        if (allLink && !this._full) allLink.innerHTML = this._allLinkLabel();
+        tabsEl.querySelectorAll('[data-open]').forEach((el) =>
+          el.addEventListener('click', () => this._openThread(el.getAttribute('data-open'))));
       }
-    } else if (mode === 'thread') {
-      const t = this._thread;
-      if (!t) return;
-      // A cold deep link renders the thread view before the thread has loaded,
-      // so the message container doesn't exist yet — only a full render can
-      // introduce it (and its composer) once the data is here.
-      if (!root.querySelector('.thread')) { this.render(); return; }
-      const titleEl = root.querySelector('[data-title]');
-      if (titleEl) {
-        const want = t.title || 'Conversation';
-        if (titleEl.textContent !== want) titleEl.textContent = want;
-      }
-      const threadEl = root.querySelector('.thread');
-      if (threadEl) {
-        const sig = this._threadSignature(t);
-        if (sig !== this._threadSig) {
-          // Preserve scroll position. Only auto-stick to bottom when the user
-          // was already near the bottom before new content arrived; otherwise a
-          // background poll must not fight the user's reading/scrolling.
-          const prevBottom = threadEl.scrollHeight - threadEl.scrollTop;
-          const stickToBottom = (prevBottom - threadEl.clientHeight) < 40;
-          const prevTop = threadEl.scrollTop;
-          threadEl.innerHTML = this._messagesHtml(t);
-          this._threadSig = sig;
-          threadEl.scrollTop = stickToBottom ? threadEl.scrollHeight : Math.max(0, threadEl.scrollHeight - prevBottom);
-          if (!stickToBottom) threadEl.scrollTop = Math.max(threadEl.scrollTop, prevTop);
-        }
-        this._updatePendingStatus(t);
-      }
-    }
-  }
-
-  async _markRead(id) {
-    try { await fetch(`/conversations/${id}/read`, { method: 'POST' }); } catch (_err) { /* ignore */ }
-  }
-
-  async _archive(id, archived) {
-    if (this._busy) return;
-    this._busy = true;
-    try {
-      const res = await fetch(`/conversations/${id}/${archived ? 'archive' : 'unarchive'}`,
-        { method: 'POST' });
-      if (!res.ok) throw new Error(String(res.status));
-      // Reflect it locally so the thread leaves/joins the current scope at once.
-      if (this._thread) this._thread.archived = archived;
-    } catch (_err) {
-      // keep the thread open; a later poll will reconcile state
-    } finally {
-      this._busy = false;
-      this._openList();
-      this.refresh();
     }
   }
 
@@ -388,86 +277,40 @@ class RetinueConversations extends HTMLElement {
     this._scope = scope;
     this._threads = [];
     this.render();
-    this.refresh();
+    this._changed(); // a refresh of the old scope in flight must not land here
   }
 
-  // `targetOverride` sends to a specific thread ('composer' for a new thread)
-  // regardless of what's open — used by send-intent dictation, where the
-  // user may have navigated away while transcription ran. Omitted for normal
-  // sends, which go to the open view.
-  async _send(text, targetOverride) {
-    const override = targetOverride != null;
-    const sendToComposer = override ? (targetOverride === 'composer') : this._composing;
-    const sendToThread = override
-      ? (targetOverride && targetOverride !== 'composer' ? targetOverride : null)
-      : this._active;
-    const draftKey = sendToThread || (sendToComposer ? 'composer' : '');
-    const currentOutFiles = this._outFiles[draftKey] || [];
-    // A message needs text or at least one attachment.
-    if (this._busy || (!text.trim() && !currentOutFiles.length)) return;
-    // Whether this send targets the view the user is currently looking at. When
-    // false (a dictation sent into a thread the user has navigated away from), we
-    // must not hijack their view with the result.
-    const affectsView = sendToThread ? (this._active === sendToThread)
-      : (sendToComposer && this._composing);
-    this._busy = true;
-    try {
-      const body = { message: text };
-      // A composer opened from a project page links the new thread to that
-      // project, so Ara starts from the project file's current state.
-      if (sendToComposer && this._composeProject) {
-        body.project = this._composeProject;
-        if (this._composeProjectTitle) body.project_title = this._composeProjectTitle;
-      }
-      // Carry the composer's model choice onto the new thread ('' = default,
-      // which the server simply leaves unset).
-      if (sendToComposer && this._composeModel) body.model = this._composeModel;
-      if (currentOutFiles.length) {
-        body.attachments = currentOutFiles.map((f) => ({
-          filename: f.name, content_type: f.type, data: f.data,
-        }));
-      }
-      const url = sendToThread ? `/conversations/${sendToThread}/messages` : LIST_URL;
-      const res = await fetch(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const conv = await res.json();
-      // Clear the draft/attachments for whichever target we just sent.
-      this._drafts[draftKey] = '';
-      this._outFiles[draftKey] = [];
-      this._attachError = '';
-      if (sendToComposer) {
-        // A brand-new thread. Only bring the user onto it if they were still on
-        // the composer; otherwise leave their current view untouched.
-        this._drafts['composer'] = '';
-        this._outFiles['composer'] = [];
-        this._composeModel = '';  // consumed by this thread; reset for the next one
-        if (affectsView) {
-          // A thread opened from the composer reuses the composer's history
-          // entry, so back still lands on the list rather than the (now gone)
-          // composer.
-          history.replaceState(null, '', `#conversation-${conv.id}`);
-          this._active = conv.id;
-          this._thread = conv;
-          this._composing = false;
-          this._setComposeProject(undefined); // link consumed by this thread
-        }
-      } else if (affectsView) {
-        this._thread = conv;
-      }
-    } catch (_err) {
-      // surface a soft failure inline by leaving the input; re-render shows state
-    } finally {
-      this._busy = false;
-      // Re-render only when this send concerns the view on screen: a
-      // background dictation-send must not rebuild (and so interrupt) a
-      // conversation the user is meanwhile typing or dictating in — the list
-      // refresh below reconciles previews and badges on its own.
-      if (affectsView) this.render();
-      this.refresh();
-    }
+  // The open thread was archived or restored. The row leaves (or joins) the
+  // list at once, from what the thread told us, before the list is shown
+  // again: an archived thread is out of the active scope and a restored one
+  // out of the archived scope, and no scope holds both. The refresh then
+  // confirms it — and any refresh that began before the archive answers from
+  // before it, so it is stale by definition and dropped (see _epoch).
+  _onArchived(detail) {
+    const id = detail.id;
+    const archived = !!detail.archived;
+    const scope = this._full ? this._scope : 'active';
+    const leaves = (scope === 'active' && archived) || (scope === 'archived' && !archived);
+    if (id && leaves) this._threads = this._threads.filter((t) => t.id !== id);
+    else if (id) this._threads.forEach((t) => { if (t.id === id) t.archived = archived; });
+    this._openList();
+    this._changed();
+  }
+
+  // The composer's first message opened a thread: the element already went on
+  // as that thread, so only this card's own state and the address bar move.
+  // The thread reuses the composer's history entry, so back still lands on
+  // the list rather than the (now gone) composer.
+  _onCreated(detail) {
+    const id = detail.id;
+    if (!id) return;
+    history.replaceState(null, '', `#conversation-${id}`);
+    this._active = id;
+    this._composing = false;
+    this._setComposeProject(undefined); // link consumed by this thread
+    this._lastMode = 'thread';
+    this.setAttribute('data-view', 'thread');
+    this._changed();
   }
 
   // _open* are user intents: they move the history stack, and the matching
@@ -482,17 +325,9 @@ class RetinueConversations extends HTMLElement {
   }
 
   _showThread(id) {
-    this._finishRecordingOnLeave();
     this._active = id;
     this._composing = false;
-    this._thread = null;
-    // Do not clear this._drafts[id] here. Let the user's previously entered text
-    // remain so it isn't lost if they navigate away and then back.
-    // this._outFiles[id] is preserved
-    this._attachError = '';
-    this._focusNext = true;
     this.render();
-    this._loadThread(id).then(() => this.render());
   }
 
   // Leaving a thread: if we pushed the entry, unwind it, so the back gesture
@@ -506,13 +341,8 @@ class RetinueConversations extends HTMLElement {
   }
 
   _showList() {
-    this._finishRecordingOnLeave();
     this._active = null;
     this._composing = false;
-    this._thread = null;
-    // this._drafts is preserved
-    // this._outFiles is preserved
-    this._attachError = '';
     this.render();
   }
 
@@ -524,22 +354,12 @@ class RetinueConversations extends HTMLElement {
   }
 
   _showComposer() {
-    this._finishRecordingOnLeave();
     this._active = null;
-    this._thread = null;
     this._composing = true;
-    // this._drafts is preserved
-    // this._outFiles is preserved
-    this._attachError = '';
-    this._focusNext = true;
     this.render();
   }
 
   render() {
-    // Remember whether our input had focus so a background-poll re-render can
-    // restore it (and not steal focus when the user wasn't typing).
-    const prev = this.shadowRoot && this.shadowRoot.querySelector('[data-form] textarea');
-    this._hadFocus = !!(prev && this.shadowRoot.activeElement === prev);
     const mode = this._active ? 'thread' : (this._composing ? 'composer' : 'list');
     // Reflect the view on the host so the page can react (styles.css hides the
     // greeting and app dock while a thread or the composer is open).
@@ -560,18 +380,11 @@ class RetinueConversations extends HTMLElement {
         `${this._unreadCount() ? `<span class="badge">${this._unreadCount()}</span>` : ''}` +
         `${viewToggleHtml(this._view)}</header>`
       : '';
-    this.shadowRoot.innerHTML = `<style>${CSS}${VIEW_TOGGLE_CSS}${VOICE_CSS}${MD_CSS}</style>` +
+    this.shadowRoot.innerHTML = `<style>${CSS}${VIEW_TOGGLE_CSS}</style>` +
       `<section class="card">${header}<div class="content">${body}</div></section>`;
     this._lastMode = mode;
     this._listSig = this._lastMode === 'list' ? this._listSignature() : '';
-    this._threadSig = (this._lastMode === 'thread' && this._thread) ? this._threadSignature(this._thread) : '';
     this._wire();
-    // After a full render in thread view, scroll to bottom so the latest
-    // message is visible (matches typical chat-app behaviour on open).
-    if (this._lastMode === 'thread') {
-      const threadEl = this.shadowRoot.querySelector('.thread');
-      if (threadEl) threadEl.scrollTop = threadEl.scrollHeight;
-    }
   }
 
   _unreadCount() {
@@ -585,16 +398,20 @@ class RetinueConversations extends HTMLElement {
     ]));
   }
 
-  _threadSignature(t) {
-    return JSON.stringify([
-      (t.messages || []).map((m) => [m.role, m.text, m.ts, (m.attachments || []).length,
-        m.model_name || '', m.cost_usd ?? '', m.agent || '']),
-      !!t.pending,
-      t.pending_since || '',
-      t.pending_status || '',
-      t.pending_error || '',
-      t.title || '',
-    ]);
+  // An open thread: the conversation element, with a back button that this
+  // card answers by unwinding the history entry it pushed.
+  _threadView() {
+    return `<retinue-conversation conversation-id="${esc(this._active)}" back></retinue-conversation>`;
+  }
+
+  // The new-thread composer: the same element with no thread yet. Coming from
+  // a project page, the project it is about rides along as the seed of the
+  // thread its first message opens.
+  _composerView() {
+    const project = this._composeProject
+      ? ` for-project="${esc(this._composeProject)}" project-title="${esc(this._composeProjectTitle)}"`
+      : '';
+    return `<retinue-conversation back${project}></retinue-conversation>`;
   }
 
   _listView() {
@@ -603,10 +420,12 @@ class RetinueConversations extends HTMLElement {
     const newBtn = (this._full && this._scope !== 'active')
       ? '' : '<button class="new" data-new>+ New conversation with Ara</button>';
     // The tabs area takes all remaining height and scrolls; the New button and
-    // page link stay pinned at the bottom, within thumb reach.
+    // page link stay pinned at the bottom, within thumb reach. The read-aloud
+    // bar sits between them: a reading follows the user out of its thread.
     return this._filterHtml() +
       `<div class="tabs${this._view === 'list' ? ' as-list' : ''}">` +
       `${this._tabsHtml()}${this._emptyHtml()}</div>` +
+      `<retinue-read-aloud></retinue-read-aloud>` +
       `<div class="list-foot">${newBtn}${this._footerHtml()}</div>`;
   }
 
@@ -670,721 +489,12 @@ class RetinueConversations extends HTMLElement {
     }).join('');
   }
 
-  _backBtnHtml() {
-    return '<button class="back" data-back aria-label="Back">&#8249;</button>';
-  }
-
-  // The model dropdown. Governs Ara's own turn only (dispatched subagents keep
-  // their own models) — the title says so. Hidden unless the gateway offers more
-  // than one model, so a single-model deployment sees no clutter. `selected` is
-  // the currently-chosen id; '' means the thread rides the gateway default,
-  // which the list carries not as its own row but as a `default: true` flag on
-  // the concrete entry that default runs on — show that entry as selected. Only
-  // when the gateway could not name its default (no flagged entry) does a
-  // hidden, unpickable placeholder keep the select from claiming a concrete
-  // model it is not running.
-  // `wide` renders the roomy composer form: a visible "Model" caption and an
-  // untruncated select, instead of the bar's compact gear + capped-width one.
-  _modelPickerHtml(selected, { wide = false } = {}) {
-    const models = this._models || [];
-    if (models.length < 2) return '';
-    let sel = selected || '';
-    if (!models.some((m) => m.id === sel)) {
-      const def = models.find((m) => m.default);
-      sel = def ? def.id : '';
-    }
-    const placeholder = models.some((m) => m.id === sel) ? ''
-      : '<option value="" hidden selected>Default</option>';
-    const opts = placeholder + models.map((m) =>
-      `<option value="${esc(m.id)}"${m.id === sel ? ' selected' : ''}>` +
-      `${esc(m.label)}</option>`).join('');
-    const title = 'Model for Ara’s replies in this conversation. ' +
-      'Dispatched subagents (Coach, Medic, …) keep their own models.';
-    const caption = wide
-      ? '<span class="mp-label">Model</span>'
-      : '<span class="mp-ico" aria-hidden="true">⚙</span>';
-    return `<label class="model-pick${wide ? ' wide' : ''}" title="${title}">` +
-      caption +
-      `<select data-model aria-label="${title}">${opts}</select></label>`;
-  }
-
-  _composerView() {
-    // Coming from a project page, show what the new thread will be about.
-    const projectChip = this._composeProject
-      ? `<div class="about-chip">About: ${esc(this._composeProjectTitle || this._composeProject)}</div>`
-      : '';
-    const hint = this._composeProject
-      ? `<p>Ask Ara about this project &mdash; she reads its current state first.</p>`
-      : `<p>Ask Ara anything &mdash; she picks it up with full context.</p>`;
-    // The picker sits in the body as a labeled, full-width row — cramped into
-    // the top bar it truncated its labels and was easy to miss, and picking
-    // the model is exactly the choice to make before the first message goes
-    // out (it can still be switched later from the thread bar).
-    return `<div class="thread-bar">${this._backBtnHtml()}` +
-      `<span class="bar-title">New conversation</span></div>` +
-      projectChip +
-      `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span>` +
-      hint +
-      this._modelPickerHtml(this._composeModel, { wide: true }) + `</div>` +
-      this._inputRow('Ask Ara something …');
-  }
-
-  _threadView() {
-    const t = this._thread;
-    if (!t) {
-      return `<div class="thread-bar">${this._backBtnHtml()}` +
-        `<span class="bar-title muted">&#8230;</span></div>`;
-    }
-    const archiveBtn = t.archived
-      ? '<button class="pill" data-unarchive>Unarchive</button>'
-      : '<button class="pill" data-archive>Archive</button>';
-    const autoBtn = ('speechSynthesis' in window)
-      ? `<button class="iconbtn${this._autoplay ? ' on' : ''}" data-autoplay ` +
-        `title="Speak Ara's replies as they arrive" aria-label="Speak replies as they arrive" ` +
-        `aria-pressed="${this._autoplay}">${this._autoplay ? '\u{1F50A}' : '\u{1F507}'}</button>`
-      : '';
-    // The attention sheet — importance, urgency, delivery and their
-    // corrections — for the threads the model lists: those an agent opened.
-    const attentionBtn = (t.initiator === 'agent' || t.attention)
-      ? `<button class="iconbtn" data-attention title="Importance, urgency, delivery — and their corrections" ` +
-        `aria-label="Attention details">&#9432;</button>`
-      : '';
-    return `<div class="thread-bar">${this._backBtnHtml()}` +
-      `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
-      `<span class="bar-actions">${this._modelPickerHtml(t.model)}${attentionBtn}${autoBtn}${archiveBtn}</span></div>` +
-      `<div class="thread">${this._messagesHtml(t)}</div>` +
-      this._inputRow('Reply …');
-  }
-
-  _messagesHtml(t) {
-    const canSpeak = 'speechSynthesis' in window;
-    const msgs = (t.messages || []).map((m, idx) => {
-      const cls = m.role === 'user' ? 'me' : (m.role === 'agent' ? 'agent' : 'ara');
-      // The sender label: the acting agent's own name when a relay set one
-      // (e.g. "Coach"), else the role default. "You" / "Retinue" / "Ara".
-      const defaultWho = m.role === 'user' ? 'You' : (m.role === 'agent' ? 'Retinue' : 'Ara');
-      const who = (m.role !== 'user' && m.agent) ? m.agent : defaultWho;
-      const speakBtn = (canSpeak && m.role !== 'user' && (m.text || '').trim())
-        ? `<button class="speak" type="button" data-speak-idx="${idx}" ` +
-          `title="Play message" aria-label="Play message">\u{1F50A}</button>`
-        : '';
-      return `<div class="msg ${cls}"><div class="msg-head">` +
-        `<small class="who">${esc(who)}</small>` +
-        this._metaHtml(m) +
-        speakBtn + `</div>` +
-        `<div class="bubble">${this._renderBubble(m.text)}` +
-        this._attachmentsHtml(t.id, m.attachments) +
-        `</div></div>`;
-    }).join('');
-    const pending = t.pending
-      ? `<div class="msg ara pending-msg"><div class="bubble pending">` +
-        `<span data-pending-status>${esc(this._pendingStatusText(t))}</span>` +
-        `<small class="pending-help">${esc(this._pendingHelpText(t))}</small>` +
-        `</div></div>`
-      : '';
-    return msgs + pending;
-  }
-
-  // The header meta after the sender name: for an answer bubble, the model
-  // short-name and the turn's list-price cost (marked "~$" — a fictional
-  // pay-per-token estimate, not the subscription's actual bill); for every
-  // message, its timestamp. Each piece is optional — older messages predating
-  // this metadata simply omit what they lack. Rendered as middot-separated
-  // muted text so it reads as one quiet line.
-  _metaHtml(m) {
-    const bits = [];
-    if (m.model_name) bits.push(`<span class="m-model">${esc(m.model_name)}</span>`);
-    if (typeof m.cost_usd === 'number' && isFinite(m.cost_usd)) {
-      bits.push(`<span class="m-cost" title="Approximate list-price cost — not the subscription bill">` +
-        `~$${this._fmtCost(m.cost_usd)}</span>`);
-    }
-    if (m.ts) {
-      bits.push(`<time class="m-ts" datetime="${esc(m.ts)}" title="${esc(m.ts)}">` +
-        `${esc(fmtAge(m.ts))}</time>`);
-    }
-    if (!bits.length) return '';
-    return `<small class="msg-meta">${bits.join('<span class="m-sep">·</span>')}</small>`;
-  }
-
-  // Cost with enough precision to stay meaningful for cheap turns: sub-cent
-  // values get more decimals so they don't collapse to "~$0.00".
-  _fmtCost(v) {
-    const c = Math.abs(v);
-    if (c === 0) return '0';
-    if (c < 0.01) return c.toFixed(4);
-    if (c < 1) return c.toFixed(3);
-    return c.toFixed(2);
-  }
-
-  // Render any files a message carries. Both links hit the gateway's per-thread
-  // attachment endpoint; `?inline=1` asks for a Content-Disposition the browser
-  // renders in place rather than saving. Viewing is the primary tap: a download
-  // writes a fresh copy to storage every time, so re-reading one invoice leaves
-  // invoice(1).pdf, invoice(2).pdf behind. Types the gateway refuses to serve
-  // inline get the download link alone — an inline href would save anyway.
-  _attachmentsHtml(cid, atts) {
-    if (!Array.isArray(atts) || !atts.length) return '';
-    const items = atts.map((a) => {
-      const url = `/conversations/${encodeURIComponent(cid)}/attachments/${encodeURIComponent(a.id)}`;
-      const name = a.filename || 'attachment';
-      const size = this._fmtSize(a.size);
-      const type = String(a.content_type || '').split(';')[0].trim().toLowerCase();
-      const viewable = INLINE_SAFE_TYPES.has(type);
-      // Same-tab navigation, deliberately: in a standalone PWA a target="_blank"
-      // link is handed to a browsing context outside the app window, with no
-      // history behind it — the back gesture then leaves the PWA instead of
-      // returning to the thread. Navigating in place keeps the viewer on the
-      // dashboard's own history stack.
-      const open = viewable
-        ? `<a class="attach" href="${esc(url)}?inline=1">`
-        : `<a class="attach" href="${esc(url)}" download="${esc(name)}">`;
-      return `<div class="attach-row">` + open +
-        `<span class="a-icon" aria-hidden="true">\u{1F4CE}</span>` +
-        `<span class="a-name">${esc(name)}</span>` +
-        (size ? `<span class="a-size">${esc(size)}</span>` : '') +
-        `</a>` +
-        (viewable
-          ? `<a class="a-dl" href="${esc(url)}" download="${esc(name)}" title="Save a copy">↓</a>`
-          : '') +
-        `</div>`;
-    }).join('');
-    return `<div class="attachments">${items}</div>`;
-  }
-
-  _fmtSize(n) {
-    if (!Number.isFinite(n) || n <= 0) return '';
-    if (n < 1024) return `${n} B`;
-    if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
-    return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  }
-
-  // Render a message body with the shared Markdown renderer (markdown.js), so
-  // bubbles and project pages show the same text the same way. Blockquotes —
-  // how Ara offers ready-to-send drafts — keep their copy button: it puts the
-  // clean, un-prefixed text on the clipboard so the user can paste it straight
-  // into WhatsApp/e-mail.
-  _renderBubble(text) {
-    return renderMarkdown(text, {
-      quote: (raw, inner) =>
-        `<blockquote class="md-quote quote"><div class="q-text">${inner}</div>` +
-        `<button class="copy" type="button" data-copy="${esc(raw)}">Copy</button>` +
-        `</blockquote>`,
-      // Fenced code blocks get the same copy affordance as blockquotes — Ara
-      // hands out ready-to-paste prompts as code blocks too. The delegated
-      // `.copy` click handler on the thread covers this button as well.
-      code: (raw, _lang, inner) =>
-        `<div class="code-wrap">${inner}` +
-        `<button class="copy code-copy" type="button" data-copy="${esc(raw)}">Copy</button>` +
-        `</div>`,
-    });
-  }
-
-  async _copyToClipboard(btn) {
-    const text = btn.getAttribute('data-copy') || '';
-    let ok = true;
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (_err) {
-      // Fallback for contexts without the async clipboard API (older WebViews).
-      try {
-        const ta = document.createElement('textarea');
-        ta.value = text;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        (this.shadowRoot || document.body).appendChild(ta);
-        ta.focus();
-        ta.select();
-        document.execCommand('copy');
-        ta.remove();
-      } catch (_e) {
-        ok = false;
-      }
-    }
-    const prev = btn.dataset.label || btn.textContent;
-    btn.dataset.label = prev;
-    btn.textContent = ok ? 'Copied ✓' : 'Error';
-    btn.classList.toggle('done', ok);
-    setTimeout(() => {
-      if (!btn.isConnected) return;
-      btn.textContent = btn.dataset.label || 'Copy';
-      btn.classList.remove('done');
-    }, 1500);
-  }
-
-  // Drop a chip's prefill text into the composer for review. Deliberately does
-  // NOT send: the user reads (and can edit) it, then taps Send — same contract
-  // as a dictation transcribed for review. APPENDS to whatever the user has already
-  // typed rather than replacing it (a chip augments the draft, it never wipes
-  // work in progress) — the same append semantics as a dictation. Persists to
-  // the draft so a background-poll re-render doesn't wipe it, then re-renders to
-  // show the text and focus the field with the caret at the end.
-  _fillComposer(text) {
-    const draftKey = this._active || (this._composing ? 'composer' : '');
-    if (!draftKey) return;
-    this._appendToDraft(text);
-    this._focusNext = true;
-    this.render();
-  }
-
-  _pendingStartedAt(t) {
-    return t.pending_since || t.updated || t.created || null;
-  }
-
-  _pendingAgeSeconds(t) {
-    const started = this._pendingStartedAt(t);
-    if (!started) return null;
-    const ms = Date.parse(started);
-    if (!Number.isFinite(ms)) return null;
-    return Math.max(0, Math.floor((Date.now() - ms) / 1000));
-  }
-
-  _pendingAgeText(seconds) {
-    if (seconds === null) return '';
-    if (seconds < 60) return `${seconds}s`;
-    const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m`;
-    const hours = Math.floor(minutes / 60);
-    return `${hours}h ${minutes % 60}m`;
-  }
-
-  _pendingStatusText(t) {
-    const age = this._pendingAgeSeconds(t);
-    const ageText = this._pendingAgeText(age);
-    const prefix = t.pending_status || 'Ara is working on this';
-    return ageText ? `${prefix} (${ageText})` : `${prefix} …`;
-  }
-
-  _pendingHelpText(t) {
-    const age = this._pendingAgeSeconds(t);
-    if (age !== null && age >= PENDING_STALE_SECONDS) {
-      return 'No progress has been reported for a while. It may still finish, but it is reasonable to stop waiting and try another reply later.';
-    }
-    if (age !== null && age >= PENDING_WARN_SECONDS) {
-      return 'Still waiting for the background Ara session. This can take a few minutes if tools or other sessions are busy.';
-    }
-    return 'This thread will update automatically when Ara replies.';
-  }
-
-  _updatePendingStatus(t) {
-    const status = this.shadowRoot.querySelector('[data-pending-status]');
-    if (status) status.textContent = this._pendingStatusText(t);
-    const help = this.shadowRoot.querySelector('.pending-help');
-    if (help) help.textContent = this._pendingHelpText(t);
-  }
-
-  _inputRow(placeholder) {
-    const disabled = this._busy ? 'disabled' : '';
-    const draftKey = this._active || (this._composing ? 'composer' : '');
-    const currentOutFiles = draftKey ? (this._outFiles[draftKey] || []) : [];
-    const chips = currentOutFiles.map((f, i) =>
-      `<span class="chip"><span class="c-name">${esc(f.name)}</span>` +
-      `<span class="c-size">${esc(this._fmtSize(f.size))}</span>` +
-      `<button type="button" class="c-x" data-rmfile="${i}" aria-label="Remove attachment" ${disabled}>&times;</button></span>`
-    ).join('');
-    const chipRow = currentOutFiles.length ? `<div class="chips">${chips}</div>` : '';
-    const voiceErr = draftKey ? (this._voiceErrors[draftKey] || '') : '';
-    const errText = this._attachError || voiceErr;
-    const errRow = errText ? `<div class="attach-err">${esc(errText)}</div>` : '';
-    const currentDraft = draftKey ? (this._drafts[draftKey] || '') : '';
-    // The voice flow owns this one view's input row: a live waveform with its
-    // own controls while recording, then a status line while this view's
-    // dictation job is transcribed (and, on the send path, sent). The textarea
-    // stays out of the DOM for the entire flow, so the phone keyboard never
-    // pops up mid-dictation. Other views are untouched — their rows render
-    // normally below, and they can dictate concurrently.
-    if (this._recState === 'recording' && this._recTarget === draftKey) {
-      return `<div class="composer">` + chipRow + errRow + recordingRowHtml() + `</div>`;
-    }
-    const job = draftKey ? this._voiceJobs[draftKey] : null;
-    if (job) {
-      const label = job.phase === 'sending' ? 'Sending …'
-        : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
-      return `<div class="composer">` + chipRow + errRow + statusRowHtml(label) + `</div>`;
-    }
-    // Only one live recording at a time — but a mere background transcription
-    // does not lock the mic here.
-    const micLabel = '\u{1F3A4}';
-    const micTitle = 'Record a voice message';
-    const micDisabled = (this._busy || this._recState !== 'idle') ? 'disabled' : '';
-    const micBtn = canRecord()
-      ? `<button type="button" class="mic" ` +
-        `data-mic title="${micTitle}" aria-label="${micTitle}" ${micDisabled}>${micLabel}</button>`
-      : '';
-    // A lean row keeps the width for the text field: mic on the left, the
-    // attach control tucked inside the field, send on the right.
-    return `<div class="composer">` + chipRow + errRow +
-      `<form class="row" data-form>` + micBtn +
-      `<div class="field">` +
-      `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" ${disabled}>` +
-      `${esc(currentDraft)}</textarea>` +
-      `<label class="clip" title="Attach a file" aria-label="Attach a file">` +
-      `<input type="file" multiple hidden data-file ${disabled}>` +
-      `<span aria-hidden="true">\u{1F4CE}</span></label>` +
-      `</div>` +
-      `<button type="submit" title="Send" aria-label="Send" ${disabled}>➤</button></form></div>`;
-  }
-
-  // Read picked files into base64 (chunked, so large files don't overflow the
-  // String.fromCharCode call stack) and stage them as pending attachments.
-  async _addFiles(fileList) {
-    this._attachError = '';
-    const draftKey = this._active || (this._composing ? 'composer' : '');
-    if (!draftKey) return;
-    if (!this._outFiles[draftKey]) this._outFiles[draftKey] = [];
-    for (const file of Array.from(fileList || [])) {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        this._attachError = `"${file.name}" is too large (max ${this._fmtSize(MAX_ATTACHMENT_BYTES)}).`;
-        continue;
-      }
-      try {
-        const buf = new Uint8Array(await file.arrayBuffer());
-        let binary = '';
-        for (let i = 0; i < buf.length; i += 0x8000) {
-          binary += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
-        }
-        this._outFiles[draftKey].push({
-          name: file.name,
-          type: file.type || 'application/octet-stream',
-          size: file.size,
-          data: btoa(binary),
-        });
-      } catch (_err) {
-        this._attachError = `Couldn't read "${file.name}".`;
-      }
-    }
-    this._focusNext = true; // return focus to the textarea to keep typing
-    this.render();
-  }
-
-  _removeFile(index) {
-    const draftKey = this._active || (this._composing ? 'composer' : '');
-    if (!draftKey || !this._outFiles[draftKey]) return;
-    this._outFiles[draftKey].splice(index, 1);
-    this._attachError = '';
-    this.render();
-  }
-
-  // ── Voice input: record → live waveform → transcribe (review or send) ──────
-  // Tapping the mic swaps the input row for a recording row: a live waveform
-  // (or a simulated one where the Web Audio API is unavailable) with three
-  // controls — abort on the left (discard the recording), and on the right a
-  // green check (transcribe, then drop the text into the composer for review)
-  // and a send button (transcribe and send in one go, with no detour through
-  // the textarea, so the phone keyboard never pops up). The server repairs the
-  // transcript before returning it, so what lands in the draft is readable
-  // rather than raw Whisper output.
-  async _startRecording() {
-    if (this._recState !== 'idle') return;
-    // Tapping the mic silences any ongoing read-aloud: you are about to speak to
-    // Ara, so a previous reply still talking over you is the wrong behaviour.
-    this._stopSpeaking();
-    const viewKey = this._viewKey();
-    // The status row hides the mic while this view's own job runs, but guard
-    // anyway: one dictation job per conversation at a time.
-    if (viewKey && this._voiceJobs[viewKey]) return;
-    if (!canRecord()) {
-      this._attachError = 'Voice recording is not supported on this device.';
-      this.render();
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      this._recStream = stream;
-      this._recChunks = [];
-      this._recIntent = null;
-      this._recAborted = false;
-      // The recording belongs to the view it runs in: that is where its
-      // controls live, and navigating away finishes it like a tap on the green
-      // check (see _finishRecordingOnLeave). So the view noted here is by
-      // construction also the view where the check/send tap — explicit or
-      // implicit — happens, and that is where the transcript lands.
-      // '' means the "new thread" composer.
-      this._recTarget = viewKey;
-      delete this._voiceErrors[viewKey];
-      const mr = new MediaRecorder(stream);
-      this._mediaRecorder = mr;
-      mr.addEventListener('dataavailable', (e) => {
-        if (e.data && e.data.size) this._recChunks.push(e.data);
-      });
-      mr.addEventListener('stop', () => this._onRecordingStopped());
-      mr.start();
-      this._recState = 'recording';
-      this._attachError = '';
-      this.render();
-      this._wave.start(stream);
-    } catch (_err) {
-      this._recState = 'idle';
-      this._recTarget = null;
-      this._attachError = 'Microphone access was denied.';
-      this._stopStream();
-      this.render();
-    }
-  }
-
-  // The view key drafts/jobs are filed under: the open thread id, or
-  // 'composer' for the new-thread composer, or '' on the list.
-  _viewKey() {
-    return this._active || (this._composing ? 'composer' : '');
-  }
-
-  // Abort: throw the recording away and return to the plain input row.
-  _abortRecording() {
-    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
-    this._recAborted = true;
-    this._stopRecording();
-  }
-
-  // Check / send buttons: stop the recorder with the chosen intent; the actual
-  // work continues in _onRecordingStopped once the recorder flushes its chunks.
-  // A decision already taken (an earlier tap, or abort) wins over later calls —
-  // this is what keeps a navigation right after a ➤ tap from downgrading the
-  // intent to 'review'.
-  _finishRecording(intent) {
-    if (this._recState !== 'recording' || this._recIntent || this._recAborted) return;
-    this._recIntent = intent;
-    this._stopRecording();
-  }
-
-  // Leaving the view that hosts a live recording is the same as tapping the
-  // green check: the recording stops, and its transcript lands in the draft of
-  // the conversation the user just left — waiting there, reviewed on return.
-  _finishRecordingOnLeave() {
-    this._finishRecording('review');
-  }
-
-  _stopRecording() {
-    try {
-      if (this._mediaRecorder && this._mediaRecorder.state !== 'inactive') {
-        this._mediaRecorder.stop();
-      }
-    } catch (_e) { /* ignore */ }
-  }
-
-  _stopStream() {
-    if (this._recStream) {
-      try { this._recStream.getTracks().forEach((tr) => tr.stop()); } catch (_e) { /* ignore */ }
-      this._recStream = null;
-    }
-  }
-
-  async _onRecordingStopped() {
-    this._wave.stop();
-    this._stopStream();
-    const chunks = this._recChunks || [];
-    this._recChunks = [];
-    const type = (this._mediaRecorder && this._mediaRecorder.mimeType)
-      || (chunks[0] && chunks[0].type) || 'audio/webm';
-    this._mediaRecorder = null;
-    const intent = this._recIntent || 'review';
-    this._recIntent = null;
-    const aborted = this._recAborted;
-    this._recAborted = false;
-    // The view the recording ran in — where the check/send tap (or the
-    // navigation that acted as one) happened, and where the transcript lands.
-    const target = this._recTarget != null ? this._recTarget : this._viewKey();
-    this._recTarget = null;
-    this._recState = 'idle';
-    if (aborted || !chunks.length) {
-      this.render();
-      return;
-    }
-    const blob = new Blob(chunks, { type });
-    // From here on the dictation is a background job of its target view alone:
-    // the recorder is free again, other conversations keep their normal input
-    // row (text and voice), and only the target's row shows the status line.
-    if (target) this._voiceJobs[target] = { sending: intent === 'send', phase: 'transcribing' };
-    this.render();
-    let toSend = '';
-    try {
-      // The target thread is context for the cleanup pass: it is what tells the
-      // model which names and topics this dictation is likely to be about.
-      // 'composer' is a UI key, not a thread id — only a real thread id is sent.
-      const q = (target && target !== 'composer')
-        ? `?thread=${encodeURIComponent(target)}` : '';
-      const res = await fetch(`/conversations/transcribe${q}`, {
-        method: 'POST',
-        headers: { 'Content-Type': blob.type || 'application/octet-stream' },
-        body: blob,
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const data = await res.json();
-      const text = ((data && data.text) || '').trim();
-      if (text) {
-        this._appendToDraft(text, target);
-        // Send the whole draft, so anything typed before dictating comes along.
-        if (intent === 'send' && target) toSend = this._drafts[target] || '';
-      } else {
-        this._voiceErrors[target] = 'No speech was detected in the recording.';
-      }
-    } catch (_err) {
-      this._voiceErrors[target] = "Couldn't transcribe the recording. Please try again.";
-    }
-    if (toSend) {
-      // Send path: the status row stays in place of the textarea until the
-      // send completes, so the keyboard never appears. _send() re-renders only
-      // when the user is looking at the target; on failure it leaves the
-      // draft in place, which then shows up (unfocused) for a manual retry.
-      if (target) this._voiceJobs[target].phase = 'sending';
-      await this._send(toSend, target);
-    }
-    delete this._voiceJobs[target];
-    // Completion must not interrupt whatever the user is doing now: only when
-    // they are still looking at the target view is it re-rendered — and only
-    // the deliberate review flow pulls up the keyboard. A background job's
-    // result just sits in that conversation's draft (or error slot) until the
-    // user returns to it.
-    if (this._viewKey() === target) {
-      this._focusNext = intent === 'review';
-      this.render();
-    }
-  }
-
-  // Model dropdown changed. In the composer it just holds the choice for the
-  // thread we're about to create. In an open thread it's persisted server-side
-  // right away (takes effect on the next turn) so a page reload keeps it.
-  async _onModelChange(value) {
-    const model = value || '';
-    if (this._composing || !this._active) {
-      this._composeModel = model;
-      return;
-    }
-    // Optimistic: reflect it locally, then persist. On failure, re-render
-    // restores the server's value on the next poll.
-    if (this._thread) this._thread.model = model;
-    try {
-      await fetch(`/conversations/${this._active}/model`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model }),
-      });
-    } catch (_err) { /* next poll re-syncs the real value */ }
-    this.refresh();
-  }
-
-  // `target` (a thread id, or 'composer') pins where the text lands; omitted, it
-  // falls back to the open view. Dictation passes the thread captured at
-  // record-start so the transcript lands there even if the user navigated away.
-  _appendToDraft(text, target) {
-    const draftKey = target != null
-      ? target
-      : (this._active || (this._composing ? 'composer' : ''));
-    if (!draftKey) return;
-    const cur = this._drafts[draftKey] || '';
-    this._drafts[draftKey] = cur ? `${cur.replace(/\s*$/, '')} ${text}` : text;
-  }
-
-  // ── Voice output: speak Ara's replies via the browser's speech synth ───────
-  // Stop any read-aloud in progress and forget what was being spoken.
-  _stopSpeaking() {
-    try { if ('speechSynthesis' in window) window.speechSynthesis.cancel(); } catch (_e) { /* ignore */ }
-    this._speakingTs = null;
-  }
-
-  _toggleAutoplay() {
-    this._autoplay = !this._autoplay;
-    try { localStorage.setItem('retinue-voice-autoplay', this._autoplay ? '1' : '0'); } catch (_e) { /* ignore */ }
-    if (!this._autoplay) this._stopSpeaking();
-    this.render();
-  }
-
-  _onSpeakButton(btn) {
-    const idx = Number(btn.dataset.speakIdx);
-    const msgs = (this._thread && this._thread.messages) || [];
-    const m = msgs[idx];
-    if (!m) return;
-    // Second tap on the message being spoken stops it.
-    if (this._speakingTs === m.ts && window.speechSynthesis && window.speechSynthesis.speaking) {
-      this._stopSpeaking();
-      return;
-    }
-    this._speak(m.text, m.lang, m.ts);
-  }
-
-  _speak(text, lang, ts) {
-    if (!('speechSynthesis' in window)) return;
-    const clean = this._plainForSpeech(text);
-    if (!clean) return;
-    try {
-      window.speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(clean);
-      // Use the server-provided language tag. Detection is done server-side and
-      // is language-agnostic — the client privileges no language, so an
-      // untagged message just reads with the browser's default voice.
-      const code = lang;
-      if (code) {
-        u.lang = code;
-        // Setting u.lang alone is not enough in some browsers — they keep the
-        // default (often English) voice. Pick a matching voice explicitly.
-        const voice = this._voiceFor(code);
-        if (voice) u.voice = voice;
-      }
-      this._speakingTs = ts || null;
-      const done = () => { if (this._speakingTs === (ts || null)) this._speakingTs = null; };
-      u.addEventListener('end', done);
-      u.addEventListener('error', done);
-      window.speechSynthesis.speak(u);
-    } catch (_e) { /* ignore */ }
-  }
-
-  // Pick a speechSynthesis voice whose language matches `code` (e.g. 'de').
-  // Prefers a local voice; caches nothing since getVoices() may populate late.
-  _voiceFor(code) {
-    const want = String(code || '').slice(0, 2).toLowerCase();
-    if (!want) return null;
-    let voices = [];
-    try { voices = window.speechSynthesis.getVoices() || []; } catch (_e) { return null; }
-    const match = voices.filter((v) => (v.lang || '').slice(0, 2).toLowerCase() === want);
-    if (!match.length) return null;
-    return match.find((v) => v.localService) || match[0];
-  }
-
-  // Strip Markdown so the synthesizer reads clean prose (no backticks, asterisks,
-  // "greater-than" quote markers, or raw URLs — link labels are kept).
-  _plainForSpeech(text) {
-    return String(text == null ? '' : text)
-      .replace(/```[\s\S]*?```/g, ' ')
-      .replace(/`([^`]+)`/g, '$1')
-      .replace(/^\s*>\s?/gm, '')
-      .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1')
-      .replace(/[*_#]+/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-  }
-
-  // When autoplay is on, speak assistant messages that arrive after the thread
-  // was opened. The first look at a thread only records its existing messages as
-  // "seen" so historical replies are never blurted out on open.
-  _maybeAutoplay(t) {
-    if (!t || !('speechSynthesis' in window)) return;
-    const cid = t.id;
-    if (!this._spoken[cid]) this._spoken[cid] = new Set();
-    const seen = this._spoken[cid];
-    const replies = (t.messages || []).filter((m) => m.role !== 'user' && (m.text || '').trim());
-    if (!this._autoReady[cid]) {
-      replies.forEach((m) => seen.add(m.ts));
-      this._autoReady[cid] = true;
-      return;
-    }
-    const fresh = replies.filter((m) => !seen.has(m.ts));
-    fresh.forEach((m) => seen.add(m.ts));
-    if (!this._autoplay || !fresh.length) return;
-    const last = fresh[fresh.length - 1];
-    this._speak(last.text, last.lang, last.ts);
-  }
-
   _wire() {
     const root = this.shadowRoot;
     root.querySelectorAll('[data-open]').forEach((el) =>
       el.addEventListener('click', () => this._openThread(el.getAttribute('data-open'))));
     const nw = root.querySelector('[data-new]');
     if (nw) nw.addEventListener('click', () => this._openComposer());
-    const back = root.querySelector('[data-back]');
-    if (back) back.addEventListener('click', () => this._openList());
-    const att = root.querySelector('[data-attention]');
-    if (att) att.addEventListener('click', () => openAttentionSheet(`thread:${this._active}`, { here: true }));
-    const arch = root.querySelector('[data-archive]');
-    if (arch) arch.addEventListener('click', () => this._archive(this._active, true));
-    const unarch = root.querySelector('[data-unarchive]');
-    if (unarch) unarch.addEventListener('click', () => this._archive(this._active, false));
     root.querySelectorAll('[data-scope]').forEach((el) =>
       el.addEventListener('click', () => this._setScope(el.getAttribute('data-scope'))));
     root.querySelectorAll('[data-setview]').forEach((el) =>
@@ -1393,90 +503,6 @@ class RetinueConversations extends HTMLElement {
         setViewPref('conversations', this._view);
         this.render();
       }));
-    // Delegate copy-button clicks on the thread container: it survives the
-    // in-place innerHTML swaps of _partialUpdate, so one listener covers the
-    // quote-block copy buttons across polls.
-    const threadEl = root.querySelector('.thread');
-    if (threadEl) {
-      threadEl.addEventListener('click', (e) => {
-        const btn = e.target.closest('.copy');
-        if (btn) { this._copyToClipboard(btn); return; }
-        const chip = e.target.closest('.md-chip');
-        if (chip) { this._fillComposer(chip.getAttribute('data-fill') || ''); return; }
-        const sbtn = e.target.closest('.speak');
-        if (sbtn) this._onSpeakButton(sbtn);
-      });
-    }
-    const mic = root.querySelector('[data-mic]');
-    if (mic) mic.addEventListener('click', () => this._startRecording());
-    const recAbort = root.querySelector('[data-rec-abort]');
-    if (recAbort) recAbort.addEventListener('click', () => this._abortRecording());
-    const recCheck = root.querySelector('[data-rec-check]');
-    if (recCheck) recCheck.addEventListener('click', () => this._finishRecording('review'));
-    const recSend = root.querySelector('[data-rec-send]');
-    if (recSend) recSend.addEventListener('click', () => this._finishRecording('send'));
-    const modelSel = root.querySelector('[data-model]');
-    if (modelSel) modelSel.addEventListener('change', () => this._onModelChange(modelSel.value));
-    const ap = root.querySelector('[data-autoplay]');
-    if (ap) ap.addEventListener('click', () => this._toggleAutoplay());
-    const fileInput = root.querySelector('[data-file]');
-    if (fileInput) {
-      fileInput.addEventListener('change', () => {
-        // Snapshot the picked files into an array *before* resetting the input.
-        // `fileInput.files` is a live FileList; setting `value = ''` (done so the
-        // same file can be re-picked after removal) empties that very list, so
-        // reading it afterwards yields zero files and no attachment ever appears.
-        const picked = Array.from(fileInput.files || []);
-        fileInput.value = '';  // allow re-picking the same file after removal
-        this._addFiles(picked);
-      });
-    }
-    root.querySelectorAll('[data-rmfile]').forEach((el) =>
-      el.addEventListener('click', () => this._removeFile(Number(el.getAttribute('data-rmfile')))));
-    const form = root.querySelector('[data-form]');
-    if (form) {
-      const input = form.querySelector('textarea');
-      const grow = () => {
-        input.style.height = 'auto';
-        input.style.height = `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
-      };
-      // Persist what the user is typing so a background poll re-render doesn't
-      // wipe it (the input's value is rebuilt from this._drafts on each render).
-      input.addEventListener('input', () => {
-        const draftKey = this._active || (this._composing ? 'composer' : '');
-        if (draftKey) {
-            this._drafts[draftKey] = input.value;
-        }
-        grow();
-      });
-      input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-          e.preventDefault();
-          form.requestSubmit();
-        }
-      });
-      grow();
-      form.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const text = input.value;
-        const draftKey = this._active || (this._composing ? 'composer' : '');
-        const currentOutFiles = draftKey ? (this._outFiles[draftKey] || []) : [];
-        if (text.trim() || currentOutFiles.length) this._send(text);
-      });
-      // Restore focus and caret after a re-render so typing isn't interrupted,
-      // but only when the field already had focus or a view was just opened —
-      // a background poll re-render must not steal focus or pop the keyboard.
-      const wantFocus = (this._hadFocus || this._focusNext) && !this._busy;
-      this._focusNext = false;
-      if (wantFocus) {
-        setTimeout(() => {
-          if (!input.isConnected) return;
-          input.focus();
-          const end = input.value.length;
-          try { input.setSelectionRange(end, end); } catch (_err) { /* ignore */ }
-        }, 0);
-      }
-    }
   }
 }
 
@@ -1484,7 +510,7 @@ const CSS = `
   :host { display: flex; flex-direction: column; min-height: 0; height: 100%; }
   * { box-sizing: border-box; }
   button { font: inherit; }
-  button:focus-visible, a:focus-visible, textarea:focus-visible {
+  button:focus-visible, a:focus-visible {
     outline: 2px solid var(--accent, #6ea8fe); outline-offset: 1px; }
 
   /* The card is chrome-less on phones (edge-to-edge, app-like) and becomes a
@@ -1501,7 +527,8 @@ const CSS = `
   .badge { background: var(--high, #ff6b6b); color: #fff; font-size: .7rem; font-weight: 700;
            border-radius: 10px; padding: 1px 7px; }
   .content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-  .muted { color: var(--muted, #8b93a3); margin: 4px 0; }
+  /* The open conversation fills the card; it lays itself out inside. */
+  retinue-conversation { flex: 1; min-height: 0; }
 
   /* ── List view ─────────────────────────────────────────────────────────── */
   /* On phones the PAGE is the scroller (see styles.css), so .tabs must NOT be
@@ -1551,11 +578,6 @@ const CSS = `
   .t-meta { color: var(--muted, #8b93a3); font-size: .72rem; white-space: nowrap; }
   .t-prev { grid-column: 1 / -1; color: var(--muted, #8b93a3); font-size: .8rem; line-height: 1.35;
             display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .about-chip { flex: none; align-self: flex-start; margin-top: 10px; padding: 5px 12px;
-                border-radius: 999px; background: var(--card-2, #1c2230);
-                border: 1px solid var(--accent, #6ea8fe); color: var(--fg, #e7ebf2);
-                font-size: .78rem; font-weight: 600; max-width: 100%;
-                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
            gap: 6px; color: var(--muted, #8b93a3); text-align: center; padding: 24px 12px; }
   .empty .e-ico { font-size: 2rem; opacity: .55; }
@@ -1573,157 +595,6 @@ const CSS = `
   .all-link { color: var(--accent, #6ea8fe); text-decoration: none; font-size: .85rem;
               text-align: center; padding: 2px; }
   .all-link:hover { text-decoration: underline; }
-
-  /* ── Thread view ───────────────────────────────────────────────────────── */
-  .thread-bar { flex: none; display: flex; align-items: center; gap: 10px; padding: 2px 0 10px;
-                border-bottom: 1px solid var(--line, rgba(231, 235, 242, .08)); }
-  .back { flex: none; width: 34px; height: 34px; border-radius: 50%; border: 0;
-          background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); cursor: pointer;
-          font-size: 1.35rem; line-height: 1; display: inline-flex; align-items: center;
-          justify-content: center; padding: 0 2px 2px 0; -webkit-tap-highlight-color: transparent; }
-  .bar-title { flex: 1; min-width: 0; font-weight: 650; overflow: hidden;
-               text-overflow: ellipsis; white-space: nowrap; }
-  .bar-actions { flex: none; display: inline-flex; align-items: center; gap: 6px; }
-  .iconbtn { width: 34px; height: 34px; border-radius: 50%; background: transparent;
-             border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);
-             cursor: pointer; font-size: .95rem; display: inline-flex; align-items: center;
-             justify-content: center; padding: 0; }
-  .iconbtn:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
-  .iconbtn.on { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
-  .pill { background: transparent; border: 1px solid var(--line, rgba(231, 235, 242, .08));
-          border-radius: 999px; color: var(--muted, #8b93a3); cursor: pointer;
-          padding: 6px 12px; font-size: .78rem; white-space: nowrap; }
-  .pill:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
-  .model-pick { flex: none; display: inline-flex; align-items: center; gap: 3px;
-                color: var(--muted, #8b93a3); }
-  .model-pick .mp-ico { font-size: .9rem; line-height: 1; }
-  .model-pick select { background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
-                       border: 1px solid var(--line, rgba(231, 235, 242, .08));
-                       border-radius: 999px; padding: 5px 8px; font-size: .74rem;
-                       max-width: 9.5rem; cursor: pointer; -webkit-appearance: none;
-                       appearance: none; }
-  .model-pick select:hover { border-color: var(--accent, #6ea8fe); }
-  /* A phone's thread bar cannot hold the back button, the picker, the
-     attention ⓘ, the speaker toggle and Archive beside the title — squeezed
-     into one row the title kept its first four letters. So on a phone the
-     title keeps the row with the back button (two lines before it cuts, as
-     in the list) and the controls wrap to a row under it, the way the chat
-     page's Archive and Mute switches sit under its header. */
-  @media (max-width: 480px) {
-    .thread-bar { flex-wrap: wrap; row-gap: 8px; }
-    .bar-title { white-space: normal; overflow-wrap: anywhere; display: -webkit-box;
-                 -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-height: 1.3; }
-    .bar-actions { flex: 1 0 100%; padding-left: 44px; }
-    .bar-actions:empty { display: none; }
-  }
-  /* The composer's roomy form: a captioned, untruncated picker centered under
-     the "Ask Ara anything" hint, so the model choice is plainly offered before
-     the conversation starts. */
-  .model-pick.wide { gap: 8px; margin-top: 14px; }
-  .model-pick.wide .mp-label { font-size: .8rem; }
-  .model-pick.wide select { max-width: none; font-size: .85rem; padding: 7px 12px; }
-  .thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
-            display: flex; flex-direction: column; gap: 12px; padding: 12px 2px; }
-  /* An open thread takes the whole frame, which on a wide display is far wider
-     than a comfortable line. Centre the messages and the composer in a reading
-     column; the bar keeps its full-width divider. */
-  @media (min-width: 1000px) {
-    .thread, .composer {
-      width: 100%; max-width: 900px; margin-left: auto; margin-right: auto; }
-  }
-  .msg { display: flex; flex-direction: column; gap: 3px; max-width: 86%; }
-  .msg.me { align-self: flex-end; align-items: flex-end; }
-  .who { color: var(--muted, #8b93a3); font-size: .7rem; }
-  /* The quiet header meta after the sender name: model · ~$cost · time. All one
-     muted, small line so it never competes with the message body. */
-  .msg-meta { color: var(--muted, #8b93a3); font-size: .7rem;
-              display: inline-flex; align-items: baseline; gap: 5px; flex-wrap: wrap; }
-  .msg-meta .m-sep { opacity: .5; }
-  .msg-meta .m-cost { font-variant-numeric: tabular-nums; }
-  .msg-meta .m-model { font-weight: 600; }
-  /* Message text is rendered by the shared Markdown renderer (its .md styles
-     are appended after this sheet), so the bubble needs no pre-wrap: block
-     structure comes from the renderer. */
-  .bubble { background: var(--card-2, #1c2230); border-radius: 16px; padding: 9px 13px;
-            line-height: 1.4; }
-  .msg.ara .bubble, .msg.agent .bubble { border-bottom-left-radius: 6px; }
-  .msg.me .bubble { background: var(--accent, #6ea8fe); color: #0b0d12; border-bottom-right-radius: 6px; }
-  .msg.agent .bubble { border: 1px solid var(--accent, #6ea8fe); }
-  .bubble a { color: var(--accent, #6ea8fe); text-decoration: underline; overflow-wrap: anywhere; }
-  .msg.me .bubble .md a, .msg.me .bubble a { color: #0b0d12; }
-  .msg.me .bubble .md code, .msg.me .bubble code { background: rgba(11, 13, 18, .15); }
-  .attachments { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
-  .attach-row { display: flex; align-items: stretch; gap: 6px; }
-  .attach-row .attach { flex: 1 1 auto; }
-  .a-dl { flex: none; display: flex; align-items: center; padding: 0 11px; border-radius: 8px;
-          border: 1px solid var(--accent, #6ea8fe); background: rgba(110, 168, 254, .1);
-          color: inherit; text-decoration: none; font-size: .9rem; }
-  .a-dl:hover { background: rgba(110, 168, 254, .2); }
-  .msg.me .a-dl { border-color: rgba(11, 13, 18, .4); background: rgba(11, 13, 18, .12); }
-  .attach { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 8px;
-            border: 1px solid var(--accent, #6ea8fe); background: rgba(110, 168, 254, .1);
-            color: inherit; text-decoration: none; font-size: .82rem; white-space: normal; }
-  .attach:hover { background: rgba(110, 168, 254, .2); }
-  .attach .a-icon { flex: none; }
-  .attach .a-name { flex: 1 1 auto; overflow-wrap: anywhere; }
-  .attach .a-size { flex: none; color: var(--muted, #8b93a3); font-size: .72rem; }
-  .msg.me .attach { border-color: rgba(11, 13, 18, .4); background: rgba(11, 13, 18, .12); }
-  .msg.me .attach .a-size { color: rgba(11, 13, 18, .7); }
-  .quote { margin: 6px 0; padding: 8px 10px; border-left: 3px solid var(--accent, #6ea8fe);
-           background: rgba(110, 168, 254, .1); border-radius: 8px;
-           display: flex; flex-direction: column; gap: 6px; }
-  .quote:first-child { margin-top: 0; }
-  .quote:last-child { margin-bottom: 0; }
-  .q-text { white-space: pre-wrap; line-height: 1.4; }
-  .copy { align-self: flex-end; background: var(--accent, #6ea8fe); color: #0b0d12; border: 0;
-          border-radius: 8px; padding: 3px 10px; font: inherit; font-size: .74rem; font-weight: 600;
-          cursor: pointer; }
-  .copy.done { background: var(--ok, #57c785); }
-  .code-wrap { position: relative; }
-  .code-wrap .md-pre { margin: 6px 0; }
-  .code-copy { position: absolute; top: 6px; right: 6px; padding: 2px 8px; font-size: .7rem;
-               opacity: .85; }
-  .code-wrap:hover .code-copy, .code-copy:focus { opacity: 1; }
-  .bubble.pending { color: var(--muted, #8b93a3); font-style: italic; }
-  .pending-help { display: block; margin-top: 4px; font-size: .72rem; line-height: 1.35; color: var(--muted, #8b93a3); }
-  .composer { flex: none; margin-top: 4px; padding-top: 10px;
-              border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
-  .row { display: flex; gap: 6px; align-items: flex-end; }
-  .field { flex: 1; min-width: 0; position: relative; display: flex; }
-  .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 35vh; background: var(--card-2, #1c2230);
-                 border: 0; border-radius: 20px; padding: 9px 42px 9px 14px; color: var(--fg, #e7ebf2);
-                 font: inherit; line-height: 1.35; resize: none; overflow-y: auto; }
-  .row textarea::placeholder { color: var(--muted, #8b93a3); }
-  .row textarea:focus-visible { outline: 1px solid rgba(110, 168, 254, .45); outline-offset: 0; }
-  .row button[type="submit"] { flex: none; display: inline-flex; align-items: center; justify-content: center;
-                width: 40px; height: 40px; border-radius: 50%; background: var(--accent, #6ea8fe);
-                color: #0b0d12; border: 0; font-size: 1.05rem; cursor: pointer; padding: 0 0 0 2px;
-                -webkit-tap-highlight-color: transparent; }
-  /* The attach control sits inside the text field's bottom-right corner, so it
-     costs the row no width of its own. */
-  .clip { position: absolute; right: 3px; bottom: 3px; display: inline-flex; align-items: center;
-          justify-content: center; height: 34px; width: 34px; border-radius: 50%;
-          background: transparent; color: var(--muted, #8b93a3); cursor: pointer;
-          font-size: 1rem; user-select: none; -webkit-tap-highlight-color: transparent; }
-  .clip:hover { background: rgba(110, 168, 254, .2); }
-  /* Mic button, recording row and status row styles come from the shared
-     VOICE_CSS (voice.js), appended to this sheet in render(). */
-  .msg-head { display: flex; align-items: center; gap: 6px; }
-  .msg.me .msg-head { flex-direction: row-reverse; }
-  .speak { background: transparent; border: 0; cursor: pointer; padding: 0 2px; font-size: .8rem;
-           line-height: 1; opacity: .65; }
-  .speak:hover { opacity: 1; }
-  .row button[disabled], .row textarea[disabled], .clip:has(input[disabled]) { opacity: .6; cursor: default; }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-  .chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 4px 6px 4px 10px;
-          border-radius: 999px; background: var(--card-2, #1c2230); border: 1px solid var(--accent, #6ea8fe);
-          font-size: .78rem; }
-  .chip .c-name { overflow-wrap: anywhere; }
-  .chip .c-size { color: var(--muted, #8b93a3); font-size: .7rem; }
-  .chip .c-x { background: none; border: 0; color: var(--muted, #8b93a3); cursor: pointer;
-               font-size: 1rem; line-height: 1; padding: 0 2px; }
-  .chip .c-x:hover { color: var(--high, #ff6b6b); }
-  .attach-err { color: var(--high, #ff6b6b); font-size: .76rem; margin-bottom: 8px; }
 `;
 
 customElements.define('retinue-conversations', RetinueConversations);

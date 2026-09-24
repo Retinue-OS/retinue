@@ -236,7 +236,7 @@ class MockStore(BaseHTTPRequestHandler):
         for p in story.PROJECTS:
             if p.get("paused") and p["story"] not in self.sim.woken:
                 continue
-            base = {"p": cell(p["id"]), "title": cell(p["title"]), "actor": cell(self.sim.wg._RETO if p["actor"] == "you" else p["actor"]),
+            base = {"p": cell(p["id"]), "title": cell(p["title"]), "actor": cell(self.sim.wg._OWNER_ACTOR if p["actor"] == "you" else p["actor"]),
                     "importance": cell(str(p["importance"])), "sphere": cell(p["sphere"]), "kind": cell(p["kind"]),
                     "next": cell(p.get("next", ""))}
             if p.get("expected") is not None:
@@ -442,8 +442,8 @@ class Simulation:
             self.ledger.reset()
             wg = self.wg
             # The generated chamber holds what outlives a session — the
-            # delivery gate's whitelist, the address book, the attention emit
-            # — so midnight has to wipe it too, or yesterday's contact card
+            # delivery gate's policy, the address book, the attention emit —
+            # so midnight has to wipe it too, or yesterday's contact card
             # would make today's stranger a known sender.
             for d in (wg.CONVERSATIONS_DIR, wg.CHAT_STATE_DIR, wg.ATTENTION_DIR,
                       wg.CHAMBERS_DIR / "_generated", wg.CHAMBERS_DIR / "story"):
@@ -594,8 +594,8 @@ class Simulation:
                 attention = {k: v for k, v in tr.items() if k != "due"}
                 if tr.get("due") is not None:
                     attention["due"] = self.clock.at(tr["due"]).isoformat()
-                # A triage turn knows the sender's sphere because the sender is
-                # known. For someone the gate flagged unknown there is nothing
+                # Whoever classified the message knows the sender's sphere
+                # because the sender is known. For a stranger there is nothing
                 # to know: the sphere is the model's to withhold, and later the
                 # contact card's to set.
                 if not c.get("unknown"):
@@ -626,22 +626,21 @@ class Simulation:
             wg._chats_cache_invalidate()
 
     def _gate(self, ev: dict, c: dict) -> dict:
-        """The delivery gate's verdict on this arrival.
+        """The delivery gate's verdict on this arrival, from the real policy
+        (scripts/triage_policy.py) against the real policy file.
 
-        The day's known correspondents are whitelisted by construction; anyone
-        marked `unknown` in the story is routed through the real policy
-        (scripts/triage_policy.py) against the real policy file — so a handle
-        the contact card whitelisted at 13:56 genuinely arrives as a known
-        sender at 16:20, and the difference is the gate's, not the script's."""
-        if not c.get("unknown"):
-            return {"forward": True, "reason": "whitelisted", "unknown": False}
+        Nobody in the day is a VIP, so the gate vouches for no one: whether a
+        sender is a stranger is what the dashboard knows about them — the
+        profile's spheres, the contact card. Nadia at 13:50 and at 16:20 get
+        the same verdict; the difference is the card, not the gate."""
         dec = self.wg.triage_policy.gate_decision(c["channel"], _sender_key(ev),
                                                   c["chat"] if c.get("group") else None)
-        verdict = {"forward": bool(dec["forward"]), "reason": str(dec["reason"]),
-                   "unknown": bool(dec["flagged_unknown"])}
-        self.say("system", f"delivery gate ({c['channel']}): {_sender_key(ev)} — {verdict['reason']}"
-                           + ("; a model turn now, flagged as an unknown sender" if verdict["unknown"]
-                              else "; a model turn now, as a known sender"))
+        verdict = {"forward": bool(dec["forward"]), "vip": bool(dec["vip"]),
+                   "reason": str(dec["reason"])}
+        if c.get("unknown"):
+            self.say("system", f"delivery gate ({c['channel']}): {_sender_key(ev)} — {verdict['reason']}; "
+                               + ("a VIP" if verdict["vip"]
+                                  else "not a VIP, so the dashboard decides from what it knows about her"))
         return verdict
 
     def _open_agent_thread(self, story_id: str, title: str, dlg: dict, agent: str | None, attention: dict,
@@ -853,9 +852,6 @@ class Simulation:
         self.say("you", f"You file {contact.get('name')} as a contact ({groups}).")
         for line in body.get("learned_now") or []:
             self.say("learn", line)
-        for handle in body.get("whitelisted") or []:
-            self.say("learn", f"{handle} is on the {chat.split(':', 1)[0]} whitelist: "
-                              f"her next message earns a triage turn as a known sender")
         item = body.get("item")
         if item:
             self.say("system", f"{item['title']}: sphere {item['sphere']}"

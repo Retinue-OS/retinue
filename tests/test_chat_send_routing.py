@@ -351,17 +351,65 @@ def test_media_references_resolve_through_the_chats_account():
         # wrong for every extra account.
         for ref in (urn, legacy):
             att = wg._shape_chat_attachments(
-                [ref], "signal", serving_slug="signal-gateway-personal")[0]
+                [ref], serving_slug="signal-gateway-personal")[0]
             assert att["url"] == f"/chats/media/signal-gateway-personal/{mid}"
             assert att["id"] == mid
 
-        # Without a resolved account: a legacy record falls back to its
-        # recorded host, a host-free one passes through and plainly fails to
-        # load. Both are honest failures in a chat whose account is ambiguous.
-        assert wg._shape_chat_attachments([legacy], "signal")[0]["url"] == \
+        # No gateway to ask (a channel with none in the registry): a legacy
+        # record falls back to its recorded host, a host-free one passes
+        # through and plainly fails to load. Both are honest failures —
+        # there is nobody to ask. (An *ambiguous* account is not this case:
+        # see test_two_inbox_accounts_still_serve_media.)
+        assert wg._shape_chat_attachments([legacy])[0]["url"] == \
             f"/chats/media/signal-gateway/{mid}"
-        assert wg._shape_chat_attachments([urn], "signal")[0]["url"] == urn
+        assert wg._shape_chat_attachments([urn])[0]["url"] == urn
     print("PASS test_media_references_resolve_through_the_chats_account")
+
+
+def test_two_inbox_accounts_still_serve_media():
+    """Serving a blob is not sending as an account.
+
+    The defect: the send resolver's refusal ("cannot tell which account") was
+    handed down as "no gateway may serve this chat's media", so every legacy
+    chat of a two-account channel rendered broken pictures. A blob needs a
+    gateway that *has* it, and a gateway asked for one it lacks says so —
+    so the media resolver ranks the channel's gateways, most likely first,
+    and refuses nothing. Sending keeps refusing exactly as before."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        _registry(wg, **{"signal-gateway": _inbox(SYSTEM),
+                         "signal-gateway-personal": _inbox(PERSONAL)})
+        _slug, gw, err = wg._chat_gateway({}, "signal")
+        assert gw is None and "cannot tell which account" in err
+        slugs = lambda *a, **k: [s for s, _ in wg._media_gateways(*a, **k)]  # noqa: E731
+        # Unattributed: every inbox gateway of the channel, registry order.
+        assert slugs("signal") == ["signal-gateway", "signal-gateway-personal"]
+        # The chat's account names the gateway that stored its records: first.
+        assert slugs("signal", PERSONAL) == ["signal-gateway-personal", "signal-gateway"]
+        assert slugs("signal", SYSTEM) == ["signal-gateway", "signal-gateway-personal"]
+        # An account-derived stamp ranks next; any other stamp is ignored.
+        assert slugs("signal", None, _stamp()) == ["signal-gateway-personal", "signal-gateway"]
+        assert slugs("signal", None, _stamp("legacy")) == ["signal-gateway", "signal-gateway-personal"]
+        # Unknown account, unknown stamp: still the channel's gateways, never [].
+        assert slugs("signal", "+41000000000", _stamp(slug="nope")) == \
+            ["signal-gateway", "signal-gateway-personal"]
+        # Another channel, or none: nobody to ask.
+        assert slugs("whatsapp") == [] and slugs("") == []
+        # The slug → channel reading the media handler uses to find siblings.
+        assert wg._slug_channel("signal-gateway-personal") == "signal"
+        assert wg._slug_channel("nope") is None
+
+        # A control account never serves ledger media, not even ranked last.
+        _registry(wg, **{"signal-gateway": _control(SYSTEM),
+                         "signal-gateway-personal": _inbox(PERSONAL)})
+        assert slugs("signal") == ["signal-gateway-personal"]
+        assert slugs("signal", SYSTEM) == ["signal-gateway-personal"]
+        # The whole ranking feeds the message payload: the first slug serves.
+        mid = "ab" * 16
+        att = wg._shape_chat_attachments([f"urn:retinue:media:signal:{mid}"],
+                                         serving_slug=slugs("signal")[0])[0]
+        assert att["url"] == f"/chats/media/signal-gateway-personal/{mid}"
+    print("PASS test_two_inbox_accounts_still_serve_media")
 
 
 def test_channel_membership():
@@ -394,5 +442,6 @@ if __name__ == "__main__":
     test_unknown_mode_is_never_eligible()
     test_rail_attributes_by_account_not_self_slug()
     test_media_references_resolve_through_the_chats_account()
+    test_two_inbox_accounts_still_serve_media()
     test_channel_membership()
     print("all chat send-routing tests passed")

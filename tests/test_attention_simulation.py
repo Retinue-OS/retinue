@@ -53,11 +53,11 @@ def main():
     # The day is today's date, so the digest's weekday is whatever today is.
     held = f"held until {sim.clock.at(17 * 60):%a} 17:00 — Focused on customers — this is not"
     assert any(held in x and "+41791000042" in x for x in system), system
-    assert any("+41791000042 — unknown" in x and "flagged as an unknown sender" in x
-               for x in system), system
-    assert any("+41791000042 — whitelisted" in x for x in system), system
+    # The gate vouches for her neither time (no VIP): the card is the difference.
+    assert sum("+41791000042 — open; not a VIP" in x for x in system) == 2, system
     assert any("sphere customers + friends" in x for x in system), system
-    assert any("whitelist" in x and "+41791000042" in x for x in learned), learned
+    assert any("sphere for Nadia Brunner" in x for x in learned), learned
+    assert not any("whitelist" in x for x in system + learned), (system, learned)
     end = sim.snapshot()["attention"]["counts"]
     assert end["now"] == 0 and end["waiting"] == 2, end
     # Seeking back replays cleanly to the same state.

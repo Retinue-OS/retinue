@@ -56,7 +56,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 #
 # .github/workflows/check-claude-code.yml watches the npm registry and opens
 # a bump PR against this ARG when a newer version appears.
-ARG CLAUDE_CODE_VERSION=2.1.260
+ARG CLAUDE_CODE_VERSION=2.1.281
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 
 # ── Core Python dependencies ────────────────────────────────────────
@@ -72,10 +72,25 @@ COPY scripts/        /workspace/scripts/
 COPY .claude/        /workspace/.claude/
 COPY .claude-plugin/ /workspace/.claude-plugin/
 COPY CLAUDE.md       /workspace/CLAUDE.md
+# The framework base schedule: scheduler.py reads it from /workspace/.schedule.json
+# (BASE_SCHEDULE), so unbaked it is simply absent and every cross-cutting job in
+# it — news-fetch, news-curate, agent-self-review, recurring-projects — silently
+# never runs, with only the chamber manifests left to schedule anything.
+COPY .schedule.json  /workspace/.schedule.json
 COPY examples/       /workspace/examples/
 COPY docs/           /workspace/docs/
 COPY webapp/         /workspace/webapp/
 RUN chmod +x /workspace/scripts/*.sh && mkdir -p /workspace/chambers
+
+# The commit this image was built from, when the build passes one (compose
+# forwards $RETINUE_BUILD_SHA; the updater's default recipe sets it after the
+# pull). Unset is fine and honest — /health then reports sha: null, and the
+# framework digest identifies the build either way. See scripts/build_stamp.py.
+#
+# Last, deliberately: the sha changes on every commit, so an earlier ENV would
+# invalidate the COPY layers above for a change that touches none of them.
+ARG RETINUE_BUILD_SHA=""
+ENV RETINUE_BUILD_SHA=${RETINUE_BUILD_SHA}
 
 # ── Entrypoint ──────────────────────────────────────────────────────
 COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh

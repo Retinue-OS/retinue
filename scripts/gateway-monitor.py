@@ -18,7 +18,8 @@ messages go unanswered. This daemon closes that gap:
     status and the pairing QR code to scan.
   * While a gateway stays down it re-reminds in the same thread every
     GATEWAY_MONITOR_REMIND_SECONDS (default 6 h); when the link comes back it
-    reports the recovery in that thread too.
+    records the recovery in that thread quietly — no push, no unread badge,
+    and an archived thread stays archived.
 
 Gateways that report ``configured: false`` (a channel the deployment simply
 does not use) are skipped, as are slugs listed in GATEWAY_MONITOR_IGNORE.
@@ -175,7 +176,7 @@ class MonitorEngine:
         if verdict == "up":
             if entry.get("status") == "down":
                 if entry.get("notified") and entry.get("thread_id"):
-                    self.notifier.append(entry["thread_id"], recovery_message(label))
+                    self.notifier.append(entry["thread_id"], recovery_message(label), quiet=True)
                 print(f"{LOG} {slug}: recovered", flush=True)
             self.state[slug] = {"status": "up", "fails": 0}
             return

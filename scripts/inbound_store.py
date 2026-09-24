@@ -13,31 +13,34 @@ out of that single act:
    or another gateway.
 
 2. **A delivery ledger.** Each message carries a ``kb:delivered`` flag. This is
-   **not** "read" — it records only whether the message has yet been *handed to
-   triage*. The flag is owned solely by the gateway and flipped ``false → true``
-   by exactly two operations, both here: :func:`undelivered`, which returns the
-   held messages **and marks them delivered as a side effect** (the daily drain),
-   and :func:`mark_delivered`, which flips one already-written message the gateway
-   persisted up front (the persist-before-forward path — see below). Nothing else
-   — no SPARQL query, no ad-hoc read — ever touches it, so browsing history never
-   silently "consumes" a message. The daily triage skill drains the backlog by
-   calling the gateway's ``/undelivered`` endpoint (which calls this), so a
-   message that arrived while its sender was not yet whitelisted is caught the
-   next day instead of being lost.
+   **not** "read" — it records only whether the message has reached the user at
+   all: the chat surface shows it, or a turn put it in front of them. The flag is
+   owned solely by the gateway and flipped ``false → true`` by exactly two
+   operations, both here: :func:`undelivered`, which returns the held messages
+   **and marks them delivered as a side effect**, and :func:`mark_delivered`,
+   which flips one already-written message the gateway persisted up front (the
+   persist-before-forward path — see below). Nothing else — no SPARQL query, no
+   ad-hoc read — ever touches it, so browsing history never silently "consumes" a
+   message.
+
+   Since the chat surface shows every arrival the moment it lands, an
+   ``undelivered`` backlog is now an **exception**, not a daily inbox: a message
+   sits there only when the handover to the chats rail could not be completed.
+   The gateway's ``/undelivered`` endpoint is the recovery path for exactly those
+   — not a sweep anyone runs on a schedule to see their mail.
 
 The delivered flag lets a gateway persist a message it deliberately did **not**
-forward — a blacklisted or no-action-class sender is written straight to
-``delivered: true`` (already accounted for, never drained). A message that *is*
-forwarded takes the never-drop path: the gateway writes it ``delivered: false``
-the instant it arrives (before the gate, before the forward — so a crash or a
-throwing forward cannot lose it), then calls :func:`mark_delivered` once the
-triage turn has actually **run**. That last part is the whole point: the forward
-POST answers 202 (accepted), not "handled", so the flip waits on the job's
-``status: done`` (see ``job_delivery.py``). Any message that was persisted but
-never reached a completed turn — a failed forward, a job that errored or
+hand over — one from an ignored group is written straight to ``delivered: true``
+(already accounted for, never re-surfaced). A message that *does* go out takes
+the never-drop path: the gateway writes it ``delivered: false`` the instant it
+arrives (before the gate, before the forward — so a crash or a throwing forward
+cannot lose it), then calls :func:`mark_delivered` once the rail has taken it,
+or once a turn it bought has actually **run**. That last part is the whole
+point: a forward POST answers 202 (accepted), not "handled", so the flip waits
+on the job's ``status: done`` (see ``job_delivery.py``). Any message that was
+persisted but never got that far — a failed forward, a job that errored or
 expired, a gateway that died mid-dispatch — stays ``delivered: false`` and is
-picked up by the daily drain (at-least-once: a rare duplicate surface beats a
-silent loss).
+recoverable (at-least-once: a rare duplicate surface beats a silent loss).
 
 Inbound is only half the ledger. The store also holds **outbound** messages
 (``kb:OutboundMessage``, :func:`write_outbound`) in the same ``messages/``
@@ -49,7 +52,7 @@ whole conversation as a single timeline (filenames sort by epoch millis
 regardless of direction). It takes **both**: a chat key identifies a peer within
 one account, and a channel's message volume is shared by every account on it, so
 the pair is the conversation's real identity. Outbound records have **no**
-delivered flag and are invisible to :func:`undelivered` — the drain is triage
+delivered flag and are invisible to :func:`undelivered` — the ledger is
 bookkeeping for inbound mail only.
 
 Only **inbox**-mode gateways write here at all, in either direction: a control
@@ -127,9 +130,26 @@ AUTHORS = ("user", "agent", "device")
 # *which* blob and deliberately not where to fetch it — a gateway's address is the
 # reader's configuration (its messenger registry), and a record that also carried
 # one would be a second source of truth free to drift from it. Multi-valued, so a
-# message with several images gets one triple each. The media type is not stored
-# here on purpose — it comes back in the serving response's Content-Type header.
+# message with several images gets one triple each. What the gateway knows about
+# the blob is stated on that IRI, in the same record — see P_CONTENT_TYPE.
 P_ATTACHMENT = KB + "attachment"
+# What the gateway knows about a blob it stored, stated on the media IRI (the
+# kb:attachment object) as its subject, inside the message's own record: the
+# content type the bytes are served as, their size, and — for an image — the
+# pixel size sniffed at ingest. A reader needs these BEFORE fetching (an image
+# and a voice note are different elements; a reserved box needs the ratio), and
+# they are the gateway's own knowledge about its own store — so the gateway
+# states them, and no reader ever looks at another service's files to learn
+# them. They are derived from the store's sidecars at write time
+# (:func:`media_meta`) and stated on older records by :func:`backfill_media_meta`.
+P_CONTENT_TYPE = KB + "contentType"
+P_BYTE_SIZE = KB + "byteSize"
+P_WIDTH = KB + "width"
+P_HEIGHT = KB + "height"
+# The name the sender gave the file, when the channel carried one (a document,
+# not a photo): what a file row shows and what a download is saved as.
+P_FILE_NAME = KB + "fileName"
+XSD_INTEGER = "http://www.w3.org/2001/XMLSchema#integer"
 # Optional reference to a retained raw-media file (e.g. a voice note's audio),
 # recorded when a message is persisted *before* transcription so a failed or
 # crashed STT run leaves a re-transcribable artifact instead of a silent drop.
@@ -186,9 +206,9 @@ def thread_key(channel: str, account: str, chat: str | None,
     Opening a thread is a side effect, and the same inbound can legitimately be
     handled twice — an escalation re-runs the turn's prompt, a channel
     redelivers a stanza after a reconnect, a live turn dies before finishing and
-    the daily drain picks the record up again. All of those must land on one
+    a recovery sweep picks the record up again. All of those must land on one
     thread, so the key has to name the *message*, identically on the live path
-    and at the drain.
+    and on recovery.
 
     A channel-native message id alone will not do that. Telegram numbers
     messages per chat, Signal identifies one by (source, sent timestamp), and a
@@ -308,6 +328,18 @@ def _render(fields: dict) -> str:
             lines.append(_iri(subj, P_ATTACHMENT, url))
     if fields.get("media"):
         lines.append(_lit(subj, P_MEDIA, fields["media"]))
+    # What this gateway knows about each blob, on the blob's own IRI (see
+    # P_CONTENT_TYPE). Only for references the record actually carries.
+    for url, meta in sorted((fields.get("attachment_meta") or {}).items()):
+        if url not in (fields.get("attachments") or []) or not meta:
+            continue
+        if meta.get("content_type"):
+            lines.append(_lit(url, P_CONTENT_TYPE, str(meta["content_type"])))
+        for key, pred in (("size", P_BYTE_SIZE), ("width", P_WIDTH), ("height", P_HEIGHT)):
+            if isinstance(meta.get(key), int) and meta[key] >= 0:
+                lines.append(_lit(url, pred, str(meta[key]), XSD_INTEGER))
+        if meta.get("file_name"):
+            lines.append(_lit(url, P_FILE_NAME, str(meta["file_name"])))
     return "".join(l + "\n" for l in sorted(lines))
 
 
@@ -322,8 +354,8 @@ def _parse(text: str) -> dict | None:
     fields: dict = {"type": T_INBOUND, "delivered": False, "group": None,
                     "message_id": None, "chat": None, "account": None,
                     "author": None, "sent_at": None, "attachments": [],
-                    "media": None}
-    subject = None
+                    "media": None, "attachment_meta": {}}
+    triples = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -331,9 +363,28 @@ def _parse(text: str) -> dict | None:
         m = _TRIPLE_RE.match(line)
         if not m:
             return None
-        subj, pred, obj_iri, lit, _dtype = m.groups()
-        subject = subj
+        triples.append(m.groups())
+    # The record's own subject is the one that carries kb:channel; a file
+    # holds one message, so every other subject is a blob the message
+    # references, and its triples are what the gateway stated about it.
+    subject = next((t[0] for t in triples if t[1] == P_CHANNEL), None)
+    if subject is None:
+        return None
+    for subj, pred, obj_iri, lit, _dtype in triples:
         value = obj_iri if obj_iri is not None else _unesc(lit)
+        if subj != subject:
+            meta = fields["attachment_meta"].setdefault(subj, {})
+            if pred == P_CONTENT_TYPE:
+                meta["content_type"] = value
+            elif pred == P_FILE_NAME:
+                meta["file_name"] = value
+            elif pred in (P_BYTE_SIZE, P_WIDTH, P_HEIGHT):
+                try:
+                    meta[{P_BYTE_SIZE: "size", P_WIDTH: "width",
+                          P_HEIGHT: "height"}[pred]] = int(value)
+                except ValueError:
+                    pass
+            continue
         if pred == RDF_TYPE:
             fields["type"] = value
         elif pred == P_CHANNEL:
@@ -364,8 +415,12 @@ def _parse(text: str) -> dict | None:
             fields["media"] = value
         elif pred == P_DELIVERED:
             fields["delivered"] = value.strip().lower() == "true"
-    if subject is None or "channel" not in fields:
-        return None
+    # Statements about a blob the record does not reference are noise, never
+    # re-emitted; statements about one it does are kept whether or not the
+    # blob still exists here — they are the record's, not the filesystem's.
+    fields["attachment_meta"] = {
+        url: meta for url, meta in fields["attachment_meta"].items()
+        if url in fields["attachments"] and meta}
     fields["subject"] = subject
     return fields
 
@@ -439,9 +494,9 @@ def write_message(
     """Persist one inbound message as a deterministic N-Triples file.
 
     Returns ``(subject_uri, path)``. ``delivered=False`` (the default) marks the
-    message as still owed to triage; pass ``delivered=True`` for a message the
-    gateway is deliberately *not* forwarding (blacklisted, group-blocked or
-    no-action-class) so the daily drain never re-surfaces it.
+    message as not yet in front of the user; pass ``delivered=True`` for a
+    message the gateway is deliberately *not* handing over (an ignored group) so
+    a recovery sweep never re-surfaces it.
 
     ``chat`` is the chat key (see :data:`P_CHAT`): the exact recipient string
     this channel's own send path accepts, computed by the gateway and persisted
@@ -454,7 +509,9 @@ def write_message(
     ``attachment_urls`` are references to this message's media (voice note,
     image), each emitted as a ``kb:attachment`` IRI — see :data:`P_ATTACHMENT`
     for the shape. The bytes are never inlined into the graph; see
-    :func:`store_media`.
+    :func:`store_media`. For every reference naming a blob in *this* store,
+    what the store knows about it (type, size, pixel size) is stated on the
+    reference in the same record — see :data:`P_CONTENT_TYPE`.
 
     ``media`` optionally records a reference (a durable file path) to raw media
     retained alongside this message — used by the persist-before-transcribe path
@@ -480,6 +537,7 @@ def write_message(
         "attachments": [u for u in (attachment_urls or []) if u],
         "media": media or None,
     }
+    fields["attachment_meta"] = _own_attachment_meta(store_dir, fields["attachments"])
     # Filename: zero-padded epoch millis (sortable) + token (unique, IRI-safe).
     fname = f"{int(ts * 1000):016d}-{token}.nt"
     path = messages_dir(store_dir) / fname
@@ -539,6 +597,7 @@ def write_outbound(
         "sent_at": _iso(ts),
         "attachments": [u for u in (attachment_urls or []) if u],
     }
+    fields["attachment_meta"] = _own_attachment_meta(store_dir, fields["attachments"])
     fname = f"{int(ts * 1000):016d}-{token}.nt"
     path = messages_dir(store_dir) / fname
     _atomic_write(_render(fields), path)
@@ -607,7 +666,40 @@ def _image_dimensions(data: bytes) -> tuple[int, int] | None:
         return None
 
 
-def store_media(store_dir: str | Path, data: bytes, content_type: str | None) -> str:
+def media_kind(content_type: str | None) -> str:
+    """``image`` / ``audio`` / ``video`` / ``file`` from a content type.
+
+    The one reading every gateway applies when deciding what to do with an
+    inbound medium: images and documents are forwarded to the agent when
+    they fit, audio is a voice note to transcribe, a video is kept for the
+    chat only. Anything unlabeled or unrecognised is a ``file``."""
+    ct = (content_type or "").strip().lower()
+    for kind in ("image", "audio", "video"):
+        if ct.startswith(kind + "/"):
+            return kind
+    return "file"
+
+
+def safe_file_name(name) -> str | None:
+    """A sender-supplied file name reduced to something safe to show and save.
+
+    Base name only (no path), control characters dropped, capped in length
+    with the extension kept. None when nothing usable remains. Never used to
+    address a file here — blobs are keyed by their own id — only to say what
+    the sender called it."""
+    text = str(name or "").replace("\\", "/").strip()
+    text = re.sub(r"[\x00-\x1f\x7f]", "", text.rsplit("/", 1)[-1]).strip()
+    if text in ("", ".", ".."):
+        return None
+    if len(text) > 200:
+        stem, dot, ext = text.rpartition(".")
+        ext = ("." + ext) if dot and len(ext) <= 12 else ""
+        text = (stem if ext else text)[:200 - len(ext)] + ext
+    return text
+
+
+def store_media(store_dir: str | Path, data: bytes, content_type: str | None,
+                file_name: str | None = None) -> str:
     """Persist one inbound media blob durably and return its server-generated id.
 
     The blob is keyed by ``token_hex(16)`` — never by an untrusted filename — so
@@ -618,14 +710,17 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     intrinsic size is written to a ``<id>.meta`` JSON sidecar
     (``{"width", "height"}``) so the chat surface can reserve the image box
     before the bytes arrive; an absent sidecar means unknown, exactly the
-    pre-sidecar behaviour. None of these files carries an RDF extension, so the
-    life store never indexes them.
+    pre-sidecar behaviour. ``file_name``, when the channel carried one, goes to a
+    ``<id>.name`` sidecar (see :func:`safe_file_name`). None of these files
+    carries an RDF extension, so the life store never indexes them.
 
     The caller builds the reference — a host-free
     ``urn:retinue:media:<channel>:<id>``, see :data:`P_ATTACHMENT` — and passes
     it to :func:`write_message` as an ``attachment_urls`` entry; the bytes stay
     on disk and out of the graph, and the reader resolves the reference through
-    the account that owns the chat.
+    the account that owns the chat. The sidecars are this store's private
+    format: what they hold is stated in the record (:data:`P_CONTENT_TYPE`),
+    which is where a reader learns it.
     """
     media_id = secrets.token_hex(16)
     d = media_dir(store_dir)
@@ -636,6 +731,9 @@ def store_media(store_dir: str | Path, data: bytes, content_type: str | None) ->
     os.replace(tmp, blob)
     ct = (content_type or "application/octet-stream").strip() or "application/octet-stream"
     _atomic_write(ct + "\n", d / (media_id + ".type"))
+    name = safe_file_name(file_name)
+    if name:
+        _atomic_write(name + "\n", d / (media_id + ".name"))
     dims = _image_dimensions(data or b"")
     if dims:
         _atomic_write(json.dumps({"width": dims[0], "height": dims[1]}) + "\n",
@@ -668,18 +766,118 @@ def load_media(store_dir: str | Path, media_id: str) -> tuple[bytes, str] | None
     return data, ct
 
 
+# A media reference's blob id: the URN a gateway records today, or the
+# ``http://<service>:<port>/media/<id>`` form written before it existed.
+_MEDIA_REF_RE = re.compile(r"(?:^urn:retinue:media:[^:]+:|/media/)([0-9a-f]{32})/?$")
+
+
+def media_id_of(reference: str) -> str | None:
+    """The blob id a ``kb:attachment`` reference names, or None."""
+    m = _MEDIA_REF_RE.search((reference or "").strip())
+    return m.group(1) if m else None
+
+
+def media_meta(store_dir: str | Path, media_id: str) -> dict | None:
+    """What this store knows about one of its blobs, or None if it holds none.
+
+    ``{"content_type", "size"}`` plus ``{"width", "height"}`` when the
+    ``.meta`` sidecar carries them and ``"file_name"`` when the ``.name`` one
+    does — the same facts :func:`store_media` wrote,
+    read back by the store that wrote them. This is the only reader of the
+    sidecars besides :func:`load_media`: a record states these on the media
+    IRI (see :data:`P_CONTENT_TYPE`) so nothing outside the gateway needs to.
+    """
+    if not _MEDIA_ID_RE.match(media_id or ""):
+        return None
+    d = media_dir(store_dir)
+    try:
+        size = (d / media_id).stat().st_size
+    except OSError:
+        return None
+    meta: dict = {"size": int(size)}
+    try:
+        ct = (d / (media_id + ".type")).read_text(encoding="utf-8").strip()
+    except OSError:
+        ct = ""
+    meta["content_type"] = ct or "application/octet-stream"
+    try:
+        name = safe_file_name((d / (media_id + ".name")).read_text(encoding="utf-8"))
+        if name:
+            meta["file_name"] = name
+    except OSError:
+        pass
+    try:
+        dims = json.loads((d / (media_id + ".meta")).read_text(encoding="utf-8"))
+        w, h = dims.get("width"), dims.get("height")
+        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+            meta["width"], meta["height"] = w, h
+    except (OSError, ValueError, AttributeError):
+        pass
+    return meta
+
+
+def _own_attachment_meta(store_dir: str | Path, references: list) -> dict:
+    """``{reference: media_meta}`` for the references naming blobs in this store."""
+    out: dict = {}
+    for ref in references or []:
+        mid = media_id_of(ref)
+        meta = media_meta(store_dir, mid) if mid else None
+        if meta:
+            out[ref] = meta
+    return out
+
+
+def backfill_media_meta(store_dir: str | Path) -> int:
+    """State the blob metadata on records written before it was recorded.
+
+    Walks this store's messages once, and rewrites every record that
+    references a blob this store holds but says less about it than
+    :func:`media_meta` knows. Idempotent — a second run rewrites nothing —
+    and never raises: a record that cannot be read or written is skipped.
+    A gateway calls this at startup, on its own store only, so the reader
+    never has to fall back to anyone's files. Returns the rewrite count.
+    """
+    marker = f"<{P_ATTACHMENT}>"
+    count = 0
+    try:
+        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+    except OSError:
+        return 0
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if marker not in text:
+            continue
+        fields = _parse(text)
+        if not fields:
+            continue
+        known = _own_attachment_meta(store_dir, fields["attachments"])
+        stated = fields.get("attachment_meta") or {}
+        if all(stated.get(ref) == meta for ref, meta in known.items()):
+            continue
+        fields["attachment_meta"] = {**stated, **known}
+        try:
+            _atomic_write(_render(fields), path)
+        except OSError:
+            continue
+        count += 1
+    return count
+
+
 def undelivered(
     store_dir: str | Path,
     since: str | float | None = None,
 ) -> list[dict]:
-    """Return messages still owed to triage, **marking each delivered**.
+    """Return messages that never reached the user, **marking each delivered**.
 
     This is the sole mutator of the ``delivered`` flag. It scans the message
     files oldest-first, selects those with ``delivered == false`` (and, when
     ``since`` is given, ``receivedAt >= since``), rewrites each of those files
     with ``delivered = true``, and returns the selected messages as dicts. A
     plain SPARQL read never calls this, so browsing history does not consume
-    anything; only the daily triage drain does.
+    anything; only the recovery sweep behind ``/undelivered`` does.
 
     Each returned dict has: ``subject``, ``channel``, ``sender``, ``group``,
     ``chat``, ``message_id``, ``received_at`` (ISO-8601), ``text``,
@@ -797,6 +995,189 @@ def update_message(path: str | Path, *, text: str | None = None,
     except OSError:
         return None
     return prev_media
+
+
+def _unlink_blob(store_dir: str | Path, media_id: str) -> tuple[bool, int]:
+    """Remove one media blob and its sidecars.
+
+    Returns ``(removed, errors)``: whether the blob itself was there and went,
+    and how many of the four files exist but could not be removed — an absent
+    sidecar is normal, a stuck one is a trace the caller must report."""
+    if not _MEDIA_ID_RE.match(media_id or ""):
+        return False, 0
+    d = media_dir(store_dir)
+    removed, errors = False, 0
+    for name in (media_id, media_id + ".type", media_id + ".name", media_id + ".meta"):
+        try:
+            (d / name).unlink()
+            removed = removed or name == media_id
+        except FileNotFoundError:
+            continue
+        except OSError:
+            errors += 1
+    return removed, errors
+
+
+def delete_chat(store_dir: str | Path, chat: str,
+                account: str | None) -> dict:
+    """Erase one chat from this store: every record of it, in both
+    directions, and every blob only those records referenced.
+
+    A chat is the pair (``kb:chat``, ``kb:account``) — see :data:`P_ACCOUNT` —
+    so ``account`` is compared exactly, and ``None`` or ``""`` selects the
+    records carrying no account (history written before the predicate
+    existed), which is what an account-less chat id names. The same peer on
+    another account is another chat and is left alone.
+
+    This is a deletion, not a flag: the files go, the life store drops their
+    graphs when it next sees the directory, and a later message from the same
+    peer starts a chat with no history. A blob is kept if a record outside the
+    chat still references it (never the case for blobs this store minted, but
+    a reference is only a string and costs nothing to honour). The retained
+    raw audio of a voice note still awaiting its transcript (``kb:media``, a
+    path inside the media directory) goes too.
+
+    Never raises on a single unreadable or undeletable file — it is skipped
+    and counted in ``errors``, so the caller can tell the erasure was partial
+    and must not treat the chat as gone. That includes a file that cannot be
+    read at all (it may be one of this chat's), and one that cannot be parsed
+    but names this chat key: failing closed there is the point.
+
+    Returns ``{"messages", "media", "errors", "subjects", "message_ids"}`` —
+    the last two identify what was erased, so a reader still serving an older
+    index can hide exactly those records and nothing that arrives afterwards.
+    """
+    wanted_chat = (chat or "").strip()
+    wanted_account = (account or "").strip()
+    result: dict = {"messages": 0, "media": 0, "errors": 0,
+                    "subjects": [], "message_ids": []}
+    if not wanted_chat:
+        return result
+    # How this chat key appears in a record, for recognising one that no
+    # longer parses (see _lit: the key is an escaped plain literal).
+    chat_marker = f'<{P_CHAT}> "{_esc(wanted_chat)}"'
+    doomed: list[tuple[Path, dict]] = []
+    kept_refs: set[str] = set()
+    try:
+        paths = sorted(messages_dir(store_dir).glob("*.nt"))
+    except OSError:
+        return result
+    for path in paths:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            result["errors"] += 1
+            continue
+        fields = _parse(text)
+        if not fields:
+            if chat_marker in text:
+                result["errors"] += 1
+            continue
+        mine = (fields.get("chat") == wanted_chat
+                and (fields.get("account") or "") == wanted_account)
+        if mine:
+            doomed.append((path, fields))
+        else:
+            kept_refs.update(filter(None, map(media_id_of, fields["attachments"])))
+    media_root = media_dir(store_dir).resolve()
+    for path, fields in doomed:
+        try:
+            path.unlink()
+            result["messages"] += 1
+            result["subjects"].append(fields["subject"])
+            if fields.get("message_id"):
+                result["message_ids"].append(fields["message_id"])
+        except FileNotFoundError:
+            continue
+        except OSError:
+            result["errors"] += 1
+            continue
+        for ref in fields["attachments"]:
+            mid = media_id_of(ref)
+            if mid and mid not in kept_refs:
+                removed, errors = _unlink_blob(store_dir, mid)
+                result["media"] += int(removed)
+                result["errors"] += errors
+        spool = fields.get("media")
+        if spool:
+            try:
+                spool_path = Path(spool).resolve()
+                if spool_path.parent == media_root:
+                    spool_path.unlink(missing_ok=True)
+            except OSError:
+                result["errors"] += 1
+    return result
+
+
+# The rest of a chat's erasure is the gateway's own bookkeeping, not the
+# ledger's — but every gateway keeps the same two files, so the walk over them
+# lives here once and each gateway supplies only its own notion of "this chat"
+# (and holds its own lock around the call).
+
+_PENDING_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def purge_pending_sends(pending_dir: str | Path, matches) -> list[str]:
+    """Delete the pending-send files ``matches(entry)`` claims; returns their ids.
+
+    Covers every state a file is kept in (queued, sent, rejected, failed) —
+    each holds the message text — except ``sending``: that one is on the wire
+    right now, and its outcome is written back by the sender thread. Only
+    ``<32 hex>.json`` files holding a dict are considered, so a stray foreign
+    file in the directory is never touched."""
+    removed: list[str] = []
+    try:
+        paths = sorted(Path(pending_dir).glob("*.json"))
+    except OSError:
+        return removed
+    for path in paths:
+        if not _PENDING_ID_RE.match(path.stem):
+            continue
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entry, dict) or entry.get("status") == "sending":
+            continue
+        try:
+            hit = bool(matches(entry))
+        except Exception:  # noqa: BLE001 — a matcher bug must not abort the erasure
+            hit = False
+        if not hit:
+            continue
+        try:
+            path.unlink()
+            removed.append(path.stem)
+        except OSError:
+            continue
+    return removed
+
+
+def purge_recent_chats(path: str | Path, matches) -> int:
+    """Drop the recent-senders entries ``matches(entry)`` claims; returns the count.
+
+    The file is a JSON list rewritten atomically, the shape every gateway's
+    ``_record_recent_sender`` keeps."""
+    p = Path(path)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, list):
+        return 0
+    kept, dropped = [], 0
+    for entry in data:
+        try:
+            hit = isinstance(entry, dict) and bool(matches(entry))
+        except Exception:  # noqa: BLE001
+            hit = False
+        if hit:
+            dropped += 1
+        else:
+            kept.append(entry)
+    if dropped:
+        _atomic_write(json.dumps(kept, ensure_ascii=False), p)
+    return dropped
 
 
 # -- echo dedup for outbound recording ----------------------------------------

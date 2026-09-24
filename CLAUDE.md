@@ -179,11 +179,12 @@ resting projects when their date comes. The rules that make them work:
 
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 
-## Messaging (Signal, WhatsApp, Telegram, e-mail)
+## Messaging (Signal, WhatsApp, Telegram, SMS, e-mail)
 
 Outbound pushes go through the thin CLIs — `scripts/signal-push.py`,
 `whatsapp-push.py`, `telegram-push.py` (text, `--image`; Signal also speaks a
-voice rendering; `--url` picks the account's gateway). The message text for a
+voice rendering; `--url` picks the account's gateway) and, where the opt-in
+SMS channel runs, `sms-push.py` (text only). The message text for a
 human comes from the `secretary` subagent (see **Routing**) — dispatch, then
 send its text verbatim. **Before any send to a
 named person, apply the `messaging-contact-lookup` skill** (recent chats
@@ -199,6 +200,24 @@ error must push an alert to the user**, not just log. Channel liveness is
 monitored by the framework — never build ad-hoc checks; a dead-seeming channel
 is checked on `/gateways`, and `configured: false` is intentional, not broken.
 Accounts, policies, extra gateways, monitoring: `docs/messaging.md`.
+
+## Calendar
+
+The calendar is a gateway like a messenger, not a tool: credentials stay in
+`caldav-gateway`, and the two thin CLIs are yours.
+
+- **Read before you propose.** `scripts/caldav-read.py` answers what is already
+  there (`--days N`, `--start/--end`, `--query`, `--calendars`, `--uid`; `--text`
+  for a compact rendering). Reads need no approval — check the agenda before
+  offering a slot, and before adding something that may be in it twice.
+- **Write with `scripts/caldav-push.py`** (`--start/--end`, `--all-day`,
+  `--description`). Writes are gated by the same `allow`/`trust`/`verify` send
+  policy as messages: a queued event is **not** in the calendar yet, so relay the
+  approval URL the script prints as a labeled link. Updating and deleting events
+  are not supported — say so rather than improvising.
+
+Endpoints, semantics (window inclusivity, recurrence expansion, which calendars
+a read spans) and configuration: README, "Calendar (CalDAV)".
 
 ## Dashboard
 
@@ -300,8 +319,14 @@ Sibling compose services: `qlever-life` (the life store), `stt`
 merging a Tier 3 PR, `python3 /workspace/scripts/self-update.py` rebuilds and
 restarts the stack via the updater sidecar. Claude sign-in is monitored by the
 framework — check `scripts/claude_auth.py status` and point the user at
-`/claude-auth`, never ad-hoc logins (details: `docs/contributing.md`,
-`docs/claude-auth.md`).
+`/claude-auth`, never ad-hoc logins; before starting any extra `claude`
+process by hand, run `scripts/claude_auth.py refresh` so it cannot race the
+live sessions for the token rotation (details: `docs/contributing.md`,
+`docs/claude-auth.md`). Every session the framework spawns sees an
+**allowlisted environment** (`scripts/session_env.py`): capability tokens and
+model variables yes, mailbox passwords and gateway keys no — a chamber
+variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
+(`docs/contributing.md`, "Session environment").
 
 ## Where the depth lives
 

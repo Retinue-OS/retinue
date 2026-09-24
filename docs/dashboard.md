@@ -16,6 +16,12 @@ lives in `webapp/` (baked into the image):
   the app-launch buttons (`tel:`/`sms:`/`mailto:`/`geo:`/`intent://`).
 - `webapp/components/*.js` are web components that each fetch one JSON document
   and render it, degrading to the last cached state offline.
+  `<retinue-conversation>` (`conversation.js`) is the one exception in
+  kind: not a card but one conversation with Ara — thread, composer,
+  dictation, attachments, chips, copy buttons, model picker, read-aloud —
+  embedded wherever a conversation is shown (the conversations card's open
+  thread and its new-thread composer today; the chat page's companion pane
+  next), so every surface renders it with the same code.
 - `webapp/data/*.json` is the curated content. The static data cards that
   consume these files are commented out in `webapp/index.html` until a
   scheduler-driven refresh job regenerates them. **Refreshing these is Ara's job**
@@ -81,17 +87,18 @@ in the sphere selector, *+ new* on the contact card
 colour from its word. The same sheet opens from the thread bar and from the chat page's
 header.
 
-A chat from a number nobody has named is **screened**: the delivery gate says
-it recognised no sender, so the message keeps the importance of a person
+A chat from a number nobody has named is **screened**: the sender is no VIP
+(the delivery gate's one sender flag), has no contact card, and the profile
+knows no sphere for them, so the message keeps the importance of a person
 writing to a person but its sphere is `unknown`, which no mode admits — it is
-listed, carried by the next digest, and never rings. The sheet then leads with
+listed, carried by the next digest, and never rings. A VIP, the other way
+round, rings in every mode unless the chat is muted. The sheet then leads with
 the **contact card**: a name, the sphere they belong to, further groups as
 tags, and optionally a permit to interrupt right now. Saving it
 (`POST /chats/<id>/contact`) names the chat, teaches the attention profile
 their sphere (carrying over whatever the bare number had already been taught),
-re-judges the open item, whitelists the handle for the delivery gate — so
-their next message earns a live triage turn — and writes the card into the
-life store's address book (`CONTACTS_EMIT_PATH`, a Turtle file of vCard
+re-judges the open item — so their next message is ranked by that sphere —
+and writes the card into the life store's address book (`CONTACTS_EMIT_PATH`, a Turtle file of vCard
 individuals under the generated chamber). An empty name removes the card and
 puts the sender back into screening. Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
@@ -381,10 +388,15 @@ thread is appended by the gateway *after* her session ends and carries no
 attachments, so a file must be pushed as its own message this way.
 
 Attachments go **both ways**: the user can attach files to their own messages
-from the composer (a paperclip button on the input row). These upload with the
+from the composer (a paperclip button on the input row), or **paste** them into
+the text box — a screenshot from the clipboard, an image copied off a page, a
+file copied in a file manager — which stages exactly what the paperclip would
+(`webapp/components/clipboard.js`; a pasted screenshot's generic `image.png`
+becomes `pasted-<date>-<time>.png`, a real filename is kept). These upload with the
 message, are stored the same way, and their on-disk paths are handed to Ara in
 her engage prompt — so she can actually open a file the user sends (a PDF, a
 CSV) rather than only knowing one exists. A message may be text, files, or both.
+The chat page's composer takes pasted images the same way (see `webapp/README.md`).
 
 ## Push notifications
 

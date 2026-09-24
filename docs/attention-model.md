@@ -30,7 +30,7 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 - **Levels, not one bell.** iOS gives each notification one of four interruption levels — *passive* (silent, listed), *active* (default), *time-sensitive* (breaks through a Focus), *critical* (always) — and Android’s channels carry the same idea. Only the top levels interrupt.
 - **Modes as allow-lists.** A Focus mode names the people and apps that may break through, by schedule or by hand; Slack’s notification schedule and calendar focus blocks do the same at work. “Customers during work time, friends during social time” is a mode.
 - **A scheduled summary.** iOS’s Notification Summary delivers the held remainder at set times, ranked by relevance — the batching study, productised.
-- **Screen the unknown.** Hey asks once per first-time sender; Retinue’s delivery gate already does this, and the design builds on it.
+- **Screen the unknown.** Hey asks once per first-time sender; Retinue screens a direct sender nothing vouches for — no VIP flag, no contact card, no sphere it has learned — until a contact card says who they are.
 - **Sections by treatment, not by source.** Gmail’s *Important · Starred · Everything else* and Hey’s *Imbox · Feed · Paper trail* replace one list with a few that mean different things; GTD adds a *waiting for* list for what is parked on others, and Kanban caps work in progress so the active list stays short.
 
 **Five principles for Retinue** follow:
@@ -48,7 +48,7 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 
 ## 3 · Recommendation: item, mode, delivery
 
-<p class="note"><small><strong>Mechanics.</strong> Threads and chats keep their JSON stores, emitted into <code>_generated/</code>; projects gain frontmatter keys; one free <code>SELECT</code> — what wants attention now, at which level — serves dashboard and scheduled jobs alike. Today’s knobs stay: the per-device <code>notification_mode</code> (<code>push_notify.py</code>), <code>muted</code> on threads and chats, and the delivery gate’s whitelist keep working; the mode wraps them. Web Push headers per RFC 8030: <code>Urgency</code> (very-low … high), <code>Topic</code> (a new push replaces a pending one with the same topic), <code>TTL</code> — today only the TTL is set. Sender side: where a contact’s send policy allows, the Secretary may tell a held sender when the message will be seen.</small></p>
+<p class="note"><small><strong>Mechanics.</strong> Threads and chats keep their JSON stores, emitted into <code>_generated/</code>; projects gain frontmatter keys; one free <code>SELECT</code> — what wants attention now, at which level — serves dashboard and scheduled jobs alike. Today’s knobs stay: the per-device <code>notification_mode</code> (<code>push_notify.py</code>), <code>muted</code> on threads and chats, and the delivery gate’s VIP flag keep working; the mode wraps them. Web Push headers per RFC 8030: <code>Urgency</code> (very-low … high), <code>Topic</code> (a new push replaces a pending one with the same topic), <code>TTL</code> — today only the TTL is set. Sender side: where a contact’s send policy allows, the Secretary may tell a held sender when the message will be seen.</small></p>
 
 **The item.** All three entities get the same five properties in the `kb:` vocabulary, set where each is created:
 
@@ -75,9 +75,15 @@ conv:8f2c…  kb:importance 4 ;  kb:sphere sphere:customers ;
 | importance 2–3 | passive | active | active |
 | importance 0–1 | passive | passive | active |
 
-**The stranger** is the one case where the model withholds a guess. A message
-from a handle the delivery gate does not recognise (`docs/triage-delivery-gate.md`)
-keeps the importance of any direct message — a person took the trouble — but
+**The VIP** is the one sender who always gets through: a person the user marked
+in the delivery gate’s policy (`docs/triage-delivery-gate.md`) as someone whose
+message is worked by a model the moment it arrives. Their message rings in
+every mode, like critical; only a muted chat or a quieted/ignored group keeps
+it quiet.
+
+**The stranger** is the one case where the model withholds a guess. A direct
+message from someone nothing vouches for — not a VIP, no contact card, no
+sphere the profile was taught for them — keeps the importance of any direct message — a person took the trouble — but
 not the sphere a known peer would get, because nobody has said which one they
 belong to and “friends” would let whoever learns the number through during
 *Social*. It goes into a sphere of its own, `unknown`, which no mode admits:
@@ -85,8 +91,8 @@ listed, carried by the next digest, never rung. Hey’s Screener, in the
 vocabulary the model already has, and the way out is a **contact card** in the
 same details sheet — a name, the sphere they belong to, further groups as
 tags. Filing it names the chat, teaches the sender’s sphere, re-judges the
-open item, whitelists the handle so the *next* message earns a live triage
-turn, and records the person in the life store. Whether they may then
+open item, and records the person in the life store, so the *next* message
+is ranked by that sphere. Whether they may then
 interrupt stays the separate question a permit answers.
 
 **The mode** is one small document the gateway keeps (`focus.json`, mirrored into the store): name, admitted spheres and admitting tags (`health` may be admitted everywhere, as sphere or tag), per-sender permits, the lowest level that breaks through, a schedule, optionally a calendar rule. The schedule is a **week of day plans** — a day’s schedule with the days it rules (`mon-fri`, `sat, sun`), every weekday in exactly one — and a plan may claim `holiday`, so time off is a date range told to the system (“I’m off 24 December to 2 January”), not a new schedule (`scripts/attention-week.py`; `docs/dashboard.md`, “The week”). *Focused* takes a **scope** — the nesting the data already has, sphere ⊃ project ⊃ item, offered at either level: a schedule entry may name a sphere (`[13:00, focused, customers]`), and by hand the menu offers the spheres and the projects on the list. With a scope the sphere or the project stands in for the rule’s allow-list for that stint; with none, only critical rings. It is set by a chip in the dashboard header, a sentence to Ara (“work mode until 17:00”), a schedule or a calendar block; every delivery decision reads it, nothing else needs to know it exists.

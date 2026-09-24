@@ -30,6 +30,7 @@ import triage_policy as _triage
 import news_ingest as _news
 import chat_ingest as _chats
 import job_delivery as _jobs
+import build_stamp as _build
 
 SIGNAL_ACCOUNT = os.environ.get("SIGNAL_ACCOUNT", "").strip()
 
@@ -102,6 +103,11 @@ HTTP_PORT = int(os.environ.get("SIGNAL_GATEWAY_HTTP_PORT", "8090"))
 DEFAULT_RECIPIENT = os.environ.get("SIGNAL_DEFAULT_RECIPIENT", "").strip()
 # Optional shared secret; when set, /send requires a matching Bearer token.
 GATEWAY_TOKEN = os.environ.get("SIGNAL_GATEWAY_TOKEN", "").strip()
+# The separate capability POST /chats/delete requires (X-Chat-Erase-Token).
+# Not the gateway token: that one is handed to every agent session so agents
+# can send, and erasing a chat is the user's own act, relayed only by the
+# web-gateway. Unset, the endpoint refuses — there is no fallback.
+CHAT_ERASE_TOKEN = os.environ.get("CHAT_ERASE_TOKEN", "").strip()
 MAX_PUSH_BODY_BYTES = int(os.environ.get("SIGNAL_GATEWAY_MAX_BODY_BYTES", str(25 * 1024 * 1024)))
 # Cap the decoded size of an inbound image forwarded to the agent (it travels
 # base64-encoded inside the POST /message JSON). Matches the retinue gateway's
@@ -185,21 +191,23 @@ def _attach_reply_tokens(messages: list) -> None:
             subject=msg.get("subject"))
 
 # ── Inbound triage delivery gate ──────────────────────────────────────────────
-# The gateway spends model credits only on senders that matter (see
-# docs/triage-delivery-gate.md). Every inbound inbox message is persisted as one
-# `.nt` file on this gateway's own volume (browsable history + a delivered
-# ledger); routing is decided by a policy `.nt` Ara maintains on the same volume,
-# read RAW off disk here so the classify hot path sees no qlever reindex lag.
+# Every inbound inbox message is persisted as one `.nt` file on this gateway's
+# own volume (browsable history + a delivered ledger), then handed to the chats
+# rail. What the gate still decides (see docs/triage-delivery-gate.md) is read
+# RAW off a policy `.nt` Ara maintains on the same volume, so the classify hot
+# path sees no qlever reindex lag:
 #
-#   whitelisted → forward to a model turn now, marked delivered
-#   unknown     → forward now flagged as an unknown sender (ask to whitelist),
-#                 marked delivered
-#   blacklisted → held (delivered:false), no turn now → the daily drain picks it
-#                 up via GET /undelivered
-#   group-blocked → stored delivered:true, never a turn and never drained
+#   open         → hand to the rail; the chat is the delivery
+#   VIP sender   → the rail runs an arrival turn, whatever chat it came from
+#   group-quieted → held (delivered:false), no turn → GET /undelivered has it
+#   group-ignored → stored delivered:true, never a turn and never drained
 #
-# The gate is on by default for an inbox account; INBOUND_GATE=0 restores the
-# always-forward behaviour (every inbound spawns a turn).
+# There is no sender whitelist or blacklist on messenger any more: a chat the
+# user wants off their screen is archived or muted in the dashboard, which is
+# the same gesture a conversation takes.
+#
+# The gate is on by default for an inbox account; INBOUND_GATE=0 treats every
+# sender as a VIP (every inbound gets a turn).
 INBOUND_CHANNEL = "signal"
 INBOUND_GATE_ENABLED = os.environ.get("INBOUND_GATE", "1").strip().lower() not in ("0", "false", "no", "")
 # Where the per-message store lives (gateway RW, qlever RO). Defaults onto the
@@ -214,9 +222,10 @@ INBOUND_POLICY_PATH = Path(
 def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
     """Classify an inbound message against the policy read raw off the volume.
 
-    Returns a dict: ``forward`` (spend a model turn now), ``flagged_unknown``
-    (annotate the turn as an unknown sender), ``delivered_if_held`` (the flag to
-    persist when we do NOT forward), and ``reason`` (for the log).
+    Returns a dict: ``forward`` (worth interrupting the user for), ``vip``
+    (this sender's messages are worked by a model on arrival),
+    ``delivered_if_held`` (the flag to persist on the fallback path when we do
+    NOT forward), ``news``, and ``reason`` (for the log).
     """
     try:
         return _triage.gate_decision(
@@ -225,7 +234,11 @@ def _inbound_gate_decision(sender: str, group_id: str | None) -> dict:
         )
     except Exception as exc:  # policy unreadable → fail OPEN (forward), never drop
         print(f"[signal-gateway] triage policy unreadable ({exc}); forwarding", flush=True)
-        return {"forward": True, "flagged_unknown": False, "delivered_if_held": True, "reason": "policy-error"}
+        # Fails open on both axes. `vip` is what the chat rail reads to decide
+        # a turn, so leaving it out would have an unreadable policy silently
+        # demote everyone to no-turn — the opposite of failing open.
+        return {"forward": True, "vip": True,
+                "delivered_if_held": True, "reason": "policy-error"}
 
 
 def _chat_key(sender: str | None, group_id: str | None) -> str:
@@ -315,8 +328,14 @@ def _mark_delivered(store_path) -> None:
         print(f"[signal-gateway] could not mark inbound delivered: {exc}", flush=True)
 
 
-def _confirm_delivery(job_path: str, store_path, label: str) -> None:
-    """Mark a forwarded inbound delivered once its triage job reports success.
+def _confirm_delivery(job_path: str, store_path, label: str,
+                      base: str | None = None) -> None:
+    """Mark a forwarded inbound delivered once the job that took it succeeds.
+
+    That job is either the triage forward's or the chats rail's companion
+    turn, so ``base`` names the service whose handle this is; it defaults to
+    the retinue gateway, where every handle came from until the chat surface
+    started taking messages.
 
     Polls in the background (see job_delivery): a job that errors, expires or
     never finishes leaves delivered=False, so the daily drain retries it.
@@ -324,7 +343,7 @@ def _confirm_delivery(job_path: str, store_path, label: str) -> None:
     if store_path is None:
         return
     _jobs.confirm_delivery(
-        urljoin(RETINUE_GATEWAY_URL, job_path),
+        urljoin(base or RETINUE_GATEWAY_URL, job_path),
         lambda: _mark_delivered(store_path),
         log=lambda msg: print(f"[signal-gateway] {label}: {msg}", flush=True),
         timeout=RETINUE_GATEWAY_TIMEOUT,
@@ -378,7 +397,8 @@ def _forward_news(question: str, source: str, group_id: str | None, lang: str) -
         print(f"[signal-gateway] forwarded news-flagged message from {source}", flush=True)
 
 
-def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
+def _store_media_ref(data: bytes, content_type: str | None,
+                     file_name: str | None = None) -> str | None:
     """Persist inbound media durably and return its store reference.
 
     The reference is a host-free URN — ``urn:retinue:media:<channel>:<id>`` —
@@ -398,7 +418,8 @@ def _store_media_ref(data: bytes, content_type: str | None) -> str | None:
     if not data:
         return None
     try:
-        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type)
+        media_id = _ibstore.store_media(INBOUND_STORE_DIR, data, content_type,
+                                        file_name=file_name)
     except Exception as exc:
         print(f"[signal-gateway] could not store inbound media: {exc}", flush=True)
         return None
@@ -565,6 +586,12 @@ def _health_snapshot() -> dict:
         # account from a transient receive failure, so any sustained down state
         # offers the QR — scanning is a deliberate user action either way.
         "needs_repair": bool(SIGNAL_ACCOUNT) and not connected,
+        # Which build this is. `framework` is a digest of the shared modules
+        # baked into this image; the retinue container carries the same set,
+        # so the /gateways page can tell a stale gateway from a current one
+        # without anyone shelling in. `sha` is the commit, when the build
+        # passed one. See scripts/build_stamp.py.
+        "build": _build.build_info(),
     }
     if not SIGNAL_ACCOUNT:
         body["error"] = "SIGNAL_ACCOUNT is not set"
@@ -601,18 +628,21 @@ def _split_attachments(event: dict) -> tuple[Path | None, list[dict], list[str]]
     """Partition inbound attachments into (voice_note_path, files, attachment_urls).
 
     signal-cli labels each attachment with its contentType: ``audio/*`` is a
-    voice note to transcribe, ``image/*`` is forwarded to the agent as a file
-    payload (``{"filename", "content_type", "data"(base64)}`` — the shape the
-    retinue gateway's POST /message accepts as ``files``). An attachment with
-    no contentType keeps the legacy voice-note treatment, since before this
-    split every attachment was handed to the transcriber.
+    voice note to transcribe, ``image/*`` and documents are forwarded to the
+    agent as a file payload (``{"filename", "content_type", "data"(base64)}``
+    — the shape the retinue gateway's POST /message accepts as ``files``), a
+    ``video/*`` is kept for the chat only (the agent cannot watch it). An
+    attachment with no contentType keeps the legacy voice-note treatment,
+    since before this split every attachment was handed to the transcriber.
 
-    Every attachment (image or voice note) is ALSO persisted durably and its
-    HTTP reference collected in ``attachment_urls`` — the ``kb:attachment`` triple
-    on the stored message. The voice note is additionally added to ``files`` so
-    the original audio rides into the conversation alongside its transcript. The
-    durable reference is stored regardless of size (consistency: a reference,
-    never inline); only the transient ``files`` payload honours the size cap."""
+    Every attachment, whatever its kind, is persisted durably — with the name
+    the sender gave it — and its reference collected in ``attachment_urls``,
+    the ``kb:attachment`` triple on the stored message: the chat shows the
+    message as the native client does. The voice note is additionally added
+    to ``files`` so the original audio rides into the conversation alongside
+    its transcript. The durable reference is stored regardless of size
+    (consistency: a reference, never inline); only the transient ``files``
+    payload honours the forwarding size cap."""
     msg = event.get("envelope", {}).get("dataMessage") or {}
     attachments = msg.get("attachments") or []
     voice: Path | None = None
@@ -626,23 +656,28 @@ def _split_attachments(event: dict) -> tuple[Path | None, list[dict], list[str]]
             print(f"[signal-gateway] attachment metadata present but file not found: {att}", flush=True)
             continue
         content_type = str(att.get("contentType") or "").lower()
+        file_name = str(att.get("filename") or "") or None
+        # No label keeps the legacy voice-note treatment (see the docstring).
+        kind = _ibstore.media_kind(content_type) if content_type else "audio"
         try:
             data = path.read_bytes()
         except OSError as exc:
             print(f"[signal-gateway] could not read inbound attachment {path}: {exc}", flush=True)
             data = b""
-        if content_type.startswith("image/"):
+        if kind in ("image", "video", "file"):
             if not data:
                 continue
-            ref = _store_media_ref(data, content_type)
+            ref = _store_media_ref(data, content_type, file_name)
             if ref:
                 attachment_urls.append(ref)
+            if kind == "video":
+                continue  # kept for the chat; the agent cannot watch it
             if len(data) > MAX_INBOUND_FILE_BYTES:
-                print(f"[signal-gateway] inbound image too large to forward ({len(data)} bytes)", flush=True)
+                print(f"[signal-gateway] inbound {kind} too large to forward ({len(data)} bytes)", flush=True)
                 continue
-            suffix = path.suffix or mimetypes.guess_extension(content_type) or ".jpg"
+            suffix = path.suffix or mimetypes.guess_extension(content_type) or (".jpg" if kind == "image" else "")
             files.append({
-                "filename": f"signal-image{suffix}",
+                "filename": f"signal-{kind}{suffix}",
                 "content_type": content_type,
                 "data": base64.b64encode(data).decode("ascii"),
             })
@@ -652,7 +687,7 @@ def _split_attachments(event: dict) -> tuple[Path | None, list[dict], list[str]]
             # attach the audio itself so the conversation carries it.
             mime = content_type or "audio/ogg"
             if data:
-                ref = _store_media_ref(data, mime)
+                ref = _store_media_ref(data, mime, file_name)
                 if ref:
                     attachment_urls.append(ref)
                 if len(data) <= MAX_INBOUND_FILE_BYTES:
@@ -1230,19 +1265,54 @@ def _list_groups() -> list[dict]:
     return groups
 
 
+# Group id → display name, refreshed from the roster at most every
+# _GROUP_NAMES_TTL seconds (a rename shows up within that window), and on a
+# miss at most every _GROUP_NAMES_MISS_RETRY seconds (a freshly joined group
+# gets its name quickly without a signal-cli call per message from an id the
+# roster does not know).
+_GROUP_NAMES_TTL = 600.0
+_GROUP_NAMES_MISS_RETRY = 60.0
+_group_names: dict[str, str] = {}
+_group_names_at = float("-inf")  # never refreshed: the first lookup always fetches
+_group_names_lock = threading.Lock()
+
+
 def _resolve_group_name(group_id: str) -> str | None:
     """Look up a group's display name from the account's groups roster.
 
     Returns None on a miss (a stale id, or the roster call itself failing) so
     callers can fall back to the raw id rather than erroring.
     """
-    try:
-        for group in _list_groups():
-            if group.get("id") == group_id:
-                return group.get("name") or None
-    except Exception as exc:
-        print(f"[signal-gateway] could not resolve group name for {group_id}: {exc}", flush=True)
-    return None
+    global _group_names, _group_names_at
+    with _group_names_lock:
+        age = time.monotonic() - _group_names_at
+        if age < _GROUP_NAMES_TTL and (group_id in _group_names
+                                       or age < _GROUP_NAMES_MISS_RETRY):
+            return _group_names.get(group_id)
+        # Stamp the attempt, not the success: a failing signal-cli is then
+        # retried on the same throttle as a miss, and the last good map stays.
+        _group_names_at = time.monotonic()
+        try:
+            _group_names = {g["id"]: g["name"] for g in _list_groups() if g.get("name")}
+        except Exception as exc:
+            print(f"[signal-gateway] could not resolve group name for {group_id}: {exc}", flush=True)
+        return _group_names.get(group_id)
+
+
+def _notify_chat_event_async(group_id: str | None = None, **kwargs) -> None:
+    """Chats-rail POST with the group's display name, off the hot path.
+
+    The name lookup may shell out to signal-cli (and wait on its lock), so it
+    runs on the rail's own daemon thread together with the POST — the gateway's
+    persist → gate → forward path is never delayed by it."""
+    if not _chats.chats_enabled():
+        return
+
+    def _send() -> None:
+        name = _resolve_group_name(group_id) if group_id else None
+        _chats.notify_chat_event(chat_name=name, **kwargs)
+
+    threading.Thread(target=_send, name="chats-rail", daemon=True).start()
 
 
 # --- Recent-senders store ----------------------------------------------------
@@ -1375,7 +1445,8 @@ def _sync_attachment_refs(sent: dict) -> list[str]:
         except OSError as exc:
             print(f"[signal-gateway] could not read own-device attachment: {exc}", flush=True)
             continue
-        ref = _store_media_ref(data, str(att.get("contentType") or "") or None)
+        ref = _store_media_ref(data, str(att.get("contentType") or "") or None,
+                               str(att.get("filename") or "") or None)
         if ref:
             refs.append(ref)
     return refs
@@ -1427,7 +1498,8 @@ def _record_sync_sent(sent: dict) -> None:
     if SIGNAL_GATEWAY_MODE == "inbox":
         # Chats rail: an own-device send advances the chat's read watermark on
         # the dashboard (the user was visibly in that chat on their phone).
-        _chats.notify_chat_event_async(
+        _notify_chat_event_async(
+            group_id=str(group_id) if group_id else None,
             direction="out", channel=INBOUND_CHANNEL, chat=chat,
             account=SIGNAL_ACCOUNT, author="device", message_id=msg_id,
             ts=(int(ts) / 1000.0) if ts else None, text=text,
@@ -1507,7 +1579,9 @@ def _handle_event(event: dict) -> None:
             lang = DEFAULT_LANGUAGE
         if question:
             print(f"[signal-gateway] processing text message from {sender}", flush=True)
-    if not question and not files:
+    # A message that is only its media — a video, a sticker — is still the
+    # message: it is recorded and shown, and the prompt says what it carries.
+    if not question and not files and not attachment_urls:
         if voice_store_path is not None:
             # A voice note whose transcription failed: not dropped — it is on disk
             # (delivered=False, audio retained) for the daily drain / a re-transcribe.
@@ -1518,7 +1592,7 @@ def _handle_event(event: dict) -> None:
         event_sample = json.dumps(event, default=str)
         if len(event_sample) > 500:
             event_sample = event_sample[:500] + "..."
-        print(f"[signal-gateway] skipping event from {sender} (no text/audio/image content): {event_sample}", flush=True)
+        print(f"[signal-gateway] skipping event from {sender} (no text or media): {event_sample}", flush=True)
         return
 
     # The account's mode — not the message content — decides how the message is
@@ -1617,29 +1691,89 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
     if gate.get("news"):
         source = (_resolve_group_name(group_id) or group_id) if is_group else sender
         _forward_news(question, source, group_id, lang)
-    # Chats rail: hand the arrival's metadata to the web-gateway so the chat
-    # surface lights up (and the user is Web-Pushed) with no model turn.
-    # Fire-and-forget on its own thread — it must never delay or reorder the
-    # persist → gate → forward path below. Held classes go too (the mirror
-    # updates silently); the gate verdict rides along so they stay quiet.
-    _chats.notify_chat_event_async(
+    # Chats rail. Every arrival's metadata goes to the web-gateway so the chat
+    # surface lights up and the user is Web-Pushed, with no model turn spent on
+    # the notification. For a message the gate forwards the same call does one
+    # thing more: it starts a turn in that chat's companion thread and answers
+    # with its job handle, which is what replaces the triage session this
+    # gateway used to spawn (docs/messenger-chats.md, phase 4). Held classes go
+    # too — the mirror updates silently — and the gate verdict rides along so
+    # they stay quiet.
+    rail_event = dict(
         direction="in", channel=INBOUND_CHANNEL,
         chat=_chat_key(sender, group_id), account=SIGNAL_ACCOUNT,
         sender=sender, sender_name=sender_name, group=is_group,
         message_id=message_id,
         ts=(int(message_id) / 1000.0) if (message_id or "").isdigit() else None,
+        # The group's own name, so the chat is titled as on the user's phone
+        # (cached roster; see _resolve_group_name).
+        chat_name=(_resolve_group_name(group_id)
+                   if is_group and _chats.chats_enabled() else None),
         text=question, attachments=attachment_urls,
         gate={"forward": bool(gate.get("forward")),
-              "reason": str(gate.get("reason") or ""),
-              # The sender the gate did not recognise: the dashboard screens
-              # their message instead of ranking them like a known contact.
-              "unknown": bool(gate.get("flagged_unknown"))},
+              "vip": bool(gate.get("vip")),
+              "reason": str(gate.get("reason") or "")},
     )
-    if not gate["forward"]:
-        # Mark delivered only for a message that is fully accounted for (a
-        # blacklisted/no-action class the drain must never re-surface). One held
-        # merely because the sender is not yet whitelisted stays delivered=False
-        # so the daily drain still picks it up.
+
+    # The chat surface is where an inbound message is delivered now — whatever
+    # the gate made of it. The mirror shows it, the user is pushed unless the
+    # gate says to stay quiet, and the record says delivered. So every message
+    # is offered to the rail, not only the ones that used to buy a triage
+    # session: that is what empties the undelivered backlog the daily drain
+    # existed to sweep, because there is no longer anything left un-handled.
+    #
+    # The call is synchronous because its answer decides what happens next, and
+    # this path has always made a synchronous POST here anyway. A job handle
+    # means a VIP's message is being worked in its chat's companion thread; a
+    # plain acceptance means the chat has it and nothing more is owed. Neither
+    # — the rail switched off, unreachable, or an older web-gateway — falls
+    # through to everything this gateway did before the chat surface existed.
+    rail = _chats.notify_chat_event(**rail_event, handover=True,
+                                    files=files if gate.get("vip") else None,
+                                    timeout=RETINUE_POST_TIMEOUT)
+    if rail is not None and rail.get("uncertain"):
+        # The rail's answer was lost, so whether the chat took this message is
+        # unknown. Handling it here as well would be the one outcome worse than
+        # waiting: two turns racing over the same draft, plus the dashboard
+        # conversation this replaced. It stays delivered=False.
+        print(f"[signal-gateway] the chats rail did not answer for the message "
+              f"from {sender_label}; left undelivered rather than handled twice",
+              flush=True)
+        return
+    # Only an explicit acceptance is a handover — a job handle on its own is
+    # not. A web-gateway built before this contract ignores `handover` and will
+    # hand back a job it started on its own rules, for a non-VIP among others;
+    # treating that as ours would apply the old policy under the new one's name
+    # for as long as the images are out of step.
+    if rail is not None and rail.get("accepted") is True:
+        rail_job = (rail.get("job_url") or "").strip() or None
+        if rail_job:
+            print(f"[signal-gateway] the chat's companion turn took the message "
+                  f"from {sender_label} (vip)", flush=True)
+            _confirm_delivery(rail_job, store_path, sender_label,
+                              base=_chats.CHATS_INGEST_URL)
+            return
+        # Accepted with no turn: the chat has the message and the user has been
+        # pushed, and that is the delivery. Nothing is owed a model — this
+        # sender is not a VIP — so the record says delivered and nothing ever
+        # re-surfaces it.
+        _mark_delivered(store_path)
+        print(f"[signal-gateway] the chat took the message from {sender_label} "
+              f"({gate['reason']}); no turn asked for", flush=True)
+        return
+
+    # From here down: the rail declined, so this is the pre-chat-surface path,
+    # unchanged.
+    # A VIP is never held here: the two axes are independent, so `forward` is
+    # about the group's noise and `vip` about the person, and the fallback
+    # reading `forward` alone let the group override the sender the whole
+    # design says it never does — for an `ignored` group, silently, by marking
+    # the message delivered with nothing left to recover it. The rail could not
+    # work this VIP's message, so the pre-chat-surface forward does.
+    if not gate["forward"] and not gate.get("vip"):
+        # Mark delivered only for a message that is fully accounted for (an
+        # ignored group, which the drain must never re-surface). One held from a
+        # quieted group stays delivered=False, so a sweep can still find it.
         if gate["delivered_if_held"]:
             _mark_delivered(store_path)
         print(
@@ -1673,18 +1807,6 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"session in it.\n")
         if reply_token else ""
     )
-    # An unknown sender (not whitelisted, not blacklisted, not in a blocked
-    # group) still gets a turn, but flagged: triage asks whether to whitelist or
-    # blacklist the handle so this decision is made once.
-    unknown_line = (
-        (f"\nThis sender ({sender}) is UNKNOWN — not on the triage whitelist. "
-         f"After triaging, open a dashboard conversation asking whether to "
-         f"whitelist this sender (so future messages trigger a turn on arrival) "
-         f"or blacklist them (so they are never asked about again). Apply the "
-         f"user's answer with: python3 /workspace/scripts/triage_policy.py "
-         f"whitelist-add --channel signal --handle {sender}  (or blacklist-add).\n")
-        if gate["flagged_unknown"] else ""
-    )
     attachment_line = (
         (f"\nThe message includes {len(files)} attached file(s) (image(s) and/or "
          f"the original voice note), forwarded with this prompt; their saved "
@@ -1693,6 +1815,15 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
          f"transcript).\n")
         if files else ""
     )
+    # Media kept with the message but not attached to the prompt: a video,
+    # a sticker, or anything over the forwarding cap. The agent should know
+    # the message is that medium, without it weighing on the turn.
+    kept = max(0, len(attachment_urls or []) - len(files or []))
+    if kept:
+        attachment_line += (
+            f"\nThe message also carries {kept} media file(s) — a video, a document, "
+            f"a sticker, or an image over the forwarding size — kept with the message "
+            f"in the chat and not attached to this prompt.\n")
     # The canonical idempotency key for this message's dashboard thread —
     # account and chat included, because a channel-native id alone is not
     # unique (see inbound_store.thread_key). The drain decorates its rows with
@@ -1717,7 +1848,7 @@ def _forward_to_inbox(question: str, lang: str, sender: str,
         f"<external_message>{html.escape(question)}</external_message>\n"
         f"{attachment_line}"
         f"{reply_line}"
-        f"{unknown_line}"
+        f""
         f"{key_line}\n"
         f"Invoke the triage skill scoped to this single message (channel: "
         f"Signal, sender: {sender_label}). Triage it as the user's incoming "
@@ -1875,6 +2006,33 @@ _pending_sends_lock = threading.Lock()
 _REQUEST_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
+def _write_pending_send(path: Path, entry: dict) -> None:
+    """Persist a pending-send entry so a concurrent GET never observes a torn file.
+
+    ``Path.write_text`` truncates the file and then writes, in place; a GET
+    that lands mid-write (or between those two steps) can read a partial file,
+    fail to parse it, and — since the status transition has already dropped
+    the entry from the in-memory ``_pending_sends`` map by the time the
+    background sender writes the terminal state — read back as "not found"
+    (a body with no "status" key at all) rather than as the entry's actual
+    state. A poll tight enough to catch that window turned "sending" into a
+    KeyError instead of "approved". Writing to a same-directory temp file and
+    renaming into place is atomic on POSIX, so a reader always sees either the
+    previous full content or the new one, never a mix.
+    """
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False))
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _lookup_existing_path(request_id: str) -> Path | None:
     """Find the on-disk file for a request id by scanning the pending directory.
 
@@ -1920,7 +2078,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
     path = SIGNAL_PENDING_SENDS_DIR / f"{request_id}.json"
     try:
         _ensure_pending_sends_dir()
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[signal-gateway] warning: could not persist pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -2007,7 +2165,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
         entry.pop("error", None)
         print(f"[signal-gateway] pending send {request_id} approved and sent to {entry['recipient']}", flush=True)
     try:
-        path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        _write_pending_send(path, entry)
     except OSError as exc:
         print(f"[signal-gateway] warning: could not update pending send: {exc}", flush=True)
     with _pending_sends_lock:
@@ -2040,7 +2198,7 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return entry
         entry["status"] = "sending" if approved else "rejected"
         try:
-            path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+            _write_pending_send(path, entry)
         except OSError as exc:
             print(f"[signal-gateway] warning: could not update pending send: {exc}", flush=True)
         _pending_sends.pop(request_id, None)
@@ -2228,6 +2386,46 @@ def _relink_qr_response() -> tuple[int, bytes | dict, str]:
 _PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
 
 
+def _erase_chat(chat: str, account: str | None) -> dict:
+    """Erase one chat from everything this gateway keeps (POST /chats/delete).
+
+    The ledger records and their media go through inbound_store.delete_chat,
+    which matches the (chat, account) pair exactly — the message volume is
+    shared by every account of the channel, so whichever gateway is asked can
+    erase it. The pending-send files and the recent-senders list are this
+    container's own, so they are purged only when the chat is this account's
+    (or an account-less legacy chat): the same peer on another account is
+    another chat, whose traces are that gateway's to erase.
+    """
+    result = _ibstore.delete_chat(INBOUND_STORE_DIR, chat, account)
+    result["pending_sends"] = 0
+    result["recent"] = 0
+    if account and account != SIGNAL_ACCOUNT:
+        return result
+
+    def _pending_hit(entry: dict) -> bool:
+        return str(entry.get("recipient") or "").strip() == chat
+
+    def _recent_hit(entry: dict) -> bool:
+        return (not chat.startswith(SIGNAL_GROUP_PREFIX)
+                and chat in (entry.get("number"), entry.get("uuid")))
+
+    with _pending_sends_lock:
+        removed = _ibstore.purge_pending_sends(SIGNAL_PENDING_SENDS_DIR, _pending_hit)
+        for request_id in removed:
+            _pending_sends.pop(request_id, None)
+    result["pending_sends"] = len(removed)
+    with _RECENT_CHATS_LOCK:
+        try:
+            result["recent"] = _ibstore.purge_recent_chats(SIGNAL_RECENT_CHATS_PATH, _recent_hit)
+        except OSError as exc:
+            print(f"[signal-gateway] could not rewrite recent chats: {exc}", flush=True)
+            result["errors"] += 1
+    print(f"[signal-gateway] erased chat {chat!r} (account {account or '-'}): "
+          f"{result}", flush=True)
+    return result
+
+
 class _PushHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log noise
         return
@@ -2367,6 +2565,36 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(200, {k: v for k, v in entry.items() if k != "images"})
             return
 
+        if self.path.rstrip("/") == "/chats/delete":
+            # Erase one chat — its ledger records, media and this gateway's
+            # own traces of it. The web-gateway calls it on the user's delete
+            # and nothing else should: besides the gateway token it requires
+            # CHAT_ERASE_TOKEN, which agent sessions do not inherit.
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            if not CHAT_ERASE_TOKEN:
+                self._reply(503, {"error": "chat erasure is not configured "
+                                           "(CHAT_ERASE_TOKEN is unset)"})
+                return
+            if not hmac.compare_digest(
+                    (self.headers.get("X-Chat-Erase-Token") or "").strip(),
+                    CHAT_ERASE_TOKEN):
+                self._reply(403, {"error": "chat erasure needs X-Chat-Erase-Token"})
+                return
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else None
+            except (ValueError, UnicodeDecodeError):
+                body = None
+            chat = str((body or {}).get("chat") or "").strip() if isinstance(body, dict) else ""
+            if not chat:
+                self._reply(400, {"error": "chat (the chat key) is required"})
+                return
+            account = str(body.get("account") or "").strip() or None
+            self._reply(200, {"status": "deleted", **_erase_chat(chat, account)})
+            return
+
         if self.path.rstrip("/") != "/send":
             self._reply(404, {"error": "not found"})
             return
@@ -2488,6 +2716,12 @@ def main() -> None:
         _serve_http()
         return
     print(f"[signal-gateway] started (account={SIGNAL_ACCOUNT}, mode={SIGNAL_GATEWAY_MODE}, poll_interval={SIGNAL_POLL_INTERVAL}s)", flush=True)
+    # Records written before the store stated what it knows about a blob
+    # (type, size, pixel size) get that statement now, from this store's own
+    # sidecars — so no reader ever has to look at this gateway's files.
+    stated = _ibstore.backfill_media_meta(INBOUND_STORE_DIR)
+    if stated:
+        print(f"[signal-gateway] stated media metadata on {stated} earlier record(s)", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
     while True:
         if _RELINK_ACTIVE.is_set():

@@ -15,15 +15,16 @@ python3 examples/attention-simulation/simulate.py --open     # http://localhost:
 ```
 
 One of the day's scenes is the stranger: at 13:50 a number nobody knows writes
-on WhatsApp — you gave it out at a workshop the day before. The real delivery
-gate flags the sender unknown, so the model screens the message (sphere
-`unknown`, which no mode admits): held for the 17:00 digest, listed under
-Held, never rung. You pull it out, read it, and fill the contact card — her
-name, the sphere she belongs to, a second group as a tag. That one write names
-the chat, teaches the profile, whitelists her handle and files her in the life
-store's address book, and when she writes again at 16:20 the gate — the real
-one, reading the file the card just wrote — forwards her as a known sender,
-the triage puts a deadline on it, and it rings.
+on WhatsApp — you gave it out at a workshop the day before. Nothing vouches
+for the sender: the real delivery gate says she is no VIP, and the dashboard
+has no contact card and no sphere for her. So the model screens the message
+(sphere `unknown`, which no mode admits): held for the 17:00 digest, listed
+under Held, never rung. You pull it out, read it, and fill the contact card —
+her name, the sphere she belongs to, a second group as a tag. That one write
+names the chat, teaches the profile and files her in the life store's address
+book, and when she writes again at 16:20 — the gate saying exactly what it
+said before — the card is what places her: a customer with a deadline, and it
+rings.
 
 The deck shows the clock, the timeline (the mode bands, the digest times, the
 beats), the day's feed — what you are doing, what arrives, what the gateway
