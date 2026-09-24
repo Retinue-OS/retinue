@@ -329,7 +329,11 @@ would write there, and so does a destination whose `source` is not one of
 `"manifest"` or `"any"` (a typo would make it silently inadmissible); a
 manifest of the wrong shape skips its chamber. Descriptions and file names
 reach the spawned session as an escaped JSON block, which the prompt tells it
-to treat as data rather than instructions. Inside an
+to treat as data rather than instructions. The documents themselves are untrusted too:
+the Archivist treats their content as material to extract from, never as
+instructions, and hands long or unstructured ones to `archivist-reader`, a
+subagent with only the Read tool, so a document that tries to instruct its
+reader has nothing to act with. Inside an
 inbox, symlinks are never handed on as documents, and neither are **hidden
 entries**: a dot-prefixed file is bookkeeping (`.gitkeep`), an OS or editor
 side file (`._x`, `.~lock.x#`) or a transfer still in flight (Syncthing's

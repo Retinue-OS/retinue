@@ -207,6 +207,9 @@ def test_manifests(mod, tmp: Path):
     g = h.chamber("g-linked", inbox_manifest("inbox"))
     (g / "inbox").symlink_to(outside, target_is_directory=True)
     h.chamber("h-root", inbox_manifest("."))
+    loop = h.chamber("h-symlink-loop", inbox_manifest("loop/inbox"))
+    (loop / "loop").symlink_to(loop / "loop", target_is_directory=True)
+    h.chamber("h-nul", inbox_manifest("in\x00box"))
     for name, dest in (("i-dest-abs", str(outside)),
                        ("j-dest-parent", "../outside"),
                        ("k-dest-root", ".")):
@@ -219,7 +222,10 @@ def test_manifests(mod, tmp: Path):
     h.chamber("l-dest-shape", {**inbox_manifest(), "destinations": "filed/"})
     for name, dest in (("m-source-typo", {"path": "filed/",
                                           "source": "manfiest"}),
-                       ("n-source-missing", {"path": "filed/"})):
+                       ("n-source-missing", {"path": "filed/"}),
+                       ("o-source-list", {"path": "filed/", "source": []}),
+                       ("p-source-object", {"path": "filed/",
+                                            "source": {"a": 1}})):
         d = h.chamber(name, {**inbox_manifest(), "destinations": [dest]})
         (d / "inbox").mkdir()
     ok = h.chamber("z-good", {**inbox_manifest(),

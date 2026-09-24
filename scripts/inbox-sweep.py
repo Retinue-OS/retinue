@@ -96,8 +96,13 @@ def resolve_in_chamber(chamber: Path, rel) -> Path | None:
     p = Path(rel)
     if p.is_absolute() or ".." in p.parts:
         return None
-    root = chamber.resolve()
-    target = (chamber / p).resolve()
+    try:
+        root = chamber.resolve()
+        target = (chamber / p).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # A symlink loop, an embedded NUL, a name the OS refuses: not a
+        # path this sweep can vouch for.
+        return None
     if root not in target.parents:
         return None
     return chamber / p
@@ -123,7 +128,9 @@ def destinations_ok(chamber: Path, data: dict) -> bool:
                   "inside the chamber; skipping chamber", file=sys.stderr)
             return False
         source = entry.get("source")
-        if source not in SOURCE_POLICIES:
+        # isinstance first: a list or object is unhashable and would raise
+        # in the set lookup instead of skipping the chamber.
+        if not isinstance(source, str) or source not in SOURCE_POLICIES:
             print(f"[inbox-sweep] {chamber.name}: destination {rel!r} has "
                   f"source {source!r}, expected one of "
                   f"{sorted(SOURCE_POLICIES)}; skipping chamber",
