@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Zero-credit gate for chamber inbox ingestion.
 
-The problem this closes: the Archivist's `inbox/ processing` rules and each
+The problem this closes: the Archivist's "Processing an inbox" rules and each
 chamber's `.inbox.json` describe *how* an incoming file is filed and *where* it
 goes -- but nothing ever says *when*. No watcher, no job. The rule "never leave
 the inbox non-empty after a push" was written down and then executed only when
@@ -18,7 +18,7 @@ declared inbox actually holds files does it spawn a single `claude -p` session,
 handed the already-scanned listing so the agent does not re-scan.
 
 Re-spawn guard: the Archivist deliberately leaves a file it cannot classify in
-the inbox and flags it (archivist.md, `inbox/ processing`, step 4). Without a
+the inbox and reports it (archivist.md, "Processing an inbox", step 4). Without a
 guard that one file would spawn a session on every tick forever. So the sweep
 records the listing it last spawned for and stays quiet while the inbox is
 unchanged -- any added, removed or modified file makes it due again. The
@@ -215,10 +215,11 @@ def build_prompt(scan: list[dict]) -> str:
         "them.",
         "",
         "For each chamber below, dispatch the `archivist` subagent to process "
-        "that chamber's inbox: file each document to its declared destination, "
-        "extract triples into the sibling .nt, and commit the destination "
-        "files together with the inbox deletions, per the Archivist's "
-        "`inbox/ processing` rules and the chamber's `.inbox.json`.",
+        "that chamber's inbox: file each document to a destination declared "
+        "in the chamber's `.inbox.json`, get its facts into the store "
+        "(converter first, per-file extraction only for one-offs), and "
+        "commit the destination files together with the inbox deletions, per "
+        "\"Processing an inbox\" in the Archivist's definition.",
         "",
         "The Archivist starts cold: include the chamber path, the file "
         "listing, and any relevant memories in the dispatch prompt.",

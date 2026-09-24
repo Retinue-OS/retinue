@@ -255,7 +255,7 @@ this public repo carries no chamber-specific or personal text.
 ## Draining chamber inboxes (`.inbox.json`)
 
 An inbox is a letterbox, not a shelf: the user drops a file in, an agent takes
-it out. The Archivist's `inbox/ processing` rules say exactly *how* a dropped
+it out. The Archivist's "Processing an inbox" rules say exactly *how* a dropped
 file is filed and *where* it goes, and a chamber's `.inbox.json` declares the
 paths — but for a long time nothing said *when*, so a chamber inbox only ever
 emptied when a human happened to ask, and one quietly accumulated months of
@@ -299,8 +299,8 @@ by a chamber's own extraction guidance), not by the sweep. A malformed
 `.inbox.json` skips that one chamber with a warning rather than failing the
 sweep — the other chambers' letterboxes are still worth emptying.
 
-**The re-spawn guard.** Step 4 of `inbox/ processing` tells the Archivist to
-*leave* a file it cannot classify in the inbox and flag it. That is correct
+**The re-spawn guard.** Step 4 of the Archivist's "Processing an inbox" tells it to
+*leave* a file it cannot classify in the inbox and report it. That is correct
 behaviour, but it means a naive gate would find the same file every hour and
 spawn a session every hour, forever — a slow credit leak with no end state. So
 the sweep records the listing it last spawned for (name, size and mtime per
