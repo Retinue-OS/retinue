@@ -4,7 +4,8 @@
 SMS reaches Retinue through the user's own Android phone running the SMS
 Gateway for Android app (https://github.com/capcom6/android-sms-gateway),
 paired with a self-hosted android-sms-gateway **private server** — the
-`sms-server` compose service. No third-party relay is involved:
+`sms-server` compose service. No third party carries the messages (for
+wake-ups, see docs/messaging.md, "Keeping the vendor out"):
 
     phone (SMSGate app) ──mobile API──▶ sms-server ◀──3rd-party API── this gateway
     phone ──signed webhook (sms:received)──▶ this gateway's POST /webhook
@@ -103,9 +104,9 @@ SMS_WEBHOOK_MAX_AGE_SECONDS = float(os.environ.get("SMS_WEBHOOK_MAX_AGE_SECONDS"
 MAX_WEBHOOK_BODY_BYTES = int(os.environ.get("SMS_WEBHOOK_MAX_BODY_BYTES", str(256 * 1024)))
 
 # Link state: the phone counts as connected when the server last saw it (or it
-# last delivered a webhook) within this window. Generous by default — a phone
-# without push relies on its own polling, and a false "disconnected" thread is
-# worse than a late one.
+# last delivered a webhook) within this window. Generous by default — how often
+# a phone checks in varies with its power settings, and a false "disconnected"
+# thread is worse than a late one.
 SMS_DEVICE_STALE_SECONDS = float(os.environ.get("SMS_DEVICE_STALE_SECONDS", str(6 * 3600)))
 SMS_POLL_SECONDS = float(os.environ.get("SMS_POLL_SECONDS", "60"))
 
@@ -397,6 +398,30 @@ def _parse_received_at(value) -> float | None:
         return None
 
 
+_PHONE_RE = re.compile(r"^\+?[0-9][0-9 ()./-]{1,30}$")
+_ALNUM_SENDER_KEEP_RE = re.compile(r"[^A-Za-z0-9 ._&-]")
+# GSM alphanumeric sender ids are at most 11 characters; a little slack for
+# what carriers and the app hand through, and nothing like room for a sentence.
+SMS_SENDER_MAX_CHARS = 16
+
+
+def _normalize_sender(raw) -> str | None:
+    """Reduce a reported sender to the shapes SMS senders actually take.
+
+    The sender is untrusted like the text, but it is rendered where the text
+    is not — as a chat key, a label, and outside the escaped message block in
+    model prompts. A real SMS sender is a phone number (kept as ``+`` and
+    digits, so both directions of a chat share one key) or a short
+    alphanumeric id ("Swisscom", "DHL"); anything else is cut down to that
+    shape, so a sender field can never carry markup or instructions."""
+    text = str(raw or "").strip()
+    if _PHONE_RE.match(text):
+        digits = re.sub(r"[^0-9]", "", text)
+        return ("+" if text.startswith("+") else "") + digits if digits else None
+    cleaned = " ".join(_ALNUM_SENDER_KEEP_RE.sub("", text).split())
+    return cleaned[:SMS_SENDER_MAX_CHARS].strip() or None
+
+
 def _parse_sms_received(event: dict) -> dict | None:
     """Pull the fields this gateway uses out of an ``sms:received`` event.
 
@@ -406,7 +431,7 @@ def _parse_sms_received(event: dict) -> dict | None:
     payload = event.get("payload")
     if not isinstance(payload, dict):
         return None
-    sender = str(payload.get("sender") or payload.get("phoneNumber") or "").strip()
+    sender = _normalize_sender(payload.get("sender") or payload.get("phoneNumber"))
     if not sender:
         return None
     message_id = str(payload.get("messageId") or "").strip() or None
@@ -422,9 +447,15 @@ def _parse_sms_received(event: dict) -> dict | None:
 # ── Webhook deduplication ─────────────────────────────────────────────────────
 # The app retries a webhook until it gets a 2xx, so the same SMS can arrive
 # more than once (a slow answer, a lost response). The ledger writes a fresh
-# record per call, so the dedup lives here: a bounded, persisted set of the
-# delivery keys already taken.
+# record per call, so the dedup lives here, in two parts: an in-memory set of
+# deliveries being processed right now (so two concurrent retries cannot both
+# record one SMS) and a bounded, persisted set of deliveries already recorded.
+# A key reaches the persisted set only AFTER its ledger record is on disk: a
+# crash in between leaves nothing durable, so the retry records the SMS
+# rather than being waved off as a duplicate. The worst case is then a second
+# record of one SMS — at-least-once, which beats a silent loss.
 _SEEN_LOCK = threading.Lock()
+_INFLIGHT: set = set()
 
 
 def _load_seen() -> list:
@@ -446,36 +477,41 @@ def _dedup_key(parsed: dict) -> str | None:
 
 
 def _claim(key: str | None) -> bool:
-    """Record ``key`` as taken; False when it already was. Keyless events are
-    always taken — nothing identifies a redelivery of those."""
+    """Start processing ``key``; False when it is already recorded or being
+    processed. Keyless events are always taken — nothing identifies a
+    redelivery of those. Every True must end in :func:`_commit` or
+    :func:`_release`."""
     if not key:
         return True
     with _SEEN_LOCK:
-        seen = _load_seen()
-        if key in seen:
+        if key in _INFLIGHT or key in _load_seen():
             return False
-        seen.append(key)
-        del seen[:-SMS_SEEN_WEBHOOKS_MAX]
-        try:
-            _atomic_json(SMS_SEEN_WEBHOOKS_PATH, seen)
-        except OSError as exc:
-            print(f"[sms-gateway] could not persist seen webhooks: {exc}", flush=True)
+        _INFLIGHT.add(key)
         return True
 
 
-def _unclaim(key: str | None) -> None:
-    """Undo a claim whose delivery could not be recorded, so its retry counts."""
+def _commit(key: str | None) -> None:
+    """Mark a claimed delivery as recorded, once its ledger write succeeded."""
     if not key:
         return
     with _SEEN_LOCK:
+        _INFLIGHT.discard(key)
         seen = _load_seen()
         if key not in seen:
-            return
-        seen.remove(key)
-        try:
-            _atomic_json(SMS_SEEN_WEBHOOKS_PATH, seen)
-        except OSError as exc:
-            print(f"[sms-gateway] could not persist seen webhooks: {exc}", flush=True)
+            seen.append(key)
+            del seen[:-SMS_SEEN_WEBHOOKS_MAX]
+            try:
+                _atomic_json(SMS_SEEN_WEBHOOKS_PATH, seen)
+            except OSError as exc:
+                # The record is on disk; a retry would record it once more.
+                print(f"[sms-gateway] could not persist seen webhooks: {exc}", flush=True)
+
+
+def _release(key: str | None) -> None:
+    """Drop a claim whose delivery could not be recorded, so its retry counts."""
+    if key:
+        with _SEEN_LOCK:
+            _INFLIGHT.discard(key)
 
 
 def _atomic_json(path: Path, data) -> None:
@@ -705,8 +741,9 @@ def _accept_webhook(body: bytes, signature: str | None, timestamp: str | None) -
         # Not on disk means not delivered: release the claim and answer with a
         # retryable error, so the app's backoff tries again instead of the
         # message being acknowledged into nowhere.
-        _unclaim(key)
+        _release(key)
         return 503, {"error": "could not persist the message; retry later"}
+    _commit(key)
     _record_recent_sender(sender)
     threading.Thread(
         target=_forward_safely, args=(parsed["text"], sender, store_path, parsed["message_id"]),
