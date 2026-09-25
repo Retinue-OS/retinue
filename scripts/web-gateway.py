@@ -2903,9 +2903,11 @@ def _conv_event_mode(conv: dict) -> str:
         if ts.tzinfo is not None:
             anchors.append(ts)
     if anchors:
-        # The attention clock where one is set (a simulated day, a test), so
-        # "stalled" is measured on the same clock the thread's times were.
-        now = ATTENTION_CLOCK() if ATTENTION_CLOCK is not None else datetime.now(timezone.utc)
+        # The wall clock, which is what a thread's times are stamped with
+        # (_new_conv, _conv_add_message, read_at) — never the attention clock
+        # a simulated day or a test pins: measured against that, whether a
+        # reply counts as "stalled" depended on the hour the run happened at.
+        now = datetime.now(timezone.utc)
         idle = (now - max(anchors)).total_seconds()
         if idle > _STALLED_AFTER_SECONDS:
             return "stalled"
