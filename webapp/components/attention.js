@@ -16,10 +16,13 @@
 // a chat on its page, a project on its page. The list polls on the
 // conversations cadence and refreshes at once after any action on the sheet.
 //
-// A digest push opens the home as /?digest=<its time>: what that digest
-// released comes first, in a section of its own, most pressing first, until
-// Done; afterwards the rows the latest digest brought keep a quiet marker
-// (each row's `digest_at` against the payload's `last_digest`).
+// A digest's items come first, in a section of their own, most pressing
+// first, until Done — on every device the home is open on, not only the one
+// whose push was tapped: the payload's `unseen_digest` is the last digest
+// sent while nobody has marked it Done anywhere (POST /attention/seen). A
+// digest push opens the home as /?digest=<its time>, which shows that digest
+// even once seen. Afterwards the rows the latest digest brought keep a quiet
+// marker (each row's `digest_at` against the payload's `last_digest`).
 
 import { esc, fmtAge } from './base.js';
 import {
@@ -207,6 +210,7 @@ class RetinueAttention extends HTMLElement {
       const item = params.get('item');
       if (item) openAttentionSheet(item);
       this._digest = params.get('digest') || null;
+      this._digestLink = !!this._digest;
     } catch (_e) { /* no query */ }
   }
 
@@ -229,8 +233,16 @@ class RetinueAttention extends HTMLElement {
       const res = await fetch(SRC, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
       const data = await res.json();
-      const sig = JSON.stringify([data.sections, data.mode, data.next_breakpoint, data.degraded, data.last_digest]);
+      const sig = JSON.stringify([data.sections, data.mode, data.next_breakpoint, data.degraded, data.last_digest,
+        data.unseen_digest]);
       this._data = data;
+      if (!this._digestLink) {
+        // The digest nobody has marked Done yet, on whichever device; gone
+        // here as soon as Done is pressed anywhere (or here, before the
+        // gateway has answered).
+        const unseen = data.unseen_digest;
+        this._digest = unseen && unseen.at !== this._doneAt ? unseen.at : null;
+      }
       this._state = 'ok';
       // An open mode menu is left alone: re-rendering it on every poll reset
       // it under the user's finger. Closing it renders from the fresh data.
@@ -353,10 +365,22 @@ class RetinueAttention extends HTMLElement {
     return !!(last && r.digest_at && r.digest_at === last.at);
   }
 
-  // Leaving the digest view: the rows go back to their sections, and the
-  // link's ?digest= goes from the address so a reload shows the plain home.
+  // Leaving the digest view: the rows go back to their sections, the
+  // link's ?digest= goes from the address so a reload shows the plain home,
+  // and the gateway hears it was seen, so no other open dashboard shows it.
   _closeDigest() {
+    const at = this._digest;
     this._digest = null;
+    this._digestLink = false;
+    this._doneAt = at;
+    if (at) {
+      fetch('/attention/seen', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ digest: at }),
+      }).then((res) => {
+        if (!res.ok) throw new Error(String(res.status));
+        window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'seen' } }));
+      }).catch(() => { this._doneAt = null; /* not recorded: the next poll shows it again */ });
+    }
     try {
       const url = new URL(location.href);
       url.searchParams.delete('digest');
@@ -507,7 +531,8 @@ class RetinueAttention extends HTMLElement {
       let s = d.sections || {};
       const mode = d.mode || {};
       head = this._headHtml(d);
-      // Opened from a digest push: what it released first, and not twice.
+      // A digest nobody has marked Done (or the one a push opened): what it
+      // released first, and not twice.
       let digest = '';
       if (this._digest) {
         const rows = this._digestRows(s, this._digest);

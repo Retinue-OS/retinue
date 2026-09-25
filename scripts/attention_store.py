@@ -153,6 +153,32 @@ class AttentionStore:
                 states[uri] = block
             policy.save_json(self.dir / "projects.json", states)
 
+    def digest_marks(self) -> dict:
+        """When the last digest went out (``sent``) and the latest one the
+        user marked Done on any device (``seen``), as datetimes or None —
+        so every open dashboard shows the digest until one of them saw it."""
+        with self.lock:
+            marks = policy.load_json(self.dir / "digest.json", {})
+            out = {}
+            for key in ("sent", "seen"):
+                try:
+                    out[key] = policy.parse_dt(marks.get(key))
+                except (TypeError, ValueError):
+                    out[key] = None
+            return out
+
+    def mark_digest(self, key: str, at: datetime) -> None:
+        """Record a digest as sent or seen; a mark never moves back."""
+        with self.lock:
+            marks = policy.load_json(self.dir / "digest.json", {})
+            try:
+                before = policy.parse_dt(marks.get(key))
+            except (TypeError, ValueError):
+                before = None
+            if before is None or at > before:
+                marks[key] = at.isoformat()
+                policy.save_json(self.dir / "digest.json", marks)
+
     def last_tick(self) -> datetime | None:
         """The last minute the gateway's tick acted on, as it left it — so a
         restart can make up a digest or a mode change it slept through."""

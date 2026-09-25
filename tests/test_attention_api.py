@@ -307,6 +307,35 @@ def test_mode_change_is_a_breakpoint(base, wg):
     print("ok test_mode_change_is_a_breakpoint")
 
 
+def test_digest_on_every_device(base, wg):
+    """A digest is framed on every open dashboard, not only the one whose
+    push was tapped, until it is marked Done on any of them."""
+    _mode(base, "focused")
+    body = _open(base, "Card renewal", "The card on file expires Friday.",
+                 {"importance": 4, "sphere": "admin", "kind": "admin chore"})
+    assert body["attention"]["delivery"] == "hold"
+    tid = "thread:" + body["id"]
+    out = _mode(base, "chores")                     # a change by hand is a breakpoint
+    unseen = out["unseen_digest"]
+    assert unseen and unseen["count"] >= 1, out.get("unseen_digest")
+    assert _find(out, tid)[1]["digest_at"] == unseen["at"]
+    # Another device loads the home: the same digest, still unseen.
+    assert _sections(base)["unseen_digest"] == unseen
+    # Done on one device, and it is seen everywhere.
+    status, done = _http(base, "POST", "/attention/seen", {"digest": unseen["at"]})
+    assert status == 200 and done["seen"] == unseen["at"], done
+    home = _sections(base)
+    assert home["unseen_digest"] is None and home["last_digest"]["at"] == unseen["at"], home["last_digest"]
+    # A seen mark never moves back; a bad one is refused.
+    status, _ = _http(base, "POST", "/attention/seen", {"digest": "2020-01-01T00:00:00+00:00"})
+    assert status == 200 and _sections(base)["unseen_digest"] is None
+    status, _ = _http(base, "POST", "/attention/seen", {"digest": "soon"})
+    assert status == 400
+    _http(base, "POST", "/attention/items/done", {"id": tid})
+    _mode(base, None)
+    print("ok test_digest_on_every_device")
+
+
 def test_corrections_learn(base, wg):
     _mode(base, "chores")
     body = _open(base, "Tax office letter", "Statement due 30 September.",
@@ -994,6 +1023,7 @@ def main():
         test_critical_and_passive(base, wg)
         test_user_thread_never_gated(base, wg)
         test_mode_change_is_a_breakpoint(base, wg)
+        test_digest_on_every_device(base, wg)
         test_corrections_learn(base, wg)
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)

@@ -1187,7 +1187,7 @@ _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
 # The attention model's writes: the mode, the rules, and the actions on one
 # item (its id travels in the body — chat ids and project URIs carry
 # characters no path segment should).
-_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|admit|spheres|profile|later|pull|done|reopen|correct)/?$")
+_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|admit|spheres|profile|seen|later|pull|done|reopen|correct)/?$")
 
 # ── Push notifications ─────────────────────────────────────────────────────────
 # The unread badge only exists while the dashboard is open, which is precisely
@@ -7240,6 +7240,9 @@ def _attention_breakpoint(items: list[dict], focus: dict, now: datetime, why: st
             digest["label"] = label
         for item in digest["items"]:
             _attention_persist(item)
+        # Sent, whether or not a device takes pushes: the home frames it on
+        # every open dashboard until it is marked Done on one.
+        _ATTENTION.mark_digest("sent", digest["at"])
         _attention_push_digest(digest, now)
         print(f"[web-gateway] attention: {why} released {len(digest['items'])} held item(s)", flush=True)
     return digest
@@ -7407,6 +7410,19 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
     }
 
 
+def _attention_unseen_digest(items: list[dict], now: datetime) -> dict | None:
+    """The last digest sent, while it has open items and nobody has marked it
+    Done on any device: what every open dashboard shows first, framed — not
+    only the page a digest push opened. None once it is seen or handled."""
+    marks = _ATTENTION.digest_marks()
+    sent, seen = marks.get("sent"), marks.get("seen")
+    if sent is None or sent > now or (seen is not None and seen >= sent):
+        return None
+    count = sum(1 for i in items if i.get("digest_at") == sent
+                and i.get("state", "open") == "open" and i.get("released"))
+    return {"at": sent.isoformat(), "count": count} if count else None
+
+
 def _attention_last_digest(items: list[dict], now: datetime) -> dict | None:
     stamps = [i["digest_at"] for i in items
               if i.get("digest_at") and i["digest_at"] <= now
@@ -7447,6 +7463,7 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
         # The latest digest that released something still open: what the
         # home marks as "from the 12:00 digest".
         "last_digest": _attention_last_digest(items, now),
+        "unseen_digest": _attention_unseen_digest(items, now),
         "degraded": degraded,
         "learned": (profile.get("learned") or [])[-5:],
     }
@@ -8871,6 +8888,18 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if action == "profile":
                 self._attention_write_profile(payload)
+                return
+            if action == "seen":
+                # Done on a digest, from any device: {digest: <its time>}.
+                try:
+                    at = attention_policy.parse_dt(payload.get("digest"))
+                except (TypeError, ValueError):
+                    at = None
+                if at is None or at.tzinfo is None:
+                    self._send_json(400, {"error": "digest (its time) is required"})
+                    return
+                _ATTENTION.mark_digest("seen", at)
+                self._send_json(200, {"seen": at.isoformat()})
                 return
             item_id = str(payload.get("id") or "")
             item = _attention_item(item_id, profile, now) if item_id else None

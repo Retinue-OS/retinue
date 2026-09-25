@@ -205,8 +205,12 @@ item saying why it is there: *Backup failed — critical*, *Beat Frei — due
 tomorrow 12:00*, *Card renewal — overdue since 07:00*, or the start of what it
 says when it has no deadline; five lines, then "… and 3 more"
 (`attention.digest_text`). Each released item is stamped `digest_at`, and the
-push opens `/?digest=<its time>`: the home shows what that digest brought
-first, in a framed section of its own, until *Done*. Afterwards the rows the
+home shows what the digest brought first, in a framed section of its own —
+on every device the dashboard is open on, not only the phone whose push was
+tapped — until *Done* on any of them (`unseen_digest` in `GET /attention`;
+`POST /attention/seen {digest}`; the gateway keeps the last digest sent and
+the last one seen in `digest.json` under `ATTENTION_DIR`). The push itself
+opens `/?digest=<its time>`, which shows that digest even once seen. Afterwards the rows the
 latest digest released keep a quiet *digest 12:00* marker (`last_digest` in
 `GET /attention`); a new arrival, *Later* or *Pull* takes it off. Nothing held
 means no digest, and Rest sends none: what waited goes out with the first
