@@ -162,7 +162,8 @@ def heal_focus(focus: dict) -> dict:
 
 def default_profile() -> dict:
     """The attention profile (profile.json): importance priors, lead times, permits."""
-    return {"priors": {}, "spheres": {}, "leads": dict(DEFAULT_LEADS), "permits": {mid: [] for mid in DEFAULT_MODES}, "learned": []}
+    return {"priors": {}, "spheres": {}, "tags": {}, "leads": dict(DEFAULT_LEADS),
+            "permits": {mid: [] for mid in DEFAULT_MODES}, "learned": []}
 
 
 def load_json(path: Path, default: dict) -> dict:
@@ -258,6 +259,10 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "title": doc.get("title") or doc.get("name") or "",
         "sphere": a.get("sphere") or doc.get("sphere") or "admin",
         "tags": list(a.get("tags") or []),
+        # "message" where a triage judgement of the latest message set the
+        # spheres, "you" after a correction; a chat otherwise shows its
+        # sender's spheres (attention_store.chat_item).
+        "sphere_from": a.get("sphere_from"),
         "importance": float(a.get("importance", DEFAULT_IMPORTANCE)),
         "importance_from": a.get("importance_from") or ("agent" if "importance" in a else "default"),
         "due": parse_dt(a.get("due")),
@@ -289,7 +294,8 @@ def item_to_attention(item: dict) -> dict:
     return {
         "importance": item["importance"], "importance_from": item.get("importance_from"),
         "due": iso(item.get("due")), "lead": item["lead"].total_seconds() / 60, "lead_from": item.get("lead_from"),
-        "sphere": item["sphere"], "tags": list(item.get("tags") or []), "kind": item.get("kind_label"),
+        "sphere": item["sphere"], "tags": list(item.get("tags") or []), "sphere_from": item.get("sphere_from"),
+        "kind": item.get("kind_label"),
         "actor": item.get("actor"), "waiting_since": iso(item.get("waiting_since")), "sender": item.get("sender"),
         "critical": bool(item.get("critical")), "vip": bool(item.get("vip")),
         "state": item.get("state", "open"), "released": bool(item.get("released")),
@@ -647,27 +653,63 @@ def mode_at(focus: dict, now: datetime) -> dict:
     return {**mode, "admits": [scope["id"]], "subject": scope}
 
 
+def spheres_of(item: dict) -> list[str]:
+    """Every sphere the item is in: its main one first, then the further ones
+    (``tags``). A person can be a customer and a friend at once, and every one
+    of their spheres counts for admission alike — the main one only leads the
+    list (the colour, the default)."""
+    return list(dict.fromkeys([item["sphere"], *(item.get("tags") or [])]))
+
+
 def about_project(item: dict, uri: str) -> bool:
     return bool(uri) and (item.get("project") == uri or item.get("id") == uri)
 
 
 def admitted(item: dict, mode: dict, profile: dict) -> bool:
-    """A sphere in ``admits`` gets through; so does one in ``admit_tags``,
-    whether the item carries it as its sphere or as a tag — "health may
-    reach me" is about the subject, not about which slot it sits in — and,
-    with Focused on a project, whatever is about that project. A VIP's
-    message is admitted everywhere (see breaks_through)."""
+    """An item gets through when any of its spheres (spheres_of) is in the
+    mode's ``admits`` or ``admit_tags`` — a customer who is also a friend
+    rings in Social as in Focused on customers — and, with Focused on a
+    project, when it is about that project. A VIP's message is admitted
+    everywhere (see breaks_through)."""
     if item.get("vip"):
         return True
-    tags = mode.get("admit_tags", [])
-    if item["sphere"] in mode["admits"] or item["sphere"] in tags:
-        return True
-    if any(t in tags for t in item.get("tags") or []):
+    words = set(mode["admits"]) | set(mode.get("admit_tags", []))
+    if any(s in words for s in spheres_of(item)):
         return True
     if about_project(item, mode.get("project")):
         return True
     sender = item.get("sender")
     return bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or [])
+
+
+def admitted_by(item: dict, mode: dict) -> dict | None:
+    """Which rule of the mode in force lets the item through, so the details
+    sheet offers the switch that actually changes it — ``{"by", "what"}``:
+
+    - ``vip`` — the sender is a VIP; no Focus rule to change;
+    - ``project`` / ``scope`` — Focused is on this project or this sphere:
+      the stint itself, not a rule;
+    - ``sphere`` — the mode's rule lists one of the item's spheres
+      (``admits``), named in ``what``;
+    - ``tag`` — the mode admits a word wherever it stands (``admit_tags``),
+      as any of the item's spheres: Focused lets *health* through this way,
+      whatever the scope.
+
+    None when no rule admits it (a permit is the sender's, not a rule of the
+    mode, and the sheet has its own switch for it)."""
+    if item.get("vip"):
+        return {"by": "vip", "what": item.get("sender") or ""}
+    if about_project(item, mode.get("project")):
+        return {"by": "project", "what": mode["project"]}
+    spheres = spheres_of(item)
+    hit = next((s for s in spheres if s in mode["admits"]), None)
+    if hit is not None:
+        return {"by": "scope" if mode.get("subject") else "sphere", "what": hit}
+    tags = mode.get("admit_tags") or []
+    hit = next((s for s in spheres if s in tags), None)
+    if hit is not None:
+        return {"by": "tag", "what": hit}
+    return None
 
 
 def mode_label(mode: dict) -> str:
@@ -683,9 +725,10 @@ def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> st
         return f"{item.get('sender') or 'the sender'} is a VIP"
     if about_project(item, mode.get("project")):
         return f"{mode_label(mode)}: this is about it"
-    if item["sphere"] in mode["admits"]:
-        return f"{mode['name']} admits {item['sphere']}"
-    tag = next((t for t in [item["sphere"]] + list(item.get("tags") or []) if t in mode.get("admit_tags", [])), None)
+    hit = next((s for s in spheres_of(item) if s in mode["admits"]), None)
+    if hit:
+        return f"{mode['name']} admits {hit}"
+    tag = next((s for s in spheres_of(item) if s in mode.get("admit_tags", [])), None)
     if tag:
         return f"{mode['name']} admits {tag} everywhere"
     if has_permit(item, mode, profile):
@@ -925,8 +968,9 @@ def reevaluate(item: dict, focus: dict, profile: dict, now: datetime, why: str) 
 
 
 def repeat_policy(item: dict, mode: dict) -> dict:
-    """Per-class repeat policy: off by default, on for family in Rest (the repeated-caller case)."""
-    if item["sphere"] == "family" and mode["id"] == "rest":
+    """Per-class repeat policy: off by default, on for family in Rest (the
+    repeated-caller case) — family among any of the sender's spheres."""
+    if "family" in spheres_of(item) and mode["id"] == "rest":
         return {"escalate": True, "reason": "a family repeat breaks through in Rest"}
     return {"escalate": False, "reason": ""}
 
@@ -951,15 +995,35 @@ def correct(item: dict, profile: dict, patch: dict, now: datetime) -> list[str]:
             learned.append(f"lead time for “{item['kind_label']}” → {fmt_duration(item['lead'])}")
     if "due" in patch:
         item["due"] = parse_dt(patch["due"])
+    # A sphere correction on a chat is about the person, so the profile
+    # learns it for the sender — main sphere and further ones alike — and the
+    # item stops carrying a message's own judgement (``sphere_from``).
     if patch.get("sphere"):
         item["sphere"] = str(patch["sphere"])
+        item["sphere_from"] = "you"
         key = item.get("sender")
         if key:
             profile.setdefault("spheres", {})[key] = item["sphere"]
             learned.append(f"sphere for {key} → {item['sphere']}")
     if isinstance(patch.get("tags"), list):
         # A tag is a further sphere, so it is the same word the rules use.
-        item["tags"] = list(dict.fromkeys(t for t in (sphere_id(x) for x in patch["tags"]) if t))
+        # The profile's further spheres sit beside the sender's main sphere,
+        # the item's beside its own: they differ while the item carries a
+        # message's judgement, which a tags-only correction leaves in place
+        # (the item keeps showing that message's sphere, now and on reload;
+        # the sender's next message shows the corrected spheres).
+        words = [t for t in dict.fromkeys(sphere_id(x) for x in patch["tags"]) if t]
+        item["tags"] = [t for t in words if t != item["sphere"]]
+        if item.get("sphere_from") != "message":
+            item["sphere_from"] = "you"
+        key = item.get("sender")
+        if key:
+            main = item["sphere"]
+            if item.get("sphere_from") == "message":
+                main = (profile.get("spheres") or {}).get(key) or main
+            tags = [t for t in words if t != main]
+            profile.setdefault("tags", {})[key] = tags
+            learned.append(f"further spheres for {key} → {', '.join(tags) or 'none'}")
     if "critical" in patch:
         item["critical"] = bool(patch["critical"])
     for text in learned:

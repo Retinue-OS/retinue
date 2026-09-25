@@ -506,6 +506,124 @@ def test_unknown_sender_screened_then_named(base, wg):
     print("ok test_unknown_sender_screened_then_named")
 
 
+def test_a_person_in_several_spheres(base, wg):
+    """A customer who is also a friend: every sphere of theirs counts for a
+    mode, until the triage judges a message to be about one of them."""
+    rita = "+41791000077"
+    chat = "signal:" + rita
+    cid = "chat:" + chat
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, rita, None, "Hi, Rita here.", "2026-09-05T09:00:00Z", gate=gate)
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Rita Keller", "sphere": "customers", "tags": ["friends"]})
+    assert status == 200 and out["item"]["sphere"] == "customers" and out["item"]["tags"] == ["friends"], out
+    assert wg._ATTENTION.profile()["tags"]["Rita Keller"] == ["friends"], "the card's further spheres are hers"
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    # Social admits friends: her friends sphere lets her through, though her
+    # main one is customers.
+    _mode(base, "social")
+    PUSHES.clear()
+    body = _inbound(base, rita, "Rita Keller", "Can you look at the offer before 18:00?", "2026-09-05T09:10:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "kind": "customer request"})
+    assert body["pushed"] is True and PUSHES, "a further sphere counts like the main one"
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["admission"] == {"by": "sphere", "what": "friends"} and row["reason"] == "Social admits friends", row
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    # Focused on customers — but the triage judged this message to be about
+    # the barbecue: friends only, for this message.
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
+    PUSHES.clear()
+    body = _inbound(base, rita, "Rita Keller", "Barbecue on Saturday — bring salad?", "2026-09-05T09:20:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "sphere": "friends"})
+    assert body["pushed"] is False and not PUSHES, "the message's own sphere decides"
+    where, row = _find(_sections(base), cid)
+    assert where == "held" and row["sphere"] == "friends" and row["tags"] == [] and row["admission"] is None, (where, row)
+    # A follow-up the triage did not judge is still about the barbecue: the
+    # deadline stays, and so does friends — it is held, not rung.
+    body = _inbound(base, rita, "Rita Keller", "Bring a salad?", "2026-09-05T09:21:00Z", gate=gate)
+    assert body["pushed"] is False and not PUSHES, "a follow-up keeps its judgement whole"
+    where, row = _find(_sections(base), cid)
+    assert where == "held" and row["sphere"] == "friends" and row["level"] == "time-sensitive", (where, row)
+    # The next message, judged without a sphere, is hers again: customers + friends.
+    body = _inbound(base, rita, "Rita Keller", "And the offer — did you see it?", "2026-09-05T09:30:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "kind": "customer request"})
+    assert body["pushed"] is True
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["admission"] == {"by": "scope", "what": "customers"}, row
+    # The sheet's switches edit her further spheres, remembered for her.
+    status, out = _http(base, "POST", "/attention/items/correct", {"id": cid, "tags": ["friends", "family", "customers"]})
+    assert status == 200 and out["item"]["tags"] == ["friends", "family"], out["item"]
+    assert wg._ATTENTION.profile()["tags"]["Rita Keller"] == ["friends", "family"]
+    assert any("further spheres for Rita Keller" in x for x in out["learned_now"]), out["learned_now"]
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    _mode(base, "")
+    print("ok test_a_person_in_several_spheres")
+
+
+def test_a_message_judgement_is_its_own(base, wg):
+    """A triage judgement belongs to the chat's open item: tags alone count
+    beside the sender's main sphere, an unclassified follow-up keeps the whole
+    judgement while the item is open, the next message after it was handled
+    starts fresh with the sender's spheres, and a tags-only correction
+    teaches the profile further spheres beside the sender's main sphere."""
+    nora = "+41791000088"
+    chat = "signal:" + nora
+    cid = "chat:" + chat
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, nora, None, "Hi, Nora here.", "2026-09-05T11:00:00Z", gate=gate)
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Nora Weber", "sphere": "customers", "tags": ["friends"]})
+    assert status == 200, out
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "family"})
+    assert status == 200
+    # Tags without a sphere: health, which Focused admits whatever the scope.
+    PUSHES.clear()
+    body = _inbound(base, nora, "Nora Weber", "The results from the clinic are in.", "2026-09-05T11:10:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "tags": ["health"]})
+    assert body["pushed"] is True and PUSHES, "a message's tags count without a sphere of its own"
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["health"], row
+    assert row["admission"] == {"by": "tag", "what": "health"}, row
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    # An unclassified follow-up while the judged item is open keeps the whole
+    # judgement — its sphere with its deadline, never one without the other.
+    _mode(base, "social")
+    _inbound(base, nora, "Nora Weber", "Barbecue Saturday?", "2026-09-05T11:20:00Z",
+             gate=gate, attention={"importance": 4, "due": _due(1), "sphere": "family"})
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "family" and row["tags"] == [], row
+    judged_due = row["due"]
+    _inbound(base, nora, "Nora Weber", "Bring a salad?", "2026-09-05T11:22:00Z", gate=gate)
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "family" and row["tags"] == [] and row["due"] == judged_due, row
+    # Once it is handled, the next message starts fresh: hers again, and
+    # without the settled deadline.
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    _inbound(base, nora, "Nora Weber", "Also, the invoice.", "2026-09-05T11:25:00Z", gate=gate)
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["due"] is None and row["importance_from"] in ("default", "prior"), row
+    assert row["admission"] == {"by": "sphere", "what": "friends"}, row
+    # A tags-only correction of a judged message: the item keeps the
+    # message's sphere now and on reload, the profile learns further spheres
+    # beside her main one.
+    _inbound(base, nora, "Nora Weber", "Barbecue Saturday — salad?", "2026-09-05T11:30:00Z",
+             gate=gate, attention={"importance": 4, "due": _due(1), "sphere": "family"})
+    status, out = _http(base, "POST", "/attention/items/correct",
+                        {"id": cid, "tags": ["friends", "family", "board-games"]})
+    assert status == 200 and out["item"]["sphere"] == "family", out["item"]
+    assert out["item"]["tags"] == ["friends", "board-games"], out["item"]
+    assert wg._ATTENTION.profile()["tags"]["Nora Weber"] == ["friends", "family", "board-games"]
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "family" and row["tags"] == ["friends", "board-games"], row
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    _mode(base, "")
+    print("ok test_a_message_judgement_is_its_own")
+
+
 def test_vip_always_rings(base, wg):
     """A VIP rings whatever the mode; a muted chat keeps even a VIP quiet."""
     lena = "+41791000077"
@@ -559,6 +677,41 @@ def test_focused_takes_a_scope(base, wg):
     for tid in (quote["id"], other["id"]):
         _http(base, "POST", "/attention/items/done", {"id": "thread:" + tid})
     print("ok test_focused_takes_a_scope")
+
+
+def test_focused_admits_health_by_word(base, wg):
+    """Focused on customers lets health through by a word it admits wherever
+    it stands, not by its sphere list: the row says so, so the sheet offers to
+    stop *that* — and stopping it folds the health items away."""
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
+    assert status == 200
+    # Listed ones (passive, so on the list at once) and one held for the digest.
+    physio = _open(base, "Physio moved", "Now Thursday 08:00.", {"importance": 2, "sphere": "health"})
+    walk = _open(base, "Walk with Anna", "Her knee is better.", {"importance": 2, "sphere": "friends", "tags": ["health"]})
+    scan = _open(base, "Scan results", "The clinic will call.", {"importance": 4, "sphere": "health"})
+    quote = _open(base, "Quote for Frei Bau", "Draft ready.", {"importance": 4, "sphere": "customers"})
+    home = _sections(base)
+    for tid in (physio["id"], walk["id"]):
+        where, row = _find(home, "thread:" + tid)
+        assert where == "next" and row["admission"] == {"by": "tag", "what": "health"}, (where, row)
+        assert row["admits_sphere"] is False, "not by the sphere list — the old switch offered to admit it"
+    assert _find(home, "thread:" + scan["id"])[1]["admission"] == {"by": "tag", "what": "health"}
+    assert _find(home, "thread:" + quote["id"])[1]["admission"] == {"by": "scope", "what": "customers"}
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "focused", "tag_off": ["health"]})
+    assert status == 200 and out["changed"] == ["Focused no longer admits the tag health"], out
+    home = _sections(base)
+    for tid in (physio["id"], walk["id"]):
+        where, row = _find(home, "thread:" + tid)
+        assert where == "not_now" and row["admission"] is None, (where, row)
+    where, row = _find(home, "thread:" + scan["id"])
+    assert where == "held" and row["admission"] is None and row["reason"] == "Focused on customers — this is not", (where, row)
+    # Back as it shipped, for the checks that follow.
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "focused", "tag_on": ["health"]})
+    assert status == 200 and _find(_sections(base), "thread:" + physio["id"])[1]["admission"]["by"] == "tag"
+    for tid in (physio["id"], walk["id"], scan["id"], quote["id"]):
+        _http(base, "POST", "/attention/items/done", {"id": "thread:" + tid})
+    _mode(base, "")
+    print("ok test_focused_admits_health_by_word")
 
 
 def test_spheres_are_a_word_away(base, wg):
@@ -997,9 +1150,12 @@ def main():
         test_corrections_learn(base, wg)
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
+        test_a_person_in_several_spheres(base, wg)
+        test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
         test_focused_takes_a_scope(base, wg)
+        test_focused_admits_health_by_word(base, wg)
         test_project_from_store(base, wg)
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)

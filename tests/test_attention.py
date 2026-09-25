@@ -432,6 +432,40 @@ def test_project_frontmatter_moves():
     assert it["due"].date().isoformat() == "2026-11-02", it["due"]
 
 
+def test_admitted_by():
+    """The rule that lets an item through, for the sheet's switch."""
+    focus = A.default_focus()
+    focused = A.mode_at(dict(focus, manual="focused", subject="customers"), at(10))
+    assert A.admitted_by(item(sphere="health"), focused) == {"by": "tag", "what": "health"}
+    assert A.admitted_by(item(sphere="friends", tags=["health"]), focused) == {"by": "tag", "what": "health"}
+    assert A.admitted_by(item(sphere="customers"), focused) == {"by": "scope", "what": "customers"}
+    assert A.admitted_by(item(sphere="family"), focused) is None
+    chores = focus["modes"]["chores"]
+    assert A.admitted_by(item(sphere="family"), chores) == {"by": "sphere", "what": "family"}
+    assert A.admitted_by(item(sphere="unknown", vip=True, sender="Mum"), chores) == {"by": "vip", "what": "Mum"}
+
+
+def test_every_sphere_counts():
+    """A person in several spheres is admitted by any of them."""
+    focus = A.default_focus()
+    social = focus["modes"]["social"]
+    both = item(sphere="customers", tags=["friends"])
+    assert A.spheres_of(both) == ["customers", "friends"]
+    assert A.admitted(both, social, A.default_profile())
+    assert A.admitted_by(both, social) == {"by": "sphere", "what": "friends"}
+    assert A.admission_reason(both, social, A.default_profile(), at(19)) == "Social admits friends"
+    focused = A.mode_at(dict(focus, manual="focused", subject="customers"), at(10))
+    assert A.admitted_by(item(sphere="friends", tags=["customers"]), focused) == {"by": "scope", "what": "customers"}
+    assert not A.admitted(item(sphere="friends"), focused, A.default_profile())
+    # The family repeat in Rest, for a family member filed under another sphere too.
+    assert A.repeat_policy(item(sphere="friends", tags=["family"]), focus["modes"]["rest"])["escalate"]
+    # A further-sphere correction on a chat is the sender's.
+    profile = A.default_profile()
+    it = item(sphere="customers", sender="Rita")
+    A.correct(it, profile, {"tags": ["Friends", "customers", "family"]}, at(10))
+    assert it["tags"] == ["friends", "family"] and profile["tags"]["Rita"] == ["friends", "family"]
+
+
 def test_zone():
     """The schedule's zone: ATTENTION_TZ, else RETINUE_DISPLAY_TZ (what the
     compose file passes), else TZ — never UTC by accident when the owner's

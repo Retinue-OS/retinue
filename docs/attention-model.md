@@ -57,7 +57,7 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 | `kb:importance` | 0–5, the Herald’s scale; unset counts as 2.5 | `--importance`, the Secretary in triage, frontmatter, a prior |
 | `kb:due` | `xsd:dateTime`; urgency = time left ÷ lead time | `--due`, `expected_by` / `next_due`, a date the Secretary extracts |
 | `kb:leadTime` | `xsd:duration`; what this kind of item typically needs; default 3 days | per-kind defaults, a project’s `remind_before`, `--lead` |
-| `kb:sphere`, `kb:tag` | one primary sphere from a small deployment-named set; more as tags | chamber instructions, contact groups, frontmatter |
+| `kb:sphere`, `kb:tag` | a main sphere from a small deployment-named set, and any further ones as tags — a person can be a customer and a friend, and every sphere counts for a mode alike | chamber instructions, contact groups, frontmatter |
 | `kb:currentActor` | who holds the ball; today only on projects | already there |
 
 ```turtle
@@ -89,15 +89,15 @@ belong to and “friends” would let whoever learns the number through during
 *Social*. It goes into a sphere of its own, `unknown`, which no mode admits:
 listed, carried by the next digest, never rung. Hey’s Screener, in the
 vocabulary the model already has, and the way out is a **contact card** in the
-same details sheet — a name, the sphere they belong to, further groups as
-tags. Filing it names the chat, teaches the sender’s sphere, re-judges the
+same details sheet — a name, the sphere they belong to, and any further
+spheres. Filing it names the chat, teaches the sender’s spheres, re-judges the
 open item, and records the person in the life store, so the *next* message
 is ranked by that sphere. Whether they may then
 interrupt stays the separate question a permit answers.
 
 **The mode** is one small document the gateway keeps (`focus.json`, mirrored into the store): name, admitted spheres and admitting tags (`health` may be admitted everywhere, as sphere or tag), per-sender permits, the lowest level that breaks through, a schedule, optionally a calendar rule. The schedule is a **week of day plans** — a day’s schedule with the days it rules (`mon-fri`, `sat, sun`), every weekday in exactly one — and a plan may claim `holiday`, so time off is a date range told to the system (“I’m off 24 December to 2 January”), not a new schedule (`scripts/attention-week.py`; `docs/dashboard.md`, “The week”). *Focused* takes a **scope** — the nesting the data already has, sphere ⊃ project ⊃ item, offered at either level: a schedule entry may name a sphere (`[13:00, focused, customers]`), and by hand the menu offers the spheres and the projects on the list. With a scope the sphere or the project stands in for the rule’s allow-list for that stint; with none, only critical rings. It is set by a chip in the dashboard header, a sentence to Ara (“work mode until 17:00”), a schedule or a calendar block; every delivery decision reads it, nothing else needs to know it exists.
 
-**Delivery** (Figure 3). An item at or above the mode’s threshold, admitted by its primary sphere, a tag or a permit, pushes at once with `Urgency: high`. Everything else waits for the next breakpoint, where one `Topic`-collapsed digest push lists the held items by level and importance. A half-hourly sweep, like `recurring-projects`, re-evaluates held items: when urgency crosses into the next band the item climbs a level — that crossing is the bound. Repeats are a per-class policy, not a fixed window: off by default, on for `family` in *Off* (the phone’s repeated-caller case), elsewhere only when the follow-up’s triage classification changes — a deadline appears, a question replaces a remark.
+**Delivery** (Figure 3). An item at or above the mode’s threshold, admitted by any of its spheres — main or further — or a permit, pushes at once with `Urgency: high`. Everything else waits for the next breakpoint, where one `Topic`-collapsed digest push lists the held items by level and importance. A half-hourly sweep, like `recurring-projects`, re-evaluates held items: when urgency crosses into the next band the item climbs a level — that crossing is the bound. Repeats are a per-class policy, not a fixed window: off by default, on for `family` in *Off* (the phone’s repeated-caller case), elsewhere only when the follow-up’s triage classification changes — a deadline appears, a question replaces a remark.
 
 <figure>
 <figcaption><strong>Figure 3.</strong> From arrival to delivery. Every source sets the same four properties; the level is arithmetic; the mode filters; three outcomes. The dashboard’s chips feed an attention profile that supplies defaults next time. No model turn is spent on delivery.</figcaption>
