@@ -7138,17 +7138,18 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
                "archived": False, "muted": bool(doc.get("muted")), "group": doc.get("group")}
         previous = dict(doc.get("attention") or {})
         was_held = bool(previous) and previous.get("state", "open") == "open" and not previous.get("released")
-        if isinstance(spec, dict) and spec:
-            # A classification is a complete judgement of the latest message:
-            # the earlier deadline, kind, importance and spheres do not linger
-            # on it. The push history stays; without spheres of its own the
-            # message shows its sender's (attention_store.chat_item).
+        # A judgement — importance, deadline, kind and spheres — is one unit,
+        # and it belongs to the chat's open item. A classification replaces it
+        # whole. An unclassified message keeps it while the item is open: most
+        # likely a follow-up ("bring a salad?" after the barbecue), and keeping
+        # the deadline but not the sphere would ring a friend's matter in a
+        # customer focus. Once the item is handled, the next message starts
+        # fresh — the defaults and the sender's spheres — rather than
+        # inheriting a settled deadline. Only the push history stays either way;
+        # without spheres of its own the message shows its sender's
+        # (attention_store.chat_item).
+        if (isinstance(spec, dict) and spec) or previous.get("state", "open") != "open":
             previous = {k: v for k, v in previous.items() if k in ("pushed", "boost")}
-        elif previous.get("sphere_from") == "message":
-            # An unclassified message has no judgement of its own: the earlier
-            # message's spheres do not carry over, it shows its sender's.
-            for k in ("sphere", "tags", "sphere_from"):
-                previous.pop(k, None)
         block = _attention_spec_to_block(spec, previous, now)
         block["state"] = "open"
         block["released"] = False

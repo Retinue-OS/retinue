@@ -539,6 +539,12 @@ def test_a_person_in_several_spheres(base, wg):
     assert body["pushed"] is False and not PUSHES, "the message's own sphere decides"
     where, row = _find(_sections(base), cid)
     assert where == "held" and row["sphere"] == "friends" and row["tags"] == [] and row["admission"] is None, (where, row)
+    # A follow-up the triage did not judge is still about the barbecue: the
+    # deadline stays, and so does friends — it is held, not rung.
+    body = _inbound(base, rita, "Rita Keller", "Bring a salad?", "2026-09-05T09:21:00Z", gate=gate)
+    assert body["pushed"] is False and not PUSHES, "a follow-up keeps its judgement whole"
+    where, row = _find(_sections(base), cid)
+    assert where == "held" and row["sphere"] == "friends" and row["level"] == "time-sensitive", (where, row)
     # The next message, judged without a sphere, is hers again: customers + friends.
     body = _inbound(base, rita, "Rita Keller", "And the offer — did you see it?", "2026-09-05T09:30:00Z",
                     gate=gate, attention={"importance": 4, "due": _due(1), "kind": "customer request"})
@@ -557,10 +563,11 @@ def test_a_person_in_several_spheres(base, wg):
 
 
 def test_a_message_judgement_is_its_own(base, wg):
-    """A triage judgement belongs to the message it judged: tags alone count
-    beside the sender's main sphere, an unclassified message after it shows
-    the sender's spheres again, and a tags-only correction teaches the
-    profile further spheres beside the sender's main sphere."""
+    """A triage judgement belongs to the chat's open item: tags alone count
+    beside the sender's main sphere, an unclassified follow-up keeps the whole
+    judgement while the item is open, the next message after it was handled
+    starts fresh with the sender's spheres, and a tags-only correction
+    teaches the profile further spheres beside the sender's main sphere."""
     nora = "+41791000088"
     chat = "signal:" + nora
     cid = "chat:" + chat
@@ -581,15 +588,24 @@ def test_a_message_judgement_is_its_own(base, wg):
     assert row["sphere"] == "customers" and row["tags"] == ["health"], row
     assert row["admission"] == {"by": "tag", "what": "health"}, row
     _http(base, "POST", "/attention/items/done", {"id": cid})
-    # An unclassified message after a judged one is hers again.
+    # An unclassified follow-up while the judged item is open keeps the whole
+    # judgement — its sphere with its deadline, never one without the other.
     _mode(base, "social")
     _inbound(base, nora, "Nora Weber", "Barbecue Saturday?", "2026-09-05T11:20:00Z",
              gate=gate, attention={"importance": 4, "due": _due(1), "sphere": "family"})
     where, row = _find(_sections(base), cid)
     assert row["sphere"] == "family" and row["tags"] == [], row
+    judged_due = row["due"]
+    _inbound(base, nora, "Nora Weber", "Bring a salad?", "2026-09-05T11:22:00Z", gate=gate)
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "family" and row["tags"] == [] and row["due"] == judged_due, row
+    # Once it is handled, the next message starts fresh: hers again, and
+    # without the settled deadline.
+    _http(base, "POST", "/attention/items/done", {"id": cid})
     _inbound(base, nora, "Nora Weber", "Also, the invoice.", "2026-09-05T11:25:00Z", gate=gate)
     where, row = _find(_sections(base), cid)
     assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["due"] is None and row["importance_from"] in ("default", "prior"), row
     assert row["admission"] == {"by": "sphere", "what": "friends"}, row
     # A tags-only correction of a judged message: the item keeps the
     # message's sphere now and on reload, the profile learns further spheres

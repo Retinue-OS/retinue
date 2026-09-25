@@ -85,9 +85,14 @@ the row: a sphere the mode lists, or a word it admits wherever it stands, as
 Focused does *health*; where none does, the rule that would), and the
 actions *Later* (next breakpoint / tomorrow), *Pull into the list now* and
 *Mark done*. A chat shows its sender's spheres, as the contact card and the
-corrections taught them, unless the triage judged its latest message to be
-about one sphere in particular — a customer who is also a friend, asking
-about Saturday's barbecue, is *friends* for that message. Spheres are the user's own subjects — a client, a hobby, a cause
+corrections taught them, unless the triage judged its message to be about a
+sphere in particular (or named further spheres alone) — a customer who is
+also a friend, asking about Saturday's barbecue, is *friends* for that
+message. A judgement — importance, deadline, kind and spheres — is one unit
+and belongs to the chat's open item: a classification replaces it whole, an
+unclassified follow-up keeps it ("bring a salad?" stays *friends*, with the
+barbecue's deadline), and once the item is handled the next message starts
+fresh, with the defaults and the sender's spheres. Spheres are the user's own subjects — a client, a hobby, a cause
 — so the vocabulary grows from wherever a sphere is chosen: *+ new sphere…*
 in the sphere selector, *+ new* on the contact card
 (`POST /attention/spheres`); a sphere the palette does not name gets a stable
