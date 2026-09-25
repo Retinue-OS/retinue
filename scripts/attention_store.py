@@ -306,13 +306,16 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     # human writing to a human — someone took the trouble — and loses only
     # the guess about *where they belong*.
     card = (state or {}).get("contact") or {}
-    if block.get("sphere_from") == "message" and block.get("sphere"):
-        sphere, tags = block["sphere"], list(block.get("tags") or [])
-    else:
-        sphere = ((profile.get("spheres") or {}).get(name) or card.get("sphere")
-                  or (UNKNOWN_SPHERE if stranger else DEFAULT_CHAT_SPHERE))
-        known = profile.get("tags") or {}
-        tags = list(known[name] if name in known else card.get("tags") or [])
+    sphere = ((profile.get("spheres") or {}).get(name) or card.get("sphere")
+              or (UNKNOWN_SPHERE if stranger else DEFAULT_CHAT_SPHERE))
+    known = profile.get("tags") or {}
+    tags = list(known[name] if name in known else card.get("tags") or [])
+    if block.get("sphere_from") == "message":
+        # A judged sphere is the message's alone (with the tags judged
+        # beside it); judged tags alone sit beside the sender's main sphere.
+        if block.get("sphere"):
+            sphere = block["sphere"]
+        tags = list(block.get("tags") or [])
     judged = dict(block, sphere=sphere, tags=[t for t in dict.fromkeys(tags) if t != sphere])
     doc = {"id": f"chat:{chat['id']}", "title": name, "attention": judged, "sphere": sphere,
            "sender": name, "archived": bool(chat.get("archived"))}

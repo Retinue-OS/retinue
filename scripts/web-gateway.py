@@ -7043,8 +7043,9 @@ def _attention_spec_to_block(spec, block: dict, now: datetime) -> dict:
     if isinstance(spec.get("tags"), list):
         block["tags"] = list(dict.fromkeys(
             t for t in (attention_policy.sphere_id(x) for x in spec["tags"]) if t))
-        if block.get("sphere"):
-            block["sphere_from"] = "message"
+        # Tags alone are a judgement too: the message's words beside the
+        # sender's main sphere (attention_store.chat_item).
+        block["sphere_from"] = "message"
     if spec.get("kind"):
         block["kind"] = str(spec["kind"]).strip().lower()
     if "project" in spec:
@@ -7143,6 +7144,11 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
             # on it. The push history stays; without spheres of its own the
             # message shows its sender's (attention_store.chat_item).
             previous = {k: v for k, v in previous.items() if k in ("pushed", "boost")}
+        elif previous.get("sphere_from") == "message":
+            # An unclassified message has no judgement of its own: the earlier
+            # message's spheres do not carry over, it shows its sender's.
+            for k in ("sphere", "tags", "sphere_from"):
+                previous.pop(k, None)
         block = _attention_spec_to_block(spec, previous, now)
         block["state"] = "open"
         block["released"] = False

@@ -556,6 +556,58 @@ def test_a_person_in_several_spheres(base, wg):
     print("ok test_a_person_in_several_spheres")
 
 
+def test_a_message_judgement_is_its_own(base, wg):
+    """A triage judgement belongs to the message it judged: tags alone count
+    beside the sender's main sphere, an unclassified message after it shows
+    the sender's spheres again, and a tags-only correction teaches the
+    profile further spheres beside the sender's main sphere."""
+    nora = "+41791000088"
+    chat = "signal:" + nora
+    cid = "chat:" + chat
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, nora, None, "Hi, Nora here.", "2026-09-05T11:00:00Z", gate=gate)
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Nora Weber", "sphere": "customers", "tags": ["friends"]})
+    assert status == 200, out
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "family"})
+    assert status == 200
+    # Tags without a sphere: health, which Focused admits whatever the scope.
+    PUSHES.clear()
+    body = _inbound(base, nora, "Nora Weber", "The results from the clinic are in.", "2026-09-05T11:10:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "tags": ["health"]})
+    assert body["pushed"] is True and PUSHES, "a message's tags count without a sphere of its own"
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["health"], row
+    assert row["admission"] == {"by": "tag", "what": "health"}, row
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    # An unclassified message after a judged one is hers again.
+    _mode(base, "social")
+    _inbound(base, nora, "Nora Weber", "Barbecue Saturday?", "2026-09-05T11:20:00Z",
+             gate=gate, attention={"importance": 4, "due": _due(1), "sphere": "family"})
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "family" and row["tags"] == [], row
+    _inbound(base, nora, "Nora Weber", "Also, the invoice.", "2026-09-05T11:25:00Z", gate=gate)
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["admission"] == {"by": "sphere", "what": "friends"}, row
+    # A tags-only correction of a judged message: the item keeps the
+    # message's sphere now and on reload, the profile learns further spheres
+    # beside her main one.
+    _inbound(base, nora, "Nora Weber", "Barbecue Saturday — salad?", "2026-09-05T11:30:00Z",
+             gate=gate, attention={"importance": 4, "due": _due(1), "sphere": "family"})
+    status, out = _http(base, "POST", "/attention/items/correct",
+                        {"id": cid, "tags": ["friends", "family", "board-games"]})
+    assert status == 200 and out["item"]["sphere"] == "family", out["item"]
+    assert out["item"]["tags"] == ["friends", "board-games"], out["item"]
+    assert wg._ATTENTION.profile()["tags"]["Nora Weber"] == ["friends", "family", "board-games"]
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "family" and row["tags"] == ["friends", "board-games"], row
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    _mode(base, "")
+    print("ok test_a_message_judgement_is_its_own")
+
+
 def test_vip_always_rings(base, wg):
     """A VIP rings whatever the mode; a muted chat keeps even a VIP quiet."""
     lena = "+41791000077"
@@ -1083,6 +1135,7 @@ def main():
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
         test_a_person_in_several_spheres(base, wg)
+        test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
         test_focused_takes_a_scope(base, wg)

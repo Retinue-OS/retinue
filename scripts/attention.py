@@ -1007,12 +1007,22 @@ def correct(item: dict, profile: dict, patch: dict, now: datetime) -> list[str]:
             learned.append(f"sphere for {key} → {item['sphere']}")
     if isinstance(patch.get("tags"), list):
         # A tag is a further sphere, so it is the same word the rules use.
-        tags = [t for t in dict.fromkeys(sphere_id(x) for x in patch["tags"]) if t and t != item["sphere"]]
-        item["tags"] = tags
-        item["sphere_from"] = "you"
+        # The profile's further spheres sit beside the sender's main sphere,
+        # the item's beside its own: they differ while the item carries a
+        # message's judgement, which a tags-only correction leaves in place
+        # (the item keeps showing that message's sphere, now and on reload;
+        # the sender's next message shows the corrected spheres).
+        words = [t for t in dict.fromkeys(sphere_id(x) for x in patch["tags"]) if t]
+        item["tags"] = [t for t in words if t != item["sphere"]]
+        if item.get("sphere_from") != "message":
+            item["sphere_from"] = "you"
         key = item.get("sender")
         if key:
-            profile.setdefault("tags", {})[key] = list(tags)
+            main = item["sphere"]
+            if item.get("sphere_from") == "message":
+                main = (profile.get("spheres") or {}).get(key) or main
+            tags = [t for t in words if t != main]
+            profile.setdefault("tags", {})[key] = tags
             learned.append(f"further spheres for {key} → {', '.join(tags) or 'none'}")
     if "critical" in patch:
         item["critical"] = bool(patch["critical"])
