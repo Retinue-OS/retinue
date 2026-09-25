@@ -508,9 +508,9 @@ TURN_GATE: dict = {"hold": None}
 
 
 def _stub_send_message(prompt, display_question=None, session_key=None,
-                       model=None, restart_message=None):
+                       model=None, restart_message=None, resume=True):
     TURNS.append({"prompt": prompt, "question": display_question,
-                  "session": session_key})
+                  "session": session_key, "resume": resume})
     hold = TURN_GATE.get("hold")
     if hold is not None:
         hold.wait(20)
@@ -1183,6 +1183,8 @@ def test_arrival_starts_a_companion_turn(base, wg):
     assert "assist" not in summary, "a chat does not carry this; a sender does"
     assert comp, "the arrival turn had nowhere to run"
     assert TURNS[0]["session"] == f"conv:{comp}"
+    # A companion turn starts a new session rather than resuming the thread's.
+    assert TURNS[0]["resume"] is False, TURNS[0]
 
     prompt = TURNS[0]["prompt"]
     assert "A new message has arrived in this chat" in prompt

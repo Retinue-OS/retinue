@@ -127,6 +127,54 @@ def check_stale_replays_whole_transcript(gw):
     print("PASS stale path replays the transcript with one attachment note")
 
 
+def check_companion_replays_only_the_tail(gw):
+    """A companion thread's new session sees its last few messages, not the
+    whole thread — the chat note carries the correspondence itself."""
+    gw._conv_chat_note = lambda conv: "\n\n[Context: chat note]"
+    n = gw.CHAT_COMPANION_THREAD_TAIL + 4
+    msgs = [_msg("user" if i % 2 == 0 else "assistant", f"turn {i:02d}")
+            for i in range(n)]
+    conv = dict(_conv(*msgs), kind="companion")
+    prompt = gw._conv_engage_prompt(conv, fresh=False)
+    assert "turn 00" not in prompt and "turn 03" not in prompt, prompt
+    assert f"turn {n - 1:02d}" in prompt and "turn 04" in prompt, prompt
+    assert "4 earlier messages of this thread omitted" in prompt, prompt
+    assert prompt.endswith("[Context: chat note]"), prompt
+    # Other thread kinds still replay everything.
+    prompt = gw._conv_engage_prompt(_conv(*msgs), fresh=False)
+    assert "turn 00" in prompt and "omitted" not in prompt, prompt
+    print("PASS companion new session replays only the thread's tail")
+
+
+def check_companion_tail_keeps_latest_message(gw):
+    """A tail of 0 (clamped at load) still replays the message being answered:
+    a companion turn's new session has no other way to see it."""
+    saved = gw.CHAT_COMPANION_THREAD_TAIL
+    gw.CHAT_COMPANION_THREAD_TAIL = 1
+    try:
+        gw._conv_chat_note = lambda conv: "\n\n[Context: chat note]"
+        conv = dict(_conv(_msg("user", "old"), _msg("assistant", "reply"),
+                          _msg("user", "the latest ask")), kind="companion")
+        prompt = gw._conv_engage_prompt(conv, fresh=False)
+        assert "the latest ask" in prompt and "old" not in prompt, prompt
+        assert "2 earlier messages of this thread omitted" in prompt, prompt
+    finally:
+        gw.CHAT_COMPANION_THREAD_TAIL = saved
+    print("PASS companion tail always carries the latest message")
+
+
+def check_history_hint_names_the_chat(gw):
+    """The hint's query is scoped to the chat's channel, account and key."""
+    hint = gw._companion_history_hint("signal:~+41700000001:+41700000002")
+    assert 'kb:channel "signal"' in hint, hint
+    assert 'kb:account "+41700000001"' in hint, hint
+    assert 'kb:chat "+41700000002"' in hint, hint
+    # A group key keeps its colons; an accountless id drops the account filter.
+    hint = gw._companion_history_hint("signal:group:abc=")
+    assert 'kb:chat "group:abc="' in hint and "kb:account" not in hint, hint
+    print("PASS history hint scopes its query to the chat")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load_gateway(Path(tmp))
@@ -135,6 +183,9 @@ def main():
         check_fresh_replays_attachment_paths(gw)
         check_fresh_without_anchor_falls_back(gw)
         check_stale_replays_whole_transcript(gw)
+        check_companion_replays_only_the_tail(gw)
+        check_companion_tail_keeps_latest_message(gw)
+        check_history_hint_names_the_chat(gw)
     print("all engage-prompt checks passed")
 
 
