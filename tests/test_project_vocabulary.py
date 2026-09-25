@@ -289,6 +289,7 @@ def main() -> int:
 
         print("\npredicate completeness (every query predicate is one md2ttl.py can emit)")
         converter_knows = {name for name, _ in md2ttl_mod.SCALAR_FIELDS.values()}
+        converter_knows |= set(md2ttl_mod.LIST_FIELDS.values())
         converter_knows.add("currentActor")
         queried = set()
         for text in (webgw._PROJECTS_SPARQL, asr.QUERY, rp.build_query(dt.date(2026, 9, 13))):

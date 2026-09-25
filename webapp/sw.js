@@ -36,6 +36,8 @@ const SHELL_ASSETS = [
   '/viewport.js',
   '/manifest.webmanifest',
   '/components/base.js',
+  '/components/attention.js',
+  '/components/attention-sheet.js',
   '/components/markdown.js',
   '/components/voice.js',
   '/components/clipboard.js',
@@ -50,6 +52,7 @@ const SHELL_ASSETS = [
   '/components/push.js',
   '/components/update.js',
   '/components/app-launcher.js',
+  '/components/nav.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];
@@ -121,6 +124,10 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
 
+  // The attention list and its actions are decided at request time — the
+  // mode in force, what is held until when — so a cached copy would lie.
+  if (url.pathname === '/attention' || url.pathname.startsWith('/attention/')) return;
+
   // Conversation API is dynamic (live chat with Ara): never serve from cache,
   // just pass through to the network so threads and replies stay current.
   if (url.pathname === '/conversations' || url.pathname.startsWith('/conversations/')) return;
@@ -158,9 +165,10 @@ self.addEventListener('fetch', (e) => {
     return;
   }
 
-  // The project and chat pages carry their subject id in the query string;
-  // match the cached shell regardless so they open offline too.
-  if (url.pathname === '/project.html' || url.pathname === '/chat.html') {
+  // The project and chat pages carry their subject id in the query string,
+  // and the home its deep links (?item=, the digest's ?digest=); match the
+  // cached shell regardless so they open offline too.
+  if (url.pathname === '/project.html' || url.pathname === '/chat.html' || url.pathname === '/') {
     e.respondWith(caches.match(url.pathname).then((res) => res || fetch(e.request)));
     return;
   }

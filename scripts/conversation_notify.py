@@ -48,14 +48,25 @@ class ConversationNotifier:
             print(f"{self.log_prefix} conversation post failed: {exc}", flush=True)
             return None
 
-    def open_thread(self, title: str, message: str) -> str | None:
-        body = self._post(self.base_url, {"title": title, "message": message})
+    def open_thread(self, title: str, message: str,
+                    attention: dict | None = None) -> str | None:
+        """Open a thread; ``attention`` declares how much it matters to the
+        dashboard's attention model (importance, sphere, kind, critical — see
+        conversation-push.py). Monitors are system alerts: without a
+        declaration the model would list the thread and never push it."""
+        payload = {"title": title, "message": message}
+        if attention:
+            payload["attention"] = dict(attention)
+        body = self._post(self.base_url, payload)
         return (body or {}).get("id")
 
-    def append(self, thread_id: str, message: str, quiet: bool = False) -> bool:
+    def append(self, thread_id: str, message: str,
+               attention: dict | None = None, quiet: bool = False) -> bool:
         # quiet: a record, not a request for attention — no unread badge, no
         # Web Push, and the thread stays archived if the user put it there.
         payload: dict = {"message": message}
+        if attention:
+            payload["attention"] = dict(attention)
         if quiet:
             payload["quiet"] = True
         body = self._post(f"{self.base_url}/{thread_id}/messages", payload)

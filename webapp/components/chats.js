@@ -477,6 +477,13 @@ class RetinueChats extends RetinueCard {
 
   css() {
     return `
+      /* Chrome-less on phones, edge to edge under the navigation like the
+         threads and projects pages; a framed card again on wide screens. */
+      .card { background: transparent; padding: 2px; }
+      @media (min-width: 700px) {
+        .card { background: var(--card, #151922); border: 1px solid var(--line, rgba(231, 235, 242, .08));
+                padding: 14px 16px; }
+      }
       ul.list { gap: 4px; }
       li { margin: 0; }
       /* A swipeable row: the link slides over two layers underneath — the
@@ -520,7 +527,8 @@ class RetinueChats extends RetinueCard {
       .ch { position: absolute; right: -3px; bottom: -3px; width: 16px; height: 16px;
             border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
             font-size: .58rem; font-weight: 800; color: #fff;
-            border: 2px solid var(--card, #151922); box-sizing: content-box; }
+            border: 2px solid var(--bg, #0b0d12); box-sizing: content-box; }
+      @media (min-width: 700px) { .ch { border-color: var(--card, #151922); } }
       .name { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis;
               white-space: nowrap; }
       /* Which account this row is, shown only when a name repeats within a
@@ -645,17 +653,13 @@ class RetinueChats extends RetinueCard {
     return `${this._filterHtml()}<ul class="list">${rows}</ul>${this._footHtml()}`;
   }
 
-  // The card leads deeper (the full list); the full page leads back out. The
-  // way back matters more than it looks: chats.html carries no chrome of its
-  // own, so without this link the only exit is the browser's back gesture —
-  // and there is none at all once the page is opened from the home screen as
-  // an installed PWA. Every other full list page (conversations, projects,
-  // news) offers the same return, in the same place.
+  // The card leads deeper (the full list). The full page's way back out is
+  // the navigation row at the top of chats.html (components/nav.js), as on
+  // every list page — not a link after the last chat, which a long list put
+  // out of reach until it was scrolled to its end.
   _footHtml() {
-    const link = this._full
-      ? '<a class="all-link" href="/">&larr; Back to dashboard</a>'
-      : '<a class="all-link" href="/chats.html">All chats &#8594;</a>';
-    return `<div class="foot">${link}</div>`;
+    if (this._full) return '';
+    return '<div class="foot"><a class="all-link" href="/chats.html">All chats &#8594;</a></div>';
   }
 }
 

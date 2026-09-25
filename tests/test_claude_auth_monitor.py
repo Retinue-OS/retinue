@@ -27,13 +27,13 @@ class FakeNotifier:
         self.appended = []  # (thread_id, message)
         self.quiet_flags = []  # one per append, in order
 
-    def open_thread(self, title, message):
+    def open_thread(self, title, message, attention=None):
         if self.fail:
             return None
         self.opened.append((title, message))
         return f"thread-{len(self.opened)}"
 
-    def append(self, thread_id, message, quiet=False):
+    def append(self, thread_id, message, attention=None, quiet=False):
         if self.fail:
             return False
         self.appended.append((thread_id, message))

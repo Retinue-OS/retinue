@@ -268,10 +268,30 @@ class ChatStateStore:
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
             "unread_since": None,
+            # Whether the last arrival's sender is one the dashboard knows
+            # nothing about from the rail: True for a direct message from
+            # anyone who is not a VIP, False for a VIP, None for a group or
+            # a chat no gated message has arrived in yet. (The delivery gate no longer
+            # tells strangers from acquaintances — the messenger whitelist is
+            # retired, docs/triage-delivery-gate.md.) The attention model
+            # screens such a sender unless something else says where they
+            # belong: a sphere the user taught the profile, or `contact` below.
+            "unknown_sender": None,
+            # The contact card the user filled in for this chat, once they
+            # have: {"name", "sphere", "tags", "at"}. None while the chat is
+            # only a handle. Naming someone is what turns a screened stranger
+            # into a correspondent — see `set_contact`.
+            "contact": None,
             # Id of this chat's companion conversation — the dashboard thread
             # where the user works out a reply with Ara. None until one is
             # first asked for; see `set_companion`.
             "companion": None,
+            # The attention model's block for this chat (scripts/attention.py,
+            # `item_from_doc`): importance, deadline, lead, sphere, tags, kind
+            # and the delivery state. Written by the web-gateway when an
+            # inbound message arrives and when the user acts on the home
+            # screen; None for a chat the model has not seen.
+            "attention": None,
         }
 
     def _read(self, chat_id: str) -> dict:
@@ -351,7 +371,8 @@ class ChatStateStore:
                      group: bool | None = None, gateway: str | None = None,
                      gateway_source: str | None = None,
                      sender: str | None = None,
-                     sender_name: str | None = None) -> dict:
+                     sender_name: str | None = None,
+                     unknown_sender: bool | None = None) -> dict:
         """Cache display metadata learned from a message event (the rail).
 
         The ledger persists handles, never names — names are remembered here as
@@ -374,6 +395,11 @@ class ChatStateStore:
                     roster[sender] = sender_name
                     doc["roster"] = roster
                     doc["roster_refreshed"] = time.time()
+            if unknown_sender is not None:
+                # Stored as the rail said it, card or no card: a contact the
+                # user filed outranks it where it is read (attention_store.
+                # chat_is_unknown), so removing the card falls back on this.
+                doc["unknown_sender"] = bool(unknown_sender)
             self._write(doc)
             return doc
 
@@ -391,6 +417,50 @@ class ChatStateStore:
             doc = self._read(chat_id)
             doc["gateway"] = slug or None
             doc["gateway_source"] = (source or None) if slug else None
+            self._write(doc)
+            return doc
+
+    def set_contact(self, chat_id: str, *, name: str,
+                    sphere: str | None = None, tags=(), at: str | None = None) -> dict:
+        """File this chat's peer in the address book, or clear the card with
+        an empty name.
+
+        One write for what naming someone means to this store: the chat is
+        called by their name from now on, and the card records which spheres
+        they belong to. The rest of what the card does — the attention
+        profile, the life-store record — is the web-gateway's business; this
+        is only what a chat document knows about it.
+
+        ``unknown_sender`` is deliberately left alone: it is what the rail
+        last said about the sender, and the card is the *user's* word about
+        the person. A named chat is not screened because a card exists (see
+        `chat_is_unknown`), so removing the card falls back on what the rail
+        said rather than a guess made here."""
+        with self._lock:
+            doc = self._read(chat_id)
+            clean = " ".join(str(name or "").split())
+            if not clean:
+                # Back to a handle: the name went with the card, and whatever
+                # the channel itself passes by next will name the chat again.
+                doc["contact"] = None
+                doc["name"] = None
+                self._write(doc)
+                return doc
+            doc["name"] = clean
+            doc["contact"] = {
+                "name": clean,
+                "sphere": (str(sphere).strip().lower() or None) if sphere else None,
+                "tags": [t for t in (str(x).strip().lower() for x in tags) if t],
+                "at": at or iso_z(),
+            }
+            self._write(doc)
+            return doc
+
+    def set_attention(self, chat_id: str, block: dict | None) -> dict:
+        """Store — or clear, with None — the attention block of a chat."""
+        with self._lock:
+            doc = self._read(chat_id)
+            doc["attention"] = dict(block) if block else None
             self._write(doc)
             return doc
 

@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 286" role="img" aria-label="One weekday: the focus mode decides which items push at once; the rest wait for the next digest" font-family="'Source Sans 3','Liberation Sans',Arial,sans-serif" font-size="11" fill="#1c2530">
+  <defs>
+    <marker id="f2-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#176a6d"/></marker>
+  </defs>
+  <rect x="0.5" y="0.5" width="759" height="285" rx="6" fill="#ffffff" stroke="#d5dbe1"/>
+  <g font-size="10" fill="#5d6b7a" text-anchor="middle">
+    <text x="70" y="22">07:00</text><text x="150" y="22">09:00</text><text x="230" y="22">11:00</text><text x="310" y="22">13:00</text><text x="390" y="22">15:00</text><text x="470" y="22">17:00</text><text x="550" y="22">19:00</text><text x="630" y="22">21:00</text><text x="710" y="22">23:00</text>
+  </g>
+  <rect x="70" y="30" width="40" height="30" fill="#e6eaee"/>
+  <rect x="110" y="30" width="160" height="30" fill="#0f4f57"/>
+  <rect x="270" y="30" width="40" height="30" fill="#eef1f4"/>
+  <rect x="310" y="30" width="160" height="30" fill="#2f8a90"/>
+  <rect x="470" y="30" width="40" height="30" fill="#eef1f4"/>
+  <rect x="510" y="30" width="160" height="30" fill="#7a4f96"/>
+  <rect x="670" y="30" width="40" height="30" fill="#e6eaee"/>
+  <g text-anchor="middle">
+    <text x="90" y="49" font-size="10" fill="#5d6b7a">off</text>
+    <text x="190" y="43" font-size="11" font-weight="700" fill="#ffffff">Deep work</text>
+    <text x="190" y="55" font-size="9.5" fill="#ffffff">only critical breaks through</text>
+    <text x="390" y="43" font-size="11" font-weight="700" fill="#ffffff">Work</text>
+    <text x="390" y="55" font-size="9.5" fill="#ffffff">customers · admin · health</text>
+    <text x="590" y="43" font-size="11" font-weight="700" fill="#ffffff">Social</text>
+    <text x="590" y="55" font-size="9.5" fill="#ffffff">friends · family</text>
+    <text x="690" y="49" font-size="10" fill="#5d6b7a">off</text>
+  </g>
+  <g stroke="#176a6d" stroke-dasharray="3 3">
+    <line x1="110" y1="60" x2="110" y2="250"/>
+    <line x1="270" y1="60" x2="270" y2="250"/>
+    <line x1="470" y1="60" x2="470" y2="250"/>
+    <line x1="630" y1="60" x2="630" y2="250"/>
+  </g>
+  <g font-size="10" fill="#176a6d" text-anchor="middle" font-weight="600">
+    <rect x="84" y="66" width="52" height="16" rx="8" fill="#e2f0ef" stroke="#176a6d"/><text x="110" y="78">digest</text>
+    <rect x="244" y="66" width="52" height="16" rx="8" fill="#e2f0ef" stroke="#176a6d"/><text x="270" y="78">digest</text>
+    <rect x="444" y="66" width="52" height="16" rx="8" fill="#e2f0ef" stroke="#176a6d"/><text x="470" y="78">digest</text>
+    <rect x="604" y="66" width="52" height="16" rx="8" fill="#e2f0ef" stroke="#176a6d"/><text x="630" y="78">digest</text>
+  </g>
+  <g stroke="#176a6d" stroke-width="3" stroke-opacity="0.3" stroke-linecap="round">
+    <line x1="137" y1="104" x2="268" y2="104"/>
+    <line x1="193" y1="126" x2="268" y2="126"/>
+    <line x1="577" y1="236" x2="704" y2="236"/>
+  </g>
+  <line x1="700" y1="236" x2="712" y2="248" stroke="#176a6d" stroke-width="1.4" marker-end="url(#f2-ah)"/>
+  <g paint-order="stroke" stroke="#ffffff" stroke-width="3" stroke-linejoin="round">
+    <text x="149" y="108">friend: dinner on Friday?</text>
+    <text x="205" y="130">customer: a contract clause, due tomorrow</text>
+    <text x="228" y="152">newsletter — listed, no push</text>
+    <text x="375" y="174">customer: quote due 17:00 — pushes now</text>
+    <text x="422" y="196">card renewal, due Friday — silent until its bound on Thursday</text>
+    <text x="545" y="218" text-anchor="end">friend: are you coming? — pushes now</text>
+    <text x="565" y="240" text-anchor="end">customer: a new request — held for the morning digest</text>
+    <text x="678" y="152" text-anchor="end">system alert — critical, always</text>
+  </g>
+  <circle cx="137" cy="104" r="6" fill="#176a6d"/>
+  <circle cx="193" cy="126" r="6" fill="#176a6d"/>
+  <circle cx="216" cy="148" r="6" fill="#8a94a0"/>
+  <circle cx="363" cy="170" r="6" fill="#d4670f"/>
+  <circle cx="410" cy="192" r="6" fill="#8a94a0"/>
+  <circle cx="557" cy="214" r="6" fill="#d4670f"/>
+  <circle cx="577" cy="236" r="6" fill="#176a6d"/>
+  <circle cx="690" cy="148" r="6" fill="#b3261e"/>
+  <g font-size="10.5" fill="#5d6b7a">
+    <circle cx="76" cy="268" r="5" fill="#d4670f"/><text x="86" y="272">pushes now</text>
+    <circle cx="176" cy="268" r="5" fill="#176a6d"/><line x1="184" y1="268" x2="204" y2="268" stroke="#176a6d" stroke-width="3" stroke-opacity="0.3" stroke-linecap="round"/><text x="210" y="272">held until the next digest</text>
+    <circle cx="370" cy="268" r="5" fill="#8a94a0"/><text x="380" y="272">silent, listed</text>
+    <circle cx="478" cy="268" r="5" fill="#b3261e"/><text x="488" y="272">critical — always, in every mode</text>
+  </g>
+</svg>

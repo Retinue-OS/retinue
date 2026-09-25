@@ -91,6 +91,10 @@ SESSION_ENV_NAMES: frozenset[str] = frozenset({
     "CHATS_INGEST_TOKEN", "CHATS_INGEST_URL",
     "UPDATER_TOKEN", "UPDATER_URL", "UPDATER_TIMEOUT",
     "WEB_GATEWAY_PORT",
+    # The attention schedule's zone (scripts/attention_store.py), so
+    # attention-week.py in a session names the same "today" as the gateway.
+    # RETINUE_DISPLAY_TZ, its fallback, arrives with the RETINUE_ prefix.
+    "ATTENTION_TZ",
     # The life store as the gateway's own scripts address it (projects card,
     # recurring-projects.py); the SPARQL_ENDPOINT_ prefix below carries the
     # advertised form.

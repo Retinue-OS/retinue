@@ -58,6 +58,40 @@ a Progressive Web App on the phone home screen.
 Env: `WEBAPP_DIR` (default `/workspace/webapp`), `DASHBOARD_DATA_DIR`
 (default `WEBAPP_DIR/data`).
 
+## The home: the attention list
+
+The home screen is one list of what wants attention (`components/attention.js`
+over `GET /attention`, design in `docs/attention-model.md`, mechanics in
+`docs/dashboard.md`): threads with Ara, messenger chats and running projects as
+one kind of thing, each with an importance, a deadline against a lead time, a
+sphere, and the delivery the gateway decided — pushed, held for the next
+digest, or listed. Sections Now · Next · Held · Waiting; every row shows its
+preview and a one-line reason; ⓘ opens the details sheet
+(`components/attention-sheet.js`, shared with the thread bar and the chat
+page) with the three fields explained and correctable, the sender's permit
+and the sphere's Focus rule for the mode in force, and Later / Pull / Mark
+done. The mode chip opens the mode menu (`POST /attention/mode`). Rows open
+where the item lives: a thread in place — the `retinue-conversations` element
+sits on the home as a `viewer`, invisible until `#conversation-<id>` or `#new`
+— a chat on `chat.html`, a project on `project.html`. `?item=<id>` deep-links
+to an item's sheet. The list refreshes on the conversations cadence and after
+every action on the sheet (`retinue-attention-change` on `window`).
+
+`GET /attention` returns `{generated, now, timezone, mode: {id, name, blurb,
+threshold, admits, admit_tags, manual, scheduled: {id, name, until}, day: {plan,
+days, holiday}}, modes, schedule and digest_times (today's, by today's day
+plan), week, holidays, spheres, next_breakpoint, sections: {now, next, held,
+waiting}, counts, last_digest: {at, count}, degraded, learned}`; a row is `{id, kind: thread|chat|project,
+title, preview, href, sphere, tags, sender, channel, group, agent, count,
+unread, pending, level, critical, importance, importance_from, importance_text,
+due, lead (minutes), lead_from, kind_label, urgency, delivery, reason, actor,
+waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere}`.
+`/?digest=<time>` — the digest push's link — shows what that digest released
+first, until *Done*.
+The actions: `POST /attention/items/later|pull|done|reopen|correct` with the
+id in the body, `POST /attention/permits`, `POST /attention/admit`,
+`GET|POST /attention/profile`.
+
 ## Conversation tabs
 
 The same gateway also backs the conversation-tabs card with a small JSON API
@@ -88,12 +122,10 @@ under `CONVERSATIONS_DIR`, one file each — the deployment points this at the
 persistent `/root` volume (`/root/.retinue/conversations`); the
 `/tmp/web-tab-conversations` default is only for ad-hoc runs.
 
-On a phone the dashboard card stays compact (the five most recent active
-threads); in the wide layout it fills its resizable region and shows every
-active thread. Either way an **All conversations →** link leads to
-`conversations.html`, a dedicated page that lists every thread with an
-Active/Archived filter (the same `retinue-conversations` element with the
-`full` attribute). Archiving is done from inside a thread; archived threads
+On the home the element is a `viewer` only — threads open from the attention
+list's rows. *Threads* in the navigation row leads to `conversations.html`, a
+dedicated page that lists every thread with an Active/Archived filter (the
+same `retinue-conversations` element with the `full` attribute). Archiving is done from inside a thread; archived threads
 leave the active list but remain on that page and via
 `GET /conversations?archived=1`.
 
@@ -101,9 +133,11 @@ The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
 splitters — double-click resets one, dragging news fully down closes it — and
 each card's header toggles between list and card view. Both preferences
-persist per device in localStorage. Device-level settings (notifications, the
-running shell version with a manual update check) live on `settings.html`,
-reached via the gear in the dashboard header.
+persist per device in localStorage. Every top-level page opens with the
+navigation row (`components/nav.js`: Home · Chats · Threads · Projects · News
+and the settings gear), pinned while a list page scrolls. Device-level
+settings (notifications, the running shell version with a manual update
+check) live on `settings.html`, reached via that gear.
 
 Shell updates apply themselves (`components/update.js`): when a new service
 worker activates, controlled pages reload once — never while a thread or the
@@ -173,8 +207,11 @@ docstring). Pieces:
   only safe if the tap can be taken back, and a staged draft is not something
   the user can retype.
   Back goes back where the chat was opened from within the
-  app, and to the chats list for a chat opened cold (a notification, a
-  bookmark). The open chat polls on the conversations cadence,
+  app, and to the home — the attention list the chat is a row of — for a chat
+  opened cold (a notification, a bookmark). The header's ⓘ opens the chat's
+  attention sheet (with the contact card), and **Archive** / **Mute** switches
+  sit under it — the same `POST /chats/<id>/flags` the list's swipe actions
+  use. The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the

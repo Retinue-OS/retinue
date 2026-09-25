@@ -345,13 +345,57 @@ def reminder_text(
     return r_title, r_msg
 
 
-def push_conversation(title: str, message: str, dry_run: bool) -> bool:
+def attention_args(fm: dict, due: "dt.date", kind: str) -> list[str]:
+    """What the wake-up thread tells the dashboard's attention model
+    (docs/attention-model.md), read from the project's own frontmatter:
+    ``importance``, ``sphere``, ``tags``, ``kind`` as declared, the wake date
+    as the deadline, ``remind_before`` as the lead. A project that declares
+    nothing wakes as an admin chore of importance 3 with the date it named —
+    active within its lead, so the reminder is listed and rings where admin
+    is admitted, rather than silently listed at the mid importance."""
+    args = ["--due", due.isoformat()]
+    # A value conversation-push.py would refuse must not cost the reminder:
+    # the project is already awake by the time it is pushed. Say so, and wake
+    # it with the default instead.
+    importance = fm.get("importance", "").strip()
+    try:
+        value = float(importance) if importance else 3.0
+    except ValueError:
+        value = None
+    if value is None or not 0 <= value <= 5:
+        print(f"[recurring-projects] importance {importance!r} is not a number "
+              "from 0 to 5; the reminder goes out at 3", file=sys.stderr)
+        value = 3.0
+    args += ["--importance", f"{value:g}"]
+    sphere = fm.get("sphere", "").strip()
+    args += ["--sphere", sphere if sphere else "admin"]
+    for tag in [t.strip(" -'\"") for t in fm.get("tags", "").strip("[]").split(",")]:
+        if tag:
+            args += ["--tag", tag]
+    args += ["--kind", fm.get("kind", "").strip() or ("invoice run" if kind == "cadence" else "admin chore")]
+    raw = fm.get("remind_before", "").strip()
+    if raw:
+        # The frontmatter's "10 / 10d / 2w / 3m" is days, weeks, calendar
+        # months; the model's lead takes minutes/hours/days/weeks.
+        lead = parse_lead(raw)
+        if lead is None:
+            print(f"[recurring-projects] remind_before {raw!r} is not a lead time; "
+                  "the kind's default applies", file=sys.stderr)
+        else:
+            unit, count = lead
+            args += ["--lead", f"{count * 30}d" if unit == "m" else f"{count}{unit}"]
+    return args
+
+
+def push_conversation(title: str, message: str, dry_run: bool,
+                      extra_args: list[str] | None = None) -> bool:
     if dry_run:
         print(f"[dry-run] would push conversation: {title!r}")
         return True
     try:
         subprocess.run(
-            ["python3", CONVERSATION_PUSH, "--title", title, message], check=True
+            ["python3", CONVERSATION_PUSH, "--title", title, *(extra_args or []), message],
+            check=True,
         )
         return True
     except subprocess.CalledProcessError as exc:
@@ -417,6 +461,10 @@ def main() -> int:
         print(f"[recurring-projects] {proj}: {kind} due {due.isoformat()} "
               f"(wake {wake_on.isoformat()}, today {today}) -> reactivating")
 
+        # What the thread declares, worked out before the file changes: a
+        # frontmatter value it cannot use is reported, never raised.
+        declared = attention_args(fm, due, kind)
+
         # Flip to active first: even if the reminder push later fails, the project
         # visibly reappears on the dashboard card (paused=false), so the worst
         # failure is a missing nudge, never a silently-skipped month. The file's
@@ -428,7 +476,10 @@ def main() -> int:
             block = set_field(block, "waiting_since", today.isoformat())
             path.write_text(f"---\n{block}\n---\n" + text[m.end():])
 
-        push_conversation(r_title, r_msg, args.dry_run)
+        # The thread is about this project: the home screen shows it in the
+        # project's place rather than both, and Ara's turns know the file.
+        push_conversation(r_title, r_msg, args.dry_run,
+                          declared + ["--project", proj, "--project-title", title])
         acted += 1
 
     if acted == 0:

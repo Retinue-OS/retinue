@@ -63,6 +63,7 @@ import { esc, WIDE_FRAME } from './base.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
+import { openAttentionSheet } from './attention-sheet.js';
 // Registers <retinue-conversation>, the companion pane (see _companionHtml).
 // The chat mirror renders no Markdown of its own — what other people sent is
 // shown as sent (linkify below) — so the Markdown renderer and its styles
@@ -72,6 +73,7 @@ import './conversation.js';
 const LIST_URL = '/chats';
 // Where the back control lands a visitor who has no app history behind them.
 const CHATS_URL = '/chats.html';
+const HOME_URL = '/';
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
 const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
@@ -126,6 +128,20 @@ const QUICK_PATTERNS = [
     prompt: () => 'Translate the last message for me, and draft a reply in the same language.' },
   { id: 'summarize', label: 'Summarize',
     prompt: () => 'Summarize this chat since my last reply.' },
+  // Rewrites of the draft in the composer — the attention prototype's
+  // "shorter / warmer / more formal" as companion turns over the shared draft.
+  { id: 'shorter', label: 'Shorter',
+    prompt: (draft) => draft
+      ? `Make this draft shorter — keep the meaning, drop the rest, and stage it in the composer:\n\n${draft}`
+      : 'Draft a short reply to the last message and stage it in the composer.' },
+  { id: 'warmer', label: 'Warmer',
+    prompt: (draft) => draft
+      ? `Make this draft warmer and more personal, and stage it in the composer:\n\n${draft}`
+      : 'Draft a warm reply to the last message and stage it in the composer.' },
+  { id: 'formal', label: 'More formal',
+    prompt: (draft) => draft
+      ? `Make this draft more formal, and stage it in the composer:\n\n${draft}`
+      : 'Draft a formal reply to the last message and stage it in the composer.' },
 ];
 
 // Minimal inline rendering for mirrored channel messages: escaped text,
@@ -249,11 +265,12 @@ class RetinueChatPage extends HTMLElement {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = new URLSearchParams(location.search).get('id') || '';
     // Where "back" leads. A same-origin referrer means the chat was opened
-    // from inside the app (the dashboard card, the chats list, another chat),
+    // from inside the app (a row on the home, the chats list, another chat),
     // so there is an entry to return to and the user expects the place they
     // came from — not a list they then have to scroll to escape. Opened cold
     // (a push notification, a bookmark, the home-screen icon) there is no such
-    // entry, and the chats list is the honest landing place.
+    // entry, and the home — the attention list the chat is a row of, with
+    // the navigation to everything else — is the honest landing place.
     this._fromApp = this._openedFromApp();
     // Pane arrangement differs across the breakpoint; re-render on a flip
     // (drafts survive — they live in fields, mirrored on every input event).
@@ -619,7 +636,7 @@ class RetinueChatPage extends HTMLElement {
       body = `<div class="center muted"><p>${esc(this._error)}</p>` +
         `<p><a class="backlink" href="${CHATS_URL}">&#8249; All chats</a></p></div>`;
     } else {
-      body = this._headHtml() + this._panesHtml();
+      body = this._headHtml() + this._flagsHtml() + this._panesHtml();
     }
     this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}</style>` +
       `<section class="page">${body}</section>`;
@@ -660,14 +677,55 @@ class RetinueChatPage extends HTMLElement {
         ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
         : `${ch} &middot; ${esc(key)}`);
     return `<header class="chat-head">` +
-      `<a class="back" href="${CHATS_URL}" data-back title="Back" aria-label="Back">&#8249;</a>` +
+      `<a class="back" href="${HOME_URL}" data-back title="Back" aria-label="Back">&#8249;</a>` +
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
+      `<button class="info" data-attention title="Importance, urgency, delivery — and their corrections" ` +
+      `aria-label="Attention details">&#9432;</button>` +
       `<nav class="pane-tabs" role="tablist" aria-label="Pane">` +
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
       `<button role="tab" data-pane-tab="companion" aria-selected="false">Ara</button>` +
       `</nav></header>`;
+  }
+
+  // Archive and mute, under the header (the header itself is full on a
+  // phone). Each switch shows the state it is in and offers the other:
+  // "Archive" / "Archived · Unarchive". The flags mean what they mean on
+  // threads — an archived chat comes back when a message arrives unless it
+  // is muted; muting archives too and silences its push — and
+  // POST /chats/<id>/flags settles or reopens the chat's attention item with
+  // the archive.
+  _flagsHtml() {
+    const c = this._chat || {};
+    const sw = (flag, on, offLabel, onLabel, hint) =>
+      `<button class="flag${on ? ' on' : ''}" data-flag="${flag}" data-on="${on ? '0' : '1'}" title="${esc(hint)}">` +
+      (on ? `<b>${esc(onLabel)}</b> · Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) + `</button>`;
+    return `<div class="flags" data-flags>` +
+      sw('archived', !!c.archived, 'Archive', 'Archived',
+         'Leaves the chat list; comes back when a message arrives, unless muted') +
+      sw('muted', !!c.muted, 'Mute', 'Muted', 'Archived, no push, and a new message does not bring it back') +
+      `</div>`;
+  }
+
+  async _setFlag(flag, on) {
+    try {
+      const res = await fetch(`/chats/${encodeURIComponent(this._id)}/flags`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ [flag]: on }),
+      });
+      if (!res.ok) throw new Error(String(res.status));
+      const out = await res.json();
+      if (this._chat) { this._chat.archived = !!out.archived; this._chat.muted = !!out.muted; }
+      window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'flags' } }));
+    } catch (_err) { /* the row keeps showing the last known state */ }
+    const row = this.shadowRoot.querySelector('[data-flags]');
+    if (row) { row.outerHTML = this._flagsHtml(); this._bindFlags(); }
+  }
+
+  _bindFlags() {
+    this.shadowRoot.querySelectorAll('[data-flag]').forEach((el) =>
+      el.addEventListener('click', () => this._setFlag(el.getAttribute('data-flag'), el.getAttribute('data-on') === '1')));
   }
 
   _panesHtml() {
@@ -822,7 +880,7 @@ class RetinueChatPage extends HTMLElement {
   _goBack() {
     if (this._lightbox) { this._closeLightbox(); return; }
     if (this._fromApp && history.length > 1) { history.back(); return; }
-    location.href = CHATS_URL;
+    location.href = HOME_URL;
   }
 
   // ── Lightbox ───────────────────────────────────────────────────────────────
@@ -1002,7 +1060,7 @@ class RetinueChatPage extends HTMLElement {
   _wire() {
     const root = this.shadowRoot;
     // Back: a real link (its href is the fallback destination, and it still
-    // opens the chats list in a new tab on a modified click) whose plain press
+    // opens the home in a new tab on a modified click) whose plain press
     // honours where the user actually came from — see _goBack.
     const back = root.querySelector('[data-back]');
     if (back) {
@@ -1012,6 +1070,11 @@ class RetinueChatPage extends HTMLElement {
         this._goBack();
       });
     }
+    // The attention sheet for this chat: its importance, urgency and delivery,
+    // the corrections, Later and Mark handled.
+    const att = root.querySelector('[data-attention]');
+    if (att) att.addEventListener('click', () => openAttentionSheet(`chat:${this._id}`, { here: true }));
+    this._bindFlags();
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
     // the indicator honest whichever way the pane was reached (tab or swipe).
     root.querySelectorAll('[data-pane-tab]').forEach((el) =>
@@ -1844,6 +1907,11 @@ const CSS = `
         border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
         font-size: .58rem; font-weight: 800; color: #fff;
         border: 2px solid var(--bg, #0b0d12); box-sizing: content-box; }
+  .info { flex: none; width: 30px; height: 30px; border-radius: 50%; background: transparent;
+          border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);
+          cursor: pointer; font: inherit; font-size: .95rem; display: inline-flex; align-items: center;
+          justify-content: center; padding: 0; -webkit-tap-highlight-color: transparent; }
+  .info:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .head-txt { flex: 1; min-width: 0; }
   .head-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .head-sub { display: block; color: var(--muted, #8b93a3); font-size: .74rem;
@@ -1854,6 +1922,14 @@ const CSS = `
                       border-radius: 999px; padding: 6px 14px; font: inherit; font-size: .8rem;
                       cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .pane-tabs button.on { background: var(--accent, #6ea8fe); color: #0b0d12; font-weight: 600; }
+  /* Archive / mute switches under the header. */
+  .flags { flex: none; display: flex; gap: 8px; padding: 8px 0 6px; }
+  .flag { border: 1px solid var(--line, rgba(231, 235, 242, .08)); background: transparent;
+          color: var(--muted, #8b93a3); border-radius: 999px; padding: 4px 12px; font: inherit;
+          font-size: .76rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .flag b { color: var(--fg, #e7ebf2); font-weight: 600; }
+  .flag.on { background: var(--card-2, #1c2230); border-color: var(--card-2, #1c2230); }
+  .flag:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
 
   /* ── Panes: swipe strip on the phone, columns behind a splitter when wide ── */
   .panes { flex: 1; min-height: 0; display: flex;

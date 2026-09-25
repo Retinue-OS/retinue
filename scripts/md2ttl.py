@@ -29,8 +29,10 @@ Frontmatter is parsed without a YAML library: nothing in this tree currently
 depends on one (`scripts/recurring-projects.py` reads the same kind of
 frontmatter the same way, scalars only, for the same reason), and pulling one
 in for a single optional field is not worth a new runtime dependency. Only
-plain `key: value` scalar lines are understood; lists and block scalars are
-silently ignored, exactly like recurring-projects.py's reader.
+plain `key: value` scalar lines are understood; block lists and block scalars
+are silently ignored, exactly like recurring-projects.py's reader. The one
+list-valued field, `tags`, is therefore read from an inline value
+(LIST_FIELDS).
 """
 
 from __future__ import annotations
@@ -64,6 +66,21 @@ SCALAR_FIELDS: dict[str, tuple[str, str | None]] = {
     "next_due": ("nextDue", "date"),
     "status": ("status", None),
     "resolved": ("resolved", "boolean"),
+    # The attention model's project properties (docs/attention-model.md): how
+    # much it matters, where it belongs, what kind of thing it is, and the
+    # lead time before its deadline. Plain strings; the dashboard parses them.
+    "importance": ("importance", None),
+    "sphere": ("sphere", None),
+    "kind": ("kind", None),
+    "remind_before": ("remindBefore", None),
+}
+
+# frontmatter key -> predicate local name, for the one list-valued field. The
+# scalar-only reader cannot see a block list, so a list is written inline —
+# `tags: [finance, tax]` or `tags: finance, tax` — and each entry becomes its
+# own triple.
+LIST_FIELDS: dict[str, str] = {
+    "tags": "tag",
 }
 
 _FM_RE = re.compile(r"^---\n(.*?)\n---\s*(?:\n|$)", re.DOTALL)
@@ -97,6 +114,20 @@ def as_bool(raw: str) -> bool:
     """Same truthiness rule as recurring-projects.py's `as_bool`, for the
     same fields, so a file reads the same way whichever side is looking."""
     return raw.strip().lower() in ("true", "yes", "1")
+
+
+def as_list(raw: str) -> list[str]:
+    """An inline list value -> its entries: `[a, b]` or `a, b`, each entry
+    stripped of whitespace and quotes, empties dropped."""
+    raw = raw.strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    out = []
+    for part in raw.split(","):
+        part = part.strip().strip("'\"").strip()
+        if part:
+            out.append(part)
+    return out
 
 
 def actor_iri(raw: str) -> str:
@@ -158,6 +189,10 @@ def render(fm: dict[str, str], fallback_id: str) -> str:
             predicates.append(f'kb:{name} "{raw}"^^xsd:date')
         else:
             predicates.append(f"kb:{name} {turtle_string(raw)}")
+
+    for key, name in LIST_FIELDS.items():
+        for entry in as_list(fm.get(key) or ""):
+            predicates.append(f"kb:{name} {turtle_string(entry)}")
 
     body = " ;\n    ".join(predicates)
     return f"{subj}\n    {body} .\n"

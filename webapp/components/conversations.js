@@ -24,7 +24,9 @@
 // shows the most recent active threads (capped at MAX_CARD_THREADS) plus a link
 // to the dedicated all-conversations page, so the dashboard stays uncluttered.
 // With the `full` attribute (used on conversations.html) it shows every thread
-// with an Active/Archived filter and no cap.
+// with an Active/Archived filter and no cap. With `viewer` (the home page,
+// whose list is the attention list) it renders nothing at all until a thread
+// or the composer is opened by hash, and then only that view.
 //
 // Everything degrades gracefully offline (the list just fails to refresh; the
 // last rendered state stays on screen).
@@ -79,6 +81,7 @@ class RetinueConversations extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._full = this.hasAttribute('full');
+    this._viewer = this.hasAttribute('viewer');
     // List rows vs reflowing tiles — a per-device choice (see base.js).
     this._view = viewPref('conversations');
     // Deep link: #conversation-<id> opens that thread (used by agent push
@@ -209,6 +212,8 @@ class RetinueConversations extends HTMLElement {
   }
 
   async refresh() {
+    // The viewer has no list of its own to keep fresh: only an open thread.
+    if (this._viewer && !this._active && !this._composing) return;
     const epoch = this._epoch;
     try {
       const res = await fetch(this._listUrl(), { cache: 'no-store' });
@@ -359,6 +364,12 @@ class RetinueConversations extends HTMLElement {
     // Reflect the view on the host so the page can react (styles.css hides the
     // greeting and app dock while a thread or the composer is open).
     this.setAttribute('data-view', mode);
+    if (this._viewer && mode === 'list') {
+      // Nothing to show: the home's attention list is the list.
+      this.shadowRoot.innerHTML = '';
+      this._lastMode = mode;
+      return;
+    }
     const body = this._active ? this._threadView()
       : this._composing ? this._composerView()
       : this._listView();
@@ -442,9 +453,10 @@ class RetinueConversations extends HTMLElement {
     return `<div class="empty"><span class="e-ico" aria-hidden="true">&#x1F4AC;</span><p>${msg}</p></div>`;
   }
 
-  // The card links out to the full page; the full page links back home.
+  // The card links out to the full page; the full page's way home is the
+  // navigation row at the top of conversations.html (components/nav.js).
   _footerHtml() {
-    if (this._full) return '<a class="all-link" href="/">&larr; Back to dashboard</a>';
+    if (this._full) return '';
     return `<a class="all-link" href="/conversations.html">${this._allLinkLabel()}</a>`;
   }
 

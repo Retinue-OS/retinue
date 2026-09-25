@@ -364,6 +364,13 @@ _CONFIRM_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 _TITLE_RE = re.compile(r"^\s*Title:\s*(.+?)\s*$", re.IGNORECASE)
+# How a confirmation presents itself to the dashboard's attention model
+# (docs/attention-model.md) — in a thread of its own (ask_ara) or appended to
+# a tell_ara note's thread. It wants an answer, but not this minute:
+# importance 4 makes it active — carried by the next digest and listed under
+# Held meanwhile — where a thread that declares nothing is passive, listed
+# on the home and never pushed, not even in a digest.
+CONFIRM_ATTENTION = {"importance": 4, "sphere": "admin", "kind": "confirmation"}
 
 
 def _confirm_instructions(own_thread: bool) -> list[str]:
@@ -430,7 +437,8 @@ def _confirmation_thread(title: str | None, message: str) -> dict:
     """Open a confirmation thread — never quiet: it wants an answer."""
     try:
         return _gateway_post("/internal/conversations",
-                             {"title": title, "message": message}) or {}
+                             {"title": title, "message": message,
+                              "attention": dict(CONFIRM_ATTENTION)}) or {}
     except Exception as exc:  # noqa: BLE001 — the answer must still reach the client
         log(f"confirm: could not open the thread: {exc}")
         return {}
@@ -592,8 +600,10 @@ def _review_note(thread_id: str, note: str) -> None:
     if not message:
         return
     try:
+        # The confirmation turns the note thread into one that wants an
+        # answer, so it declares what the ask_ara confirmation thread does.
         _gateway_post(f"/internal/conversations/{thread_id}/messages",
-                      {"message": message})
+                      {"message": message, "attention": dict(CONFIRM_ATTENTION)})
     except Exception as exc:  # noqa: BLE001
         log(f"review: could not append to thread {thread_id}: {exc}")
 

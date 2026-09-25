@@ -204,6 +204,13 @@ python3 /workspace/scripts/emit-conversation-models.py || \
 python3 /workspace/scripts/discover-agents.py || \
   echo "[plugin] warning: agent registry generation failed (non-fatal)"
 
+# ── Emit the attention properties of what is already waiting ────────
+# The open threads' and chats' importance, deadline, lead time and sphere
+# (docs/attention-model.md) into chambers/_generated/attention/, so the store
+# boots with them; the web-gateway keeps the file current from then on.
+python3 /workspace/scripts/emit-attention.py || \
+  echo "[plugin] warning: attention emit failed (non-fatal)"
+
 # ── Register chamber plugins (marketplace lives at /workspace) ───────
 # Non-fatal: on first-ever start claude may not be configured yet.
 # `claude plugin install` is a no-op once the plugin's version is cached, and the

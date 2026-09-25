@@ -153,16 +153,14 @@ class RetinueProjects extends HTMLElement {
       inner = this.full ? this.bodyFull(data) : this.bodyCard(data);
       if (data && data.generated) stamp = `<time>${esc(fmtAge(data.generated))}</time>`;
     }
-    // On the dedicated page the component is all there is, so it must carry
-    // the way home itself — in every state, including loading and offline
-    // (inside the installed PWA there is no URL bar to fall back on).
-    const home = this.full
-      ? '<a class="more" href="/">&larr; Back to dashboard</a>' : '';
+    // On the dedicated page the way home is the navigation row above the
+    // component (components/nav.js) — in every state, loading and offline
+    // included, since it is plain page markup.
     this.shadowRoot.innerHTML =
       `<style>${CSS}${VIEW_TOGGLE_CSS}</style>` +
       `<section class="card"><header><h2>${esc(this.heading)}</h2>` +
       `${viewToggleHtml(this._view)}${stamp}</header>` +
-      `<div class="content">${inner}</div>${home}</section>`;
+      `<div class="content">${inner}</div></section>`;
   }
 
   get _ulOpen() { return this._view === 'list' ? '<ul class="as-list">' : '<ul>'; }

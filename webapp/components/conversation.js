@@ -82,6 +82,7 @@ import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
+import { openAttentionSheet } from './attention-sheet.js';
 
 const LIST_URL = '/conversations';
 const POLL_MS = 4000;
@@ -919,10 +920,16 @@ class RetinueConversation extends HTMLElement {
         `<span class="bar-actions"><span data-picker>${this._modelPickerHtml()}</span>` +
         `${autoBtn}</span></div>`;
     }
+    // The attention sheet — importance, urgency, delivery and their
+    // corrections — for the threads the model lists: those an agent opened.
+    const attentionBtn = (t.initiator === 'agent' || t.attention)
+      ? `<button class="iconbtn" data-attention title="Importance, urgency, delivery — and their corrections" ` +
+        `aria-label="Attention details">&#9432;</button>`
+      : '';
     return `<div class="thread-bar">${back}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
       `<span class="bar-actions"><span data-picker>${this._modelPickerHtml()}</span>` +
-      `${autoBtn}${archiveBtn}</span></div>`;
+      `${attentionBtn}${autoBtn}${archiveBtn}</span></div>`;
   }
 
   // What the composer's box is called. A host that frames the element its own
@@ -1802,6 +1809,8 @@ class RetinueConversation extends HTMLElement {
     const root = this.shadowRoot;
     const back = root.querySelector('[data-back]');
     if (back) back.addEventListener('click', () => this._emit('retinue-back', { id: this._id }));
+    const att = root.querySelector('[data-attention]');
+    if (att) att.addEventListener('click', () => openAttentionSheet(`thread:${this._id}`, { here: true }));
     const arch = root.querySelector('[data-archive]');
     if (arch) arch.addEventListener('click', () => this._archive(true));
     const unarch = root.querySelector('[data-unarchive]');
@@ -2022,6 +2031,20 @@ const CSS = `
   /* bar="actions": no title to push the cluster across, so the row does it,
      and it sits tighter — the host's own header is directly above it. */
   .thread-bar.bar-slim { justify-content: flex-end; padding: 0 0 8px; }
+  /* A phone's thread bar cannot hold the back button, the picker, the
+     attention ⓘ, the speaker toggle and Archive beside the title — squeezed
+     into one row the title kept its first four letters. So on a phone the
+     title keeps the row with the back button (two lines before it cuts, as
+     in the list) and the controls wrap to a row under it, the way the chat
+     page's Archive and Mute switches sit under its header. */
+  @media (max-width: 480px) {
+    .thread-bar:not(.bar-slim) { flex-wrap: wrap; row-gap: 8px; }
+    .thread-bar:not(.bar-slim) .bar-title { white-space: normal; overflow-wrap: anywhere;
+                 display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+                 line-height: 1.3; }
+    .thread-bar:not(.bar-slim) .bar-actions { flex: 1 0 100%; padding-left: 44px; }
+    .bar-actions:empty { display: none; }
+  }
   .iconbtn { width: 34px; height: 34px; border-radius: 50%; background: transparent;
              border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);
              cursor: pointer; font-size: .95rem; display: inline-flex; align-items: center;

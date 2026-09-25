@@ -189,6 +189,17 @@ group look like a handle whose id happened to be the room's. Where a post
 genuinely has no individual sender — a broadcast channel — the channel itself is
 the only identity there is, and it stands in for one.
 
+The VIP flag also rides on the **chats rail** (`chat_ingest.py`: `gate.vip`),
+where the attention model reads it next to what the dashboard itself knows
+about the sender. A VIP always rings — unless their chat is muted or the group
+is quieted/ignored — whatever mode is on. A direct message from anyone else is
+ranked by what is known about them: a **contact card** (name, sphere, further
+groups) or a sphere the user has taught the profile. A sender the dashboard
+knows nothing about is *screened* — listed and carried by the next digest,
+never rung — until the contact card says who it is. This replaces the old
+`gate.unknown` flag, which went with the whitelist; see
+`docs/attention-model.md`.
+
 ### Messenger group axis: news / quieted / ignored
 
 A group carries up to three flags, all set through Ara's policy editor:
