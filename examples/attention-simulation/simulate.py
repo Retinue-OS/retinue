@@ -306,6 +306,7 @@ def load_gateway(tmp: Path, store_port: int, gateways: dict[str, int], sim_port:
         "EDGE_PROXY_PEERS": "127.0.0.1",
         "CHAT_STATE_DIR": str(tmp / "chat-state"),
         "CHAT_LIST_CACHE_SECONDS": "0",
+        "ATTENTION_PROJECTS_CACHE_SECONDS": "0",
         "CONVERSATION_BACKEND_TOKEN": TOKEN,
         "CONVERSATIONS_DIR": str(tmp / "convs"),
         "CONVERSATION_DIR": str(tmp / "convlog"),

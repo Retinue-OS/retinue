@@ -122,6 +122,44 @@ def upgrade_focus(doc: dict) -> dict:
     return doc
 
 
+def heal_focus(focus: dict) -> dict:
+    """Make a focus document safe to read: every mode it names exists.
+
+    A hand-edited file, or one written while the modes had other names (Off,
+    Home, Deep work, Open, Work), can define modes without the ones the
+    shipped week names, or name a mode it does not define — in a day plan or
+    in the override. Every reading of the mode would then fail on the missing
+    id, and with it the list, the inbound rail and the tick. So the shipped
+    modes are put back where missing (a deployment renames and adds modes;
+    the shipped week still relies on these), a mode missing a field it needs
+    gets it, a schedule entry naming a mode that does not exist is dropped —
+    the entry before it runs on, and a plan left with none takes the shipped
+    workday — and an override to one is released."""
+    modes = focus.get("modes")
+    modes = {mid: m for mid, m in modes.items() if isinstance(m, dict)} if isinstance(modes, dict) else {}
+    for mid, mode in DEFAULT_MODES.items():
+        modes.setdefault(mid, json.loads(json.dumps(mode)))
+    for mid, mode in modes.items():
+        shipped = DEFAULT_MODES.get(mid, {})
+        mode["id"] = mid
+        mode.setdefault("name", shipped.get("name") or mid.replace("-", " ").capitalize())
+        if not isinstance(mode.get("admits"), list):
+            mode["admits"] = list(shipped.get("admits") or [])
+        if mode.get("threshold") not in RANK:
+            mode["threshold"] = shipped.get("threshold") or "time-sensitive"
+    focus["modes"] = modes
+    for plan in focus.get("week") or []:
+        if not isinstance(plan, dict):
+            continue
+        entries = plan.get("schedule")
+        kept = [list(e) for e in entries if isinstance(e, (list, tuple)) and len(e) >= 2 and e[1] in modes] \
+            if isinstance(entries, list) else []
+        plan["schedule"] = kept or [list(e) for e in DEFAULT_SCHEDULE]
+    if focus.get("manual") and focus["manual"] not in modes:
+        focus.update(manual=None, subject=None, manual_until=None, breaks=[])
+    return focus
+
+
 def default_profile() -> dict:
     """The attention profile (profile.json): importance priors, lead times, permits."""
     return {"priors": {}, "spheres": {}, "leads": dict(DEFAULT_LEADS), "permits": {mid: [] for mid in DEFAULT_MODES}, "learned": []}
@@ -920,7 +958,8 @@ def correct(item: dict, profile: dict, patch: dict, now: datetime) -> list[str]:
             profile.setdefault("spheres", {})[key] = item["sphere"]
             learned.append(f"sphere for {key} → {item['sphere']}")
     if isinstance(patch.get("tags"), list):
-        item["tags"] = [str(t) for t in patch["tags"] if str(t).strip()]
+        # A tag is a further sphere, so it is the same word the rules use.
+        item["tags"] = list(dict.fromkeys(t for t in (sphere_id(x) for x in patch["tags"]) if t))
     if "critical" in patch:
         item["critical"] = bool(patch["critical"])
     for text in learned:
@@ -1458,23 +1497,35 @@ def _lit(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
 
 
+# What N-Triples forbids inside an IRI: controls, the space, and <>"{}|^`\.
+_IRI_FORBIDDEN = re.compile(r'[\x00-\x20<>"{}|^`\\]')
+
+
+def _iri_part(value) -> str:
+    """A value spliced into an IRI, with what N-Triples forbids there
+    percent-encoded, so one odd sphere or actor name cannot make the whole
+    file unloadable. Letters in any script stay as they are, as an IRI
+    allows; the words the model itself writes (sphere_id) pass unchanged."""
+    return _IRI_FORBIDDEN.sub(lambda m: "".join(f"%{b:02X}" for b in m.group(0).encode("utf-8")), str(value))
+
+
 def to_ntriples(items: list[dict], subject_for) -> str:
     """Deterministic, blank-node-free N-Triples for the four properties, so the
     dashboard's question — what wants attention, at which level — is a SELECT."""
     lines = []
     for item in items:
-        s = subject_for(item)
+        s = _iri_part(subject_for(item))
         importance = "%g" % item["importance"]
         lead_minutes = int(item["lead"].total_seconds() // 60)
         lines.append(f"<{s}> <{KB}importance> {_lit(importance)}^^<http://www.w3.org/2001/XMLSchema#decimal> .")
         lines.append(f"<{s}> <{KB}leadTime> {_lit('PT%dM' % lead_minutes)}^^<http://www.w3.org/2001/XMLSchema#duration> .")
-        lines.append(f"<{s}> <{KB}sphere> <urn:retinue:sphere:{item['sphere']}> .")
+        lines.append(f"<{s}> <{KB}sphere> <urn:retinue:sphere:{_iri_part(item['sphere'])}> .")
         for tag in item.get("tags") or []:
-            lines.append(f"<{s}> <{KB}tag> <urn:retinue:sphere:{tag}> .")
+            lines.append(f"<{s}> <{KB}tag> <urn:retinue:sphere:{_iri_part(tag)}> .")
         if item.get("due") is not None:
             lines.append(f"<{s}> <{KB}due> {_lit(item['due'].isoformat())}^^<http://www.w3.org/2001/XMLSchema#dateTime> .")
         actor = item.get("actor") or "you"
-        lines.append(f"<{s}> <{KB}currentActor> <urn:retinue:actor:{actor.replace(' ', '-')}> .")
+        lines.append(f"<{s}> <{KB}currentActor> <urn:retinue:actor:{_iri_part(actor.replace(' ', '-'))}> .")
     return "\n".join(sorted(set(lines))) + ("\n" if lines else "")
 
 

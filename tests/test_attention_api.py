@@ -48,6 +48,11 @@ TOKEN = "agent-token"
 PROJECT = "urn:retinue:project:vat-q3"
 PUSHES: list = []
 STATE: dict = {"projects": True}
+# What the project's frontmatter says, as the store serves it; a test moves
+# the deadline here the way an author edits the file.
+PROJECT_ROW = {"title": "VAT return Q3", "actor": "urn:retinue:actor:owner", "expected": "2026-09-30",
+               "importance": "4", "sphere": "admin", "tag": "finance", "kind": "tax filing",
+               "next": "Collect the receipts"}
 
 
 class _MockSparql(BaseHTTPRequestHandler):
@@ -62,10 +67,7 @@ class _MockSparql(BaseHTTPRequestHandler):
         bindings = []
         if "k:Project" in query and STATE["projects"]:
             cell = lambda v: {"value": v}  # noqa: E731
-            bindings = [{"p": cell(PROJECT), "title": cell("VAT return Q3"),
-                         "actor": cell("urn:retinue:actor:owner"), "expected": cell("2026-09-30"),
-                         "importance": cell("4"), "sphere": cell("admin"), "tag": cell("finance"),
-                         "kind": cell("tax filing"), "next": cell("Collect the receipts")}]
+            bindings = [{"p": cell(PROJECT), **{k: cell(v) for k, v in PROJECT_ROW.items() if v is not None}}]
         payload = json.dumps({"results": {"bindings": bindings}}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/sparql-results+json")
@@ -88,6 +90,7 @@ def _load_gateway(tmp: Path, sparql_port: int):
     os.environ["EDGE_PROXY_PEERS"] = "127.0.0.1"
     os.environ["CHAT_STATE_DIR"] = str(tmp / "chat-state")
     os.environ["CHAT_LIST_CACHE_SECONDS"] = "0"
+    os.environ["ATTENTION_PROJECTS_CACHE_SECONDS"] = "0"
     os.environ["CONVERSATION_BACKEND_TOKEN"] = TOKEN
     os.environ["CONVERSATIONS_DIR"] = str(tmp / "convs")
     os.environ["CONVERSATION_DIR"] = str(tmp / "convlog")
@@ -845,6 +848,135 @@ def test_week_and_holidays(base, wg):
     _clock(wg, None)
     print("ok test_week_and_holidays")
 
+# ── what the review of the branch found ─────────────────────────────────────
+
+def test_append_reports_delivery(base, wg):
+    """An append is judged like an opening, and says so: an agent told
+    nothing would report the user notified while the news waits."""
+    _mode(base, "focused")
+    body = _open(base, "Card renewal, again", "The card expires Friday.",
+                 {"importance": 4, "sphere": "admin", "kind": "admin chore"})
+    assert body["attention"]["delivery"] == "hold", body
+    PUSHES.clear()
+    status, out = _http(base, "POST", f"/internal/conversations/{body['id']}/messages",
+                        {"message": "The bank sent a reminder."}, AGENT)
+    assert status == 201 and out["attention"]["delivery"] == "hold" and out["attention"]["until"], out
+    assert not PUSHES
+    status, out = _http(base, "POST", f"/internal/conversations/{body['id']}/messages",
+                        {"message": "It is blocked now.", "attention": {"critical": True}}, AGENT)
+    assert status == 201 and out["attention"]["delivery"] == "push", out
+    print("ok test_append_reports_delivery")
+
+
+def test_unarchive_keeps_done(base, wg):
+    """Unarchiving brings back what archiving settled, not what the user had
+    already marked done — as on the chat path."""
+    _mode(base, "chores")
+    done = _open(base, "Settled before archiving", "Nothing left to do.", {"importance": 4})
+    _http(base, "POST", "/attention/items/done", {"id": "thread:" + done["id"]})
+    _http(base, "POST", f"/conversations/{done['id']}/archive")
+    _http(base, "POST", f"/conversations/{done['id']}/unarchive")
+    assert _find(_sections(base), "thread:" + done["id"])[0] is None, "marked done stays done"
+    open_ = _open(base, "Archived while open", "Still wants an answer.", {"importance": 4})
+    _http(base, "POST", f"/conversations/{open_['id']}/archive")
+    assert _find(_sections(base), "thread:" + open_["id"])[0] is None
+    _http(base, "POST", f"/conversations/{open_['id']}/unarchive")
+    assert _find(_sections(base), "thread:" + open_["id"])[0] is not None, "what archiving settled comes back"
+    print("ok test_unarchive_keeps_done")
+
+
+def test_declared_spheres_are_words(base, wg):
+    """A sphere or tag an agent declares is normalised to the word the rules
+    use, and the emit stays loadable N-Triples."""
+    _mode(base, "chores")
+    body = _open(base, "Game night", "Saturday at Tom's?",
+                 {"importance": 2, "sphere": "Board Games", "tags": ["Friends", "Board Games"]})
+    where, row = _find(_sections(base), "thread:" + body["id"])
+    assert row["sphere"] == "board-games" and row["tags"] == ["friends", "board-games"], row
+    wg._attention_emit(wg._attention_items(wg._ATTENTION.profile(), wg._attention_now())[0])
+    emitted = (Path(os.environ["CHAMBERS_DIR"]) / "_generated" / "attention" / "items.nt").read_text()
+    assert "<urn:retinue:sphere:board-games>" in emitted and "Board Games" not in emitted
+    print("ok test_declared_spheres_are_words")
+
+
+def test_broken_focus_document(base, wg):
+    """A focus.json naming modes it does not define serves the list anyway."""
+    path = wg.ATTENTION_DIR / "focus.json"
+    saved = path.read_text()
+    try:
+        path.write_text(json.dumps({"modes": {"off": {"id": "off", "name": "Off", "admits": [],
+                                                       "threshold": "critical"}}, "manual": "deep"}))
+        status, body = _http(base, "GET", "/attention")
+        assert status == 200 and body["mode"]["id"] in {m["id"] for m in body["modes"]}, (status, body)
+        chat = {"channel": "signal", "account": "+41790000000", "chat": "+41791234567", "direction": "in",
+                "text": "Still on for tonight?", "ts": "2026-09-07T10:00:00+00:00"}
+        status, _ = _http(base, "POST", "/internal/chats/inbound", chat, {"X-Chats-Ingest-Token": "x"})
+        assert status != 500, "the inbound rail must not fail on the focus document"
+        wg._attention_tick_state.update(minute=None, emitted=False, ended=None)
+        wg._attention_tick(datetime(2026, 9, 7, 10, 0, tzinfo=timezone.utc))
+    finally:
+        path.write_text(saved)
+    print("ok test_broken_focus_document")
+
+
+def test_project_frontmatter_moves(base, wg):
+    """A deadline moved in the project file after the gateway stored the
+    project's block is the deadline the list shows."""
+    _mode(base, "chores")
+    status, out = _http(base, "POST", "/attention/items/later", {"id": PROJECT, "when": "next"})
+    assert status == 200
+    states = json.loads((Path(os.environ["ATTENTION_DIR"]) / "projects.json").read_text())
+    assert states[PROJECT]["frontmatter"]["deadline"] == "2026-09-30", states[PROJECT]
+    PROJECT_ROW["expected"] = "2026-10-15"
+    try:
+        status, out = _http(base, "GET", "/attention/item?id=" + urllib.parse.quote(PROJECT, safe=""))
+        assert status == 200 and out["item"]["due"].startswith("2026-10-15"), out["item"]["due"]
+    finally:
+        PROJECT_ROW["expected"] = "2026-09-30"
+    print("ok test_project_frontmatter_moves")
+
+
+def test_tick_makes_up_what_it_missed(base, wg):
+    """A digest time the tick never got to — a stall, a restart — or whose
+    run failed is made up, not lost."""
+    _mode(base, None)
+    tuesday = datetime(2026, 9, 8, tzinfo=timezone.utc)
+    wg._attention_tick_state.update(minute=None, emitted=False, ended=None)
+    wg._attention_tick(tuesday.replace(hour=7, minute=58))
+    # 08:00 passes without a tick; the next one, at 08:02, makes it up.
+    report = wg._attention_tick(tuesday.replace(hour=8, minute=2))
+    assert "digest" in report["events"], report
+    # A run that fails is tried again within the same minute.
+    real = wg._attention_items
+    calls = []
+
+    def failing(*a, **k):
+        if not calls:
+            calls.append(1)
+            raise RuntimeError("store stalled")
+        return real(*a, **k)
+    wg._attention_items = failing
+    try:
+        try:
+            wg._attention_tick(tuesday.replace(hour=12, minute=0))
+            raise AssertionError("the first run should have failed")
+        except RuntimeError:
+            pass
+        report = wg._attention_tick(tuesday.replace(hour=12, minute=0))
+        assert "digest" in report["events"], report
+    finally:
+        wg._attention_items = real
+    # A restart across 17:00: the marker on disk says where the tick stopped.
+    wg._attention_tick(tuesday.replace(hour=16, minute=30))
+    wg._attention_tick_state.update(minute=None, emitted=False, ended=None)
+    report = wg._attention_tick(tuesday.replace(hour=17, minute=3))
+    assert "digest" in report["events"], report
+    # A clock that went back (the simulation's seek) answers for its own
+    # minute only: the half-hour sweep, and nothing made up.
+    report = wg._attention_tick(tuesday.replace(hour=9, minute=0))
+    assert report["events"] == ["sweep"], report
+    print("ok test_tick_makes_up_what_it_missed")
+
 
 def main():
     sparql = _serve(_MockSparql)
@@ -873,6 +1005,12 @@ def main():
         test_internal_set(base, wg)
         test_hand_set_focus_and_breaks(base, wg)
         test_week_and_holidays(base, wg)
+        test_append_reports_delivery(base, wg)
+        test_unarchive_keeps_done(base, wg)
+        test_declared_spheres_are_words(base, wg)
+        test_broken_focus_document(base, wg)
+        test_project_frontmatter_moves(base, wg)
+        test_tick_makes_up_what_it_missed(base, wg)
         server.shutdown()
     sparql.shutdown()
     print("all attention API checks passed")

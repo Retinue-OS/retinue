@@ -158,12 +158,19 @@ The chat page carries **Archive** and **Mute** switches under its header
 (`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
 meaning: an archived chat leaves the chats list and comes back when a
 message arrives unless it is muted, and muted also silences its push;
-unarchiving reopens the item only where archiving settled it. A project's properties
+unarchiving reopens the item only where archiving settled it — for a chat as
+for a thread, so one the user had marked done stays done. A project's properties
 come from its frontmatter — `importance`, `sphere`, `tags`, `kind`, the
-deadline `expected_by` / `next_due`, the lead `remind_before` — where the
-chamber's Markdown converter maps them; a correction on a project changes the
-gateway's state for it, never the chamber file. `recurring-projects.py` passes
-the same fields on the wake-up thread it opens. The monitors declare their
+deadline `expected_by` / `next_due`, the lead `remind_before` (days, weeks or
+months, as `recurring-projects.py` reads it) — where the chamber's Markdown
+converter maps them; a correction on a project changes the gateway's state
+for it, never the chamber file. The two meet by the latest word: the state
+keeps a snapshot of the frontmatter it was stored with, so a value the author
+changes afterwards — a deadline moved, `next_due` advanced — replaces the
+stored one, while a correction the author has not contradicted stands.
+`recurring-projects.py` passes the same fields on the wake-up thread it
+opens. A sphere or tag an agent or a file declares is normalised to the word
+the rules use (`Board Games` → `board-games`). The monitors declare their
 alerts (a broken Claude sign-in is critical; a dead channel a high system
 alert).
 
@@ -180,7 +187,11 @@ band climbs, and one the mode now admits is pushed. Both run on the gateway's
 own tick (`ATTENTION_TICK_SECONDS`, default 20 s), with no browser open, in
 the deployment's zone (`ATTENTION_TZ`, else `RETINUE_DISPLAY_TZ`, else `TZ`,
 else the container's, which is UTC — so a deployment sets
-`RETINUE_DISPLAY_TZ`, which the compose file already passes).
+`RETINUE_DISPLAY_TZ`, which the compose file already passes). A minute counts
+as handled only once its work is done, and the next run makes up every minute
+since the last handled one — a failed run, a slow store query, a restart
+across a digest time (`tick.json` under `ATTENTION_DIR` keeps the mark) — up
+to three hours back.
 Repeats are a per-class policy: a family sender writing again while held in
 *Rest* breaks through; anyone else waits with their first message. The
 per-device notification modes of the settings page keep working as a second
@@ -239,12 +250,18 @@ weekday would be in no plan or two. Ara makes these changes when asked, with
 --schedule "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"`). A
 `focus.json` from before the week keeps its one schedule for every day, as an
 *Every day* plan — unless it was the shipped schedule, which gives way to
-the shipped week. The mode menu's *Follow the schedule* row names today's
+the shipped week. A document is healed as it is read
+(`attention.heal_focus`): the shipped modes are put back where missing, a
+schedule entry naming a mode that does not exist is dropped, and an override
+to one is released — so a hand-edited or older file can never make every
+attention call fail. The mode menu's *Follow the schedule* row names today's
 plan, and the holiday when there is one.
 
 **The API** (behind the dashboard's auth like the rest): `GET /attention`
 (the sections, the mode, the next breakpoint, `degraded` naming a source the
-store could not answer for), `GET /attention/item?id=…`, `POST
+store could not answer for — read without the lock inbound messages and the
+tick take, the projects' rows cached for `ATTENTION_PROJECTS_CACHE_SECONDS`,
+default 15, and expired by a write on the project page), `GET /attention/item?id=…`, `POST
 /attention/mode {mode, subject?, project?, minutes? | until?, breaks?}` (`null`
 follows the schedule), `POST
 /attention/items/later {id, when: next|tomorrow}`, `…/pull`, `…/done`,

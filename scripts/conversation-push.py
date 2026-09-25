@@ -196,6 +196,11 @@ def main() -> int:
     if args.thread and args.title:
         print("conversation-push: --title applies only to a new thread", file=sys.stderr)
         return 2
+    # The project link is set when a thread opens; an append would drop it
+    # without a word, and the agent would believe the thread linked.
+    if (args.thread or flags_only) and (args.project or args.project_title):
+        print("conversation-push: --project applies only to a new thread", file=sys.stderr)
+        return 2
     if flags_only and not args.thread:
         print("conversation-push: --archive/--mute need --thread", file=sys.stderr)
         return 2

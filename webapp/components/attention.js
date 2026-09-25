@@ -222,7 +222,9 @@ class RetinueAttention extends HTMLElement {
   // the attention list was one line of chrome saying what the page already is.
   get heading() { return this.getAttribute('heading') || 'Attention'; }
 
-  async load() {
+  // `force` renders even with the menu open: after a change made from the
+  // menu itself, whose controls must show the new state.
+  async load(force = false) {
     try {
       const res = await fetch(SRC, { cache: 'no-store' });
       if (!res.ok) throw new Error(String(res.status));
@@ -230,7 +232,9 @@ class RetinueAttention extends HTMLElement {
       const sig = JSON.stringify([data.sections, data.mode, data.next_breakpoint, data.degraded, data.last_digest]);
       this._data = data;
       this._state = 'ok';
-      if (sig === this._sig && !this._menu) return;
+      // An open mode menu is left alone: re-rendering it on every poll reset
+      // it under the user's finger. Closing it renders from the fresh data.
+      if (!force && (sig === this._sig || this._menu)) return;
       this._sig = sig;
       this.render();
     } catch (_err) {
@@ -248,7 +252,7 @@ class RetinueAttention extends HTMLElement {
       this._sig = '';
       window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'rules' } }));
     } catch (_err) { /* the next poll shows the truth */ }
-    await this.load();
+    await this.load(true);
   }
 
   // The projects on the list — as items, or as what a thread is about —

@@ -314,6 +314,20 @@ def test_conversation_push_key():
     check("a deduplicated response is reported to the caller",
           code == 0 and "already opened a thread" in err, err.strip())
 
+    # The project link is set when a thread opens; on an append it would be
+    # dropped without a word, so the combination is refused.
+    code, payload, _, err = _run_push(push, ["--thread", thread_id, "--project", "urn:retinue:project:x", "hi"])
+    check("--project with --thread is refused, not silently dropped",
+          code == 2 and payload is None and "--project" in err, f"exit {code}: {err.strip()}")
+    # An append reports the attention model's decision like an opening does.
+    code, _, _, err = _run_push(push, ["--thread", thread_id, "news"],
+                                response={"id": thread_id, "title": "T", "push_subscribers": 1,
+                                          "attention": {"delivery": "hold", "level": "active",
+                                                        "reason": "Focused admits only critical",
+                                                        "until": "2026-09-08T12:00:00+00:00"}})
+    check("a held append is reported as not notified",
+          code == 0 and "has NOT been notified" in err, err.strip())
+
 
 # ── 4. Live forward and drain agree ───────────────────────────────────────────
 

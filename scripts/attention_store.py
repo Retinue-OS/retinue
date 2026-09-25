@@ -103,6 +103,9 @@ class AttentionStore:
             stored = policy.upgrade_focus(policy.load_json(self.dir / "focus.json", {}))
             focus = policy.default_focus()
             focus.update(stored)
+            # Every mode the document names exists, whatever wrote it — or
+            # every reading of the mode would fail on the missing one.
+            policy.heal_focus(focus)
             focus.setdefault("spheres", list(DEFAULT_SPHERES))
             if UNKNOWN_SPHERE not in focus["spheres"]:
                 # Structural, not a matter of taste: the model itself puts a
@@ -149,6 +152,19 @@ class AttentionStore:
             else:
                 states[uri] = block
             policy.save_json(self.dir / "projects.json", states)
+
+    def last_tick(self) -> datetime | None:
+        """The last minute the gateway's tick acted on, as it left it — so a
+        restart can make up a digest or a mode change it slept through."""
+        with self.lock:
+            try:
+                return policy.parse_dt(policy.load_json(self.dir / "tick.json", {}).get("minute"))
+            except (TypeError, ValueError):
+                return None
+
+    def save_last_tick(self, minute: datetime) -> None:
+        with self.lock:
+            policy.save_json(self.dir / "tick.json", {"minute": minute.isoformat()})
 
 
 # -- adapters ---------------------------------------------------------------------
@@ -316,6 +332,70 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     return item
 
 
+_FRONTMATTER_LEAD_RE = re.compile(r"^\s*(\d+)\s*([dwm]?)\s*$", re.IGNORECASE)
+_FRONTMATTER_LEAD_DAYS = {"": 1, "d": 1, "w": 7, "m": 30}
+
+
+def frontmatter_lead(text) -> float | None:
+    """A project's ``remind_before`` in minutes. The frontmatter speaks the
+    grammar of recurring-projects.py — a bare number or ``Nd`` days, ``Nw``
+    weeks, ``Nm`` calendar months (thirty days here) — not the agents' one,
+    where a bare number and ``m`` are minutes. None when it is not one."""
+    m = _FRONTMATTER_LEAD_RE.match(str(text or ""))
+    if not m:
+        return None
+    return float(int(m.group(1)) * _FRONTMATTER_LEAD_DAYS[m.group(2).lower()] * policy.DAY)
+
+
+def _frontmatter_said(row: dict) -> dict:
+    """What a project's frontmatter says about the four properties, as plain
+    comparable values — the snapshot project_item keeps in the block."""
+    tags = sorted({t for t in (policy.sphere_id(_humanize_sphere(x)) for x in row.get("tags") or []) if t})
+    return {
+        "importance": row.get("importance"),
+        "sphere": policy.sphere_id(_humanize_sphere(row["sphere"])) if row.get("sphere") else None,
+        "tags": tags or None,
+        "kind": row.get("kind") or None,
+        "deadline": row.get("expected") or row.get("next_due") or None,
+        "remind_before": row.get("remind_before") or None,
+    }
+
+
+def _apply_frontmatter(block: dict, key: str, value, now: datetime) -> None:
+    """Put one frontmatter value into the block — or, where the author took
+    it out, the field back to its default."""
+    if key == "importance":
+        block.pop("importance", None)
+        block.pop("importance_from", None)
+        try:
+            block["importance"] = max(0.0, min(5.0, float(value)))
+            block["importance_from"] = "frontmatter"
+        except (TypeError, ValueError):
+            pass
+    elif key == "sphere":
+        if value:
+            block["sphere"] = value
+        else:
+            block.pop("sphere", None)
+    elif key == "tags":
+        block["tags"] = list(value or [])
+    elif key == "kind":
+        if value:
+            block["kind"] = value
+        else:
+            block.pop("kind", None)
+    elif key == "deadline":
+        due = policy.parse_due(value, now) if value else None
+        block["due"] = due.isoformat() if due else None
+    elif key == "remind_before":
+        block.pop("lead", None)
+        block.pop("lead_from", None)
+        lead = frontmatter_lead(value) if value else None
+        if lead is not None:
+            block["lead"] = lead
+            block["lead_from"] = "remind_before"
+
+
 def project_item(row: dict, state_block: dict | None, profile: dict, now: datetime,
                  you: str) -> dict:
     """A project (one SPARQL row of the projects query) as an item.
@@ -324,32 +404,30 @@ def project_item(row: dict, state_block: dict | None, profile: dict, now: dateti
     ``expected``, ``next_due``, ``since``, ``importance``, ``sphere``, ``tags``,
     ``kind``, ``remind_before``); ``state_block`` is what the model keeps
     about it. A correction on a project changes the state block, never the
-    chamber file — the author's frontmatter stays the author's."""
+    chamber file — the author's frontmatter stays the author's.
+
+    The two meet by the latest word: the block keeps a snapshot of what the
+    frontmatter said when it was last stored (``frontmatter``), and a value
+    the author has changed since — a deadline moved, recurring-projects.py
+    advancing ``next_due``, an importance raised — replaces whatever the block
+    held, while one the author left alone lets a correction stand. A block
+    from before the snapshot takes what the frontmatter states."""
     block = dict(state_block or {})
+    seen = block.pop("frontmatter", None)
+    seen = seen if isinstance(seen, dict) else {}
+    said = _frontmatter_said(row)
+    for key, value in said.items():
+        changed = seen[key] != value if key in seen else value is not None
+        if changed:
+            _apply_frontmatter(block, key, value, now)
+    if block.get("lead_from") == "kind default":
+        # A stored copy of the kind's lead is no decision about this project:
+        # its kind's lead as the profile has it now (a correction on another
+        # item of the kind teaches it), for the kind the frontmatter names now.
+        block.pop("lead", None)
+        block.pop("lead_from", None)
     actor_uri = row.get("actor") or ""
     actor = "you" if (not actor_uri or actor_uri == you) else _humanize(actor_uri)
-    if "importance" not in block and row.get("importance") is not None:
-        try:
-            block["importance"] = float(row["importance"])
-            block["importance_from"] = "frontmatter"
-        except (TypeError, ValueError):
-            pass
-    if not block.get("sphere") and row.get("sphere"):
-        block["sphere"] = _humanize_sphere(row["sphere"])
-    if not block.get("tags") and row.get("tags"):
-        block["tags"] = [_humanize_sphere(t) for t in row["tags"]]
-    if not block.get("kind") and row.get("kind"):
-        block["kind"] = row["kind"]
-    if "due" not in block:
-        deadline = row.get("expected") or row.get("next_due")
-        due = policy.parse_due(deadline, now) if deadline else None
-        if due is not None:
-            block["due"] = due.isoformat()
-    if "lead" not in block and row.get("remind_before"):
-        lead = policy.parse_lead(row["remind_before"])
-        if lead is not None:
-            block["lead"] = lead
-            block["lead_from"] = "remind_before"
     block["actor"] = actor
     if row.get("since") and not block.get("waiting_since"):
         since = policy.parse_due(row["since"], now)
@@ -365,6 +443,9 @@ def project_item(row: dict, state_block: dict | None, profile: dict, now: dateti
         item["released"] = True
     item.update({
         "source_id": row["id"],
+        # Stored with the block (block_for), so the next read can tell the
+        # author's changes from what the block has held since.
+        "frontmatter": said,
         "preview": _one_line(row.get("next") or ""),
         "href": "/project.html?" + urllib.parse.urlencode({"id": row["id"]}),
         "count": 1,
@@ -408,8 +489,12 @@ def _humanize_sphere(value: str) -> str:
 
 
 def block_for(item: dict) -> dict:
-    """The ``attention`` block to store back on the item's document."""
-    return policy.item_to_attention(item)
+    """The ``attention`` block to store back on the item's document — for a
+    project with the snapshot of its frontmatter (see project_item)."""
+    block = policy.item_to_attention(item)
+    if item.get("frontmatter") is not None:
+        block["frontmatter"] = item["frontmatter"]
+    return block
 
 
 # -- the life-store emit --------------------------------------------------------

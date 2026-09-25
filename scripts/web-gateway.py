@@ -1217,6 +1217,10 @@ _ATTENTION = attention_store.AttentionStore(ATTENTION_DIR)
 # (a digest, a scheduled mode change, the sweep); well under a minute so no
 # minute is skipped, and nothing happens on a tick that is due for nothing.
 ATTENTION_TICK_SECONDS = float(os.environ.get("ATTENTION_TICK_SECONDS", "20"))
+# How far back the tick makes up minutes it did not get to — a slow store
+# query, a failed run, a restart across a digest time or a mode change. A gap
+# longer than this is not made up: the next breakpoint carries what waited.
+ATTENTION_CATCH_UP_MINUTES = 180
 # The life-store emit of the open items' properties (docs/attention-model.md).
 ATTENTION_EMIT_PATH = Path(os.environ.get(
     "ATTENTION_EMIT_PATH", str(CHAMBERS_DIR / "_generated" / "attention" / "items.nt")))
@@ -6862,7 +6866,10 @@ def _contacts_emit() -> None:
 # own document, pushing what the policy says to push, and the tick.
 
 _attention_lock = threading.RLock()
-_attention_tick_state: dict = {"minute": None, "emitted": False}
+# The last minute the tick handled (an aware datetime; tick.json keeps it
+# across restarts), whether the emit has run since boot, and the name of a
+# timed mode whose end still owes its breakpoint.
+_attention_tick_state: dict = {"minute": None, "emitted": False, "ended": None}
 
 
 def _attention_now() -> datetime:
@@ -6895,11 +6902,37 @@ def _attention_chat_items(profile: dict) -> list[dict]:
     return items
 
 
+# The projects' rows as the attention list reads them, briefly cached: the
+# home polls every few seconds, and a project's row moves only when its
+# chamber file does. A write through the project page expires them at once;
+# a file changed elsewhere shows within the window.
+ATTENTION_PROJECTS_CACHE_SECONDS = float(os.environ.get("ATTENTION_PROJECTS_CACHE_SECONDS", "15"))
+_attention_projects_cache_lock = threading.Lock()
+_attention_projects_cache: dict = {"at": 0.0, "rows": None}
+
+
+def _attention_project_rows() -> list[dict]:
+    """Raises when the life store is down and nothing fresh is cached."""
+    with _attention_projects_cache_lock:
+        rows = _attention_projects_cache["rows"]
+        if rows is not None and time.monotonic() - _attention_projects_cache["at"] <= ATTENTION_PROJECTS_CACHE_SECONDS:
+            return list(rows)
+    rows = _fetch_project_rows()
+    with _attention_projects_cache_lock:
+        _attention_projects_cache.update(at=time.monotonic(), rows=rows)
+    return list(rows)
+
+
+def _attention_projects_cache_invalidate() -> None:
+    with _attention_projects_cache_lock:
+        _attention_projects_cache.update(at=0.0, rows=None)
+
+
 def _attention_project_items(profile: dict, now: datetime) -> list[dict]:
     """Raises when the life store is down — the caller degrades honestly."""
     states = _ATTENTION.projects()
     return [attention_store.project_item(row, states.get(row["id"]), profile, now, _OWNER_ACTOR)
-            for row in _fetch_project_rows()]
+            for row in _attention_project_rows()]
 
 
 def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str]]:
@@ -6948,7 +6981,7 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
     states = _ATTENTION.projects()
     row = None
     try:
-        row = next((r for r in _fetch_project_rows() if r["id"] == item_id), None)
+        row = next((r for r in _attention_project_rows() if r["id"] == item_id), None)
     except Exception as exc:  # noqa: BLE001
         print(f"[web-gateway] attention: project row unavailable ({exc})", flush=True)
     if row is None:
@@ -6995,10 +7028,15 @@ def _attention_spec_to_block(spec, block: dict, now: datetime) -> dict:
     if lead is not None:
         block["lead"] = lead
         block["lead_from"] = "agent"
-    if spec.get("sphere"):
-        block["sphere"] = str(spec["sphere"]).strip().lower()
+    # Spheres and tags as the words the rules and the store use ("Board
+    # games" → board-games), or a declaration would never match a rule and
+    # would put a space into an IRI of the life-store emit.
+    sphere = attention_policy.sphere_id(spec.get("sphere")) if spec.get("sphere") else None
+    if sphere:
+        block["sphere"] = sphere
     if isinstance(spec.get("tags"), list):
-        block["tags"] = [str(t).strip().lower() for t in spec["tags"] if str(t).strip()]
+        block["tags"] = list(dict.fromkeys(
+            t for t in (attention_policy.sphere_id(x) for x in spec["tags"]) if t))
     if spec.get("kind"):
         block["kind"] = str(spec["kind"]).strip().lower()
     if "project" in spec:
@@ -7054,18 +7092,22 @@ def _attention_arrive_thread(conv: dict, spec, reopen: bool = False) -> tuple[di
         return decision, item
 
 
-def _attention_append(conv: dict, message: str, payload: dict) -> int:
+def _attention_append(conv: dict, message: str, payload: dict) -> tuple[int, dict | None]:
     """News appended to a thread goes through the model like an opening does;
     a thread of another kind keeps the plain push. Returns the device count
-    the fan-out targets, as _push_conv_notification does."""
+    the fan-out targets, as _push_conv_notification does, and what the agent
+    is told about the delivery (_attention_decision_body; None for a thread
+    the model does not judge) — so an append, like an opening, can say "held
+    until 12:00" instead of letting the agent report the user notified."""
     if (conv.get("kind") or "chat") != "chat":
-        return _push_conv_notification(conv, message)
-    decision, _item = _attention_arrive_thread(conv, payload.get("attention"), reopen=True)
+        return _push_conv_notification(conv, message), None
+    decision, item = _attention_arrive_thread(conv, payload.get("attention"), reopen=True)
+    told = _attention_decision_body(decision, item)
     if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
-        return _push_conv_notification(conv, message, urgency="high" if decision["deliver"] == "push" else None)
+        return _push_conv_notification(conv, message, urgency="high" if decision["deliver"] == "push" else None), told
     print(f"[web-gateway] attention: thread {conv['id']} {decision['deliver']} — "
           f"{decision.get('reason', '')}", flush=True)
-    return push_notify.subscription_count() if push_notify.enabled() else 0
+    return (push_notify.subscription_count() if push_notify.enabled() else 0), told
 
 
 def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
@@ -7208,30 +7250,57 @@ def _attention_emit(items: list[dict]) -> None:
         print(f"[web-gateway] attention: emit failed ({exc})", flush=True)
 
 
+def _attention_tick_minutes(stamp: datetime) -> list[datetime]:
+    """The minutes this tick answers for: every one since the last it handled
+    — a slow store query, a failed run or a restart can pass a digest time by
+    — or this one alone on the first run, when the clock went back (the
+    simulation's jumps), or when the gap is longer than the catch-up reaches."""
+    last = _attention_tick_state["minute"]
+    if last is None:
+        last = _ATTENTION.last_tick()
+    if last is None or last >= stamp or stamp - last > timedelta(minutes=ATTENTION_CATCH_UP_MINUTES):
+        return [stamp]
+    count = int((stamp - last).total_seconds() // 60)
+    return [last + timedelta(minutes=k) for k in range(1, count + 1)]
+
+
 def _attention_tick(now: datetime | None = None) -> dict:
     """What the gateway does on its own clock: at a digest time or a scheduled
     mode change, release what was held and push the digest; every half hour,
     the sweep — items that crossed into the next urgency band climb, and
     those the mode now admits are pushed. Runs at most once per minute; a
-    minute due for nothing costs nothing (no store query)."""
+    minute due for nothing costs nothing (no store query).
+
+    A minute counts as handled only once its work is done: a run that fails
+    is tried again on the next tick, and a minute the tick never got to — a
+    slow query, a restart across a digest time — is made up by the next run,
+    which answers for every minute since the last handled one (up to
+    ATTENTION_CATCH_UP_MINUTES back). Making up is safe to repeat: what a
+    digest released is released, and a pushed item is not pushed twice."""
     now = now or _attention_now()
-    key = now.strftime("%Y-%m-%d %H:%M")
-    if _attention_tick_state["minute"] == key:
+    stamp = now.replace(second=0, microsecond=0)
+    if _attention_tick_state["minute"] == stamp:
         return {}
-    _attention_tick_state["minute"] = key
+    minutes = _attention_tick_minutes(stamp)
     with _attention_lock:
         focus = _ATTENTION.focus()
         profile = _ATTENTION.profile()
-        ended = None
+        # An end noticed by a run that then failed is still owed its
+        # breakpoint: the override is gone from the focus by then.
+        ended = _attention_tick_state.get("ended")
         if attention_policy.manual_expired(focus, now):
             # A timed hand-set mode ran out: back to the schedule, and that
             # is a breakpoint like any change.
             ended = focus["modes"][focus["manual"]]["name"]
             attention_policy.set_manual(focus, None, None, now)
             _ATTENTION.save_focus(focus)
-        events = attention_policy.due_events(focus, now) | ({"end"} if ended else set())
+            _attention_tick_state["ended"] = ended
+        events = set().union(*(attention_policy.due_events(focus, m) for m in minutes)) \
+            | ({"end"} if ended else set())
         if not events and _attention_tick_state["emitted"]:
+            _attention_tick_state["minute"] = stamp
             return {}
+        key = stamp.strftime("%Y-%m-%d %H:%M")
         items, _degraded = _attention_items(profile, now)
         report: dict = {"at": key, "events": sorted(events), "pushed": [], "digest": 0}
         if events & {"digest", "mode", "break", "end"}:
@@ -7250,7 +7319,9 @@ def _attention_tick(now: datetime | None = None) -> dict:
                 if attention_store.block_for(item) != before[item["id"]]:
                     _attention_persist(item)
         _attention_emit(items)
-        _attention_tick_state["emitted"] = True
+        _attention_tick_state.update(minute=stamp, emitted=True, ended=None)
+        if events:
+            _ATTENTION.save_last_tick(stamp)
         return report
 
 
@@ -8132,7 +8203,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         name = " ".join(str(payload.get("name") or "").split())
         sphere = str(payload.get("sphere") or "").strip().lower() or None
-        tags = [t for t in (str(x).strip().lower() for x in (payload.get("tags") or [])) if t]
+        # Tags are further spheres: the same words, or the address book's
+        # `sphere:<tag>` would not parse.
+        tags = list(dict.fromkeys(t for t in (attention_policy.sphere_id(x) for x in (payload.get("tags") or [])) if t))
         channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
         before = _CHAT_STATE.get(chat_id)
         was = _chat_display_name(before, channel, key)
@@ -8740,21 +8813,22 @@ class Handler(BaseHTTPRequestHandler):
     # and on the rules. Behind the dashboard's own auth like the rest; the one
     # agent-facing write is /internal/attention/set, token-gated.
 
+    # The reads take no _attention_lock: they write nothing, every document
+    # they read is written atomically, and the lock is what inbound messages
+    # and the tick wait on — a poll must not hold them up behind the store.
     def _handle_attention_get(self) -> None:
         now = _attention_now()
-        with _attention_lock:
-            focus = _ATTENTION.focus()
-            profile = _ATTENTION.profile()
-            items, degraded = _attention_items(profile, now)
+        focus = _ATTENTION.focus()
+        profile = _ATTENTION.profile()
+        items, degraded = _attention_items(profile, now)
         self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
 
     def _handle_attention_item_get(self, query: str) -> None:
         item_id = (urllib.parse.parse_qs(query).get("id") or [""])[0]
         now = _attention_now()
-        with _attention_lock:
-            focus = _ATTENTION.focus()
-            profile = _ATTENTION.profile()
-            item = _attention_item(item_id, profile, now) if item_id else None
+        focus = _ATTENTION.focus()
+        profile = _ATTENTION.profile()
+        item = _attention_item(item_id, profile, now) if item_id else None
         if item is None:
             self._send_json(404, {"error": "unknown item"})
             return
@@ -9040,7 +9114,8 @@ class Handler(BaseHTTPRequestHandler):
             doc = {"id": item["id"], "title": item["title"], "attention": block,
                    "sphere": block.get("sphere") or item["sphere"], "sender": item.get("sender")}
             revised = attention_policy.item_from_doc(doc, item["kind"], profile)
-            revised.update({k: item[k] for k in ("source_id", "preview", "href", "channel", "agent", "count", "unread")
+            revised.update({k: item[k] for k in ("source_id", "preview", "href", "channel", "agent", "count", "unread",
+                                                 "frontmatter")
                             if k in item})
             if payload.get("sender_sphere") and item.get("sender") and block.get("sphere"):
                 profile.setdefault("spheres", {})[item["sender"]] = block["sphere"]
@@ -9157,6 +9232,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(502, {"error": "life store unreachable",
                                   "detail": str(exc)})
             return
+        if status == 200:
+            _attention_projects_cache_invalidate()
         self._send_json(status, body)
 
     def _handle_conversation_create(self) -> None:
@@ -9270,9 +9347,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": "not found"})
             return
         # Archiving settles the thread's attention item; bringing it back
-        # reopens it — on the list, never pushed again for that.
+        # reopens it — on the list, never pushed again for that. Only what
+        # archiving itself settled comes back, as on the chat path: a thread
+        # the user had marked done, then archived, stays done.
         if conv.get("initiator") == "agent" or conv.get("attention"):
-            _attention_mark(f"thread:{cid}", "done" if archived else "open", "archived")
+            if archived:
+                _attention_mark(f"thread:{cid}", "done", "archived")
+            elif (conv.get("attention") or {}).get("done_how") == "archived":
+                _attention_mark(f"thread:{cid}", "open", "archived")
         self._send_json(200, _conv_summary(conv))
 
     def _handle_agent_conversation_flags(self, cid: str) -> None:
@@ -9492,7 +9574,9 @@ class Handler(BaseHTTPRequestHandler):
         # A quiet writer stays quiet on this path too — a cowork audit trail
         # does not start badging the dashboard just because it was reopened.
         if not quiet:
-            body["push_subscribers"] = _attention_append(conv, message, payload)
+            body["push_subscribers"], told = _attention_append(conv, message, payload)
+            if told is not None:
+                body["attention"] = told
         return body
 
     def _handle_agent_conversation_message(self, cid: str) -> None:
@@ -9539,8 +9623,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = {"id": conv["id"], "title": conv["title"]}
         if not quiet:
-            body["push_subscribers"] = _attention_append(
+            body["push_subscribers"], told = _attention_append(
                 conv, message or "Sent you a file", payload)
+            if told is not None:
+                body["attention"] = told
         if CONVERSATION_BASE_URL:
             body["url"] = f"{CONVERSATION_BASE_URL}/#conversation-{conv['id']}"
         self._send_json(201, body)

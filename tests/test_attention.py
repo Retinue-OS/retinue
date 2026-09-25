@@ -350,6 +350,88 @@ def test_repeat_policy():
     assert not A.repeat_policy(item(sphere="family"), A.mode_at(focus, at(10)))["escalate"]
 
 
+def test_focus_heals():
+    """A focus.json naming modes it does not define — one hand-edited, or
+    written while the modes had other names — reads as a working document
+    instead of failing every attention call on a KeyError."""
+    import tempfile
+    import attention_store
+    d = Path(tempfile.mkdtemp())
+    (d / "focus.json").write_text(json.dumps({
+        "modes": {"off": {"id": "off", "name": "Off", "admits": [], "threshold": "critical"},
+                  "odd": {"name": "Odd"}},
+        "manual": "gone",
+        "week": [{"name": "Mine", "days": ["mon-sun", "holiday"],
+                  "schedule": [[0, "off"], [480, "nowhere"], [1200, "odd"]]}]}), encoding="utf-8")
+    focus = attention_store.AttentionStore(d).focus()
+    assert {"rest", "focused", "chores", "social", "off", "odd"} <= set(focus["modes"]), focus["modes"]
+    assert focus["modes"]["odd"]["admits"] == [] and focus["modes"]["odd"]["threshold"] == "time-sensitive"
+    assert focus["manual"] is None, "an override to a mode that is not there is released"
+    assert focus["week"][0]["schedule"] == [[0, "off"], [1200, "odd"]], focus["week"]
+    assert A.mode_at(focus, at(9))["id"] == "off" and A.mode_at(focus, at(21))["id"] == "odd"
+    # Nothing but unknown modes: the plan takes the shipped workday.
+    (d / "focus.json").write_text(json.dumps({"modes": {"off": {"id": "off"}},
+                                              "week": [{"name": "X", "days": ["mon-sun"], "schedule": [[0, "nope"]]}]}))
+    focus = attention_store.AttentionStore(d).focus()
+    assert A.mode_at(focus, at(9))["id"] == "focused"
+    # A document with the shipped week and old modes only (no schedule of its own).
+    (d / "focus.json").write_text(json.dumps({"modes": {"off": {"id": "off", "name": "Off", "admits": [], "threshold": "critical"}}}))
+    assert A.mode_at(attention_store.AttentionStore(d).focus(), at(10))["id"] == "focused"
+
+
+def test_ntriples_are_loadable():
+    """Whatever a sphere, a tag or an actor is called, the emit stays valid
+    N-Triples: what an IRI may not hold is percent-encoded."""
+    import re
+    it = item(sphere="Board games", tags=["tax <stuff>"], actor='Anna "the" Accountant')
+    nt = A.to_ntriples([it], lambda i: "urn:retinue:thread:x")
+    # Every line is subject, predicate, object and a dot, each IRI clean.
+    iri = r'<[^\x00-\x20<>"{}|^`\\]*>'
+    for line in nt.splitlines():
+        assert re.fullmatch(rf'{iri} {iri} (?:{iri}|"[^"]*"\^\^{iri}) \.', line), line
+    assert "<urn:retinue:sphere:Board%20games>" in nt and "<urn:retinue:sphere:tax%20%3Cstuff%3E>" in nt, nt
+    assert "<urn:retinue:actor:Anna-%22the%22-Accountant>" in nt, nt
+    # The words the model writes itself pass unchanged, in any script.
+    assert "<urn:retinue:sphere:ökologie>" in A.to_ntriples([item(sphere="ökologie")], lambda i: "urn:x")
+
+
+def test_project_frontmatter_moves():
+    """A project's frontmatter is the author's latest word: a deadline moved
+    after the block was stored — or next_due advanced by recurring-projects —
+    replaces the stored one, while a correction the author has not
+    contradicted stands."""
+    import attention_store as S
+    profile = A.default_profile()
+    now = at(10)
+    row = {"id": "urn:retinue:project:vat", "title": "VAT", "actor": "", "expected": "2026-09-30",
+           "importance": "4", "sphere": "Admin", "tags": ["Finance"], "kind": "tax filing", "remind_before": "3m"}
+    it = S.project_item(row, None, profile, now, "")
+    assert it["sphere"] == "admin" and it["tags"] == ["finance"], (it["sphere"], it["tags"])
+    assert it["lead"] == timedelta(days=90), "remind_before speaks days, weeks and months, not minutes"
+    block = S.block_for(it)
+    assert block["frontmatter"]["deadline"] == "2026-09-30"
+    # The deadline moves in the file after the block was stored.
+    it = S.project_item(dict(row, expected="2026-10-15"), block, profile, now, "")
+    assert it["due"].date().isoformat() == "2026-10-15", it["due"]
+    # A correction stands while the frontmatter leaves that field alone …
+    A.correct(it, profile, {"importance": 5}, now)
+    block = S.block_for(it)
+    it = S.project_item(dict(row, expected="2026-10-15"), block, profile, now, "")
+    assert it["importance"] == 5 and it["importance_from"] == "you"
+    # … and gives way when the author changes it.
+    it = S.project_item(dict(row, expected="2026-10-15", importance="2"), S.block_for(it), profile, now, "")
+    assert it["importance"] == 2 and it["importance_from"] == "frontmatter"
+    # The author takes the lead out: the kind's lead, as the profile has it now.
+    profile["leads"]["tax filing"] = 28 * A.DAY
+    it = S.project_item(dict(row, expected="2026-10-15", importance="2", remind_before=None), S.block_for(it), profile, now, "")
+    assert it["lead"] == timedelta(days=28) and it["lead_from"] == "kind default", (it["lead"], it["lead_from"])
+    # A block stored before the snapshot existed takes what the file says.
+    legacy = {k: v for k, v in S.block_for(it).items() if k != "frontmatter"}
+    legacy["due"] = "2026-09-30T17:00:00+02:00"
+    it = S.project_item(dict(row, expected="2026-11-02"), legacy, profile, now, "")
+    assert it["due"].date().isoformat() == "2026-11-02", it["due"]
+
+
 def test_zone():
     """The schedule's zone: ATTENTION_TZ, else RETINUE_DISPLAY_TZ (what the
     compose file passes), else TZ — never UTC by accident when the owner's

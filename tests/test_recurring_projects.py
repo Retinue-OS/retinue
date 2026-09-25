@@ -144,10 +144,35 @@ def test_reminder_fallback(rp):
     check("own wording wins", msg3, "Fristablauf naht.")
 
 
+def test_attention_args(rp):
+    print("attention_args")
+    due = dt.date(2026, 9, 30)
+
+    def flag(args, name):
+        return args[args.index(name) + 1] if name in args else None
+    args = rp.attention_args({"importance": "4", "sphere": "finance", "tags": "[tax, 'admin']",
+                              "remind_before": "3m"}, due, "deadline")
+    check("importance as declared", flag(args, "--importance"), "4")
+    check("months are thirty days", flag(args, "--lead"), "90d")
+    check("tags without quotes", [args[i + 1] for i, a in enumerate(args) if a == "--tag"], ["tax", "admin"])
+    check("bare number is days", flag(rp.attention_args({"remind_before": "10"}, due, "deadline"), "--lead"), "10d")
+    # Values conversation-push.py would refuse wake the project with the
+    # defaults instead of failing the push after the file was flipped.
+    args = rp.attention_args({"importance": "high", "remind_before": "1.5m"}, due, "cadence")
+    check("a word for importance falls back to 3", flag(args, "--importance"), "3")
+    check("out of range falls back to 3",
+          flag(rp.attention_args({"importance": "9"}, due, "cadence"), "--importance"), "3")
+    check("an unreadable lead is left out", flag(args, "--lead"), None)
+    check("nothing declared: admin chore", (flag(rp.attention_args({}, due, "deadline"), "--kind"),
+                                             flag(rp.attention_args({}, due, "deadline"), "--sphere")),
+          ("admin chore", "admin"))
+
+
 def main():
     rp = load()
     for t in (test_parse_lead, test_minus_lead, test_wake_plan,
-              test_is_finished, test_due_comparison, test_reminder_fallback):
+              test_is_finished, test_due_comparison, test_reminder_fallback,
+              test_attention_args):
         t(rp)
     if failures:
         print(f"\n{len(failures)} check(s) failed: {', '.join(failures)}")
