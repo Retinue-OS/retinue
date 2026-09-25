@@ -128,6 +128,7 @@ class AttentionStore:
         with self.lock:
             profile = policy.load_json(self.dir / "profile.json", policy.default_profile())
             profile.setdefault("spheres", {})
+            profile.setdefault("tags", {})
             profile.setdefault("priors", {})
             profile.setdefault("permits", {})
             profile.setdefault("learned", [])
@@ -310,6 +311,8 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
     key the profile's priors and permits use, since that is how the user
     thinks of them."""
     block = dict((state or {}).get("attention") or {})
+    # Read before the defaults below fill the block in.
+    predates_model = not block
     name = chat.get("name") or chat.get("key") or chat.get("id") or "Chat"
     stranger = chat_is_unknown(state)
     priors = profile.get("priors") or {}
@@ -320,15 +323,31 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         else:
             block["importance"] = DEFAULT_GROUP_IMPORTANCE if chat.get("group") else DEFAULT_DIRECT_IMPORTANCE
             block["importance_from"] = "default"
-    # A stranger keeps the importance of a human writing to a human — someone
-    # took the trouble — and loses only the guess about *where they belong*.
-    sphere = (block.get("sphere") or (profile.get("spheres") or {}).get(name)
+    # The spheres: a triage judgement of the latest message where there is
+    # one (a customer who is also a friend, asking about Saturday's
+    # barbecue, is friends for that message), otherwise the sender's own —
+    # every sphere they are in, as the profile learned them from the contact
+    # card and the corrections, the card itself for one filed before the
+    # profile kept further spheres. A stranger keeps the importance of a
+    # human writing to a human — someone took the trouble — and loses only
+    # the guess about *where they belong*.
+    card = (state or {}).get("contact") or {}
+    sphere = ((profile.get("spheres") or {}).get(name) or card.get("sphere")
               or (UNKNOWN_SPHERE if stranger else DEFAULT_CHAT_SPHERE))
-    doc = {"id": f"chat:{chat['id']}", "title": name, "attention": block, "sphere": sphere,
+    known = profile.get("tags") or {}
+    tags = list(known[name] if name in known else card.get("tags") or [])
+    if block.get("sphere_from") == "message":
+        # A judged sphere is the message's alone (with the tags judged
+        # beside it); judged tags alone sit beside the sender's main sphere.
+        if block.get("sphere"):
+            sphere = block["sphere"]
+        tags = list(block.get("tags") or [])
+    judged = dict(block, sphere=sphere, tags=[t for t in dict.fromkeys(tags) if t != sphere])
+    doc = {"id": f"chat:{chat['id']}", "title": name, "attention": judged, "sphere": sphere,
            "sender": name, "archived": bool(chat.get("archived"))}
     item = policy.item_from_doc(doc, "chat", profile)
     last = chat.get("last") or {}
-    if not block:
+    if predates_model:
         # No block yet (the chat predates the model): it is on the list, not
         # held — nobody decided to hold it, and hiding it would lose it.
         item["released"] = True

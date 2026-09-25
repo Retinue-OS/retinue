@@ -68,7 +68,8 @@ The home screen is **one list of what wants attention** — threads with Ara,
 messenger chats and running projects as one kind of thing
 (`webapp/components/attention.js` over `GET /attention`), each with the four
 properties of `docs/attention-model.md`: an importance (0–5), a deadline
-against a lead time, a sphere plus tags, and who it waits on. The gateway
+against a lead time, its spheres — a main one and any further ones (tags);
+every one counts for a mode alike — and who it waits on. The gateway
 turns those and the **focus mode** in force into a level (passive · active ·
 time-sensitive · critical) and a **delivery decision**: pushed now, held for
 the next digest, or merely listed. The list shows them as *Now* (may
@@ -77,10 +78,21 @@ next breakpoint>* and *Waiting on others*; every row carries its preview and
 a one-line reason, and its ⓘ opens the details sheet
 (`webapp/components/attention-sheet.js`) with the three fields explained and
 correctable — importance (writes the sender's or kind's prior), deadline and
-lead (writes the kind's lead time), sphere (remembered for the sender) — plus
-a permit for the sender in this mode, a Focus rule for the sphere, and the
+lead (writes the kind's lead time), the main sphere and the further ones
+(remembered for the sender) — plus a permit for the sender in this mode, the
+switch for the Focus rule that actually lets the item through (`admission` on
+the row: a sphere the mode lists, or a word it admits wherever it stands, as
+Focused does *health*; where none does, the rule that would), and the
 actions *Later* (next breakpoint / tomorrow), *Pull into the list now* and
-*Mark done*. Spheres are the user's own subjects — a client, a hobby, a cause
+*Mark done*. A chat shows its sender's spheres, as the contact card and the
+corrections taught them, unless the triage judged its message to be about a
+sphere in particular (or named further spheres alone) — a customer who is
+also a friend, asking about Saturday's barbecue, is *friends* for that
+message. A judgement — importance, deadline, kind and spheres — is one unit
+and belongs to the chat's open item: a classification replaces it whole, an
+unclassified follow-up keeps it ("bring a salad?" stays *friends*, with the
+barbecue's deadline), and once the item is handled the next message starts
+fresh, with the defaults and the sender's spheres. Spheres are the user's own subjects — a client, a hobby, a cause
 — so the vocabulary grows from wherever a sphere is chosen: *+ new sphere…*
 in the sphere selector, *+ new* on the contact card
 (`POST /attention/spheres`); a sphere the palette does not name gets a stable
@@ -93,10 +105,10 @@ knows no sphere for them, so the message keeps the importance of a person
 writing to a person but its sphere is `unknown`, which no mode admits — it is
 listed, carried by the next digest, and never rings. A VIP, the other way
 round, rings in every mode unless the chat is muted. The sheet then leads with
-the **contact card**: a name, the sphere they belong to, further groups as
-tags, and optionally a permit to interrupt right now. Saving it
+the **contact card**: a name, the sphere they belong to, any further spheres,
+and optionally a permit to interrupt right now. Saving it
 (`POST /chats/<id>/contact`) names the chat, teaches the attention profile
-their sphere (carrying over whatever the bare number had already been taught),
+their spheres (carrying over whatever the bare number had already been taught),
 re-judges the open item — so their next message is ranked by that sphere —
 and writes the card into the life store's address book (`CONTACTS_EMIT_PATH`, a Turtle file of vCard
 individuals under the generated chamber). An empty name removes the card and

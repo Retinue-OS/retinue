@@ -87,7 +87,9 @@ waiting}, counts, last_digest: {at, count}, unseen_digest: {at, count} | null, d
 title, preview, href, sphere, tags, sender, channel, group, agent, count,
 unread, pending, level, critical, importance, importance_from, importance_text,
 due, lead (minutes), lead_from, kind_label, urgency, delivery, reason, actor,
-waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere}`.
+waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere,
+admission: {by: vip|project|scope|sphere|tag, what} | null}` — `admission` is the rule of the
+mode in force that lets the row through, which the details sheet's switch changes.
 The home shows what the unseen digest released first, on every device, until
 *Done* on any of them; `/?digest=<time>` — the digest push's link — shows that
 digest even once seen.
