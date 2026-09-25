@@ -85,7 +85,9 @@ waiting}, counts, last_digest: {at, count}, degraded, learned}`; a row is `{id, 
 title, preview, href, sphere, tags, sender, channel, group, agent, count,
 unread, pending, level, critical, importance, importance_from, importance_text,
 due, lead (minutes), lead_from, kind_label, urgency, delivery, reason, actor,
-waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere}`.
+waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere,
+admission: {by: vip|project|scope|sphere|tag, what} | null}` — `admission` is the rule of the
+mode in force that lets the row through, which the details sheet's switch changes.
 `/?digest=<time>` — the digest push's link — shows what that digest released
 first, until *Done*.
 The actions: `POST /attention/items/later|pull|done|reopen|correct` with the

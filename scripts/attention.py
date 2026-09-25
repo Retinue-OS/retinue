@@ -670,6 +670,33 @@ def admitted(item: dict, mode: dict, profile: dict) -> bool:
     return bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or [])
 
 
+def admitted_by(item: dict, mode: dict) -> dict | None:
+    """Which rule of the mode in force lets the item through, so the details
+    sheet offers the switch that actually changes it — ``{"by", "what"}``:
+
+    - ``vip`` — the sender is a VIP; no Focus rule to change;
+    - ``project`` / ``scope`` — Focused is on this project or this sphere:
+      the stint itself, not a rule;
+    - ``sphere`` — the mode's rule lists the item's sphere (``admits``);
+    - ``tag`` — the mode admits a word wherever it stands (``admit_tags``),
+      as the item's sphere or as one of its tags: Focused lets *health*
+      through this way, whatever the scope.
+
+    None when no rule admits it (a permit is the sender's, not a rule of the
+    mode, and the sheet has its own switch for it)."""
+    if item.get("vip"):
+        return {"by": "vip", "what": item.get("sender") or ""}
+    if about_project(item, mode.get("project")):
+        return {"by": "project", "what": mode["project"]}
+    if item["sphere"] in mode["admits"]:
+        return {"by": "scope" if mode.get("subject") else "sphere", "what": item["sphere"]}
+    tags = mode.get("admit_tags") or []
+    hit = next((t for t in [item["sphere"], *(item.get("tags") or [])] if t in tags), None)
+    if hit is not None:
+        return {"by": "tag", "what": hit}
+    return None
+
+
 def mode_label(mode: dict) -> str:
     """The mode as the reason line names it: "Focused on Müller AG"."""
     scope = mode.get("subject")

@@ -7373,6 +7373,10 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "digest_at": iso(item.get("digest_at")),
         "permit": bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or []),
         "admits_sphere": item["sphere"] in mode["admits"],
+        # Which rule lets it through, so the sheet's switch changes that one
+        # (attention.admitted_by): a tag Focused admits whatever the scope
+        # is not in `admits`, and a scope replaces `admits` for the stint.
+        "admission": attention_policy.admitted_by(item, mode),
     }
 
 

@@ -432,6 +432,19 @@ def test_project_frontmatter_moves():
     assert it["due"].date().isoformat() == "2026-11-02", it["due"]
 
 
+def test_admitted_by():
+    """The rule that lets an item through, for the sheet's switch."""
+    focus = A.default_focus()
+    focused = A.mode_at(dict(focus, manual="focused", subject="customers"), at(10))
+    assert A.admitted_by(item(sphere="health"), focused) == {"by": "tag", "what": "health"}
+    assert A.admitted_by(item(sphere="friends", tags=["health"]), focused) == {"by": "tag", "what": "health"}
+    assert A.admitted_by(item(sphere="customers"), focused) == {"by": "scope", "what": "customers"}
+    assert A.admitted_by(item(sphere="family"), focused) is None
+    chores = focus["modes"]["chores"]
+    assert A.admitted_by(item(sphere="family"), chores) == {"by": "sphere", "what": "family"}
+    assert A.admitted_by(item(sphere="unknown", vip=True, sender="Mum"), chores) == {"by": "vip", "what": "Mum"}
+
+
 def test_zone():
     """The schedule's zone: ATTENTION_TZ, else RETINUE_DISPLAY_TZ (what the
     compose file passes), else TZ — never UTC by accident when the owner's

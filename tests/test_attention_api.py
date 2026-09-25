@@ -561,6 +561,41 @@ def test_focused_takes_a_scope(base, wg):
     print("ok test_focused_takes_a_scope")
 
 
+def test_focused_admits_health_by_word(base, wg):
+    """Focused on customers lets health through by a word it admits wherever
+    it stands, not by its sphere list: the row says so, so the sheet offers to
+    stop *that* — and stopping it folds the health items away."""
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
+    assert status == 200
+    # Listed ones (passive, so on the list at once) and one held for the digest.
+    physio = _open(base, "Physio moved", "Now Thursday 08:00.", {"importance": 2, "sphere": "health"})
+    walk = _open(base, "Walk with Anna", "Her knee is better.", {"importance": 2, "sphere": "friends", "tags": ["health"]})
+    scan = _open(base, "Scan results", "The clinic will call.", {"importance": 4, "sphere": "health"})
+    quote = _open(base, "Quote for Frei Bau", "Draft ready.", {"importance": 4, "sphere": "customers"})
+    home = _sections(base)
+    for tid in (physio["id"], walk["id"]):
+        where, row = _find(home, "thread:" + tid)
+        assert where == "next" and row["admission"] == {"by": "tag", "what": "health"}, (where, row)
+        assert row["admits_sphere"] is False, "not by the sphere list — the old switch offered to admit it"
+    assert _find(home, "thread:" + scan["id"])[1]["admission"] == {"by": "tag", "what": "health"}
+    assert _find(home, "thread:" + quote["id"])[1]["admission"] == {"by": "scope", "what": "customers"}
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "focused", "tag_off": ["health"]})
+    assert status == 200 and out["changed"] == ["Focused no longer admits the tag health"], out
+    home = _sections(base)
+    for tid in (physio["id"], walk["id"]):
+        where, row = _find(home, "thread:" + tid)
+        assert where == "not_now" and row["admission"] is None, (where, row)
+    where, row = _find(home, "thread:" + scan["id"])
+    assert where == "held" and row["admission"] is None and row["reason"] == "Focused on customers — this is not", (where, row)
+    # Back as it shipped, for the checks that follow.
+    status, out = _http(base, "POST", "/attention/modes", {"mode": "focused", "tag_on": ["health"]})
+    assert status == 200 and _find(_sections(base), "thread:" + physio["id"])[1]["admission"]["by"] == "tag"
+    for tid in (physio["id"], walk["id"], scan["id"], quote["id"]):
+        _http(base, "POST", "/attention/items/done", {"id": "thread:" + tid})
+    _mode(base, "")
+    print("ok test_focused_admits_health_by_word")
+
+
 def test_spheres_are_a_word_away(base, wg):
     """A sphere is the user's subject; adding one costs a word."""
     status, out = _http(base, "POST", "/attention/spheres", {"add": "Board Games"})
@@ -1000,6 +1035,7 @@ def main():
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
         test_focused_takes_a_scope(base, wg)
+        test_focused_admits_health_by_word(base, wg)
         test_project_from_store(base, wg)
         test_tick_digest_and_sweep(base, wg)
         test_internal_set(base, wg)

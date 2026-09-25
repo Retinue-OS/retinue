@@ -10,6 +10,7 @@
 //   POST /attention/items/<action>     later | pull | done | reopen | correct
 //   POST /attention/permits            {sender, on}   a sender's permit in the mode in force
 //   POST /attention/admit              {sphere, on}   a Focus rule of the mode in force
+//   POST /attention/modes              {mode, tag_on | tag_off}  a word it admits wherever it stands
 //   POST /chats/<id>/contact           {name, sphere, tags}  the contact card
 // A chat whose sender the delivery gate did not recognise is screened — sphere
 // `unknown`, which no mode admits — and the sheet leads with the contact card
@@ -299,8 +300,18 @@ class RetinueAttentionSheet extends HTMLElement {
         if (item && item.sender) this._rule('permits', { sender: item.sender, on: !item.permit });
         break;
       case 'admit':
-        if (item) this._rule('admit', { sphere: item.sphere, on: !item.admits_sphere });
+        if (item) this._rule('admit', { sphere: item.sphere, on: el.getAttribute('data-on') === '1' });
         break;
+      case 'tag': {
+        // A word the mode in force admits wherever it stands (admit_tags).
+        const mode = (this._data && this._data.mode) || {};
+        const tag = el.getAttribute('data-tag');
+        if (mode.id && tag) {
+          this._rule('modes', el.getAttribute('data-on') === '1'
+            ? { mode: mode.id, tag_on: [tag] } : { mode: mode.id, tag_off: [tag] });
+        }
+        break;
+      }
       case 'contact-edit': this._form = this._blankCard(item); this.render(); break;
       case 'contact-cancel': this._form = null; this.render(); break;
       case 'contact-sphere':
@@ -536,9 +547,29 @@ class RetinueAttentionSheet extends HTMLElement {
           ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit`
           : `Let ${esc(item.sender)} interrupt in ${esc(mode.name)}`}</button>`
         : '';
-      const admitBtn = `<button class="btn tiny${item.admits_sphere ? ' on' : ''}" data-act="admit"${busy}>${item.admits_sphere
-        ? `Stop admitting ${esc(item.sphere)} in ${esc(mode.name)}`
-        : `Admit ${esc(item.sphere)} in ${esc(mode.name)}`}</button>`;
+      // The switch for the rule that actually lets the item through
+      // (item.admission, attention.admitted_by) — a sphere the mode lists, or
+      // a word it admits wherever it stands, as Focused does health — or, when
+      // none does, the one that would. A mode that takes a scope admits by
+      // word: its sphere list stands aside while it is on a scope, so a
+      // sphere added there would change nothing in the stint at hand.
+      const adm = item.admission;
+      let admitBtn = '';
+      if (adm && adm.by === 'tag') {
+        admitBtn = `<button class="btn tiny on" data-act="tag" data-tag="${esc(adm.what)}" data-on="0"${busy}>` +
+          `Stop admitting ${esc(adm.what)} in ${esc(mode.name)}</button>`;
+      } else if (adm && adm.by === 'sphere') {
+        admitBtn = `<button class="btn tiny on" data-act="admit" data-on="0"${busy}>` +
+          `Stop admitting ${esc(item.sphere)} in ${esc(mode.name)}</button>`;
+      } else if (adm && (adm.by === 'scope' || adm.by === 'project')) {
+        admitBtn = `<span class="f-note">${esc(mode.label || mode.name)} — the stint is about this</span>`;
+      } else if (!adm) {
+        admitBtn = mode.with_subject
+          ? `<button class="btn tiny" data-act="tag" data-tag="${esc(item.sphere)}" data-on="1"${busy}>` +
+            `Admit ${esc(item.sphere)} in ${esc(mode.name)}, whatever the scope</button>`
+          : `<button class="btn tiny" data-act="admit" data-on="1"${busy}>` +
+            `Admit ${esc(item.sphere)} in ${esc(mode.name)}</button>`;
+      }
       // A screened stranger leads with the card — naming them is the whole
       // question, and the corrections below only make sense afterwards.
       const contactField = this._contactField(item, spheres);
