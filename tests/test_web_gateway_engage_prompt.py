@@ -163,6 +163,18 @@ def check_companion_tail_keeps_latest_message(gw):
     print("PASS companion tail always carries the latest message")
 
 
+def check_history_hint_names_the_chat(gw):
+    """The hint's query is scoped to the chat's channel, account and key."""
+    hint = gw._companion_history_hint("signal:~+41700000001:+41700000002")
+    assert 'kb:channel "signal"' in hint, hint
+    assert 'kb:account "+41700000001"' in hint, hint
+    assert 'kb:chat "+41700000002"' in hint, hint
+    # A group key keeps its colons; an accountless id drops the account filter.
+    hint = gw._companion_history_hint("signal:group:abc=")
+    assert 'kb:chat "group:abc="' in hint and "kb:account" not in hint, hint
+    print("PASS history hint scopes its query to the chat")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load_gateway(Path(tmp))
@@ -173,6 +185,7 @@ def main():
         check_stale_replays_whole_transcript(gw)
         check_companion_replays_only_the_tail(gw)
         check_companion_tail_keeps_latest_message(gw)
+        check_history_hint_names_the_chat(gw)
     print("all engage-prompt checks passed")
 
 
