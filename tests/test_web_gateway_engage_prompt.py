@@ -146,6 +146,23 @@ def check_companion_replays_only_the_tail(gw):
     print("PASS companion new session replays only the thread's tail")
 
 
+def check_companion_tail_keeps_latest_message(gw):
+    """A tail of 0 (clamped at load) still replays the message being answered:
+    a companion turn's new session has no other way to see it."""
+    saved = gw.CHAT_COMPANION_THREAD_TAIL
+    gw.CHAT_COMPANION_THREAD_TAIL = 1
+    try:
+        gw._conv_chat_note = lambda conv: "\n\n[Context: chat note]"
+        conv = dict(_conv(_msg("user", "old"), _msg("assistant", "reply"),
+                          _msg("user", "the latest ask")), kind="companion")
+        prompt = gw._conv_engage_prompt(conv, fresh=False)
+        assert "the latest ask" in prompt and "old" not in prompt, prompt
+        assert "2 earlier messages of this thread omitted" in prompt, prompt
+    finally:
+        gw.CHAT_COMPANION_THREAD_TAIL = saved
+    print("PASS companion tail always carries the latest message")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load_gateway(Path(tmp))
@@ -155,6 +172,7 @@ def main():
         check_fresh_without_anchor_falls_back(gw)
         check_stale_replays_whole_transcript(gw)
         check_companion_replays_only_the_tail(gw)
+        check_companion_tail_keeps_latest_message(gw)
     print("all engage-prompt checks passed")
 
 

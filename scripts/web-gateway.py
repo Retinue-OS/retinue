@@ -1119,10 +1119,11 @@ CHAT_COMPANION_CONTEXT_MESSAGES = int(
 # tool output. Over one busy week that took a turn from cents to dollars. The
 # thread's own latest messages are replayed instead, capped here; anything that
 # must outlive them (a standing preference) belongs in the memory store.
-# CHAT_COMPANION_RESUME=1 restores resuming.
+# CHAT_COMPANION_RESUME=1 restores resuming. The tail is at least 1: a new
+# session learns the user's latest message only from this replay.
 CHAT_COMPANION_RESUME = os.environ.get("CHAT_COMPANION_RESUME", "0") == "1"
-CHAT_COMPANION_THREAD_TAIL = int(
-    os.environ.get("CHAT_COMPANION_THREAD_TAIL", "8"))
+CHAT_COMPANION_THREAD_TAIL = max(1, int(
+    os.environ.get("CHAT_COMPANION_THREAD_TAIL", "8")))
 # Voice input: the dashboard uploads recorded audio here and we proxy it to the
 # shared STT service (scripts/stt-service.py), which owns the Whisper model — so
 # this image ships no ASR stack. Empty URL disables the feature (the endpoint
@@ -2827,7 +2828,7 @@ def _conv_replay(conv: dict, messages: list) -> str:
     if ((conv.get("kind") or "chat") != "companion"
             or len(messages) <= CHAT_COMPANION_THREAD_TAIL):
         return _conv_render_messages(conv, messages)
-    tail = messages[-CHAT_COMPANION_THREAD_TAIL:] if CHAT_COMPANION_THREAD_TAIL else []
+    tail = messages[-CHAT_COMPANION_THREAD_TAIL:]
     return (f"[{len(messages) - len(tail)} earlier messages of this thread "
             "omitted — standing preferences live in the memory store]\n"
             + _conv_render_messages(conv, tail))
