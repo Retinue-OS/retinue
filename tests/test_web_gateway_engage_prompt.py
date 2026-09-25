@@ -127,6 +127,25 @@ def check_stale_replays_whole_transcript(gw):
     print("PASS stale path replays the transcript with one attachment note")
 
 
+def check_companion_replays_only_the_tail(gw):
+    """A companion thread's new session sees its last few messages, not the
+    whole thread — the chat note carries the correspondence itself."""
+    gw._conv_chat_note = lambda conv: "\n\n[Context: chat note]"
+    n = gw.CHAT_COMPANION_THREAD_TAIL + 4
+    msgs = [_msg("user" if i % 2 == 0 else "assistant", f"turn {i:02d}")
+            for i in range(n)]
+    conv = dict(_conv(*msgs), kind="companion")
+    prompt = gw._conv_engage_prompt(conv, fresh=False)
+    assert "turn 00" not in prompt and "turn 03" not in prompt, prompt
+    assert f"turn {n - 1:02d}" in prompt and "turn 04" in prompt, prompt
+    assert "4 earlier messages of this thread omitted" in prompt, prompt
+    assert prompt.endswith("[Context: chat note]"), prompt
+    # Other thread kinds still replay everything.
+    prompt = gw._conv_engage_prompt(_conv(*msgs), fresh=False)
+    assert "turn 00" in prompt and "omitted" not in prompt, prompt
+    print("PASS companion new session replays only the thread's tail")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load_gateway(Path(tmp))
@@ -135,6 +154,7 @@ def main():
         check_fresh_replays_attachment_paths(gw)
         check_fresh_without_anchor_falls_back(gw)
         check_stale_replays_whole_transcript(gw)
+        check_companion_replays_only_the_tail(gw)
     print("all engage-prompt checks passed")
 
 
