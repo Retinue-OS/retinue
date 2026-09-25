@@ -161,7 +161,7 @@ def main() -> int:
                      help="lead time before the deadline in which it becomes urgent: 90m, 2h, 3d, 2w "
                           "(default: the kind's)")
     att.add_argument("--sphere", metavar="NAME",
-                     help="the primary sphere: customers, admin, health, friends, family, system")
+                     help="the main sphere: customers, admin, health, friends, family, system; further ones with --tag — every sphere counts for a mode alike")
     att.add_argument("--tag", action="append", default=[], metavar="NAME",
                      help="a further sphere this also belongs to (repeatable)")
     att.add_argument("--kind", metavar="LABEL",

@@ -506,6 +506,56 @@ def test_unknown_sender_screened_then_named(base, wg):
     print("ok test_unknown_sender_screened_then_named")
 
 
+def test_a_person_in_several_spheres(base, wg):
+    """A customer who is also a friend: every sphere of theirs counts for a
+    mode, until the triage judges a message to be about one of them."""
+    rita = "+41791000077"
+    chat = "signal:" + rita
+    cid = "chat:" + chat
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, rita, None, "Hi, Rita here.", "2026-09-05T09:00:00Z", gate=gate)
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Rita Keller", "sphere": "customers", "tags": ["friends"]})
+    assert status == 200 and out["item"]["sphere"] == "customers" and out["item"]["tags"] == ["friends"], out
+    assert wg._ATTENTION.profile()["tags"]["Rita Keller"] == ["friends"], "the card's further spheres are hers"
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    # Social admits friends: her friends sphere lets her through, though her
+    # main one is customers.
+    _mode(base, "social")
+    PUSHES.clear()
+    body = _inbound(base, rita, "Rita Keller", "Can you look at the offer before 18:00?", "2026-09-05T09:10:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "kind": "customer request"})
+    assert body["pushed"] is True and PUSHES, "a further sphere counts like the main one"
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["admission"] == {"by": "sphere", "what": "friends"} and row["reason"] == "Social admits friends", row
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    # Focused on customers — but the triage judged this message to be about
+    # the barbecue: friends only, for this message.
+    status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "customers"})
+    PUSHES.clear()
+    body = _inbound(base, rita, "Rita Keller", "Barbecue on Saturday — bring salad?", "2026-09-05T09:20:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "sphere": "friends"})
+    assert body["pushed"] is False and not PUSHES, "the message's own sphere decides"
+    where, row = _find(_sections(base), cid)
+    assert where == "held" and row["sphere"] == "friends" and row["tags"] == [] and row["admission"] is None, (where, row)
+    # The next message, judged without a sphere, is hers again: customers + friends.
+    body = _inbound(base, rita, "Rita Keller", "And the offer — did you see it?", "2026-09-05T09:30:00Z",
+                    gate=gate, attention={"importance": 4, "due": _due(1), "kind": "customer request"})
+    assert body["pushed"] is True
+    where, row = _find(_sections(base), cid)
+    assert row["sphere"] == "customers" and row["tags"] == ["friends"], row
+    assert row["admission"] == {"by": "scope", "what": "customers"}, row
+    # The sheet's switches edit her further spheres, remembered for her.
+    status, out = _http(base, "POST", "/attention/items/correct", {"id": cid, "tags": ["friends", "family", "customers"]})
+    assert status == 200 and out["item"]["tags"] == ["friends", "family"], out["item"]
+    assert wg._ATTENTION.profile()["tags"]["Rita Keller"] == ["friends", "family"]
+    assert any("further spheres for Rita Keller" in x for x in out["learned_now"]), out["learned_now"]
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    _mode(base, "")
+    print("ok test_a_person_in_several_spheres")
+
+
 def test_vip_always_rings(base, wg):
     """A VIP rings whatever the mode; a muted chat keeps even a VIP quiet."""
     lena = "+41791000077"
@@ -1032,6 +1082,7 @@ def main():
         test_corrections_learn(base, wg)
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
+        test_a_person_in_several_spheres(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
         test_focused_takes_a_scope(base, wg)

@@ -7033,12 +7033,18 @@ def _attention_spec_to_block(spec, block: dict, now: datetime) -> dict:
     # Spheres and tags as the words the rules and the store use ("Board
     # games" → board-games), or a declaration would never match a rule and
     # would put a space into an IRI of the life-store emit.
+    # Declared, they are a judgement of this item — on a chat, of its latest
+    # message (sphere_from; attention_store.chat_item shows the sender's own
+    # spheres otherwise).
     sphere = attention_policy.sphere_id(spec.get("sphere")) if spec.get("sphere") else None
     if sphere:
         block["sphere"] = sphere
+        block["sphere_from"] = "message"
     if isinstance(spec.get("tags"), list):
         block["tags"] = list(dict.fromkeys(
             t for t in (attention_policy.sphere_id(x) for x in spec["tags"]) if t))
+        if block.get("sphere"):
+            block["sphere_from"] = "message"
     if spec.get("kind"):
         block["kind"] = str(spec["kind"]).strip().lower()
     if "project" in spec:
@@ -7133,9 +7139,10 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
         was_held = bool(previous) and previous.get("state", "open") == "open" and not previous.get("released")
         if isinstance(spec, dict) and spec:
             # A classification is a complete judgement of the latest message:
-            # the earlier deadline, kind and importance do not linger on it.
-            # The sphere (the sender's) and the push history stay.
-            previous = {k: v for k, v in previous.items() if k in ("sphere", "pushed", "boost")}
+            # the earlier deadline, kind, importance and spheres do not linger
+            # on it. The push history stays; without spheres of its own the
+            # message shows its sender's (attention_store.chat_item).
+            previous = {k: v for k, v in previous.items() if k in ("pushed", "boost")}
         block = _attention_spec_to_block(spec, previous, now)
         block["state"] = "open"
         block["released"] = False
@@ -7166,7 +7173,7 @@ def _attention_rename_sender(profile: dict, was: str, now_name: str) -> list[str
     number. Existing knowledge under the new name wins: it is about the
     person, not about the handle they arrived on."""
     moved = []
-    for key, label in (("priors", "importance prior"), ("spheres", "sphere")):
+    for key, label in (("priors", "importance prior"), ("spheres", "sphere"), ("tags", "further spheres")):
         table = profile.get(key) or {}
         if was in table:
             value = table.pop(was)
@@ -8235,13 +8242,16 @@ class Handler(BaseHTTPRequestHandler):
             item = _attention_item(item_id, profile, now)
             effect = None
             if item is not None and item.get("state", "open") == "open":
+                # The card says who they are, every sphere of it: the
+                # further ones replace what the profile knew for them.
                 patch = {}
                 if not name:
                     patch = {"sphere": attention_store.UNKNOWN_SPHERE, "tags": []}
-                if sphere:
-                    patch["sphere"] = sphere
-                if tags:
-                    patch["tags"] = sorted(set(list(item.get("tags") or []) + tags))
+                else:
+                    if sphere:
+                        patch["sphere"] = sphere
+                    if tags or item.get("tags"):
+                        patch["tags"] = tags
                 if patch:
                     learned += attention_policy.correct(item, profile, patch, now)
                     effect = attention_policy.reevaluate(item, focus, profile, now, "the contact card")
@@ -9124,7 +9134,12 @@ class Handler(BaseHTTPRequestHandler):
                                                  "frontmatter")
                             if k in item})
             if payload.get("sender_sphere") and item.get("sender") and block.get("sphere"):
+                # The sender's spheres, not only this message's: the main one
+                # and, where given, the further ones.
                 profile.setdefault("spheres", {})[item["sender"]] = block["sphere"]
+                if isinstance(payload.get("tags"), list):
+                    profile.setdefault("tags", {})[item["sender"]] = [
+                        t for t in (block.get("tags") or []) if t != block["sphere"]]
                 _ATTENTION.save_profile(profile)
             effect = attention_policy.reevaluate(revised, focus, profile, now, "the agent's declaration")
             _attention_persist(revised)

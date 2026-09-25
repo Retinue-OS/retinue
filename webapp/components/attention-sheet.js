@@ -300,8 +300,21 @@ class RetinueAttentionSheet extends HTMLElement {
         if (item && item.sender) this._rule('permits', { sender: item.sender, on: !item.permit });
         break;
       case 'admit':
-        if (item) this._rule('admit', { sphere: item.sphere, on: el.getAttribute('data-on') === '1' });
+        if (item) {
+          this._rule('admit', { sphere: el.getAttribute('data-sphere') || item.sphere,
+                                on: el.getAttribute('data-on') === '1' });
+        }
         break;
+      case 'further': {
+        // A further sphere on or off. Every sphere counts for a mode alike;
+        // on a chat the change is the sender's, remembered for them.
+        if (!item) break;
+        const s = el.getAttribute('data-sphere');
+        const tags = (item.tags || []).includes(s)
+          ? item.tags.filter((t) => t !== s) : [...(item.tags || []), s];
+        this._act('correct', { tags });
+        break;
+      }
       case 'tag': {
         // A word the mode in force admits wherever it stands (admit_tags).
         const mode = (this._data && this._data.mode) || {};
@@ -353,7 +366,7 @@ class RetinueAttentionSheet extends HTMLElement {
       // The item's own new sphere: create it, then move the item into it.
       this._createSphere(el.value, (id) => this._act('correct', { sphere: id }));
     } else if (what === 'contact-sphere-new') {
-      // The card's new sphere: the primary one if none is picked yet, else a further group.
+      // The card's new sphere: the main one if none is picked yet, else a further one.
       this._createSphere(el.value, (id) => {
         if (!this._form) return;
         if (!this._form.sphere) this._form.sphere = id;
@@ -472,7 +485,7 @@ class RetinueAttentionSheet extends HTMLElement {
       (this._newSphere === 'contact'
         ? `<input class="sphere-new" type="text" data-set="contact-sphere-new" placeholder="new sphere" autocomplete="off" autofocus>`
         : `<button class="btn tiny" data-act="contact-new-sphere"${busy}>+ new</button>`) +
-      `</div><div class="f-note">Further groups, as tags — a mode may admit a tag on its own. A sphere is a word: add one here.</div></div>` +
+      `</div><div class="f-note">Further spheres — each counts for a mode like the first. A sphere is a word: add one here.</div></div>` +
       `<div class="f-ctl"><button class="btn tiny${form.permit ? ' on' : ''}" data-act="contact-permit"${busy}>` +
       `${form.permit ? '✓ ' : ''}May interrupt right now</button></div>` +
       `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy}>Save the contact</button>` +
@@ -542,6 +555,10 @@ class RetinueAttentionSheet extends HTMLElement {
           spheres.map((s) => `<option value="${esc(s)}"${s === item.sphere ? ' selected' : ''}>${esc(s)}</option>`).join('') +
           (spheres.includes(item.sphere) ? '' : `<option value="${esc(item.sphere)}" selected>${esc(item.sphere)}</option>`) +
           `<option value="${NEW_SPHERE}">+ new sphere…</option></select>`);
+      // Further spheres, as switches: a person can be a customer and a friend.
+      const furtherBtns = spheres.filter((s) => s !== item.sphere && s !== 'unknown').map((s) =>
+        `<button class="btn tiny${(item.tags || []).includes(s) ? ' on' : ''}" data-act="further" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`,
+      ).join('');
       const permitBtn = item.sender
         ? `<button class="btn tiny${item.permit ? ' on' : ''}" data-act="permit"${busy}>${item.permit
           ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit`
@@ -559,15 +576,16 @@ class RetinueAttentionSheet extends HTMLElement {
         admitBtn = `<button class="btn tiny on" data-act="tag" data-tag="${esc(adm.what)}" data-on="0"${busy}>` +
           `Stop admitting ${esc(adm.what)} in ${esc(mode.name)}</button>`;
       } else if (adm && adm.by === 'sphere') {
-        admitBtn = `<button class="btn tiny on" data-act="admit" data-on="0"${busy}>` +
-          `Stop admitting ${esc(item.sphere)} in ${esc(mode.name)}</button>`;
+        // Whichever of the item's spheres the mode lists — a further one, too.
+        admitBtn = `<button class="btn tiny on" data-act="admit" data-sphere="${esc(adm.what)}" data-on="0"${busy}>` +
+          `Stop admitting ${esc(adm.what)} in ${esc(mode.name)}</button>`;
       } else if (adm && (adm.by === 'scope' || adm.by === 'project')) {
         admitBtn = `<span class="f-note">${esc(mode.label || mode.name)} — the stint is about this</span>`;
       } else if (!adm) {
         admitBtn = mode.with_subject
           ? `<button class="btn tiny" data-act="tag" data-tag="${esc(item.sphere)}" data-on="1"${busy}>` +
             `Admit ${esc(item.sphere)} in ${esc(mode.name)}, whatever the scope</button>`
-          : `<button class="btn tiny" data-act="admit" data-on="1"${busy}>` +
+          : `<button class="btn tiny" data-act="admit" data-sphere="${esc(item.sphere)}" data-on="1"${busy}>` +
             `Admit ${esc(item.sphere)} in ${esc(mode.name)}</button>`;
       }
       // A screened stranger leads with the card — naming them is the whole
@@ -607,7 +625,8 @@ class RetinueAttentionSheet extends HTMLElement {
         `<div class="field"><div class="f-label">Urgency</div><div class="f-value">${esc(item.urgency)}</div><div class="f-ctl">${dueCtl}</div></div>` +
         `<div class="field"><div class="f-label">Sphere</div><div class="f-value">` +
         `<span style="color:${sphereColor(item.sphere)}">${esc(item.sphere)}</span>${item.tags.length ? ` <span class="f-note">+ ${item.tags.map(esc).join(', ')}</span>` : ''}</div>` +
-        `<div class="f-ctl">${sphereSel}<span class="f-note">${item.sender ? `remembered for ${esc(item.sender)}` : 'this item'}</span></div></div>` +
+        `<div class="f-ctl">${sphereSel}<span class="f-note">${item.sender ? `remembered for ${esc(item.sender)}` : 'this item'}</span></div>` +
+        `<div class="f-ctl">${furtherBtns}<span class="f-note">further spheres — each counts for a mode like the first</span></div></div>` +
         `<div class="field"><div class="f-label">Delivery</div><div class="f-value">level <span class="lvl" style="color:${LEVEL_COLORS[lvl] || '#9aa5b1'}">${esc(lvl)}</span> · ${esc(item.delivery)}</div>` +
         `<div class="f-ctl">${permitBtn}${admitBtn}<span class="f-note">a Focus rule of ${esc(mode.name)} — importance untouched</span></div></div>` +
         (item.unknown_sender || this._form ? '' : contactField) +
