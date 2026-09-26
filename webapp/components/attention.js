@@ -11,6 +11,11 @@
 //   POST /attention/modes             {mode, only_admitted} — whether this mode's list shows
 //                                     only what it admits (the rest folds into "Not now")
 //   (the sheet, components/attention-sheet.js, carries the per-item actions)
+// One of them is also a gesture here: a row swiped to the right is marked
+// done (POST /attention/items/done, the sheet's *Mark done* / *Mark handled*),
+// with an Undo that puts it back (…/reopen). Done is the attention item's
+// state only — it never archives the thread or the chat, which stay where
+// they are on their own pages; the next message opens a fresh item.
 // Opening a row goes where it goes today: a thread opens in place (the
 // conversations viewer on the same page answers the #conversation-<id> hash),
 // a chat on its page, a project on its page. The list polls on the
@@ -26,11 +31,12 @@
 
 import { esc, fmtAge } from './base.js';
 import {
-  LEVEL_COLORS, sphereColor, fmtWhen, openAttentionSheet, attentionRule,
+  LEVEL_COLORS, sphereColor, fmtWhen, openAttentionSheet, attentionRule, attentionAction,
 } from './attention-sheet.js';
 
 const SRC = '/attention';
 const POLL_MS = 5000;
+const UNDO_MS = 6000;     // how long the Undo after a swipe stays offered
 // Modes are moods — how interruptible — from none (rest) to all (chores).
 const MODE_COLORS = {
   rest: '#3a4250', flow: '#0f4f57', focused: '#2f8a90', chores: '#8a94a0', social: '#7a4f96',
@@ -111,7 +117,24 @@ const CSS = `
          background: var(--card-2, #1c2230); border: 0; border-radius: 12px;
          padding: 10px 12px 10px 18px; cursor: pointer; position: relative;
          -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none;
-         touch-action: manipulation; }
+         -webkit-touch-callout: none; touch-action: pan-y; }
+  /* A swipeable row: the row slides right over what a release will do. The
+     row's own background is opaque, so the layer shows only while it moves. */
+  .swipe { position: relative; overflow: hidden; border-radius: 12px; }
+  .swipe .row { z-index: 1; }
+  .swipe .done-under { position: absolute; inset: 0; display: flex; align-items: center;
+                       padding-left: 18px; font-size: .8rem; font-weight: 600; color: #0b0d12;
+                       background: #4f9e63; visibility: hidden; }
+  .swipe.show-under .done-under { visibility: visible; }
+  .swipe.armed .done-under { background: #5fbf78; }
+  .toast { position: fixed; left: 50%; transform: translateX(-50%); z-index: 30;
+           bottom: calc(env(safe-area-inset-bottom, 0px) + 84px); max-width: calc(100% - 32px);
+           display: flex; align-items: center; gap: 14px; padding: 10px 14px; border-radius: 12px;
+           background: var(--card, #151922); color: var(--fg, #e7ebf2); font-size: .85rem;
+           border: 1px solid var(--line, rgba(231, 235, 242, .12)); box-shadow: 0 6px 20px rgba(0, 0, 0, .4); }
+  .toast .t { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .toast button { flex: none; background: none; border: 0; padding: 2px 4px; cursor: pointer;
+                  color: var(--accent, #6ea8fe); font-weight: 600; }
   .row::before { content: ""; position: absolute; left: 8px; top: 10px; bottom: 10px; width: 3px;
                  border-radius: 2px; background: var(--stripe); }
   @media (hover: hover) { .row:hover { outline: 1px solid var(--accent, #6ea8fe); } }
@@ -195,6 +218,7 @@ class RetinueAttention extends HTMLElement {
     this._dur = durGet();
     this._breaks = prefGet('breaks', true);
     this.shadowRoot.addEventListener('click', (e) => this._onClick(e));
+    this._wireSwipe();
     this._onChange = () => this.load();
     window.addEventListener('retinue-attention-change', this._onChange);
     this._onVisible = () => { if (document.visibilityState === 'visible') this.load(); };
@@ -217,6 +241,7 @@ class RetinueAttention extends HTMLElement {
   disconnectedCallback() {
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
+    if (this._undo) clearTimeout(this._undo.timer);
     window.removeEventListener('retinue-attention-change', this._onChange);
     document.removeEventListener('visibilitychange', this._onVisible);
   }
@@ -246,7 +271,8 @@ class RetinueAttention extends HTMLElement {
       this._state = 'ok';
       // An open mode menu is left alone: re-rendering it on every poll reset
       // it under the user's finger. Closing it renders from the fresh data.
-      if (!force && (sig === this._sig || this._menu)) return;
+      // Nor is a row under a finger mid-swipe: a rebuild would drop it.
+      if (!force && (sig === this._sig || this._menu || this._drag)) return;
       this._sig = sig;
       this.render();
     } catch (_err) {
@@ -297,6 +323,9 @@ class RetinueAttention extends HTMLElement {
   }
 
   _onClick(e) {
+    // A swipe ends on the row, and the browser then clicks it: that click is
+    // the swipe's, not a tap to open.
+    if (performance.now() < (this._suppressUntil || 0)) { this._suppressUntil = 0; return; }
     const el = e.target.closest('[data-act]');
     if (!el) {
       if (e.target.classList && e.target.classList.contains('overlay')) { this._menu = false; this.render(); }
@@ -318,8 +347,110 @@ class RetinueAttention extends HTMLElement {
       case 'breaks': this._breaks = !this._breaks; prefSet('breaks', this._breaks); this.render(); break;
       case 'new': location.hash = '#new'; break;
       case 'digest-done': this._closeDigest(); break;
+      case 'undo': this._undoDone(); break;
       default: break;
     }
+  }
+
+  // ── Swipe right: mark done ─────────────────────────────────────────────
+  // Pointer events, delegated from the shadow root since every render
+  // replaces the rows. The row declares `touch-action: pan-y`, so the
+  // browser keeps vertical scrolling and hands horizontal movement to us; a
+  // gesture is claimed only once it is clearly horizontal and rightward, so
+  // a scroll that starts on a row stays a scroll. Same feel as the chats
+  // page's swipe (components/chats.js), minus the shelf: the home has one
+  // gesture, and everything else stays on the ⓘ sheet.
+  _wireSwipe() {
+    const root = this.shadowRoot;
+    root.addEventListener('pointerdown', (e) => {
+      const row = e.target.closest('.swipe .row');
+      if (!row || e.button !== 0 || this._marking) return;
+      this._drag = { li: row.parentElement, row, id: e.pointerId, x0: e.clientX, y0: e.clientY, dx: 0, axis: null };
+    });
+    root.addEventListener('pointermove', (e) => {
+      const d = this._drag;
+      if (!d || e.pointerId !== d.id) return;
+      const dx = e.clientX - d.x0;
+      const dy = e.clientY - d.y0;
+      if (!d.axis) {
+        if (Math.abs(dx) < 8 && Math.abs(dy) < 8) return;
+        d.axis = dx > Math.abs(dy) ? 'x' : 'y';
+        if (d.axis === 'y') { this._drag = null; return; }
+        try { d.row.setPointerCapture(d.id); } catch (_e) { /* already released */ }
+      }
+      e.preventDefault();
+      const width = d.li.offsetWidth;
+      d.dx = Math.max(0, Math.min(dx, width * 0.8));
+      d.li.classList.toggle('armed', d.dx > this._threshold(width));
+      this._slide(d.li, d.dx, false);
+    });
+    const end = (e, cancelled) => {
+      const d = this._drag;
+      if (!d || (e && e.pointerId !== d.id)) return;
+      this._drag = null;
+      if (d.axis !== 'x') return;
+      // The click a mouse drag ends in must not open the item. A touch pan
+      // produces no click, so this lapses rather than eating the next tap.
+      this._suppressUntil = performance.now() + 400;
+      const width = d.li.offsetWidth;
+      if (!cancelled && d.dx > this._threshold(width)) {
+        this._slide(d.li, width);
+        setTimeout(() => this._markDone(d.li), 160);
+      } else {
+        d.li.classList.remove('armed');
+        this._slide(d.li, 0);
+      }
+    };
+    root.addEventListener('pointerup', (e) => end(e, false));
+    root.addEventListener('pointercancel', (e) => end(e, true));
+  }
+
+  _threshold(width) { return Math.min(120, width * 0.35); }
+
+  _slide(li, x, animate = true) {
+    const row = li.querySelector('.row');
+    row.style.transition = animate ? 'transform .18s ease-out' : 'none';
+    row.style.transform = x ? `translateX(${x}px)` : '';
+    li.classList.toggle('show-under', x > 0);
+  }
+
+  // The item leaves the list at once; the gateway hears it, and the toast
+  // offers the way back for a few seconds. On failure the row slides back.
+  async _markDone(li) {
+    const id = li.dataset.id;
+    const row = this._rows().find((r) => r.id === id);
+    if (!id || this._marking) return;
+    this._marking = true;
+    try {
+      await attentionAction('done', { id });
+      this._offerUndo(id, row ? row.title : '');
+      this._sig = '';
+      await this.load(true);
+    } catch (_err) {
+      li.classList.remove('armed');
+      this._slide(li, 0);
+    } finally {
+      this._marking = false;
+    }
+  }
+
+  _offerUndo(id, title) {
+    if (this._undo) clearTimeout(this._undo.timer);
+    const timer = setTimeout(() => { this._undo = null; this.render(); }, UNDO_MS);
+    this._undo = { id, title, timer };
+  }
+
+  async _undoDone() {
+    const u = this._undo;
+    if (!u) return;
+    clearTimeout(u.timer);
+    this._undo = null;
+    this.render();
+    try {
+      await attentionAction('reopen', { id: u.id });
+    } catch (_err) { /* the sheet's "Put it back on the list" remains */ }
+    this._sig = '';
+    await this.load(true);
   }
 
   _openItem(id) {
@@ -347,7 +478,11 @@ class RetinueAttention extends HTMLElement {
       ? `importance ${r.importance} · parked on ${esc(r.actor)}`
       : `importance ${r.importance} · ${esc(section === 'now' ? r.reason : r.delivery)}`;
     const cls = `row${r.unread ? ' unread' : ''}${r.pending ? ' pending' : ''}`;
-    return `<button class="${cls}" data-act="open" data-id="${esc(r.id)}" style="--stripe:${LEVEL_COLORS[lvl] || '#4a5563'}" title="${esc(lvl)}">` +
+    // Swiped right, a row is marked done: *handled* for a chat, *resolved*
+    // for what waits on someone else — the sheet's own words for it.
+    const doneLabel = r.actor !== 'you' ? 'Resolved' : r.kind === 'chat' ? 'Handled' : 'Done';
+    return `<div class="swipe" data-id="${esc(r.id)}"><div class="done-under" aria-hidden="true">✓ ${doneLabel}</div>` +
+      `<button class="${cls}" data-act="open" data-id="${esc(r.id)}" style="--stripe:${LEVEL_COLORS[lvl] || '#4a5563'}" title="${esc(lvl)}">` +
       `<div class="row-top"><span class="chip"><i style="background:${sphereColor(r.sphere)}"></i>${esc(r.sphere)}</span>` +
       (r.unknown_sender ? '<span class="count">new number</span>' : '') +
       (r.count > 1 ? `<span class="count">${r.count} msgs</span>` : '') +
@@ -357,7 +492,7 @@ class RetinueAttention extends HTMLElement {
       `<div class="row-title"><span class="t">${esc(r.title)}</span>` +
       `<span class="info" role="button" tabindex="0" data-act="info" data-id="${esc(r.id)}" title="Importance, urgency, delivery — and their corrections" aria-label="Details">ⓘ</span></div>` +
       (r.preview ? `<div class="row-preview">${esc(r.preview)}</div>` : '') +
-      `<div class="row-why">${why}</div></button>`;
+      `<div class="row-why">${why}</div></button></div>`;
   }
 
   _fromLastDigest(r) {
@@ -556,8 +691,12 @@ class RetinueAttention extends HTMLElement {
     // The one action the home offers beside the rows, within thumb reach;
     // the pages beside the home are in the navigation row at the top.
     const foot = `<div class="foot"><button class="new" data-act="new">+ Ask Ara</button></div>`;
+    const u = this._undo;
+    const toast = u
+      ? `<div class="toast" role="status"><span class="t">Marked done${u.title ? ` · ${esc(u.title)}` : ''}</span>` +
+        `<button data-act="undo">Undo</button></div>` : '';
     root.innerHTML = `<style>${CSS}</style><section class="card" aria-label="${esc(this.heading)}">${head}<div class="content">${body}${foot}</div></section>` +
-      (this._menu ? this._menuHtml() : '');
+      toast + (this._menu ? this._menuHtml() : '');
   }
 }
 

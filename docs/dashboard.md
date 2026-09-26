@@ -84,7 +84,10 @@ switch for the Focus rule that actually lets the item through (`admission` on
 the row: a sphere the mode lists, or a word it admits wherever it stands, as
 Focused does *health*; where none does, the rule that would), and the
 actions *Later* (next breakpoint / tomorrow), *Pull into the list now* and
-*Mark done*. A chat shows its sender's spheres, as the contact card and the
+*Mark done* — the last also a gesture: a row swiped right on the home is
+marked done, with an Undo for a few seconds. Done is the attention item's
+state, not the source's: it never archives the thread or the chat, and the
+next message opens a fresh item. A chat shows its sender's spheres, as the contact card and the
 corrections taught them, unless the triage judged its message to be about a
 sphere in particular (or named further spheres alone) — a customer who is
 also a friend, asking about Saturday's barbecue, is *friends* for that
