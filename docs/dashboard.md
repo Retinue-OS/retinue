@@ -166,7 +166,7 @@ sender, else the default — a person writing directly is *active* (held for the
 next digest, rung at once where the sender holds a permit), a group is chatter
 (passive). `attention-set.py chat:<id> …` revises it; a reply (from the
 dashboard or the phone), *Mark handled* or archiving the chat settles it.
-The chat page carries **Archive** and **Mute** switches under its header
+The chat page carries **Archive** and **Mute** switches in its header's ⋮ menu
 (`POST /chats/<id>/flags {archived?, muted?}`), with the thread flags'
 meaning: an archived chat leaves the chats list and comes back when a
 message arrives unless it is muted, and muted also silences its push;

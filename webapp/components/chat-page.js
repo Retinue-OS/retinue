@@ -296,11 +296,76 @@ class RetinueChatPage extends HTMLElement {
         if (this._chat) this._chat.companion = this._companionId;
       });
     }
+    this._watchKeyboard();
     this.render();
     this._load();
   }
 
+  // ── Typing mode (phone) ────────────────────────────────────────────────────
+  // While the on-screen keyboard is up, the visible frame is roughly half the
+  // screen, and the header (back, avatar, name, tabs, menu) would take a good
+  // part of what is left from the thread and the field the text lands in. So
+  // in that state the page drops the header and the companion's bar, and gets
+  // them back the moment the keyboard goes.
+  //
+  // "The keyboard is up" is two facts together: a text field on this page has
+  // focus, and the visual viewport is well short of the tallest it has been at
+  // this width (the frame height with no keyboard). Focus alone is not enough:
+  // Android's back gesture dismisses the keyboard without blurring the field,
+  // and the header must come back then. The height alone is not enough either
+  // (a bar showing, a split-screen resize). Never in the wide layout, where
+  // there is room, and without the visualViewport API focus decides alone.
+  _watchKeyboard() {
+    if (this._kbd) return;
+    const vv = window.visualViewport;
+    const st = { maxH: 0, width: 0 };
+    const apply = () => {
+      let up = !this._wide.matches && this._focusedInside();
+      if (vv) {
+        // A new width (rotation, a split-screen change) starts a new baseline.
+        const w = Math.round(vv.width);
+        if (w !== st.width) { st.width = w; st.maxH = 0; }
+        st.maxH = Math.max(st.maxH, vv.height);
+        if (up) up = vv.height < st.maxH * 0.8;
+      }
+      const page = this.shadowRoot && this.shadowRoot.querySelector('.page');
+      if (page && page.classList.contains('typing') !== up) {
+        page.classList.toggle('typing', up);
+        // The keyboard took half the frame: the newest messages are what the
+        // user is answering, so keep them in view above the field.
+        if (up) { this._toggleMenu(false); this._scrollThread('[data-chat-thread]'); }
+      }
+    };
+    const onIn = () => apply();
+    // Focus moving from one field to another passes through a blur: settle
+    // after the new focus has landed, so the header does not flash back.
+    const onOut = () => setTimeout(apply, 0);
+    this.addEventListener('focusin', onIn);
+    this.addEventListener('focusout', onOut);
+    if (vv) vv.addEventListener('resize', apply);
+    this._kbd = { apply, onIn, onOut, vv };
+  }
+
+  // Whether focus is on a text field anywhere inside this element's shadow
+  // tree (the companion's composer sits one shadow root further in).
+  _focusedInside() {
+    let a = this.shadowRoot && this.shadowRoot.activeElement;
+    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+    return !!a && (a.tagName === 'TEXTAREA' || a.isContentEditable ||
+      (a.tagName === 'INPUT' && /^(text|search|email|url|tel|)$/.test(a.type || '')));
+  }
+
+  _unwatchKeyboard() {
+    const k = this._kbd;
+    if (!k) return;
+    this.removeEventListener('focusin', k.onIn);
+    this.removeEventListener('focusout', k.onOut);
+    if (k.vv) k.vv.removeEventListener('resize', k.apply);
+    this._kbd = null;
+  }
+
   disconnectedCallback() {
+    this._unwatchKeyboard();
     this._wide.removeEventListener('change', this._onFrame);
     if (this._onPop) window.removeEventListener('popstate', this._onPop);
     this._onPop = null;
@@ -311,6 +376,7 @@ class RetinueChatPage extends HTMLElement {
     if (this._pollTimer) clearInterval(this._pollTimer);
     if (this._onVis) document.removeEventListener('visibilitychange', this._onVis);
     this._onVis = null;
+    this._toggleMenu(false);
     this._stopRecording();
     this._wave.stop();
     this._stopStream();
@@ -636,8 +702,9 @@ class RetinueChatPage extends HTMLElement {
       body = `<div class="center muted"><p>${esc(this._error)}</p>` +
         `<p><a class="backlink" href="${CHATS_URL}">&#8249; All chats</a></p></div>`;
     } else {
-      body = this._headHtml() + this._flagsHtml() + this._panesHtml();
+      body = this._headHtml() + this._panesHtml();
     }
+    this._toggleMenu(false);
     this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}</style>` +
       `<section class="page">${body}</section>`;
     if (this._state === 'ok') {
@@ -649,6 +716,8 @@ class RetinueChatPage extends HTMLElement {
     // A full render replaces the shadow DOM wholesale; an open lightbox (its
     // node lives beside .page) survives by being re-appended.
     if (this._lightbox) this._renderLightbox();
+    // A render replaces .page, and with it the typing-mode class.
+    if (this._kbd) this._kbd.apply();
   }
 
   _headHtml() {
@@ -681,16 +750,52 @@ class RetinueChatPage extends HTMLElement {
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
-      `<button class="info" data-attention title="Importance, urgency, delivery — and their corrections" ` +
-      `aria-label="Attention details">&#9432;</button>` +
       `<nav class="pane-tabs" role="tablist" aria-label="Pane">` +
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
       `<button role="tab" data-pane-tab="companion" aria-selected="false">Ara</button>` +
-      `</nav></header>`;
+      `</nav>` + this._menuHtml() + `</header>`;
   }
 
-  // Archive and mute, under the header (the header itself is full on a
-  // phone). Each switch shows the state it is in and offers the other:
+  // The chat's menu, at the header's right end: the attention sheet, Archive
+  // and Mute. They used to take a ⓘ in the header and a row of switches under
+  // it — a whole row on a phone for two controls that are rarely touched. The
+  // button carries a dot while the chat is archived or muted, so the state
+  // stays visible with the menu shut.
+  _menuHtml() {
+    const c = this._chat || {};
+    const flagged = c.archived || c.muted;
+    return `<div class="menu-wrap" data-menu-wrap>` +
+      `<button class="menu-btn${flagged ? ' flagged' : ''}" data-menu-btn aria-haspopup="menu" ` +
+      `aria-expanded="false" title="More" aria-label="More">&#8942;</button>` +
+      `<div class="menu" role="menu" data-menu hidden>${this._flagsHtml()}</div></div>`;
+  }
+
+  _toggleMenu(open) {
+    const root = this.shadowRoot;
+    const menu = root && root.querySelector('[data-menu]');
+    const btn = root && root.querySelector('[data-menu-btn]');
+    if (!menu || !btn) return;
+    const show = open === undefined ? menu.hidden : open;
+    menu.hidden = !show;
+    btn.setAttribute('aria-expanded', String(show));
+    if (show && !this._onMenuAway) {
+      // Any press outside the menu, or Esc, shuts it. composedPath: presses
+      // land on this host from the document's point of view.
+      this._onMenuAway = (e) => {
+        if (e.type === 'keydown' ? e.key === 'Escape'
+          : !e.composedPath().includes(root.querySelector('[data-menu-wrap]'))) this._toggleMenu(false);
+      };
+      document.addEventListener('pointerdown', this._onMenuAway, true);
+      document.addEventListener('keydown', this._onMenuAway);
+    } else if (!show && this._onMenuAway) {
+      document.removeEventListener('pointerdown', this._onMenuAway, true);
+      document.removeEventListener('keydown', this._onMenuAway);
+      this._onMenuAway = null;
+    }
+  }
+
+  // The menu's items: the attention sheet, then Archive and Mute. Each switch
+  // shows the state it is in and offers the other:
   // "Archive" / "Archived · Unarchive". The flags mean what they mean on
   // threads — an archived chat comes back when a message arrives unless it
   // is muted; muting archives too and silences its push — and
@@ -699,9 +804,12 @@ class RetinueChatPage extends HTMLElement {
   _flagsHtml() {
     const c = this._chat || {};
     const sw = (flag, on, offLabel, onLabel, hint) =>
-      `<button class="flag${on ? ' on' : ''}" data-flag="${flag}" data-on="${on ? '0' : '1'}" title="${esc(hint)}">` +
+      `<button class="item${on ? ' on' : ''}" role="menuitem" data-flag="${flag}" data-on="${on ? '0' : '1'}" ` +
+      `title="${esc(hint)}">` +
       (on ? `<b>${esc(onLabel)}</b> · Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) + `</button>`;
-    return `<div class="flags" data-flags>` +
+    return `<div class="items" data-flags>` +
+      `<button class="item" role="menuitem" data-attention ` +
+      `title="Importance, urgency, delivery — and their corrections">Attention details</button>` +
       sw('archived', !!c.archived, 'Archive', 'Archived',
          'Leaves the chat list; comes back when a message arrives, unless muted') +
       sw('muted', !!c.muted, 'Mute', 'Muted', 'Archived, no push, and a new message does not bring it back') +
@@ -721,11 +829,23 @@ class RetinueChatPage extends HTMLElement {
     } catch (_err) { /* the row keeps showing the last known state */ }
     const row = this.shadowRoot.querySelector('[data-flags]');
     if (row) { row.outerHTML = this._flagsHtml(); this._bindFlags(); }
+    const btn = this.shadowRoot.querySelector('[data-menu-btn]');
+    if (btn && this._chat) btn.classList.toggle('flagged', !!(this._chat.archived || this._chat.muted));
   }
 
   _bindFlags() {
-    this.shadowRoot.querySelectorAll('[data-flag]').forEach((el) =>
+    const root = this.shadowRoot;
+    root.querySelectorAll('[data-flag]').forEach((el) =>
       el.addEventListener('click', () => this._setFlag(el.getAttribute('data-flag'), el.getAttribute('data-on') === '1')));
+    // The attention sheet for this chat: its importance, urgency and delivery,
+    // the corrections, Later and Mark handled.
+    const att = root.querySelector('[data-attention]');
+    if (att) {
+      att.addEventListener('click', () => {
+        this._toggleMenu(false);
+        openAttentionSheet(`chat:${this._id}`, { here: true });
+      });
+    }
   }
 
   _panesHtml() {
@@ -738,8 +858,9 @@ class RetinueChatPage extends HTMLElement {
       `aria-label="Resize companion pane" tabindex="0" ` +
       `title="Drag to resize &middot; double-click to reset"></div>` +
       `<section class="pane pane-companion" aria-label="Ara">` +
-      `<div class="comp-bar"><span class="comp-who">Ara</span>` +
-      `<span class="comp-hint">reads this chat, writes into your draft</span></div>` +
+      `<p class="comp-help" id="comp-help" data-comp-help hidden>Ara reads this chat and writes ` +
+      `replies into its draft &mdash; you read the draft in the chat&rsquo;s composer, change what ` +
+      `you like, and your send press is what sends it.</p>` +
       this._companionHtml() +
       `</section></div>`;
   }
@@ -754,7 +875,7 @@ class RetinueChatPage extends HTMLElement {
   //    ordinary conversation client. Once the id is known it is passed
   //    directly and the mint URL is moot.
   //  - `bar="actions"` keeps the model picker and the speak-replies toggle but
-  //    drops the title (the bar above names the pane) and Archive (a companion
+  //    drops the title (the tab or the slotted lead names the pane) and Archive (a companion
   //    is not filed away separately from the chat it belongs to).
   //  - `stamp="clock"` matches the mirror's clock-stamped timeline beside it.
   //  - `no-autofocus` because this pane is mounted whether or not the user is
@@ -765,8 +886,15 @@ class RetinueChatPage extends HTMLElement {
     const at = this._companionId
       ? ` conversation-id="${esc(this._companionId)}"`
       : ` create-url="/chats/${encodeURIComponent(this._id)}/companion"`;
+    // The bar's lead (slot "bar-start"): the pane's name where no tab names it
+    // (the wide layout) and a help button for what this pane is — the line
+    // that used to take a row of its own above the thread.
     return `<retinue-conversation bar="actions" stamp="clock" placeholder="Ask Ara …" ` +
-      `no-autofocus${at}></retinue-conversation>`;
+      `no-autofocus${at}><span slot="bar-start" class="comp-lead">` +
+      `<span class="comp-who">Ara</span>` +
+      `<button type="button" class="help-btn" data-comp-help-btn aria-controls="comp-help" ` +
+      `aria-expanded="false" title="What is this pane?" aria-label="What is this pane?">?</button>` +
+      `</span></retinue-conversation>`;
   }
 
   // The element, while it is on screen.
@@ -1070,11 +1198,18 @@ class RetinueChatPage extends HTMLElement {
         this._goBack();
       });
     }
-    // The attention sheet for this chat: its importance, urgency and delivery,
-    // the corrections, Later and Mark handled.
-    const att = root.querySelector('[data-attention]');
-    if (att) att.addEventListener('click', () => openAttentionSheet(`chat:${this._id}`, { here: true }));
+    const menuBtn = root.querySelector('[data-menu-btn]');
+    if (menuBtn) menuBtn.addEventListener('click', () => this._toggleMenu());
     this._bindFlags();
+    const help = root.querySelector('[data-comp-help-btn]');
+    if (help) {
+      help.addEventListener('click', () => {
+        const note = root.querySelector('[data-comp-help]');
+        if (!note) return;
+        note.hidden = !note.hidden;
+        help.setAttribute('aria-expanded', String(!note.hidden));
+      });
+    }
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
     // the indicator honest whichever way the pane was reached (tab or swipe).
     root.querySelectorAll('[data-pane-tab]').forEach((el) =>
@@ -1907,11 +2042,6 @@ const CSS = `
         border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
         font-size: .58rem; font-weight: 800; color: #fff;
         border: 2px solid var(--bg, #0b0d12); box-sizing: content-box; }
-  .info { flex: none; width: 30px; height: 30px; border-radius: 50%; background: transparent;
-          border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);
-          cursor: pointer; font: inherit; font-size: .95rem; display: inline-flex; align-items: center;
-          justify-content: center; padding: 0; -webkit-tap-highlight-color: transparent; }
-  .info:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .head-txt { flex: 1; min-width: 0; }
   .head-name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .head-sub { display: block; color: var(--muted, #8b93a3); font-size: .74rem;
@@ -1922,14 +2052,33 @@ const CSS = `
                       border-radius: 999px; padding: 6px 14px; font: inherit; font-size: .8rem;
                       cursor: pointer; -webkit-tap-highlight-color: transparent; }
   .pane-tabs button.on { background: var(--accent, #6ea8fe); color: #0b0d12; font-weight: 600; }
-  /* Archive / mute switches under the header. */
-  .flags { flex: none; display: flex; gap: 8px; padding: 8px 0 6px; }
-  .flag { border: 1px solid var(--line, rgba(231, 235, 242, .08)); background: transparent;
-          color: var(--muted, #8b93a3); border-radius: 999px; padding: 4px 12px; font: inherit;
-          font-size: .76rem; cursor: pointer; -webkit-tap-highlight-color: transparent; }
-  .flag b { color: var(--fg, #e7ebf2); font-weight: 600; }
-  .flag.on { background: var(--card-2, #1c2230); border-color: var(--card-2, #1c2230); }
-  .flag:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
+  /* The ⋮ menu: attention details, Archive, Mute. */
+  .menu-wrap { flex: none; position: relative; }
+  .menu-btn { position: relative; width: 32px; height: 34px; border-radius: 50%; border: 0;
+              background: transparent; color: var(--fg, #e7ebf2); cursor: pointer; font: inherit;
+              font-size: 1.3rem; line-height: 1; padding: 0; display: inline-flex;
+              align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+  .menu-btn:hover, .menu-btn[aria-expanded="true"] { background: var(--card-2, #1c2230); }
+  /* Archived or muted: a dot, so the state shows with the menu shut. */
+  .menu-btn.flagged::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px;
+                             height: 7px; border-radius: 50%; background: var(--accent, #6ea8fe); }
+  .menu { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; min-width: 200px;
+          background: var(--card-2, #1c2230); border: 1px solid var(--line, rgba(231, 235, 242, .08));
+          border-radius: 12px; padding: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, .45); }
+  .menu[hidden] { display: none; }
+  .items { display: flex; flex-direction: column; }
+  .item { border: 0; background: transparent; color: var(--fg, #e7ebf2); text-align: left;
+          border-radius: 8px; padding: 10px 12px; font: inherit; font-size: .88rem; cursor: pointer;
+          -webkit-tap-highlight-color: transparent; }
+  .item.on { color: var(--muted, #8b93a3); }
+  .item b { color: var(--fg, #e7ebf2); font-weight: 600; }
+  .item:hover { background: rgba(110, 168, 254, .14); }
+
+  /* Typing mode (phone keyboard up, see _watchKeyboard): the header and the
+     companion's bar give their rows to the thread and the field. */
+  .page.typing .chat-head { display: none; }
+  .page.typing retinue-conversation::part(bar) { display: none; }
+  .page.typing .comp-help { display: none; }
 
   /* ── Panes: swipe strip on the phone, columns behind a splitter when wide ── */
   .panes { flex: 1; min-height: 0; display: flex;
@@ -1939,16 +2088,28 @@ const CSS = `
   .pane { flex: 0 0 100%; min-width: 0; scroll-snap-align: start; scroll-snap-stop: always;
           display: flex; flex-direction: column; min-height: 0; }
   .pane-splitter { display: none; }
-  .comp-bar { flex: none; display: flex; align-items: baseline; gap: 8px; padding: 8px 2px 0; }
-  .comp-who { font-weight: 650; font-size: .85rem; }
-  .comp-hint { color: var(--muted, #8b93a3); font-size: .72rem; overflow: hidden;
-               text-overflow: ellipsis; white-space: nowrap; }
+  .pane-companion { padding-top: 8px; }
+  /* The companion's lead in its bar: the name (wide layout only — on a phone
+     the tab names the pane) and the help button, whose note opens above. */
+  .comp-lead { display: inline-flex; align-items: center; gap: 8px; }
+  .comp-who { display: none; font-weight: 650; font-size: .85rem; }
+  .help-btn { flex: none; width: 28px; height: 28px; border-radius: 50%; background: transparent;
+              border: 1px solid var(--line, rgba(231, 235, 242, .12)); color: var(--muted, #8b93a3);
+              cursor: pointer; font: inherit; font-size: .8rem; font-weight: 650; padding: 0;
+              display: inline-flex; align-items: center; justify-content: center;
+              -webkit-tap-highlight-color: transparent; }
+  .help-btn:hover, .help-btn[aria-expanded="true"] { border-color: var(--accent, #6ea8fe);
+                                                    color: var(--accent, #6ea8fe); }
+  .comp-help { flex: none; margin: 8px 2px 6px; color: var(--muted, #8b93a3); font-size: .78rem;
+               line-height: 1.4; }
+  .comp-help[hidden] { display: none; }
   @media ${WIDE_FRAME} {
     .panes { overflow-x: visible; scroll-snap-type: none; }
     .pane-chat { flex: 1 1 auto; }
     .pane-companion { flex: 0 0 auto; width: var(--comp-w, clamp(300px, 32vw, 440px));
                       min-width: 280px; max-width: 60%; }
     .pane-tabs { display: none; }
+    .comp-who { display: inline; }
     /* Same look and hit area as the dashboard's splitters (styles.css). */
     .pane-splitter { display: block; flex: none; position: relative; z-index: 2; width: 14px;
                      cursor: col-resize; touch-action: none; user-select: none;

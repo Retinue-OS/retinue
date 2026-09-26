@@ -23,6 +23,11 @@
 //                     title and no archive — for a host that names the thread
 //                     itself and whose thread is not the user's to file away
 //                     (a messenger chat's companion belongs to its chat).
+//                     A child with slot="bar-start" is shown at the bar's
+//                     left end (the host's pane name, a help button), and
+//                     keeps the bar up before the thread exists. The bar is
+//                     exposed as part="bar" so a host can hide it (the chat
+//                     page does, while the phone keyboard is up).
 //   stamp="clock"     stamp messages with the clock time instead of an age,
 //                     for a host that sits beside a clock-stamped timeline.
 //   placeholder       what the composer's box is called, where the host's own
@@ -893,7 +898,14 @@ class RetinueConversation extends HTMLElement {
     // The actions-only bar has nothing to show until there is a thread to act
     // on: before the first turn the model is picked in the body instead (see
     // _newHtml), where the choice is the one thing worth making.
-    if (bar === 'actions' && !this._id) return '';
+    // A host may put its own lead into the actions-only bar (slot "bar-start":
+    // the chat page's pane name and help button); that lead is there from the
+    // start, so the bar is too, holding only the slot until a thread exists.
+    const lead = bar === 'actions' && this.querySelector(':scope > [slot="bar-start"]')
+      ? '<slot name="bar-start"></slot>' : '';
+    if (bar === 'actions' && !this._id) {
+      return lead ? `<div class="thread-bar bar-slim" part="bar">${lead}</div>` : '';
+    }
     const back = this.hasAttribute('back')
       ? '<button class="back" data-back aria-label="Back">&#8249;</button>' : '';
     if (!this._id) {
@@ -901,7 +913,7 @@ class RetinueConversation extends HTMLElement {
     }
     const t = this._thread;
     if (!t) {
-      if (bar === 'actions') return '';
+      if (bar === 'actions') return lead ? `<div class="thread-bar bar-slim" part="bar">${lead}</div>` : '';
       const title = this._missing ? 'Conversation not found' : '&#8230;';
       return `<div class="thread-bar">${back}<span class="bar-title muted" data-title>${title}</span></div>`;
     }
@@ -916,7 +928,7 @@ class RetinueConversation extends HTMLElement {
     // Actions only: the host names the pane, and archiving is not offered for
     // a thread the user does not own separately from what it belongs to.
     if (bar === 'actions') {
-      return `<div class="thread-bar bar-slim">` +
+      return `<div class="thread-bar bar-slim" part="bar">${lead}` +
         `<span class="bar-actions"><span data-picker>${this._modelPickerHtml()}</span>` +
         `${autoBtn}</span></div>`;
     }
@@ -2031,6 +2043,8 @@ const CSS = `
   /* bar="actions": no title to push the cluster across, so the row does it,
      and it sits tighter — the host's own header is directly above it. */
   .thread-bar.bar-slim { justify-content: flex-end; padding: 0 0 8px; }
+  /* The host's lead (slot "bar-start") takes the left end; the cluster stays right. */
+  .thread-bar.bar-slim ::slotted([slot="bar-start"]) { margin-right: auto; min-width: 0; }
   /* A phone's thread bar cannot hold the back button, the picker, the
      attention ⓘ, the speaker toggle and Archive beside the title — squeezed
      into one row the title kept its first four letters. So on a phone the
