@@ -94,13 +94,16 @@
          intent:// works in Chromium browsers and can launch arbitrary installed
          apps (these local OS actions work offline). Plain paths like /sends
          navigate within the PWA; the dashboard's own pages are in the
-         navigation row at the top, so the dock does not repeat them. -->
+         navigation row at the top, so the dock does not repeat them — the
+         address book (/contacts.html) lives here, beside the phone and mail
+         it stands behind. -->
     <retinue-app-launcher>
       <a href="tel:"><span class="ico">&#128222;</span><span class="lbl">Phone</span></a>
       <a href="sms:"><span class="ico">&#128172;</span><span class="lbl">SMS</span></a>
       <a href="mailto:"><span class="ico">&#9993;&#65039;</span><span class="lbl">Mail</span></a>
       <a href="geo:0,0?q="><span class="ico">&#128506;&#65039;</span><span class="lbl">Map</span></a>
       <a href="/sends"><span class="ico">&#128228;</span><span class="lbl">Sends</span></a>
+      <a href="/contacts.html"><span class="ico">&#128211;</span><span class="lbl">Contacts</span></a>
     </retinue-app-launcher>
   </main>
 

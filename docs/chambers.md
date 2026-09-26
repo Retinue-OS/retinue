@@ -61,6 +61,21 @@ mailbox-persona chamber, an operations/data chamber). Whatever the mix, each
 chamber describes itself through its own instructions rather than through
 `CLAUDE.md`.
 
+## Contacts — where a chamber keeps its people
+
+Every contact is one person stored in exactly one chamber
+(`scripts/contacts.py`, [contacts.md](contacts.md)). A chamber's manifest entry
+says where:
+
+```json
+{"name": "private", "url_env": "PRIVATE_CHAMBER_URL", "contacts": "people"}
+```
+
+`contacts` is a directory relative to the chamber root; left out, it is
+`contacts/`, and `"contacts": false` opts the chamber out. The manifest's order
+is the preference order — the first location is the pre-selected chamber on the
+dashboard's contact card and the one the migration of older cards files into.
+
 ## Chamber instructions — the aggregate import
 
 A chamber provides session-start guidance at

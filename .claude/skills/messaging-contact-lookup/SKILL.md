@@ -107,4 +107,5 @@ Sobald der JID / die Empfänger-ID gefunden ist, Nachricht senden mit dem entspr
 - ✅ Letzten Nachrichtentext als Kontext nutzen (Firma, Inhalt) um richtigen Kontakt zu identifizieren
 - ✅ Bei unklaren Namen immer Klankvarianten mitdenken
 - ✅ Gilt für **WhatsApp, Signal und Telegram** gleichermassen
-- ✅ **SMS** (where the `sms` profile runs): the gateway only knows numbers that have written in or been written to (`GET http://sms-gateway:8095/recent-chats`) and has no address book — for a name, look the number up in the chambers' contacts (life store), then `sms-push.py --recipient <number>`
+- ✅ **Address book** (`scripts/contacts.py`, docs/contacts.md): when the recent chats do not settle a name, `contacts.py find --name <name>` lists every handle a person has on any channel — a known account there beats the messenger's own contact directory
+- ✅ **SMS** (where the `sms` profile runs): the gateway only knows numbers that have written in or been written to (`GET http://sms-gateway:8095/recent-chats`) and has no address book — for a name, look the number up in the address book (`python3 /workspace/scripts/contacts.py find --name <name>`; its phone numbers are SMS handles), then `sms-push.py --recipient <number>`

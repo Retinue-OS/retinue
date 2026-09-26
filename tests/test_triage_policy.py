@@ -544,6 +544,48 @@ def test_quiet_and_ignore_wildcards_roundtrip():
             del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]
 
 
+def test_contact_owned_members():
+    """The address book's VIP persons live under a subject of their own: a
+    sync replaces them wholesale, hand-set VIPs and the Sent-derived whitelist
+    stay, writers that know nothing of them keep them, and a loader that reads
+    only the predicate (a gateway built earlier) sees them too."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TRIAGE_MESSENGER_DIR"] = str(Path(tmp) / "messenger")
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(Path(tmp) / "email.nt")
+        try:
+            (Path(tmp) / "messenger" / "signal").mkdir(parents=True)
+            tp._mutate_messenger("signal", vip_add=["+41790000001"])
+            tp._mutate_email(add_addresses=["boss@work.com"])
+            written = tp.sync_contacts({"signal": {"+41790000002"}, "matrix": set()}, {"Mara@Example.org"})
+            assert len(written) == 2, written
+            pol = tp.load_messenger_policy("signal")
+            assert pol.vip == {"+41790000001"} and pol.vip_contacts == {"+41790000002"}, pol
+            assert tp.gate_decision("signal", "+41790000002")["vip"] is True
+            assert not (Path(tmp) / "messenger" / "matrix").exists(), "no directory for a channel with nobody"
+            email = tp.load_email_policy()
+            assert email.addresses == {"boss@work.com"} and email.contact_addresses == {"mara@example.org"}
+            assert tp.email_gate_decision("mara@example.org")["triage_now"] is True
+            assert "mara@example.org" in tp.load_email_whitelist()[0]
+            # Writers that know nothing of the address book keep its members.
+            tp._mutate_messenger("signal", news_add=["group-x"])
+            tp._mutate_email(add_addresses=["peer@partner.com"])
+            assert tp.load_messenger_policy("signal").vip_contacts == {"+41790000002"}
+            assert tp.load_email_policy().contact_addresses == {"mara@example.org"}
+            # An older loader reads the predicate, not the subject.
+            text = tp.messenger_policy_path("signal").read_text(encoding="utf-8")
+            vips = {lit for _s, p, lit in tp._parse(tp.messenger_policy_path("signal")) if p == tp.P_VIP_HANDLE}
+            assert vips == {"+41790000001", "+41790000002"}, text
+            # A sync that says nobody clears the projection only; unchanged, it writes nothing.
+            tp.sync_contacts({}, set())
+            assert tp.load_messenger_policy("signal").vip == {"+41790000001"}
+            assert tp.load_messenger_policy("signal").vip_contacts == set()
+            assert tp.load_email_policy().addresses == {"boss@work.com", "peer@partner.com"}
+            assert tp.sync_contacts({}, set()) == []
+        finally:
+            del os.environ["TRIAGE_MESSENGER_DIR"]
+            del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]
+
+
 def _run() -> int:
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

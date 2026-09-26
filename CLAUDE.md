@@ -185,6 +185,22 @@ not classify and has flagged for the user.
 
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 
+## Contacts
+
+A contact is a **person, not a handle**: one file in one chamber holding every
+channel that reaches them — e-mail addresses, phone numbers, Signal, WhatsApp
+and Telegram accounts. Each chamber's `chambers.json` entry names its address
+book (`contacts`, default `contacts/`). Use `scripts/contacts.py` — `find
+--email/--phone/--handle/--name` before asking who someone is, `add --chamber
+<chamber>` (a contact always names its chamber; ask when unclear), `update <id>
+--add-handle`/`--add-email` rather than filing a second person. The person also
+carries the attention model's facts about them (sphere, importance prior, the
+modes they may interrupt) and the **VIP flag** (`--vip`: a model works their
+messages on every channel; their e-mail is whitelisted) — set these on the
+person, not per handle. The dashboard's contact card and its Contacts page (the
+dock at the foot of the home) write the same files. Vocabulary and file format:
+`docs/contacts.md`.
+
 ## Messaging (Signal, WhatsApp, Telegram, SMS, e-mail)
 
 Outbound pushes go through the thin CLIs — `scripts/signal-push.py`,
@@ -344,6 +360,7 @@ variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
 | chamber mounting, plugins, INSTRUCTIONS.md contract | `docs/chambers.md` |
 | editing `.refresh.json`/`.schedule.json`/`.inbox.json`, project wake semantics | `docs/scheduling.md` |
 | unfamiliar messaging accounts, send policies, gateway config | `docs/messaging.md` |
+| contacts: the address book, its vocabulary, a chamber's `contacts` entry | `docs/contacts.md` |
 | webapp/gateway changes, attachments, push, voice input | `docs/dashboard.md` |
 | importance, urgency, focus modes, the digest — the attention model | `docs/attention-model.md`, `docs/attention-migration.md` |
 | news ranking/ingestion/learning changes | `docs/news.md` |

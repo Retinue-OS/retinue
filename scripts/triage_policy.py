@@ -64,6 +64,16 @@ indexed in the life store for `who is a VIP?` queries.
 
 Retinue (Ara) is the sole writer; the gateways are readers. The `_generated`
 paths are framework-owned, in no chamber's git repo.
+
+**Contact-owned members.** A person filed in the address book
+(`scripts/contacts.py`, docs/contacts.md) can be a VIP; the person, not a
+handle, is then the truth, and :func:`sync_contacts` projects every handle of
+every VIP person into these files — messenger accounts as VIP handles, e-mail
+addresses as whitelisted addresses. They are written under a subject of their
+own (``…:contacts``), so the projection is rewritten wholesale without touching
+what was set by hand or learned from the Sent folder, and a reader that does
+not know the split (a gateway built before it) still sees every member: the
+loaders read the predicate and ignore the subject.
 """
 
 from __future__ import annotations
@@ -116,6 +126,8 @@ P_QUIETED_WILDCARD = KB + "triageQuietedWildcard"
 P_BLOCKED_GROUP = KB + "triageBlockedGroup"
 
 EMAIL_SUBJECT = "urn:retinue:triage:email-whitelist"
+# The subject suffix of the contact-owned members (see the module docstring).
+CONTACTS_SUFFIX = ":contacts"
 
 # The loaded e-mail policy: the whitelist pair plus one (exact, wildcard) pair
 # per group flag. One file holds all four classes, so every write goes through
@@ -126,13 +138,15 @@ EMAIL_SUBJECT = "urn:retinue:triage:email-whitelist"
 EmailPolicy = namedtuple(
     "EmailPolicy",
     "addresses wildcards news news_wildcards "
-    "quieted quieted_wildcards ignored ignored_wildcards",
-    defaults=(frozenset(),) * 6,
+    "quieted quieted_wildcards ignored ignored_wildcards contact_addresses",
+    defaults=(frozenset(),) * 7,
 )
 
 # The loaded messenger policy: the three group-flag sets plus the one sender set
-# that still decides anything.
-MessengerPolicy = namedtuple("MessengerPolicy", "ignored quieted news vip")
+# that still decides anything — set by hand (`vip`) or projected from the VIP
+# persons of the address book (`vip_contacts`); a sender is a VIP if either says so.
+MessengerPolicy = namedtuple("MessengerPolicy", "ignored quieted news vip vip_contacts",
+                             defaults=(frozenset(),))
 
 
 def _channel_subject(channel: str) -> str:
@@ -263,9 +277,12 @@ def load_email_policy(path: Path | None = None) -> EmailPolicy:
         # reaches triage" this way; read it as `ignored` so it keeps its meaning.
         P_BLOCKED_GROUP: "ignored",
     }
-    for _subj, pred, lit in _parse(path):
+    buckets["contact_addresses"] = set()
+    for subj, pred, lit in _parse(path):
         low = lit.strip().lower()
         key = by_predicate.get(pred)
+        if key == "addresses" and subj.endswith(CONTACTS_SUFFIX):
+            key = "contact_addresses"
         if low and key:
             buckets[key].add(low)
     return EmailPolicy(**buckets)
@@ -279,7 +296,7 @@ def load_email_whitelist(path: Path | None = None) -> tuple[set[str], set[str]]:
     :func:`save_email_policy`.
     """
     pol = load_email_policy(path)
-    return pol.addresses, pol.wildcards
+    return pol.addresses | pol.contact_addresses, pol.wildcards
 
 
 def render_email_policy(pol: EmailPolicy) -> str:
@@ -294,6 +311,7 @@ def render_email_policy(pol: EmailPolicy) -> str:
         (P_IGNORED_WILDCARD, pol.ignored_wildcards),
     )
     lines = [_triple(EMAIL_SUBJECT, pred, v) for pred, values in pairs for v in values]
+    lines += [_triple(EMAIL_SUBJECT + CONTACTS_SUFFIX, P_ADDRESS, v) for v in pol.contact_addresses]
     lines.sort()
     return "".join(line + "\n" for line in lines)
 
@@ -459,7 +477,7 @@ def email_gate_decision(
     news = (email_group_member(group, pol.news, pol.news_wildcards)
             or email_news_sender(addr, pol.news, pol.news_wildcards))
 
-    if email_whitelisted(addr, pol.addresses, pol.wildcards):
+    if email_whitelisted(addr, pol.addresses | pol.contact_addresses, pol.wildcards):
         dec = {"triage_now": True, "daily": True, "reason": "whitelisted"}
     elif email_group_member(group, pol.ignored, pol.ignored_wildcards):
         dec = {"triage_now": False, "daily": False, "reason": "group-ignored"}
@@ -515,19 +533,20 @@ def load_messenger_policy(
     quieted: set[str] = set()
     news: set[str] = set()
     vip: set[str] = set()
-    for _subj, pred, lit in _parse(path):
+    vip_contacts: set[str] = set()
+    for subj, pred, lit in _parse(path):
         val = lit.strip()
         if not val:
             continue
         if pred == P_VIP_HANDLE:
-            vip.add(_norm_handle(val))
+            (vip_contacts if subj.endswith(CONTACTS_SUFFIX) else vip).add(_norm_handle(val))
         elif pred in (P_IGNORED_GROUP, P_BLOCKED_GROUP):
             ignored.add(val)
         elif pred == P_QUIETED_GROUP:
             quieted.add(val)
         elif pred == P_NEWS_GROUP:
             news.add(val)
-    return MessengerPolicy(ignored, quieted, news, vip)
+    return MessengerPolicy(ignored, quieted, news, vip, vip_contacts)
 
 
 def render_messenger_policy(channel: str, pol: MessengerPolicy) -> str:
@@ -536,6 +555,7 @@ def render_messenger_policy(channel: str, pol: MessengerPolicy) -> str:
     lines += [_triple(subj, P_IGNORED_GROUP, g) for g in pol.ignored]
     lines += [_triple(subj, P_QUIETED_GROUP, g) for g in pol.quieted]
     lines += [_triple(subj, P_NEWS_GROUP, g) for g in pol.news]
+    lines += [_triple(subj + CONTACTS_SUFFIX, P_VIP_HANDLE, h) for h in pol.vip_contacts]
     lines.sort()
     return "".join(line + "\n" for line in lines)
 
@@ -604,7 +624,7 @@ def gate_decision(
     pol = load_messenger_policy(channel, path=path)
     grp = group_id.strip() if group_id else None
     news = bool(grp and grp in pol.news)
-    vip = _norm_handle(sender) in pol.vip
+    vip = _norm_handle(sender) in (set(pol.vip) | set(pol.vip_contacts))
 
     if grp and grp in pol.ignored:
         dec = {"forward": False, "delivered_if_held": True,
@@ -684,10 +704,45 @@ def _mutate_messenger(channel, *, ig_add=(), ig_del=(), q_add=(), q_del=(),
     quieted -= {g.strip() for g in ig_add if g.strip()}
     write_if_changed(
         render_messenger_policy(
-            channel, MessengerPolicy(ignored, quieted, news, vip)
+            channel, MessengerPolicy(ignored, quieted, news, vip, pol.vip_contacts)
         ),
         messenger_policy_path(channel),
     )
+
+
+def messenger_policy_channels() -> list[str]:
+    """Every channel with a policy directory on this side — the gateways'
+    mounted volumes, plus any channel a policy was already written for."""
+    base = os.environ.get("TRIAGE_MESSENGER_DIR")
+    root = Path(base) if base else (CHAMBERS_DIR / "_generated" / "messenger")
+    try:
+        return sorted(p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    except OSError:
+        return []
+
+
+def sync_contacts(vip_handles: dict[str, set[str]], emails: set[str]) -> list[str]:
+    """Project the address book's VIP persons into the gate: ``vip_handles``
+    maps a channel to the handles of every VIP person on it, ``emails`` holds
+    their addresses. Replaces the contact-owned members wholesale — hand-set
+    VIPs and the Sent-derived whitelist stay as they are — and writes a file
+    only when its bytes change. A channel with no policy directory yet is
+    written only when it has members. Returns the files written."""
+    written = []
+    channels = set(messenger_policy_channels()) | {c for c, hs in vip_handles.items() if hs}
+    for channel in sorted(channels):
+        want = {_norm_handle(h) for h in vip_handles.get(channel, ()) if h.strip()}
+        path = messenger_policy_path(channel)
+        pol = load_messenger_policy(channel, path=path)
+        if set(pol.vip_contacts) == want:
+            continue
+        if write_if_changed(render_messenger_policy(channel, pol._replace(vip_contacts=want)), path):
+            written.append(str(path))
+    pol = load_email_policy()
+    want = {e.strip().lower() for e in emails if e.strip()}
+    if set(pol.contact_addresses) != want and save_email_policy(pol._replace(contact_addresses=want)):
+        written.append(str(email_whitelist_path()))
+    return written
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -729,7 +784,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "show-email":
         pol = load_email_policy()
-        for a in sorted(pol.addresses | pol.wildcards):
+        for a in sorted(pol.addresses | pol.contact_addresses | pol.wildcards):
             print(f"whitelist\t{a}")
         for a in sorted(pol.news | pol.news_wildcards):
             print(f"news\t{a}")
@@ -768,6 +823,8 @@ def main(argv: list[str] | None = None) -> int:
         pol = load_messenger_policy(args.channel)
         for h in sorted(pol.vip):
             print(f"vip\t{h}")
+        for h in sorted(set(pol.vip_contacts) - set(pol.vip)):
+            print(f"vip\t{h}\t(address book)")
         for g in sorted(pol.ignored):
             print(f"ignore\t{g}")
         for g in sorted(pol.quieted):
@@ -793,7 +850,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "check-handle":
         # One question left about a sender: does a model work their messages?
         pol = load_messenger_policy(args.channel)
-        vip = _norm_handle(args.handle) in pol.vip
+        vip = _norm_handle(args.handle) in (set(pol.vip) | set(pol.vip_contacts))
         print("vip" if vip else "not-vip")
         return 0 if vip else 3
     return 0
