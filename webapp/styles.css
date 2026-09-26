@@ -9,9 +9,9 @@
  *    height (--frame-h from viewport.js, else 100dvh). The .deck / .col
  *    wrappers in index.html are display:contents here, so the cards stack in
  *    main's column: the navigation, the attention list (whose first line is
- *    the mode), news, the dock. The page never scrolls — the attention list
- *    scrolls inside its own region and the news inside a capped share of the
- *    column, so the navigation and the dock always stay in view. The full
+ *    the mode), the dock. The page never scrolls — the attention list
+ *    scrolls inside its own region, so the navigation and the dock always
+ *    stay in view. No news on the home: it lives on its own page. The full
  *    list pages (chats, conversations, news, projects) keep a scrolling
  *    document on the phone, under the pinned navigation.
  *  - Thread/composer open: the frame locks to exactly 100dvh and everything
@@ -19,10 +19,9 @@
  *    and a pinned composer. The thread viewer on the home is otherwise
  *    invisible — the attention list is the list.
  *  - Wide screens (>=1000px and tall enough): a fixed app frame. The column
- *    becomes a real one — the attention list above the news — each region
- *    scrolling internally, the boundary a draggable splitter (layout.js
- *    persists the size per device, VS Code style; double-click resets). The
- *    list drops its dashboard row caps here (see isWideFrame in
+ *    becomes a real one, each region scrolling internally, boundaries
+ *    draggable splitters (layout.js persists sizes per device, VS Code
+ *    style; double-click resets). The list drops its dashboard row caps here (see isWideFrame in
  *    components/base.js), so the room carries content rather than empty
  *    space. */
 :root {
@@ -88,7 +87,7 @@ retinue-nav {
 /* Phone layout: the deck wrappers dissolve, cards join main's flex column
    directly, and the splitters (a wide-layout affordance) do not exist. The
    home locks its frame to the visible height so nothing scrolls but the
-   list (and the news inside its share); the visible height can be less
+   list; the visible height can be less
    than 100dvh, so the base min-height must not hold the frame taller. */
 .deck, .col { display: contents; }
 main:has(> .deck) {
@@ -103,19 +102,17 @@ main:has(> .deck) {
 /* The attention list takes the leftover height and scrolls inside it (the
    element's own .list rule). The thread viewer is invisible until a thread or
    the composer is open (the immersive rules below), and then takes the
-   frame. The news on a phone is a capped, self-scrolling share of the
-   column; an empty feed hides it (the explicit display:none matters because
-   the element's own :host{display:block} outranks the UA [hidden] rule). */
+   frame. An empty news feed (on its own page) hides the card; the explicit
+   display:none matters because the element's own :host{display:block}
+   outranks the UA [hidden] rule. */
 retinue-attention { flex: 1; min-height: 0; }
 retinue-conversations[viewer][data-view="list"] { display: none; }
 retinue-conversations[viewer] { flex: 1; min-height: 0; }
 retinue-projects { flex: none; }
-retinue-news { flex: 0 0 auto; max-height: 28%; overflow-y: auto; overscroll-behavior: contain; }
 retinue-news[hidden] { display: none; }
 /* Chats card: natural height in the phone stack, like the other list cards. */
 retinue-chats { flex: none; }
-/* Phone stacking: the list, then news (read-mostly), then the dock. */
-retinue-news { order: 1; }
+/* Phone stacking: the list, then the dock. */
 retinue-app-launcher { order: 2; }
 
 /* App dock (slotted content lives in the light DOM, so it is styled here). */
@@ -182,8 +179,8 @@ retinue-project-page { flex: 1; min-height: 0; }
 /* Wide-and-tall screens: a fixed app frame whose regions are real, resizable
    columns. Wide-but-short windows keep the single-column scroll layout above
    instead. Sizes come from two custom properties layout.js sets and persists —
-   --side-w (projects column width) and --news-h (news region height); with
-   neither set, the CSS defaults below apply. */
+   --side-w (projects column width) and --chats-h (chats region height);
+   with neither set, the CSS defaults below apply. */
 @media (min-width: 1000px) and (min-height: 480px) {
   main {
     /* Fill the window rather than centring a fixed column with dead margins
@@ -195,21 +192,14 @@ retinue-project-page { flex: 1; min-height: 0; }
     height: var(--frame-h, 100dvh);
   }
 
-  /* The deck between header and dock: one column, the attention list over
-     the news, the boundary a splitter. Visual gaps come from the splitters
+  /* The deck between header and dock: one column, the attention list (and
+     the thread viewer). Where a splitter is declared, visual gaps come from the splitters
      themselves, so dragging happens exactly where the boundary is seen. */
   .deck { display: flex; flex: 1; min-height: 0; align-items: stretch; }
   .col { display: flex; flex-direction: column; min-height: 0; }
   .col-main { flex: 1 1 0; min-width: 0; }
-  /* Defaults deliberately favor the attention list (the interactive surface)
-     over news (read-mostly): roughly two thirds to one third. */
   .col-main retinue-attention { flex: 1 1 auto; min-height: 0; }
   .col-main retinue-conversations { flex: 1 1 auto; min-height: 0; }
-  .col-main retinue-news { flex: 0 0 auto; height: var(--news-h, 34%);
-                           min-height: 0; max-height: 75%; overflow-y: auto; }
-  /* The user can drag the news region shut (layout.js snaps small heights to
-     closed); the splitter stays as the handle to pull it open again. */
-  .col-main[data-news="closed"] retinue-news { display: none; }
   /* Splitters: a generous hit area around a hairline, VS Code style. */
   .splitter { display: block; flex: none; position: relative; z-index: 2;
               touch-action: none; user-select: none; -webkit-user-select: none; }
@@ -221,12 +211,6 @@ retinue-project-page { flex: 1; min-height: 0; }
   .splitter:hover::before, .splitter:focus-visible::before,
   .splitter.dragging::before { background: var(--accent); }
   .splitter:focus-visible { outline: none; }
-  /* No news to show (empty feed hides the card): no box holding 34% of the
-     column, and no boundary to drag either. The explicit display:none matters
-     because the element's own :host{display:block} outranks the UA [hidden]
-     rule. */
-  .col-main retinue-news[hidden] { display: none; }
-  .col-main:has(retinue-news[hidden]) .splitter-h { display: none; }
 
   retinue-app-launcher { align-self: center; width: 100%; max-width: 560px; }
 
