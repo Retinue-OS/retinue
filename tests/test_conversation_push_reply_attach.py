@@ -71,7 +71,8 @@ def test_refuses_other_options(tmp: Path):
     (tmp / "ok.txt").write_text("x")
     manifest = tmp / "manifest-mixed"
     for extra in (["some text"], ["--thread", "a" * 32], ["--attach", "ok.txt"],
-                  ["--title", "T"]):
+                  ["--title", "T"], ["--timeout", "1"], ["--importance", "4"],
+                  ["--critical"], ["--tag", "friends"]):
         r = _run(["--reply-attach", "ok.txt", *extra], tmp, manifest)
         assert r.returncode == 2, (extra, r.returncode, r.stderr)
     assert not manifest.exists()

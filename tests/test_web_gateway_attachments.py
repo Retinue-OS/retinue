@@ -28,6 +28,7 @@ import importlib.util
 import io
 import json
 import os
+import uuid
 import sys
 import tempfile
 import types
@@ -262,6 +263,39 @@ def _run_worker(wg, result: dict) -> dict:
     return {"conv": wg._load_conv(conv["id"]), "pushed": pushed}
 
 
+def test_session_controlled_paths_cannot_pin_the_worker(wg, tmp: Path):
+    # A FIFO where the manifest or an attachment should be must be refused at
+    # once, not block the conversation worker waiting for a writer. Run in a
+    # thread with a deadline so a regression fails instead of hanging CI.
+    import threading
+    fifo = tmp / "fifo"
+    os.mkfifo(fifo)
+    manifest_fifo = tmp / "manifest-fifo"
+    os.mkfifo(manifest_fifo)
+    real = tmp / "real.txt"
+    real.write_text("hello")
+    link_manifest = tmp / "manifest-link"
+    target = tmp / "manifest-target"
+    target.write_text(str(real) + "\n")
+    link_manifest.symlink_to(target)
+    out: dict = {}
+
+    def run():
+        out["manifest"] = wg._read_reply_manifest(manifest_fifo)
+        out["link"] = wg._read_reply_manifest(link_manifest)
+        out["stored"] = wg._store_reply_files(uuid.uuid4().hex, [str(fifo), str(real)])
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(10)
+    assert not t.is_alive(), "reading a FIFO blocked the worker"
+    assert out["manifest"] == [] and not manifest_fifo.exists()
+    assert out["link"] == [], "a symlinked manifest must not be followed"
+    assert target.exists(), "only the link itself is removed"
+    assert [m["filename"] for m in out["stored"]] == ["real.txt"], out["stored"]
+    print("ok: FIFOs and a symlinked manifest are refused without blocking")
+
+
 def test_worker_attaches_reply_files_to_the_reply(wg, tmp: Path):
     chart = tmp / "chart.png"
     chart.write_bytes(_png(10, 10))
@@ -299,6 +333,7 @@ def main():
         scratch.mkdir()
         test_reply_manifest_is_consumed_once(wg, scratch)
         test_reply_files_are_stored_and_bad_entries_skipped(wg, scratch)
+        test_session_controlled_paths_cannot_pin_the_worker(wg, scratch)
         test_worker_attaches_reply_files_to_the_reply(wg, scratch)
     print("all web-gateway attachment tests passed")
 

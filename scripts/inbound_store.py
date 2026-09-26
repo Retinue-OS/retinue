@@ -608,7 +608,8 @@ def _image_dimensions(data: bytes) -> tuple[int, int] | None:
     """Best-effort (width, height) from an image blob's header, else None.
 
     A deliberately tiny magic-number parser — PNG (IHDR), GIF (logical screen
-    descriptor), JPEG (the first SOF segment), WebP (VP8 / VP8L / VP8X) — so
+    descriptor), JPEG (the first SOF segment), WebP (VP8 / VP8L / VP8X), AVIF
+    (the first ``ispe`` image-spatial-extents property) — so
     the chat surface can tell the client an image's intrinsic size and the
     bubble reserves its box before the bytes arrive. Detection is by magic, not
     by declared content type, so non-images (voice notes) simply miss. Never
@@ -661,6 +662,22 @@ def _image_dimensions(data: bytes) -> tuple[int, int] | None:
             if fourcc == b"VP8L" and data[20] == 0x2F:  # lossless: 14+14 bits
                 bits = int.from_bytes(data[21:25], "little")
                 return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+        if len(data) >= 16 and data[4:8] == b"ftyp":
+            # AVIF: an ISO-BMFF file whose ftyp box lists an AVIF brand. The
+            # size lives in an `ispe` property (version/flags(4), width(4 BE),
+            # height(4 BE)) in the meta box near the start; the first one is
+            # the primary item's in the files encoders write.
+            ftyp_len = int.from_bytes(data[:4], "big")
+            brands = data[8:12] + data[16:max(16, min(ftyp_len, 256))]
+            if not any(brands[i:i + 4] in (b"avif", b"avis")
+                       for i in range(0, len(brands) - 3, 4)):
+                return None
+            at = data.find(b"ispe", 0, 1 << 16)
+            if at < 0 or at + 16 > len(data):
+                return None
+            w = int.from_bytes(data[at + 8:at + 12], "big")
+            h = int.from_bytes(data[at + 12:at + 16], "big")
+            return (w, h) if w and h else None
         return None
     except Exception:  # noqa: BLE001 - sniffing must never cost the blob
         return None

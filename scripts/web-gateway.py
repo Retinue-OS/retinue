@@ -2169,6 +2169,43 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
 # At most this many files ride on one reply; the rest of a runaway manifest is
 # ignored rather than filling the thread (and the disk) with copies.
 MAX_REPLY_ATTACHMENTS = 20
+# A manifest is a list of paths; anything larger is not one.
+MAX_REPLY_MANIFEST_BYTES = 64 * 1024
+
+
+def _read_regular_file(path, limit: int, *, follow: bool = True) -> bytes:
+    """The bytes of the regular file at ``path``, at most ``limit`` of them.
+
+    For paths a session controls: the path is opened non-blocking (a FIFO
+    opens at once instead of waiting for a writer) and what was actually
+    opened is checked with fstat, so neither a FIFO, device or directory, nor
+    one swapped in between a check and the open, can pin the worker reading
+    it. ``follow=False`` refuses a symlink as the last component. Anything
+    that does not qualify — including a file over ``limit`` — raises
+    OSError."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if not follow:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_size > limit:
+            raise OSError(f"larger than {limit} bytes")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= limit:
+            chunk = os.read(fd, min(1 << 20, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > limit:
+            raise OSError(f"larger than {limit} bytes")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def _read_reply_manifest(path: Path | None) -> list[str]:
@@ -2178,11 +2215,14 @@ def _read_reply_manifest(path: Path | None) -> list[str]:
     one path per line, at RETINUE_REPLY_ATTACHMENTS_FILE. It is consumed
     exactly once: read, then deleted, so a leftover can never ride on a later
     turn. A missing manifest (the session attached nothing) is the common
-    case and yields []."""
+    case and yields []. The session can write where the manifest lives, so it
+    is read like any session-controlled path (_read_regular_file), and not
+    through a symlink."""
     if path is None:
         return []
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
+        raw = _read_regular_file(path, MAX_REPLY_MANIFEST_BYTES, follow=False).decode(
+            "utf-8", errors="replace")
     except FileNotFoundError:
         return []
     except OSError as exc:
@@ -2223,14 +2263,7 @@ def _store_reply_files(cid: str, paths: list[str]) -> list[dict]:
             continue
         seen.add(real)
         try:
-            # Checked before opening: open() on a FIFO would block the worker.
-            st = os.stat(real)
-            if not stat.S_ISREG(st.st_mode):
-                raise OSError("not a regular file")
-            if st.st_size > MAX_ATTACHMENT_BYTES:
-                raise OSError(f"larger than {MAX_ATTACHMENT_BYTES} bytes")
-            with open(real, "rb") as fh:
-                blob = fh.read(MAX_ATTACHMENT_BYTES + 1)
+            blob = _read_regular_file(real, MAX_ATTACHMENT_BYTES)
         except OSError as exc:
             print(f"[web-gateway] {cid}: reply attachment {entry!r} skipped: {exc}",
                   flush=True)
@@ -4584,49 +4617,53 @@ def send_message(message: str, display_question: str | None = None,
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
 
-            # Remember the resume point and prompt the final first-pass run
-            # used, so an escalated re-run replays exactly that turn on the
-            # frontier tier — abandoning junior's fork, never stacking on it.
-            if resume and _session_is_fresh(state, session_key):
-                session_action = "resumed"
-                run_resume, run_prompt = state["session_id"], message
-                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
-                                effective_model)
-                if result.returncode != 0 and _resume_refused(result):
-                    # The state file outlived the transcript. Start over rather
-                    # than hand the user an error for a session they never chose.
-                    print(
-                        f"[web-gateway] session {state['session_id']} is gone — "
-                        f"starting a fresh one for {session_key}",
-                        flush=True,
-                    )
-                    session_action = "restarted"
-                    run_resume, run_prompt = None, restart_message or message
+            try:
+                # Remember the resume point and prompt the final first-pass run
+                # used, so an escalated re-run replays exactly that turn on the
+                # frontier tier — abandoning junior's fork, never stacking on it.
+                if resume and _session_is_fresh(state, session_key):
+                    session_action = "resumed"
+                    run_resume, run_prompt = state["session_id"], message
                     result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
                                     effective_model)
-            else:
-                session_action = "new"
-                run_resume, run_prompt = None, message
-                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
-                                effective_model)
+                    if result.returncode != 0 and _resume_refused(result):
+                        # The state file outlived the transcript. Start over rather
+                        # than hand the user an error for a session they never chose.
+                        print(
+                            f"[web-gateway] session {state['session_id']} is gone — "
+                            f"starting a fresh one for {session_key}",
+                            flush=True,
+                        )
+                        session_action = "restarted"
+                        run_resume, run_prompt = None, restart_message or message
+                        result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                        effective_model)
+                else:
+                    session_action = "new"
+                    run_resume, run_prompt = None, message
+                    result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                    effective_model)
 
-            escalated = False
-            if escalate_flag is not None and escalate_flag.exists():
-                escalate_flag.unlink(missing_ok=True)
-                if result.returncode == 0:
-                    escalated = True
-                    print(f"[web-gateway] {session_key}: junior escalated — "
-                          f"re-running on {FRONTIER_MODEL}", flush=True)
-                    result = _spawn(
-                        _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
-                        FRONTIER_MODEL)
+                escalated = False
+                if escalate_flag is not None and escalate_flag.exists():
+                    escalate_flag.unlink(missing_ok=True)
+                    if result.returncode == 0:
+                        escalated = True
+                        print(f"[web-gateway] {session_key}: junior escalated — "
+                              f"re-running on {FRONTIER_MODEL}", flush=True)
+                        result = _spawn(
+                            _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
+                            FRONTIER_MODEL)
 
-            # Only the kept run's manifest is read; the discarded runs' ones
-            # are dropped unread. A failed run's files go with its reply.
-            reply_files = (_read_reply_manifest(manifests[-1])
-                           if manifests and result.returncode == 0 else [])
-            for stale in manifests:
-                stale.unlink(missing_ok=True)
+                # Only the kept run's manifest is read; the discarded runs' ones
+                # are dropped unread. A failed run's files go with its reply.
+                reply_files = (_read_reply_manifest(manifests[-1])
+                               if manifests and result.returncode == 0 else [])
+            finally:
+                # Every spawn's manifest goes, whatever happened — a spawn
+                # that raised included.
+                for stale in manifests:
+                    stale.unlink(missing_ok=True)
 
             if result.returncode != 0:
                 err_detail = result.stderr.strip()

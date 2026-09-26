@@ -117,7 +117,7 @@ _THREAD_ID_RE = re.compile(r"[0-9a-f]{32}")
 REPLY_MANIFEST_VAR = "RETINUE_REPLY_ATTACHMENTS_FILE"
 
 
-def _reply_attach(args) -> int:
+def _reply_attach(args, defaults: dict) -> int:
     """List files for the current turn's reply in the gateway's manifest.
 
     No request is made: the gateway reads the manifest once the session ends
@@ -125,12 +125,16 @@ def _reply_attach(args) -> int:
     the turn's reply is discarded (an escalated junior turn). Paths are made
     absolute here, since the gateway does not share this process's cwd, and
     checked here too, so a typo fails now rather than silently at turn end."""
-    others = [args.message.strip(), args.title, args.thread, args.archived,
-              args.muted, args.on_behalf_of, args.agent, args.key,
-              args.context, args.attach, args.url]
-    if any(v not in (None, "", []) for v in others):
-        print("conversation-push: --reply-attach takes only file paths; your reply's "
-              "text is your answer itself", file=sys.stderr)
+    # Any option given besides the paths is refused rather than silently
+    # dropped — judged against the parser's defaults, so an option added to
+    # the parser later is covered without a list to keep in step.
+    given = [f"--{dest.replace('_', '-')}" for dest, default in defaults.items()
+             if dest not in ("reply_attach", "message")
+             and getattr(args, dest, default) != default]
+    if given or args.message.strip():
+        what = ", ".join(given) if given else "message text"
+        print(f"conversation-push: --reply-attach takes only file paths (got {what}); "
+              "your reply's text is your answer itself", file=sys.stderr)
         return 2
     manifest = os.environ.get(REPLY_MANIFEST_VAR, "").strip()
     if not manifest:
@@ -239,7 +243,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.reply_attach:
-        return _reply_attach(args)
+        return _reply_attach(args, vars(parser.parse_args([])))
 
     message = args.message.strip()
     flags_only = args.archived is not None or args.muted is not None

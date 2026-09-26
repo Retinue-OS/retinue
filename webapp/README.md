@@ -11,7 +11,7 @@ a Progressive Web App on the phone home screen.
 - **A conversation** (`components/conversation.js`) is one element,
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
   buttons on quotes and code, click-to-fill chips, attachments — images the
-  gateway serves inline preview in the bubble, sized from the dimensions it
+  gateway serves inline get a preview in the bubble, sized from the dimensions it
   recorded at store time — model and cost meta), the pending state while Ara answers, the composer with text,
   file attachments (picked or pasted) and voice dictation, the model picker,
   and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
