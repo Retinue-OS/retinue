@@ -106,7 +106,14 @@ writing to a person but its sphere is `unknown`, which no mode admits — it is
 listed, carried by the next digest, and never rings. A VIP, the other way
 round, rings in every mode unless the chat is muted. The sheet then leads with
 the **contact card**: a name, the sphere they belong to, any further spheres,
-and optionally a permit to interrupt right now. Saving it
+and optionally a permit to interrupt right now. The name starts as the one
+the messenger passed along with the message (the chat's title, unless that is
+only the handle). *Same person as* picks an existing contact instead
+(`GET /contacts`: every card, one entry per name, plus the names the chambers'
+address books know): their name and spheres fill the card, and their other
+chats are sent as `same_as`, so one person on two handles — a phone number and
+a WhatsApp `@lid`, Signal and WhatsApp — is one individual (`owl:sameAs` in
+the address book). Saving it
 (`POST /chats/<id>/contact`) names the chat, teaches the attention profile
 their spheres (carrying over whatever the bare number had already been taught),
 re-judges the open item — so their next message is ranked by that sphere —

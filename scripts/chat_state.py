@@ -421,7 +421,8 @@ class ChatStateStore:
             return doc
 
     def set_contact(self, chat_id: str, *, name: str,
-                    sphere: str | None = None, tags=(), at: str | None = None) -> dict:
+                    sphere: str | None = None, tags=(), at: str | None = None,
+                    same_as=()) -> dict:
         """File this chat's peer in the address book, or clear the card with
         an empty name.
 
@@ -435,7 +436,12 @@ class ChatStateStore:
         last said about the sender, and the card is the *user's* word about
         the person. A named chat is not screened because a card exists (see
         `chat_is_unknown`), so removing the card falls back on what the rail
-        said rather than a guess made here."""
+        said rather than a guess made here.
+
+        ``same_as`` names the other chats whose cards are this same person —
+        one person, several handles (a phone number and a WhatsApp ``@lid``,
+        Signal and WhatsApp). The caller vouches that each is a chat with a
+        card; this store only keeps the list."""
         with self._lock:
             doc = self._read(chat_id)
             clean = " ".join(str(name or "").split())
@@ -453,6 +459,9 @@ class ChatStateStore:
                 "tags": [t for t in (str(x).strip().lower() for x in tags) if t],
                 "at": at or iso_z(),
             }
+            linked = [c for c in dict.fromkeys(str(x) for x in same_as or ()) if c and c != chat_id]
+            if linked:
+                doc["contact"]["same_as"] = linked
             self._write(doc)
             return doc
 

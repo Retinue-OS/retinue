@@ -6877,6 +6877,7 @@ def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
 VCARD = "http://www.w3.org/2006/vcard/ns#"
 _TTL_HEADER = (f"@prefix kb: <{attention_policy.KB}> .\n"
                f"@prefix vcard: <{VCARD}> .\n"
+               "@prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
                "@prefix sphere: <urn:retinue:sphere:> .\n"
                "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n")
 # A handle that is a phone number also gets the standard tel: property, so
@@ -6913,11 +6914,50 @@ def _contacts_turtle(docs: dict) -> str:
         if card.get("sphere"):
             props.append(f"kb:sphere sphere:{card['sphere']}")
         props += [f"kb:tag sphere:{tag}" for tag in sorted(set(card.get("tags") or []))]
+        # The same person on another handle: one individual, several URIs.
+        for other in sorted(set(card.get("same_as") or [])):
+            other_parts = chat_state_mod.split_chat_id(other)
+            if other_parts is not None:
+                props.append(f"owl:sameAs <{_contact_uri(*other_parts)}>")
         if card.get("at"):
             props.append(f"kb:addedAt {_ttl_literal(card['at'])}^^xsd:dateTime")
         blocks.append(f"<{_contact_uri(channel, handle)}>\n"
                       + " ;\n".join("    " + prop for prop in props) + " .")
     return _TTL_HEADER + "\n\n".join(sorted(blocks)) + ("\n" if blocks else "")
+
+
+def _contacts_list() -> list[dict]:
+    """The address book as the contact form offers it: every card the
+    dashboard holds, one entry per person (cards sharing a name, or linked by
+    `same_as`, are one person with several chats), then the names the
+    chambers' own address books know that no card has yet — a name only,
+    which is still what the attention profile keys on."""
+    people: dict[str, dict] = {}
+    for chat_id, doc in _CHAT_STATE.all().items():
+        card = doc.get("contact") or {}
+        name = str(card.get("name") or "").strip()
+        if not name or doc.get("group"):
+            continue
+        parts = chat_state_mod.split_chat_id(chat_id)
+        if parts is None:
+            continue
+        person = people.setdefault(name.casefold(), {
+            "name": name, "sphere": None, "tags": [], "chats": [], "at": ""})
+        # The most recently filed card speaks for the person's spheres.
+        if str(card.get("at") or "") >= person["at"]:
+            person.update(sphere=card.get("sphere") or person["sphere"],
+                          tags=list(card.get("tags") or []), at=str(card.get("at") or ""))
+        person["chats"].append({"id": chat_id, "channel": parts[0], "handle": parts[1]})
+    for name in _contact_names(limit=1000):
+        people.setdefault(name.casefold(), {"name": name, "sphere": None, "tags": [],
+                                            "chats": [], "at": ""})
+    out = []
+    for person in people.values():
+        person.pop("at", None)
+        person["chats"].sort(key=lambda c: c["id"])
+        out.append(person)
+    out.sort(key=lambda p: p["name"].casefold())
+    return out
 
 
 def _contacts_emit() -> None:
@@ -8270,7 +8310,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_chat_contact(self, raw_id: str) -> None:
         """The contact card: say who this number is, and where they belong
-        (body {name, sphere?, tags?, permit?}).
+        (body {name, sphere?, tags?, permit?, same_as?}). `same_as` lists the
+        chats of an existing contact this number also belongs to (GET
+        /contacts), so one person on two handles is one individual.
 
         The answer to the message from a number nobody knows. Until it is
         filled in, a sender the dashboard knows nothing about is *screened*:
@@ -8309,6 +8351,14 @@ class Handler(BaseHTTPRequestHandler):
         # Tags are further spheres: the same words, or the address book's
         # `sphere:<tag>` would not parse.
         tags = list(dict.fromkeys(t for t in (attention_policy.sphere_id(x) for x in (payload.get("tags") or [])) if t))
+        # An existing contact this handle also belongs to: only chats that
+        # carry a card can be the same person as anyone.
+        raw_same = payload.get("same_as") or []
+        if isinstance(raw_same, str):
+            raw_same = [raw_same]
+        same_as = [c for c in dict.fromkeys(str(x) for x in raw_same)
+                   if c != chat_id and chat_state_mod.split_chat_id(c) is not None
+                   and (_CHAT_STATE.get(c).get("contact") or {}).get("name")] if name else []
         channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
         before = _CHAT_STATE.get(chat_id)
         was = _chat_display_name(before, channel, key)
@@ -8322,7 +8372,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "unknown sphere"})
                 return
             doc = _CHAT_STATE.set_contact(chat_id, name=name, sphere=sphere, tags=tags,
-                                          at=now.isoformat())
+                                          at=now.isoformat(), same_as=same_as)
             _chats_cache_invalidate()
             learned: list[str] = []
             if name and name != was:
@@ -9878,6 +9928,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # transport/parse — be honest, don't fake data
                 self._send_json(502, {"error": "life store unreachable",
                                       "detail": str(exc)})
+            return
+        if conv_path in ("/contacts", "/contacts/"):
+            self._send_json(200, {"contacts": _contacts_list()})
             return
         if conv_path in ("/chats", "/chats/"):
             self._handle_chats_list()

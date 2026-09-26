@@ -17,7 +17,9 @@ covers, end to end through HTTP:
   breaks through in Off, the user's own reply settles the chat's item;
 - a direct sender nothing vouches for (no VIP flag, no card) is screened into
   the `unknown` sphere, and the contact card names them, teaches the profile,
-  writes the address book and lets their next message through; a VIP rings
+  writes the address book and lets their next message through; a known
+  person on a new handle is filed as the same contact (GET /contacts,
+  `same_as`, owl:sameAs); a VIP rings
   in any mode, unless their chat is muted;
 - a project from the store carries its frontmatter's importance and deadline;
 - the tick: the 12:00 digest releases what Focused held, the sweep pushes
@@ -589,6 +591,43 @@ def test_a_person_in_several_spheres(base, wg):
     _http(base, "POST", "/attention/items/done", {"id": cid})
     _mode(base, "")
     print("ok test_a_person_in_several_spheres")
+
+
+def test_a_second_handle_for_a_known_contact(base, wg):
+    """A known person writes from a new handle: the row carries the name the
+    messenger passed along (the form's default), GET /contacts offers the
+    existing card, and filing the handle as theirs links the two in the
+    address book."""
+    rita_old = "signal:+41791000077"
+    handle = "+41791000078"
+    chat = "signal:" + handle
+    cid = "chat:" + chat
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, handle, "Rita", "New number, same Rita.", "2026-09-05T12:00:00Z", gate=gate)
+    where, row = _find(_sections(base), cid)
+    assert row["unknown_sender"] is True and row["title"] == "Rita" and row["handle"] == handle, row
+
+    status, out = _http(base, "GET", "/contacts")
+    assert status == 200, out
+    rita = next(c for c in out["contacts"] if c["name"] == "Rita Keller")
+    assert rita["sphere"] == "customers" and rita["tags"] == ["friends"], rita
+    assert rita["chats"] == [{"id": rita_old, "channel": "signal", "handle": "+41791000077"}], rita
+
+    # Picked in the form: her name, her spheres, her other chat — and a chat
+    # without a card is nobody to be the same as.
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Rita Keller", "sphere": "customers", "tags": ["friends"],
+                         "same_as": [rita_old, "signal:+41799999999", chat]})
+    assert status == 200, out
+    assert out["contact"]["same_as"] == [rita_old], out["contact"]
+    assert out["item"]["unknown_sender"] is False and out["item"]["title"] == "Rita Keller", out["item"]
+    card = wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
+    assert "owl:sameAs <urn:retinue:contact:signal%3A%2B41791000077>" in card, card
+    status, out = _http(base, "GET", "/contacts")
+    rita = next(c for c in out["contacts"] if c["name"] == "Rita Keller")
+    assert [c["id"] for c in rita["chats"]] == [rita_old, chat], rita
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    print("ok test_a_second_handle_for_a_known_contact")
 
 
 def test_a_message_judgement_is_its_own(base, wg):
@@ -1181,6 +1220,7 @@ def main():
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
         test_a_person_in_several_spheres(base, wg)
+        test_a_second_handle_for_a_known_contact(base, wg)
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)

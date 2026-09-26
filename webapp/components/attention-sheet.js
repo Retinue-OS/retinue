@@ -11,7 +11,8 @@
 //   POST /attention/permits            {sender, on}   a sender's permit in the mode in force
 //   POST /attention/admit              {sphere, on}   a Focus rule of the mode in force
 //   POST /attention/modes              {mode, tag_on | tag_off}  a word it admits wherever it stands
-//   POST /chats/<id>/contact           {name, sphere, tags}  the contact card
+//   GET  /contacts                     the address book the card can pick from
+//   POST /chats/<id>/contact           {name, sphere, tags, same_as}  the contact card
 // A chat whose sender the delivery gate did not recognise is screened — sphere
 // `unknown`, which no mode admits — and the sheet leads with the contact card
 // instead of the corrections: naming someone is the correction that matters.
@@ -180,7 +181,16 @@ class RetinueAttentionSheet extends HTMLElement {
     // jump), so it writes straight into the pending card.
     this.shadowRoot.addEventListener('input', (e) => {
       const el = e.target.closest('[data-set="contact-name"]');
-      if (el && this._form) this._form.name = el.value;
+      if (el && this._form) {
+        this._form.name = el.value;
+        // Renamed away from the picked person: a new person after all.
+        if (this._form.picked && el.value.trim().toLowerCase() !== this._form.picked) {
+          this._form.sameAs = [];
+          this._form.picked = '';
+          const sel = this.shadowRoot.querySelector('[data-set="contact-existing"]');
+          if (sel) sel.value = '';
+        }
+      }
     });
   }
 
@@ -325,7 +335,11 @@ class RetinueAttentionSheet extends HTMLElement {
         }
         break;
       }
-      case 'contact-edit': this._form = this._blankCard(item); this.render(); break;
+      case 'contact-edit':
+        this._form = this._blankCard(item);
+        this.render();
+        this._loadContacts();
+        break;
       case 'contact-cancel': this._form = null; this.render(); break;
       case 'contact-sphere':
         if (this._form) { this._form.sphere = el.getAttribute('data-sphere'); this.render(); }
@@ -365,6 +379,8 @@ class RetinueAttentionSheet extends HTMLElement {
     } else if (what === 'sphere-new') {
       // The item's own new sphere: create it, then move the item into it.
       this._createSphere(el.value, (id) => this._act('correct', { sphere: id }));
+    } else if (what === 'contact-existing') {
+      this._pickContact(el.value);
     } else if (what === 'contact-sphere-new') {
       // The card's new sphere: the main one if none is picked yet, else a further one.
       this._createSphere(el.value, (id) => {
@@ -395,15 +411,58 @@ class RetinueAttentionSheet extends HTMLElement {
   }
 
   // The card the form starts from: what the chat already says about this
-  // person, or an empty one for a number nobody has named.
+  // person — the card, else the name the messenger passed along with the
+  // message (the chat's title, unless that is only the handle) — or an
+  // empty one for a number nobody has named.
   _blankCard(item) {
     const card = (item && item.contact) || {};
+    const title = (item && item.title) || '';
+    const offered = title && title !== (item.handle || '') ? title : '';
     return {
-      name: card.name || (item && !item.unknown_sender ? item.title : '') || '',
+      name: card.name || offered,
       sphere: card.sphere || (item && item.sphere !== 'unknown' ? item.sphere : ''),
       tags: [...(card.tags || [])],
       permit: false,
+      sameAs: [...(card.same_as || [])],
+      picked: card.same_as && card.same_as.length ? String(card.name || '').toLowerCase() : '',
     };
+  }
+
+  // The address book the card can pick from — fetched when the form opens,
+  // and optional: without it the form is only a new person.
+  async _loadContacts() {
+    try {
+      const res = await fetch('/contacts', { cache: 'no-store' });
+      if (!res.ok) throw new Error(String(res.status));
+      const data = await res.json();
+      const own = this._id && this._id.startsWith('chat:') ? this._id.slice('chat:'.length) : '';
+      // This chat's own card is not someone else it could be.
+      this._contacts = (data.contacts || [])
+        .filter((c) => !(c.chats || []).length || c.chats.some((ch) => ch.id !== own))
+        .map((c) => ({ ...c, chats: (c.chats || []).filter((ch) => ch.id !== own) }));
+    } catch {
+      this._contacts = [];
+    }
+    if (this._form) this.render();
+  }
+
+  // Picking an existing contact: this handle is them too — their name and
+  // spheres, and a link to their other chats.
+  _pickContact(value) {
+    if (!this._form) return;
+    const person = (this._contacts || []).find((c) => c.name.toLowerCase() === String(value).toLowerCase());
+    if (!person) {
+      this._form.sameAs = [];
+      this._form.picked = '';
+      this.render();
+      return;
+    }
+    this._form.name = person.name;
+    if (person.sphere) this._form.sphere = person.sphere;
+    this._form.tags = [...(person.tags || [])].filter((t) => t !== this._form.sphere);
+    this._form.sameAs = person.chats.map((ch) => ch.id);
+    this._form.picked = person.name.toLowerCase();
+    this.render();
   }
 
   async _saveContact(nameOverride) {
@@ -427,6 +486,7 @@ class RetinueAttentionSheet extends HTMLElement {
           sphere: name ? (form.sphere || null) : null,
           tags: name ? form.tags : [],
           permit: Boolean(name && form.permit),
+          same_as: name ? (form.sameAs || []) : [],
         }),
       });
       if (!res.ok) throw new Error(String(res.status));
@@ -476,8 +536,21 @@ class RetinueAttentionSheet extends HTMLElement {
     const pick = (s) => `<button class="btn tiny${form.sphere === s ? ' on' : ''}" data-act="contact-sphere" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`;
     const tag = (s) => `<button class="btn tiny${form.tags.includes(s) ? ' on' : ''}" data-act="contact-tag" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`;
     const choices = spheres.filter((s) => s !== 'unknown');
+    const book = this._contacts || [];
+    const picked = form.picked || '';
+    const existing = book.length
+      ? `<div><div class="f-k">same person as</div>` +
+        `<select class="select" data-set="contact-existing"${busy}>` +
+        `<option value=""${picked ? '' : ' selected'}>— someone new —</option>` +
+        book.map((c) => {
+          const via = c.chats.length ? ` (${c.chats.map((ch) => ch.channel).filter((v, i, a) => a.indexOf(v) === i).join(', ')})` : '';
+          return `<option value="${esc(c.name)}"${c.name.toLowerCase() === picked ? ' selected' : ''}>${esc(c.name + via)}</option>`;
+        }).join('') +
+        `</select><div class="f-note">A contact you already have: this ${esc(item.channel || 'chat')} handle becomes theirs too.</div></div>`
+      : '';
     return `<div class="field screened"><div class="f-label">${card ? 'Contact' : 'New contact'}</div>` +
       `<div class="card-form">` +
+      existing +
       `<input type="text" data-set="contact-name" value="${esc(form.name)}" placeholder="Their name" autocomplete="off">` +
       `<div><div class="f-k">belongs to</div><div class="chips">${choices.map(pick).join('')}</div>` +
       `<div class="f-note">The sphere decides which modes let them through.</div></div>` +
