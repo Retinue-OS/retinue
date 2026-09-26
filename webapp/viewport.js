@@ -20,17 +20,46 @@
 // dvh fallback stands as before. While pinch-zoomed the visual viewport is a
 // magnified crop and its height means nothing for layout, so the property is
 // dropped until the scale is back to 1.
+//
+// The same measurement answers a second question for pages that change their
+// layout while the on-screen keyboard is up (the chat page's typing mode):
+// is the visible frame well short of the tallest it has been at this width?
+// That is published as data-viewport-short="1" on <html>, with a
+// `retinue-viewport` event on window whenever it flips, so there is one
+// interpretation of the viewport rather than one per page. The baseline is
+// kept per width, so a rotation with the keyboard up does not learn the
+// keyboard-shrunk height as the keyboard-less one; and while pinch-zoomed
+// the flag is dropped, as --frame-h is. A short frame alone does not mean
+// "keyboard": a page combines it with whether one of its fields has focus.
 
 const root = document.documentElement;
 const vv = window.visualViewport;
+
+// Tallest visible height seen per viewport width (the keyboard-less frame).
+const tallest = new Map();
+// How much shorter than that counts as short: a keyboard takes 35–50% of a
+// phone's frame, a browser bar showing or hiding well under 20%.
+const SHORT = 0.8;
+
+function setShort(short) {
+  if ((root.dataset.viewportShort === '1') === short) return;
+  if (short) root.dataset.viewportShort = '1';
+  else delete root.dataset.viewportShort;
+  window.dispatchEvent(new CustomEvent('retinue-viewport', { detail: { short } }));
+}
 
 function apply() {
   if (!vv) return;
   if (vv.scale !== 1) {
     root.style.removeProperty('--frame-h');
+    setShort(false);
     return;
   }
   root.style.setProperty('--frame-h', `${Math.round(vv.height)}px`);
+  const w = Math.round(vv.width);
+  const max = Math.max(tallest.get(w) || 0, vv.height);
+  tallest.set(w, max);
+  setShort(vv.height < max * SHORT);
 }
 
 if (vv) {

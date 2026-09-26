@@ -903,9 +903,8 @@ class RetinueConversation extends HTMLElement {
     // start, so the bar is too, holding only the slot until a thread exists.
     const lead = bar === 'actions' && this.querySelector(':scope > [slot="bar-start"]')
       ? '<slot name="bar-start"></slot>' : '';
-    if (bar === 'actions' && !this._id) {
-      return lead ? `<div class="thread-bar bar-slim" part="bar">${lead}</div>` : '';
-    }
+    const leadOnly = lead ? `<div class="thread-bar bar-slim" part="bar">${lead}</div>` : '';
+    if (bar === 'actions' && !this._id) return leadOnly;
     const back = this.hasAttribute('back')
       ? '<button class="back" data-back aria-label="Back">&#8249;</button>' : '';
     if (!this._id) {
@@ -913,7 +912,7 @@ class RetinueConversation extends HTMLElement {
     }
     const t = this._thread;
     if (!t) {
-      if (bar === 'actions') return lead ? `<div class="thread-bar bar-slim" part="bar">${lead}</div>` : '';
+      if (bar === 'actions') return leadOnly;
       const title = this._missing ? 'Conversation not found' : '&#8230;';
       return `<div class="thread-bar">${back}<span class="bar-title muted" data-title>${title}</span></div>`;
     }
@@ -2049,8 +2048,7 @@ const CSS = `
      attention ⓘ, the speaker toggle and Archive beside the title — squeezed
      into one row the title kept its first four letters. So on a phone the
      title keeps the row with the back button (two lines before it cuts, as
-     in the list) and the controls wrap to a row under it, the way the chat
-     page's Archive and Mute switches sit under its header. */
+     in the list) and the controls wrap to a row under it. */
   @media (max-width: 480px) {
     .thread-bar:not(.bar-slim) { flex-wrap: wrap; row-gap: 8px; }
     .thread-bar:not(.bar-slim) .bar-title { white-space: normal; overflow-wrap: anywhere;

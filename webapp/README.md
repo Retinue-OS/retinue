@@ -219,9 +219,10 @@ docstring). Pieces:
   the list's swipe actions use; a dot on the ⋮ shows an archived or muted
   chat with the menu shut. What the companion pane does sits behind a **?**
   in its bar rather than on a row of its own. While the phone keyboard is up
-  (a field on the page focused *and* the visual viewport well short of its
-  keyboard-less height), the header and the companion's bar are hidden, so
-  the thread and the field keep the little room there is. The open chat polls on the conversations cadence,
+  (a field on the page focused *and* `viewport.js` reporting the visible
+  frame well short of its keyboard-less height at that width, as
+  `data-viewport-short` on `<html>`), the header and the companion's bar are
+  hidden, and the pane being typed in scrolls to its newest message. The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the

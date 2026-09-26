@@ -224,6 +224,7 @@ class RetinueChatPage extends HTMLElement {
     this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
     this._imgError = '';       // staged-image error line (limit hit, unreadable file)
     this._lightbox = null;     // {url, alt} while the image overlay is open
+    this._helpOpen = false;    // the companion pane's help note is showing
     this._lbClosing = false;   // its history entry is being unwound
     this._lbKeydown = null;    // window keydown handler while the lightbox is open
     this._lbPrevFocus = null;  // element to restore focus to on lightbox close
@@ -309,31 +310,24 @@ class RetinueChatPage extends HTMLElement {
   // them back the moment the keyboard goes.
   //
   // "The keyboard is up" is two facts together: a text field on this page has
-  // focus, and the visual viewport is well short of the tallest it has been at
-  // this width (the frame height with no keyboard). Focus alone is not enough:
-  // Android's back gesture dismisses the keyboard without blurring the field,
-  // and the header must come back then. The height alone is not enough either
-  // (a bar showing, a split-screen resize). Never in the wide layout, where
-  // there is room, and without the visualViewport API focus decides alone.
+  // focus, and the visible frame is well short of its keyboard-less height at
+  // this width — data-viewport-short on <html>, published by viewport.js, the
+  // one module that interprets the visual viewport (baseline per width, off
+  // while pinch-zoomed). Focus alone is not enough: Android's back gesture
+  // dismisses the keyboard without blurring the field, and the header must
+  // come back then. The height alone is not enough either (a split-screen
+  // resize). Never in the wide layout, where there is room; and without the
+  // visualViewport API, where nothing can be measured, focus decides alone.
   _watchKeyboard() {
     if (this._kbd) return;
-    const vv = window.visualViewport;
-    const st = { maxH: 0, width: 0 };
+    const measured = !!window.visualViewport;
     const apply = () => {
-      let up = !this._wide.matches && this._focusedInside();
-      if (vv) {
-        // A new width (rotation, a split-screen change) starts a new baseline.
-        const w = Math.round(vv.width);
-        if (w !== st.width) { st.width = w; st.maxH = 0; }
-        st.maxH = Math.max(st.maxH, vv.height);
-        if (up) up = vv.height < st.maxH * 0.8;
-      }
+      const up = !this._wide.matches && this._focusedInside() &&
+        (!measured || document.documentElement.dataset.viewportShort === '1');
       const page = this.shadowRoot && this.shadowRoot.querySelector('.page');
       if (page && page.classList.contains('typing') !== up) {
         page.classList.toggle('typing', up);
-        // The keyboard took half the frame: the newest messages are what the
-        // user is answering, so keep them in view above the field.
-        if (up) { this._toggleMenu(false); this._scrollThread('[data-chat-thread]'); }
+        if (up) { this._toggleMenu(false); this._scrollFocusedPane(); }
       }
     };
     const onIn = () => apply();
@@ -342,8 +336,20 @@ class RetinueChatPage extends HTMLElement {
     const onOut = () => setTimeout(apply, 0);
     this.addEventListener('focusin', onIn);
     this.addEventListener('focusout', onOut);
-    if (vv) vv.addEventListener('resize', apply);
-    this._kbd = { apply, onIn, onOut, vv };
+    window.addEventListener('retinue-viewport', apply);
+    this._kbd = { apply, onIn, onOut };
+  }
+
+  // The keyboard took half the frame: the newest messages are what the user is
+  // answering, so keep them in view above the field — in whichever pane the
+  // field is. The companion's thread lives in <retinue-conversation>'s own
+  // (open) shadow root.
+  _scrollFocusedPane() {
+    const comp = this._companionEl();
+    const inComp = comp && comp.shadowRoot && comp.shadowRoot.activeElement;
+    if (!inComp) { this._scrollThread('[data-chat-thread]'); return; }
+    const t = comp.shadowRoot.querySelector('.thread');
+    if (t) t.scrollTop = t.scrollHeight;
   }
 
   // Whether focus is on a text field anywhere inside this element's shadow
@@ -360,7 +366,7 @@ class RetinueChatPage extends HTMLElement {
     if (!k) return;
     this.removeEventListener('focusin', k.onIn);
     this.removeEventListener('focusout', k.onOut);
-    if (k.vv) k.vv.removeEventListener('resize', k.apply);
+    window.removeEventListener('retinue-viewport', k.apply);
     this._kbd = null;
   }
 
@@ -762,22 +768,31 @@ class RetinueChatPage extends HTMLElement {
   // button carries a dot while the chat is archived or muted, so the state
   // stays visible with the menu shut.
   _menuHtml() {
-    const c = this._chat || {};
-    const flagged = c.archived || c.muted;
+    // A disclosure, not an ARIA menu: a button that shows and hides a short
+    // list of ordinary buttons, reached with Tab like the rest of the page.
     return `<div class="menu-wrap" data-menu-wrap>` +
-      `<button class="menu-btn${flagged ? ' flagged' : ''}" data-menu-btn aria-haspopup="menu" ` +
-      `aria-expanded="false" title="More" aria-label="More">&#8942;</button>` +
-      `<div class="menu" role="menu" data-menu hidden>${this._flagsHtml()}</div></div>`;
+      `<button class="menu-btn${this._flagged() ? ' flagged' : ''}" data-menu-btn ` +
+      `aria-controls="chat-menu" aria-expanded="false" title="More" aria-label="More">&#8942;</button>` +
+      `<div class="menu" id="chat-menu" data-menu hidden>${this._flagsHtml()}</div></div>`;
+  }
+
+  // Archived or muted: what the ⋮ button's dot shows.
+  _flagged() {
+    const c = this._chat || {};
+    return !!(c.archived || c.muted);
   }
 
   _toggleMenu(open) {
     const root = this.shadowRoot;
     const menu = root && root.querySelector('[data-menu]');
     const btn = root && root.querySelector('[data-menu-btn]');
-    if (!menu || !btn) return;
-    const show = open === undefined ? menu.hidden : open;
-    menu.hidden = !show;
-    btn.setAttribute('aria-expanded', String(show));
+    // With the menu's nodes gone (a render in progress) it can only close —
+    // and the document listeners must still come off.
+    const show = menu && btn ? (open === undefined ? menu.hidden : open) : false;
+    if (menu && btn) {
+      menu.hidden = !show;
+      btn.setAttribute('aria-expanded', String(show));
+    }
     if (show && !this._onMenuAway) {
       // Any press outside the menu, or Esc, shuts it. composedPath: presses
       // land on this host from the document's point of view.
@@ -804,11 +819,11 @@ class RetinueChatPage extends HTMLElement {
   _flagsHtml() {
     const c = this._chat || {};
     const sw = (flag, on, offLabel, onLabel, hint) =>
-      `<button class="item${on ? ' on' : ''}" role="menuitem" data-flag="${flag}" data-on="${on ? '0' : '1'}" ` +
+      `<button class="item${on ? ' on' : ''}" data-flag="${flag}" data-on="${on ? '0' : '1'}" ` +
       `title="${esc(hint)}">` +
       (on ? `<b>${esc(onLabel)}</b> · Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) + `</button>`;
     return `<div class="items" data-flags>` +
-      `<button class="item" role="menuitem" data-attention ` +
+      `<button class="item" data-attention ` +
       `title="Importance, urgency, delivery — and their corrections">Attention details</button>` +
       sw('archived', !!c.archived, 'Archive', 'Archived',
          'Leaves the chat list; comes back when a message arrives, unless muted') +
@@ -830,7 +845,7 @@ class RetinueChatPage extends HTMLElement {
     const row = this.shadowRoot.querySelector('[data-flags]');
     if (row) { row.outerHTML = this._flagsHtml(); this._bindFlags(); }
     const btn = this.shadowRoot.querySelector('[data-menu-btn]');
-    if (btn && this._chat) btn.classList.toggle('flagged', !!(this._chat.archived || this._chat.muted));
+    if (btn) btn.classList.toggle('flagged', this._flagged());
   }
 
   _bindFlags() {
@@ -858,7 +873,7 @@ class RetinueChatPage extends HTMLElement {
       `aria-label="Resize companion pane" tabindex="0" ` +
       `title="Drag to resize &middot; double-click to reset"></div>` +
       `<section class="pane pane-companion" aria-label="Ara">` +
-      `<p class="comp-help" id="comp-help" data-comp-help hidden>Ara reads this chat and writes ` +
+      `<p class="comp-help" id="comp-help" data-comp-help${this._helpOpen ? '' : ' hidden'}>Ara reads this chat and writes ` +
       `replies into its draft &mdash; you read the draft in the chat&rsquo;s composer, change what ` +
       `you like, and your send press is what sends it.</p>` +
       this._companionHtml() +
@@ -893,7 +908,7 @@ class RetinueChatPage extends HTMLElement {
       `no-autofocus${at}><span slot="bar-start" class="comp-lead">` +
       `<span class="comp-who">Ara</span>` +
       `<button type="button" class="help-btn" data-comp-help-btn aria-controls="comp-help" ` +
-      `aria-expanded="false" title="What is this pane?" aria-label="What is this pane?">?</button>` +
+      `aria-expanded="${!!this._helpOpen}" title="What is this pane?" aria-label="What is this pane?">?</button>` +
       `</span></retinue-conversation>`;
   }
 
@@ -1206,8 +1221,12 @@ class RetinueChatPage extends HTMLElement {
       help.addEventListener('click', () => {
         const note = root.querySelector('[data-comp-help]');
         if (!note) return;
-        note.hidden = !note.hidden;
-        help.setAttribute('aria-expanded', String(!note.hidden));
+        // Held on the instance: a render (a recording starting, a breakpoint
+        // flip, a draft conflict) rebuilds the pane and must not shut the
+        // note on someone reading it.
+        this._helpOpen = !this._helpOpen;
+        note.hidden = !this._helpOpen;
+        help.setAttribute('aria-expanded', String(this._helpOpen));
       });
     }
     // Pane tabs (phone): scroll the snap strip; the scroll handler below keeps
