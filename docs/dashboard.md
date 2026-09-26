@@ -43,10 +43,10 @@ their bar's back button returns to where they were opened from, or, opened
 cold (a push, a bookmark), to the home. On a phone the home never scrolls as
 a page (the attention list scrolls inside a locked frame, between the
 navigation and the dock); in the wide layout (`isWideFrame` in
-`webapp/components/base.js`) the list sits above the news, the boundary a
-draggable splitter (`webapp/layout.js`), VS Code style: drag to resize,
-double-click to reset, drag news all the way down to close it; sizes persist
-per device in localStorage. *Threads* is `conversations.html`, which lists
+`webapp/components/base.js`) it fills a fixed frame and scrolls internally.
+The home carries no news: a feed there defeats the point of a
+distraction-free list of what wants attention, so the news lives only on its
+own page (`news.html`), one tap away in the navigation row. *Threads* is `conversations.html`, which lists
 every thread with an Active/Archived/Edits/Cowork filter — the last two being
 where the otherwise hidden kinds (project edit commands, and the Ask-Ara
 connector's cowork audit threads) are reachable. Threads can be archived from

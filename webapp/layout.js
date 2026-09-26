@@ -1,11 +1,12 @@
 // Splitter manager for the dashboard's wide layout, VS Code style.
 //
-// Three draggable boundaries, declared in index.html as .splitter elements:
+// Two draggable boundaries, declared in index.html as .splitter elements:
 //   data-splitter="side"  — vertical bar; sets --side-w (projects column width)
-//   data-splitter="news"  — horizontal bar; sets --news-h (news region height)
 //   data-splitter="chats" — horizontal bar; sets --chats-h (chats region
-//                           height). Ships commented out beside the chats card;
-//                           everything here is a no-op while it is absent.
+//                           height).
+// Neither ships in index.html today (the home is the attention list alone,
+// and the news has its own page); everything here is a no-op while they are
+// absent.
 //
 // Sizes live as CSS custom properties on <main>; styles.css supplies the
 // defaults when a property is unset, so this module only ever *overrides* the
@@ -17,7 +18,7 @@
 //   drag         resize (pointer events, so mouse/pen/touch all work)
 //   double-click reset this boundary to the stylesheet default
 //   arrow keys   resize in steps (the splitters are focusable separators)
-//   drag news/chats below a threshold: snaps closed (display:none via a
+//   drag chats below a threshold: snaps closed (display:none via a
 //                data-* attribute); the splitter remains as the handle to
 //                pull the region back open
 //
@@ -28,11 +29,10 @@
 import { WIDE_FRAME } from './components/base.js';
 
 const STORE_KEY = 'retinue.layout.v1';
-const SNAP_CLOSED_PX = 60;   // dragging news/chats shorter than this closes it
+const SNAP_CLOSED_PX = 60;   // dragging chats shorter than this closes it
 const KEY_STEP_PX = 32;      // arrow-key resize increment
 const MIN_SIDE_PX = 280;     // keep in sync with .col-side min-width
 const MAX_SIDE_FRACTION = 0.45;   // …and max-width
-const MAX_NEWS_FRACTION = 0.75;   // …and retinue-news max-height
 const MAX_CHATS_FRACTION = 0.6;   // leave the conversations below real room
 
 const mainEl = document.querySelector('main');
@@ -53,7 +53,7 @@ function saveSizes(sizes) {
 let sizes = loadSizes();
 
 // Push the stored sizes into the CSS properties (or clear them back to the
-// stylesheet defaults). data-news/data-chats "closed" is how a zero-height
+// stylesheet defaults). data-chats "closed" is how a zero-height
 // region is expressed — display:none rather than a squashed 0px scroll box.
 function applyClosable(which, attr, prop) {
   if (sizes[which] === 'closed') {
@@ -75,7 +75,6 @@ function apply() {
   } else {
     mainEl.style.removeProperty('--side-w');
   }
-  applyClosable('news', 'data-news', '--news-h');
   applyClosable('chats', 'data-chats', '--chats-h');
 }
 
@@ -87,7 +86,7 @@ function currentSize(which) {
     const col = document.querySelector('.col-side');
     return col ? col.getBoundingClientRect().width : 0;
   }
-  const el = document.querySelector(which === 'chats' ? 'retinue-chats' : 'retinue-news');
+  const el = document.querySelector('retinue-chats');
   return el && sizes[which] !== 'closed' ? el.getBoundingClientRect().height : 0;
 }
 
@@ -96,15 +95,13 @@ function clampSize(which, px) {
     const max = deckEl.getBoundingClientRect().width * MAX_SIDE_FRACTION;
     return Math.min(Math.max(px, MIN_SIDE_PX), max);
   }
-  // News and chats may go all the way to 0 — small values snap to closed in
-  // setSize.
-  const fraction = which === 'chats' ? MAX_CHATS_FRACTION : MAX_NEWS_FRACTION;
-  const max = colMain.getBoundingClientRect().height * fraction;
+  // Chats may go all the way to 0 — small values snap to closed in setSize.
+  const max = colMain.getBoundingClientRect().height * MAX_CHATS_FRACTION;
   return Math.min(Math.max(px, 0), max);
 }
 
 function setSize(which, px) {
-  if ((which === 'news' || which === 'chats') && px < SNAP_CLOSED_PX) {
+  if (which === 'chats' && px < SNAP_CLOSED_PX) {
     sizes[which] = 'closed';
   } else {
     sizes[which] = Math.round(clampSize(which, px));
@@ -131,9 +128,9 @@ function wireSplitter(el) {
     const startSize = currentSize(which);
 
     const move = (ev) => {
-      // Projects and news sit on the far side of their splitter (right /
-      // below), so they grow when the drag moves toward the start edge; the
-      // chats region sits above its splitter and grows the other way.
+      // Projects sit on the far side of their splitter (right), so they grow
+      // when the drag moves toward the start edge; the chats region sits
+      // above its splitter and grows the other way.
       const toward = startPos - (vertical ? ev.clientX : ev.clientY);
       const delta = which === 'chats' ? -toward : toward;
       setSize(which, startSize + delta);
@@ -154,8 +151,8 @@ function wireSplitter(el) {
 
   el.addEventListener('keydown', (e) => {
     if (!wide.matches) return;
-    // Growing follows the drag direction: toward the start edge for side and
-    // news, away from it for chats (which sits above its splitter).
+    // Growing follows the drag direction: toward the start edge for side,
+    // away from it for chats (which sits above its splitter).
     const grow = vertical ? ['ArrowLeft'] : (which === 'chats' ? ['ArrowDown'] : ['ArrowUp']);
     const shrink = vertical ? ['ArrowRight'] : (which === 'chats' ? ['ArrowUp'] : ['ArrowDown']);
     let delta = 0;
@@ -165,7 +162,7 @@ function wireSplitter(el) {
     else return;
     e.preventDefault();
     // Reopening a closed region by keyboard starts from a usable height.
-    const base = ((which === 'news' || which === 'chats') && sizes[which] === 'closed' && delta > 0)
+    const base = (which === 'chats' && sizes[which] === 'closed' && delta > 0)
       ? SNAP_CLOSED_PX : currentSize(which);
     setSize(which, base + delta);
     saveSizes(sizes);

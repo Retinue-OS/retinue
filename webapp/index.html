@@ -25,7 +25,6 @@
        #conversation-<id> hash that rows and push notifications use, and the
        composer (#new) for a new conversation. Invisible until then. -->
   <script type="module" src="/components/conversations.js"></script>
-  <script type="module" src="/components/news.js"></script>
   <script type="module" src="/components/app-launcher.js"></script>
   <!-- No opt-in element here (that UI lives on /settings.html now), but the
        module keeps an already-granted subscription healthy on every load. -->
@@ -61,10 +60,11 @@
          The state the user is in is the one thing worth the space above a
          list of what wants their attention — and a greeting was not it. -->
 
-    <!-- The deck: the resizable region above the dock. On phones the
-         wrappers are display:contents (everything stacks, the page scrolls);
-         in the wide layout the column is a fixed frame whose regions scroll
-         internally, the boundary to the news a draggable splitter (layout.js). -->
+    <!-- The deck: the region above the dock. On phones the wrappers are
+         display:contents (everything stacks, the page scrolls); in the wide
+         layout the column is a fixed frame whose regions scroll internally.
+         No news here: the home is for what wants attention, and a feed is a
+         distraction — the news has its own page in the navigation row. -->
     <div class="deck">
       <section class="col col-main">
         <!-- The home: what wants attention now, next, held for the digest, and
@@ -79,17 +79,6 @@
              is immersive. Its list is never shown here — the attention list
              above is the list. -->
         <retinue-conversations viewer heading="Conversations"></retinue-conversations>
-
-        <div class="splitter splitter-h" data-splitter="news" role="separator"
-             aria-orientation="horizontal" aria-label="Resize news"
-             title="Drag to resize &middot; double-click to reset" tabindex="0"></div>
-
-        <!-- Broadcast-style inbound that needs no reply and fits no project: feed
-             items, newsletter blurbs, channel announcements. Ranked live by
-             GET /news (importance decayed by age; dated items drop out once they
-             lapse), every headline a link to the source. 👍/👎/✕ teach the Herald
-             agent, which keeps the profile behind the ranking. -->
-        <retinue-news heading="News"></retinue-news>
       </section>
     </div>
     <!-- Non-functional/static mock cards are intentionally disabled until they
