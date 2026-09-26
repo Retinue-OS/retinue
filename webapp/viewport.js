@@ -21,45 +21,86 @@
 // magnified crop and its height means nothing for layout, so the property is
 // dropped until the scale is back to 1.
 //
-// The same measurement answers a second question for pages that change their
-// layout while the on-screen keyboard is up (the chat page's typing mode):
-// is the visible frame well short of the tallest it has been at this width?
-// That is published as data-viewport-short="1" on <html>, with a
-// `retinue-viewport` event on window whenever it flips, so there is one
-// interpretation of the viewport rather than one per page. The baseline is
-// kept per width, so a rotation with the keyboard up does not learn the
-// keyboard-shrunk height as the keyboard-less one; and while pinch-zoomed
-// the flag is dropped, as --frame-h is. A short frame alone does not mean
-// "keyboard": a page combines it with whether one of its fields has focus.
+// The same measurement, with focus, answers a second question for pages that
+// change their layout while the on-screen keyboard is up (the chat page's
+// typing mode): is the keyboard up? That is published as data-keyboard="1"
+// on <html>, with a `retinue-viewport` event on window whenever the flag or
+// the visible height changes while it is set (the keyboard animates in steps
+// on iOS), so there is one interpretation of the viewport rather than one per
+// page. The rule:
+//  - With no text field focused there is no keyboard, and the visible height
+//    IS the keyboard-less height for this width. It is re-learned on every
+//    reading, so a split-screen or a browser bar can never leave behind a
+//    stale "tallest" that makes an ordinary frame look short.
+//  - With a field focused, the keyboard is up when the frame is well short of
+//    that width's keyboard-less height.
+//  - A width seen for the first time while a field is focused (rotating with
+//    the keyboard up) has no keyboard-less height yet. The keyboard state
+//    carries over from the old width, and that width's height is learned when
+//    a reading clearly taller than the shortest one comes (the keyboard went
+//    down) or when the field loses focus.
+//  - While pinch-zoomed the flag is dropped, as --frame-h is.
+
+import { deepActiveElement, isTextEntry } from './components/base.js';
 
 const root = document.documentElement;
 const vv = window.visualViewport;
 
-// Tallest visible height seen per viewport width (the keyboard-less frame).
-const tallest = new Map();
-// How much shorter than that counts as short: a keyboard takes 35–50% of a
-// phone's frame, a browser bar showing or hiding well under 20%.
+// How much shorter than keyboard-less counts as a keyboard: one takes 35–50%
+// of a phone's frame, a browser bar showing or hiding well under 20%.
 const SHORT = 0.8;
+// Keyboard-less visible height per viewport width.
+const baseline = new Map();
+// A width being learned with the keyboard carried over: {width, lowest}.
+let carry = null;
+let keyboard = false;
+let lastH = 0;
 
-function setShort(short) {
-  if ((root.dataset.viewportShort === '1') === short) return;
-  if (short) root.dataset.viewportShort = '1';
-  else delete root.dataset.viewportShort;
-  window.dispatchEvent(new CustomEvent('retinue-viewport', { detail: { short } }));
+function publish(up, h) {
+  const changed = up !== keyboard || (up && h !== lastH);
+  keyboard = up;
+  lastH = h;
+  if (up) root.dataset.keyboard = '1';
+  else delete root.dataset.keyboard;
+  if (changed) window.dispatchEvent(new CustomEvent('retinue-viewport', { detail: { keyboard: up, height: h } }));
 }
 
 function apply() {
   if (!vv) return;
   if (vv.scale !== 1) {
     root.style.removeProperty('--frame-h');
-    setShort(false);
+    carry = null;
+    publish(false, 0);
     return;
   }
-  root.style.setProperty('--frame-h', `${Math.round(vv.height)}px`);
+  const h = Math.round(vv.height);
   const w = Math.round(vv.width);
-  const max = Math.max(tallest.get(w) || 0, vv.height);
-  tallest.set(w, max);
-  setShort(vv.height < max * SHORT);
+  root.style.setProperty('--frame-h', `${h}px`);
+  if (!isTextEntry(deepActiveElement())) {
+    baseline.set(w, h);
+    carry = null;
+    publish(false, h);
+    return;
+  }
+  if (carry && carry.width !== w) carry = null;
+  const base = baseline.get(w);
+  if (base === undefined || carry) {
+    if (!keyboard) { baseline.set(w, h); publish(false, h); return; }
+    carry = carry || { width: w, lowest: h };
+    carry.lowest = Math.min(carry.lowest, h);
+    if (carry.lowest < h * SHORT) {
+      // Clearly taller than the frame the keyboard left: it went down.
+      baseline.set(w, h);
+      carry = null;
+      publish(false, h);
+    } else {
+      publish(true, h);
+    }
+    return;
+  }
+  const max = Math.max(base, h);
+  baseline.set(w, max);
+  publish(h < max * SHORT, h);
 }
 
 if (vv) {
@@ -68,5 +109,11 @@ if (vv) {
   // which is also when a bar has just hidden or shown.
   vv.addEventListener('scroll', apply);
   window.addEventListener('orientationchange', apply);
+  // Focus decides whether a reading is a baseline or a comparison. Focus
+  // moving between two fields passes through a blur: settle after it lands.
+  // (A move that stays inside one component's shadow tree reaches no
+  // document listener; the keyboard's own resize re-reads focus then.)
+  document.addEventListener('focusin', apply);
+  document.addEventListener('focusout', () => setTimeout(apply, 0));
   apply();
 }
