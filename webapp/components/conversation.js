@@ -112,6 +112,10 @@ const INLINE_SAFE_TYPES = new Set([
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
   'application/pdf', 'text/plain',
 ]);
+// The inline preview of an image attachment: at most this wide, and never
+// taller than the second bound (the width shrinks to keep the true ratio).
+const IMG_PREVIEW_MAX_W = 360;
+const IMG_PREVIEW_MAX_H = 420;
 // The draft key of a composer that has no thread yet: one per context, so a
 // plain composer and each project's composer keep their own text, files,
 // model choice and dictation — the text typed towards a plain new thread
@@ -1036,6 +1040,10 @@ class RetinueConversation extends HTMLElement {
   // writes a fresh copy to storage every time, so re-reading one invoice leaves
   // invoice(1).pdf, invoice(2).pdf behind. Types the gateway refuses to serve
   // inline get the download link alone — an inline href would save anyway.
+  // Images the gateway serves inline also preview in the bubble (see
+  // _imagePreviewHtml): the thread's own attachment, same-origin behind the
+  // dashboard's auth — not a remote fetch, so markdown.js's rule for rendered
+  // content is untouched. SVG is not in the inline set, so it stays a file row.
   _attachmentsHtml(cid, atts) {
     if (!Array.isArray(atts) || !atts.length) return '';
     const items = atts.map((a) => {
@@ -1052,8 +1060,10 @@ class RetinueConversation extends HTMLElement {
       const open = viewable
         ? `<a class="attach" href="${esc(url)}?inline=1">`
         : `<a class="attach" href="${esc(url)}" download="${esc(name)}">`;
-      return `<div class="attach-row">` + open +
-        `<span class="a-icon" aria-hidden="true">\u{1F4CE}</span>` +
+      const preview = viewable && type.startsWith('image/')
+        ? this._imagePreviewHtml(`${url}?inline=1`, name, a) : '';
+      return preview + `<div class="attach-row${preview ? ' a-caption' : ''}">` + open +
+        (preview ? '' : `<span class="a-icon" aria-hidden="true">\u{1F4CE}</span>`) +
         `<span class="a-name">${esc(name)}</span>` +
         (size ? `<span class="a-size">${esc(size)}</span>` : '') +
         `</a>` +
@@ -1063,6 +1073,28 @@ class RetinueConversation extends HTMLElement {
         `</div>`;
     }).join('');
     return `<div class="attachments">${items}</div>`;
+  }
+
+  // An inline image preview linking to the full view. Loading it must never
+  // shift the thread: the gateway records an image's intrinsic size at store
+  // time, and with it the true aspect box is reserved up front — the inline
+  // aspect-ratio and a fixed-length width, as chat-page.js does. The width is
+  // min(cap, natural, the width at which the height reaches the max height),
+  // so a tall screenshot shrinks rather than towering over the thread, never
+  // upscales, and max-width:100% clamps it inside a narrower bubble with the
+  // height following the ratio. Older records without a size get a fixed
+  // frame instead (.no-dims).
+  _imagePreviewHtml(href, name, a) {
+    const w = Number(a.width);
+    const h = Number(a.height);
+    const hasDims = w > 0 && h > 0;
+    const box = hasDims
+      ? ` width="${w}" height="${h}" style="aspect-ratio: ${w} / ${h}; ` +
+        `width: ${Math.max(1, Math.round(Math.min(IMG_PREVIEW_MAX_W, w, IMG_PREVIEW_MAX_H * w / h)))}px"`
+      : '';
+    return `<a class="a-imglink" href="${esc(href)}" aria-label="View ${esc(name)}">` +
+      `<img class="a-img${hasDims ? '' : ' no-dims'}" src="${esc(href)}" alt="${esc(name)}"` +
+      `${box} loading="lazy" decoding="async"></a>`;
   }
 
   // A message body via the shared Markdown renderer (markdown.js), so bubbles
@@ -2126,7 +2158,21 @@ const CSS = `
   .msg.me .bubble .md a, .msg.me .bubble a { color: #0b0d12; }
   .msg.me .bubble .md code, .msg.me .bubble code { background: rgba(11, 13, 18, .15); }
   .attachments { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+  /* A files-only message (e.g. a reply that is just a chart): no text above. */
+  .md:empty + .attachments { margin-top: 0; }
   .attach-row { display: flex; align-items: stretch; gap: 6px; }
+  /* An image attachment previews above its name row. Sized inline by
+     _imagePreviewHtml (fixed-length width + aspect-ratio); height:auto
+     follows the ratio and max-width:100% clamps inside a narrower bubble. */
+  .a-imglink { display: block; width: fit-content; max-width: 100%; border-radius: 10px;
+               cursor: zoom-in; -webkit-tap-highlight-color: transparent; }
+  .a-imglink:focus-visible { outline: 2px solid var(--accent, #6ea8fe); outline-offset: 1px; }
+  .a-img { display: block; max-width: 100%; height: auto; border-radius: 10px; }
+  /* No recorded size (stored before sizes were): a fixed frame keeps the box
+     stable through the lazy load — object-fit crops rather than reflows. */
+  .a-img.no-dims { width: 220px; height: 160px; object-fit: cover;
+                   background: rgba(0, 0, 0, .2); }
+  .attach-row.a-caption { margin-top: -2px; }
   .attach-row .attach { flex: 1 1 auto; }
   .a-dl { flex: none; display: flex; align-items: center; padding: 0 11px; border-radius: 8px;
           border: 1px solid var(--accent, #6ea8fe); background: rgba(110, 168, 254, .1);

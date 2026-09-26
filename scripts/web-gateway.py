@@ -214,6 +214,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -234,6 +235,7 @@ import build_stamp
 import claude_auth
 import chat_state as chat_state_mod
 import email_client as ec
+import inbound_store
 import session_env
 import gateway_auth
 import messenger_gateways
@@ -2115,7 +2117,6 @@ def _store_attachments(cid: str, raw_atts) -> list[dict]:
     stored: list[dict] = []
     if not isinstance(raw_atts, list):
         return stored
-    conv_dir = CONVERSATION_ATTACHMENTS_DIR / cid
     for item in raw_atts:
         if not isinstance(item, dict) or not isinstance(item.get("data"), str):
             continue
@@ -2123,23 +2124,163 @@ def _store_attachments(cid: str, raw_atts) -> list[dict]:
             blob = base64.b64decode(item["data"], validate=True)
         except (binascii.Error, ValueError):
             continue
-        if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
+        meta = _store_attachment_blob(cid, blob, item.get("filename"),
+                                      item.get("content_type"))
+        if meta is not None:
+            stored.append(meta)
+    return stored
+
+
+def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dict | None:
+    """Write one attachment's bytes for thread ``cid``; its metadata, or None.
+
+    The single place a thread attachment reaches the disk — _store_attachments
+    (base64 payloads from the internal API and the composer) and
+    _store_reply_files (files Ara attaches to her own reply) both end here, so
+    naming, size cap and metadata shape cannot drift apart. An empty or
+    oversized blob is refused (None). An image's intrinsic ``width``/``height``
+    (sniffed by magic, the same parser the chat store uses) is recorded when
+    found, so the dashboard reserves its inline preview's box before the bytes
+    arrive."""
+    if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
+        return None
+    content_type = str(content_type or "application/octet-stream")
+    suffix = Path(os.path.basename(str(filename or ""))).suffix
+    if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
+        suffix = mimetypes.guess_extension(content_type) or ""
+    att_id = uuid.uuid4().hex
+    conv_dir = CONVERSATION_ATTACHMENTS_DIR / cid
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    (conv_dir / f"{att_id}{suffix}").write_bytes(blob)
+    filename = os.path.basename(str(filename or "attachment")) or "attachment"
+    meta = {
+        "id": att_id,
+        "filename": filename,
+        "content_type": content_type,
+        "size": len(blob),
+        "suffix": suffix,
+    }
+    dims = inbound_store._image_dimensions(blob)
+    if dims:
+        meta["width"], meta["height"] = dims
+    return meta
+
+
+# At most this many files ride on one reply; the rest of a runaway manifest is
+# ignored rather than filling the thread (and the disk) with copies.
+MAX_REPLY_ATTACHMENTS = 20
+# A manifest is a list of paths; anything larger is not one.
+MAX_REPLY_MANIFEST_BYTES = 64 * 1024
+
+
+def _read_regular_file(path, limit: int, *, follow: bool = True) -> bytes:
+    """The bytes of the regular file at ``path``, at most ``limit`` of them.
+
+    For paths a session controls: the path is opened non-blocking (a FIFO
+    opens at once instead of waiting for a writer) and what was actually
+    opened is checked with fstat, so neither a FIFO, device or directory, nor
+    one swapped in between a check and the open, can pin the worker reading
+    it. ``follow=False`` refuses a symlink as the last component. Anything
+    that does not qualify — including a file over ``limit`` — raises
+    OSError."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if not follow:
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        if st.st_size > limit:
+            raise OSError(f"larger than {limit} bytes")
+        chunks: list[bytes] = []
+        size = 0
+        while size <= limit:
+            chunk = os.read(fd, min(1 << 20, limit + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        if size > limit:
+            raise OSError(f"larger than {limit} bytes")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _read_reply_manifest(path: Path | None) -> list[str]:
+    """The file paths a session listed for its own reply, and the manifest gone.
+
+    The manifest is what ``conversation-push.py --reply-attach`` appends to —
+    one path per line, at RETINUE_REPLY_ATTACHMENTS_FILE. It is consumed
+    exactly once: read, then deleted, so a leftover can never ride on a later
+    turn. A missing manifest (the session attached nothing) is the common
+    case and yields []. The session can write where the manifest lives, so it
+    is read like any session-controlled path (_read_regular_file), and not
+    through a symlink."""
+    if path is None:
+        return []
+    try:
+        raw = _read_regular_file(path, MAX_REPLY_MANIFEST_BYTES, follow=False).decode(
+            "utf-8", errors="replace")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        print(f"[web-gateway] reply attachment manifest {path} unreadable: {exc}",
+              flush=True)
+        return []
+    finally:
+        path.unlink(missing_ok=True)
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _store_reply_files(cid: str, paths: list[str]) -> list[dict]:
+    """Store the files a session attached to its own reply in thread ``cid``.
+
+    Each entry is a path the session named; it is copied into the thread's
+    attachment store like any other attachment (_store_attachment_blob), so
+    the reply keeps its file even after the session's scratch copy is gone.
+    Anything that does not check out — a relative path, a directory or other
+    non-regular file, an empty or oversized file, a duplicate — is logged and
+    skipped: a bad entry costs that one file, never the reply. There is no
+    root restriction beyond that: the session runs as the gateway's uid and
+    could push any file it can read with ``--thread --attach`` anyway, so a
+    path allowlist here would guard nothing."""
+    stored: list[dict] = []
+    seen: set[str] = set()
+    for entry in paths:
+        if len(stored) >= MAX_REPLY_ATTACHMENTS:
+            print(f"[web-gateway] {cid}: more than {MAX_REPLY_ATTACHMENTS} reply "
+                  "attachments — ignoring the rest", flush=True)
+            break
+        path = Path(entry)
+        if not path.is_absolute():
+            print(f"[web-gateway] {cid}: reply attachment {entry!r} is not an "
+                  "absolute path — skipped", flush=True)
             continue
-        content_type = str(item.get("content_type") or "application/octet-stream")
-        suffix = Path(os.path.basename(str(item.get("filename") or ""))).suffix
-        if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
-            suffix = mimetypes.guess_extension(content_type) or ""
-        att_id = uuid.uuid4().hex
-        conv_dir.mkdir(parents=True, exist_ok=True)
-        (conv_dir / f"{att_id}{suffix}").write_bytes(blob)
-        filename = os.path.basename(str(item.get("filename") or "attachment")) or "attachment"
-        stored.append({
-            "id": att_id,
-            "filename": filename,
-            "content_type": content_type,
-            "size": len(blob),
-            "suffix": suffix,
-        })
+        real = os.path.realpath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            blob = _read_regular_file(real, MAX_ATTACHMENT_BYTES)
+        except OSError as exc:
+            print(f"[web-gateway] {cid}: reply attachment {entry!r} skipped: {exc}",
+                  flush=True)
+            continue
+        try:
+            meta = _store_attachment_blob(
+                cid, blob, path.name,
+                mimetypes.guess_type(path.name)[0] or "application/octet-stream")
+        except OSError as exc:
+            print(f"[web-gateway] {cid}: reply attachment {entry!r} could not be "
+                  f"stored: {exc}", flush=True)
+            continue
+        if meta is None:
+            print(f"[web-gateway] {cid}: reply attachment {entry!r} skipped: "
+                  "empty or oversized", flush=True)
+            continue
+        stored.append(meta)
     return stored
 
 
@@ -2310,6 +2451,7 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       unread: bool | None = None,
                       pending: bool | None = None,
                       attachments=None,
+                      stored_attachments: list[dict] | None = None,
                       model_name: str | None = None,
                       cost_usd: float | None = None,
                       agent: str | None = None,
@@ -2323,7 +2465,9 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     to surface. `agent` overrides the displayed sender name (e.g. "Coach") when
     a relay answers on a subagent's behalf. `context` is agent-only context
     stored with the message and replayed to Ara's sessions, never rendered to
-    the user — see _conv_context_note.
+    the user — see _conv_context_note. `stored_attachments` is metadata of
+    files already written to the thread's store (_store_reply_files), appended
+    after whatever `attachments` stores.
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -2335,7 +2479,7 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     is news arriving from outside.
     """
     now = datetime.now(timezone.utc).isoformat()
-    stored = _store_attachments(cid, attachments or [])
+    stored = _store_attachments(cid, attachments or []) + list(stored_attachments or [])
     with _conversations_lock:
         conv = _load_conv(cid)
         if conv is None:
@@ -3029,6 +3173,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
     whether the gateway may flip the message's `delivered` flag.
     """
     ok = False
+    reply_atts: list[dict] = []
     with _conv_pending_lock:
         _conv_pending_turns[cid] = _conv_pending_turns.get(cid, 0) + 1
     try:
@@ -3061,7 +3206,8 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             chosen = _default_thread_model()
         result = send_message(prompt, display_question=latest, session_key=session_key,
                               model=chosen, restart_message=restart,
-                              resume=resume)
+                              resume=resume,
+                              reply_attachments=True)
         if result.get("escalated"):
             _conv_set_flags(cid, escalated=True)
         if "error" in result:
@@ -3069,12 +3215,18 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                      f"({result['error']}). Please try again.")
         else:
             ok = True
+            # Files the session attached to its own reply (conversation-push.py
+            # --reply-attach) ride on this very message.
+            reply_atts = _store_reply_files(cid, result.get("reply_files") or [])
             # The lint enforces the dashboard-composing form (chips for
             # options, no bare URLs) on the way out — the net under whichever
             # model composed the reply. Error replies above skip it: they are
-            # gateway-authored and already plain.
-            reply = _lint_presentation(result.get("response") or "(no reply)",
-                                       kind=conv.get("kind") or "chat")
+            # gateway-authored and already plain. A reply that is only files
+            # stays text-less rather than saying "(no reply)" above them.
+            text = result.get("response") or ""
+            reply = (_lint_presentation(text or "(no reply)",
+                                        kind=conv.get("kind") or "chat")
+                     if text or not reply_atts else "")
     except Exception as exc:  # noqa: BLE001 - always surface a turn back to the UI
         print(f"[web-gateway] conversation {cid} worker failed: {exc!r}", flush=True)
         reply = f"Sorry, an error occurred: {exc}"
@@ -3093,6 +3245,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             _conv_pending_turns.pop(cid, None)
     conv = _conv_add_message(cid, "assistant", reply, unread=True,
                              pending=bool(still_running),
+                             stored_attachments=reply_atts,
                              model_name=result.get("model_name"),
                              cost_usd=result.get("cost_usd"))
     if conv is None:
@@ -3101,7 +3254,8 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         # message delivered against a reply that does not exist.
         return False
     if push:
-        _push_conv_notification(conv, reply)
+        _push_conv_notification(
+            conv, reply or ", ".join(a["filename"] for a in reply_atts))
     return ok
 
 
@@ -4338,7 +4492,8 @@ def send_message(message: str, display_question: str | None = None,
                  session_key: str = DEFAULT_SESSION_KEY,
                  model: str | None = None,
                  restart_message: str | None = None,
-                 resume: bool = True) -> dict:
+                 resume: bool = True,
+                 reply_attachments: bool = False) -> dict:
     """Send message to the session for `session_key` (resume or new) and return result.
 
     `resume=False` starts a new session even when the stored one is still
@@ -4370,6 +4525,14 @@ def send_message(message: str, display_question: str | None = None,
     session lineage. The result carries "escalated": True so the caller can
     keep the thread escalated. Every spawned session also gets
     RETINUE_SESSION_MODEL, the stamp scripts/memory.py records on memories.
+
+    `reply_attachments` is set for a dashboard-thread turn, whose reply becomes
+    a thread message that can carry files: every spawn is then handed a fresh
+    RETINUE_REPLY_ATTACHMENTS_FILE manifest (conversation-push.py
+    --reply-attach appends to it), and the paths the run whose reply is kept
+    listed come back as "reply_files". Fresh per spawn, so a run whose reply is
+    discarded — junior's before an escalation, a refused resume — takes its
+    files with it.
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
@@ -4426,6 +4589,10 @@ def send_message(message: str, display_question: str | None = None,
                 cmd.extend(["--", prompt])
                 return cmd
 
+            # Every spawn's manifest, so all of them are cleaned up; the last
+            # one belongs to the run whose reply is kept.
+            manifests: list[Path] = []
+
             def _spawn(cmd: list[str], run_model: str):
                 # The session's environment is built from the allowlist in
                 # scripts/session_env.py, never copied from this daemon's —
@@ -4438,48 +4605,65 @@ def send_message(message: str, display_question: str | None = None,
                 # below the frontier tier — senior has nobody to escalate to.
                 offer_flag = (escalate_flag is not None
                               and not _same_model(run_model, FRONTIER_MODEL))
+                manifest = None
+                if reply_attachments:
+                    manifest = (Path(tempfile.gettempdir())
+                                / f"retinue-reply-attachments-{uuid.uuid4().hex}")
+                    manifests.append(manifest)
                 env = session_env.build(
                     model=run_model,
-                    escalate_file=escalate_flag if offer_flag else None)
+                    escalate_file=escalate_flag if offer_flag else None,
+                    reply_attachments_file=manifest)
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
 
-            # Remember the resume point and prompt the final first-pass run
-            # used, so an escalated re-run replays exactly that turn on the
-            # frontier tier — abandoning junior's fork, never stacking on it.
-            if resume and _session_is_fresh(state, session_key):
-                session_action = "resumed"
-                run_resume, run_prompt = state["session_id"], message
-                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
-                                effective_model)
-                if result.returncode != 0 and _resume_refused(result):
-                    # The state file outlived the transcript. Start over rather
-                    # than hand the user an error for a session they never chose.
-                    print(
-                        f"[web-gateway] session {state['session_id']} is gone — "
-                        f"starting a fresh one for {session_key}",
-                        flush=True,
-                    )
-                    session_action = "restarted"
-                    run_resume, run_prompt = None, restart_message or message
+            try:
+                # Remember the resume point and prompt the final first-pass run
+                # used, so an escalated re-run replays exactly that turn on the
+                # frontier tier — abandoning junior's fork, never stacking on it.
+                if resume and _session_is_fresh(state, session_key):
+                    session_action = "resumed"
+                    run_resume, run_prompt = state["session_id"], message
                     result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
                                     effective_model)
-            else:
-                session_action = "new"
-                run_resume, run_prompt = None, message
-                result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
-                                effective_model)
+                    if result.returncode != 0 and _resume_refused(result):
+                        # The state file outlived the transcript. Start over rather
+                        # than hand the user an error for a session they never chose.
+                        print(
+                            f"[web-gateway] session {state['session_id']} is gone — "
+                            f"starting a fresh one for {session_key}",
+                            flush=True,
+                        )
+                        session_action = "restarted"
+                        run_resume, run_prompt = None, restart_message or message
+                        result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                        effective_model)
+                else:
+                    session_action = "new"
+                    run_resume, run_prompt = None, message
+                    result = _spawn(_build_cmd(run_resume, run_prompt, effective_model),
+                                    effective_model)
 
-            escalated = False
-            if escalate_flag is not None and escalate_flag.exists():
-                escalate_flag.unlink(missing_ok=True)
-                if result.returncode == 0:
-                    escalated = True
-                    print(f"[web-gateway] {session_key}: junior escalated — "
-                          f"re-running on {FRONTIER_MODEL}", flush=True)
-                    result = _spawn(
-                        _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
-                        FRONTIER_MODEL)
+                escalated = False
+                if escalate_flag is not None and escalate_flag.exists():
+                    escalate_flag.unlink(missing_ok=True)
+                    if result.returncode == 0:
+                        escalated = True
+                        print(f"[web-gateway] {session_key}: junior escalated — "
+                              f"re-running on {FRONTIER_MODEL}", flush=True)
+                        result = _spawn(
+                            _build_cmd(run_resume, run_prompt, FRONTIER_MODEL),
+                            FRONTIER_MODEL)
+
+                # Only the kept run's manifest is read; the discarded runs' ones
+                # are dropped unread. A failed run's files go with its reply.
+                reply_files = (_read_reply_manifest(manifests[-1])
+                               if manifests and result.returncode == 0 else [])
+            finally:
+                # Every spawn's manifest goes, whatever happened — a spawn
+                # that raised included.
+                for stale in manifests:
+                    stale.unlink(missing_ok=True)
 
             if result.returncode != 0:
                 err_detail = result.stderr.strip()
@@ -4541,6 +4725,8 @@ def send_message(message: str, display_question: str | None = None,
             }
             if escalated:
                 out["escalated"] = True
+            if reply_files:
+                out["reply_files"] = reply_files
 
             if response_text:
                 shown_question = display_question or message

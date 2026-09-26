@@ -71,6 +71,17 @@ def _webp_vp8l(w, h):
             + b"VP8L" + len(payload).to_bytes(4, "little") + payload)
 
 
+def _box(kind: bytes, payload: bytes) -> bytes:
+    return (8 + len(payload)).to_bytes(4, "big") + kind + payload
+
+
+def _avif(w: int, h: int, major: bytes = b"avif", compat: bytes = b"mif1miaf") -> bytes:
+    ftyp = _box(b"ftyp", major + b"\x00\x00\x00\x00" + compat)
+    ispe = _box(b"ispe", b"\x00" * 4 + w.to_bytes(4, "big") + h.to_bytes(4, "big"))
+    meta = _box(b"meta", b"\x00" * 4 + _box(b"iprp", _box(b"ipco", ispe)))
+    return ftyp + meta
+
+
 def test_sniffer_formats():
     dims = ist._image_dimensions
     assert dims(_png(320, 420)) == (320, 420)
@@ -85,6 +96,9 @@ def test_sniffer_formats():
     assert dims(_webp_vp8x(2000, 1500)) == (2000, 1500)
     assert dims(_webp_vp8(640, 480)) == (640, 480)
     assert dims(_webp_vp8l(333, 77)) == (333, 77)
+    assert dims(_avif(1920, 1080)) == (1920, 1080)
+    # The AVIF brand as a compatible brand only (major brand mif1).
+    assert dims(_avif(40, 30, major=b"mif1", compat=b"avifmiaf")) == (40, 30)
     print("PASS test_sniffer_formats")
 
 
@@ -100,6 +114,9 @@ def test_sniffer_garbage_is_none():
     assert dims(_png(0, 10)) is None                           # zero dimension
     # OGG audio magic (a voice note) never matches an image sniff.
     assert dims(b"OggS" + b"\x00" * 40) is None
+    # ISO-BMFF that is not AVIF (an MP4, a HEIC) is not sniffed.
+    assert dims(_avif(640, 480, major=b"isom", compat=b"mp41")) is None
+    assert dims(_avif(640, 480, major=b"heic", compat=b"mif1")) is None
     print("PASS test_sniffer_garbage_is_none")
 
 
