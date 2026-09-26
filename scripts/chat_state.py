@@ -421,7 +421,9 @@ class ChatStateStore:
             return doc
 
     def set_contact(self, chat_id: str, *, name: str,
-                    sphere: str | None = None, tags=(), at: str | None = None) -> dict:
+                    sphere: str | None = None, tags=(), at: str | None = None,
+                    person: str | None = None, chamber: str | None = None,
+                    path: str | None = None) -> dict:
         """File this chat's peer in the address book, or clear the card with
         an empty name.
 
@@ -435,7 +437,11 @@ class ChatStateStore:
         last said about the sender, and the card is the *user's* word about
         the person. A named chat is not screened because a card exists (see
         `chat_is_unknown`), so removing the card falls back on what the rail
-        said rather than a guess made here."""
+        said rather than a guess made here.
+
+        ``person``, ``chamber`` and ``path`` point at the contact the card is
+        filed under (scripts/contacts.py): the person is the truth, and the
+        name and spheres here are this chat's copy of it."""
         with self._lock:
             doc = self._read(chat_id)
             clean = " ".join(str(name or "").split())
@@ -453,6 +459,8 @@ class ChatStateStore:
                 "tags": [t for t in (str(x).strip().lower() for x in tags) if t],
                 "at": at or iso_z(),
             }
+            if person:
+                doc["contact"].update(person=str(person), chamber=chamber or None, path=path or None)
             self._write(doc)
             return doc
 

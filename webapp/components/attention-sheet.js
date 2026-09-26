@@ -342,6 +342,20 @@ class RetinueAttentionSheet extends HTMLElement {
         if (this._form) { this._form.permit = !this._form.permit; this.render(); }
         break;
       case 'contact-new-sphere': this._newSphere = 'contact'; this.render(); break;
+      case 'contact-chamber':
+        if (this._form) { this._form.chamber = el.getAttribute('data-chamber'); this.render(); }
+        break;
+      case 'contact-link': {
+        // One tap: this handle is theirs — the person's own name and spheres.
+        const book = (this._data && this._data.contact_book) || {};
+        const who = (book.suggestions || []).find((p) => p.id === el.getAttribute('data-person'));
+        if (who) {
+          this._form = { name: who.name, sphere: who.sphere || '', tags: [...(who.tags || [])],
+            permit: false, chamber: who.chamber, person: who.id };
+          this._saveContact();
+        }
+        break;
+      }
       case 'contact-save': this._saveContact(); break;
       case 'contact-remove': this._saveContact(''); break;
       default: break;
@@ -396,13 +410,18 @@ class RetinueAttentionSheet extends HTMLElement {
 
   // The card the form starts from: what the chat already says about this
   // person, or an empty one for a number nobody has named.
+  // A new contact is stored in a chamber: the one the card is already filed
+  // in, else the address book's default (the first in chambers.json).
   _blankCard(item) {
     const card = (item && item.contact) || {};
+    const book = (this._data && this._data.contact_book) || {};
     return {
       name: card.name || (item && !item.unknown_sender ? item.title : '') || '',
       sphere: card.sphere || (item && item.sphere !== 'unknown' ? item.sphere : ''),
       tags: [...(card.tags || [])],
       permit: false,
+      chamber: card.chamber || book.default || '',
+      person: card.person || null,
     };
   }
 
@@ -413,6 +432,11 @@ class RetinueAttentionSheet extends HTMLElement {
     const name = nameOverride !== undefined ? nameOverride : (form.name || '').trim();
     if (nameOverride === undefined && !name) {
       this._error = 'A name, so the chat can be called something.';
+      this.render();
+      return;
+    }
+    if (nameOverride === undefined && !form.person && !form.chamber) {
+      this._error = 'A chamber to keep the contact in.';
       this.render();
       return;
     }
@@ -427,6 +451,8 @@ class RetinueAttentionSheet extends HTMLElement {
           sphere: name ? (form.sphere || null) : null,
           tags: name ? form.tags : [],
           permit: Boolean(name && form.permit),
+          chamber: name ? (form.chamber || null) : null,
+          person: name ? (form.person || null) : null,
         }),
       });
       if (!res.ok) throw new Error(String(res.status));
@@ -454,10 +480,20 @@ class RetinueAttentionSheet extends HTMLElement {
     if (item.kind !== 'chat' || item.group) return '';
     const busy = this._busy ? ' disabled' : '';
     const card = item.contact;
+    const book = (this._data && this._data.contact_book) || {};
+    // Someone the address book already has — by this handle, or by the same
+    // number on another channel: linking is one tap.
+    const suggestions = card && card.person ? [] : (book.suggestions || []);
+    const suggest = suggestions.length
+      ? `<div class="f-ctl">${suggestions.map((p) =>
+        `<button class="btn tiny" data-act="contact-link" data-person="${esc(p.id)}"${busy}>` +
+        `This is ${esc(p.name)}</button><span class="f-note">${p.exact ? 'has this handle' : 'same number, another channel'} · ${esc(p.chamber)}</span>`).join('')}</div>`
+      : '';
     if (!this._form) {
       const label = card
         ? `<div class="f-value">${esc(card.name)}${card.sphere ? ` · <span style="color:${sphereColor(card.sphere)}">${esc(card.sphere)}</span>` : ''}` +
-          `${(card.tags || []).length ? ` <span class="f-note">+ ${card.tags.map(esc).join(', ')}</span>` : ''}</div>`
+          `${(card.tags || []).length ? ` <span class="f-note">+ ${card.tags.map(esc).join(', ')}</span>` : ''}` +
+          `${card.chamber ? ` <span class="f-note">· in ${esc(card.chamber)}</span>` : ''}</div>`
         : item.unknown_sender
           ? `<div class="f-value">${esc(item.handle || item.sender || '')} — nobody has this number yet.</div>` +
             `<div class="f-note">Screened: their message is listed and carried by the next digest, but no mode admits ` +
@@ -466,7 +502,7 @@ class RetinueAttentionSheet extends HTMLElement {
           // knows for them: nothing is screened, the card only names them.
           : `<div class="f-value">${esc(item.handle || item.sender || '')} — no contact card yet.</div>`;
       return `<div class="field${item.unknown_sender ? ' screened' : ''}">` +
-        `<div class="f-label">${card || !item.unknown_sender ? 'Contact' : 'New number'}</div>${label}` +
+        `<div class="f-label">${card || !item.unknown_sender ? 'Contact' : 'New number'}</div>${label}${suggest}` +
         `<div class="f-ctl" style="margin-top:6px"><button class="btn tiny" data-act="contact-edit"${busy}>` +
         `${card ? 'Edit the contact' : 'Add a contact'}</button>` +
         (card ? `<button class="btn tiny" data-act="contact-remove"${busy}>Remove</button>` : '') +
@@ -476,9 +512,21 @@ class RetinueAttentionSheet extends HTMLElement {
     const pick = (s) => `<button class="btn tiny${form.sphere === s ? ' on' : ''}" data-act="contact-sphere" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`;
     const tag = (s) => `<button class="btn tiny${form.tags.includes(s) ? ' on' : ''}" data-act="contact-tag" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`;
     const choices = spheres.filter((s) => s !== 'unknown');
+    // Where a new contact is kept: a contact always belongs to one chamber.
+    // A card already filed stays where its person lives.
+    const chambers = book.chambers || [];
+    const where = form.person
+      ? (form.chamber ? `<div class="f-note">Kept in ${esc(form.chamber)}.</div>` : '')
+      : chambers.length
+        ? `<div><div class="f-k">kept in</div><div class="chips">${chambers.map((c) =>
+          `<button class="btn tiny${form.chamber === c ? ' on' : ''}" data-act="contact-chamber" data-chamber="${esc(c)}"${busy}>${esc(c)}</button>`).join('')}</div>` +
+          `<div class="f-note">The chamber the contact is stored in, with every channel that reaches them.</div></div>`
+        : `<div class="f-note">No chamber holds contacts — see the contacts entry in chambers.json.</div>`;
     return `<div class="field screened"><div class="f-label">${card ? 'Contact' : 'New contact'}</div>` +
       `<div class="card-form">` +
+      (form.person ? '' : suggest) +
       `<input type="text" data-set="contact-name" value="${esc(form.name)}" placeholder="Their name" autocomplete="off">` +
+      where +
       `<div><div class="f-k">belongs to</div><div class="chips">${choices.map(pick).join('')}</div>` +
       `<div class="f-note">The sphere decides which modes let them through.</div></div>` +
       `<div><div class="f-k">also</div><div class="chips">${choices.filter((s) => s !== form.sphere).map(tag).join('')}` +

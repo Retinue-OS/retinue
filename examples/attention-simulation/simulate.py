@@ -311,6 +311,10 @@ def load_gateway(tmp: Path, store_port: int, gateways: dict[str, int], sim_port:
         "CONVERSATIONS_DIR": str(tmp / "convs"),
         "CONVERSATION_DIR": str(tmp / "convlog"),
         "CHAMBERS_DIR": str(tmp / "chambers"),
+        # No manifest: every mounted chamber (here, `story`) keeps contacts at
+        # the default path, and nothing is a git repository to commit to.
+        "CHAMBERS_MANIFEST": str(tmp / "no-chambers.json"),
+        "CONTACTS_COMMIT": "0",
         "WEB_GATEWAY_STATE": str(tmp / "state.json"),
         "PUSH_DIR": str(tmp / "push"),
         "ATTENTION_DIR": str(tmp / "attention"),
@@ -442,10 +446,11 @@ class Simulation:
             self.epoch += 1
             self.ledger.reset()
             wg = self.wg
-            # The generated chamber holds what outlives a session — the
-            # delivery gate's policy, the address book, the attention emit —
-            # so midnight has to wipe it too, or yesterday's contact card
-            # would make today's stranger a known sender.
+            # The generated chamber and the story chamber hold what outlives a
+            # session — the delivery gate's policy, the attention emit, the
+            # address book (story/contacts/) — so midnight has to wipe them
+            # too, or yesterday's contact card would make today's stranger a
+            # known sender.
             for d in (wg.CONVERSATIONS_DIR, wg.CHAT_STATE_DIR, wg.ATTENTION_DIR,
                       wg.CHAMBERS_DIR / "_generated", wg.CHAMBERS_DIR / "story"):
                 shutil.rmtree(d, ignore_errors=True)
@@ -843,7 +848,8 @@ class Simulation:
         chat = story.chat_id(who)
         status, body = self.api("POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
                                 {"name": card.get("name") or "", "sphere": card.get("sphere"),
-                                 "tags": card.get("tags") or [], "permit": bool(card.get("permit"))})
+                                 "tags": card.get("tags") or [], "permit": bool(card.get("permit")),
+                                 "chamber": "story"})
         if status != 200:
             self.say("system", f"contact card refused: {status} {body}")
             return False, None

@@ -821,7 +821,8 @@ This framework is content-neutral. A deployment supplies its own chambers and
 edge wiring without forking the framework:
 
 1. Provide a `chambers.json` (content-only: `name`, optional `url`/`url_env`, or
-   a local `path`). See [`chambers.example.json`](chambers.example.json) and the
+   a local `path`; optionally `contacts`, the chamber's address-book directory —
+   see [docs/contacts.md](docs/contacts.md)). See [`chambers.example.json`](chambers.example.json) and the
    [example chambers](examples/chambers/).
 2. Copy [`docker-compose.override.example.yml`](docker-compose.override.example.yml)
    to `docker-compose.override.yml` (Compose merges it automatically; it is

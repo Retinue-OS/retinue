@@ -113,8 +113,12 @@ and optionally a permit to interrupt right now. Saving it
 (`POST /chats/<id>/contact`) names the chat, teaches the attention profile
 their spheres (carrying over whatever the bare number had already been taught),
 re-judges the open item — so their next message is ranked by that sphere —
-and writes the card into the life store's address book (`CONTACTS_EMIT_PATH`, a Turtle file of vCard
-individuals under the generated chamber). An empty name removes the card and
+and files the handle under a person in the address book — one N-Triples file in
+a chamber ([contacts.md](contacts.md)). A new person needs the chamber it is
+kept in (the card pre-selects the first contact location of `chambers.json`);
+the card also offers, one tap each, anyone the book already has for this handle
+or for the same number on another channel, and a change to a person reaches
+every chat of theirs. An empty name unlinks the handle — the person stays — and
 puts the sender back into screening. Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project

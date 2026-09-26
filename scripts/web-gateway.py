@@ -118,12 +118,25 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          group is a news source, or costs a
                                          model turn, is that policy's business.
   POST /chats/<id>/contact            -> the contact card: {name, sphere?,
-                                         tags?, permit?}. Names the chat's
-                                         peer, teaches the attention profile
-                                         where they belong, re-judges the open
-                                         item and writes the card into the
-                                         life store. An empty name puts them
-                                         back into screening.
+                                         tags?, permit?, chamber?, person?}.
+                                         Files the chat's peer as a person in
+                                         a chamber (a new one needs `chamber`;
+                                         `person` links an existing contact),
+                                         teaches the attention profile where
+                                         they belong and re-judges the open
+                                         item. An empty name unlinks the
+                                         handle and puts them back into
+                                         screening.
+  GET  /contacts                      -> the address book (scripts/contacts.py):
+                                         {locations, default, contacts}.
+                                         ?q=<text> searches names and e-mail
+                                         addresses; ?channel=&handle= looks
+                                         a handle up (email, sms, signal, …).
+  POST /contacts                      -> create a contact: {chamber, name,
+                                         handles: [{channel, handle}],
+                                         sphere?, tags?}.
+  POST /contacts/<id>                 -> change one: {name?, sphere?, tags?,
+                                         add?: [handle], remove?: [handle]}.
   POST /chats/<id>/delete             -> erase the chat for good: its ledger
                                          records and media (via every inbox
                                          gateway of the channel), the gateways'
@@ -233,6 +246,7 @@ import attention_store
 import build_stamp
 import claude_auth
 import chat_state as chat_state_mod
+import contacts as contacts_mod
 import email_client as ec
 import session_env
 import gateway_auth
@@ -1236,13 +1250,17 @@ ATTENTION_CATCH_UP_MINUTES = 180
 # The life-store emit of the open items' properties (docs/attention-model.md).
 ATTENTION_EMIT_PATH = Path(os.environ.get(
     "ATTENTION_EMIT_PATH", str(CHAMBERS_DIR / "_generated" / "attention" / "items.nt")))
-# The address book the dashboard writes: one Turtle file holding the contact
-# card of every chat the user has named (POST /chats/<id>/contact), so a name
-# the user gave a number is a fact in the life store like any other — and so
-# the next session, the Secretary and the transcript repair all know it.
-# Under a chamber's `contacts/` by convention, in the generated chamber the
-# framework owns.
-CONTACTS_EMIT_PATH = Path(os.environ.get(
+# The address book: every contact is one person, stored in one chamber where
+# that chamber's chambers.json entry says (`contacts`, default `contacts/`) —
+# scripts/contacts.py, docs/contacts.md. The contact card files a chat's peer
+# there, so a name the user gave a number is chamber data like any other:
+# versioned, in the life store, known to the next session and the Secretary.
+CHAMBERS_MANIFEST = Path(os.environ.get("CHAMBERS_MANIFEST", "/workspace/chambers.json"))
+_CONTACTS = contacts_mod.ContactBook(CHAMBERS_DIR, CHAMBERS_MANIFEST)
+# The single Turtle file earlier versions derived from the chat cards. The
+# startup migration (_contacts_migrate) files its cards in a chamber and
+# removes it.
+LEGACY_CONTACTS_EMIT_PATH = Path(os.environ.get(
     "CONTACTS_EMIT_PATH", str(CHAMBERS_DIR / "_generated" / "contacts" / "dashboard.ttl")))
 # Whether the model's delivery decision governs the push (the default) or
 # every arrival pushes as it did before the model existed, while the decision
@@ -4553,11 +4571,11 @@ def send_message(message: str, display_question: str | None = None,
 
 # ── Transcript cleanup ────────────────────────────────────────────────────────
 
-# Literal objects of any *name predicate in a chamber's contacts graph — the
-# people the user is likely to dictate about, and the words Whisper most often
-# mangles. Cached against the source files' mtimes.
-# `…name "X"` covers foaf/schema/kb spellings; `:fn "X"` the vCard one the
-# dashboard's own address book writes (CONTACTS_EMIT_PATH).
+# The names in the address book — the people the user is likely to dictate
+# about, and the words Whisper most often mangles: every contact's name, plus
+# the literal objects of any *name predicate in a hand-kept Turtle file beside
+# them (`…name "X"` covers foaf/schema/kb spellings, `:fn "X"` the vCard one).
+# Cached against the source files' mtimes.
 _NAME_LITERAL_RE = re.compile(r'(?:[Nn]ame|:fn)\s+"([^"\n]{2,80})"')
 _contact_names_cache: tuple[float, list[str]] | None = None
 _contact_names_lock = threading.Lock()
@@ -4566,8 +4584,9 @@ _contact_names_lock = threading.Lock()
 def _contact_names(limit: int = 200) -> list[str]:
     global _contact_names_cache
     try:
-        sources = sorted(CHAMBERS_DIR.glob("*/contacts/*.ttl"))
-        stamp = sum(p.stat().st_mtime for p in sources)
+        dirs = [loc["dir"] for loc in _CONTACTS.locations()]
+        turtle = sorted(p for d in dirs for p in d.glob("*.ttl"))
+        stamp = sum(p.stat().st_mtime for d in dirs for p in list(d.glob("*.nt")) + list(d.glob("*.ttl")))
     except OSError:
         return []
     with _contact_names_lock:
@@ -4575,16 +4594,17 @@ def _contact_names(limit: int = 200) -> list[str]:
             return _contact_names_cache[1]
         names: list[str] = []
         seen: set[str] = set()
-        for path in sources:
+        found = [r["name"] for r in _CONTACTS.all() if r.get("name")]
+        for path in turtle:
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                found += _NAME_LITERAL_RE.findall(path.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 continue
-            for name in _NAME_LITERAL_RE.findall(text):
-                key = name.casefold()
-                if key not in seen:
-                    seen.add(key)
-                    names.append(name)
+        for name in found:
+            key = name.casefold()
+            if key not in seen:
+                seen.add(key)
+                names.append(name)
         names = names[:limit]
         _contact_names_cache = (stamp, names)
         return names
@@ -5102,6 +5122,7 @@ _CHAT_DRAFT_UNDO_RE = re.compile(r"^/chats/([^/]+)/draft/undo/?$")
 _CHAT_SEND_RE = re.compile(r"^/chats/([^/]+)/send/?$")
 _CHAT_COMPANION_RE = re.compile(r"^/chats/([^/]+)/companion/?$")
 _CHAT_CONTACT_RE = re.compile(r"^/chats/([^/]+)/contact/?$")
+_CONTACT_RE = re.compile(r"^/contacts/([^/]+)/?$")
 _INTERNAL_CHAT_DRAFT_RE = re.compile(r"^/internal/chats/([^/]+)/draft/?$")
 # The media id is the gateways' token_hex(16) — 32 hex chars, path-safe by
 # construction; the slug charset matches the gateway-registry slugs.
@@ -6320,11 +6341,9 @@ def _delete_chat(chat_id: str) -> tuple[dict, str | None]:
         companion = (removed or {}).get("companion")
         if companion:
             report["companion"] = _delete_conversation(str(companion))
+    # The contact, if the card filed one, stays: it is a person in a chamber,
+    # not a trace of this chat (the account remains theirs until unlinked).
     _chats_cache_invalidate()
-    if (removed or {}).get("contact"):
-        # The card lived in the chat state; the address book it was written
-        # into is derived from that, so an erased chat leaves it too.
-        _contacts_emit()
     print(f"[web-gateway] deleted chat {chat_id!r}: {json.dumps(report)}", flush=True)
     return report, None
 
@@ -6865,66 +6884,149 @@ def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
                              mode="reply" if had_unread else "new", urgency=urgency)
 
 
-# ── Contacts: the address book the dashboard writes ─────────────────────────
+# ── Contacts: people, in chambers ───────────────────────────────────────────
 # A messenger chat is a handle until someone says whose it is. The contact
-# card (POST /chats/<id>/contact) is where the user says it, and this is the
-# record it leaves outside the gateway's own state: every named chat as one
-# vCard individual, with the spheres that name puts them in. Derived from the
-# chat documents on every write, so the file is a projection and never a
-# second truth; sorted and write-if-changed, the discover-agents discipline,
-# so an unchanged address book never triggers a qlever rebuild.
-
-VCARD = "http://www.w3.org/2006/vcard/ns#"
-_TTL_HEADER = (f"@prefix kb: <{attention_policy.KB}> .\n"
-               f"@prefix vcard: <{VCARD}> .\n"
-               "@prefix sphere: <urn:retinue:sphere:> .\n"
-               "@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n")
-# A handle that is a phone number also gets the standard tel: property, so
-# "who is +41 79 …?" is one query against a vocabulary other data speaks too.
-_PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
+# card (POST /chats/<id>/contact) is where the user says it, and the answer is
+# a person in the address book (scripts/contacts.py): one file in one chamber,
+# holding every handle that reaches them — this chat's account among them,
+# their e-mail addresses, their phone numbers. The chat document keeps a copy
+# of the card (name, spheres) and the person it points at; the person is the
+# truth, and a change to it is copied to every chat that points there.
 
 
-def _ttl_literal(value: str) -> str:
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
-
-
-def _contact_uri(channel: str, handle: str) -> str:
-    return ("urn:retinue:contact:" + urllib.parse.quote(f"{channel}:{handle}", safe=""))
-
-
-def _contacts_turtle(docs: dict) -> str:
-    blocks = []
-    for chat_id, doc in docs.items():
-        card = doc.get("contact") or {}
-        name = str(card.get("name") or "").strip()
-        if not name or doc.get("group"):
-            continue
-        parts = chat_state_mod.split_chat_id(chat_id)
-        if parts is None:
-            continue
-        channel, handle = parts
-        props = ["a vcard:Individual",
-                 f"vcard:fn {_ttl_literal(name)}",
-                 f"kb:channel {_ttl_literal(channel)}",
-                 f"kb:handle {_ttl_literal(handle)}",
-                 f"kb:chat {_ttl_literal(chat_id)}"]
-        if _PHONE_RE.match(handle):
-            props.append(f"vcard:hasTelephone <tel:{handle}>")
-        if card.get("sphere"):
-            props.append(f"kb:sphere sphere:{card['sphere']}")
-        props += [f"kb:tag sphere:{tag}" for tag in sorted(set(card.get("tags") or []))]
-        if card.get("at"):
-            props.append(f"kb:addedAt {_ttl_literal(card['at'])}^^xsd:dateTime")
-        blocks.append(f"<{_contact_uri(channel, handle)}>\n"
-                      + " ;\n".join("    " + prop for prop in props) + " .")
-    return _TTL_HEADER + "\n\n".join(sorted(blocks)) + ("\n" if blocks else "")
-
-
-def _contacts_emit() -> None:
+def _chat_handle(chat_id: str) -> tuple[str, str] | None:
+    """The (channel, handle) a 1:1 chat's peer is reached by; None for a group."""
+    parts = chat_state_mod.split_chat_id(chat_id)
+    if parts is None or _chat_is_group(*parts):
+        return None
     try:
-        attention_policy.write_if_changed(CONTACTS_EMIT_PATH, _contacts_turtle(_CHAT_STATE.all()))
-    except OSError as exc:
-        print(f"[web-gateway] contacts: emit failed ({exc})", flush=True)
+        return contacts_mod.normalize_handle(*parts)
+    except contacts_mod.ContactError:
+        return None
+
+
+def _contact_commit(record: dict, verb: str) -> None:
+    """Commit the person's file in its chamber, off the request path."""
+    threading.Thread(
+        target=contacts_mod.commit,
+        args=(CHAMBERS_DIR, record["path"], f"chore(contacts): {verb} {record['name']} via dashboard"),
+        name="contact-commit", daemon=True).start()
+
+
+def _contact_card_fields(record: dict) -> dict:
+    return {"name": record["name"], "sphere": record.get("sphere"), "tags": list(record.get("tags") or []),
+            "person": record["key"], "chamber": record["chamber"], "path": record["path"]}
+
+
+def _contact_sync_chats(record: dict, profile: dict | None = None, *, skip: str | None = None) -> list[str]:
+    """Copy the person onto every chat whose card points at them; renames move
+    what the attention profile learned under the old name. Returns what was
+    learned, for the reply."""
+    learned: list[str] = []
+    for chat_id, doc in _CHAT_STATE.all().items():
+        card = doc.get("contact") or {}
+        if chat_id == skip or card.get("person") != record["key"]:
+            continue
+        fields = _contact_card_fields(record)
+        if all(card.get(k) == v for k, v in fields.items()):
+            continue
+        _CHAT_STATE.set_contact(chat_id, at=card.get("at"), **fields)
+        if profile is not None and card.get("name") and card["name"] != record["name"]:
+            learned += _attention_rename_sender(profile, card["name"], record["name"])
+    _chats_cache_invalidate()
+    return learned
+
+
+def _contact_file_card(handle: tuple[str, str], card: dict, *, name: str, sphere, tags,
+                       chamber: str | None, person: str | None) -> tuple[dict | None, str]:
+    """Apply a contact card to the address book; returns (person, verb).
+
+    - no name: the handle leaves the person the card pointed at (the person
+      stays — they are more than this chat);
+    - ``person``: link the handle to that contact (moving it off another);
+    - a card already filed: update that person;
+    - a handle someone already owns: update the owner;
+    - otherwise: a new person, in ``chamber`` — a contact always has one.
+
+    Raises contacts.ContactError, whose status is the HTTP answer."""
+    current = _CONTACTS.get(card["person"]) if card.get("person") else None
+    if not name:
+        if current and _CONTACTS.find(*handle) and _CONTACTS.find(*handle)["iri"] == current["iri"]:
+            return _CONTACTS.update(current["key"], remove=[handle]), "unlink a handle of"
+        return None, ""
+    target = None
+    if person:
+        target = _CONTACTS.get(person)
+        if target is None:
+            raise contacts_mod.ContactError(f"no contact {person!r}", 404)
+    else:
+        target = current or _CONTACTS.find(*handle)
+    if target is None:
+        if not chamber:
+            raise contacts_mod.ContactError("chamber is required: which chamber stores this contact?")
+        return _CONTACTS.create(chamber, name, [handle], sphere=sphere, tags=tags), "add"
+    owner = _CONTACTS.find(*handle)
+    if owner and owner["iri"] != target["iri"]:
+        _CONTACTS.update(owner["key"], remove=[handle])
+    add = [] if owner and owner["iri"] == target["iri"] else [handle]
+    return _CONTACTS.update(target["key"], name=name, sphere=sphere, tags=tags, add=add), "update"
+
+
+def _contact_brief(record: dict) -> dict:
+    """A person as the contact card offers them: to link, or to show."""
+    out = contacts_mod.public(record)
+    out["exact"] = bool(record.get("exact", False))
+    return out
+
+
+def _contact_book_for(item: dict) -> dict:
+    """What the contact card needs beyond the item: where a new contact can be
+    stored, which chamber is pre-selected, and who this handle may belong to."""
+    handle = _chat_handle(str(item.get("id") or "")[len("chat:"):]) if item.get("kind") == "chat" else None
+    if handle is None:
+        return {}
+    card = item.get("contact") or {}
+    suggestions = [] if card.get("person") else [_contact_brief(r) for r in _CONTACTS.suggest(*handle)]
+    return {"chambers": [loc["chamber"] for loc in _CONTACTS.locations()],
+            "default": _CONTACTS.default_chamber(), "suggestions": suggestions}
+
+
+def _contacts_migrate() -> int:
+    """File the cards of earlier versions — a name on a chat document, written
+    into one generated Turtle file — as persons in the default chamber (the
+    first contact location in chambers.json), and retire that file once no
+    card is left behind. Idempotent: a card that points at a person is done."""
+    default = _CONTACTS.default_chamber()
+    filed: list[dict] = []
+    left = 0
+    for chat_id, doc in _CHAT_STATE.all().items():
+        card = doc.get("contact") or {}
+        if not card.get("name") or card.get("person"):
+            continue
+        handle = _chat_handle(chat_id)
+        if handle is None or default is None:
+            left += 1
+            continue
+        try:
+            record = _CONTACTS.find(*handle) or _CONTACTS.create(
+                default, card["name"], [handle], sphere=card.get("sphere"),
+                tags=card.get("tags") or (), created=card.get("at"))
+        except contacts_mod.ContactError as exc:
+            print(f"[web-gateway] contacts: could not migrate {chat_id!r} ({exc})", flush=True)
+            left += 1
+            continue
+        _CHAT_STATE.set_contact(chat_id, at=card.get("at"), **_contact_card_fields(record))
+        filed.append(record)
+    if not left:
+        LEGACY_CONTACTS_EMIT_PATH.unlink(missing_ok=True)
+    if filed:
+        _chats_cache_invalidate()
+
+        def _commit_all():
+            for record in filed:
+                contacts_mod.commit(CHAMBERS_DIR, record["path"], f"chore(contacts): file {record['name']} from the dashboard")
+        threading.Thread(target=_commit_all, name="contact-migrate", daemon=True).start()
+    return len(filed)
 
 
 # ── Attention: the home screen's model ──────────────────────────────────────
@@ -7749,6 +7851,13 @@ class Handler(BaseHTTPRequestHandler):
         if chat_contact_match:
             self._handle_chat_contact(chat_contact_match.group(1))
             return
+        if self.path.split("?", 1)[0] in ("/contacts", "/contacts/"):
+            self._handle_contact_write(None)
+            return
+        contact_match = _CONTACT_RE.match(self.path.split("?", 1)[0])
+        if contact_match:
+            self._handle_contact_write(urllib.parse.unquote(contact_match.group(1)))
+            return
         chat_delete_match = _CHAT_DELETE_RE.match(self.path)
         if chat_delete_match:
             self._handle_chat_delete(chat_delete_match.group(1))
@@ -8284,15 +8393,21 @@ class Handler(BaseHTTPRequestHandler):
           user had already taught about the bare handle — a prior, a permit);
         - the open item is corrected to that sphere and re-judged on the spot,
           so a customer named during Work rings a second later;
-        - the card is written into the life store's address book, so the fact
-          outlives the session (CONTACTS_EMIT_PATH).
+        - the handle is filed under a person in the address book
+          (scripts/contacts.py), so the fact outlives the session and every
+          other channel of theirs shares it. A new person is stored in the
+          chamber the body names (``chamber``, required — a contact always
+          belongs to one); ``person`` links the handle to an existing contact
+          instead; a card already filed updates its person, and every other
+          chat of theirs follows.
 
-        An empty name removes the card: the chat is a handle again, its item
-        goes back to the `unknown` sphere, and the sender is screened again
-        unless they are a VIP or the profile still knows their sphere. The card
-        says nothing to the delivery gate: whether a message is worked by a
-        model on arrival is the sender's VIP flag (triage_policy), which the
-        user sets per person.
+        An empty name removes the card: the handle leaves the person (who
+        stays in the address book), the chat is a handle again, its item goes
+        back to the `unknown` sphere, and the sender is screened again unless
+        they are a VIP or the profile still knows their sphere. The card says
+        nothing to the delivery gate: whether a message is worked by a model on
+        arrival is the sender's VIP flag (triage_policy), which the user sets
+        per person.
         """
         chat_id = self._chat_id_or_404(raw_id)
         if chat_id is None:
@@ -8310,6 +8425,12 @@ class Handler(BaseHTTPRequestHandler):
         # `sphere:<tag>` would not parse.
         tags = list(dict.fromkeys(t for t in (attention_policy.sphere_id(x) for x in (payload.get("tags") or [])) if t))
         channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+        handle = _chat_handle(chat_id)
+        if handle is None:
+            self._send_json(400, {"error": "a group chat has no contact card"})
+            return
+        chamber = str(payload.get("chamber") or "").strip() or None
+        person_ref = str(payload.get("person") or "").strip() or None
         before = _CHAT_STATE.get(chat_id)
         was = _chat_display_name(before, channel, key)
         item_id = f"chat:{chat_id}"
@@ -8321,10 +8442,24 @@ class Handler(BaseHTTPRequestHandler):
             if sphere and sphere not in spheres:
                 self._send_json(400, {"error": "unknown sphere"})
                 return
-            doc = _CHAT_STATE.set_contact(chat_id, name=name, sphere=sphere, tags=tags,
-                                          at=now.isoformat())
-            _chats_cache_invalidate()
+            try:
+                record, verb = _contact_file_card(handle, (before or {}).get("contact") or {}, name=name,
+                                                  sphere=sphere, tags=tags, chamber=chamber,
+                                                  person=person_ref)
+            except contacts_mod.ContactError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+                return
             learned: list[str] = []
+            if name and record is not None:
+                # The person is the truth: their name and spheres are the card's.
+                name, sphere, tags = record["name"], record.get("sphere"), list(record.get("tags") or [])
+                doc = _CHAT_STATE.set_contact(chat_id, at=now.isoformat(), **_contact_card_fields(record))
+                learned += _contact_sync_chats(record, profile, skip=chat_id)
+            else:
+                doc = _CHAT_STATE.set_contact(chat_id, name="")
+            if record is not None:
+                _contact_commit(record, verb)
+            _chats_cache_invalidate()
             if name and name != was:
                 # Priors and permits are keyed on the name the user sees, so
                 # what they taught the bare number follows it to the person.
@@ -8356,14 +8491,75 @@ class Handler(BaseHTTPRequestHandler):
             _ATTENTION.save_profile(profile)
             if effect and effect["type"] == "push" and item is not None:
                 _attention_push_item(item, effect.get("reason", ""))
-        _contacts_emit()
         body = {"id": chat_id, "contact": doc.get("contact"), "name": doc.get("name"),
+                "person": contacts_mod.public(record) if record is not None and name else None,
                 "learned_now": learned,
                 "effect": ({"type": effect["type"], "reason": effect.get("reason", "")}
                            if effect else None)}
         if item is not None:
             body.update(self._attention_item_body(item, focus, profile, now))
         self._send_json(200, body)
+
+    def _handle_contacts_get(self, query: str) -> None:
+        """The address book: where contacts are stored, and who is in it —
+        all, a name/e-mail search (?q=), or the owner of one handle
+        (?channel=&handle=, any channel: email, sms, signal, …)."""
+        params = urllib.parse.parse_qs(query or "")
+        first = lambda k: (params.get(k) or [""])[0].strip()  # noqa: E731
+        if first("handle"):
+            records = _CONTACTS.suggest(first("channel") or "sms", first("handle"))
+        elif first("q"):
+            records = _CONTACTS.search(first("q"))
+        else:
+            records = _CONTACTS.all()
+        self._send_json(200, {
+            "locations": [{"chamber": loc["chamber"], "path": loc["path"]} for loc in _CONTACTS.locations()],
+            "default": _CONTACTS.default_chamber(),
+            "contacts": [_contact_brief(r) for r in records],
+        })
+
+    def _handle_contact_write(self, key: str | None) -> None:
+        """Create a contact (POST /contacts: {chamber, name, handles, sphere?,
+        tags?}) or change one (POST /contacts/<id>: {name?, sphere?, tags?,
+        add?, remove?}); handles are {channel, handle} of any channel. Every
+        chat whose card points at the person follows the change."""
+        payload = self._read_json_body()
+        if not isinstance(payload, dict):
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+
+        def pairs(field):
+            out = []
+            for h in payload.get(field) or []:
+                if not isinstance(h, dict):
+                    raise contacts_mod.ContactError(f"{field}: expected {{channel, handle}} objects")
+                out.append(contacts_mod.normalize_handle(h.get("channel"), h.get("handle")))
+            return out
+
+        tags = payload.get("tags")
+        tags = None if tags is None else [t for t in (attention_policy.sphere_id(x) for x in tags) if t]
+        sphere = payload.get("sphere", False)
+        if sphere not in (False, None):
+            sphere = attention_policy.sphere_id(sphere) or None
+        with _attention_lock:
+            profile = _ATTENTION.profile()
+            try:
+                if key is None:
+                    record = _CONTACTS.create(str(payload.get("chamber") or ""), str(payload.get("name") or ""),
+                                              pairs("handles"), sphere=sphere or None, tags=tags or ())
+                    verb, status = "add", 201
+                else:
+                    name = payload.get("name")
+                    record = _CONTACTS.update(key, name=None if name is None else str(name), sphere=sphere,
+                                              tags=tags, add=pairs("add"), remove=pairs("remove"))
+                    verb, status = "update", 200
+            except contacts_mod.ContactError as exc:
+                self._send_json(exc.status, {"error": str(exc)})
+                return
+            learned = _contact_sync_chats(record, profile)
+            _ATTENTION.save_profile(profile)
+        _contact_commit(record, verb)
+        self._send_json(status, {"contact": contacts_mod.public(record), "learned_now": learned})
 
     def _handle_chat_delete(self, raw_id: str) -> None:
         """Erase a chat for good (no body): every message and blob in the
@@ -8947,6 +9143,7 @@ class Handler(BaseHTTPRequestHandler):
             "next_breakpoint": attention_policy.next_breakpoint(focus, now).isoformat(),
             "spheres": list(focus.get("spheres") or attention_store.DEFAULT_SPHERES),
             "learned": (profile.get("learned") or [])[-3:],
+            "contact_book": _contact_book_for(item),
         }
 
     def _handle_attention_post(self, action: str) -> None:
@@ -9882,6 +10079,9 @@ class Handler(BaseHTTPRequestHandler):
         if conv_path in ("/chats", "/chats/"):
             self._handle_chats_list()
             return
+        if conv_path in ("/contacts", "/contacts/"):
+            self._handle_contacts_get(conv_query)
+            return
         chat_media_match = _CHAT_MEDIA_RE.match(conv_path)
         if chat_media_match:
             self._handle_chat_media(chat_media_match.group(1),
@@ -10217,6 +10417,14 @@ if __name__ == "__main__":
     # ThreadingHTTPServer so quick requests (job polls, /health) are never
     # blocked head-of-line behind a long-running job. Actual `claude` concurrency
     # is still bounded by the worker pool inside send_message().
+    # File the contact cards of earlier versions as persons in a chamber.
+    # Idempotent and best-effort, like the repairs above.
+    try:
+        migrated = _contacts_migrate()
+        if migrated:
+            print(f"[web-gateway] filed {migrated} contact card(s) in the address book", flush=True)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[web-gateway] contact migration skipped: {exc}", flush=True)
     # The attention model's clock: breakpoints (digest times, scheduled mode
     # changes) and the half-hourly sweep run here, with no browser open.
     threading.Thread(target=_attention_tick_loop, name="attention-tick", daemon=True).start()

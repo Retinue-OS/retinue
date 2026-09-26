@@ -21,6 +21,7 @@ that same guide.
 | Units of measure | **UCUM** codes, as the unit string (`"mmol/L"`) | — (codes, not IRIs) |
 | Dates and times | XSD datatypes (`xsd:date`, `xsd:dateTime`) | `http://www.w3.org/2001/XMLSchema#` |
 | People and organisations as contacts | **vCard** | `http://www.w3.org/2006/vcard/ns#` |
+| A person's account on a messaging service (Signal, WhatsApp, Telegram, …) | **FOAF** `foaf:OnlineAccount`, `foaf:account`, `foaf:accountName` | `http://xmlns.com/foaf/0.1/` |
 | Roles, events, places, general things | **schema.org** | `http://schema.org/` |
 | Documents and their metadata (title, date, creator, format) | **Dublin Core Terms** | `http://purl.org/dc/terms/` |
 | Labels and simple classification | RDFS / **SKOS** | `http://www.w3.org/2000/01/rdf-schema#`, `http://www.w3.org/2004/02/skos/core#` |
