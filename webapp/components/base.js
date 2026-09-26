@@ -48,6 +48,36 @@ export function onFrameChange(fn) {
   return () => mq.removeEventListener('change', handler);
 }
 
+// ── Focus and presses ─────────────────────────────────────────────────────────
+// The element that actually has focus, followed through shadow roots (every
+// card and page component renders into one).
+export function deepActiveElement(doc = document) {
+  let el = doc.activeElement;
+  while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
+  return el;
+}
+
+// Input types that do not raise a keyboard: everything else is text entry.
+const NON_TEXT_INPUTS = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image',
+  'radio', 'range', 'reset', 'submit']);
+
+// Whether `el` is somewhere the user types — the one definition of "typing"
+// behind the update check's reload guard and the phone keyboard detection.
+export function isTextEntry(el) {
+  if (!el) return false;
+  if (el.tagName === 'TEXTAREA' || el.isContentEditable) return true;
+  return el.tagName === 'INPUT' && !NON_TEXT_INPUTS.has((el.getAttribute('type') || 'text').toLowerCase());
+}
+
+// Call `fn` on any pointer press outside `el` (shadow-aware: composedPath sees
+// through the shadow roots a press lands in). Returns an unsubscribe function.
+// `capture` runs it before the pressed element's own handlers see the press.
+export function onPressOutside(el, fn, { capture = false } = {}) {
+  const handler = (e) => { if (!e.composedPath().includes(el)) fn(e); };
+  document.addEventListener('pointerdown', handler, capture);
+  return () => document.removeEventListener('pointerdown', handler, capture);
+}
+
 // ── List/cards view preference ────────────────────────────────────────────────
 // Each list card (conversations, projects, news) can present its rows either as
 // reflowing tiles ("cards") or as a single full-width column ("list"). The

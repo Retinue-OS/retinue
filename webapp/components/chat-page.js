@@ -59,7 +59,7 @@
 // composer — empty, or holding the text she was asked to rework — marked as
 // hers; the send press stays the user's.
 
-import { esc, WIDE_FRAME } from './base.js';
+import { esc, WIDE_FRAME, deepActiveElement, onPressOutside } from './base.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
@@ -275,7 +275,8 @@ class RetinueChatPage extends HTMLElement {
     this._fromApp = this._openedFromApp();
     // Pane arrangement differs across the breakpoint; re-render on a flip
     // (drafts survive — they live in fields, mirrored on every input event).
-    this._onFrame = () => this.render();
+    // Typing mode is phone-only, so the flip re-decides it too.
+    this._onFrame = () => { this.render(); if (this._kbd) this._kbd.apply(); };
     this._wide.addEventListener('change', this._onFrame);
     // The lightbox holds one history entry while open, so the platform back
     // gesture closes it instead of leaving the page; popstate is where the
@@ -309,41 +310,40 @@ class RetinueChatPage extends HTMLElement {
   // in that state the page drops the header and the companion's bar, and gets
   // them back the moment the keyboard goes.
   //
-  // "The keyboard is up" is two facts together: a text field on this page has
-  // focus, and the visible frame is well short of its keyboard-less height at
-  // this width — data-viewport-short on <html>, published by viewport.js, the
-  // one module that interprets the visual viewport (baseline per width, off
-  // while pinch-zoomed). Focus alone is not enough: Android's back gesture
-  // dismisses the keyboard without blurring the field, and the header must
-  // come back then. The height alone is not enough either (a split-screen
-  // resize). Never in the wide layout, where there is room; and without the
-  // visualViewport API, where nothing can be measured, focus decides alone.
+  // Whether the keyboard is up is viewport.js's call — data-keyboard on <html>,
+  // the one place that interprets the visual viewport: a text field focused
+  // and the frame well short of its keyboard-less height at that width (see
+  // there for rotation, split-screen and pinch-zoom). All this page adds is
+  // "never in the wide layout", where there is room. The state is a host
+  // attribute, so a render, which replaces everything inside, keeps it.
+  //
+  // While typing, the pane holding the field is kept scrolled to its newest
+  // message — on entering, on every height step the keyboard's animation
+  // reports (iOS shrinks the frame in several), and whenever focus moves to
+  // another field (a swipe to the other pane and a tap in its composer).
   _watchKeyboard() {
     if (this._kbd) return;
-    const measured = !!window.visualViewport;
     const apply = () => {
-      const up = !this._wide.matches && this._focusedInside() &&
-        (!measured || document.documentElement.dataset.viewportShort === '1');
-      const page = this.shadowRoot && this.shadowRoot.querySelector('.page');
-      if (page && page.classList.contains('typing') !== up) {
-        page.classList.toggle('typing', up);
-        if (up) { this._toggleMenu(false); this._scrollFocusedPane(); }
+      const up = !this._wide.matches && document.documentElement.dataset.keyboard === '1';
+      if (up !== this.hasAttribute('typing')) {
+        this.toggleAttribute('typing', up);
+        if (up) this._toggleMenu(false);
       }
+      if (up) this._scrollFocusedPane();
     };
-    const onIn = () => apply();
-    // Focus moving from one field to another passes through a blur: settle
-    // after the new focus has landed, so the header does not flash back.
-    const onOut = () => setTimeout(apply, 0);
-    this.addEventListener('focusin', onIn);
-    this.addEventListener('focusout', onOut);
+    const onIn = () => { if (this.hasAttribute('typing')) this._scrollFocusedPane(); };
+    // On the shadow root, not the host: focus moving from one field in here
+    // to another (chat composer → companion composer) retargets both ends to
+    // the host, and the event is not delivered outside it at all.
+    this.shadowRoot.addEventListener('focusin', onIn);
     window.addEventListener('retinue-viewport', apply);
-    this._kbd = { apply, onIn, onOut };
+    this._kbd = { apply, onIn };
+    apply();
   }
 
-  // The keyboard took half the frame: the newest messages are what the user is
-  // answering, so keep them in view above the field — in whichever pane the
-  // field is. The companion's thread lives in <retinue-conversation>'s own
-  // (open) shadow root.
+  // The newest messages are what the user is answering: keep them in view
+  // above the field, in whichever pane the field is. The companion's thread
+  // lives in <retinue-conversation>'s own (open) shadow root.
   _scrollFocusedPane() {
     const comp = this._companionEl();
     const inComp = comp && comp.shadowRoot && comp.shadowRoot.activeElement;
@@ -352,20 +352,10 @@ class RetinueChatPage extends HTMLElement {
     if (t) t.scrollTop = t.scrollHeight;
   }
 
-  // Whether focus is on a text field anywhere inside this element's shadow
-  // tree (the companion's composer sits one shadow root further in).
-  _focusedInside() {
-    let a = this.shadowRoot && this.shadowRoot.activeElement;
-    while (a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
-    return !!a && (a.tagName === 'TEXTAREA' || a.isContentEditable ||
-      (a.tagName === 'INPUT' && /^(text|search|email|url|tel|)$/.test(a.type || '')));
-  }
-
   _unwatchKeyboard() {
     const k = this._kbd;
     if (!k) return;
-    this.removeEventListener('focusin', k.onIn);
-    this.removeEventListener('focusout', k.onOut);
+    if (this.shadowRoot) this.shadowRoot.removeEventListener('focusin', k.onIn);
     window.removeEventListener('retinue-viewport', k.apply);
     this._kbd = null;
   }
@@ -722,8 +712,6 @@ class RetinueChatPage extends HTMLElement {
     // A full render replaces the shadow DOM wholesale; an open lightbox (its
     // node lives beside .page) survives by being re-appended.
     if (this._lightbox) this._renderLightbox();
-    // A render replaces .page, and with it the typing-mode class.
-    if (this._kbd) this._kbd.apply();
   }
 
   _headHtml() {
@@ -773,7 +761,10 @@ class RetinueChatPage extends HTMLElement {
     return `<div class="menu-wrap" data-menu-wrap>` +
       `<button class="menu-btn${this._flagged() ? ' flagged' : ''}" data-menu-btn ` +
       `aria-controls="chat-menu" aria-expanded="false" title="More" aria-label="More">&#8942;</button>` +
-      `<div class="menu" id="chat-menu" data-menu hidden>${this._flagsHtml()}</div></div>`;
+      `<div class="menu" id="chat-menu" data-menu hidden><div class="items">` +
+      `<button class="item" data-attention ` +
+      `title="Importance, urgency, delivery — and their corrections">Attention details</button>` +
+      this._switchesHtml() + `</div></div></div>`;
   }
 
   // Archived or muted: what the ⋮ button's dot shows.
@@ -790,41 +781,39 @@ class RetinueChatPage extends HTMLElement {
     // and the document listeners must still come off.
     const show = menu && btn ? (open === undefined ? menu.hidden : open) : false;
     if (menu && btn) {
+      // Hiding the item that has focus would drop focus to the document and
+      // send the next Tab to the top of the page: hand it back to the ⋮.
+      if (!show && !menu.hidden && menu.contains(deepActiveElement())) btn.focus();
       menu.hidden = !show;
       btn.setAttribute('aria-expanded', String(show));
     }
-    if (show && !this._onMenuAway) {
-      // Any press outside the menu, or Esc, shuts it. composedPath: presses
-      // land on this host from the document's point of view.
-      this._onMenuAway = (e) => {
-        if (e.type === 'keydown' ? e.key === 'Escape'
-          : !e.composedPath().includes(root.querySelector('[data-menu-wrap]'))) this._toggleMenu(false);
-      };
-      document.addEventListener('pointerdown', this._onMenuAway, true);
-      document.addEventListener('keydown', this._onMenuAway);
-    } else if (!show && this._onMenuAway) {
-      document.removeEventListener('pointerdown', this._onMenuAway, true);
-      document.removeEventListener('keydown', this._onMenuAway);
-      this._onMenuAway = null;
+    if (show && !this._menuAway) {
+      // Any press outside the menu, or Esc, shuts it.
+      const wrap = root.querySelector('[data-menu-wrap]');
+      const onKey = (e) => { if (e.key === 'Escape') this._toggleMenu(false); };
+      const offPress = onPressOutside(wrap, () => this._toggleMenu(false), { capture: true });
+      document.addEventListener('keydown', onKey);
+      this._menuAway = () => { offPress(); document.removeEventListener('keydown', onKey); };
+    } else if (!show && this._menuAway) {
+      this._menuAway();
+      this._menuAway = null;
     }
   }
 
-  // The menu's items: the attention sheet, then Archive and Mute. Each switch
+  // The menu's switches, under Attention details: Archive and Mute. Each
   // shows the state it is in and offers the other:
   // "Archive" / "Archived · Unarchive". The flags mean what they mean on
   // threads — an archived chat comes back when a message arrives unless it
   // is muted; muting archives too and silences its push — and
   // POST /chats/<id>/flags settles or reopens the chat's attention item with
   // the archive.
-  _flagsHtml() {
+  _switchesHtml() {
     const c = this._chat || {};
     const sw = (flag, on, offLabel, onLabel, hint) =>
       `<button class="item${on ? ' on' : ''}" data-flag="${flag}" data-on="${on ? '0' : '1'}" ` +
       `title="${esc(hint)}">` +
       (on ? `<b>${esc(onLabel)}</b> · Un${esc(offLabel.toLowerCase())}` : esc(offLabel)) + `</button>`;
     return `<div class="items" data-flags>` +
-      `<button class="item" data-attention ` +
-      `title="Importance, urgency, delivery — and their corrections">Attention details</button>` +
       sw('archived', !!c.archived, 'Archive', 'Archived',
          'Leaves the chat list; comes back when a message arrives, unless muted') +
       sw('muted', !!c.muted, 'Mute', 'Muted', 'Archived, no push, and a new message does not bring it back') +
@@ -843,15 +832,28 @@ class RetinueChatPage extends HTMLElement {
       window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'flags' } }));
     } catch (_err) { /* the row keeps showing the last known state */ }
     const row = this.shadowRoot.querySelector('[data-flags]');
-    if (row) { row.outerHTML = this._flagsHtml(); this._bindFlags(); }
+    if (row) {
+      // The pressed switch is replaced by its new state: keep focus on it.
+      const had = row.contains(deepActiveElement());
+      row.outerHTML = this._switchesHtml();
+      this._bindSwitches();
+      const again = had && this.shadowRoot.querySelector(`[data-flag="${flag}"]`);
+      if (again) again.focus();
+    }
     const btn = this.shadowRoot.querySelector('[data-menu-btn]');
     if (btn) btn.classList.toggle('flagged', this._flagged());
   }
 
-  _bindFlags() {
-    const root = this.shadowRoot;
-    root.querySelectorAll('[data-flag]').forEach((el) =>
+  _bindSwitches() {
+    this.shadowRoot.querySelectorAll('[data-flag]').forEach((el) =>
       el.addEventListener('click', () => this._setFlag(el.getAttribute('data-flag'), el.getAttribute('data-on') === '1')));
+  }
+
+  _bindMenu() {
+    const root = this.shadowRoot;
+    const menuBtn = root.querySelector('[data-menu-btn]');
+    if (menuBtn) menuBtn.addEventListener('click', () => this._toggleMenu());
+    this._bindSwitches();
     // The attention sheet for this chat: its importance, urgency and delivery,
     // the corrections, Later and Mark handled.
     const att = root.querySelector('[data-attention]');
@@ -1213,9 +1215,7 @@ class RetinueChatPage extends HTMLElement {
         this._goBack();
       });
     }
-    const menuBtn = root.querySelector('[data-menu-btn]');
-    if (menuBtn) menuBtn.addEventListener('click', () => this._toggleMenu());
-    this._bindFlags();
+    this._bindMenu();
     const help = root.querySelector('[data-comp-help-btn]');
     if (help) {
       help.addEventListener('click', () => {
@@ -2095,9 +2095,9 @@ const CSS = `
 
   /* Typing mode (phone keyboard up, see _watchKeyboard): the header and the
      companion's bar give their rows to the thread and the field. */
-  .page.typing .chat-head { display: none; }
-  .page.typing retinue-conversation::part(bar) { display: none; }
-  .page.typing .comp-help { display: none; }
+  :host([typing]) .chat-head { display: none; }
+  :host([typing]) retinue-conversation::part(bar) { display: none; }
+  :host([typing]) .comp-help { display: none; }
 
   /* ── Panes: swipe strip on the phone, columns behind a splitter when wide ── */
   .panes { flex: 1; min-height: 0; display: flex;

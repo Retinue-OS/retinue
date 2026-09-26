@@ -28,6 +28,8 @@
 // shell version plus a "Check for updates" action — the manual fallback, and
 // the support answer to "which version are you on?".
 
+import { deepActiveElement, isTextEntry } from './base.js';
+
 const hasSW = 'serviceWorker' in navigator;
 
 // A controllerchange also fires when the very first worker claims a fresh
@@ -38,11 +40,7 @@ let pendingReload = false;
 let reloaded = false;
 
 function textEntryActive() {
-  // Follow the focus chain through shadow roots (all cards use them).
-  let el = document.activeElement;
-  while (el && el.shadowRoot && el.shadowRoot.activeElement) el = el.shadowRoot.activeElement;
-  return !!el && (el.tagName === 'TEXTAREA'
-    || (el.tagName === 'INPUT' && el.getAttribute('type') !== 'checkbox'));
+  return isTextEntry(deepActiveElement());
 }
 
 function safeToReload() {

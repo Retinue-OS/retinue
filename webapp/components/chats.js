@@ -35,7 +35,7 @@
 // cadence and keeps its last rendered state over a failed fetch (a store blip
 // must not blank the list).
 
-import { RetinueCard, esc, fmtAge, isWideFrame, onFrameChange } from './base.js';
+import { RetinueCard, esc, fmtAge, isWideFrame, onFrameChange, onPressOutside } from './base.js';
 
 const LIST_URL = '/chats';
 // Rows shown on the dashboard card before "All chats →" takes over — the same
@@ -257,9 +257,7 @@ class RetinueChats extends RetinueCard {
     }
     if (!this._outsideWired) {
       this._outsideWired = true;
-      document.addEventListener('pointerdown', (e) => {
-        if (this._openId && !e.composedPath().includes(this)) this._close();
-      });
+      onPressOutside(this, () => { if (this._openId) this._close(); });
     }
   }
 
