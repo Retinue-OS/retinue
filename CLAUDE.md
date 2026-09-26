@@ -193,8 +193,12 @@ and Telegram accounts. Each chamber's `chambers.json` entry names its address
 book (`contacts`, default `contacts/`). Use `scripts/contacts.py` — `find
 --email/--phone/--handle/--name` before asking who someone is, `add --chamber
 <chamber>` (a contact always names its chamber; ask when unclear), `update <id>
---add-handle`/`--add-email` rather than filing a second person. The dashboard's
-contact card writes the same files. Vocabulary and file format:
+--add-handle`/`--add-email` rather than filing a second person. The person also
+carries the attention model's facts about them (sphere, importance prior, the
+modes they may interrupt) and the **VIP flag** (`--vip`: a model works their
+messages on every channel; their e-mail is whitelisted) — set these on the
+person, not per handle. The dashboard's contact card and its Contacts page (the
+dock at the foot of the home) write the same files. Vocabulary and file format:
 `docs/contacts.md`.
 
 ## Messaging (Signal, WhatsApp, Telegram, SMS, e-mail)

@@ -150,8 +150,36 @@ def test_hand_written_person(chambers, manifest):
     print("ok test_hand_written_person")
 
 
+def test_attention_and_vip(chambers, manifest):
+    """The person carries the attention model's facts and the VIP flag, and
+    the VIPs project into the delivery gate's policy."""
+    book = contacts.ContactBook(chambers, manifest)
+    lou = book.create("work", "Lou Berg", [("telegram", "@lou_berg"), ("email", "lou@example.org")],
+                      importance=4.5, permits=["Focused", "social"], vip=True)
+    assert (lou["importance"], lou["permits"], lou["vip"]) == (4.5, ["focused", "social"], True), lou
+    text = (chambers / lou["path"]).read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#importance> "4.5"^^<http://www.w3.org/2001/XMLSchema#decimal>' in text
+    assert "<urn:retinue:mode:focused>" in text and '"true"^^<http://www.w3.org/2001/XMLSchema#boolean>' in text
+    handles, emails = contacts.policy_projection(book)
+    assert handles == {"telegram": {"@lou_berg"}} and emails == {"lou@example.org"}, (handles, emails)
+    for bad in ({"importance": 7}, {"importance": "high"}, {"permits": ["not a mode!"]}):
+        try:
+            book.update(lou["key"], **bad)
+            raise AssertionError(f"accepted {bad}")
+        except contacts.ContactError:
+            pass
+    lou = book.update(lou["key"], importance=None, permits=[], vip=False)
+    assert (lou["importance"], lou["permits"], lou["vip"]) == (None, [], False), lou
+    assert "kb#vip" not in (chambers / lou["path"]).read_text(encoding="utf-8")
+    assert contacts.policy_projection(book) == ({}, set())
+    book.delete(lou["key"])
+    print("ok test_attention_and_vip")
+
+
 def test_cli(chambers, manifest):
-    env = dict(os.environ, CONTACTS_COMMIT="0")
+    env = dict(os.environ, CONTACTS_COMMIT="0",
+               TRIAGE_MESSENGER_DIR=str(chambers.parent / "policy" / "messenger"),
+               TRIAGE_EMAIL_WHITELIST_PATH=str(chambers.parent / "policy" / "email.nt"))
     base = CLI + ["--chambers-dir", str(chambers), "--manifest", str(manifest), "--json"]
 
     def run(*args, code=0):
@@ -174,6 +202,15 @@ def test_cli(chambers, manifest):
     upd = run("update", eva["id"], "--add-email", "eva@work.example", "--remove-handle", "whatsapp:+41790000001")
     assert {h["channel"] for h in upd["handles"]} == {"email", "sms"}, upd
     run("add", "--chamber", "archive", "--name", "X", code=2)
+    # --vip projects the person's handles into the gate's policy files.
+    vip = run("update", eva["id"], "--vip", "--importance", "4", "--permit", "focused")
+    assert vip["vip"] is True and vip["importance"] == 4 and vip["permits"] == ["focused"], vip
+    policy = (Path(env["TRIAGE_EMAIL_WHITELIST_PATH"])).read_text(encoding="utf-8")
+    assert '"eva@example.org"' in policy and "email-whitelist:contacts" in policy, policy
+    sms = Path(env["TRIAGE_MESSENGER_DIR"]) / "sms" / "policy" / "policy.nt"
+    assert '"+41790000000"' in sms.read_text(encoding="utf-8")
+    run("update", eva["id"], "--no-vip", "--importance", "", "--no-permits")
+    assert '"eva@example.org"' not in Path(env["TRIAGE_EMAIL_WHITELIST_PATH"]).read_text(encoding="utf-8")
     print("ok test_cli")
 
 
@@ -210,6 +247,7 @@ def main():
         test_handles()
         test_create_find_update(chambers, manifest)
         test_hand_written_person(chambers, manifest)
+        test_attention_and_vip(chambers, manifest)
         test_cli(chambers, manifest)
         test_commit(tmp)
     print("all contacts checks passed")

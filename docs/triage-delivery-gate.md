@@ -269,7 +269,21 @@ editor.** Every change flows through Ara: instructions like "trust everyone at
 moment they arrive" are conversational — Ara emits the wildcard, the group id or
 the VIP handle and confirms. The files stay plain, readable `.nt`, so they *can*
 be corrected by hand, but that is a fallback. Ara also reads them (over SPARQL)
-to answer "who is a VIP?". The one thing that is **not** hers alone is where a
+to answer "who is a VIP?".
+
+**A VIP is a person.** When the correspondent is in the address book
+([contacts.md](contacts.md)), the flag belongs on the person (`contacts.py
+update <id> --vip`, the VIP switch on the contact card or the Contacts page),
+not on one handle: `contacts.sync_policy` projects every handle of every VIP
+person into these files — messenger accounts as `triageVipHandle`, e-mail
+addresses as whitelisted addresses — under a subject of their own
+(`urn:retinue:triage:<channel>:contacts`, `…email-whitelist:contacts`). The
+projection is replaced wholesale on every change and on the gateway's tick;
+hand-set VIPs and the Sent-derived whitelist are never touched by it. Readers
+need no change: the loaders read the predicate and ignore the subject.
+`triage_policy.py vip-add` remains for a handle nobody has filed.
+
+The one thing that is **not** hers alone is where a
 chat sits on the user's screen: Archive and Mute are buttons in the dashboard,
 and Ara can press them on request but is never in the way.
 

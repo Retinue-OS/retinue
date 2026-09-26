@@ -33,7 +33,10 @@ the ontology defaults (docs/ontology.md):
 - the person: ``vcard:Individual`` with ``vcard:fn``, ``vcard:hasEmail
   <mailto:…>``, ``vcard:hasTelephone <tel:…>``, ``vcard:hasInstantMessage``,
   ``dcterms:created``; spheres as ``kb:sphere`` / ``kb:tag`` pointing at
-  ``urn:retinue:sphere:<word>``;
+  ``urn:retinue:sphere:<word>``; what the attention model knows about them —
+  their importance prior (``kb:importance``, 0–5) and the Focus modes they may
+  interrupt (``kb:permit <urn:retinue:mode:<id>>``); and whether they are a
+  VIP (``kb:vip true``), whose messages a model works the moment they arrive;
 - each messaging-service handle: a ``foaf:OnlineAccount`` linked by
   ``foaf:account``, with ``foaf:accountName``, ``foaf:accountServiceHomepage``
   and ``kb:channel`` (the literal the message ledger carries, so an account
@@ -61,6 +64,7 @@ Command line (agents)::
     contacts.py find --name mara
     contacts.py add --chamber private --name "Mara Keller" --email mara@example.org
     contacts.py update <id> --add-handle whatsapp:+41791234567
+    contacts.py update <id> --vip --importance 4 --permit focused
 
 Writes are committed and pushed in the owning chamber (best effort, like the
 dashboard's project edits); ``--no-commit`` or ``CONTACTS_COMMIT=0`` skips it.
@@ -89,10 +93,13 @@ FOAF = "http://xmlns.com/foaf/0.1/"
 DCTERMS = "http://purl.org/dc/terms/"
 KB = "https://w3id.org/retinue/kb#"
 XSD_DATETIME = "http://www.w3.org/2001/XMLSchema#dateTime"
+XSD_DECIMAL = "http://www.w3.org/2001/XMLSchema#decimal"
+XSD_BOOLEAN = "http://www.w3.org/2001/XMLSchema#boolean"
 
 PERSON_PREFIX = "urn:retinue:person:"
 ACCOUNT_PREFIX = "urn:retinue:account:"
 SPHERE_PREFIX = "urn:retinue:sphere:"
+MODE_PREFIX = "urn:retinue:mode:"
 
 # Classes a hand-written file may use for a person; this module writes the first.
 PERSON_CLASSES = (VCARD + "Individual", FOAF + "Person", "http://schema.org/Person")
@@ -255,6 +262,12 @@ def _person_triples(record: dict) -> set[tuple[str, str, str]]:
         out.add((s, _iri(KB + "sphere"), _iri(SPHERE_PREFIX + urllib.parse.quote(record["sphere"], safe=""))))
     for tag in record.get("tags") or []:
         out.add((s, _iri(KB + "tag"), _iri(SPHERE_PREFIX + urllib.parse.quote(tag, safe=""))))
+    if record.get("importance") is not None:
+        out.add((s, _iri(KB + "importance"), _lit("%g" % record["importance"], XSD_DECIMAL)))
+    for mode in record.get("permits") or []:
+        out.add((s, _iri(KB + "permit"), _iri(MODE_PREFIX + urllib.parse.quote(mode, safe=""))))
+    if record.get("vip"):
+        out.add((s, _iri(KB + "vip"), _lit("true", XSD_BOOLEAN)))
     for address in record.get("emails") or []:
         out.add((s, _iri(VCARD + "hasEmail"), _iri("mailto:" + address)))
     for number in record.get("phones") or []:
@@ -286,7 +299,8 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
         if not iri or not types & set(PERSON_CLASSES):
             continue
         record = {"iri": iri, "name": "", "sphere": None, "tags": [], "emails": [],
-                  "phones": [], "accounts": [], "created": None}
+                  "phones": [], "accounts": [], "created": None, "importance": None,
+                  "permits": [], "vip": False}
         tels = []
         for p, o in sorted(props):
             pred = _iri_value(p)
@@ -298,6 +312,15 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                 record["sphere"] = urllib.parse.unquote(_iri_value(o)[len(SPHERE_PREFIX):])
             elif pred == KB + "tag" and (_iri_value(o) or "").startswith(SPHERE_PREFIX):
                 record["tags"].append(urllib.parse.unquote(_iri_value(o)[len(SPHERE_PREFIX):]))
+            elif pred == KB + "importance":
+                try:
+                    record["importance"] = _importance(_lit_value(o))
+                except ContactError:
+                    pass
+            elif pred == KB + "permit" and (_iri_value(o) or "").startswith(MODE_PREFIX):
+                record["permits"].append(urllib.parse.unquote(_iri_value(o)[len(MODE_PREFIX):]))
+            elif pred == KB + "vip":
+                record["vip"] = (_lit_value(o) or "").strip().lower() in ("true", "1")
             elif pred == VCARD + "hasEmail" and (_iri_value(o) or "").lower().startswith("mailto:"):
                 record["emails"].append(_iri_value(o)[7:].lower())
             elif pred == VCARD + "hasTelephone" and (_iri_value(o) or "").lower().startswith("tel:"):
@@ -315,6 +338,7 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
         record["emails"] = sorted(set(record["emails"]))
         record["accounts"] = sorted(set(record["accounts"]))
         record["tags"] = sorted(set(record["tags"]))
+        record["permits"] = sorted(set(record["permits"]))
         record.update(chamber=chamber, path=rel, file=str(path), key=person_key(iri))
         records.append(record)
     return records
@@ -326,6 +350,29 @@ def person_key(iri: str) -> str:
     if iri.startswith(PERSON_PREFIX):
         return iri[len(PERSON_PREFIX):]
     return urllib.parse.quote(iri, safe="")
+
+
+def _importance(value) -> float | None:
+    """An importance prior as the attention model keeps it: 0–5, or None."""
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ContactError(f"not an importance: {value!r}")
+    if not 0 <= number <= 5:
+        raise ContactError(f"importance is 0–5, not {value!r}")
+    return number
+
+
+def _modes(values) -> list[str]:
+    out = set()
+    for value in values or ():
+        mode = str(value or "").strip().lower()
+        if not re.match(r"^[a-z0-9][a-z0-9_-]{0,31}$", mode):
+            raise ContactError(f"not a mode id: {value!r}")
+        out.add(mode)
+    return sorted(out)
 
 
 def handles_of(record: dict) -> list[dict]:
@@ -341,7 +388,8 @@ def public(record: dict) -> dict:
             "chamber": record["chamber"], "path": record["path"],
             "sphere": record.get("sphere"), "tags": list(record.get("tags") or []),
             "handles": handles_of(record), "phones": list(record.get("all_phones") or []),
-            "created": record.get("created")}
+            "importance": record.get("importance"), "permits": list(record.get("permits") or []),
+            "vip": bool(record.get("vip")), "created": record.get("created")}
 
 
 def _slug(name: str) -> str:
@@ -500,7 +548,8 @@ class ContactBook:
         self._cache.pop(str(path), None)
 
     def create(self, chamber: str, name: str, handles=(), *, sphere: str | None = None,
-               tags=(), created: str | None = None) -> dict:
+               tags=(), created: str | None = None, importance=None, permits=(),
+               vip: bool = False) -> dict:
         name = " ".join(str(name or "").split())
         if not name:
             raise ContactError("a contact needs a name")
@@ -516,6 +565,7 @@ class ContactBook:
             uid = str(uuid.uuid4())
             record = _blank(PERSON_PREFIX + uid, name, sphere, tags,
                             created or datetime.now(timezone.utc).replace(microsecond=0).isoformat())
+            record.update(importance=_importance(importance), permits=_modes(permits), vip=bool(vip))
             for pair in pairs:
                 _add_pair(record, pair)
             path = loc["dir"] / f"{_slug(name)}-{uid[:8]}.nt"
@@ -523,8 +573,10 @@ class ContactBook:
             return self.get(uid) or record
 
     def update(self, key: str, *, name: str | None = None, sphere: str | None | bool = False,
-               tags=None, add=(), remove=()) -> dict:
-        """Change a person. ``sphere=False`` leaves it; None clears it."""
+               tags=None, add=(), remove=(), importance=False, permits=None,
+               vip: bool | None = None) -> dict:
+        """Change a person. ``sphere=False`` / ``importance=False`` leave the
+        field; None clears it. ``tags`` / ``permits`` None leave them."""
         with self._lock:
             old = self.get(key)
             if old is None:
@@ -539,6 +591,12 @@ class ContactBook:
                 new["sphere"] = (str(sphere).strip().lower() or None) if sphere else None
             if tags is not None:
                 new["tags"] = sorted({str(t).strip().lower() for t in tags if str(t).strip()} - {new["sphere"]})
+            if importance is not False:
+                new["importance"] = _importance(importance)
+            if permits is not None:
+                new["permits"] = _modes(permits)
+            if vip is not None:
+                new["vip"] = bool(vip)
             for channel, handle in (normalize_handle(c, h) for c, h in remove):
                 _remove_pair(new, (channel, handle))
             for channel, handle in (normalize_handle(c, h) for c, h in add):
@@ -562,7 +620,8 @@ def _blank(iri, name, sphere, tags, created) -> dict:
     sphere = (str(sphere).strip().lower() or None) if sphere else None
     return {"iri": iri, "name": name, "sphere": sphere,
             "tags": sorted({str(t).strip().lower() for t in tags if str(t).strip()} - {sphere}),
-            "emails": [], "phones": [], "accounts": [], "created": created}
+            "emails": [], "phones": [], "accounts": [], "created": created,
+            "importance": None, "permits": [], "vip": False}
 
 
 def _copy(record: dict) -> dict:
@@ -587,6 +646,34 @@ def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
         record["phones"] = [p for p in record["phones"] if p != handle]
     else:
         record["accounts"] = [a for a in record["accounts"] if a != pair]
+
+
+# ── The delivery gate ───────────────────────────────────────────────────────
+
+def policy_projection(book: ContactBook) -> tuple[dict[str, set[str]], set[str]]:
+    """What the address book's VIP persons mean to the triage delivery gate:
+    the handles of each on every messenger channel (their telephones count
+    for SMS), and their e-mail addresses (whitelisted: worked on the frequent
+    run). docs/triage-delivery-gate.md."""
+    handles: dict[str, set[str]] = {}
+    emails: set[str] = set()
+    for record in book.all():
+        if not record.get("vip"):
+            continue
+        for channel, handle in record.get("accounts") or []:
+            handles.setdefault(channel, set()).add(handle)
+        for number in record.get("all_phones") or []:
+            handles.setdefault(SMS, set()).add(number)
+        emails |= set(record.get("emails") or [])
+    return handles, emails
+
+
+def sync_policy(book: ContactBook) -> list[str]:
+    """Write the projection into the gate's policy files (triage_policy's
+    contact-owned members). Idempotent and write-if-changed; returns the
+    files it wrote."""
+    import triage_policy
+    return triage_policy.sync_contacts(*policy_projection(book))
 
 
 # ── Committing ──────────────────────────────────────────────────────────────
@@ -627,7 +714,8 @@ def _print(args, value) -> None:
             print(f"{row['chamber']}\t{row['path']}")
             continue
         handles = ", ".join(f"{h['channel']}:{h['handle']}" for h in row["handles"]) or "—"
-        spheres = " · ".join(filter(None, [row.get("sphere")] + row.get("tags", [])))
+        spheres = " · ".join(filter(None, [row.get("sphere")] + row.get("tags", [])
+                                    + (["VIP"] if row.get("vip") else [])))
         note = " [same phone number, other channel]" if row.get("match") == "phone" else ""
         print(f"[{row['id']}] {row['name']} ({row['chamber']}){' — ' + spheres if spheres else ''}{note}\n    {handles}")
 
@@ -653,6 +741,11 @@ def main(argv=None) -> int:
         p.add_argument("--name")
         p.add_argument("--sphere")
         p.add_argument("--tag", action="append", help="a further sphere (repeatable; replaces on update)")
+        p.add_argument("--importance", help="the attention model's prior for them, 0–5 ('' clears)")
+        p.add_argument("--permit", action="append",
+                       help="a Focus mode id they may interrupt (repeatable; replaces on update)")
+        p.add_argument("--vip", action=argparse.BooleanOptionalAction, default=None,
+                       help="a model works their messages the moment they arrive, on every channel")
         p.add_argument("--no-commit", action="store_true")
     p_add.add_argument("--chamber", required=True, help="the chamber the contact is stored in")
     p_add.add_argument("--email", action="append", default=[])
@@ -665,6 +758,7 @@ def main(argv=None) -> int:
     p_upd.add_argument("--remove-email", action="append", default=[])
     p_upd.add_argument("--add-phone", action="append", default=[])
     p_upd.add_argument("--remove-phone", action="append", default=[])
+    p_upd.add_argument("--no-permits", action="store_true", help="clear every Focus-mode permit")
     p_del = sub.add_parser("delete")
     p_del.add_argument("id")
     p_del.add_argument("--no-commit", action="store_true")
@@ -698,7 +792,10 @@ def main(argv=None) -> int:
                 raise ContactError("--name is required")
             pairs = ([("email", e) for e in args.email] + [("sms", p) for p in args.phone]
                      + [parse_handle(h) for h in args.handle])
-            record = book.create(args.chamber, args.name, pairs, sphere=args.sphere, tags=args.tag or ())
+            record = book.create(args.chamber, args.name, pairs, sphere=args.sphere, tags=args.tag or (),
+                                 importance=args.importance or None, permits=args.permit or (),
+                                 vip=bool(args.vip))
+            sync_policy(book)
             if not args.no_commit:
                 commit(book.chambers_dir, record["path"], f"chore(contacts): add {record['name']}")
             _print(args, public(record))
@@ -709,12 +806,16 @@ def main(argv=None) -> int:
                       + [("sms", p) for p in args.remove_phone])
             record = book.update(args.id, name=args.name,
                                  sphere=args.sphere if args.sphere is not None else False,
-                                 tags=args.tag, add=add, remove=remove)
+                                 tags=args.tag, add=add, remove=remove,
+                                 importance=False if args.importance is None else (args.importance or None),
+                                 permits=[] if args.no_permits else args.permit, vip=args.vip)
+            sync_policy(book)
             if not args.no_commit:
                 commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
             _print(args, public(record))
         elif args.cmd == "delete":
             record = book.delete(args.id)
+            sync_policy(book)
             if not args.no_commit:
                 commit(book.chambers_dir, record["path"], f"chore(contacts): remove {record['name']}")
             _print(args, public(record))

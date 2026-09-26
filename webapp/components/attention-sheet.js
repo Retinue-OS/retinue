@@ -341,6 +341,9 @@ class RetinueAttentionSheet extends HTMLElement {
       case 'contact-permit':
         if (this._form) { this._form.permit = !this._form.permit; this.render(); }
         break;
+      case 'contact-vip':
+        if (this._form) { this._form.vip = !this._form.vip; this.render(); }
+        break;
       case 'contact-new-sphere': this._newSphere = 'contact'; this.render(); break;
       case 'contact-chamber':
         if (this._form) { this._form.chamber = el.getAttribute('data-chamber'); this.render(); }
@@ -351,7 +354,7 @@ class RetinueAttentionSheet extends HTMLElement {
         const who = (book.suggestions || []).find((p) => p.id === el.getAttribute('data-person'));
         if (who) {
           this._form = { name: who.name, sphere: who.sphere || '', tags: [...(who.tags || [])],
-            permit: false, chamber: who.chamber, person: who.id };
+            permit: false, chamber: who.chamber, person: who.id, vip: Boolean(who.vip) };
           this._saveContact();
         }
         break;
@@ -422,6 +425,7 @@ class RetinueAttentionSheet extends HTMLElement {
       permit: false,
       chamber: card.chamber || book.default || '',
       person: card.person || null,
+      vip: Boolean(book.person && book.person.vip),
     };
   }
 
@@ -453,6 +457,7 @@ class RetinueAttentionSheet extends HTMLElement {
           permit: Boolean(name && form.permit),
           chamber: name ? (form.chamber || null) : null,
           person: name ? (form.person || null) : null,
+          ...(name && form.vip !== undefined ? { vip: Boolean(form.vip) } : {}),
         }),
       });
       if (!res.ok) throw new Error(String(res.status));
@@ -493,7 +498,9 @@ class RetinueAttentionSheet extends HTMLElement {
       const label = card
         ? `<div class="f-value">${esc(card.name)}${card.sphere ? ` · <span style="color:${sphereColor(card.sphere)}">${esc(card.sphere)}</span>` : ''}` +
           `${(card.tags || []).length ? ` <span class="f-note">+ ${card.tags.map(esc).join(', ')}</span>` : ''}` +
-          `${card.chamber ? ` <span class="f-note">· in ${esc(card.chamber)}</span>` : ''}</div>`
+          `${book.person && book.person.vip ? ' <span class="f-note">· VIP</span>' : ''}` +
+          `${card.chamber ? ` <span class="f-note">· in ${esc(card.chamber)}</span>` : ''}` +
+          ` <a class="f-note" href="/contacts.html">address book</a></div>`
         : item.unknown_sender
           ? `<div class="f-value">${esc(item.handle || item.sender || '')} — nobody has this number yet.</div>` +
             `<div class="f-note">Screened: their message is listed and carried by the next digest, but no mode admits ` +
@@ -535,7 +542,9 @@ class RetinueAttentionSheet extends HTMLElement {
         : `<button class="btn tiny" data-act="contact-new-sphere"${busy}>+ new</button>`) +
       `</div><div class="f-note">Further spheres — each counts for a mode like the first. A sphere is a word: add one here.</div></div>` +
       `<div class="f-ctl"><button class="btn tiny${form.permit ? ' on' : ''}" data-act="contact-permit"${busy}>` +
-      `${form.permit ? '✓ ' : ''}May interrupt right now</button></div>` +
+      `${form.permit ? '✓ ' : ''}May interrupt right now</button>` +
+      `<button class="btn tiny${form.vip ? ' on' : ''}" data-act="contact-vip"${busy}>${form.vip ? '✓ ' : ''}VIP</button>` +
+      `<span class="f-note">A VIP's messages are worked by a model the moment they arrive, on every channel of theirs.</span></div>` +
       `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy}>Save the contact</button>` +
       `<button class="btn" data-act="contact-cancel"${busy}>Cancel</button>` +
       `<span class="f-note">Their next message reaches triage as a known sender.</span></div>` +

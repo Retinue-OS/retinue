@@ -134,8 +134,10 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          a handle up (email, sms, signal, …).
   POST /contacts                      -> create a contact: {chamber, name,
                                          handles: [{channel, handle}],
-                                         sphere?, tags?}.
+                                         sphere?, tags?, importance?,
+                                         permits?, vip?}.
   POST /contacts/<id>                 -> change one: {name?, sphere?, tags?,
+                                         importance?, permits?: [mode], vip?,
                                          add?: [handle], remove?: [handle]}.
   POST /chats/<id>/delete             -> erase the chat for good: its ledger
                                          records and media (via every inbox
@@ -1238,7 +1240,29 @@ push_notify.init(PUSH_DIR)
 # digest goes out with no browser open. ATTENTION_DIR defaults beside the
 # conversations, on the persistent volume.
 ATTENTION_DIR = Path(os.environ.get("ATTENTION_DIR", str(CONVERSATIONS_DIR.parent / "attention")))
-_ATTENTION = attention_store.AttentionStore(ATTENTION_DIR)
+
+
+class _PeopleAttentionStore(attention_store.AttentionStore):
+    """The attention store, with what it knows about *people* read from and
+    written to the address book.
+
+    The profile keys its priors, spheres, further spheres and permits on the
+    sender's display name. For a sender who is a person in the address book
+    those four belong to the person (scripts/contacts.py: ``kb:importance``,
+    ``kb:sphere``, ``kb:tag``, ``kb:permit``), so they follow them across
+    channels and outlive the profile: every load lays the people over the
+    profile (_profile_with_people), and every save writes back what changed for
+    a person since that load (_people_learn)."""
+
+    def profile(self) -> dict:
+        return _profile_with_people(super().profile())
+
+    def save_profile(self, profile: dict) -> None:
+        _people_learn(profile)
+        super().save_profile(profile)
+
+
+_ATTENTION = _PeopleAttentionStore(ATTENTION_DIR)
 # The tick wakes this often to see whether the minute is due for anything
 # (a digest, a scheduled mode change, the sweep); well under a minute so no
 # minute is skipped, and nothing happens on a tick that is due for nothing.
@@ -6938,7 +6962,8 @@ def _contact_sync_chats(record: dict, profile: dict | None = None, *, skip: str 
 
 
 def _contact_file_card(handle: tuple[str, str], card: dict, *, name: str, sphere, tags,
-                       chamber: str | None, person: str | None) -> tuple[dict | None, str]:
+                       chamber: str | None, person: str | None,
+                       vip: bool | None = None) -> tuple[dict | None, str]:
     """Apply a contact card to the address book; returns (person, verb).
 
     - no name: the handle leaves the person the card pointed at (the person
@@ -6964,12 +6989,12 @@ def _contact_file_card(handle: tuple[str, str], card: dict, *, name: str, sphere
     if target is None:
         if not chamber:
             raise contacts_mod.ContactError("chamber is required: which chamber stores this contact?")
-        return _CONTACTS.create(chamber, name, [handle], sphere=sphere, tags=tags), "add"
+        return _CONTACTS.create(chamber, name, [handle], sphere=sphere, tags=tags, vip=bool(vip)), "add"
     owner = _CONTACTS.find(*handle)
     if owner and owner["iri"] != target["iri"]:
         _CONTACTS.update(owner["key"], remove=[handle])
     add = [] if owner and owner["iri"] == target["iri"] else [handle]
-    return _CONTACTS.update(target["key"], name=name, sphere=sphere, tags=tags, add=add), "update"
+    return _CONTACTS.update(target["key"], name=name, sphere=sphere, tags=tags, add=add, vip=vip), "update"
 
 
 def _contact_brief(record: dict) -> dict:
@@ -6986,9 +7011,143 @@ def _contact_book_for(item: dict) -> dict:
     if handle is None:
         return {}
     card = item.get("contact") or {}
+    person = _CONTACTS.get(card["person"]) if card.get("person") else None
     suggestions = [] if card.get("person") else [_contact_brief(r) for r in _CONTACTS.suggest(*handle)]
     return {"chambers": [loc["chamber"] for loc in _CONTACTS.locations()],
-            "default": _CONTACTS.default_chamber(), "suggestions": suggestions}
+            "default": _CONTACTS.default_chamber(), "suggestions": suggestions,
+            # The person the card is filed under, as the address book has them
+            # (their VIP flag, importance, permits): the card edits the flag.
+            "person": contacts_mod.public(person) if person else None}
+
+
+# ── People in the attention profile ─────────────────────────────────────────
+# See _PeopleAttentionStore. A person's four attention facts, as the profile
+# spells them: the prior (priors), the main sphere (spheres), the further
+# spheres (tags) and the modes they may interrupt (permits, mode → names).
+
+_PEOPLE_SNAPSHOT = "__people__"  # the overlay a loaded profile carries, never saved
+
+
+def _person_attention(record: dict) -> dict:
+    return {"importance": record.get("importance"), "sphere": record.get("sphere"),
+            "tags": sorted(record.get("tags") or []), "permits": sorted(record.get("permits") or [])}
+
+
+def _profile_attention(profile: dict, name: str) -> dict:
+    prior = (profile.get("priors") or {}).get(name)
+    return {"importance": float(prior) if prior is not None else None,
+            "sphere": (profile.get("spheres") or {}).get(name) or None,
+            "tags": sorted((profile.get("tags") or {}).get(name) or []),
+            "permits": sorted(m for m, names in (profile.get("permits") or {}).items() if name in (names or []))}
+
+
+def _people_by_name() -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    try:
+        records = _CONTACTS.all()
+    except Exception as exc:  # noqa: BLE001 - a broken address book must not break attention
+        print(f"[web-gateway] contacts: unreadable ({exc})", flush=True)
+        return out
+    for record in records:
+        if record.get("name") and record["name"] not in out:
+            out[record["name"]] = record
+    return out
+
+
+def _profile_with_people(profile: dict) -> dict:
+    """Lay every named person's attention facts over the profile, keyed on
+    their name as the rest of the model expects. The person wins: a field the
+    person does not set is cleared for their name."""
+    snapshot = {}
+    for name, record in _people_by_name().items():
+        facts = _person_attention(record)
+        snapshot[record["key"]] = facts
+        # The address book keeps further spheres as a set; the profile's own
+        # order (the user's) stands wherever it holds the same ones.
+        held = (profile.get("tags") or {}).get(name)
+        tags = list(held) if held is not None and set(held) == set(facts["tags"]) else facts["tags"]
+        for table, value in (("priors", facts["importance"]), ("spheres", facts["sphere"]),
+                             ("tags", tags or None)):
+            if value is None:
+                profile.setdefault(table, {}).pop(name, None)
+            else:
+                profile.setdefault(table, {})[name] = value
+        permits = profile.setdefault("permits", {})
+        for mode in set(permits) | set(facts["permits"]):
+            names = permits.setdefault(mode, [])
+            if mode in facts["permits"] and name not in names:
+                names.append(name)
+            elif mode not in facts["permits"] and name in names:
+                names.remove(name)
+    profile[_PEOPLE_SNAPSHOT] = snapshot
+    return profile
+
+
+def _people_learn(profile: dict) -> list[dict]:
+    """Write into each person what the profile learned for them since it was
+    loaded: a correction on the sheet, a permit, the card. A person the load
+    did not know (just filed) takes whatever the profile holds for their name
+    — the bare number's lessons, carried over by the rename. Returns the
+    persons written."""
+    snapshot = profile.pop(_PEOPLE_SNAPSHOT, None) or {}
+    empty = {"importance": None, "sphere": None, "tags": [], "permits": []}
+    written = []
+    for name, record in _people_by_name().items():
+        now = _profile_attention(profile, name)
+        base = snapshot.get(record["key"], empty)
+        changed = {k: v for k, v in now.items() if v != base[k]}
+        mine = _person_attention(record)
+        changed = {k: v for k, v in changed.items() if v != mine[k]}
+        if not changed:
+            continue
+        try:
+            updated = _CONTACTS.update(record["key"], **changed)
+        except contacts_mod.ContactError as exc:
+            print(f"[web-gateway] contacts: could not learn for {name!r} ({exc})", flush=True)
+            continue
+        written.append(updated)
+        _contact_changed(updated, "learn attention for")
+    return written
+
+
+def _contacts_import_attention() -> int:
+    """Once per start: what the profile already knows about a person the
+    address book leaves unset — a prior learned before persons existed — is
+    copied into the person, so the first overlay does not erase it."""
+    raw = attention_store.AttentionStore.profile(_ATTENTION)
+    count = 0
+    for name, record in _people_by_name().items():
+        known = _profile_attention(raw, name)
+        mine = _person_attention(record)
+        fill = {k: v for k, v in known.items() if v not in (None, []) and mine[k] in (None, [])}
+        if not fill:
+            continue
+        try:
+            updated = _CONTACTS.update(record["key"], **fill)
+        except contacts_mod.ContactError:
+            continue
+        _contact_changed(updated, "import attention for")
+        count += 1
+    return count
+
+
+def _contacts_sync_policy() -> None:
+    """Project the address book's VIPs into the delivery gate's policy files
+    (contacts.sync_policy); cheap and write-if-changed, so it also runs on the
+    attention tick and picks up a contact edited outside the gateway."""
+    try:
+        written = contacts_mod.sync_policy(_CONTACTS)
+    except Exception as exc:  # noqa: BLE001 - best effort; the gate keeps its last policy
+        print(f"[web-gateway] contacts: VIP sync failed ({exc})", flush=True)
+        return
+    for path in written:
+        print(f"[web-gateway] contacts: VIPs written to {path}", flush=True)
+
+
+def _contact_changed(record: dict, verb: str) -> None:
+    """After any write to a person: the VIP projection, and the commit."""
+    _contacts_sync_policy()
+    _contact_commit(record, verb)
 
 
 def _contacts_migrate() -> int:
@@ -7518,6 +7677,7 @@ def _attention_tick_loop() -> None:
             _attention_tick()
         except Exception as exc:  # noqa: BLE001 - the loop must survive a bad minute
             print(f"[web-gateway] attention tick failed: {exc!r}", flush=True)
+        _contacts_sync_policy()
         time.sleep(ATTENTION_TICK_SECONDS)
 
 
@@ -8431,6 +8591,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         chamber = str(payload.get("chamber") or "").strip() or None
         person_ref = str(payload.get("person") or "").strip() or None
+        # The VIP flag is the person's (docs/contacts.md): absent leaves it.
+        vip = bool(payload["vip"]) if "vip" in payload and payload["vip"] is not None else None
         before = _CHAT_STATE.get(chat_id)
         was = _chat_display_name(before, channel, key)
         item_id = f"chat:{chat_id}"
@@ -8445,7 +8607,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 record, verb = _contact_file_card(handle, (before or {}).get("contact") or {}, name=name,
                                                   sphere=sphere, tags=tags, chamber=chamber,
-                                                  person=person_ref)
+                                                  person=person_ref, vip=vip)
             except contacts_mod.ContactError as exc:
                 self._send_json(exc.status, {"error": str(exc)})
                 return
@@ -8458,7 +8620,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 doc = _CHAT_STATE.set_contact(chat_id, name="")
             if record is not None:
-                _contact_commit(record, verb)
+                _contact_changed(record, verb)
             _chats_cache_invalidate()
             if name and name != was:
                 # Priors and permits are keyed on the name the user sees, so
@@ -8541,24 +8703,44 @@ class Handler(BaseHTTPRequestHandler):
         sphere = payload.get("sphere", False)
         if sphere not in (False, None):
             sphere = attention_policy.sphere_id(sphere) or None
+        # The attention facts the person carries (the profile reads them from
+        # here): an importance prior, the Focus modes they may interrupt, VIP.
+        importance = payload.get("importance", False)
+        permits = payload.get("permits")
+        vip = payload.get("vip")
         with _attention_lock:
+            focus = _ATTENTION.focus()
             profile = _ATTENTION.profile()
+            if permits is not None:
+                unknown = [m for m in permits if m not in (focus.get("modes") or {})]
+                if not isinstance(permits, list) or unknown:
+                    self._send_json(400, {"error": f"unknown mode(s): {', '.join(map(str, unknown)) or permits!r}"})
+                    return
             try:
                 if key is None:
                     record = _CONTACTS.create(str(payload.get("chamber") or ""), str(payload.get("name") or ""),
-                                              pairs("handles"), sphere=sphere or None, tags=tags or ())
+                                              pairs("handles"), sphere=sphere or None, tags=tags or (),
+                                              importance=None if importance is False else importance,
+                                              permits=permits or (), vip=bool(vip))
                     verb, status = "add", 201
+                    learned = []
                 else:
+                    before = _CONTACTS.get(key)
                     name = payload.get("name")
                     record = _CONTACTS.update(key, name=None if name is None else str(name), sphere=sphere,
-                                              tags=tags, add=pairs("add"), remove=pairs("remove"))
+                                              tags=tags, add=pairs("add"), remove=pairs("remove"),
+                                              importance=importance, permits=permits,
+                                              vip=None if vip is None else bool(vip))
                     verb, status = "update", 200
+                    # A rename carries what the profile knows under the old name.
+                    learned = (_attention_rename_sender(profile, before["name"], record["name"])
+                               if before and before["name"] != record["name"] else [])
             except contacts_mod.ContactError as exc:
                 self._send_json(exc.status, {"error": str(exc)})
                 return
-            learned = _contact_sync_chats(record, profile)
+            learned += _contact_sync_chats(record, profile)
             _ATTENTION.save_profile(profile)
-        _contact_commit(record, verb)
+        _contact_changed(record, verb)
         self._send_json(status, {"contact": contacts_mod.public(record), "learned_now": learned})
 
     def _handle_chat_delete(self, raw_id: str) -> None:
@@ -10423,6 +10605,10 @@ if __name__ == "__main__":
         migrated = _contacts_migrate()
         if migrated:
             print(f"[web-gateway] filed {migrated} contact card(s) in the address book", flush=True)
+        imported = _contacts_import_attention()
+        if imported:
+            print(f"[web-gateway] gave {imported} contact(s) what the attention profile knew", flush=True)
+        _contacts_sync_policy()
     except Exception as exc:  # noqa: BLE001
         print(f"[web-gateway] contact migration skipped: {exc}", flush=True)
     # The attention model's clock: breakpoints (digest times, scheduled mode

@@ -118,8 +118,15 @@ a chamber ([contacts.md](contacts.md)). A new person needs the chamber it is
 kept in (the card pre-selects the first contact location of `chambers.json`);
 the card also offers, one tap each, anyone the book already has for this handle
 or for the same number on another channel, and a change to a person reaches
-every chat of theirs. An empty name unlinks the handle — the person stays — and
-puts the sender back into screening. Rows open where the item lives: a thread in place (the conversations
+every chat of theirs. The card also carries the person's VIP switch. An empty
+name unlinks the handle — the person stays — and puts the sender back into
+screening.
+
+The **Contacts page** (`contacts.html`, the *Contacts* button in the dock at the
+foot of the home) is the address book itself: every person, searchable by name
+and e-mail address, each editable in place — their handles on every channel,
+their spheres, importance prior, the Focus modes they may interrupt, and the VIP
+flag. A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone

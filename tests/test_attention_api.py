@@ -606,6 +606,58 @@ def test_one_person_many_channels(base, wg):
     print("ok test_one_person_many_channels")
 
 
+def test_a_person_carries_attention_and_vip(base, wg):
+    """What the attention model learns about a person is the person's: the
+    sheet's corrections and permits land in their contact file, an edit there
+    reaches the profile, and the VIP flag — set on the person — reaches the
+    delivery gate for every handle they have, e-mail included."""
+    pia = "+41791000122"
+    chat = "signal:" + pia
+    cid = "chat:" + chat
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, pia, None, "Pia here.", "2026-09-05T13:00:00Z", gate=gate)
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Pia Frei", "sphere": "friends", "chamber": "private"})
+    assert status == 200 and out["person"]["vip"] is False, out
+    person = out["person"]["id"]
+    # A correction on the sheet: her importance prior, learned for her.
+    status, out = _http(base, "POST", "/attention/items/correct", {"id": cid, "importance": 5})
+    assert status == 200, out
+    assert wg._CONTACTS.get(person)["importance"] == 5, wg._CONTACTS.get(person)
+    # A permit, the same way.
+    status, out = _http(base, "POST", "/attention/permits", {"sender": "Pia Frei", "on": True})
+    assert status == 200, out
+    mode = wg.attention_policy.mode_at(wg._ATTENTION.focus(), wg._attention_now())["id"]
+    assert wg._CONTACTS.get(person)["permits"] == [mode], wg._CONTACTS.get(person)
+    # The person, edited through the address book, is what the profile says.
+    status, out = _http(base, "POST", f"/contacts/{person}",
+                        {"importance": 2, "permits": [], "vip": True,
+                         "add": [{"channel": "email", "handle": "pia@example.org"},
+                                 {"channel": "whatsapp", "handle": pia}]})
+    assert status == 200 and out["contact"]["vip"] is True and out["contact"]["importance"] == 2, out
+    profile = wg._ATTENTION.profile()
+    assert profile["priors"]["Pia Frei"] == 2, profile["priors"]
+    assert all("Pia Frei" not in names for names in profile["permits"].values()), profile["permits"]
+    status, out = _http(base, "POST", f"/contacts/{person}", {"permits": ["no-such-mode"]})
+    assert status == 400, out
+    # VIP reaches the gate on every channel she has, and her address is
+    # whitelisted — beside what was set by hand, which it leaves alone.
+    import triage_policy as tp  # the gateway's scripts/ is on sys.path
+    tp._mutate_messenger("signal", vip_add=["+41790000999"])
+    wg._contacts_sync_policy()
+    assert tp.gate_decision("signal", pia)["vip"] is True
+    assert tp.gate_decision("whatsapp", pia)["vip"] is True
+    assert tp.gate_decision("signal", "+41790000999")["vip"] is True, "a hand-set VIP stays"
+    assert tp.email_gate_decision("pia@example.org")["triage_now"] is True
+    status, out = _http(base, "POST", f"/contacts/{person}", {"vip": False})
+    assert status == 200 and out["contact"]["vip"] is False, out
+    assert tp.gate_decision("signal", pia)["vip"] is False
+    assert tp.gate_decision("signal", "+41790000999")["vip"] is True
+    assert tp.email_gate_decision("pia@example.org")["triage_now"] is False
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    print("ok test_a_person_carries_attention_and_vip")
+
+
 def test_legacy_cards_are_filed(base, wg):
     """A card of the earlier, chamber-less kind — a name on the chat document
     and one generated Turtle file — is filed as a person in the default
@@ -1277,6 +1329,7 @@ def main():
         test_unknown_sender_screened_then_named(base, wg)
         test_a_person_in_several_spheres(base, wg)
         test_one_person_many_channels(base, wg)
+        test_a_person_carries_attention_and_vip(base, wg)
         test_legacy_cards_are_filed(base, wg)
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
