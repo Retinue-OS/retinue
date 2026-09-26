@@ -213,10 +213,16 @@ docstring). Pieces:
   the user can retype.
   Back goes back where the chat was opened from within the
   app, and to the home — the attention list the chat is a row of — for a chat
-  opened cold (a notification, a bookmark). The header's ⓘ opens the chat's
-  attention sheet (with the contact card), and **Archive** / **Mute** switches
-  sit under it — the same `POST /chats/<id>/flags` the list's swipe actions
-  use. The open chat polls on the conversations cadence,
+  opened cold (a notification, a bookmark). The header's ⋮ menu holds
+  *Attention details* — the chat's attention sheet, with the contact card —
+  and the **Archive** / **Mute** switches, the same `POST /chats/<id>/flags`
+  the list's swipe actions use; a dot on the ⋮ shows an archived or muted
+  chat with the menu shut. What the companion pane does sits behind a **?**
+  in its bar rather than on a row of its own. While the phone keyboard is up
+  (a field on the page focused *and* `viewport.js` reporting the visible
+  frame well short of its keyboard-less height at that width, as
+  `data-viewport-short` on `<html>`), the header and the companion's bar are
+  hidden, and the pane being typed in scrolls to its newest message. The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the
