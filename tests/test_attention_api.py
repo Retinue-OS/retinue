@@ -101,11 +101,10 @@ def _load_gateway(tmp: Path, sparql_port: int):
     os.environ["ATTENTION_TZ"] = "UTC"
     os.environ["PRESENTATION_LINT"] = "0"
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
-    # One chamber, declaring no contacts path, so it keeps them at the
-    # default. Nothing here is a git repository: no commits.
+    # One chamber, with nothing declared about it (no manifest), so it keeps
+    # contacts at the default. Nothing here is a git repository: no commits.
     (tmp / "chambers" / "private").mkdir(parents=True, exist_ok=True)
-    (tmp / "chambers.json").write_text('{"chambers": [{"name": "private"}]}', encoding="utf-8")
-    os.environ["CHAMBERS_MANIFEST"] = str(tmp / "chambers.json")
+    os.environ["CHAMBERS_MANIFEST"] = str(tmp / "no-manifest.json")
     os.environ["CONTACTS_COMMIT"] = "0"
     # The gateway renders its own pages with markdown-it; nothing here reads
     # them, so a stock Python without the package gets a stand-in.

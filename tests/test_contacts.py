@@ -29,7 +29,7 @@ CLI = [sys.executable, str(REPO_ROOT / "scripts" / "contacts.py")]
 
 def _setup(tmp: Path) -> tuple[Path, Path]:
     chambers = tmp / "chambers"
-    for name in ("private", "work", "archive", "sneaky"):
+    for name in ("private", "work", "archive", "sneaky", "attic", "_generated"):
         (chambers / name).mkdir(parents=True)
     manifest = tmp / "chambers.json"
     manifest.write_text(json.dumps({"chambers": [
@@ -44,9 +44,11 @@ def _setup(tmp: Path) -> tuple[Path, Path]:
 def test_locations(chambers, manifest):
     book = contacts.ContactBook(chambers, manifest)
     # Declared, or the default; an opted-out chamber has none; a path that
-    # would leave the chamber is refused for the default.
+    # would leave the chamber is refused for the default. `attic` is mounted
+    # but not listed: a chamber all the same, after the listed ones.
+    # `_generated` is the framework's output, no chamber.
     assert [(l["chamber"], l["path"]) for l in book.locations()] == [
-        ("private", "people"), ("work", "contacts"), ("sneaky", "contacts")]
+        ("private", "people"), ("work", "contacts"), ("sneaky", "contacts"), ("attic", "contacts")]
     assert book.default_chamber() == "private"
     for name, why in (("archive", "keeps no contacts"), ("elsewhere", "no chamber")):
         try:
@@ -54,6 +56,10 @@ def test_locations(chambers, manifest):
             raise AssertionError(f"{name} has a contact location")
         except contacts.ContactError as exc:
             assert why in str(exc), exc
+    # No manifest at all: every chamber, by name, at the default path.
+    bare = contacts.ContactBook(chambers, chambers.parent / "no-manifest.json")
+    assert [(l["chamber"], l["path"]) for l in bare.locations()] == [
+        (n, "contacts") for n in ("archive", "attic", "private", "sneaky", "work")]
     print("ok test_locations")
 
 
@@ -187,7 +193,7 @@ def test_cli(chambers, manifest):
         return json.loads(proc.stdout) if proc.stdout.strip() else None
 
     assert run("locations") == [{"chamber": "private", "path": "people"}, {"chamber": "work", "path": "contacts"},
-                                {"chamber": "sneaky", "path": "contacts"}]
+                                {"chamber": "sneaky", "path": "contacts"}, {"chamber": "attic", "path": "contacts"}]
     # Creating needs a chamber: argparse refuses without one.
     run("add", "--name", "No Chamber", code=2)
     eva = run("add", "--chamber", "private", "--name", "Eva Roth", "--email", "eva@example.org",
@@ -226,9 +232,7 @@ def test_commit(tmp: Path):
         git("config", key, value, cwd=repo)
     git("commit", "-q", "--allow-empty", "-m", "init", cwd=repo)
     git("push", "-q", "origin", "HEAD", cwd=repo)
-    manifest = tmp / "git-chambers.json"
-    manifest.write_text(json.dumps({"chambers": [{"name": "private"}]}), encoding="utf-8")
-    book = contacts.ContactBook(chambers, manifest)
+    book = contacts.ContactBook(chambers, tmp / "no-manifest.json")
     record = book.create("private", "Ada Muster", [("email", "ada@example.org")])
     os.environ.pop("CONTACTS_COMMIT", None)
     assert contacts.commit(chambers, record["path"], "chore(contacts): add Ada Muster") is True

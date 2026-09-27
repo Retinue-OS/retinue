@@ -16,8 +16,8 @@
 //   POST /contacts/<id>         -> change
 //   GET  /attention/profile     -> { focus: { spheres, modes } } for the choices
 //
-// A new contact always names the chamber it is kept in; the first location in
-// chambers.json is pre-selected.
+// A new contact always names the chamber it is kept in; the address book's
+// default (the first contact location, contacts.py) is pre-selected.
 
 import { esc } from './base.js';
 
@@ -246,7 +246,7 @@ class RetinueContacts extends HTMLElement {
       `<button class="btn tiny${on ? ' on' : ''}" data-act="${act}" data-v="${esc(v)}"${busy}>${on && act !== 'sphere' ? '✓ ' : ''}${esc(label || v)}</button>`;
     const where = isNew
       ? `<div><div class="k">Kept in</div><div class="chips">${chambers.map((c) => chip('chamber', c, f.chamber === c)).join('') ||
-        '<span class="note">No chamber keeps contacts — every one opts out in chambers.json.</span>'}</div></div>`
+        '<span class="note">No chamber keeps contacts — each opts out in chambers.json, or none is mounted.</span>'}</div></div>`
       : `<div class="note">Kept in ${esc(f.chamber)}.</div>`;
     const handles = f.handles.map((h, i) =>
       `<div class="handle"><span class="ch">${esc(CHANNEL_LABEL[h.channel] || h.channel)}</span>` +

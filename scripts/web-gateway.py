@@ -7153,7 +7153,7 @@ def _contact_changed(record: dict, verb: str) -> None:
 def _contacts_migrate() -> int:
     """File the cards of earlier versions — a name on a chat document, written
     into one generated Turtle file — as persons in the default chamber (the
-    first contact location in chambers.json), and retire that file once no
+    first contact location, ContactBook.default_chamber), and retire that file once no
     card is left behind. Idempotent: a card that points at a person is done."""
     default = _CONTACTS.default_chamber()
     filed: list[dict] = []

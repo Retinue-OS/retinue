@@ -10,17 +10,18 @@ Where contacts live
 -------------------
 Every contact belongs to exactly one chamber and is stored inside it, so it is
 versioned with that chamber's data and indexed by the life store like any other
-chamber file. Each chamber entry in the deployment's ``chambers.json`` may
-declare where its contacts go::
+chamber file. A chamber is a directory mounted under ``CHAMBERS_DIR`` (not the
+framework's own ``_generated/`` output); its entry in the deployment's
+``chambers.json``, if it has one, may declare where its contacts go::
 
     {"name": "private", "url": "…", "contacts": "people"}
 
-``contacts`` is a directory relative to the chamber root; where the entry
-declares none, it is :data:`DEFAULT_PATH` — holding contacts is the default.
-``"contacts": false`` opts a chamber out. The manifest's order is the preference order: the first
-chamber is the default where one must be picked without asking (the migration
-of old cards, the dashboard's pre-selection). Creating a contact always names
-its chamber.
+``contacts`` is a directory relative to the chamber root; where nothing is
+declared, it is :data:`DEFAULT_PATH` — holding contacts is the default.
+``"contacts": false`` opts a chamber out. The preference order is the
+manifest's order, then any chamber it does not list, by name: the first is the
+default where one must be picked without asking (the migration of old cards,
+the dashboard's pre-selection). Creating a contact always names its chamber.
 
 The file
 --------
@@ -87,6 +88,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_PATH = "contacts"
+# The framework's own derived output under CHAMBERS_DIR — in no chamber's
+# repository, so no place for a person.
+GENERATED = "_generated"
 
 RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 VCARD = "http://www.w3.org/2006/vcard/ns#"
@@ -413,25 +417,40 @@ class ContactBook:
     # Locations
 
     def _manifest_entries(self) -> list[dict]:
-        """The chambers, as chambers.json declares them (the entrypoint mounts
-        each at CHAMBERS_DIR/<name>, or the container does not start)."""
+        """What chambers.json declares about chambers, in its order. It
+        declares; it does not make a chamber — a chamber it does not list
+        simply has nothing declared."""
         try:
             data = json.loads(self.manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            print(f"[contacts] cannot read {self.manifest} ({exc})", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
             return []
         entries = data.get("chambers") if isinstance(data, dict) else None
         return [e for e in entries if isinstance(e, dict) and e.get("name")] if isinstance(entries, list) else []
 
+    def chambers(self) -> list[str]:
+        """Every chamber: each directory mounted under CHAMBERS_DIR, except the
+        framework's generated output. Manifest order first, then by name."""
+        try:
+            mounted = {p.name for p in self.chambers_dir.iterdir()
+                       if p.is_dir() and p.name != GENERATED and not p.name.startswith(".")}
+        except OSError:
+            return []
+        listed = [str(e["name"]) for e in self._manifest_entries() if str(e["name"]) in mounted]
+        return list(dict.fromkeys(listed)) + sorted(mounted - set(listed))
+
     def locations(self) -> list[dict]:
-        """``[{chamber, path, dir}]``: one per chamber, in manifest order — the
-        entry's ``contacts`` directory, or :data:`DEFAULT_PATH` where it
-        declares none; a chamber declaring ``"contacts": false`` has none. A
-        declared path must stay inside its chamber; one that leads out of it is
-        refused, and the default is used instead."""
-        out = []
+        """``[{chamber, path, dir}]``, one per chamber in preference order: the
+        ``contacts`` directory its manifest entry declares, or
+        :data:`DEFAULT_PATH` where nothing is declared; a chamber declaring
+        ``"contacts": false`` has none. A declared path must stay inside its
+        chamber; one that leads out of it is refused, and the default is used
+        instead."""
+        entries: dict[str, dict] = {}
         for entry in self._manifest_entries():
-            name = str(entry["name"])
+            entries.setdefault(str(entry["name"]), entry)
+        out = []
+        for name in self.chambers():
+            entry = entries.get(name, {})
             if entry.get("contacts") is False:
                 continue
             root = self.chambers_dir / name
@@ -450,10 +469,9 @@ class ContactBook:
         for loc in self.locations():
             if loc["chamber"] == chamber:
                 return loc
-        known = {str(e["name"]) for e in self._manifest_entries()}
-        if chamber in known:
+        if chamber in self.chambers():
             raise ContactError(f"chamber {chamber!r} keeps no contacts (\"contacts\": false in chambers.json)")
-        raise ContactError(f"no chamber {chamber!r} in chambers.json")
+        raise ContactError(f"no chamber {chamber!r} (none is mounted under {self.chambers_dir})")
 
     def default_chamber(self) -> str | None:
         locs = self.locations()

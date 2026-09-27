@@ -16,8 +16,9 @@ e-mail is one channel among the others.
 
 **Every contact belongs to exactly one chamber and is stored inside it.** It is
 versioned with that chamber's data, committed like any other operational file
-(Tier 1), and indexed by the life store like every chamber file. Each entry in
-the deployment's `chambers.json` may declare where its address book is kept:
+(Tier 1), and indexed by the life store like every chamber file. A chamber's
+entry in the deployment's `chambers.json` may declare where its address book is
+kept:
 
 ```json
 {"chambers": [
@@ -27,14 +28,18 @@ the deployment's `chambers.json` may declare where its address book is kept:
 ]}
 ```
 
-- `contacts` is a directory relative to the chamber root. Where the manifest
-  declares none, it is `contacts/`, so `work` above keeps its people in
-  `work/contacts/`: keeping contacts is the default.
+- `contacts` is a directory relative to the chamber root. Where nothing is
+  declared — no `contacts` key, or no entry for the chamber at all — it is
+  `contacts/`, so `work` above keeps its people in `work/contacts/`: keeping
+  contacts is the default, for every chamber.
 - `"contacts": false` opts a chamber out; `health` above keeps none.
 - A declared path must stay inside its chamber; one that leads out of it is
   refused (logged) and the default is used.
-- **The order is the preference order.** The first chamber is the one the
-  dashboard pre-selects and the one older cards are migrated into.
+- `_generated/` is the framework's own derived output, in no chamber's
+  repository, and never holds contacts.
+- **Preference order:** the manifest's order, then any chamber it does not
+  list, by name. The first is the one the dashboard pre-selects and the one
+  older cards are migrated into.
 
 **Creating a contact always names its chamber.** The CLI requires `--chamber`,
 `POST /contacts` requires `chamber`, and the contact card sends the chamber the

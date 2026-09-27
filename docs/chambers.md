@@ -65,17 +65,18 @@ chamber describes itself through its own instructions rather than through
 
 Every contact is one person stored in exactly one chamber
 (`scripts/contacts.py`, [contacts.md](contacts.md)). A chamber's manifest entry
-says where:
+may say where:
 
 ```json
 {"name": "private", "url_env": "PRIVATE_CHAMBER_URL", "contacts": "people"}
 ```
 
-`contacts` is a directory relative to the chamber root; where the entry
-declares none, it is `contacts/` — keeping contacts is the default, and
-`"contacts": false` opts a chamber out. The manifest's order
-is the preference order — the first location is the pre-selected chamber on the
-dashboard's contact card and the one the migration of older cards files into.
+`contacts` is a directory relative to the chamber root; where nothing is
+declared (or the chamber has no entry), it is `contacts/` — keeping contacts is
+the default, and `"contacts": false` opts a chamber out. The manifest's order,
+then the unlisted chambers by name, is the preference order — the first is the
+pre-selected chamber on the dashboard's contact card and the one the migration
+of older cards files into.
 
 ## Chamber instructions — the aggregate import
 
