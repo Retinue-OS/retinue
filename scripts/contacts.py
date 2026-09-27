@@ -16,8 +16,8 @@ declare where its contacts go::
     {"name": "private", "url": "…", "contacts": "people"}
 
 ``contacts`` is a directory relative to the chamber root; where the entry
-declares none, it is :data:`DEFAULT_PATH`. So every chamber has exactly one
-contact location. The manifest's order is the preference order: the first
+declares none, it is :data:`DEFAULT_PATH` — holding contacts is the default.
+``"contacts": false`` opts a chamber out. The manifest's order is the preference order: the first
 chamber is the default where one must be picked without asking (the migration
 of old cards, the dashboard's pre-selection). Creating a contact always names
 its chamber.
@@ -426,11 +426,14 @@ class ContactBook:
     def locations(self) -> list[dict]:
         """``[{chamber, path, dir}]``: one per chamber, in manifest order — the
         entry's ``contacts`` directory, or :data:`DEFAULT_PATH` where it
-        declares none. A declared path must stay inside its chamber; one that
-        leads out of it is refused, and the default is used instead."""
+        declares none; a chamber declaring ``"contacts": false`` has none. A
+        declared path must stay inside its chamber; one that leads out of it is
+        refused, and the default is used instead."""
         out = []
         for entry in self._manifest_entries():
             name = str(entry["name"])
+            if entry.get("contacts") is False:
+                continue
             root = self.chambers_dir / name
             declared = entry.get("contacts")
             rel = str(declared).strip().strip("/") if isinstance(declared, str) else ""
@@ -447,6 +450,9 @@ class ContactBook:
         for loc in self.locations():
             if loc["chamber"] == chamber:
                 return loc
+        known = {str(e["name"]) for e in self._manifest_entries()}
+        if chamber in known:
+            raise ContactError(f"chamber {chamber!r} keeps no contacts (\"contacts\": false in chambers.json)")
         raise ContactError(f"no chamber {chamber!r} in chambers.json")
 
     def default_chamber(self) -> str | None:

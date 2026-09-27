@@ -3,7 +3,7 @@
 per file, stored in the chamber the manifest names (docs/contacts.md).
 
 Covers: manifest locations (a declared path, the default where none is
-declared, a declared path that would leave its chamber); handles of every kind (e-mail, SMS,
+declared, the opt-out, a declared path that would leave its chamber); handles of every kind (e-mail, SMS,
 messenger accounts) and their normalization; lookup by handle, phone and name;
 the uniqueness of accounts and addresses; lossless rewrites that keep lines the
 module did not write; the CLI; and the best-effort commit in the chamber repo.
@@ -29,12 +29,13 @@ CLI = [sys.executable, str(REPO_ROOT / "scripts" / "contacts.py")]
 
 def _setup(tmp: Path) -> tuple[Path, Path]:
     chambers = tmp / "chambers"
-    for name in ("private", "work", "sneaky"):
+    for name in ("private", "work", "archive", "sneaky"):
         (chambers / name).mkdir(parents=True)
     manifest = tmp / "chambers.json"
     manifest.write_text(json.dumps({"chambers": [
         {"name": "private", "path": "x", "contacts": "people"},
         {"name": "work"},
+        {"name": "archive", "contacts": False},
         {"name": "sneaky", "contacts": "../private"},
     ]}), encoding="utf-8")
     return chambers, manifest
@@ -42,16 +43,17 @@ def _setup(tmp: Path) -> tuple[Path, Path]:
 
 def test_locations(chambers, manifest):
     book = contacts.ContactBook(chambers, manifest)
-    # Every chamber has one: declared, or the default; a path that would leave
-    # the chamber is refused for the default.
+    # Declared, or the default; an opted-out chamber has none; a path that
+    # would leave the chamber is refused for the default.
     assert [(l["chamber"], l["path"]) for l in book.locations()] == [
         ("private", "people"), ("work", "contacts"), ("sneaky", "contacts")]
     assert book.default_chamber() == "private"
-    try:
-        book.location("elsewhere")
-        raise AssertionError("a name the manifest does not declare is no chamber")
-    except contacts.ContactError:
-        pass
+    for name, why in (("archive", "keeps no contacts"), ("elsewhere", "no chamber")):
+        try:
+            book.location(name)
+            raise AssertionError(f"{name} has a contact location")
+        except contacts.ContactError as exc:
+            assert why in str(exc), exc
     print("ok test_locations")
 
 

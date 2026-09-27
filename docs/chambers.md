@@ -72,7 +72,8 @@ says where:
 ```
 
 `contacts` is a directory relative to the chamber root; where the entry
-declares none, it is `contacts/`. The manifest's order
+declares none, it is `contacts/` — keeping contacts is the default, and
+`"contacts": false` opts a chamber out. The manifest's order
 is the preference order — the first location is the pre-selected chamber on the
 dashboard's contact card and the one the migration of older cards files into.
 

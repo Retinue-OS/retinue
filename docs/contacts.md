@@ -22,13 +22,15 @@ the deployment's `chambers.json` may declare where its address book is kept:
 ```json
 {"chambers": [
   {"name": "private", "url_env": "PRIVATE_CHAMBER_URL", "contacts": "people"},
-  {"name": "work",    "url_env": "WORK_CHAMBER_URL"}
+  {"name": "work",    "url_env": "WORK_CHAMBER_URL"},
+  {"name": "health",  "url_env": "HEALTH_CHAMBER_URL", "contacts": false}
 ]}
 ```
 
 - `contacts` is a directory relative to the chamber root. Where the manifest
   declares none, it is `contacts/`, so `work` above keeps its people in
-  `work/contacts/`. Every chamber therefore has exactly one contact location.
+  `work/contacts/`: keeping contacts is the default.
+- `"contacts": false` opts a chamber out; `health` above keeps none.
 - A declared path must stay inside its chamber; one that leads out of it is
   refused (logged) and the default is used.
 - **The order is the preference order.** The first chamber is the one the
