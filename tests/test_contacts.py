@@ -56,6 +56,13 @@ def test_locations(chambers, manifest):
             raise AssertionError(f"{name} has a contact location")
         except contacts.ContactError as exc:
             assert why in str(exc), exc
+    # The default is the chamber the last contact was created in, else the
+    # first location.
+    assert book.default_chamber() == "private"
+    older = book.create("private", "Older One", created="2026-01-01T09:00:00+00:00")
+    newer = book.create("work", "Newer One", created="2026-02-01T09:00:00Z")
+    assert book.default_chamber() == "work"
+    book.delete(older["key"]); book.delete(newer["key"])
     # No manifest at all: every chamber, by name, at the default path.
     bare = contacts.ContactBook(chambers, chambers.parent / "no-manifest.json")
     assert [(l["chamber"], l["path"]) for l in bare.locations()] == [

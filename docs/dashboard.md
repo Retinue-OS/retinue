@@ -115,7 +115,7 @@ their spheres (carrying over whatever the bare number had already been taught),
 re-judges the open item — so their next message is ranked by that sphere —
 and files the handle under a person in the address book — one N-Triples file in
 a chamber ([contacts.md](contacts.md)). A new person needs the chamber it is
-kept in (the card pre-selects the first contact location of `chambers.json`);
+kept in (a dropdown, pre-selecting the chamber the last contact was created in);
 the card also offers, one tap each, anyone the book already has for this handle
 or for the same number on another channel, and a change to a person reaches
 every chat of theirs. The card also carries the person's VIP switch. An empty

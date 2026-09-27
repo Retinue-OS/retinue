@@ -345,9 +345,6 @@ class RetinueAttentionSheet extends HTMLElement {
         if (this._form) { this._form.vip = !this._form.vip; this.render(); }
         break;
       case 'contact-new-sphere': this._newSphere = 'contact'; this.render(); break;
-      case 'contact-chamber':
-        if (this._form) { this._form.chamber = el.getAttribute('data-chamber'); this.render(); }
-        break;
       case 'contact-link': {
         // One tap: this handle is theirs — the person's own name and spheres.
         const book = (this._data && this._data.contact_book) || {};
@@ -369,6 +366,10 @@ class RetinueAttentionSheet extends HTMLElement {
     const el = e.target.closest('[data-set]');
     if (!el) return;
     const what = el.getAttribute('data-set');
+    if (what === 'contact-chamber') {
+      if (this._form) this._form.chamber = el.value;
+      return;
+    }
     if (what === 'due') {
       if (el.value === 'pick') { this._picking = true; this.render(); return; }
       this._act('correct', { due: el.value === 'none' ? null : el.value });
@@ -414,7 +415,8 @@ class RetinueAttentionSheet extends HTMLElement {
   // The card the form starts from: what the chat already says about this
   // person, or an empty one for a number nobody has named.
   // A new contact is stored in a chamber: the one the card is already filed
-  // in, else the address book's default (the first in chambers.json).
+  // in, else the address book's default — the chamber the last contact was
+  // created in.
   _blankCard(item) {
     const card = (item && item.contact) || {};
     const book = (this._data && this._data.contact_book) || {};
@@ -525,8 +527,8 @@ class RetinueAttentionSheet extends HTMLElement {
     const where = form.person
       ? (form.chamber ? `<div class="f-note">Kept in ${esc(form.chamber)}.</div>` : '')
       : chambers.length
-        ? `<div><div class="f-k">kept in</div><div class="chips">${chambers.map((c) =>
-          `<button class="btn tiny${form.chamber === c ? ' on' : ''}" data-act="contact-chamber" data-chamber="${esc(c)}"${busy}>${esc(c)}</button>`).join('')}</div>` +
+        ? `<div><div class="f-k">kept in</div><select class="select" data-set="contact-chamber"${busy}>${chambers.map((c) =>
+          `<option value="${esc(c)}"${form.chamber === c ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select>` +
           `<div class="f-note">The chamber the contact is stored in, with every channel that reaches them.</div></div>`
         : `<div class="f-note">No chamber keeps contacts — each opts out in chambers.json, or none is mounted.</div>`;
     return `<div class="field screened"><div class="f-label">${card ? 'Contact' : 'New contact'}</div>` +

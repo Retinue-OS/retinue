@@ -17,7 +17,7 @@
 //   GET  /attention/profile     -> { focus: { spheres, modes } } for the choices
 //
 // A new contact always names the chamber it is kept in; the address book's
-// default (the first contact location, contacts.py) is pre-selected.
+// default — the chamber the last contact was created in — is pre-selected.
 
 import { esc } from './base.js';
 
@@ -145,6 +145,7 @@ class RetinueContacts extends HTMLElement {
     if (what === 'name') this._form.name = el.value;
     else if (what === 'add-handle') this._form.add.handle = el.value;
     else if (what === 'add-channel') this._form.add.channel = el.value;
+    else if (what === 'chamber') this._form.chamber = el.value;
     else if (what === 'importance' && e.type === 'change') {
       this._form.importance = el.value === '' ? null : Number(el.value);
     }
@@ -160,7 +161,6 @@ class RetinueContacts extends HTMLElement {
       case 'open': this._startEdit(el.getAttribute('data-id')); break;
       case 'new': this._startEdit('new'); break;
       case 'cancel': this._open = null; this._form = null; this._error = ''; this.render(); break;
-      case 'chamber': if (f) { f.chamber = arg; this.render(); } break;
       case 'sphere': if (f) { f.sphere = f.sphere === arg ? '' : arg; f.tags = f.tags.filter((t) => t !== f.sphere); this.render(); } break;
       case 'tag': if (f) { f.tags = f.tags.includes(arg) ? f.tags.filter((t) => t !== arg) : f.tags.concat([arg]); this.render(); } break;
       case 'permit': if (f) { f.permits = f.permits.includes(arg) ? f.permits.filter((m) => m !== arg) : f.permits.concat([arg]); this.render(); } break;
@@ -245,8 +245,10 @@ class RetinueContacts extends HTMLElement {
     const chip = (act, v, on, label) =>
       `<button class="btn tiny${on ? ' on' : ''}" data-act="${act}" data-v="${esc(v)}"${busy}>${on && act !== 'sphere' ? '✓ ' : ''}${esc(label || v)}</button>`;
     const where = isNew
-      ? `<div><div class="k">Kept in</div><div class="chips">${chambers.map((c) => chip('chamber', c, f.chamber === c)).join('') ||
-        '<span class="note">No chamber keeps contacts — each opts out in chambers.json, or none is mounted.</span>'}</div></div>`
+      ? `<div><div class="k">Kept in</div>${chambers.length
+        ? `<select data-set="chamber"${busy}>${chambers.map((c) =>
+          `<option value="${esc(c)}"${f.chamber === c ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select>`
+        : '<span class="note">No chamber keeps contacts — each opts out in chambers.json, or none is mounted.</span>'}</div>`
       : `<div class="note">Kept in ${esc(f.chamber)}.</div>`;
     const handles = f.handles.map((h, i) =>
       `<div class="handle"><span class="ch">${esc(CHANNEL_LABEL[h.channel] || h.channel)}</span>` +

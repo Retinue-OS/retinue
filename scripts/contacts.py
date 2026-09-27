@@ -18,10 +18,12 @@ framework's own ``_generated/`` output); its entry in the deployment's
 
 ``contacts`` is a directory relative to the chamber root; where nothing is
 declared, it is :data:`DEFAULT_PATH` — holding contacts is the default.
-``"contacts": false`` opts a chamber out. The preference order is the
-manifest's order, then any chamber it does not list, by name: the first is the
-default where one must be picked without asking (the migration of old cards,
-the dashboard's pre-selection). Creating a contact always names its chamber.
+``"contacts": false`` opts a chamber out. The order of
+the locations is the manifest's order, then any chamber it does not list, by
+name. Creating a contact always names its chamber; where one is pre-selected
+(the dashboard) or must be picked without asking (the migration of old
+cards), it is :meth:`ContactBook.default_chamber` — the chamber the last
+contact was created in, else the first location.
 
 The file
 --------
@@ -474,8 +476,16 @@ class ContactBook:
         raise ContactError(f"no chamber {chamber!r} (none is mounted under {self.chambers_dir})")
 
     def default_chamber(self) -> str | None:
-        locs = self.locations()
-        return locs[0]["chamber"] if locs else None
+        """Where a new contact goes unless told otherwise: the chamber the
+        last contact was created in (``dcterms:created``), so the pick carries
+        over from one to the next — on every device, and from the CLI too.
+        With nobody created yet, the first location."""
+        locs = [loc["chamber"] for loc in self.locations()]
+        if not locs:
+            return None
+        created = [(_when(r.get("created")), r["chamber"]) for r in self.all() if r["chamber"] in locs]
+        created = [c for c in created if c[0] is not None]
+        return max(created)[1] if created else locs[0]
 
     # Reading
 
@@ -639,6 +649,15 @@ class ContactBook:
                 raise ContactError(f"no contact {key!r}", 404)
             self._write(Path(old["file"]), old, None)
             return old
+
+
+def _when(value) -> datetime | None:
+    """A ``dcterms:created`` value as an aware datetime, or None."""
+    try:
+        when = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
 
 
 def _blank(iri, name, sphere, tags, created) -> dict:

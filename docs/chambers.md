@@ -73,10 +73,10 @@ may say where:
 
 `contacts` is a directory relative to the chamber root; where nothing is
 declared (or the chamber has no entry), it is `contacts/` — keeping contacts is
-the default, and `"contacts": false` opts a chamber out. The manifest's order,
-then the unlisted chambers by name, is the preference order — the first is the
-pre-selected chamber on the dashboard's contact card and the one the migration
-of older cards files into.
+the default, and `"contacts": false` opts a chamber out. Where a new contact is
+not told its chamber — the dashboard's pre-selection, the migration of older
+cards — it goes where the last contact was created, or to the first chamber
+(manifest order, then the unlisted ones by name) while nobody has been.
 
 ## Chamber instructions — the aggregate import
 

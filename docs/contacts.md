@@ -37,9 +37,12 @@ kept:
   refused (logged) and the default is used.
 - `_generated/` is the framework's own derived output, in no chamber's
   repository, and never holds contacts.
-- **Preference order:** the manifest's order, then any chamber it does not
-  list, by name. The first is the one the dashboard pre-selects and the one
-  older cards are migrated into.
+- **The default chamber** — pre-selected in the dashboard's chamber dropdown,
+  and where older cards are migrated — is **the chamber the last contact was
+  created in** (the newest `dcterms:created`), so the pick carries over from
+  one contact to the next, across devices and from the CLI. While nobody has
+  been created, it is the first chamber: the manifest's order, then any
+  chamber it does not list, by name.
 
 **Creating a contact always names its chamber.** The CLI requires `--chamber`,
 `POST /contacts` requires `chamber`, and the contact card sends the chamber the
@@ -204,8 +207,9 @@ chamber first.
 The **contact card** on a chat's attention sheet (`docs/dashboard.md`) files
 the chat's peer:
 
-- **A new person** is created in the chamber picked under *kept in*. The first
-  location is pre-selected.
+- **A new person** is created in the chamber picked in the *kept in*
+  dropdown; the default chamber (where the last contact was created) is
+  pre-selected.
 - **Someone the book already has** is offered as a one-tap *This is …*. That
   covers the owner of this handle, and anyone with the same number on another
   channel (Mara filed from Signal, now writing on WhatsApp). Linking adds this
