@@ -196,6 +196,29 @@ Message-ID of but don't have in a folder. In that case pass all previous IDs in
 
 ---
 
+## Contacts: who a sender is, and a person's address
+
+E-mail addresses are handles in the channel-independent address book
+(`scripts/contacts.py`, docs/contacts.md): one person per file, stored in a
+chamber, with every channel that reaches them. Use it both ways:
+
+```bash
+# Who wrote this? (the sender's address, any case)
+python3 /workspace/scripts/contacts.py find --email mara@example.org
+# What is Mara's address? (names and addresses are both searched)
+python3 /workspace/scripts/contacts.py find --name mara
+# File a new correspondent — a contact always names the chamber it is kept in:
+python3 /workspace/scripts/contacts.py add --chamber <chamber> --name "Mara Keller" --email mara@example.org
+# Add an address to someone the book already knows (e.g. from a Signal chat):
+python3 /workspace/scripts/contacts.py update <id> --add-email mara@work.example
+```
+
+Pick the chamber from `contacts.py locations` and the context (whose sphere the
+person belongs to); ask the user when that is not clear. An address belongs to
+one person only, so `add` refuses one that is already filed; `find` first.
+
+---
+
 ## Best practice: mark as read before sending a reply
 
 **Always call `flag --read` before sending the reply** — not after.

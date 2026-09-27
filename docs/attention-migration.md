@@ -67,9 +67,9 @@ places is not screened.
 The way out is the contact card, and it is deliberately one gesture with four
 consequences (the chat's name, the profile's sphere, the item's re-judgement,
 the life store's address book), because the user is answering one question:
-*who is this?* The card is stored on the chat document (`contact`), and the
-address book it emits lives at `CONTACTS_EMIT_PATH` as vCard individuals with
-`kb:sphere` / `kb:tag`. It says nothing to the delivery gate: whether a
+*who is this?* The card is stored on the chat document (`contact`) as a copy
+of the person it files the handle under: a `vcard:Individual` with `kb:sphere` /
+`kb:tag`, in a chamber's address book ([contacts.md](contacts.md)). It says nothing to the delivery gate: whether a
 message is worked by a model on arrival is the sender's VIP flag, set per
 person in the triage policy.
 

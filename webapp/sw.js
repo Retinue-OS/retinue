@@ -31,6 +31,7 @@ const SHELL_ASSETS = [
   '/chats.html',
   '/chat.html',
   '/settings.html',
+  '/contacts.html',
   '/styles.css',
   '/layout.js',
   '/viewport.js',
@@ -53,6 +54,7 @@ const SHELL_ASSETS = [
   '/components/update.js',
   '/components/app-launcher.js',
   '/components/nav.js',
+  '/components/contacts.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];
@@ -147,6 +149,10 @@ self.addEventListener('fetch', (e) => {
   // yesterday's order, with lapsed items still in it. The page shell
   // (/news.html) is a separate path and stays cache-first.
   if (url.pathname === '/news' || url.pathname.startsWith('/news/')) return;
+
+  // The address book is live: a contact filed from a chat card a second ago
+  // must be on the list. The page shell (/contacts.html) stays cache-first.
+  if (url.pathname === '/contacts' || url.pathname.startsWith('/contacts/')) return;
 
   // Push config carries the server's current VAPID key; a stale cached copy
   // would silently produce subscriptions this server cannot send to.

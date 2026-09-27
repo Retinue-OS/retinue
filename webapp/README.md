@@ -143,7 +143,10 @@ persist per device in localStorage. Every top-level page opens with the
 navigation row (`components/nav.js`: Home · Chats · Threads · Projects · News
 and the settings gear), pinned while a list page scrolls. Device-level
 settings (notifications, the running shell version with a manual update
-check) live on `settings.html`, reached via that gear.
+check) live on `settings.html`, reached via that gear. The address book
+(`contacts.html`, `components/contacts.js`; docs/contacts.md) is reached from
+the app dock at the foot of the home — people, their handles on every channel,
+their attention settings and the VIP flag — over the live `/contacts` API.
 
 Shell updates apply themselves (`components/update.js`): when a new service
 worker activates, controlled pages reload once — never while a thread or the

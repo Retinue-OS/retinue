@@ -85,7 +85,10 @@ messenger is **push**:
   **VIP**, the rail also runs a turn in that chat's companion thread: it files
   what the message changes (a project, a memory) and stages any reply into the
   chat's shared draft for the user's send press. The VIP flag follows the
-  person, so it holds in a group exactly as in a 1:1. **No messenger message
+  person, so it holds in a group exactly as in a 1:1 — set it on the person
+  (`contacts.py update <id> --vip`), which reaches every channel of theirs and
+  whitelists their e-mail addresses; `triage_policy.py vip-add` only for a
+  handle nobody has filed. **No messenger message
   asks the user to whitelist or blacklist anyone any more**; that ask-flow is
   gone, along with the messenger whitelist and blacklist themselves — a chat
   the user wants off their screen is archived or muted in the dashboard, and

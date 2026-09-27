@@ -6,7 +6,8 @@
     },
     {
       "name": "hitchhiker",
-      "path": "examples/chambers/hitchhiker"
+      "path": "examples/chambers/hitchhiker",
+      "contacts": "people"
     }
   ]
 }

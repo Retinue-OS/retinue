@@ -101,6 +101,10 @@ def _load_gateway(tmp: Path, sparql_port: int):
     os.environ["ATTENTION_TZ"] = "UTC"
     os.environ["PRESENTATION_LINT"] = "0"
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
+    # One chamber, with nothing declared about it (no manifest), so it keeps
+    # contacts at the default. It is no git repository: commits are skipped.
+    (tmp / "chambers" / "private").mkdir(parents=True, exist_ok=True)
+    os.environ["CHAMBERS_MANIFEST"] = str(tmp / "no-manifest.json")
     # The gateway renders its own pages with markdown-it; nothing here reads
     # them, so a stock Python without the package gets a stand-in.
     try:
@@ -494,6 +498,11 @@ def test_unknown_sender_screened_then_named(base, wg):
     # The contact card: a name, a sphere, and a second group as a tag.
     status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
                         {"name": "Nadia Brunner", "sphere": "customers", "tags": ["friends"]})
+    # A new contact is stored in a chamber, and the card must say which.
+    assert status == 400 and "chamber" in out["error"], out
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Nadia Brunner", "sphere": "customers", "tags": ["friends"],
+                         "chamber": "private"})
     assert status == 200, out
     assert out["contact"]["name"] == "Nadia Brunner" and out["contact"]["sphere"] == "customers"
     assert out["contact"]["tags"] == ["friends"] and out["name"] == "Nadia Brunner"
@@ -505,10 +514,18 @@ def test_unknown_sender_screened_then_named(base, wg):
     # What the card taught, where each half of it lives.
     profile = wg._ATTENTION.profile()
     assert profile["spheres"]["Nadia Brunner"] == "customers"
-    card = wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
-    assert 'vcard:fn "Nadia Brunner"' in card and "kb:sphere sphere:customers" in card
-    assert "kb:tag sphere:friends" in card and f"<tel:{nadia}>" in card
+    assert out["contact"]["chamber"] == "private" and out["person"]["chamber"] == "private", out
+    files = list((Path(os.environ["CHAMBERS_DIR"]) / "private" / "contacts").glob("nadia-brunner-*.nt"))
+    assert len(files) == 1, files
+    card = files[0].read_text(encoding="utf-8")
+    assert '<http://www.w3.org/2006/vcard/ns#fn> "Nadia Brunner"' in card, card
+    assert "<https://w3id.org/retinue/kb#sphere> <urn:retinue:sphere:customers>" in card, card
+    assert "<urn:retinue:sphere:friends>" in card and f"<tel:{nadia}>" in card, card
+    assert '<https://w3id.org/retinue/kb#channel> "signal"' in card and "foaf/0.1/OnlineAccount" in card, card
     assert "Nadia Brunner" in wg._contact_names()
+    # The address book knows her by her number, on any channel.
+    status, book = _http(base, "GET", f"/contacts?channel=signal&handle={urllib.parse.quote(nadia)}")
+    assert status == 200 and [c["name"] for c in book["contacts"]] == ["Nadia Brunner"], book
 
     # Her next message comes from a named contact with a deadline:
     # time-sensitive, and customers is the scope — it rings, where the first
@@ -531,8 +548,176 @@ def test_unknown_sender_screened_then_named(base, wg):
     assert out["item"]["sphere"] == "unknown" and out["item"]["contact"] is None, out["item"]
     # Nothing vouches for her any more: no card, and she is no VIP.
     assert out["item"]["unknown_sender"] is True, out["item"]
-    assert "vcard:fn" not in wg.CONTACTS_EMIT_PATH.read_text(encoding="utf-8")
+    # The handle left her; she stays in the address book, reachable no more
+    # by this chat.
+    card = files[0].read_text(encoding="utf-8")
+    assert '"Nadia Brunner"' in card and "OnlineAccount" not in card, card
+    status, book = _http(base, "GET", f"/contacts?channel=signal&handle={urllib.parse.quote(nadia)}")
+    assert status == 200 and book["contacts"] == [], book
     print("ok test_unknown_sender_screened_then_named")
+
+
+def test_one_person_many_channels(base, wg):
+    """A contact is a person, not a handle: the WhatsApp chat of someone filed
+    from Signal is offered their contact and links to it, a rename reaches
+    every chat of theirs, and an e-mail address is one more handle."""
+    ivo = "+41791000099"
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, ivo, None, "Hi, Ivo here.", "2026-09-05T12:00:00Z", gate=gate)
+    _inbound(base, ivo, None, "Ivo, on WhatsApp.", "2026-09-05T12:01:00Z", gate=gate, channel="whatsapp")
+    sig, wa = "signal:" + ivo, "whatsapp:" + ivo
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(sig, safe='')}/contact",
+                        {"name": "Ivo Brand", "sphere": "friends", "chamber": "private"})
+    assert status == 200, out
+    person = out["person"]["id"]
+    # The WhatsApp chat's sheet: same number, another channel — a suggestion,
+    # and the chambers a new contact could go to.
+    status, sheet = _http(base, "GET", "/attention/item?id=" + urllib.parse.quote("chat:" + wa, safe=""))
+    assert status == 200, sheet
+    book = sheet["contact_book"]
+    assert book["chambers"] == ["private"] and book["default"] == "private", book
+    assert [(c["id"], c["exact"]) for c in book["suggestions"]] == [(person, False)], book
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(wa, safe='')}/contact",
+                        {"name": "Ivo Brand", "sphere": "friends", "person": person})
+    assert status == 200 and out["contact"]["person"] == person, out
+    handles = {(h["channel"], h["handle"]) for h in out["person"]["handles"]}
+    assert handles == {("signal", ivo), ("whatsapp", ivo)}, handles
+    # E-mail through the address book's own API; a rename there reaches both chats.
+    status, out = _http(base, "POST", f"/contacts/{person}",
+                        {"name": "Ivo Brandt", "add": [{"channel": "email", "handle": "Ivo@Example.org"}]})
+    assert status == 200 and out["contact"]["name"] == "Ivo Brandt", out
+    assert ("email", "ivo@example.org") in {(h["channel"], h["handle"]) for h in out["contact"]["handles"]}, out
+    assert wg._CHAT_STATE.get(sig)["name"] == "Ivo Brandt" and wg._CHAT_STATE.get(wa)["name"] == "Ivo Brandt"
+    status, found = _http(base, "GET", "/contacts?channel=email&handle=ivo%40example.org")
+    assert status == 200 and [c["id"] for c in found["contacts"]] == [person], found
+    # A second contact cannot claim his address; a chamber that holds no
+    # contacts cannot store one.
+    status, out = _http(base, "POST", "/contacts", {"chamber": "private", "name": "Someone Else",
+                                                    "handles": [{"channel": "email", "handle": "ivo@example.org"}]})
+    assert status == 409, out
+    status, out = _http(base, "POST", "/contacts", {"chamber": "elsewhere", "name": "Someone Else"})
+    assert status == 400 and "elsewhere" in out["error"], out
+    status, out = _http(base, "POST", "/contacts", {"chamber": "private", "name": "Eva Roth",
+                                                    "handles": [{"channel": "email", "handle": "eva@example.org"}]})
+    assert status == 201 and out["contact"]["chamber"] == "private", out
+    for chat in (sig, wa):
+        _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
+    print("ok test_one_person_many_channels")
+
+
+def test_a_person_carries_attention_and_vip(base, wg):
+    """What the attention model learns about a person is the person's: the
+    sheet's corrections and permits land in their contact file, an edit there
+    reaches the profile, and the VIP flag — set on the person — reaches the
+    delivery gate for every handle they have, e-mail included."""
+    pia = "+41791000122"
+    chat = "signal:" + pia
+    cid = "chat:" + chat
+    gate = {"forward": True, "vip": False, "reason": "open"}
+    _inbound(base, pia, None, "Pia here.", "2026-09-05T13:00:00Z", gate=gate)
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "Pia Frei", "sphere": "friends", "chamber": "private"})
+    assert status == 200 and out["person"]["vip"] is False, out
+    person = out["person"]["id"]
+    # A correction on the sheet: her importance prior, learned for her.
+    status, out = _http(base, "POST", "/attention/items/correct", {"id": cid, "importance": 5})
+    assert status == 200, out
+    assert wg._CONTACTS.get(person)["importance"] == 5, wg._CONTACTS.get(person)
+    # A permit, the same way.
+    status, out = _http(base, "POST", "/attention/permits", {"sender": "Pia Frei", "on": True})
+    assert status == 200, out
+    mode = wg.attention_policy.mode_at(wg._ATTENTION.focus(), wg._attention_now())["id"]
+    assert wg._CONTACTS.get(person)["permits"] == [mode], wg._CONTACTS.get(person)
+    # The person, edited through the address book, is what the profile says.
+    status, out = _http(base, "POST", f"/contacts/{person}",
+                        {"importance": 2, "permits": [], "vip": True,
+                         "add": [{"channel": "email", "handle": "pia@example.org"},
+                                 {"channel": "whatsapp", "handle": pia}]})
+    assert status == 200 and out["contact"]["vip"] is True and out["contact"]["importance"] == 2, out
+    profile = wg._ATTENTION.profile()
+    assert profile["priors"]["Pia Frei"] == 2, profile["priors"]
+    assert all("Pia Frei" not in names for names in profile["permits"].values()), profile["permits"]
+    status, out = _http(base, "POST", f"/contacts/{person}", {"permits": ["no-such-mode"]})
+    assert status == 400, out
+    # VIP reaches the gate on every channel she has, and her address is
+    # whitelisted — beside what was set by hand, which it leaves alone.
+    import triage_policy as tp  # the gateway's scripts/ is on sys.path
+    tp._mutate_messenger("signal", vip_add=["+41790000999"])
+    wg._contacts_sync_policy()
+    assert tp.gate_decision("signal", pia)["vip"] is True
+    assert tp.gate_decision("whatsapp", pia)["vip"] is True
+    assert tp.gate_decision("signal", "+41790000999")["vip"] is True, "a hand-set VIP stays"
+    assert tp.email_gate_decision("pia@example.org")["triage_now"] is True
+    status, out = _http(base, "POST", f"/contacts/{person}", {"vip": False})
+    assert status == 200 and out["contact"]["vip"] is False, out
+    assert tp.gate_decision("signal", pia)["vip"] is False
+    assert tp.gate_decision("signal", "+41790000999")["vip"] is True
+    assert tp.email_gate_decision("pia@example.org")["triage_now"] is False
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    print("ok test_a_person_carries_attention_and_vip")
+
+
+def test_review_fixes(base, wg):
+    """A person filed while the gateway runs keeps what the profile knew; a
+    handle moved off one person commits that person too; the profile view
+    carries no overlay snapshot; a malformed permits list is a 400."""
+    # Filed after startup (the CLI, say): the profile's prior for the name
+    # goes into the person instead of being cleared by the overlay.
+    raw = wg.attention_store.AttentionStore.profile(wg._ATTENTION)
+    raw["priors"]["Zoe Lang"] = 4.5
+    wg.attention_store.AttentionStore.save_profile(wg._ATTENTION, raw)
+    zoe = wg._CONTACTS.create("private", "Zoe Lang")
+    assert wg._ATTENTION.profile()["priors"].get("Zoe Lang") == 4.5
+    assert wg._CONTACTS.get(zoe["key"])["importance"] == 4.5
+    # Moving a handle: both persons are committed.
+    committed = []
+    real_commit = wg._contact_commit
+    wg._contact_commit = lambda record, verb: committed.append((record["name"], verb))
+    try:
+        kai = "+41791000133"
+        chat = "signal:" + kai
+        _inbound(base, kai, None, "Kai.", "2026-09-05T14:00:00Z",
+                 gate={"forward": True, "vip": False, "reason": "open"})
+        status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                            {"name": "Kai Wolf", "chamber": "private"})
+        assert status == 200, out
+        committed.clear()
+        status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                            {"name": "Zoe Lang", "person": zoe["key"]})
+        assert status == 200 and out["person"]["id"] == zoe["key"], out
+        names = {name for name, _verb in committed}
+        assert {"Kai Wolf", "Zoe Lang"} <= names, committed
+        _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
+    finally:
+        wg._contact_commit = real_commit
+    status, out = _http(base, "GET", "/attention/profile")
+    assert status == 200 and wg._PEOPLE_SNAPSHOT not in out["profile"], sorted(out["profile"])
+    for bad in ("focused", 3):
+        status, out = _http(base, "POST", f"/contacts/{zoe['key']}", {"permits": bad})
+        assert status == 400, (bad, status, out)
+    print("ok test_review_fixes")
+
+
+def test_legacy_cards_are_filed(base, wg):
+    """A card of the earlier, chamber-less kind — a name on the chat document
+    and one generated Turtle file — is filed as a person in the default
+    chamber at startup, and the generated file goes."""
+    lea = "+41791000111"
+    chat = "signal:" + lea
+    _inbound(base, lea, None, "Lea here.", "2026-09-05T12:30:00Z",
+             gate={"forward": True, "vip": False, "reason": "open"})
+    wg._CHAT_STATE.set_contact(chat, name="Lea Graf", sphere="friends")
+    wg.LEGACY_CONTACTS_EMIT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    wg.LEGACY_CONTACTS_EMIT_PATH.write_text("# old\n", encoding="utf-8")
+    assert wg._contacts_migrate() == 1
+    card = wg._CHAT_STATE.get(chat)["contact"]
+    assert card["chamber"] == "private" and card["person"], card
+    record = wg._CONTACTS.get(card["person"])
+    assert record["name"] == "Lea Graf" and ("signal", lea) in record["accounts"], record
+    assert not wg.LEGACY_CONTACTS_EMIT_PATH.exists()
+    assert wg._contacts_migrate() == 0, "a filed card is done"
+    _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
+    print("ok test_legacy_cards_are_filed")
 
 
 def test_a_person_in_several_spheres(base, wg):
@@ -544,7 +729,8 @@ def test_a_person_in_several_spheres(base, wg):
     gate = {"forward": True, "vip": False, "reason": "open"}
     _inbound(base, rita, None, "Hi, Rita here.", "2026-09-05T09:00:00Z", gate=gate)
     status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
-                        {"name": "Rita Keller", "sphere": "customers", "tags": ["friends"]})
+                        {"name": "Rita Keller", "sphere": "customers", "tags": ["friends"],
+                         "chamber": "private"})
     assert status == 200 and out["item"]["sphere"] == "customers" and out["item"]["tags"] == ["friends"], out
     assert wg._ATTENTION.profile()["tags"]["Rita Keller"] == ["friends"], "the card's further spheres are hers"
     _http(base, "POST", "/attention/items/done", {"id": cid})
@@ -603,7 +789,8 @@ def test_a_message_judgement_is_its_own(base, wg):
     gate = {"forward": True, "vip": False, "reason": "open"}
     _inbound(base, nora, None, "Hi, Nora here.", "2026-09-05T11:00:00Z", gate=gate)
     status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
-                        {"name": "Nora Weber", "sphere": "customers", "tags": ["friends"]})
+                        {"name": "Nora Weber", "sphere": "customers", "tags": ["friends"],
+                         "chamber": "private"})
     assert status == 200, out
     _http(base, "POST", "/attention/items/done", {"id": cid})
     status, _ = _http(base, "POST", "/attention/mode", {"mode": "focused", "subject": "family"})
@@ -1181,6 +1368,10 @@ def main():
         test_chat_inbound_gated_and_settled(base, wg)
         test_unknown_sender_screened_then_named(base, wg)
         test_a_person_in_several_spheres(base, wg)
+        test_one_person_many_channels(base, wg)
+        test_a_person_carries_attention_and_vip(base, wg)
+        test_review_fixes(base, wg)
+        test_legacy_cards_are_filed(base, wg)
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
