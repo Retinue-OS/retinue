@@ -246,7 +246,7 @@ class RetinueContacts extends HTMLElement {
       `<button class="btn tiny${on ? ' on' : ''}" data-act="${act}" data-v="${esc(v)}"${busy}>${on && act !== 'sphere' ? '✓ ' : ''}${esc(label || v)}</button>`;
     const where = isNew
       ? `<div><div class="k">Kept in</div><div class="chips">${chambers.map((c) => chip('chamber', c, f.chamber === c)).join('') ||
-        '<span class="note">No chamber holds contacts — see the contacts entry in chambers.json.</span>'}</div></div>`
+        '<span class="note">No chambers declared in chambers.json.</span>'}</div></div>`
       : `<div class="note">Kept in ${esc(f.chamber)}.</div>`;
     const handles = f.handles.map((h, i) =>
       `<div class="handle"><span class="ch">${esc(CHANNEL_LABEL[h.channel] || h.channel)}</span>` +

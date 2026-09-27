@@ -71,8 +71,8 @@ says where:
 {"name": "private", "url_env": "PRIVATE_CHAMBER_URL", "contacts": "people"}
 ```
 
-`contacts` is a directory relative to the chamber root; left out, it is
-`contacts/`, and `"contacts": false` opts the chamber out. The manifest's order
+`contacts` is a directory relative to the chamber root; where the entry
+declares none, it is `contacts/`. The manifest's order
 is the preference order — the first location is the pre-selected chamber on the
 dashboard's contact card and the one the migration of older cards files into.
 

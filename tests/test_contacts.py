@@ -2,8 +2,8 @@
 """Checks for scripts/contacts.py — channel-independent contacts, one person
 per file, stored in the chamber the manifest names (docs/contacts.md).
 
-Covers: manifest locations (declared path, the default, opt-out, unmounted
-chambers, paths escaping the chamber); handles of every kind (e-mail, SMS,
+Covers: manifest locations (a declared path, the default where none is
+declared, a declared path that would leave its chamber); handles of every kind (e-mail, SMS,
 messenger accounts) and their normalization; lookup by handle, phone and name;
 the uniqueness of accounts and addresses; lossless rewrites that keep lines the
 module did not write; the CLI; and the best-effort commit in the chamber repo.
@@ -29,32 +29,29 @@ CLI = [sys.executable, str(REPO_ROOT / "scripts" / "contacts.py")]
 
 def _setup(tmp: Path) -> tuple[Path, Path]:
     chambers = tmp / "chambers"
-    for name in ("private", "work", "archive"):
+    for name in ("private", "work", "sneaky"):
         (chambers / name).mkdir(parents=True)
     manifest = tmp / "chambers.json"
     manifest.write_text(json.dumps({"chambers": [
         {"name": "private", "path": "x", "contacts": "people"},
         {"name": "work"},
-        {"name": "archive", "contacts": False},
-        {"name": "unmounted"},
         {"name": "sneaky", "contacts": "../private"},
     ]}), encoding="utf-8")
-    (chambers / "sneaky").mkdir()
     return chambers, manifest
 
 
 def test_locations(chambers, manifest):
     book = contacts.ContactBook(chambers, manifest)
-    assert [(l["chamber"], l["path"]) for l in book.locations()] == [("private", "people"), ("work", "contacts")]
+    # Every chamber has one: declared, or the default; a path that would leave
+    # the chamber is refused for the default.
+    assert [(l["chamber"], l["path"]) for l in book.locations()] == [
+        ("private", "people"), ("work", "contacts"), ("sneaky", "contacts")]
     assert book.default_chamber() == "private"
     try:
-        book.location("archive")
-        raise AssertionError("an opted-out chamber holds no contacts")
+        book.location("elsewhere")
+        raise AssertionError("a name the manifest does not declare is no chamber")
     except contacts.ContactError:
         pass
-    # Without a manifest: every mounted chamber, at the default path.
-    bare = contacts.ContactBook(chambers, chambers / "missing.json")
-    assert [l["chamber"] for l in bare.locations()] == ["archive", "private", "sneaky", "work"]
     print("ok test_locations")
 
 
@@ -187,7 +184,8 @@ def test_cli(chambers, manifest):
         assert proc.returncode == code, (args, proc.returncode, proc.stdout, proc.stderr)
         return json.loads(proc.stdout) if proc.stdout.strip() else None
 
-    assert run("locations") == [{"chamber": "private", "path": "people"}, {"chamber": "work", "path": "contacts"}]
+    assert run("locations") == [{"chamber": "private", "path": "people"}, {"chamber": "work", "path": "contacts"},
+                                {"chamber": "sneaky", "path": "contacts"}]
     # Creating needs a chamber: argparse refuses without one.
     run("add", "--name", "No Chamber", code=2)
     eva = run("add", "--chamber", "private", "--name", "Eva Roth", "--email", "eva@example.org",
@@ -201,7 +199,7 @@ def test_cli(chambers, manifest):
     run("find", "--email", "nobody@example.org", code=1)
     upd = run("update", eva["id"], "--add-email", "eva@work.example", "--remove-handle", "whatsapp:+41790000001")
     assert {h["channel"] for h in upd["handles"]} == {"email", "sms"}, upd
-    run("add", "--chamber", "archive", "--name", "X", code=2)
+    run("add", "--chamber", "elsewhere", "--name", "X", code=2)
     # --vip projects the person's handles into the gate's policy files.
     vip = run("update", eva["id"], "--vip", "--importance", "4", "--permit", "focused")
     assert vip["vip"] is True and vip["importance"] == 4 and vip["permits"] == ["focused"], vip
@@ -226,7 +224,9 @@ def test_commit(tmp: Path):
         git("config", key, value, cwd=repo)
     git("commit", "-q", "--allow-empty", "-m", "init", cwd=repo)
     git("push", "-q", "origin", "HEAD", cwd=repo)
-    book = contacts.ContactBook(chambers, tmp / "none.json")
+    manifest = tmp / "git-chambers.json"
+    manifest.write_text(json.dumps({"chambers": [{"name": "private"}]}), encoding="utf-8")
+    book = contacts.ContactBook(chambers, manifest)
     record = book.create("private", "Ada Muster", [("email", "ada@example.org")])
     os.environ.pop("CONTACTS_COMMIT", None)
     assert contacts.commit(chambers, record["path"], "chore(contacts): add Ada Muster") is True

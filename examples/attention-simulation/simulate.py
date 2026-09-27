@@ -311,9 +311,9 @@ def load_gateway(tmp: Path, store_port: int, gateways: dict[str, int], sim_port:
         "CONVERSATIONS_DIR": str(tmp / "convs"),
         "CONVERSATION_DIR": str(tmp / "convlog"),
         "CHAMBERS_DIR": str(tmp / "chambers"),
-        # No manifest: every mounted chamber (here, `story`) keeps contacts at
-        # the default path, and nothing is a git repository to commit to.
-        "CHAMBERS_MANIFEST": str(tmp / "no-chambers.json"),
+        # The one chamber, `story`, keeps contacts at the default path
+        # (written below), and nothing is a git repository to commit to.
+        "CHAMBERS_MANIFEST": str(tmp / "chambers.json"),
         "CONTACTS_COMMIT": "0",
         "WEB_GATEWAY_STATE": str(tmp / "state.json"),
         "PUSH_DIR": str(tmp / "push"),
@@ -328,6 +328,7 @@ def load_gateway(tmp: Path, store_port: int, gateways: dict[str, int], sim_port:
         os.environ[f"{channel.upper()}_GATEWAY_BASE_URL"] = f"http://127.0.0.1:{port}"
         os.environ[f"{channel.upper()}_GATEWAY_TOKEN"] = "mock"
     (tmp / "chambers").mkdir(parents=True, exist_ok=True)
+    (tmp / "chambers.json").write_text('{"chambers": [{"name": "story"}]}', encoding="utf-8")
     # The gateway renders its own pages with markdown-it; the simulation shows
     # none of them, so a stock Python without the package gets a stand-in.
     try:

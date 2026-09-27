@@ -15,11 +15,12 @@ declare where its contacts go::
 
     {"name": "private", "url": "…", "contacts": "people"}
 
-``contacts`` is a directory relative to the chamber root; left out, it is
-:data:`DEFAULT_PATH`. ``"contacts": false`` says the chamber holds no contacts.
-The manifest's order is the preference order: the first location is the
-default where one must be picked without asking (the migration of old cards,
-the dashboard's pre-selection). Creating a contact always names its chamber.
+``contacts`` is a directory relative to the chamber root; where the entry
+declares none, it is :data:`DEFAULT_PATH`. So every chamber has exactly one
+contact location. The manifest's order is the preference order: the first
+chamber is the default where one must be picked without asking (the migration
+of old cards, the dashboard's pre-selection). Creating a contact always names
+its chamber.
 
 The file
 --------
@@ -411,34 +412,34 @@ class ContactBook:
 
     # Locations
 
-    def _manifest_entries(self) -> list[dict] | None:
+    def _manifest_entries(self) -> list[dict]:
+        """The chambers, as chambers.json declares them (the entrypoint mounts
+        each at CHAMBERS_DIR/<name>, or the container does not start)."""
         try:
             data = json.loads(self.manifest.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return None
+        except (OSError, ValueError) as exc:
+            print(f"[contacts] cannot read {self.manifest} ({exc})", file=sys.stderr, flush=True)
+            return []
         entries = data.get("chambers") if isinstance(data, dict) else None
-        return [e for e in entries if isinstance(e, dict) and e.get("name")] if isinstance(entries, list) else None
+        return [e for e in entries if isinstance(e, dict) and e.get("name")] if isinstance(entries, list) else []
 
     def locations(self) -> list[dict]:
-        """``[{chamber, path, dir}]`` in preference order, mounted chambers only.
-
-        Without a readable manifest every mounted chamber (not ``_generated``,
-        nothing hidden) is a location at the default path, in name order."""
-        entries = self._manifest_entries()
-        if entries is None:
-            entries = [{"name": p.name} for p in sorted(self.chambers_dir.glob("*"))
-                       if p.is_dir() and not p.name.startswith(("_", "."))]
+        """``[{chamber, path, dir}]``: one per chamber, in manifest order — the
+        entry's ``contacts`` directory, or :data:`DEFAULT_PATH` where it
+        declares none. A declared path must stay inside its chamber; one that
+        leads out of it is refused, and the default is used instead."""
         out = []
-        for entry in entries:
+        for entry in self._manifest_entries():
             name = str(entry["name"])
-            declared = entry.get("contacts", DEFAULT_PATH)
-            if declared is False or declared is None:
-                continue
-            rel = str(declared).strip().strip("/") or DEFAULT_PATH
             root = self.chambers_dir / name
-            target = (root / rel).resolve()
-            if not root.is_dir() or (target != root.resolve() and root.resolve() not in target.parents):
-                continue
+            declared = entry.get("contacts")
+            rel = str(declared).strip().strip("/") if isinstance(declared, str) else ""
+            target = (root / rel).resolve() if rel else None
+            if target is not None and root.resolve() not in target.parents:
+                print(f"[contacts] chamber {name!r}: contacts path {declared!r} leaves the chamber; "
+                      f"using {DEFAULT_PATH}/", file=sys.stderr, flush=True)
+                rel = ""
+            rel = rel or DEFAULT_PATH
             out.append({"chamber": name, "path": rel, "dir": root / rel})
         return out
 
@@ -446,7 +447,7 @@ class ContactBook:
         for loc in self.locations():
             if loc["chamber"] == chamber:
                 return loc
-        raise ContactError(f"chamber {chamber!r} holds no contacts (see its contacts entry in chambers.json)")
+        raise ContactError(f"no chamber {chamber!r} in chambers.json")
 
     def default_chamber(self) -> str | None:
         locs = self.locations()

@@ -528,7 +528,7 @@ class RetinueAttentionSheet extends HTMLElement {
         ? `<div><div class="f-k">kept in</div><div class="chips">${chambers.map((c) =>
           `<button class="btn tiny${form.chamber === c ? ' on' : ''}" data-act="contact-chamber" data-chamber="${esc(c)}"${busy}>${esc(c)}</button>`).join('')}</div>` +
           `<div class="f-note">The chamber the contact is stored in, with every channel that reaches them.</div></div>`
-        : `<div class="f-note">No chamber holds contacts — see the contacts entry in chambers.json.</div>`;
+        : `<div class="f-note">No chambers declared in chambers.json.</div>`;
     return `<div class="field screened"><div class="f-label">${card ? 'Contact' : 'New contact'}</div>` +
       `<div class="card-form">` +
       (form.person ? '' : suggest) +
