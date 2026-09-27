@@ -27,13 +27,7 @@ model_list:
       model: anthropic/claude-opus-5-5
     model_info:
       retinue_picker: true
-      retinue_label: Opus 5.5 (deepest reasoning)
-  - model_name: claude-opus-5
-    litellm_params:
-      model: anthropic/claude-opus-5
-    model_info:
-      retinue_picker: true
-      retinue_label: Opus 5
+      retinue_label: Opus (deepest reasoning)
   - model_name: claude-sonnet-5
     litellm_params:
       model: anthropic/claude-sonnet-5
