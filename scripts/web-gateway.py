@@ -4984,25 +4984,37 @@ _OWNER_ACTOR = os.environ.get("RETINUE_OWNER_ACTOR", "").strip() or "urn:retinue
 # projects and non-active statuses are excluded so the dashboard shows only what
 # is actually running. currentActor drives the split: the owner == "your move",
 # anyone else == "waiting on <them>".
+#
+# Every field is read from the project's *source* graph — the one holding its
+# rdf:type triple, i.e. the converted frontmatter file — never from anywhere
+# else in the store. The gateway's own attention emit
+# (chambers/_generated/attention/items.nt) states currentActor, importance,
+# sphere and tag for the same project IRI, derived from this very query; read
+# back, it gave a project two actors, the fold below kept whichever binding
+# came first, and a humanized label ("Reto") written out as an actor IRI
+# re-entered as the actor and was emitted again — a loop that pinned projects
+# to "waiting on" their own owner. agent-self-review.py scopes the same way.
 _PROJECTS_SPARQL = """
 PREFIX k: <%s>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 SELECT ?p ?title ?actor ?next ?since ?expected ?status
        ?importance ?sphere ?tag ?kind ?nextDue ?remindBefore WHERE {
-  ?p rdf:type k:Project .
-  OPTIONAL { ?p k:title ?title }
-  OPTIONAL { ?p k:currentActor ?actor }
-  OPTIONAL { ?p k:currentNextAction ?next }
-  OPTIONAL { ?p k:waitingSince ?since }
-  OPTIONAL { ?p k:expectedBy ?expected }
-  OPTIONAL { ?p k:status ?status }
-  OPTIONAL { ?p k:paused ?paused }
-  OPTIONAL { ?p k:importance ?importance }
-  OPTIONAL { ?p k:sphere ?sphere }
-  OPTIONAL { ?p k:tag ?tag }
-  OPTIONAL { ?p k:kind ?kind }
-  OPTIONAL { ?p k:nextDue ?nextDue }
-  OPTIONAL { ?p k:remindBefore ?remindBefore }
+  GRAPH ?g {
+    ?p rdf:type k:Project .
+    OPTIONAL { ?p k:title ?title }
+    OPTIONAL { ?p k:currentActor ?actor }
+    OPTIONAL { ?p k:currentNextAction ?next }
+    OPTIONAL { ?p k:waitingSince ?since }
+    OPTIONAL { ?p k:expectedBy ?expected }
+    OPTIONAL { ?p k:status ?status }
+    OPTIONAL { ?p k:paused ?paused }
+    OPTIONAL { ?p k:importance ?importance }
+    OPTIONAL { ?p k:sphere ?sphere }
+    OPTIONAL { ?p k:tag ?tag }
+    OPTIONAL { ?p k:kind ?kind }
+    OPTIONAL { ?p k:nextDue ?nextDue }
+    OPTIONAL { ?p k:remindBefore ?remindBefore }
+  }
   FILTER (!BOUND(?paused) || ?paused = false)
   FILTER (!BOUND(?status) || ?status != "done")
 } ORDER BY ?title

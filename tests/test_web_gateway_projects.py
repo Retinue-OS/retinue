@@ -244,6 +244,29 @@ def test_fetch_projects_owner_binding(tmp: Path):
     print("ok: fetch_projects owner binding (explicit match + unset fail-safe)")
 
 
+def test_projects_query_reads_source_graph_only(wg):
+    """Every project field comes from the graph holding the project's rdf:type
+    triple -- its converted frontmatter file. The gateway's own attention emit
+    (_generated/attention/items.nt) states currentActor for the same project
+    IRI; read back unscoped, it handed a project a second actor, and the
+    humanized label it carries ("Reto") fed itself back as the actor on every
+    emit. Checked structurally, as the CI has no SPARQL engine: the type
+    triple and every OPTIONAL sit inside one GRAPH block."""
+    q = wg._PROJECTS_SPARQL
+    start = q.index("GRAPH ?g {")
+    depth, i = 0, q.index("{", start)
+    while True:
+        depth += {"{": 1, "}": -1}.get(q[i], 0)
+        if depth == 0:
+            break
+        i += 1
+    inside, outside = q[start:i + 1], q[:start] + q[i + 1:]
+    assert "rdf:type k:Project" in inside, inside
+    assert inside.count("OPTIONAL") == q.count("OPTIONAL") > 0, q
+    assert "OPTIONAL" not in outside and "k:currentActor" not in outside, outside
+    print("ok: projects query reads the source graph only")
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -253,6 +276,7 @@ def main():
         test_item_payload_and_write(wg, chambers)
         test_conversation_kinds(wg)
         test_engage_prompt_context(wg, chambers)
+        test_projects_query_reads_source_graph_only(wg)
         test_fetch_projects_owner_binding(tmp)
     print("all web-gateway project tests passed")
 
