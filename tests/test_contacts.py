@@ -182,7 +182,7 @@ def test_attention_and_vip(chambers, manifest):
 
 
 def test_cli(chambers, manifest):
-    env = dict(os.environ, CONTACTS_COMMIT="0",
+    env = dict(os.environ,
                TRIAGE_MESSENGER_DIR=str(chambers.parent / "policy" / "messenger"),
                TRIAGE_EMAIL_WHITELIST_PATH=str(chambers.parent / "policy" / "email.nt"))
     base = CLI + ["--chambers-dir", str(chambers), "--manifest", str(manifest), "--json"]
@@ -234,14 +234,19 @@ def test_commit(tmp: Path):
     git("push", "-q", "origin", "HEAD", cwd=repo)
     book = contacts.ContactBook(chambers, tmp / "no-manifest.json")
     record = book.create("private", "Ada Muster", [("email", "ada@example.org")])
-    os.environ.pop("CONTACTS_COMMIT", None)
     assert contacts.commit(chambers, record["path"], "chore(contacts): add Ada Muster") is True
     log = subprocess.run(["git", "--git-dir", str(remote), "log", "--name-only", "--format=%s"],
                          capture_output=True, text=True, check=True).stdout
     assert "chore(contacts): add Ada Muster" in log and record["path"].split("/", 1)[1] in log, log
     assert contacts.commit(chambers, record["path"], "again") is False, "nothing to commit"
-    os.environ["CONTACTS_COMMIT"] = "0"
-    assert contacts.commit(chambers, record["path"], "off") is False
+    # A chamber directory that is no repository of its own is not committed
+    # into the repository around it.
+    plain = repo / "nested"
+    (plain / "contacts").mkdir(parents=True)
+    (plain / "contacts" / "x.nt").write_text("# x\n", encoding="utf-8")
+    assert contacts.commit(repo, "nested/contacts/x.nt", "wrong repo") is False
+    assert "wrong repo" not in subprocess.run(["git", "-C", str(repo), "log", "--format=%s"],
+                                              capture_output=True, text=True).stdout
     print("ok test_commit")
 
 

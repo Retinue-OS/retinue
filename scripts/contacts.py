@@ -69,7 +69,7 @@ Command line (agents)::
     contacts.py update <id> --vip --importance 4 --permit focused
 
 Writes are committed and pushed in the owning chamber (best effort, like the
-dashboard's project edits); ``--no-commit`` or ``CONTACTS_COMMIT=0`` skips it.
+dashboard's project edits).
 """
 
 from __future__ import annotations
@@ -707,12 +707,18 @@ def commit(chambers_dir: str | Path, rel_path: str, message: str) -> bool:
     """Best-effort ``git add`` + commit + push of one contact file in its
     chamber (Tier 1: operational data, user-initiated). The in-container git
     is the serializing wrapper, so concurrent commits in a chamber do not race.
-    A failure is logged, never raised: the file on disk is already the truth."""
-    if os.environ.get("CONTACTS_COMMIT", "1").strip().lower() in ("0", "false", "no"):
-        return False
+    A failure is logged, never raised: the file on disk is already the truth.
+    Only the chamber's own repository is committed to: a chamber directory
+    that is no repository of its own is never committed into one around it."""
     chamber_name, _sep, inner = str(rel_path).partition("/")
     chamber = Path(chambers_dir) / chamber_name
     try:
+        top = subprocess.run(["git", "-C", str(chamber), "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=60)
+        if top.returncode != 0 or Path(top.stdout.strip()).resolve() != chamber.resolve():
+            print(f"[contacts] {chamber_name} is no git repository of its own; {inner} not committed",
+                  file=sys.stderr, flush=True)
+            return False
         subprocess.run(["git", "-C", str(chamber), "add", "-A", "--", inner],
                        check=True, capture_output=True, timeout=60)
         if subprocess.run(["git", "-C", str(chamber), "diff", "--cached", "--quiet", "--", inner],
@@ -771,7 +777,6 @@ def main(argv=None) -> int:
                        help="a Focus mode id they may interrupt (repeatable; replaces on update)")
         p.add_argument("--vip", action=argparse.BooleanOptionalAction, default=None,
                        help="a model works their messages the moment they arrive, on every channel")
-        p.add_argument("--no-commit", action="store_true")
     p_add.add_argument("--chamber", required=True, help="the chamber the contact is stored in")
     p_add.add_argument("--email", action="append", default=[])
     p_add.add_argument("--phone", action="append", default=[], help="a telephone (also reachable by SMS)")
@@ -786,7 +791,6 @@ def main(argv=None) -> int:
     p_upd.add_argument("--no-permits", action="store_true", help="clear every Focus-mode permit")
     p_del = sub.add_parser("delete")
     p_del.add_argument("id")
-    p_del.add_argument("--no-commit", action="store_true")
     args = ap.parse_args(argv)
     book = ContactBook(args.chambers_dir, args.manifest)
     try:
@@ -821,8 +825,7 @@ def main(argv=None) -> int:
                                  importance=args.importance or None, permits=args.permit or (),
                                  vip=bool(args.vip))
             sync_policy(book)
-            if not args.no_commit:
-                commit(book.chambers_dir, record["path"], f"chore(contacts): add {record['name']}")
+            commit(book.chambers_dir, record["path"], f"chore(contacts): add {record['name']}")
             _print(args, public(record))
         elif args.cmd == "update":
             add = ([parse_handle(h) for h in args.add_handle] + [("email", e) for e in args.add_email]
@@ -835,14 +838,12 @@ def main(argv=None) -> int:
                                  importance=False if args.importance is None else (args.importance or None),
                                  permits=[] if args.no_permits else args.permit, vip=args.vip)
             sync_policy(book)
-            if not args.no_commit:
-                commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
+            commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
             _print(args, public(record))
         elif args.cmd == "delete":
             record = book.delete(args.id)
             sync_policy(book)
-            if not args.no_commit:
-                commit(book.chambers_dir, record["path"], f"chore(contacts): remove {record['name']}")
+            commit(book.chambers_dir, record["path"], f"chore(contacts): remove {record['name']}")
             _print(args, public(record))
     except ContactError as exc:
         print(f"contacts: {exc}", file=sys.stderr)

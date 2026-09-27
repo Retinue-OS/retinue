@@ -312,9 +312,8 @@ def load_gateway(tmp: Path, store_port: int, gateways: dict[str, int], sim_port:
         "CONVERSATION_DIR": str(tmp / "convlog"),
         "CHAMBERS_DIR": str(tmp / "chambers"),
         # The one chamber, `story`, declares nothing (no manifest), so it
-        # keeps contacts at the default path; nothing is a repo to commit to.
+        # keeps contacts at the default path; it is no repo, so no commits.
         "CHAMBERS_MANIFEST": str(tmp / "no-manifest.json"),
-        "CONTACTS_COMMIT": "0",
         "WEB_GATEWAY_STATE": str(tmp / "state.json"),
         "PUSH_DIR": str(tmp / "push"),
         "ATTENTION_DIR": str(tmp / "attention"),

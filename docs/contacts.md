@@ -189,8 +189,7 @@ python3 /workspace/scripts/contacts.py delete <id>
 - `--json` gives machine-readable output.
 - `find --handle` also lists people who have the same number on another channel,
   marked `match: "phone"`. That is a suggestion to confirm, not an identity.
-- Writes are committed and pushed in the owning chamber. Pass `--no-commit` or
-  set `CONTACTS_COMMIT=0` to skip that.
+- Writes are committed and pushed in the owning chamber's repository.
 - Always `find` before `add`: a second person for someone the book already
   knows splits their channels again.
 
