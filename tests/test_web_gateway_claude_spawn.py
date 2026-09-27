@@ -383,11 +383,14 @@ def test_dashboard_model_governs_threads_and_only_threads(wg_dashboard):
                                          {"id": "sonnet", "label": "Sonnet"}])
     assert marked[1].get("default") is True and "default" in marked[1]["label"]
     assert "default" not in marked[0]
-    # …and flags nothing at all rather than mislabelling another row when the
-    # configured model is not offered.
+    # …and, when the configured model is not offered, gets a row of its own
+    # rather than mislabelling another one or leaving the picker to show a
+    # bare "Default" that names no model.
     unoffered = wg_dashboard._mark_default([{"id": "opus", "label": "Opus"},
                                             {"id": "haiku", "label": "Haiku"}])
-    assert unoffered == [{"id": "opus", "label": "Opus"},
+    assert unoffered == [{"id": "sonnet", "label": "sonnet (default)",
+                          "default": True},
+                         {"id": "opus", "label": "Opus"},
                          {"id": "haiku", "label": "Haiku"}], unoffered
 
     # The lint's default tier is the router model, untouched by the split.

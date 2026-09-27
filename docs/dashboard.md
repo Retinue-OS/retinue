@@ -397,7 +397,11 @@ over SPARQL). Whatever the source, `id` is passed to `claude --model`. The
 list carries only concrete models — no synthetic "Default" row: the entry the
 gateway's configured default resolves to (through LiteLLM's route aliases)
 is flagged `default: true` and labeled as the default, and a thread without a
-stored choice runs that default (stored as the empty string internally).
+stored choice runs that default (stored as the empty string internally). A
+default no picker route names (say a newer model reached only through the
+`claude-*` wildcard) is added as a row of its own under its concrete id, so the
+picker always names a real model; give it a picker route in
+`litellm/config.yaml` for a friendlier label.
 The dashboard reads the list from `GET /conversation-models` and
 persists a thread's choice via `POST /conversations/<id>/model` — an id not on
 the offered list is ignored (the thread falls back to the default), so a client
