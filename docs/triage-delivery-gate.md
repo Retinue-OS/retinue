@@ -247,9 +247,11 @@ That choice does three jobs at once: it indexes natively in qlever (no
 converter), it is trivial for a gateway to parse off disk, and it retires any
 separate per-app JSON.
 
-**Retinue (Ara) is the sole writer of the policy files; the gateways are
-readers** — the reverse direction of the message files, so single-writer-per-file
-still holds and there is no write race. The messenger policy rides on the **same
+**The retinue side writes the policy files; the gateways are readers** — the
+reverse direction of the message files. On the retinue side there are two
+writers: Ara (`triage_policy.py`, the Sent-folder derivation) and the web
+gateway's projection of the address book's VIPs; every read-modify-write holds
+the file's `policy_lock`, so neither drops the other's change. The messenger policy rides on the **same
 per-gateway volume as that channel's messages** (see the volume topology below),
 because the gateway must read it at classify time — see the next point. The
 e-mail whitelist has no gateway, so it lives on the retinue side under

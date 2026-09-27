@@ -159,7 +159,9 @@ and, on every save, writes back into the person what changed for them — a −/
 on the sheet, a permit, the contact card. So they follow the person across
 channels, survive a rename, and live in the chamber with the rest of the
 contact. What the profile knew about a person before they were filed is copied
-into the person once, at start, where the person leaves the field unset.
+into the person where the person leaves the field unset — the first time the
+gateway sees them, at start or when they are filed while it runs (the CLI, a
+hand edit) — before the overlay takes over.
 
 **The VIP flag** says a model works this person's messages the moment they
 arrive (docs/triage-delivery-gate.md). It is set on the person, never per
@@ -286,14 +288,16 @@ SELECT ?channel ?text WHERE {
 ## Migration
 
 At startup, the gateway files every older card (a name on a chat document, with
-no `person`) as a person in the **default chamber**, the first contact location.
+no `person`) as a person in the **default chamber** (the chamber the last
+contact was created in, else the first contact location).
 If a person already has the handle, the card is linked to them instead. Once no
 card is left unfiled, it removes the old generated file
 (`CONTACTS_EMIT_PATH`, `_generated/contacts/dashboard.ttl`). Cards with the same
 name are not merged automatically; the card offers the match instead.
 
-The migration is idempotent. A deployment whose manifest declares no contact
-location keeps its old cards, and the old file, until it declares one.
+The migration is idempotent. A deployment in which no chamber keeps contacts —
+every one opts out, or none is mounted — keeps its old cards, and the old
+file, until one does.
 
 ## Not yet
 

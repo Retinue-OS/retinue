@@ -62,8 +62,12 @@ write-if-changed discipline as `discover-agents.py`, so an unchanged policy neve
 triggers a qlever-dir rebuild, and the very same file the gateway reads raw is
 indexed in the life store for `who is a VIP?` queries.
 
-Retinue (Ara) is the sole writer; the gateways are readers. The `_generated`
-paths are framework-owned, in no chamber's git repo.
+The retinue side writes, the gateways read. There are two writers there: Ara,
+through this module's CLI (and the Sent-folder derivation in triage-gate.py),
+and the web gateway, which projects the address book's VIPs on every contact
+write and on its tick (:func:`sync_contacts`). Every read-modify-write holds
+the file's :func:`policy_lock`, so neither can drop the other's change. The
+`_generated` paths are framework-owned, in no chamber's git repo.
 
 **Contact-owned members.** A person filed in the address book
 (`scripts/contacts.py`, docs/contacts.md) can be a VIP; the person, not a
@@ -79,7 +83,9 @@ loaders read the predicate and ignore the subject.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import email.utils
+import fcntl
 import os
 import re
 import sys
@@ -126,6 +132,8 @@ P_QUIETED_WILDCARD = KB + "triageQuietedWildcard"
 P_BLOCKED_GROUP = KB + "triageBlockedGroup"
 
 EMAIL_SUBJECT = "urn:retinue:triage:email-whitelist"
+# The messenger channels the framework runs gateways for.
+MESSENGER_CHANNELS = ("signal", "whatsapp", "telegram", "sms")
 # The subject suffix of the contact-owned members (see the module docstring).
 CONTACTS_SUFFIX = ":contacts"
 
@@ -235,6 +243,23 @@ def _parse(path: Path) -> list[tuple[str, str, str]]:
         if m:
             triples.append((m.group(1), m.group(2), _unescape(m.group(3))))
     return triples
+
+
+@contextlib.contextmanager
+def policy_lock(path: Path):
+    """Hold an exclusive lock for a read-modify-write of one policy file.
+
+    Advisory, on a ``<file>.lock`` sibling, so the gateways — readers only —
+    are never blocked, and a write stays one atomic rename they may read at
+    any moment."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 def write_if_changed(content: str, path: Path) -> bool:
@@ -640,7 +665,12 @@ def gate_decision(
     return dec
 
 
-def _mutate_email(add_addresses=(), add_wildcards=(), remove=(),
+def _mutate_email(*args, **kwargs) -> None:
+    with policy_lock(email_whitelist_path()):
+        _mutate_email_locked(*args, **kwargs)
+
+
+def _mutate_email_locked(add_addresses=(), add_wildcards=(), remove=(),
                   news_add=(), news_remove=(),
                   quiet_add=(), quiet_remove=(),
                   ignore_add=(), ignore_remove=()) -> None:
@@ -683,8 +713,13 @@ def _mutate_email(add_addresses=(), add_wildcards=(), remove=(),
     save_email_policy(EmailPolicy(**sets))
 
 
-def _mutate_messenger(channel, *, ig_add=(), ig_del=(), q_add=(), q_del=(),
-                      news_add=(), news_del=(), vip_add=(), vip_del=()) -> None:
+def _mutate_messenger(channel, **kwargs) -> None:
+    with policy_lock(messenger_policy_path(channel)):
+        _mutate_messenger_locked(channel, **kwargs)
+
+
+def _mutate_messenger_locked(channel, *, ig_add=(), ig_del=(), q_add=(), q_del=(),
+                             news_add=(), news_del=(), vip_add=(), vip_del=()) -> None:
     pol = load_messenger_policy(channel)
     ignored = set(pol.ignored)
     quieted = set(pol.quieted)
@@ -727,21 +762,27 @@ def sync_contacts(vip_handles: dict[str, set[str]], emails: set[str]) -> list[st
     their addresses. Replaces the contact-owned members wholesale — hand-set
     VIPs and the Sent-derived whitelist stay as they are — and writes a file
     only when its bytes change. A channel with no policy directory yet is
-    written only when it has members. Returns the files written."""
+    written only when it has members and is one of MESSENGER_CHANNELS.
+    Returns the files written."""
     written = []
-    channels = set(messenger_policy_channels()) | {c for c, hs in vip_handles.items() if hs}
+    # A channel no gateway reads (a person's Matrix account, say) gets no
+    # policy directory of its own: only the ones already there, and the
+    # messenger services the framework runs gateways for.
+    channels = set(messenger_policy_channels()) | (
+        {c for c, hs in vip_handles.items() if hs} & set(MESSENGER_CHANNELS))
     for channel in sorted(channels):
         want = {_norm_handle(h) for h in vip_handles.get(channel, ()) if h.strip()}
         path = messenger_policy_path(channel)
-        pol = load_messenger_policy(channel, path=path)
-        if set(pol.vip_contacts) == want:
-            continue
-        if write_if_changed(render_messenger_policy(channel, pol._replace(vip_contacts=want)), path):
-            written.append(str(path))
-    pol = load_email_policy()
+        with policy_lock(path):
+            pol = load_messenger_policy(channel, path=path)
+            if set(pol.vip_contacts) != want and write_if_changed(
+                    render_messenger_policy(channel, pol._replace(vip_contacts=want)), path):
+                written.append(str(path))
     want = {e.strip().lower() for e in emails if e.strip()}
-    if set(pol.contact_addresses) != want and save_email_policy(pol._replace(contact_addresses=want)):
-        written.append(str(email_whitelist_path()))
+    with policy_lock(email_whitelist_path()):
+        pol = load_email_policy()
+        if set(pol.contact_addresses) != want and save_email_policy(pol._replace(contact_addresses=want)):
+            written.append(str(email_whitelist_path()))
     return written
 
 

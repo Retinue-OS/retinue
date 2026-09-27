@@ -6992,7 +6992,8 @@ def _contact_file_card(handle: tuple[str, str], card: dict, *, name: str, sphere
         return _CONTACTS.create(chamber, name, [handle], sphere=sphere, tags=tags, vip=bool(vip)), "add"
     owner = _CONTACTS.find(*handle)
     if owner and owner["iri"] != target["iri"]:
-        _CONTACTS.update(owner["key"], remove=[handle])
+        # The handle moves: the person it leaves is written — and committed — too.
+        _contact_changed(_CONTACTS.update(owner["key"], remove=[handle]), "move a handle off")
     add = [] if owner and owner["iri"] == target["iri"] else [handle]
     return _CONTACTS.update(target["key"], name=name, sphere=sphere, tags=tags, add=add, vip=vip), "update"
 
@@ -7054,10 +7055,41 @@ def _people_by_name() -> dict[str, dict]:
     return out
 
 
+# Persons this process has already reconciled with the profile (by key).
+_PEOPLE_RECONCILED: set[str] = set()
+
+
+def _people_reconcile(profile: dict) -> int:
+    """First sight of a person — at startup, or filed while the gateway runs
+    (the CLI, a hand edit): what the profile already knows under their name
+    and the person leaves unset is copied into the person, so the overlay that
+    follows does not erase what the user taught before they were filed.
+    Returns the persons written."""
+    count = 0
+    for name, record in _people_by_name().items():
+        if record["key"] in _PEOPLE_RECONCILED:
+            continue
+        _PEOPLE_RECONCILED.add(record["key"])
+        known = _profile_attention(profile, name)
+        mine = _person_attention(record)
+        fill = {k: v for k, v in known.items() if v not in (None, []) and mine[k] in (None, [])}
+        if not fill:
+            continue
+        try:
+            updated = _CONTACTS.update(record["key"], **fill)
+        except contacts_mod.ContactError:
+            continue
+        _contact_changed(updated, "import attention for")
+        count += 1
+    return count
+
+
 def _profile_with_people(profile: dict) -> dict:
     """Lay every named person's attention facts over the profile, keyed on
     their name as the rest of the model expects. The person wins: a field the
-    person does not set is cleared for their name."""
+    person does not set is cleared for their name — once the person has been
+    reconciled with what the profile knew (_people_reconcile)."""
+    _people_reconcile(profile)
     snapshot = {}
     for name, record in _people_by_name().items():
         facts = _person_attention(record)
@@ -7111,24 +7143,15 @@ def _people_learn(profile: dict) -> list[dict]:
 
 
 def _contacts_import_attention() -> int:
-    """Once per start: what the profile already knows about a person the
-    address book leaves unset — a prior learned before persons existed — is
-    copied into the person, so the first overlay does not erase it."""
-    raw = attention_store.AttentionStore.profile(_ATTENTION)
-    count = 0
-    for name, record in _people_by_name().items():
-        known = _profile_attention(raw, name)
-        mine = _person_attention(record)
-        fill = {k: v for k, v in known.items() if v not in (None, []) and mine[k] in (None, [])}
-        if not fill:
-            continue
-        try:
-            updated = _CONTACTS.update(record["key"], **fill)
-        except contacts_mod.ContactError:
-            continue
-        _contact_changed(updated, "import attention for")
-        count += 1
-    return count
+    """At start: reconcile every person with the profile (_people_reconcile)."""
+    return _people_reconcile(attention_store.AttentionStore.profile(_ATTENTION))
+
+
+def _attention_profile_view() -> dict:
+    """The profile as clients see it: without the overlay's snapshot."""
+    profile = _ATTENTION.profile()
+    profile.pop(_PEOPLE_SNAPSHOT, None)
+    return profile
 
 
 def _contacts_sync_policy() -> None:
@@ -8712,9 +8735,12 @@ class Handler(BaseHTTPRequestHandler):
             focus = _ATTENTION.focus()
             profile = _ATTENTION.profile()
             if permits is not None:
+                if not isinstance(permits, list):
+                    self._send_json(400, {"error": "permits must be a list of mode ids"})
+                    return
                 unknown = [m for m in permits if m not in (focus.get("modes") or {})]
-                if not isinstance(permits, list) or unknown:
-                    self._send_json(400, {"error": f"unknown mode(s): {', '.join(map(str, unknown)) or permits!r}"})
+                if unknown:
+                    self._send_json(400, {"error": f"unknown mode(s): {', '.join(map(str, unknown))}"})
                     return
             try:
                 if key is None:
@@ -9586,7 +9612,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": str(exc)})
                 return
             _ATTENTION.save_focus(base)
-        self._send_json(200, {"profile": _ATTENTION.profile(), "focus": _ATTENTION.focus()})
+        self._send_json(200, {"profile": _attention_profile_view(), "focus": _ATTENTION.focus()})
 
     def _handle_internal_attention_set(self) -> None:
         """An agent declares — or revises — an item's attention properties:
@@ -10246,7 +10272,7 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_attention_item_get(conv_query)
             return
         if conv_path in ("/attention/profile", "/attention/profile/"):
-            self._send_json(200, {"profile": _ATTENTION.profile(), "focus": _ATTENTION.focus()})
+            self._send_json(200, {"profile": _attention_profile_view(), "focus": _ATTENTION.focus()})
             return
         if conv_path in ("/projects", "/projects/"):
             # Live projects view, computed from the life store on demand. No

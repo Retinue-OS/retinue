@@ -556,12 +556,13 @@ def test_contact_owned_members():
             (Path(tmp) / "messenger" / "signal").mkdir(parents=True)
             tp._mutate_messenger("signal", vip_add=["+41790000001"])
             tp._mutate_email(add_addresses=["boss@work.com"])
-            written = tp.sync_contacts({"signal": {"+41790000002"}, "matrix": set()}, {"Mara@Example.org"})
+            written = tp.sync_contacts({"signal": {"+41790000002"}, "matrix": {"@mara:example.org"}},
+                                       {"Mara@Example.org"})
             assert len(written) == 2, written
             pol = tp.load_messenger_policy("signal")
             assert pol.vip == {"+41790000001"} and pol.vip_contacts == {"+41790000002"}, pol
             assert tp.gate_decision("signal", "+41790000002")["vip"] is True
-            assert not (Path(tmp) / "messenger" / "matrix").exists(), "no directory for a channel with nobody"
+            assert not (Path(tmp) / "messenger" / "matrix").exists(), "no directory for a channel no gateway reads"
             email = tp.load_email_policy()
             assert email.addresses == {"boss@work.com"} and email.contact_addresses == {"mara@example.org"}
             assert tp.email_gate_decision("mara@example.org")["triage_now"] is True
@@ -581,6 +582,11 @@ def test_contact_owned_members():
             assert tp.load_messenger_policy("signal").vip_contacts == set()
             assert tp.load_email_policy().addresses == {"boss@work.com", "peer@partner.com"}
             assert tp.sync_contacts({}, set()) == []
+            # A known messenger service gets its directory when it has a VIP.
+            tp.sync_contacts({"whatsapp": {"+41790000003"}}, set())
+            assert tp.load_messenger_policy("whatsapp").vip_contacts == {"+41790000003"}
+            # Every read-modify-write holds the file's lock (a sibling .lock).
+            assert tp.messenger_policy_path("signal").with_name("policy.nt.lock").exists()
         finally:
             del os.environ["TRIAGE_MESSENGER_DIR"]
             del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]

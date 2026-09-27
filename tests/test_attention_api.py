@@ -657,6 +657,47 @@ def test_a_person_carries_attention_and_vip(base, wg):
     print("ok test_a_person_carries_attention_and_vip")
 
 
+def test_review_fixes(base, wg):
+    """A person filed while the gateway runs keeps what the profile knew; a
+    handle moved off one person commits that person too; the profile view
+    carries no overlay snapshot; a malformed permits list is a 400."""
+    # Filed after startup (the CLI, say): the profile's prior for the name
+    # goes into the person instead of being cleared by the overlay.
+    raw = wg.attention_store.AttentionStore.profile(wg._ATTENTION)
+    raw["priors"]["Zoe Lang"] = 4.5
+    wg.attention_store.AttentionStore.save_profile(wg._ATTENTION, raw)
+    zoe = wg._CONTACTS.create("private", "Zoe Lang")
+    assert wg._ATTENTION.profile()["priors"].get("Zoe Lang") == 4.5
+    assert wg._CONTACTS.get(zoe["key"])["importance"] == 4.5
+    # Moving a handle: both persons are committed.
+    committed = []
+    real_commit = wg._contact_commit
+    wg._contact_commit = lambda record, verb: committed.append((record["name"], verb))
+    try:
+        kai = "+41791000133"
+        chat = "signal:" + kai
+        _inbound(base, kai, None, "Kai.", "2026-09-05T14:00:00Z",
+                 gate={"forward": True, "vip": False, "reason": "open"})
+        status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                            {"name": "Kai Wolf", "chamber": "private"})
+        assert status == 200, out
+        committed.clear()
+        status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                            {"name": "Zoe Lang", "person": zoe["key"]})
+        assert status == 200 and out["person"]["id"] == zoe["key"], out
+        names = {name for name, _verb in committed}
+        assert {"Kai Wolf", "Zoe Lang"} <= names, committed
+        _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
+    finally:
+        wg._contact_commit = real_commit
+    status, out = _http(base, "GET", "/attention/profile")
+    assert status == 200 and wg._PEOPLE_SNAPSHOT not in out["profile"], sorted(out["profile"])
+    for bad in ("focused", 3):
+        status, out = _http(base, "POST", f"/contacts/{zoe['key']}", {"permits": bad})
+        assert status == 400, (bad, status, out)
+    print("ok test_review_fixes")
+
+
 def test_legacy_cards_are_filed(base, wg):
     """A card of the earlier, chamber-less kind — a name on the chat document
     and one generated Turtle file — is filed as a person in the default
@@ -1329,6 +1370,7 @@ def main():
         test_a_person_in_several_spheres(base, wg)
         test_one_person_many_channels(base, wg)
         test_a_person_carries_attention_and_vip(base, wg)
+        test_review_fixes(base, wg)
         test_legacy_cards_are_filed(base, wg)
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)

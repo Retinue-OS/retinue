@@ -334,12 +334,15 @@ def refresh_whitelist_from_sent() -> int:
     if res is None:
         return -1
     derived = tp.recipients_from_sent(res.get("messages", []))
-    pol = tp.load_email_policy()
-    merged = pol.addresses | derived
-    if merged != pol.addresses:
-        # Save the *whole* policy: the file also holds the news senders, and
-        # rendering only the whitelist would silently drop them.
-        tp.save_email_policy(pol._replace(addresses=merged))
+    # Under the file's lock: the web gateway rewrites the address book's VIPs
+    # into the same file (triage_policy.sync_contacts).
+    with tp.policy_lock(tp.email_whitelist_path()):
+        pol = tp.load_email_policy()
+        merged = pol.addresses | derived
+        if merged != pol.addresses:
+            # Save the *whole* policy: the file also holds the news senders, and
+            # rendering only the whitelist would silently drop them.
+            tp.save_email_policy(pol._replace(addresses=merged))
     return len(merged)
 
 
