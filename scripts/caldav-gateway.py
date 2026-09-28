@@ -937,8 +937,9 @@ def _execute_approved_event(path: Path, entry: dict) -> None:
         _pending_sends.pop(request_id, None)
 
 
-def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
-    """Approve or reject a pending event (see signal-gateway.py for the same
+def _complete_pending_send(request_id: str, approved: bool,
+                           retracted: bool = False) -> dict | None:
+    """Approve, reject or retract a pending event (see signal-gateway.py for the same
     asynchronous-approval rationale, issue #116)."""
     path = _lookup_existing_path(request_id)
     if path is None:
@@ -950,7 +951,8 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return None
         if entry.get("status") != "pending":
             return entry
-        entry["status"] = "sending" if approved else "rejected"
+        entry["status"] = ("sending" if approved
+                           else "retracted" if retracted else "rejected")
         try:
             path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
         except OSError as exc:
@@ -961,13 +963,13 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
         threading.Thread(target=_execute_approved_event, args=(path, dict(entry)),
                          name=f"event-{request_id[:8]}", daemon=True).start()
     else:
-        print(f"[caldav-gateway] pending event {request_id} rejected", flush=True)
+        print(f"[caldav-gateway] pending event {request_id} {snapshot['status']}", flush=True)
     return snapshot
 
 
 # ── HTTP API ─────────────────────────────────────────────────────────────────
 
-_PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
+_PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject|retract))?/?$")
 
 
 def _route_and_params(path: str) -> tuple:
@@ -1115,7 +1117,8 @@ class _PushHandler(BaseHTTPRequestHandler):
                 return
             request_id = m.group(1)
             verb = m.group(2)
-            entry = _complete_pending_send(request_id, approved=(verb == "approve"))
+            entry = _complete_pending_send(request_id, approved=(verb == "approve"),
+                                           retracted=(verb == "retract"))
             if entry is None:
                 self._reply(404, {"error": "pending event not found"})
                 return

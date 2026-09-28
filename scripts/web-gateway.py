@@ -3898,6 +3898,8 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         note_pending = "Adding to the calendar…"
         note_done = "Added to the calendar."
         note_rejected = "The event was discarded; nothing was added to the calendar."
+        note_retracted = ("The agent retracted this event before approval; "
+                          "nothing was added to the calendar.")
         note_error = "The gateway could not create the event: "
     else:
         # A gateway that stores its text as "body" (the e-mail-shaped entry) is
@@ -3913,6 +3915,8 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         note_pending = "Delivering in the background…"
         note_done = "Sent."
         note_rejected = "The message was discarded without sending."
+        note_retracted = ("The agent retracted this message before approval; "
+                          "nothing was sent.")
         note_error = "The gateway could not deliver the message: "
     status = detail.get("status") or "pending"
     if status != "pending":
@@ -3933,6 +3937,9 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         elif status == "rejected":
             icon = '<div class="cross">✕</div>'
             note = note_rejected
+        elif status == "retracted":
+            icon = '<div class="cross">✕</div>'
+            note = note_retracted
         else:  # "error"
             icon = '<div class="cross">✕</div>'
             note = note_error + (detail.get("error") or "unknown error")
@@ -3971,6 +3978,7 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
             + f"  var pollUrl={json.dumps(f'/sends/{channel}/{request_id}/status')};\n"
             + f"  var noteDone={json.dumps(note_done)};\n"
             + f"  var noteRejected={json.dumps(note_rejected)};\n"
+            + f"  var noteRetracted={json.dumps(note_retracted)};\n"
             + f"  var noteError={json.dumps(note_error)};\n"
             + "  var icon=document.getElementById('st-icon');\n"
               "  var note=document.getElementById('st-note');\n"
@@ -3989,6 +3997,10 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
               "    }else if(st==='rejected'){\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
               "      note.textContent=noteRejected;\n"
+              "      showNext();\n"
+              "    }else if(st==='retracted'){\n"
+              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+              "      note.textContent=noteRetracted;\n"
               "      showNext();\n"
               "    }else{\n"
               "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
