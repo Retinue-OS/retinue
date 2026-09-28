@@ -962,7 +962,12 @@ class RetinueConversation extends HTMLElement {
         `<p>This conversation is no longer here.</p></div></div>`;
     }
     if (!t) return `<div class="thread"></div>`;
-    return `<div class="thread">${this._messagesHtml(t)}</div>`;
+    // A thread about a project leads back to it — the way home from a
+    // "Discuss with Ara" started on the project page.
+    const about = t.project
+      ? `<a class="about-chip about-link" href="/project.html?id=${encodeURIComponent(t.project)}">`
+        + `About: ${esc(t.project_title || t.project)} &#8250;</a>` : '';
+    return `${about}<div class="thread">${this._messagesHtml(t)}</div>`;
   }
 
   // The composer that has no thread yet: what the first message will be about.
@@ -2121,6 +2126,8 @@ const CSS = `
                 border: 1px solid var(--accent, #6ea8fe); color: var(--fg, #e7ebf2);
                 font-size: .78rem; font-weight: 600; max-width: 100%;
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .about-link { margin: 8px 0 2px; text-decoration: none; }
+  .about-link:hover { background: var(--accent, #6ea8fe); color: var(--bg, #0e1117); }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
            gap: 6px; color: var(--muted, #8b93a3); text-align: center; padding: 24px 12px; }
   .empty .e-ico { font-size: 2rem; opacity: .55; }

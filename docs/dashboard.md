@@ -545,7 +545,10 @@ to Ara as a conversation of **kind `edit`** linked to the project: apply the
 change to the project file and confirm in one short sentence. Edit threads are
 marked as such and hidden from the default conversation list (they stay under
 the Edits filter); "Discuss with Ara" on a project page starts a normal,
-visible thread whose engage prompt points Ara at the project file.
+visible thread whose engage prompt points Ara at the project file. The link
+runs both ways: such a thread carries an "About: <project>" chip back to the
+project page, and the project page lists the project's threads (open ones
+first, archived folded) so an ongoing discussion is picked up, not restarted.
 
 ## Speech-to-text (the `stt` service) and voice input
 

@@ -486,6 +486,14 @@ weight:
    project (`#new?project=…&title=…`). The resulting thread is a normal,
    visible conversation whose engage prompt points Ara at the project file.
 
+The link runs both ways. A thread linked to a project shows an
+**About: <project>** chip above its messages that opens the project page, and
+the project page lists the project's threads above its notes
+(`GET /conversations?all&project=<uri>`): open ones as rows (unread dot, last
+activity), archived ones folded. Edit-command threads are left out of that
+list — each is one applied change, reachable from its confirmation and under
+the Edits filter.
+
 ## News
 
 `components/news.js` is the news card (`index.html`) and, with the `full`
