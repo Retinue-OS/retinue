@@ -9784,13 +9784,21 @@ class Handler(BaseHTTPRequestHandler):
                               "focus": focus, "pushed": pushed})
 
     def _attention_set_spheres(self, payload: dict, focus: dict) -> None:
-        """Grow or prune the sphere vocabulary: body {add} or {remove}.
+        """Grow, prune or nest the sphere vocabulary: body {add}, {remove},
+        or {sphere, within} — ``within`` the sphere it lies inside, null to
+        let it stand alone.
 
         Spheres are the user's subjects — a client, a hobby, a cause — and
         the vocabulary must cost a word to extend, from wherever a sphere is
         chosen (the details sheet, the contact card). Removal is refused while
-        a mode still admits the sphere; items keep the word either way."""
+        a mode still admits the sphere; items keep the word either way. A
+        sphere within another is admitted wherever the outer one is."""
         try:
+            if "within" in payload and payload.get("sphere") is not None:
+                sid = attention_policy.set_within(focus, payload["sphere"], payload["within"])
+                _ATTENTION.save_focus(focus)
+                self._send_json(200, {"nested": sid, "within": dict(focus.get("within") or {})})
+                return
             if payload.get("add") is not None:
                 sid = attention_policy.add_sphere(focus, payload["add"])
                 what = "added"
@@ -9798,7 +9806,7 @@ class Handler(BaseHTTPRequestHandler):
                 sid = attention_policy.remove_sphere(focus, payload["remove"])
                 what = "removed"
             else:
-                self._send_json(400, {"error": "add or remove a sphere"})
+                self._send_json(400, {"error": "add, remove or nest a sphere"})
                 return
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})

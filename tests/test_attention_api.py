@@ -962,6 +962,20 @@ def test_spheres_are_a_word_away(base, wg):
     print("ok test_spheres_are_a_word_away")
 
 
+def test_a_sphere_within_another_over_http(base, wg):
+    """The nesting is set on the spheres endpoint and read back in the focus."""
+    _http(base, "POST", "/attention/spheres", {"add": "Acme"})
+    status, out = _http(base, "POST", "/attention/spheres", {"sphere": "acme", "within": "customers"})
+    assert status == 200 and out["nested"] == "acme" and out["within"] == {"acme": "customers"}, out
+    status, out = _http(base, "POST", "/attention/spheres", {"sphere": "customers", "within": "acme"})
+    assert status == 400, out
+    status, prof = _http(base, "GET", "/attention/profile")
+    assert status == 200 and prof["focus"]["within"] == {"acme": "customers"}, prof
+    status, out = _http(base, "POST", "/attention/spheres", {"sphere": "acme", "within": None})
+    assert status == 200 and out["within"] == {}, out
+    print("ok test_a_sphere_within_another_over_http")
+
+
 # ── projects ───────────────────────────────────────────────────────────────
 
 def test_project_from_store(base, wg):
@@ -1375,6 +1389,7 @@ def main():
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)
         test_spheres_are_a_word_away(base, wg)
+        test_a_sphere_within_another_over_http(base, wg)
         test_focused_takes_a_scope(base, wg)
         test_focused_admits_health_by_word(base, wg)
         test_project_from_store(base, wg)

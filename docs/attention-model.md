@@ -57,7 +57,7 @@ Products turned the same research into a few mechanisms Retinue can borrow:
 | `kb:importance` | 0–5, the Herald’s scale; unset counts as 2.5 | `--importance`, the Secretary in triage, frontmatter, a prior |
 | `kb:due` | `xsd:dateTime`; urgency = time left ÷ lead time | `--due`, `expected_by` / `next_due`, a date the Secretary extracts |
 | `kb:leadTime` | `xsd:duration`; what this kind of item typically needs; default 3 days | per-kind defaults, a project’s `remind_before`, `--lead` |
-| `kb:sphere`, `kb:tag` | a main sphere from a small deployment-named set, and any further ones as tags — a person can be a customer and a friend, and every sphere counts for a mode alike | chamber instructions, contact groups, frontmatter |
+| `kb:sphere`, `kb:tag` | a main sphere from a small deployment-named set, and any further ones as tags — a person can be a customer and a friend, and every sphere counts for a mode alike; a sphere may lie *within* another (`focus.json` `within`, `scripts/attention-spheres.py`), and is then admitted wherever the outer one is | chamber instructions, contact groups, frontmatter |
 | `kb:currentActor` | who holds the ball; today only on projects | already there |
 
 ```turtle

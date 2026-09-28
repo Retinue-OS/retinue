@@ -645,6 +645,9 @@ def mode_at(focus: dict, now: datetime) -> dict:
     list — and ``subject`` carries the scope so the title can say so. The
     stored rule is never touched; releasing the override drops its scope."""
     mode = focus["modes"][focus.get("manual") or scheduled_id(focus, now)]
+    # The sphere nesting travels with the mode, so every admission check
+    # that reads the mode also reads which sphere lies within which.
+    mode = {**mode, "within": dict(focus.get("within") or {})}
     scope = scope_of(focus, now) if mode.get("with_subject") else None
     if not scope:
         return mode
@@ -653,12 +656,26 @@ def mode_at(focus: dict, now: datetime) -> dict:
     return {**mode, "admits": [scope["id"]], "subject": scope}
 
 
-def spheres_of(item: dict) -> list[str]:
+def enclosing(sphere: str, within: dict | None) -> list[str]:
+    """The sphere and every sphere it lies within, innermost first — with
+    ``within`` {"acme": "customers"}, acme → [acme, customers]. A loop in
+    a hand-edited document ends the chain where it would repeat."""
+    chain = [sphere]
+    while (outer := (within or {}).get(chain[-1])) and outer not in chain:
+        chain.append(outer)
+    return chain
+
+
+def spheres_of(item: dict, within: dict | None = None) -> list[str]:
     """Every sphere the item is in: its main one first, then the further ones
     (``tags``). A person can be a customer and a friend at once, and every one
     of their spheres counts for admission alike — the main one only leads the
-    list (the colour, the default)."""
-    return list(dict.fromkeys([item["sphere"], *(item.get("tags") or [])]))
+    list (the colour, the default). With the focus document's ``within``
+    (``mode["within"]``, see mode_at), each is followed by the spheres it lies
+    within: a Acme item is a customers item too, so a mode or a scope that
+    admits customers admits it, while one on acme admits only Acme."""
+    own = [item["sphere"], *(item.get("tags") or [])]
+    return list(dict.fromkeys(s for sphere in own for s in enclosing(sphere, within)))
 
 
 def about_project(item: dict, uri: str) -> bool:
@@ -674,7 +691,7 @@ def admitted(item: dict, mode: dict, profile: dict) -> bool:
     if item.get("vip"):
         return True
     words = set(mode["admits"]) | set(mode.get("admit_tags", []))
-    if any(s in words for s in spheres_of(item)):
+    if any(s in words for s in spheres_of(item, mode.get("within"))):
         return True
     if about_project(item, mode.get("project")):
         return True
@@ -701,7 +718,7 @@ def admitted_by(item: dict, mode: dict) -> dict | None:
         return {"by": "vip", "what": item.get("sender") or ""}
     if about_project(item, mode.get("project")):
         return {"by": "project", "what": mode["project"]}
-    spheres = spheres_of(item)
+    spheres = spheres_of(item, mode.get("within"))
     hit = next((s for s in spheres if s in mode["admits"]), None)
     if hit is not None:
         return {"by": "scope" if mode.get("subject") else "sphere", "what": hit}
@@ -725,12 +742,13 @@ def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> st
         return f"{item.get('sender') or 'the sender'} is a VIP"
     if about_project(item, mode.get("project")):
         return f"{mode_label(mode)}: this is about it"
-    hit = next((s for s in spheres_of(item) if s in mode["admits"]), None)
+    spheres = spheres_of(item, mode.get("within"))
+    hit = next((s for s in spheres if s in mode["admits"]), None)
     if hit:
-        return f"{mode['name']} admits {hit}"
-    tag = next((s for s in spheres_of(item) if s in mode.get("admit_tags", [])), None)
+        return f"{mode['name']} admits {hit}{_via(item, hit, mode)}"
+    tag = next((s for s in spheres if s in mode.get("admit_tags", [])), None)
     if tag:
-        return f"{mode['name']} admits {tag} everywhere"
+        return f"{mode['name']} admits {tag} everywhere{_via(item, tag, mode)}"
     if has_permit(item, mode, profile):
         return f"{item['sender']} holds a {mode['name']} permit"
     if mode["threshold"] == "critical":
@@ -740,6 +758,15 @@ def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> st
     if mode.get("with_subject") and not mode["admits"]:
         return f"{mode['name']} on nothing admits only critical"
     return f"{mode['name']} does not admit {item['sphere']}"
+
+
+def _via(item: dict, hit: str, mode: dict) -> str:
+    """ ", which holds acme" when the admitted sphere is not the item's own
+    but one its sphere lies within — so the reason line says why."""
+    if hit in spheres_of(item):
+        return ""
+    inner = next((s for s in spheres_of(item) if hit in enclosing(s, mode.get("within"))), None)
+    return f", which holds {inner}" if inner else ""
 
 
 def has_permit(item: dict, mode: dict, profile: dict) -> bool:
@@ -970,7 +997,7 @@ def reevaluate(item: dict, focus: dict, profile: dict, now: datetime, why: str) 
 def repeat_policy(item: dict, mode: dict) -> dict:
     """Per-class repeat policy: off by default, on for family in Rest (the
     repeated-caller case) — family among any of the sender's spheres."""
-    if "family" in spheres_of(item) and mode["id"] == "rest":
+    if "family" in spheres_of(item, mode.get("within")) and mode["id"] == "rest":
         return {"escalate": True, "reason": "a family repeat breaks through in Rest"}
     return {"escalate": False, "reason": ""}
 
@@ -1414,6 +1441,36 @@ def remove_sphere(focus: dict, text) -> str:
     if admitting:
         raise ValueError(f"still admitted in {', '.join(admitting)} — change those rules first")
     focus["spheres"] = [x for x in focus["spheres"] if x != sid]
+    # Out of the nesting too: the spheres it held stand on their own again.
+    within = focus.get("within") or {}
+    if within:
+        focus["within"] = {k: v for k, v in within.items() if sid not in (k, v)}
+    return sid
+
+
+def set_within(focus: dict, text, outer) -> str:
+    """Put a sphere within another — acme within customers — so that whatever
+    admits the outer one admits it too (spheres_of); ``outer`` None or empty
+    lets it stand on its own again. Returns the inner sphere's id. Both must
+    be in the vocabulary, and the nesting must not loop. ValueError says why
+    not."""
+    spheres = focus.get("spheres") or []
+    sid = sphere_id(text)
+    if sid is None or sid not in spheres:
+        raise ValueError("no such sphere")
+    within = dict(focus.get("within") or {})
+    if outer in (None, ""):
+        within.pop(sid, None)
+    else:
+        oid = sphere_id(outer)
+        if oid is None or oid not in spheres:
+            raise ValueError("no such sphere to put it within")
+        if oid == sid or sid in enclosing(oid, within):
+            raise ValueError(f"{oid} already lies within {sid}")
+        if sid == "unknown":
+            raise ValueError("“unknown” is admitted by no mode; it cannot lie within another sphere")
+        within[sid] = oid
+    focus["within"] = within
     return sid
 
 
