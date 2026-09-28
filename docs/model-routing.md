@@ -61,8 +61,9 @@ A third, optional variable splits one entry point off the router tier:
   swept up in a dashboard upgrade. In the code the split is one function,
   `_default_thread_model()`, used by `_conv_worker` and by the picker's
   `(default)` flag so the dropdown always names the model unpinned threads
-  actually run (and flags nothing, rather than another row, when that model is
-  not in the offered list).
+  actually run (and, when that model is not in the offered list, adds it as
+  a row of its own labeled with its concrete id — never another row, never a
+  bare "Default").
 
   Precedence inside a thread is unchanged: an explicit pick in the model
   picker wins, and a thread Ara junior escalated stays with senior. Setting

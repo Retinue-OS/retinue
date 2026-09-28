@@ -387,7 +387,8 @@ def _default_thread_model() -> str:
 # shows. The list carries only concrete models — no synthetic "Default" row.
 # Instead, the entry an un-pinned thread actually runs on
 # (_default_thread_model(), resolved through LiteLLM's route aliases) is flagged
-# `default: true` and says so in its label; a thread without a stored choice
+# `default: true` and says so in its label (added as its own row when no
+# offered entry names it — see _mark_default); a thread without a stored choice
 # runs that default, stored as the empty string internally. Empty-id entries
 # in a static source are dropped for the same reason.
 _DEFAULT_CONVERSATION_MODELS = [
@@ -901,7 +902,7 @@ _warned_missing_defaults: set[str] = set()
 
 
 def _warn_default_not_offered(model_name: str) -> None:
-    """Log once per model that the picker cannot represent the actual default.
+    """Log once per model that the offered list lacks the actual default.
 
     The list is rebuilt on every cache miss, so an unconditional print would
     repeat for as long as the misconfiguration lasts."""
@@ -909,7 +910,8 @@ def _warn_default_not_offered(model_name: str) -> None:
         return
     _warned_missing_defaults.add(model_name)
     print(f"[web-gateway] default model {model_name!r} is not in the offered "
-          "model list — the picker shows no default row", flush=True)
+          "model list — the picker adds it as its own row; give it a "
+          "picker route to label it", flush=True)
 
 
 def _mark_default(models: list[dict]) -> list[dict]:
@@ -924,14 +926,24 @@ def _mark_default(models: list[dict]) -> list[dict]:
     flag on any other row would repeat the very lie this flag exists to end
     (observed live: the header showed the gateway default while the turns ran
     the router model). So when the configured model is not in the offered
-    list, nothing is flagged and the operator gets one warning naming it,
-    rather than a different model silently wearing the "(default)" label."""
+    list — typically a newer release reached through the `claude-*` wildcard
+    route, which never surfaces in the picker — it is added as its own row,
+    labeled with its concrete id, and the operator gets one warning naming
+    it. Leaving it out made the dashboard fall back to a bare "Default"
+    placeholder that names no model at all (observed live with
+    RETINUE_DASHBOARD_MODEL=claude-opus-5-5 against a list ending at Opus 5).
+    An empty list stays empty: the picker hides itself then."""
     out = [dict(m) for m in models]
     configured = _default_thread_model()
     entry = _offered_entry_for(configured, out)
     if entry is None:
-        if configured and out:
-            _warn_default_not_offered(configured)
+        if not configured or not out:
+            return out
+        _warn_default_not_offered(configured)
+        concrete = _resolve_route_model(configured)
+        label = concrete.split("/")[-1] or configured
+        out.insert(0, {"id": configured, "label": label + " (default)",
+                       "default": True})
         return out
     entry["default"] = True
     label = str(entry.get("label") or entry["id"])
