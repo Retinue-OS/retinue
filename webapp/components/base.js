@@ -57,6 +57,14 @@ export function deepActiveElement(doc = document) {
   return el;
 }
 
+// Whether text entry raises an on-screen keyboard: a touch-first device, where
+// a focused field costs half the screen. Sending a message there puts the
+// keyboard away so the thread — and the reply arriving in it — is what shows;
+// with a physical keyboard the field keeps focus for the next line.
+export function softKeyboard() {
+  return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+}
+
 // Input types that do not raise a keyboard: everything else is text entry.
 const NON_TEXT_INPUTS = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image',
   'radio', 'range', 'reset', 'submit']);

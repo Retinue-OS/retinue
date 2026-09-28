@@ -82,7 +82,7 @@
 //   POST /conversations/transcribe      dictation audio → {text, lang}
 //   GET  /conversation-models           the offered models (once per page)
 
-import { esc, fmtAge } from './base.js';
+import { esc, fmtAge, softKeyboard } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
@@ -1310,6 +1310,7 @@ class RetinueConversation extends HTMLElement {
     this.render();
     // Where the send landed (see _liveFor), for the cleanup below.
     let landed = null;
+    let delivered = false;
     try {
       // A model pin still in flight is stored before this turn starts, or
       // the gateway may run it on the model the picker no longer shows; a
@@ -1323,6 +1324,7 @@ class RetinueConversation extends HTMLElement {
       // and no exit can forget what it owes the composer.
       const target = await targetFor(key, this.getAttribute('create-url'), this._newModel);
       const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel);
+      delivered = true;
       if (fromDraft) clearSent(d, text, sent.files);
       this._attachError = '';
       VOICE_ERRORS.delete(key); // a failed dictation's note, moot once a send went out
@@ -1376,9 +1378,13 @@ class RetinueConversation extends HTMLElement {
       // go out, wherever the kept draft shows now (see _liveFor). A detached
       // or re-pointed instance is left alone: this send is no longer its
       // concern, and a render would move its scroll and focus.
+      // The field takes focus back for the next line — except after a
+      // delivered send on a touch device, where that would pop the keyboard
+      // straight back over the reply (see softKeyboard). A turn that did not
+      // go out returns to the field either way: the words are there to retry.
       const el = landed || this._liveFor(key);
       if (el) {
-        el._focusNext = true;
+        el._focusNext = !(delivered && softKeyboard());
         el.render();
         el._schedulePoll();
       }
@@ -1934,7 +1940,10 @@ class RetinueConversation extends HTMLElement {
       form.addEventListener('submit', (e) => {
         e.preventDefault();
         const text = input.value;
-        if (text.trim() || draftOf(this._key()).files.length) this._send(text);
+        if (!text.trim() && !draftOf(this._key()).files.length) return;
+        // Put the phone keyboard away now rather than when the send settles.
+        if (softKeyboard()) input.blur();
+        this._send(text);
       });
       // Restore focus and caret after a re-render so typing isn't interrupted,
       // but only when the field already had focus or the view was just opened —

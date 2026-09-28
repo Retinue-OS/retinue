@@ -59,7 +59,7 @@
 // composer — empty, or holding the text she was asked to rework — marked as
 // hers; the send press stays the user's.
 
-import { esc, WIDE_FRAME, deepActiveElement, onPressOutside } from './base.js';
+import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard } from './base.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, CHANNELS } from './chats.js';
@@ -1474,6 +1474,10 @@ class RetinueChatPage extends HTMLElement {
       input.value = '';
       field.classList.remove('has-text');
       grow();
+      // Put the phone keyboard away (see softKeyboard). After the reset, so the
+      // save the blur fires writes the emptied draft, which _sendChat awaits
+      // before the send.
+      if (softKeyboard()) input.blur();
       // After the field reset: _sendChat consumes the staged images and
       // replaces the composer block to drop their previews.
       this._sendChat(text);
