@@ -80,6 +80,32 @@ link in the same message (the `dashboard-composing` skill, rule 5). A report
 that names `/sends` without the link makes the user find the page and the entry
 themselves — and a queued send nobody approves is a message never sent.
 
+### Retracting a queued send
+
+Until the user decides, the agent that queued a send may take it back — the
+message is superseded, the facts changed, or it went to the wrong person. Every
+gateway with a pending store supports it, with the id the push script printed
+when it queued the send (`send queued for approval (id=…)`):
+
+```bash
+python3 /workspace/scripts/signal-push.py   --retract <id>
+python3 /workspace/scripts/whatsapp-push.py --retract <id>
+python3 /workspace/scripts/telegram-push.py --retract <id>
+python3 /workspace/scripts/sms-push.py      --retract <id>
+python3 /workspace/scripts/caldav-push.py   --retract <id>   # a queued event
+python3 /workspace/scripts/email_client.py  retract --request-id <id>
+```
+
+Pass the same `--url` the send used when it went to a non-default gateway. On
+a messenger or calendar gateway this is `POST /pending-sends/<id>/retract`: the
+entry moves to the terminal status `retracted` (distinct from the user's
+`rejected`), leaves the `/sends` list, and its approval page says the agent
+took it back; e-mail deletes the pending draft. A retraction the user has
+already overtaken is not silent: approved (or being sent) exits non-zero with
+"too late", denied exits zero with "nothing was sent". After retracting, say
+so wherever the approval link was relayed — the link now leads to a
+retracted entry, not a message waiting for the user.
+
 ## Multiple gateways per channel
 
 The `/sends` page enrols the built-in

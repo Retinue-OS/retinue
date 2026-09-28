@@ -217,8 +217,11 @@ defaults to `verify`, queued for approval on the dashboard's `/sends` page) —
 a queued send is not a failure, but it is **not done either**: the push script
 prints that send's own approval URL, and your reply relays it as a labeled
 link, so the user can approve without hunting for the page. Reporting a queue
-without the link leaves the message stuck. **An autonomous agent that hits a blocking
-error must push an alert to the user**, not just log. Channel liveness is
+without the link leaves the message stuck. A queued send you no longer want is
+taken back before approval with `--retract <id>` on any push CLI
+(`email_client.py retract` for e-mail) — never left for the user to deny.
+**An autonomous agent that hits a blocking error must push an alert to the
+user**, not just log. Channel liveness is
 monitored by the framework — never build ad-hoc checks; a dead-seeming channel
 is checked on `/gateways`, and `configured: false` is intentional, not broken.
 Accounts, policies, extra gateways, monitoring: `docs/messaging.md`.
@@ -235,8 +238,9 @@ The calendar is a gateway like a messenger, not a tool: credentials stay in
 - **Write with `scripts/caldav-push.py`** (`--start/--end`, `--all-day`,
   `--description`). Writes are gated by the same `allow`/`trust`/`verify` send
   policy as messages: a queued event is **not** in the calendar yet, so relay the
-  approval URL the script prints as a labeled link. Updating and deleting events
-  are not supported — say so rather than improvising.
+  approval URL the script prints as a labeled link; `--retract <id>` takes a
+  queued event back before approval. Updating and deleting events are not
+  supported — say so rather than improvising.
 
 Endpoints, semantics (window inclusivity, recurrence expansion, which calendars
 a read spans) and configuration: README, "Calendar (CalDAV)".

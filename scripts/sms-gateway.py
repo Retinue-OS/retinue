@@ -960,8 +960,9 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
         _pending_sends.pop(request_id, None)
 
 
-def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
-    """Approve (asynchronously, status "sending") or reject a pending send."""
+def _complete_pending_send(request_id: str, approved: bool,
+                           retracted: bool = False) -> dict | None:
+    """Approve (asynchronously, status "sending"), reject or retract a pending send."""
     path = _lookup_existing_path(request_id)
     if path is None:
         return None
@@ -972,7 +973,8 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return None
         if entry.get("status") != "pending":
             return entry
-        entry["status"] = "sending" if approved else "rejected"
+        entry["status"] = ("sending" if approved
+                           else "retracted" if retracted else "rejected")
         # The transition must be on disk before anything acts on it: a file
         # still saying "pending" could be approved a second time after the
         # first SMS went out. A failed write raises to the handler (a
@@ -984,7 +986,7 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
         threading.Thread(target=_execute_approved_send, args=(path, dict(entry)),
                          name=f"send-{request_id[:8]}", daemon=True).start()
     else:
-        print(f"[sms-gateway] pending send {request_id} rejected", flush=True)
+        print(f"[sms-gateway] pending send {request_id} {snapshot['status']}", flush=True)
     return snapshot
 
 
@@ -1043,7 +1045,7 @@ def _erase_chat(chat: str, account: str | None) -> dict:
 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
 
-_PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
+_PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject|retract))?/?$")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -1130,7 +1132,8 @@ class _Handler(BaseHTTPRequestHandler):
         m = _PENDING_SEND_RE.match(self.path)
         if m and m.group(2):
             try:
-                entry = _complete_pending_send(m.group(1), approved=(m.group(2) == "approve"))
+                entry = _complete_pending_send(m.group(1), approved=(m.group(2) == "approve"),
+                                           retracted=(m.group(2) == "retract"))
             except OSError as exc:
                 print(f"[sms-gateway] could not record the approval decision: {exc}", flush=True)
                 self._reply(503, {"error": "could not record the decision; retry later"})

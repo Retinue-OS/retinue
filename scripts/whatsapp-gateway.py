@@ -2527,8 +2527,9 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
         _pending_sends.pop(request_id, None)
 
 
-def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
-    """Approve or reject a pending send.
+def _complete_pending_send(request_id: str, approved: bool,
+                           retracted: bool = False) -> dict | None:
+    """Approve, reject (the user) or retract (the queuing agent) a pending send.
 
     Approval is asynchronous (issue #116): the entry moves to status "sending"
     and is returned immediately, while a background thread executes the send
@@ -2551,7 +2552,8 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
             return None
         if entry.get("status") != "pending":
             return entry
-        entry["status"] = "sending" if approved else "rejected"
+        entry["status"] = ("sending" if approved
+                           else "retracted" if retracted else "rejected")
         try:
             _write_pending_send(path, entry)
         except OSError as exc:
@@ -2565,7 +2567,7 @@ def _complete_pending_send(request_id: str, approved: bool) -> dict | None:
         threading.Thread(target=_execute_approved_send, args=(path, dict(entry)),
                          name=f"send-{request_id[:8]}", daemon=True).start()
     else:
-        print(f"[whatsapp-gateway] pending send {request_id} rejected", flush=True)
+        print(f"[whatsapp-gateway] pending send {request_id} {snapshot['status']}", flush=True)
     return snapshot
 
 
@@ -2670,7 +2672,7 @@ def _erase_chat(chat: str, account: str | None) -> dict:
 
 # ── HTTP API ──────────────────────────────────────────────────────────────────
 
-_PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject))?/?$")
+_PENDING_SEND_RE = re.compile(r"^/pending-sends/([0-9a-f]{32})(?:/(approve|reject|retract))?/?$")
 
 
 class _PushHandler(BaseHTTPRequestHandler):
@@ -2807,7 +2809,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._reply(401, {"error": "unauthorized"})
                 return
-            entry = _complete_pending_send(m.group(1), approved=(m.group(2) == "approve"))
+            entry = _complete_pending_send(m.group(1), approved=(m.group(2) == "approve"),
+                                           retracted=(m.group(2) == "retract"))
             if entry is None:
                 self._reply(404, {"error": "pending send not found"})
                 return
