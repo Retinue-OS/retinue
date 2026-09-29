@@ -634,6 +634,11 @@ class RetinueAttentionSheet extends HTMLElement {
       if (adm && adm.by === 'tag') {
         admitBtn = `<button class="btn tiny on" data-act="tag" data-tag="${esc(adm.what)}" data-on="0"${busy}>` +
           `Stop admitting ${esc(adm.what)} in ${esc(mode.name)}</button>`;
+      } else if (adm && adm.via) {
+        // Admitted through a sphere its own lies within (acme within
+        // customers): the rule is the outer sphere's, and switching it off
+        // here would drop everything it holds, not just this item.
+        admitBtn = `<span class="f-note">${esc(mode.name)} admits ${esc(adm.what)}, which holds ${esc(adm.via)}</span>`;
       } else if (adm && adm.by === 'sphere') {
         // Whichever of the item's spheres the mode lists — a further one, too.
         admitBtn = `<button class="btn tiny on" data-act="admit" data-sphere="${esc(adm.what)}" data-on="0"${busy}>` +

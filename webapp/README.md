@@ -89,8 +89,10 @@ title, preview, href, sphere, tags, sender, channel, group, agent, count,
 unread, pending, level, critical, importance, importance_from, importance_text,
 due, lead (minutes), lead_from, kind_label, urgency, delivery, reason, actor,
 waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere,
-admission: {by: vip|project|scope|sphere|tag, what} | null}` — `admission` is the rule of the
-mode in force that lets the row through, which the details sheet's switch changes.
+admission: {by: vip|project|scope|sphere|tag, what, via?} | null}` — `admission` is the rule of the
+mode in force that lets the row through, which the details sheet's switch changes;
+`via` names the item's own sphere when `what` is one it lies within, and the sheet
+then offers no switch (it would change the rule for everything the outer sphere holds).
 The home shows what the unseen digest released first, on every device, until
 *Done* on any of them; `/?digest=<time>` — the digest push's link — shows that
 digest even once seen.
@@ -531,6 +533,14 @@ weight:
 3. **Discuss with Ara** — opens the conversation composer pre-linked to the
    project (`#new?project=…&title=…`). The resulting thread is a normal,
    visible conversation whose engage prompt points Ara at the project file.
+
+The link runs both ways. A thread linked to a project shows an
+**About: <project>** chip above its messages that opens the project page, and
+the project page lists the project's threads above its notes
+(`GET /conversations?all&project=<uri>`): open ones as rows (unread dot, last
+activity), archived ones folded. Edit-command threads are left out of that
+list — each is one applied change, reachable from its confirmation and under
+the Edits filter.
 
 ## News
 

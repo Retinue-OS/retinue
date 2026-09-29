@@ -11,15 +11,17 @@
 //     with the sha of what was loaded, so a concurrent change by an agent or
 //     another device surfaces as a conflict instead of being clobbered.
 //  3. A real conversation: "Discuss with Ara" opens the dashboard composer
-//     pre-linked to this project (a normal, visible thread).
+//     pre-linked to this project (a normal, visible thread). The page lists
+//     the project's threads above its notes, so an ongoing discussion is
+//     picked up again rather than started twice.
 //
 // Data comes from the gateway:
 //   GET  /projects/item?id=…   -> {id, title, path, markdown, sha256}
 //   POST /projects/item        -> save {id, content, base_sha}
 //   POST /conversations        -> quick edit command ({kind:"edit", project})
-//   GET  /conversations?project=…&kind=all — the project's recent threads
+//   GET  /conversations?all&project=…      -> the project's threads (kind chat)
 
-import { esc } from './base.js';
+import { esc, fmtAge } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { shelf, goLive, takeRestore } from './shelf-store.js';
@@ -113,6 +115,7 @@ class RetinueProjectPage extends HTMLElement {
     super();
     this._id = new URLSearchParams(location.search).get('id') || '';
     this._item = null;       // {id, title, path, markdown, sha256}
+    this._threads = [];      // the project's conversation summaries, newest first
     this._state = 'loading'; // loading | ok | missing | offline
     this._mode = 'view';     // view | edit
     this._draft = '';        // editor content while in edit mode
@@ -180,6 +183,7 @@ class RetinueProjectPage extends HTMLElement {
 
   async load() {
     if (!this._id) { this._state = 'missing'; this.render(); return; }
+    const threads = this._loadThreads();
     try {
       const res = await fetch(`/projects/item?id=${encodeURIComponent(this._id)}`,
         { cache: 'no-store' });
@@ -191,7 +195,21 @@ class RetinueProjectPage extends HTMLElement {
       // Keep showing the last loaded state if we have one; otherwise offline.
       if (!this._item) this._state = 'offline';
     }
+    await threads;
     this.render();
+  }
+
+  // The discussions linked to this project (archived ones included, shown
+  // folded). Edit-command threads are left out: each is one applied change,
+  // reachable from its own confirmation and under the Edits filter.
+  async _loadThreads() {
+    try {
+      const res = await fetch(`/conversations?all&project=${encodeURIComponent(this._id)}`,
+        { cache: 'no-store' });
+      if (!res.ok) return;
+      const body = await res.json();
+      this._threads = Array.isArray(body.conversations) ? body.conversations : [];
+    } catch (_err) { /* offline — keep the last list */ }
   }
 
   // ── Direct editing ─────────────────────────────────────────────────────────
@@ -513,6 +531,7 @@ class RetinueProjectPage extends HTMLElement {
     return bar
       + `<div class="scroll">`
       + this._metaHtml(fields)
+      + this._threadsHtml()
       + `<div class="body">${body.trim() ? renderMarkdown(body) : '<p class="muted">No notes yet.</p>'}</div>`
       + `</div>`
       + `<div class="foot">`
@@ -559,6 +578,31 @@ class RetinueProjectPage extends HTMLElement {
     return `<div class="meta">${lead.join('')}`
       + (chips.length ? `<div class="chips">${chips.join('')}</div>` : '')
       + lists.join('') + `</div>`;
+  }
+
+  // The project's conversations: open ones as rows, archived ones folded.
+  _threadsHtml() {
+    const active = this._threads.filter((t) => !t.archived);
+    const archived = this._threads.filter((t) => t.archived);
+    if (!active.length && !archived.length) return '';
+    const row = (t) => {
+      const age = fmtAge(t.updated);
+      const unread = t.unread ? '<span class="dot" aria-label="Unread"></span>' : '';
+      return `<a class="thread-row" href="/conversations.html#conversation-${esc(t.id)}">`
+        + `${unread}<span class="t-title">${esc(t.title || 'Conversation')}</span>`
+        + (age ? `<span class="t-age">${esc(age)}</span>` : '')
+        + `</a>`;
+    };
+    const key = 'threads:archived';
+    const open = this._openLists.has(key) ? ' open' : '';
+    const folded = archived.length
+      ? `<details class="list" data-list="${key}"${open}>`
+        + `<summary><b>Archived</b> <span class="count">${archived.length}</span></summary>`
+        + `<div class="thread-rows">${archived.map(row).join('')}</div></details>`
+      : '';
+    return `<div class="threads"><div class="threads-head">Threads</div>`
+      + (active.length ? `<div class="thread-rows">${active.map(row).join('')}</div>` : '')
+      + folded + `</div>`;
   }
 
   _applyHtml() {
@@ -737,6 +781,20 @@ const CSS = `
   .count { color: var(--fg2, #c3cad6); }
   .list ul { margin: 0; padding: 0 11px 8px 26px; }
   .list li { padding: 2px 0; overflow-wrap: anywhere; }
+
+  .threads { display: flex; flex-direction: column; gap: 6px; padding: 10px 0 2px; }
+  .threads-head { font-size: .72rem; font-weight: 600; color: var(--muted, #8b93a3);
+                  text-transform: uppercase; letter-spacing: .04em; }
+  .thread-rows { display: flex; flex-direction: column; gap: 4px; }
+  .list .thread-rows { padding: 0 6px 6px; }
+  .thread-row { display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+                border-radius: 12px; background: var(--card-2, #1c2230); text-decoration: none;
+                color: var(--fg, #e7ebf2); font-size: .86rem;
+                -webkit-tap-highlight-color: transparent; }
+  .thread-row:hover { outline: 1px solid var(--accent, #6ea8fe); }
+  .t-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t-age { flex: none; color: var(--muted, #8b93a3); font-size: .72rem; }
+  .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #6ea8fe); }
 
   .body { padding: 10px 2px 14px; }
 
