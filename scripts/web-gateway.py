@@ -7962,7 +7962,8 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "pushed": [iso(p) for p in item.get("pushed") or []],
         "digest_at": iso(item.get("digest_at")),
         "permit": bool(sender) and sender in (profile.get("permits", {}).get(mode["id"]) or []),
-        "admits_sphere": item["sphere"] in mode["admits"],
+        "admits_sphere": any(s in mode["admits"]
+                             for s in attention_policy.spheres_of({"sphere": item["sphere"]}, mode.get("within"))),
         # Which rule lets it through, so the sheet's switch changes that one
         # (attention.admitted_by): a tag Focused admits whatever the scope
         # is not in `admits`, and a scope replaces `admits` for the stint.
@@ -9598,7 +9599,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._attention_set_rules(payload, focus, profile, now)
                 return
             if action == "spheres":
-                self._attention_set_spheres(payload, focus)
+                self._attention_set_spheres(payload, focus, profile, now)
                 return
             if action == "profile":
                 self._attention_write_profile(payload)
@@ -9783,27 +9784,40 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"changed": changes, "mode": _attention_mode_summary(focus, now),
                               "focus": focus, "pushed": pushed})
 
-    def _attention_set_spheres(self, payload: dict, focus: dict) -> None:
-        """Grow or prune the sphere vocabulary: body {add} or {remove}.
+    def _attention_set_spheres(self, payload: dict, focus: dict, profile: dict, now: datetime) -> None:
+        """Grow, prune or nest the sphere vocabulary: body {add}, {remove},
+        or {sphere, within} — ``within`` the sphere it lies inside, null to
+        let it stand alone.
 
         Spheres are the user's subjects — a client, a hobby, a cause — and
         the vocabulary must cost a word to extend, from wherever a sphere is
         chosen (the details sheet, the contact card). Removal is refused while
-        a mode still admits the sphere; items keep the word either way."""
+        a mode still admits the sphere; items keep the word either way. A
+        sphere within another is admitted wherever the outer one is."""
         try:
-            if payload.get("add") is not None:
+            if "within" in payload and payload.get("sphere") is not None:
+                sid = attention_policy.set_within(focus, payload["sphere"], payload["within"])
+                what = "nested"
+            elif payload.get("add") is not None:
                 sid = attention_policy.add_sphere(focus, payload["add"])
                 what = "added"
             elif payload.get("remove") is not None:
                 sid = attention_policy.remove_sphere(focus, payload["remove"])
                 what = "removed"
             else:
-                self._send_json(400, {"error": "add or remove a sphere"})
+                self._send_json(400, {"error": "add, remove or nest a sphere"})
                 return
         except ValueError as exc:
             self._send_json(400, {"error": str(exc)})
             return
         _ATTENTION.save_focus(focus)
+        if what == "nested":
+            # Nesting changes what the modes admit: what now qualifies is
+            # pushed, what no longer does is held.
+            pushed = self._handle_reevaluate(focus, profile, now, "the sphere nesting")
+            self._send_json(200, {"nested": sid, "within": dict(focus.get("within") or {}),
+                                  "pushed": pushed})
+            return
         self._send_json(200, {what: sid, "spheres": list(focus["spheres"])})
 
     def _attention_write_profile(self, payload: dict) -> None:
@@ -9833,6 +9847,8 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, TypeError) as exc:
                 self._send_json(400, {"error": str(exc)})
                 return
+            base.setdefault("spheres", list(attention_store.DEFAULT_SPHERES))
+            attention_policy.heal_within(base)
             _ATTENTION.save_focus(base)
         self._send_json(200, {"profile": _attention_profile_view(), "focus": _ATTENTION.focus()})
 
