@@ -46,6 +46,9 @@
   <script type="module" src="/components/todo.js"></script>
   <script type="module" src="/components/briefing.js"></script>
   -->
+  <!-- The minimized pages: threads, chats and projects parked one tap away
+       (issue #282). Every page carries it as the last child of <main>. -->
+  <script type="module" src="/components/shelf.js"></script>
 </head>
 <body>
   <main>
@@ -105,6 +108,7 @@
       <a href="/sends"><span class="ico">&#128228;</span><span class="lbl">Sends</span></a>
       <a href="/contacts.html"><span class="ico">&#128211;</span><span class="lbl">Contacts</span></a>
     </retinue-app-launcher>
+    <retinue-shelf></retinue-shelf>
   </main>
 
   <script>

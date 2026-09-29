@@ -62,8 +62,9 @@
 import { esc, WIDE_FRAME, deepActiveElement, onPressOutside } from './base.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
-import { avatarHtml, colorFor, CHANNELS } from './chats.js';
+import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
 import { openAttentionSheet } from './attention-sheet.js';
+import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 // Registers <retinue-conversation>, the companion pane (see _companionHtml).
 // The chat mirror renders no Markdown of its own — what other people sent is
 // shown as sent (linkify below) — so the Markdown renderer and its styles
@@ -299,6 +300,16 @@ class RetinueChatPage extends HTMLElement {
       });
     }
     this._watchKeyboard();
+    // The shelf (issue #282): this chat is the page being shown, a restore
+    // handed over by a shelf item is taken once the chat is read, and
+    // navigating away while Ara works in the companion parks the chat.
+    const shelfKey = this._shelfKey();
+    if (shelfKey && !this._shelfRelease) {
+      this._shelfRelease = goLive(shelfKey);
+      this._shelfRestore = takeRestore(shelfKey);
+      this._onPageHide = () => this._shelfLeave();
+      window.addEventListener('pagehide', this._onPageHide);
+    }
     this.render();
     this._load();
   }
@@ -361,6 +372,10 @@ class RetinueChatPage extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._onPageHide) window.removeEventListener('pagehide', this._onPageHide);
+    this._onPageHide = null;
+    if (this._shelfRelease) this._shelfRelease();
+    this._shelfRelease = null;
     this._unwatchKeyboard();
     this._wide.removeEventListener('change', this._onFrame);
     if (this._onPop) window.removeEventListener('popstate', this._onPop);
@@ -432,7 +447,13 @@ class RetinueChatPage extends HTMLElement {
       }
       this._state = 'ok';
       try { document.title = `Retinue — ${this._chat.name}`; } catch (_e) { /* ignore */ }
+      const restore = this._shelfRestore;
+      this._shelfRestore = null;
+      if (restore && restore.pane) this._pane = restore.pane === 'companion' ? 'companion' : 'chat';
       this.render();
+      if (restore) this._applyShelfRestore(restore);
+      // Open means read: the shelf item (if any) has nothing unread any more.
+      shelf.observe(this._shelfKey(), { unread: 0, title: this._chat.name || '', avatar: this._avatar() });
       // Opening the chat reads it: advance the watermark to the newest
       // message, then keep the mirror fresh on the conversations cadence.
       this._postRead(this._newestTs());
@@ -747,7 +768,11 @@ class RetinueChatPage extends HTMLElement {
       `<nav class="pane-tabs" role="tablist" aria-label="Pane">` +
       `<button role="tab" data-pane-tab="chat" aria-selected="true">Chat</button>` +
       `<button role="tab" data-pane-tab="companion" aria-selected="false">Ara</button>` +
-      `</nav>` + this._menuHtml() + `</header>`;
+      `</nav>` +
+      `<button class="menu-btn" data-minimize title="Minimize to the shelf" aria-label="Minimize">` +
+      `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" ` +
+      `stroke-linecap="round" aria-hidden="true"><path d="M6 17h12"/></svg></button>` +
+      this._menuHtml() + `</header>`;
   }
 
   // The chat's menu, at the header's right end: the attention sheet, Archive
@@ -829,6 +854,12 @@ class RetinueChatPage extends HTMLElement {
       if (!res.ok) throw new Error(String(res.status));
       const out = await res.json();
       if (this._chat) { this._chat.archived = !!out.archived; this._chat.muted = !!out.muted; }
+      // Muted: off the shelf, whatever put it there. Archived: not waiting.
+      if (out.muted) shelf.muted(this._shelfKey());
+      else if (flag === 'archived' && out.archived) {
+        const f = threadFacts(this._companionThread());
+        shelf.archived(this._shelfKey(), true, f.pending ? f.turn : '');
+      }
       window.dispatchEvent(new CustomEvent('retinue-attention-change', { detail: { action: 'flags' } }));
     } catch (_err) { /* the row keeps showing the last known state */ }
     const row = this.shadowRoot.querySelector('[data-flags]');
@@ -907,7 +938,7 @@ class RetinueChatPage extends HTMLElement {
     // (the wide layout) and a help button for what this pane is — the line
     // that used to take a row of its own above the thread.
     return `<retinue-conversation bar="actions" stamp="clock" placeholder="Ask Ara …" ` +
-      `no-autofocus${at}><span slot="bar-start" class="comp-lead">` +
+      `shelf-key="${esc(this._shelfKey())}" no-autofocus${at}><span slot="bar-start" class="comp-lead">` +
       `<span class="comp-who">Ara</span>` +
       `<button type="button" class="help-btn" data-comp-help-btn aria-controls="comp-help" ` +
       `aria-expanded="${!!this._helpOpen}" title="What is this pane?" aria-label="What is this pane?">?</button>` +
@@ -1004,6 +1035,77 @@ class RetinueChatPage extends HTMLElement {
     return `<a class="att-file" href="${esc(a.url)}" target="_blank" rel="noopener" ` +
       `title="${esc(a.name || 'Attachment')}">&#128206; <span class="att-name">` +
       `${esc(a.name || 'Attachment')}</span>${size ? ` <span class="att-size">${esc(size)}</span>` : ''}</a>`;
+  }
+
+  // ── The shelf (shelf-store.js, issue #282) ─────────────────────────────────
+  _shelfKey() { return this._id ? `chat:${this._id}` : ''; }
+
+  _avatar() {
+    const c = this._chat || {};
+    return { text: initials(c.name), color: colorFor(`${c.channel || ''}\u0000${c.key || c.id || ''}`) };
+  }
+
+  _companionThread() {
+    const el = this._companionEl();
+    return (el && el.thread) || null;
+  }
+
+  // The chat as a shelf item: Ara's side from the companion, and the place —
+  // which pane, where the mirror and the companion were scrolled to.
+  _shelfItem() {
+    const comp = this._companionEl();
+    const f = threadFacts(this._companionThread());
+    delete f.muted;
+    return {
+      key: this._shelfKey(), kind: 'chat', id: this._id,
+      title: (this._chat && this._chat.name) || 'Chat',
+      href: `/chat.html?id=${encodeURIComponent(this._id)}`,
+      avatar: this._avatar(), unread: 0,
+      location: {
+        pane: this._pane,
+        mirror: this._mirrorLocation(),
+        companion: comp && comp.shelfLocation ? comp.shelfLocation() : null,
+      },
+      muted: !!(this._chat && this._chat.muted),
+      ...f,
+    };
+  }
+
+  _minimize() {
+    if (this._state !== 'ok') return;
+    shelf.minimize(this._shelfItem());
+    this._goBack();
+  }
+
+  // Leaving the chat while Ara works in its companion parks it by itself.
+  _shelfLeave() {
+    const t = this._companionThread();
+    if (this._state !== 'ok' || !t || !t.pending) return;
+    shelf.left(this._shelfItem());
+  }
+
+  // The first mirror message still in view and its offset, or the bottom.
+  _mirrorLocation() {
+    const t = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
+    if (!t || this._atBottom()) return { bottom: true };
+    const top = t.getBoundingClientRect().top;
+    for (const m of t.querySelectorAll('[data-mid]')) {
+      const r = m.getBoundingClientRect();
+      if (r.bottom > top + 1) return { anchor: m.getAttribute('data-mid'), offset: Math.round(r.top - top) };
+    }
+    return { bottom: true };
+  }
+
+  _applyShelfRestore(loc) {
+    const t = this.shadowRoot.querySelector('[data-chat-thread]');
+    const m = loc.mirror;
+    if (t && m && m.anchor) {
+      const el = [...t.querySelectorAll('[data-mid]')].find((n) => n.getAttribute('data-mid') === m.anchor);
+      if (el) t.scrollTop += el.getBoundingClientRect().top - t.getBoundingClientRect().top - (m.offset || 0);
+    }
+    // The companion reads its thread after this; it applies the place then.
+    const comp = this._companionEl();
+    if (comp && loc.companion) comp._shelfRestore = loc.companion;
   }
 
   // ── Leaving the chat ───────────────────────────────────────────────────────
@@ -1216,6 +1318,8 @@ class RetinueChatPage extends HTMLElement {
       });
     }
     this._bindMenu();
+    const min = root.querySelector('[data-minimize]');
+    if (min) min.addEventListener('click', () => this._minimize());
     const help = root.querySelector('[data-comp-help-btn]');
     if (help) {
       help.addEventListener('click', () => {

@@ -55,6 +55,8 @@ const SHELL_ASSETS = [
   '/components/app-launcher.js',
   '/components/nav.js',
   '/components/contacts.js',
+  '/components/shelf.js',
+  '/components/shelf-store.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];

@@ -133,6 +133,20 @@ main.settings { max-width: 640px; height: auto; }
 .linklist a { display: block; padding: 10px 12px; border-radius: 10px;
               background: var(--card-2); color: var(--fg); text-decoration: none; }
 .linklist a:hover { outline: 1px solid var(--accent); }
+.shelf-size { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.shelf-size input { width: 5.5em; min-height: 40px; padding: 0 10px; border-radius: 10px;
+                    border: 1px solid var(--line); background: var(--card-2); color: var(--fg);
+                    font: inherit; }
+
+/* The shelf of minimized pages (components/shelf.js): the last child of main
+   on every page. In a locked frame (the home, an open thread, a chat, a
+   project) it is simply the column's last row, so the page above makes room
+   for it; on a scrolling list page it sticks to the bottom of the screen.
+   On the home it sits above the dock (order). While the phone keyboard is up
+   it steps aside — the field being typed in needs the room. */
+retinue-shelf { flex: none; order: 1; position: sticky; bottom: 0; z-index: 15;
+                margin-top: auto; background: var(--bg); }
+html[data-keyboard="1"] retinue-shelf { display: none; }
 
 /* Immersive chat: while a thread or the composer is open, lock the frame back
    to the viewport and hand the whole screen to the conversation (the thread
