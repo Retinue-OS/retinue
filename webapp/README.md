@@ -442,6 +442,52 @@ existing thread, the rest carry `companion: null`. Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
 
+## The shelf: minimized pages
+
+A thread, a chat or a project can be **minimized** (the `–` in its bar) onto
+the shelf at the foot of every page (`components/shelf.js`, issue #282), and
+reopened from there where it was left. A thread or chat the user **leaves while
+Ara is still answering** goes onto the shelf by itself, so waiting for an answer
+never means coming back to check. Every page carries `<retinue-shelf>` as the
+last child of `<main>`: a row of icons on a phone (no labels; long press,
+right-click or the context-menu key opens *Open · Close · Close all quiet
+ones*), a taskbar of chips with titles on a wide screen.
+
+Markers, two corners: top right a chat's unread count (blue); bottom right
+Ara — `···` while she works (outlined, never animated) and a green dot once she
+has answered. When the answer lands the dots gather into the dot once.
+
+All rules live in `components/shelf-store.js`, a pure reducer over one item per
+key (`thread:<id>` · `chat:<id>` · `project:<uri>`) with independent membership
+(`origin: explicit | automatic`) and status (`pending`, `lastAraTs`, `seenTs`,
+`unread`), pinned by `tests/test_webapp_shelf.py`:
+
+- Explicit wins over automatic. An automatic item lives only for the turn that
+  created it: it leaves once that answer has actually been on screen (in the
+  viewport of a visible tab — for a chat, in the companion pane, not the mirror).
+- *Close* on a working item suppresses re-adding for that same turn.
+- Capacity (*Shelf size* on the settings page, default 5) evicts only quiet
+  items (no marker), least recently used first; items with a marker are never
+  dropped, so the shelf may hold more than its size and shrinks back as they go
+  quiet.
+- Projects are plain parked pages, never with an Ara state.
+- Archiving drops an automatic item (and suppresses it for the running turn);
+  archive + mute drops any item.
+- Restoring reopens the page with current data and only puts the place back
+  (pane; the first message in view by its `ts`/id plus an offset; a project's
+  scroll position) — handed from the shelf to the next page load of that tab
+  through `sessionStorage`.
+
+The shelf is per device and browser: `localStorage`, shared by all tabs, which
+follow each other's changes through the `storage` event. It is event-driven
+first — a page showing an item (`<retinue-conversation shelf-key=…>`, the chat
+page, the project page) feeds its facts as it reads and marks the key as the
+current page — and reads only the items no page in the tab is showing
+(`GET /conversations/<id>`, `GET /chats`), every 4 s while one is waiting on
+Ara and every 20 s otherwise, never in a hidden tab. A thread's unsent draft
+still lives only in page memory, so it survives a minimize within the same page
+but not a reload.
+
 ## Markdown rendering
 
 All Markdown shown by the dashboard — conversation bubbles and project pages —

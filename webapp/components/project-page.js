@@ -22,6 +22,7 @@
 import { esc } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { shelf, goLive, takeRestore } from './shelf-store.js';
 
 const APPLY_POLL_MS = 3000;
 // Frontmatter keys that are rendered elsewhere (or meaningless to the user)
@@ -150,6 +151,12 @@ class RetinueProjectPage extends HTMLElement {
         return !!ref && new URL(ref, location.href).origin === location.origin;
       } catch (_e) { return false; }
     })();
+    // The shelf (issue #282): this project is the page being shown, and a
+    // restore handed over by its shelf item is applied once it is read.
+    if (this._id && !this._shelfRelease) {
+      this._shelfRelease = goLive(this._shelfKey());
+      this._shelfRestore = takeRestore(this._shelfKey());
+    }
     this.render();
     this.load();
     // Content may be changed elsewhere (Ara, another device) while the page
@@ -162,6 +169,8 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._shelfRelease) this._shelfRelease();
+    this._shelfRelease = null;
     document.removeEventListener('visibilitychange', this._onVisible);
     if (this._applyTimer) clearTimeout(this._applyTimer);
     this._stopRecording();
@@ -449,7 +458,30 @@ class RetinueProjectPage extends HTMLElement {
       + `<section class="card">${body}</section>`;
     const next = this.shadowRoot.querySelector('.scroll');
     if (next && scrollTop) next.scrollTop = scrollTop;
+    if (next && this._shelfRestore && this._state === 'ok') {
+      next.scrollTop = Number(this._shelfRestore.scrollTop) || 0;
+      this._shelfRestore = null;
+    }
     this._wire();
+  }
+
+  // ── The shelf (shelf-store.js, issue #282) ─────────────────────────────────
+  // A project on the shelf is a parked page: its place is how far down it was
+  // read. It never carries an Ara state.
+  _shelfKey() { return `project:${this._id}`; }
+
+  _minimize() {
+    const it = this._item || {};
+    const { fields } = splitFrontmatter(it.markdown || '');
+    const sc = this.shadowRoot.querySelector('.scroll');
+    shelf.minimize({
+      key: this._shelfKey(), kind: 'project', id: this._id,
+      title: fields.get('title') || it.title || 'Project',
+      href: `/project.html?id=${encodeURIComponent(this._id)}`,
+      location: { scrollTop: sc ? Math.round(sc.scrollTop) : 0 },
+    });
+    if (this._fromApp && history.length > 1) history.back();
+    else location.href = '/';
   }
 
   _backHtml() {
@@ -471,6 +503,9 @@ class RetinueProjectPage extends HTMLElement {
     const bar = `<div class="bar">${this._backHtml()}`
       + `<span class="bar-title">${esc(title)}</span>`
       + `<button class="iconbtn" data-edit title="Edit this page" aria-label="Edit this page">&#9998;</button>`
+      + `<button class="iconbtn" data-minimize title="Minimize to the shelf" aria-label="Minimize">`
+      + `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" `
+      + `stroke-linecap="round" aria-hidden="true"><path d="M6 17h12"/></svg></button>`
       + `</div>`;
     // Metadata and notes scroll together as one page between the fixed title
     // bar and the fixed footer/command bar — so a long frontmatter never
@@ -591,6 +626,7 @@ class RetinueProjectPage extends HTMLElement {
       history.back();
     });
     on('[data-edit]', () => this._startEdit());
+    on('[data-minimize]', () => this._minimize());
     on('[data-cancel]', () => this._cancelEdit());
     on('[data-save]', () => this._save());
     on('[data-dismiss]', () => this._dismissApply());

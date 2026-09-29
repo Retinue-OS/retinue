@@ -531,6 +531,19 @@ python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
 The behavioural rule this implies for Ara — Archive-click vs "archive this" —
 is in `CLAUDE.md`, since it applies on ordinary turns.
 
+## The shelf (minimized pages)
+
+Threads, chats and projects can be minimized to a shelf at the foot of every
+page and reopened where they were left; a thread or chat the user leaves while
+Ara is still answering goes there by itself, marked `···` until her answer
+lands and then with a green dot. Nothing server-side: the shelf is per device
+and browser (`localStorage`, shared by its tabs) and reads the existing
+conversation and chat APIs. The rules (one item per page, automatic items
+living for one turn, Close suppressing re-adding for that turn, capacity
+evicting quiet items only, archive/mute) and the mechanics are in
+`webapp/README.md`, "The shelf: minimized pages"; the size is a setting on the
+settings page. Design and acceptance criteria: issue #282.
+
 ## Project pages and edit threads
 
 Every project on the projects card has its **own page**

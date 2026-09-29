@@ -39,6 +39,18 @@
 //                     mounted whether or not it is on screen must set this:
 //                     taking focus scrolls the element into view, which on the
 //                     chat page's phone strip is a tab switch nobody asked for.
+//   shelf-key         the shelf item this conversation feeds (shelf-store.js,
+//                     issue #282): thread:<id> for a thread, chat:<id> for a
+//                     chat's companion. The element then reports what it
+//                     reads (Ara working, her newest message) and when her
+//                     newest message has actually been on screen, takes a
+//                     restore handed over by the shelf, and marks the key as
+//                     the page being shown.
+//   shelf-leave       leaving this thread while Ara's turn is running puts it
+//                     on the shelf by itself (thread keys only — a chat page
+//                     does that for its own chat).
+//   minimize          a minimize button in the bar: the thread goes on the
+//                     shelf where it is, and the host gets `retinue-back`.
 //   create-url        no thread yet, and the HOST owns creating it: the first
 //                     turn POSTs here (no body) for a {id}, then goes in as an
 //                     ordinary reply to that thread. For a thread that belongs
@@ -88,6 +100,7 @@ import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from 
 import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
 import { openAttentionSheet } from './attention-sheet.js';
+import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 
 const LIST_URL = '/conversations';
 const POLL_MS = 4000;
@@ -635,6 +648,7 @@ class RetinueConversation extends HTMLElement {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = this.getAttribute('conversation-id') || '';
     LIVE.set(this._key(), this);
+    this._shelfEnter();
     loadModels().then(() => this._syncPicker());
     this._focusOnOpen();
     this.render();
@@ -650,6 +664,7 @@ class RetinueConversation extends HTMLElement {
     // waiting there, reviewed on return.
     this._finishRecording('review');
     this._stopPolling();
+    this._shelfExit();
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
     this._wave.stop();
     this._stopStream();
@@ -663,6 +678,7 @@ class RetinueConversation extends HTMLElement {
     // new thread must not show its controls, nor send its audio.
     this._finishRecording('review');
     // Pointed at another thread: forget this one and read that one.
+    this._shelfExit();
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
     this._stopPolling();
     this._id = now || '';
@@ -671,6 +687,7 @@ class RetinueConversation extends HTMLElement {
     this._attachError = '';
     this._missing = false;
     LIVE.set(this._key(), this);
+    this._shelfEnter();
     this._focusOnOpen();
     this.render();
     if (this._id) {
@@ -691,6 +708,153 @@ class RetinueConversation extends HTMLElement {
   _focusOnOpen() {
     if (this.hasAttribute('no-autofocus')) return;
     this._focusNext = true;
+  }
+
+  // ── The shelf (shelf-store.js, issue #282) ─────────────────────────────────
+  // The key this element feeds: a host-given one (a chat's companion feeds
+  // its chat), or its own thread's when the host asked for `shelf`.
+  _shelfKey() {
+    const k = this.getAttribute('shelf-key');
+    if (k) return k;
+    return this.hasAttribute('shelf') && this._id ? `thread:${this._id}` : '';
+  }
+
+  _shelfEnter() {
+    // Idempotent: at upgrade the attribute path runs before connectedCallback,
+    // and both enter — a second registration would keep the key live forever.
+    this._shelfDetach();
+    const key = this._shelfKey();
+    this._shelfKeyNow = key;
+    if (!key) return;
+    this._shelfRelease = goLive(key);
+    this._lastLoc = null;
+    // A chat page takes its own restore (it holds the pane and the mirror);
+    // a thread's is this element's.
+    if (key.startsWith('thread:')) this._shelfRestore = takeRestore(key) || this._shelfRestore || null;
+    // Navigating away with a turn running counts as leaving it; nothing is
+    // disconnected on a page unload, so that is caught here.
+    this._onPageHide = () => this._shelfLeave(true);
+    window.addEventListener('pagehide', this._onPageHide);
+    this._onShelfVis = () => { if (this._seenVisible) this._reportSeen(); };
+    document.addEventListener('visibilitychange', this._onShelfVis);
+  }
+
+  _shelfExit() {
+    this._shelfDetach();
+    this._shelfLeave(false);
+  }
+
+  _shelfDetach() {
+    if (this._onPageHide) window.removeEventListener('pagehide', this._onPageHide);
+    if (this._onShelfVis) document.removeEventListener('visibilitychange', this._onShelfVis);
+    this._onPageHide = null;
+    this._onShelfVis = null;
+    if (this._seenIO) this._seenIO.disconnect();
+    this._seenIO = null;
+    this._seenVisible = false;
+    if (this._shelfRelease) this._shelfRelease();
+    this._shelfRelease = null;
+  }
+
+  // Left while Ara is working: the thread goes on the shelf by itself. A
+  // host re-rendering puts a new element on the same thread at once — that
+  // is not leaving, so the decision waits a tick to see who is live then.
+  _shelfLeave(unloading) {
+    const key = this._shelfKeyNow;
+    if (!key || !key.startsWith('thread:') || !this.hasAttribute('shelf-leave')) return;
+    if (!this._thread || !this._thread.pending) return;
+    const item = this._shelfItem(key);
+    if (unloading) { shelf.left(item); return; }
+    const convKey = this._key();
+    setTimeout(() => {
+      const live = LIVE.get(convKey);
+      if (live && live !== this && live.isConnected) return;
+      shelf.left(item);
+    }, 0);
+  }
+
+  _shelfItem(key) {
+    const t = this._thread || {};
+    return {
+      key, kind: 'thread', id: this._id,
+      title: t.title || 'Conversation',
+      href: this.getAttribute('shelf-href') || `${location.pathname}#conversation-${this._id}`,
+      location: this.isConnected ? this.shelfLocation() : (this._lastLoc || null),
+      ...threadFacts(this._thread),
+    };
+  }
+
+  _minimize() {
+    const key = this._shelfKey();
+    if (!key || !this._id) return;
+    shelf.minimize(this._shelfItem(key));
+    this._emit('retinue-back', { id: this._id });
+  }
+
+  _shelfObserve(t) {
+    const key = this._shelfKey();
+    if (!key) return;
+    const f = threadFacts(t);
+    // A companion reports only Ara's side: the chat's own mute and title are
+    // the chat page's to say.
+    if (key.startsWith('thread:')) f.title = t.title || 'Conversation'; else delete f.muted;
+    shelf.observe(key, f);
+  }
+
+  // Ara's newest message counts as seen once it is actually on screen — in
+  // the viewport, in a visible tab — not merely rendered: on the chat page's
+  // phone strip the companion pane is rendered while the mirror is showing.
+  _watchSeen() {
+    if (this._seenIO) this._seenIO.disconnect();
+    this._seenIO = null;
+    this._seenVisible = false;
+    if (!this._shelfKey() || typeof IntersectionObserver === 'undefined') return;
+    const all = this.shadowRoot ? this.shadowRoot.querySelectorAll('.thread .msg[data-ara]') : [];
+    const el = all[all.length - 1];
+    if (!el) return;
+    this._seenTs = el.getAttribute('data-ts') || '';
+    this._seenIO = new IntersectionObserver((entries) => {
+      for (const e of entries) {
+        this._seenVisible = e.isIntersecting &&
+          (e.intersectionRatio >= 0.5 || e.intersectionRect.height >= 120);
+        if (this._seenVisible) this._reportSeen();
+      }
+    }, { threshold: [0, 0.25, 0.5, 0.75, 1] });
+    this._seenIO.observe(el);
+  }
+
+  _reportSeen() {
+    const key = this._shelfKey();
+    if (!key || !this._seenTs || document.visibilityState === 'hidden') return;
+    shelf.seen(key, this._seenTs);
+  }
+
+  // Where the reader is in the thread: at the bottom, or the first message
+  // still (partly) in view and how far below the top it sits. A place, never
+  // content — a restore reads the thread afresh and finds that message.
+  shelfLocation() {
+    const threadEl = this.shadowRoot && this.shadowRoot.querySelector('.thread');
+    if (!threadEl || !this.isConnected) return this._lastLoc || null;
+    if (threadEl.scrollHeight - threadEl.scrollTop - threadEl.clientHeight < 40) return { bottom: true };
+    const top = threadEl.getBoundingClientRect().top;
+    for (const m of threadEl.querySelectorAll('.msg[data-ts]')) {
+      const r = m.getBoundingClientRect();
+      if (r.bottom > top + 1) return { anchor: m.getAttribute('data-ts'), offset: Math.round(r.top - top) };
+    }
+    return { bottom: true };
+  }
+
+  // Put the thread back at a place shelfLocation() described. False when the
+  // message is gone (the thread then stays at its newest message).
+  applyLocation(loc) {
+    const threadEl = this.shadowRoot && this.shadowRoot.querySelector('.thread');
+    if (!threadEl || !loc || loc.bottom || !loc.anchor) return false;
+    const el = Array.from(threadEl.querySelectorAll('.msg[data-ts]'))
+      .find((m) => m.getAttribute('data-ts') === loc.anchor);
+    if (!el) return false;
+    threadEl.scrollTop += el.getBoundingClientRect().top - threadEl.getBoundingClientRect().top - (loc.offset || 0);
+    this._lastLoc = loc;
+    return true;
   }
 
   get conversationId() { return this._id; }
@@ -780,6 +944,7 @@ class RetinueConversation extends HTMLElement {
       if (gen === pinGen(id) && FAILED_PINS.delete(id)) this._pickerStale = true;
       this._thread = t;
       this._missing = false;
+      this._shelfObserve(t);
       if (t.unread) this._markRead();
       this._maybeAutoplay(t);
       this._restorePosition(t);
@@ -850,6 +1015,7 @@ class RetinueConversation extends HTMLElement {
       this._threadSig = sig;
       threadEl.scrollTop = stickToBottom ? threadEl.scrollHeight : Math.max(0, threadEl.scrollHeight - prevBottom);
       if (!stickToBottom) threadEl.scrollTop = Math.max(threadEl.scrollTop, prevTop);
+      this._watchSeen();
     }
     this._updatePendingStatus(t);
     this._syncPicker();
@@ -894,6 +1060,12 @@ class RetinueConversation extends HTMLElement {
     // is visible (matches typical chat-app behaviour on open).
     const threadEl = root.querySelector('.thread');
     if (threadEl) threadEl.scrollTop = threadEl.scrollHeight;
+    // …unless the shelf handed over the place the thread was left at.
+    if (threadEl && this._shelfRestore && this._thread) {
+      this.applyLocation(this._shelfRestore);
+      this._shelfRestore = null;
+    }
+    this._watchSeen();
   }
 
   _barHtml() {
@@ -941,10 +1113,15 @@ class RetinueConversation extends HTMLElement {
       ? `<button class="iconbtn" data-attention title="Importance, urgency, delivery — and their corrections" ` +
         `aria-label="Attention details">&#9432;</button>`
       : '';
+    const minBtn = this.hasAttribute('minimize')
+      ? `<button class="iconbtn" data-minimize title="Minimize to the shelf" aria-label="Minimize">` +
+        `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" ` +
+        `stroke-linecap="round" aria-hidden="true"><path d="M6 17h12"/></svg></button>`
+      : '';
     return `<div class="thread-bar">${back}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
       `<span class="bar-actions"><span data-picker>${this._modelPickerHtml()}</span>` +
-      `${attentionBtn}${autoBtn}${archiveBtn}</span></div>`;
+      `${attentionBtn}${autoBtn}${archiveBtn}${minBtn}</span></div>`;
   }
 
   // What the composer's box is called. A host that frames the element its own
@@ -993,7 +1170,8 @@ class RetinueConversation extends HTMLElement {
       const who = (m.role !== 'user' && m.agent) ? m.agent : defaultWho;
       const speakBtn = (canSpeak && m.role !== 'user' && (m.text || '').trim())
         ? this._speakBtnHtml(t, m, idx) : '';
-      return `<div class="msg ${cls}${reading}"><div class="msg-head">` +
+      const mark = ` data-ts="${esc(m.ts || '')}"${m.role === 'user' ? '' : ' data-ara'}`;
+      return `<div class="msg ${cls}${reading}"${mark}><div class="msg-head">` +
         `<small class="who">${esc(who)}</small>` +
         this._metaHtml(m) +
         speakBtn + `</div>` +
@@ -1406,6 +1584,8 @@ class RetinueConversation extends HTMLElement {
     this._adopting = true;
     try { this.setAttribute('conversation-id', this._id); } finally { this._adopting = false; }
     LIVE.set(this._key(), this);
+    // A composer with `shelf` had no key until now: it is this thread from here.
+    if (this._shelfKey() !== this._shelfKeyNow) { this._shelfExit(); this._shelfEnter(); }
     this._schedulePoll();
   }
 
@@ -1754,6 +1934,14 @@ class RetinueConversation extends HTMLElement {
       // hearing "archived" from an element on another thread would leave
       // that one (the card returns to its list on the event).
       const target = this._liveFor(key);
+      // Archiving says "I am not waiting for this" — told to the shelf before
+      // the host leaves the thread, which would otherwise count as leaving
+      // while Ara works.
+      const shelfKey = target ? target._shelfKey() : (this._shelfKey() || '');
+      if (shelfKey) {
+        const t = (target && target._thread) || this._thread;
+        shelf.archived(shelfKey, archived, t && t.pending ? threadFacts(t).turn : '');
+      }
       if (target) {
         target._loadSeq += 1; // a read in flight would put the old flag back
         if (target._thread) target._thread.archived = archived;
@@ -1858,6 +2046,8 @@ class RetinueConversation extends HTMLElement {
     if (arch) arch.addEventListener('click', () => this._archive(true));
     const unarch = root.querySelector('[data-unarchive]');
     if (unarch) unarch.addEventListener('click', () => this._archive(false));
+    const min = root.querySelector('[data-minimize]');
+    if (min) min.addEventListener('click', () => this._minimize());
     // Copy buttons, chips and speak buttons: delegated on the thread container,
     // which survives the in-place message swaps of a poll, so one listener
     // covers every bubble ever rendered here.
@@ -1871,6 +2061,16 @@ class RetinueConversation extends HTMLElement {
         const sbtn = e.target.closest('.speak');
         if (sbtn) this._onSpeakButton(sbtn);
       });
+      // Where the reader is, kept as they scroll: the place a shelf item
+      // restores to must be known after the element has left the page, when
+      // there is no layout left to measure.
+      if (this._shelfKey()) {
+        let raf = 0;
+        threadEl.addEventListener('scroll', () => {
+          if (raf) return;
+          raf = requestAnimationFrame(() => { raf = 0; this._lastLoc = this.shelfLocation(); });
+        }, { passive: true });
+      }
     }
     const mic = root.querySelector('[data-mic]');
     if (mic) mic.addEventListener('click', () => this._startRecording());
