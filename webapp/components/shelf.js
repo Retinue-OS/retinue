@@ -24,7 +24,7 @@
 // Long press, right-click or the context-menu key: Open · Close · Close all
 // quiet ones.
 
-import { esc, WIDE_FRAME, onPressOutside } from './base.js';
+import { esc, WIDE_FRAME } from './base.js';
 import { shelf, subscribe, readState, isLive, isQuiet, setRestore, threadFacts } from './shelf-store.js';
 
 // How often items no open page is watching are re-read: tight while one of
@@ -220,12 +220,22 @@ class RetinueShelf extends HTMLElement {
     this._closeMenu();
     this._menuKey = key;
     this.render();
-    const menu = this.shadowRoot.querySelector('[data-menu]');
-    if (!menu) return;
+    if (!this.shadowRoot.querySelector('[data-menu]')) return;
     const onKey = (e) => { if (e.key === 'Escape') this._closeMenu(true); };
-    const offPress = onPressOutside(menu, () => this._closeMenu(true), { capture: true });
+    // The menu node is looked up at press time, not captured here: any store
+    // change while the menu is open redraws the shelf (a marker landing, the
+    // reconciliation read), and a press on the redrawn menu must still count
+    // as inside. Capture phase, so an outside press closes before it acts.
+    const onPress = (e) => {
+      const menu = this.shadowRoot && this.shadowRoot.querySelector('[data-menu]');
+      if (!menu || !e.composedPath().includes(menu)) this._closeMenu(true);
+    };
+    document.addEventListener('pointerdown', onPress, true);
     document.addEventListener('keydown', onKey);
-    this._menuAway = () => { offPress(); document.removeEventListener('keydown', onKey); };
+    this._menuAway = () => {
+      document.removeEventListener('pointerdown', onPress, true);
+      document.removeEventListener('keydown', onKey);
+    };
   }
 
   _closeMenu(redraw) {
@@ -258,6 +268,7 @@ class RetinueShelf extends HTMLElement {
   // by their pages. Chats come from one list read; a chat's companion thread
   // and plain threads from their documents.
   _schedule(earlierOnly) {
+    if (!this.isConnected) return; // a read that outlived the element must not re-arm
     const items = readState().items.filter((i) => !isLive(i.key) && i.kind !== 'project');
     const busy = items.some((i) => i.araState === 'working');
     const due = Date.now() + (busy ? WORKING_POLL_MS : IDLE_POLL_MS);
@@ -268,8 +279,8 @@ class RetinueShelf extends HTMLElement {
   }
 
   async _reconcile() {
-    if (this._polling) return;
-    if (document.hidden || !this.isConnected) { this._schedule(); return; }
+    if (this._polling || !this.isConnected) return;
+    if (document.hidden) { this._schedule(); return; }
     this._polling = true;
     try {
       const items = readState().items.filter((i) => !isLive(i.key) && i.kind !== 'project');
