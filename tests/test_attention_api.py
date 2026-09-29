@@ -967,6 +967,7 @@ def test_a_sphere_within_another_over_http(base, wg):
     _http(base, "POST", "/attention/spheres", {"add": "Acme"})
     status, out = _http(base, "POST", "/attention/spheres", {"sphere": "acme", "within": "customers"})
     assert status == 200 and out["nested"] == "acme" and out["within"] == {"acme": "customers"}, out
+    assert isinstance(out["pushed"], list), out
     status, out = _http(base, "POST", "/attention/spheres", {"sphere": "customers", "within": "acme"})
     assert status == 400, out
     status, prof = _http(base, "GET", "/attention/profile")

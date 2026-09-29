@@ -157,6 +157,23 @@ def heal_focus(focus: dict) -> dict:
         plan["schedule"] = kept or [list(e) for e in DEFAULT_SCHEDULE]
     if focus.get("manual") and focus["manual"] not in modes:
         focus.update(manual=None, subject=None, manual_until=None, breaks=[])
+    heal_within(focus)
+    return focus
+
+
+def heal_within(focus: dict) -> dict:
+    """Keep only the sphere nesting that can be read: word → word pairs
+    whose both sides are in the vocabulary (when it is known). A hand-edited
+    or client-written ``within`` of another shape would otherwise fail every
+    reading of the mode (mode_at), and with it the list, the rail and the
+    tick."""
+    within = focus.get("within")
+    spheres = focus.get("spheres")
+    known = set(spheres) if isinstance(spheres, list) else None
+    focus["within"] = {k: v for k, v in within.items()
+                       if isinstance(k, str) and isinstance(v, str) and k != v
+                       and (known is None or (k in known and v in known))} \
+        if isinstance(within, dict) else {}
     return focus
 
 
@@ -647,7 +664,8 @@ def mode_at(focus: dict, now: datetime) -> dict:
     mode = focus["modes"][focus.get("manual") or scheduled_id(focus, now)]
     # The sphere nesting travels with the mode, so every admission check
     # that reads the mode also reads which sphere lies within which.
-    mode = {**mode, "within": dict(focus.get("within") or {})}
+    within = focus.get("within")
+    mode = {**mode, "within": dict(within) if isinstance(within, dict) else {}}
     scope = scope_of(focus, now) if mode.get("with_subject") else None
     if not scope:
         return mode
@@ -712,6 +730,12 @@ def admitted_by(item: dict, mode: dict) -> dict | None:
       as any of the item's spheres: Focused lets *health* through this way,
       whatever the scope.
 
+    When the admitted sphere is not one of the item's own but one its sphere
+    lies within (acme within customers, the mode admitting customers),
+    ``via`` names the item's own sphere: the switch then changes the outer
+    rule for everything it holds, which the sheet must not offer as if it
+    were about this item alone.
+
     None when no rule admits it (a permit is the sender's, not a rule of the
     mode, and the sheet has its own switch for it)."""
     if item.get("vip"):
@@ -721,11 +745,11 @@ def admitted_by(item: dict, mode: dict) -> dict | None:
     spheres = spheres_of(item, mode.get("within"))
     hit = next((s for s in spheres if s in mode["admits"]), None)
     if hit is not None:
-        return {"by": "scope" if mode.get("subject") else "sphere", "what": hit}
+        return {"by": "scope" if mode.get("subject") else "sphere", "what": hit, **_via_of(item, hit, mode)}
     tags = mode.get("admit_tags") or []
     hit = next((s for s in spheres if s in tags), None)
     if hit is not None:
-        return {"by": "tag", "what": hit}
+        return {"by": "tag", "what": hit, **_via_of(item, hit, mode)}
     return None
 
 
@@ -760,12 +784,19 @@ def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> st
     return f"{mode['name']} does not admit {item['sphere']}"
 
 
+def _via_of(item: dict, hit: str, mode: dict) -> dict:
+    """{"via": "acme"} when the admitted sphere is not the item's own but one
+    its sphere lies within; {} when it is the item's own."""
+    if hit in spheres_of(item):
+        return {}
+    inner = next((s for s in spheres_of(item) if hit in enclosing(s, mode.get("within"))), None)
+    return {"via": inner} if inner else {}
+
+
 def _via(item: dict, hit: str, mode: dict) -> str:
     """ ", which holds acme" when the admitted sphere is not the item's own
     but one its sphere lies within — so the reason line says why."""
-    if hit in spheres_of(item):
-        return ""
-    inner = next((s for s in spheres_of(item) if hit in enclosing(s, mode.get("within"))), None)
+    inner = _via_of(item, hit, mode).get("via")
     return f", which holds {inner}" if inner else ""
 
 
@@ -1441,10 +1472,15 @@ def remove_sphere(focus: dict, text) -> str:
     if admitting:
         raise ValueError(f"still admitted in {', '.join(admitting)} — change those rules first")
     focus["spheres"] = [x for x in focus["spheres"] if x != sid]
-    # Out of the nesting too: the spheres it held stand on their own again.
+    # Out of the nesting too, without changing what the rest admits: the
+    # spheres it held move up to the one it lay within (acme-labs within
+    # acme within customers, acme removed: acme-labs within customers), or
+    # stand on their own when it lay within nothing.
     within = focus.get("within") or {}
     if within:
-        focus["within"] = {k: v for k, v in within.items() if sid not in (k, v)}
+        outer = within.get(sid)
+        focus["within"] = {k: (outer if v == sid else v) for k, v in within.items()
+                           if k != sid and not (v == sid and outer is None)}
     return sid
 
 
@@ -1465,7 +1501,9 @@ def set_within(focus: dict, text, outer) -> str:
         oid = sphere_id(outer)
         if oid is None or oid not in spheres:
             raise ValueError("no such sphere to put it within")
-        if oid == sid or sid in enclosing(oid, within):
+        if oid == sid:
+            raise ValueError("a sphere cannot lie within itself")
+        if sid in enclosing(oid, within):
             raise ValueError(f"{oid} already lies within {sid}")
         if sid == "unknown":
             raise ValueError("“unknown” is admitted by no mode; it cannot lie within another sphere")

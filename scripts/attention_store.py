@@ -113,6 +113,8 @@ class AttentionStore:
                 # written before it existed (or a deployment that pruned the
                 # vocabulary) still has to be able to name it in a rule.
                 focus["spheres"].append(UNKNOWN_SPHERE)
+            # The nesting names only spheres the vocabulary holds.
+            policy.heal_within(focus)
             for mid, mode in focus["modes"].items():
                 # A document from before the flag: the shipped default for
                 # the mode of that name, off for one the deployment named.

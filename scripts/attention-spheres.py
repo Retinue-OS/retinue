@@ -18,35 +18,16 @@ Configuration (environment): ATTENTION_URL, else the web-gateway on
 localhost:WEB_GATEWAY_PORT (8080).
 """
 import argparse
-import json
-import os
 import sys
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import attention as policy  # noqa: E402
-
-BASE = os.environ.get("ATTENTION_URL", f"http://localhost:{os.environ.get('WEB_GATEWAY_PORT', '8080')}").rstrip("/")
-TIMEOUT = 30
+import attention_cli  # noqa: E402
 
 
 def _call(method: str, path: str, body: dict | None = None) -> dict:
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(BASE + path, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        try:
-            reason = json.loads(exc.read().decode("utf-8")).get("error") or exc.reason
-        except ValueError:
-            reason = exc.reason
-        sys.exit(f"attention-spheres: {reason}")
-    except urllib.error.URLError as exc:
-        sys.exit(f"attention-spheres: the gateway at {BASE} did not answer ({exc.reason})")
+    return attention_cli.call("attention-spheres", method, path, body)
 
 
 def show() -> int:

@@ -277,7 +277,9 @@ them — a plan left with none is gone — and the patch is refused while a
 weekday would be in no plan or two. Ara makes these changes when asked, with
 `scripts/attention-week.py` (the week and today's plan; `holiday add
 2026-12-24..2027-01-02 --name Christmas`; `plan Friday --days fri
---schedule "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"`). A
+--schedule "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"`), and
+puts one sphere within another with `scripts/attention-spheres.py` (`within
+acme customers`: whatever admits customers admits Acme too). A
 `focus.json` from before the week keeps its one schedule for every day, as an
 *Every day* plan — unless it was the shipped schedule, which gives way to
 the shipped week. A document is healed as it is read

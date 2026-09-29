@@ -479,7 +479,8 @@ def test_a_sphere_within_another():
     on_customers = A.mode_at(dict(focus, manual="focused", subject="customers"), at(10))
     assert A.spheres_of(item(sphere="acme"), on_customers["within"]) == ["acme", "customers"]
     assert A.admitted(item(sphere="acme-labs"), on_customers, profile)
-    assert A.admitted_by(item(sphere="acme"), on_customers) == {"by": "scope", "what": "customers"}
+    assert A.admitted_by(item(sphere="acme"), on_customers) == {"by": "scope", "what": "customers", "via": "acme"}
+    assert A.admitted_by(item(sphere="customers"), on_customers) == {"by": "scope", "what": "customers"}
     assert A.admission_reason(item(sphere="acme"), on_customers, profile, at(10)) == \
         "Focused admits customers, which holds acme"
     on_acme = A.mode_at(dict(focus, manual="focused", subject="acme"), at(10))
@@ -494,6 +495,15 @@ def test_a_sphere_within_another():
             raise AssertionError((inner, outer))
         except ValueError:
             pass
+    try:
+        A.set_within(focus, "acme", "acme")
+    except ValueError as exc:
+        assert str(exc) == "a sphere cannot lie within itself"
+    # Removing a middle sphere keeps what the rest admits: acme-labs moves up.
+    trial = json.loads(json.dumps(focus))
+    trial["spheres"].append("x")
+    A.remove_sphere(trial, "acme")
+    assert trial["within"] == {"acme-labs": "customers"}
     A.set_within(focus, "acme-labs", None)
     assert focus["within"] == {"acme": "customers"}
     # Removing the outer sphere unnests what it held.
@@ -502,6 +512,13 @@ def test_a_sphere_within_another():
     assert focus["within"] == {}
     # A hand-edited loop ends the chain instead of spinning.
     assert A.enclosing("a", {"a": "b", "b": "a"}) == ["a", "b"]
+    # A malformed nesting is healed away rather than failing every read.
+    for bad in ("acme", ["acme"], {"acme": ["customers"]}, {"acme": "nowhere"}, {"acme": "acme"}):
+        healed = A.heal_focus(dict(A.default_focus(), spheres=["acme", "customers"], within=bad))
+        assert healed["within"] == {}, bad
+        A.mode_at(healed, at(10))
+    kept = A.heal_focus(dict(A.default_focus(), spheres=["acme", "customers"], within={"acme": "customers"}))
+    assert kept["within"] == {"acme": "customers"}
 
 
 def test_zone():
