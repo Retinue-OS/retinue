@@ -365,8 +365,8 @@ without touching the gate.
 
 1. **Runs Phases 2–4** on this one message, in that order: classify, resolve
    the sender, recall the sender's standing instructions (Phase 2, "Sender
-   instructions") and apply them, link it to a project (Phase 3), then gather what the reply
-   depends on — the project's state included, which is why the link comes
+   instructions") and apply them, link it to a project (Phase 3), then
+   gather what the reply depends on — the project's state included, which is why the link comes
    first — dispatch the `secretary` for the decision, and open the dashboard
    conversation that carries it. The
    conversation is the user's push notification. **Hand the reply token over**:
@@ -424,8 +424,8 @@ returns in Phase 4a, and its verdict wins.
 
 Standing instructions about a particular sender ("with this service's
 notifications always say which of my addresses they went to", "never propose
-deleting this sender's statements") live in **memory**, not in this skill. Before classifying an item
-— and before any line about it reaches the user, in a proposal, an omnibus
+deleting this sender's statements") live in **memory**, not in this skill.
+Before classifying an item — and before any line about it reaches the user, in a proposal, an omnibus
 row or a notification thread — recall them:
 
 ```bash
@@ -562,8 +562,8 @@ has: the sender resolved to a contact (the **messaging-contact-lookup** skill
 for messenger; the contact note for e-mail), the linked project's state,
 `memory.py recall` for the standing preferences and past decisions on this
 person or topic — the Phase 2 sender recall included, so the `secretary` sees
-the sender's standing instructions too — the life store, and — where the deployment provides one — the
-calendar for any date or slot the message proposes. A source this deployment
+the sender's standing instructions too — the life store, and — where the
+deployment provides one — the calendar for any date or slot the message proposes. A source this deployment
 does not have is simply a fact you lack; note it and move on, never guess it.
 
 **2. Dispatch `secretary` for the decision.** Hand over the message, the
