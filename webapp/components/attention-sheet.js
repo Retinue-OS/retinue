@@ -45,9 +45,10 @@ const NEW_SPHERE = '__new__';
 // name the messenger delivered ("Ludmila") is worth offering even when nobody
 // vouches for the sender, but the gateway's fallback — the raw handle, a
 // phone number, an `…@lid` id — is not a name, so the field starts empty.
+// Not compared against `sender`: a chat row's sender *is* its title.
 function chatName(item) {
   const title = String((item && item.title) || '').trim();
-  if (!title || title === item.handle || title === item.sender) return '';
+  if (!title || title === item.handle) return '';
   if (title.includes('@') || !/\p{L}/u.test(title)) return '';
   return title;
 }
