@@ -1653,11 +1653,14 @@ class RetinueConversation extends HTMLElement {
   // Drop a chip's prefill text into the composer for review. Deliberately does
   // NOT send: the user reads (and can edit) it, then taps Send — same contract
   // as a dictation transcribed for review. Appends to whatever the user has
-  // already typed rather than replacing it, then re-renders to show the text
-  // and focus the field with the caret at the end.
+  // already typed rather than replacing it, then re-renders to show the text.
+  // The thread stays where the user was reading: a long list carries a chip on
+  // every row, and working down it must not jump to the newest message (and
+  // back up) after each tap. Nor does a tap pop the keyboard — focus is kept
+  // only when the field already had it.
   _fillComposer(text) {
     appendToDraft(this._key(), text);
-    this._focusNext = true;
+    this._shelfRestore = this.shelfLocation();
     this.render();
   }
 
@@ -2158,7 +2161,7 @@ class RetinueConversation extends HTMLElement {
       if (wantFocus) {
         setTimeout(() => {
           if (!input.isConnected) return;
-          input.focus();
+          input.focus({ preventScroll: true });
           const end = input.value.length;
           try { input.setSelectionRange(end, end); } catch (_err) { /* ignore */ }
         }, 0);

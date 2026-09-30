@@ -631,8 +631,8 @@ left exactly as the user last saw it until the next `4b` emission gathers
 every `omnibus_pending` item — the ones just accumulated together with any
 from earlier passes — into that one fresh conversation. Do not reach for
 `--thread <existing-omnibus-id>` here: that flag exists to add material to a
-conversation the user is already looking at (an attachment, a Phase 5 nudge on
-a *proposed* item), not to slip more omnibus content into a batch the user has
+conversation the user is already looking at (an attachment on a *proposed*
+item), not to slip more omnibus content into a batch the user has
 not approved yet — every append fires its own unread badge and Web Push, which
 is exactly the per-item noise the single-digest design exists to prevent. A
 run that finds new archive/delete items mid-interval ends silently on this
@@ -697,8 +697,8 @@ thread lands *on top of* the real proposals in the conversation list, pushing
 the actual decisions down.
 
 The one legitimate way to re-surface something already proposed is **Phase 5**:
-a nudge posted **into the existing active conversation** (or a Signal push
-pointing at it), at most once per interval. Never a second thread about the same
+raising the existing conversation's attention (or a Signal push pointing at
+it), at most once per interval — never a message posted into it. Never a second thread about the same
 items.
 
 **Failures are the exception — substantive ones only.** If the run could not do
@@ -716,10 +716,20 @@ engaged** its conversation — no user reply, thread still agent-last. Detect vi
 age), cross-referenced with the status store.
 
 Once un-engaged for at least `EMAIL_PROCESSING_INTERVAL` (the grace period),
-remind — scaled by urgency and importance:
+remind — scaled by urgency and importance — by **raising the thread's
+attention**, not by writing into it:
 
-- post a fresh nudge **into the existing active conversation**, **and/or**
-- send a **Signal push** (`scripts/signal-push.py`) pointing at it.
+- `scripts/attention-set.py thread:<id> --importance <n>` (one step up per
+  interval, capped at 4) and, where the items have a real deadline,
+  `--due`/`--lead`, so the attention model lifts the thread on the home screen
+  and decides itself whether it rings; **and/or**
+- send a **Signal push** (`scripts/signal-push.py`) pointing at it, for the
+  urgent messenger cases below.
+
+**Never post a nudge message into the thread.** A reminder appended to an
+open proposal buries the proposal under its own reminders: the user scrolls
+past each of them to reach the list and its chips, and a repeated "still
+waiting" line says nothing the thread's place on the home screen doesn't.
 
 **Archived conversations are exempt.** If the user archived the thread, they
 have decided not to pursue the topic for now — respect that. Send no nudge and
@@ -729,8 +739,8 @@ message on the subject**, or Phase 1's re-collection of a stalled item — both
 arriving through Phases 1–4, in a new thread — may raise the subject again.
 
 **Urgency scaling:** Signal/WhatsApp/SMS escalate **sooner** and prefer the
-Signal push; e-mail defaults to the in-thread nudge. Record `last_nudge` in the
-status file; nudge at most once per interval.
+Signal push; e-mail defaults to the attention raise. Record `last_nudge` in
+the status file; nudge at most once per interval.
 
 ---
 
