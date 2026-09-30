@@ -8833,7 +8833,9 @@ class Handler(BaseHTTPRequestHandler):
         channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
         handle = _chat_handle(chat_id)
         if handle is None:
-            self._send_json(400, {"error": "a group chat has no contact card"})
+            parts = chat_state_mod.split_chat_id(chat_id)
+            self._send_json(400, {"error": "a group chat has no contact card" if parts and _chat_is_group(*parts)
+                                  else f"this chat's handle {key!r} cannot be filed as a contact"})
             return
         chamber = str(payload.get("chamber") or "").strip() or None
         person_ref = str(payload.get("person") or "").strip() or None

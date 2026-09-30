@@ -50,7 +50,9 @@ Handles
 -------
 Code speaks of *handles*: ``(channel, handle)`` pairs, whatever the channel.
 ``email`` maps to ``vcard:hasEmail``, ``sms`` to ``vcard:hasTelephone`` (an SMS
-number is a telephone, not an account), every other channel to an account. An
+number is a telephone, not an account) — or, for an alphanumeric sender ID such
+as a bank's "HBL", to an account on the SMS channel — and every other channel
+to an account. An
 account whose name is an E.164 number also gives the person that telephone.
 An account or an e-mail address belongs to at most one person across all
 chambers; telephones may be shared (a family landline).
@@ -151,6 +153,17 @@ def normalize_phone(value: str) -> str:
     return compact if _PHONE_RE.match(compact) else raw
 
 
+def _is_sender_id(value: str) -> bool:
+    """An SMS alphanumeric sender ID: at most 11 characters with a letter."""
+    compact = str(value or "").strip()
+    return 0 < len(compact) <= 11 and bool(re.search(r"[^\W\d_]", compact))
+
+
+def is_sms_phone(channel: str, handle: str) -> bool:
+    """Whether an SMS handle is a telephone (else a sender ID, an account)."""
+    return channel == SMS and bool(_PHONE_RE.match(handle))
+
+
 def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
     channel = str(channel or "").strip().lower()
     if not _CHANNEL_RE.match(channel):
@@ -163,9 +176,16 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
         if not _EMAIL_RE.match(value):
             raise ContactError(f"not an e-mail address: {handle!r}")
     elif channel == SMS:
-        value = normalize_phone(value)
-        if not _PHONE_RE.match(value):
-            raise ContactError(f"not an E.164 phone number: {handle!r}")
+        # A number (E.164 only: a national one is refused rather than guessed),
+        # or an alphanumeric sender ID — "HBL", "Digitec" — that banks and
+        # services send from, which is no telephone but names a sender all the
+        # same (it is kept as an account on the SMS channel).
+        if _is_sender_id(value):
+            value = " ".join(value.split())
+        else:
+            value = normalize_phone(value)
+            if not _PHONE_RE.match(value):
+                raise ContactError(f"not an E.164 phone number or a sender ID: {handle!r}")
     else:
         maybe = normalize_phone(value)
         if _PHONE_RE.match(maybe):
@@ -528,7 +548,7 @@ class ContactBook:
         for record in self.all():
             if channel == EMAIL and handle in record["emails"]:
                 return record
-            if channel == SMS and handle in record["all_phones"]:
+            if is_sms_phone(channel, handle) and handle in record["all_phones"]:
                 return record
             if (channel, handle) in record["accounts"]:
                 return record
@@ -560,7 +580,7 @@ class ContactBook:
     # Writing
 
     def _claimed(self, channel: str, handle: str, but: str | None = None) -> dict | None:
-        if channel == SMS:
+        if is_sms_phone(channel, handle):
             return None  # telephones may be shared
         owner = self.find(channel, handle)
         return owner if owner and owner["iri"] != but else None
@@ -676,7 +696,7 @@ def _add_pair(record: dict, pair: tuple[str, str]) -> None:
     channel, handle = pair
     if channel == EMAIL:
         record["emails"] = sorted(set(record["emails"]) | {handle})
-    elif channel == SMS:
+    elif is_sms_phone(channel, handle):
         record["phones"] = sorted(set(record["phones"]) | {handle})
     else:
         record["accounts"] = sorted(set(record["accounts"]) | {pair})
@@ -686,7 +706,7 @@ def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
     channel, handle = pair
     if channel == EMAIL:
         record["emails"] = [e for e in record["emails"] if e != handle]
-    elif channel == SMS:
+    elif is_sms_phone(channel, handle):
         record["phones"] = [p for p in record["phones"] if p != handle]
     else:
         record["accounts"] = [a for a in record["accounts"] if a != pair]

@@ -48,8 +48,10 @@ const NEW_SPHERE = '__new__';
 // Not compared against `sender`: a chat row's sender *is* its title.
 function chatName(item) {
   const title = String((item && item.title) || '').trim();
-  if (!title || title === item.handle) return '';
-  if (title.includes('@') || !/\p{L}/u.test(title)) return '';
+  // The chat's own name is the natural first guess — also where it is the
+  // handle itself, as with an SMS sender ID ("HBL"). A number or an address
+  // is no name.
+  if (!title || title.includes('@') || !/\p{L}/u.test(title)) return '';
   return title;
 }
 
@@ -454,7 +456,7 @@ class RetinueAttentionSheet extends HTMLElement {
       return;
     }
     if (nameOverride === undefined && !form.person && !form.chamber) {
-      this._error = 'A chamber to keep the contact in.';
+      this._error = 'Pick the chamber to keep the contact in.';
       this.render();
       return;
     }
@@ -536,13 +538,20 @@ class RetinueAttentionSheet extends HTMLElement {
     // Where a new contact is kept: a contact always belongs to one chamber.
     // A card already filed stays where its person lives.
     const chambers = book.chambers || [];
+    // Nowhere to keep a new person: say why and what to change, and do not
+    // offer a save that can only fail.
+    const blocked = !form.person && !chambers.length;
+    const why = !book.chambers
+      ? 'This chat’s handle cannot be filed as a contact.'
+      : 'No chamber keeps contacts: every mounted chamber declares "contacts": false in chambers.json. ' +
+        'Remove that from one chamber’s entry to keep contacts there.';
     const where = form.person
       ? (form.chamber ? `<div class="f-note">Kept in ${esc(form.chamber)}.</div>` : '')
       : chambers.length
         ? `<div><div class="f-k">kept in</div><select class="select" data-set="contact-chamber"${busy}>${chambers.map((c) =>
           `<option value="${esc(c)}"${form.chamber === c ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select>` +
           `<div class="f-note">The chamber the contact is stored in, with every channel that reaches them.</div></div>`
-        : `<div class="f-note">No chamber keeps contacts — each opts out in chambers.json, or none is mounted.</div>`;
+        : `<div class="err">${esc(why)}</div>`;
     return `<div class="field screened"><div class="f-label">${card ? 'Contact' : 'New contact'}</div>` +
       `<div class="card-form">` +
       (form.person ? '' : suggest) +
@@ -559,9 +568,11 @@ class RetinueAttentionSheet extends HTMLElement {
       `${form.permit ? '✓ ' : ''}May interrupt right now</button>` +
       `<button class="btn tiny${form.vip ? ' on' : ''}" data-act="contact-vip"${busy}>${form.vip ? '✓ ' : ''}VIP</button>` +
       `<span class="f-note">A VIP's messages are worked by a model the moment they arrive, on every channel of theirs.</span></div>` +
-      `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy}>Save the contact</button>` +
+      `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy || (blocked ? ' disabled' : '')}>Save the contact</button>` +
       `<button class="btn" data-act="contact-cancel"${busy}>Cancel</button>` +
       `<span class="f-note">Their next message reaches triage as a known sender.</span></div>` +
+      // The form's own problems show here, where the eye is, not below the sheet.
+      (this._error ? `<div class="err">${esc(this._error)}</div>` : '') +
       `</div></div>`;
   }
 
@@ -694,6 +705,9 @@ class RetinueAttentionSheet extends HTMLElement {
         (item.preview ? `<div class="body">${esc(item.preview)}</div>` : '') +
         `<div class="fields">` +
         (item.unknown_sender || this._form ? contactField : '') +
+        // While the card is open it is the whole question: the fields below
+        // would ask the same things (spheres, a permit) a second time.
+        (this._form ? '' :
         `<div class="field"><div class="f-label">Importance</div><div class="f-value">${esc(item.importance_text)}</div>` +
         `<div class="f-ctl"><button class="btn tiny" data-act="imp" data-delta="-1"${busy}>−</button>` +
         `<button class="btn tiny" data-act="imp" data-delta="1"${busy}>+</button>` +
@@ -704,10 +718,10 @@ class RetinueAttentionSheet extends HTMLElement {
         `<div class="f-ctl">${sphereSel}<span class="f-note">${item.sender ? `remembered for ${esc(item.sender)}` : 'this item'}</span></div>` +
         `<div class="f-ctl">${furtherBtns}<span class="f-note">further spheres — each counts for a mode like the first</span></div></div>` +
         `<div class="field"><div class="f-label">Delivery</div><div class="f-value">level <span class="lvl" style="color:${LEVEL_COLORS[lvl] || '#9aa5b1'}">${esc(lvl)}</span> · ${esc(item.delivery)}</div>` +
-        `<div class="f-ctl">${permitBtn}${admitBtn}<span class="f-note">a Focus rule of ${esc(mode.name)} — importance untouched</span></div></div>` +
+        `<div class="f-ctl">${permitBtn}${admitBtn}<span class="f-note">a Focus rule of ${esc(mode.name)} — importance untouched</span></div></div>`) +
         (item.unknown_sender || this._form ? '' : contactField) +
-        `</div>${actions}${learned}${effect}` +
-        (this._error ? `<div class="err">${esc(this._error)}</div>` : '');
+        `</div>${this._form ? '' : actions}${learned}${effect}` +
+        (this._error && !this._form ? `<div class="err">${esc(this._error)}</div>` : '');
     }
     root.innerHTML = `<style>${CSS}</style><div class="overlay"><div class="sheet" role="dialog" aria-modal="true">${inner}</div></div>`;
   }

@@ -112,7 +112,7 @@ and the `kb:` terms the rest of Retinue already uses.
 | Channel | Stored as | Also derived |
 |---|---|---|
 | `email` | `vcard:hasEmail <mailto:…>` (lowercased) | — |
-| `sms` | `vcard:hasTelephone <tel:…>` (E.164 only) | — |
+| `sms` | a number: `vcard:hasTelephone <tel:…>` (E.164 only); an alphanumeric sender ID (a bank's `HBL`, at most 11 characters with a letter): `foaf:OnlineAccount` with `kb:channel "sms"` | — |
 | `signal` | `foaf:OnlineAccount`, homepage `https://signal.org/` | for a phone handle: `tel:`, and `sgnl://signal.me/#p/<E.164>` |
 | `whatsapp` | `foaf:OnlineAccount`, homepage `https://www.whatsapp.com/` | for a phone handle: `tel:`, and `https://wa.me/<digits>` |
 | `telegram` | `foaf:OnlineAccount`, homepage `https://telegram.org/` | for a username: `https://t.me/<name>` |

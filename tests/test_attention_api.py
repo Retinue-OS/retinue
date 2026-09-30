@@ -698,6 +698,21 @@ def test_review_fixes(base, wg):
     print("ok test_review_fixes")
 
 
+def test_sms_sender_id_card(base, wg):
+    """A bank texting from an alphanumeric sender ID ("HBL") gets a contact
+    card like anyone: the sheet offers the chambers, and saving files it."""
+    _inbound(base, "HBL", None, "3DSecure Check: 73.10 CHF.", "2026-09-05T15:00:00Z",
+             gate={"forward": True, "vip": False, "reason": "open"}, channel="sms")
+    chat = "sms:HBL"
+    status, sheet = _http(base, "GET", "/attention/item?id=" + urllib.parse.quote("chat:" + chat, safe=""))
+    assert status == 200 and sheet["contact_book"]["chambers"] == ["private"], sheet.get("contact_book")
+    status, out = _http(base, "POST", f"/chats/{urllib.parse.quote(chat, safe='')}/contact",
+                        {"name": "HBL", "sphere": "admin", "chamber": "private"})
+    assert status == 200 and out["person"]["handles"] == [{"channel": "sms", "handle": "HBL"}], out
+    _http(base, "POST", "/attention/items/done", {"id": "chat:" + chat})
+    print("ok test_sms_sender_id_card")
+
+
 def test_legacy_cards_are_filed(base, wg):
     """A card of the earlier, chamber-less kind — a name on the chat document
     and one generated Turtle file — is filed as a person in the default
@@ -1386,6 +1401,7 @@ def main():
         test_one_person_many_channels(base, wg)
         test_a_person_carries_attention_and_vip(base, wg)
         test_review_fixes(base, wg)
+        test_sms_sender_id_card(base, wg)
         test_legacy_cards_are_filed(base, wg)
         test_a_message_judgement_is_its_own(base, wg)
         test_vip_always_rings(base, wg)

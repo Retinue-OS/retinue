@@ -78,7 +78,12 @@ def test_handles():
     assert contacts.normalize_handle("whatsapp", "123456@lid") == ("whatsapp", "123456@lid")
     assert contacts.normalize_handle("matrix", "@mara:example.org") == ("matrix", "@mara:example.org")
     assert contacts.parse_handle("telegram:@mara_k") == ("telegram", "@mara_k")
-    for bad in (("email", "no-at-sign"), ("sms", "not a number"), ("Not A Channel", "x"), ("signal", " ")):
+    # An SMS alphanumeric sender ID (a bank's "HBL") is a handle too; a
+    # national number without its country code is still refused.
+    assert contacts.normalize_handle("sms", " HBL ") == ("sms", "HBL")
+    assert contacts.normalize_handle("sms", "TWINT-Info") == ("sms", "TWINT-Info")
+    for bad in (("email", "no-at-sign"), ("sms", "not a number at all"), ("sms", "079 123 45 67"),
+                ("Not A Channel", "x"), ("signal", " ")):
         try:
             contacts.normalize_handle(*bad)
             raise AssertionError(f"accepted {bad}")
@@ -139,6 +144,26 @@ def test_create_find_update(chambers, manifest):
     except contacts.ContactError:
         pass
     print("ok test_create_find_update")
+
+
+def test_sms_sender_id(chambers, manifest):
+    """A sender ID is an account on the SMS channel — not a telephone — found
+    by its handle, owned by one person, and a VIP's reaches the SMS gate."""
+    book = contacts.ContactBook(chambers, manifest)
+    bank = book.create("work", "HBL", [("sms", "HBL")], vip=True)
+    assert bank["accounts"] == [("sms", "HBL")] and bank["phones"] == [], bank
+    assert {"channel": "sms", "handle": "HBL"} in contacts.handles_of(bank)
+    text = (chambers / bank["path"]).read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#channel> "sms"' in text and "tel:" not in text, text
+    assert book.find("sms", "HBL")["key"] == bank["key"]
+    try:
+        book.create("work", "Another bank", [("sms", "HBL")])
+        raise AssertionError("a sender ID was claimed twice")
+    except contacts.ContactError as exc:
+        assert exc.status == 409
+    assert "HBL" in contacts.policy_projection(book)[0]["sms"]
+    book.delete(bank["key"])
+    print("ok test_sms_sender_id")
 
 
 def test_hand_written_person(chambers, manifest):
@@ -264,6 +289,7 @@ def main():
         test_locations(chambers, manifest)
         test_handles()
         test_create_find_update(chambers, manifest)
+        test_sms_sender_id(chambers, manifest)
         test_hand_written_person(chambers, manifest)
         test_attention_and_vip(chambers, manifest)
         test_cli(chambers, manifest)
