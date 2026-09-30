@@ -19,7 +19,7 @@
 //   GET  /projects/item?id=…   -> {id, title, path, markdown, sha256}
 //   POST /projects/item        -> save {id, content, base_sha}
 //   POST /conversations        -> quick edit command ({kind:"edit", project})
-//   GET  /conversations?all&project=…      -> the project's threads (kind chat)
+//   GET  /conversations?all=1&project=…    -> the project's threads (kind chat)
 
 import { esc, fmtAge } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
@@ -116,6 +116,7 @@ class RetinueProjectPage extends HTMLElement {
     this._id = new URLSearchParams(location.search).get('id') || '';
     this._item = null;       // {id, title, path, markdown, sha256}
     this._threads = [];      // the project's conversation summaries, newest first
+    this._threadsState = 'loading'; // loading | ok | failed
     this._state = 'loading'; // loading | ok | missing | offline
     this._mode = 'view';     // view | edit
     this._draft = '';        // editor content while in edit mode
@@ -169,12 +170,19 @@ class RetinueProjectPage extends HTMLElement {
       if (!document.hidden && this._mode === 'view') this.load();
     };
     document.addEventListener('visibilitychange', this._onVisible);
+    // Back from a thread, the browser may restore this page from its
+    // back/forward cache — as it was before that thread existed. Reload.
+    this._onPageShow = (e) => {
+      if (e.persisted && this._mode === 'view') this.load();
+    };
+    window.addEventListener('pageshow', this._onPageShow);
   }
 
   disconnectedCallback() {
     if (this._shelfRelease) this._shelfRelease();
     this._shelfRelease = null;
     document.removeEventListener('visibilitychange', this._onVisible);
+    window.removeEventListener('pageshow', this._onPageShow);
     if (this._applyTimer) clearTimeout(this._applyTimer);
     this._stopRecording();
     this._wave.stop();
@@ -204,12 +212,18 @@ class RetinueProjectPage extends HTMLElement {
   // reachable from its own confirmation and under the Edits filter.
   async _loadThreads() {
     try {
-      const res = await fetch(`/conversations?all&project=${encodeURIComponent(this._id)}`,
+      // `all=1`, not a bare `all`: the gateway's query parser drops blank
+      // values, which silently left the archived threads out.
+      const res = await fetch(`/conversations?all=1&project=${encodeURIComponent(this._id)}`,
         { cache: 'no-store' });
-      if (!res.ok) return;
+      if (!res.ok) throw new Error(String(res.status));
       const body = await res.json();
       this._threads = Array.isArray(body.conversations) ? body.conversations : [];
-    } catch (_err) { /* offline — keep the last list */ }
+      this._threadsState = 'ok';
+    } catch (_err) {
+      // Keep the last list; say so only when there is none to show.
+      if (this._threadsState !== 'ok') this._threadsState = 'failed';
+    }
   }
 
   // ── Direct editing ─────────────────────────────────────────────────────────
@@ -584,7 +598,14 @@ class RetinueProjectPage extends HTMLElement {
   _threadsHtml() {
     const active = this._threads.filter((t) => !t.archived);
     const archived = this._threads.filter((t) => t.archived);
-    if (!active.length && !archived.length) return '';
+    // Always present, so an empty list reads as "none yet", never as missing.
+    if (!active.length && !archived.length) {
+      const note = this._threadsState === 'failed' ? "Couldn't load this project's threads."
+        : this._threadsState === 'loading' ? 'Loading …'
+          : 'None yet — "Discuss with Ara" starts one.';
+      return `<div class="threads"><div class="threads-head">Threads</div>`
+        + `<p class="muted threads-none">${esc(note)}</p></div>`;
+    }
     const row = (t) => {
       const age = fmtAge(t.updated);
       const unread = t.unread ? '<span class="dot" aria-label="Unread"></span>' : '';
@@ -785,6 +806,7 @@ const CSS = `
   .threads { display: flex; flex-direction: column; gap: 6px; padding: 10px 0 2px; }
   .threads-head { font-size: .72rem; font-weight: 600; color: var(--muted, #8b93a3);
                   text-transform: uppercase; letter-spacing: .04em; }
+  .threads-none { font-size: .82rem; margin: 0; }
   .thread-rows { display: flex; flex-direction: column; gap: 4px; }
   .list .thread-rows { padding: 0 6px 6px; }
   .thread-row { display: flex; align-items: center; gap: 8px; padding: 7px 12px;
