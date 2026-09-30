@@ -148,7 +148,9 @@ Rules: **reinforce, don't duplicate; challenge, don't edit.** Store memories
 as they arise and before ending a session that learned something. Recall at
 the start of non-trivial work and **when dispatching a subagent** — subagents
 start cold, so include the relevant memories in the dispatch prompt (`recall`
-output is prompt-ready). What does *not* belong: data that already enters the
+output is prompt-ready). A standing instruction the user gives about one
+sender is tagged `sender:<address or handle>` (or `sender:<domain>`) so triage
+finds it — pass the raw value, `memory.py` slugs it. What does *not* belong: data that already enters the
 store through a chamber, and never secrets — the store is readable by every
 agent. `RETINUE_MEMORY=0` disables the mechanism. **This store is the only
 memory**: Claude Code's built-in auto memory is disabled deployment-wide — do
