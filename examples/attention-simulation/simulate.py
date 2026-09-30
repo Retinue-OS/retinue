@@ -192,11 +192,12 @@ class MockStore(BaseHTTPRequestHandler):
                     latest[r["chat"]] = r
             for r in latest.values():
                 rows.append(self._row(r, with_chat=True))
-        elif "GRAPH ?g" in query and "k:Project" in query:
+        elif (m := re.search(r"GRAPH \?g \{ <([^>]+)> rdf:type k:Project", query)):
             # The project page's lookup: which chamber file holds this
-            # project — the one the runner wrote at midnight.
-            m = re.search(r"GRAPH \?g \{ <([^>]+)> rdf:type k:Project", query)
-            p = next((p for p in story.PROJECTS if m and p["id"] == m.group(1)), None)
+            # project — the one the runner wrote at midnight. Told apart from
+            # the projects list by its concrete subject IRI: the list query
+            # reads from a GRAPH block too, with ?p as the subject.
+            p = next((p for p in story.PROJECTS if p["id"] == m.group(1)), None)
             if p is not None:
                 rows = [{"g": cell(self.sim.wg.QLEVER_GRAPH_BASE + project_path(p)), "title": cell(p["title"])}]
         elif "k:Project" in query:

@@ -163,7 +163,7 @@ ANTHROPIC_CUSTOM_HEADERS=x-litellm-api-key: Bearer sk-retinue-...
 RETINUE_CLAUDE_MODEL=retinue-claude
 RETINUE_GATEWAY_USES_CLAUDE_OAUTH=true
 LITELLM_MASTER_KEY=sk-retinue-...
-LITELLM_PRIMARY_MODEL=anthropic/claude-opus-5
+LITELLM_PRIMARY_MODEL=anthropic/claude-opus-5-5
 LITELLM_FALLBACK_MODEL=openrouter/anthropic/claude-sonnet-4
 OPENROUTER_API_KEY=sk-or-v1-...
 ```
@@ -425,12 +425,19 @@ user's own linked number stays `verify`.
 # Recipients matched by a verify/trust policy return a pending-approval notice
 scripts/signal-push.py --recipient +15551112222 "Draft reply to review"
 # → signal-push: send queued for approval (id=…)
+#   signal-push: take it back before approval with signal-push.py --retract …
 #   signal-push: approve or deny at https://agents.example.com/sends/signal-gateway/…
+
+# Retract it before the user decides (every push CLI takes --retract)
+scripts/signal-push.py --retract <id>
 ```
 
 Pending Signal sends appear on `/sends` alongside e-mail approvals; the
 web-gateway fetches them from the signal-gateway's token-gated `/pending-sends`
 API (`SIGNAL_GATEWAY_BASE_URL`) and proxies the allow/deny action back to it.
+The agent's own `--retract` goes straight to the gateway
+(`POST /pending-sends/<id>/retract`, status `retracted`); see
+`docs/messaging.md`, "Retracting a queued send".
 Approval is **asynchronous** on all messenger gateways: the gateway answers
 `status: sending` immediately and delivers in the background, and the approval
 page live-refreshes until the terminal status — so a slow send (a large

@@ -277,7 +277,9 @@ them — a plan left with none is gone — and the patch is refused while a
 weekday would be in no plan or two. Ara makes these changes when asked, with
 `scripts/attention-week.py` (the week and today's plan; `holiday add
 2026-12-24..2027-01-02 --name Christmas`; `plan Friday --days fri
---schedule "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"`). A
+--schedule "07:00 chores, 08:00 focused, 14:00 social, 22:00 rest"`), and
+puts one sphere within another with `scripts/attention-spheres.py` (`within
+acme customers`: whatever admits customers admits Acme too). A
 `focus.json` from before the week keeps its one schedule for every day, as an
 *Every day* plan — unless it was the shipped schedule, which gives way to
 the shipped week. A document is healed as it is read
@@ -408,7 +410,11 @@ over SPARQL). Whatever the source, `id` is passed to `claude --model`. The
 list carries only concrete models — no synthetic "Default" row: the entry the
 gateway's configured default resolves to (through LiteLLM's route aliases)
 is flagged `default: true` and labeled as the default, and a thread without a
-stored choice runs that default (stored as the empty string internally).
+stored choice runs that default (stored as the empty string internally). A
+default no picker route names (say a newer model reached only through the
+`claude-*` wildcard) is added as a row of its own under its concrete id, so the
+picker always names a real model; give it a picker route in
+`litellm/config.yaml` for a friendlier label.
 The dashboard reads the list from `GET /conversation-models` and
 persists a thread's choice via `POST /conversations/<id>/model` — an id not on
 the offered list is ignored (the thread falls back to the default), so a client
@@ -423,18 +429,45 @@ the dashboard — e.g. an e-mail attachment (a PDF invoice) forwarded into a
 thread, so it's reachable without an e-mail client. Pass `--attach PATH`
 (repeatable) to `conversation-push.py`; the file is stored beside the thread
 (under `CONVERSATIONS_DIR/attachments/<id>/`, keyed by a server-generated id so
-untrusted filenames never touch the filesystem) and rendered as a download link
-in the message bubble, served by `GET /conversations/<id>/attachments/<att-id>`
-behind the dashboard's own auth. Prefer this over pushing a document via Signal
-when the user is already working in the dashboard.
+untrusted filenames never touch the filesystem) and rendered as a link in the
+message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
+the dashboard's own auth. Prefer this over pushing a document via Signal when
+the user is already working in the dashboard.
+
+Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
+AVIF — never SVG, which is script in the dashboard's origin) also **preview in
+the bubble**: a lazy-loaded `<img>` at its true aspect ratio, capped in width
+and height, linking to the full view (`?inline=1`), with the name row and the
+↓ save link beneath. The gateway records an image's intrinsic size when it
+stores it, so the preview's box is reserved before the bytes arrive and a
+thread never jumps while it loads (older records without a size get a fixed
+frame). This is the thread's own same-origin attachment, not a remote fetch:
+the Markdown renderer's no-remote-images rule is unaffected.
 
 To deliver a file into a thread that **already exists** — rather than stranding
 it in a fresh tab the user has to go find — pass `--thread <id>` (the thread id
 from the conversation URL). It posts to the token-gated
 `POST /internal/conversations/<id>/messages`, appending an agent message with
-the attachments and marking the thread unread. Note that Ara's own reply to a
-thread is appended by the gateway *after* her session ends and carries no
-attachments, so a file must be pushed as its own message this way.
+the attachments and marking the thread unread. Use this to post into *another*
+thread, or from a session that is not answering one.
+
+To attach a file to **Ara's own reply** in the thread her turn is answering,
+use `conversation-push.py --reply-attach PATH` (repeatable, nothing else on the
+line). That reply is appended by the gateway *after* her session ends, so the
+CLI makes no request: for every dashboard-thread turn the gateway hands the
+session a fresh manifest path in `RETINUE_REPLY_ATTACHMENTS_FILE` (a per-spawn
+value in `scripts/session_env.py`, never inherited), the CLI appends absolute
+paths to it, and when the turn ends the gateway reads the manifest, copies
+each file into the thread's attachment store through the same function every
+other attachment goes through, and puts them on the reply message — rendered
+at its end, like any attachment. Each entry must be an absolute path to a
+non-empty regular file within the attachment size limit (at most 20 per
+reply); anything else is logged and skipped, never costing the reply itself.
+A reply may be files only — it is then stored without text. The manifest is
+fresh per spawn and read only for the run whose reply is kept, so when Ara
+junior escalates, the files her discarded run listed are discarded with it.
+Outside a thread turn the variable is unset and the CLI refuses, pointing at
+`--thread <id> --attach`.
 
 Attachments go **both ways**: the user can attach files to their own messages
 from the composer (a paperclip button on the input row), or **paste** them into
@@ -500,6 +533,19 @@ python3 /workspace/scripts/conversation-push.py --thread <id> --archive --mute
 The behavioural rule this implies for Ara — Archive-click vs "archive this" —
 is in `CLAUDE.md`, since it applies on ordinary turns.
 
+## The shelf (minimized pages)
+
+Threads, chats and projects can be minimized to a shelf at the foot of every
+page and reopened where they were left; a thread or chat the user leaves while
+Ara is still answering goes there by itself, marked `···` until her answer
+lands and then with a green dot. Nothing server-side: the shelf is per device
+and browser (`localStorage`, shared by its tabs) and reads the existing
+conversation and chat APIs. The rules (one item per page, automatic items
+living for one turn, Close suppressing re-adding for that turn, capacity
+evicting quiet items only, archive/mute) and the mechanics are in
+`webapp/README.md`, "The shelf: minimized pages"; the size is a setting on the
+settings page. Design and acceptance criteria: issue #282.
+
 ## Project pages and edit threads
 
 Every project on the projects card has its **own page**
@@ -514,7 +560,10 @@ to Ara as a conversation of **kind `edit`** linked to the project: apply the
 change to the project file and confirm in one short sentence. Edit threads are
 marked as such and hidden from the default conversation list (they stay under
 the Edits filter); "Discuss with Ara" on a project page starts a normal,
-visible thread whose engage prompt points Ara at the project file.
+visible thread whose engage prompt points Ara at the project file. The link
+runs both ways: such a thread carries an "About: <project>" chip back to the
+project page, and the project page lists the project's threads (open ones
+first, archived folded) so an ongoing discussion is picked up, not restarted.
 
 ## Speech-to-text (the `stt` service) and voice input
 

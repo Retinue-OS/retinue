@@ -22,9 +22,9 @@ model_list:
   # /model/info expands a wildcard into one entry per known matching model,
   # each copy carrying the same model_info — so a flagged wildcard floods the
   # picker with identically-labeled entries.
-  - model_name: claude-opus-5
+  - model_name: claude-opus-5-5
     litellm_params:
-      model: anthropic/claude-opus-5
+      model: anthropic/claude-opus-5-5
     model_info:
       retinue_picker: true
       retinue_label: Opus (deepest reasoning)

@@ -267,6 +267,32 @@ def test_default_flagged_on_concrete_entry(wg):
         wg._record_route_upstreams(_model_info_response())
 
 
+def test_unoffered_default_gets_its_own_row(wg):
+    # The configured default is served (via the claude-* wildcard) but no
+    # picker route names it: the picker must still name the model unpinned
+    # threads run, as its own row, never fall back to a bare "Default".
+    wg.DASHBOARD_MODEL = "claude-opus-5-5"
+    try:
+        wg._fetch_litellm_models = lambda: [
+            {"id": "anthropic/claude-opus-5", "label": "Opus (deepest reasoning)"},
+            {"id": "anthropic/claude-sonnet-5", "label": "Sonnet (balanced)"},
+        ]
+        models = wg._conversation_models(force=True)
+        assert models == [
+            {"id": "claude-opus-5-5", "label": "claude-opus-5-5 (default)",
+             "default": True},
+            {"id": "anthropic/claude-opus-5", "label": "Opus (deepest reasoning)"},
+            {"id": "anthropic/claude-sonnet-5", "label": "Sonnet (balanced)"},
+        ], models
+        # Picking it explicitly is a valid pin.
+        assert wg._model_offered("claude-opus-5-5")
+        # Nothing offered stays nothing: the picker hides, no lone default row.
+        wg._fetch_litellm_models = lambda: []
+        assert wg._conversation_models(force=True) == []
+    finally:
+        wg.DASHBOARD_MODEL = ""
+
+
 def test_envelope_model_name_resolves_route_label(wg):
     # The claude -p envelope reports the LiteLLM route it was called with; the
     # bubble header must name the concrete model that answered, not the route.
@@ -420,6 +446,7 @@ def main() -> None:
         test_merge_replaces_stale_ollama_catalog(wg)
         test_dynamic_list_has_no_default_entry(wg)
         test_default_flagged_on_concrete_entry(wg)
+        test_unoffered_default_gets_its_own_row(wg)
         test_envelope_model_name_resolves_route_label(wg)
         test_static_fallback_when_litellm_empty_or_down(wg)
         test_last_good_survives_refresh_failure(wg)

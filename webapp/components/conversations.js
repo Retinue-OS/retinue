@@ -399,9 +399,12 @@ class RetinueConversations extends HTMLElement {
   }
 
   // An open thread: the conversation element, with a back button that this
-  // card answers by unwinding the history entry it pushed.
+  // card answers by unwinding the history entry it pushed. It feeds the shelf
+  // (issue #282): a minimize button parks it there, and leaving it while Ara
+  // is still answering parks it by itself.
   _threadView() {
-    return `<retinue-conversation conversation-id="${esc(this._active)}" back></retinue-conversation>`;
+    return `<retinue-conversation conversation-id="${esc(this._active)}" back shelf shelf-leave minimize>` +
+      `</retinue-conversation>`;
   }
 
   // The new-thread composer: the same element with no thread yet. Coming from
@@ -411,7 +414,9 @@ class RetinueConversations extends HTMLElement {
     const project = this._composeProject
       ? ` for-project="${esc(this._composeProject)}" project-title="${esc(this._composeProjectTitle)}"`
       : '';
-    return `<retinue-conversation back${project}></retinue-conversation>`;
+    // `shelf` here too: the thread the first message opens goes on as this
+    // element, and from then on it is a thread like any other.
+    return `<retinue-conversation back shelf shelf-leave minimize${project}></retinue-conversation>`;
   }
 
   _listView() {

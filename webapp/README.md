@@ -10,8 +10,9 @@ a Progressive Web App on the phone home screen.
   configuration: it declares the active cards and app-launch buttons.
 - **A conversation** (`components/conversation.js`) is one element,
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
-  buttons on quotes and code, click-to-fill chips, attachments, model and
-  cost meta), the pending state while Ara answers, the composer with text,
+  buttons on quotes and code, click-to-fill chips, attachments — images the
+  gateway serves inline get a preview in the bubble, sized from the dimensions it
+  recorded at store time — model and cost meta), the pending state while Ara answers, the composer with text,
   file attachments (picked or pasted) and voice dictation, the model picker,
   and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
   any host). Given a
@@ -88,8 +89,10 @@ title, preview, href, sphere, tags, sender, channel, group, agent, count,
 unread, pending, level, critical, importance, importance_from, importance_text,
 due, lead (minutes), lead_from, kind_label, urgency, delivery, reason, actor,
 waiting_since, state, released, snoozed_until, pushed, digest_at, permit, admits_sphere,
-admission: {by: vip|project|scope|sphere|tag, what} | null}` — `admission` is the rule of the
-mode in force that lets the row through, which the details sheet's switch changes.
+admission: {by: vip|project|scope|sphere|tag, what, via?} | null}` — `admission` is the rule of the
+mode in force that lets the row through, which the details sheet's switch changes;
+`via` names the item's own sphere when `what` is one it lies within, and the sheet
+then offers no switch (it would change the rule for everything the outer sphere holds).
 The home shows what the unseen digest released first, on every device, until
 *Done* on any of them; `/?digest=<time>` — the digest push's link — shows that
 digest even once seen.
@@ -441,6 +444,52 @@ existing thread, the rest carry `companion: null`. Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
 
+## The shelf: minimized pages
+
+A thread, a chat or a project can be **minimized** (the `–` in its bar) onto
+the shelf at the foot of every page (`components/shelf.js`, issue #282), and
+reopened from there where it was left. A thread or chat the user **leaves while
+Ara is still answering** goes onto the shelf by itself, so waiting for an answer
+never means coming back to check. Every page carries `<retinue-shelf>` as the
+last child of `<main>`: a row of icons on a phone (no labels; long press,
+right-click or the context-menu key opens *Open · Close · Close all quiet
+ones*), a taskbar of chips with titles on a wide screen.
+
+Markers, two corners: top right a chat's unread count (blue); bottom right
+Ara — `···` while she works (outlined, never animated) and a green dot once she
+has answered. When the answer lands the dots gather into the dot once.
+
+All rules live in `components/shelf-store.js`, a pure reducer over one item per
+key (`thread:<id>` · `chat:<id>` · `project:<uri>`) with independent membership
+(`origin: explicit | automatic`) and status (`pending`, `lastAraTs`, `seenTs`,
+`unread`), pinned by `tests/test_webapp_shelf.py`:
+
+- Explicit wins over automatic. An automatic item lives only for the turn that
+  created it: it leaves once that answer has actually been on screen (in the
+  viewport of a visible tab — for a chat, in the companion pane, not the mirror).
+- *Close* on a working item suppresses re-adding for that same turn.
+- Capacity (*Shelf size* on the settings page, default 5) evicts only quiet
+  items (no marker), least recently used first; items with a marker are never
+  dropped, so the shelf may hold more than its size and shrinks back as they go
+  quiet.
+- Projects are plain parked pages, never with an Ara state.
+- Archiving drops an automatic item (and suppresses it for the running turn);
+  archive + mute drops any item.
+- Restoring reopens the page with current data and only puts the place back
+  (pane; the first message in view by its `ts`/id plus an offset; a project's
+  scroll position) — handed from the shelf to the next page load of that tab
+  through `sessionStorage`.
+
+The shelf is per device and browser: `localStorage`, shared by all tabs, which
+follow each other's changes through the `storage` event. It is event-driven
+first — a page showing an item (`<retinue-conversation shelf-key=…>`, the chat
+page, the project page) feeds its facts as it reads and marks the key as the
+current page — and reads only the items no page in the tab is showing
+(`GET /conversations/<id>`, `GET /chats`), every 4 s while one is waiting on
+Ara and every 20 s otherwise, never in a hidden tab. A thread's unsent draft
+still lives only in page memory, so it survives a minimize within the same page
+but not a reload.
+
 ## Markdown rendering
 
 All Markdown shown by the dashboard — conversation bubbles and project pages —
@@ -484,6 +533,14 @@ weight:
 3. **Discuss with Ara** — opens the conversation composer pre-linked to the
    project (`#new?project=…&title=…`). The resulting thread is a normal,
    visible conversation whose engage prompt points Ara at the project file.
+
+The link runs both ways. A thread linked to a project shows an
+**About: <project>** chip above its messages that opens the project page, and
+the project page lists the project's threads above its notes
+(`GET /conversations?all&project=<uri>`): open ones as rows (unread dot, last
+activity), archived ones folded. Edit-command threads are left out of that
+list — each is one applied change, reachable from its confirmation and under
+the Edits filter.
 
 ## News
 

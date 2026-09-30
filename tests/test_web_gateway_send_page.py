@@ -113,6 +113,18 @@ def test_error_page_shows_gateway_error():
         assert "usync query timed out" in out
 
 
+def test_retracted_page_says_the_agent_took_it_back():
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        out = wg._render_channel_send_html(_detail("retracted"), "whatsapp-gateway", "a" * 32, None)
+        assert 'class="cross"' in out
+        # The visible note, not a gateway error.
+        assert ('<p id="st-note" class="meta">The agent retracted this message '
+                "before approval; nothing was sent.</p>") in out
+        event = wg._render_channel_send_html(_event("retracted"), "caldav-gateway", "a" * 32, None)
+        assert "retracted this event before approval" in event
+
+
 def test_approval_page_skip_only_with_next():
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp))
@@ -517,6 +529,7 @@ def main() -> int:
              test_sending_page_with_next_shows_button,
              test_approved_page_shows_check_and_advances,
              test_error_page_shows_gateway_error,
+             test_retracted_page_says_the_agent_took_it_back,
              test_approval_page_skip_only_with_next,
              test_event_approval_page_shows_the_event,
              test_event_without_description_says_so,

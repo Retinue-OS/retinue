@@ -213,26 +213,33 @@ def test_gateway_client_suffixes_cover_deployment_added_gateways():
 
 def test_per_spawn_stamps_are_never_inherited():
     src = _source(RETINUE_SESSION_MODEL="stale-model",
-                  RETINUE_ESCALATE_FILE="/tmp/stale-flag")
+                  RETINUE_ESCALATE_FILE="/tmp/stale-flag",
+                  RETINUE_REPLY_ATTACHMENTS_FILE="/tmp/stale-manifest")
     env = se.build(src)
     assert "RETINUE_SESSION_MODEL" not in env
     assert "RETINUE_ESCALATE_FILE" not in env
-    env = se.build(src, model="sonnet", escalate_file=Path("/tmp/flag-1"))
+    assert "RETINUE_REPLY_ATTACHMENTS_FILE" not in env
+    env = se.build(src, model="sonnet", escalate_file=Path("/tmp/flag-1"),
+                   reply_attachments_file=Path("/tmp/manifest-1"))
     assert env["RETINUE_SESSION_MODEL"] == "sonnet"
     assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-1"
+    assert env["RETINUE_REPLY_ATTACHMENTS_FILE"] == "/tmp/manifest-1"
     # An empty model is "no stamp", not the inherited one.
     assert "RETINUE_SESSION_MODEL" not in se.build(src, model="")
     # Nor can the escape hatch bring a stale one back: naming the stamp or
     # the flag there, verbatim or by wildcard, admits configuration only.
-    for extra in ("RETINUE_SESSION_MODEL,RETINUE_ESCALATE_FILE", "RETINUE_*"):
+    for extra in ("RETINUE_SESSION_MODEL,RETINUE_ESCALATE_FILE,"
+                  "RETINUE_REPLY_ATTACHMENTS_FILE", "RETINUE_*"):
         hatch = {**src, "RETINUE_SESSION_ENV_EXTRA": extra}
         env = se.build(hatch, model="")
         assert "RETINUE_SESSION_MODEL" not in env, extra
         assert "RETINUE_ESCALATE_FILE" not in env, extra
+        assert "RETINUE_REPLY_ATTACHMENTS_FILE" not in env, extra
         env = se.build(hatch, model="sonnet", escalate_file="/tmp/flag-2")
         assert env["RETINUE_SESSION_MODEL"] == "sonnet", extra
         assert env["RETINUE_ESCALATE_FILE"] == "/tmp/flag-2", extra
-    print("ok: the model stamp and the escalation flag are set per spawn, "
+    print("ok: the model stamp, the escalation flag and the reply manifest are "
+          "set per spawn, "
           "never inherited — not even through the escape hatch")
 
 

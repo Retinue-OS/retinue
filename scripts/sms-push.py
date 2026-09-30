@@ -27,6 +27,8 @@ import sys
 import urllib.error
 import urllib.request
 
+import pending_retract
+
 DEFAULT_URL = os.environ.get("SMS_GATEWAY_SEND_URL", "http://sms-gateway:8095/send")
 TOKEN = os.environ.get("SMS_GATEWAY_TOKEN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("SMS_GATEWAY_TIMEOUT", "60"))
@@ -34,7 +36,7 @@ DEFAULT_TIMEOUT = float(os.environ.get("SMS_GATEWAY_TIMEOUT", "60"))
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Push an SMS via the sms-gateway.")
-    parser.add_argument("message", help="message body")
+    parser.add_argument("message", nargs="?", default="", help="message body")
     parser.add_argument("--recipient", help="phone number (E.164, e.g. +41791234567). "
                                             "Defaults to the gateway's configured recipient.")
     parser.add_argument("--reply-to", metavar="TOKEN",
@@ -43,9 +45,16 @@ def main() -> int:
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this send; "
                              "bypasses the verify flow for 'trust'-category accounts")
+    parser.add_argument("--retract", metavar="REQUEST_ID",
+                        help="retract a queued send you created (the id printed when it "
+                             "was queued) before the user approves it; nothing is sent")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"gateway send URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()
+
+    if args.retract:
+        return pending_retract.retract("sms-push", args.url, args.retract, TOKEN,
+                                       args.timeout)
 
     if not args.message.strip():
         parser.error("provide a non-empty message")
@@ -71,6 +80,8 @@ def main() -> int:
             body = json.loads(resp.read().decode("utf-8"))
         if body.get("status") == "pending_approval":
             print(f"sms-push: send queued for approval (id={body.get('request_id', '?')})")
+            print(f"sms-push: take it back before approval with "
+                  f"sms-push.py --retract {body.get('request_id', '?')}")
             approval_url = body.get("approval_url", "")
             # Absolutize a relative approval path, as telegram-push.py does.
             if approval_url.startswith("/"):

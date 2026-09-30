@@ -532,7 +532,7 @@ services:
       # os.environ/LITELLM_PRIMARY_MODEL, so an unset variable is not a
       # fallback, it is a broken primary. Deployments that want a cheaper or
       # older default still set it in .env, which wins over this.
-      - LITELLM_PRIMARY_MODEL=${LITELLM_PRIMARY_MODEL:-anthropic/claude-opus-5}
+      - LITELLM_PRIMARY_MODEL=${LITELLM_PRIMARY_MODEL:-anthropic/claude-opus-5-5}
       # No default: OpenRouter slugs are the operator's to pick, and a wrong
       # guess here would only surface once the primary is already failing.
       - LITELLM_FALLBACK_MODEL=${LITELLM_FALLBACK_MODEL}

@@ -28,11 +28,13 @@ suffixes below. Deployments whose chamber scripts read variables the framework
 does not know about name them in RETINUE_SESSION_ENV_EXTRA (comma-separated;
 a trailing `*` admits a prefix) instead of editing this file.
 
-Two per-session values are never inherited, whatever the source holds:
+Three per-session values are never inherited, whatever the source holds:
 RETINUE_SESSION_MODEL (the model stamp scripts/memory.py records; a stale one
-would mislabel a session) and RETINUE_ESCALATE_FILE (Ara junior's escape
-hatch, docs/model-routing.md) — the spawner sets them per spawn through the
-`model` and `escalate_file` arguments.
+would mislabel a session), RETINUE_ESCALATE_FILE (Ara junior's escape hatch,
+docs/model-routing.md) and RETINUE_REPLY_ATTACHMENTS_FILE (the manifest a
+dashboard-thread turn lists the files for its own reply in, docs/dashboard.md)
+— the spawner sets them per spawn through the `model`, `escalate_file` and
+`reply_attachments_file` arguments.
 
 What this does NOT do: a session runs as the same uid as the daemons, so it can
 still read a daemon's /proc/<pid>/environ. Keeping the secrets out of the
@@ -162,7 +164,8 @@ SESSION_ENV_SUFFIXES: tuple[str, ...] = (
 SESSION_ENV_EXCLUDED: frozenset[str] = frozenset({"RETINUE_LITELLM_KEY"})
 
 # Never inherited: set per spawn (see build()).
-_PER_SPAWN: tuple[str, ...] = ("RETINUE_SESSION_MODEL", "RETINUE_ESCALATE_FILE")
+_PER_SPAWN: tuple[str, ...] = ("RETINUE_SESSION_MODEL", "RETINUE_ESCALATE_FILE",
+                               "RETINUE_REPLY_ATTACHMENTS_FILE")
 
 EXTRA_VAR = "RETINUE_SESSION_ENV_EXTRA"
 
@@ -213,7 +216,9 @@ def allowed(name: str, source: Mapping[str, str] | None = None) -> bool:
 
 
 def build(source: Mapping[str, str] | None = None, *, model: str = "",
-          escalate_file: "str | os.PathLike[str] | None" = None) -> dict[str, str]:
+          escalate_file: "str | os.PathLike[str] | None" = None,
+          reply_attachments_file: "str | os.PathLike[str] | None" = None,
+          ) -> dict[str, str]:
     """Return the environment for one spawned session.
 
     `source` is the spawner's environment (default os.environ); only the
@@ -221,7 +226,11 @@ def build(source: Mapping[str, str] | None = None, *, model: str = "",
     on as RETINUE_SESSION_MODEL (a session cannot introspect its own --model
     flag; empty means no stamp, never an inherited one). `escalate_file` hands
     Ara junior her escalation flag path as RETINUE_ESCALATE_FILE; None means
-    the session has nobody to escalate to.
+    the session has nobody to escalate to. `reply_attachments_file` hands a
+    dashboard-thread turn the manifest its reply's attachments are listed in
+    (conversation-push.py --reply-attach) as RETINUE_REPLY_ATTACHMENTS_FILE;
+    None means the session's reply is not a thread message that could carry
+    one.
 
     E-mail goes through the gateway's backend: whenever the spawner holds the
     EMAIL_BACKEND_TOKEN (the entrypoint always mints one in remote-control
@@ -236,6 +245,8 @@ def build(source: Mapping[str, str] | None = None, *, model: str = "",
         env["RETINUE_SESSION_MODEL"] = model
     if escalate_file is not None:
         env["RETINUE_ESCALATE_FILE"] = str(escalate_file)
+    if reply_attachments_file is not None:
+        env["RETINUE_REPLY_ATTACHMENTS_FILE"] = str(reply_attachments_file)
     if env.get("EMAIL_BACKEND_TOKEN"):
         port = env.get("WEB_GATEWAY_PORT", "8080")
         env["EMAIL_BACKEND_URL"] = f"http://localhost:{port}/internal/email"

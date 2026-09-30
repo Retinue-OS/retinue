@@ -29,6 +29,8 @@ import sys
 import urllib.error
 import urllib.request
 
+import pending_retract
+
 DEFAULT_URL = os.environ.get("CALDAV_GATEWAY_CREATE_URL", "http://caldav-gateway:8094/create-event")
 TOKEN = os.environ.get("CALDAV_GATEWAY_TOKEN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("CALDAV_GATEWAY_TIMEOUT", "30"))
@@ -36,11 +38,11 @@ DEFAULT_TIMEOUT = float(os.environ.get("CALDAV_GATEWAY_TIMEOUT", "30"))
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a calendar event via the caldav-gateway.")
-    parser.add_argument("summary", help="event title")
-    parser.add_argument("--start", required=True,
+    parser.add_argument("summary", nargs="?", default="", help="event title")
+    parser.add_argument("--start",
                         help="start date/time, ISO 8601 (e.g. 2026-09-03T14:00:00, or "
                              "2026-09-03 with --all-day)")
-    parser.add_argument("--end", required=True, help="end date/time, ISO 8601 (same format as --start)")
+    parser.add_argument("--end", help="end date/time, ISO 8601 (same format as --start)")
     parser.add_argument("--all-day", action="store_true",
                         help="create an all-day event (--start/--end are plain dates)")
     parser.add_argument("--description", default="", help="event description/notes")
@@ -50,9 +52,18 @@ def main() -> int:
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this event; "
                              "bypasses the verify flow for 'trust'-category accounts")
+    parser.add_argument("--retract", metavar="REQUEST_ID",
+                        help="retract a queued event you created (the id printed when it "
+                             "was queued) before the user approves it; nothing is added")
     parser.add_argument("--url", default=DEFAULT_URL, help=f"gateway create-event URL (default {DEFAULT_URL})")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="HTTP timeout in seconds")
     args = parser.parse_args()
+
+    if args.retract:
+        return pending_retract.retract("caldav-push", args.url, args.retract, TOKEN,
+                                       args.timeout, noun="event")
+    if not args.summary or not args.start or not args.end:
+        parser.error("an event needs a summary, --start and --end")
 
     payload: dict = {
         "summary": args.summary,
@@ -78,6 +89,8 @@ def main() -> int:
             body = json.loads(resp.read().decode("utf-8"))
         if body.get("status") == "pending_approval":
             print(f"caldav-push: event queued for approval (id={body.get('request_id', '?')})")
+            print(f"caldav-push: take it back before approval with "
+                  f"caldav-push.py --retract {body.get('request_id', '?')}")
             approval_url = body.get("approval_url", "")
             # The gateway returns an absolute URL only when SEND_APPROVAL_BASE_URL
             # is set on its side; otherwise it hands back a bare relative path.

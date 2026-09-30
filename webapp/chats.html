@@ -26,11 +26,15 @@
        chat's own page (chat.html) with the mirror and the companion pane. -->
   <script type="module" src="/components/chats.js"></script>
   <script type="module" src="/components/nav.js"></script>
+  <!-- The minimized pages: threads, chats and projects parked one tap away
+       (issue #282). Every page carries it as the last child of <main>. -->
+  <script type="module" src="/components/shelf.js"></script>
 </head>
 <body>
   <main>
     <retinue-nav current="chats"></retinue-nav>
     <retinue-chats full heading="Chats"></retinue-chats>
+    <retinue-shelf></retinue-shelf>
   </main>
 
   <script>

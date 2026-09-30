@@ -41,6 +41,18 @@ export const sphereColor = (s) => {
 
 const NEW_SPHERE = '__new__';
 
+// The name a chat already goes by, as a new contact's first guess: the push
+// name the messenger delivered ("Ludmila") is worth offering even when nobody
+// vouches for the sender, but the gateway's fallback — the raw handle, a
+// phone number, an `…@lid` id — is not a name, so the field starts empty.
+// Not compared against `sender`: a chat row's sender *is* its title.
+function chatName(item) {
+  const title = String((item && item.title) || '').trim();
+  if (!title || title === item.handle) return '';
+  if (title.includes('@') || !/\p{L}/u.test(title)) return '';
+  return title;
+}
+
 export async function addSphere(name) {
   const res = await fetch('/attention/spheres', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ add: name }),
@@ -421,7 +433,7 @@ class RetinueAttentionSheet extends HTMLElement {
     const card = (item && item.contact) || {};
     const book = (this._data && this._data.contact_book) || {};
     return {
-      name: card.name || (item && !item.unknown_sender ? item.title : '') || '',
+      name: card.name || chatName(item),
       sphere: card.sphere || (item && item.sphere !== 'unknown' ? item.sphere : ''),
       tags: [...(card.tags || [])],
       permit: false,
@@ -634,6 +646,11 @@ class RetinueAttentionSheet extends HTMLElement {
       if (adm && adm.by === 'tag') {
         admitBtn = `<button class="btn tiny on" data-act="tag" data-tag="${esc(adm.what)}" data-on="0"${busy}>` +
           `Stop admitting ${esc(adm.what)} in ${esc(mode.name)}</button>`;
+      } else if (adm && adm.via) {
+        // Admitted through a sphere its own lies within (acme within
+        // customers): the rule is the outer sphere's, and switching it off
+        // here would drop everything it holds, not just this item.
+        admitBtn = `<span class="f-note">${esc(mode.name)} admits ${esc(adm.what)}, which holds ${esc(adm.via)}</span>`;
       } else if (adm && adm.by === 'sphere') {
         // Whichever of the item's spheres the mode lists — a further one, too.
         admitBtn = `<button class="btn tiny on" data-act="admit" data-sphere="${esc(adm.what)}" data-on="0"${busy}>` +

@@ -148,8 +148,10 @@ Rules: **reinforce, don't duplicate; challenge, don't edit.** Store memories
 as they arise and before ending a session that learned something. Recall at
 the start of non-trivial work and **when dispatching a subagent** — subagents
 start cold, so include the relevant memories in the dispatch prompt (`recall`
-output is prompt-ready). What does *not* belong: data that already enters the
-store through a chamber, and never secrets — the store is readable by every
+output is prompt-ready). A standing instruction the user gives about one
+sender is tagged `sender:<address or handle>` (or `sender:<domain>`) so triage
+finds it — pass the raw value, `memory.py` slugs it. What does *not* belong:
+data that already enters the store through a chamber, and never secrets — the store is readable by every
 agent. `RETINUE_MEMORY=0` disables the mechanism. **This store is the only
 memory**: Claude Code's built-in auto memory is disabled deployment-wide — do
 not create `MEMORY.md`-style files.
@@ -217,8 +219,11 @@ defaults to `verify`, queued for approval on the dashboard's `/sends` page) —
 a queued send is not a failure, but it is **not done either**: the push script
 prints that send's own approval URL, and your reply relays it as a labeled
 link, so the user can approve without hunting for the page. Reporting a queue
-without the link leaves the message stuck. **An autonomous agent that hits a blocking
-error must push an alert to the user**, not just log. Channel liveness is
+without the link leaves the message stuck. A queued send you no longer want is
+taken back before approval with `--retract <id>` on any push CLI
+(`email_client.py retract` for e-mail) — never left for the user to deny.
+**An autonomous agent that hits a blocking error must push an alert to the
+user**, not just log. Channel liveness is
 monitored by the framework — never build ad-hoc checks; a dead-seeming channel
 is checked on `/gateways`, and `configured: false` is intentional, not broken.
 Accounts, policies, extra gateways, monitoring: `docs/messaging.md`.
@@ -235,8 +240,9 @@ The calendar is a gateway like a messenger, not a tool: credentials stay in
 - **Write with `scripts/caldav-push.py`** (`--start/--end`, `--all-day`,
   `--description`). Writes are gated by the same `allow`/`trust`/`verify` send
   policy as messages: a queued event is **not** in the calendar yet, so relay the
-  approval URL the script prints as a labeled link. Updating and deleting events
-  are not supported — say so rather than improvising.
+  approval URL the script prints as a labeled link; `--retract <id>` takes a
+  queued event back before approval. Updating and deleting events are not
+  supported — say so rather than improvising.
 
 Endpoints, semantics (window inclusivity, recurrence expansion, which calendars
 a read spans) and configuration: README, "Calendar (CalDAV)".
@@ -250,7 +256,8 @@ Open one from any agent:
 python3 /workspace/scripts/conversation-push.py --title "Party RSVP" \
   --importance 3 --due 2026-09-12 --kind invitation --sphere friends \
   "You've got an invite to Mara's party. Confirm and add to agenda, or decline?"
-# --attach PATH delivers files; --thread <id> appends to an existing thread
+# --attach PATH delivers files; --thread <id> appends to an existing thread;
+# --reply-attach PATH (alone) attaches a file to your own reply in this thread turn
 ```
 
 **Say how much it matters.** The dashboard's home is an attention list

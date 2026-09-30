@@ -17,7 +17,10 @@ credentials for its e-mail backend plus whatever else .env carries, and none
 of it may reach a session — a dashboard turn, the transcript cleanup or the
 presentation lint. The session gets the allowlist: the capability tokens, the
 model credential, e-mail routed through the backend, the model stamp set per
-spawn, and Ara junior's escalation flag only below the frontier tier.
+spawn, and Ara junior's escalation flag only below the frontier tier. A
+dashboard-thread turn also gets a reply-attachment manifest, fresh per spawn,
+so the files a discarded run (junior's, before an escalation) listed never
+reach the reply that is kept.
 
     python3 tests/test_web_gateway_claude_spawn.py
 """
@@ -175,7 +178,8 @@ _NEEDED = {"EMAIL_BACKEND_TOKEN": "email-cap", "WEB_GATEWAY_PORT": "8080",
            "NEWS_INGEST_TOKEN": "news-cap", "SIGNAL_GATEWAY_TOKEN": "signal-cap",
            "SPARQL_ENDPOINT_LIFE": "http://qlever-life:7001",
            "RETINUE_SESSION_MODEL": "stale-stamp",
-           "RETINUE_ESCALATE_FILE": "/tmp/stale-flag"}
+           "RETINUE_ESCALATE_FILE": "/tmp/stale-flag",
+           "RETINUE_REPLY_ATTACHMENTS_FILE": "/tmp/stale-manifest"}
 
 
 class _daemon_environment:
@@ -237,7 +241,30 @@ def test_dashboard_turn_env_is_allowlisted(wg):
     _assert_allowlisted(env)
     assert env["RETINUE_SESSION_MODEL"] == "sonnet"
     assert "RETINUE_ESCALATE_FILE" not in env, "senior has nobody to escalate to"
+    assert "RETINUE_REPLY_ATTACHMENTS_FILE" not in env, "not a thread turn"
     assert "--model" in cmd and "sonnet" in cmd
+
+
+def test_thread_turn_collects_reply_attachments(wg):
+    """A thread turn's session lists files in its own manifest; they come
+    back as reply_files and the manifest is gone afterwards."""
+    manifests = []
+
+    def attach_and_answer(cmd, **kwargs):
+        manifest = kwargs["env"]["RETINUE_REPLY_ATTACHMENTS_FILE"]
+        manifests.append(manifest)
+        Path(manifest).write_text("/tmp/a.png\n/tmp/b.pdf\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "", "session_id": "s-5"}), stderr="")
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = attach_and_answer
+    with _daemon_environment():
+        out = wg.send_message("chart please", session_key="env-reply",
+                              model="sonnet", reply_attachments=True)
+    assert out.get("reply_files") == ["/tmp/a.png", "/tmp/b.pdf"], out
+    assert manifests[0] != "/tmp/stale-manifest", manifests
+    assert not Path(manifests[0]).exists(), "manifest left behind"
 
 
 def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
@@ -278,6 +305,33 @@ def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
     assert "RETINUE_ESCALATE_FILE" in junior_env
     assert senior_env["RETINUE_SESSION_MODEL"] == "opus"
     assert "RETINUE_ESCALATE_FILE" not in senior_env
+
+    # With reply attachments: junior's listed file is discarded with her
+    # reply; only the re-run's own manifest counts.
+    spawns.clear()
+
+    def attach_escalate_then_answer(cmd, **kwargs):
+        spawns.append((cmd, kwargs))
+        manifest = Path(kwargs["env"]["RETINUE_REPLY_ATTACHMENTS_FILE"])
+        if len(spawns) == 1:
+            manifest.write_text("/tmp/junior.png\n", encoding="utf-8")
+            Path(kwargs["env"]["RETINUE_ESCALATE_FILE"]).touch()
+        else:
+            manifest.write_text("/tmp/senior.png\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "senior", "session_id": "s-6"}),
+            stderr="")
+
+    wg_tiered.subprocess.run = attach_escalate_then_answer
+    with _daemon_environment():
+        out = wg_tiered.send_message("harder", session_key="env-tiered-3",
+                                     reply_attachments=True)
+    assert out.get("escalated") is True, out
+    assert out.get("reply_files") == ["/tmp/senior.png"], out
+    junior_m, senior_m = (spawns[0][1]["env"]["RETINUE_REPLY_ATTACHMENTS_FILE"],
+                          spawns[1][1]["env"]["RETINUE_REPLY_ATTACHMENTS_FILE"])
+    assert junior_m != senior_m, "each spawn needs its own manifest"
+    assert not Path(junior_m).exists() and not Path(senior_m).exists()
 
 
 def _run_thread_turn(wg, *, escalated: bool = False, **conv_kwargs) -> str | None:
@@ -329,11 +383,14 @@ def test_dashboard_model_governs_threads_and_only_threads(wg_dashboard):
                                          {"id": "sonnet", "label": "Sonnet"}])
     assert marked[1].get("default") is True and "default" in marked[1]["label"]
     assert "default" not in marked[0]
-    # …and flags nothing at all rather than mislabelling another row when the
-    # configured model is not offered.
+    # …and, when the configured model is not offered, gets a row of its own
+    # rather than mislabelling another one or leaving the picker to show a
+    # bare "Default" that names no model.
     unoffered = wg_dashboard._mark_default([{"id": "opus", "label": "Opus"},
                                             {"id": "haiku", "label": "Haiku"}])
-    assert unoffered == [{"id": "opus", "label": "Opus"},
+    assert unoffered == [{"id": "sonnet", "label": "sonnet (default)",
+                          "default": True},
+                         {"id": "opus", "label": "Opus"},
                          {"id": "haiku", "label": "Haiku"}], unoffered
 
     # The lint's default tier is the router model, untouched by the split.
@@ -380,6 +437,7 @@ def main():
         test_first_attempt_does_not_sleep(wg)
         test_refreshes_credentials_once_before_the_first_attempt(wg)
         test_dashboard_turn_env_is_allowlisted(wg)
+        test_thread_turn_collects_reply_attachments(wg)
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
 
         wg_short = _load_gateway(

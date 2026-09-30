@@ -11,22 +11,32 @@
 //     with the sha of what was loaded, so a concurrent change by an agent or
 //     another device surfaces as a conflict instead of being clobbered.
 //  3. A real conversation: "Discuss with Ara" opens the dashboard composer
-//     pre-linked to this project (a normal, visible thread).
+//     pre-linked to this project (a normal, visible thread). The page lists
+//     the project's threads above its notes, so an ongoing discussion is
+//     picked up again rather than started twice.
 //
 // Data comes from the gateway:
 //   GET  /projects/item?id=…   -> {id, title, path, markdown, sha256}
 //   POST /projects/item        -> save {id, content, base_sha}
 //   POST /conversations        -> quick edit command ({kind:"edit", project})
-//   GET  /conversations?project=…&kind=all — the project's recent threads
+//   GET  /conversations?all&project=…      -> the project's threads (kind chat)
 
-import { esc } from './base.js';
+import { esc, fmtAge } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { shelf, goLive, takeRestore } from './shelf-store.js';
 
 const APPLY_POLL_MS = 3000;
 // Frontmatter keys that are rendered elsewhere (or meaningless to the user)
 // and therefore left out of the meta chips.
 const HIDDEN_FM_KEYS = new Set(['id', 'title']);
+// Frontmatter keys shown as a callout above the chips: what the project needs
+// next is the first thing to read on its page.
+const LEAD_FM_KEYS = ['current_next_action', 'next_action'];
+// Scalar values longer than this read better as a full-width row than a chip.
+const LONG_VALUE = 60;
+// Lists with more items than this collapse into a disclosure ("Emails · 14").
+const INLINE_LIST_MAX = 3;
 
 // Parse the leading --- fenced frontmatter block the way the chambers'
 // md2ttl converter does: scalar `key: value` lines plus simple `- item` lists.
@@ -36,7 +46,18 @@ function splitFrontmatter(markdown) {
   if (!m) return { fields: new Map(), body: markdown || '' };
   const fields = new Map();
   let currentList = null;
+  let block = null; // {key, folded, lines} while inside a `key: >-` / `key: |` scalar
+  const endBlock = () => {
+    if (!block) return;
+    const text = block.folded ? block.lines.join(' ').replace(/\s+/g, ' ') : block.lines.join('\n');
+    fields.set(block.key, text.trim());
+    block = null;
+  };
   for (const raw of m[1].split('\n')) {
+    if (block) {
+      if (/^\s+\S/.test(raw) || raw.trim() === '') { block.lines.push(raw.trim()); continue; }
+      endBlock();
+    }
     const item = /^\s*-\s+(.*)$/.exec(raw);
     if (item && currentList !== null) {
       fields.get(currentList).push(stripQuotes(item[1].trim()));
@@ -45,7 +66,10 @@ function splitFrontmatter(markdown) {
     const kv = /^([A-Za-z0-9_]+):\s*(.*)$/.exec(raw);
     if (!kv) continue;
     const value = kv[2].trim();
-    if (value === '') {
+    if (/^[>|][+-]?$/.test(value)) {
+      block = { key: kv[1], folded: value[0] === '>', lines: [] };
+      currentList = null;
+    } else if (value === '') {
       fields.set(kv[1], []);
       currentList = kv[1];
     } else {
@@ -53,6 +77,7 @@ function splitFrontmatter(markdown) {
       currentList = null;
     }
   }
+  endBlock();
   return { fields, body: (markdown || '').slice(m[0].length) };
 }
 
@@ -68,11 +93,29 @@ function humanizeRef(v) {
   return tail.split(/[-_]/).map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
+// One list entry for display: an Obsidian-style [[wiki-link]] shows as its
+// bare name (the page cannot resolve it to a file), anything else as inline
+// Markdown.
+function listItemHtml(v) {
+  const wiki = /^\[\[([^\]|]+)(?:\|([^\]]+))?\]\]$/.exec(String(v).trim());
+  return wiki ? esc((wiki[2] || wiki[1]).trim()) : renderInline(v);
+}
+
+// A scalar that is really a comma-separated run of [[wiki-links]] (written
+// inline instead of as a YAML list) -> its items; otherwise null.
+function wikiRun(v) {
+  const items = String(v).match(/\[\[[^\]]+\]\]/g);
+  if (!items || items.length < 2) return null;
+  const rest = String(v).replace(/\[\[[^\]]+\]\]/g, '').replace(/[\s,;]/g, '');
+  return rest ? null : items;
+}
+
 class RetinueProjectPage extends HTMLElement {
   constructor() {
     super();
     this._id = new URLSearchParams(location.search).get('id') || '';
     this._item = null;       // {id, title, path, markdown, sha256}
+    this._threads = [];      // the project's conversation summaries, newest first
     this._state = 'loading'; // loading | ok | missing | offline
     this._mode = 'view';     // view | edit
     this._draft = '';        // editor content while in edit mode
@@ -96,6 +139,8 @@ class RetinueProjectPage extends HTMLElement {
     this._cmdError = '';
     // Live waveform on the recording row's canvas (shared renderer, voice.js).
     this._wave = new Waveform(this);
+    // Frontmatter lists the user expanded — kept across re-renders.
+    this._openLists = new Set();
   }
 
   connectedCallback() {
@@ -109,6 +154,12 @@ class RetinueProjectPage extends HTMLElement {
         return !!ref && new URL(ref, location.href).origin === location.origin;
       } catch (_e) { return false; }
     })();
+    // The shelf (issue #282): this project is the page being shown, and a
+    // restore handed over by its shelf item is applied once it is read.
+    if (this._id && !this._shelfRelease) {
+      this._shelfRelease = goLive(this._shelfKey());
+      this._shelfRestore = takeRestore(this._shelfKey());
+    }
     this.render();
     this.load();
     // Content may be changed elsewhere (Ara, another device) while the page
@@ -121,6 +172,8 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._shelfRelease) this._shelfRelease();
+    this._shelfRelease = null;
     document.removeEventListener('visibilitychange', this._onVisible);
     if (this._applyTimer) clearTimeout(this._applyTimer);
     this._stopRecording();
@@ -130,6 +183,7 @@ class RetinueProjectPage extends HTMLElement {
 
   async load() {
     if (!this._id) { this._state = 'missing'; this.render(); return; }
+    const threads = this._loadThreads();
     try {
       const res = await fetch(`/projects/item?id=${encodeURIComponent(this._id)}`,
         { cache: 'no-store' });
@@ -141,7 +195,21 @@ class RetinueProjectPage extends HTMLElement {
       // Keep showing the last loaded state if we have one; otherwise offline.
       if (!this._item) this._state = 'offline';
     }
+    await threads;
     this.render();
+  }
+
+  // The discussions linked to this project (archived ones included, shown
+  // folded). Edit-command threads are left out: each is one applied change,
+  // reachable from its own confirmation and under the Edits filter.
+  async _loadThreads() {
+    try {
+      const res = await fetch(`/conversations?all&project=${encodeURIComponent(this._id)}`,
+        { cache: 'no-store' });
+      if (!res.ok) return;
+      const body = await res.json();
+      this._threads = Array.isArray(body.conversations) ? body.conversations : [];
+    } catch (_err) { /* offline — keep the last list */ }
   }
 
   // ── Direct editing ─────────────────────────────────────────────────────────
@@ -400,9 +468,38 @@ class RetinueProjectPage extends HTMLElement {
     } else {
       body = this._viewHtml();
     }
+    // A re-render (a background reload, the apply status) must not throw the
+    // reader back to the top of the page.
+    const prev = this.shadowRoot.querySelector('.scroll');
+    const scrollTop = prev ? prev.scrollTop : 0;
     this.shadowRoot.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>`
       + `<section class="card">${body}</section>`;
+    const next = this.shadowRoot.querySelector('.scroll');
+    if (next && scrollTop) next.scrollTop = scrollTop;
+    if (next && this._shelfRestore && this._state === 'ok') {
+      next.scrollTop = Number(this._shelfRestore.scrollTop) || 0;
+      this._shelfRestore = null;
+    }
     this._wire();
+  }
+
+  // ── The shelf (shelf-store.js, issue #282) ─────────────────────────────────
+  // A project on the shelf is a parked page: its place is how far down it was
+  // read. It never carries an Ara state.
+  _shelfKey() { return `project:${this._id}`; }
+
+  _minimize() {
+    const it = this._item || {};
+    const { fields } = splitFrontmatter(it.markdown || '');
+    const sc = this.shadowRoot.querySelector('.scroll');
+    shelf.minimize({
+      key: this._shelfKey(), kind: 'project', id: this._id,
+      title: fields.get('title') || it.title || 'Project',
+      href: `/project.html?id=${encodeURIComponent(this._id)}`,
+      location: { scrollTop: sc ? Math.round(sc.scrollTop) : 0 },
+    });
+    if (this._fromApp && history.length > 1) history.back();
+    else location.href = '/';
   }
 
   _backHtml() {
@@ -424,10 +521,19 @@ class RetinueProjectPage extends HTMLElement {
     const bar = `<div class="bar">${this._backHtml()}`
       + `<span class="bar-title">${esc(title)}</span>`
       + `<button class="iconbtn" data-edit title="Edit this page" aria-label="Edit this page">&#9998;</button>`
+      + `<button class="iconbtn" data-minimize title="Minimize to the shelf" aria-label="Minimize">`
+      + `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" `
+      + `stroke-linecap="round" aria-hidden="true"><path d="M6 17h12"/></svg></button>`
       + `</div>`;
+    // Metadata and notes scroll together as one page between the fixed title
+    // bar and the fixed footer/command bar — so a long frontmatter never
+    // squeezes the notes into a sliver of their own.
     return bar
+      + `<div class="scroll">`
       + this._metaHtml(fields)
+      + this._threadsHtml()
       + `<div class="body">${body.trim() ? renderMarkdown(body) : '<p class="muted">No notes yet.</p>'}</div>`
+      + `</div>`
       + `<div class="foot">`
       + `<a class="discuss" href="/conversations.html#new?project=${encodeURIComponent(it.id)}&title=${encodeURIComponent(title)}">`
       + `&#x1F4AC; Discuss with Ara</a>`
@@ -438,21 +544,65 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   _metaHtml(fields) {
-    const chips = [];
-    for (const [key, value] of fields) {
+    const lead = [];   // full-width callouts: the next action, long values
+    const chips = [];  // short scalars
+    const lists = [];  // collapsible lists
+    const label = (key) => esc(key.replace(/_/g, ' '));
+    for (const [key, raw] of fields) {
       if (HIDDEN_FM_KEYS.has(key)) continue;
-      const label = key.replace(/_/g, ' ');
+      const value = Array.isArray(raw) ? raw : (wikiRun(raw) || raw);
       if (Array.isArray(value)) {
         if (!value.length) continue;
-        const items = value.map((v) => renderInline(v)).join(', ');
-        chips.push(`<span class="chip"><b>${esc(label)}</b> ${items}</span>`);
+        if (value.length <= INLINE_LIST_MAX) {
+          chips.push(`<span class="chip"><b>${label(key)}</b> `
+            + `${value.map(listItemHtml).join(', ')}</span>`);
+          continue;
+        }
+        const open = this._openLists.has(key) ? ' open' : '';
+        lists.push(`<details class="list" data-list="${esc(key)}"${open}>`
+          + `<summary><b>${label(key)}</b> <span class="count">${value.length}</span></summary>`
+          + `<ul>${value.map((v) => `<li>${listItemHtml(v)}</li>`).join('')}</ul></details>`);
         continue;
       }
-      const shown = /^(current_actor|actor|waiting_on)$/.test(key)
-        ? humanizeRef(value) : value;
-      chips.push(`<span class="chip"><b>${esc(label)}</b> ${esc(shown)}</span>`);
+      // Noise: an unset flag and the page's own type say nothing here.
+      if (value === '' || value === 'false' || (key === 'type' && value === 'project')) continue;
+      const shown = /^(current_actor|actor|waiting_on)$/.test(key) ? humanizeRef(value) : value;
+      if (LEAD_FM_KEYS.includes(key) || shown.length > LONG_VALUE) {
+        const cls = LEAD_FM_KEYS.includes(key) ? 'field next' : 'field';
+        lead.push(`<div class="${cls}"><b>${label(key)}</b><span>${renderInline(shown)}</span></div>`);
+        continue;
+      }
+      chips.push(`<span class="chip"><b>${label(key)}</b> ${esc(shown)}</span>`);
     }
-    return chips.length ? `<div class="meta">${chips.join('')}</div>` : '';
+    if (!lead.length && !chips.length && !lists.length) return '';
+    return `<div class="meta">${lead.join('')}`
+      + (chips.length ? `<div class="chips">${chips.join('')}</div>` : '')
+      + lists.join('') + `</div>`;
+  }
+
+  // The project's conversations: open ones as rows, archived ones folded.
+  _threadsHtml() {
+    const active = this._threads.filter((t) => !t.archived);
+    const archived = this._threads.filter((t) => t.archived);
+    if (!active.length && !archived.length) return '';
+    const row = (t) => {
+      const age = fmtAge(t.updated);
+      const unread = t.unread ? '<span class="dot" aria-label="Unread"></span>' : '';
+      return `<a class="thread-row" href="/conversations.html#conversation-${esc(t.id)}">`
+        + `${unread}<span class="t-title">${esc(t.title || 'Conversation')}</span>`
+        + (age ? `<span class="t-age">${esc(age)}</span>` : '')
+        + `</a>`;
+    };
+    const key = 'threads:archived';
+    const open = this._openLists.has(key) ? ' open' : '';
+    const folded = archived.length
+      ? `<details class="list" data-list="${key}"${open}>`
+        + `<summary><b>Archived</b> <span class="count">${archived.length}</span></summary>`
+        + `<div class="thread-rows">${archived.map(row).join('')}</div></details>`
+      : '';
+    return `<div class="threads"><div class="threads-head">Threads</div>`
+      + (active.length ? `<div class="thread-rows">${active.map(row).join('')}</div>` : '')
+      + folded + `</div>`;
   }
 
   _applyHtml() {
@@ -520,10 +670,17 @@ class RetinueProjectPage extends HTMLElement {
       history.back();
     });
     on('[data-edit]', () => this._startEdit());
+    on('[data-minimize]', () => this._minimize());
     on('[data-cancel]', () => this._cancelEdit());
     on('[data-save]', () => this._save());
     on('[data-dismiss]', () => this._dismissApply());
     on('[data-mic]', () => this._startRecording());
+    root.querySelectorAll('details[data-list]').forEach((d) => {
+      d.addEventListener('toggle', () => {
+        if (d.open) this._openLists.add(d.dataset.list);
+        else this._openLists.delete(d.dataset.list);
+      });
+    });
     on('[data-rec-abort]', () => this._abortRecording());
     on('[data-rec-check]', () => this._finishRecording('review'));
     on('[data-rec-send]', () => this._finishRecording('send'));
@@ -599,22 +756,54 @@ const CSS = `
              justify-content: center; padding: 0; -webkit-tap-highlight-color: transparent; }
   .iconbtn:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
 
-  .meta { flex: none; display: flex; flex-wrap: wrap; gap: 6px; padding: 12px 0 2px; }
-  .chip { background: var(--card-2, #1c2230); border-radius: 999px; padding: 4px 11px;
-          font-size: .78rem; color: var(--fg2, #c3cad6); }
-  .chip b { font-weight: 600; color: var(--muted, #8b93a3); text-transform: capitalize;
-            margin-right: 4px; }
-  .chip a { color: var(--accent, #6ea8fe); }
+  /* The one scrolling region: metadata and notes together. */
+  .scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
 
-  .body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
-          padding: 10px 2px 14px; }
+  .meta { display: flex; flex-direction: column; gap: 8px; padding: 12px 0 4px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: var(--card-2, #1c2230); border-radius: 12px; padding: 4px 11px;
+          font-size: .78rem; color: var(--fg2, #c3cad6); max-width: 100%;
+          overflow-wrap: anywhere; }
+  .chip b, .field b, .list summary b { font-weight: 600; color: var(--muted, #8b93a3);
+            text-transform: capitalize; margin-right: 4px; }
+  .chip a, .field a, .list a { color: var(--accent, #6ea8fe); }
+  .field { background: var(--card-2, #1c2230); border-radius: 12px; padding: 7px 12px;
+           font-size: .84rem; color: var(--fg2, #c3cad6); overflow-wrap: anywhere; }
+  .field b { display: block; font-size: .72rem; margin-bottom: 2px; }
+  .field.next { border-left: 3px solid var(--accent, #6ea8fe); color: var(--fg, #e7ebf2); }
+  .list { background: var(--card-2, #1c2230); border-radius: 12px; font-size: .78rem;
+          color: var(--fg2, #c3cad6); }
+  .list summary { cursor: pointer; padding: 5px 11px; list-style: none;
+                  -webkit-tap-highlight-color: transparent; }
+  .list summary::-webkit-details-marker { display: none; }
+  .list summary::after { content: '\\25B8'; margin-left: 6px; color: var(--muted, #8b93a3); }
+  .list[open] summary::after { content: '\\25BE'; }
+  .count { color: var(--fg2, #c3cad6); }
+  .list ul { margin: 0; padding: 0 11px 8px 26px; }
+  .list li { padding: 2px 0; overflow-wrap: anywhere; }
+
+  .threads { display: flex; flex-direction: column; gap: 6px; padding: 10px 0 2px; }
+  .threads-head { font-size: .72rem; font-weight: 600; color: var(--muted, #8b93a3);
+                  text-transform: uppercase; letter-spacing: .04em; }
+  .thread-rows { display: flex; flex-direction: column; gap: 4px; }
+  .list .thread-rows { padding: 0 6px 6px; }
+  .thread-row { display: flex; align-items: center; gap: 8px; padding: 7px 12px;
+                border-radius: 12px; background: var(--card-2, #1c2230); text-decoration: none;
+                color: var(--fg, #e7ebf2); font-size: .86rem;
+                -webkit-tap-highlight-color: transparent; }
+  .thread-row:hover { outline: 1px solid var(--accent, #6ea8fe); }
+  .t-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t-age { flex: none; color: var(--muted, #8b93a3); font-size: .72rem; }
+  .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #6ea8fe); }
+
+  .body { padding: 10px 2px 14px; }
 
   .foot { flex: none; display: flex; align-items: center; justify-content: space-between;
           gap: 10px; padding: 8px 0; border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
-  .discuss { color: var(--accent, #6ea8fe); text-decoration: none; font-weight: 600;
+  .discuss { flex: none; white-space: nowrap; color: var(--accent, #6ea8fe); text-decoration: none; font-weight: 600;
              font-size: .9rem; }
   .discuss:hover { text-decoration: underline; }
-  .path { color: var(--muted, #8b93a3); font-size: .68rem; overflow: hidden;
+  .path { min-width: 0; color: var(--muted, #8b93a3); font-size: .68rem; overflow: hidden;
           text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 
   .apply { flex: none; display: flex; align-items: center; gap: 10px; margin: 8px 0 0;

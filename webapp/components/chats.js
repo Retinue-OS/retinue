@@ -36,6 +36,7 @@
 // must not blank the list).
 
 import { RetinueCard, esc, fmtAge, isWideFrame, onFrameChange, onPressOutside } from './base.js';
+import { shelf } from './shelf-store.js';
 
 const LIST_URL = '/chats';
 // Rows shown on the dashboard card before "All chats →" takes over — the same
@@ -458,6 +459,10 @@ class RetinueChats extends RetinueCard {
       const doc = await res.json();
       const chat = (this._data && this._data.chats || []).find((c) => c.id === id);
       if (chat) { chat.archived = !!doc.archived; chat.muted = !!doc.muted; }
+      // The minimized-pages shelf (issue #282) follows: a muted chat leaves it
+      // whatever put it there; archiving drops only what was parked by itself.
+      if (doc.muted) shelf.muted(`chat:${id}`);
+      else if (doc.archived) shelf.archived(`chat:${id}`, true);
       this._openId = null;
       this._confirmId = null;
       this._sig = '';
