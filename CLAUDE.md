@@ -258,6 +258,13 @@ python3 /workspace/scripts/conversation-push.py --title "Party RSVP" \
 # --reply-attach PATH (alone) attaches a file to your own reply in this thread turn
 ```
 
+**Link a thread to its project.** A thread about a project passes
+`--project <project URI> --project-title "<title>"` (the URI is the project's
+IRI in the life store). Only a linked thread is listed on the project page and
+leads back to it; an unlinked one is invisible from there. Link an existing
+thread with `--thread <id> --project <uri> --project-title "<title>"` (no
+message).
+
 **Say how much it matters.** The dashboard's home is an attention list
 (`docs/attention-model.md`): every thread, chat and project carries an
 importance (0–5), an optional deadline with a lead time, a sphere and tags,

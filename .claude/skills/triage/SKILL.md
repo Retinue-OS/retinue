@@ -553,6 +553,11 @@ quoted above it, and nothing is sent.
       --importance 4 --due 2026-09-05T12:00 --kind invitation --sphere friends \
       "<quoted original>\n\n<the question>\n[[chip: This morning]] [[chip: Friday morning]] [[chip: Neither works]]"
 
+**Link the thread to its project.** When Phase 3 linked the item to a project
+that has a URI in the life store, the thread carries it too —
+`--project <project URI> --project-title "<title>"` on the call that opens
+it — so the proposal is listed on the project page and leads back to it.
+
 **Declare how much it matters.** Every thread you open carries the four
 properties of `docs/attention-model.md` — `--importance` (0–5: 4+ is worth
 an interruption on its own, 2–3 only with a deadline, 0–1 is chatter),

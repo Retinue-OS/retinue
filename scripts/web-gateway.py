@@ -71,7 +71,9 @@ Projects (dashboard project pages):
                                          (either or both). Same token gate. The
                                          only way to set `muted`, which is what
                                          keeps a thread archived when new
-                                         messages are filed into it.
+                                         messages are filed into it. Also links
+                                         an existing thread to a project
+                                         ({project, project_title?}).
 
 News feed (dashboard news page; see scripts/news_store.py):
   GET  /news                          -> {"generated", "items": [...]} ranked at
@@ -10124,7 +10126,8 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, _conv_summary(conv))
 
     def _handle_agent_conversation_flags(self, cid: str) -> None:
-        """A retinue agent sets a thread's `archived`/`muted` flags.
+        """A retinue agent sets a thread's `archived`/`muted` flags, or links
+        the thread to a project.
 
         The agent-side counterpart to the dashboard's archive button, and the
         only way `muted` can be set today (there is deliberately no UI for it
@@ -10137,6 +10140,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         flags = {key: bool(payload[key])
                  for key in ("archived", "muted") if key in payload}
+        # Linking a thread to its project after the fact: a thread an agent
+        # opened without --project otherwise never shows on the project page.
+        if "project" in payload:
+            project = payload.get("project")
+            title = payload.get("project_title")
+            if (not isinstance(project, str) or not project.strip()
+                    or len(project) > 1024
+                    or (title is not None and not isinstance(title, str))):
+                self._send_json(400, {"error": "project must be a non-empty URI string"})
+                return
+            flags["project"] = project.strip()
+            flags["project_title"] = (title or "").strip() or None
         if not flags:
             self._send_json(400, {"error": "no flags given"})
             return

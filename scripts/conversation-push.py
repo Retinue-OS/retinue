@@ -41,6 +41,13 @@ keep it archived" is expressed. Set the flags (no message) with:
 
     conversation-push.py --thread 42ecb0113a3d48ac87be514cfaf99a7c --archive --mute
 
+A thread about a project should carry the link (--project, with its title) —
+it is what lists the thread on the project page and leads from the thread back
+to the project. Link a thread that was opened without it the same way:
+
+    conversation-push.py --thread 42ecb0113a3d48ac87be514cfaf99a7c \
+        --project urn:retinue:project:vat-q3 --project-title "VAT Q3"
+
 Use --context to hand machine-usable context to the Ara sessions that will
 later serve this thread, without showing it to the user — canonically the
 exact reply command (reply token included) for a proposed messenger reply:
@@ -230,7 +237,8 @@ def main() -> int:
     att.add_argument("--project", metavar="URI",
                      help="the project this thread is about (its URI in the life store): the "
                           "home screen shows the thread in the project's place rather than both, "
-                          "and Ara's turns in the thread know the project. New threads only.")
+                          "and Ara's turns in the thread know the project; the project page "
+                          "lists it. With --thread (no message): link that existing thread.")
     att.add_argument("--project-title", dest="project_title", metavar="TEXT",
                      help="the project's title, shown with --project")
     parser.add_argument("--reply-attach", dest="reply_attach", action="append",
@@ -246,7 +254,9 @@ def main() -> int:
         return _reply_attach(args, vars(parser.parse_args([])))
 
     message = args.message.strip()
-    flags_only = args.archived is not None or args.muted is not None
+    # With --thread, --project links that thread: a flag change like the others.
+    link_project = bool(args.thread and args.project)
+    flags_only = args.archived is not None or args.muted is not None or link_project
     if not message and not args.attach and not flags_only:
         print("conversation-push: empty message", file=sys.stderr)
         return 2
@@ -260,10 +270,8 @@ def main() -> int:
     if args.thread and args.title:
         print("conversation-push: --title applies only to a new thread", file=sys.stderr)
         return 2
-    # The project link is set when a thread opens; an append would drop it
-    # without a word, and the agent would believe the thread linked.
-    if (args.thread or flags_only) and (args.project or args.project_title):
-        print("conversation-push: --project applies only to a new thread", file=sys.stderr)
+    if args.project_title and not args.project:
+        print("conversation-push: --project-title needs --project", file=sys.stderr)
         return 2
     if flags_only and not args.thread:
         print("conversation-push: --archive/--mute need --thread", file=sys.stderr)
@@ -272,7 +280,8 @@ def main() -> int:
     # the ordering (does the append wake the thread before or after the mute?)
     # implicit. Send the flags first, then the message.
     if flags_only and (message or args.attach):
-        print("conversation-push: --archive/--mute cannot be combined with a message",
+        print("conversation-push: --archive/--mute/--project on --thread cannot be "
+              "combined with a message — send the flags first, then the message",
               file=sys.stderr)
         return 2
     # Context rides with a message; on a flags-only call there is no message
@@ -293,6 +302,10 @@ def main() -> int:
             payload["archived"] = args.archived
         if args.muted is not None:
             payload["muted"] = args.muted
+        if link_project:
+            payload["project"] = args.project
+            if args.project_title:
+                payload["project_title"] = args.project_title
     else:
         payload["message"] = message
         if args.agent:

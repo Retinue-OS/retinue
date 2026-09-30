@@ -564,6 +564,10 @@ visible thread whose engage prompt points Ara at the project file. The link
 runs both ways: such a thread carries an "About: <project>" chip back to the
 project page, and the project page lists the project's threads (open ones
 first, archived folded) so an ongoing discussion is picked up, not restarted.
+Agent-opened threads join that list only when they carry the link:
+`conversation-push.py --project <uri> --project-title …` on a new thread, or
+`--thread <id> --project <uri>` (no message) to link an existing one
+(`POST /internal/conversations/<id>/flags` with `{project, project_title}`).
 
 ## Speech-to-text (the `stt` service) and voice input
 
