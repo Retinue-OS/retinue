@@ -1265,6 +1265,55 @@ def _list_groups() -> list[dict]:
     return groups
 
 
+# ── Roster sync from the primary device ──────────────────────────────────────
+# This gateway is a linked device. A linked device does not download the
+# account's contacts and groups by itself: it learns them only when the
+# primary (the phone) sends a sync, and the phone sends one only when asked.
+# Without that request signal-cli's roster stays empty for the life of the
+# link — listContacts/listGroups return nothing, every group chat on the
+# dashboard is titled by its raw id, and name lookup before a send misses.
+# `signal-cli sendSyncRequest` is the ask. It is sent on start, after every
+# successful (re)link, and — throttled — whenever a group id turns up that the
+# roster does not know. The phone answers through the normal receive stream,
+# where signal-cli stores what arrives; the roster cache then picks it up on
+# its usual miss retry.
+SIGNAL_ROSTER_SYNC_INTERVAL = float(os.environ.get("SIGNAL_ROSTER_SYNC_INTERVAL", "") or "3600")
+_roster_sync_at = float("-inf")  # monotonic stamp of the last request attempt
+_roster_sync_lock = threading.Lock()
+
+
+def _request_roster_sync(reason: str, force: bool = False) -> bool:
+    """Ask the primary device to sync contacts and groups to this one.
+
+    Non-fatal by design: a failure (an unlinked account, a primary that is
+    offline) is logged and the gateway carries on with the roster it has.
+    Unless ``force`` is set, requests are throttled to one per
+    SIGNAL_ROSTER_SYNC_INTERVAL seconds, so a miss on every message from an
+    unknown group id does not turn into a sync request per message. Returns
+    True when a request went out.
+    """
+    global _roster_sync_at
+    with _roster_sync_lock:
+        if not force and time.monotonic() - _roster_sync_at < SIGNAL_ROSTER_SYNC_INTERVAL:
+            return False
+        # Stamp the attempt, not the success: a failing signal-cli is retried
+        # on the same throttle, not on every miss.
+        _roster_sync_at = time.monotonic()
+    cmd = ["signal-cli", "-a", SIGNAL_ACCOUNT, "sendSyncRequest"]
+    try:
+        with SIGNAL_CLI_LOCK:
+            proc = _run(cmd, check=False, timeout=SIGNAL_CLI_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001 - the roster is a nicety, never a crash
+        print(f"[signal-gateway] roster sync request ({reason}) failed: {exc}", flush=True)
+        return False
+    if proc.returncode != 0:
+        detail = (proc.stderr or "").strip() or f"exit code {proc.returncode}"
+        print(f"[signal-gateway] roster sync request ({reason}) failed: {detail}", flush=True)
+        return False
+    print(f"[signal-gateway] roster sync requested from the primary device ({reason})", flush=True)
+    return True
+
+
 # Group id → display name, refreshed from the roster at most every
 # _GROUP_NAMES_TTL seconds (a rename shows up within that window), and on a
 # miss at most every _GROUP_NAMES_MISS_RETRY seconds (a freshly joined group
@@ -1296,7 +1345,16 @@ def _resolve_group_name(group_id: str) -> str | None:
             _group_names = {g["id"]: g["name"] for g in _list_groups() if g.get("name")}
         except Exception as exc:
             print(f"[signal-gateway] could not resolve group name for {group_id}: {exc}", flush=True)
-        return _group_names.get(group_id)
+            # signal-cli itself is failing: keep the last good map, and do not
+            # add a sync request on top of a call that just failed.
+            return _group_names.get(group_id)
+        name = _group_names.get(group_id)
+        if name is None:
+            # The roster was read fine and still does not know this group: the
+            # phone has not synced it to us yet. Ask (throttled) — the name
+            # then lands via the receive stream and the next miss retry.
+            _request_roster_sync(f"group {group_id[:12]}… unknown to the roster")
+        return name
 
 
 def _notify_chat_event_async(group_id: str | None = None, **kwargs) -> None:
@@ -2340,6 +2398,10 @@ def _relink_worker() -> None:
             _note_receive_result(True)
             with _RELINK_LOCK:
                 _relink["error"] = None
+            # A fresh link starts with an empty roster; ask the phone for it
+            # now, while the receive loop is still parked and the link
+            # subprocess has released the account data dir.
+            _request_roster_sync("after relink", force=True)
         else:
             msg = stderr or ("relink timed out waiting for the QR scan"
                             if uri else f"signal-cli link failed (exit {proc.returncode})")
@@ -2726,6 +2788,9 @@ def main() -> None:
     if stated:
         print(f"[signal-gateway] stated media metadata on {stated} earlier record(s)", flush=True)
     threading.Thread(target=_serve_http, name="push-http", daemon=True).start()
+    # Ask the phone for contacts and groups once per process start: a linked
+    # device never learns them otherwise, and the link may be months old.
+    _request_roster_sync("gateway start", force=True)
     while True:
         if _RELINK_ACTIVE.is_set():
             # The link subprocess owns the account data dir; polling would race it.

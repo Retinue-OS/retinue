@@ -291,6 +291,15 @@ seems dead, check `/gateways` (or the gateways' `/health`) first, and treat a
 `SIGNAL_SEND_POLICY`-style unconfigured channel (`configured: false`) as
 intentional, not broken.
 
+A healthy Signal link with an **empty roster** (`signal-contacts.py --groups`
+and `--contacts` both return nothing, group chats titled by their raw id) is
+not a dead link but a phone that has never synced: a linked device only gets
+contacts and groups when the primary sends them, on request. The gateway
+sends that request (`signal-cli sendSyncRequest`) on start, after a (re)link,
+and throttled on every unknown group id (`SIGNAL_ROSTER_SYNC_INTERVAL`,
+default one hour). If the roster stays empty, the phone was offline when
+asked — a gateway restart asks again.
+
 **A channel that answers but behaves like an older build** is the other thing
 to look for there, and it is not an outage: each `/health` carries a `build`
 block, and `/gateways` flags any gateway whose shared-module digest differs
