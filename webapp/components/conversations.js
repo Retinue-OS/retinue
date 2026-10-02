@@ -479,8 +479,12 @@ class RetinueConversations extends HTMLElement {
         t.initiator === 'agent' ? 'Retinue' : 'You',
         t.updated ? fmtAge(t.updated) : '',
         t.archived ? 'archived' : '',
-        t.project_title || '',
       ].filter(Boolean).join(' · ');
+      // The project gets its own line: in the meta (which never wraps) a long
+      // project title widened the auto column until it pushed the thread's
+      // own title out and the tile past the page edge.
+      const proj = t.project_title
+        ? `<small class="t-proj">${esc(t.project_title)}</small>` : '';
       // Edit-command threads only ever appear under the Edits filter (or on
       // their project's page) — badge them so their nature is obvious there.
       const editTag = t.kind === 'edit' ? '<span class="tag-edit">edit</span>' : '';
@@ -489,6 +493,7 @@ class RetinueConversations extends HTMLElement {
         editTag +
         `<span class="t-name">${esc(t.title || 'Conversation')}</span></span>` +
         `<small class="t-meta">${esc(meta)}</small>` +
+        proj +
         (t.last_preview ? `<small class="t-prev">${esc(t.last_preview)}</small>` : '') +
         `</button>`;
     }).join('');
@@ -581,6 +586,8 @@ const CSS = `
               text-transform: uppercase; color: var(--accent, #6ea8fe);
               border: 1px solid var(--accent, #6ea8fe); border-radius: 6px; padding: 1px 5px; }
   .t-meta { color: var(--muted, #8b93a3); font-size: .72rem; white-space: nowrap; }
+  .t-proj { grid-column: 1 / -1; min-width: 0; color: var(--accent, #6ea8fe); font-size: .74rem;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .t-prev { grid-column: 1 / -1; color: var(--muted, #8b93a3); font-size: .8rem; line-height: 1.35;
             display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
   .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
