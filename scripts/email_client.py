@@ -1268,6 +1268,26 @@ def _smtp_send(cfg, msg, recipients):
             s.send_message(msg, from_addr=cfg.user, to_addrs=recipients)
     except smtplib.SMTPException as e:
         die(f"SMTP send failed: {e}")
+    _whitelist_recipients(recipients)
+
+
+def _whitelist_recipients(recipients):
+    """Whitelist every address this system just sent to, for the triage gate.
+
+    A reply to mail sent from here must reach the frequent triage tick at once;
+    the gate's daily refresh from the Sent folder only backs up mail sent by
+    other clients. Best-effort: the mail is already out, so a policy write
+    failure is reported and never fails the send.
+    """
+    addrs = [a.strip().lower() for a in recipients if a and "@" in a]
+    if not addrs:
+        return
+    try:
+        import triage_policy
+        triage_policy._mutate_email(add_addresses=addrs)
+    except Exception as e:  # noqa: BLE001 — never fail a send that went out
+        print(f"[email_client] warning: could not whitelist recipients: {e}",
+              file=sys.stderr)
 
 
 _APPENDUID_RE = re.compile(rb"APPENDUID\s+\d+\s+(\d+)")
