@@ -84,7 +84,8 @@ def main() -> int:
     if args.due is not None:
         payload["due"] = None if args.due.lower() == "none" else args.due
     if args.sphere or args.tag:
-        problem = attention_cli.unknown_spheres("attention-set", args.sphere, args.tag)
+        problem = attention_cli.unknown_spheres("attention-set", args.sphere, args.tag,
+                                                args.url or DEFAULT_URL)
         if problem:
             print(problem, file=sys.stderr)
             return 2

@@ -169,6 +169,10 @@ def test_attention_args(rp):
                              ["admin", "customers"])
     check("an unknown sphere falls back to admin", flag(args, "--sphere"), "admin")
     check("unknown tags are left out", [args[i + 1] for i, a in enumerate(args) if a == "--tag"], ["admin"])
+    args = rp.attention_args({"sphere": "Board games", "tags": "[Ökologie]"}, due, "deadline",
+                             ["board-games", "ökologie"])
+    check("a sphere is compared as the gateway stores it", flag(args, "--sphere"), "Board games")
+    check("so is a tag", flag(args, "--tag"), "Ökologie")
     check("nothing declared: admin chore", (flag(rp.attention_args({}, due, "deadline"), "--kind"),
                                              flag(rp.attention_args({}, due, "deadline"), "--sphere")),
           ("admin chore", "admin"))

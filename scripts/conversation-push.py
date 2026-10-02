@@ -329,7 +329,7 @@ def main() -> int:
     if args.lead:
         attention["lead"] = args.lead
     if args.sphere or args.tag:
-        problem = attention_cli.unknown_spheres("conversation-push", args.sphere, args.tag)
+        problem = attention_cli.unknown_spheres("conversation-push", args.sphere, args.tag, url)
         if problem:
             print(problem, file=sys.stderr)
             return 2

@@ -36,13 +36,16 @@ class _Profile(BaseHTTPRequestHandler):
         pass
 
 
-def _run(script, args, attention_url):
+def _run(script, args, gateway):
+    """Run a CLI against ``gateway``: the vocabulary is read from the gateway
+    the declaration goes to, so the backend URL names it. The scripted gateway
+    answers no POST, so a call that passes the check fails on the send, loudly.
+    ATTENTION_URL points elsewhere on purpose: it must not be what is asked."""
     env = dict(os.environ)
     env["CONVERSATION_BACKEND_TOKEN"] = "t"
-    # Unroutable, so a call that passes the check fails on the send, loudly.
-    env["CONVERSATION_BACKEND_URL"] = "http://127.0.0.1:9/internal/conversations"
+    env["CONVERSATION_BACKEND_URL"] = gateway + "/internal/conversations"
     env.pop("ATTENTION_BACKEND_URL", None)
-    env["ATTENTION_URL"] = attention_url
+    env["ATTENTION_URL"] = "http://127.0.0.1:9"
     return subprocess.run([sys.executable, str(script), *args], env=env,
                           capture_output=True, text=True, timeout=60)
 
@@ -65,6 +68,17 @@ def test_known_spheres_pass(url):
     print("ok: words of the vocabulary pass, compared as the gateway stores them")
 
 
+def test_url_picks_the_gateway(url):
+    # --url names another gateway: its vocabulary decides, not the default's.
+    r = _run(PUSH, ["--title", "x", "--sphere", "work", "--url", url + "/internal/conversations", "hi"],
+             "http://127.0.0.1:9")
+    assert r.returncode == 2 and "not a sphere of this deployment: work" in r.stderr, r.stderr
+    r = _run(SET, ["thread:" + "0" * 32, "--sphere", "work", "--url", url + "/attention/set"],
+             "http://127.0.0.1:9")
+    assert r.returncode == 2 and "not a sphere of this deployment: work" in r.stderr, r.stderr
+    print("ok: --url selects the gateway whose vocabulary is checked")
+
+
 def test_unreadable_vocabulary_steps_aside():
     r = _run(PUSH, ["--title", "x", "--sphere", "anything", "hi"], "http://127.0.0.1:9")
     assert "not a sphere" not in r.stderr, r.stderr
@@ -78,6 +92,7 @@ def main():
     try:
         test_unknown_sphere_refused(url)
         test_known_spheres_pass(url)
+        test_url_picks_the_gateway(url)
         test_unreadable_vocabulary_steps_aside()
     finally:
         server.shutdown()

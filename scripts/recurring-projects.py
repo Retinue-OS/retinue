@@ -373,10 +373,10 @@ def attention_args(fm: dict, due: "dt.date", kind: str,
               "from 0 to 5; the reminder goes out at 3", file=sys.stderr)
         value = 3.0
     args += ["--importance", f"{value:g}"]
-    known = set(vocabulary) if vocabulary else None
-
     def usable(word: str) -> bool:
-        if known is None or word.lower() in known:
+        # The same comparison conversation-push.py makes ("Board games" is the
+        # sphere board-games), so a reminder keeps every word a push would.
+        if not vocabulary or not attention_cli.unknown_words([word], vocabulary):
             return True
         print(f"[recurring-projects] {word!r} is not a sphere of this deployment; "
               "the reminder goes out without it", file=sys.stderr)
@@ -435,6 +435,10 @@ def main() -> int:
         print("[recurring-projects] nothing due.")
         return 0
 
+    # The vocabulary once for the run: asked per project, an unreachable
+    # gateway would cost each due project its own timeout.
+    vocabulary = attention_cli.spheres()
+
     acted = 0
     for r in rows:
         proj = r["project"]
@@ -477,7 +481,7 @@ def main() -> int:
 
         # What the thread declares, worked out before the file changes: a
         # frontmatter value it cannot use is reported, never raised.
-        declared = attention_args(fm, due, kind, attention_cli.spheres())
+        declared = attention_args(fm, due, kind, vocabulary)
 
         # Flip to active first: even if the reminder push later fails, the project
         # visibly reappears on the dashboard card (paused=false), so the worst
