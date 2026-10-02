@@ -169,12 +169,17 @@ class RetinueProjectPage extends HTMLElement {
       if (!document.hidden && this._mode === 'view') this.load();
     };
     document.addEventListener('visibilitychange', this._onVisible);
+    // The command bar's cap follows the visible height, which the keyboard
+    // changes without a keystroke (viewport.js says when).
+    this._onViewport = () => { if (this._grow) this._grow(); };
+    window.addEventListener('retinue-viewport', this._onViewport);
   }
 
   disconnectedCallback() {
     if (this._shelfRelease) this._shelfRelease();
     this._shelfRelease = null;
     document.removeEventListener('visibilitychange', this._onVisible);
+    window.removeEventListener('retinue-viewport', this._onViewport);
     if (this._applyTimer) clearTimeout(this._applyTimer);
     this._stopRecording();
     this._wave.stop();
@@ -697,6 +702,7 @@ class RetinueProjectPage extends HTMLElement {
         input.style.height = 'auto';
         input.style.height = `${Math.min(input.scrollHeight, Math.round(visibleHeight() * 0.3))}px`;
       };
+      this._grow = grow;  // re-run when the visible height changes
       input.addEventListener('input', () => { this._cmd = input.value; grow(); });
       // Cmd/Ctrl+Enter sends, as in the conversation composer; plain Enter
       // breaks the line in this multi-line field.

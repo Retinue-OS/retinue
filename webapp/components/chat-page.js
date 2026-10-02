@@ -340,6 +340,7 @@ class RetinueChatPage extends HTMLElement {
         this.toggleAttribute('typing', up);
         if (up) this._toggleMenu(false);
       }
+      if (this._grow) this._grow();
       if (up) this._scrollFocusedPane();
     };
     const onIn = () => { if (this.hasAttribute('typing')) this._scrollFocusedPane(); };
@@ -1503,6 +1504,10 @@ class RetinueChatPage extends HTMLElement {
       input.style.height =
         `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
     };
+    // Re-capped from the keyboard watch too: the visible height changes
+    // without a keystroke when the keyboard comes up, and a multi-line draft
+    // must not keep its keyboard-less height and push the send row off.
+    this._grow = grow;
     input.addEventListener('input', () => {
       if (isChat) {
         this._draft = input.value;
