@@ -21,7 +21,7 @@
 //   POST /conversations        -> quick edit command ({kind:"edit", project})
 //   GET  /conversations?all&project=…      -> the project's threads (kind chat)
 
-import { esc, fmtAge } from './base.js';
+import { esc, fmtAge, visibleHeight } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { shelf, goLive, takeRestore } from './shelf-store.js';
@@ -695,7 +695,7 @@ class RetinueProjectPage extends HTMLElement {
       // capped so a long dictation never swallows the page.
       const grow = () => {
         input.style.height = 'auto';
-        input.style.height = `${Math.min(input.scrollHeight, Math.round(window.innerHeight * 0.3))}px`;
+        input.style.height = `${Math.min(input.scrollHeight, Math.round(visibleHeight() * 0.3))}px`;
       };
       input.addEventListener('input', () => { this._cmd = input.value; grow(); });
       // Cmd/Ctrl+Enter sends, as in the conversation composer; plain Enter

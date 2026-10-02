@@ -59,7 +59,7 @@
 // composer — empty, or holding the text she was asked to rework — marked as
 // hers; the send press stays the user's.
 
-import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard } from './base.js';
+import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
@@ -1501,7 +1501,7 @@ class RetinueChatPage extends HTMLElement {
     const grow = () => {
       input.style.height = 'auto';
       input.style.height =
-        `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+        `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
     };
     input.addEventListener('input', () => {
       if (isChat) {

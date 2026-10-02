@@ -94,7 +94,7 @@
 //   POST /conversations/transcribe      dictation audio → {text, lang}
 //   GET  /conversation-models           the offered models (once per page)
 
-import { esc, fmtAge, softKeyboard } from './base.js';
+import { esc, fmtAge, softKeyboard, visibleHeight } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
@@ -2114,7 +2114,7 @@ class RetinueConversation extends HTMLElement {
       const input = form.querySelector('textarea');
       const grow = () => {
         input.style.height = 'auto';
-        input.style.height = `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+        input.style.height = `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
       };
       // The draft follows the keystrokes, so a re-render never wipes it (the
       // input's value is rebuilt from the draft on each render) and a return
@@ -2337,8 +2337,23 @@ const CSS = `
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .about-link { margin: 8px 0 2px; text-decoration: none; }
   .about-link:hover { background: var(--accent, #6ea8fe); color: var(--bg, #0e1117); }
-  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  /* The empty state takes what the composer leaves and never more: when the
+     on-screen keyboard halves the frame it shrinks (and scrolls) rather than
+     holding its content height and pushing the composer below the visible
+     edge. Centred with auto margins, not justify-content, so a squeezed body
+     clips at the bottom and scrolls, instead of losing its top unreachably. */
+  .empty { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+           display: flex; flex-direction: column; align-items: center;
            gap: 6px; color: var(--muted, #8b93a3); text-align: center; padding: 24px 12px; }
+  .empty > :first-child { margin-top: auto; }
+  .empty > :last-child { margin-bottom: auto; }
+  /* A short frame (the keyboard is up, or a landscape phone) drops the
+     decoration so the hint and the model picker still fit. */
+  @media (max-height: 520px) {
+    .empty { padding: 8px 12px; }
+    .empty .e-ico { display: none; }
+    .model-pick.wide { margin-top: 6px; }
+  }
   .empty .e-ico { font-size: 2rem; opacity: .55; }
   .empty p { margin: 0; max-width: 32ch; }
 
