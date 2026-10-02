@@ -82,7 +82,10 @@ screen by itself).
 The whitelist is a list of match entries:
 
 - **Auto-added:** exact addresses the user has corresponded with
-  (`alice@epfl.ch`), derived from the Sent folder and refreshed periodically.
+  (`alice@epfl.ch`). Mail sent through `email_client.py` whitelists its
+  recipients the moment it leaves (directly or on approval), so a reply reaches
+  the next frequent tick; the daily refresh from the Sent folder is the backstop
+  for mail sent from other clients.
 - **Manual:** a `*@domain` (or `*@*.domain`) **wildcard** the user adds
   deliberately to trust a whole domain.
 
