@@ -555,6 +555,18 @@ that gap:
   default `retinue`); Telegram runs Telethon's QR login (a 2FA-protected
   account additionally needs `TELEGRAM_2FA_PASSWORD`, or the one-time
   interactive login above).
+- **Signal roster sync.** A linked device learns the account's contacts and
+  groups only when the phone sends a sync, and the phone sends one only when
+  asked. The Signal gateway asks (`signal-cli sendSyncRequest`) on every
+  start, after every successful (re)link, and — at most once per
+  `SIGNAL_ROSTER_SYNC_INTERVAL` seconds, default 3600 — whenever a message
+  arrives from a group the roster does not know. Without it `listGroups` and
+  `listContacts` stay empty for the life of the link, group chats on the
+  dashboard are titled by their raw id, and contact lookup before a send
+  misses. The phone must be online to answer; the names then show up on the
+  first message from that group after the gateway's group-name miss retry
+  (up to 60 seconds after the previous lookup) — a message sooner than that
+  still shows the raw id.
 
 ## Calendar (CalDAV)
 
