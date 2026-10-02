@@ -163,6 +163,12 @@ def test_attention_args(rp):
     check("out of range falls back to 3",
           flag(rp.attention_args({"importance": "9"}, due, "cadence"), "--importance"), "3")
     check("an unreadable lead is left out", flag(args, "--lead"), None)
+    # Tags are free text in a project file, but a further sphere to the
+    # model: words outside the vocabulary are dropped, not refused.
+    args = rp.attention_args({"sphere": "Finance", "tags": "[tax, admin]"}, due, "deadline",
+                             ["admin", "customers"])
+    check("an unknown sphere falls back to admin", flag(args, "--sphere"), "admin")
+    check("unknown tags are left out", [args[i + 1] for i, a in enumerate(args) if a == "--tag"], ["admin"])
     check("nothing declared: admin chore", (flag(rp.attention_args({}, due, "deadline"), "--kind"),
                                              flag(rp.attention_args({}, due, "deadline"), "--sphere")),
           ("admin chore", "admin"))

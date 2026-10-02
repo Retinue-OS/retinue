@@ -22,7 +22,9 @@ Item ids are the ones the dashboard uses: ``thread:<id>``, ``chat:<chat id>``
 (the id GET /chats shows, or the rail's <channel>:~<account>:<key>), or a
 project's URI. ``--sender-sphere`` also remembers the sphere for the chat's
 sender, so their next message starts there. The gateway re-evaluates at once:
-a raised importance can ring, and the reply says what was decided.
+a raised importance can ring, and the reply says what was decided. A sphere
+or tag must be one of the deployment's spheres (attention-spheres.py lists
+them); an unknown one is refused before anything is sent.
 
 Configuration (environment): CONVERSATION_BACKEND_URL / _TOKEN as for
 conversation-push.py — the endpoint is the same token-gated internal API.
@@ -33,6 +35,10 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import attention_cli  # noqa: E402
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
 _BASE = os.environ.get(
@@ -49,8 +55,10 @@ def main() -> int:
     parser.add_argument("--importance", type=float, metavar="0-5")
     parser.add_argument("--due", metavar="WHEN", help="ISO date-time, YYYY-MM-DD (17:00), or 'none'")
     parser.add_argument("--lead", metavar="SPAN", help="90m, 2h, 3d, 2w")
-    parser.add_argument("--sphere", metavar="NAME")
-    parser.add_argument("--tag", action="append", default=[], metavar="NAME")
+    parser.add_argument("--sphere", metavar="NAME",
+                        help="one of the deployment's spheres (attention-spheres.py lists them)")
+    parser.add_argument("--tag", action="append", default=[], metavar="NAME",
+                        help="a further sphere, from the same list (repeatable)")
     parser.add_argument("--kind", metavar="LABEL")
     parser.add_argument("--critical", dest="critical", action="store_true", default=None)
     parser.add_argument("--not-critical", dest="critical", action="store_false")
@@ -75,6 +83,11 @@ def main() -> int:
         payload["importance"] = args.importance
     if args.due is not None:
         payload["due"] = None if args.due.lower() == "none" else args.due
+    if args.sphere or args.tag:
+        problem = attention_cli.unknown_spheres("attention-set", args.sphere, args.tag)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
     for key in ("lead", "sphere", "kind", "actor", "state"):
         value = getattr(args, key)
         if value:

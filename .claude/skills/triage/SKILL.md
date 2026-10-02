@@ -602,11 +602,21 @@ default: "customer request", "invitation", "appointment", "tax filing", …),
 them and the user's focus mode whether the thread rings now, waits for the
 next digest, or is merely listed. A thread that declares nothing is passive:
 listed, never pushed. Take the values from the classification you just made
-(the sender's relationship is the sphere, the deadline the message names is
-the due date); `--critical` only for what must ring in every mode, Off
-included — an outage, a deadline within the hour — never for ordinary
-importance. The reply reports the decision (`attention.delivery`); a hold is
-not a failure, and not a notification either.
+(the deadline the message names is the due date); `--critical` only for what
+must ring in every mode, Off included — an outage, a deadline within the hour
+— never for ordinary importance. The reply reports the decision
+(`attention.delivery`); a hold is not a failure, and not a notification either.
+
+**Spheres come from the deployment's list, never from a guess.** Run
+`attention-spheres.py` once per run and pick `--sphere` and every `--tag` from
+what it prints — the words are the user's, in whatever language they named
+them, so never translate one or coin a near-synonym beside it. The sphere is
+the sender's relationship where the contact card or profile records one;
+for a sender nothing records, take it from the subject matter (an applicant
+for a job the user advertised belongs with that work, not under `family`). When no sphere on the list fits, leave
+`--sphere` out rather than reaching for the nearest; descriptive words
+(`banking`, `ci`) are not tags. `conversation-push.py` and `attention-set.py`
+refuse a word that is not on the list and print the list — correct and rerun.
 
 **Never post a draft that defers the substance.** "Thanks for your message,
 let me check and get back to you" is not a reply: it spends a round trip to

@@ -101,6 +101,9 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import attention_cli  # noqa: E402
+
 KB = "https://w3id.org/retinue/kb#"
 ENDPOINT = os.environ.get("SPARQL_ENDPOINT_LIFE", "http://qlever-life:7001")
 CHAMBERS_ROOT = Path(os.environ.get("CHAMBERS_ROOT", "/workspace/chambers"))
@@ -345,14 +348,17 @@ def reminder_text(
     return r_title, r_msg
 
 
-def attention_args(fm: dict, due: "dt.date", kind: str) -> list[str]:
+def attention_args(fm: dict, due: "dt.date", kind: str,
+                   vocabulary: list[str] | None = None) -> list[str]:
     """What the wake-up thread tells the dashboard's attention model
     (docs/attention-model.md), read from the project's own frontmatter:
     ``importance``, ``sphere``, ``tags``, ``kind`` as declared, the wake date
     as the deadline, ``remind_before`` as the lead. A project that declares
     nothing wakes as an admin chore of importance 3 with the date it named —
     active within its lead, so the reminder is listed and rings where admin
-    is admitted, rather than silently listed at the mid importance."""
+    is admitted, rather than silently listed at the mid importance.
+    ``vocabulary`` is the deployment's spheres (None: unchecked); a sphere or
+    tag outside it is left out, since conversation-push.py would refuse it."""
     args = ["--due", due.isoformat()]
     # A value conversation-push.py would refuse must not cost the reminder:
     # the project is already awake by the time it is pushed. Say so, and wake
@@ -367,10 +373,18 @@ def attention_args(fm: dict, due: "dt.date", kind: str) -> list[str]:
               "from 0 to 5; the reminder goes out at 3", file=sys.stderr)
         value = 3.0
     args += ["--importance", f"{value:g}"]
+    known = set(vocabulary) if vocabulary else None
+
+    def usable(word: str) -> bool:
+        if known is None or word.lower() in known:
+            return True
+        print(f"[recurring-projects] {word!r} is not a sphere of this deployment; "
+              "the reminder goes out without it", file=sys.stderr)
+        return False
     sphere = fm.get("sphere", "").strip()
-    args += ["--sphere", sphere if sphere else "admin"]
+    args += ["--sphere", sphere if sphere and usable(sphere) else "admin"]
     for tag in [t.strip(" -'\"") for t in fm.get("tags", "").strip("[]").split(",")]:
-        if tag:
+        if tag and usable(tag):
             args += ["--tag", tag]
     args += ["--kind", fm.get("kind", "").strip() or ("invoice run" if kind == "cadence" else "admin chore")]
     raw = fm.get("remind_before", "").strip()
@@ -463,7 +477,7 @@ def main() -> int:
 
         # What the thread declares, worked out before the file changes: a
         # frontmatter value it cannot use is reported, never raised.
-        declared = attention_args(fm, due, kind)
+        declared = attention_args(fm, due, kind, attention_cli.spheres())
 
         # Flip to active first: even if the reminder push later fails, the project
         # visibly reappears on the dashboard card (paused=false), so the worst
