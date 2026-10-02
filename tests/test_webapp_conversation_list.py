@@ -223,6 +223,31 @@ await ok('an archive event without an id changes no rows but still shows the lis
   card.disconnectedCallback();
 });
 
+// ── The tile's markup ────────────────────────────────────────────────────────
+// A thread's project has its own ellipsized line below the subject. In the
+// meta line (sender · age, which never wraps) a long project title widened
+// the grid's auto column until the subject collapsed to nothing and the tile
+// ran past the page edge.
+await ok('a thread\'s project is its own line, not part of the meta', async () => {
+  const long = 'A project title long enough to have pushed the subject out <b>&</b> ' + 'x'.repeat(80);
+  const card = await mount({ threads: [thread(A, { title: 'Subject', project_title: long }), thread(B)] });
+  const html = card._tabsHtml();
+  const tiles = html.split('<button ').slice(1);
+  assert.equal(tiles.length, 2);
+  const [withProject, without] = tiles;
+  const proj = withProject.match(/<small class="t-proj">(.*?)<\/small>/);
+  assert.ok(proj, 'the project is a .t-proj line');
+  assert.equal(proj[1], long.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'), 'escaped');
+  const meta = withProject.match(/<small class="t-meta">(.*?)<\/small>/)[1];
+  assert.ok(!meta.includes('x'.repeat(20)), 'the meta line carries no project title');
+  assert.ok(meta.startsWith('You'), 'the meta still names the sender: ' + meta);
+  assert.ok(withProject.indexOf('class="t-meta"') < withProject.indexOf('class="t-proj"'),
+    'the project line follows the meta');
+  assert.ok(withProject.includes('<span class="t-name">Subject</span>'), 'the subject is still there');
+  assert.ok(!without.includes('t-proj'), 'a thread without a project has no project line');
+  card.disconnectedCallback();
+});
+
 console.log(`${passed} checks passed`);
 process.exit(0);
 """
