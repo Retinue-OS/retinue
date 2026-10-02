@@ -132,13 +132,21 @@ function renderListItems(items) {
   let html = '';
   const stack = []; // open list tags: 'ul' | 'ol'
   let prevIndent = 0;
-  const open = (ordered) => { const tag = ordered ? 'ol' : 'ul'; stack.push(tag); html += `<${tag}>`; };
+  // An ordered list keeps the author's first number: a list split by a heading
+  // ("Archive" 1–26, "Delete" 27–123) must not restart at 1, or the numbers a
+  // reply or chip refers to no longer match what the reader sees.
+  const open = (ordered, marker) => {
+    const tag = ordered ? 'ol' : 'ul';
+    const start = ordered ? parseInt(marker, 10) : 1;
+    stack.push(tag);
+    html += start !== 1 ? `<${tag} start="${start}">` : `<${tag}>`;
+  };
   for (const it of items) {
     const ordered = /^\d/.test(it.marker);
     if (!stack.length) {
-      open(ordered);
+      open(ordered, it.marker);
     } else if (it.indent > prevIndent) {
-      open(ordered); // nest inside the still-open <li>
+      open(ordered, it.marker); // nest inside the still-open <li>
     } else {
       html += '</li>';
       while (stack.length > 1 && it.indent < prevIndent) {
