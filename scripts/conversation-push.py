@@ -65,11 +65,12 @@ mid importance and no deadline — listed, never pushed:
 
     conversation-push.py --title "Quote for Müller AG" --importance 4 \
         --due 2026-09-04T17:00 --kind "customer request" --sphere customers \
-        --tag finance "Draft ready for review; Müller expects it today by 17:00."
+        --tag admin "Draft ready for review; Müller expects it today by 17:00."
 
     --importance 0–5 · --due ISO date-time or YYYY-MM-DD (17:00 that day)
-    --lead 2h|3d|2w (else the kind's default) · --sphere customers|admin|health|
-    friends|family|system · --tag (repeatable) · --kind "appointment"|"tax filing"|…
+    --lead 2h|3d|2w (else the kind's default) · --sphere one of the deployment's
+    spheres (attention-spheres.py lists them; an unknown one is refused) · --tag
+    a further one (repeatable) · --kind "appointment"|"tax filing"|…
     --critical (rings in every mode; declare, never infer) · --actor NAME (parked
     on someone: listed under Waiting, not pushed)
 
@@ -104,6 +105,9 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import attention_cli  # noqa: E402
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
 DEFAULT_URL = os.environ.get(
@@ -217,9 +221,10 @@ def main() -> int:
                      help="lead time before the deadline in which it becomes urgent: 90m, 2h, 3d, 2w "
                           "(default: the kind's)")
     att.add_argument("--sphere", metavar="NAME",
-                     help="the main sphere: customers, admin, health, friends, family, system; further ones with --tag — every sphere counts for a mode alike")
+                     help="the main sphere, one of the deployment's (attention-spheres.py lists them; an "
+                          "unknown one is refused); further ones with --tag — every sphere counts for a mode alike")
     att.add_argument("--tag", action="append", default=[], metavar="NAME",
-                     help="a further sphere this also belongs to (repeatable)")
+                     help="a further sphere this also belongs to, from the same list (repeatable)")
     att.add_argument("--kind", metavar="LABEL",
                      help="the kind of item, which supplies the lead-time default: "
                           "\"customer request\", \"invitation\", \"appointment\", \"tax filing\", …")
@@ -323,6 +328,11 @@ def main() -> int:
         attention["due"] = args.due
     if args.lead:
         attention["lead"] = args.lead
+    if args.sphere or args.tag:
+        problem = attention_cli.unknown_spheres("conversation-push", args.sphere, args.tag, url)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 2
     if args.sphere:
         attention["sphere"] = args.sphere
     if args.tag:
