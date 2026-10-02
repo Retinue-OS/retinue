@@ -57,6 +57,13 @@ def _stub_run(sg, calls: list, returncode: int = 0, stderr: str = ""):
     sg._run = _fake_run
 
 
+def _join_sync_workers(sg) -> None:
+    """Wait for miss-triggered sync requests, which run on daemon threads."""
+    for t in sg.threading.enumerate():
+        if t.name == "roster-sync":
+            t.join(timeout=5)
+
+
 def _sync_calls(calls: list) -> list:
     return [c for c in calls if "sendSyncRequest" in c]
 
@@ -116,14 +123,34 @@ def test_unknown_group_id_asks_for_a_sync_once():
         # An unknown one: the roster was read fine but lacks it — ask the phone.
         sg._group_names_at -= sg._GROUP_NAMES_MISS_RETRY + 1
         assert sg._resolve_group_name("g-new") is None
+        _join_sync_workers(sg)
         assert len(_sync_calls(calls)) == 1
         # Repeated misses inside the sync interval do not ask again.
         sg._group_names_at -= sg._GROUP_NAMES_MISS_RETRY + 1
         assert sg._resolve_group_name("g-new") is None
         sg._group_names_at -= sg._GROUP_NAMES_MISS_RETRY + 1
         assert sg._resolve_group_name("g-other") is None
+        _join_sync_workers(sg)
         assert len(_sync_calls(calls)) == 1
     print("ok: an unknown group id triggers one throttled sync request")
+
+
+def test_miss_does_not_wait_on_a_busy_signal_cli():
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(tmp)
+        calls = []
+        _stub_run(sg, calls)
+        sg._signal_cli_json = lambda args: []
+        # Another signal-cli call holds the lock: the lookup must still return
+        # at once, and the sync request go out once the lock is free.
+        with sg.SIGNAL_CLI_LOCK:
+            start = sg.time.monotonic()
+            assert sg._resolve_group_name("g-new") is None
+            assert sg.time.monotonic() - start < 1
+            assert _sync_calls(calls) == []
+        _join_sync_workers(sg)
+        assert len(_sync_calls(calls)) == 1
+    print("ok: a group-name miss never waits on the sync request")
 
 
 def test_failing_roster_read_keeps_names_and_does_not_ask():
@@ -146,6 +173,7 @@ def test_failing_roster_read_keeps_names_and_does_not_ask():
         # request is stacked on top of the failing call.
         assert sg._resolve_group_name("g-1") == "Family"
         assert sg._resolve_group_name("g-other") is None
+        _join_sync_workers(sg)
         assert _sync_calls(calls) == []
     print("ok: a failing roster read keeps the last names and asks for nothing")
 
@@ -197,6 +225,7 @@ def main() -> int:
         test_sync_request_command_and_throttle,
         test_sync_request_failure_is_non_fatal_and_throttled,
         test_unknown_group_id_asks_for_a_sync_once,
+        test_miss_does_not_wait_on_a_busy_signal_cli,
         test_failing_roster_read_keeps_names_and_does_not_ask,
         test_successful_relink_requests_a_sync,
     ]

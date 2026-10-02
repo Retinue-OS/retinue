@@ -1314,6 +1314,20 @@ def _request_roster_sync(reason: str, force: bool = False) -> bool:
     return True
 
 
+def _request_roster_sync_async(reason: str) -> threading.Thread:
+    """Throttled sync request on a daemon thread, off the inbound path.
+
+    The request waits on SIGNAL_CLI_LOCK and may then spend up to
+    SIGNAL_CLI_TIMEOUT in signal-cli; a caller holding _group_names_lock (or
+    working through a received batch) must not wait on that. The throttle
+    inside _request_roster_sync still applies."""
+    worker = threading.Thread(
+        target=_request_roster_sync, args=(reason,), name="roster-sync", daemon=True
+    )
+    worker.start()
+    return worker
+
+
 # Group id → display name, refreshed from the roster at most every
 # _GROUP_NAMES_TTL seconds (a rename shows up within that window), and on a
 # miss at most every _GROUP_NAMES_MISS_RETRY seconds (a freshly joined group
@@ -1351,9 +1365,10 @@ def _resolve_group_name(group_id: str) -> str | None:
         name = _group_names.get(group_id)
         if name is None:
             # The roster was read fine and still does not know this group: the
-            # phone has not synced it to us yet. Ask (throttled) — the name
-            # then lands via the receive stream and the next miss retry.
-            _request_roster_sync(f"group {group_id[:12]}… unknown to the roster")
+            # phone has not synced it to us yet. Ask (throttled, on its own
+            # thread so a busy signal-cli never holds up this lookup) — the
+            # name then lands via the receive stream and the next miss retry.
+            _request_roster_sync_async(f"group {group_id[:12]}… unknown to the roster")
         return name
 
 

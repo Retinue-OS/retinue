@@ -564,7 +564,9 @@ that gap:
   `listContacts` stay empty for the life of the link, group chats on the
   dashboard are titled by their raw id, and contact lookup before a send
   misses. The phone must be online to answer; the names then show up on the
-  next message from that group.
+  first message from that group after the gateway's group-name miss retry
+  (up to 60 seconds after the previous lookup) — a message sooner than that
+  still shows the raw id.
 
 ## Calendar (CalDAV)
 
