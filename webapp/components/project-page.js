@@ -21,7 +21,7 @@
 //   POST /conversations        -> quick edit command ({kind:"edit", project})
 //   GET  /conversations?all&project=…      -> the project's threads (kind chat)
 
-import { esc, fmtAge } from './base.js';
+import { esc, fmtAge, visibleHeight } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { shelf, goLive, takeRestore } from './shelf-store.js';
@@ -169,12 +169,17 @@ class RetinueProjectPage extends HTMLElement {
       if (!document.hidden && this._mode === 'view') this.load();
     };
     document.addEventListener('visibilitychange', this._onVisible);
+    // The command bar's cap follows the visible height, which the keyboard
+    // changes without a keystroke (viewport.js says when).
+    this._onViewport = () => { if (this._grow) this._grow(); };
+    window.addEventListener('retinue-viewport', this._onViewport);
   }
 
   disconnectedCallback() {
     if (this._shelfRelease) this._shelfRelease();
     this._shelfRelease = null;
     document.removeEventListener('visibilitychange', this._onVisible);
+    window.removeEventListener('retinue-viewport', this._onViewport);
     if (this._applyTimer) clearTimeout(this._applyTimer);
     this._stopRecording();
     this._wave.stop();
@@ -695,8 +700,9 @@ class RetinueProjectPage extends HTMLElement {
       // capped so a long dictation never swallows the page.
       const grow = () => {
         input.style.height = 'auto';
-        input.style.height = `${Math.min(input.scrollHeight, Math.round(window.innerHeight * 0.3))}px`;
+        input.style.height = `${Math.min(input.scrollHeight, Math.round(visibleHeight() * 0.3))}px`;
       };
+      this._grow = grow;  // re-run when the visible height changes
       input.addEventListener('input', () => { this._cmd = input.value; grow(); });
       // Cmd/Ctrl+Enter sends, as in the conversation composer; plain Enter
       // breaks the line in this multi-line field.

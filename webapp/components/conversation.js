@@ -94,7 +94,7 @@
 //   POST /conversations/transcribe      dictation audio → {text, lang}
 //   GET  /conversation-models           the offered models (once per page)
 
-import { esc, fmtAge, softKeyboard } from './base.js';
+import { esc, fmtAge, softKeyboard, visibleHeight } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
@@ -109,6 +109,11 @@ const PENDING_POLL_MS = 1500;
 const PENDING_WARN_SECONDS = 2 * 60;
 const PENDING_STALE_SECONDS = 10 * 60;
 const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
+// A frame this short (the keyboard is up, or a landscape phone) drops the
+// empty state's decoration so the hint and the model picker still fit. The
+// stylesheet's max-height query says the same; it cannot see a keyboard that
+// shrinks only the visual viewport (iOS), so the element decides too.
+const SHORT_FRAME = 520;
 // Keep the client cap in step with the gateway's CONVERSATION_MAX_ATTACHMENT_BYTES
 // (default 25 MiB) so oversized files are rejected before a doomed upload.
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -647,6 +652,12 @@ class RetinueConversation extends HTMLElement {
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     this._id = this.getAttribute('conversation-id') || '';
+    // The visible height changes without a keystroke when the keyboard comes
+    // up or goes away (viewport.js says so): refit the composer's cap and the
+    // empty state to the frame that is left.
+    this._onViewport = () => this._fitFrame();
+    window.addEventListener('retinue-viewport', this._onViewport);
+    this._fitFrame();
     LIVE.set(this._key(), this);
     this._shelfEnter();
     loadModels().then(() => this._syncPicker());
@@ -666,9 +677,19 @@ class RetinueConversation extends HTMLElement {
     this._stopPolling();
     this._shelfExit();
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
+    if (this._onViewport) window.removeEventListener('retinue-viewport', this._onViewport);
+    this._onViewport = null;
     this._wave.stop();
     this._stopStream();
     // The reader is not stopped: a reading follows the user out of the thread.
+  }
+
+  // Fit what depends on the visible height: the `short` attribute drops the
+  // empty state's decoration, and a multi-line draft is re-capped so it never
+  // keeps its keyboard-less height and pushes the send row off the frame.
+  _fitFrame() {
+    this.toggleAttribute('short', visibleHeight() <= SHORT_FRAME);
+    if (this._grow) this._grow();
   }
 
   attributeChangedCallback(name, was, now) {
@@ -2109,13 +2130,15 @@ class RetinueConversation extends HTMLElement {
     }
     root.querySelectorAll('[data-rmfile]').forEach((el) =>
       el.addEventListener('click', () => this._removeFile(Number(el.getAttribute('data-rmfile')))));
+    this._grow = null;
     const form = root.querySelector('[data-form]');
     if (form) {
       const input = form.querySelector('textarea');
       const grow = () => {
         input.style.height = 'auto';
-        input.style.height = `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+        input.style.height = `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
       };
+      this._grow = grow;  // re-run when the visible height changes (_fitFrame)
       // The draft follows the keystrokes, so a re-render never wipes it (the
       // input's value is rebuilt from the draft on each render) and a return
       // to the thread finds it.
@@ -2337,8 +2360,28 @@ const CSS = `
                 overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .about-link { margin: 8px 0 2px; text-decoration: none; }
   .about-link:hover { background: var(--accent, #6ea8fe); color: var(--bg, #0e1117); }
-  .empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  /* The empty state takes what the composer leaves and never more: when the
+     on-screen keyboard halves the frame it shrinks (and scrolls) rather than
+     holding its content height and pushing the composer below the visible
+     edge. Centred with auto margins, not justify-content, so a squeezed body
+     clips at the bottom and scrolls, instead of losing its top unreachably. */
+  .empty { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+           display: flex; flex-direction: column; align-items: center;
            gap: 6px; color: var(--muted, #8b93a3); text-align: center; padding: 24px 12px; }
+  .empty > :first-child { margin-top: auto; }
+  .empty > :last-child { margin-bottom: auto; }
+  /* A short frame (the keyboard is up, or a landscape phone) drops the
+     decoration so the hint and the model picker still fit. Twice over: the
+     media query sees a layout viewport the keyboard shrank; where only the
+     visual viewport shrinks (iOS) the element sets its short attribute (SHORT_FRAME). */
+  @media (max-height: 520px) {
+    .empty { padding: 8px 12px; }
+    .empty .e-ico { display: none; }
+    .model-pick.wide { margin-top: 6px; }
+  }
+  :host([short]) .empty { padding: 8px 12px; }
+  :host([short]) .empty .e-ico { display: none; }
+  :host([short]) .model-pick.wide { margin-top: 6px; }
   .empty .e-ico { font-size: 2rem; opacity: .55; }
   .empty p { margin: 0; max-width: 32ch; }
 

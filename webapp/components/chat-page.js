@@ -59,7 +59,7 @@
 // composer — empty, or holding the text she was asked to rework — marked as
 // hers; the send press stays the user's.
 
-import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard } from './base.js';
+import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
@@ -340,6 +340,7 @@ class RetinueChatPage extends HTMLElement {
         this.toggleAttribute('typing', up);
         if (up) this._toggleMenu(false);
       }
+      if (this._grow) this._grow();
       if (up) this._scrollFocusedPane();
     };
     const onIn = () => { if (this.hasAttribute('typing')) this._scrollFocusedPane(); };
@@ -1501,8 +1502,12 @@ class RetinueChatPage extends HTMLElement {
     const grow = () => {
       input.style.height = 'auto';
       input.style.height =
-        `${Math.min(input.scrollHeight, Math.round(window.innerHeight * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+        `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
     };
+    // Re-capped from the keyboard watch too: the visible height changes
+    // without a keystroke when the keyboard comes up, and a multi-line draft
+    // must not keep its keyboard-less height and push the send row off.
+    this._grow = grow;
     input.addEventListener('input', () => {
       if (isChat) {
         this._draft = input.value;

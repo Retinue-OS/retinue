@@ -65,6 +65,17 @@ export function softKeyboard() {
   return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
 }
 
+// The height the user can actually see: the visual viewport, which the
+// on-screen keyboard shrinks on every platform (window.innerHeight does not on
+// iOS, nor where the browser resizes only the visual viewport). A growing text
+// field caps itself against this, so its cap leaves room for the rest of the
+// frame with the keyboard up. While pinch-zoomed the visual viewport is a
+// magnified crop, so the layout height stands in.
+export function visibleHeight() {
+  const vv = window.visualViewport;
+  return vv && vv.scale === 1 ? vv.height : window.innerHeight;
+}
+
 // Input types that do not raise a keyboard: everything else is text entry.
 const NON_TEXT_INPUTS = new Set(['button', 'checkbox', 'color', 'file', 'hidden', 'image',
   'radio', 'range', 'reset', 'submit']);
