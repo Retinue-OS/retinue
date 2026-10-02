@@ -1265,10 +1265,18 @@ def _smtp_send(cfg, msg, recipients):
             s.starttls(context=ctx)
             s.ehlo()
             s.login(cfg.user, cfg.password)
-            s.send_message(msg, from_addr=cfg.user, to_addrs=recipients)
+            # A partial refusal does not raise: the server took the mail for
+            # the others and send_message() hands back the refused addresses.
+            refused = s.send_message(msg, from_addr=cfg.user, to_addrs=recipients) or {}
     except smtplib.SMTPException as e:
         die(f"SMTP send failed: {e}")
-    _whitelist_recipients(recipients)
+    if refused:
+        print(f"[email_client] warning: the server refused "
+              f"{', '.join(sorted(refused))}; the mail went to the others",
+              file=sys.stderr)
+    # Only an address the server accepted is a correspondent: whitelisting a
+    # refused one would let unrelated mail from it into the frequent tick.
+    _whitelist_recipients([r for r in recipients if r not in refused])
 
 
 def _whitelist_recipients(recipients):

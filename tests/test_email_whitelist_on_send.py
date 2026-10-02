@@ -52,8 +52,12 @@ class _FakeSMTP:
     def login(self, user, password):
         pass
 
+    # Addresses the scripted server refuses: send_message() returns them,
+    # keyed as passed, instead of raising (the mail went to the others).
+    refuse = set()
+
     def send_message(self, msg, from_addr=None, to_addrs=None):
-        pass
+        return {a: (550, b"no such user") for a in to_addrs if a in self.refuse}
 
 
 class _Cfg:
@@ -81,6 +85,17 @@ def test_recipients_whitelisted_after_send(ec, tp):
     assert not wildcards, wildcards
 
 
+def test_refused_recipient_not_whitelisted(ec, tp):
+    _FakeSMTP.refuse = {"gone@example.org"}
+    try:
+        ec._smtp_send(_Cfg(), _msg(), ["kept@example.org", "gone@example.org"])
+    finally:
+        _FakeSMTP.refuse = set()
+    addresses, _ = tp.load_email_whitelist()
+    assert "kept@example.org" in addresses, addresses
+    assert "gone@example.org" not in addresses, addresses
+
+
 def test_policy_failure_does_not_fail_send(ec, tp):
     orig = tp._mutate_email
 
@@ -102,6 +117,7 @@ def main() -> int:
         smtplib.SMTP = _FakeSMTP
         try:
             test_recipients_whitelisted_after_send(ec, tp)
+            test_refused_recipient_not_whitelisted(ec, tp)
             test_policy_failure_does_not_fail_send(ec, tp)
         finally:
             smtplib.SMTP = real_smtp
