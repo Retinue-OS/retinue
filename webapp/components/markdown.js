@@ -65,31 +65,43 @@ export function renderInline(text) {
   s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\]\]/gi,
     (_m, text) => stash(
       `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`));
+  // `code` before any link: a code span is literal, so a URL inside one
+  // (`https://schema.org/`) stays code instead of becoming a link with the
+  // backticks left standing around it. Stashed, so no later pass — links,
+  // bold, italic, strike — fires inside it either.
+  s = s.replace(/`([^`]+)`/g, (_m, c) => stash(`<code>${c}</code>`));
   // ![alt](url) — no remote fetches from rendered content; show it as a link.
   s = s.replace(/!\[([^\]]*)\]\(((?:https?:\/\/)[^\s)]+)\)/gi,
     (_m, alt, url) => stash(anchor(url, alt || url)));
   // [label](url)
   s = s.replace(/\[([^\]]+)\]\(((?:https?:\/\/|mailto:|tel:)[^\s)]+)\)/gi,
     (_m, label, url) => stash(anchor(url, label)));
-  // Bare URLs; keep any trailing punctuation (URL_TAIL_RE) outside the link.
-  s = s.replace(/\bhttps?:\/\/[^\s<]+/gi, (m) => {
+  // Bare URLs; keep any trailing punctuation (URL_TAIL_RE) outside the link,
+  // and stop at a stash placeholder (\x01 is SEP) so a code span right after a
+  // URL is not swallowed into its href.
+  s = s.replace(/\bhttps?:\/\/[^\s<\x01]+/gi, (m) => {
     const t = m.match(URL_TAIL_RE);
     const tail = t ? t[0] : '';
     const url = tail ? m.slice(0, -tail.length) : m;
     return stash(anchor(url, url)) + tail;
   });
-  s = s.replace(/\bwww\.[^\s<]+/gi, (m) => {
+  s = s.replace(/\bwww\.[^\s<\x01]+/gi, (m) => {
     const t = m.match(URL_TAIL_RE);
     const tail = t ? t[0] : '';
     const host = tail ? m.slice(0, -tail.length) : m;
     return stash(anchor('https://' + host, host)) + tail;
   });
-  // `code` is stashed too: bold/italic/strike must not fire inside it.
-  s = s.replace(/`([^`]+)`/g, (_m, c) => stash(`<code>${c}</code>`));
   s = s.replace(/\*\*([^*]+?)\*\*/g, (_m, c) => `<strong>${c}</strong>`);
   s = s.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\w)/g, (_m, pre, c) => `${pre}<em>${c}</em>`);
   s = s.replace(/~~([^~\n]+?)~~/g, (_m, c) => `<del>${c}</del>`);
-  return s.replace(new RegExp(SEP + '(\\d+)' + SEP, 'g'), (_m, i) => stashed[Number(i)]);
+  // Restore until nothing changes: a stashed link's label may itself hold a
+  // stashed code span ([`x`](url)).
+  const placeholder = new RegExp(SEP + '(\\d+)' + SEP, 'g');
+  for (let prev = null; prev !== s;) {
+    prev = s;
+    s = s.replace(placeholder, (m, i) => stashed[Number(i)] ?? m);
+  }
+  return s;
 }
 
 // ── Block pass ────────────────────────────────────────────────────────────────
@@ -102,8 +114,8 @@ const LIST_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 const TASK_RE = /^\[([ xX])\]\s+(.*)$/;
 const TABLE_SEP_RE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/;
 
-function renderParagraph(lines) {
-  return `<p>${lines.map(renderInline).join('<br>')}</p>`;
+function renderParagraph(lines, br) {
+  return `<p>${lines.map(renderInline).join(br)}</p>`;
 }
 
 function splitTableRow(line) {
@@ -185,11 +197,17 @@ function renderListItems(items) {
  * blocks — rawText is the raw (unescaped) code, lang the fence's language tag
  * (or ''), innerHtml the default <pre><code>… markup. Lets a host add a
  * copy-to-clipboard button the same way the quote hook does.
+ * opts.hardWrapped: the source is a document wrapped at a fixed width (the
+ * framework's docs/*.md), not a message: a single newline inside a paragraph
+ * or quote is a space, and an indented line continues the list item above it.
+ * A message keeps every line break its author typed.
  */
 export function renderMarkdown(text, opts = {}) {
   const quoteHook = opts.quote
     || ((_raw, inner) => `<blockquote class="md-quote">${inner}</blockquote>`);
   const codeHook = opts.code || ((_raw, _lang, inner) => inner);
+  const wrapped = Boolean(opts.hardWrapped);
+  const br = wrapped ? ' ' : '<br>';
   const lines = String(text == null ? '' : text).split('\n');
   const out = [];
   let i = 0;
@@ -227,7 +245,7 @@ export function renderMarkdown(text, opts = {}) {
         i++;
       }
       const raw = quoted.join('\n');
-      out.push(quoteHook(raw, quoted.map(renderInline).join('<br>')));
+      out.push(quoteHook(raw, quoted.map(renderInline).join(br)));
       continue;
     }
 
@@ -236,8 +254,13 @@ export function renderMarkdown(text, opts = {}) {
       const items = [];
       while (i < lines.length) {
         const m = LIST_RE.exec(lines[i]);
-        if (!m) break;
-        items.push({ indent: m[1].length, marker: m[2], text: m[3] });
+        if (m) {
+          items.push({ indent: m[1].length, marker: m[2], text: m[3] });
+        } else if (wrapped && /^\s+\S/.test(lines[i])) {
+          items[items.length - 1].text += ` ${lines[i].trim()}`;
+        } else {
+          break;
+        }
         i++;
       }
       out.push(renderListItems(items));
@@ -270,7 +293,7 @@ export function renderMarkdown(text, opts = {}) {
       plain.push(lines[i]);
       i++;
     }
-    if (plain.length) out.push(renderParagraph(plain));
+    if (plain.length) out.push(renderParagraph(plain, br));
   }
   return `<div class="md">${out.join('')}</div>`;
 }

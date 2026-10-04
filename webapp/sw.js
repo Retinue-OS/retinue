@@ -160,6 +160,24 @@ self.addEventListener('fetch', (e) => {
   // would silently produce subscriptions this server cannot send to.
   if (url.pathname.startsWith('/push/')) return;
 
+  // The SPARQL endpoint answers live from the store (its page, served at the
+  // same path, needs the store anyway), and the docs it renders are the
+  // image's own: both straight from the network.
+  if (url.pathname === '/sparql' || url.pathname.startsWith('/sparql/')) return;
+  if (url.pathname.startsWith('/docs/')) return;
+
+  // Vendored libraries (YASGUI, a megabyte) are fetched on first use, then
+  // kept in the shell cache: the shell hash covers them, so a new version
+  // arrives with the next worker.
+  if (url.pathname.startsWith('/vendor/')) {
+    e.respondWith(caches.open(SHELL).then((c) => c.match(e.request).then((hit) => hit ||
+      fetch(e.request).then((res) => {
+        if (res.ok) c.put(e.request, res.clone());
+        return res;
+      }))));
+    return;
+  }
+
   if (url.pathname.startsWith('/data/')) {
     e.respondWith(
       fetch(e.request)

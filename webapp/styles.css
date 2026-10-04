@@ -133,6 +133,39 @@ main.settings { max-width: 640px; height: auto; }
 .linklist a { display: block; padding: 10px 12px; border-radius: 10px;
               background: var(--card-2); color: var(--fg); text-decoration: none; }
 .linklist a:hover { outline: 1px solid var(--accent); }
+/* The life store's page (sparql.html, components/sparql.js): a reading column
+   like Settings, wider for queries and result tables. Its elements render in
+   the light DOM — YASGUI's stylesheet is global — so they are styled here.
+   YASGUI keeps its own light theme: each live example and the workbench sit
+   on a light sheet inside the dark card, the way a document would, rather
+   than under a half-overridden palette that leaves some of its parts
+   unreadable. */
+main.sparql { max-width: 960px; height: auto; }
+.sparql-jump { color: var(--accent); font-size: .9rem; text-decoration: none; }
+.sparql-curl { margin: 0; padding: 10px 12px; border-radius: 10px; background: var(--card-2);
+               overflow-x: auto; font-size: .8rem; }
+.scard code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+retinue-sparql-doc { display: block; }
+retinue-sparql-doc .md h1 { font-size: 1.3rem; }
+retinue-sparql-doc .md h2 { font-size: 1.1rem; margin-top: 22px; }
+retinue-sparql-doc .md a code { color: var(--accent); }
+.sparql-note { color: var(--muted); font-size: .9rem; margin: 0; }
+.sparql-example { position: relative; margin: 8px 0 12px; }
+.sparql-example .md-pre { margin: 0; padding-right: 72px; }
+.sparql-run { position: absolute; top: 8px; right: 8px; min-height: 30px; padding: 0 12px;
+              border: 1px solid var(--accent); border-radius: 999px; background: var(--card);
+              color: var(--accent); font: inherit; font-size: .8rem; font-weight: 600; cursor: pointer; }
+.sparql-run::before { content: "▶ "; font-size: .7em; vertical-align: 1px; }
+.sparql-run:hover:not(:disabled) { background: var(--accent); color: var(--bg); }
+.sparql-run:disabled { cursor: default; opacity: .7; border-color: var(--line); color: var(--muted); }
+.sparql-example.live, retinue-sparql-workbench .yasgui {
+  color-scheme: light; background: #fff; color: #1d2330;
+  border-radius: 10px; padding: 6px; overflow: hidden; }
+retinue-sparql-workbench { display: block; min-height: 120px; }
+/* The workbench queries this store only; its endpoint field has nothing to
+   choose. */
+retinue-sparql-workbench .yasgui .controlbar { display: none; }
+.sparql-example.live .yasr, retinue-sparql-workbench .yasr { font-size: .85rem; }
 .shelf-size { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .shelf-size input { width: 5.5em; min-height: 40px; padding: 0 10px; border-radius: 10px;
                     border: 1px solid var(--line); background: var(--card-2); color: var(--fg);

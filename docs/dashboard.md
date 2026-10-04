@@ -565,6 +565,55 @@ runs both ways: such a thread carries an "About: <project>" chip back to the
 project page, and the project page lists the project's threads (open ones
 first, archived folded) so an ongoing discussion is picked up, not restarted.
 
+## The life store page (`/sparql`)
+
+The gateway publishes the life store at **`/sparql`**, behind the dashboard's
+own sign-in (the host-wide forward-auth covers it like every other path). The
+store is read-only, but it is the whole personal store, so nothing about it is
+public. One URL serves two audiences, the way public SPARQL endpoints usually
+do:
+
+- **Programs** use it as a SPARQL 1.1 Protocol endpoint: `query=` in the URL or
+  a form, or an `application/sparql-query` body; the store's answer, in the
+  format the `Accept` header asked for, comes back unchanged. Asked without a
+  query by anything but a browser, it returns a SPARQL 1.1 Service Description
+  (Turtle).
+- **A browser** gets `webapp/sparql.html`, linked from Settings › System: the
+  endpoint with a ready `curl` line, then `docs/ontology.md` itself. The page
+  fetches the doc from `/docs/<name>.md` (the image's own `docs/`, read-only)
+  and renders it with the dashboard's Markdown renderer, so the documentation
+  and the page cannot drift apart. Every ` ```sparql ` block in it gets a
+  **Run** button. Run turns the block, where it stands, into a YASQE editor
+  with the same query and opens its YASR results beneath it. `?doc=<name>`
+  renders another doc the same way, and a `docs/<name>.md` mentioned in the
+  text links there. At the foot of the page is a full YASGUI **workbench** for
+  your own queries, kept in tabs on the device.
+
+Safety lives in the gateway, not the page. Only a `query` ever reaches the
+store, as a fresh form POST carrying nothing of the caller's request but the
+query and its `Accept`: no `Authorization` header, no access token, no other
+argument. Every form of SPARQL Update is refused (403) before the store is
+asked; the store's own front refuses writes too. A result is never served as
+HTML on the dashboard's origin. A query may run for `SPARQL_PROXY_TIMEOUT`
+seconds (default 120).
+
+YASGUI is **vendored at image build** by `scripts/vendor-yasgui.sh` (pinned
+version and sha256) into `webapp/vendor/yasgui/`, which is not committed; run
+the script once for a checkout served directly. The page loads it on first
+use, and the service worker then keeps it in the shell cache. The dashboard
+makes no third-party requests, and this page keeps that rule: YASQE's stock
+autocompleters, which call prefix.cc and send what is being typed to the LOV
+API, are replaced by one that completes the prefixes the ontology's own
+examples declare. Typing `sosa:` adds `PREFIX sosa: <…>` from the
+documentation. The workbench keeps queries on the device, never results, and a
+shared link (`#query=…`) brings only its query, never an endpoint.
+
+`tests/test_doc_sparql.py` keeps every documented query runnable: one
+self-contained, read-only query per block (parsed by rdflib where installed),
+and an example for every namespace in the ontology's defaults table.
+`tests/test_web_gateway_sparql.py` pins the endpoint's behaviour, and
+`tests/test_webapp_sparql_doc.py` the rendering.
+
 ## Speech-to-text (the `stt` service) and voice input
 
 Transcription is a **shared capability**, not the business of any one gateway, so

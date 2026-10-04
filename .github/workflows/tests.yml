@@ -31,8 +31,10 @@ jobs:
         with:
           python-version: "3.12"
 
+      # rdflib is no module-scope import: tests/test_doc_sparql.py uses it,
+      # when present, to parse every documented SPARQL example.
       - name: Install test dependencies
-        run: pip install markdown-it-py requests pywebpush
+        run: pip install markdown-it-py requests pywebpush rdflib
 
       - name: Run test suite
         run: |

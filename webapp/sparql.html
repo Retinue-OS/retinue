@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#0b0d12">
+  <title>Retinue — Life store</title>
+
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon-192.png">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- The life store's own page: what the gateway answers when a browser opens
+       the SPARQL endpoint, /sparql, without a query. The documentation it
+       shows is docs/ontology.md itself, and every example in it runs in
+       place; the workbench below takes queries of one's own. Reached from
+       Settings › System. -->
+  <script type="module" src="/components/sparql.js"></script>
+  <script type="module" src="/components/nav.js"></script>
+  <!-- The minimized pages: threads, chats and projects parked one tap away
+       (issue #282). Every page carries it as the last child of <main>. -->
+  <script type="module" src="/components/shelf.js"></script>
+</head>
+<body>
+  <main class="sparql">
+    <retinue-nav></retinue-nav>
+    <header class="top">
+      <h1>Life store</h1>
+      <a class="sparql-jump" href="#workbench">Workbench</a>
+    </header>
+
+    <section class="scard">
+      <h2>Endpoint</h2>
+      <p class="hint">Everything in your chambers, over SPARQL: read-only, and
+        behind this dashboard's sign-in. Programs use the same address with a
+        <code>query</code> (SPARQL 1.1 Protocol); asked without one, it
+        describes itself.</p>
+      <pre class="sparql-curl"><code data-curl>curl -u &lt;user&gt; /sparql</code></pre>
+    </section>
+
+    <retinue-sparql-doc class="scard"></retinue-sparql-doc>
+
+    <section class="scard" id="workbench">
+      <h2>Workbench</h2>
+      <p class="hint">Queries of your own, in tabs this device keeps (the
+        results it does not).</p>
+      <retinue-sparql-workbench></retinue-sparql-workbench>
+    </section>
+    <retinue-shelf></retinue-shelf>
+  </main>
+
+  <script>
+    // The endpoint as a program would call it, with this host in it.
+    document.querySelector('[data-curl]').textContent =
+      `curl -u <user> -H 'Accept: text/csv' ${location.origin}/sparql \\\n` +
+      `  --data-urlencode 'query=SELECT ?class (COUNT(?s) AS ?n) WHERE { ?s a ?class } GROUP BY ?class'`;
+  </script>
+  <script>
+    // Register the service worker so this page gets the shared shell too.
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
+    }
+  </script>
+</body>
+</html>

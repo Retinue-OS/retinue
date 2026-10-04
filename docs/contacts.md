@@ -253,6 +253,11 @@ SELECT ?person ?name ?channel ?handle WHERE {
   { ?person foaf:account ?a . ?a kb:channel ?channel ; foaf:accountName ?handle }
   UNION { ?person vcard:hasEmail ?m . BIND ("email" AS ?channel) BIND (STR(?m) AS ?handle) }
 }
+```
+
+```sparql
+PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
+PREFIX kb:    <https://w3id.org/retinue/kb#>
 
 # Everything a person wrote, on every messenger: accounts join the ledger on
 # (kb:channel, kb:sender).

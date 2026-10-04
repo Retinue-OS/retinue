@@ -54,10 +54,17 @@ a Progressive Web App on the phone home screen.
 
 - `/` and `/index.html` → `WEBAPP_DIR/index.html`
 - `/data/<file>.json`   → `DASHBOARD_DATA_DIR/<file>.json` (no-store)
+- `/sparql`             → the life store, read-only (a query), or `sparql.html`
+                          (a browser without one) — see `docs/dashboard.md`
+- `/docs/<name>.md`     → `DOCS_DIR/<name>.md`, the framework docs that page renders
 - everything else       → `WEBAPP_DIR/<path>` (shell assets)
 
+`vendor/` is not committed: `scripts/vendor-yasgui.sh webapp/vendor/yasgui`
+fetches YASGUI (pinned, checksummed) for the SPARQL page; the image build runs
+it.
+
 Env: `WEBAPP_DIR` (default `/workspace/webapp`), `DASHBOARD_DATA_DIR`
-(default `WEBAPP_DIR/data`).
+(default `WEBAPP_DIR/data`), `DOCS_DIR` (default `/workspace/docs`).
 
 ## The home: the attention list
 
