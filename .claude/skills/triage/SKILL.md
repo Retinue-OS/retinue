@@ -505,15 +505,6 @@ like Phase 3's link commits, not proposals. When one happened, say so in that
 message's omnibus line ("filed to the news feed", "ingested into the life
 store"): it tells the user the delete loses nothing.
 
-### Failed-action alerts are neither — they get their own conversation
-
-A failing CI run, a job that reported an error, a delivery that bounced: the
-user may want to act on it, or may have fixed it already. Give it its **own**
-dashboard conversation — one per failing workflow, or grouped per repository or
-run — offering *solved / keep on it / ignore*. Never fold one into the
-archive/delete omnibus: archiving hides both outcomes, the recurring problem and
-the one already dealt with.
-
 ### Already-answered check — before proposing any reply
 
 Inspect the thread first. If an **outbound** message follows the incoming one —
