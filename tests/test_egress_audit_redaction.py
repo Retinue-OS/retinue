@@ -11,6 +11,9 @@ strings, URL paths and bodies before writing. What these pin down:
 - a body cut off by the size limit mid-string is still redacted;
 - form bodies, query strings and credential-named headers are covered;
 - credential-shaped values are caught under names nobody listed;
+- the gaps a review found are closed: access/private-key names, plural
+  credential fields, numeric OTPs and PINs, and percent-encoded names and
+  values;
 - ordinary content is left alone, and the names of redacted fields stay
   visible, so the log still shows that a credential travelled.
 
@@ -101,6 +104,9 @@ def test_form_bodies_and_query_strings():
     for secret in ("abc123", "xyz789", "s3cr3t"):
         assert secret not in out, out
     assert "grant_type=authorization_code" in out and "redirect_uri=x" in out
+    # A callback URL quoted inside a JSON body carries its query along.
+    out = addon._redact_text('{"url": "https://x/cb?code=abc123&state=s"}')
+    assert "abc123" not in out and "state=s" in out, out
     line, entry = _logged(_flow("/search?q=weather&api_key=k3y&access_token=t0k", [], b"",
                                 [], b""))
     assert "k3y" not in line and "t0k" not in line, line
@@ -126,9 +132,42 @@ def test_credential_shaped_values_under_unlisted_names():
     assert "Q" * 35 not in line, line
 
 
+def test_access_and_private_key_names():
+    line, _ = _logged(_flow("/?access_key=ak1", [("X-Access-Key", "plainAK"),
+                                                 ("X-Private-Key", "plainPK")],
+                            json.dumps({"access_key": "ak2", "privateKey": "pk2"}).encode(),
+                            [], b""))
+    for secret in ("ak1", "ak2", "pk2", "plainAK", "plainPK"):
+        assert secret not in line, (secret, line)
+
+
+def test_plural_credential_fields():
+    out = addon._redact_text(json.dumps({"refresh_tokens": "rt1", "session_tokens": "st1"}))
+    assert "rt1" not in out and "st1" not in out, out
+    assert "rt2" not in addon._redact_text("refresh_tokens=rt2")
+
+
+def test_numeric_credentials():
+    out = addon._redact_text('{"otp": 123456, "pin": 4321, "count": 7}')
+    assert "123456" not in out and "4321" not in out, out
+    assert '"count": 7' in out
+    assert "98765" not in addon._redact_text('{"otp": 98765')
+
+
+def test_percent_encoded_names_and_values():
+    out = addon._redact_text("q=x&access%5Ftoken=opaque1")
+    assert "opaque1" not in out and out.startswith("q=x&access%5Ftoken="), out
+    line, _ = _logged(_flow("/bot123456789%3A" + "Q" * 35 + "/getMe", [], b"", [], b""))
+    assert "Q" * 35 not in line, line
+    # Nothing to hide: the original spelling stays.
+    assert addon._redact_text("/files/a%20b") == "/files/a%20b"
+
+
 def test_ordinary_content_is_untouched():
     text = json.dumps({"model": "claude", "messages": [{"role": "user", "content": "hi"}],
-                       "usage": {"input_tokens": 12, "output_tokens": 34}})
+                       "max_tokens": 1024, "token_type": "Bearer",
+                       "usage": {"input_tokens": 12, "output_tokens": 34,
+                                 "cache_read_input_tokens": 5}})
     assert addon._redact_text(text) == text
 
 
@@ -138,6 +177,10 @@ def main() -> int:
     test_form_bodies_and_query_strings()
     test_credential_headers()
     test_credential_shaped_values_under_unlisted_names()
+    test_access_and_private_key_names()
+    test_plural_credential_fields()
+    test_numeric_credentials()
+    test_percent_encoded_names_and_values()
     test_ordinary_content_is_untouched()
     print("all egress-audit redaction tests passed")
     return 0

@@ -32,6 +32,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 from pathlib import Path
 
 from mitmproxy import http
@@ -46,29 +47,48 @@ SENSITIVE_HEADERS = {
     "cookie",
     "set-cookie",
 }
+# The words that mark a name — header, JSON member, form or query field — as
+# carrying a credential. Shared so headers and payload fields cannot drift.
+_CREDENTIAL_WORDS = (
+    r"token|secret|password|passwd|credential|signature"
+    r"|(?:api|access|private|secret)[_-]?key|apikey"
+)
 # Any other header whose name says it carries a credential (x-api-key,
-# x-goog-api-key, x-auth-token, ...). Rate-limit headers that count tokens
-# (anthropic-ratelimit-tokens-remaining) are not credentials and stay.
-SENSITIVE_HEADER_RE = re.compile(r"token(?!s)|secret|api-?key|password|credential|signature", re.I)
+# x-access-key, x-private-key, x-auth-token, ...). Rate-limit headers that
+# count tokens (anthropic-ratelimit-tokens-remaining) are not credentials and
+# stay.
+SENSITIVE_HEADER_RE = re.compile(r"^(?!.*ratelimit)(?:.*(?:" + _CREDENTIAL_WORDS + r"))", re.I)
 
 REDACTED = "[redacted]"
 
 # Field names (JSON members, form and query parameters) whose value is a
-# credential. Matched case-insensitively against the whole name. Names that
-# merely describe a credential or count tokens (token_type, max_tokens,
-# input_tokens) are excluded: their values are not secrets, and keeping them
-# keeps the log readable.
-_SENSITIVE_NAME = (
-    r"(?![\w.-]*(?:_type|tokens)(?![\w.-]))"
-    r"(?:[\w.-]*(?:token|secret|password|passwd|api[_-]?key|apikey|credential|private[_-]?key)[\w.-]*"
-    r"|code|code_verifier|assertion|client_assertion|otp|pin|session|session_?id|sig|signature)"
+# credential. Matched case-insensitively against the whole name. Two kinds of
+# name contain a credential word without carrying one, and are named
+# explicitly rather than by pattern — a pattern broad enough to catch them
+# (say, anything ending in "tokens") also lets refresh_tokens through:
+# token_type and the token counters of LLM APIs (max_tokens, input_tokens,
+# cache_read_input_tokens, ...).
+_NOT_SENSITIVE = (
+    r"[\w.-]*_type"
+    r"|(?:[\w.-]*_)?(?:max|min|total|input|output|prompt|completion|budget"
+    r"|cached|reasoning)_tokens"
 )
-# "name": "value" — the value is a JSON string, escapes included. An unclosed
-# string (body cut off by the size limit) is redacted to its end.
+_SENSITIVE_NAME = (
+    r"(?!(?:" + _NOT_SENSITIVE + r")(?![\w.-]))"
+    r"(?:[\w.-]*(?:" + _CREDENTIAL_WORDS + r")[\w.-]*"
+    r"|code|code_verifier|assertion|client_assertion|otp|pin|session|session_?id|sig)"
+)
+_SENSITIVE_NAME_RE = re.compile(r"(?:" + _SENSITIVE_NAME + r")\Z", re.I)
+# "name": value — a JSON string (escapes included) or a number, since an OTP
+# or PIN is often sent as one. An unclosed string (body cut off by the size
+# limit) is redacted to its end.
 _JSON_FIELD_RE = re.compile(
-    r'("(?:' + _SENSITIVE_NAME + r')"\s*:\s*)"(?:[^"\\]|\\.)*(?:"|$)', re.I)
-# name=value in a query string or form body.
-_FORM_FIELD_RE = re.compile(r"(^|[?&;\s])((?:" + _SENSITIVE_NAME + r")=)[^&;\s]*", re.I)
+    r'("(?:' + _SENSITIVE_NAME + r')"\s*:\s*)'
+    r'(?:"(?:[^"\\]|\\.)*(?:"|$)|-?\d[\d.eE+-]*)', re.I)
+# name=value in a query string or form body. The name is matched after
+# percent-decoding (access%5Ftoken is access_token), the text keeps its
+# original spelling.
+_FORM_FIELD_RE = re.compile(r"(^|[?&;\s])([^=?&;\s]+=)([^&;\s]*)")
 # Credential-shaped values, wherever they appear.
 _VALUE_RES = (
     re.compile(r"sk-ant-[A-Za-z0-9_-]+"),
@@ -79,13 +99,36 @@ _VALUE_RES = (
 )
 
 
-def _redact_text(text: str) -> str:
-    """Return `text` with every credential value replaced by REDACTED."""
+def _redact_form_field(m: re.Match) -> str:
+    name = urllib.parse.unquote_plus(m.group(2)[:-1])
+    if _SENSITIVE_NAME_RE.match(name):
+        return m.group(1) + m.group(2) + REDACTED
+    return m.group(0)
+
+
+def _redact_raw(text: str) -> str:
     text = _JSON_FIELD_RE.sub(lambda m: m.group(1) + f'"{REDACTED}"', text)
-    text = _FORM_FIELD_RE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, text)
+    text = _FORM_FIELD_RE.sub(_redact_form_field, text)
     for pattern in _VALUE_RES:
         text = pattern.sub(
             lambda m: (m.group(1) if pattern.groups else "") + REDACTED, text)
+    return text
+
+
+def _redact_text(text: str) -> str:
+    """Return `text` with every credential value replaced by REDACTED.
+
+    Percent-encoding can hide a credential's shape (a Telegram token with its
+    colon written %3A). So the decoded text is checked as well, and when it
+    still holds something to redact, the decoded, redacted text is what gets
+    logged: the original spelling is given up only where keeping it would
+    keep a credential."""
+    text = _redact_raw(text)
+    if "%" in text:
+        decoded = urllib.parse.unquote(text)
+        redacted = _redact_raw(decoded)
+        if redacted != decoded:
+            return redacted
     return text
 
 
