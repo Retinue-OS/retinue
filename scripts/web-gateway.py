@@ -76,7 +76,8 @@ Projects (dashboard project pages):
 The life store (behind the dashboard's sign-in; read-only):
   GET|POST /sparql                    -> SPARQL 1.1 Protocol: query=<SPARQL>
                                          (URL or form) or an application/
-                                         sparql-query body, answered by the
+                                         sparql-query body, with default-/
+                                         named-graph-uri, answered by the
                                          life store as it answers; any update
                                          is refused (403). Without a query a
                                          browser gets webapp/sparql.html, any
@@ -5151,9 +5152,11 @@ def _sparql_bindings(query: str, timeout: float | None = None) -> list[dict]:
 #
 # Read-only by construction, not by trust: only a `query` ever leaves for the
 # store, always as a fresh form POST carrying nothing of the caller's request
-# but the query text and its Accept header. An `update`, the store's access
-# token or the user's own Authorization header cannot ride along. (The store's
-# front refuses writes as well; this is the second lock, not the only one.)
+# but the query text, the dataset it names (default-graph-uri,
+# named-graph-uri: graphs to read, nothing else) and its Accept header. An
+# `update`, the store's access token or the user's own Authorization header
+# cannot ride along. (The store's front refuses writes as well; this is the
+# second lock, not the only one.)
 SPARQL_PROXY_TIMEOUT = float(os.environ.get("SPARQL_PROXY_TIMEOUT", "120"))
 # A query is text; a body beyond this is not one.
 SPARQL_MAX_BODY = 1024 * 1024
@@ -5164,11 +5167,17 @@ DOCS_DIR = Path(os.environ.get("DOCS_DIR", "/workspace/docs"))
 _DOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.md$")
 
 
-def _sparql_operation(query_string: str, content_type: str = "",
-                      body: bytes = b"") -> tuple[str | None, tuple[int, str] | None]:
-    """The query a SPARQL Protocol request carries, as ``(query, refusal)``.
+_SPARQL_DATASET_PARAMS = ("default-graph-uri", "named-graph-uri")
 
-    Reads all three ways the protocol passes an operation — URL parameters, a
+
+def _sparql_operation(query_string: str, content_type: str = "", body: bytes = b"",
+                      ) -> tuple[list[tuple[str, str]] | None, tuple[int, str] | None]:
+    """The query a SPARQL Protocol request carries, as ``(form, refusal)``.
+
+    ``form`` is what the store is sent: the query, and the dataset the
+    request names with ``default-graph-uri``/``named-graph-uri``, if any —
+    dropping those would answer over the whole store without a word. Reads
+    all three ways the protocol passes an operation — URL parameters, a
     form-encoded POST body, a bare ``application/sparql-query`` body — and the
     update forms only to refuse them. ``refusal`` is ``(status, message)``;
     both are None when the request carries no operation at all, which on a
@@ -5192,7 +5201,8 @@ def _sparql_operation(query_string: str, content_type: str = "",
         return None, None
     if not queries[0].strip():
         return None, (400, "the query is empty")
-    return queries[0], None
+    dataset = [(key, iri) for key in _SPARQL_DATASET_PARAMS for iri in params.get(key, [])]
+    return [("query", queries[0])] + dataset, None
 
 
 def _sparql_service_description() -> str:
@@ -8310,13 +8320,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(413, {"error": "not a query: the body is too large"})
                 return
             body = self.rfile.read(length) if length else b""
-        query, refusal = _sparql_operation(
+        form, refusal = _sparql_operation(
             query_string, self.headers.get("Content-Type", ""), body)
         if refusal:
             self._send_json(refusal[0], {"error": refusal[1]})
             return
-        if query is not None:
-            self._sparql_forward(query)
+        if form is not None:
+            self._sparql_forward(form)
         elif self.command == "POST":
             self._send_json(400, {"error": "no query: send query=<SPARQL> as a form, "
                                            "or the query as an application/sparql-query body"})
@@ -8331,13 +8341,14 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
 
-    def _sparql_forward(self, query: str) -> None:
+    def _sparql_forward(self, form: list[tuple[str, str]]) -> None:
         """Run one query on the life store and stream its answer back as the
         store gave it — status, type and body — so a client sees the store's
-        own error for a bad query, not a gateway paraphrase of it."""
+        own error for a bad query, not a gateway paraphrase of it. ``form`` is
+        _sparql_operation's: the query and the dataset it names."""
         req = urllib.request.Request(
             QLEVER_LIFE_URL,
-            data=urllib.parse.urlencode({"query": query}).encode("utf-8"),
+            data=urllib.parse.urlencode(form).encode("utf-8"),
             headers={"Accept": self.headers.get("Accept") or "application/sparql-results+json",
                      "Content-Type": "application/x-www-form-urlencoded"},
             method="POST",

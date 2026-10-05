@@ -8,8 +8,9 @@ declares every prefix it uses — a block that leans on a prefix declared in a
 neighbouring block, or holds two queries, reads fine and fails on Run.
 
 docs/ontology.md also promises one example per kind of data in its defaults
-table: every namespace the table names must appear in at least one of its
-examples, so adding a row without an example fails here.
+table: every namespace the table names must be used — not merely declared —
+by at least one of its examples, so adding a row without an example, or
+dropping the example a row had, fails here.
 
 The structural checks need nothing installed. When rdflib is importable (CI
 installs it) every block is also parsed and translated by a SPARQL 1.1 parser.
@@ -32,7 +33,11 @@ PREFIX_DECL_RE = re.compile(r"^\s*PREFIX\s+([A-Za-z][\w.-]*)?:\s*<([^>]*)>", re.
 OPAQUE_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"|\'(?:[^\'\\\n]|\\.)*\'|<[^<>"\s]*>|#[^\n]*')
 PNAME_RE = re.compile(r"(?<![\w.:?$-])([A-Za-z][\w.-]*)?:(?=[\w%])")
 QUERY_FORM_RE = re.compile(r"\b(SELECT|ASK|CONSTRUCT|DESCRIBE)\b", re.I)
-UPDATE_RE = re.compile(r"\b(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|COPY|MOVE|ADD)\b", re.I)
+# An update keyword standing alone: not a variable (?load, $add) and not part
+# of a prefixed name (ex:add, add:x).
+UPDATE_RE = re.compile(r"(?<![\w?$:.-])(INSERT|DELETE|LOAD|CLEAR|CREATE|DROP|COPY|MOVE|ADD)(?![\w:-])",
+                       re.I)
+IRI_RE = re.compile(r"<([^<>\"\s]*)>")
 
 
 def sparql_blocks(path: Path) -> list[str]:
@@ -51,6 +56,21 @@ def _top_level_forms(body: str) -> int:
         elif depth == 0:
             count += 1
     return count
+
+
+def used_iris(query: str) -> set[str]:
+    """What the query itself uses: every IRI written out in full, and the
+    namespace of every prefixed name, resolved through the block's own PREFIX
+    lines. A prefix declared and never used, and anything in a comment or a
+    string, does not count."""
+    declared = {m.group(1) or "": m.group(2) for m in PREFIX_DECL_RE.finditer(query)}
+    body = PREFIX_DECL_RE.sub(" ", query)
+    full = IRI_RE.findall(OPAQUE_RE.sub(
+        lambda m: m.group(0) if m.group(0).startswith("<") else " ", body))
+    blank = OPAQUE_RE.sub(" ", body)
+    named = {declared[m.group(1) or ""] for m in PNAME_RE.finditer(blank)
+             if (m.group(1) or "") in declared}
+    return set(full) | named
 
 
 def structural_problems(query: str) -> list[str]:
@@ -111,8 +131,8 @@ def test_every_default_namespace_has_an_example():
         if line.startswith("|"):
             namespaces.update(re.findall(r"`(https?://[^`]+)`", line))
     assert len(namespaces) >= 9, f"the defaults table lost its namespaces? {namespaces}"
-    examples = "\n".join(sparql_blocks(DOCS / "ontology.md"))
-    missing = sorted(ns for ns in namespaces if f"<{ns}" not in examples)
+    used = set().union(*map(used_iris, sparql_blocks(DOCS / "ontology.md")))
+    missing = sorted(ns for ns in namespaces if not any(iri.startswith(ns) for iri in used))
     assert not missing, ("docs/ontology.md: no example query uses "
                          + ", ".join(missing) + " — add one per kind of data")
     print(f"ok - all {len(namespaces)} default namespaces have an example query")
@@ -133,7 +153,15 @@ def test_structural_check_catches_what_it_should():
         "SELECT * WHERE { ?s ?p ?o }\nSELECT * WHERE { ?s ?p ?o }"))
     assert any("read-only" in p for p in structural_problems(
         "INSERT DATA { <a> <b> <c> }"))
-    print("ok - the structural check flags undeclared prefixes, two queries and updates")
+    # A variable or a local name that spells an update keyword is no update.
+    named = ("PREFIX ex: <http://ex/>\n"
+             "SELECT ?load ?add WHERE { ?s ex:add ?load ; ex:drop $add }")
+    assert structural_problems(named) == [], structural_problems(named)
+    # Coverage counts what a query uses, not what it declares or mentions.
+    assert used_iris("PREFIX p: <http://p/>\nPREFIX q: <http://q/>\n"
+                     "SELECT * WHERE { ?s p:x <http://r/y> } # q:z") == {"http://p/", "http://r/y"}
+    print("ok - the structural check flags undeclared prefixes, two queries and updates, "
+          "and nothing that merely spells one")
 
 
 def main() -> int:

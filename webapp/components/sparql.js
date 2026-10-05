@@ -141,15 +141,23 @@ class RetinueSparqlDoc extends HTMLElement {
 
   async load(src) {
     this.innerHTML = '<p class="sparql-note">Loading…</p>';
-    let text;
     try {
       const res = await fetch(src);
       if (!res.ok) throw new Error(`${res.status}`);
-      text = await res.text();
+      this.render(await res.text());
     } catch (err) {
       this.innerHTML = `<p class="sparql-note">Could not load ${esc(src)} (${esc(err.message)}).</p>`;
-      return;
     }
+    // Only now does the page have its height. The workbench waits for this
+    // to measure where it is, and a jump the URL asked for (#workbench) was
+    // made against the 'Loading…' placeholder, so it is made again.
+    this.toggleAttribute('loaded', true);
+    this.dispatchEvent(new Event('retinue-doc-loaded'));
+    const target = location.hash.length > 1 && document.getElementById(location.hash.slice(1));
+    if (target) target.scrollIntoView();
+  }
+
+  render(text) {
     this.queries = [];
     this.innerHTML = renderMarkdown(text, {
       hardWrapped: true,
@@ -223,6 +231,10 @@ SELECT * WHERE {
   ?s ?p ?o
 } LIMIT 10`;
 
+// A shared link — what the workbench's share button makes, /sparql#query=… —
+// as URL parameters; the page's own anchors (#workbench) carry no query.
+const sharedLink = () => new URLSearchParams(location.hash.slice(1));
+
 class RetinueSparqlWorkbench extends HTMLElement {
   connectedCallback() {
     if (this.observer || this.yasgui) return;
@@ -232,7 +244,18 @@ class RetinueSparqlWorkbench extends HTMLElement {
       this.observer.disconnect();
       this.start();
     }, { rootMargin: '200px' });
-    this.observer.observe(this);
+    // Watched only once the doc above has its height: before that the
+    // workbench sits on the first screen, behind the doc's 'Loading…', and
+    // would load YASGUI on every visit. A shared link is the exception that
+    // brings it into view, since its query is what the visit is for.
+    const watch = () => {
+      if (!this.observer) return;
+      if (sharedLink().get('query')) (this.closest('section') || this).scrollIntoView();
+      this.observer.observe(this);
+    };
+    const doc = document.querySelector('retinue-sparql-doc');
+    if (doc && !doc.hasAttribute('loaded')) doc.addEventListener('retinue-doc-loaded', watch, { once: true });
+    else watch();
   }
 
   disconnectedCallback() {
@@ -250,22 +273,44 @@ class RetinueSparqlWorkbench extends HTMLElement {
       return;
     }
     const prefixes = await ontologyPrefixes();
+    const link = sharedLink();
     this.yasgui = new Yasgui(this, {
       requestConfig: REQUEST,
       endpointCatalogueOptions: { getData: () => [{ endpoint: ENDPOINT }] },
-      // A shared link (#query=…) opens as a tab, but brings only its query:
-      // the request is always this store's, never an endpoint, header or
-      // extra argument the link names.
-      populateFromUrl: (tab) => ({
-        ...tab,
-        requestConfig: { ...tab.requestConfig, endpoint: ENDPOINT, headers: {}, args: [] },
-      }),
+      // YASGUI does not read the URL itself: it would write whatever a link
+      // names (endpoint, headers, arguments) into the defaults every later
+      // tab starts from, query or no query. The link is read below instead.
+      populateFromUrl: false,
       persistenceId: 'retinue-sparql-workbench',
       autofocus: false,
       yasqe: { value: WORKBENCH_QUERY },
       // Queries are kept per device; results never are.
       yasr: { maxPersistentResponseSize: 0, prefixes },
     });
+    // Whatever a stored tab says, every tab asks this store with nothing but
+    // its query and the dataset the query itself names.
+    for (const id of this.yasgui.persistentConfig.getTabs()) {
+      const tab = this.yasgui.getTab(id);
+      if (tab) {
+        tab.setRequestConfig({ endpoint: ENDPOINT, headers: {}, args: [],
+                               namedGraphs: [], defaultGraphs: [] });
+      }
+    }
+    // A shared link opens as a tab of its own, run at once, and brings
+    // nothing but its query (and the tab's name).
+    const query = link.get('query');
+    if (query) {
+      history.replaceState(null, '', location.pathname + location.search);
+      // The same link opened again selects its tab rather than adding one.
+      // (Not YASGUI's avoidDuplicateTabs: its selectTabId hands back the tab
+      // that was active before, so the wrong query would run.)
+      const known = this.yasgui.persistentConfig.getTabs()
+        .find((id) => this.yasgui.persistentConfig.getTab(id)?.yasqe?.value === query);
+      if (known) this.yasgui.selectTabId(known);
+      const tab = known ? this.yasgui.getTab(known)
+        : this.yasgui.addTab(true, { name: link.get('tabTitle') || undefined, yasqe: { value: query } });
+      tab.query().catch(() => {});
+    }
   }
 }
 

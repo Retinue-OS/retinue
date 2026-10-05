@@ -143,13 +143,20 @@ SELECT ?time ?property ?value ?sensor WHERE {
 ### Contacts — vCard
 
 ```sparql
-PREFIX vcard: <http://www.w3.org/2006/vcard/ns#>
+PREFIX vcard:  <http://www.w3.org/2006/vcard/ns#>
+PREFIX foaf:   <http://xmlns.com/foaf/0.1/>
+PREFIX schema: <http://schema.org/>
 
-# The address book: every person, with their e-mail addresses and phone numbers.
+# The address book: every person, with their e-mail addresses and phone
+# numbers. scripts/contacts.py files a person as a vcard:Individual named by
+# vcard:fn; a hand-written file may use foaf:Person or schema:Person and their
+# name properties instead, and is a contact all the same.
 SELECT ?person ?name
        (GROUP_CONCAT(DISTINCT STRAFTER(STR(?mail), "mailto:"); SEPARATOR=", ") AS ?emails)
        (GROUP_CONCAT(DISTINCT STRAFTER(STR(?tel), "tel:"); SEPARATOR=", ") AS ?phones) WHERE {
-  ?person a vcard:Individual ; vcard:fn ?name .
+  VALUES ?class { vcard:Individual foaf:Person schema:Person }
+  ?person a ?class .
+  OPTIONAL { ?person vcard:fn|foaf:name|schema:name ?name }
   OPTIONAL { ?person vcard:hasEmail ?mail }
   OPTIONAL { ?person vcard:hasTelephone ?tel }
 } GROUP BY ?person ?name ORDER BY ?name
@@ -158,17 +165,19 @@ SELECT ?person ?name
 ### Messaging accounts — FOAF
 
 ```sparql
-PREFIX vcard: <http://www.w3.org/2006/vcard/ns#>
-PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
-PREFIX kb:    <https://w3id.org/retinue/kb#>
+PREFIX vcard:  <http://www.w3.org/2006/vcard/ns#>
+PREFIX foaf:   <http://xmlns.com/foaf/0.1/>
+PREFIX schema: <http://schema.org/>
+PREFIX kb:     <https://w3id.org/retinue/kb#>
 
 # Every messenger account, the person it belongs to, and how many messages the
 # ledger holds from it. An account joins its messages on (channel, handle).
-SELECT ?name ?channel ?handle (COUNT(?message) AS ?messages) WHERE {
-  ?person vcard:fn ?name ; foaf:account ?account .
+SELECT ?person ?name ?channel ?handle (COUNT(?message) AS ?messages) WHERE {
+  ?person foaf:account ?account .
   ?account kb:channel ?channel ; foaf:accountName ?handle .
+  OPTIONAL { ?person vcard:fn|foaf:name|schema:name ?name }
   OPTIONAL { ?message kb:channel ?channel ; kb:sender ?handle }
-} GROUP BY ?name ?channel ?handle ORDER BY DESC(?messages)
+} GROUP BY ?person ?name ?channel ?handle ORDER BY DESC(?messages)
 ```
 
 ### Events, places and everything else — schema.org

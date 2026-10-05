@@ -11,8 +11,10 @@ says. This pins the pieces that promise rests on:
 - the prefix map the editor completes from is the one the examples declare;
 - a doc name from the URL can only name a doc;
 - the renderer fixes the docs needed, without changing messages: a code span
-  is literal (a URL in backticks is code, not a link inside backticks), and
-  hard-wrapped prose flows (`hardWrapped`) while a message keeps its breaks.
+  is literal (a URL in backticks is code, not a link inside backticks),
+  hard-wrapped prose flows (`hardWrapped`), with code spans and bold free to
+  cross the wrap, while a message keeps its breaks; and no input, however
+  crafted, keeps the renderer from returning.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes.
@@ -77,8 +79,20 @@ ok('a code span is literal, links and all', () => {
     /^<a href="https:\/\/w3id.org\/retinue\/kb#"[^>]*><code>kb:<\/code><\/a>$/);
   // A URL right before a code span keeps its own href.
   assert.match(renderInline('https://example.org`x`'), /href="https:\/\/example.org"/);
-  // Text that happens to hold the stash sentinel cannot hang the renderer.
+  // Text holding the stash sentinel cannot hang the renderer, not even text
+  // crafted to name the very stash it lands in.
   assert.equal(typeof renderInline('a \u0001 7 \u0001 b'), 'string');
+  assert.match(renderInline('`\u00010\u0001`'), /^<code>[^\u0001]*<\/code>$/);
+  assert.match(renderMarkdown('**Asked:** `\u00010\u0001`'), /<code>/);
+});
+
+ok('in a document, code spans and bold may cross a line break', () => {
+  const doc = renderMarkdown('A naive `"urn:retinue:" +\nvalue` mapping turns `x` into\n**two\nwords** here.\n\n> a `quoted\n> span`',
+    { hardWrapped: true });
+  assert.match(doc, /<code>&quot;urn:retinue:&quot; \+ value<\/code> mapping turns <code>x<\/code>/);
+  assert.match(doc, /<strong>two words<\/strong>/);
+  assert.match(doc, /<code>quoted span<\/code>/);
+  assert.ok(!/`/.test(doc.replace(/<code>[^<]*<\/code>/g, '')), doc);
 });
 
 ok('a document flows, a message keeps its line breaks', () => {
@@ -109,7 +123,13 @@ def main() -> int:
             fh.write('{"type":"module"}')
         with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:
             fh.write(HARNESS)
-        proc = subprocess.run([node, "harness.mjs"], cwd=tmp, capture_output=True, text=True)
+        try:
+            # A renderer that loops forever must fail the test, not stall CI.
+            proc = subprocess.run([node, "harness.mjs"], cwd=tmp, capture_output=True,
+                                  text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            print("FAIL: SPARQL page rendering test timed out (a renderer loop?)")
+            return 1
         sys.stdout.write(proc.stdout)
         if proc.returncode != 0:
             sys.stderr.write(proc.stderr)

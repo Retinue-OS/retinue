@@ -591,11 +591,18 @@ do:
 
 Safety lives in the gateway, not the page. Only a `query` ever reaches the
 store, as a fresh form POST carrying nothing of the caller's request but the
-query and its `Accept`: no `Authorization` header, no access token, no other
-argument. Every form of SPARQL Update is refused (403) before the store is
-asked; the store's own front refuses writes too. A result is never served as
-HTML on the dashboard's origin. A query may run for `SPARQL_PROXY_TIMEOUT`
-seconds (default 120).
+query, the dataset it names (`default-graph-uri`, `named-graph-uri`) and its
+`Accept`: no `Authorization` header, no access token, no other argument. Every
+form of SPARQL Update is refused (403) before the store is asked; the store's
+own front refuses writes too. A result is never served as HTML on the
+dashboard's origin. A body the gateway cannot read is named as such: chunked
+transfer gets 411, a malformed `Content-Length` 400.
+
+**Timeouts.** The store cancels a query after its own default timeout
+(`qlever-server --default-query-timeout`, 30 s as qlever-dir starts it) and
+says so in its answer. `SPARQL_PROXY_TIMEOUT` (default 120 s) only bounds how
+long the gateway waits on the store's connection, so raising it does not let a
+query run longer; a longer budget is a qlever-dir setting.
 
 YASGUI is **vendored at image build** by `scripts/vendor-yasgui.sh` (pinned
 version and sha256) into `webapp/vendor/yasgui/`, which is not committed; run

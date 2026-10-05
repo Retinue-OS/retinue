@@ -6,8 +6,9 @@ store that records what reaches it, and pins what makes the endpoint safe to
 open to the dashboard's users:
 
 - only a query ever reaches the store — as a fresh form POST holding nothing
-  but `query`, with the caller's Accept and never their Authorization header
-  (nor the store's access token, should a caller send one);
+  but `query` and the dataset it names (default-/named-graph-uri), with the
+  caller's Accept and never their Authorization header (nor the store's
+  access token, nor any other argument a caller sends);
 - every way of sending a SPARQL Update is refused before the store is asked;
 - the store's answer comes back as it gave it, an error included, but never as
   HTML on the dashboard's origin;
@@ -120,8 +121,9 @@ def test_query_reaches_the_store_alone(c: Client):
     FakeStore.calls.clear()
     FakeStore.reply = (200, "text/csv", b"class\nurn:x\n")
     status, headers, body = c.request(
-        "POST", "/sparql?access-token=leaked",
-        body=urllib.parse.urlencode({"query": QUERY, "default-graph-uri": "urn:g"}),
+        "POST", "/sparql?access-token=leaked&named-graph-uri=urn:n1",
+        body=urllib.parse.urlencode([("query", QUERY), ("default-graph-uri", "urn:g"),
+                                     ("named-graph-uri", "urn:n2"), ("timeout", "999s")]),
         headers={**FORM, "Accept": "text/csv", "Authorization": "Basic dXNlcjpwdw=="})
     assert status == 200, status
     assert body == b"class\nurn:x\n", body
@@ -130,11 +132,16 @@ def test_query_reaches_the_store_alone(c: Client):
     assert len(FakeStore.calls) == 1, FakeStore.calls
     call = FakeStore.calls[0]
     assert call["method"] == "POST" and call["path"] == "/", call
-    assert urllib.parse.parse_qs(call["body"]) == {"query": [QUERY]}, call["body"]
+    # The query and the dataset it names, nothing else: not the token, not
+    # the extra argument.
+    assert urllib.parse.parse_qs(call["body"]) == {
+        "query": [QUERY], "default-graph-uri": ["urn:g"],
+        "named-graph-uri": ["urn:n1", "urn:n2"]}, call["body"]
     assert call["headers"]["accept"] == "text/csv", call["headers"]
     assert call["headers"]["content-type"] == "application/x-www-form-urlencoded"
     assert "authorization" not in call["headers"], call["headers"]
-    print("ok - only the query and its Accept reach the store; credentials and tokens stay behind")
+    print("ok - only the query, its dataset and its Accept reach the store; "
+          "credentials, tokens and other arguments stay behind")
 
 
 def test_every_protocol_form_of_a_query(c: Client):
