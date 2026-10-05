@@ -8,7 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates ffmpeg python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --break-system-packages --no-cache-dir faster-whisper
+# Pinned: an unpinned install takes whatever PyAV is current at build time.
+# PyAV 19 dropped av.open(metadata_errors=...), which faster-whisper's
+# decode_audio() still passes, so every transcription failed. Naming the
+# versions also invalidates this layer, so a bump actually reaches the image.
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+    faster-whisper==1.2.1 av==18.1.0
 
 WORKDIR /app
 COPY scripts/stt-service.py /app/stt-service.py
