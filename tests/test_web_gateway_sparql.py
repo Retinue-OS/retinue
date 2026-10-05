@@ -25,6 +25,7 @@ import http.client
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -281,16 +282,30 @@ def test_nothing_leaves_through_the_store(c: Client):
 def test_the_service_check_stays_linear(wg):
     """The check runs on every query a signed-in client sends, up to the body
     limit: no input may make it slow. (Its first form retried a prefixed-name
-    pattern at every position of a long run, ~30 s for 64 KB.)"""
+    pattern at every position of a long run, ~30 s for 64 KB.) Judged by how
+    the time grows with the input, not by the clock, so a slow runner cannot
+    fail it: four times the input costs about four times as long when the
+    check is linear, and about sixteen times when it is quadratic."""
     import time
+
+    def best_of_three(text):
+        times = []
+        for _ in range(3):
+            started = time.perf_counter()
+            wg._sparql_calls_out(text)
+            times.append(time.perf_counter() - started)
+        return min(times)
+
     worst = 0.0
     for unit in ("a.", "a-", "a:", '"""', "'a", "<a", "\\u0041", "ex:%41", "#", 'a.b:c-"x"<y>', "?a.", "@a-"):
-        text = "SELECT * WHERE { " + unit * (256 * 1024 // len(unit)) + " }"
-        started = time.perf_counter()
-        wg._sparql_calls_out(text)
-        worst = max(worst, time.perf_counter() - started)
-    assert worst < 2.0, f"the SERVICE check took {worst:.1f} s on a 256 KB query"
-    print(f"ok - the SERVICE check stays linear (worst 256 KB input: {worst * 1000:.0f} ms)")
+        def query(size):
+            return "SELECT * WHERE { " + unit * (size // len(unit)) + " }"
+        small, large = best_of_three(query(64 * 1024)), best_of_three(query(256 * 1024))
+        growth = large / max(small, 1e-4)
+        worst = max(worst, growth)
+        assert growth < 11, (f"the SERVICE check grows {growth:.1f}x from 64 KB to 256 KB of "
+                            f"{unit!r} ({small * 1000:.0f} -> {large * 1000:.0f} ms): not linear")
+    print(f"ok - the SERVICE check stays linear (worst growth for 4x the input: {worst:.1f}x)")
 
 
 def test_store_answers_pass_through_but_never_as_html(c: Client):
@@ -372,10 +387,12 @@ def main() -> int:
         wg.DOCS_DIR = docs
         wg.WEBAPP_DIR = webapp
         gateway = _serve(wg.Handler)
-        # A port nothing listens on, for the store-down case.
-        probe = ThreadingHTTPServer(("127.0.0.1", 0), FakeStore)
-        dead_port = probe.server_address[1]
-        probe.server_close()
+        # A port nothing listens on, for the store-down case: bound for the
+        # whole run but never listening, so it refuses connections and no
+        # other process can take it in the meantime.
+        dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
         c = Client(gateway.server_address[1])
         try:
             test_query_reaches_the_store_alone(c)
@@ -394,6 +411,7 @@ def main() -> int:
         finally:
             gateway.shutdown()
             store.shutdown()
+            dead.close()
     print("PASS")
     return 0
 
