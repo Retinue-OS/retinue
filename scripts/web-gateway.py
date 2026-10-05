@@ -73,6 +73,17 @@ Projects (dashboard project pages):
                                          keeps a thread archived when new
                                          messages are filed into it.
 
+The life store (behind the dashboard's sign-in; read-only):
+  GET|POST /sparql                    -> SPARQL 1.1 Protocol: query=<SPARQL>
+                                         (URL or form) or an application/
+                                         sparql-query body, answered by the
+                                         life store as it answers; any update
+                                         is refused (403). Without a query a
+                                         browser gets webapp/sparql.html, any
+                                         other client a Service Description.
+  GET  /docs/<name>.md                -> a framework doc, as Markdown — what the
+                                         SPARQL page renders and runs.
+
 News feed (dashboard news page; see scripts/news_store.py):
   GET  /news                          -> {"generated", "items": [...]} ranked at
                                          read time. ?scope=feed|read|hidden|all
@@ -1412,6 +1423,7 @@ _STATIC_CONTENT_TYPES = {
     ".js": "text/javascript; charset=utf-8",
     ".css": "text/css; charset=utf-8",
     ".json": "application/json; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
     ".webmanifest": "application/manifest+json; charset=utf-8",
     ".png": "image/png",
     ".svg": "image/svg+xml; charset=utf-8",
@@ -5126,6 +5138,85 @@ def _sparql_bindings(query: str, timeout: float | None = None) -> list[dict]:
     return payload.get("results", {}).get("bindings", [])
 
 
+# ── The life store, published (/sparql) ───────────────────────────────────────
+# The store the gateway queries above, opened to the people and programs that
+# hold the dashboard's sign-in (issue #261). It sits behind exactly that
+# sign-in — the host-wide forward-auth in front of every path served here —
+# because it is the whole personal store, and nothing about it is public.
+#
+# One URL, negotiated the way public endpoints usually are: with a query it is
+# a SPARQL 1.1 Protocol endpoint; without one a browser gets its documentation
+# page (webapp/sparql.html — docs/ontology.md with every example runnable in
+# place) and any other client a SPARQL 1.1 Service Description.
+#
+# Read-only by construction, not by trust: only a `query` ever leaves for the
+# store, always as a fresh form POST carrying nothing of the caller's request
+# but the query text and its Accept header. An `update`, the store's access
+# token or the user's own Authorization header cannot ride along. (The store's
+# front refuses writes as well; this is the second lock, not the only one.)
+SPARQL_PROXY_TIMEOUT = float(os.environ.get("SPARQL_PROXY_TIMEOUT", "120"))
+# A query is text; a body beyond this is not one.
+SPARQL_MAX_BODY = 1024 * 1024
+# The framework's own documentation, baked into the image beside the webapp.
+# Served read-only at /docs/<name>.md, so the SPARQL page renders the very
+# documents whose examples it runs and the two cannot drift apart.
+DOCS_DIR = Path(os.environ.get("DOCS_DIR", "/workspace/docs"))
+_DOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.md$")
+
+
+def _sparql_operation(query_string: str, content_type: str = "",
+                      body: bytes = b"") -> tuple[str | None, tuple[int, str] | None]:
+    """The query a SPARQL Protocol request carries, as ``(query, refusal)``.
+
+    Reads all three ways the protocol passes an operation — URL parameters, a
+    form-encoded POST body, a bare ``application/sparql-query`` body — and the
+    update forms only to refuse them. ``refusal`` is ``(status, message)``;
+    both are None when the request carries no operation at all, which on a
+    GET is the page or the service description rather than an error."""
+    params = urllib.parse.parse_qs(query_string or "", keep_blank_values=True)
+    ctype = (content_type or "").split(";", 1)[0].strip().lower()
+    text = body.decode("utf-8", errors="replace") if body else ""
+    if ctype == "application/x-www-form-urlencoded":
+        for key, values in urllib.parse.parse_qs(text, keep_blank_values=True).items():
+            params.setdefault(key, []).extend(values)
+    elif ctype == "application/sparql-query":
+        params.setdefault("query", []).append(text)
+    elif ctype == "application/sparql-update":
+        params.setdefault("update", []).append(text)
+    if "update" in params:
+        return None, (403, "the life store is read-only: SPARQL Update is not accepted")
+    queries = params.get("query") or []
+    if len(queries) > 1:
+        return None, (400, "exactly one query per request")
+    if not queries:
+        return None, None
+    if not queries[0].strip():
+        return None, (400, "the query is empty")
+    return queries[0], None
+
+
+def _sparql_service_description() -> str:
+    """A SPARQL 1.1 Service Description of /sparql, for clients that ask the
+    endpoint about itself. Relative IRIs resolve against the URL it was
+    fetched from, so it names the endpoint under whatever host serves it."""
+    return """\
+@prefix sd: <http://www.w3.org/ns/sparql-service-description#> .
+@prefix formats: <http://www.w3.org/ns/formats/> .
+@prefix dcterms: <http://purl.org/dc/terms/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+<> a sd:Service ;
+    sd:endpoint <> ;
+    dcterms:title "Retinue life store" ;
+    dcterms:description "Every RDF file in every mounted chamber, one named graph per file (<file:chamber/path>); the default graph is their union. Read-only." ;
+    sd:supportedLanguage sd:SPARQL11Query ;
+    sd:feature sd:UnionDefaultGraph ;
+    sd:resultFormat formats:SPARQL_Results_JSON, formats:SPARQL_Results_CSV,
+        formats:SPARQL_Results_TSV, formats:Turtle ;
+    rdfs:seeAlso </docs/ontology.md>, </docs/triple-stores.md> .
+"""
+
+
 def _fetch_project_rows() -> list[dict]:
     """Every running project as one row — the frontmatter fields the card and
     the attention model read. The optional ``k:tag`` multiplies a project's
@@ -8197,6 +8288,84 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return self._serve_static_file(WEBAPP_DIR / rel, WEBAPP_DIR)
 
+    def _handle_sparql(self) -> None:
+        """/sparql, GET or POST — see "The life store, published" above."""
+        query_string = self.path.partition("?")[2]
+        body = b""
+        if self.command == "POST":
+            # A streamed (chunked) body is one this server cannot read; say so
+            # rather than answer "no query" to a client that sent one. Neither
+            # header at all is a request without a body (RFC 9112, 6.3), which
+            # is fine when the query rides in the URL.
+            if self.headers.get("Transfer-Encoding"):
+                self._send_json(411, {"error": "send the body with a Content-Length "
+                                               "(chunked transfer is not supported)"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._send_json(400, {"error": "Content-Length is not a number"})
+                return
+            if not 0 <= length <= SPARQL_MAX_BODY:
+                self._send_json(413, {"error": "not a query: the body is too large"})
+                return
+            body = self.rfile.read(length) if length else b""
+        query, refusal = _sparql_operation(
+            query_string, self.headers.get("Content-Type", ""), body)
+        if refusal:
+            self._send_json(refusal[0], {"error": refusal[1]})
+            return
+        if query is not None:
+            self._sparql_forward(query)
+        elif self.command == "POST":
+            self._send_json(400, {"error": "no query: send query=<SPARQL> as a form, "
+                                           "or the query as an application/sparql-query body"})
+        elif "text/html" in (self.headers.get("Accept") or "").lower():
+            if not self._serve_static_file(WEBAPP_DIR / "sparql.html", WEBAPP_DIR):
+                self._send_json(404, {"error": "not found"})
+        else:
+            payload = _sparql_service_description().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/turtle; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    def _sparql_forward(self, query: str) -> None:
+        """Run one query on the life store and stream its answer back as the
+        store gave it — status, type and body — so a client sees the store's
+        own error for a bad query, not a gateway paraphrase of it."""
+        req = urllib.request.Request(
+            QLEVER_LIFE_URL,
+            data=urllib.parse.urlencode({"query": query}).encode("utf-8"),
+            headers={"Accept": self.headers.get("Accept") or "application/sparql-results+json",
+                     "Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            resp = urllib.request.urlopen(req, timeout=SPARQL_PROXY_TIMEOUT)
+        except urllib.error.HTTPError as exc:
+            resp = exc  # the store answered, with an error: that is the answer
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            self._send_json(502, {"error": "life store unreachable", "detail": str(exc)})
+            return
+        with resp:
+            ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+            # No result format is HTML; never let one render on this origin.
+            if "html" in ctype.lower():
+                ctype = "text/plain; charset=utf-8"
+            self.send_response(resp.getcode())
+            self.send_header("Content-Type", ctype)
+            if resp.headers.get("Content-Length"):
+                self.send_header("Content-Length", resp.headers["Content-Length"])
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            try:
+                shutil.copyfileobj(resp, self.wfile, 64 * 1024)
+            except OSError:
+                pass  # the client left, or the store stalled mid-answer
+
     def _serve_service_worker(self) -> bool:
         """Serve sw.js with its cache name stamped from a content hash of the
         whole shell tree.
@@ -8226,6 +8395,9 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_POST(self):
+        if self.path.split("?", 1)[0] in ("/sparql", "/sparql/"):
+            self._handle_sparql()
+            return
         if self.path == "/message":
             self._handle_message()
             return
@@ -10521,6 +10693,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # transport/parse — be honest, don't fake data
                 self._send_json(502, {"error": "life store unreachable",
                                       "detail": str(exc)})
+            return
+        if conv_path in ("/sparql", "/sparql/"):
+            self._handle_sparql()
+            return
+        if conv_path.startswith("/docs/"):
+            name = conv_path[len("/docs/"):]
+            if not (_DOC_NAME_RE.fullmatch(name)
+                    and self._serve_static_file(DOCS_DIR / name, DOCS_DIR)):
+                self._send_json(404, {"error": "not found"})
             return
         if conv_path in ("/chats", "/chats/"):
             self._handle_chats_list()

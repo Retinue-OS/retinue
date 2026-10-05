@@ -66,6 +66,14 @@ RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
 # stored replies (~55 languages, no per-language bias); see web-gateway.py.
 RUN python3 -m pip install --break-system-packages --no-cache-dir markdown-it-py pywebpush langdetect
 
+# ── YASGUI, for the dashboard's SPARQL page (webapp/sparql.html) ─────
+# Vendored at build time, pinned by version and checksum, never from a CDN —
+# the reasons and the pin live in the script. Ahead of `COPY webapp/` (which
+# merges into the same directory) so an ordinary webapp edit keeps this layer;
+# a version bump edits the script, and that is what rebuilds it.
+COPY scripts/vendor-yasgui.sh /tmp/vendor-yasgui.sh
+RUN sh /tmp/vendor-yasgui.sh /workspace/webapp/vendor/yasgui && rm /tmp/vendor-yasgui.sh
+
 # ── Agent logic, scripts, and session instructions (baked into image)
 COPY agents/         /workspace/agents/
 COPY scripts/        /workspace/scripts/

@@ -118,7 +118,9 @@ env | grep '^SPARQL_ENDPOINT_' | sort
 All endpoints are **read-only** — data enters the store by writing files into
 chambers. Query by POSTing form-urlencoded `query=` with
 `Accept: application/sparql-results+json`. **Before a non-trivial query or any
-new data design, read `docs/triple-stores.md`.**
+new data design, read `docs/triple-stores.md`.** `docs/ontology.md` has one
+example query for each kind of data. For the user, the dashboard's `/sparql`
+page runs those same examples in place, and offers a YASGUI workbench.
 
 ## Memory (the session log in the life store)
 

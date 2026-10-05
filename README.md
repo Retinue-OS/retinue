@@ -42,7 +42,11 @@ Defines these core compose services:
   applied to the live index within seconds. See
   [`docs/triple-stores.md`](docs/triple-stores.md) for what this makes possible
   — querying Markdown frontmatter, sensor CSVs at scale, and why some data gets
-  its own store. For a worked look at the named-graph half of that design, with
+  its own store. The dashboard publishes the store at `/sparql`, behind its own
+  sign-in and read-only. Programs get a SPARQL 1.1 endpoint there; a browser
+  gets [`docs/ontology.md`](docs/ontology.md) with every example query runnable
+  in place, plus a YASGUI workbench ([`docs/dashboard.md`](docs/dashboard.md)).
+  For a worked look at the named-graph half of that design, with
   queries run against a live store and its limits stated,
   see [Provenance by path](https://github.com/Retinue-OS/retinue-os-chamber/blob/main/writing/provenance-by-path.md).
 
