@@ -5248,13 +5248,21 @@ def _sparql_cross_site(headers) -> bool:
     origin = headers.get("Origin")
     if origin is None:
         return False
-    # The host the browser asked for: Host, or what a proxy that rewrites Host
-    # forwards. No other site can set X-Forwarded-Host on a request: it is not
-    # a header a page may send without a preflight, which this server fails.
-    asked = {(headers.get("Host") or "").strip().lower()}
-    for value in headers.get_all("X-Forwarded-Host") or []:
-        asked.update(h.strip().lower() for h in value.split(","))
-    return urllib.parse.urlsplit(origin.strip()).netloc.lower() not in asked
+    # Same origin is same scheme and host: the ones the request reached the
+    # front proxy with (the first X-Forwarded-Proto / X-Forwarded-Host entry,
+    # the client-facing one, as gateway_auth reads the chain), else what this
+    # server saw. No other site can send those headers: a page may not set
+    # them without a preflight, which this server fails.
+    def first(name: str) -> str:
+        return (headers.get(name) or "").split(",")[0].strip().lower()
+
+    scheme = first("X-Forwarded-Proto") or "http"
+    host = first("X-Forwarded-Host") or (headers.get("Host") or "").strip().lower()
+    try:
+        parts = urllib.parse.urlsplit(origin.strip())
+    except ValueError:
+        return True  # no browser sends an Origin that does not parse
+    return (parts.scheme.lower(), parts.netloc.lower()) != (scheme, host)
 
 
 def _sparql_operation(query_string: str, content_type: str = "", body: bytes = b"",
@@ -8402,7 +8410,9 @@ class Handler(BaseHTTPRequestHandler):
             if not raw_length.isascii() or not raw_length.isdigit():
                 self._send_json(400, {"error": "Content-Length is not a number"})
                 return
-            length = int(raw_length)
+            # A number too long to convert (Python refuses past 4300 digits)
+            # is also far past the limit.
+            length = int(raw_length) if len(raw_length) <= 18 else SPARQL_MAX_BODY + 1
             if not 0 <= length <= SPARQL_MAX_BODY:
                 self._send_json(413, {"error": "not a query: the body is too large"})
                 return

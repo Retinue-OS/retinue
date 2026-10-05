@@ -601,13 +601,15 @@ lexical and errs towards refusing, but a variable, a prefixed name or a string
 merely spelled "service" passes; QLever's in-process extensions that use the
 keyword (`pathSearch`, `spatialSearch`) are refused with the rest. And so is a
 query a browser sends from another site (`Sec-Fetch-Site`, else `Origin`
-against `Host` or `X-Forwarded-Host`), which is how a page the user happens
-to visit would fire one with the user's credentials. Programs send neither
+against the scheme and host the request arrived with: the first
+`X-Forwarded-Proto` / `X-Forwarded-Host` entry, else `Host`), which is how a
+page the user happens to visit would fire one with the user's credentials. Programs send neither
 header, and the page itself still opens from a link anywhere. Browsers send
 `Sec-Fetch-Site` only over HTTPS, so serve the dashboard over HTTPS alone:
 over plain HTTP another site's image or form GET carries no such header and
 could still have a query run blind (unread, and never calling out), and a
-proxy in front must keep `Host` or set `X-Forwarded-Host`. A store-level lock
+proxy in front must set `X-Forwarded-Proto` and keep `Host` or set
+`X-Forwarded-Host` (Traefik does all of this by default). A store-level lock
 is possible too (`qlever-server --service-allowed-iri-prefixes -`, a
 qlever-dir change); the gateway does not rely on it. A result
 is never served as HTML on the dashboard's origin. A body the gateway cannot
@@ -638,8 +640,9 @@ until you press Run: a link is somebody else's query.
 
 `tests/test_doc_sparql.py` keeps every documented query runnable: one
 self-contained, read-only query per block (parsed by rdflib where installed),
-and, for every row of the ontology's defaults table, an example section of its
-own that uses the row's namespace.
+and, for every vocabulary in the ontology's defaults table, an example section
+of its own that uses its namespace (the fallback row names schema.org again
+and shares its section).
 `tests/test_web_gateway_sparql.py` pins the endpoint's behaviour, and
 `tests/test_webapp_sparql_doc.py` the rendering.
 

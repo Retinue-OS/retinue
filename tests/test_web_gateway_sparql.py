@@ -207,6 +207,10 @@ def test_malformed_requests(c: Client, wg):
     resp.read()
     conn.close()
     assert resp.status == 411, resp.status
+    # A length too long even to convert is too large, not a crash.
+    status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D",
+                               headers={**FORM, "Content-Length": "9" * 5000})
+    assert status == 413, status
     for bogus in ("fifteen", "-1", "1_5", "+15"):
         status, _h, data = c.request("POST", "/sparql", body="query=ASK%7B%7D",
                                      headers={**FORM, "Content-Length": bogus})
@@ -260,14 +264,22 @@ def test_nothing_leaves_through_the_store(c: Client):
         assert status == 403 and not FakeStore.calls, (headers, status)
         status, _h, _d = c.request("GET", "/sparql?query=ASK%7B%7D", headers=headers)
         assert status == 403 and not FakeStore.calls, (headers, status)
-    # Behind a proxy that rewrites Host, the browser's host arrives as
-    # X-Forwarded-Host, which no other site can set.
-    status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D",
-                               headers={**FORM, "Origin": "https://evil.example",
-                                        "X-Forwarded-Host": "dash.example"})
-    assert status == 403, status
+    # Behind a proxy, the browser's scheme and host arrive as the first
+    # X-Forwarded-Proto / X-Forwarded-Host entries, which no other site can
+    # set. Same origin means both match: another host, the same host over
+    # another scheme, a later hop of the chain, or an Origin that does not
+    # parse, is another site.
+    proxied = {"X-Forwarded-Host": "dash.example", "X-Forwarded-Proto": "https"}
+    for headers in ({"Origin": "https://evil.example", **proxied},
+                    {"Origin": "http://dash.example", **proxied},
+                    {"Origin": "https://dash.example", "X-Forwarded-Proto": "https",
+                     "X-Forwarded-Host": "evil.example, dash.example"},
+                    {"Origin": "http://[::1"}):
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})
+        assert status == 403 and not FakeStore.calls, (headers, status)
     for headers in ({"Sec-Fetch-Site": "same-origin", "Origin": here}, {"Sec-Fetch-Site": "none"},
-                    {"Origin": here}, {"Origin": "https://dash.example", "X-Forwarded-Host": "dash.example"},
+                    {"Origin": here}, {"Origin": "https://dash.example", **proxied},
                     {}):
         FakeStore.calls.clear()
         status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})

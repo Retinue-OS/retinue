@@ -8,10 +8,12 @@ declares every prefix it uses — a block that leans on a prefix declared in a
 neighbouring block, or holds two queries, reads fine and fails on Run.
 
 docs/ontology.md also promises one example per kind of data in its defaults
-table: each row needs an example section of its own ('### … — <vocabulary>',
-the names after the dash found in the row's vocabulary cell) whose queries use
-— not merely declare — the row's namespace. Adding a row without an example,
-or dropping the example a row had, fails here.
+table: each vocabulary the table names needs an example section of its own
+('### … — <vocabulary>', the names after the dash found in the row's
+vocabulary cell; rows naming the same vocabulary, like the Fallback row,
+share it) whose queries use — not merely declare — its namespace, and no
+section may answer for two vocabularies. Adding a row without an example, or
+dropping the example a row had, fails here.
 
 The structural checks need nothing installed. When rdflib is importable (CI
 installs it) every block is also parsed and translated by a SPARQL 1.1 parser.
@@ -161,19 +163,29 @@ def test_every_default_namespace_has_an_example():
         if line.startswith("|") and len(cells) >= 3 and namespaces:
             rows.append((cells[1].replace("**", ""), namespaces))
     assert sum(len(n) for _v, n in rows) >= 10, f"the defaults table lost its namespaces? {rows}"
-    sections = example_sections(text)
-    failures = []
+    # Rows that name the same vocabulary (the Fallback row names schema.org
+    # again) share its section; every distinct vocabulary needs its own.
+    vocabularies: dict[str, set[str]] = {}
     for vocabulary, namespaces in rows:
+        vocabularies.setdefault(vocabulary, set()).update(namespaces)
+    sections = example_sections(text)
+    failures, answers_for = [], {}
+    for vocabulary, namespaces in vocabularies.items():
         own = [h for h in sections if _names_vocabulary(h, vocabulary)]
         if not own:
             failures.append(f"no '### … — <vocabulary>' example section for {vocabulary!r}")
             continue
+        for heading in own:
+            if answers_for.setdefault(heading, vocabulary) != vocabulary:
+                failures.append(f"{heading!r} answers for both {answers_for[heading]!r} and "
+                                f"{vocabulary!r}: each vocabulary needs a section of its own")
         used = set().union(*(used_iris(q) for h in own for q in sections[h]))
-        for ns in namespaces:
+        for ns in sorted(namespaces):
             if not any(iri.startswith(ns) for iri in used):
                 failures.append(f"the example for {vocabulary!r} ({', '.join(own)}) does not use {ns}")
     assert not failures, "docs/ontology.md, one example per kind of data:\n" + "\n".join(failures)
-    print(f"ok - each of the {len(rows)} rows of the defaults table has an example of its own")
+    print(f"ok - each of the {len(vocabularies)} vocabularies of the defaults table "
+          f"({len(rows)} rows) has an example of its own")
 
 
 def test_structural_check_catches_what_it_should():

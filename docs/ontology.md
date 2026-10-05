@@ -103,7 +103,8 @@ There is one query for each kind of data in the defaults table. Each
 query declares its own prefixes, so it runs exactly as written. The queries
 are generic on purpose: a query that knows a chamber's property IRIs belongs in
 that chamber's guide. `tests/test_doc_sparql.py` keeps the queries
-self-contained, and fails when a row of the table has no example of its own.
+self-contained, and fails when a vocabulary in the table has no example of
+its own (the Fallback row names schema.org again, and shares its section).
 
 ### Measurements — SOSA
 
