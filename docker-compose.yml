@@ -486,6 +486,7 @@ services:
       - TRIAGE_EMAIL_WHITELIST_PATH
       - WEBAPP_DIR
       - DASHBOARD_DATA_DIR
+      - DOCS_DIR
       - PUSH_DIR
       - MESSAGE_FILES_DIR
       - QLEVER_GRAPH_BASE

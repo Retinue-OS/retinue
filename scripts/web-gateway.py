@@ -8293,10 +8293,19 @@ class Handler(BaseHTTPRequestHandler):
         query_string = self.path.partition("?")[2]
         body = b""
         if self.command == "POST":
+            # A streamed (chunked) body is one this server cannot read; say so
+            # rather than answer "no query" to a client that sent one. Neither
+            # header at all is a request without a body (RFC 9112, 6.3), which
+            # is fine when the query rides in the URL.
+            if self.headers.get("Transfer-Encoding"):
+                self._send_json(411, {"error": "send the body with a Content-Length "
+                                               "(chunked transfer is not supported)"})
+                return
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
-                length = -1
+                self._send_json(400, {"error": "Content-Length is not a number"})
+                return
             if not 0 <= length <= SPARQL_MAX_BODY:
                 self._send_json(413, {"error": "not a query: the body is too large"})
                 return

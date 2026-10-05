@@ -45,8 +45,20 @@ def _load_gateway(tmp: Path):
         try:
             import markdown_it  # noqa: F401
         except ImportError:
+            # Just enough for the gateway's import-time
+            # MarkdownIt("commonmark", {...}).enable("table").
+            class _MarkdownIt:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def enable(self, *args, **kwargs):
+                    return self
+
+                def render(self, text):
+                    return text
+
             stub = types.ModuleType("markdown_it")
-            stub.MarkdownIt = object
+            stub.MarkdownIt = _MarkdownIt
             sys.modules["markdown_it"] = stub
     sys.path.insert(0, str(SCRIPTS_DIR))
     spec = importlib.util.spec_from_file_location(
@@ -176,7 +188,24 @@ def test_malformed_requests(c: Client, wg):
         assert status == 413, status
     finally:
         wg.SPARQL_MAX_BODY = limit
-    print("ok - an empty, doubled or oversized request is refused")
+    # A body the server cannot read is named as such, not as "no query".
+    FakeStore.calls.clear()
+    conn = http.client.HTTPConnection("127.0.0.1", c.port, timeout=10)
+    conn.request("POST", "/sparql", body=iter([b"query=ASK%7B%7D"]),
+                 headers={**FORM, "Transfer-Encoding": "chunked"}, encode_chunked=True)
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+    assert resp.status == 411, resp.status
+    status, _h, data = c.request("POST", "/sparql", body="query=ASK%7B%7D",
+                                 headers={**FORM, "Content-Length": "fifteen"})
+    assert status == 400 and "not a number" in json.loads(data)["error"], (status, data)
+    assert not FakeStore.calls
+    # An empty body is fine when the query rides in the URL.
+    FakeStore.reply = (200, "application/sparql-results+json", b'{"boolean":true}')
+    status, _h, _d = c.request("POST", "/sparql?query=ASK%7B%7D")
+    assert status == 200 and len(FakeStore.calls) == 1, status
+    print("ok - an empty, doubled, oversized, chunked or mislabelled request is refused")
 
 
 def test_store_answers_pass_through_but_never_as_html(c: Client):
