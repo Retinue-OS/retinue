@@ -5181,27 +5181,41 @@ _SPARQL_DATASET_PARAMS = ("default-graph-uri", "named-graph-uri")
 # The check is lexical and errs towards refusing. What a SPARQL lexer passes
 # over is blanked first, by the grammar's own delimiters (SPARQL 1.1 §19.8):
 # strings, IRIs, comments, and the backslash escapes a prefixed name may hold
-# (`ex:a\#b` is a name, not the start of a comment). What remains is cut into
-# tokens, and SERVICE as a token of its own is the keyword; inside a variable,
-# a prefixed name, a language tag or a blank node it is not. The query is
-# checked as written and with its \u escapes decoded, which the grammar
-# allows anywhere: whichever reading the store uses, the keyword is seen.
+# (`ex:a\#b` is a name, not the start of a comment). What remains is read in
+# runs of name characters, each run once, so the check stays linear in the
+# query's length: a run with a colon is a prefixed name or a blank node, and
+# none of it is a keyword; in any other run each word is one, so SERVICE as a
+# word of its own is the keyword. Variables and language tags are tokens of
+# their own. The query is checked as written and with its \u escapes decoded,
+# which the grammar allows anywhere: whichever reading the store uses, the
+# keyword is seen. QLever's in-process SERVICE extensions (pathSearch,
+# spatialSearch) are refused with the rest.
 _SPARQL_OPAQUE_RE = re.compile(
     r'"""(?:[^"\\]|\\.|"(?!""))*"""'
     r"|'''(?:[^'\\]|\\.|'(?!''))*'''"
     r'|"(?:[^"\\\n\r]|\\.)*"'
     r"|'(?:[^'\\\n\r]|\\.)*'"
-    r'|<[^<>"{}|^`\\\x00-\x20]*>'
+    r'|<(?:[^<>"{}|^`\\\x00-\x20]|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})*>'
     r"|\\."
     r"|#[^\n\r]*", re.S)
-_SPARQL_PN = r"\w\u00B7\u0300-\u036F\u203F\u2040\-"
+_SPARQL_PN = r"\w\u00B7\u0300-\u036F\u203F\u2040"
 _SPARQL_TOKEN_RE = re.compile(
-    r"[?$][\w\u00B7\u0300-\u036F\u203F\u2040]+"          # a variable
-    r"|@[A-Za-z]+(?:-[A-Za-z0-9]+)*"                      # a language tag
-    rf"|_:[{_SPARQL_PN}.]*"                               # a blank node
-    rf"|(?:[^\W\d_][{_SPARQL_PN}.]*)?:[{_SPARQL_PN}.:%]*"  # a prefixed name
-    r"|[A-Za-z_]\w*")                                    # a keyword, function, `a`
+    rf"[?$][{_SPARQL_PN}]+"                    # a variable
+    r"|@[A-Za-z]+(?:-[A-Za-z0-9]+)*"            # a language tag
+    rf"|[{_SPARQL_PN}.:%\-]+")                  # a run of name characters
+_SPARQL_WORD_RE = re.compile(r"[A-Za-z_]\w*")
 _SPARQL_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+
+
+def _sparql_run_words(run: str) -> list[str]:
+    """The words of a run of name characters that the store reads as
+    keywords. `ex:SERVICE`, `SERVICE:x`, `a.SERVICE:x` and `_:SERVICE` are
+    names; a prefix that cannot be one (holding `%`, or ending in `.`) puts
+    its words back in play. Without a colon, every word counts."""
+    head, colon, _local = run.partition(":")
+    if colon and "%" not in head and not head.endswith("."):
+        return []
+    return _SPARQL_WORD_RE.findall(head)
 
 
 def _sparql_calls_out(query: str) -> bool:
@@ -5216,7 +5230,9 @@ def _sparql_calls_out(query: str) -> bool:
 
     for text in (query, _SPARQL_UNICODE_ESCAPE_RE.sub(unescape, query)):
         for token in _SPARQL_TOKEN_RE.finditer(_SPARQL_OPAQUE_RE.sub(blank, text)):
-            if token.group(0).upper() == "SERVICE":
+            if token.group(0)[0] in "?$@":
+                continue
+            if any(word.upper() == "SERVICE" for word in _sparql_run_words(token.group(0))):
                 return True
     return False
 
@@ -5232,7 +5248,13 @@ def _sparql_cross_site(headers) -> bool:
     origin = headers.get("Origin")
     if origin is None:
         return False
-    return urllib.parse.urlsplit(origin.strip()).netloc.lower() != (headers.get("Host") or "").strip().lower()
+    # The host the browser asked for: Host, or what a proxy that rewrites Host
+    # forwards. No other site can set X-Forwarded-Host on a request: it is not
+    # a header a page may send without a preflight, which this server fails.
+    asked = {(headers.get("Host") or "").strip().lower()}
+    for value in headers.get_all("X-Forwarded-Host") or []:
+        asked.update(h.strip().lower() for h in value.split(","))
+    return urllib.parse.urlsplit(origin.strip()).netloc.lower() not in asked
 
 
 def _sparql_operation(query_string: str, content_type: str = "", body: bytes = b"",
@@ -5266,9 +5288,6 @@ def _sparql_operation(query_string: str, content_type: str = "", body: bytes = b
         return None, None
     if not queries[0].strip():
         return None, (400, "the query is empty")
-    if _sparql_calls_out(queries[0]):
-        return None, (403, "federated queries (SERVICE) are not allowed: the life store "
-                           "does not send its data to other endpoints")
     dataset = [(key, iri) for key in _SPARQL_DATASET_PARAMS for iri in params.get(key, [])]
     return [("query", queries[0])] + dataset, None
 
@@ -8393,9 +8412,14 @@ class Handler(BaseHTTPRequestHandler):
         if refusal:
             self._send_json(refusal[0], {"error": refusal[1]})
             return
+        # The cheap refusal first: another site's request costs no lexing.
         if form is not None and _sparql_cross_site(self.headers):
             self._send_json(403, {"error": "a query sent from another site is not run; "
                                            "open /sparql on this dashboard instead"})
+            return
+        if form is not None and _sparql_calls_out(form[0][1]):
+            self._send_json(403, {"error": "federated queries (SERVICE) are not allowed: "
+                                           "the life store does not send its data to other endpoints"})
             return
         if form is not None:
             self._sparql_forward(form)

@@ -598,10 +598,18 @@ own front refuses writes too. So is a query that uses `SERVICE` (403): a
 federated query makes the store itself call the endpoint it names and send it
 bindings from the store, which is data leaving by a side door. The check is
 lexical and errs towards refusing, but a variable, a prefixed name or a string
-merely spelled "service" passes. And so is a query a browser sends from
-another site (`Sec-Fetch-Site`, else `Origin`), which is how a page the user
-happens to visit would fire one with the user's credentials. Programs send
-neither header, and the page itself still opens from a link anywhere. A result
+merely spelled "service" passes; QLever's in-process extensions that use the
+keyword (`pathSearch`, `spatialSearch`) are refused with the rest. And so is a
+query a browser sends from another site (`Sec-Fetch-Site`, else `Origin`
+against `Host` or `X-Forwarded-Host`), which is how a page the user happens
+to visit would fire one with the user's credentials. Programs send neither
+header, and the page itself still opens from a link anywhere. Browsers send
+`Sec-Fetch-Site` only over HTTPS, so serve the dashboard over HTTPS alone:
+over plain HTTP another site's image or form GET carries no such header and
+could still have a query run blind (unread, and never calling out), and a
+proxy in front must keep `Host` or set `X-Forwarded-Host`. A store-level lock
+is possible too (`qlever-server --service-allowed-iri-prefixes -`, a
+qlever-dir change); the gateway does not rely on it. A result
 is never served as HTML on the dashboard's origin. A body the gateway cannot
 read is named as such: chunked transfer gets 411, a malformed
 `Content-Length` 400.

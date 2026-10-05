@@ -240,6 +240,7 @@ def test_nothing_leaves_through_the_store(c: Client):
         assert not FakeStore.calls, f"reached the store: {query!r}"
     looks_like_it = [
         "SELECT ?service WHERE { ?s ?p ?service }",
+        "SELECT * WHERE { GRAPH <file:home/Vertr\\u00E4ge/service-vertrag.nt> { ?s ?p ?o } }",
         "PREFIX ex: <http://ex/> SELECT * { ?s ex:service ?o ; ex:a.SERVICE ?x }",
         'SELECT * { ?s ?p "customer service"@en , <http://ex/service> } # service',
         "PREFIX schema: <http://schema.org/> SELECT * { ?s a schema:Service }",
@@ -258,8 +259,15 @@ def test_nothing_leaves_through_the_store(c: Client):
         assert status == 403 and not FakeStore.calls, (headers, status)
         status, _h, _d = c.request("GET", "/sparql?query=ASK%7B%7D", headers=headers)
         assert status == 403 and not FakeStore.calls, (headers, status)
+    # Behind a proxy that rewrites Host, the browser's host arrives as
+    # X-Forwarded-Host, which no other site can set.
+    status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D",
+                               headers={**FORM, "Origin": "https://evil.example",
+                                        "X-Forwarded-Host": "dash.example"})
+    assert status == 403, status
     for headers in ({"Sec-Fetch-Site": "same-origin", "Origin": here}, {"Sec-Fetch-Site": "none"},
-                    {"Origin": here}, {}):
+                    {"Origin": here}, {"Origin": "https://dash.example", "X-Forwarded-Host": "dash.example"},
+                    {}):
         FakeStore.calls.clear()
         status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})
         assert status == 200 and len(FakeStore.calls) == 1, (headers, status)
@@ -268,6 +276,21 @@ def test_nothing_leaves_through_the_store(c: Client):
                                                             "Sec-Fetch-Site": "cross-site"})
     assert status == 200 and b"<retinue-sparql-doc" in body, status
     print("ok - SERVICE and cross-site queries are refused; look-alikes, programs and the page are not")
+
+
+def test_the_service_check_stays_linear(wg):
+    """The check runs on every query a signed-in client sends, up to the body
+    limit: no input may make it slow. (Its first form retried a prefixed-name
+    pattern at every position of a long run, ~30 s for 64 KB.)"""
+    import time
+    worst = 0.0
+    for unit in ("a.", "a-", "a:", '"""', "'a", "<a", "\\u0041", "ex:%41", "#", 'a.b:c-"x"<y>', "?a.", "@a-"):
+        text = "SELECT * WHERE { " + unit * (256 * 1024 // len(unit)) + " }"
+        started = time.perf_counter()
+        wg._sparql_calls_out(text)
+        worst = max(worst, time.perf_counter() - started)
+    assert worst < 2.0, f"the SERVICE check took {worst:.1f} s on a 256 KB query"
+    print(f"ok - the SERVICE check stays linear (worst 256 KB input: {worst * 1000:.0f} ms)")
 
 
 def test_store_answers_pass_through_but_never_as_html(c: Client):
@@ -360,6 +383,7 @@ def main() -> int:
             test_updates_are_refused_before_the_store(c)
             test_malformed_requests(c, wg)
             test_nothing_leaves_through_the_store(c)
+            test_the_service_check_stays_linear(wg)
             test_store_answers_pass_through_but_never_as_html(c)
             test_without_a_query_the_endpoint_describes_itself(c)
             test_store_down_is_a_502(c, wg, dead_port)
