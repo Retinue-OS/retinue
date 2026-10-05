@@ -17,7 +17,7 @@ __pycache__/
 # Session caches
 .garmin_session
 
-# YASGUI a checkout fetched for serving itself directly. The image vendors
+# The YASGUI a checkout fetches to serve itself directly. The image vendors
 # its own, pinned and checksummed (scripts/vendor-yasgui.sh); COPY webapp/
 # would otherwise lay the local copy over it.
 webapp/vendor/

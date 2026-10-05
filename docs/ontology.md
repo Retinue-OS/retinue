@@ -103,7 +103,7 @@ There is one query for each kind of data in the defaults table. Each
 query declares its own prefixes, so it runs exactly as written. The queries
 are generic on purpose: a query that knows a chamber's property IRIs belongs in
 that chamber's guide. `tests/test_doc_sparql.py` keeps the queries
-self-contained and fails when a namespace in the table has no example.
+self-contained, and fails when a row of the table has no example of its own.
 
 ### Measurements — SOSA
 
@@ -147,19 +147,20 @@ PREFIX vcard:  <http://www.w3.org/2006/vcard/ns#>
 PREFIX foaf:   <http://xmlns.com/foaf/0.1/>
 PREFIX schema: <http://schema.org/>
 
-# The address book: every person, with their e-mail addresses and phone
-# numbers. scripts/contacts.py files a person as a vcard:Individual named by
-# vcard:fn; a hand-written file may use foaf:Person or schema:Person and their
-# name properties instead, and is a contact all the same.
-SELECT ?person ?name
+# Everyone the store knows as a person, with their e-mail addresses and phone
+# numbers: a vcard:Individual named by vcard:fn, the way scripts/contacts.py
+# files a contact, or a foaf:Person / schema:Person a hand-written file
+# describes. (The address book itself is the part filed in a chamber's
+# contacts directory: add  GRAPH ?file { ?person a ?class }  to see where.)
+SELECT ?person (MIN(?n) AS ?name)
        (GROUP_CONCAT(DISTINCT STRAFTER(STR(?mail), "mailto:"); SEPARATOR=", ") AS ?emails)
        (GROUP_CONCAT(DISTINCT STRAFTER(STR(?tel), "tel:"); SEPARATOR=", ") AS ?phones) WHERE {
   VALUES ?class { vcard:Individual foaf:Person schema:Person }
   ?person a ?class .
-  OPTIONAL { ?person vcard:fn|foaf:name|schema:name ?name }
+  OPTIONAL { ?person vcard:fn|foaf:name|schema:name ?n }
   OPTIONAL { ?person vcard:hasEmail ?mail }
   OPTIONAL { ?person vcard:hasTelephone ?tel }
-} GROUP BY ?person ?name ORDER BY ?name
+} GROUP BY ?person ORDER BY ?name
 ```
 
 ### Messaging accounts — FOAF
@@ -172,12 +173,12 @@ PREFIX kb:     <https://w3id.org/retinue/kb#>
 
 # Every messenger account, the person it belongs to, and how many messages the
 # ledger holds from it. An account joins its messages on (channel, handle).
-SELECT ?person ?name ?channel ?handle (COUNT(?message) AS ?messages) WHERE {
+SELECT ?person (MIN(?n) AS ?name) ?channel ?handle (COUNT(DISTINCT ?message) AS ?messages) WHERE {
   ?person foaf:account ?account .
   ?account kb:channel ?channel ; foaf:accountName ?handle .
-  OPTIONAL { ?person vcard:fn|foaf:name|schema:name ?name }
+  OPTIONAL { ?person vcard:fn|foaf:name|schema:name ?n }
   OPTIONAL { ?message kb:channel ?channel ; kb:sender ?handle }
-} GROUP BY ?person ?name ?channel ?handle ORDER BY DESC(?messages)
+} GROUP BY ?person ?channel ?handle ORDER BY DESC(?messages)
 ```
 
 ### Events, places and everything else — schema.org

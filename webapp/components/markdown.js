@@ -58,16 +58,20 @@ export function renderInline(text) {
   // Stashed like a link so bold/italic passes don't touch the button markup.
   // A label may not contain "|" (the separator); prefill runs to the closing
   // "]]". Whitespace around each part is trimmed.
-  s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/gi,
-    (_m, label, fill) => stash(
-      `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`));
+  // A code span met first is matched and handed back untouched, so chip syntax
+  // quoted as code (`[[chip: Yes]]`) stays code for the code pass below; a
+  // chip's own label and prefill may still hold backticks.
+  const chip = (re) => new RegExp('(`[^`]+`)|' + re.source, 'gi');
+  s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/),
+    (m, code, label, fill) => (code ? m : stash(
+      `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`)));
   // Shorthand: [[chip: Text]] with no "|" — the text is used as BOTH the label
   // and the prefill. Runs after the two-part form above, so any [[chip: …]] left
   // here has no separator. This avoids the silent failure where a missing "|"
   // left the whole marker as raw literal text in the bubble.
-  s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\]\]/gi,
-    (_m, text) => stash(
-      `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`));
+  s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\]\]/),
+    (m, code, text) => (code ? m : stash(
+      `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`)));
   // `code` before any link: a code span is literal, so a URL inside one
   // (`https://schema.org/`) stays code instead of becoming a link with the
   // backticks left standing around it. Stashed, so no later pass — links,

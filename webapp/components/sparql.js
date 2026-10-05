@@ -246,21 +246,34 @@ class RetinueSparqlWorkbench extends HTMLElement {
     }, { rootMargin: '200px' });
     // Watched only once the doc above has its height: before that the
     // workbench sits on the first screen, behind the doc's 'Loading…', and
-    // would load YASGUI on every visit. A shared link is the exception that
-    // brings it into view, since its query is what the visit is for.
+    // would load YASGUI on every visit. A doc that never arrives must not
+    // keep it from working, so a few seconds are the limit. A shared link is
+    // the exception that brings it into view: its query is what the visit
+    // is for.
     const watch = () => {
-      if (!this.observer) return;
-      if (sharedLink().get('query')) (this.closest('section') || this).scrollIntoView();
+      if (!this.observer || this.watching) return;
+      this.watching = true;
+      if (sharedLink().get('query')) this.reveal();
       this.observer.observe(this);
     };
     const doc = document.querySelector('retinue-sparql-doc');
-    if (doc && !doc.hasAttribute('loaded')) doc.addEventListener('retinue-doc-loaded', watch, { once: true });
-    else watch();
+    if (doc && !doc.hasAttribute('loaded')) {
+      doc.addEventListener('retinue-doc-loaded', watch, { once: true });
+      setTimeout(watch, 5000);
+    } else {
+      watch();
+    }
   }
 
   disconnectedCallback() {
     if (this.observer) this.observer.disconnect();
     this.observer = null;
+  }
+
+  // The workbench's section, in view: the URL's jump (#workbench) or a
+  // shared link. Made again once YASGUI has drawn, since it grows the page.
+  reveal() {
+    (this.closest('section') || this).scrollIntoView();
   }
 
   async start() {
@@ -287,30 +300,28 @@ class RetinueSparqlWorkbench extends HTMLElement {
       // Queries are kept per device; results never are.
       yasr: { maxPersistentResponseSize: 0, prefixes },
     });
-    // Whatever a stored tab says, every tab asks this store with nothing but
-    // its query and the dataset the query itself names.
-    for (const id of this.yasgui.persistentConfig.getTabs()) {
-      const tab = this.yasgui.getTab(id);
-      if (tab) {
-        tab.setRequestConfig({ endpoint: ENDPOINT, headers: {}, args: [],
-                               namedGraphs: [], defaultGraphs: [] });
-      }
+    // Whatever a stored tab says, every tab asks this store, the page's way,
+    // with nothing but its query and the dataset the query itself names. The
+    // tab YASGUI keeps for "undo close" is not restored across visits.
+    const stored = this.yasgui.persistentConfig;
+    stored.retrieveLastClosedTab();
+    for (const id of stored.getTabs()) {
+      this.yasgui.getTab(id)?.setRequestConfig({ ...REQUEST, headers: {}, args: [],
+                                                namedGraphs: [], defaultGraphs: [] });
     }
-    // A shared link opens as a tab of its own, run at once, and brings
-    // nothing but its query (and the tab's name).
+    // A shared link opens as a tab of its own and brings nothing but its
+    // query (and the tab's name). It does not run: a link is somebody else's
+    // query, so Run is the reader's call, once they have read it.
     const query = link.get('query');
     if (query) {
       history.replaceState(null, '', location.pathname + location.search);
       // The same link opened again selects its tab rather than adding one.
-      // (Not YASGUI's avoidDuplicateTabs: its selectTabId hands back the tab
-      // that was active before, so the wrong query would run.)
-      const known = this.yasgui.persistentConfig.getTabs()
-        .find((id) => this.yasgui.persistentConfig.getTab(id)?.yasqe?.value === query);
+      const known = stored.getTabs().find((id) => stored.getTab(id)?.yasqe?.value === query);
       if (known) this.yasgui.selectTabId(known);
-      const tab = known ? this.yasgui.getTab(known)
-        : this.yasgui.addTab(true, { name: link.get('tabTitle') || undefined, yasqe: { value: query } });
-      tab.query().catch(() => {});
+      else this.yasgui.addTab(true, { name: link.get('tabTitle') || undefined, yasqe: { value: query } });
     }
+    const target = location.hash.length > 1 && document.getElementById(location.hash.slice(1));
+    if (query || (target && target.contains(this))) this.reveal();
   }
 }
 

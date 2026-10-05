@@ -242,13 +242,16 @@ The HTTP API behind it, for the dashboard and anything on the edge:
 Contacts are chamber files, so the life store holds them like any other data:
 
 ```sparql
-PREFIX vcard: <http://www.w3.org/2006/vcard/ns#>
-PREFIX foaf:  <http://xmlns.com/foaf/0.1/>
-PREFIX kb:    <https://w3id.org/retinue/kb#>
+PREFIX vcard:  <http://www.w3.org/2006/vcard/ns#>
+PREFIX foaf:   <http://xmlns.com/foaf/0.1/>
+PREFIX schema: <http://schema.org/>
+PREFIX kb:     <https://w3id.org/retinue/kb#>
 
-# Every handle of everyone called Mara, whatever the channel.
+# Every handle of everyone called Mara, whatever the channel — filed by this
+# module (vcard:Individual) or by hand (foaf:Person, schema:Person).
 SELECT ?person ?name ?channel ?handle WHERE {
-  ?person a vcard:Individual ; vcard:fn ?name .
+  VALUES ?class { vcard:Individual foaf:Person schema:Person }
+  ?person a ?class ; vcard:fn|foaf:name|schema:name ?name .
   FILTER (CONTAINS(LCASE(?name), "mara"))
   { ?person foaf:account ?a . ?a kb:channel ?channel ; foaf:accountName ?handle }
   UNION { ?person vcard:hasEmail ?m . BIND ("email" AS ?channel) BIND (STR(?m) AS ?handle) }

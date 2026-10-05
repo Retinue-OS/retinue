@@ -77,6 +77,10 @@ ok('a code span is literal, links and all', () => {
   assert.equal(html, '<code>http://schema.org/</code> and <code>**not bold**</code>');
   assert.match(renderInline('[`kb:`](https://w3id.org/retinue/kb#)'),
     /^<a href="https:\/\/w3id.org\/retinue\/kb#"[^>]*><code>kb:<\/code><\/a>$/);
+  // Chip syntax quoted as code stays code; a chip may still quote code.
+  assert.equal(renderInline('`[[chip: Yes]]` is the syntax'), '<code>[[chip: Yes]]</code> is the syntax');
+  assert.match(renderInline('[[chip: Run `ls` | please run `ls -la`]]'),
+    /^<button type="button" class="md-chip" data-fill="please run `ls -la`">Run `ls`<\/button>$/);
   // A URL right before a code span keeps its own href.
   assert.match(renderInline('https://example.org`x`'), /href="https:\/\/example.org"/);
   // Text holding the stash sentinel cannot hang the renderer, not even text
