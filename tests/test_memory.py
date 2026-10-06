@@ -928,6 +928,46 @@ def test_review_followups(mod):
                   for s in ("20261005T120000Z-sum001", "20261006T110000Z-sum002")), True)
 
     with tempdir() as d:
+        # The summary carrying the challenged entry shares its tag and wording:
+        # it is about to be questioned, not a duplicate.
+        st = FakeStore(tags=TWENTY_TAGS, entries=[("20261005T120000Z-sum001", RULE)],
+                       compacted={"20260801T100000Z-aaaaaa": ["20261005T120000Z-sum001"]})
+        rc, _, err = run(mod, ["store", "--tag", "ludmila", "--supersedes",
+                               "20260801T100000Z-aaaaaa", RULE + " today"],
+                         st, LOWER_ENV, d)
+        check("a lower tier may supersede an entry a summary carries", rc, 0)
+        check("and the summary is questioned", "summary 20261005T120000Z-sum001 carries" in err,
+              True)
+
+    with tempdir() as d:
+        # A -> S in a recent compaction file, S corrected in a newer file: the
+        # claim is undone before the store has indexed either.
+        (d / "compaction-late.nt").write_text(
+            f'<{PFX}20260830T090000Z-aaaaaa> <{mod.KB}compactedInto> '
+            f'<{PFX}20261006T110000Z-sum002> .\n', encoding="utf-8")
+        (d / "undo.nt").write_text(
+            f'<{PFX}20261006T110000Z-sum002> <{mod.KB}correctedBy> '
+            f'<{PFX}20261006T115900Z-cccccc> .\n', encoding="utf-8")
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         FakeStore(facts=facts), FRONTIER_ENV, d)
+        check("a locally corrected summary no longer claims its members", rc, 0)
+
+    class AskDown(FakeStore):
+        def ask(self, sparql):
+            raise OSError("connection refused")
+
+    with tempdir() as d:
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         AskDown(facts=facts), FRONTIER_ENV, d)
+        check("an unreachable existence check aborts compaction", rc, 1)
+        check("and says nothing was written", "nothing written" in err, True)
+        check("nothing written indeed", nt_files(d), [])
+
+    with tempdir() as d:
         rc, _, _ = run(mod, ["store", "--tag", "ludmila", "--relevance", "0.0000001",
                              "Tiny relevance still a valid decimal"],
                        FakeStore(tags=TWENTY_TAGS), FRONTIER_ENV, d)

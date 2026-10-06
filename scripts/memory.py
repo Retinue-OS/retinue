@@ -652,8 +652,17 @@ def _recent_local_claims(ids: list[str]) -> dict[str, list[str]]:
     already claim it for. A compaction that starts inside the index lag of
     the previous one would not see those claims through SPARQL."""
     links = _recent_local_links()
-    return {i: links[i]["compactedInto"] for i in ids
-            if links.get(i, {}).get("compactedInto")}
+    out: dict[str, list[str]] = {}
+    for i in ids:
+        # A summary corrected in a recent file stands no more, and its claim
+        # is undone with it — the same rule the store applies, applied to
+        # what the store has not indexed yet. A superseded one keeps its
+        # claim, as in recall.
+        standing = [s for s in links.get(i, {}).get("compactedInto", [])
+                    if "correctedBy" not in links.get(s, {})]
+        if standing:
+            out[i] = standing
+    return out
 
 
 _CHALLENGE_LINKS = frozenset({"correctedBy", "supersededBy", "questionedBy"})
@@ -997,7 +1006,12 @@ def store(args: argparse.Namespace) -> int:
     # store cannot arbitrate — it indexes seconds later. The lock turns the
     # second one into the refusal it earns, and it covers no network call.
     with _dir_lock():
-        linked = {old_id for _, old_id in challenges}
+        # The summaries carrying a challenged entry share its tags and much
+        # of its wording; they are what the new entry is about to question,
+        # not duplicates of it.
+        carried_by = _standing_summaries_of([old_id for _, old_id in challenges],
+                                            claims) if challenges else []
+        linked = {old_id for _, old_id in challenges} | set(carried_by)
         if not _duplicate_guard(content, tags, linked, tier, args.duplicate_ok, now,
                                 hits, store_down):
             return 1
@@ -1030,8 +1044,6 @@ def store(args: argparse.Namespace) -> int:
         # rolling consolidation the one a reader sees is the top of the chain:
         # recall flags it next to the new entry, and the next compaction
         # re-plans it.
-        carried_by = _standing_summaries_of([old_id for _, old_id in challenges],
-                                            claims) if challenges else []
         lines += [f"<{MEMORY_PREFIX}{s}> <{KB}questionedBy> {subj} ." for s in carried_by]
 
         _append(path, lines)
@@ -1667,17 +1679,18 @@ def compact(args: argparse.Namespace) -> int:
 
     all_ids = [m for item in items for m in item["summarizes"] + item["retires"]]
 
-    # Existence, like _verify_exists — but one warning, not one per member,
-    # when the store is down.
+    # Existence, like _verify_exists — except that compaction fails closed:
+    # a store that cannot answer here cannot answer the facts queries either,
+    # and a half-validated plan must not be written.
     if not args.force:
         for entry_id in all_ids:
             try:
                 if not _ask(f"ASK {{ <{MEMORY_PREFIX}{entry_id}> a <{KB}Memory> }}"):
                     errors.append(f"no such memory in the life store: {entry_id}")
             except Exception as exc:  # noqa: BLE001
-                print(f"[memory] store unreachable ({exc}); members unverified",
-                      file=sys.stderr)
-                break
+                print(f"[memory] store unreachable ({exc}); members unverified "
+                      "— nothing written", file=sys.stderr)
+                return 1
 
     # The store's answers, with no lock held (a query waits up to 30 s when
     # the store is down). Generation and coverage are facts about the members

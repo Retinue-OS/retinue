@@ -229,7 +229,8 @@ more letters, any script. An overlap of **0.6** or more is a near-duplicate;
 **0.3** or more is merely similar, printed as a warning while the store
 proceeds. A near-duplicate that this very call challenges (`--supersedes`,
 `--corrects`, `--questions`) is intended — a successor resembles what it
-replaces — and does not count. The guard also reads the entries *recorded* in
+replaces — and does not count, and neither do the standing summaries that
+carry the challenged entry, which the call is about to question. The guard also reads the entries *recorded* in
 the last ten minutes in the memory directory's files — skipping any that has
 expired or that a local link has already corrected, superseded or compacted —
 which the store,
