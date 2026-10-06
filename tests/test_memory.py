@@ -884,11 +884,47 @@ def test_review_followups(mod):
         planfile = d / "plan.json"
         planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
         doubted = [{"m": uri(PFX + "20260830T090000Z-aaaaaa"),
-                    "p": uri(mod.KB + "questionedBy")}]
-        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
-                         FakeStore(facts=facts, rows=doubted), FRONTIER_ENV, d)
+                    "p": uri(mod.KB + "questionedBy"),
+                    "x": uri(PFX + "20261001T000000Z-dbt001")}]
+        rc, out, err = run(mod, ["compact", "--plan", str(planfile)],
+                           FakeStore(facts=facts, rows=doubted), FRONTIER_ENV, d)
         check("a questioned kept member compacts", rc, 0)
-        check("with a warning to state the doubt", "is questioned" in err, True)
+        check("and says the summary inherits the doubt", "inherits the doubt" in err, True)
+        sid = out.split()[0] if out.split() else ""
+        text = nt_files(d)[0].read_text(encoding="utf-8") if nt_files(d) else ""
+        check("the summary carries the questionedBy link",
+              f"<{PFX}{sid}> <{mod.KB}questionedBy> <{PFX}20261001T000000Z-dbt001> ." in text,
+              True)
+
+    with tempdir() as d:
+        st = FakeStore(tags=TWENTY_TAGS,
+                       compacted={"20260801T100000Z-aaaaaa": ["20261005T120000Z-sum001"]})
+        rc, _, err = run(mod, ["store", "--tag", "ludmila", "--corrects",
+                               "20260801T100000Z-aaaaaa", "Ludmila moved to Basel in 2026"],
+                         st, FRONTIER_ENV, d)
+        check("correcting a compacted member stores", rc, 0)
+        text = nt_files(d)[0].read_text(encoding="utf-8") if nt_files(d) else ""
+        new_id = err.split("stored ")[1].split()[0]
+        check("and questions the summary that carries it",
+              f"<{PFX}20261005T120000Z-sum001> <{mod.KB}questionedBy> <{PFX}{new_id}> ." in text,
+              True)
+        check("says so", "summary 20261005T120000Z-sum001 carries" in err, True)
+
+    with tempdir() as d:
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", "--relevance", "0.0000001",
+                             "Tiny relevance still a valid decimal"],
+                       FakeStore(tags=TWENTY_TAGS), FRONTIER_ENV, d)
+        text = nt_files(d)[0].read_text(encoding="utf-8") if nt_files(d) else ""
+        check("store writes a fixed-point decimal",
+              f'<{mod.KB}relevance> "0.0000001"^^<{mod.XSD}decimal> .' in text, True)
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item(relevance=0.0000001)), encoding="utf-8")
+        rc, _, _ = run(mod, ["compact", "--plan", str(planfile)],
+                       FakeStore(facts=facts), FRONTIER_ENV, d)
+        comp = [p for p in nt_files(d) if p.name.startswith("compaction-")]
+        text = comp[0].read_text(encoding="utf-8") if comp else ""
+        check("compact writes a fixed-point decimal",
+              f'<{mod.KB}relevance> "0.0000001"^^<{mod.XSD}decimal> .' in text, True)
 
 
 def main():

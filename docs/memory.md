@@ -262,8 +262,12 @@ deliberately.
 | compacted into a summary that is not itself corrected | `--include-compacted` | `COMPACTED into <id>` |
 
 Questioned entries stay in, flagged, until a summary carries them — doubt is
-a signal, not a verdict. Compaction is where the doubt moves: `compact` warns
-about every kept member that is questioned, and the summary states it.
+a signal, not a verdict — and then the doubt moves with them: `compact`
+copies a kept member's `kb:questionedBy` links onto the summary, so recall
+flags the summary, whose text states the doubt. Challenging a member a
+standing summary already carries (`--corrects`, `--supersedes` or
+`--questions` on a compacted id) questions that summary the same way: recall
+flags it next to the new entry, and the next compaction re-plans it.
 The current time is injected into the query as a literal rather than read
 from `NOW()`, so a query is reproducible. The same liveness definition serves
 the duplicate guard and `tags`.

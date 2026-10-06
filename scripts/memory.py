@@ -116,9 +116,12 @@ EXPIRED), and entries compacted into a summary that stands
 (`--include-compacted`, labeled COMPACTED). Summaries come first, highest
 generation first, then everything newest first; `--expand SUM` lists a
 summary's members, kept and retired. Questioned entries stay in, flagged,
-until a summary carries them — doubt is a signal, not a verdict — and
-compact warns about every kept member that is questioned, so the summary
-states the doubt.
+until a summary carries them — doubt is a signal, not a verdict — and then
+the doubt moves with them: compact copies a kept member's questionedBy
+links onto the summary, and challenging a member a standing summary
+already carries (`--corrects/--supersedes/--questions` on a compacted id)
+questions that summary too, so recall flags it next to the new entry and
+the next compaction re-plans it.
 
 File layout: one flat directory. Entries from the same session share a file
 when a session label is known (`--session` or RETINUE_MEMORY_SESSION —
@@ -167,6 +170,7 @@ import argparse
 import calendar
 import contextlib
 import datetime
+import decimal
 import difflib
 import json
 import os
@@ -258,6 +262,13 @@ def _xsd_datetime(dt: datetime.datetime) -> str:
 
 def _nt_datetime(dt: datetime.datetime) -> str:
     return f"{_nt_string(_xsd_datetime(dt))}^^<{XSD}dateTime>"
+
+
+def _nt_decimal(value: float) -> str:
+    """A fixed-point xsd:decimal literal. `:g` would write 1e-07 for a small
+    relevance, and an exponent is not a lexical form of xsd:decimal."""
+    text = format(decimal.Decimal(repr(float(value))), "f")
+    return f'"{text}"^^<{XSD}decimal>'
 
 
 def _parse_datetime(value: str) -> datetime.datetime | None:
@@ -640,12 +651,16 @@ def _recent_local_claims(ids: list[str]) -> dict[str, list[str]]:
 _CHALLENGE_LINKS = frozenset({"correctedBy", "supersededBy", "questionedBy"})
 
 
-def _recent_local_challenges(ids: list[str]) -> dict[str, set[str]]:
-    """id -> the challenge links (correctedBy, supersededBy, questionedBy)
+def _recent_local_challenges(ids: list[str]) -> dict[str, dict[str, list[str]]]:
+    """id -> challenge predicate -> challenging entries, from the links
     written in the last few minutes, which the store has not indexed yet."""
     links = _recent_local_links()
-    return {i: set(links[i]) & _CHALLENGE_LINKS for i in ids
-            if set(links.get(i, {})) & _CHALLENGE_LINKS}
+    out: dict[str, dict[str, list[str]]] = {}
+    for i in ids:
+        preds = {p: t for p, t in links.get(i, {}).items() if p in _CHALLENGE_LINKS}
+        if preds:
+            out[i] = preds
+    return out
 
 
 LOCK_FILE = ".memory.lock"
@@ -962,9 +977,7 @@ def store(args: argparse.Namespace) -> int:
         ]
         lines += [f"{subj} <{KB}tag> {_nt_string(t)} ." for t in tags]
         if args.relevance is not None:
-            lines.append(
-                f"{subj} <{KB}relevance> \"{args.relevance:g}\"^^<{XSD}decimal> ."
-            )
+            lines.append(f"{subj} <{KB}relevance> {_nt_decimal(args.relevance)} .")
         if expires is not None:
             lines.append(f"{subj} <{KB}expires> {_nt_datetime(expires)} .")
         if session:
@@ -973,11 +986,21 @@ def store(args: argparse.Namespace) -> int:
             lines.append(f"{subj} <{KB}model> {_nt_string(model)} .")
         lines += [f"<{MEMORY_PREFIX}{old_id}> <{KB}{pred}> {subj} ."
                   for pred, old_id in challenges]
+        # A challenged entry may already be hidden inside a standing summary,
+        # which then carries the stale statement forward. The challenge becomes
+        # a doubt on that summary: recall flags it next to the new entry, and
+        # the next compaction re-plans it.
+        carried_by = _standing_summaries_of([old_id for _, old_id in challenges]) \
+            if challenges else []
+        lines += [f"<{MEMORY_PREFIX}{s}> <{KB}questionedBy> {subj} ." for s in carried_by]
 
         _append(path, lines)
         print(f"[memory] stored {entry_id} -> {path}", file=sys.stderr)
         for pred, old_id in challenges:
             print(f"[memory] {old_id} {pred} {entry_id}", file=sys.stderr)
+        for s in carried_by:
+            print(f"[memory] summary {s} carries a challenged entry: "
+                  f"questioned by {entry_id}", file=sys.stderr)
         return 0
 
 
@@ -1415,24 +1438,53 @@ SELECT ?m ?t ?gen ?from ?to WHERE {{
     return facts
 
 
-def _challenged(ids: list[str]) -> dict[str, set[str]]:
-    """id -> the challenge links (correctedBy, supersededBy, questionedBy)
-    the store holds for it. The caller decides what each means: a correction
-    or supersession voids a plan that keeps the entry, a question is a doubt
-    the summary has to state."""
+def _challenged(ids: list[str]) -> dict[str, dict[str, list[str]]]:
+    """id -> challenge predicate (correctedBy, supersededBy, questionedBy) ->
+    the challenging entries, as the store holds them. The caller decides
+    what each means: a correction or supersession voids a plan that keeps
+    the entry, a question is a doubt the summary inherits."""
     sparql = f"""
 PREFIX kb: <{KB}>
-SELECT ?m ?p WHERE {{
+SELECT ?m ?p ?x WHERE {{
   VALUES ?m {{ {_values_clause(ids)} }}
   VALUES ?p {{ kb:correctedBy kb:supersededBy kb:questionedBy }}
   ?m ?p ?x .
 }}
 """
-    out: dict[str, set[str]] = {}
+    out: dict[str, dict[str, list[str]]] = {}
     for r in _query(sparql):
-        out.setdefault(_bare_id(_val(r, "m")), set()).add(
-            _val(r, "p").removeprefix(KB))
+        slot = out.setdefault(_bare_id(_val(r, "m")), {}).setdefault(
+            _val(r, "p").removeprefix(KB), [])
+        target = _bare_id(_val(r, "x"))
+        if target and target not in slot:
+            slot.append(target)
     return out
+
+
+def _merge_links(into: dict[str, dict[str, list[str]]],
+                 more: dict[str, dict[str, list[str]]]) -> None:
+    for entry_id, preds in more.items():
+        slot = into.setdefault(entry_id, {})
+        for pred, targets in preds.items():
+            have = slot.setdefault(pred, [])
+            have += [t for t in targets if t not in have]
+
+
+def _standing_summaries_of(ids: list[str]) -> list[str]:
+    """The standing summaries that carry any of these entries, from the
+    store and from the compaction files it has not indexed yet. An
+    unreachable store only loses its half: a challenge is written either
+    way."""
+    try:
+        claims = _already_compacted(ids)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[memory] store unreachable ({exc}); summaries carrying the "
+              "challenged entries not looked up there", file=sys.stderr)
+        claims = {}
+    for entry_id, summaries in _recent_local_claims(ids).items():
+        have = claims.setdefault(entry_id, [])
+        have += [x for x in summaries if x not in have]
+    return sorted({x for summaries in claims.values() for x in summaries})
 
 
 def _already_compacted(ids: list[str]) -> dict[str, list[str]]:
@@ -1480,7 +1532,8 @@ def summary_covers(member_ids: list[str], facts: Mapping[str, dict]
 def compaction_lines(summary_id: str, item: dict, generation: int,
                      covers_from: datetime.datetime | None,
                      covers_to: datetime.datetime | None,
-                     actor: str, model: str, now: datetime.datetime) -> list[str]:
+                     actor: str, model: str, now: datetime.datetime,
+                     questioned_by: list[str] = ()) -> list[str]:
     subj = f"<{MEMORY_PREFIX}{summary_id}>"
     lines = [
         f"{subj} <{RDF_TYPE}> <{KB}Memory> .",
@@ -1492,7 +1545,7 @@ def compaction_lines(summary_id: str, item: dict, generation: int,
     ]
     lines += [f"{subj} <{KB}tag> {_nt_string(t)} ." for t in item["tags"]]
     if item["relevance"] is not None:
-        lines.append(f"{subj} <{KB}relevance> \"{item['relevance']:g}\"^^<{XSD}decimal> .")
+        lines.append(f"{subj} <{KB}relevance> {_nt_decimal(item['relevance'])} .")
     if model:
         lines.append(f"{subj} <{KB}model> {_nt_string(model)} .")
     if covers_from is not None:
@@ -1501,6 +1554,8 @@ def compaction_lines(summary_id: str, item: dict, generation: int,
         lines.append(f"{subj} <{KB}coversTo> {_nt_datetime(covers_to)} .")
     for pred, key in (("summarizes", "summarizes"), ("retires", "retires")):
         lines += [f"{subj} <{KB}{pred}> <{MEMORY_PREFIX}{m}> ." for m in item[key]]
+    # The doubt on a kept member becomes doubt on the summary that hides it.
+    lines += [f"{subj} <{KB}questionedBy> <{MEMORY_PREFIX}{q}> ." for q in questioned_by]
     # The member side, by subject-merge: what recall's exclusion reads.
     lines += [f"<{MEMORY_PREFIX}{m}> <{KB}compactedInto> {subj} ."
               for m in item["summarizes"] + item["retires"]]
@@ -1602,19 +1657,20 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
         print(f"[memory] store unreachable ({exc}); cannot check the kept "
               "members — nothing written", file=sys.stderr)
         return 1
-    for entry_id, preds in _recent_local_challenges(kept).items():
-        challenged.setdefault(entry_id, set()).update(preds)
+    _merge_links(challenged, _recent_local_challenges(kept))
+    doubts: dict[str, list[str]] = {}  # kept member -> the entries questioning it
     for entry_id in kept:
-        void = challenged.get(entry_id, set()) & {"correctedBy", "supersededBy"}
+        links = challenged.get(entry_id, {})
+        void = sorted(set(links) & {"correctedBy", "supersededBy"})
         if void:
-            errors.append(f"{entry_id} was challenged ({', '.join(sorted(void))}) "
+            errors.append(f"{entry_id} was challenged ({', '.join(void)}) "
                           "since the plan was drawn up — re-plan: retire it or "
                           "carry the correction")
-        elif "questionedBy" in challenged.get(entry_id, set()):
-            # Recall flags a questioned entry as long as it is visible; once
-            # a summary hides it, the summary is where the doubt must live.
-            print(f"[memory] warning: kept member {entry_id} is questioned — "
-                  "the summary must state the doubt", file=sys.stderr)
+        elif "questionedBy" in links:
+            # Recall flags a questioned entry as long as it is visible. Once
+            # a summary hides it, the doubt moves onto the summary: the same
+            # questionedBy links, so recall flags the summary instead.
+            doubts[entry_id] = links["questionedBy"]
     for entry_id in all_ids:
         if compacted.get(entry_id):
             errors.append(f"{entry_id} is already compacted into "
@@ -1639,8 +1695,14 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
         auto_from, auto_to = summary_covers(members, facts)
         covers_from = item["covers_from"] or auto_from
         covers_to = item["covers_to"] or auto_to
+        questioners = sorted({q for m in item["summarizes"] for q in doubts.get(m, [])})
         lines += compaction_lines(summary_id, item, generation, covers_from,
-                                  covers_to, actor, model, now)
+                                  covers_to, actor, model, now, questioners)
+        if questioners:
+            doubted = sorted(m for m in item["summarizes"] if doubts.get(m))
+            print(f"[memory] summary {summary_id} inherits the doubt on "
+                  f"{', '.join(doubted)}: questioned by {', '.join(questioners)} "
+                  "— state it in the summary", file=sys.stderr)
         written.append((summary_id, item, generation))
 
     path = MEMORY_DIR / f"compaction-{_new_id(now)}.nt"
