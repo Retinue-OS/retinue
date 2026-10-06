@@ -61,15 +61,16 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
 - **A silent run is the normal outcome.** The only conversations triage may open
   are Phase 4's two kinds — an individual proposal or the omnibus. A run never
   reports on itself. See **4c** below.
-- **An archived conversation is not a decision on the message.** Archiving means
-  the user is not pursuing the topic at this stage. Never un-archive a thread —
-  or post into it, which un-archives it as a side effect — just to remind the
-  user. What may bring the subject back is genuinely new external content (a new
-  inbound message) or a **stalled** item re-collected by Phase 1's fourth pass,
-  and either way through Phases 1–4 in a *new* thread, never through a reminder.
-  Only **`muted`** (with `archived`) is the user saying the topic is done for
-  good — per CLAUDE.md, the one decidable signal — and only that stops triage
-  from asking again.
+- **An archived conversation is not by itself a decision on the message** —
+  but what the user wrote in it is. Archiving means the user is not pursuing
+  the topic at this stage. Never un-archive a thread — or post into it, which
+  un-archives it as a side effect — just to remind the user. What may bring the
+  subject back is genuinely new external content (a new inbound message,
+  through Phases 1–4) or a **stalled** item re-collected by Phase 1's fourth
+  pass — which first reads the thread, treats any user answer there as the
+  decision, and otherwise re-opens that *same* thread: one message, one
+  thread. Only **`muted`** (with `archived`) is the user saying the topic is
+  done for good without answering — per CLAUDE.md, the one decidable signal.
 
 ### The delivery gate
 
@@ -220,17 +221,40 @@ status. Reconcile in both directions:
    it was never shown to the user, so there is no thread to judge and no
    decision to read off one. Treat it as the "thread gone" branch — re-collect
    it into the next due digest, never resolve it.
+
+   **One message, one thread.** An individually proposed message keeps the
+   thread its proposal opened for as long as it is tracked; this pass never
+   opens a second one for it while that thread exists. So before branching,
+   **read the thread** (`GET /conversations/<id>`), whatever its state: a user
+   message after the proposal means the user engaged, and their answer is on
+   record there. A record still non-terminal then means the executing session
+   skipped its bookkeeping (Phase 6), not that the question is open. The
+   classic case is an `action` carried out in another thread or channel — the
+   requested form mailed to a third party, say — which the already-answered
+   check cannot see, because no reply follows the message in its own thread.
+   - **User engaged the thread** (archived or not) → the decision exists.
+     Never re-propose and never nudge. Check whether it was carried out (Sent
+     folder, the `/sends` queue, the linked project): if so, resolve the
+     message exactly as pass 3 does and write `resolved`, citing the thread and
+     what carried the decision out. If a step is still open, do it now under
+     Phase 6 — or, when it waits on the user or a third party, resolve the
+     message anyway and leave the open step on its project, which is where
+     waiting work is tracked, not the INBOX.
    - **Thread archived *and* muted** → that is the user's decision on the
      message (per CLAUDE.md `muted` is the only decidable signal of "archive
      this for good"). Do not re-propose: resolve it out of the INBOX exactly as
      pass 3 does — `flag --read` + `move` to its disposition folder — and write
      `resolved`, recording the muted thread as the reason.
-   - **Thread gone, or archived and not muted** → the proposal never landed.
-     Re-collect the message as if it were untracked: it goes through Phases 2–4
-     and gets a **new** proposal thread (or a place in the omnibus), reusing the
-     status file. Never post into the archived thread and never un-archive it —
-     a quiet or archived thread is not a decision, so the new thread is the only
-     way to ask again.
+   - **Thread archived, not muted, never engaged** → the user set the question
+     aside without answering it. If it still needs them, **re-open the original
+     thread**: re-check the facts (Phase 4a step 1 — things may have moved
+     since), then post the updated proposal into it with `conversation-push.py
+     --thread <id>`, which un-archives it, and stamp `updated` and `last_nudge`
+     on the record. If it no longer needs them, resolve it as pass 3 does.
+   - **Thread gone** (deleted, or no id recorded) → there is nothing to
+     re-open. Re-collect the message as if it were untracked: it goes through
+     Phases 2–4 and gets a new proposal thread (or a place in the omnibus),
+     reusing the status file.
    - **Thread alive** → the proposal is intact and merely old; leave the
      decision to the user and let Phase 5 nudge it, but **stamp `updated` on the
      status record** so the gate stops counting it as stalled.
@@ -646,8 +670,17 @@ The context is stored with the message and replayed to every later Ara session
 in the thread, invisible to the user — it is the only way the token reaches
 the session that executes the approved reply. A proposal thread opened without
 it forces that session back onto name resolution, the failure mode reply
-tokens exist to prevent. E-mail needs no context: its reply is addressed by
-`--uid` from the status store (Phase 6).
+tokens exist to prevent. E-mail needs no reply command: its reply is addressed
+by `--uid` from the status store (Phase 6).
+
+**Every proposal thread names its status record**, any channel. Add a line to
+the `--context` (beside the reply command, for messenger) such as `Triage
+record: $TRIAGE_STATE_DIR/<sanitized id> (uid <UID>). Once the user's decision
+is carried out — here or anywhere else — set it resolved and move the mail out
+of the INBOX (triage skill, Phase 6).` The session that executes the decision
+is an ordinary thread turn that may never load this skill; without the pointer
+it does the work and leaves the record `proposed`, and a week later the stall
+pass finds a message that looks undecided.
 
 ### 4b. Omnibus proposal — once per `EMAIL_PROCESSING_INTERVAL`
 
@@ -767,7 +800,8 @@ have decided not to pursue the topic for now — respect that. Send no nudge and
 no push for it, and never un-archive it as a reminder (posting into it would
 un-archive it as a side effect, so don't post either). Only a **new external
 message on the subject**, or Phase 1's re-collection of a stalled item — both
-arriving through Phases 1–4, in a new thread — may raise the subject again.
+arriving through Phases 1–4 — may raise the subject again; the latter
+re-opens the original thread rather than starting another (Phase 1, pass 4).
 
 **Urgency scaling:** Signal/WhatsApp/SMS escalate **sooner** and prefer the
 Signal push; e-mail defaults to the in-thread nudge. Record `last_nudge` in the
@@ -843,7 +877,13 @@ Then carry out the disposition:
   `/sends` and — as with e-mail — the item stays non-terminal until that send
   is approved.
 - **Action** → do the concrete thing; if it advanced a project, append to its
-  log.
+  log. Then resolve the message (status `resolved` + move, below) **in the
+  same turn**, even when the action happened elsewhere — a mail to a third
+  party, a form filed, a call booked. Nothing follows the message in its own
+  thread then, so the already-answered check can never catch it later; this
+  turn is the only one that knows. Steps still waiting on someone (the
+  third party's answer, the user's signature) go on the linked project, not
+  into a non-terminal record.
 
 **Inbox-zero:** engaging a conversation — approving the proposal or giving an
 alternative instruction — resolves the underlying e-mail out of the INBOX
