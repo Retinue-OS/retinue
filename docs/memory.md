@@ -272,7 +272,9 @@ exclusion, each labeled `kept` or `retired`, in the same row format (no limit
 unless `--limit` is given); it does not combine with the filter flags.
 `--json` returns the same rows as objects, including `expires`, `summary`,
 `generation`, `covers_from`, `covers_to`, `summarizes`, `retires` and
-`compacted_into` (and `role` under `--expand`).
+`compacted_into` (and `role` under `--expand`). `compacted_into` and the
+`COMPACTED into` label name standing summaries only: once a summary is
+corrected, its members are live again and carry no such label.
 
 ## Compaction
 
