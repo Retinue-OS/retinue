@@ -582,7 +582,7 @@ do:
   endpoint with a ready `curl` line, then `docs/ontology.md` itself. The page
   fetches the doc from `/docs/<name>.md` (the image's own `docs/`, read-only)
   and renders it with the dashboard's Markdown renderer, so the documentation
-  and the page cannot drift apart. Every ` ```sparql ` block in it gets a
+  and the page cannot drift apart. Every fenced `sparql` block in it gets a
   **Run** button. Run turns the block, where it stands, into a YASQE editor
   with the same query and opens its YASR results beneath it. `?doc=<name>`
   renders another doc the same way, and a `docs/<name>.md` mentioned in the
@@ -591,11 +591,39 @@ do:
 
 Safety lives in the gateway, not the page. Only a `query` ever reaches the
 store, as a fresh form POST carrying nothing of the caller's request but the
-query and its `Accept`: no `Authorization` header, no access token, no other
-argument. Every form of SPARQL Update is refused (403) before the store is
-asked; the store's own front refuses writes too. A result is never served as
-HTML on the dashboard's origin. A query may run for `SPARQL_PROXY_TIMEOUT`
-seconds (default 120).
+query, the dataset it names (`default-graph-uri`, `named-graph-uri`) and its
+`Accept`: no `Authorization` header, no access token, no other argument. Every
+form of SPARQL Update is refused (403) before the store is asked; the store's
+own front refuses writes too. So is a query that uses `SERVICE` (403): a
+federated query makes the store itself call the endpoint it names and send it
+bindings from the store, which is data leaving by a side door. The check is
+lexical and errs towards refusing, but a variable, a prefixed name or a string
+merely spelled "service" passes; QLever's in-process extensions that use the
+keyword (`pathSearch`, `spatialSearch`) are refused with the rest. And so is a
+query a browser sends from another site (`Sec-Fetch-Site`, else `Origin`
+against the scheme and host the request arrived with: the first
+`X-Forwarded-Proto` / `X-Forwarded-Host` entry, else `Host`), which is how a
+page the user happens to visit would fire one with the user's credentials. Programs send neither
+header, and the page itself still opens from a link anywhere. Browsers send
+`Sec-Fetch-Site` only over HTTPS, so serve the dashboard over HTTPS alone:
+over plain HTTP another site's image or form GET carries no such header and
+could still have a query run blind (unread, and never calling out), and a
+proxy in front must set `X-Forwarded-Proto` and keep `Host` or set
+`X-Forwarded-Host` (Traefik does all of this by default). A store-level lock
+is possible too (`qlever-server --service-allowed-iri-prefixes -`, a
+qlever-dir change); the gateway does not rely on it. A result
+is never served as HTML on the dashboard's origin. A body the gateway cannot
+read is named as such: chunked transfer gets 411, a malformed
+`Content-Length` 400.
+
+**Timeouts.** The store cancels a query after its own default timeout
+(`qlever-server --default-query-timeout`, 30 s as qlever-dir starts it) and
+says so in its answer (429, "Operation timed out"). `SPARQL_PROXY_TIMEOUT`
+(default 120 s) only bounds how long the gateway waits on the store's
+connection, so raising it does not let a query run longer. A longer budget
+needs qlever-dir to start `qlever-server` with `--default-query-timeout`
+(`start_qlever` in its `orchestrator.py`), which it does not offer as a setting
+today.
 
 YASGUI is **vendored at image build** by `scripts/vendor-yasgui.sh` (pinned
 version and sha256) into `webapp/vendor/yasgui/`, which is not committed; run
@@ -605,12 +633,16 @@ makes no third-party requests, and this page keeps that rule: YASQE's stock
 autocompleters, which call prefix.cc and send what is being typed to the LOV
 API, are replaced by one that completes the prefixes the ontology's own
 examples declare. Typing `sosa:` adds `PREFIX sosa: <…>` from the
-documentation. The workbench keeps queries on the device, never results, and a
-shared link (`#query=…`) brings only its query, never an endpoint.
+documentation. The workbench keeps queries on the device, never results. A
+shared link (`#query=…`) opens as a tab of its own with its query and nothing
+else (no endpoint, header or argument the link names), and it does not run
+until you press Run: a link is somebody else's query.
 
 `tests/test_doc_sparql.py` keeps every documented query runnable: one
 self-contained, read-only query per block (parsed by rdflib where installed),
-and an example for every namespace in the ontology's defaults table.
+and, for every vocabulary in the ontology's defaults table, an example section
+of its own that uses its namespace (the fallback row names schema.org again
+and shares its section).
 `tests/test_web_gateway_sparql.py` pins the endpoint's behaviour, and
 `tests/test_webapp_sparql_doc.py` the rendering.
 

@@ -76,9 +76,12 @@ Projects (dashboard project pages):
 The life store (behind the dashboard's sign-in; read-only):
   GET|POST /sparql                    -> SPARQL 1.1 Protocol: query=<SPARQL>
                                          (URL or form) or an application/
-                                         sparql-query body, answered by the
-                                         life store as it answers; any update
-                                         is refused (403). Without a query a
+                                         sparql-query body, with default-/
+                                         named-graph-uri, answered by the
+                                         life store as it answers; an update,
+                                         a SERVICE clause or a cross-site
+                                         browser request is refused (403).
+                                         Without a query a
                                          browser gets webapp/sparql.html, any
                                          other client a Service Description.
   GET  /docs/<name>.md                -> a framework doc, as Markdown — what the
@@ -5151,9 +5154,11 @@ def _sparql_bindings(query: str, timeout: float | None = None) -> list[dict]:
 #
 # Read-only by construction, not by trust: only a `query` ever leaves for the
 # store, always as a fresh form POST carrying nothing of the caller's request
-# but the query text and its Accept header. An `update`, the store's access
-# token or the user's own Authorization header cannot ride along. (The store's
-# front refuses writes as well; this is the second lock, not the only one.)
+# but the query text, the dataset it names (default-graph-uri,
+# named-graph-uri: graphs to read, nothing else) and its Accept header. An
+# `update`, the store's access token or the user's own Authorization header
+# cannot ride along. (The store's front refuses writes as well; this is the
+# second lock, not the only one.)
 SPARQL_PROXY_TIMEOUT = float(os.environ.get("SPARQL_PROXY_TIMEOUT", "120"))
 # A query is text; a body beyond this is not one.
 SPARQL_MAX_BODY = 1024 * 1024
@@ -5164,11 +5169,110 @@ DOCS_DIR = Path(os.environ.get("DOCS_DIR", "/workspace/docs"))
 _DOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*\.md$")
 
 
-def _sparql_operation(query_string: str, content_type: str = "",
-                      body: bytes = b"") -> tuple[str | None, tuple[int, str] | None]:
-    """The query a SPARQL Protocol request carries, as ``(query, refusal)``.
+_SPARQL_DATASET_PARAMS = ("default-graph-uri", "named-graph-uri")
 
-    Reads all three ways the protocol passes an operation — URL parameters, a
+# Federation is refused. A SERVICE clause makes the store itself call the IRI
+# it names and send that endpoint bindings from the store: data leaving by a
+# side door, whoever wrote the query — a shared link, or a page the user merely
+# visited that fires a request at this endpoint with the user's credentials.
+# (qlever-server --service-allowed-iri-prefixes can lock this at the store
+# too; this check does not rely on it.)
+#
+# The check is lexical and errs towards refusing. What a SPARQL lexer passes
+# over is blanked first, by the grammar's own delimiters (SPARQL 1.1 §19.8):
+# strings, IRIs, comments, and the backslash escapes a prefixed name may hold
+# (`ex:a\#b` is a name, not the start of a comment). What remains is read in
+# runs of name characters, each run once, so the check stays linear in the
+# query's length: a run with a colon is a prefixed name or a blank node, and
+# none of it is a keyword; in any other run each word is one, so SERVICE as a
+# word of its own is the keyword. Variables and language tags are tokens of
+# their own. The query is checked as written and with its \u escapes decoded,
+# which the grammar allows anywhere: whichever reading the store uses, the
+# keyword is seen. QLever's in-process SERVICE extensions (pathSearch,
+# spatialSearch) are refused with the rest.
+_SPARQL_OPAQUE_RE = re.compile(
+    r'"""(?:[^"\\]|\\.|"(?!""))*"""'
+    r"|'''(?:[^'\\]|\\.|'(?!''))*'''"
+    r'|"(?:[^"\\\n\r]|\\.)*"'
+    r"|'(?:[^'\\\n\r]|\\.)*'"
+    r'|<(?:[^<>"{}|^`\\\x00-\x20]|\\u[0-9A-Fa-f]{4}|\\U[0-9A-Fa-f]{8})*>'
+    r"|\\."
+    r"|#[^\n\r]*", re.S)
+_SPARQL_PN = r"\w\u00B7\u0300-\u036F\u203F\u2040"
+_SPARQL_TOKEN_RE = re.compile(
+    rf"[?$][{_SPARQL_PN}]+"                    # a variable
+    r"|@[A-Za-z]+(?:-[A-Za-z0-9]+)*"            # a language tag
+    rf"|[{_SPARQL_PN}.:%\-]+")                  # a run of name characters
+_SPARQL_WORD_RE = re.compile(r"[A-Za-z_]\w*")
+_SPARQL_UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+
+
+def _sparql_run_words(run: str) -> list[str]:
+    """The words of a run of name characters that the store reads as
+    keywords. `ex:SERVICE`, `SERVICE:x`, `a.SERVICE:x` and `_:SERVICE` are
+    names; a prefix that cannot be one (holding `%`, or ending in `.`) puts
+    its words back in play. Without a colon, every word counts."""
+    head, colon, _local = run.partition(":")
+    if colon and "%" not in head and not head.endswith("."):
+        return []
+    return _SPARQL_WORD_RE.findall(head)
+
+
+def _sparql_calls_out(query: str) -> bool:
+    """Whether the query uses SERVICE, read the way the store might read it."""
+    def unescape(m: re.Match) -> str:
+        point = int(m.group(1) or m.group(2), 16)
+        return chr(point) if point <= 0x10FFFF else m.group(0)
+
+    def blank(m: re.Match) -> str:
+        # An escape stays part of the name it is in; the rest separates.
+        return "__" if m.group(0).startswith("\\") else " "
+
+    for text in (query, _SPARQL_UNICODE_ESCAPE_RE.sub(unescape, query)):
+        for token in _SPARQL_TOKEN_RE.finditer(_SPARQL_OPAQUE_RE.sub(blank, text)):
+            if token.group(0)[0] in "?$@":
+                continue
+            if any(word.upper() == "SERVICE" for word in _sparql_run_words(token.group(0))):
+                return True
+    return False
+
+
+def _sparql_cross_site(headers) -> bool:
+    """Whether a browser sent this request from another site: a page the user
+    happened to visit, firing a query with the user's credentials. Programs
+    send neither header and are not affected; the dashboard's own page is
+    same-origin."""
+    site = (headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site:
+        return site not in ("same-origin", "none")
+    origin = headers.get("Origin")
+    if origin is None:
+        return False
+    # Same origin is same scheme and host: the ones the request reached the
+    # front proxy with (the first X-Forwarded-Proto / X-Forwarded-Host entry,
+    # the client-facing one, as gateway_auth reads the chain), else what this
+    # server saw. No other site can send those headers: a page may not set
+    # them without a preflight, which this server fails.
+    def first(name: str) -> str:
+        return (headers.get(name) or "").split(",")[0].strip().lower()
+
+    scheme = first("X-Forwarded-Proto") or "http"
+    host = first("X-Forwarded-Host") or (headers.get("Host") or "").strip().lower()
+    try:
+        parts = urllib.parse.urlsplit(origin.strip())
+    except ValueError:
+        return True  # no browser sends an Origin that does not parse
+    return (parts.scheme.lower(), parts.netloc.lower()) != (scheme, host)
+
+
+def _sparql_operation(query_string: str, content_type: str = "", body: bytes = b"",
+                      ) -> tuple[list[tuple[str, str]] | None, tuple[int, str] | None]:
+    """The query a SPARQL Protocol request carries, as ``(form, refusal)``.
+
+    ``form`` is what the store is sent: the query, and the dataset the
+    request names with ``default-graph-uri``/``named-graph-uri``, if any —
+    dropping those would answer over the whole store without a word. Reads
+    all three ways the protocol passes an operation — URL parameters, a
     form-encoded POST body, a bare ``application/sparql-query`` body — and the
     update forms only to refuse them. ``refusal`` is ``(status, message)``;
     both are None when the request carries no operation at all, which on a
@@ -5192,7 +5296,8 @@ def _sparql_operation(query_string: str, content_type: str = "",
         return None, None
     if not queries[0].strip():
         return None, (400, "the query is empty")
-    return queries[0], None
+    dataset = [(key, iri) for key in _SPARQL_DATASET_PARAMS for iri in params.get(key, [])]
+    return [("query", queries[0])] + dataset, None
 
 
 def _sparql_service_description() -> str:
@@ -8301,22 +8406,33 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(411, {"error": "send the body with a Content-Length "
                                                "(chunked transfer is not supported)"})
                 return
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
+            raw_length = (self.headers.get("Content-Length") or "0").strip()
+            if not raw_length.isascii() or not raw_length.isdigit():
                 self._send_json(400, {"error": "Content-Length is not a number"})
                 return
+            # A number too long to convert (Python refuses past 4300 digits)
+            # is also far past the limit.
+            length = int(raw_length) if len(raw_length) <= 18 else SPARQL_MAX_BODY + 1
             if not 0 <= length <= SPARQL_MAX_BODY:
                 self._send_json(413, {"error": "not a query: the body is too large"})
                 return
             body = self.rfile.read(length) if length else b""
-        query, refusal = _sparql_operation(
+        form, refusal = _sparql_operation(
             query_string, self.headers.get("Content-Type", ""), body)
         if refusal:
             self._send_json(refusal[0], {"error": refusal[1]})
             return
-        if query is not None:
-            self._sparql_forward(query)
+        # The cheap refusal first: another site's request costs no lexing.
+        if form is not None and _sparql_cross_site(self.headers):
+            self._send_json(403, {"error": "a query sent from another site is not run; "
+                                           "open /sparql on this dashboard instead"})
+            return
+        if form is not None and _sparql_calls_out(form[0][1]):
+            self._send_json(403, {"error": "federated queries (SERVICE) are not allowed: "
+                                           "the life store does not send its data to other endpoints"})
+            return
+        if form is not None:
+            self._sparql_forward(form)
         elif self.command == "POST":
             self._send_json(400, {"error": "no query: send query=<SPARQL> as a form, "
                                            "or the query as an application/sparql-query body"})
@@ -8331,13 +8447,14 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(payload)
 
-    def _sparql_forward(self, query: str) -> None:
+    def _sparql_forward(self, form: list[tuple[str, str]]) -> None:
         """Run one query on the life store and stream its answer back as the
         store gave it — status, type and body — so a client sees the store's
-        own error for a bad query, not a gateway paraphrase of it."""
+        own error for a bad query, not a gateway paraphrase of it. ``form`` is
+        _sparql_operation's: the query and the dataset it names."""
         req = urllib.request.Request(
             QLEVER_LIFE_URL,
-            data=urllib.parse.urlencode({"query": query}).encode("utf-8"),
+            data=urllib.parse.urlencode(form).encode("utf-8"),
             headers={"Accept": self.headers.get("Accept") or "application/sparql-results+json",
                      "Content-Type": "application/x-www-form-urlencoded"},
             method="POST",

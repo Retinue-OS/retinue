@@ -43,7 +43,10 @@ function anchor(url, label) {
 // auto-linked (too easily confused with filenames) — write them as explicit
 // Markdown links.
 export function renderInline(text) {
-  let s = esc(text);
+  // The sentinel never comes from the text itself: a literal one could name
+  // a stash from inside that very stash, and the restore below would expand
+  // it forever. Only stash() writes placeholders, so they nest one way.
+  let s = esc(text).replaceAll(SEP, '\uFFFD');
   const stashed = [];
   // Stash generated <a> HTML behind a placeholder so the later bold/italic
   // passes never mangle a URL, and restore them at the end.
@@ -55,16 +58,20 @@ export function renderInline(text) {
   // Stashed like a link so bold/italic passes don't touch the button markup.
   // A label may not contain "|" (the separator); prefill runs to the closing
   // "]]". Whitespace around each part is trimmed.
-  s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/gi,
-    (_m, label, fill) => stash(
-      `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`));
+  // A code span met first is matched and handed back untouched, so chip syntax
+  // quoted as code (`[[chip: Yes]]`) stays code for the code pass below; a
+  // chip's own label and prefill may still hold backticks.
+  const chip = (re) => new RegExp('(`[^`]+`)|' + re.source, 'gi');
+  s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\|\s*(.+?)\s*\]\]/),
+    (m, code, label, fill) => (code ? m : stash(
+      `<button type="button" class="md-chip" data-fill="${fill}">${label}</button>`)));
   // Shorthand: [[chip: Text]] with no "|" — the text is used as BOTH the label
   // and the prefill. Runs after the two-part form above, so any [[chip: …]] left
   // here has no separator. This avoids the silent failure where a missing "|"
   // left the whole marker as raw literal text in the bubble.
-  s = s.replace(/\[\[chip:\s*([^|\]]+?)\s*\]\]/gi,
-    (_m, text) => stash(
-      `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`));
+  s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\]\]/),
+    (m, code, text) => (code ? m : stash(
+      `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`)));
   // `code` before any link: a code span is literal, so a URL inside one
   // (`https://schema.org/`) stays code instead of becoming a link with the
   // backticks left standing around it. Stashed, so no later pass — links,
@@ -95,9 +102,10 @@ export function renderInline(text) {
   s = s.replace(/(^|[^*\w])\*([^*\n]+?)\*(?!\w)/g, (_m, pre, c) => `${pre}<em>${c}</em>`);
   s = s.replace(/~~([^~\n]+?)~~/g, (_m, c) => `<del>${c}</del>`);
   // Restore until nothing changes: a stashed link's label may itself hold a
-  // stashed code span ([`x`](url)).
+  // stashed code span ([`x`](url)). A stash only holds earlier stashes, so
+  // stashed.length + 1 passes always suffice; the bound makes that certain.
   const placeholder = new RegExp(SEP + '(\\d+)' + SEP, 'g');
-  for (let prev = null; prev !== s;) {
+  for (let prev = null, pass = 0; prev !== s && pass <= stashed.length; pass++) {
     prev = s;
     s = s.replace(placeholder, (m, i) => stashed[Number(i)] ?? m);
   }
@@ -114,8 +122,11 @@ const LIST_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
 const TASK_RE = /^\[([ xX])\]\s+(.*)$/;
 const TABLE_SEP_RE = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/;
 
-function renderParagraph(lines, br) {
-  return `<p>${lines.map(renderInline).join(br)}</p>`;
+// A run of source lines as inline HTML: in a message each line break is the
+// author's; in a hard-wrapped document it is only the wrap, so the lines are
+// one text — and a code span or bold run may cross the break.
+function renderLines(lines, wrapped) {
+  return wrapped ? renderInline(lines.join(' ')) : lines.map(renderInline).join('<br>');
 }
 
 function splitTableRow(line) {
@@ -207,7 +218,6 @@ export function renderMarkdown(text, opts = {}) {
     || ((_raw, inner) => `<blockquote class="md-quote">${inner}</blockquote>`);
   const codeHook = opts.code || ((_raw, _lang, inner) => inner);
   const wrapped = Boolean(opts.hardWrapped);
-  const br = wrapped ? ' ' : '<br>';
   const lines = String(text == null ? '' : text).split('\n');
   const out = [];
   let i = 0;
@@ -245,7 +255,7 @@ export function renderMarkdown(text, opts = {}) {
         i++;
       }
       const raw = quoted.join('\n');
-      out.push(quoteHook(raw, quoted.map(renderInline).join(br)));
+      out.push(quoteHook(raw, renderLines(quoted, wrapped)));
       continue;
     }
 
@@ -283,7 +293,8 @@ export function renderMarkdown(text, opts = {}) {
       continue;
     }
 
-    // Paragraph: consecutive plain lines, single newlines become <br>.
+    // Paragraph: consecutive plain lines; a single newline is a <br> in a
+    // message and a space in a document (renderLines).
     const plain = [];
     while (i < lines.length && lines[i].trim()
         && !FENCE_RE.test(lines[i]) && !HEADING_RE.test(lines[i])
@@ -293,7 +304,7 @@ export function renderMarkdown(text, opts = {}) {
       plain.push(lines[i]);
       i++;
     }
-    if (plain.length) out.push(renderParagraph(plain, br));
+    if (plain.length) out.push(`<p>${renderLines(plain, wrapped)}</p>`);
   }
   return `<div class="md">${out.join('')}</div>`;
 }

