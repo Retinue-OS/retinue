@@ -217,7 +217,10 @@ more letters, any script. An overlap of **0.6** or more is a near-duplicate;
 **0.3** or more is merely similar, printed as a warning while the store
 proceeds. A near-duplicate that this very call challenges (`--supersedes`,
 `--corrects`, `--questions`) is intended — a successor resembles what it
-replaces — and does not count.
+replaces — and does not count. The guard also reads the entries written to
+the memory directory in the last ten minutes, which the store, indexing a few
+seconds behind, may not return yet: the production duplicates were stored
+seconds apart by one session.
 
 | | lower tier | frontier |
 |---|---|---|
@@ -299,8 +302,12 @@ in the store (skipped with `--force`; an unreachable store warns, as for
 generation and coverage come from the store; when it cannot be reached
 `compact` refuses rather than write invented metadata. The whole plan becomes
 one `compaction-*.nt`; the summary ids are printed on stdout, one per line.
-The store guards do not apply: compaction is frontier work by policy, and the
-job enforces that.
+The store guards do not apply, but `compact` refuses a lower-tier session
+outright: compaction hides entries from every recall and is frontier work.
+One compaction runs at a time per memory directory (a lock file the store
+ignores), and a run also reads the compaction files written in the last ten
+minutes, which the store may not have indexed yet, so two runs cannot claim
+the same members.
 
 ### The compaction scheme
 

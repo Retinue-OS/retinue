@@ -727,13 +727,54 @@ def test_compact_writes(mod):
         check("plan from stdin", (rc, len(out.split())), (0, 1))
 
 
+def test_review_followups(mod):
+    """What the first review of memory v2 asked for: no traceback on absurd
+    durations, no compaction from a lower tier, and the index lag closed by
+    reading the last minutes' files."""
+    print("review follow-ups")
+    check("oversized days refused", mod.parse_expires("99999999999d", NOW), None)
+    check("oversized months refused", mod.parse_expires("999999999m", NOW), None)
+
+    with tempdir() as d:
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE],
+                       FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("first store written", rc, 0)
+        rc, _, err = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
+                         FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("seconds later: the store knows nothing, the file does", rc, 1)
+        check("names the unindexed entry", "near-duplicate of live memories" in err, True)
+        rc, _, _ = run(mod, ["store", "--tag", "signal", "Signal gateway restarted"],
+                       FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("a different tag is not compared", rc, 0)
+
+    facts = {"20260830T090000Z-aaaaaa": {"t": "2026-08-30T09:00:00Z"},
+             "20260901T080000Z-bbbbbb": {"t": "2026-09-01T08:00:00Z"}}
+    with tempdir() as d:
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         FakeStore(facts=facts), LOWER_ENV, d)
+        check("lower tier: compaction refused", rc, 1)
+        check("lower tier: told why", "frontier work" in err, True)
+        check("lower tier: nothing written", nt_files(d), [])
+        rc, _, _ = run(mod, ["compact", "--plan", str(planfile)],
+                       FakeStore(facts=facts), FRONTIER_ENV, d)
+        check("frontier: compacted", rc, 0)
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         FakeStore(facts=facts), FRONTIER_ENV, d)
+        check("again inside the index lag: refused from the file", rc, 1)
+        check("names the claim", "is already compacted into" in err, True)
+        check("still one compaction file", len(nt_files(d)), 1)
+
+
 def main():
     mod = load()
     for t in (test_parse_expires, test_normalize_model, test_session_tier,
               test_word_overlap, test_classify_and_closest, test_liveness,
               test_duplicate_guard, test_new_tag_guard, test_store_writes,
               test_recall_query, test_recall_render, test_expand, test_tags,
-              test_validate_plan, test_compact_writes):
+              test_validate_plan, test_compact_writes,
+              test_review_followups):
         t(mod)
     if failures:
         print(f"\n{len(failures)} check(s) failed: {', '.join(failures)}")

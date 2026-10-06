@@ -134,8 +134,8 @@ in `chambers/_generated/memory/`, indexed by the life store:
 # A pending state or deadline gets --expires (date, dateTime, 10d/2w/3m);
 # a rule, preference, lesson or decision never does.
 python3 /workspace/scripts/memory.py store \
-  --actor ara --tag insurance --tag deadline --relevance 0.3 --expires 2026-09-20 \
-  "IV filing for August submitted; response expected mid-September."
+  --actor ara --tag insurance --tag deadline --relevance 0.3 --expires 3w \
+  "IV filing submitted; response expected within three weeks."
 
 # Tags in use, with counts: pick an existing one before storing or recalling.
 python3 /workspace/scripts/memory.py tags --contains insur

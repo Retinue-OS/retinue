@@ -123,8 +123,8 @@ memories.
 Usage:
 
     memory.py store --tag insurance --tag deadline --relevance 0.3 \
-        --expires 2026-09-15 \
-        "IV filing for August submitted; response expected mid-September."
+        --expires 3w \
+        "IV filing submitted; response expected within three weeks."
     memory.py tags --prefix sender
     memory.py recall --tag insurance --since 2026-06-01 --limit 10
     memory.py recall --tag health --json
@@ -156,6 +156,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import contextlib
 import datetime
 import difflib
 import json
@@ -163,6 +164,7 @@ import os
 import re
 import secrets
 import sys
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -340,11 +342,16 @@ def parse_expires(spec: str, now: datetime.datetime) -> datetime.datetime | None
     m = _DURATION_RE.match(s)
     if m:
         count, unit = int(m.group(1)), (m.group(2) or "d").lower()
-        if unit == "d":
-            return now + datetime.timedelta(days=count)
-        if unit == "w":
-            return now + datetime.timedelta(weeks=count)
-        return _add_months(now, count)
+        try:
+            if unit == "d":
+                return now + datetime.timedelta(days=count)
+            if unit == "w":
+                return now + datetime.timedelta(weeks=count)
+            return _add_months(now, count)
+        except (OverflowError, ValueError):
+            # Syntactically a duration, arithmetically nonsense (a year past
+            # 9999): unreadable, so the caller refuses instead of crashing.
+            return None
     if _DATE_RE.match(s):
         try:
             d = datetime.date.fromisoformat(s)
@@ -499,6 +506,102 @@ def _excerpt(text: str) -> str:
     return flat if len(flat) <= EXCERPT_CHARS else flat[:EXCERPT_CHARS - 1] + "…"
 
 
+# ---------------------------------------------------------------- local files
+
+# The store indexes a new or appended file a few seconds after it is written.
+# Anything the guards or compact decide inside that lag has to come from the
+# files themselves; this window bounds how far back they look.
+LOCAL_WINDOW = datetime.timedelta(minutes=10)
+
+_ENTRY_LINE_RE = re.compile(
+    r'^<' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> <' + re.escape(KB)
+    + r'(content|tag)> "((?:[^"\\]|\\.)*)" \.$')
+_CLAIM_LINE_RE = re.compile(
+    r'^<' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> <' + re.escape(KB)
+    + r'compactedInto> <' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> \.$')
+
+
+def _unescape_nt(raw: str) -> str:
+    """Undo _nt_string for the literals this script wrote itself."""
+    return re.sub(r'\\(.)', lambda mt: {"n": "\n", "r": "\r", "t": "\t"}.get(
+        mt.group(1), mt.group(1)), raw)
+
+
+def _recent_files(pattern: str) -> list[Path]:
+    if not MEMORY_DIR.is_dir():
+        return []
+    cutoff = time.time() - LOCAL_WINDOW.total_seconds()
+    out = []
+    for path in sorted(MEMORY_DIR.glob(pattern)):
+        try:
+            if path.stat().st_mtime >= cutoff:
+                out.append(path)
+        except OSError:
+            continue
+    return out
+
+
+def _recent_local_entries(tags: list[str]) -> list[tuple[str, str]]:
+    """(id, content) of entries written here in the last few minutes that
+    share a tag — what the store has not indexed yet. The production
+    duplicates were stored seconds apart by one session; a guard that only
+    asks a store lagging a few seconds behind never sees them."""
+    wanted = set(tags)
+    contents: dict[str, str] = {}
+    entry_tags: dict[str, set[str]] = {}
+    for path in _recent_files("*.nt"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            mt = _ENTRY_LINE_RE.match(line)
+            if not mt:
+                continue
+            entry_id, pred, raw = mt.groups()
+            if pred == "content":
+                contents[entry_id] = _unescape_nt(raw)
+            else:
+                entry_tags.setdefault(entry_id, set()).add(raw)
+    return [(i, contents[i]) for i in sorted(contents)
+            if entry_tags.get(i, set()) & wanted]
+
+
+def _recent_local_claims(ids: list[str]) -> dict[str, list[str]]:
+    """id -> summaries that compaction files written in the last few minutes
+    already claim it for. A compaction that starts inside the index lag of
+    the previous one would not see those claims through SPARQL."""
+    wanted = set(ids)
+    out: dict[str, list[str]] = {}
+    for path in _recent_files("compaction-*.nt"):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            mt = _CLAIM_LINE_RE.match(line)
+            if mt and mt.group(1) in wanted:
+                out.setdefault(mt.group(1), []).append(mt.group(2))
+    return out
+
+
+@contextlib.contextmanager
+def _compaction_lock():
+    """One compaction at a time per memory directory: the already-compacted
+    check reads the store and the file lands later, and two runs inside that
+    window would both claim the same members. The lock file is not `.nt`, so
+    the store ignores it. Without fcntl (a development host) there is no lock."""
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    with (MEMORY_DIR / ".compact.lock").open("a", encoding="utf-8") as fh:
+        if fcntl is not None:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 # ---------------------------------------------------------------- network
 
 
@@ -648,9 +751,14 @@ def _duplicate_guard(content: str, tags: list[str], linked: set[str], tier: str,
     try:
         hits = _live_entries_sharing(tags, now)
     except Exception as exc:  # noqa: BLE001 — one endpoint, one failure mode
-        print(f"[memory] store unreachable ({exc}); duplicates not checked",
+        print(f"[memory] store unreachable ({exc}); duplicates not checked "
+              "against the store, only against the last minutes' files",
               file=sys.stderr)
-        return True
+        hits = []
+    # What the store has not indexed yet: the entries this or another session
+    # wrote moments ago, which is where the production duplicates came from.
+    seen = {entry_id for entry_id, _ in hits}
+    hits += [h for h in _recent_local_entries(tags) if h[0] not in seen]
     near, similar = classify_duplicates(content, hits, linked)
     for entry_id, other, score in similar:
         print(f"[memory] warning: similar to {entry_id} (overlap {score:.2f}): "
@@ -1299,6 +1407,15 @@ def compact(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 0
 
+    # Compaction hides members from every recall; a plan written by a session
+    # that may not even coin a tag has no business doing that. The scheduled
+    # job runs as frontier by construction; this is for the hand-run case.
+    model = normalize_model(args.model or os.environ.get("RETINUE_SESSION_MODEL", ""))
+    if session_tier(os.environ, model) != FRONTIER:
+        print("[memory] refused: compaction is frontier work — run it from Ara "
+              "senior or let the scheduled job do it", file=sys.stderr)
+        return 1
+
     try:
         raw = sys.stdin.read() if args.plan == "-" else \
             Path(args.plan).read_text(encoding="utf-8")
@@ -1330,6 +1447,12 @@ def compact(args: argparse.Namespace) -> int:
                       file=sys.stderr)
                 break
 
+    with _compaction_lock():
+        return _compact_locked(items, all_ids, errors, args.actor, model)
+
+
+def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
+                    actor_arg: str, model: str) -> int:
     # Generation and coverage are facts about the members that only the store
     # knows; a summary with an invented generation would break the ordering
     # and the consolidation chain, so here an unreachable store refuses.
@@ -1340,6 +1463,9 @@ def compact(args: argparse.Namespace) -> int:
         print(f"[memory] store unreachable ({exc}); cannot compute generations "
               "and coverage — nothing written", file=sys.stderr)
         return 1
+    for entry_id, summaries in _recent_local_claims(all_ids).items():
+        known = compacted.setdefault(entry_id, [])
+        known += [x for x in summaries if x not in known]
     for entry_id in all_ids:
         if compacted.get(entry_id):
             errors.append(f"{entry_id} is already compacted into "
@@ -1349,8 +1475,8 @@ def compact(args: argparse.Namespace) -> int:
             print(f"[memory] plan error: {e}", file=sys.stderr)
         return 1
 
+    actor = _slug(actor_arg or os.environ.get("RETINUE_MEMORY_ACTOR", "") or "ara")
     now = _now()
-    model = normalize_model(args.model or os.environ.get("RETINUE_SESSION_MODEL", ""))
     lines: list[str] = []
     written: list[tuple[str, dict, int]] = []
     used: set[str] = set()
