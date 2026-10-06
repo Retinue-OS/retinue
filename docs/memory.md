@@ -242,7 +242,8 @@ A refusal lists the matched ids with an excerpt of each and the ways out. The
 existing `--force` keeps its one meaning — skip the existence check of
 challenged ids — and overrides neither guard. Guards and write run under the memory
 directory's one lock file, shared with `compact`, so two sessions storing at
-once cannot both pass.
+once cannot both pass; the store is queried before the lock is taken, so a
+store that is down delays its own caller only.
 A store that cannot be reached never blocks a write: the guards then only
 warn, from the recent local files, and the existence check proceeds
 unverified, as it always has.
@@ -326,10 +327,13 @@ with nothing written, unlike `store`, which only loses its guards. The whole pla
 one `compaction-*.nt`; the summary ids are printed on stdout, one per line.
 The store guards do not apply, but `compact` refuses a lower-tier session
 outright: compaction hides entries from every recall and is frontier work.
-`compact` holds the same lock file as `store` (one per memory directory, which
-the store ignores), so no correction lands while it checks and writes; it also
-reads the compaction claims and challenge links written to local files in the
-last ten minutes, which the store may not have indexed yet. So two runs cannot
+`compact` queries the store first, then holds the same lock file as `store`
+(one per memory directory, which the store ignores) while it re-reads the
+local files and writes, so no correction lands in between; the local files
+hold the compaction claims and challenge links written in the last ten
+minutes, which the store may not have indexed yet. A bound the plan states is
+checked against the members' span once the other bound is filled in, so no
+inverted coverage reaches the file. So two runs cannot
 claim the same members, and a kept member that was corrected or superseded
 after the plan was drawn up refuses the plan: re-plan, retiring it or carrying
 the correction.

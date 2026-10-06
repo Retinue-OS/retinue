@@ -680,8 +680,10 @@ def _dir_lock():
     the store guards and compact's member checks read a store that indexes
     seconds behind, and two processes inside that window would both pass —
     or a correction would land while a summary is being written over the
-    entry it corrects. One lock serves both, so neither can interleave. The
-    lock file is not `.nt`, so the store ignores it. Without fcntl (a
+    entry it corrects. One lock serves both, so neither can interleave. It
+    is held across the local-file checks and the write only, never across a
+    store query: a store that is down makes its caller wait, not everyone.
+    The lock file is not `.nt`, so the store ignores it. Without fcntl (a
     development host) there is no lock."""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     with (MEMORY_DIR / LOCK_FILE).open("a", encoding="utf-8") as fh:
@@ -788,20 +790,41 @@ SELECT DISTINCT ?m ?content WHERE {{
 # ---------------------------------------------------------------- store guards
 
 
+def _fetch_tag_counts(now: datetime.datetime) -> dict[str, int] | None:
+    """The store's half of the tag guard, fetched before the lock is taken:
+    None when the store cannot be reached."""
+    try:
+        return _tag_counts(include_all=True, now=now)
+    except Exception as exc:  # noqa: BLE001 — one endpoint, one failure mode
+        print(f"[memory] store unreachable ({exc}); tags not checked",
+              file=sys.stderr)
+        return None
+
+
+def _fetch_live_hits(tags: list[str], now: datetime.datetime
+                     ) -> tuple[list[tuple[str, str]], bool]:
+    """The store's half of the duplicate guard, fetched before the lock is
+    taken: (hits, store_down)."""
+    try:
+        return _live_entries_sharing(tags, now), False
+    except Exception as exc:  # noqa: BLE001 — one endpoint, one failure mode
+        print(f"[memory] store unreachable ({exc}); duplicates not checked "
+              "against the store, only against the last minutes' files",
+              file=sys.stderr)
+        return [], True
+
+
 def _tag_guard(tags: list[str], tier: str, allow_new: bool,
-               now: datetime.datetime) -> bool:
+               now: datetime.datetime, counts: dict[str, int] | None) -> bool:
     """True when the store may proceed as far as its tags are concerned.
 
     Tags are what recall finds entries by; production had 443 tags after five
     weeks, 40% of them used once — entries filed under a tag nobody will ever
     ask for again. A lower-tier session has to reuse the vocabulary; a
-    frontier session may extend it, but has to say so.
+    frontier session may extend it, but has to say so. `counts` is the
+    store's answer, fetched beforehand; None (store down) skips the guard.
     """
-    try:
-        counts = _tag_counts(include_all=True, now=now)
-    except Exception as exc:  # noqa: BLE001 — one endpoint, one failure mode
-        print(f"[memory] store unreachable ({exc}); tags not checked",
-              file=sys.stderr)
+    if counts is None:
         return True
     # Tags coined in the last minutes are vocabulary too; the store returns
     # them only once it has indexed the file they are in.
@@ -838,21 +861,18 @@ def _tag_guard(tags: list[str], tier: str, allow_new: bool,
 
 
 def _duplicate_guard(content: str, tags: list[str], linked: set[str], tier: str,
-                     duplicate_ok: bool, now: datetime.datetime) -> bool:
+                     duplicate_ok: bool, now: datetime.datetime,
+                     hits: list[tuple[str, str]], store_down: bool) -> bool:
     """True when the store may proceed as far as near-duplicates are concerned.
 
     Production: four reinforcements in five weeks while standing rules were
     re-stored as fresh entries, each copy then competing with the original for
     recall's limit. The way out of a refusal is the operation that was meant.
+    `hits` is the store's answer, fetched beforehand (empty with store_down
+    when it could not be reached); the local files are read here, under the
+    lock, because they are what another writer changes.
     """
-    store_down = False
-    try:
-        hits = _live_entries_sharing(tags, now)
-    except Exception as exc:  # noqa: BLE001 — one endpoint, one failure mode
-        print(f"[memory] store unreachable ({exc}); duplicates not checked "
-              "against the store, only against the last minutes' files",
-              file=sys.stderr)
-        hits, store_down = [], True
+    hits = list(hits)
     # What the store has not indexed yet: the entries this or another session
     # wrote moments ago, which is where the production duplicates came from.
     seen = {entry_id for entry_id, _ in hits}
@@ -959,17 +979,27 @@ def store(args: argparse.Namespace) -> int:
     model = normalize_model(args.model or os.environ.get("RETINUE_SESSION_MODEL", ""))
     tier = session_tier(os.environ)
 
-    # Guards and write under one lock per memory directory: two sessions
-    # storing the same thing at once would otherwise both pass the guards
-    # before either file exists, and the store cannot arbitrate — it indexes
-    # seconds later. The lock turns the second one into the refusal it earns.
+    # The store's answers first, with no lock held: a query waits up to 30 s
+    # when the store is down, and that wait must delay nobody else's write.
+    # Tags before duplicates: a tag is cheap to fix, and a refused tag changes
+    # which entries the duplicate check would compare against, so the
+    # duplicate query is not even sent for a refused tag. Two sessions
+    # coining the same tag at once both pass or both fail — harmless, so the
+    # tag guard needs no lock.
+    if not _tag_guard(tags, tier, args.new_tag, now, _fetch_tag_counts(now)):
+        return 1
+    hits, store_down = _fetch_live_hits(tags, now)
+    claims = _fetch_claims([old_id for _, old_id in challenges]) if challenges else {}
+
+    # Then the duplicate check against the local files and the write, under
+    # one lock per memory directory: two sessions storing the same thing at
+    # once would otherwise both pass before either file exists, and the
+    # store cannot arbitrate — it indexes seconds later. The lock turns the
+    # second one into the refusal it earns, and it covers no network call.
     with _dir_lock():
-        # Guards: tags first (cheap to fix, and a refused tag changes which
-        # entries the duplicate check would compare against), then duplicates.
-        if not _tag_guard(tags, tier, args.new_tag, now):
-            return 1
         linked = {old_id for _, old_id in challenges}
-        if not _duplicate_guard(content, tags, linked, tier, args.duplicate_ok, now):
+        if not _duplicate_guard(content, tags, linked, tier, args.duplicate_ok, now,
+                                hits, store_down):
             return 1
 
         entry_id = _new_id(now)
@@ -998,8 +1028,8 @@ def store(args: argparse.Namespace) -> int:
         # which then carries the stale statement forward. The challenge becomes
         # a doubt on that summary: recall flags it next to the new entry, and
         # the next compaction re-plans it.
-        carried_by = _standing_summaries_of([old_id for _, old_id in challenges]) \
-            if challenges else []
+        carried_by = _standing_summaries_of([old_id for _, old_id in challenges],
+                                            claims) if challenges else []
         lines += [f"<{MEMORY_PREFIX}{s}> <{KB}questionedBy> {subj} ." for s in carried_by]
 
         _append(path, lines)
@@ -1478,17 +1508,23 @@ def _merge_links(into: dict[str, dict[str, list[str]]],
             have += [t for t in targets if t not in have]
 
 
-def _standing_summaries_of(ids: list[str]) -> list[str]:
-    """The standing summaries that carry any of these entries, from the
-    store and from the compaction files it has not indexed yet. An
-    unreachable store only loses its half: a challenge is written either
-    way."""
+def _fetch_claims(ids: list[str]) -> dict[str, list[str]]:
+    """The store's standing summaries carrying these entries, fetched before
+    the lock is taken. An unreachable store only loses its half: a challenge
+    is written either way."""
     try:
-        claims = _already_compacted(ids)
+        return _already_compacted(ids)
     except Exception as exc:  # noqa: BLE001
         print(f"[memory] store unreachable ({exc}); summaries carrying the "
               "challenged entries not looked up there", file=sys.stderr)
-        claims = {}
+        return {}
+
+
+def _standing_summaries_of(ids: list[str], claims: dict[str, list[str]]) -> list[str]:
+    """The standing summaries that carry any of these entries: the store's
+    answer (`claims`, fetched beforehand) plus the compaction files the store
+    has not indexed yet."""
+    claims = {k: list(v) for k, v in claims.items()}
     for entry_id, summaries in _recent_local_claims(ids).items():
         have = claims.setdefault(entry_id, [])
         have += [x for x in summaries if x not in have]
@@ -1629,22 +1665,34 @@ def compact(args: argparse.Namespace) -> int:
                       file=sys.stderr)
                 break
 
-    with _dir_lock():
-        return _compact_locked(items, all_ids, errors, args.actor, model)
-
-
-def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
-                    actor_arg: str, model: str) -> int:
-    # Generation and coverage are facts about the members that only the store
-    # knows; a summary with an invented generation would break the ordering
-    # and the consolidation chain, so here an unreachable store refuses.
+    # The store's answers, with no lock held (a query waits up to 30 s when
+    # the store is down). Generation and coverage are facts about the members
+    # that only the store knows; a summary with an invented generation would
+    # break the ordering and the consolidation chain, so here an unreachable
+    # store refuses.
+    kept = [m for item in items for m in item["summarizes"]]
     try:
         compacted = _already_compacted(all_ids)
         facts = _member_facts(all_ids)
+        challenged = _challenged(kept) if kept else {}
     except Exception as exc:  # noqa: BLE001
-        print(f"[memory] store unreachable ({exc}); cannot compute generations "
-              "and coverage — nothing written", file=sys.stderr)
+        print(f"[memory] store unreachable ({exc}); cannot compute generations, "
+              "coverage and the kept members' state — nothing written",
+              file=sys.stderr)
         return 1
+
+    with _dir_lock():
+        return _compact_locked(items, all_ids, errors, args.actor, model,
+                               compacted, facts, challenged)
+
+
+def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
+                    actor_arg: str, model: str, compacted: dict[str, list[str]],
+                    facts: dict[str, dict],
+                    challenged: dict[str, dict[str, list[str]]]) -> int:
+    """The half of compact that runs under the directory lock: the local
+    files, which another writer may change, re-read now, and the write."""
+    compacted = {k: list(v) for k, v in compacted.items()}
     for entry_id, summaries in _recent_local_claims(all_ids).items():
         known = compacted.setdefault(entry_id, [])
         known += [x for x in summaries if x not in known]
@@ -1659,12 +1707,7 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
     # that landed after the plan was drawn up — in the store, or in a file
     # the store has not indexed yet — would be carried forward as fact.
     kept = [m for item in items for m in item["summarizes"]]
-    try:
-        challenged = _challenged(kept) if kept else {}
-    except Exception as exc:  # noqa: BLE001
-        print(f"[memory] store unreachable ({exc}); cannot check the kept "
-              "members — nothing written", file=sys.stderr)
-        return 1
+    challenged = {k: {p: list(t) for p, t in v.items()} for k, v in challenged.items()}
     _merge_links(challenged, _recent_local_challenges(kept))
     doubts: dict[str, list[str]] = {}  # kept member -> the entries questioning it
     for entry_id in kept:
@@ -1703,6 +1746,15 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
         auto_from, auto_to = summary_covers(members, facts)
         covers_from = item["covers_from"] or auto_from
         covers_to = item["covers_to"] or auto_to
+        if covers_from and covers_to and covers_from > covers_to:
+            # validate_plan checked the bounds the plan stated against each
+            # other; a stated bound against the members' span is known only
+            # now, and an inverted span must not reach the file.
+            errors.append(f"summary over {', '.join(members)}: coverage "
+                          f"{_xsd_datetime(covers_from)} is after "
+                          f"{_xsd_datetime(covers_to)} once the members' span fills "
+                          "the bound the plan left out")
+            continue
         questioners = sorted({q for m in item["summarizes"] for q in doubts.get(m, [])})
         lines += compaction_lines(summary_id, item, generation, covers_from,
                                   covers_to, actor, model, now, questioners)
@@ -1713,6 +1765,10 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
                   "— state it in the summary", file=sys.stderr)
         written.append((summary_id, item, generation))
 
+    if errors:
+        for e in errors:
+            print(f"[memory] plan error: {e}", file=sys.stderr)
+        return 1
     path = MEMORY_DIR / f"compaction-{_new_id(now)}.nt"
     _write_atomically(path, lines)
     for summary_id, item, generation in written:

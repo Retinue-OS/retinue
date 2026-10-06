@@ -927,6 +927,39 @@ def test_review_followups(mod):
         check("compact writes a fixed-point decimal",
               f'<{mod.KB}relevance> "0.0000001"^^<{mod.XSD}decimal> .' in text, True)
 
+    with tempdir() as d:
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item(covers_from="2026-12-01")),
+                            encoding="utf-8")
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         FakeStore(facts=facts), FRONTIER_ENV, d)
+        check("a stated bound past the members' span refuses", rc, 1)
+        check("names the inversion", "is after" in err, True)
+        check("nothing written", nt_files(d), [])
+
+    with tempdir() as d:
+        st = FakeStore(tags=TWENTY_TAGS, facts=facts)
+        inside = []
+        real_lock = mod._dir_lock
+
+        @contextlib.contextmanager
+        def probe():
+            before = len(st.queries) + len(st.asks)
+            with real_lock():
+                yield
+            inside.append(len(st.queries) + len(st.asks) - before)
+
+        mod._dir_lock = probe
+        try:
+            run(mod, ["store", "--tag", "ludmila", "--corrects", "20260801T100000Z-aaaaaa",
+                      "Ludmila moved to Basel"], st, FRONTIER_ENV, d)
+            planfile = d / "plan.json"
+            planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+            run(mod, ["compact", "--plan", str(planfile)], st, FRONTIER_ENV, d)
+        finally:
+            mod._dir_lock = real_lock
+        check("no store query runs under the lock", inside, [0, 0])
+
 
 def main():
     mod = load()
