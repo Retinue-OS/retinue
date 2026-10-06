@@ -81,11 +81,13 @@ stamp does not):
     entry this very call challenges is an intended neighbour, not a duplicate.
 
 Both guards also read the files written to the memory directory in the
-last minutes, which the store, indexing seconds behind, cannot return yet;
-guards and write run under a lock per directory, so two sessions storing
-at once cannot both pass. A store that cannot be reached never blocks a
-write: the guards then only warn, from those recent files, and the
-existence check of challenged ids proceeds unverified.
+last minutes — the entries recorded inside that window that no local link
+has corrected, superseded or compacted, and their tags — which the store,
+indexing seconds behind, cannot return yet. Every check-then-write (store
+and compact) runs under one lock per directory, so two sessions cannot
+both pass. A store that cannot be reached never blocks a write: the
+guards then only warn, from those recent files, and the existence check
+of challenged ids proceeds unverified.
 
 Compaction. `compact --plan` writes summaries that carry the substance of many
 older entries forward and hide them from recall:
@@ -518,12 +520,14 @@ def _excerpt(text: str) -> str:
 # files themselves; this window bounds how far back they look.
 LOCAL_WINDOW = datetime.timedelta(minutes=10)
 
-_ENTRY_LINE_RE = re.compile(
+_LITERAL_LINE_RE = re.compile(
     r'^<' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> <' + re.escape(KB)
-    + r'(content|tag)> "((?:[^"\\]|\\.)*)" \.$')
-_CLAIM_LINE_RE = re.compile(
+    + r'(content|tag|recordedAt)> "((?:[^"\\]|\\.)*)"(?:\^\^<[^>]+>)? \.$')
+_LINK_LINE_RE = re.compile(
     r'^<' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> <' + re.escape(KB)
-    + r'compactedInto> <' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> \.$')
+    + r'(compactedInto|correctedBy|supersededBy)> <' + re.escape(MEMORY_PREFIX)
+    + r'([A-Za-z0-9-]+)> \.$')
+_LOCAL_DEAD_LINKS = frozenset({"compactedInto", "correctedBy", "supersededBy"})
 
 
 def _unescape_nt(raw: str) -> str:
@@ -546,59 +550,108 @@ def _recent_files(pattern: str) -> list[Path]:
     return out
 
 
-def _recent_local_entries(tags: list[str]) -> list[tuple[str, str]]:
-    """(id, content) of entries written here in the last few minutes that
-    share a tag — what the store has not indexed yet. The production
-    duplicates were stored seconds apart by one session; a guard that only
-    asks a store lagging a few seconds behind never sees them."""
-    wanted = set(tags)
-    contents: dict[str, str] = {}
-    entry_tags: dict[str, set[str]] = {}
-    for path in _recent_files("*.nt"):
+def _recent_local_lines(pattern: str = "*.nt"):
+    for path in _recent_files(pattern):
         try:
             text = path.read_text(encoding="utf-8")
         except OSError:
             continue
-        for line in text.splitlines():
-            mt = _ENTRY_LINE_RE.match(line)
-            if not mt:
-                continue
-            entry_id, pred, raw = mt.groups()
-            if pred == "content":
-                contents[entry_id] = _unescape_nt(raw)
-            else:
-                entry_tags.setdefault(entry_id, set()).add(raw)
-    return [(i, contents[i]) for i in sorted(contents)
-            if entry_tags.get(i, set()) & wanted]
+        yield from text.splitlines()
+
+
+def _recent_local_links() -> dict[str, dict[str, list[str]]]:
+    """id -> link predicate -> targets, from the files written in the last
+    minutes: the compaction claims and the challenges the store has not
+    indexed yet."""
+    out: dict[str, dict[str, list[str]]] = {}
+    for line in _recent_local_lines():
+        ml = _LINK_LINE_RE.match(line)
+        if ml:
+            out.setdefault(ml.group(1), {}).setdefault(ml.group(2), []).append(ml.group(3))
+    return out
+
+
+def _recent_local_records(now: datetime.datetime) -> dict[str, dict]:
+    """id -> {"content", "tags"} for the entries *recorded* in the last
+    minutes that no local link has already corrected, superseded or
+    compacted — the store's liveness rule, applied to what the store cannot
+    return yet. A session file appended to a minute ago also holds that
+    session's older entries; those the store knows about, and an old one
+    that is corrected by now must not be mistaken for a live neighbour."""
+    records: dict[str, dict] = {}
+    for line in _recent_local_lines():
+        mt = _LITERAL_LINE_RE.match(line)
+        if not mt:
+            continue
+        entry_id, pred, raw = mt.groups()
+        rec = records.setdefault(entry_id, {"content": "", "tags": set(), "recorded": None})
+        if pred == "content":
+            rec["content"] = _unescape_nt(raw)
+        elif pred == "tag":
+            rec["tags"].add(raw)
+        else:
+            rec["recorded"] = _parse_datetime(raw)
+    links = _recent_local_links()
+    cutoff = now - LOCAL_WINDOW
+    return {
+        i: {"content": r["content"], "tags": r["tags"]}
+        for i, r in records.items()
+        if r["recorded"] is not None and r["recorded"] >= cutoff
+        and not (_LOCAL_DEAD_LINKS & links.get(i, {}).keys())
+    }
+
+
+def _recent_local_entries(tags: list[str], now: datetime.datetime) -> list[tuple[str, str]]:
+    """(id, content) of the live entries recorded here in the last minutes
+    that share a tag. The production duplicates were stored seconds apart by
+    one session; a guard that only asks a store lagging a few seconds behind
+    never sees them."""
+    wanted = set(tags)
+    records = _recent_local_records(now)
+    return [(i, records[i]["content"]) for i in sorted(records)
+            if records[i]["tags"] & wanted]
+
+
+def _recent_local_tags(now: datetime.datetime) -> set[str]:
+    """The tags of the entries recorded here in the last minutes: vocabulary
+    the store will report once it has indexed the files."""
+    out: set[str] = set()
+    for rec in _recent_local_records(now).values():
+        out |= rec["tags"]
+    return out
 
 
 def _recent_local_claims(ids: list[str]) -> dict[str, list[str]]:
     """id -> summaries that compaction files written in the last few minutes
     already claim it for. A compaction that starts inside the index lag of
     the previous one would not see those claims through SPARQL."""
-    wanted = set(ids)
-    out: dict[str, list[str]] = {}
-    for path in _recent_files("compaction-*.nt"):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        for line in text.splitlines():
-            mt = _CLAIM_LINE_RE.match(line)
-            if mt and mt.group(1) in wanted:
-                out.setdefault(mt.group(1), []).append(mt.group(2))
-    return out
+    links = _recent_local_links()
+    return {i: links[i]["compactedInto"] for i in ids
+            if links.get(i, {}).get("compactedInto")}
+
+
+def _recent_local_challenges(ids: list[str]) -> dict[str, set[str]]:
+    """id -> {"correctedBy", "supersededBy"} links written in the last few
+    minutes, which the store has not indexed yet."""
+    links = _recent_local_links()
+    return {i: set(links[i]) & {"correctedBy", "supersededBy"} for i in ids
+            if set(links.get(i, {})) & {"correctedBy", "supersededBy"}}
+
+
+LOCK_FILE = ".memory.lock"
 
 
 @contextlib.contextmanager
-def _dir_lock(name: str):
-    """One writer at a time per memory directory for a check-then-write: the
-    store guards and the already-compacted check read a store that indexes
-    seconds behind, and two processes inside that window would both pass.
-    The lock file is not `.nt`, so the store ignores it. Without fcntl (a
+def _dir_lock():
+    """One writer at a time per memory directory for every check-then-write:
+    the store guards and compact's member checks read a store that indexes
+    seconds behind, and two processes inside that window would both pass —
+    or a correction would land while a summary is being written over the
+    entry it corrects. One lock serves both, so neither can interleave. The
+    lock file is not `.nt`, so the store ignores it. Without fcntl (a
     development host) there is no lock."""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    with (MEMORY_DIR / name).open("a", encoding="utf-8") as fh:
+    with (MEMORY_DIR / LOCK_FILE).open("a", encoding="utf-8") as fh:
         if fcntl is not None:
             fcntl.flock(fh, fcntl.LOCK_EX)
         try:
@@ -717,6 +770,11 @@ def _tag_guard(tags: list[str], tier: str, allow_new: bool,
         print(f"[memory] store unreachable ({exc}); tags not checked",
               file=sys.stderr)
         return True
+    # Tags coined in the last minutes are vocabulary too; the store returns
+    # them only once it has indexed the file they are in.
+    counts = dict(counts)
+    for t in _recent_local_tags(now):
+        counts.setdefault(t, 0)
     if len(counts) < NEW_TAG_BOOTSTRAP:
         return True
     unknown = [t for t in tags
@@ -765,7 +823,7 @@ def _duplicate_guard(content: str, tags: list[str], linked: set[str], tier: str,
     # What the store has not indexed yet: the entries this or another session
     # wrote moments ago, which is where the production duplicates came from.
     seen = {entry_id for entry_id, _ in hits}
-    hits += [h for h in _recent_local_entries(tags) if h[0] not in seen]
+    hits += [h for h in _recent_local_entries(tags, now) if h[0] not in seen]
     near, similar = classify_duplicates(content, hits, linked)
     for entry_id, other, score in similar:
         print(f"[memory] warning: similar to {entry_id} (overlap {score:.2f}): "
@@ -866,7 +924,7 @@ def store(args: argparse.Namespace) -> int:
     # storing the same thing at once would otherwise both pass the guards
     # before either file exists, and the store cannot arbitrate — it indexes
     # seconds later. The lock turns the second one into the refusal it earns.
-    with _dir_lock(".store.lock"):
+    with _dir_lock():
         # Guards: tags first (cheap to fix, and a refused tag changes which
         # entries the duplicate check would compare against), then duplicates.
         if not _tag_guard(tags, tier, args.new_tag, now):
@@ -1337,6 +1395,25 @@ SELECT ?m ?t ?gen ?from ?to WHERE {{
     return facts
 
 
+def _challenged(ids: list[str]) -> dict[str, set[str]]:
+    """id -> the challenge links (correctedBy, supersededBy) the store holds
+    for it. Questioned entries are not included: doubt is a signal the
+    summary may carry, not a verdict that voids the plan."""
+    sparql = f"""
+PREFIX kb: <{KB}>
+SELECT ?m ?p WHERE {{
+  VALUES ?m {{ {_values_clause(ids)} }}
+  VALUES ?p {{ kb:correctedBy kb:supersededBy }}
+  ?m ?p ?x .
+}}
+"""
+    out: dict[str, set[str]] = {}
+    for r in _query(sparql):
+        out.setdefault(_bare_id(_val(r, "m")), set()).add(
+            _val(r, "p").removeprefix(KB))
+    return out
+
+
 def _already_compacted(ids: list[str]) -> dict[str, list[str]]:
     """id -> the uncorrected summaries it is already compacted into."""
     sparql = f"""
@@ -1468,7 +1545,7 @@ def compact(args: argparse.Namespace) -> int:
                       file=sys.stderr)
                 break
 
-    with _dir_lock(".compact.lock"):
+    with _dir_lock():
         return _compact_locked(items, all_ids, errors, args.actor, model)
 
 
@@ -1494,6 +1571,23 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
         if entry_id not in facts:
             errors.append(f"{entry_id} is not indexed yet (the store lags a "
                           "few seconds after a store); nothing written")
+    # A member the plan keeps must still hold. A correction or supersession
+    # that landed after the plan was drawn up — in the store, or in a file
+    # the store has not indexed yet — would be carried forward as fact.
+    kept = [m for item in items for m in item["summarizes"]]
+    try:
+        challenged = _challenged(kept) if kept else {}
+    except Exception as exc:  # noqa: BLE001
+        print(f"[memory] store unreachable ({exc}); cannot check the kept "
+              "members — nothing written", file=sys.stderr)
+        return 1
+    for entry_id, preds in _recent_local_challenges(kept).items():
+        challenged.setdefault(entry_id, set()).update(preds)
+    for entry_id in kept:
+        if challenged.get(entry_id):
+            errors.append(f"{entry_id} was challenged ({', '.join(sorted(challenged[entry_id]))}) "
+                          "since the plan was drawn up — re-plan: retire it or "
+                          "carry the correction")
     for entry_id in all_ids:
         if compacted.get(entry_id):
             errors.append(f"{entry_id} is already compacted into "

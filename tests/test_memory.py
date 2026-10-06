@@ -417,7 +417,7 @@ def test_store_writes(mod):
         check("relevance", f'<{kb}relevance> "0.3"^^<{mod.XSD}decimal> .' in text, True)
         check("recordedAt", f'<{kb}recordedAt> "2026-10-06T12:00:00Z"' in text, True)
         check("only the entry file and the store lock",
-              sorted(p.name for p in Path(d).iterdir()), [".store.lock", "sess-1.nt"])
+              sorted(p.name for p in Path(d).iterdir()), [".memory.lock", "sess-1.nt"])
 
     with tempdir() as d:
         rc, _, err = run(mod, ["store", "--tag", "insurance", "--expires", "soon", "x y z"],
@@ -747,7 +747,7 @@ def test_review_followups(mod):
         rc, _, _ = run(mod, ["store", "--tag", "signal", "Signal gateway restarted"],
                        FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
         check("a different tag is not compared", rc, 0)
-        check("guard and write ran under the store lock", (d / ".store.lock").exists(), True)
+        check("guard and write ran under the lock", (d / ".memory.lock").exists(), True)
         rc, _, err = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
                          FakeStore(down=True), LOWER_ENV, d)
         check("store down: a local near-duplicate only warns", rc, 0)
@@ -759,6 +759,40 @@ def test_review_followups(mod):
                          FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
         check("--model naming the frontier does not buy its flags", rc, 1)
         check("the refusal is the lower-tier one", "only Ara senior can coin" in err, True)
+
+    with tempdir() as d:
+        rc, _, _ = run(mod, ["store", "--tag", "brand-new", "--new-tag",
+                             "A new topic begins here"],
+                       FakeStore(tags=TWENTY_TAGS), FRONTIER_ENV, d)
+        check("frontier coins a tag", rc, 0)
+        rc, _, err = run(mod, ["store", "--tag", "brand-new", "Second note on the new topic"],
+                         FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("lower tier may use it before the store indexes it", rc, 0)
+
+    with tempdir() as d:
+        env = dict(LOWER_ENV, RETINUE_MEMORY_SESSION="sess-9")
+        rc, _, err = run(mod, ["store", "--tag", "ludmila", RULE],
+                         FakeStore(tags=TWENTY_TAGS), env, d)
+        first = err.split("stored ")[1].split()[0]
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", "--corrects", first,
+                             "Ludmila now wants plain text, no voice notes"],
+                       FakeStore(tags=TWENTY_TAGS), env, d)
+        check("correction written into the same session file", rc, 0)
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
+                       FakeStore(tags=TWENTY_TAGS), env, d)
+        check("a locally corrected entry is not a live duplicate", rc, 0)
+
+    with tempdir() as d:
+        old = PFX + "20260101T000000Z-oldold"
+        (d / "old.nt").write_text(
+            f'<{old}> <{mod.RDF_TYPE}> <{mod.KB}Memory> .\n'
+            f'<{old}> <{mod.KB}content> "{RULE}" .\n'
+            f'<{old}> <{mod.KB}tag> "ludmila" .\n'
+            f'<{old}> <{mod.KB}recordedAt> "2026-01-01T00:00:00Z"^^<{mod.XSD}dateTime> .\n',
+            encoding="utf-8")
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
+                       FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("an old entry in a freshly touched file is the store's business", rc, 0)
 
     facts = {"20260830T090000Z-aaaaaa": {"t": "2026-08-30T09:00:00Z"},
              "20260901T080000Z-bbbbbb": {"t": "2026-09-01T08:00:00Z"}}
@@ -788,6 +822,36 @@ def test_review_followups(mod):
         check("--force does not cover an unindexed member", rc, 1)
         check("says which", "20260901T080000Z-bbbbbb is not indexed yet" in err, True)
         check("nothing written over it", nt_files(d), [])
+
+    with tempdir() as d:
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+        (d / "late.nt").write_text(
+            f'<{PFX}20260830T090000Z-aaaaaa> <{mod.KB}correctedBy> '
+            f'<{PFX}20261006T115900Z-cccccc> .\n', encoding="utf-8")
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         FakeStore(facts=facts), FRONTIER_ENV, d)
+        check("a kept member corrected locally after planning refuses the plan", rc, 1)
+        check("says so", "since the plan was drawn up" in err, True)
+        check("compaction not written", [p.name for p in nt_files(d)], ["late.nt"])
+
+    with tempdir() as d:
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+        challenged = [{"m": uri(PFX + "20260830T090000Z-aaaaaa"),
+                       "p": uri(mod.KB + "supersededBy")}]
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         FakeStore(facts=facts, rows=challenged), FRONTIER_ENV, d)
+        check("a kept member superseded in the store refuses the plan", rc, 1)
+        check("names the link", "supersededBy" in err, True)
+        rc, _, _ = run(mod, ["compact", "--plan", str(planfile)],
+                       FakeStore(facts=facts, rows=challenged), FRONTIER_ENV, d)
+        plan_retired = plan_item(summarizes=[], retires=["20260830T090000Z-aaaaaa",
+                                                        "20260901T080000Z-bbbbbb"])
+        planfile.write_text(json.dumps(plan_retired), encoding="utf-8")
+        rc, _, _ = run(mod, ["compact", "--plan", str(planfile)],
+                       FakeStore(facts=facts, rows=challenged), FRONTIER_ENV, d)
+        check("retiring the challenged member is fine", rc, 0)
 
 
 def main():

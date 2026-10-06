@@ -209,7 +209,8 @@ are fewer than 20 it is off — a fresh deployment has no vocabulary to reuse
 and must be able to start. Beyond that, a tag no memory uses yet is refused
 with the closest existing tags as a hint (fuzzy matches and tags that contain
 it or are contained in it). Identifier tags (`sender-…`) are exempt: one per
-sender is their design, not drift.
+sender is their design, not drift. A tag coined in the last ten minutes counts
+as in use before the store has indexed it.
 
 **Duplicates.** The guard queries every *live* entry (see recall) sharing at
 least one of the new entry's tags — with no time cutoff, because the entries
@@ -219,10 +220,11 @@ more letters, any script. An overlap of **0.6** or more is a near-duplicate;
 **0.3** or more is merely similar, printed as a warning while the store
 proceeds. A near-duplicate that this very call challenges (`--supersedes`,
 `--corrects`, `--questions`) is intended — a successor resembles what it
-replaces — and does not count. The guard also reads the entries written to
-the memory directory in the last ten minutes, which the store, indexing a few
-seconds behind, may not return yet: the production duplicates were stored
-seconds apart by one session.
+replaces — and does not count. The guard also reads the entries *recorded* in
+the last ten minutes in the memory directory's files — skipping any that a
+local link has already corrected, superseded or compacted — which the store,
+indexing a few seconds behind, may not return yet: the production duplicates
+were stored seconds apart by one session.
 
 | | lower tier | frontier |
 |---|---|---|
@@ -233,8 +235,9 @@ seconds apart by one session.
 
 A refusal lists the matched ids with an excerpt of each and the ways out. The
 existing `--force` keeps its one meaning — skip the existence check of
-challenged ids — and overrides neither guard. Guards and write run under a lock
-file per memory directory, so two sessions storing at once cannot both pass.
+challenged ids — and overrides neither guard. Guards and write run under the memory
+directory's one lock file, shared with `compact`, so two sessions storing at
+once cannot both pass.
 A store that cannot be reached never blocks a write: the guards then only
 warn, from the recent local files, and the existence check proceeds
 unverified, as it always has.
@@ -311,10 +314,13 @@ write invented metadata. The whole plan becomes
 one `compaction-*.nt`; the summary ids are printed on stdout, one per line.
 The store guards do not apply, but `compact` refuses a lower-tier session
 outright: compaction hides entries from every recall and is frontier work.
-One compaction runs at a time per memory directory (a lock file the store
-ignores), and a run also reads the compaction files written in the last ten
-minutes, which the store may not have indexed yet, so two runs cannot claim
-the same members.
+`compact` holds the same lock file as `store` (one per memory directory, which
+the store ignores), so no correction lands while it checks and writes; it also
+reads the compaction claims and challenge links written to local files in the
+last ten minutes, which the store may not have indexed yet. So two runs cannot
+claim the same members, and a kept member that was corrected or superseded
+after the plan was drawn up refuses the plan: re-plan, retiring it or carrying
+the correction.
 
 ### The compaction scheme
 
