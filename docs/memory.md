@@ -254,13 +254,17 @@ A store that cannot be reached never blocks a write: the guards then only
 warn, from the recent local files, and the existence check proceeds
 unverified, as it always has.
 
-**The subagent-stamp caveat.** A subagent inherits the environment of the
-session that spawned it, `RETINUE_SESSION_MODEL` included, so a subagent that
-Ara senior dispatches on a smaller pinned model stores with senior's stamp and
-senior's latitude.
-That is accepted: the guards are a nudge toward the right operation, not a
-security boundary, and the frontier flags still have to be passed
-deliberately.
+**The guards are advisory.** The tier is read from the environment the
+spawner set, and a session controls the environment of the commands it runs
+itself, so a session could name the frontier model to its own `store` call;
+a subagent likewise inherits the environment of the session that spawned it,
+`RETINUE_SESSION_MODEL` included, so a subagent that Ara senior dispatches on
+a smaller pinned model stores with senior's stamp and senior's latitude.
+Both are accepted: the guards are a nudge toward the right operation
+(reinforce, challenge, reuse a tag), not a security boundary; the frontier
+flags still have to be passed deliberately, and the stamp an entry carries is
+what a reader judges it by. A spawner-controlled capability would make the
+tier enforceable and is not in scope here.
 
 ## Recall
 

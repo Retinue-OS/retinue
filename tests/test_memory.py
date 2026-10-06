@@ -968,6 +968,32 @@ def test_review_followups(mod):
         check("nothing written indeed", nt_files(d), [])
 
     with tempdir() as d:
+        # A recent entry A, compacted into S in a recent file, S corrected in
+        # a newer one: A is live again, and a near-duplicate of it is refused.
+        a = PFX + "20261006T115500Z-aaaaaa"
+        (d / "a.nt").write_text(
+            f'<{a}> <{mod.RDF_TYPE}> <{mod.KB}Memory> .\n'
+            f'<{a}> <{mod.KB}content> "{RULE}" .\n'
+            f'<{a}> <{mod.KB}tag> "ludmila" .\n'
+            f'<{a}> <{mod.KB}recordedAt> "2026-10-06T11:55:00Z"^^<{mod.XSD}dateTime> .\n',
+            encoding="utf-8")
+        (d / "compaction-late.nt").write_text(
+            f'<{a}> <{mod.KB}compactedInto> <{PFX}20261006T110000Z-sum002> .\n',
+            encoding="utf-8")
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
+                       FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("compacted in a recent file: not a live duplicate", rc, 0)
+        for p in nt_files(d):  # the probe's own entry must not be the duplicate
+            if p.name not in ("a.nt", "compaction-late.nt"):
+                p.unlink()
+        (d / "undo.nt").write_text(
+            f'<{PFX}20261006T110000Z-sum002> <{mod.KB}correctedBy> '
+            f'<{PFX}20261006T115900Z-cccccc> .\n', encoding="utf-8")
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE + " tonight"],
+                       FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("its summary corrected in a newer file: live again, refused", rc, 1)
+
+    with tempdir() as d:
         rc, _, _ = run(mod, ["store", "--tag", "ludmila", "--relevance", "0.0000001",
                              "Tiny relevance still a valid decimal"],
                        FakeStore(tags=TWENTY_TAGS), FRONTIER_ENV, d)

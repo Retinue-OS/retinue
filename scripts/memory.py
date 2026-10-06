@@ -80,6 +80,11 @@ stamp does not):
     frontier only — pass `--duplicate-ok`); an overlap >= 0.3 only warns. An
     entry this very call challenges is an intended neighbour, not a duplicate.
 
+The tier is read from the environment the spawner set, which a session
+could override for a command it runs itself: the guards are a nudge toward
+the right operation (reinforce, challenge, reuse a tag), not a security
+boundary, and the stamp an entry carries is what a reader judges it by.
+
 Both guards also read the files written to the memory directory in the
 last minutes — the entries recorded inside that window, not expired, that
 no local link has corrected, superseded or compacted, and their tags — which
@@ -552,6 +557,18 @@ _LINK_LINE_RE = re.compile(
 _LOCAL_DEAD_LINKS = frozenset({"compactedInto", "correctedBy", "supersededBy"})
 
 
+def _locally_dead(entry_id: str, links: dict[str, dict[str, list[str]]]) -> bool:
+    """Whether the recent local links alone make an entry not live: corrected
+    or superseded, or compacted into a summary that stands — a summary
+    corrected in a recent file stands no more, so its members are live
+    again, the same undo the store's liveness filter applies."""
+    own = links.get(entry_id, {})
+    if "correctedBy" in own or "supersededBy" in own:
+        return True
+    return any("correctedBy" not in links.get(s, {})
+               for s in own.get("compactedInto", []))
+
+
 def _unescape_nt(raw: str) -> str:
     """Undo _nt_string for the literals this script wrote itself."""
     return re.sub(r'\\(.)', lambda mt: {"n": "\n", "r": "\r", "t": "\t"}.get(
@@ -623,7 +640,7 @@ def _recent_local_records(now: datetime.datetime) -> dict[str, dict]:
         for i, r in records.items()
         if r["recorded"] is not None and r["recorded"] >= cutoff
         and (r["expires"] is None or r["expires"] >= now)
-        and not (_LOCAL_DEAD_LINKS & links.get(i, {}).keys())
+        and not _locally_dead(i, links)
     }
 
 
@@ -890,8 +907,7 @@ def _duplicate_guard(content: str, tags: list[str], linked: set[str], tier: str,
     # file it has not indexed yet — corrected, superseded or compacted a
     # moment ago, in this session's file or another's.
     local_links = _recent_local_links()
-    hits = [h for h in hits
-            if not (_LOCAL_DEAD_LINKS & local_links.get(h[0], {}).keys())]
+    hits = [h for h in hits if not _locally_dead(h[0], local_links)]
     near, similar = classify_duplicates(content, hits, linked)
     for entry_id, other, score in similar:
         print(f"[memory] warning: similar to {entry_id} (overlap {score:.2f}): "
