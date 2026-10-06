@@ -794,6 +794,19 @@ def test_review_followups(mod):
                        FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
         check("an old entry in a freshly touched file is the store's business", rc, 0)
 
+    with tempdir() as d:
+        gone = PFX + "20261006T115800Z-expird"
+        (d / "expired.nt").write_text(
+            f'<{gone}> <{mod.RDF_TYPE}> <{mod.KB}Memory> .\n'
+            f'<{gone}> <{mod.KB}content> "{RULE}" .\n'
+            f'<{gone}> <{mod.KB}tag> "ludmila" .\n'
+            f'<{gone}> <{mod.KB}recordedAt> "2026-10-06T11:58:00Z"^^<{mod.XSD}dateTime> .\n'
+            f'<{gone}> <{mod.KB}expires> "2026-10-06T11:59:00Z"^^<{mod.XSD}dateTime> .\n',
+            encoding="utf-8")
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
+                       FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("an expired unindexed entry is not a live duplicate", rc, 0)
+
     facts = {"20260830T090000Z-aaaaaa": {"t": "2026-08-30T09:00:00Z"},
              "20260901T080000Z-bbbbbb": {"t": "2026-09-01T08:00:00Z"}}
     with tempdir() as d:

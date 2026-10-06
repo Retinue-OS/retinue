@@ -81,8 +81,9 @@ stamp does not):
     entry this very call challenges is an intended neighbour, not a duplicate.
 
 Both guards also read the files written to the memory directory in the
-last minutes — the entries recorded inside that window that no local link
-has corrected, superseded or compacted, and their tags — which the store,
+last minutes — the entries recorded inside that window, not expired, that
+no local link has corrected, superseded or compacted, and their tags — which
+the store,
 indexing seconds behind, cannot return yet. Every check-then-write (store
 and compact) runs under one lock per directory, so two sessions cannot
 both pass. A store that cannot be reached never blocks a write: the
@@ -522,7 +523,7 @@ LOCAL_WINDOW = datetime.timedelta(minutes=10)
 
 _LITERAL_LINE_RE = re.compile(
     r'^<' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> <' + re.escape(KB)
-    + r'(content|tag|recordedAt)> "((?:[^"\\]|\\.)*)"(?:\^\^<[^>]+>)? \.$')
+    + r'(content|tag|recordedAt|expires)> "((?:[^"\\]|\\.)*)"(?:\^\^<[^>]+>)? \.$')
 _LINK_LINE_RE = re.compile(
     r'^<' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> <' + re.escape(KB)
     + r'(compactedInto|correctedBy|supersededBy)> <' + re.escape(MEMORY_PREFIX)
@@ -573,9 +574,9 @@ def _recent_local_links() -> dict[str, dict[str, list[str]]]:
 
 def _recent_local_records(now: datetime.datetime) -> dict[str, dict]:
     """id -> {"content", "tags"} for the entries *recorded* in the last
-    minutes that no local link has already corrected, superseded or
-    compacted — the store's liveness rule, applied to what the store cannot
-    return yet. A session file appended to a minute ago also holds that
+    minutes that have not expired and that no local link has already
+    corrected, superseded or compacted — the store's liveness rule, applied
+    to what the store cannot return yet. A session file appended to a minute ago also holds that
     session's older entries; those the store knows about, and an old one
     that is corrected by now must not be mistaken for a live neighbour."""
     records: dict[str, dict] = {}
@@ -584,19 +585,23 @@ def _recent_local_records(now: datetime.datetime) -> dict[str, dict]:
         if not mt:
             continue
         entry_id, pred, raw = mt.groups()
-        rec = records.setdefault(entry_id, {"content": "", "tags": set(), "recorded": None})
+        rec = records.setdefault(entry_id, {"content": "", "tags": set(),
+                                            "recorded": None, "expires": None})
         if pred == "content":
             rec["content"] = _unescape_nt(raw)
         elif pred == "tag":
             rec["tags"].add(raw)
-        else:
+        elif pred == "recordedAt":
             rec["recorded"] = _parse_datetime(raw)
+        else:
+            rec["expires"] = _parse_datetime(raw)
     links = _recent_local_links()
     cutoff = now - LOCAL_WINDOW
     return {
         i: {"content": r["content"], "tags": r["tags"]}
         for i, r in records.items()
         if r["recorded"] is not None and r["recorded"] >= cutoff
+        and (r["expires"] is None or r["expires"] >= now)
         and not (_LOCAL_DEAD_LINKS & links.get(i, {}).keys())
     }
 

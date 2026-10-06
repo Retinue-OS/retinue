@@ -221,8 +221,9 @@ more letters, any script. An overlap of **0.6** or more is a near-duplicate;
 proceeds. A near-duplicate that this very call challenges (`--supersedes`,
 `--corrects`, `--questions`) is intended — a successor resembles what it
 replaces — and does not count. The guard also reads the entries *recorded* in
-the last ten minutes in the memory directory's files — skipping any that a
-local link has already corrected, superseded or compacted — which the store,
+the last ten minutes in the memory directory's files — skipping any that has
+expired or that a local link has already corrected, superseded or compacted —
+which the store,
 indexing a few seconds behind, may not return yet: the production duplicates
 were stored seconds apart by one session.
 
@@ -304,13 +305,14 @@ reported at once: non-empty content; at least one tag (the topic always joins
 the tags — it is the tag recall finds the summary by); relevance within 0..1;
 `summarizes` and `retires` disjoint and together non-empty; syntactically
 valid ids; each entry in at most one summary of the plan; each member present
-in the store (skipped with `--force`; an unreachable store warns, as for
-`store`); every member indexed, so its `recordedAt` and generation are known
+in the store (this existence check alone may be skipped with `--force`);
+every member indexed, so its `recordedAt` and generation are known
 (`--force` does not lift this: the index lags a few seconds after a store,
 and a summary over a member it cannot see would guess both); and no member
 already compacted into a summary that stands. The generation and coverage
-come from the store; when it cannot be reached `compact` refuses rather than
-write invented metadata. The whole plan becomes
+come from the store, and so does the check that no kept member has been
+challenged meanwhile; an unreachable store therefore **aborts** compaction
+with nothing written, unlike `store`, which only loses its guards. The whole plan becomes
 one `compaction-*.nt`; the summary ids are printed on stdout, one per line.
 The store guards do not apply, but `compact` refuses a lower-tier session
 outright: compaction hides entries from every recall and is frontier work.
