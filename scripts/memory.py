@@ -104,7 +104,9 @@ older entries forward and hide them from recall:
 
 plus the usual content, tags, recordedAt, actor, relevance and model. Nothing
 is deleted: a summary that is later corrected (`store --corrects SUM`) stops
-hiding its members, which is the undo. The plan is JSON, one object or a list:
+hiding its members, which is the undo. Superseding a summary does not: the
+new entry is then the current picture, and the members, older still, stay
+hidden under it (`--include-compacted` shows them). The plan is JSON, one object or a list:
 
     {"topic": "ludmila", "content": "…", "tags": ["ludmila", "signal"],
      "relevance": 0.8, "summarizes": ["<id>", …], "retires": ["<id>", …],
@@ -361,8 +363,11 @@ def parse_expires(spec: str, now: datetime.datetime) -> datetime.datetime | None
         return None
     m = _DURATION_RE.match(s)
     if m:
-        count, unit = int(m.group(1)), (m.group(2) or "d").lower()
+        unit = (m.group(2) or "d").lower()
         try:
+            # int() itself refuses thousands of digits (ValueError), before
+            # the arithmetic gets a chance to overflow; both are "unreadable".
+            count = int(m.group(1))
             if unit == "d":
                 return now + datetime.timedelta(days=count)
             if unit == "w":
@@ -498,7 +503,10 @@ def liveness_patterns(var: str = "?m", *, include_superseded: bool = False,
     Live means: not corrected, not superseded (no longer true), not past its
     kb:expires (no longer relevant), and not compacted into a summary that
     stands — compaction into a summary that was later corrected is undone, so
-    the member counts as live again. Each include_* flag lifts one exclusion.
+    the member counts as live again. A *superseded* summary keeps hiding its
+    members on purpose: superseding says the world moved on and the new entry
+    is the current picture, and the members are older still; only a
+    correction says the summary misrepresented them. Each include_* flag lifts one exclusion.
     The current time is injected as a literal rather than NOW(), so a query is
     reproducible and testable. The query must declare the kb: and xsd:
     prefixes.

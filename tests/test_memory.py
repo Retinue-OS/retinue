@@ -735,6 +735,7 @@ def test_review_followups(mod):
     print("review follow-ups")
     check("oversized days refused", mod.parse_expires("99999999999d", NOW), None)
     check("oversized months refused", mod.parse_expires("999999999m", NOW), None)
+    check("thousands of digits refused", mod.parse_expires("9" * 5000 + "d", NOW), None)
 
     with tempdir() as d:
         rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE],

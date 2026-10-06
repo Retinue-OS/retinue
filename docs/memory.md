@@ -115,7 +115,11 @@ Every member, kept or retired, gets `kb:compactedInto` back to its summary in
 the same compaction file. **Nothing is ever deleted.** A summary that turns out
 wrong is corrected like any memory (`store --corrects <summary>`); a corrected
 summary stops hiding its members, so they reappear in recall — that is the
-undo.
+undo. Superseding a summary (`store --supersedes <summary>`) is different on
+purpose: it says the world moved on and the new entry is the current picture,
+so the members — older still — stay hidden under the superseded summary
+(`--include-compacted` shows them). Only a correction says the summary
+misrepresented what it carried.
 
 How many entries each standing summary carries, as the store sees it:
 
