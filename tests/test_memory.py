@@ -746,6 +746,11 @@ def test_review_followups(mod):
         rc, _, _ = run(mod, ["store", "--tag", "signal", "Signal gateway restarted"],
                        FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
         check("a different tag is not compared", rc, 0)
+        check("guard and write ran under the store lock", (d / ".store.lock").exists(), True)
+        rc, _, err = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
+                         FakeStore(down=True), LOWER_ENV, d)
+        check("store down: a local near-duplicate still refuses", rc, 1)
+        check("store down: says what it checked", "last minutes' files" in err, True)
 
     facts = {"20260830T090000Z-aaaaaa": {"t": "2026-08-30T09:00:00Z"},
              "20260901T080000Z-bbbbbb": {"t": "2026-09-01T08:00:00Z"}}

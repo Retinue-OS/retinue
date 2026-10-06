@@ -80,8 +80,12 @@ stamp does not):
     frontier only — pass `--duplicate-ok`); an overlap >= 0.3 only warns. An
     entry this very call challenges is an intended neighbour, not a duplicate.
 
-A store that cannot be reached never blocks a write: the guards warn and let
-it through, as the existence check of challenged ids always has.
+Both guards also read the files written to the memory directory in the
+last minutes, which the store, indexing seconds behind, cannot return yet;
+guards and write run under a lock per directory, so two sessions storing
+at once cannot both pass. A store that cannot be reached never blocks a
+write on its own account: the guards then judge from those recent files
+alone, and the existence check of challenged ids warns and proceeds.
 
 Compaction. `compact --plan` writes summaries that carry the substance of many
 older entries forward and hide them from recall:
@@ -586,13 +590,14 @@ def _recent_local_claims(ids: list[str]) -> dict[str, list[str]]:
 
 
 @contextlib.contextmanager
-def _compaction_lock():
-    """One compaction at a time per memory directory: the already-compacted
-    check reads the store and the file lands later, and two runs inside that
-    window would both claim the same members. The lock file is not `.nt`, so
-    the store ignores it. Without fcntl (a development host) there is no lock."""
+def _dir_lock(name: str):
+    """One writer at a time per memory directory for a check-then-write: the
+    store guards and the already-compacted check read a store that indexes
+    seconds behind, and two processes inside that window would both pass.
+    The lock file is not `.nt`, so the store ignores it. Without fcntl (a
+    development host) there is no lock."""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    with (MEMORY_DIR / ".compact.lock").open("a", encoding="utf-8") as fh:
+    with (MEMORY_DIR / name).open("a", encoding="utf-8") as fh:
         if fcntl is not None:
             fcntl.flock(fh, fcntl.LOCK_EX)
         try:
@@ -846,44 +851,49 @@ def store(args: argparse.Namespace) -> int:
     model = normalize_model(args.model or os.environ.get("RETINUE_SESSION_MODEL", ""))
     tier = session_tier(os.environ, model)
 
-    # Guards: tags first (cheap to fix, and a refused tag changes which
-    # entries the duplicate check would compare against), then duplicates.
-    if not _tag_guard(tags, tier, args.new_tag, now):
-        return 1
-    linked = {old_id for _, old_id in challenges}
-    if not _duplicate_guard(content, tags, linked, tier, args.duplicate_ok, now):
-        return 1
+    # Guards and write under one lock per memory directory: two sessions
+    # storing the same thing at once would otherwise both pass the guards
+    # before either file exists, and the store cannot arbitrate — it indexes
+    # seconds later. The lock turns the second one into the refusal it earns.
+    with _dir_lock(".store.lock"):
+        # Guards: tags first (cheap to fix, and a refused tag changes which
+        # entries the duplicate check would compare against), then duplicates.
+        if not _tag_guard(tags, tier, args.new_tag, now):
+            return 1
+        linked = {old_id for _, old_id in challenges}
+        if not _duplicate_guard(content, tags, linked, tier, args.duplicate_ok, now):
+            return 1
 
-    entry_id = _new_id(now)
-    session = (args.session or os.environ.get("RETINUE_MEMORY_SESSION", "")).strip()
-    path = _target_file(entry_id, session)
+        entry_id = _new_id(now)
+        session = (args.session or os.environ.get("RETINUE_MEMORY_SESSION", "")).strip()
+        path = _target_file(entry_id, session)
 
-    subj = f"<{MEMORY_PREFIX}{entry_id}>"
-    lines = [
-        f"{subj} <{RDF_TYPE}> <{KB}Memory> .",
-        f"{subj} <{KB}content> {_nt_string(content)} .",
-        f"{subj} <{KB}recordedAt> {_nt_datetime(now)} .",
-        f"{subj} <{KB}actor> <{ACTOR_PREFIX}{actor}> .",
-    ]
-    lines += [f"{subj} <{KB}tag> {_nt_string(t)} ." for t in tags]
-    if args.relevance is not None:
-        lines.append(
-            f"{subj} <{KB}relevance> \"{args.relevance:g}\"^^<{XSD}decimal> ."
-        )
-    if expires is not None:
-        lines.append(f"{subj} <{KB}expires> {_nt_datetime(expires)} .")
-    if session:
-        lines.append(f"{subj} <{KB}session> {_nt_string(session)} .")
-    if model:
-        lines.append(f"{subj} <{KB}model> {_nt_string(model)} .")
-    lines += [f"<{MEMORY_PREFIX}{old_id}> <{KB}{pred}> {subj} ."
-              for pred, old_id in challenges]
+        subj = f"<{MEMORY_PREFIX}{entry_id}>"
+        lines = [
+            f"{subj} <{RDF_TYPE}> <{KB}Memory> .",
+            f"{subj} <{KB}content> {_nt_string(content)} .",
+            f"{subj} <{KB}recordedAt> {_nt_datetime(now)} .",
+            f"{subj} <{KB}actor> <{ACTOR_PREFIX}{actor}> .",
+        ]
+        lines += [f"{subj} <{KB}tag> {_nt_string(t)} ." for t in tags]
+        if args.relevance is not None:
+            lines.append(
+                f"{subj} <{KB}relevance> \"{args.relevance:g}\"^^<{XSD}decimal> ."
+            )
+        if expires is not None:
+            lines.append(f"{subj} <{KB}expires> {_nt_datetime(expires)} .")
+        if session:
+            lines.append(f"{subj} <{KB}session> {_nt_string(session)} .")
+        if model:
+            lines.append(f"{subj} <{KB}model> {_nt_string(model)} .")
+        lines += [f"<{MEMORY_PREFIX}{old_id}> <{KB}{pred}> {subj} ."
+                  for pred, old_id in challenges]
 
-    _append(path, lines)
-    print(f"[memory] stored {entry_id} -> {path}", file=sys.stderr)
-    for pred, old_id in challenges:
-        print(f"[memory] {old_id} {pred} {entry_id}", file=sys.stderr)
-    return 0
+        _append(path, lines)
+        print(f"[memory] stored {entry_id} -> {path}", file=sys.stderr)
+        for pred, old_id in challenges:
+            print(f"[memory] {old_id} {pred} {entry_id}", file=sys.stderr)
+        return 0
 
 
 # ---------------------------------------------------------------- reinforce
@@ -1447,7 +1457,7 @@ def compact(args: argparse.Namespace) -> int:
                       file=sys.stderr)
                 break
 
-    with _compaction_lock():
+    with _dir_lock(".compact.lock"):
         return _compact_locked(items, all_ids, errors, args.actor, model)
 
 

@@ -231,9 +231,13 @@ seconds apart by one session.
 
 A refusal lists the matched ids with an excerpt of each and the ways out. The
 existing `--force` keeps its one meaning — skip the existence check of
-challenged ids — and overrides neither guard. A store that cannot be reached
-never blocks a write: both guards warn and let it through, as the existence
-check always has.
+challenged ids — and overrides neither guard. Guards and write run under a lock
+file per memory directory, so two sessions storing at once cannot both pass.
+A store that cannot be reached never blocks a write on its own account: the
+guards then judge from the recent local files alone — a near-duplicate
+written minutes ago is still refused, because the ways out (reinforce,
+challenge) proceed unverified when the store is down — and the existence
+check warns and proceeds, as it always has.
 
 **The subagent-stamp caveat.** A subagent inherits the environment of the
 session that spawned it, `RETINUE_SESSION_MODEL` included, so a subagent that
