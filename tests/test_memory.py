@@ -416,7 +416,8 @@ def test_store_writes(mod):
         check("tags slugged", f'<{kb}tag> "insurance" .' in text, True)
         check("relevance", f'<{kb}relevance> "0.3"^^<{mod.XSD}decimal> .' in text, True)
         check("recordedAt", f'<{kb}recordedAt> "2026-10-06T12:00:00Z"' in text, True)
-        check("no lock leftovers", sorted(p.name for p in Path(d).iterdir()), ["sess-1.nt"])
+        check("only the entry file and the store lock",
+              sorted(p.name for p in Path(d).iterdir()), [".store.lock", "sess-1.nt"])
 
     with tempdir() as d:
         rc, _, err = run(mod, ["store", "--tag", "insurance", "--expires", "soon", "x y z"],
