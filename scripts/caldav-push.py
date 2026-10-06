@@ -30,6 +30,7 @@ import urllib.error
 import urllib.request
 
 import pending_retract
+import send_origin
 
 DEFAULT_URL = os.environ.get("CALDAV_GATEWAY_CREATE_URL", "http://caldav-gateway:8094/create-event")
 TOKEN = os.environ.get("CALDAV_GATEWAY_TOKEN", "").strip()
@@ -52,6 +53,7 @@ def main() -> int:
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this event; "
                              "bypasses the verify flow for 'trust'-category accounts")
+    send_origin.add_argument(parser)
     parser.add_argument("--retract", metavar="REQUEST_ID",
                         help="retract a queued event you created (the id printed when it "
                              "was queued) before the user approves it; nothing is added")
@@ -76,6 +78,7 @@ def main() -> int:
         payload["calendar_id"] = args.calendar_id
     if args.user_approved:
         payload["user_approved"] = True
+    send_origin.stamp(payload, args.thread)
 
     headers = {"Content-Type": "application/json"}
     if TOKEN:

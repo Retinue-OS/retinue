@@ -265,6 +265,7 @@ import claude_auth
 import chat_state as chat_state_mod
 import contacts as contacts_mod
 import email_client as ec
+import send_origin
 import inbound_store
 import session_env
 import gateway_auth
@@ -3276,7 +3277,7 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
         result = send_message(prompt, display_question=latest, session_key=session_key,
                               model=chosen, restart_message=restart,
                               resume=resume,
-                              reply_attachments=True)
+                              reply_attachments=True, thread_id=cid)
         if result.get("escalated"):
             _conv_set_flags(cid, escalated=True)
         if "error" in result:
@@ -4574,7 +4575,8 @@ def send_message(message: str, display_question: str | None = None,
                  model: str | None = None,
                  restart_message: str | None = None,
                  resume: bool = True,
-                 reply_attachments: bool = False) -> dict:
+                 reply_attachments: bool = False,
+                 thread_id: str | None = None) -> dict:
     """Send message to the session for `session_key` (resume or new) and return result.
 
     `resume=False` starts a new session even when the stored one is still
@@ -4614,6 +4616,11 @@ def send_message(message: str, display_question: str | None = None,
     listed come back as "reply_files". Fresh per spawn, so a run whose reply is
     discarded — junior's before an escalation, a refused resume — takes its
     files with it.
+
+    `thread_id` is the dashboard thread the turn answers, handed to every
+    spawn as RETINUE_THREAD_ID: the push CLIs stamp it on the sends they
+    queue, so the user's Allow/Deny on /sends lands back in this thread
+    (_report_send_decision).
     """
     # Hold the per-session lock first (so the same key's messages stay ordered
     # and queued requests don't occupy a worker slot), then acquire a worker slot
@@ -4694,7 +4701,8 @@ def send_message(message: str, display_question: str | None = None,
                 env = session_env.build(
                     model=run_model,
                     escalate_file=escalate_flag if offer_flag else None,
-                    reply_attachments_file=manifest)
+                    reply_attachments_file=manifest,
+                    thread_id=thread_id)
                 return _run_claude(cmd, capture_output=True, text=True,
                                    cwd="/workspace", env=env)
 
@@ -6634,6 +6642,168 @@ def _gateway_hop(gw: dict, path: str, payload: dict | None = None,
             return exc.code, json.loads(raw)
         except ValueError:
             return exc.code, {"error": raw}
+
+
+# ── Send decisions reported back into the thread that queued them ─────────
+# A send a dashboard-thread turn queued for approval carries that thread's id
+# (scripts/send_origin.py: RETINUE_THREAD_ID → the push CLI's "thread" → the
+# gateway's pending entry, or the e-mail draft's X-Send-Request-Thread header).
+# When the user allows or denies it on /sends, a note goes into that thread, so
+# the conversation that proposed the message says what became of it — and the
+# next turn there knows too (the note's context carries the request id).
+#
+# An approval executes asynchronously on a channel gateway (issue #116), so its
+# note waits for the terminal status: "sent", or the gateway's real error. How
+# long it waits before saying the outcome is not known yet:
+SEND_DECISION_OUTCOME_TIMEOUT = float(
+    os.environ.get("SEND_DECISION_OUTCOME_TIMEOUT", "120"))
+SEND_DECISION_POLL_INTERVAL = 1.0
+# (channel, request_id) pairs already reported, so a double-clicked Allow —
+# which the gateway answers with the same entry — notes the decision once.
+_reported_send_decisions: dict[tuple[str, str], None] = {}
+_reported_send_decisions_lock = threading.Lock()
+_REPORTED_SEND_DECISIONS_MAX = 1000
+
+
+def _claim_send_decision(channel: str, request_id: str) -> bool:
+    """True the first time a decision on this send is to be reported."""
+    key = (channel, request_id)
+    with _reported_send_decisions_lock:
+        if key in _reported_send_decisions:
+            return False
+        _reported_send_decisions[key] = None
+        while len(_reported_send_decisions) > _REPORTED_SEND_DECISIONS_MAX:
+            _reported_send_decisions.pop(next(iter(_reported_send_decisions)))
+        return True
+
+
+def _send_decision_subject(entry: dict, label: str) -> str:
+    """What was decided on, in a few words: "the Signal message to X: “…”"."""
+    def excerpt(text: str, limit: int = 80) -> str:
+        text = " ".join(str(text or "").split())
+        return (text[:limit].rstrip() + "…") if len(text) > limit else text
+
+    if entry.get("kind") == "event":
+        summary = excerpt(entry.get("summary") or entry.get("subject") or "")
+        start = str(entry.get("start") or "").strip()
+        what = f"the calendar event “{summary}”" if summary else "the calendar event"
+        return what + (f" ({start})" if start else "")
+    to = entry.get("recipient") or entry.get("to") or ""
+    if isinstance(to, (list, tuple)):
+        to = ", ".join(str(t) for t in to)
+    to = excerpt(to, 60)
+    if label == "e-mail":
+        subject = excerpt(entry.get("subject") or "")
+        what = "the e-mail" + (f" to {to}" if to else "")
+        return what + (f" “{subject}”" if subject else "")
+    what = f"the {label} message" + (f" to {to}" if to else "")
+    body = excerpt(entry.get("message") or "")
+    return what + (f": “{body}”" if body else "")
+
+
+def _report_send_decision(channel: str, request_id: str, entry: dict,
+                          label: str, outcome: str,
+                          error: str | None = None) -> None:
+    """Note the user's decision on a queued send in the thread that queued it.
+
+    `outcome` is "sent", "failed", "unconfirmed" (allowed, still sending when
+    the wait ran out) or "denied". A send without a (live) thread is not
+    reported — it was queued outside a dashboard turn. The user made this
+    decision themselves, so the note is a record, not news: it neither badges
+    nor wakes the thread, except a failed send, which the user has not seen
+    the end of.
+    """
+    cid = send_origin.valid_thread(entry.get("thread"))
+    if not cid or _load_conv(cid) is None:
+        return
+    subject = _send_decision_subject(entry, label)
+    noun = "event" if entry.get("kind") == "event" else (
+        "e-mail" if label == "e-mail" else "message")
+    if outcome == "sent":
+        text = (f"✅ You allowed {subject} — "
+                + ("it is in the calendar." if noun == "event" else "it was sent."))
+    elif outcome == "failed":
+        text = (f"⚠️ You allowed {subject}, but "
+                + ("writing it" if noun == "event" else "sending it")
+                + f" failed: {error or 'unknown error'}")
+    elif outcome == "unconfirmed":
+        text = (f"⏳ You allowed {subject}; it is still being "
+                + ("written" if noun == "event" else "sent")
+                + f" — [its approval page](/sends/{channel}/{request_id}) "
+                "shows the outcome.")
+    else:
+        text = f"🚫 You denied {subject} — nothing was " + (
+            "written." if noun == "event" else "sent.")
+    status = {"sent": "approved", "failed": "error",
+              "unconfirmed": "sending"}.get(outcome, "rejected")
+    context = (f"Send decision on /sends: {channel}/{request_id} is {status}"
+               + (f" ({error})" if error else "")
+               + ". The user decided this on the approval page; nothing "
+               "further is needed for it unless they ask.")
+    noticed = outcome == "failed"
+    _conv_add_message(cid, "agent", text, unread=True if noticed else None,
+                      wake=noticed, context=context)
+    print(f"[web-gateway] send decision {channel}/{request_id} ({outcome}) "
+          f"reported into thread {cid}", flush=True)
+
+
+def _await_channel_send_outcome(channel: str, gw: dict, request_id: str,
+                                entry: dict) -> None:
+    """Wait for an approved channel send's terminal status, then report it
+    (background thread — the approving request has already been answered)."""
+    label = gw.get("label", channel.title())
+    deadline = time.monotonic() + SEND_DECISION_OUTCOME_TIMEOUT
+    current = entry
+    try:
+        while str(current.get("status")) not in ("approved", "error"):
+            if time.monotonic() >= deadline:
+                _report_send_decision(channel, request_id, entry, label,
+                                      "unconfirmed")
+                return
+            time.sleep(SEND_DECISION_POLL_INTERVAL)
+            try:
+                code, body = _gateway_hop(gw, f"/pending-sends/{request_id}",
+                                          method="GET")
+            except Exception as exc:  # noqa: BLE001 - keep polling until the deadline
+                print(f"[web-gateway] send outcome poll {channel}/{request_id} "
+                      f"failed: {exc}", flush=True)
+                continue
+            if code == 200 and isinstance(body, dict):
+                current = {**entry, **body}
+        if current.get("status") == "approved":
+            _report_send_decision(channel, request_id, current, label, "sent")
+        else:
+            _report_send_decision(channel, request_id, current, label, "failed",
+                                  error=str(current.get("error") or "") or None)
+    except Exception as exc:  # noqa: BLE001 - a report must never take the gateway down
+        print(f"[web-gateway] reporting send decision {channel}/{request_id} "
+              f"failed: {exc!r}", flush=True)
+
+
+def _report_channel_send_action(channel: str, gw: dict, request_id: str,
+                                verb: str, entry: dict) -> None:
+    """Hook for an approve/reject a channel gateway accepted: report it into
+    the originating thread, if the send has one."""
+    if not isinstance(entry, dict) or not send_origin.valid_thread(entry.get("thread")):
+        return
+    status = str(entry.get("status") or "")
+    if verb == "approve" and status not in ("sending", "approved", "error"):
+        return
+    if verb == "reject" and status != "rejected":
+        return
+    if not _claim_send_decision(channel, request_id):
+        return
+    if verb == "reject":
+        try:
+            _report_send_decision(channel, request_id, entry,
+                                  gw.get("label", channel.title()), "denied")
+        except Exception as exc:  # noqa: BLE001 - the decision itself already stands
+            print(f"[web-gateway] reporting send decision {channel}/{request_id} "
+                  f"failed: {exc!r}", flush=True)
+        return
+    threading.Thread(target=_await_channel_send_outcome,
+                     args=(channel, gw, request_id, entry),
+                     name=f"send-outcome-{request_id[:8]}", daemon=True).start()
 
 
 # A Claude Code session id, as the state file records it: a UUID. Validated
@@ -8664,6 +8834,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         env = dict(os.environ)
         env.pop("EMAIL_BACKEND_URL", None)  # the backend must not re-proxy
+        # The calling session's dashboard thread (if any), so a send this
+        # queues is linked to it — the gateway's own environment has none.
+        env.pop("RETINUE_THREAD_ID", None)
+        thread = (send_origin.valid_thread(payload.get("thread"))
+                  if isinstance(payload, dict) else None)
+        if thread:
+            env["RETINUE_THREAD_ID"] = thread
         try:
             proc = subprocess.run(
                 ["python3", EMAIL_CLIENT_PATH, *argv],
@@ -8700,10 +8877,12 @@ class Handler(BaseHTTPRequestHandler):
         if channel:
             self._handle_channel_send_action(channel, request_id, verb)
             return
+        decided: dict | None = None
         try:
             cfg = _ec_config(account)
             if verb == "approve":
                 result = ec.approve_pending_send(cfg, request_id)
+                decided = result
                 stripped = result.get("stripped_headers")
                 if stripped:
                     # The workaround for #60's Zoho/Exchange bounce fired —
@@ -8712,12 +8891,26 @@ class Handler(BaseHTTPRequestHandler):
                     print(f"[web-gateway] {request_id}: stripped provider "
                           f"header(s) {', '.join(stripped)}", flush=True)
             else:
+                # Read before deleting: the draft is the only record of which
+                # thread queued it.
+                try:
+                    decided = ec.get_pending_send(cfg, request_id)
+                except Exception:  # noqa: BLE001 - the report is optional, the denial is not
+                    decided = None
                 ec.delete_pending_draft(cfg, request_id)
         except ec.EmailError as exc:
             self._send_html(400, _HTML_HEAD + "<body><h1>Send action failed</h1><p>"
                             + html.escape(str(exc)) + '</p><p><a href="/sends">Back</a></p>'
                             + "</body></html>")
             return
+        if (decided and send_origin.valid_thread(decided.get("thread"))
+                and _claim_send_decision(account, request_id)):
+            try:
+                _report_send_decision(account, request_id, decided, "e-mail",
+                                      "sent" if verb == "approve" else "denied")
+            except Exception as exc:  # noqa: BLE001 - the decision itself already stands
+                print(f"[web-gateway] reporting send decision {account}/"
+                      f"{request_id} failed: {exc!r}", flush=True)
         # Move on to the next pending request for quick one-click processing.
         self._redirect("/sends/next")
 
@@ -8735,8 +8928,8 @@ class Handler(BaseHTTPRequestHandler):
             headers["Authorization"] = "Bearer " + gw["token"]
         try:
             req = urllib.request.Request(url, data=b"", headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=30):
-                pass
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", "replace")
             self._send_html(exc.code, _HTML_HEAD + f"<body><h1>{html.escape(label)} send action failed</h1><p>"
@@ -8748,6 +8941,13 @@ class Handler(BaseHTTPRequestHandler):
                             + html.escape(str(exc)) + '</p><p><a href="/sends">Back</a></p>'
                             + "</body></html>")
             return
+        # The gateway answers with the entry it moved; a send queued from a
+        # dashboard thread gets the decision noted there.
+        try:
+            entry = json.loads(raw.decode("utf-8")) if raw else {}
+        except ValueError:
+            entry = {}
+        _report_channel_send_action(channel, gw, request_id, verb, entry)
         if verb == "approve":
             # Approval is asynchronous on the gateway (issue #116): it answers
             # "sending" immediately and executes in the background. Land on the

@@ -840,8 +840,21 @@ def _lookup_existing_path(request_id: str) -> Path | None:
     return None
 
 
+
+# The dashboard thread a queued send came from (scripts/send_origin.py): kept on
+# the pending entry so the web-gateway can report the user's Allow/Deny back
+# into it. Anything that is not a thread id is dropped — the link is optional.
+_THREAD_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _origin_thread(payload: dict) -> str | None:
+    value = str(payload.get("thread") or "").strip().lower()
+    return value if _THREAD_ID_RE.fullmatch(value) else None
+
+
 def _new_pending_send(summary: str, start: str, end: str, all_day: bool,
-                      description: str, calendar_id: str | None, category: str) -> str:
+                      description: str, calendar_id: str | None, category: str,
+                      thread: str | None = None) -> str:
     """Store a pending calendar event and return its request_id."""
     request_id = uuid.uuid4().hex
     entry = {
@@ -866,6 +879,7 @@ def _new_pending_send(summary: str, start: str, end: str, all_day: bool,
         "calendar_target": calendar_id or CALDAV_CALENDAR_ID or "",
         "body": _format_pending_body(start, end, all_day, description),
         "category": category,
+        "thread": thread,
         "created": int(time.time()),
         "status": "pending",
     }
@@ -1170,7 +1184,8 @@ class _PushHandler(BaseHTTPRequestHandler):
 
         category = _outbound_policy_category()
         if category == "verify" or (category == "trust" and not user_approved):
-            request_id = _new_pending_send(summary, start, end, all_day, description, calendar_id, category)
+            request_id = _new_pending_send(summary, start, end, all_day, description, calendar_id, category,
+                                           thread=_origin_thread(payload))
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
             approval_url = (SEND_APPROVAL_BASE_URL + approval_path) if SEND_APPROVAL_BASE_URL else approval_path
             print(f"[caldav-gateway] pending event registered for {CALDAV_ACCOUNT} "

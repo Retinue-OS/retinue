@@ -886,8 +886,21 @@ def _lookup_existing_path(request_id: str) -> Path | None:
     return None
 
 
+
+# The dashboard thread a queued send came from (scripts/send_origin.py): kept on
+# the pending entry so the web-gateway can report the user's Allow/Deny back
+# into it. Anything that is not a thread id is dropped — the link is optional.
+_THREAD_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _origin_thread(payload: dict) -> str | None:
+    value = str(payload.get("thread") or "").strip().lower()
+    return value if _THREAD_ID_RE.fullmatch(value) else None
+
+
 def _new_pending_send(recipient: str, message: str, category: str,
-                      author: str = "agent") -> str:
+                      author: str = "agent",
+                      thread: str | None = None) -> str:
     request_id = uuid.uuid4().hex
     entry = {
         "id": request_id,
@@ -895,6 +908,7 @@ def _new_pending_send(recipient: str, message: str, category: str,
         "message": message,
         "category": category,
         "author": author,
+        "thread": thread,
         "created": int(time.time()),
         "status": "pending",
     }
@@ -1219,7 +1233,8 @@ class _Handler(BaseHTTPRequestHandler):
         category = _outbound_policy_category()
         if not _send_is_direct(category, user_approved):
             try:
-                request_id = _new_pending_send(recipient, message, category, author=author)
+                request_id = _new_pending_send(recipient, message, category, author=author,
+                                           thread=_origin_thread(payload))
             except OSError as exc:
                 print(f"[sms-gateway] could not persist pending send: {exc}", flush=True)
                 self._reply(503, {"error": "could not queue the send for approval; retry later"})
