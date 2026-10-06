@@ -989,7 +989,7 @@ def store(args: argparse.Namespace) -> int:
     if not _tag_guard(tags, tier, args.new_tag, now, _fetch_tag_counts(now)):
         return 1
     hits, store_down = _fetch_live_hits(tags, now)
-    claims = _fetch_claims([old_id for _, old_id in challenges]) if challenges else {}
+    claims = _fetch_claims([old_id for _, old_id in challenges]) if challenges else set()
 
     # Then the duplicate check against the local files and the write, under
     # one lock per memory directory: two sessions storing the same thing at
@@ -1026,8 +1026,10 @@ def store(args: argparse.Namespace) -> int:
                   for pred, old_id in challenges]
         # A challenged entry may already be hidden inside a standing summary,
         # which then carries the stale statement forward. The challenge becomes
-        # a doubt on that summary: recall flags it next to the new entry, and
-        # the next compaction re-plans it.
+        # a doubt on that summary — and on every summary above it, since after
+        # rolling consolidation the one a reader sees is the top of the chain:
+        # recall flags it next to the new entry, and the next compaction
+        # re-plans it.
         carried_by = _standing_summaries_of([old_id for _, old_id in challenges],
                                             claims) if challenges else []
         lines += [f"<{MEMORY_PREFIX}{s}> <{KB}questionedBy> {subj} ." for s in carried_by]
@@ -1508,27 +1510,39 @@ def _merge_links(into: dict[str, dict[str, list[str]]],
             have += [t for t in targets if t not in have]
 
 
-def _fetch_claims(ids: list[str]) -> dict[str, list[str]]:
-    """The store's standing summaries carrying these entries, fetched before
-    the lock is taken. An unreachable store only loses its half: a challenge
-    is written either way."""
+def _climb(ids: list[str], parents) -> set[str]:
+    """Every standing summary above these entries, transitively: after
+    rolling consolidation a member sits under a chain (A -> S1 -> S2), and
+    the summary a reader sees is the top one. `parents(ids)` returns id ->
+    the standing summaries directly carrying it."""
+    seen: set[str] = set()
+    frontier = list(dict.fromkeys(ids))
+    while frontier:
+        found = parents(frontier)
+        above = sorted({s for summaries in found.values() for s in summaries}
+                       - seen)
+        seen |= set(above)
+        frontier = above
+    return seen
+
+
+def _fetch_claims(ids: list[str]) -> set[str]:
+    """The store's standing summaries carrying these entries, the whole
+    chain up, fetched before the lock is taken. An unreachable store only
+    loses its half: a challenge is written either way."""
     try:
-        return _already_compacted(ids)
+        return _climb(ids, _already_compacted)
     except Exception as exc:  # noqa: BLE001
         print(f"[memory] store unreachable ({exc}); summaries carrying the "
               "challenged entries not looked up there", file=sys.stderr)
-        return {}
+        return set()
 
 
-def _standing_summaries_of(ids: list[str], claims: dict[str, list[str]]) -> list[str]:
-    """The standing summaries that carry any of these entries: the store's
-    answer (`claims`, fetched beforehand) plus the compaction files the store
-    has not indexed yet."""
-    claims = {k: list(v) for k, v in claims.items()}
-    for entry_id, summaries in _recent_local_claims(ids).items():
-        have = claims.setdefault(entry_id, [])
-        have += [x for x in summaries if x not in have]
-    return sorted({x for summaries in claims.values() for x in summaries})
+def _standing_summaries_of(ids: list[str], claims: set[str]) -> list[str]:
+    """The standing summaries that carry any of these entries, the whole
+    chain up: the store's answer (`claims`, fetched beforehand) plus the
+    compaction files the store has not indexed yet, climbed the same way."""
+    return sorted(claims | _climb(list(ids) + sorted(claims), _recent_local_claims))
 
 
 def _already_compacted(ids: list[str]) -> dict[str, list[str]]:

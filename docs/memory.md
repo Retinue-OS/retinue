@@ -36,8 +36,10 @@ getting worse at its one job, putting the right memories into a prompt:
 
 Memory v2 answers each of these: entries about pending states expire, the
 store refuses near-duplicates and new tags from sessions that should reuse
-what exists, model stamps are normalized, and a compaction pass folds old
-entries into topic summaries that recall puts first.
+what exists, model stamps are normalized to one spelling (a bare tier alias
+such as `opus`, which only its spawner could resolve, stays as written), and a
+compaction pass folds old entries into topic summaries that recall puts
+first.
 
 ## Data model
 
@@ -119,7 +121,10 @@ undo. Superseding a summary (`store --supersedes <summary>`) is different on
 purpose: it says the world moved on and the new entry is the current picture,
 so the members — older still — stay hidden under the superseded summary
 (`--include-compacted` shows them). Only a correction says the summary
-misrepresented what it carried.
+misrepresented what it carried. After rolling consolidation a member sits
+under a chain of summaries (`A → S1 → S2`); recall shows the nearest standing
+one, so correcting `S2` brings `S1` back as the summary that carries `A`, and
+a challenge to `A` questions every standing summary above it, `S2` included.
 
 How many entries each standing summary carries, as the store sees it:
 

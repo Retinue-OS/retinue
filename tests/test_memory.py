@@ -912,6 +912,22 @@ def test_review_followups(mod):
         check("says so", "summary 20261005T120000Z-sum001 carries" in err, True)
 
     with tempdir() as d:
+        # A -> S1 in the store, S1 -> S2 in a compaction file not indexed yet.
+        (d / "compaction-late.nt").write_text(
+            f'<{PFX}20261005T120000Z-sum001> <{mod.KB}compactedInto> '
+            f'<{PFX}20261006T110000Z-sum002> .\n', encoding="utf-8")
+        st = FakeStore(tags=TWENTY_TAGS,
+                       compacted={"20260801T100000Z-aaaaaa": ["20261005T120000Z-sum001"]})
+        rc, _, err = run(mod, ["store", "--tag", "ludmila", "--supersedes",
+                               "20260801T100000Z-aaaaaa", "Ludmila moved to Basel in 2026"],
+                         st, FRONTIER_ENV, d)
+        new_id = err.split("stored ")[1].split()[0]
+        text = "".join(p.read_text(encoding="utf-8") for p in nt_files(d))
+        check("the whole summary chain is questioned",
+              all(f"<{PFX}{s}> <{mod.KB}questionedBy> <{PFX}{new_id}> ." in text
+                  for s in ("20261005T120000Z-sum001", "20261006T110000Z-sum002")), True)
+
+    with tempdir() as d:
         rc, _, _ = run(mod, ["store", "--tag", "ludmila", "--relevance", "0.0000001",
                              "Tiny relevance still a valid decimal"],
                        FakeStore(tags=TWENTY_TAGS), FRONTIER_ENV, d)
