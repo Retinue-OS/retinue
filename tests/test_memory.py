@@ -807,6 +807,17 @@ def test_review_followups(mod):
                        FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
         check("an expired unindexed entry is not a live duplicate", rc, 0)
 
+    with tempdir() as d:
+        # The store still returns the old entry, but a file it has not indexed
+        # yet corrects it.
+        (d / "late.nt").write_text(
+            f'<{PFX}20260801T100000Z-aaaaaa> <{mod.KB}correctedBy> '
+            f'<{PFX}20261006T115900Z-cccccc> .\n', encoding="utf-8")
+        rc, _, _ = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
+                       FakeStore(tags=TWENTY_TAGS, entries=[("20260801T100000Z-aaaaaa", RULE)]),
+                       LOWER_ENV, d)
+        check("a store hit corrected in an unindexed file is not a duplicate", rc, 0)
+
     facts = {"20260830T090000Z-aaaaaa": {"t": "2026-08-30T09:00:00Z"},
              "20260901T080000Z-bbbbbb": {"t": "2026-09-01T08:00:00Z"}}
     with tempdir() as d:
@@ -862,9 +873,22 @@ def test_review_followups(mod):
         plan_retired = plan_item(summarizes=[], retires=["20260830T090000Z-aaaaaa",
                                                         "20260901T080000Z-bbbbbb"])
         planfile.write_text(json.dumps(plan_retired), encoding="utf-8")
-        rc, _, _ = run(mod, ["compact", "--plan", str(planfile)],
-                       FakeStore(facts=facts, rows=challenged), FRONTIER_ENV, d)
+        st = FakeStore(facts=facts, rows=challenged)
+        rc, _, _ = run(mod, ["compact", "--plan", str(planfile)], st, FRONTIER_ENV, d)
         check("retiring the challenged member is fine", rc, 0)
+        facts_queries = [q for q in st.queries if "SELECT ?m ?t ?gen ?from ?to" in q]
+        check("the facts query keeps the memory type",
+              bool(facts_queries) and all("a kb:Memory" in q for q in facts_queries), True)
+
+    with tempdir() as d:
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+        doubted = [{"m": uri(PFX + "20260830T090000Z-aaaaaa"),
+                    "p": uri(mod.KB + "questionedBy")}]
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile)],
+                         FakeStore(facts=facts, rows=doubted), FRONTIER_ENV, d)
+        check("a questioned kept member compacts", rc, 0)
+        check("with a warning to state the doubt", "is questioned" in err, True)
 
 
 def main():

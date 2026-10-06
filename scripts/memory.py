@@ -115,8 +115,10 @@ Recall leaves out, by default: corrected and superseded entries
 EXPIRED), and entries compacted into a summary that stands
 (`--include-compacted`, labeled COMPACTED). Summaries come first, highest
 generation first, then everything newest first; `--expand SUM` lists a
-summary's members, kept and retired. Questioned entries always stay in,
-flagged — doubt is a signal, not a verdict.
+summary's members, kept and retired. Questioned entries stay in, flagged,
+until a summary carries them — doubt is a signal, not a verdict — and
+compact warns about every kept member that is questioned, so the summary
+states the doubt.
 
 File layout: one flat directory. Entries from the same session share a file
 when a session label is known (`--session` or RETINUE_MEMORY_SESSION —
@@ -526,7 +528,7 @@ _LITERAL_LINE_RE = re.compile(
     + r'(content|tag|recordedAt|expires)> "((?:[^"\\]|\\.)*)"(?:\^\^<[^>]+>)? \.$')
 _LINK_LINE_RE = re.compile(
     r'^<' + re.escape(MEMORY_PREFIX) + r'([A-Za-z0-9-]+)> <' + re.escape(KB)
-    + r'(compactedInto|correctedBy|supersededBy)> <' + re.escape(MEMORY_PREFIX)
+    + r'(compactedInto|correctedBy|supersededBy|questionedBy)> <' + re.escape(MEMORY_PREFIX)
     + r'([A-Za-z0-9-]+)> \.$')
 _LOCAL_DEAD_LINKS = frozenset({"compactedInto", "correctedBy", "supersededBy"})
 
@@ -635,12 +637,15 @@ def _recent_local_claims(ids: list[str]) -> dict[str, list[str]]:
             if links.get(i, {}).get("compactedInto")}
 
 
+_CHALLENGE_LINKS = frozenset({"correctedBy", "supersededBy", "questionedBy"})
+
+
 def _recent_local_challenges(ids: list[str]) -> dict[str, set[str]]:
-    """id -> {"correctedBy", "supersededBy"} links written in the last few
-    minutes, which the store has not indexed yet."""
+    """id -> the challenge links (correctedBy, supersededBy, questionedBy)
+    written in the last few minutes, which the store has not indexed yet."""
     links = _recent_local_links()
-    return {i: set(links[i]) & {"correctedBy", "supersededBy"} for i in ids
-            if set(links.get(i, {})) & {"correctedBy", "supersededBy"}}
+    return {i: set(links[i]) & _CHALLENGE_LINKS for i in ids
+            if set(links.get(i, {})) & _CHALLENGE_LINKS}
 
 
 LOCK_FILE = ".memory.lock"
@@ -829,6 +834,12 @@ def _duplicate_guard(content: str, tags: list[str], linked: set[str], tier: str,
     # wrote moments ago, which is where the production duplicates came from.
     seen = {entry_id for entry_id, _ in hits}
     hits += [h for h in _recent_local_entries(tags, now) if h[0] not in seen]
+    # And the reverse lag: a hit the store still returns may be dead in a
+    # file it has not indexed yet — corrected, superseded or compacted a
+    # moment ago, in this session's file or another's.
+    local_links = _recent_local_links()
+    hits = [h for h in hits
+            if not (_LOCAL_DEAD_LINKS & local_links.get(h[0], {}).keys())]
     near, similar = classify_duplicates(content, hits, linked)
     for entry_id, other, score in similar:
         print(f"[memory] warning: similar to {entry_id} (overlap {score:.2f}): "
@@ -1380,12 +1391,16 @@ def _values_clause(ids: list[str]) -> str:
 
 
 def _member_facts(ids: list[str]) -> dict[str, dict]:
-    """id -> {"t", "gen", "from", "to"} for the members the store knows."""
+    """id -> {"t", "gen", "from", "to"} for the members the store knows.
+    Typed kb:Memory on purpose: --force skips only the per-member ASK, and a
+    subject in the memory namespace that is not a memory must still end up
+    without facts, which refuses the plan."""
     sparql = f"""
 PREFIX kb: <{KB}>
 SELECT ?m ?t ?gen ?from ?to WHERE {{
   VALUES ?m {{ {_values_clause(ids)} }}
-  ?m kb:recordedAt ?t .
+  ?m a kb:Memory ;
+     kb:recordedAt ?t .
   OPTIONAL {{ ?m kb:generation ?gen }}
   OPTIONAL {{ ?m kb:coversFrom ?from }}
   OPTIONAL {{ ?m kb:coversTo ?to }}
@@ -1401,14 +1416,15 @@ SELECT ?m ?t ?gen ?from ?to WHERE {{
 
 
 def _challenged(ids: list[str]) -> dict[str, set[str]]:
-    """id -> the challenge links (correctedBy, supersededBy) the store holds
-    for it. Questioned entries are not included: doubt is a signal the
-    summary may carry, not a verdict that voids the plan."""
+    """id -> the challenge links (correctedBy, supersededBy, questionedBy)
+    the store holds for it. The caller decides what each means: a correction
+    or supersession voids a plan that keeps the entry, a question is a doubt
+    the summary has to state."""
     sparql = f"""
 PREFIX kb: <{KB}>
 SELECT ?m ?p WHERE {{
   VALUES ?m {{ {_values_clause(ids)} }}
-  VALUES ?p {{ kb:correctedBy kb:supersededBy }}
+  VALUES ?p {{ kb:correctedBy kb:supersededBy kb:questionedBy }}
   ?m ?p ?x .
 }}
 """
@@ -1589,10 +1605,16 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
     for entry_id, preds in _recent_local_challenges(kept).items():
         challenged.setdefault(entry_id, set()).update(preds)
     for entry_id in kept:
-        if challenged.get(entry_id):
-            errors.append(f"{entry_id} was challenged ({', '.join(sorted(challenged[entry_id]))}) "
+        void = challenged.get(entry_id, set()) & {"correctedBy", "supersededBy"}
+        if void:
+            errors.append(f"{entry_id} was challenged ({', '.join(sorted(void))}) "
                           "since the plan was drawn up — re-plan: retire it or "
                           "carry the correction")
+        elif "questionedBy" in challenged.get(entry_id, set()):
+            # Recall flags a questioned entry as long as it is visible; once
+            # a summary hides it, the summary is where the doubt must live.
+            print(f"[memory] warning: kept member {entry_id} is questioned — "
+                  "the summary must state the doubt", file=sys.stderr)
     for entry_id in all_ids:
         if compacted.get(entry_id):
             errors.append(f"{entry_id} is already compacted into "

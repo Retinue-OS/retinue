@@ -261,7 +261,9 @@ deliberately.
 | past `kb:expires` (no longer relevant) | `--include-expired` | `EXPIRED <date>` |
 | compacted into a summary that is not itself corrected | `--include-compacted` | `COMPACTED into <id>` |
 
-Questioned entries always stay in, flagged — doubt is a signal, not a verdict.
+Questioned entries stay in, flagged, until a summary carries them — doubt is
+a signal, not a verdict. Compaction is where the doubt moves: `compact` warns
+about every kept member that is questioned, and the summary states it.
 The current time is injected into the query as a literal rather than read
 from `NOW()`, so a query is reproducible. The same liveness definition serves
 the duplicate guard and `tags`.
@@ -348,7 +350,8 @@ writing half:
   least twice, plus the cluster tag.
 - **What to keep.** Corrected, superseded and expired members are retired,
   with the outcome kept in one clause when it matters ("the August filing
-  arrangement was voided"). Standing rules are kept with their dates and
+  arrangement was voided"). A questioned member is kept with its doubt
+  stated, or retired. Standing rules are kept with their dates and
   restatement counts. Chains collapse to their terminal state ("queued",
   "approved", "sent" becomes "sent on …"). Identifiers — ids, addresses,
   numbers, file names — are kept verbatim. Open items stay explicit.
