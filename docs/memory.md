@@ -196,8 +196,10 @@ session's tier, derived from the environment:
 - No `RETINUE_FRONTIER_MODEL` and no `RETINUE_ROUTER_MODEL`: the deployment is
   untiered, one model does everything, and every session counts as
   **frontier**.
-- Otherwise a session is frontier iff its normalized stamp (`--model` or
-  `RETINUE_SESSION_MODEL`) equals the normalized frontier model
+- Otherwise a session is frontier iff its normalized stamp
+  (`RETINUE_SESSION_MODEL`, which the spawner sets and the session cannot
+  change; `--model` adjusts the recorded stamp only) equals the normalized
+  frontier model
   (`RETINUE_FRONTIER_MODEL`, falling back to `RETINUE_CLAUDE_MODEL` as the
   spawners do). The router model, a scheduled job's own model and a missing
   stamp are all **lower** tier: unknown is not trusted.
@@ -233,11 +235,9 @@ A refusal lists the matched ids with an excerpt of each and the ways out. The
 existing `--force` keeps its one meaning — skip the existence check of
 challenged ids — and overrides neither guard. Guards and write run under a lock
 file per memory directory, so two sessions storing at once cannot both pass.
-A store that cannot be reached never blocks a write on its own account: the
-guards then judge from the recent local files alone — a near-duplicate
-written minutes ago is still refused, because the ways out (reinforce,
-challenge) proceed unverified when the store is down — and the existence
-check warns and proceeds, as it always has.
+A store that cannot be reached never blocks a write: the guards then only
+warn, from the recent local files, and the existence check proceeds
+unverified, as it always has.
 
 **The subagent-stamp caveat.** A subagent inherits the environment of the
 session that spawned it, `RETINUE_SESSION_MODEL` included, so a subagent that
@@ -302,9 +302,12 @@ the tags — it is the tag recall finds the summary by); relevance within 0..1;
 `summarizes` and `retires` disjoint and together non-empty; syntactically
 valid ids; each entry in at most one summary of the plan; each member present
 in the store (skipped with `--force`; an unreachable store warns, as for
-`store`); and no member already compacted into a summary that stands. The
-generation and coverage come from the store; when it cannot be reached
-`compact` refuses rather than write invented metadata. The whole plan becomes
+`store`); every member indexed, so its `recordedAt` and generation are known
+(`--force` does not lift this: the index lags a few seconds after a store,
+and a summary over a member it cannot see would guess both); and no member
+already compacted into a summary that stands. The generation and coverage
+come from the store; when it cannot be reached `compact` refuses rather than
+write invented metadata. The whole plan becomes
 one `compaction-*.nt`; the summary ids are printed on stdout, one per line.
 The store guards do not apply, but `compact` refuses a lower-tier session
 outright: compaction hides entries from every recall and is frontier work.

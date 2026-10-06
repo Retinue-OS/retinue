@@ -84,8 +84,8 @@ Both guards also read the files written to the memory directory in the
 last minutes, which the store, indexing seconds behind, cannot return yet;
 guards and write run under a lock per directory, so two sessions storing
 at once cannot both pass. A store that cannot be reached never blocks a
-write on its own account: the guards then judge from those recent files
-alone, and the existence check of challenged ids warns and proceeds.
+write: the guards then only warn, from those recent files, and the
+existence check of challenged ids proceeds unverified.
 
 Compaction. `compact --plan` writes summaries that carry the substance of many
 older entries forward and hide them from recall:
@@ -382,7 +382,7 @@ def normalize_model(stamp: str | None) -> str:
     return s
 
 
-def session_tier(env: Mapping[str, str], model: str | None = None) -> str:
+def session_tier(env: Mapping[str, str]) -> str:
     """FRONTIER or LOWER for the session described by `env`.
 
     A deployment that declares no tiers is one model doing everything, so it
@@ -390,17 +390,18 @@ def session_tier(env: Mapping[str, str], model: str | None = None) -> str:
     frontier model is frontier — the router, a scheduled job pinned to its own
     model, and a session with no stamp at all are LOWER: unknown is not
     trusted. The frontier tier falls back to RETINUE_CLAUDE_MODEL exactly as
-    the spawners resolve it (docs/model-routing.md). `model` overrides the
-    environment's RETINUE_SESSION_MODEL (store passes the stamp it writes, so
-    the recorded model and the tier it was judged by never disagree).
+    the spawners resolve it (docs/model-routing.md). Only the environment's
+    RETINUE_SESSION_MODEL counts, which the spawner sets and the session
+    cannot change; `--model` adjusts the recorded stamp and nothing else, or
+    a lower-tier session could name the frontier model and pass its own
+    guards.
     """
     frontier_var = env.get("RETINUE_FRONTIER_MODEL", "").strip()
     router_var = env.get("RETINUE_ROUTER_MODEL", "").strip()
     if not frontier_var and not router_var:
         return FRONTIER
     frontier = normalize_model(frontier_var or env.get("RETINUE_CLAUDE_MODEL", ""))
-    stamp = normalize_model(env.get("RETINUE_SESSION_MODEL", "")
-                            if model is None else model)
+    stamp = normalize_model(env.get("RETINUE_SESSION_MODEL", ""))
     return FRONTIER if stamp and stamp == frontier else LOWER
 
 
@@ -753,13 +754,14 @@ def _duplicate_guard(content: str, tags: list[str], linked: set[str], tier: str,
     re-stored as fresh entries, each copy then competing with the original for
     recall's limit. The way out of a refusal is the operation that was meant.
     """
+    store_down = False
     try:
         hits = _live_entries_sharing(tags, now)
     except Exception as exc:  # noqa: BLE001 — one endpoint, one failure mode
         print(f"[memory] store unreachable ({exc}); duplicates not checked "
               "against the store, only against the last minutes' files",
               file=sys.stderr)
-        hits = []
+        hits, store_down = [], True
     # What the store has not indexed yet: the entries this or another session
     # wrote moments ago, which is where the production duplicates came from.
     seen = {entry_id for entry_id, _ in hits}
@@ -769,6 +771,15 @@ def _duplicate_guard(content: str, tags: list[str], linked: set[str], tier: str,
         print(f"[memory] warning: similar to {entry_id} (overlap {score:.2f}): "
               f"{_excerpt(other)}", file=sys.stderr)
     if not near:
+        return True
+    if store_down:
+        # The store being down never blocks a write: what the local files
+        # show is said, not enforced — the ways out of a refusal cannot be
+        # verified either while it is down.
+        for entry_id, _, score in near:
+            print(f"[memory] warning: near-duplicate of {entry_id} "
+                  f"(overlap {score:.2f}) in a recent local file; stored anyway "
+                  "because the store is unreachable", file=sys.stderr)
         return True
     if tier == FRONTIER and duplicate_ok:
         for entry_id, _, score in near:
@@ -849,7 +860,7 @@ def store(args: argparse.Namespace) -> int:
             challenges.append((pred, old_id))
 
     model = normalize_model(args.model or os.environ.get("RETINUE_SESSION_MODEL", ""))
-    tier = session_tier(os.environ, model)
+    tier = session_tier(os.environ)
 
     # Guards and write under one lock per memory directory: two sessions
     # storing the same thing at once would otherwise both pass the guards
@@ -1421,7 +1432,7 @@ def compact(args: argparse.Namespace) -> int:
     # that may not even coin a tag has no business doing that. The scheduled
     # job runs as frontier by construction; this is for the hand-run case.
     model = normalize_model(args.model or os.environ.get("RETINUE_SESSION_MODEL", ""))
-    if session_tier(os.environ, model) != FRONTIER:
+    if session_tier(os.environ) != FRONTIER:
         print("[memory] refused: compaction is frontier work — run it from Ara "
               "senior or let the scheduled job do it", file=sys.stderr)
         return 1
@@ -1476,6 +1487,13 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
     for entry_id, summaries in _recent_local_claims(all_ids).items():
         known = compacted.setdefault(entry_id, [])
         known += [x for x in summaries if x not in known]
+    # --force skips only the existence check. A member the store does not
+    # return has no recordedAt and no generation, and a summary written over
+    # it would carry a guessed generation and coverage while hiding it.
+    for entry_id in all_ids:
+        if entry_id not in facts:
+            errors.append(f"{entry_id} is not indexed yet (the store lags a "
+                          "few seconds after a store); nothing written")
     for entry_id in all_ids:
         if compacted.get(entry_id):
             errors.append(f"{entry_id} is already compacted into "
@@ -1500,9 +1518,6 @@ def _compact_locked(items: list[dict], all_ids: list[str], errors: list[str],
         auto_from, auto_to = summary_covers(members, facts)
         covers_from = item["covers_from"] or auto_from
         covers_to = item["covers_to"] or auto_to
-        if covers_from is None or covers_to is None:
-            print(f"[memory] warning: coverage of {summary_id} unknown "
-                  "(members not indexed yet?)", file=sys.stderr)
         lines += compaction_lines(summary_id, item, generation, covers_from,
                                   covers_to, actor, model, now)
         written.append((summary_id, item, generation))

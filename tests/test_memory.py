@@ -227,8 +227,8 @@ def test_session_tier(mod):
                    "RETINUE_SESSION_MODEL": "claude-opus-5"}
     check("frontier falls back to RETINUE_CLAUDE_MODEL",
           mod.session_tier(only_router), F)
-    check("the stamp argument overrides the environment",
-          mod.session_tier(LOWER_ENV, "claude-opus-5"), F)
+    check("only the environment counts; a --model naming the frontier is a stamp",
+          mod.session_tier(dict(LOWER_ENV, RETINUE_SESSION_MODEL="claude-haiku-4")), L)
 
 
 def test_word_overlap(mod):
@@ -750,8 +750,15 @@ def test_review_followups(mod):
         check("guard and write ran under the store lock", (d / ".store.lock").exists(), True)
         rc, _, err = run(mod, ["store", "--tag", "ludmila", RULE + " today"],
                          FakeStore(down=True), LOWER_ENV, d)
-        check("store down: a local near-duplicate still refuses", rc, 1)
-        check("store down: says what it checked", "last minutes' files" in err, True)
+        check("store down: a local near-duplicate only warns", rc, 0)
+        check("store down: names it", "in a recent local file" in err, True)
+
+    with tempdir() as d:
+        rc, _, err = run(mod, ["store", "--tag", "ludmila", "--model", "claude-opus-5",
+                               "--new-tag", "--tag", "brand-new", RULE],
+                         FakeStore(tags=TWENTY_TAGS), LOWER_ENV, d)
+        check("--model naming the frontier does not buy its flags", rc, 1)
+        check("the refusal is the lower-tier one", "only Ara senior can coin" in err, True)
 
     facts = {"20260830T090000Z-aaaaaa": {"t": "2026-08-30T09:00:00Z"},
              "20260901T080000Z-bbbbbb": {"t": "2026-09-01T08:00:00Z"}}
@@ -771,6 +778,16 @@ def test_review_followups(mod):
         check("again inside the index lag: refused from the file", rc, 1)
         check("names the claim", "is already compacted into" in err, True)
         check("still one compaction file", len(nt_files(d)), 1)
+
+    with tempdir() as d:
+        planfile = d / "plan.json"
+        planfile.write_text(json.dumps(plan_item()), encoding="utf-8")
+        half = {"20260830T090000Z-aaaaaa": facts["20260830T090000Z-aaaaaa"]}
+        rc, _, err = run(mod, ["compact", "--plan", str(planfile), "--force"],
+                         FakeStore(facts=half), FRONTIER_ENV, d)
+        check("--force does not cover an unindexed member", rc, 1)
+        check("says which", "20260901T080000Z-bbbbbb is not indexed yet" in err, True)
+        check("nothing written over it", nt_files(d), [])
 
 
 def main():
