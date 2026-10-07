@@ -2,8 +2,8 @@
 
 *Reference depth for the "Data refresh", "Scheduled tasks" and project-parking
 digests in `CLAUDE.md`. Read this before adding or editing a `.refresh.json` /
-`.schedule.json`, changing the self-review or recurring-projects jobs, or
-debugging why a resting project did not wake.*
+`.schedule.json`, changing the self-review, recurring-projects or
+memory-compact jobs, or debugging why a resting project did not wake.*
 
 ## Data refresh (`.refresh.json`)
 
@@ -251,6 +251,21 @@ optimisation, not the guarantee.
 
 The reminder wording lives in the project frontmatter, not in framework code —
 this public repo carries no chamber-specific or personal text.
+
+## Compacting the memory log
+
+The **`memory-compact`** base job (`scripts/memory-compact.py`) folds memory
+entries older than two weeks into topic summaries, weekly. Same pattern again:
+a scheduler `command` job whose gate is a free SPARQL `SELECT` — memory.py's
+own recall query — and **no qualifying topic spawns nothing**. Otherwise it
+writes a payload file and starts one `claude -p` on the **frontier tier**,
+since judging what of a topic still holds is Ara senior's work and
+`memory.py compact` refuses anything lower. It is the one base job that uses
+both opt-in waits: `timeout_seconds` of an hour for a session over ten
+summaries, and `resume_after_seconds` of an hour after a run its per-run cap
+cut short (exit 75), so a backlog drains the same day rather than a week per
+slice. Clustering, payload, idempotence and its failure alert:
+`docs/memory.md`, "The compaction job".
 
 ## Draining chamber inboxes (`.inbox.json`)
 

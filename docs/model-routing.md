@@ -83,6 +83,7 @@ their difficulty before any model runs:
 | Scheduler prompt jobs (mailbox checks, dispatch turns) | router | Routine by construction; the real work is done by the dispatched subagent on its own pinned model. |
 | `news-curate.py` spawn | router | The turn only dispatches the Herald. |
 | `agent-self-review.py` spawn | frontier | Supervision by construction, and rare — the free SPARQL gate means it usually spawns nothing. |
+| `memory-compact.py` spawn | frontier | Deciding what of a topic still holds is judgement, and `memory.py compact` refuses a lower tier; weekly, behind a free SPARQL gate. |
 | Main remote-control session | frontier | Interactive system administration and development — Ara senior's desk. |
 | Dashboard threads, messenger inbound (`POST /message`), `ask_ara` | phase 2 | Difficulty unknown before a model reads the message; needs the escalation flow below. Dashboard threads take `RETINUE_DASHBOARD_MODEL` when the deployment sets one; the other two stay on the router tier. |
 
