@@ -264,20 +264,16 @@ router tier below Sonnet-class is not recommended for conversational entry
 points; scheduler dispatch jobs tolerate weaker routers via their per-job
 `model` field.
 
-### Memory as triples (first slice shipped with phase 1)
+### Memory as triples
 
 Per-turn statelessness makes context the whole game, and the tier split raises
 the stakes: briefing workers and Ara senior cheaply is what keeps the
 architecture affordable. The complement is a session log in the life store,
-and its first slice ships alongside phase 1: `scripts/memory.py` stores
-entries as N-Triples files under `chambers/_generated/memory/` (indexed like
-any chamber data) and recalls them by tag, time range, actor, or minimum
-relevance. An entry is a resource, not a bare fact — content, tags, actor,
-timestamp, optional relevance — and `recall`'s output is prompt-ready, so a
-dispatched agent that cannot query the store itself still gets the memories
-joined into its briefing. `RETINUE_MEMORY=0` disables the mechanism
-deployment-wide. Still open for a later pass: retention/compaction, and what
-junior may log versus what senior curates.
+`scripts/memory.py`, whose prompt-ready `recall` joins memories into a
+dispatched agent's briefing. Its design — the data model, expiry, compaction
+into topic summaries, and the tier-aware store guards (junior may store, but
+must reuse tags and reinforce rather than duplicate; the model stamp, not a
+gate, is the trust signal) — has its own document: `docs/memory.md`.
 
 ## Non-goals
 

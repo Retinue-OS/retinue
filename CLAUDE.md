@@ -131,9 +131,14 @@ in `chambers/_generated/memory/`, indexed by the life store:
 
 ```bash
 # Store: a decision, an outcome, a user preference, a system quirk.
+# A pending state or deadline gets --expires (date, dateTime, 10d/2w/3m);
+# a rule, preference, lesson or decision never does.
 python3 /workspace/scripts/memory.py store \
-  --actor ara --tag insurance --tag deadline --relevance 0.7 \
-  "IV filing for August submitted; response expected mid-September."
+  --actor ara --tag insurance --tag deadline --relevance 0.3 --expires 3w \
+  "IV filing submitted; response expected within three weeks."
+
+# Tags in use, with counts: pick an existing one before storing or recalling.
+python3 /workspace/scripts/memory.py tags --contains insur
 
 # Recall: by tag / time range / actor / minimum relevance.
 python3 /workspace/scripts/memory.py recall --tag insurance --since 2026-06-01
@@ -150,10 +155,25 @@ Rules: **reinforce, don't duplicate; challenge, don't edit.** Store memories
 as they arise and before ending a session that learned something. Recall at
 the start of non-trivial work and **when dispatching a subagent** — subagents
 start cold, so include the relevant memories in the dispatch prompt (`recall`
-output is prompt-ready). A standing instruction the user gives about one
-sender is tagged `sender:<address or handle>` (or `sender:<domain>`) so triage
-finds it — pass the raw value, `memory.py` slugs it. What does *not* belong:
-data that already enters the store through a chamber, and never secrets — the store is readable by every
+output is prompt-ready). Recall leaves out corrected/superseded, expired and
+compacted entries (`--include-superseded/-expired/-compacted` lift that) and
+lists summaries first; `--expand <id>` shows what a summary carries. Relevance
+is expected durability: 1.0 standing rule, 0.7 decision or lesson, 0.3
+incident or status. A subagent asked to store must be told its own `--actor`.
+A standing instruction the user gives about one sender is tagged
+`sender:<address or handle>` (or `sender:<domain>`) so triage finds it — pass
+the raw value, `memory.py` slugs it.
+
+`store` refuses in two cases — a refusal names the way out, never retry
+blindly. **Near-duplicate** of a live entry: reinforce it, or challenge it
+with `--supersedes/--corrects/--questions <id>`; Ara senior may override with
+`--duplicate-ok`, any other session escalates. **New tag** (once the store
+has 20; `sender:` tags exempt): reuse one of the closest tags it lists; only
+Ara senior may coin one with `--new-tag`. Design, compaction and the guards:
+`docs/memory.md`.
+
+What does *not* belong: data that already enters the store through a chamber,
+and never secrets — the store is readable by every
 agent. `RETINUE_MEMORY=0` disables the mechanism. **This store is the only
 memory**: Claude Code's built-in auto memory is disabled deployment-wide — do
 not create `MEMORY.md`-style files.
@@ -367,7 +387,8 @@ variable a session needs is named in `RETINUE_SESSION_ENV_EXTRA`
 | Before… | read |
 |---|---|
 | non-trivial SPARQL, new data design, a new endpoint | `docs/triple-stores.md` |
-| model tiers, escalation, memory design | `docs/model-routing.md` |
+| model tiers, escalation | `docs/model-routing.md` |
+| memory design, compaction, the store guards | `docs/memory.md` |
 | chamber mounting, plugins, INSTRUCTIONS.md contract | `docs/chambers.md` |
 | editing `.refresh.json`/`.schedule.json`/`.inbox.json`, project wake semantics | `docs/scheduling.md` |
 | unfamiliar messaging accounts, send policies, gateway config | `docs/messaging.md` |
