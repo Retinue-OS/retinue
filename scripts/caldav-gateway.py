@@ -251,7 +251,13 @@ def _health_snapshot() -> dict:
 # ── Event creation (generic CalDAV client — no provider-specific code) ────────
 
 def _parse_event_datetime(value: str, all_day: bool):
-    """Parse an ISO 8601 date/date-time string into date (all-day) or datetime."""
+    """Parse an ISO 8601 date/date-time string into date (all-day) or datetime.
+
+    A timed value must carry its UTC offset (or a trailing "Z"). A naive time
+    has no single meaning — this container runs in UTC while the user lives in
+    some other zone — and reading it as UTC silently put events hours off, so
+    it is rejected instead of interpreted.
+    """
     value = (value or "").strip()
     if not value:
         raise BadRequest("missing date/time value")
@@ -264,9 +270,13 @@ def _parse_event_datetime(value: str, all_day: bool):
     # datetime.fromisoformat only accepts "+00:00" for older Python versions.
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     try:
-        return datetime.datetime.fromisoformat(normalized)
+        parsed = datetime.datetime.fromisoformat(normalized)
     except ValueError as exc:
         raise BadRequest(f"invalid date-time {value!r}: {exc}") from exc
+    if parsed.tzinfo is None:
+        raise BadRequest(f"date-time {value!r} has no UTC offset; state the zone "
+                         f"explicitly, e.g. {value}+02:00 or {value}Z")
+    return parsed
 
 
 def _connect_principal():

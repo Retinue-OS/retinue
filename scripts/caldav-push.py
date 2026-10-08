@@ -6,16 +6,20 @@ the calendar analogue of signal-push.py. Agents use it to put something on the
 user's real calendar ("add this to my agenda") instead of the old workarounds
 (a downloaded .ics file, an external "add to calendar" link).
 
+A timed --start/--end must state its UTC offset (2026-09-03T14:00:00+02:00, or
+a trailing Z): a bare 14:00 is ambiguous, and the gateway refuses it rather
+than guess a zone.
+
 Examples:
     # A timed event
-    caldav-push.py "Dentist" --start 2026-09-03T14:00:00 --end 2026-09-03T14:30:00
+    caldav-push.py "Dentist" --start 2026-09-03T14:00:00+02:00 --end 2026-09-03T14:30:00+02:00
 
     # An all-day event with a description
     caldav-push.py "Conference" --start 2026-09-10 --end 2026-09-12 --all-day \\
         --description "Keynote at 9am, badge pickup Wednesday"
 
     # Target a non-default calendar
-    caldav-push.py "Team lunch" --start 2026-09-05T12:00:00 --end 2026-09-05T13:00:00 \\
+    caldav-push.py "Team lunch" --start 2026-09-05T12:00:00+02:00 --end 2026-09-05T13:00:00+02:00 \\
         --calendar-id reminders
 
 Configuration (environment):
@@ -23,6 +27,7 @@ Configuration (environment):
     CALDAV_GATEWAY_TOKEN       optional bearer token (must match the gateway)
 """
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -36,12 +41,27 @@ TOKEN = os.environ.get("CALDAV_GATEWAY_TOKEN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("CALDAV_GATEWAY_TIMEOUT", "30"))
 
 
+def _lacks_offset(value: str) -> bool:
+    """True for a parseable ISO date-time without a UTC offset.
+
+    Mirrors the gateway's own check so the mistake is caught before a request
+    is made; anything unparseable is left for the gateway to reject.
+    """
+    value = value.strip()
+    if value.endswith("Z"):
+        return False
+    try:
+        return datetime.datetime.fromisoformat(value).tzinfo is None
+    except ValueError:
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a calendar event via the caldav-gateway.")
     parser.add_argument("summary", nargs="?", default="", help="event title")
     parser.add_argument("--start",
-                        help="start date/time, ISO 8601 (e.g. 2026-09-03T14:00:00, or "
-                             "2026-09-03 with --all-day)")
+                        help="start date/time, ISO 8601 with UTC offset (e.g. "
+                             "2026-09-03T14:00:00+02:00, or 2026-09-03 with --all-day)")
     parser.add_argument("--end", help="end date/time, ISO 8601 (same format as --start)")
     parser.add_argument("--all-day", action="store_true",
                         help="create an all-day event (--start/--end are plain dates)")
@@ -64,6 +84,11 @@ def main() -> int:
                                        args.timeout, noun="event")
     if not args.summary or not args.start or not args.end:
         parser.error("an event needs a summary, --start and --end")
+    if not args.all_day:
+        for flag, value in (("--start", args.start), ("--end", args.end)):
+            if _lacks_offset(value):
+                parser.error(f"{flag} {value} has no UTC offset; state the zone "
+                             f"explicitly, e.g. {value}+02:00 or {value}Z")
 
     payload: dict = {
         "summary": args.summary,

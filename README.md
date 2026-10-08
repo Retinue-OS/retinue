@@ -642,13 +642,17 @@ An account matching no entry and no `"*"` wildcard falls back to `verify`
 written to autonomously.
 
 ```bash
-scripts/caldav-push.py "Dentist" --start 2026-09-03T14:00:00 --end 2026-09-03T14:30:00
+scripts/caldav-push.py "Dentist" --start 2026-09-03T14:00:00+02:00 --end 2026-09-03T14:30:00+02:00
 # → caldav-push: event queued for approval (id=…)
 #   caldav-push: approve or deny at https://agents.example.com/sends/caldav-gateway/…
 
 scripts/caldav-push.py "Conference" --start 2026-09-10 --end 2026-09-12 --all-day \
     --description "Keynote at 9am"
 ```
+
+A timed `--start`/`--end` must carry its UTC offset (`+02:00`, or a trailing
+`Z`); a naive time is ambiguous and the gateway answers it with a 400 instead
+of guessing a zone. All-day events take plain dates.
 
 The approval card describes the **event**, not a message: its title, when it
 runs (a same-day event as `Thu 03 Sep 2026, 14:00 – 14:30`, an all-day one as a
