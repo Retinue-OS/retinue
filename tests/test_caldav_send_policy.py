@@ -241,8 +241,16 @@ def test_event_datetime_validation():
     with tempfile.TemporaryDirectory() as tmp:
         cg = _load_caldav_gateway([], tmp)
         # Timed events.
-        dt = cg._parse_event_datetime("2026-09-03T14:00:00", False)
+        dt = cg._parse_event_datetime("2026-09-03T14:00:00+02:00", False)
         assert dt.year == 2026 and dt.month == 9 and dt.day == 3 and dt.hour == 14
+        assert dt.utcoffset().total_seconds() == 2 * 3600
+        # A timed value without an offset is ambiguous and rejected.
+        try:
+            cg._parse_event_datetime("2026-09-03T14:00:00", False)
+        except ValueError as exc:
+            assert "no UTC offset" in str(exc)
+        else:
+            raise AssertionError("expected ValueError for a naive date-time")
         # A trailing "Z" (UTC) is accepted.
         dt_z = cg._parse_event_datetime("2026-09-03T14:00:00Z", False)
         assert dt_z.tzinfo is not None

@@ -261,10 +261,15 @@ def test_offsets_are_read_in_the_configured_display_zone():
             local = wg._format_event_when("2026-09-18T16:00:00+02:00",
                                           "2026-09-18T16:45:00+02:00", False)
             assert in_utc != local
-            assert "18:00" in in_utc and "CEST" in in_utc
-            assert "16:00" in local and "CEST" in local
-            # Same day on both ends: the date is not repeated after the dash.
-            assert local == "Fri 18 Sep 2026, 16:00 CEST – 16:45 CEST"
+            assert "18:00" in in_utc and "Europe/Zurich" in in_utc
+            assert "16:00" in local and "Europe/Zurich" in local
+            # Same day on both ends: neither the date nor the zone is repeated
+            # after the dash, and the zone is named, not abbreviated.
+            assert local == "Fri 18 Sep 2026, 16:00 – 16:45 Europe/Zurich"
+            # Winter time reads the same way; CET vs CEST is the system's job.
+            winter = wg._format_event_when("2026-12-03T10:00:00+01:00",
+                                           "2026-12-03T11:00:00+01:00", False)
+            assert winter == "Thu 03 Dec 2026, 10:00 – 11:00 Europe/Zurich"
             # A naive time has no offset to convert from and names no zone.
             naive = wg._format_event_when("2026-09-18T16:00:00",
                                           "2026-09-18T16:45:00", False)
