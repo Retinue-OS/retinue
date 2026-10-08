@@ -612,10 +612,10 @@ RETINUE_DISPLAY_TZ=Europe/Zurich   # optional; falls back to TZ, then UTC
 ```
 
 This is presentation only: it changes how a stored time is *shown*, never what
-is written. An event that carries a UTC offset is converted into this zone and
-labelled with it ("Fri 18 Sep 2026, 18:00 CEST"); a time written without an
-offset is taken as already local and labelled with none. An unknown zone name
-falls back to UTC rather than failing the page.
+is written. An event's times are converted into this zone and labelled with
+its name ("Fri 18 Sep 2026, 18:00 Europe/Zurich"); every stored timed event
+carries a UTC offset, since the gateway refuses one without (see below). An
+unknown zone name falls back to UTC rather than failing the page.
 
 Like the messenger gateways, `CALDAV_ACCOUNT` is a property of the *gateway
 instance*, not of any request — one service writes to one calendar. A
