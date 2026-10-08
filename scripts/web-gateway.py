@@ -3608,8 +3608,21 @@ def _format_iso_moment(value: str, *, all_day: bool) -> str:
     rendered = moment.strftime("%a %d %b %Y, %H:%M")
     # The zone name is what tells a mis-zoned event from a correct one at a
     # glance; a naive value has none to name.
-    zone = moment.strftime("%Z") if moment.tzinfo is not None else ""
+    zone = _zone_label(moment) if moment.tzinfo is not None else ""
     return f"{rendered} {zone}" if zone else rendered
+
+
+def _zone_label(moment) -> str:
+    """The zone an aware moment is shown in, by its IANA name where it has one.
+
+    "Europe/Zurich" rather than "CEST": the abbreviation flips with daylight
+    saving time, so a reader checking an autumn date would have to know
+    whether it still falls in summer time. The name leaves that to the system.
+    """
+    key = getattr(moment.tzinfo, "key", None)
+    if key:
+        return key
+    return "UTC" if moment.utcoffset() == timedelta(0) else moment.strftime("%Z")
 
 
 def _all_day_last_day(end: str) -> str:
@@ -3662,6 +3675,10 @@ def _format_event_when(start: str, end: str, all_day: bool) -> str:
     # not the raw strings: converting to the display zone can move either end
     # across midnight.
     if ", " in first and ", " in last and first.split(", ", 1)[0] == last.split(", ", 1)[0]:
+        # A zone shared by both ends is named once, after the span.
+        head, _, zone = first.rpartition(" ")
+        if ":" not in zone and last.endswith(" " + zone):
+            first = head
         return f"{first} \u2013 {last.split(', ', 1)[1]}"
     return f"{first} \u2013 {last}"
 

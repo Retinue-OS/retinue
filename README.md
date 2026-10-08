@@ -642,7 +642,8 @@ An account matching no entry and no `"*"` wildcard falls back to `verify`
 written to autonomously.
 
 ```bash
-scripts/caldav-push.py "Dentist" --start 2026-09-03T14:00:00+02:00 --end 2026-09-03T14:30:00+02:00
+scripts/caldav-push.py "Dentist" --start 2026-09-03T14:00:00 --end 2026-09-03T14:30:00 \
+    --tz Europe/Zurich
 # → caldav-push: event queued for approval (id=…)
 #   caldav-push: approve or deny at https://agents.example.com/sends/caldav-gateway/…
 
@@ -650,9 +651,13 @@ scripts/caldav-push.py "Conference" --start 2026-09-10 --end 2026-09-12 --all-da
     --description "Keynote at 9am"
 ```
 
-A timed `--start`/`--end` must carry its UTC offset (`+02:00`, or a trailing
-`Z`); a naive time is ambiguous and the gateway answers it with a 400 instead
-of guessing a zone. All-day events take plain dates.
+A timed event must state its zone; a naive time is ambiguous and the gateway
+answers it with a 400 instead of guessing one. Name the zone with `--tz`
+(an IANA name — the client then resolves summer or winter time for the
+event's date), or give an explicit offset (`+02:00`, or a trailing `Z`). All-day
+events take plain dates. The approval card shows times in `RETINUE_DISPLAY_TZ`,
+labeled by the zone's name (`16:00 – 16:45 Europe/Zurich`) rather than its
+season-dependent abbreviation.
 
 The approval card describes the **event**, not a message: its title, when it
 runs (a same-day event as `Thu 03 Sep 2026, 14:00 – 14:30`, an all-day one as a

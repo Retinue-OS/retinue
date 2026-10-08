@@ -6,13 +6,16 @@ the calendar analogue of signal-push.py. Agents use it to put something on the
 user's real calendar ("add this to my agenda") instead of the old workarounds
 (a downloaded .ics file, an external "add to calendar" link).
 
-A timed --start/--end must state its UTC offset (2026-09-03T14:00:00+02:00, or
-a trailing Z): a bare 14:00 is ambiguous, and the gateway refuses it rather
-than guess a zone.
+A timed event must state its zone: a bare 14:00 is ambiguous, and the gateway
+refuses it rather than guess. Prefer naming the zone with --tz (an IANA name
+such as Europe/Zurich) — the offset for that date, summer or winter time, is
+then worked out here instead of by whoever types the command. An explicit
+offset (2026-09-03T14:00:00+02:00, or a trailing Z) works too.
 
 Examples:
     # A timed event
-    caldav-push.py "Dentist" --start 2026-09-03T14:00:00+02:00 --end 2026-09-03T14:30:00+02:00
+    caldav-push.py "Dentist" --start 2026-09-03T14:00:00 --end 2026-09-03T14:30:00 \\
+        --tz Europe/Zurich
 
     # An all-day event with a description
     caldav-push.py "Conference" --start 2026-09-10 --end 2026-09-12 --all-day \\
@@ -33,6 +36,7 @@ import os
 import sys
 import urllib.error
 import urllib.request
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pending_retract
 
@@ -41,28 +45,40 @@ TOKEN = os.environ.get("CALDAV_GATEWAY_TOKEN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("CALDAV_GATEWAY_TIMEOUT", "30"))
 
 
-def _lacks_offset(value: str) -> bool:
-    """True for a parseable ISO date-time without a UTC offset.
+def _with_offset(value: str, zone) -> str:
+    """The date-time `value` as ISO 8601 with its UTC offset.
 
-    Mirrors the gateway's own check so the mistake is caught before a request
-    is made; anything unparseable is left for the gateway to reject.
+    A naive value is read as wall-clock time in `zone` (None: no zone given),
+    and a value carrying its own offset must agree with `zone` at that moment.
+    Raises ValueError with the message the user sees; an unparseable value is
+    passed through for the gateway to reject.
     """
     value = value.strip()
-    if value.endswith("Z"):
-        return False
     try:
-        return datetime.datetime.fromisoformat(value).tzinfo is None
+        parsed = datetime.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
     except ValueError:
-        return False
+        return value
+    if parsed.tzinfo is None:
+        if zone is None:
+            raise ValueError(f"{value} names no zone; add --tz (e.g. --tz Europe/Zurich) "
+                             f"or an explicit offset")
+        return parsed.replace(tzinfo=zone).isoformat()
+    if zone is not None and parsed.utcoffset() != parsed.astimezone(zone).utcoffset():
+        raise ValueError(f"{value} contradicts --tz {zone.key}, whose offset on that "
+                         f"date is {parsed.astimezone(zone).strftime('%z')}")
+    return value
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create a calendar event via the caldav-gateway.")
     parser.add_argument("summary", nargs="?", default="", help="event title")
     parser.add_argument("--start",
-                        help="start date/time, ISO 8601 with UTC offset (e.g. "
-                             "2026-09-03T14:00:00+02:00, or 2026-09-03 with --all-day)")
+                        help="start date/time, ISO 8601 (e.g. 2026-09-03T14:00:00 with "
+                             "--tz, 2026-09-03T14:00:00+02:00, or 2026-09-03 with --all-day)")
     parser.add_argument("--end", help="end date/time, ISO 8601 (same format as --start)")
+    parser.add_argument("--tz", metavar="ZONE",
+                        help="IANA zone of a timed event (e.g. Europe/Zurich); summer/winter "
+                             "time is resolved for the event's date")
     parser.add_argument("--all-day", action="store_true",
                         help="create an all-day event (--start/--end are plain dates)")
     parser.add_argument("--description", default="", help="event description/notes")
@@ -85,10 +101,17 @@ def main() -> int:
     if not args.summary or not args.start or not args.end:
         parser.error("an event needs a summary, --start and --end")
     if not args.all_day:
-        for flag, value in (("--start", args.start), ("--end", args.end)):
-            if _lacks_offset(value):
-                parser.error(f"{flag} {value} has no UTC offset; state the zone "
-                             f"explicitly, e.g. {value}+02:00 or {value}Z")
+        zone = None
+        if args.tz:
+            try:
+                zone = ZoneInfo(args.tz)
+            except (ZoneInfoNotFoundError, ValueError):
+                parser.error(f"--tz {args.tz} is not a known IANA zone (e.g. Europe/Zurich)")
+        try:
+            args.start = _with_offset(args.start, zone)
+            args.end = _with_offset(args.end, zone)
+        except ValueError as exc:
+            parser.error(str(exc))
 
     payload: dict = {
         "summary": args.summary,

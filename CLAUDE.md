@@ -260,8 +260,9 @@ The calendar is a gateway like a messenger, not a tool: credentials stay in
   for a compact rendering). Reads need no approval — check the agenda before
   offering a slot, and before adding something that may be in it twice.
 - **Write with `scripts/caldav-push.py`** (`--start/--end`, `--all-day`,
-  `--description`). A timed `--start/--end` must state its UTC offset
-  (`…T11:00:00+02:00`; mind summer/winter time) — a naive time is refused. Writes are gated by the same `allow`/`trust`/`verify` send
+  `--description`). A timed event must name its zone — pass `--tz <IANA
+  zone>` (e.g. `--tz Europe/Zurich`) with plain local times and let the script
+  resolve summer/winter time; a time with no zone is refused. Writes are gated by the same `allow`/`trust`/`verify` send
   policy as messages: a queued event is **not** in the calendar yet, so relay the
   approval URL the script prints as a labeled link; `--retract <id>` takes a
   queued event back before approval. Updating and deleting events are not
