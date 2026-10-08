@@ -177,6 +177,37 @@ def test_signal_cli_json_nonzero_raises():
     print("ok: signal_cli_json surfaces non-zero exit")
 
 
+def test_signal_cli_json_parses_roster_listing():
+    # Real signal-cli output, not a monkeypatched _signal_cli_json: the roster
+    # entries carry no envelope, and the receive-event parser used to drop them.
+    with tempfile.TemporaryDirectory() as tmp:
+        sg = _load_signal_gateway(tmp)
+
+        class _Proc:
+            returncode = 0
+            stderr = ""
+
+        array = _Proc()
+        array.stdout = '[{"id": "g-1", "name": "Family"}, {"id": "g-2", "name": "Work"}]\n'
+        sg._run = lambda *a, **k: array
+        assert sg._list_groups() == [
+            {"id": "g-1", "name": "Family"},
+            {"id": "g-2", "name": "Work"},
+        ], sg._list_groups()
+
+        lines = _Proc()
+        lines.stdout = '{"number": "+15550001111", "name": "Jane"}\n{"number": "+15550002222"}\n'
+        sg._run = lambda *a, **k: lines
+        numbers = [c["number"] for c in sg._list_contacts()]
+        assert numbers == ["+15550001111", "+15550002222"], numbers
+
+        empty = _Proc()
+        empty.stdout = ""
+        sg._run = lambda *a, **k: empty
+        assert sg._list_groups() == []
+    print("ok: signal_cli_json parses roster listings (array and per-line)")
+
+
 def _envelope(**fields):
     return {"envelope": fields}
 
@@ -244,6 +275,7 @@ def main():
     test_group_name_failed_refresh_is_throttled()
     test_chat_event_carries_group_name()
     test_signal_cli_json_nonzero_raises()
+    test_signal_cli_json_parses_roster_listing()
     test_recent_senders_recorded_most_recent_first()
     test_recent_sender_dedups_and_moves_to_front()
     test_recent_chats_cap_enforced()

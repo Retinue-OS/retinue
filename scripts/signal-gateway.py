@@ -1218,7 +1218,26 @@ def _signal_cli_json(args: list[str]) -> list[dict]:
             proc.stderr.strip()
             or f"signal-cli {' '.join(args)} failed (exit code {proc.returncode})"
         )
-    payload = _parse_json_payload(proc.stdout)
+    # Plain JSON, not _parse_json_payload: that is the receive-event parser and
+    # drops every object without an envelope — i.e. every contact and group.
+    text = proc.stdout.strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        # Some signal-cli versions print one object per line instead of an array.
+        payload = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    if isinstance(payload, dict):
+        payload = [payload]
     return payload if isinstance(payload, list) else []
 
 
