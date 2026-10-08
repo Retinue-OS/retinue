@@ -195,6 +195,38 @@ def test_email_decisions_are_noted(wg):
     assert "Re: Keys" in notes[1] and "denied" in notes[1], notes
 
 
+def test_email_approval_failure_is_noted(wg):
+    cid = wg._new_conv("user", "me", "Mail", "user", "reply to the bank")["id"]
+    wg._conv_set_flags(cid, unread=False)
+    pending = {"request_id": "44", "to": "bank@example.com",
+               "subject": "Re: Card", "thread": cid}
+    handler = _FakeSendHandler()
+    with patch.object(wg.ec, "approve_pending_send",
+                      side_effect=wg.ec.EmailError("SMTP refused")), \
+            patch.object(wg.ec, "get_pending_send", return_value=pending):
+        with redirect_stdout(io.StringIO()):
+            wg.Handler._handle_send_action(handler, "default", "44", "approve")
+    assert handler.html and handler.html[0] == 400, handler.html
+    notes = [m["text"] for m in _agent_notes(wg, cid)]
+    assert len(notes) == 1 and "Re: Card" in notes[0] and "SMTP refused" in notes[0], notes
+    assert wg._load_conv(cid)["unread"] is True
+
+
+def test_unconfirmed_link_is_absolute(wg):
+    cid = wg._new_conv("user", "me", "Reply", "user", "x")["id"]
+    entry = {"id": "e" * 32, "thread": cid, "recipient": "+1555"}
+    with redirect_stdout(io.StringIO()):
+        with patch.object(wg, "CONVERSATION_BASE_URL", ""):
+            wg._report_send_decision("signal-gateway", "e" * 32, entry, "Signal",
+                                     "unconfirmed")
+        with patch.object(wg, "CONVERSATION_BASE_URL", "https://ara.example.com"):
+            wg._report_send_decision("signal-gateway", "e" * 32, entry, "Signal",
+                                     "unconfirmed")
+    bare, linked = [m["text"] for m in _agent_notes(wg, cid)]
+    assert "](/" not in bare and "Sends" in bare, bare
+    assert f"(https://ara.example.com/sends/signal-gateway/{'e' * 32})" in linked, linked
+
+
 def test_email_header_round_trip():
     spec = importlib.util.spec_from_file_location(
         "email_client_thread_test", SCRIPTS_DIR / "email_client.py")
@@ -229,6 +261,8 @@ def main():
         test_channel_approve_failure_wakes_thread(wg, gw)
         test_no_thread_no_note(wg, gw)
         test_email_decisions_are_noted(wg)
+        test_email_approval_failure_is_noted(wg)
+        test_unconfirmed_link_is_absolute(wg)
     print("all send-decision thread tests passed")
 
 

@@ -6727,10 +6727,13 @@ def _report_send_decision(channel: str, request_id: str, entry: dict,
                 + ("writing it" if noun == "event" else "sending it")
                 + f" failed: {error or 'unknown error'}")
     elif outcome == "unconfirmed":
+        # The dashboard renderer links only absolute URLs.
+        page = (f"[its approval page]({CONVERSATION_BASE_URL}/sends/{channel}/"
+                f"{request_id})" if CONVERSATION_BASE_URL
+                else "its approval page under Sends")
         text = (f"⏳ You allowed {subject}; it is still being "
                 + ("written" if noun == "event" else "sent")
-                + f" — [its approval page](/sends/{channel}/{request_id}) "
-                "shows the outcome.")
+                + f" — {page} shows the outcome.")
     else:
         text = f"🚫 You denied {subject} — nothing was " + (
             "written." if noun == "event" else "sent.")
@@ -6745,6 +6748,20 @@ def _report_send_decision(channel: str, request_id: str, entry: dict,
                       wake=noticed, context=context)
     print(f"[web-gateway] send decision {channel}/{request_id} ({outcome}) "
           f"reported into thread {cid}", flush=True)
+
+
+def _report_failed_email_approval(account: str, request_id: str,
+                                  error: str) -> None:
+    """Note a failed e-mail approval in the thread that queued it. Not
+    claimed: the draft stays pending, so a retried approval reports again."""
+    try:
+        entry = ec.get_pending_send(_ec_config(account), request_id)
+        if entry and send_origin.valid_thread(entry.get("thread")):
+            _report_send_decision(account, request_id, entry, "e-mail",
+                                  "failed", error=error)
+    except Exception as exc:  # noqa: BLE001 - the failure page is answered regardless
+        print(f"[web-gateway] reporting failed approval {account}/"
+              f"{request_id} failed: {exc!r}", flush=True)
 
 
 def _await_channel_send_outcome(channel: str, gw: dict, request_id: str,
@@ -8899,6 +8916,8 @@ class Handler(BaseHTTPRequestHandler):
                     decided = None
                 ec.delete_pending_draft(cfg, request_id)
         except ec.EmailError as exc:
+            if verb == "approve":
+                _report_failed_email_approval(account, request_id, str(exc))
             self._send_html(400, _HTML_HEAD + "<body><h1>Send action failed</h1><p>"
                             + html.escape(str(exc)) + '</p><p><a href="/sends">Back</a></p>'
                             + "</body></html>")
@@ -11147,6 +11166,8 @@ class Handler(BaseHTTPRequestHandler):
             cfg = _ec_config(account)
             detail = ec.get_pending_send(cfg, request_id)
         except ec.EmailError as exc:
+            if verb == "approve":
+                _report_failed_email_approval(account, request_id, str(exc))
             self._send_html(400, _HTML_HEAD + "<body><h1>Cannot load request</h1><p>"
                             + html.escape(str(exc)) + '</p><p><a href="/sends">Back</a></p>'
                             + "</body></html>")
