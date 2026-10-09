@@ -258,9 +258,10 @@ The **`memory-compact`** base job (`scripts/memory-compact.py`) folds memory
 entries older than two weeks into topic summaries, weekly. Same pattern again:
 a scheduler `command` job whose gate is a free SPARQL `SELECT` — memory.py's
 own recall query — and **no qualifying topic spawns nothing**. Otherwise it
-writes a payload file and starts one `claude -p` on the **frontier tier**,
-since judging what of a topic still holds is Ara senior's work and
-`memory.py compact` refuses anything lower. It is the one base job that uses
+starts one tool-less `claude -p` on the **frontier tier**, since judging
+what of a topic still holds is Ara senior's work and `memory.py compact`
+refuses anything lower; the session only answers with a plan, which the job
+holds to the payload and hands to `compact` itself. It is the one base job that uses
 both opt-in waits: `timeout_seconds` of an hour for a session over ten
 summaries, and `resume_after_seconds` of an hour after a run its per-run cap
 cut short (exit 75), so a backlog drains the same day rather than a week per

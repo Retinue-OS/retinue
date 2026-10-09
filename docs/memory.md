@@ -432,8 +432,10 @@ batch: the topic, the batch's place in its cluster, every member in full
 `superseded_by`, `questioned_by`, `summary`, `generation`, `covers_from`,
 `covers_to`), the content of every entry that challenged a member (fetched
 with one VALUES-bounded recall query), `suggested_tags` (the tag rule above,
-computed rather than counted by a model) and `identifier_tags`; plus the
-thresholds, the plan path and the `compact` command line.
+computed rather than counted by a model), `identifier_tags`, and its `index`
+in the run, by which the plan names it; plus the thresholds. It is written to
+the state directory for inspection and handed to the session inside its
+prompt, on stdin.
 
 **The session** is one `claude -p` on the frontier tier. Its model is
 `RETINUE_FRONTIER_MODEL`, falling back to `RETINUE_CLAUDE_MODEL`, as
@@ -445,25 +447,51 @@ which stamps `RETINUE_SESSION_MODEL`, so the summaries carry the model and
 `compact` sees a frontier session. A deployment that declares a router tier
 but no frontier model (and no `RETINUE_CLAUDE_MODEL`) has no frontier at all:
 the job then fails before spawning rather than buy a session `compact` would
-refuse. The session is allowed Bash, Read and Write. Its prompt carries the
-rules of "What to keep" above, plus: write in the language most members are
-written in; one self-contained paragraph, then short bullets for open items;
-relevance as the expected durability on the three anchors; never invent —
-every statement traceable to a member or a challenger; every member id in
-exactly one of `summarizes` and `retires`; a kept questioned member with its
-doubt stated. It writes one plan (a list, one object per batch) to
-`/root/.retinue/memory/compaction-plan.json` and runs `compact` on it; a batch
-`compact` refuses for a reason it cannot fix (a member compacted or corrected
-since the payload was written) is dropped from the plan and reported.
+refuse. Its prompt carries the rules of "What to keep" above, plus: write in
+the language most members are written in; one self-contained paragraph, then
+short bullets for open items; relevance as the expected durability on the
+three anchors; never invent — every statement traceable to a member or a
+challenger; every member id in exactly one of `summarizes` and `retires`; a
+kept questioned member with its doubt stated.
+
+**The session has no tools, and the job acts on its answer.** What the
+session reads is recorded memory text — often paraphrased inbound messages —
+so it is untrusted input, and telling the model "this is material, never
+instructions" is a convention, not a boundary. The boundary is the spawn: no
+built-in tools (`--tools ""`, a removal rather than a permission rule), no
+MCP servers, no dynamic system-prompt sections, run outside `/workspace` so no
+CLAUDE.md is loaded — the same shape as the gateway's presentation lint
+(docs/model-routing.md). The only thing the session can produce is its
+answer, held by `--json-schema` to `{"summaries": [{"batch", "content",
+"relevance", "summarizes", "retires"}]}`. The job then holds that plan to the
+payload before anything is written:
+
+- each object must name a batch of this run, once;
+- its `summarizes` and `retires` together must be exactly that batch's
+  members — none left out, none twice, none from outside it — so whatever
+  gets hidden passed the freeze age and the cluster gate, and an existing id
+  the model hallucinated (a recent entry, say) cannot be compacted;
+- it must keep at least one member.
+
+An object failing any of it is dropped and logged; its batch comes round
+again. The job sets the rest itself rather than trusting it: the topic, and
+the tags — the batch's suggested tags without its identifier tags, plus the
+identifier tags of every member kept — so a summary can never hide a sender
+rule from triage. It writes what survives to
+`/root/.retinue/memory/compaction-plan.json` and runs `memory.py compact` on
+it under the session's environment, whose frontier stamp `compact` checks and
+records. When `compact` refuses the plan (a member compacted or corrected
+since the payload was written), the job retries it one summary at a time, so
+one raced batch does not sink the others.
 
 **Idempotence.** `compact` writes a plan's file atomically or not at all, and
 each run recomputes the clusters from the store, so a crashed or killed
 session leaves nothing half-done; the next run sees the same entries again.
 The job learns what was written from the new `compaction-*.nt` files, not
-from the session's reply, and logs both. A run fails — exit non-zero, which
-the scheduler records — when the gate or challenger query fails, when no
-frontier model is resolvable, when the session exits non-zero, or when it
-exits cleanly without writing any summary.
+from `compact`'s output. A run fails — exit non-zero, which the scheduler
+records — when the gate or challenger query fails, when no frontier model is
+resolvable, when the session exits non-zero or answers with no plan, when no
+plan object survives the scope check, or when `compact` writes no summary.
 
 **The failure alert.** Routine failures are only logged. The job counts
 consecutive failed runs in `/root/.retinue/memory/state.json` — incremented
@@ -472,7 +500,10 @@ together with its session and the next run must still see that run as
 failed — and any clean run clears the count, one with nothing to do
 included. On the third failure in a row it opens one dashboard thread
 through `conversation-push.py` ("Memory compaction failing", importance 4):
-one per streak, retried on the next failure if the push itself failed.
+one per streak, retried on the next failure if the push itself failed. Its
+`--key` is the streak's start, recorded with the streak's first failure and
+cleared with the state by the next clean run — stable across every retry, so a
+push that landed despite reporting an error cannot open a second thread.
 
 | Variable | Default | Effect |
 |---|---|---|

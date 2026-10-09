@@ -3,12 +3,13 @@
 
 No store, no network, no Claude: the job's only store access is
 `memory._query`, which every case replaces with a fake answering from canned
-SPARQL JSON bindings; the session spawn (`run_session`) and the alert push
-are replaced by recorders. What is pinned here is the job's own judgement —
-which entries the gate asks for, how they are clustered and batched, what the
-session is handed, which model it runs on, and when a failing streak reaches
-the user — because a mistake in any of them either compacts the wrong
-entries or silently never compacts at all.
+SPARQL JSON bindings; the session spawn (`run_session`), the `compact`
+call (`run_compact`) and the alert push are replaced by recorders. What is
+pinned here is the job's own judgement — which entries the gate asks for, how
+they are clustered and batched, what the session is handed and what it is
+allowed to do, how its plan is held to the payload, which model it runs on,
+and when a failing streak reaches the user — because a mistake in any of them
+either compacts the wrong entries or silently never compacts at all.
 
     python3 tests/test_memory_compact.py
 """
@@ -130,9 +131,10 @@ def member(entry_id, t, tags):
 
 
 @contextlib.contextmanager
-def harness(mod, store, env=None, spawn=None):
+def harness(mod, store, env=None, spawn=None, compact=None):
     """Fake store, temp state and memory directories, a clean tier
-    environment, a recording spawn and a recording alert push."""
+    environment, a recording spawn, a recording `compact` (default: writes
+    one summary per plan item) and a recording alert push."""
     tmp = Path(tempfile.mkdtemp(prefix="memory-compact-test-"))
     saved = {k: os.environ.get(k) for k in ENV_VARS}
     for k in ENV_VARS:
@@ -140,16 +142,25 @@ def harness(mod, store, env=None, spawn=None):
     os.environ.update(env or {})
     mem = mod.memory
     old = (mem._query, mem._now, mem.MEMORY_DIR, mod.STATE_DIR,
-           mod.run_session, mod.push_alert)
-    rec = {"spawns": [], "alerts": [], "tmp": tmp}
+           mod.run_session, mod.run_compact, mod.push_alert)
+    rec = {"spawns": [], "compacts": [], "alerts": [], "alert_keys": [],
+           "push_ok": True, "tmp": tmp}
 
-    def fake_spawn(cmd, session_env):
-        rec["spawns"].append({"cmd": cmd, "env": session_env})
-        return spawn(rec, cmd, session_env) if spawn else (1, "boom")
+    def fake_spawn(cmd, session_env, prompt):
+        rec["spawns"].append({"cmd": cmd, "env": session_env, "prompt": prompt})
+        return spawn(rec, cmd, session_env, prompt) if spawn else (1, "boom")
 
-    def fake_push(n, reason):
+    def fake_compact(items, session_env):
+        rec["compacts"].append({"items": items, "env": session_env})
+        if compact:
+            return compact(rec, items)
+        write_summary(rec, *[f"S{len(rec['compacts'])}-{n}" for n in range(len(items))])
+        return 0, ""
+
+    def fake_push(n, reason, key):
         rec["alerts"].append((n, reason))
-        return True
+        rec["alert_keys"].append(key)
+        return rec["push_ok"]
 
     mem._query = store.query
     mem._now = lambda: NOW
@@ -157,12 +168,13 @@ def harness(mod, store, env=None, spawn=None):
     mem.MEMORY_DIR.mkdir()
     mod.STATE_DIR = tmp / "state"
     mod.run_session = fake_spawn
+    mod.run_compact = fake_compact
     mod.push_alert = fake_push
     try:
         yield rec
     finally:
         (mem._query, mem._now, mem.MEMORY_DIR, mod.STATE_DIR,
-         mod.run_session, mod.push_alert) = old
+         mod.run_session, mod.run_compact, mod.push_alert) = old
         for k, v in saved.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -179,10 +191,31 @@ def run_main(mod, argv=()):
 
 
 def write_summary(rec, *ids):
-    """What a successful session leaves behind: one compaction file."""
+    """What a successful `compact` leaves behind: one compaction file."""
     lines = [f"<{PFX}{i}> <{RDF_TYPE}> <{KB}MemorySummary> ." for i in ids]
     path = rec["tmp"] / "memory" / f"compaction-test-{len(list((rec['tmp'] / 'memory').iterdir()))}.nt"
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def payload_of(prompt):
+    """The payload the session was handed, out of its prompt."""
+    return json.loads(prompt.split("<payload>\n", 1)[1].rsplit("\n</payload>", 1)[0])
+
+
+def plan_for(prompt, keep_all=True):
+    """A well-formed answer: one object per batch, every member named once."""
+    out = []
+    for b in payload_of(prompt)["batches"]:
+        ids = [m["id"] for m in b["members"]]
+        out.append({"batch": b["index"], "content": f"Summary of {b['topic']}.",
+                    "relevance": 0.7, "summarizes": ids if keep_all else ids[:1],
+                    "retires": [] if keep_all else ids[1:]})
+    return json.dumps({"summaries": out})
+
+
+def answers(rec, cmd, env, prompt):
+    """A session that answers with a well-formed plan."""
+    return 0, plan_for(prompt)
 
 
 def cluster_rows(tag, n, start=20, prefix=None):
@@ -381,19 +414,18 @@ def test_payload(mod):
     print("payload: what the session is handed")
     st = eligible_store()
     with harness(mod, st, {"RETINUE_FRONTIER_MODEL": "claude-opus-5"},
-                 spawn=lambda rec, cmd, env: (write_summary(rec, "S1"), (0, "ok"))[1]) as rec:
+                 spawn=answers) as rec:
         rc, _, err = run_main(mod)
         payload = json.loads((rec["tmp"] / "state" / "compaction-payload.json")
                              .read_text(encoding="utf-8"))
         state = json.loads((rec["tmp"] / "state" / "state.json").read_text("utf-8")) \
             if (rec["tmp"] / "state" / "state.json").exists() else None
     check("clean run exits 0", rc, 0)
-    check("logs the summary ids written", "wrote 1 of 1 summar(y/ies): S1" in err, True)
-    check("logs the session's reply", "session: ok" in err, True)
+    check("logs the summary ids written", "wrote 1 of 1 summar(y/ies): S1-0" in err, True)
     check("a clean run leaves the failure state empty", state, {})
     check("one batch", len(payload["batches"]), 1)
     b = payload["batches"][0]
-    check("topic", b["topic"], "insurance")
+    check("topic and index", (b["topic"], b["index"]), ("insurance", 1))
     check("all six members, oldest first",
           [m["id"] for m in b["members"]][:4],
           ["20260801T090000Z-aaaaaa", "20260802T090000Z-bbbbbb",
@@ -427,26 +459,39 @@ def test_payload(mod):
     check("thresholds", payload["thresholds"], {
         "freeze_days": 14, "frozen_before": "2026-09-23T12:00:00Z",
         "min_cluster": 5, "batch_size": 40, "max_batches": 10})
-    check("plan path in the state dir",
-          payload["plan_path"].endswith("compaction-plan.json"), True)
-    check("compact command names the plan",
-          payload["compact_command"],
-          f"python3 /workspace/scripts/memory.py compact --plan {payload['plan_path']}")
+    check("no plan path or command handed over: the session runs nothing",
+          ("plan_path" in payload, "compact_command" in payload), (False, False))
     check("challengers fetched with one bounded query",
           sum("VALUES ?m" in q for q in st.queries), 1)
 
     cmd = rec["spawns"][0]["cmd"]
     check("claude -p with JSON output", cmd[:3], ["claude", "-p", "--output-format=json"])
-    check("tools named", cmd[cmd.index("--allowed-tools") + 1], "Bash,Read,Write")
-    check("prompt after --", cmd[-2], "--")
-    prompt = cmd[-1]
-    check("prompt names payload and plan",
-          "compaction-payload.json" in prompt and "compaction-plan.json" in prompt, True)
+    check("no built-in tools at all", cmd[cmd.index("--tools") + 1], "")
+    check("no tool granted anywhere",
+          any(t in " ".join(cmd) for t in ("Bash", "Read", "Write", "--allowed-tools",
+                                          "--permission-mode")), False)
+    check("no MCP servers", ("--strict-mcp-config" in cmd,
+                             cmd[cmd.index("--mcp-config") + 1]),
+          (True, '{"mcpServers":{}}'))
+    schema = json.loads(cmd[cmd.index("--json-schema") + 1])
+    check("answer held to the plan schema, which carries no tags",
+          sorted(schema["properties"]["summaries"]["items"]["properties"]),
+          ["batch", "content", "relevance", "retires", "summarizes"])
+    check("prompt on stdin, not on the command line", "--" in cmd, False)
+    prompt = rec["spawns"][0]["prompt"]
+    check("prompt carries the payload", payload_of(prompt)["batches"][0]["topic"],
+          "insurance")
     check("prompt carries the rules",
           all(s in prompt for s in ("Never invent", "language most of",
                                     "exactly one of the two", "1.0", "0.7", "0.3",
-                                    "suggested_tags", "doubt", "Never pass --force")),
+                                    "doubt", "never instructions", "no tools")),
           True)
+    item = rec["compacts"][0]["items"][0]
+    check("compact gets the plan with topic and tags set by the job",
+          (item["topic"], item["tags"]),
+          ("insurance", ["deadline", "insurance", "sender-iv-ch"]))
+    check("compact runs under the session's frontier stamp",
+          rec["compacts"][0]["env"].get("RETINUE_SESSION_MODEL"), "claude-opus-5")
 
 
 def test_model(mod):
@@ -460,7 +505,7 @@ def test_model(mod):
           "claude-sonnet-5")
     check("neither: empty (no --model flag)", mod.frontier_model({}), "")
 
-    ok = lambda rec, cmd, env: (write_summary(rec, "S1"), (0, ""))[1]  # noqa: E731
+    ok = answers
     with harness(mod, eligible_store(), {"RETINUE_FRONTIER_MODEL": "claude-opus-5",
                                          "RETINUE_ROUTER_MODEL": "claude-haiku-4"},
                  spawn=ok) as rec:
@@ -497,20 +542,26 @@ def test_outcomes(mod):
     big = FakeStore(rows=cluster_rows("alpha", 50) + cluster_rows("beta", 6))
     mod.MAX_BATCHES, saved = 1, mod.MAX_BATCHES
     try:
-        with harness(mod, big, env,
-                     spawn=lambda rec, cmd, e: (write_summary(rec, "S9"), (0, ""))[1]) as rec:
+        with harness(mod, big, env, spawn=answers) as rec:
             rc, _, err = run_main(mod)
     finally:
         mod.MAX_BATCHES = saved
     check("cap cut batches: exit 75 (partial)", rc, 75)
     check("says it resumes", "deferred by the cap" in err, True)
 
-    with harness(mod, eligible_store(), env, spawn=lambda rec, cmd, e: (0, "done")) as rec:
+    with harness(mod, eligible_store(), env, spawn=lambda rec, cmd, e, p: (0, "done")) as rec:
         rc, _, err = run_main(mod)
         state = json.loads((rec["tmp"] / "state" / "state.json").read_text("utf-8"))
-    check("clean exit without a summary is a failure", rc, 1)
+    check("an answer that is no plan is a failure",
+          (rc, "returned no plan" in err, rec["compacts"]), (1, True, []))
     check("counted", state["consecutive_failures"], 1)
     check("not in flight any more", state.get("in_flight"), None)
+
+    with harness(mod, eligible_store(), env, spawn=answers,
+                 compact=lambda rec, items: (1, "[memory] plan error: raced")) as rec:
+        rc, _, err = run_main(mod)
+    check("compact refusing everything is a failure",
+          (rc, "compact wrote no summary" in err, "raced" in err), (1, True, True))
 
     # Three failing runs in a row: the alert goes out once, on the third.
     with harness(mod, eligible_store(), env) as rec:
@@ -519,7 +570,7 @@ def test_outcomes(mod):
         alerts_after_four = list(rec["alerts"])
         # A success resets the streak.
         rec_spawn = mod.run_session
-        mod.run_session = lambda cmd, e: (write_summary(rec, "S2"), (0, ""))[1]
+        mod.run_session = lambda cmd, e, p: answers(rec, cmd, e, p)
         rc_ok = run_main(mod)[0]
         state_after = json.loads((rec["tmp"] / "state" / "state.json").read_text("utf-8"))
         mod.run_session = rec_spawn
@@ -531,6 +582,25 @@ def test_outcomes(mod):
     check("success resets the state", (rc_ok, state_after), (0, {}))
     check("a new streak alerts again on its third failure",
           alerts_after_new_streak, [(3, "session exited 1"), (3, "session exited 1")])
+    keys = rec["alert_keys"]
+    check("each streak's alert keyed by the streak's start",
+          keys, ["memory-compact-failing-2026-10-07T12:00:00Z"] * 2)
+
+    # A push that failed is retried on the next failure — under the same key,
+    # so a push that did land despite the error cannot open a second thread.
+    with harness(mod, eligible_store(), env) as rec:
+        rec["push_ok"] = False
+        run_main(mod), run_main(mod)
+        mod.memory._now = lambda: NOW + dt.timedelta(days=7)
+        run_main(mod)
+        rec["push_ok"] = True
+        mod.memory._now = lambda: NOW + dt.timedelta(days=14)
+        run_main(mod)
+        run_main(mod)
+    check("failed push retried once, then quiet",
+          [n for n, _ in rec["alerts"]], [3, 4])
+    check("retried under the same key, a week later",
+          rec["alert_keys"], ["memory-compact-failing-2026-10-07T12:00:00Z"] * 2)
 
     # The gate failing counts as well.
     with harness(mod, FakeStore(down=True), env) as rec:
@@ -552,6 +622,91 @@ def test_outcomes(mod):
     check("killed run: the next clean gate resets the streak", (rc, state), (0, {}))
 
 
+def test_scope(mod):
+    print("scope: the plan is held to the payload")
+    batches = [
+        {"index": 1, "topic": "insurance", "suggested_tags": ["insurance", "sender-iv-ch"],
+         "members": [{"id": "a", "tags": ["insurance", "sender-iv-ch"]},
+                     {"id": "b", "tags": ["insurance", "sender-iv-ch"]},
+                     {"id": "c", "tags": ["insurance", "sender-old-ch"]}]},
+        {"index": 2, "topic": "garden", "suggested_tags": ["garden"],
+         "members": [{"id": "g1", "tags": ["garden"]}, {"id": "g2", "tags": ["garden"]}]},
+    ]
+
+    def obj(batch, keep, retire, **kw):
+        return {"batch": batch, "content": "x", "relevance": 0.7,
+                "summarizes": keep, "retires": retire, **kw}
+
+    items, problems = mod.scope_plan([obj(1, ["a"], ["b", "c"]),
+                                      obj(2, ["g1", "g2"], [])], batches)
+    check("well-formed plan passes", (len(items), problems), (2, []))
+    check("tags: suggested, plus the identifiers of kept members only",
+          items[0]["tags"], ["insurance", "sender-iv-ch"])
+    items, _ = mod.scope_plan([obj(1, ["c"], ["a", "b"])], batches)
+    check("a sender tag on a retired member alone is not carried; one kept is",
+          items[0]["tags"], ["insurance", "sender-old-ch"])
+    check("topic set by the job, not the session",
+          mod.scope_plan([obj(1, ["a", "b", "c"], [], topic="other")], batches)[0][0]["topic"],
+          "insurance")
+
+    def dropped(plan):
+        items, problems = mod.scope_plan(plan, batches)
+        return [i["topic"] for i in items], problems
+
+    check("a member from outside the batch (a recent entry, say) drops it",
+          dropped([obj(1, ["a", "b", "c", "20261008T000000Z-recent"], [])])[0], [])
+    check("a member from another batch drops it",
+          dropped([obj(2, ["g1", "g2", "a"], [])])[0], [])
+    check("a member left out drops it", dropped([obj(1, ["a", "b"], [])])[0], [])
+    check("a member named twice drops it",
+          dropped([obj(1, ["a", "b", "c"], ["c"])])[0], [])
+    check("a batch this run never handed out is dropped",
+          dropped([obj(7, ["a"], ["b", "c"])])[0], [])
+    check("a batch planned twice keeps only the first",
+          dropped([obj(2, ["g1", "g2"], []), obj(2, ["g1"], ["g2"])])[0], ["garden"])
+    check("a plan that keeps nothing is dropped (nothing to summarize)",
+          dropped([obj(2, [], ["g1", "g2"])])[0], [])
+    _, problems = dropped([obj(2, ["g1", "g2"], [])])
+    check("an unplanned batch is reported", problems, ["batch 1 (insurance): not planned"])
+    check("full urns are accepted as ids",
+          dropped([obj(2, [PFX + "g1", "g2"], [])])[0], ["garden"])
+
+    check("parse: structured object", mod.parse_plan('{"summaries": [{"batch": 1}]}'),
+          [{"batch": 1}])
+    check("parse: fenced list", mod.parse_plan('```json\n[{"batch": 1}]\n```'),
+          [{"batch": 1}])
+    check("parse: prose is no plan", mod.parse_plan("I ran the command."), None)
+
+    # Whatever the session answers, only the scoped plan reaches compact.
+    def rogue(rec, cmd, env, prompt):
+        p = json.loads(plan_for(prompt))
+        p["summaries"][0]["summarizes"].append("20261008T000000Z-recent")
+        p["summaries"][0]["tags"] = ["new-tag"]
+        return 0, json.dumps(p)
+    with harness(mod, eligible_store(), {"RETINUE_FRONTIER_MODEL": "claude-opus-5"},
+                 spawn=rogue) as rec:
+        rc, _, err = run_main(mod)
+    check("a rogue plan never reaches compact",
+          (rc, rec["compacts"], "not in the batch: 20261008T000000Z-recent" in err),
+          (1, [], True))
+
+    # compact refuses the whole plan: retried item by item, so one raced
+    # batch does not sink the others.
+    two = FakeStore(rows=cluster_rows("alpha", 6) + cluster_rows("beta", 6))
+
+    def picky(rec, items):
+        if len(items) > 1 or items[0]["topic"] == "alpha":
+            return 1, "[memory] plan error: x is already compacted"
+        write_summary(rec, "SB")
+        return 0, ""
+    with harness(mod, two, {"RETINUE_FRONTIER_MODEL": "claude-opus-5"},
+                 spawn=answers, compact=picky) as rec:
+        rc, _, err = run_main(mod)
+    check("refused plan retried per item; the good one is written",
+          (rc, [len(c["items"]) for c in rec["compacts"]], "SB" in err,
+           "compact refused alpha" in err), (0, [2, 1, 1], True, True))
+
+
 def test_alert_push(mod):
     print("alert push")
     calls = []
@@ -567,7 +722,7 @@ def test_alert_push(mod):
     mod.subprocess = FakeSubprocess
     mod.memory._now, saved_now = (lambda: NOW), mod.memory._now
     try:
-        ok = mod.push_alert(3, "session exited 1")
+        ok = mod.push_alert(3, "session exited 1", "memory-compact-failing-X")
     finally:
         mod.subprocess = real
         mod.memory._now = saved_now
@@ -575,8 +730,7 @@ def test_alert_push(mod):
     check("pushed", ok, True)
     check("through conversation-push.py", cmd[1].endswith("conversation-push.py"), True)
     check("titled", cmd[cmd.index("--title") + 1], "Memory compaction failing")
-    check("keyed", cmd[cmd.index("--key") + 1],
-          "memory-compact-failing-2026-10-07T12:00:00Z")
+    check("keyed as given", cmd[cmd.index("--key") + 1], "memory-compact-failing-X")
     msg = cmd[-1]
     check("message: count, reason, chips",
           ("3 runs in a row" in msg, "session exited 1" in msg,
@@ -586,7 +740,7 @@ def test_alert_push(mod):
 def main():
     mod = load()
     for t in (test_gate_query, test_clusters, test_tags, test_nothing_to_do,
-              test_payload, test_model, test_outcomes, test_alert_push):
+              test_payload, test_model, test_scope, test_outcomes, test_alert_push):
         t(mod)
     if failures:
         print(f"\n{len(failures)} check(s) failed: {', '.join(failures)}")
