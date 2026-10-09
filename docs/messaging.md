@@ -106,6 +106,30 @@ already overtaken is not silent: approved (or being sent) exits non-zero with
 so wherever the approval link was relayed — the link now leads to a
 retracted entry, not a message waiting for the user.
 
+### The decision comes back to the thread
+
+A send queued during a dashboard-thread turn is linked to that thread: the
+web-gateway hands every thread turn its id as `RETINUE_THREAD_ID`, every push
+CLI (and `email_client.py`, through its backend proxy) stamps it on the request
+as `thread`, and the gateway keeps it on the pending entry (for e-mail, the
+draft's `X-Send-Request-Thread` header, stripped before sending). When the user
+allows or denies the send on `/sends`, the web-gateway notes the decision in
+that thread as a *Retinue* message:
+
+- **Denied** — "🚫 You denied the Signal message to … — nothing was sent."
+- **Allowed** — the note waits for the gateway's terminal status (approval
+  executes asynchronously) and says it was sent, or quotes the real error. A
+  failed send marks the thread unread and wakes it; the other notes are a
+  record of the user's own decision and badge nothing. A send still running
+  after `SEND_DECISION_OUTCOME_TIMEOUT` seconds (default 120) is reported as
+  allowed with a link to its approval page.
+
+The note's agent context names the request (`<gateway>/<id>` and its status),
+so the next turn in the thread knows what became of the message it proposed.
+A job outside a thread turn that opened a thread for its proposal links the
+send explicitly with `--thread <id>`; a send with no thread is simply not
+reported. Retractions are the agent's own act and are not noted.
+
 ## Multiple gateways per channel
 
 The `/sends` page enrols the built-in

@@ -244,6 +244,9 @@ link, so the user can approve without hunting for the page. Reporting a queue
 without the link leaves the message stuck. A queued send you no longer want is
 taken back before approval with `--retract <id>` on any push CLI
 (`email_client.py retract` for e-mail) — never left for the user to deny.
+A send queued in a dashboard-thread turn is linked to that thread
+(`RETINUE_THREAD_ID`; `--thread <id>` from elsewhere), and the user's
+Allow/Deny is noted back into it automatically — don't poll for it.
 **An autonomous agent that hits a blocking error must push an alert to the
 user**, not just log. Channel liveness is
 monitored by the framework — never build ad-hoc checks; a dead-seeming channel
