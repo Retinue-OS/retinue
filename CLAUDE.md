@@ -157,7 +157,10 @@ the start of non-trivial work and **when dispatching a subagent** — subagents
 start cold, so include the relevant memories in the dispatch prompt (`recall`
 output is prompt-ready). Recall leaves out corrected/superseded, expired and
 compacted entries (`--include-superseded/-expired/-compacted` lift that) and
-lists summaries first; `--expand <id>` shows what a summary carries. Relevance
+lists summaries first; `--expand <id>` shows what a summary carries. The
+weekly `memory-compact` base job folds entries older than two weeks into one
+summary per topic, so a recall shows a topic's summary first and only its
+newer entries one by one. Relevance
 is expected durability: 1.0 standing rule, 0.7 decision or lesson, 0.3
 incident or status. A subagent asked to store must be told its own `--actor`.
 A standing instruction the user gives about one sender is tagged

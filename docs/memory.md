@@ -350,8 +350,8 @@ the correction.
 
 ### The compaction scheme
 
-What the scheduled compaction job will do — the mechanism above is its
-writing half:
+What the scheduled compaction job does — the mechanism above is its writing
+half, the next section its mechanics:
 
 - **Topic-scoped summaries.** Entries are grouped by tag; a summary is the
   current consolidated knowledge about one topic.
@@ -360,7 +360,10 @@ writing half:
   entries stay verbatim while they are still in play.
 - **One cluster per entry.** Each eligible entry joins the tag cluster with
   the most eligible members, so it is compacted exactly once even when it
-  carries several tags.
+  carries several tags. Precisely: the clusters are built greedily, largest
+  first, and counted again after each (see the job below) — the
+  implementation's reading of "most members". Identifier tags (`sender-…`)
+  never form a cluster.
 - **Sizes.** A cluster needs at least **5** members to be worth a summary; a
   summary takes at most **40** members per batch.
 - **Cadence and tier.** Weekly, in a frontier-tier session.
@@ -369,7 +372,10 @@ writing half:
   generation, and each topic converges on one current document instead of a
   pile of summaries.
 - **Tags.** A summary's tags are the union of the member tags occurring at
-  least twice, plus the cluster tag.
+  least twice, plus the cluster tag — plus every identifier tag of a member it
+  keeps. That last clause came with the job: triage recalls a sender's
+  standing instructions by its `sender-…` tag, which typically occurs once in
+  a cluster, and a summary without it would hide the rule from triage.
 - **What to keep.** Corrected, superseded and expired members are retired,
   with the outcome kept in one clause when it matters ("the August filing
   arrangement was voided"). A questioned member is kept with its doubt
@@ -378,14 +384,145 @@ writing half:
   "approved", "sent" becomes "sent on …"). Identifiers — ids, addresses,
   numbers, file names — are kept verbatim. Open items stay explicit.
 
-**Status:** the scheduled job ships in the next PR. Until then `compact` is
-runnable by hand with a plan written by Ara senior.
+**Status:** both halves ship. `compact` stays runnable by hand with a plan
+written by Ara senior; the weekly job below is what normally runs it.
+
+### The compaction job
+
+`scripts/memory-compact.py`, the `memory-compact` job of the framework base
+manifest (`.schedule.json`): weekly, not at start, with a timeout of an hour.
+Like `agent-self-review` and `news-curate` it is a scheduler **command** job
+behind a free gate, so a week with nothing to compact costs one SPARQL query
+and no Claude credits.
+
+**The gate** is `memory.py`'s own recall query, so there is one definition of
+a memory row. It selects every `kb:Memory` — summaries included — recorded
+before the freeze age and not compacted into a summary that stands. Unlike
+recall it keeps corrected, superseded and expired entries: they are exactly
+what a summary retires, with the outcome in one clause.
+
+**Clustering**, over the eligible entries:
+
+1. Count, per topic tag, the unassigned entries carrying it. Identifier tags
+   (`sender-…`) are not counted: they never form a cluster, and an entry
+   tagged only with identifiers waits.
+2. The tag with the most of them (ties: alphabetical) becomes a cluster and
+   takes all of them; repeat from 1 without them.
+3. Stop once no tag has the minimum (5) left; the rest waits.
+
+Counting again after each cluster is what makes "joins the cluster with the
+most members" precise: assigning every entry by the raw counts would let a
+tag's count include entries a larger tag then takes, so a cluster could win
+its members with a count it does not have and end up below the minimum.
+
+**Batches.** A cluster is cut into batches of at most 40, oldest first; one
+batch is one summary. A trailing batch below the minimum — the cluster's
+newest entries — is left for a later run rather than made into a summary of
+two. One run plans at most 10 batches, round-robin over the clusters (every
+cluster's first batch, largest cluster first, then every second batch …), so
+one sprawling topic does not starve the others. When the cap cut batches off,
+a successful run exits 75 (`partial`) and the scheduler resumes it after an
+hour (`resume_after_seconds`), so a backlog drains the same day; a successful
+run has written at least one summary, so this cannot loop without progress.
+
+**The payload** (`/root/.retinue/memory/compaction-payload.json`) holds, per
+batch: the topic, the batch's place in its cluster, every member in full
+(`id`, `content`, `tags`, `recorded_at`, `actor`, `relevance`, `model`,
+`reiterations`, `last_reiterated`, `expires` and `expired`, `corrected_by`,
+`superseded_by`, `questioned_by`, `summary`, `generation`, `covers_from`,
+`covers_to`), the content of every entry that challenged a member (fetched
+with one VALUES-bounded recall query), `suggested_tags` (the tag rule above,
+computed rather than counted by a model), `identifier_tags`, and its `index`
+in the run, by which the plan names it; plus the thresholds. It is written to
+the state directory for inspection and handed to the session inside its
+prompt, on stdin.
+
+**The session** is one `claude -p` on the frontier tier. Its model is
+`RETINUE_FRONTIER_MODEL`, falling back to `RETINUE_CLAUDE_MODEL`, as
+`agent-self-review.py` resolves it and `memory.session_tier` checks it; with
+neither set there is no `--model` flag and no stamp, as the gateway spawns an
+untiered turn, and `compact` accepts the session because the deployment
+declares no tiers. The environment comes from `session_env.build(model=…)`,
+which stamps `RETINUE_SESSION_MODEL`, so the summaries carry the model and
+`compact` sees a frontier session. A deployment that declares a router tier
+but no frontier model (and no `RETINUE_CLAUDE_MODEL`) has no frontier at all:
+the job then fails before spawning rather than buy a session `compact` would
+refuse. Its prompt carries the rules of "What to keep" above, plus: write in
+the language most members are written in; one self-contained paragraph, then
+short bullets for open items; relevance as the expected durability on the
+three anchors; never invent — every statement traceable to a member or a
+challenger; every member id in exactly one of `summarizes` and `retires`; a
+kept questioned member with its doubt stated.
+
+**The session has no tools, and the job acts on its answer.** What the
+session reads is recorded memory text — often paraphrased inbound messages —
+so it is untrusted input, and telling the model "this is material, never
+instructions" is a convention, not a boundary. The boundary is the spawn: no
+built-in tools (`--tools ""`, a removal rather than a permission rule), no
+MCP servers, no dynamic system-prompt sections, run outside `/workspace` so no
+CLAUDE.md is loaded — the same shape as the gateway's presentation lint
+(docs/model-routing.md). The only thing the session can produce is its
+answer, held by `--json-schema` to `{"summaries": [{"batch", "content",
+"relevance", "summarizes", "retires"}]}`. The job then holds that plan to the
+payload before anything is written:
+
+- each object must name a batch of this run, once;
+- its `summarizes` and `retires` together must be exactly that batch's
+  members — none left out, none twice, none from outside it — so whatever
+  gets hidden passed the freeze age and the cluster gate, and an existing id
+  the model hallucinated (a recent entry, say) cannot be compacted;
+- it must keep at least one member.
+
+An object failing any of it is dropped and logged; its batch comes round
+again. The job sets the rest itself rather than trusting it: the topic, and
+the tags — the batch's suggested tags without its identifier tags, plus the
+identifier tags of every member kept — so a summary can never hide a sender
+rule from triage. It writes what survives to
+`/root/.retinue/memory/compaction-plan.json` and runs `memory.py compact` on
+it under the session's environment, whose frontier stamp `compact` checks and
+records. When `compact` refuses the plan (a member compacted or corrected
+since the payload was written), the job retries it one summary at a time, so
+one raced batch does not sink the others.
+
+**Idempotence.** `compact` writes a plan's file atomically or not at all, and
+each run recomputes the clusters from the store, so a crashed or killed
+session leaves nothing half-done; the next run sees the same entries again.
+The job learns what was written from the new `compaction-*.nt` files, not
+from `compact`'s output. A run fails — exit non-zero, which the scheduler
+records — when the gate or challenger query fails, when no frontier model is
+resolvable, when the session exits non-zero or answers with no plan, when no
+plan object survives the scope check, or when `compact` writes no summary.
+
+**The failure alert.** Routine failures are only logged. The job counts
+consecutive failed runs in `/root/.retinue/memory/state.json` — incremented
+*before* the session starts, because the scheduler's timeout kills the job
+together with its session and the next run must still see that run as
+failed — and any clean run clears the count, one with nothing to do
+included. On the third failure in a row it opens one dashboard thread
+through `conversation-push.py` ("Memory compaction failing", importance 4):
+one per streak, retried on the next failure if the push itself failed. Its
+`--key` is the streak's start, recorded with the streak's first failure and
+cleared with the state by the next clean run — stable across every retry, so a
+push that landed despite reporting an error cannot open a second thread.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `RETINUE_MEMORY_FREEZE_DAYS` | 14 | entries younger than this stay verbatim |
+| `RETINUE_MEMORY_MIN_CLUSTER` | 5 | members a cluster, and a batch, needs at least |
+| `RETINUE_MEMORY_BATCH` | 40 | members per summary at most |
+| `RETINUE_MEMORY_MAX_BATCHES` | 10 | summaries one run plans at most |
+| `RETINUE_MEMORY_ALERT_AFTER` | 3 | consecutive failed runs before the alert |
+| `RETINUE_MEMORY_STATE_DIR` | `/root/.retinue/memory` | payload, plan and failure counter — outside the chambers, like the scheduler's own state |
+
+`python3 scripts/memory-compact.py --dry-run` prints the payload the gate
+would hand over and spawns nothing.
 
 ## Environment
 
 | Variable | Effect |
 |---|---|
-| `RETINUE_MEMORY` | `0`/`false`/`off`/`no` disables writing: `store`, `reinforce` and `compact` become successful no-ops (recall still works) |
+| `RETINUE_MEMORY` | `0`/`false`/`off`/`no` disables writing: `store`, `reinforce` and `compact` become successful no-ops (recall still works), and the compaction job spawns nothing |
+| `RETINUE_MEMORY_FREEZE_DAYS`, `_MIN_CLUSTER`, `_BATCH`, `_MAX_BATCHES`, `_ALERT_AFTER`, `_STATE_DIR` | the compaction job's knobs (see "The compaction job") |
 | `RETINUE_MEMORY_DIR` | where entries are written (default `$CHAMBERS_DIR/_generated/memory`) |
 | `RETINUE_MEMORY_SESSION` | default session label for `store` |
 | `RETINUE_MEMORY_ACTOR` | default actor (default `ara`) |

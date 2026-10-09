@@ -40,6 +40,16 @@
       "interval_seconds": 3600,
       "enabled": true,
       "run_at_start": false
+    },
+    {
+      "_comment": "Fold memory entries older than the freeze age into topic summaries (docs/memory.md, 'The compaction job'). Gated by a free SPARQL SELECT: spawns one frontier-tier Claude session only when a topic has enough eligible entries. A run the per-run cap cut short exits 75 and resumes an hour later; a session may take a while over ten summaries, hence the hour's timeout.",
+      "id": "memory-compact",
+      "command": "python3 /workspace/scripts/memory-compact.py",
+      "interval_seconds": 604800,
+      "resume_after_seconds": 3600,
+      "timeout_seconds": 3600,
+      "enabled": true,
+      "run_at_start": false
     }
   ]
 }
