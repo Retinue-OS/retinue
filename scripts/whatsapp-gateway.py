@@ -872,6 +872,27 @@ def _jid_addr(jid) -> str | None:
     return _jid_user(jid)
 
 
+def _sender_handle(jid) -> str | None:
+    """The sender's handle in the one form the address book files it under.
+
+    A phone-number JID (``…@s.whatsapp.net``) becomes the E.164 number
+    (``+41…``), a LID JID stays ``<user>@lid`` — exactly what a contact's
+    ``whatsapp`` channel holds (contacts.normalize_handle). Every consumer of
+    the sender — the VIP check of the delivery gate above all — compares this
+    string against the address book verbatim, so it must not depend on which
+    of the two addressing modes WhatsApp happened to deliver in; a bare user
+    without its server matched neither filed form, and a VIP's message went
+    unworked.
+    """
+    addr = _jid_addr(jid)
+    if not addr:
+        return None
+    user, _, server = addr.partition("@")
+    if not server or server == WA_PN_SERVER:
+        return "+" + user.lstrip("+") if user.lstrip("+").isdigit() else user
+    return addr
+
+
 def _jid_is_group(jid) -> bool:
     server = _attr(jid, "Server", "server", default="")
     return str(server).endswith("g.us") or str(jid).endswith("@g.us")
@@ -1601,7 +1622,7 @@ def _handle_message_event(event) -> None:
     if bool(_attr(source, "is_from_me", "IsFromMe", default=False)):
         _record_own_device_send(info, chat_jid, message, msg_id)
         return
-    sender = _jid_user(sender_jid)
+    sender = _sender_handle(sender_jid)
     if not sender:
         return
     # Status/broadcast posts (a contact's story feed, broadcast lists) arrive as

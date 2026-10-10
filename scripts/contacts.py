@@ -122,6 +122,7 @@ EMAIL = "email"
 SMS = "sms"
 _CHANNEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
+_WA_PN_SUFFIX = "@s.whatsapp.net"
 _PHONE_PUNCT_RE = re.compile(r"[\s\-().\u00a0/]")
 _EMAIL_RE = re.compile(r"^[^@\s<>\"]+@[^@\s<>\"]+$")
 
@@ -167,6 +168,10 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
         if not _PHONE_RE.match(value):
             raise ContactError(f"not an E.164 phone number: {handle!r}")
     else:
+        if channel == "whatsapp" and value.lower().endswith(_WA_PN_SUFFIX):
+            # A phone-number JID (a chat key) is the number itself; a LID JID
+            # (``…@lid``) is no number and stays as it is.
+            value = "+" + value[:-len(_WA_PN_SUFFIX)].lstrip("+")
         maybe = normalize_phone(value)
         if _PHONE_RE.match(maybe):
             value = maybe
@@ -705,6 +710,12 @@ def policy_projection(book: ContactBook) -> tuple[dict[str, set[str]], set[str]]
         if not record.get("vip"):
             continue
         for channel, handle in record.get("accounts") or []:
+            # Filed handles predate some normalization rules; project the
+            # current form, which is the one the gateways deliver.
+            try:
+                channel, handle = normalize_handle(channel, handle)
+            except ContactError:
+                pass
             handles.setdefault(channel, set()).add(handle)
         for number in record.get("all_phones") or []:
             handles.setdefault(SMS, set()).add(number)
