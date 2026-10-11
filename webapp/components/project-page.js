@@ -25,6 +25,7 @@ import { esc, fmtAge, visibleHeight } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { shelf, goLive, takeRestore } from './shelf-store.js';
+import { registerUnsavedCheck } from './shell.js';
 
 const APPLY_POLL_MS = 3000;
 // Frontmatter keys that are rendered elsewhere (or meaningless to the user)
@@ -145,6 +146,10 @@ class RetinueProjectPage extends HTMLElement {
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    // What a wake or a Home press from the Android shell must not navigate
+    // away from (shell.js): an edit not yet saved, a change request typed or
+    // on the wire, a dictation recording or being transcribed.
+    if (!this._offUnsaved) this._offUnsaved = registerUnsavedCheck(() => this._unsaved());
     // Where "back" leads, as on the chat page: opened from inside the app (a
     // row on the home, the projects list) there is an entry to return to;
     // opened cold (a push, a bookmark) the home is the landing place.
@@ -176,6 +181,8 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._offUnsaved) this._offUnsaved();
+    this._offUnsaved = null;
     if (this._shelfRelease) this._shelfRelease();
     this._shelfRelease = null;
     document.removeEventListener('visibilitychange', this._onVisible);
@@ -229,6 +236,12 @@ class RetinueProjectPage extends HTMLElement {
     this._draft = this._item.markdown;
     this._editError = '';
     this.render();
+  }
+
+  _unsaved() {
+    const editing = this._mode === 'edit' && this._item && this._draft !== this._item.markdown;
+    return !!(editing || this._saving || (this._cmd || '').trim() || this._sending ||
+      this._recState !== 'idle' || this._voiceJob);
   }
 
   _cancelEdit() {

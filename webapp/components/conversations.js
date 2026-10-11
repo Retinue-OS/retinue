@@ -28,6 +28,18 @@
 // whose list is the attention list) it renders nothing at all until a thread
 // or the composer is opened by hash, and then only that view.
 //
+// Continuous conversation (components/continuous.js) is opened from here by
+// address: #new?voice=1 is the composer in the mode, and on the home a wake —
+// the Android shell's `retinue-shell` event with type `wake`, or a load of
+// /?wake=1 — opens the thread used in the mode within the last fifteen
+// minutes, else that voice composer. Both flags leave the address once read,
+// and only inside the shell (shell.js, inShell) do they open the mic by
+// themselves; elsewhere they may be a link in a message, so the conversation
+// opens in the mode with a "Start talking" button. The shell's `home` event
+// (a Home press while the shell is in front) puts the home back at rest:
+// every view entry is unwound to the list, the attention list scrolls to its
+// top.
+//
 // Everything degrades gracefully offline (the list just fails to refresh; the
 // last rendered state stays on screen).
 
@@ -36,6 +48,8 @@ import {
   viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
 } from './base.js';
 import { hasUnsentInput } from './conversation.js';
+import { modeEntries, pickWakeThread, setContinuous } from './continuous.js';
+import { claimShellEvents, inShell, shellEventHeld } from './shell.js';
 
 const LIST_URL = '/conversations';
 // Views are addressable by location hash, so opening a thread or the composer
@@ -44,7 +58,8 @@ const LIST_URL = '/conversations';
 // gateway (_CONV_ID_RE); agent push URLs deep-link with the same hash.
 const CONV_HASH_RE = /^#conversation-([0-9a-f]{32})$/;
 // The composer hash may carry a project link (from a project page's "Discuss
-// with Ara"): #new?project=<encoded uri>&title=<encoded title>.
+// with Ara"): #new?project=<encoded uri>&title=<encoded title>; and voice=1
+// opens it in continuous conversation.
 const COMPOSER_HASH = '#new';
 const COMPOSER_HASH_RE = /^#new(?:\?(.*))?$/;
 // Most recent threads shown on the dashboard card before the user is sent to
@@ -67,6 +82,10 @@ class RetinueConversations extends HTMLElement {
     this._scope = 'active';  // full-mode thread filter: active|archived|edits|cowork
     this._composeProject = null;      // project URI the composer is about, if any
     this._composeProjectTitle = '';   // its display title (for the chip)
+    this._composeVoice = false;       // the composer opens in continuous mode
+    this._composeListen = false;      // …and its next render opens the mic
+    this._listenNext = null; // thread id whose next render opens it in the mode
+    this._listenNextMic = false; // …with the mic opening by itself
     this._pushDepth = 0;     // history entries we pushed and have not unwound
     // Bumped whenever the list is changed from this side — an archive, a
     // scope switch, a thread created or written to. A refresh that began
@@ -89,7 +108,10 @@ class RetinueConversations extends HTMLElement {
     const m = CONV_HASH_RE.exec(location.hash || '');
     const cm = COMPOSER_HASH_RE.exec(location.hash || '');
     if (m) this._active = m[1];
-    else if (cm) { this._composing = true; this._setComposeProject(cm[1]); }
+    else if (cm) { this._composing = true; this._setComposeProject(cm[1]); this._takeVoiceFlag(); }
+    // The entry the page loaded on is the bottom of this card's stack, even
+    // with a hash (a deep link: there is nothing of ours to go back to).
+    this._pushDepth = this._stampEntry(0);
     this._onPop = () => this._syncFromLocation();
     window.addEventListener('popstate', this._onPop);
     // Also on hashchange: tapping a push notification navigates an
@@ -116,9 +138,95 @@ class RetinueConversations extends HTMLElement {
         if (id) this._openThread(id);
       });
     }
+    // The home answers the Android shell's wake and home events in place
+    // (shell.js sends every other page here for them).
+    if (this._viewer && !this._onShell) {
+      claimShellEvents();
+      this._onShell = (e) => {
+        const type = e && e.detail && e.detail.type;
+        // Claiming the events means the fallback's guard is ours to apply:
+        // a draft or a take in flight holds the press here as it would on
+        // any other page, else a wake could record over it and Home drop it.
+        if ((type === 'wake' || type === 'home') && shellEventHeld(type)) return;
+        if (type === 'wake') this._wake(true);
+        else if (type === 'home') this._rest();
+      };
+      window.addEventListener('retinue-shell', this._onShell);
+    }
     this.render();
     this.refresh();
     this._timer = setInterval(() => this.refresh(), POLL_MS);
+    // A wake that found the page not loaded loads /?wake=1. The flag leaves
+    // the address at once, so a reload or a later visit is not a wake. Only
+    // the shell's own load of it opens the mic by itself: anywhere else the
+    // address may be a link in a message, and following one is no request
+    // to record — the conversation opens in the mode, offering "Start talking".
+    if (this._viewer && this._takeWakeFlag()) this._wake(inShell());
+  }
+
+  // `voice=1` on the composer hash is consumed like the wake flag: it leaves
+  // the address at once (a reload or a restored tab must not open the mic
+  // without a gesture), and it opens the mic by itself only inside the shell.
+  _takeVoiceFlag() {
+    if (!this._composeVoice) return;
+    this._composeListen = inShell();
+    try {
+      const cm = COMPOSER_HASH_RE.exec(location.hash || '');
+      const params = new URLSearchParams((cm && cm[1]) || '');
+      params.delete('voice');
+      const q = params.toString();
+      history.replaceState(history.state, '', `${location.pathname}${location.search}${COMPOSER_HASH}${q ? `?${q}` : ''}`);
+    } catch (_e) { /* the address keeps the flag; the mic still waits for a tap */ }
+  }
+
+  _takeWakeFlag() {
+    try {
+      const url = new URL(location.href);
+      if (url.searchParams.get('wake') !== '1') return false;
+      url.searchParams.delete('wake');
+      history.replaceState(history.state, '', `${url.pathname}${url.search}${url.hash}`);
+      return true;
+    } catch (_e) { return false; }
+  }
+
+  // A wake: carry on the conversation the user was just having by voice — the
+  // thread used in continuous mode within the window — or start a new one,
+  // in the mode either way. Whatever is on screen already answers in place.
+  // `mic`: the wake came from the shell, so the mic opens by itself;
+  // otherwise the conversation opens in the mode and waits for a tap.
+  _wake(mic) {
+    const id = pickWakeThread(modeEntries(), Date.now());
+    const open = this.shadowRoot && this.shadowRoot.querySelector('retinue-conversation');
+    if (id) {
+      setContinuous(id, true);
+      if (this._active === id && open) { if (mic) open.listen(); else open.render(); return; }
+      this._listenNext = id;
+      this._listenNextMic = !!mic;
+      this._openThread(id);
+      return;
+    }
+    // A composer already open (a project's, say) keeps its context.
+    if (this._composing && open) { if (mic) open.listen(); return; }
+    this._pushView(COMPOSER_HASH);
+    this._setComposeProject(undefined);
+    this._composeVoice = true;
+    this._composeListen = !!mic;
+    this._showComposer();
+  }
+
+  // The shell's Home press: the home as it is when nothing is open. All the
+  // way back to the list, not one entry: after a wake the entry before the
+  // thread may be another thread (one opened by hand, or by an earlier wake).
+  // Every view entry this card pushed is unwound in one go, and whatever
+  // the stack still holds then (a deep link's hash) is dropped in place.
+  _rest() {
+    if (this._active || this._composing || location.hash) this._toList();
+    else history.replaceState(history.state, '', this._homeAddress());
+    const sheet = document.querySelector('retinue-attention-sheet');
+    if (sheet && !sheet.hidden && typeof sheet.close === 'function') sheet.close();
+    const list = document.querySelector('retinue-attention');
+    if (list && typeof list.rest === 'function') list.rest();
+    window.scrollTo(0, 0);
   }
 
   disconnectedCallback() {
@@ -131,6 +239,8 @@ class RetinueConversations extends HTMLElement {
     this._onPop = null;
     if (this._offFrame) this._offFrame();
     this._offFrame = null;
+    if (this._onShell) window.removeEventListener('retinue-shell', this._onShell);
+    this._onShell = null;
   }
 
   // Bring the view in line with the address bar after the browser has already
@@ -138,9 +248,18 @@ class RetinueConversations extends HTMLElement {
   // never push — pushing here would fight the history stack.
   _syncFromLocation() {
     const hash = location.hash || '';
-    // At most one view entry is ever on the stack (the composer's is replaced
-    // by the thread's on send), so presence of a hash is the whole state.
-    this._pushDepth = hash ? 1 : 0;
+    // How many view entries are below this one: every entry records it in
+    // its state (_pushView, and _stampEntry for the rest), so a back, a
+    // forward or a jump of several entries all leave the count right.
+    this._pushDepth = this._stampEntry(hash ? this._pushDepth + 1 : 0);
+    // Unwinding to the list (_toList): land on it, whatever entry that was.
+    if (this._resting) {
+      this._resting = false;
+      history.replaceState({ retinueDepth: 0 }, '', this._homeAddress());
+      this._pushDepth = 0;
+      if (this._active || this._composing) this._showList();
+      return;
+    }
     const m = CONV_HASH_RE.exec(hash);
     if (m) {
       if (this._active !== m[1]) this._showThread(m[1]);
@@ -150,9 +269,20 @@ class RetinueConversations extends HTMLElement {
     if (cm) {
       // The project context is snapshotted into the element's attributes at
       // render time, so a change of context while composing re-renders.
-      const was = `${this._composeProject || ''}\n${this._composeProjectTitle}`;
+      const was = `${this._composeProject || ''}\n${this._composeProjectTitle}\n${this._composeVoice}`;
+      const wasVoice = this._composeVoice;
       this._setComposeProject(cm[1]);
-      const now = `${this._composeProject || ''}\n${this._composeProjectTitle}`;
+      // No voice flag on the address does not switch the mode off: the flag
+      // leaves the address as soon as it is read (_takeVoiceFlag), and that
+      // same entry is reported again — setting location.hash fires popstate
+      // and then hashchange — so the second report must not undo the first.
+      // Only a change of context starts the composer afresh.
+      if (this._composeVoice) this._takeVoiceFlag();
+      else if (this._composing && wasVoice &&
+          `${this._composeProject || ''}\n${this._composeProjectTitle}\n${wasVoice}` === was) {
+        this._composeVoice = true;
+      }
+      const now = `${this._composeProject || ''}\n${this._composeProjectTitle}\n${this._composeVoice}`;
       if (!this._composing) this._showComposer();
       else if (now !== was) this.render();
       return;
@@ -160,16 +290,19 @@ class RetinueConversations extends HTMLElement {
     if (this._active || this._composing) this._showList();
   }
 
-  // Parse the composer hash's optional query (project=…&title=…) into the
-  // pending project link. Called with the raw query part, or undefined.
+  // Parse the composer hash's optional query (project=…&title=…&voice=1)
+  // into the pending project link and the voice flag. Called with the raw
+  // query part, or undefined.
   _setComposeProject(query) {
     this._composeProject = null;
     this._composeProjectTitle = '';
+    this._composeVoice = false;
     if (!query) return;
     try {
       const params = new URLSearchParams(query);
       this._composeProject = params.get('project') || null;
       this._composeProjectTitle = params.get('title') || '';
+      this._composeVoice = params.get('voice') === '1';
     } catch (_e) { /* malformed hash — plain composer */ }
   }
 
@@ -304,7 +437,7 @@ class RetinueConversations extends HTMLElement {
   _onCreated(detail) {
     const id = detail.id;
     if (!id) return;
-    history.replaceState(null, '', `#conversation-${id}`);
+    history.replaceState({ retinueDepth: this._pushDepth }, '', `#conversation-${id}`);
     this._active = id;
     this._composing = false;
     this._setComposeProject(undefined); // link consumed by this thread
@@ -319,9 +452,55 @@ class RetinueConversations extends HTMLElement {
 
   _openThread(id) {
     if (this._active === id) return;
-    history.pushState(null, '', `#conversation-${id}`);
-    this._pushDepth += 1;
+    this._pushView(`#conversation-${id}`);
     this._showThread(id);
+  }
+
+  // The depth the current history entry records; an entry without one (the
+  // page's first, or one a plain `location.hash =` navigation made — the
+  // attention list opens threads that way) is stamped with `fallback`, so
+  // coming back to it later reads the same depth.
+  _stampEntry(fallback) {
+    const st = history.state;
+    if (st && Number.isInteger(st.retinueDepth)) return st.retinueDepth;
+    try {
+      const base = (st && typeof st === 'object') ? st : {};
+      history.replaceState(Object.assign({}, base, { retinueDepth: fallback }), '');
+    } catch (_e) { /* unstamped: counted again on the next visit */ }
+    return fallback;
+  }
+
+  _pushView(hash) {
+    this._pushDepth += 1;
+    history.pushState({ retinueDepth: this._pushDepth }, '', hash);
+  }
+
+  // Back to the list from however deep: every entry this card pushed is
+  // unwound (popstate then lands in _syncFromLocation, which finishes the
+  // job); with none, the hash is dropped in place.
+  _toList(depth = this._pushDepth) {
+    if (depth > 0) {
+      this._resting = true;
+      history.go(-depth);
+      // A traversal the browser refused never reports: land in place.
+      setTimeout(() => { if (this._resting) { this._resting = false; this._toList(0); } }, 1500);
+      return;
+    }
+    history.replaceState({ retinueDepth: 0 }, '', this._homeAddress());
+    this._pushDepth = 0;
+    this._showList();
+  }
+
+  // The address the home rests on: no hash, and none of the deep links that
+  // open something over the list (?item= a sheet, ?digest= a digest) — or
+  // a reload after Home would bring them back.
+  _homeAddress() {
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('item');
+      url.searchParams.delete('digest');
+      return `${url.pathname}${url.search}`;
+    } catch (_e) { return location.pathname; }
   }
 
   _showThread(id) {
@@ -347,8 +526,7 @@ class RetinueConversations extends HTMLElement {
   }
 
   _openComposer() {
-    history.pushState(null, '', COMPOSER_HASH);
-    this._pushDepth += 1;
+    this._pushView(COMPOSER_HASH);
     this._setComposeProject(undefined); // the "+ New" button starts a plain thread
     this._showComposer();
   }
@@ -362,7 +540,7 @@ class RetinueConversations extends HTMLElement {
   render() {
     const mode = this._active ? 'thread' : (this._composing ? 'composer' : 'list');
     // Reflect the view on the host so the page can react (styles.css hides the
-    // greeting and app dock while a thread or the composer is open).
+    // navigation and every other card while a thread or the composer is open).
     this.setAttribute('data-view', mode);
     if (this._viewer && mode === 'list') {
       // Nothing to show: the home's attention list is the list.
@@ -403,7 +581,13 @@ class RetinueConversations extends HTMLElement {
   // (issue #282): a minimize button parks it there, and leaving it while Ara
   // is still answering parks it by itself.
   _threadView() {
-    return `<retinue-conversation conversation-id="${esc(this._active)}" back shelf shelf-leave minimize>` +
+    // Opened by a wake: this one render puts the thread in continuous mode
+    // and opens the mic; a later render of the same thread is just the thread.
+    const listen = this._listenNext === this._active
+      ? (this._listenNextMic ? ' continuous listen' : ' continuous') : '';
+    this._listenNext = null;
+    this._listenNextMic = false;
+    return `<retinue-conversation conversation-id="${esc(this._active)}" back shelf shelf-leave minimize${listen}>` +
       `</retinue-conversation>`;
   }
 
@@ -411,9 +595,13 @@ class RetinueConversations extends HTMLElement {
   // a project page, the project it is about rides along as the seed of the
   // thread its first message opens.
   _composerView() {
-    const project = this._composeProject
+    const project = (this._composeProject
       ? ` for-project="${esc(this._composeProject)}" project-title="${esc(this._composeProjectTitle)}"`
-      : '';
+      : '') + (this._composeVoice ? ' continuous' : '') +
+      (this._composeVoice && this._composeListen ? ' listen' : '');
+    // The mic opens by itself once: a later render of the composer (a change
+    // of context) offers "Start talking" instead.
+    this._composeListen = false;
     // `shelf` here too: the thread the first message opens goes on as this
     // element, and from then on it is a thread like any other.
     return `<retinue-conversation back shelf shelf-leave minimize${project}></retinue-conversation>`;

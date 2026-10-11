@@ -1,9 +1,8 @@
 /* Retinue dashboard service worker.
  *
  * Strategy:
- *  - Shell assets (HTML/CSS/JS/icons): cache-first, so the dashboard -- and
- *    crucially the local app-launch buttons like the dialer -- open instantly
- *    and work with no connectivity.
+ *  - Shell assets (HTML/CSS/JS/icons): cache-first, so the dashboard opens
+ *    instantly and works with no connectivity.
  *  - Data documents (/data/*.json): network-first with cache fallback, so you
  *    see fresh curated content when online and the last known state offline.
  *
@@ -50,9 +49,10 @@ const SHELL_ASSETS = [
   '/components/chat-page.js',
   '/components/news.js',
   '/components/speech.js',
+  '/components/continuous.js',
+  '/components/shell.js',
   '/components/push.js',
   '/components/update.js',
-  '/components/app-launcher.js',
   '/components/nav.js',
   '/components/contacts.js',
   '/components/shelf.js',

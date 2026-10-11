@@ -70,6 +70,7 @@ import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 // shown as sent (linkify below) — so the Markdown renderer and its styles
 // belong to the element now, not to this page.
 import './conversation.js';
+import { registerUnsavedCheck } from './shell.js';
 
 const LIST_URL = '/chats';
 // Where the back control lands a visitor who has no app history behind them.
@@ -265,6 +266,15 @@ class RetinueChatPage extends HTMLElement {
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
+    // What a wake or a Home press from the Android shell must not navigate
+    // away from (shell.js): a draft not yet stored (saves are debounced), a
+    // dictation recording or being transcribed, images staged for a send.
+    // The companion thread's own input is the conversation module's check.
+    if (!this._offUnsaved) {
+      this._offUnsaved = registerUnsavedCheck(() => this._draft !== this._draftSaved ||
+        !!this._draftInflight || this._recState !== 'idle' ||
+        Object.keys(this._voiceJobs).length > 0 || this._outImages.length > 0);
+    }
     this._id = new URLSearchParams(location.search).get('id') || '';
     // Where "back" leads. A same-origin referrer means the chat was opened
     // from inside the app (a row on the home, the chats list, another chat),
@@ -373,6 +383,8 @@ class RetinueChatPage extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._offUnsaved) this._offUnsaved();
+    this._offUnsaved = null;
     if (this._onPageHide) window.removeEventListener('pagehide', this._onPageHide);
     this._onPageHide = null;
     if (this._shelfRelease) this._shelfRelease();
