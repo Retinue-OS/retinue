@@ -15,7 +15,8 @@
   <!-- Web components. Each is a standalone custom element that fetches its
        own data document. Edit this file to add, remove or reorder cards. -->
   <!-- The navigation row every top-level page opens with: the home and the
-       chats, threads, projects and news pages beside it, plus settings. -->
+       chats, threads, projects, news and contacts pages beside it, plus the
+       pending sends and settings. -->
   <script type="module" src="/components/nav.js"></script>
   <!-- The home: one list of what wants attention — threads, chats and projects
        alike, each with its importance, urgency and delivery — over the
@@ -23,9 +24,10 @@
   <script type="module" src="/components/attention.js"></script>
   <!-- The thread viewer: threads with Ara open in place, answering the
        #conversation-<id> hash that rows and push notifications use, and the
-       composer (#new) for a new conversation. Invisible until then. -->
+       composer (#new) for a new conversation. Invisible until then. It also
+       answers the Android shell's wake (continuous conversation by voice)
+       and Home press (components/shell.js). -->
   <script type="module" src="/components/conversations.js"></script>
-  <script type="module" src="/components/app-launcher.js"></script>
   <!-- No opt-in element here (that UI lives on /settings.html now), but the
        module keeps an already-granted subscription healthy on every load. -->
   <script type="module" src="/components/push.js"></script>
@@ -63,7 +65,7 @@
          The state the user is in is the one thing worth the space above a
          list of what wants their attention — and a greeting was not it. -->
 
-    <!-- The deck: the region above the dock. On phones the wrappers are
+    <!-- The deck: the page's one region. On phones the wrappers are
          display:contents (everything stacks, the page scrolls); in the wide
          layout the column is a fixed frame whose regions scroll internally.
          No news here: the home is for what wants attention, and a feed is a
@@ -92,28 +94,15 @@
     <retinue-briefing heading="Briefing"             src="/data/briefing.json"></retinue-briefing>
     -->
 
-    <!-- App quick-launch dock. Configure the buttons by hand here. Each child is
-         a normal link: tel: / sms: / mailto: / geo: work in every browser;
-         intent:// works in Chromium browsers and can launch arbitrary installed
-         apps (these local OS actions work offline). Plain paths like /sends
-         navigate within the PWA; the dashboard's own pages are in the
-         navigation row at the top, so the dock does not repeat them — the
-         address book (/contacts.html) lives here, beside the phone and mail
-         it stands behind. -->
-    <retinue-app-launcher>
-      <a href="tel:"><span class="ico">&#128222;</span><span class="lbl">Phone</span></a>
-      <a href="sms:"><span class="ico">&#128172;</span><span class="lbl">SMS</span></a>
-      <a href="mailto:"><span class="ico">&#9993;&#65039;</span><span class="lbl">Mail</span></a>
-      <a href="geo:0,0?q="><span class="ico">&#128506;&#65039;</span><span class="lbl">Map</span></a>
-      <a href="/sends"><span class="ico">&#128228;</span><span class="lbl">Sends</span></a>
-      <a href="/contacts.html"><span class="ico">&#128211;</span><span class="lbl">Contacts</span></a>
-    </retinue-app-launcher>
+    <!-- No app dock: the phone's own dialer, SMS, mail and map are the Android
+         shell's launcher bar now (they are the OS's, not Retinue's), and the
+         contacts and pending sends it also held are in the navigation row. -->
     <retinue-shelf></retinue-shelf>
   </main>
 
   <script>
     // Register the service worker so the shell (and the last data) stay
-    // available offline -- the dialer button keeps working without signal.
+    // available offline.
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js'));
     }

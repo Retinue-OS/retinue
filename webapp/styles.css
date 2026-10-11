@@ -9,9 +9,9 @@
  *    height (--frame-h from viewport.js, else 100dvh). The .deck / .col
  *    wrappers in index.html are display:contents here, so the cards stack in
  *    main's column: the navigation, the attention list (whose first line is
- *    the mode), the dock. The page never scrolls — the attention list
- *    scrolls inside its own region, so the navigation and the dock always
- *    stay in view. No news on the home: it lives on its own page. The full
+ *    the mode), the shelf. The page never scrolls — the attention list
+ *    scrolls inside its own region, so the navigation always stays in
+ *    view. No news on the home: it lives on its own page. The full
  *    list pages (chats, conversations, news, projects) keep a scrolling
  *    document on the phone, under the pinned navigation.
  *  - Thread/composer open: the frame locks to exactly 100dvh and everything
@@ -112,13 +112,6 @@ retinue-projects { flex: none; }
 retinue-news[hidden] { display: none; }
 /* Chats card: natural height in the phone stack, like the other list cards. */
 retinue-chats { flex: none; }
-/* Phone stacking: the list, then the dock. */
-retinue-app-launcher { order: 2; }
-
-/* App dock (slotted content lives in the light DOM, so it is styled here). */
-retinue-app-launcher { flex: none; }
-retinue-app-launcher .ico { font-size: 1.35rem; line-height: 1.25; }
-retinue-app-launcher .lbl { font-size: .68rem; color: var(--muted); }
 
 /* Settings page (settings.html): a plain readable column of cards, the same
    width in every layout — none of the dashboard's frame rules apply to it. */
@@ -166,17 +159,22 @@ retinue-sparql-workbench { display: block; min-height: 120px; }
    choose. */
 retinue-sparql-workbench .yasgui .controlbar { display: none; }
 .sparql-example.live .yasr, retinue-sparql-workbench .yasr { font-size: .85rem; }
-.shelf-size { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.shelf-size input { width: 5.5em; min-height: 40px; padding: 0 10px; border-radius: 10px;
+/* A labelled number on a settings card: the shelf size, the voice timeouts. */
+.shelf-size, .num-setting { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.num-setting + .num-setting { margin-top: 8px; }
+.shelf-size input, .num-setting input { width: 5.5em; min-height: 40px; padding: 0 10px; border-radius: 10px;
                     border: 1px solid var(--line); background: var(--card-2); color: var(--fg);
                     font: inherit; }
+.setting-btn { min-height: 40px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--accent);
+               background: var(--card-2); color: var(--fg); font: inherit; cursor: pointer; }
+.setting-btn:hover { background: var(--accent); color: var(--bg); }
 
 /* The shelf of minimized pages (components/shelf.js): the last child of main
    on every page. In a locked frame (the home, an open thread, a chat, a
    project) it is simply the column's last row, so the page above makes room
    for it; on a scrolling list page it sticks to the bottom of the screen.
-   On the home it sits above the dock (order). While the phone keyboard is up
-   it steps aside — the field being typed in needs the room. */
+   While the phone keyboard is up it steps aside — the field being typed in
+   needs the room. */
 retinue-shelf { flex: none; order: 1; position: sticky; bottom: 0; z-index: 15;
                 margin-top: auto; background: var(--bg); }
 html[data-keyboard="1"] retinue-shelf { display: none; }
@@ -195,9 +193,9 @@ main:has(retinue-conversations[data-view="composer"]) {
   overflow: hidden;
 }
 main:has(retinue-conversations[data-view="thread"])
-  :is(.top, retinue-nav, .splitter, .col-side, retinue-app-launcher),
+  :is(.top, retinue-nav, .splitter, .col-side),
 main:has(retinue-conversations[data-view="composer"])
-  :is(.top, retinue-nav, .splitter, .col-side, retinue-app-launcher),
+  :is(.top, retinue-nav, .splitter, .col-side),
 /* …and every other card sharing the main column. Matched by position rather
    than named one by one: the enumeration silently stopped covering the column
    the moment a card was added to it, which is how the chats list stayed on
@@ -239,7 +237,7 @@ retinue-project-page { flex: 1; min-height: 0; }
     height: var(--frame-h, 100dvh);
   }
 
-  /* The deck between header and dock: one column, the attention list (and
+  /* The deck under the navigation: one column, the attention list (and
      the thread viewer). Where a splitter is declared, visual gaps come from the splitters
      themselves, so dragging happens exactly where the boundary is seen. */
   .deck { display: flex; flex: 1; min-height: 0; align-items: stretch; }
@@ -258,8 +256,6 @@ retinue-project-page { flex: 1; min-height: 0; }
   .splitter:hover::before, .splitter:focus-visible::before,
   .splitter.dragging::before { background: var(--accent); }
   .splitter:focus-visible { outline: none; }
-
-  retinue-app-launcher { align-self: center; width: 100%; max-width: 560px; }
 
   /* The project page is a single column at a readable width. */
   main:has(retinue-project-page) { max-width: 760px; }

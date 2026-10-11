@@ -41,6 +41,31 @@
     </section>
 
     <section class="scard">
+      <h2>Voice</h2>
+      <p class="hint">Continuous conversation (the loop button in a thread's
+        bar) reads Ara's answers aloud, then opens the mic. A pause as long as
+        the first value ends what you say and sends it; if you say nothing,
+        the mic closes after the second (tap the mic to talk again). Per
+        device.</p>
+      <label class="num-setting">Pause that ends a take (seconds)
+        <input type="number" min="0.5" max="5" step="0.1" inputmode="decimal" data-voice-silence>
+      </label>
+      <label class="num-setting">Mic closes with no speech after (seconds)
+        <input type="number" min="2" max="30" step="1" inputmode="decimal" data-voice-nospeech>
+      </label>
+    </section>
+
+    <!-- Only inside the Android shell (window.RetinueShell, components/shell.js):
+         what needs native APIs — the base URL, the client certificate, the
+         launcher bar and the wake phrase — is set there, not here. -->
+    <section class="scard" data-shell-settings hidden>
+      <h2>Phone shell</h2>
+      <p class="hint">The Android app around this dashboard: its address and
+        client certificate, the launcher bar, and the wake phrase.</p>
+      <button type="button" class="setting-btn" data-shell-open>Open phone shell settings</button>
+    </section>
+
+    <section class="scard">
       <h2>Layout</h2>
       <p class="hint">On a wide screen the dashboard's columns are resizable —
         drag the dividers, double-click one to reset it. Each card's header
@@ -76,14 +101,37 @@
   </main>
 
   <script type="module">
+    import { shelfSize, setShelfSize, subscribe } from '/components/shelf-store.js';
+    import { voiceTimeouts, setVoiceTimeouts } from '/components/continuous.js';
+    import { inShell, openShellSettings } from '/components/shell.js';
+
     // The shelf size (components/shelf-store.js): kept per device and browser
     // like the shelf; lowering it makes room at once, quiet items first.
-    import { shelfSize, setShelfSize, subscribe } from '/components/shelf-store.js';
     const input = document.querySelector('[data-shelf-size]');
     const show = () => { if (document.activeElement !== input) input.value = String(shelfSize()); };
     input.addEventListener('change', () => { input.value = String(setShelfSize(input.value)); });
     subscribe(show);
     show();
+
+    // The voice timeouts (components/continuous.js): per device; shown in
+    // seconds, kept in milliseconds, clamped to what the loop accepts.
+    const silence = document.querySelector('[data-voice-silence]');
+    const noSpeech = document.querySelector('[data-voice-nospeech]');
+    const showVoice = (t) => {
+      silence.value = String(t.silenceMs / 1000);
+      noSpeech.value = String(t.noSpeechMs / 1000);
+    };
+    silence.addEventListener('change', () =>
+      showVoice(setVoiceTimeouts({ silenceMs: Number(silence.value) * 1000 })));
+    noSpeech.addEventListener('change', () =>
+      showVoice(setVoiceTimeouts({ noSpeechMs: Number(noSpeech.value) * 1000 })));
+    showVoice(voiceTimeouts());
+
+    // The phone shell's own settings, where the page runs inside it.
+    if (inShell()) {
+      document.querySelector('[data-shell-settings]').hidden = false;
+      document.querySelector('[data-shell-open]').addEventListener('click', () => openShellSettings());
+    }
   </script>
   <script>
     // Register the service worker so this page is available offline too.
