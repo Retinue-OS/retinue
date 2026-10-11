@@ -705,7 +705,17 @@ back as the room (it may have been a voice). No speech within the no-speech time
 closes the mic with the mode kept on (the mic button resumes); leaving the
 thread or hiding the page ends listening. Where the page cannot hear the
 stream at all, plain timers stand in: the same no-speech timeout (unless the
-recording row was touched) and the same cap, to review. Both timeouts are
+recording row was touched) and the same cap, both ending the take for review
+— nothing there knows whether the user spoke. The loop never takes the
+input row from under a user who is writing: with text or files in the box,
+or the cursor in it, the mic does not open by itself (the loop stops and
+offers **Start talking**), and a take that ends while the box holds
+anything goes to review rather than out with it. Playing another message
+while the loop reads its answer ends the loop (the mode stays on), as the
+bar's ✕ does. An engaged loop that has nothing going on for 90 s — no mic,
+no take on its way, no answer awaited or playing — lets go, and so does one
+whose thread turns out deleted (which also drops it from the wake's
+choice). Both timeouts are
 per device (Settings → Voice). Only an answer to the element's own turn
 carries the loop on: another message pushed into a thread in the mode may be
 read aloud, but never opens the mic. A mic the loop wants while the page is

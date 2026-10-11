@@ -465,10 +465,23 @@ function isLoaded(convId, m) {
 // `fraction` (0..1) of its text. Called from a tap where possible: the first
 // speak of a page load must sit inside a user gesture on iOS.
 // Returns whether there was anything to read.
+//
+// Another message taking the player from the loop's reading (the user
+// played an earlier answer, say) ends the spoken conversation, as the ✕ on
+// the bar does: said so here, at once, rather than left to a stop event that
+// a reading replaced by another never sends. The mode stays on; the mic
+// button or a wake resumes. Opening the mic when the user's own reading
+// ends instead would turn any message they play into a turn they never
+// asked to take.
 function playMessage(conv, m, fraction) {
   if (!conv || !m || !speechAvailable()) return false;
   const clean = plainForSpeech(m.text);
   if (!clean) return false;
+  if (CONT_READ && (CONT_READ.conv !== conv.id || CONT_READ.ts !== m.ts)) {
+    const el = LIVE.get(CONT_READ.conv);
+    CONT_READ = null;
+    if (el) el._contDisengage();
+  }
   PLAYING = playingInfo(conv, m);
   if (!READER.load([{ id: m.ts, lang: m.lang, text: clean }], { fraction: fraction || 0 })) return false;
   READER.resume();
@@ -2207,6 +2220,9 @@ class RetinueConversation extends HTMLElement {
     if (this._id) setContinuous(this._id, on); else this._contNew = on;
     if (!on) { this._contStopListening(); this._contDisengage(); }
     this._contReady = false;
+    // Switched on while Ara is answering: the answer under way is the turn
+    // the loop goes on from — read aloud, then the mic.
+    if (on && this._thread && this._thread.pending) this._contEngage();
     this.render();
     // Switched on: the tap is the gesture that lets the page play the chime
     // and start the microphone, so the loop starts from it.
@@ -2371,11 +2387,14 @@ class RetinueConversation extends HTMLElement {
   // good when nobody is there: unless the user touches the recording row,
   // it closes after the no-speech timeout, as the detector would; and a take
   // they did start ends for review at the length cap, as the detector's does.
+  // Closed for review, not dropped: nothing here knows whether the user
+  // spoke, and a take thrown away cannot be had back (an empty one only
+  // leaves the "no speech" note).
   _contUnheard(mr, noSpeechMs) {
     this._contClearTimers();
     this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder !== mr || this._recTouched) return;
-      this._abortRecording();
+      this._finishRecording('review');
     }, noSpeechMs));
     this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder === mr) this._finishRecording('review');
