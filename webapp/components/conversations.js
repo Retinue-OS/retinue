@@ -265,8 +265,18 @@ class RetinueConversations extends HTMLElement {
       // The project context is snapshotted into the element's attributes at
       // render time, so a change of context while composing re-renders.
       const was = `${this._composeProject || ''}\n${this._composeProjectTitle}\n${this._composeVoice}`;
+      const wasVoice = this._composeVoice;
       this._setComposeProject(cm[1]);
-      this._takeVoiceFlag();
+      // No voice flag on the address does not switch the mode off: the flag
+      // leaves the address as soon as it is read (_takeVoiceFlag), and that
+      // same entry is reported again — setting location.hash fires popstate
+      // and then hashchange — so the second report must not undo the first.
+      // Only a change of context starts the composer afresh.
+      if (this._composeVoice) this._takeVoiceFlag();
+      else if (this._composing && wasVoice &&
+          `${this._composeProject || ''}\n${this._composeProjectTitle}\n${wasVoice}` === was) {
+        this._composeVoice = true;
+      }
       const now = `${this._composeProject || ''}\n${this._composeProjectTitle}\n${this._composeVoice}`;
       if (!this._composing) this._showComposer();
       else if (now !== was) this.render();
