@@ -112,20 +112,25 @@ function holdNote(type) {
   noteTimer = setTimeout(() => { el.hidden = true; noteTimer = null; }, 3500);
 }
 
+// Unsent input here: a Home press does nothing, and a wake goes nowhere —
+// the wake phrase can be said again once the input is dealt with, the input
+// could not be had back. Said so, and the input shown. True when the event
+// is held. The page that claims the events (the home) asks this too before
+// acting on one, so its own draft is as safe as any other page's.
+export function shellEventHeld(type) {
+  const holder = unsavedHolder();
+  if (!holder) return false;
+  holdNote(type);
+  if (holder.reveal) { try { holder.reveal(); } catch (_e) { /* the note still says it */ } }
+  return true;
+}
+
 if (typeof window !== 'undefined') {
   window.addEventListener('retinue-shell', (e) => {
     if (claimed) return;
     const type = e && e.detail && e.detail.type;
     if (type !== 'wake' && type !== 'home') return;
-    // Unsent input here: a Home press does nothing, and a wake goes nowhere
-    // — the wake phrase can be said again once the input is dealt with,
-    // the input could not be had back. Said so, and the input shown.
-    const holder = unsavedHolder();
-    if (holder) {
-      holdNote(type);
-      if (holder.reveal) { try { holder.reveal(); } catch (_e) { /* the note still says it */ } }
-      return;
-    }
+    if (shellEventHeld(type)) return;
     if (type === 'wake') location.assign('/?wake=1');
     else location.assign('/');
   });

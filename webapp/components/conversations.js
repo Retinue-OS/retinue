@@ -49,7 +49,7 @@ import {
 } from './base.js';
 import { hasUnsentInput } from './conversation.js';
 import { modeEntries, pickWakeThread, setContinuous } from './continuous.js';
-import { claimShellEvents, inShell } from './shell.js';
+import { claimShellEvents, inShell, shellEventHeld } from './shell.js';
 
 const LIST_URL = '/conversations';
 // Views are addressable by location hash, so opening a thread or the composer
@@ -144,6 +144,10 @@ class RetinueConversations extends HTMLElement {
       claimShellEvents();
       this._onShell = (e) => {
         const type = e && e.detail && e.detail.type;
+        // Claiming the events means the fallback's guard is ours to apply:
+        // a draft or a take in flight holds the press here as it would on
+        // any other page, else a wake could record over it and Home drop it.
+        if ((type === 'wake' || type === 'home') && shellEventHeld(type)) return;
         if (type === 'wake') this._wake(true);
         else if (type === 'home') this._rest();
       };
