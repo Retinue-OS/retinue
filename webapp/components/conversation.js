@@ -307,10 +307,26 @@ export function hasUnsentInput() {
   return false;
 }
 
-// The same question for the Android shell's wake and Home press on a page
-// that is not the home (shell.js): those navigate, so they also wait for a
-// send on the wire and a mic in use (being asked for, or recording).
-registerUnsavedCheck(() => hasUnsentInput() || SENDS.size > 0 || MIC_HOLDS.size > 0);
+// A close cousin for the Android shell's wake and Home press on a page that
+// is not the home (shell.js): those navigate, so they wait for a send on the
+// wire, a dictation on its way and a mic in use (being asked for, or
+// recording) — but of the drafts only the one on screen counts. A draft left
+// in another thread is what the user walked away from: it holding every
+// press back, with nothing to see why, made the button look dead.
+function shownWithDraft() {
+  for (const el of LIVE.values()) {
+    if (el.isConnected && el._draftHasInput()) return el;
+  }
+  return null;
+}
+registerUnsavedCheck(
+  () => !!(VOICE_JOBS.size || FILE_READS || SENDS.size || MIC_HOLDS.size || shownWithDraft()),
+  () => {
+    const el = [...MIC_HOLDS].find((e) => e.isConnected) || shownWithDraft() ||
+      [...LIVE.values()].find((e) => e.isConnected && (VOICE_JOBS.has(e._key()) || SENDS.has(e._key())));
+    if (el) el._revealInput();
+  },
+);
 
 // The offered model list, fetched once and shared. A failure (or a
 // single-model list) simply leaves every picker hidden.
@@ -2399,6 +2415,18 @@ class RetinueConversation extends HTMLElement {
     this._contTimers.push(setTimeout(() => {
       if (this._mediaRecorder === mr) this._finishRecording('review');
     }, VAD_DEFAULTS.maxMs));
+  }
+
+  // The shell's press was held back by what is in this conversation's input
+  // row (see registerUnsavedCheck above): bring the row into view, and the
+  // cursor into a draft — not into a recording or a send under way, where
+  // there is nothing to type.
+  _revealInput() {
+    const root = this.shadowRoot;
+    const row = root && root.querySelector('.composer');
+    if (row && row.scrollIntoView) row.scrollIntoView({ block: 'nearest' });
+    const ta = root && root.querySelector('[data-form] textarea');
+    if (ta && !ta.disabled && this._recState === 'idle') ta.focus();
   }
 
   // Text or files waiting in this conversation's box.

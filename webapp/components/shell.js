@@ -62,19 +62,54 @@ export function claimShellEvents() { claimed = true; }
 // edit not yet saved. Returns the function that unregisters it. Kept here,
 // with no imports, so any page module can use it without a cycle (update.js
 // asks the same question of the conversations card before a reload).
-const unsavedChecks = new Set();
+// `reveal`, optional: called when that input has just held a wake or a Home
+// press back, to show the user where it is (focus the field holding it,
+// scroll it into view) — a press that did nothing visible reads as broken.
+const unsavedChecks = new Map();
 
-export function registerUnsavedCheck(fn) {
+export function registerUnsavedCheck(fn, reveal) {
   if (typeof fn !== 'function') return () => {};
-  unsavedChecks.add(fn);
-  return () => { unsavedChecks.delete(fn); };
+  const entry = { fn, reveal: typeof reveal === 'function' ? reveal : null };
+  // Keyed by an object of its own: the same function registered twice is
+  // two registrations, each undone by its own unregister.
+  const token = {};
+  unsavedChecks.set(token, entry);
+  return () => { unsavedChecks.delete(token); };
+}
+
+// The registration holding unsaved input, or null.
+function unsavedHolder() {
+  for (const entry of unsavedChecks.values()) {
+    try { if (entry.fn()) return entry; } catch (_e) { /* a broken check is no veto */ }
+  }
+  return null;
 }
 
 export function hasUnsavedInput() {
-  for (const fn of unsavedChecks) {
-    try { if (fn()) return true; } catch (_e) { /* a broken check is no veto */ }
+  return !!unsavedHolder();
+}
+
+// A short note at the bottom of the page: why the press did nothing.
+let noteTimer = null;
+function holdNote(type) {
+  if (typeof document === 'undefined' || !document.body) return;
+  let el = document.getElementById('retinue-shell-note');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'retinue-shell-note';
+    el.setAttribute('role', 'status');
+    el.style.cssText = 'position:fixed;left:16px;right:16px;bottom:calc(16px + env(safe-area-inset-bottom, 0px));' +
+      'z-index:2147483647;margin:0 auto;max-width:420px;padding:10px 14px;border-radius:12px;' +
+      'background:var(--card-2, #1c2230);color:var(--fg, #e7ebf2);font:14px/1.35 system-ui, sans-serif;' +
+      'box-shadow:0 4px 18px rgba(0,0,0,.35);text-align:center;pointer-events:none';
+    document.body.appendChild(el);
   }
-  return false;
+  el.textContent = type === 'wake'
+    ? 'Unsent input here — send or clear it, then wake again.'
+    : 'Unsent input here — send or clear it first.';
+  el.hidden = false;
+  if (noteTimer) clearTimeout(noteTimer);
+  noteTimer = setTimeout(() => { el.hidden = true; noteTimer = null; }, 3500);
 }
 
 if (typeof window !== 'undefined') {
@@ -84,8 +119,13 @@ if (typeof window !== 'undefined') {
     if (type !== 'wake' && type !== 'home') return;
     // Unsent input here: a Home press does nothing, and a wake goes nowhere
     // — the wake phrase can be said again once the input is dealt with,
-    // the input could not be had back.
-    if (hasUnsavedInput()) return;
+    // the input could not be had back. Said so, and the input shown.
+    const holder = unsavedHolder();
+    if (holder) {
+      holdNote(type);
+      if (holder.reveal) { try { holder.reveal(); } catch (_e) { /* the note still says it */ } }
+      return;
+    }
     if (type === 'wake') location.assign('/?wake=1');
     else location.assign('/');
   });
