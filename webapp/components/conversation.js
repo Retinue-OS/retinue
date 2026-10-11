@@ -1260,6 +1260,10 @@ class RetinueConversation extends HTMLElement {
     // not steal focus when the user wasn't typing).
     const prev = root.querySelector('[data-form] textarea');
     this._hadFocus = !!(prev && root.activeElement === prev);
+    // The loop toggle too: switching it re-renders (and so does the mic it
+    // opens), and a keyboard user must not be thrown back to the page's top.
+    const prevToggle = root.querySelector('[data-continuous]');
+    const toggleFocus = !!(prevToggle && root.activeElement === prevToggle);
     const mode = this._id ? 'thread' : 'new';
     const here = esc(this._id);
     root.innerHTML = `<style>${CSS}${VOICE_CSS}${MD_CSS}</style>` +
@@ -1275,6 +1279,10 @@ class RetinueConversation extends HTMLElement {
     this._threadSig = this._thread ? this._signature(this._thread) : '';
     this._pickerStale = false; // rebuilt from the state just now
     this._wire();
+    if (toggleFocus) {
+      const toggle = root.querySelector('[data-continuous]');
+      if (toggle) toggle.focus();
+    }
     // After a full render of a thread, scroll to bottom so the latest message
     // is visible (matches typical chat-app behaviour on open).
     const threadEl = root.querySelector('.thread');

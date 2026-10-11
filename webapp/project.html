@@ -14,11 +14,10 @@
 
   <!-- One project's own page (?id=<project URI>): rendered details, in-place
        editing of the underlying Markdown file, and a command bar that hands
-       quick change requests (typed or dictated) to Ara. -->
+       quick change requests (typed or dictated) to Ara. It imports
+       components/shell.js, so a wake or Home press of the Android shell here
+       goes to the home — unless an edit is unsaved. -->
   <script type="module" src="/components/project-page.js"></script>
-  <!-- The Android shell's fallback: a wake or Home press here goes to the
-       home (this page has no navigation row to bring it). -->
-  <script type="module" src="/components/shell.js"></script>
   <!-- Keeps the locked frame the height that is actually visible. -->
   <script type="module" src="/viewport.js"></script>
   <!-- The minimized pages: threads, chats and projects parked one tap away

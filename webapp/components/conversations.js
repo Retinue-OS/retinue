@@ -217,6 +217,7 @@ class RetinueConversations extends HTMLElement {
   // the stack still holds then (a deep link's hash) is dropped in place.
   _rest() {
     if (this._active || this._composing || location.hash) this._toList();
+    else history.replaceState(history.state, '', this._homeAddress());
     const sheet = document.querySelector('retinue-attention-sheet');
     if (sheet && !sheet.hidden && typeof sheet.close === 'function') sheet.close();
     const list = document.querySelector('retinue-attention');
@@ -250,7 +251,7 @@ class RetinueConversations extends HTMLElement {
     // Unwinding to the list (_toList): land on it, whatever entry that was.
     if (this._resting) {
       this._resting = false;
-      if (hash) history.replaceState({ retinueDepth: 0 }, '', `${location.pathname}${location.search}`);
+      history.replaceState({ retinueDepth: 0 }, '', this._homeAddress());
       this._pushDepth = 0;
       if (this._active || this._composing) this._showList();
       return;
@@ -481,9 +482,21 @@ class RetinueConversations extends HTMLElement {
       setTimeout(() => { if (this._resting) { this._resting = false; this._toList(0); } }, 1500);
       return;
     }
-    if (location.hash) history.replaceState({ retinueDepth: 0 }, '', `${location.pathname}${location.search}`);
+    history.replaceState({ retinueDepth: 0 }, '', this._homeAddress());
     this._pushDepth = 0;
     this._showList();
+  }
+
+  // The address the home rests on: no hash, and none of the deep links that
+  // open something over the list (?item= a sheet, ?digest= a digest) — or
+  // a reload after Home would bring them back.
+  _homeAddress() {
+    try {
+      const url = new URL(location.href);
+      url.searchParams.delete('item');
+      url.searchParams.delete('digest');
+      return `${url.pathname}${url.search}`;
+    } catch (_e) { return location.pathname; }
   }
 
   _showThread(id) {
