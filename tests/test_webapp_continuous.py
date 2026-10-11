@@ -25,7 +25,7 @@ HARNESS = r"""
 import assert from 'node:assert/strict';
 import {
   Vad, VAD_DEFAULTS, rms, pickWakeThread, WAKE_WINDOW_MS,
-  modeEntries, isContinuous, setContinuous, touchContinuous, MODE_KEY,
+  modeEntries, isContinuous, setContinuous, touchContinuous, forgetContinuous, MODE_KEY,
   voiceTimeouts, setVoiceTimeouts, DEFAULT_SILENCE_MS, DEFAULT_NO_SPEECH_MS,
 } from './continuous.mjs';
 
@@ -319,6 +319,19 @@ ok('mode flags round-trip through storage and feed the wake choice', () => {
   assert.equal(modeEntries().nope, undefined);
   setContinuous('', true);
   assert.equal(Object.keys(modeEntries()).length, 2);
+});
+
+ok('a thread found gone is forgotten, and no wake goes back to it', () => {
+  store.clear();
+  setContinuous('gone', true, NOW - MIN);
+  setContinuous('older', true, NOW - 5 * MIN);
+  assert.equal(pickWakeThread(modeEntries(), NOW), 'gone');
+  forgetContinuous('gone');
+  assert.equal(modeEntries().gone, undefined);
+  assert.equal(pickWakeThread(modeEntries(), NOW), 'older');
+  forgetContinuous('never-there');
+  forgetContinuous('');
+  assert.deepEqual(Object.keys(modeEntries()), ['older']);
 });
 
 ok('the stored map keeps the 50 most recently used threads', () => {

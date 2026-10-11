@@ -114,7 +114,7 @@ import { Reader, speechAvailable } from './speech.js';
 import { openAttentionSheet } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 import {
-  isContinuous, setContinuous, touchContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
+  isContinuous, setContinuous, touchContinuous, forgetContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
   chime, primeAudio,
 } from './continuous.js';
 import { setVoiceActive, registerUnsavedCheck } from './shell.js';
@@ -124,6 +124,12 @@ const POLL_MS = 4000;
 // How long a mic the loop wanted while the page was hidden (a wake in the
 // background, an answer read in a pocket) waits for the page to come back.
 const CONT_PENDING_MS = 60 * 1000;
+// An engaged loop with nothing going on — no mic, no take on its way, no
+// answer awaited or being read — for this long has stopped without saying
+// so (a thread that never loads, the network gone): it lets the shell's
+// voice flag go (see _contWatch). Looked at every CONT_WATCH_MS.
+const CONT_IDLE_MS = 90 * 1000;
+const CONT_WATCH_MS = 5 * 1000;
 // While Ara is answering the reply is what the user is waiting for.
 const PENDING_POLL_MS = 1500;
 const PENDING_WARN_SECONDS = 2 * 60;
@@ -752,6 +758,7 @@ class RetinueConversation extends HTMLElement {
     this._contArmed = false; // the next answer is to this element's own turn (see _contEngage)
     this._contPending = null; // {loop}: a listen asked for while the page was hidden
     this._contPendingTimer = null;
+    this._contWatchTimer = null; // the engaged loop's watchdog (see _contWatch)
     this._contReady = false; // opened in the mode without a gesture: offer "Start talking"
   }
 
@@ -1094,6 +1101,12 @@ class RetinueConversation extends HTMLElement {
           this._thread = null;
           this._threadSig = '';
           this._stopPolling();
+          // No conversation to carry on: the loop stops (a wake into a
+          // deleted thread would otherwise hold the shell's voice flag for
+          // good), and the thread leaves the mode for wakes to come.
+          this._listenOnOpen = false;
+          forgetContinuous(id);
+          this._contDisengage();
           this.render();
         }
         return false;
@@ -2043,9 +2056,19 @@ class RetinueConversation extends HTMLElement {
     // A take of the loop that goes out keeps the loop engaged through the
     // transcription and Ara's answer; one dropped (nobody spoke, ✕) or kept
     // for review (✓, the length cap, leaving) ends it.
+    // Engaged where the turn lands: this element while it is still on the
+    // key the take was made for; otherwise (left, or pointed at another
+    // thread) whatever is live under that key now, or nothing — a detached
+    // element holding the shell's voice flag would hold it for good.
     if (wasTake) {
-      if (!aborted && intent === 'send' && chunks.length) this._contEngage();
-      else this._contDisengage();
+      const goes = !aborted && intent === 'send' && chunks.length;
+      const here = this.isConnected && this._key() === key;
+      if (goes && here) this._contEngage();
+      else {
+        this._contDisengage();
+        const el = goes ? LIVE.get(key) : null;
+        if (el && el !== this) el._contEngage();
+      }
     }
     this._recState = 'idle';
     // Pointed at another thread since (attributeChangedCallback): that
@@ -2199,6 +2222,7 @@ class RetinueConversation extends HTMLElement {
   _contEngage() {
     this._contArmed = true;
     if (!ENGAGED.has(this)) { ENGAGED.add(this); syncShellVoice(); }
+    this._contWatch();
   }
 
   // The loop has stopped: the mode was switched off, nobody spoke, the user
@@ -2206,7 +2230,39 @@ class RetinueConversation extends HTMLElement {
   _contDisengage() {
     this._contArmed = false;
     this._contClearPending();
+    if (this._contWatchTimer) clearInterval(this._contWatchTimer);
+    this._contWatchTimer = null;
     if (ENGAGED.delete(this)) syncShellVoice();
+  }
+
+  // The watchdog of an engaged loop. Every way the loop stops is meant to
+  // disengage it, but one that just never goes on — the thread never loads,
+  // the answer's read fails for good, a reading the user paused and left —
+  // would keep the screen on and the wake phrase paused indefinitely. So
+  // while engaged the loop is looked at now and then, and idle for
+  // CONT_IDLE_MS on end it is disengaged; the mode stays on, and the mic
+  // button (or a wake) resumes.
+  _contWatch() {
+    if (this._contWatchTimer) return;
+    let idleSince = 0;
+    this._contWatchTimer = setInterval(() => {
+      if (!ENGAGED.has(this)) { this._contDisengage(); return; }
+      if (this._contBusy()) { idleSince = 0; return; }
+      const now = Date.now();
+      if (!idleSince) idleSince = now;
+      else if (now - idleSince >= CONT_IDLE_MS) this._contDisengage();
+    }, CONT_WATCH_MS);
+  }
+
+  // Something the loop is waiting on is under way: the mic (asked for or
+  // open), a take being transcribed or sent, a listen waiting for the page
+  // to come back (it has its own deadline), Ara answering, or the loop's
+  // reading of her answer playing.
+  _contBusy() {
+    const key = this._key();
+    if (this._recState !== 'idle' || VOICE_JOBS.has(key) || SENDS.has(key) || this._contPending) return true;
+    if (this._id && this._thread && this._thread.pending) return true;
+    return !!(CONT_READ && CONT_READ.conv === this._id && READER.state === 'playing');
   }
 
   // Open the mic for the next take, if this is the moment for one: the mode
@@ -2225,7 +2281,8 @@ class RetinueConversation extends HTMLElement {
     // for the page to come to the front (see _onContVis), for a while.
     if (document.visibilityState === 'hidden') { this._contDefer(loop, asked); return; }
     if (this._recState !== 'idle' || this._busy || VOICE_JOBS.has(this._key())) return;
-    if (this._id && (!this._thread || this._thread.pending || this._missing)) return;
+    if (this._missing) { this._contDisengage(); return; }
+    if (this._id && (!this._thread || this._thread.pending)) return;
     if (!canRecord()) { this._contDisengage(); return; }
     // The user is writing — text or files in the box, or the cursor in it:
     // the loop going round must not take the row from under their hands

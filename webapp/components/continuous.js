@@ -115,6 +115,16 @@ export function setContinuous(id, on, now = Date.now()) {
   saveEntries(entries);
 }
 
+// The thread is gone (deleted, or a link to none): forgotten, so no wake
+// goes back to it.
+export function forgetContinuous(id) {
+  if (!id) return;
+  const entries = modeEntries();
+  if (!(id in entries)) return;
+  delete entries[id];
+  saveEntries(entries);
+}
+
 // The thread was used in the mode just now (the mic opened, a take went out).
 export function touchContinuous(id, now = Date.now()) {
   if (!id) return;
