@@ -304,6 +304,15 @@ class RetinueAttention extends HTMLElement {
     return [...seen].map(([id, title]) => ({ id, title }));
   }
 
+  // The home at rest (the Android shell's Home press, components/shell.js):
+  // the mode menu closed and the list back at its top, where what matters
+  // most is.
+  rest() {
+    if (this._menu) { this._menu = false; this.render(); }
+    const list = this.shadowRoot && this.shadowRoot.querySelector('.list');
+    if (list) list.scrollTop = 0;
+  }
+
   async _setMode(mode, subject, project) {
     this._menu = false;
     try {
