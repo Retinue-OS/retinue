@@ -200,8 +200,8 @@ python3 /workspace/scripts/contacts.py delete <id>
 
 ### The dashboard
 
-The **Contacts page** (`contacts.html`, the *Contacts* button in the dock at the
-foot of the home) is the address book: every person, searchable by name and
+The **Contacts page** (`contacts.html`, the *Contacts* tab of the dashboard's
+navigation row) is the address book: every person, searchable by name and
 e-mail address, each edited in place — handles on every channel, spheres,
 importance prior, the modes they may interrupt, VIP. *+ New contact* names the
 chamber first.

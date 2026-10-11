@@ -12,8 +12,10 @@ the **site root** (`/`) of the gateway (`agents.example.com`, behind
 Traefik basic auth) and is installable as a Progressive Web App. The front-end
 lives in `webapp/` (baked into the image):
 
-- `webapp/index.html` is the hand-editable shell/config — which cards show and
-  the app-launch buttons (`tel:`/`sms:`/`mailto:`/`geo:`/`intent://`).
+- `webapp/index.html` is the hand-editable shell/config — which cards show.
+  The app-launch dock that sat under the list (phone, SMS, mail, map) is gone:
+  those are OS actions, not Retinue, and live in the Android shell's launcher
+  bar now (see "Inside the Android shell" below).
 - `webapp/components/*.js` are web components that each fetch one JSON document
   and render it, degrading to the last cached state offline.
   `<retinue-conversation>` (`conversation.js`) is the one exception in
@@ -28,12 +30,14 @@ lives in `webapp/` (baked into the image):
   (currently mock data). The server serves them at `/data/` from
   `DASHBOARD_DATA_DIR` (default `webapp/data`), kept separate from the baked
   shell so data can be written without rebuilding.
-- `webapp/sw.js` caches the shell so the dashboard and its local app-launch
-  buttons (notably the dialer) keep working with no connectivity.
+- `webapp/sw.js` caches the shell so the dashboard opens with no
+  connectivity.
 
 **Navigation is one row at the top of every top-level page**
-(`webapp/components/nav.js`): *Home · Chats · Threads · Projects · News* and
-the settings gear, with the page you are on underlined. It is the first thing
+(`webapp/components/nav.js`): *Home · Chats · Threads · Projects · News ·
+Contacts*, then an outbox icon for the pending sends (`/sends`, the approval
+queue — a queue that wants action, one tap away) and the settings gear, with
+the page you are on underlined. It is the first thing
 on the home, the list pages and settings, and it stays pinned while a list
 page scrolls, so leaving a page never means scrolling to its end — the list
 pages used to end in a "← Back to dashboard" link, and the home linked to
@@ -41,8 +45,8 @@ them from the foot of the list. The drill-downs — a chat (`chat.html`), a
 project (`project.html`), an open thread — are immersive and carry no row;
 their bar's back button returns to where they were opened from, or, opened
 cold (a push, a bookmark), to the home. On a phone the home never scrolls as
-a page (the attention list scrolls inside a locked frame, between the
-navigation and the dock); in the wide layout (`isWideFrame` in
+a page (the attention list scrolls inside a locked frame, under the
+navigation); in the wide layout (`isWideFrame` in
 `webapp/components/base.js`) it fills a fixed frame and scrolls internally.
 The home carries no news: a feed there defeats the point of a
 distraction-free list of what wants attention, so the news lives only on its
@@ -122,8 +126,8 @@ every chat of theirs. The card also carries the person's VIP switch. An empty
 name unlinks the handle — the person stays — and puts the sender back into
 screening.
 
-The **Contacts page** (`contacts.html`, the *Contacts* button in the dock at the
-foot of the home) is the address book itself: every person, searchable by name
+The **Contacts page** (`contacts.html`, the *Contacts* tab of the navigation
+row) is the address book itself: every person, searchable by name
 and e-mail address, each editable in place — their handles on every channel,
 their spheres, importance prior, the Focus modes they may interrupt, and the VIP
 flag. A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
@@ -679,8 +683,56 @@ live waveform with three controls: discard the recording, transcribe it into
 the text field for review, or transcribe-and-send in one step (no review stop,
 as over Signal).
 
+**Continuous conversation** is a per-thread mode on top of that composer
+(`webapp/components/conversation.js`, its pure logic in
+`webapp/components/continuous.js`). A loop button in the thread bar switches
+it for *this* thread, remembered per thread on the device. In the mode Ara's
+answers are read aloud (regardless of the speaker toggle); when the reading
+ends, or there is nothing to read, the mic opens with a short chime and a
+voice-activity detector — the RMS level of the recorder's own stream from a
+Web Audio `AnalyserNode`, against a noise floor learned while nobody speaks —
+ends the take after a pause (default 1.5 s) once speech was heard. The take is
+transcribed and sent on the same path as ➤, the loop waits for the answer, and
+repeats. No speech within the no-speech timeout (default 8 s) closes the mic
+with the mode kept on (the mic button resumes); leaving the thread or hiding
+the page ends listening. Both timeouts are per device (Settings → Voice).
+Entry points: the toggle, `/#new?voice=1` (the composer in the mode — its
+first take opens the thread, which continues in it) and a wake (`/?wake=1`
+or the shell's `wake` event), which opens the thread used in the mode within
+the last 15 minutes, else a new one. The detector listens for energy, not
+words, so it is language-agnostic.
+
 Language handling (constrain detection to the languages the user speaks, and
 re-decode when a guess falls outside that set) lives entirely in the service via
 `STT_SUPPORTED_LANGUAGES`. An optional `STT_TOKEN` gates the endpoint
 (defence-in-depth; the service is not published to the host). Downloaded model
 weights persist in the `stt-models` volume.
+
+## Inside the Android shell
+
+The Android app (`ara-android`, its own repository) is a specialised browser
+and home launcher: a full-height WebView on the dashboard's origin, a launcher
+bar beneath it configured on the device (installed apps, `tel:`/`sms:`/
+`mailto:`/`geo:` and other URIs, dashboard pages — its defaults are the four
+OS actions the web dock used to hold), and the few capabilities a browser tab
+cannot have: the home-screen role, a wake phrase, native speech output where
+the WebView has none, and the client certificate. Android never lets a PWA be
+the HOME app itself, so "the dashboard as home screen" is the shell holding
+the home role with the attention list as its start page. Everything that is
+Retinue — threads, voice conversation, attention, contacts, sends — stays in
+the web app, so it behaves the same in the shell, in Chrome and on a desktop.
+
+The contract the two sides share (web side: `webapp/components/shell.js`):
+
+| Direction | What |
+|---|---|
+| User agent | ` RetinueShell/1 (Android)` appended. |
+| `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` — the page reports its mic in use, so the shell pauses wake detection and keeps the screen on — and `openSettings()`, behind Settings → Phone shell (shown only when the object exists). |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` closes an open thread or sheet back to `/` and scrolls the list to its top. Other pages answer by loading `/?wake=1` or `/`. |
+| Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. |
+| Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
+
+`manifest.webmanifest` declares `launch_handler: {client_mode:
+"navigate-existing"}`, so a second launch of the installed PWA reuses its
+window. Known gap: Web Push does not reach a page inside an Android WebView,
+so notifications still need the PWA installed in Chrome alongside.

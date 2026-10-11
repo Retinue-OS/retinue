@@ -7,7 +7,9 @@ a Progressive Web App on the phone home screen.
 ## Architecture
 
 - **Static shell, no server rendering.** `index.html` is the hand-editable
-  configuration: it declares the active cards and app-launch buttons.
+  configuration: it declares the active cards. (The app-launch dock — phone,
+  SMS, mail, map — left the home: those are the Android shell's launcher bar
+  now; see "Inside the Android shell".)
 - **A conversation** (`components/conversation.js`) is one element,
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
   buttons on quotes and code, click-to-fill chips, attachments — images the
@@ -23,7 +25,8 @@ a Progressive Web App on the phone home screen.
   `retinue-thread`); drafts, dictation jobs and the reader outlive one
   instance, so a thread left and reopened has its text, and a reading goes
   on. A host can shape the frame without forking the thread: `bar="none"` or
-  `bar="actions"` for a header of its own, `stamp="clock"` beside a
+  `bar="actions"` for a header of its own, `continuous` to open it in
+  continuous conversation (see "Voice conversations"), `stamp="clock"` beside a
   clock-stamped timeline, `no-autofocus` where the host keeps it mounted
   whether or not it is on screen (taking focus scrolls the element into view,
   which on the chat page's phone strip is a tab switch), and `create-url`
@@ -39,14 +42,11 @@ a Progressive Web App on the phone home screen.
   and a retinue agent can open one when it needs a decision (e.g. an RSVP).
   It talks to the gateway's `/conversations` API rather than a static data
   file.
-- **App launcher** (`components/app-launcher.js`) provides local OS launch
-  buttons.
 - **Curated data** lives in `data/*.json`. Today these are mock files; the
   static mock cards that consume them are commented out in `index.html` until a
   refresh job regenerates them (write target = `DASHBOARD_DATA_DIR`).
-- **Offline:** `sw.js` caches the shell (cache-first) so the dashboard and the
-  local app-launch buttons — notably the dialer — work without connectivity.
-  Data is network-first with cache fallback.
+- **Offline:** `sw.js` caches the shell (cache-first) so the dashboard opens
+  without connectivity. Data is network-first with cache fallback.
 
 ## Serving
 
@@ -150,12 +150,16 @@ splitters — double-click resets one, dragging news fully down closes it — an
 each card's header toggles between list and card view. Both preferences
 persist per device in localStorage. Every top-level page opens with the
 navigation row (`components/nav.js`: Home · Chats · Threads · Projects · News
-and the settings gear), pinned while a list page scrolls. Device-level
-settings (notifications, the running shell version with a manual update
-check) live on `settings.html`, reached via that gear. The address book
-(`contacts.html`, `components/contacts.js`; docs/contacts.md) is reached from
-the app dock at the foot of the home — people, their handles on every channel,
-their attention settings and the VIP flag — over the live `/contacts` API.
+· Contacts, then the pending-sends outbox icon and the settings gear), pinned
+while a list page scrolls. Device-level settings (notifications, the voice
+timeouts, the running shell version with a manual update check, and — inside
+the Android shell only — a button into the shell's own settings) live on
+`settings.html`, reached via that gear. The address book (`contacts.html`,
+`components/contacts.js`; docs/contacts.md) is the *Contacts* tab — people,
+their handles on every channel, their attention settings and the VIP flag —
+over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
+page, the queue of messages waiting for approval: a queue that wants action,
+one tap away from every page.
 
 Shell updates apply themselves (`components/update.js`): when a new service
 worker activates, controlled pages reload once — never while a thread or the
@@ -613,17 +617,71 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   engine), but the position is remembered per passage in `localStorage`
   (`retinue-voice-position`, kept for a week) and the next time that thread
   opens the bar is back, paused right there — ▶ on the message or on the bar
-  carries on from that passage, ✕ forgets it. A per-thread **Auto** toggle
-  (persisted in `localStorage`) speaks replies automatically as they arrive;
+  carries on from that passage, ✕ forgets it. The speaker toggle in the
+  thread bar (one setting per device, persisted in `localStorage`) speaks
+  replies automatically as they arrive;
   the browser's own voice is used, so quality varies by platform, and iOS may
   require a tap (the play button) to start speech — the bar says so when the
   engine refuses. The controls are hidden where `speechSynthesis` is
   unavailable.
+- **Continuous conversation (hands-free).** The loop button in the thread bar
+  (also in `bar="actions"`, and in the new-thread composer's bar) puts *this*
+  thread into continuous mode; the flag is kept per thread on the device
+  (`retinue-continuous` in `localStorage`, with when the thread was last used
+  in the mode). In the mode Ara's answers are read aloud whatever the speaker
+  toggle says; when the reading ends — or there is nothing to read — the mic
+  opens with a short Web Audio chime, and a voice-activity detector over the
+  recorder's own stream (RMS level from an `AnalyserNode` against a learned
+  noise floor) ends the take after a pause of about 1.5 s once speech was
+  heard. The take goes out on the dictation's ➤ path (transcribe, send), the
+  loop waits for the answer, and goes round again. No speech for about 8 s
+  closes the mic with the mode left on — the mic button resumes; leaving the
+  thread or hiding the page ends listening (a take with speech in it lands in
+  the draft for review, as on leaving any dictation; one without is dropped).
+  The recording row keeps its ✕/✓/➤ throughout. Both timeouts are per-device
+  settings (Settings → Voice). Opening it: the toggle; `#new?voice=1`, the
+  composer in the mode, whose first take opens the thread that then goes on
+  in it; and a wake (`/?wake=1`, or the shell's `wake` event), which reopens
+  the thread used in the mode within the last 15 minutes, else that voice
+  composer. The pure parts — the detector's state machine and the wake's
+  choice of thread — are `components/continuous.js`
+  (`tests/test_webapp_continuous.py`).
 
 ## Installing on Android
 
-Open the URL in Chrome/Brave/Edge → menu → **Install app**. App launching uses
-`tel:` / `sms:` / `mailto:` / `geo:` (all browsers) and `intent://` (Chromium).
+Open the URL in Chrome/Brave/Edge → menu → **Install app**. The manifest's
+`launch_handler` (`navigate-existing`) makes a second launch reuse the open
+window rather than start another. Or use the Android shell (below), which
+can also be the phone's home screen.
+
+## Inside the Android shell
+
+The Android app (`ara-android`) is a specialised browser and home launcher
+around this web app: a full-height WebView on the configured origin, a
+launcher bar under it (the phone, SMS, mail and map buttons that used to be
+the home's dock, plus whatever the user pins), and the few things a page
+cannot do — the home-screen role, a wake phrase, native speech output, the
+client certificate. Everything that is Retinue stays here, so it behaves the
+same in the shell, in Chrome and on a desktop. The contract between them:
+
+- **User agent**: the shell appends ` RetinueShell/1 (Android)`.
+- **`window.RetinueShell`**, installed at document start on the configured
+  origin only: `platform`, `version`, `setVoiceActive(bool)` and
+  `openSettings()`. The page calls `setVoiceActive(true)` whenever its mic
+  opens and `false` when it closes (so the shell pauses its wake word and
+  keeps the screen on), and Settings → Phone shell — shown only when the
+  object exists — calls `openSettings()`. `components/shell.js` wraps both.
+- **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
+  {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
+  press while the shell is in front). The home answers both in place: a wake
+  opens continuous conversation (above), a home press closes an open thread or
+  sheet back to `/` and scrolls the list to its top. Any other page answers by
+  loading `/?wake=1` or `/`. A wake while the page is not loaded makes the shell
+  load `/?wake=1` itself; the home drops the flag from the address on load.
+- **Speech output**: Android's WebView has no Web Speech API, so the shell
+  installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
+  the native TTS where the page has none. `components/speech.js` is unchanged;
+  it simply finds an engine there.
 
 ## Next steps
 
