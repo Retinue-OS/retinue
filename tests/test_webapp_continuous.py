@@ -154,9 +154,47 @@ ok('the floor follows a room that grows quieter quickly, and a louder one slowly
 ok('a take that never falls silent ends at the length cap', () => {
   const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000, maxMs: 10000 });
   run(vad, 0, 500, QUIET);
-  const evs = run(vad, 500, 20000, SPEECH);
+  // Speech has gaps between words: 250 ms of voice, 100 ms between.
+  const evs = run(vad, 500, 20000, (t) => ((t % 350) < 250 ? SPEECH : QUIET));
   assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'max']]);
   assert.equal(evs[1].t, 10000);
+});
+
+ok('a room that gets louder for good is not speech, and no take ends in it', () => {
+  // Quiet 2 s, then a fan: a constant level well above the old threshold.
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000 });
+  const FAN = 0.05;
+  const evs = run(vad, 0, 30000, (t) => (t < 2000 ? QUIET : FAN));
+  // It looks like speech at first, is retracted once it has not dipped for
+  // stepMs, and the open mic closes on the no-speech timeout: nothing ends
+  // as a take, so nothing could be sent.
+  assert.deepEqual(evs.map((e) => e.type), ['speech', 'noise', 'timeout']);
+  assert.equal(evs[1].t, 2000 + VAD_DEFAULTS.stepMs);
+  assert.equal(evs[2].t, 8000);
+  assert.equal(vad.heard, false);
+  assert.ok(Math.abs(vad.floor - FAN) < 0.005, `floor ${vad.floor}`);
+});
+
+ok('a noise step after the no-speech window closes the mic at once', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 4000 });
+  const evs = run(vad, 0, 30000, (t) => (t < 3000 ? QUIET : 0.05));
+  assert.deepEqual(evs.map((e) => [e.type, e.t]), [['speech', 3150], ['timeout', 6000]]);
+});
+
+ok('a room that gets louder mid-sentence: the floor follows, the take still ends on silence', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000 });
+  run(vad, 0, 500, QUIET);
+  // Speech with gaps for 2 s, then a fan starts under it and stays.
+  const FAN = 0.05;
+  const level = (t) => {
+    if (t < 2500) return (t % 350) < 250 ? SPEECH : QUIET;
+    return FAN;
+  };
+  const evs = run(vad, 500, 20000, level);
+  const types = evs.map((e) => [e.type, e.reason || '']);
+  assert.deepEqual(types, [['speech', ''], ['end', 'silence']]);
+  // Not at the cap: once the fan is the floor, the speaker is silent.
+  assert.ok(evs[1].t <= 2500 + VAD_DEFAULTS.stepMs + 1500 + FRAME, `end at ${evs[1].t}`);
 });
 
 ok('reset() starts a fresh take', () => {

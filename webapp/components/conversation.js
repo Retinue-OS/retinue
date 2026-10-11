@@ -109,7 +109,8 @@ import { Reader, speechAvailable } from './speech.js';
 import { openAttentionSheet } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 import {
-  isContinuous, setContinuous, touchContinuous, voiceTimeouts, Vad, LevelMeter, chime,
+  isContinuous, setContinuous, touchContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
+  chime, primeAudio,
 } from './continuous.js';
 import { setVoiceActive } from './shell.js';
 
@@ -694,6 +695,9 @@ class RetinueConversation extends HTMLElement {
     this._contRec = false;   // the recording under way is a take of the loop
     this._vadHeard = false;  // …and the detector has heard speech in it
     this._meter = null;      // the detector's level meter for that take
+    this._vadLive = null;    // …which hears the stream (true), cannot (false), or is not up yet
+    this._contTimers = [];   // the plain timers standing in for a meter that cannot hear
+    this._recTouched = false; // the user has touched the recording row of this take
     this._listenOnOpen = false; // open the mic once the thread is read
   }
 
@@ -1935,8 +1939,10 @@ class RetinueConversation extends HTMLElement {
     this._wave.stop();
     if (this._meter) this._meter.stop();
     this._meter = null;
+    this._contClearTimers();
     this._contRec = false;
     this._vadHeard = false;
+    this._vadLive = null;
     this._stopStream();
     const chunks = this._recChunks || [];
     this._recChunks = [];
@@ -2106,21 +2112,54 @@ class RetinueConversation extends HTMLElement {
   _contTake(stream, mr) {
     this._contRec = true;
     this._vadHeard = false;
+    this._vadLive = null;
+    this._recTouched = false;
+    const { noSpeechMs } = voiceTimeouts();
     const meter = new LevelMeter(new Vad(voiceTimeouts()), (ev) => this._onVad(ev, mr));
     this._meter = meter;
-    chime().then(() => {
+    const still = () => this._meter === meter && this._mediaRecorder === mr && this._recState === 'recording';
+    chime().then(async () => {
       // Still this take? A tap on ✕/✓/➤ during the chime has ended it.
-      if (this._meter !== meter || this._mediaRecorder !== mr || this._recState !== 'recording') return;
-      // Where the page cannot hear the stream the take is ended by hand,
-      // like any dictation — the row's ✓ and ➤ are there for that.
-      meter.start(stream);
+      if (!still()) return;
+      const heard = await meter.start(stream);
+      if (!still()) return;
+      this._vadLive = heard;
+      if (!heard) this._contUnheard(mr, noSpeechMs);
     });
+  }
+
+  // The page cannot hear the stream (no Web Audio, or a context the browser
+  // will not start): the take is ended by hand, like any dictation, with the
+  // row's ✓ and ➤. But a mic that opened by itself must not stay open for
+  // good when nobody is there: unless the user touches the recording row,
+  // it closes after the no-speech timeout, as the detector would; and a take
+  // they did start ends for review at the length cap, as the detector's does.
+  _contUnheard(mr, noSpeechMs) {
+    this._contClearTimers();
+    this._contTimers.push(setTimeout(() => {
+      if (this._mediaRecorder !== mr || this._recTouched) return;
+      this._abortRecording();
+    }, noSpeechMs));
+    this._contTimers.push(setTimeout(() => {
+      if (this._mediaRecorder === mr) this._finishRecording('review');
+    }, VAD_DEFAULTS.maxMs));
+  }
+
+  _contClearTimers() {
+    this._contTimers.forEach((t) => clearTimeout(t));
+    this._contTimers = [];
   }
 
   _onVad(ev, mr) {
     if (this._mediaRecorder !== mr) return;
     if (ev.type === 'speech') this._vadHeard = true;
-    else if (ev.type === 'end') this._finishRecording('send');
+    // What began as speech was the room getting louder (continuous.js).
+    else if (ev.type === 'noise') this._vadHeard = false;
+    // A pause after speech ends the take and sends it. One that ran to the
+    // length cap never fell silent — a voice that did not stop, or a room
+    // the detector could not tell from one — and goes to the draft for the
+    // user to read first: nothing unheard is sent on a guess.
+    else if (ev.type === 'end') this._finishRecording(ev.reason === 'max' ? 'review' : 'send');
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).
     else if (ev.type === 'timeout') this._abortRecording();
@@ -2129,10 +2168,11 @@ class RetinueConversation extends HTMLElement {
   // Listening ends without the user ending the take (they left, the page
   // went to the background, the mode was switched off): a take with speech
   // in it is kept for review in the draft, as any dictation is on leaving;
-  // one with nothing said is dropped.
+  // one with nothing said is dropped. Where the page could not hear the
+  // stream, nobody knows whether anything was said: kept, to be safe.
   _contStopListening() {
     if (!this._contRec || this._recState !== 'recording') return;
-    if (this._vadHeard) this._finishRecording('review'); else this._abortRecording();
+    if (this._vadHeard || this._vadLive === false) this._finishRecording('review'); else this._abortRecording();
   }
 
   // ── Model, archive, autoplay ───────────────────────────────────────────────
@@ -2316,7 +2356,11 @@ class RetinueConversation extends HTMLElement {
       }
     }
     const mic = root.querySelector('[data-mic]');
-    if (mic) mic.addEventListener('click', () => this._startRecording());
+    if (mic) mic.addEventListener('click', () => { if (this._contOn()) primeAudio(); this._startRecording(); });
+    // Touching the recording row at all means someone is there and will end
+    // the take by hand: a meter-less take's no-speech timer stands down.
+    const recRow = root.querySelector('.rec-row');
+    if (recRow) recRow.addEventListener('pointerdown', () => { this._recTouched = true; });
     const recAbort = root.querySelector('[data-rec-abort]');
     if (recAbort) recAbort.addEventListener('click', () => this._abortRecording());
     const recCheck = root.querySelector('[data-rec-check]');
@@ -2328,7 +2372,7 @@ class RetinueConversation extends HTMLElement {
     const ap = root.querySelector('[data-autoplay]');
     if (ap) ap.addEventListener('click', () => this._toggleAutoplay());
     const cont = root.querySelector('[data-continuous]');
-    if (cont) cont.addEventListener('click', () => this._toggleContinuous());
+    if (cont) cont.addEventListener('click', () => { primeAudio(); this._toggleContinuous(); });
     const fileInput = root.querySelector('[data-file]');
     if (fileInput) {
       fileInput.addEventListener('change', () => {

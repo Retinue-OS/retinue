@@ -146,15 +146,25 @@ export function pickWakeThread(entries, now, windowMs = WAKE_WINDOW_MS) {
 // A take ends on silence after speech, and the mic gives up on no speech at
 // all. Both are decided over one number per frame: the signal's RMS level
 // (0..1) from an AnalyserNode over the recorder's own stream. Speech is a
-// level clearly above the room's noise floor — the floor is learned while
-// nobody speaks (quickly downwards, slowly upwards, never from speech), so a
-// fan or traffic raises the bar instead of keeping the take open forever.
+// level clearly above the room's noise floor. The floor is learned from the
+// frames below the threshold (quickly downwards, slowly upwards) — which
+// alone would never follow a room that gets louder for good: a fan or a TV
+// switched on mid-take sits above the threshold from then on, and would read
+// as one endless sentence. So a level that stays above the threshold without
+// a single dip for stepMs is taken for the room, not for a voice — speech
+// always has gaps between words — and the floor jumps to it. If that run was
+// all the "speech" the take had, it was never speech: the take goes back to
+// waiting for some (event `noise`), and its no-speech timeout still runs.
 //
 // States: 'waiting' (mic open, no speech yet), 'speaking', 'done'. feed()
 // returns the event a frame caused, or null:
-//   {type: 'speech'}            speech began (once per take)
+//   {type: 'speech'}            speech began (once per take, unless retracted)
+//   {type: 'noise'}             what began as speech was the room getting
+//                               louder: back to waiting, nothing was heard
 //   {type: 'end', reason}       the take is over: 'silence' after speech, or
-//                               'max' when it ran to the length cap
+//                               'max' when it ran to the length cap (the
+//                               caller should not trust such a take enough
+//                               to send it unseen)
 //   {type: 'timeout'}           no speech within noSpeechMs: close the mic
 export const VAD_DEFAULTS = {
   silenceMs: DEFAULT_SILENCE_MS,
@@ -175,6 +185,9 @@ export const VAD_DEFAULTS = {
   // louder (non-speech) level slowly.
   floorDown: 0.3,
   floorUp: 0.02,
+  // A run above the threshold with no dip at all for this long is a louder
+  // room, not a voice (see above).
+  stepMs: 3000,
 };
 
 export class Vad {
@@ -190,6 +203,8 @@ export class Vad {
     this.heard = false;      // speech began in this take
     this._aboveSince = null; // the current run above the threshold began here
     this._lastVoice = null;  // last frame above the threshold, once speaking
+    this._runMin = null;     // quietest level of the current run above it
+    this._dipped = false;    // a frame fell below it since speech began
   }
 
   threshold() {
@@ -208,19 +223,41 @@ export class Vad {
       return null;
     }
     if (this.floor == null) this.floor = lv;
-    const above = lv > this.threshold();
+    let above = lv > this.threshold();
+    if (above) {
+      if (this._aboveSince == null) { this._aboveSince = now; this._runMin = lv; }
+      this._runMin = Math.min(this._runMin, lv);
+      if (now - this._aboveSince >= o.stepMs) {
+        // The room got louder: its new level is the floor from here on.
+        this.floor = this._runMin;
+        this._aboveSince = null;
+        this._runMin = null;
+        above = lv > this.threshold();
+        // Still above even the new floor: a fresh run starts here.
+        if (above) { this._aboveSince = now; this._runMin = lv; }
+        if (this.state === 'speaking' && !this._dipped) {
+          this.state = 'waiting';
+          this.heard = false;
+          this._lastVoice = null;
+          if (elapsed >= o.noSpeechMs) return this._done({ type: 'timeout' });
+          return { type: 'noise' };
+        }
+      }
+    } else {
+      this._aboveSince = null;
+      this._runMin = null;
+    }
 
     if (this.state === 'waiting') {
       if (above) {
-        if (this._aboveSince == null) this._aboveSince = now;
         if (now - this._aboveSince >= o.minSpeechMs) {
           this.state = 'speaking';
           this.heard = true;
+          this._dipped = false;
           this._lastVoice = now;
           return { type: 'speech' };
         }
       } else {
-        this._aboveSince = null;
         this._learn(lv);
       }
       if (elapsed >= o.noSpeechMs) return this._done({ type: 'timeout' });
@@ -231,6 +268,7 @@ export class Vad {
     if (above) {
       this._lastVoice = now;
     } else {
+      this._dipped = true;
       this._learn(lv);
       if (now - this._lastVoice >= o.silenceMs) return this._done({ type: 'end', reason: 'silence' });
     }
@@ -260,14 +298,34 @@ export function rms(samples) {
 
 // ── Page helpers (touch Web Audio only when called) ──────────────────────────
 
+// One AudioContext for the chime and the level meter, made — and resumed —
+// inside a user gesture where there is one (primeAudio, from the loop's
+// toggle or the mic). A context first made later, when the mic opens by
+// itself after an answer, has no gesture behind it, and an autoplay policy
+// may keep it suspended: the chime would be silent and the meter deaf.
+let sharedCtx = null;
+
+export function audioContext() {
+  const AC = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
+  if (!AC) return null;
+  if (sharedCtx && sharedCtx.state !== 'closed') return sharedCtx;
+  try { sharedCtx = new AC(); } catch (_e) { sharedCtx = null; }
+  return sharedCtx;
+}
+
+// Call from a tap: makes the shared context and lets it run.
+export function primeAudio() {
+  const ctx = audioContext();
+  try { if (ctx && ctx.state === 'suspended' && ctx.resume) ctx.resume().catch(() => {}); } catch (_e) { /* ignore */ }
+  return ctx;
+}
+
 // The short rising two-note chime that says "the mic is open now". Resolves
 // when it has played (or at once where Web Audio is missing), so the mic's
 // detector starts listening after it rather than hearing it.
 export function chime() {
-  const AC = typeof window !== 'undefined' && (window.AudioContext || window.webkitAudioContext);
-  if (!AC) return Promise.resolve();
-  let ctx;
-  try { ctx = new AC(); } catch (_e) { return Promise.resolve(); }
+  const ctx = audioContext();
+  if (!ctx) return Promise.resolve();
   try {
     if (ctx.state === 'suspended' && ctx.resume) ctx.resume().catch(() => {});
     const t0 = ctx.currentTime + 0.02;
@@ -284,45 +342,43 @@ export function chime() {
       osc.stop(t0 + at + 0.13);
     });
   } catch (_e) { /* no chime is no reason to keep the mic shut */ }
-  return new Promise((resolve) => setTimeout(() => {
-    try { ctx.close(); } catch (_e) { /* ignore */ }
-    resolve();
-  }, 260));
+  return new Promise((resolve) => setTimeout(resolve, 260));
 }
 
 // Feeds a Vad from a live stream: an AnalyserNode over it, sampled on a
 // timer (not animation frames — those stop when the screen is covered, and a
 // take must still end). `onEvent` gets each event feed() returns. start()
-// returns false where Web Audio cannot hear the stream (missing, or a context
-// the browser keeps suspended): the take is then ended by hand, as a plain
-// dictation is.
+// resolves to false where Web Audio cannot hear the stream (missing, or a
+// context the browser keeps suspended): the caller then falls back to plain
+// timers (conversation.js, _contUnheard) and the take is ended by hand.
 export class LevelMeter {
   constructor(vad, onEvent, intervalMs = 50) {
     this.vad = vad;
     this.onEvent = onEvent;
     this.intervalMs = intervalMs;
-    this._ctx = null;
+    this._src = null;
     this._timer = null;
+    this._run = 0;
   }
 
   async start(stream) {
     this.stop();
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return false;
+    const run = this._run;
+    const ctx = audioContext();
+    if (!ctx) return false;
     try {
-      const ctx = new AC();
-      this._ctx = ctx;
       if (ctx.state === 'suspended' && ctx.resume) {
         // An autoplay policy may hold the context until a gesture; a hold
         // means silence, which would read as "nobody spoke".
         await Promise.race([ctx.resume(), new Promise((r) => setTimeout(r, 400))]);
       }
-      if (this._ctx !== ctx) return false; // stopped meanwhile
-      if (ctx.state !== 'running') { this.stop(); return false; }
+      if (this._run !== run) return false; // stopped meanwhile
+      if (ctx.state !== 'running') return false;
       const src = ctx.createMediaStreamSource(stream);
       const an = ctx.createAnalyser();
       an.fftSize = 1024;
       src.connect(an);
+      this._src = src;
       const buf = new Float32Array(an.fftSize);
       this.vad.reset();
       this._timer = setInterval(() => {
@@ -335,7 +391,7 @@ export class LevelMeter {
         }
         const ev = this.vad.feed(rms(buf), Date.now());
         if (ev) {
-          if (ev.type !== 'speech') this.stop();
+          if (ev.type === 'end' || ev.type === 'timeout') this.stop();
           try { this.onEvent(ev); } catch (_e) { /* the listener's own bug */ }
         }
       }, this.intervalMs);
@@ -346,12 +402,14 @@ export class LevelMeter {
     }
   }
 
+  // The shared context stays: the next take (and its chime) reuse it.
   stop() {
+    this._run += 1;
     if (this._timer) clearInterval(this._timer);
     this._timer = null;
-    if (this._ctx) {
-      try { this._ctx.close(); } catch (_e) { /* ignore */ }
-      this._ctx = null;
+    if (this._src) {
+      try { this._src.disconnect(); } catch (_e) { /* ignore */ }
+      this._src = null;
     }
   }
 }
