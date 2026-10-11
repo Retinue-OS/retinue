@@ -794,7 +794,7 @@ class RetinueConversation extends HTMLElement {
       this._schedulePoll();
     } else if (this._listenOnOpen) {
       this._listenOnOpen = false;
-      this._contListen({ loop: true });
+      this._contListen({ loop: true, asked: true });
     }
   }
 
@@ -1123,7 +1123,7 @@ class RetinueConversation extends HTMLElement {
         // After the render the caller does with this read. Armed (see
         // connectedCallback, listen), so a thread still answering opens the
         // mic once that answer is in and read.
-        setTimeout(() => this._contListen({ loop: true }), 0);
+        setTimeout(() => this._contListen({ loop: true, asked: true }), 0);
       }
       this._emit('retinue-thread', { id, conversation: t });
       return true;
@@ -2176,7 +2176,7 @@ class RetinueConversation extends HTMLElement {
     this._contEngage();
     if (this._id && !this._thread) { this._listenOnOpen = true; this.render(); return; }
     this.render();
-    this._contListen({ loop: true });
+    this._contListen({ loop: true, asked: true });
   }
 
   _toggleContinuous() {
@@ -2215,25 +2215,37 @@ class RetinueConversation extends HTMLElement {
   // first, and its reading ends by calling this again). `loop` marks the
   // calls the loop itself makes (an answer read, a turn done): those open
   // the mic only for an answer to this element's own turn.
-  _contListen({ loop = false } = {}) {
+  // `asked`: the user asked for the mic just now (Start talking, a wake),
+  // rather than the loop going round by itself.
+  _contListen({ loop = false, asked = false } = {}) {
     if (!this._contOn() || !this.isConnected) return;
     if (loop && !this._contArmed) return;
     // A wake (or an answer) while the page is in the background: the mic is
     // not opened behind the user's back, nor is the request lost — it waits
     // for the page to come to the front (see _onContVis), for a while.
-    if (document.visibilityState === 'hidden') { this._contDefer(loop); return; }
+    if (document.visibilityState === 'hidden') { this._contDefer(loop, asked); return; }
     if (this._recState !== 'idle' || this._busy || VOICE_JOBS.has(this._key())) return;
     if (this._id && (!this._thread || this._thread.pending || this._missing)) return;
     if (!canRecord()) { this._contDisengage(); return; }
+    // The user is writing — text or files in the box, or the cursor in it:
+    // the loop going round must not take the row from under their hands
+    // (the recording row replaces the field), nor send what they wrote
+    // along with the take. It stops and offers Start talking instead.
+    if (loop && !asked && this._typing()) {
+      this._contDisengage();
+      this._contReady = true;
+      this.render();
+      return;
+    }
     this._contArmed = false;
     this._contReady = false;
     if (this._id) touchContinuous(this._id);
     this._startRecording();
   }
 
-  _contDefer(loop) {
+  _contDefer(loop, asked = false) {
     this._contClearPending();
-    this._contPending = { loop };
+    this._contPending = { loop, asked };
     this._contPendingTimer = setTimeout(() => {
       this._contPendingTimer = null;
       if (!this._contPending) return;
@@ -2263,7 +2275,7 @@ class RetinueConversation extends HTMLElement {
     const p = this._contPending;
     if (!p) return;
     this._contClearPending();
-    this._contListen({ loop: p.loop });
+    this._contListen({ loop: p.loop, asked: p.asked });
   }
 
   // Ara's turn ended. If the loop is reading her answer, the end of that
@@ -2313,6 +2325,20 @@ class RetinueConversation extends HTMLElement {
     }, VAD_DEFAULTS.maxMs));
   }
 
+  // Text or files waiting in this conversation's box.
+  _draftHasInput() {
+    const d = DRAFTS.get(this._key());
+    return !!(d && ((d.text && d.text.trim()) || (d.files && d.files.length)));
+  }
+
+  // …or the user is in the box, about to write.
+  _typing() {
+    if (this._draftHasInput()) return true;
+    const root = this.shadowRoot;
+    const ta = root && root.querySelector('[data-form] textarea');
+    return !!(ta && root.activeElement === ta);
+  }
+
   _contClearTimers() {
     this._contTimers.forEach((t) => clearTimeout(t));
     this._contTimers = [];
@@ -2329,7 +2355,12 @@ class RetinueConversation extends HTMLElement {
     // detector could not tell from one), and one that ended 'unsure' had
     // its speech taken back as the room, perhaps wrongly: nothing unheard
     // is sent on a guess, and nothing said is thrown away on one.
-    else if (ev.type === 'end') this._finishRecording(ev.reason === 'silence' ? 'send' : 'review');
+    // So does a take that would carry text or files the user put in the box
+    // before it: the send takes the whole draft, which they have not seen
+    // go together with what they said.
+    else if (ev.type === 'end') {
+      this._finishRecording(ev.reason === 'silence' && !this._draftHasInput() ? 'send' : 'review');
+    }
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).
     else if (ev.type === 'timeout') this._abortRecording();
