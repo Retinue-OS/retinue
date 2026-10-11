@@ -752,6 +752,8 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
-"navigate-existing"}`, so a second launch of the installed PWA reuses its
-window. Known gap: Web Push does not reach a page inside an Android WebView,
-so notifications still need the PWA installed in Chrome alongside.
+"focus-existing"}`, so a second launch of the installed PWA brings its open
+window to the front as it is — an open thread, a draft or a recording under
+way are kept; `navigate-existing` would load `/` over them. Known gap: Web
+Push does not reach a page inside an Android WebView, so notifications still
+need the PWA installed in Chrome alongside.

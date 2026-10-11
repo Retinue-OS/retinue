@@ -658,8 +658,8 @@ Threads can be spoken as well as typed, with no streaming and split by direction
 ## Installing on Android
 
 Open the URL in Chrome/Brave/Edge → menu → **Install app**. The manifest's
-`launch_handler` (`navigate-existing`) makes a second launch reuse the open
-window rather than start another. Or use the Android shell (below), which
+`launch_handler` (`focus-existing`) makes a second launch bring the open
+window to the front as it was left, rather than start another or reload it. Or use the Android shell (below), which
 can also be the phone's home screen.
 
 ## Inside the Android shell
