@@ -692,12 +692,16 @@ ends, or there is nothing to read, the mic opens with a short chime and a
 voice-activity detector — the RMS level of the recorder's own stream from a
 Web Audio `AnalyserNode`, against a noise floor learned while nobody speaks —
 ends the take after a pause (default 1.5 s) once speech was heard. A level
-that stays above the threshold without a dip for 3 s is taken for a louder
-room (a fan, a TV), not a voice: the floor jumps to it, and if it was all the
-take had heard, the take goes back to waiting. The take is transcribed and
-sent on the same path as ➤, the loop waits for the answer, and repeats. A
-take that runs to the 120 s cap without falling silent goes to the draft for
-review, never out. No speech within the no-speech timeout (default 8 s)
+that stays above the threshold without a dip for 3 s, and holds flat all the
+while (loudest frame under twice the quietest), is taken for a louder room (a
+fan, an engine), not a voice — a gain control can squeeze speech above the
+threshold with no dip, but a voice still swings: the floor jumps to it, and
+if it was all the take had heard, the take goes back to waiting. Only a take
+that ends on a pause after speech is transcribed and sent, on the same path
+as ➤; the loop waits for the answer, and repeats. Every other end goes to the
+draft for review, never out: a take that runs to the 120 s cap without
+falling silent, and one whose no-speech window closes after a run was taken
+back as the room (it may have been a voice). No speech within the no-speech timeout (default 8 s)
 closes the mic with the mode kept on (the mic button resumes); leaving the
 thread or hiding the page ends listening. Where the page cannot hear the
 stream at all, plain timers stand in: the same no-speech timeout (unless the

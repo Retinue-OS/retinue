@@ -151,21 +151,31 @@ export function pickWakeThread(entries, now, windowMs = WAKE_WINDOW_MS) {
 // alone would never follow a room that gets louder for good: a fan or a TV
 // switched on mid-take sits above the threshold from then on, and would read
 // as one endless sentence. So a level that stays above the threshold without
-// a single dip for stepMs is taken for the room, not for a voice — speech
-// always has gaps between words — and the floor jumps to it. If that run was
-// all the "speech" the take had, it was never speech: the take goes back to
-// waiting for some (event `noise`), and its no-speech timeout still runs.
+// a single dip for stepMs, and holds steady all the while, is taken for the
+// room, not for a voice, and the floor jumps to it. Both tests are needed: a
+// phone's gain control can squeeze fluent speech above the threshold with no
+// dip between words, but a voice still swings — loud syllables, soft ones —
+// where a fan or an engine is flat. A run that swings is left alone (and
+// looked at afresh over the next stepMs). If a steady run was all the
+// "speech" the take had, it is taken back: the take goes back to waiting
+// for some (event `noise`). Taken back on a guess, though — it may have
+// been a voice after all — so the take no longer just times out when the
+// no-speech window closes: it ends for review (reason `unsure`), and the
+// caller lets the user decide instead of throwing it away.
 //
 // States: 'waiting' (mic open, no speech yet), 'speaking', 'done'. feed()
 // returns the event a frame caused, or null:
 //   {type: 'speech'}            speech began (once per take, unless retracted)
 //   {type: 'noise'}             what began as speech was the room getting
 //                               louder: back to waiting, nothing was heard
-//   {type: 'end', reason}       the take is over: 'silence' after speech, or
-//                               'max' when it ran to the length cap (the
-//                               caller should not trust such a take enough
-//                               to send it unseen)
-//   {type: 'timeout'}           no speech within noSpeechMs: close the mic
+//   {type: 'end', reason}       the take is over: 'silence' after speech;
+//                               'max' when it ran to the length cap; or
+//                               'unsure' when the no-speech window closed
+//                               after a run was taken back as the room. Only
+//                               'silence' is a take to send unseen: the
+//                               others go to the user to read first
+//   {type: 'timeout'}           no speech within noSpeechMs, and nothing
+//                               taken back: close the mic
 export const VAD_DEFAULTS = {
   silenceMs: DEFAULT_SILENCE_MS,
   noSpeechMs: DEFAULT_NO_SPEECH_MS,
@@ -186,8 +196,10 @@ export const VAD_DEFAULTS = {
   floorDown: 0.3,
   floorUp: 0.02,
   // A run above the threshold with no dip at all for this long is a louder
-  // room, not a voice (see above).
+  // room, not a voice (see above) — if its loudest frame is less than this
+  // many times its quietest: flat, as a fan is and a voice is not.
   stepMs: 3000,
+  steadyRatio: 2,
 };
 
 export class Vad {
@@ -204,6 +216,8 @@ export class Vad {
     this._aboveSince = null; // the current run above the threshold began here
     this._lastVoice = null;  // last frame above the threshold, once speaking
     this._runMin = null;     // quietest level of the current run above it
+    this._runMax = null;     // …and its loudest
+    this._retracted = false; // a run was taken back as the room in this take
     this._dipped = false;    // a frame fell below it since speech began
   }
 
@@ -225,27 +239,37 @@ export class Vad {
     if (this.floor == null) this.floor = lv;
     let above = lv > this.threshold();
     if (above) {
-      if (this._aboveSince == null) { this._aboveSince = now; this._runMin = lv; }
+      if (this._aboveSince == null) this._startRun(now, lv);
       this._runMin = Math.min(this._runMin, lv);
+      this._runMax = Math.max(this._runMax, lv);
       if (now - this._aboveSince >= o.stepMs) {
-        // The room got louder: its new level is the floor from here on.
-        this.floor = this._runMin;
-        this._aboveSince = null;
-        this._runMin = null;
-        above = lv > this.threshold();
-        // Still above even the new floor: a fresh run starts here.
-        if (above) { this._aboveSince = now; this._runMin = lv; }
-        if (this.state === 'speaking' && !this._dipped) {
-          this.state = 'waiting';
-          this.heard = false;
-          this._lastVoice = null;
-          if (elapsed >= o.noSpeechMs) return this._done({ type: 'timeout' });
-          return { type: 'noise' };
+        if (this._runMax >= this._runMin * o.steadyRatio) {
+          // It swings like a voice: no step. The next stepMs is judged on
+          // its own, so a fan that starts under a sentence is still found.
+          this._startRun(now, lv);
+        } else {
+          // The room got louder: its new level is the floor from here on.
+          this.floor = this._runMin;
+          this._aboveSince = null;
+          this._runMin = null;
+          this._runMax = null;
+          above = lv > this.threshold();
+          // Still above even the new floor: a fresh run starts here.
+          if (above) this._startRun(now, lv);
+          if (this.state === 'speaking' && !this._dipped) {
+            this.state = 'waiting';
+            this.heard = false;
+            this._lastVoice = null;
+            this._retracted = true;
+            if (elapsed >= o.noSpeechMs) return this._waitedOut();
+            return { type: 'noise' };
+          }
         }
       }
     } else {
       this._aboveSince = null;
       this._runMin = null;
+      this._runMax = null;
     }
 
     if (this.state === 'waiting') {
@@ -260,7 +284,7 @@ export class Vad {
       } else {
         this._learn(lv);
       }
-      if (elapsed >= o.noSpeechMs) return this._done({ type: 'timeout' });
+      if (elapsed >= o.noSpeechMs) return this._waitedOut();
       return null;
     }
 
@@ -274,6 +298,19 @@ export class Vad {
     }
     if (elapsed >= o.maxMs) return this._done({ type: 'end', reason: 'max' });
     return null;
+  }
+
+  _startRun(now, lv) {
+    this._aboveSince = now;
+    this._runMin = lv;
+    this._runMax = lv;
+  }
+
+  // The no-speech window has closed. Nothing heard at all: the mic just
+  // closes. A run taken back as the room may have been a voice the detector
+  // could not tell from one: that take ends for the user to review.
+  _waitedOut() {
+    return this._done(this._retracted ? { type: 'end', reason: 'unsure' } : { type: 'timeout' });
   }
 
   _learn(lv) {

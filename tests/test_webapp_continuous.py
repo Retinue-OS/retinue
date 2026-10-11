@@ -165,10 +165,10 @@ ok('a room that gets louder for good is not speech, and no take ends in it', () 
   const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000 });
   const FAN = 0.05;
   const evs = run(vad, 0, 30000, (t) => (t < 2000 ? QUIET : FAN));
-  // It looks like speech at first, is retracted once it has not dipped for
-  // stepMs, and the open mic closes on the no-speech timeout: nothing ends
-  // as a take, so nothing could be sent.
-  assert.deepEqual(evs.map((e) => e.type), ['speech', 'noise', 'timeout']);
+  // It looks like speech at first, is retracted once it has held flat with
+  // no dip for stepMs, and the open mic closes when the no-speech window
+  // does — ending 'unsure', for review: a guess is never sent.
+  assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['noise', ''], ['end', 'unsure']]);
   assert.equal(evs[1].t, 2000 + VAD_DEFAULTS.stepMs);
   assert.equal(evs[2].t, 8000);
   assert.equal(vad.heard, false);
@@ -178,7 +178,36 @@ ok('a room that gets louder for good is not speech, and no take ends in it', () 
 ok('a noise step after the no-speech window closes the mic at once', () => {
   const vad = new Vad({ silenceMs: 1500, noSpeechMs: 4000 });
   const evs = run(vad, 0, 30000, (t) => (t < 3000 ? QUIET : 0.05));
-  assert.deepEqual(evs.map((e) => [e.type, e.t]), [['speech', 3150], ['timeout', 6000]]);
+  assert.deepEqual(evs.map((e) => [e.type, e.reason || '', e.t]), [['speech', '', 3150], ['end', 'unsure', 6000]]);
+});
+
+ok('a steady fan hum (a little ripple, no dips) is retracted as the room', () => {
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 20000 });
+  const fan = (t) => (t < 1000 ? QUIET : 0.05 + 0.01 * Math.sin(t / 37));
+  const evs = run(vad, 0, 10000, fan);
+  assert.deepEqual(evs.map((e) => e.type), ['speech', 'noise']);
+  assert.equal(evs[1].t, 1000 + VAD_DEFAULTS.stepMs);
+  assert.ok(vad.threshold() > 0.06, `threshold ${vad.threshold()}`);
+});
+
+ok('compressed speech with no dips but a voice-like swing is kept, and sent on silence', () => {
+  // A gain control holding fluent speech at 0.03..0.15: never below the
+  // threshold for 5 s, but never flat either.
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000 });
+  const evs = run(vad, 0, 12000, (t) => (t >= 1000 && t < 6000 ? 0.03 + 0.12 * Math.abs(Math.sin(t / 130)) : QUIET));
+  assert.deepEqual(evs.map((e) => [e.type, e.reason || '']), [['speech', ''], ['end', 'silence']]);
+  assert.ok(evs[1].t >= 6000 + 1500 - FRAME && evs[1].t <= 6000 + 1500 + FRAME, `end at ${evs[1].t}`);
+  assert.equal(vad.heard, true);
+});
+
+ok('late, flat-ish speech taken back as the room still ends for review, not as a timeout', () => {
+  // Starts at 6 s, squeezed to 0.05..0.08 (steady enough to pass for a fan),
+  // then silence: when the no-speech window closes, the take is reviewed.
+  const vad = new Vad({ silenceMs: 1500, noSpeechMs: 8000 });
+  const evs = run(vad, 0, 14000, (t) => (t >= 6000 && t < 10000 ? 0.05 + 0.03 * Math.abs(Math.sin(t / 130)) : QUIET));
+  const types = evs.map((e) => [e.type, e.reason || '']);
+  assert.deepEqual(types, [['speech', ''], ['end', 'unsure']]);
+  assert.equal(evs[1].t, 6000 + VAD_DEFAULTS.stepMs);
 });
 
 ok('a room that gets louder mid-sentence: the floor follows, the take still ends on silence', () => {
@@ -193,8 +222,10 @@ ok('a room that gets louder mid-sentence: the floor follows, the take still ends
   const evs = run(vad, 500, 20000, level);
   const types = evs.map((e) => [e.type, e.reason || '']);
   assert.deepEqual(types, [['speech', ''], ['end', 'silence']]);
-  // Not at the cap: once the fan is the floor, the speaker is silent.
-  assert.ok(evs[1].t <= 2500 + VAD_DEFAULTS.stepMs + 1500 + FRAME, `end at ${evs[1].t}`);
+  // Not at the cap: once the fan is the floor, the speaker is silent. The
+  // run that began on the last word swings (speech, then the fan), so it
+  // is not taken for the room; the next stepMs, all fan, is.
+  assert.ok(evs[1].t <= 2500 + 2 * VAD_DEFAULTS.stepMs + 1500 + FRAME, `end at ${evs[1].t}`);
 });
 
 ok('reset() starts a fresh take', () => {

@@ -2323,11 +2323,13 @@ class RetinueConversation extends HTMLElement {
     if (ev.type === 'speech') this._vadHeard = true;
     // What began as speech was the room getting louder (continuous.js).
     else if (ev.type === 'noise') this._vadHeard = false;
-    // A pause after speech ends the take and sends it. One that ran to the
-    // length cap never fell silent — a voice that did not stop, or a room
-    // the detector could not tell from one — and goes to the draft for the
-    // user to read first: nothing unheard is sent on a guess.
-    else if (ev.type === 'end') this._finishRecording(ev.reason === 'max' ? 'review' : 'send');
+    // A pause after speech ends the take and sends it. Any other end goes
+    // to the draft for the user to read first — one that ran to the length
+    // cap never fell silent (a voice that did not stop, or a room the
+    // detector could not tell from one), and one that ended 'unsure' had
+    // its speech taken back as the room, perhaps wrongly: nothing unheard
+    // is sent on a guess, and nothing said is thrown away on one.
+    else if (ev.type === 'end') this._finishRecording(ev.reason === 'silence' ? 'send' : 'review');
     // Nobody spoke: the mic closes, the mode stays on, and nothing is sent
     // (no "no speech detected" note either — silence was the answer).
     else if (ev.type === 'timeout') this._abortRecording();
