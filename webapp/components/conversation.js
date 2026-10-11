@@ -52,9 +52,12 @@
 //   minimize          a minimize button in the bar: the thread goes on the
 //                     shelf where it is, and the host gets `retinue-back`.
 //   continuous        open in continuous conversation (components/continuous.js):
-//                     a thread is put in the mode, a composer starts in it,
-//                     and the mic opens as soon as there is nothing to wait
-//                     for — what a wake and #new?voice=1 open.
+//                     a thread is put in the mode, a composer starts in it.
+//   listen            with `continuous`: the mic opens as soon as there is
+//                     nothing to wait for (Ara's answer read, if she is
+//                     answering) — what a wake in the shell opens. Without
+//                     it the conversation offers "Start talking", as a mic
+//                     needs a gesture or the shell behind it.
 //   create-url        no thread yet, and the HOST owns creating it: the first
 //                     turn POSTs here (no body) for a {id}, then goes in as an
 //                     ordinary reply to that thread. For a thread that belongs
@@ -68,8 +71,10 @@
 //   ask(text)         send a turn as though the user had typed it and pressed
 //                     Send, for a host whose own control IS the send press.
 //   listen()          put this conversation in continuous mode and open the
-//                     mic now (or once Ara's answer has been read) — a wake
-//                     arriving while the thread is already on screen.
+//                     mic: now, or — while Ara is still answering — once her
+//                     answer is in and has been read. A wake arriving while
+//                     the conversation is already on screen; on a hidden
+//                     page it waits for the page to come back (60 s).
 //
 // Events (all bubble and cross the shadow boundary):
 //   retinue-back      the back button.
@@ -116,6 +121,9 @@ import { setVoiceActive } from './shell.js';
 
 const LIST_URL = '/conversations';
 const POLL_MS = 4000;
+// How long a mic the loop wanted while the page was hidden (a wake in the
+// background, an answer read in a pocket) waits for the page to come back.
+const CONT_PENDING_MS = 60 * 1000;
 // While Ara is answering the reply is what the user is waiting for.
 const PENDING_POLL_MS = 1500;
 const PENDING_WARN_SECONDS = 2 * 60;
@@ -257,6 +265,23 @@ let PLAYING = null;     // {conv, ts, who, title} of the loaded message
 // the loop's, and its end opens nothing.
 let CONT_READ = null;
 let SCRUBBING = false;  // the user is dragging a bar's position slider
+// The Android shell's voice flag (shell.js, setVoiceActive): "a voice
+// conversation is engaged — keep the screen on, pause the wake phrase". It is
+// asserted while any element holds the mic (from before the mic is asked for:
+// the shell's wake detector must let go of it first) and while any thread's
+// continuous loop is engaged — from a take sent until the loop stops. Covering
+// only the open-mic spans let the screen time out while Ara was answering,
+// and the loop died with it. One flag for the page, so it moves only when the
+// last holder lets go.
+const MIC_HOLDS = new Set();
+const ENGAGED = new Set();
+let shellVoice = false;
+function syncShellVoice() {
+  const on = MIC_HOLDS.size > 0 || ENGAGED.size > 0;
+  if (on === shellVoice) return;
+  shellVoice = on;
+  setVoiceActive(on);
+}
 READER.onprogress = (ev) => onReaderProgress(ev);
 // A backgrounded engine may drop the utterance it was speaking without a
 // word; on return the reader checks and picks the passage up again.
@@ -428,13 +453,24 @@ function isLoaded(convId, m) {
 // Load message `m` of thread `conv` into the player and speak it from
 // `fraction` (0..1) of its text. Called from a tap where possible: the first
 // speak of a page load must sit inside a user gesture on iOS.
+// Returns whether there was anything to read.
 function playMessage(conv, m, fraction) {
-  if (!conv || !m || !speechAvailable()) return;
+  if (!conv || !m || !speechAvailable()) return false;
   const clean = plainForSpeech(m.text);
-  if (!clean) return;
+  if (!clean) return false;
   PLAYING = playingInfo(conv, m);
-  READER.load([{ id: m.ts, lang: m.lang, text: clean }], { fraction: fraction || 0 });
+  if (!READER.load([{ id: m.ts, lang: m.lang, text: clean }], { fraction: fraction || 0 })) return false;
   READER.resume();
+  return true;
+}
+
+// The user's own pause or play/pause tap, told apart from a pause the
+// platform imposes (another app taking the audio, an engine that dropped the
+// utterance): only the latter may carry the continuous loop on to the mic.
+let USER_PAUSE = false;
+function userReader(fn) {
+  USER_PAUSE = true;
+  try { fn(); } finally { USER_PAUSE = false; }
 }
 
 // A thread this page just opened or wrote to (a send's answer, see _take) has
@@ -491,17 +527,27 @@ function closePlayer() {
 // place, never a re-render: a full render mid-reading would drop a composer's
 // focus and a thread's scroll.
 function onReaderProgress(ev) {
-  // The loop's reading is over — read to the end, or refused by the engine
-  // (an iOS page with no gesture yet, a voice that failed): either way it is
-  // the user's turn now, so the thread listens. Before the stop that follows
-  // an end, which forgets what was playing.
-  if ((ev.event === 'end' || ev.event === 'error') && CONT_READ && PLAYING &&
-      PLAYING.conv === CONT_READ.conv && PLAYING.ts === CONT_READ.ts) {
+  // The loop's reading is over — read to the end, refused by the engine (an
+  // iOS page with no gesture yet, a voice that failed), or halted by the
+  // platform: either way it is the user's turn now, so the thread listens.
+  // Before the stop that follows an end, which forgets what was playing. A
+  // pause the user made is theirs: the reading waits there, and its end
+  // still opens the mic once they resume it.
+  const loopRead = CONT_READ && PLAYING &&
+    PLAYING.conv === CONT_READ.conv && PLAYING.ts === CONT_READ.ts;
+  if (loopRead && (ev.event === 'end' || ev.event === 'error' ||
+      (ev.event === 'pause' && !USER_PAUSE))) {
     const el = LIVE.get(CONT_READ.conv);
     CONT_READ = null;
-    if (el) setTimeout(() => el._contListen(), 0);
+    if (el) setTimeout(() => el._contListen({ loop: true }), 0);
   }
-  if (ev.event === 'stop') CONT_READ = null;
+  // Stopped with the loop's reading still on: the user's ✕ on the bar. That
+  // ends the spoken conversation, not just the reading.
+  if (ev.event === 'stop' && CONT_READ) {
+    const el = LIVE.get(CONT_READ.conv);
+    CONT_READ = null;
+    if (el) el._contDisengage();
+  }
   if (ev.event === 'end') clearPosition();
   else if (ev.event === 'load' || ev.event === 'start' || ev.event === 'piece' ||
            ev.event === 'pause' || ev.event === 'seek') savePosition(ev);
@@ -585,7 +631,7 @@ class RetinueReadAloud extends HTMLElement {
   _wire() {
     const host = this.shadowRoot.querySelector('.host');
     host.addEventListener('click', (e) => {
-      if (e.target.closest('[data-p-toggle]')) { READER.toggle(); return; }
+      if (e.target.closest('[data-p-toggle]')) { userReader(() => READER.toggle()); return; }
       if (e.target.closest('[data-p-back]')) { READER.back(); return; }
       if (e.target.closest('[data-p-fwd]')) { READER.forward(); return; }
       if (e.target.closest('[data-p-close]')) { closePlayer(); return; }
@@ -687,7 +733,6 @@ class RetinueConversation extends HTMLElement {
     this._recIntent = null;  // what to do with the transcript: 'review' | 'send'
     this._recAborted = false;
     this._wave = new Waveform(this);
-    this._micActive = false; // the shell has been told the mic is in use
     // Continuous conversation (components/continuous.js). A thread's mode is
     // its stored flag; a composer has no id to store it under, so its mode
     // is this element's until the first message opens the thread.
@@ -699,6 +744,10 @@ class RetinueConversation extends HTMLElement {
     this._contTimers = [];   // the plain timers standing in for a meter that cannot hear
     this._recTouched = false; // the user has touched the recording row of this take
     this._listenOnOpen = false; // open the mic once the thread is read
+    this._contArmed = false; // the next answer is to this element's own turn (see _contEngage)
+    this._contPending = null; // {loop}: a listen asked for while the page was hidden
+    this._contPendingTimer = null;
+    this._contReady = false; // opened in the mode without a gesture: offer "Start talking"
   }
 
   connectedCallback() {
@@ -713,17 +762,25 @@ class RetinueConversation extends HTMLElement {
     LIVE.set(this._key(), this);
     this._shelfEnter();
     loadModels().then(() => this._syncPicker());
-    // Opened in continuous mode (a wake, #new?voice=1): the mode is set now,
-    // and the mic opens as soon as there is nothing to wait for — at once in
-    // a composer, after the first read in a thread (Ara may be answering).
+    // Opened in continuous mode (a wake, #new?voice=1): the mode is set now.
+    // With `listen` the mic opens as soon as there is nothing to wait for —
+    // at once in a composer, after the first read in a thread, or after
+    // Ara's answer if she is still answering. Without it (an address typed,
+    // reloaded or followed from a link, outside the shell) nobody asked for
+    // the mic by a gesture: the conversation offers "Start talking" instead.
     if (this.hasAttribute('continuous')) {
       if (this._id) setContinuous(this._id, true); else this._contNew = true;
-      this._listenOnOpen = true;
+      if (this.hasAttribute('listen')) {
+        this._listenOnOpen = true;
+        this._contEngage();
+      } else {
+        this._contReady = true;
+      }
     }
     // A hidden page ends listening: a phone in a pocket is not a user
     // talking, and the browser takes the mic away from a background tab
     // anyway, on some platforms without a word.
-    this._onContVis = () => { if (document.visibilityState === 'hidden') this._contStopListening(); };
+    this._onContVis = () => this._onContVisibility();
     document.addEventListener('visibilitychange', this._onContVis);
     this._focusOnOpen();
     this.render();
@@ -732,7 +789,7 @@ class RetinueConversation extends HTMLElement {
       this._schedulePoll();
     } else if (this._listenOnOpen) {
       this._listenOnOpen = false;
-      this._contListen();
+      this._contListen({ loop: true });
     }
   }
 
@@ -747,6 +804,7 @@ class RetinueConversation extends HTMLElement {
     if (this._onContVis) document.removeEventListener('visibilitychange', this._onContVis);
     this._onContVis = null;
     this._listenOnOpen = false;
+    this._contDisengage();
     if (this._meter) this._meter.stop();
     this._meter = null;
     this._stopPolling();
@@ -775,6 +833,8 @@ class RetinueConversation extends HTMLElement {
     this._contStopListening();
     this._finishRecording('review');
     this._listenOnOpen = false;
+    this._contDisengage();
+    this._contReady = false;
     // Pointed at another thread: forget this one and read that one.
     this._shelfExit();
     if (LIVE.get(this._key()) === this) LIVE.delete(this._key());
@@ -980,6 +1040,8 @@ class RetinueConversation extends HTMLElement {
     this._loadSeq += 1;
     this._thread = conv;
     primeSpoken(conv);
+    // A turn sent in continuous mode: its answer carries the loop on.
+    if (conv && conv.id && isContinuous(String(conv.id))) this._contEngage();
   }
   // The model picked for the thread about to open. Module state like the
   // draft it belongs to: the element is torn down whenever the host leaves
@@ -1053,8 +1115,10 @@ class RetinueConversation extends HTMLElement {
       if (wasPending && !t.pending) this._contReplyDone();
       if (this._listenOnOpen) {
         this._listenOnOpen = false;
-        // After the render the caller does with this read.
-        setTimeout(() => this._contListen(), 0);
+        // After the render the caller does with this read. Armed (see
+        // connectedCallback, listen), so a thread still answering opens the
+        // mic once that answer is in and read.
+        setTimeout(() => this._contListen({ loop: true }), 0);
       }
       this._emit('retinue-thread', { id, conversation: t });
       return true;
@@ -1574,6 +1638,12 @@ class RetinueConversation extends HTMLElement {
       return `<div class="composer">` + chipRow + errRow + statusRowHtml(label) + `</div>`;
     }
     const micTitle = this._contOn() ? 'Talk — continuous conversation' : 'Record a voice message';
+    // Opened in the mode without a gesture behind it: the first take starts
+    // from a tap, which is also what lets the page play the chime.
+    const startRow = (this._contReady && this._contOn() && canRecord() && !this._busy)
+      ? `<button type="button" class="start-talk" data-start-talk>` +
+        `<span aria-hidden="true">\u{1F3A4}</span> Start talking</button>`
+      : '';
     const micDisabled = (this._busy || this._recState !== 'idle') ? 'disabled' : '';
     const micBtn = canRecord()
       ? `<button type="button" class="mic" ` +
@@ -1581,7 +1651,7 @@ class RetinueConversation extends HTMLElement {
       : '';
     // A lean row keeps the width for the text field: mic on the left, the
     // attach control tucked inside the field, send on the right.
-    return `<div class="composer">` + chipRow + errRow +
+    return `<div class="composer">` + chipRow + errRow + startRow +
       `<form class="row" data-form>` + micBtn +
       `<div class="field">` +
       `<textarea rows="1" placeholder="${esc(placeholder)}" aria-label="${esc(placeholder)}" autocomplete="off" ${disabled}>` +
@@ -1679,6 +1749,10 @@ class RetinueConversation extends HTMLElement {
         }
       }
       this._keepUnsent(key, text, fromDraft);
+      // A turn that did not go out has no answer coming: the loop stops.
+      this._contDisengage();
+      const kept = this._liveFor(key);
+      if (kept && kept !== this) kept._contDisengage();
     } finally {
       SENDS.delete(key);
       // Unlock, render and poll where the send landed — or, when it did not
@@ -1822,10 +1896,11 @@ class RetinueConversation extends HTMLElement {
   // rather than raw Whisper output.
   async _startRecording() {
     if (this._recState !== 'idle') return;
+    this._contReady = false;
     // Tapping the mic pauses any ongoing read-aloud: you are about to speak to
     // Ara, so a previous reply still talking over you is the wrong behaviour —
     // but the place is kept, so the reading can go on afterwards.
-    READER.pause();
+    userReader(() => READER.pause());
     const key = this._key();
     // The status row hides the mic while this conversation's own job runs, but
     // guard anyway: one dictation job per conversation at a time.
@@ -1838,6 +1913,9 @@ class RetinueConversation extends HTMLElement {
     // Acquiring counts from the first tap: a second tap while the permission
     // prompt is up must not open a second microphone.
     this._recState = 'acquiring';
+    // Before the mic is asked for: the shell's wake detector has it, and must
+    // let go of it for this recording to hear anything.
+    this._micHold(true);
     this.render();
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -1849,6 +1927,10 @@ class RetinueConversation extends HTMLElement {
       if (!this.isConnected || this._key() !== key || (continuous && document.hidden)) {
         stream.getTracks().forEach((tr) => tr.stop());
         this._recState = 'idle';
+        this._micHold(false);
+        // Only hidden (the user switched away while the mic was coming up):
+        // the take waits for the page to come back rather than being lost.
+        if (this.isConnected && this._key() === key) this._contDefer(false);
         // Pointed at another thread meanwhile: its row was rendered with the
         // mic held, so it is rendered again now that the mic is free.
         if (this.isConnected) this.render();
@@ -1878,9 +1960,6 @@ class RetinueConversation extends HTMLElement {
       this._recState = 'recording';
       this._recKey = key;
       this._attachError = '';
-      // The shell (if any) pauses its wake word while the mic is ours.
-      this._micActive = true;
-      setVoiceActive(true);
       this.render();
       this._wave.start(stream);
       if (continuous) this._contTake(stream, mr);
@@ -1923,10 +2002,12 @@ class RetinueConversation extends HTMLElement {
       try { this._recStream.getTracks().forEach((tr) => tr.stop()); } catch (_e) { /* ignore */ }
       this._recStream = null;
     }
-    if (this._micActive) {
-      this._micActive = false;
-      setVoiceActive(false);
-    }
+    this._micHold(false);
+  }
+
+  _micHold(on) {
+    if (on) MIC_HOLDS.add(this); else MIC_HOLDS.delete(this);
+    syncShellVoice();
   }
 
   // From here on the dictation is a background job of its conversation alone:
@@ -1940,6 +2021,7 @@ class RetinueConversation extends HTMLElement {
     if (this._meter) this._meter.stop();
     this._meter = null;
     this._contClearTimers();
+    const wasTake = this._contRec;
     this._contRec = false;
     this._vadHeard = false;
     this._vadLive = null;
@@ -1953,6 +2035,13 @@ class RetinueConversation extends HTMLElement {
     this._recIntent = null;
     const aborted = this._recAborted;
     this._recAborted = false;
+    // A take of the loop that goes out keeps the loop engaged through the
+    // transcription and Ara's answer; one dropped (nobody spoke, ✕) or kept
+    // for review (✓, the length cap, leaving) ends it.
+    if (wasTake) {
+      if (!aborted && intent === 'send' && chunks.length) this._contEngage();
+      else this._contDisengage();
+    }
     this._recState = 'idle';
     // Pointed at another thread since (attributeChangedCallback): that
     // thread's row is refreshed at the end, its mic having been held.
@@ -2046,6 +2135,12 @@ class RetinueConversation extends HTMLElement {
     }
     VOICE_JOBS.delete(key);
     const el = adopted || live();
+    // The loop's take did not get through (nothing heard, a failed
+    // transcription or send): the loop stops on the note in the composer.
+    if (wasTake && VOICE_ERRORS.has(key)) {
+      this._contDisengage();
+      if (el && el !== this) el._contDisengage();
+    }
     if (el) {
       el._focusNext = intent === 'review';
       el.render();
@@ -2067,45 +2162,113 @@ class RetinueConversation extends HTMLElement {
     return this._id ? isContinuous(this._id) : this._contNew;
   }
 
-  // What a host calls when a wake finds this conversation on screen.
+  // What a host calls when a wake finds this conversation on screen: the
+  // mode goes on, and the mic opens now — or, while Ara is still answering,
+  // once her answer has been read (the wake counts as the user's turn).
   listen() {
     if (this._id) setContinuous(this._id, true); else this._contNew = true;
+    this._contReady = false;
+    this._contEngage();
     if (this._id && !this._thread) { this._listenOnOpen = true; this.render(); return; }
     this.render();
-    this._contListen();
+    this._contListen({ loop: true });
   }
 
   _toggleContinuous() {
     const on = !this._contOn();
     if (this._id) setContinuous(this._id, on); else this._contNew = on;
-    if (!on) this._contStopListening();
+    if (!on) { this._contStopListening(); this._contDisengage(); }
+    this._contReady = false;
     this.render();
     // Switched on: the tap is the gesture that lets the page play the chime
     // and start the microphone, so the loop starts from it.
     if (on) this._contListen();
   }
 
+  // The loop is engaged from a take sent (or a wake) until it stops: the
+  // shell keeps the screen on and its wake phrase paused all along, Ara's
+  // thinking time included (see syncShellVoice). Engaged also means armed:
+  // the answer to that turn is the one whose end opens the mic again — and
+  // only that one (see _maybeAutoplay). Any other message arriving in the
+  // thread may be read in the mode, but never opens the mic by itself.
+  _contEngage() {
+    this._contArmed = true;
+    if (!ENGAGED.has(this)) { ENGAGED.add(this); syncShellVoice(); }
+  }
+
+  // The loop has stopped: the mode was switched off, nobody spoke, the user
+  // left, a take went to review, or something failed on the way.
+  _contDisengage() {
+    this._contArmed = false;
+    this._contClearPending();
+    if (ENGAGED.delete(this)) syncShellVoice();
+  }
+
   // Open the mic for the next take, if this is the moment for one: the mode
   // is on, the page is in front, nothing is being recorded, sent or
   // transcribed here, and Ara is not still answering (her answer comes
-  // first, and its reading ends by calling this again).
-  _contListen() {
-    if (!this._contOn() || !this.isConnected || document.visibilityState === 'hidden') return;
+  // first, and its reading ends by calling this again). `loop` marks the
+  // calls the loop itself makes (an answer read, a turn done): those open
+  // the mic only for an answer to this element's own turn.
+  _contListen({ loop = false } = {}) {
+    if (!this._contOn() || !this.isConnected) return;
+    if (loop && !this._contArmed) return;
+    // A wake (or an answer) while the page is in the background: the mic is
+    // not opened behind the user's back, nor is the request lost — it waits
+    // for the page to come to the front (see _onContVis), for a while.
+    if (document.visibilityState === 'hidden') { this._contDefer(loop); return; }
     if (this._recState !== 'idle' || this._busy || VOICE_JOBS.has(this._key())) return;
     if (this._id && (!this._thread || this._thread.pending || this._missing)) return;
-    if (!canRecord()) return;
+    if (!canRecord()) { this._contDisengage(); return; }
+    this._contArmed = false;
+    this._contReady = false;
     if (this._id) touchContinuous(this._id);
     this._startRecording();
+  }
+
+  _contDefer(loop) {
+    this._contClearPending();
+    this._contPending = { loop };
+    this._contPendingTimer = setTimeout(() => {
+      this._contPendingTimer = null;
+      if (!this._contPending) return;
+      // Nobody came back: the conversation is over, and the shell may let
+      // the screen go.
+      this._contPending = null;
+      this._contDisengage();
+    }, CONT_PENDING_MS);
+  }
+
+  _contClearPending() {
+    if (this._contPendingTimer) clearTimeout(this._contPendingTimer);
+    this._contPendingTimer = null;
+    this._contPending = null;
+  }
+
+  _onContVisibility() {
+    if (document.visibilityState === 'hidden') {
+      // A take under way ends with the page (see _contStopListening); the
+      // loop stops with it unless an answer is still to come.
+      if (this._contRec && this._recState === 'recording') {
+        this._contStopListening();
+        this._contDisengage();
+      }
+      return;
+    }
+    const p = this._contPending;
+    if (!p) return;
+    this._contClearPending();
+    this._contListen({ loop: p.loop });
   }
 
   // Ara's turn ended. If the loop is reading her answer, the end of that
   // reading opens the mic (onReaderProgress); with nothing to read — no
   // speech engine, an answer of attachments only — it opens now.
   _contReplyDone() {
-    if (!this._contOn()) return;
+    if (!this._contOn() || !this._contArmed) return;
     const p = PLAYING;
     if (p && p.conv === this._id && READER.state === 'playing') return;
-    this._contListen();
+    this._contListen({ loop: true });
   }
 
   // A take of the loop has started recording: chime, then listen for its end.
@@ -2250,7 +2413,7 @@ class RetinueConversation extends HTMLElement {
     const t = this._thread;
     const m = (t && t.messages) ? t.messages[idx] : null;
     if (!m) return;
-    if (isLoaded(t.id, m)) { READER.toggle(); return; }
+    if (isLoaded(t.id, m)) { userReader(() => READER.toggle()); return; }
     playMessage(t, m, 0);
   }
 
@@ -2312,10 +2475,22 @@ class RetinueConversation extends HTMLElement {
     const cont = this._contOn() && LIVE.get(cid) === this && this.isConnected;
     if (!fresh.length || (!autoplay && !cont)) return;
     const m = fresh[fresh.length - 1];
+    // Only an answer to this element's own turn (it is armed, _contEngage)
+    // is the loop's reading, whose end opens the mic. Anything else pushed
+    // into the thread is read in the mode, never opening the mic — and never
+    // over the loop's own reading.
+    const loop = cont && this._contArmed;
+    if (!loop && CONT_READ && CONT_READ.conv === cid) return;
     // Named before the reading starts: an engine that refuses at once
     // reports it from inside playMessage, and that refusal must open the mic.
-    CONT_READ = cont ? { conv: cid, ts: m.ts } : null;
-    playMessage(t, m, 0);
+    if (loop) CONT_READ = { conv: cid, ts: m.ts };
+    const read = playMessage(t, m, 0);
+    if (loop && !read) {
+      // Nothing speakable in it (a link, a table): no reading will end, so
+      // the mic opens once the turn is over — now, if it already is.
+      if (CONT_READ && CONT_READ.ts === m.ts) CONT_READ = null;
+      if (!t.pending) setTimeout(() => this._contListen({ loop: true }), 0);
+    }
   }
 
   // ── Wiring ─────────────────────────────────────────────────────────────────
@@ -2357,6 +2532,8 @@ class RetinueConversation extends HTMLElement {
     }
     const mic = root.querySelector('[data-mic]');
     if (mic) mic.addEventListener('click', () => { if (this._contOn()) primeAudio(); this._startRecording(); });
+    const startTalk = root.querySelector('[data-start-talk]');
+    if (startTalk) startTalk.addEventListener('click', () => { primeAudio(); this.listen(); });
     // Touching the recording row at all means someone is there and will end
     // the take by hand: a meter-less take's no-speech timer stands down.
     const recRow = root.querySelector('.rec-row');
@@ -2767,6 +2944,11 @@ const CSS = `
                font-size: 1rem; line-height: 1; padding: 0 2px; }
   .chip .c-x:hover { color: var(--high, #ff6b6b); }
   .attach-err { color: var(--high, #ff6b6b); font-size: .76rem; margin-bottom: 8px; }
+  .start-talk { display: flex; align-items: center; justify-content: center; gap: 8px;
+                width: 100%; margin-bottom: 8px; padding: 12px; cursor: pointer;
+                font: inherit; font-weight: 600; color: #0b0d12;
+                background: var(--accent, #6ea8fe); border: 0; border-radius: 12px; }
+  .start-talk:hover { filter: brightness(1.08); }
 `;
 
 customElements.define('retinue-read-aloud', RetinueReadAloud);
