@@ -633,17 +633,25 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   opens with a short Web Audio chime, and a voice-activity detector over the
   recorder's own stream (RMS level from an `AnalyserNode` against a learned
   noise floor) ends the take after a pause of about 1.5 s once speech was
-  heard. The take goes out on the dictation's ➤ path (transcribe, send), the
-  loop waits for the answer, and goes round again. No speech for about 8 s
-  closes the mic with the mode left on — the mic button resumes; leaving the
-  thread or hiding the page ends listening (a take with speech in it lands in
-  the draft for review, as on leaving any dictation; one without is dropped).
-  The recording row keeps its ✕/✓/➤ throughout. Both timeouts are per-device
-  settings (Settings → Voice). Opening it: the toggle; `#new?voice=1`, the
-  composer in the mode, whose first take opens the thread that then goes on
-  in it; and a wake (`/?wake=1`, or the shell's `wake` event), which reopens
-  the thread used in the mode within the last 15 minutes, else that voice
-  composer. The pure parts — the detector's state machine and the wake's
+  heard; a level that holds above the threshold without a dip for 3 s is a
+  louder room, not a voice, and becomes the new floor. The take goes out on
+  the dictation's ➤ path (transcribe, send), the loop waits for the answer,
+  and goes round again — only for an answer to its own turn: other messages
+  pushed into the thread may be read, but do not open the mic. A take that
+  reaches the 120 s cap goes to the draft for review instead. No speech for
+  about 8 s closes the mic with the mode left on — the mic button resumes;
+  leaving the thread or hiding the page ends listening (a take with speech in
+  it lands in the draft for review, as on leaving any dictation; one without
+  is dropped). Where the page cannot hear the stream, plain timers stand in
+  for the detector. A listen wanted while the page is hidden waits up to 60 s
+  for it to return. The recording row keeps its ✕/✓/➤ throughout. Both
+  timeouts are per-device settings (Settings → Voice). Opening it: the
+  toggle; `#new?voice=1`, the composer in the mode, whose first take opens
+  the thread that then goes on in it; and a wake (`/?wake=1`, or the shell's
+  `wake` event), which reopens the thread used in the mode within the last
+  15 minutes, else that voice composer. Both flags are dropped from the
+  address once read and open the mic by themselves only inside the shell;
+  elsewhere the conversation offers a **Start talking** button. The pure parts — the detector's state machine and the wake's
   choice of thread — are `components/continuous.js`
   (`tests/test_webapp_continuous.py`).
 
@@ -667,17 +675,27 @@ same in the shell, in Chrome and on a desktop. The contract between them:
 - **User agent**: the shell appends ` RetinueShell/1 (Android)`.
 - **`window.RetinueShell`**, installed at document start on the configured
   origin only: `platform`, `version`, `setVoiceActive(bool)` and
-  `openSettings()`. The page calls `setVoiceActive(true)` whenever its mic
-  opens and `false` when it closes (so the shell pauses its wake word and
-  keeps the screen on), and Settings → Phone shell — shown only when the
-  object exists — calls `openSettings()`. `components/shell.js` wraps both.
+  `openSettings()`. `setVoiceActive(true)` means "a voice conversation is
+  engaged: keep the screen on, pause the wake phrase". The page asserts it
+  before asking for the mic (so the wake detector lets go of it first) and
+  holds it for as long as a continuous conversation is engaged — Ara's
+  thinking and reading time included — then sends `false` once the loop
+  stops (mode off, no speech, leaving, an error). Settings → Phone shell —
+  shown only when the object exists — calls `openSettings()`.
+  `components/shell.js` wraps both.
 - **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
   {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
   press while the shell is in front). The home answers both in place: a wake
   opens continuous conversation (above), a home press closes an open thread or
-  sheet back to `/` and scrolls the list to its top. Any other page answers by
-  loading `/?wake=1` or `/`. A wake while the page is not loaded makes the shell
-  load `/?wake=1` itself; the home drops the flag from the address on load.
+  sheet back to `/` (every view entry unwound, not just one) and scrolls the
+  list to its top. Any other page of the web app answers by loading
+  `/?wake=1` or `/` — unless it holds unsent input (pages register a check
+  with `registerUnsavedCheck` in `components/shell.js`), in which case
+  neither event navigates. The gateway's own pages (`/sends`, `/claude-auth`)
+  carry no `shell.js`, so the shell itself loads the home (or `/?wake=1`)
+  when the page in front is not the dashboard's. A wake while the page is not
+  loaded makes the shell load `/?wake=1` itself; the home drops the flag from
+  the address on load.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;
