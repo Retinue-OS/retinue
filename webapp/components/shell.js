@@ -12,9 +12,17 @@
 //     (the wake phrase) or `home` (a Home press while the shell is in front).
 //
 // The home (the conversations viewer on index.html) answers both events in
-// place and says so with claimShellEvents(). Every other page answers by
-// going there: a wake loads `/?wake=1`, which the home turns into the
-// continuous conversation; a home press loads the home.
+// place and says so with claimShellEvents(). Every other page of the web app
+// answers by going there: a wake loads `/?wake=1`, which the home turns into
+// the continuous conversation; a home press loads the home — unless the page
+// holds input that leaving would lose (see registerUnsavedCheck): then it
+// stays where it is, and the user finishes or drops that input first.
+//
+// Pages that do not load this module — the gateway's own (/sends,
+// /claude-auth) and anything else outside the web app — never answer either
+// event. The shell handles those itself: when the page in front is not one
+// of the dashboard's, it loads the home (with `?wake=1` for a wake) rather
+// than dispatching an event nobody hears (docs/dashboard.md).
 
 let claimed = false;
 
@@ -22,9 +30,13 @@ export function inShell() {
   return typeof window !== 'undefined' && !!window.RetinueShell;
 }
 
-// The web app's mic is in use (or no longer): the shell pauses its wake-word
-// detection meanwhile and keeps the screen on. A shell without the call, or
-// one that throws, is no reason to fail the recording.
+// A voice conversation is engaged (or no longer): the shell keeps the screen
+// on and pauses its wake phrase meanwhile. The web app asserts it before it
+// asks for the mic (the wake detector must let go of it first), and holds it
+// for as long as a continuous conversation is going — Ara's thinking and
+// reading time included, or the screen would time out mid-conversation and
+// the loop die with it (conversation.js, syncShellVoice). A shell without
+// the call, or one that throws, is no reason to fail the recording.
 export function setVoiceActive(on) {
   try {
     const s = window.RetinueShell;
@@ -44,11 +56,37 @@ export function openShellSettings() {
 // so the fallback below stays out of its way.
 export function claimShellEvents() { claimed = true; }
 
+// What a page registers to say "leaving now would lose something": a
+// function returning true while it holds unsent or unsaved input — a typed
+// draft not yet stored, a dictation recording or being transcribed, an
+// edit not yet saved. Returns the function that unregisters it. Kept here,
+// with no imports, so any page module can use it without a cycle (update.js
+// asks the same question of the conversations card before a reload).
+const unsavedChecks = new Set();
+
+export function registerUnsavedCheck(fn) {
+  if (typeof fn !== 'function') return () => {};
+  unsavedChecks.add(fn);
+  return () => { unsavedChecks.delete(fn); };
+}
+
+export function hasUnsavedInput() {
+  for (const fn of unsavedChecks) {
+    try { if (fn()) return true; } catch (_e) { /* a broken check is no veto */ }
+  }
+  return false;
+}
+
 if (typeof window !== 'undefined') {
   window.addEventListener('retinue-shell', (e) => {
     if (claimed) return;
     const type = e && e.detail && e.detail.type;
+    if (type !== 'wake' && type !== 'home') return;
+    // Unsent input here: a Home press does nothing, and a wake goes nowhere
+    // — the wake phrase can be said again once the input is dealt with,
+    // the input could not be had back.
+    if (hasUnsavedInput()) return;
     if (type === 'wake') location.assign('/?wake=1');
-    else if (type === 'home') location.assign('/');
+    else location.assign('/');
   });
 }

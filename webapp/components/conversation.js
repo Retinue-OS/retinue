@@ -117,7 +117,7 @@ import {
   isContinuous, setContinuous, touchContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
   chime, primeAudio,
 } from './continuous.js';
-import { setVoiceActive } from './shell.js';
+import { setVoiceActive, registerUnsavedCheck } from './shell.js';
 
 const LIST_URL = '/conversations';
 const POLL_MS = 4000;
@@ -300,6 +300,11 @@ export function hasUnsentInput() {
   }
   return false;
 }
+
+// The same question for the Android shell's wake and Home press on a page
+// that is not the home (shell.js): those navigate, so they also wait for a
+// send on the wire and a mic in use (being asked for, or recording).
+registerUnsavedCheck(() => hasUnsentInput() || SENDS.size > 0 || MIC_HOLDS.size > 0);
 
 // The offered model list, fetched once and shared. A failure (or a
 // single-model list) simply leaves every picker hidden.
