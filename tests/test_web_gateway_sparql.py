@@ -201,8 +201,14 @@ def test_malformed_requests(c: Client, wg):
     # A body the server cannot read is named as such, not as "no query".
     FakeStore.calls.clear()
     conn = http.client.HTTPConnection("127.0.0.1", c.port, timeout=10)
-    conn.request("POST", "/sparql", body=iter([b"query=ASK%7B%7D"]),
-                 headers={**FORM, "Transfer-Encoding": "chunked"}, encode_chunked=True)
+    try:
+        conn.request("POST", "/sparql", body=iter([b"query=ASK%7B%7D"]),
+                     headers={**FORM, "Transfer-Encoding": "chunked"},
+                     encode_chunked=True)
+    except (BrokenPipeError, ConnectionResetError):
+        # The server may answer 411 and close before the terminating chunk
+        # is written; its answer is still waiting to be read.
+        pass
     resp = conn.getresponse()
     resp.read()
     conn.close()
