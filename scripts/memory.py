@@ -111,7 +111,9 @@ plus the usual content, tags, recordedAt, actor, relevance and model. Nothing
 is deleted: a summary that is later corrected (`store --corrects SUM`) stops
 hiding its members, which is the undo. Superseding a summary does not: the
 new entry is then the current picture, and the members, older still, stay
-hidden under it (`--include-compacted` shows them). The plan is JSON, one object or a list:
+hidden under it (`--include-compacted` shows them). The weekly job
+`memory-compact.py` draws up the plans in a frontier session; by hand, Ara
+senior can. The plan is JSON, one object or a list:
 
     {"topic": "ludmila", "content": "…", "tags": ["ludmila", "signal"],
      "relevance": 0.8, "summarizes": ["<id>", …], "retires": ["<id>", …],

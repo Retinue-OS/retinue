@@ -284,6 +284,14 @@ services:
       - RETINUE_SESSION_ENV_EXTRA
       # Memory (scripts/memory.py): RETINUE_MEMORY=0 disables the store.
       - RETINUE_MEMORY
+      # The weekly compaction job's knobs (scripts/memory-compact.py,
+      # docs/memory.md "The compaction job").
+      - RETINUE_MEMORY_FREEZE_DAYS
+      - RETINUE_MEMORY_MIN_CLUSTER
+      - RETINUE_MEMORY_BATCH
+      - RETINUE_MEMORY_MAX_BATCHES
+      - RETINUE_MEMORY_ALERT_AFTER
+      - RETINUE_MEMORY_STATE_DIR
       # Claude Code: the permission mode for every `claude` the framework
       # starts, the pre-spawn token refresh and the monitor's remaining
       # tunables (docs/claude-auth.md), the in-container auto-updater switch
