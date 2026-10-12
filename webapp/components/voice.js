@@ -11,6 +11,15 @@
 // three buttons (what "review" and "send" mean is per-host); this module owns
 // only the presentation.
 
+// The user-facing text for a failed recording start. Only a refusal is
+// called a denial; anything else (no device, the device busy, the recorder
+// failing) names the browser's error so the cause is visible on the page.
+export function micErrorText(err) {
+  const name = err && err.name;
+  if (name === 'NotAllowedError' || name === 'SecurityError') return 'Microphone access was denied.';
+  return `The microphone could not be started${name ? ` (${name})` : ''}.`;
+}
+
 export function canRecord() {
   return !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
 }

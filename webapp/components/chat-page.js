@@ -60,7 +60,7 @@
 // hers; the send press stays the user's.
 
 import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
-import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
 import { openAttentionSheet } from './attention-sheet.js';
@@ -1635,10 +1635,10 @@ class RetinueChatPage extends HTMLElement {
       this._recState = 'recording';
       this.render();
       this._wave.start(stream);
-    } catch (_err) {
+    } catch (err) {
       this._recState = 'idle';
       this._recTarget = null;
-      this._voiceErrors[target] = 'Microphone access was denied.';
+      this._voiceErrors[target] = micErrorText(err);
       this._stopStream();
       this.render();
     }
