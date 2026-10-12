@@ -2923,6 +2923,9 @@ const CSS = `
                  row-gap: 6px; padding-left: 44px; }
     .thread-bar:not(.bar-slim) .bar-actions [data-picker] { min-width: 0; max-width: 100%; }
     .bar-actions:empty, .bar-thread:empty { display: none; }
+    /* The picker's host stays in the DOM for _syncPicker, so with no picker
+       and no other setting the row is not :empty — hide it all the same. */
+    .bar-actions:has(> [data-picker]:empty:only-child) { display: none; }
   }
   /* Very narrow (or zoomed) frames: the settings row uses the full width. */
   @media (max-width: 360px) {
