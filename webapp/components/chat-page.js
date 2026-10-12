@@ -2078,6 +2078,14 @@ class RetinueChatPage extends HTMLElement {
       // through the guard's one-shot retry).
       this._draftSaved = '';
       this._postRead(msg.ts);
+      // A failed dictation's note is moot once a send went out (#149) — dropped
+      // in place, since rebuilding the composer block here would wipe anything
+      // typed while the send was on the wire.
+      if (this._voiceErrors.chat) {
+        delete this._voiceErrors.chat;
+        const row = this.shadowRoot.querySelector('.pane-chat .attach-err');
+        if (row) row.remove();
+      }
     } catch (_err) {
       // Not sent: take the bubble down, give words and images back to the
       // composer. The preview object URLs were never revoked, so the staged
