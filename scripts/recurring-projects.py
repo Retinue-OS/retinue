@@ -31,9 +31,10 @@ months (``Nm``). A date already in the past wakes on the next run rather than
 being skipped, so nothing is lost when this is first deployed — or when the
 container was down on the day.
 
-Two exclusions keep finished work asleep, matching ``agent-self-review.py``:
-``resolved: true`` and ``status: done``. A project that is merely ``paused`` is
-resting, not done, and is exactly what this looks for.
+Two exclusions keep finished work asleep -- ``resolved: true`` and
+``status: done``, the same pair ``agent-self-review.py`` and the dashboard's
+projects card exclude. A project that is merely ``paused`` is resting, not
+done, and is exactly what this looks for.
 
 Optionally, the reminder shown when either kind wakes:
 

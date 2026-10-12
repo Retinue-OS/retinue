@@ -5081,9 +5081,13 @@ _KB = "https://w3id.org/retinue/kb#"
 _OWNER_ACTOR = os.environ.get("RETINUE_OWNER_ACTOR", "").strip() or "urn:retinue:actor:owner"
 
 # One query returns every active project with the fields the card needs. Paused
-# projects and non-active statuses are excluded so the dashboard shows only what
-# is actually running. currentActor drives the split: the owner == "your move",
-# anyone else == "waiting on <them>".
+# projects and finished ones are excluded so the dashboard shows only what is
+# actually running. "Finished" has two spellings in project frontmatter,
+# `status: done` and `resolved: true` (the one agent-self-review.py's prompt
+# tells an agent to set), and the card hides either, as the sweep and
+# recurring-projects.py do -- a project retired with `resolved: true` alone
+# used to stay listed here (retinue-os/retinue#23). currentActor drives the
+# split: the owner == "your move", anyone else == "waiting on <them>".
 #
 # Every field is read from the project's *source* graph — the one holding its
 # rdf:type triple, i.e. the converted frontmatter file — never from anywhere
@@ -5108,6 +5112,7 @@ SELECT ?p ?title ?actor ?next ?since ?expected ?status
     OPTIONAL { ?p k:expectedBy ?expected }
     OPTIONAL { ?p k:status ?status }
     OPTIONAL { ?p k:paused ?paused }
+    OPTIONAL { ?p k:resolved ?resolved }
     OPTIONAL { ?p k:importance ?importance }
     OPTIONAL { ?p k:sphere ?sphere }
     OPTIONAL { ?p k:tag ?tag }
@@ -5117,6 +5122,7 @@ SELECT ?p ?title ?actor ?next ?since ?expected ?status
   }
   FILTER (!BOUND(?paused) || ?paused = false)
   FILTER (!BOUND(?status) || ?status != "done")
+  FILTER (!BOUND(?resolved) || ?resolved = false)
 } ORDER BY ?title
 """ % _KB
 # The attention properties (importance / sphere / tag / kind, and the wake

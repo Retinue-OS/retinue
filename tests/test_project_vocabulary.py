@@ -210,6 +210,28 @@ def optional_predicate_vars(query_text: str, subject_var: str) -> dict[str, str]
     ))
 
 
+def bound_guards(query_text: str, subject_var: str) -> list[tuple[str, str]]:
+    """[(predicate_local, excluded_literal_token), ...] for every guard of
+    the shape `FILTER (!BOUND(?v) || ?v != "x")` or `FILTER (!BOUND(?v) ||
+    ?v = false)` -- the projects card's spelling of "drop the rows carrying
+    this value" -- with `?v` resolved to the predicate its OPTIONAL binds.
+    The token is the value the guard EXCLUDES, so `?v = false` yields "true":
+    the same (predicate, token) shape not_exists_clauses() returns, so the
+    card's guards and the sweep's can be compared outright."""
+    pred_of = {var: pred for pred, var
+               in optional_predicate_vars(query_text, subject_var).items()}
+    guards = []
+    for var, op, token in re.findall(
+            r'FILTER\s*\(\s*!BOUND\(\?(\w+)\)\s*\|\|\s*\?\1\s*(!=|=)\s*'
+            r'(true|false|"[^"]*")\s*\)', query_text):
+        if var not in pred_of:
+            continue
+        if op == "=":
+            token = "true" if token == "false" else "false"
+        guards.append((pred_of[var], token))
+    return guards
+
+
 def all_predicate_locals(query_text: str) -> set[str]:
     """Every `<prefix>:Local` token bound to the query's own kb# prefix
     (never `rdf:`/`xsd:`, which are structural, not project vocabulary),
@@ -369,6 +391,40 @@ def main() -> int:
               asr_excludes, True)
         check("web-gateway's card would hide it too (status: done)",
               literal_check(store_c, subj_c, KB, wg_optionals["status"], "done"), True)
+
+        # The same two markers, one at a time (retinue-os/retinue#23, item 3).
+        # The combined fixture above carries both, so it could not see that the
+        # sweep once excluded only `resolved: true` and the card only
+        # `status: done`: a project retired the way the sweep's own prompt says
+        # stayed on the card, and one retired with `status: done` while parked
+        # on an agent was swept again daily. Every reader must hide either --
+        # and each reader's guards are read from its own query text, so the
+        # three can be compared outright rather than restated here.
+        wg_guards = bound_guards(webgw._PROJECTS_SPARQL, "p")
+        asr_guards = not_exists_clauses(asr.QUERY, "project")
+        rp_guards = not_exists_clauses(rp_query, "project")
+        check("the card and the sweep exclude the same markers (read from their "
+              "own filters)", set(wg_guards), set(asr_guards))
+        check("the sweep and the recurring-projects wake exclude the same finished "
+              "markers (the claim in recurring-projects.py's docstring; the wake "
+              "requires paused rather than excluding it)",
+              set(asr_guards) - {("paused", "true")}, set(rp_guards))
+        for marker, extra in (("resolved: true", "paused: false\nresolved: true\n"),
+                              ("status: done", "paused: false\nstatus: done\n")):
+            print(f"\nproject finished by `{marker}` alone (retinue-os/retinue#23, item 3)")
+            slug = "fixture-" + marker.split(":", 1)[0] + "-only"
+            fx = write_fixture(tmp, slug, "coach", extra)
+            store = parse_data(convert(SCRIPTS_DIR / "md2ttl.py", fx)) + agents_store
+            subj = md2ttl_mod.PROJECT_PREFIX + slug
+            check("agent-self-review's gate excludes it",
+                  any(literal_check(store, subj, KB, pred, token)
+                      for pred, token in asr_guards), True)
+            check("web-gateway's projects card hides it",
+                  any(literal_check(store, subj, KB, pred, token)
+                      for pred, token in wg_guards), True)
+            check("recurring-projects' wake excludes it",
+                  any(literal_check(store, subj, KB, pred, token)
+                      for pred, token in rp_guards), True)
 
     if failures:
         print(f"\n{len(failures)} check(s) FAILED:")

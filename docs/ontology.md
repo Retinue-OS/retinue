@@ -250,6 +250,7 @@ PREFIX kb: <https://w3id.org/retinue/kb#>
 
 # Running projects and who has the next move, each field read from the
 # project's own file (the dashboard's projects card asks the same question).
+# A project is finished by `status: done` or by `resolved: true`; both hide it.
 SELECT ?title ?actor ?next ?file WHERE {
   GRAPH ?file {
     ?project a kb:Project .
@@ -258,9 +259,11 @@ SELECT ?title ?actor ?next ?file WHERE {
     OPTIONAL { ?project kb:currentNextAction ?next }
     OPTIONAL { ?project kb:paused ?paused }
     OPTIONAL { ?project kb:status ?status }
+    OPTIONAL { ?project kb:resolved ?resolved }
   }
   FILTER (!BOUND(?paused) || ?paused = false)
   FILTER (!BOUND(?status) || ?status != "done")
+  FILTER (!BOUND(?resolved) || ?resolved = false)
 } ORDER BY ?actor ?title
 ```
 

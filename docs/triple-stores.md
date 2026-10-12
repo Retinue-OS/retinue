@@ -183,10 +183,17 @@ SELECT ?p ?title ?actor ?next ?since ?expected ?status WHERE {
   OPTIONAL { ?p k:expectedBy ?expected }
   OPTIONAL { ?p k:status ?status }
   OPTIONAL { ?p k:paused ?paused }
+  OPTIONAL { ?p k:resolved ?resolved }
   FILTER (!BOUND(?paused) || ?paused = false)
   FILTER (!BOUND(?status) || ?status != "done")
+  FILTER (!BOUND(?resolved) || ?resolved = false)
 } ORDER BY ?title
 ```
+
+A project is finished by `status: done` or by `resolved: true`, and the card
+excludes both spellings — as do the self-review sweep and the recurring-projects
+wake; a reader that honoured only one of them is what
+[retinue-os/retinue#23](https://github.com/Retinue-OS/retinue/issues/23) was about.
 
 The results split into "mine" and "waiting on someone else" by `currentActor`.
 Note what *didn't* happen: nobody maintained a project database. Someone edited

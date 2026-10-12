@@ -152,8 +152,10 @@ human pokes it. The **`agent-self-review`** base job closes that gap.
 
 It is a scheduler `command` job — so the scheduler spends **no Claude credits**
 to invoke it — that runs `scripts/agent-self-review.py`. The script's gate is a
-plain SPARQL `SELECT` against the life store (also free): unresolved `kb:Project`
-whose `kb:currentActor` is typed `kb:AiAgent`. An **empty result spawns nothing**
+plain SPARQL `SELECT` against the life store (also free): every `kb:Project`
+whose `kb:currentActor` is typed `kb:AiAgent` and that is neither finished —
+`status: done` or `resolved: true`, both spellings count — nor `paused: true`.
+An **empty result spawns nothing**
 — zero credits when no agent owes work. Only on a non-empty result does it start
 a single `claude -p` session, handed the already-fetched tuples so the agent does
 not re-query; the agent then does each next action or opens a dashboard
@@ -191,7 +193,7 @@ project frontmatter is already in the store, so one query covers notes,
 operations, and any chamber added later.
 
 Both kinds of resting project rest as `paused: true` (the dashboard card hides
-them; unlike `status: done` they stay alive and queryable).
+them; unlike `status: done` or `resolved: true` they stay alive and queryable).
 
 **Standing cadences** — an action due a day each month (an IV assistance-cost
 filing) or each quarter (a VAT return):
@@ -247,7 +249,11 @@ re-read just before acting, which closes any store-lag window and, importantly,
 is where `resolved: true` / `status: done` are actually checked: a chamber's
 converter maps only the keys it chose, so a finished project may carry no
 `kb:resolved` in the store at all. The query's own exclusions are an
-optimisation, not the guarantee.
+optimisation, not the guarantee. Either spelling finishes a project for every
+reader: the self-review sweep's gate and the dashboard's projects card exclude
+both `status: done` and `resolved: true` as well, so a project retired one way
+does not linger in the other
+([retinue-os/retinue#23](https://github.com/Retinue-OS/retinue/issues/23)).
 
 The reminder wording lives in the project frontmatter, not in framework code —
 this public repo carries no chamber-specific or personal text.
