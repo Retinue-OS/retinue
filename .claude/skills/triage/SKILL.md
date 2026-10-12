@@ -67,8 +67,8 @@ execute. Goal: **inbox-zero, entirely through Retinue**.
   un-archives it as a side effect — just to remind the user. What may bring the
   subject back is genuinely new external content (a new inbound message,
   through Phases 1–4) or a **stalled** item re-collected by Phase 1's fourth
-  pass — which first reads the thread, treats any user answer there as the
-  decision, and otherwise re-opens that *same* thread: one message, one
+  pass — which first reads the thread, acts on a decision the user wrote there,
+  and otherwise re-opens that *same* thread: one message, one
   thread. Only **`muted`** (with `archived`) is the user saying the topic is
   done for good without answering — per CLAUDE.md, the one decidable signal.
 
@@ -226,13 +226,18 @@ status. Reconcile in both directions:
    thread its proposal opened for as long as it is tracked; this pass never
    opens a second one for it while that thread exists. So before branching,
    **read the thread** (`GET /conversations/<id>`), whatever its state: a user
-   message after the proposal means the user engaged, and their answer is on
-   record there. A record still non-terminal then means the executing session
-   skipped its bookkeeping (Phase 6), not that the question is open. The
-   classic case is an `action` carried out in another thread or channel — the
-   requested form mailed to a third party, say — which the already-answered
-   check cannot see, because no reply follows the message in its own thread.
-   - **User engaged the thread** (archived or not) → the decision exists.
+   message after the proposal that decides the item — approves, declines, or
+   tells Ara what to do — is the user's answer, on record there. A record
+   still non-terminal then means the executing session skipped its
+   bookkeeping (Phase 6), not that the question is open. The classic case is
+   an `action` carried out in another thread or channel — the requested form
+   mailed to a third party, say — which the already-answered check cannot
+   see, because no reply follows the message in its own thread. A question or
+   an adjustment ("shorter, please") is not a decision: when the thread's
+   last word is a revised proposal still awaiting the user, the question is
+   open — take the branch below that fits the thread's state as if it was
+   never engaged, and never act on a clarification.
+   - **User decided in the thread** (archived or not) → the decision exists.
      Never re-propose and never nudge. Check whether it was carried out (Sent
      folder, the `/sends` queue, the linked project): if so, resolve the
      message exactly as pass 3 does and write `resolved`, citing the thread and
@@ -673,14 +678,16 @@ it forces that session back onto name resolution, the failure mode reply
 tokens exist to prevent. E-mail needs no reply command: its reply is addressed
 by `--uid` from the status store (Phase 6).
 
-**Every proposal thread names its status record**, any channel. Add a line to
-the `--context` (beside the reply command, for messenger) such as `Triage
-record: $TRIAGE_STATE_DIR/<sanitized id> (uid <UID>). Once the user's decision
-is carried out — here or anywhere else — set it resolved and move the mail out
-of the INBOX (triage skill, Phase 6).` The session that executes the decision
-is an ordinary thread turn that may never load this skill; without the pointer
-it does the work and leaves the record `proposed`, and a week later the stall
-pass finds a message that looks undecided.
+**Every e-mail proposal thread names its status record.** Add a line to its
+`--context` such as `Triage record: $TRIAGE_STATE_DIR/<sanitized id> (uid
+<UID>). Once the user's decision is carried out — here or anywhere else — set
+it resolved and move the mail out of the INBOX (triage skill, Phase 6).` The
+session that executes the decision is an ordinary thread turn that may never
+load this skill; without the pointer it does the work and leaves the record
+`proposed`, and a week later the stall pass finds a message that looks
+undecided. A messenger item has no such record — its handled-state is the
+delivery ledger's `delivered` flag, which the gateway owns — so its context
+carries only the reply command above.
 
 ### 4b. Omnibus proposal — once per `EMAIL_PROCESSING_INTERVAL`
 
