@@ -76,6 +76,9 @@ def test_handles():
     assert contacts.normalize_handle("sms", "0041 79 123 45 67") == ("sms", "+41791234567")
     assert contacts.normalize_handle("Signal", "+41 (79) 123-45-67") == ("signal", "+41791234567")
     assert contacts.normalize_handle("whatsapp", "123456@lid") == ("whatsapp", "123456@lid")
+    # A phone-number JID (a WhatsApp chat key) is the number: the form the
+    # gateway delivers a sender in, so a VIP filed from a chat matches.
+    assert contacts.normalize_handle("whatsapp", "41791234567@s.whatsapp.net") == ("whatsapp", "+41791234567")
     assert contacts.normalize_handle("matrix", "@mara:example.org") == ("matrix", "@mara:example.org")
     assert contacts.parse_handle("telegram:@mara_k") == ("telegram", "@mara_k")
     for bad in (("email", "no-at-sign"), ("sms", "not a number"), ("Not A Channel", "x"), ("signal", " ")):
@@ -185,6 +188,15 @@ def test_attention_and_vip(chambers, manifest):
     assert "kb#vip" not in (chambers / lou["path"]).read_text(encoding="utf-8")
     assert contacts.policy_projection(book) == ({}, set())
     book.delete(lou["key"])
+    # A handle filed before a normalization rule existed projects in its
+    # current form — the one the gateway compares against.
+    old = book.create("work", "Old Filing", [("telegram", "@old_filing")], vip=True)
+    path = chambers / old["path"]
+    path.write_text(path.read_text(encoding="utf-8").replace('"@old_filing"', '"41791234567@s.whatsapp.net"')
+                    .replace('"telegram"', '"whatsapp"'), encoding="utf-8")
+    handles, _ = contacts.policy_projection(book)
+    assert handles == {"whatsapp": {"+41791234567"}}, handles
+    book.delete(old["key"])
     print("ok test_attention_and_vip")
 
 
