@@ -23,7 +23,7 @@
 
 import { esc, fmtAge, visibleHeight } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
-import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { shelf, goLive, takeRestore } from './shelf-store.js';
 import { registerUnsavedCheck } from './shell.js';
 
@@ -374,9 +374,9 @@ class RetinueProjectPage extends HTMLElement {
       this._cmdError = '';
       this.render();
       this._wave.start(stream);
-    } catch (_err) {
+    } catch (err) {
       this._recState = 'idle';
-      this._cmdError = 'Microphone access was denied.';
+      this._cmdError = micErrorText(err);
       this._stopStream();
       this.render();
     }

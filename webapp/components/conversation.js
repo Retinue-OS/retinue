@@ -108,7 +108,7 @@
 
 import { esc, fmtAge, softKeyboard, visibleHeight } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
-import { canRecord, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
+import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
 import { openAttentionSheet } from './attention-sheet.js';
@@ -2018,10 +2018,14 @@ class RetinueConversation extends HTMLElement {
       this.render();
       this._wave.start(stream);
       if (continuous) this._contTake(stream, mr);
-    } catch (_err) {
+    } catch (err) {
       this._recState = 'idle';
-      this._attachError = 'Microphone access was denied.';
+      this._attachError = micErrorText(err);
       this._stopStream();
+      // A loop take that cannot open the mic ends the spoken turn now rather
+      // than holding the shell's voice state until the watchdog; the mode
+      // stays on, so the mic button tries again.
+      if (this._contOn()) this._contDisengage();
       if (this.isConnected) this.render();
     }
   }
