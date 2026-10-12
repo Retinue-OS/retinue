@@ -2022,6 +2022,10 @@ class RetinueConversation extends HTMLElement {
       this._recState = 'idle';
       this._attachError = micErrorText(err);
       this._stopStream();
+      // A loop take that cannot open the mic ends the spoken turn now rather
+      // than holding the shell's voice state until the watchdog; the mode
+      // stays on, so the mic button tries again.
+      if (this._contOn()) this._contDisengage();
       if (this.isConnected) this.render();
     }
   }
