@@ -1346,10 +1346,17 @@ class RetinueConversation extends HTMLElement {
         `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" ` +
         `stroke-linecap="round" aria-hidden="true"><path d="M6 17h12"/></svg></button>`
       : '';
+    // Archive and Minimize act on the thread as a whole, so they are kept
+    // apart from its settings: on a phone they stay on the title row, where
+    // they cannot be pushed off the edge by a long model name (see the CSS).
+    // The DOM follows that phone order, so a screen reader and the tab key
+    // meet them right after the title they belong to.
     return `<div class="thread-bar">${back}` +
       `<span class="bar-title" data-title>${esc(t.title || 'Conversation')}</span>` +
-      `<span class="bar-actions"><span data-picker>${this._modelPickerHtml()}</span>` +
-      `${attentionBtn}${this._contBtnHtml()}${autoBtn}${archiveBtn}${minBtn}</span></div>`;
+      `<span class="bar-thread" role="group" aria-label="Conversation">${archiveBtn}${minBtn}</span>` +
+      `<span class="bar-actions" role="group" aria-label="Conversation settings">` +
+      `<span data-picker>${this._modelPickerHtml()}</span>` +
+      `${attentionBtn}${this._contBtnHtml()}${autoBtn}</span></div>`;
   }
 
   // The loop toggle: this conversation in continuous mode, or not. Offered
@@ -2895,24 +2902,38 @@ const CSS = `
           justify-content: center; padding: 0 2px 2px 0; -webkit-tap-highlight-color: transparent; }
   .bar-title { flex: 1; min-width: 0; font-weight: 650; overflow: hidden;
                text-overflow: ellipsis; white-space: nowrap; }
-  .bar-actions { flex: none; display: inline-flex; align-items: center; gap: 6px; }
+  .bar-actions, .bar-thread { flex: none; display: inline-flex; align-items: center; gap: 6px; }
+  /* A wide bar reads title · settings · thread actions, like window chrome. */
+  .bar-thread { order: 1; }
   /* bar="actions": no title to push the cluster across, so the row does it,
      and it sits tighter — the host's own header is directly above it. */
   .thread-bar.bar-slim { justify-content: flex-end; padding: 0 0 8px; }
   /* The host's lead (slot "bar-start") takes the left end; the cluster stays right. */
   .thread-bar.bar-slim ::slotted([slot="bar-start"]) { margin-right: auto; min-width: 0; }
   /* A phone's thread bar cannot hold the back button, the picker, the
-     attention ⓘ, the speaker toggle and Archive beside the title — squeezed
-     into one row the title kept its first four letters. So on a phone the
-     title keeps the row with the back button (two lines before it cuts, as
-     in the list) and the controls wrap to a row under it. */
+     attention ⓘ, the speaker toggle, Archive and Minimize beside the title.
+     So on a phone the title row keeps the back button and the thread's own
+     actions (Archive, Minimize — never pushed off the edge), the title takes
+     two lines before it cuts, as in the list, and the settings go to a row
+     under it. That row wraps rather than clips, so a long model name or an
+     enlarged system font moves a control down instead of hiding it. */
   @media (max-width: 480px) {
     .thread-bar:not(.bar-slim) { flex-wrap: wrap; row-gap: 8px; }
     .thread-bar:not(.bar-slim) .bar-title { white-space: normal; overflow-wrap: anywhere;
                  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
                  line-height: 1.3; }
-    .thread-bar:not(.bar-slim) .bar-actions { flex: 1 0 100%; padding-left: 44px; }
-    .bar-actions:empty { display: none; }
+    .thread-bar:not(.bar-slim) .bar-thread { order: 0; }
+    .thread-bar:not(.bar-slim) .bar-actions { order: 1; flex: 1 0 100%; flex-wrap: wrap;
+                 row-gap: 6px; padding-left: 44px; }
+    .thread-bar:not(.bar-slim) .bar-actions [data-picker] { min-width: 0; max-width: 100%; }
+    .bar-actions:empty, .bar-thread:empty { display: none; }
+    /* The picker's host stays in the DOM for _syncPicker, so with no picker
+       and no other setting the row is not :empty — hide it all the same. */
+    .bar-actions:has(> [data-picker]:empty:only-child) { display: none; }
+  }
+  /* Very narrow (or zoomed) frames: the settings row uses the full width. */
+  @media (max-width: 360px) {
+    .thread-bar:not(.bar-slim) .bar-actions { padding-left: 0; }
   }
   .iconbtn { width: 34px; height: 34px; border-radius: 50%; background: transparent;
              border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);
