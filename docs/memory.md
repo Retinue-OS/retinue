@@ -371,11 +371,15 @@ half, the next section its mechanics:
   ordinary member of its topic, so the next run folds it into a new
   generation, and each topic converges on one current document instead of a
   pile of summaries.
-- **Tags.** A summary's tags are the union of the member tags occurring at
-  least twice, plus the cluster tag — plus every identifier tag of a member it
-  keeps. That last clause came with the job: triage recalls a sender's
-  standing instructions by its `sender-…` tag, which typically occurs once in
-  a cluster, and a summary without it would hide the rule from triage.
+- **Tags.** A summary's tags are the cluster tag plus every tag of every
+  member it keeps. Recall finds a compacted entry only through its summary,
+  so a summary missing one of those tags would hide the entry from
+  `recall --tag`: a sender's standing instructions from triage, which
+  recalls them by a `sender-…` tag that typically occurs once in a cluster,
+  and as well any entry filed under a tag no other member shares — many are,
+  since tags are coined freely. (The scheme first carried only the tags
+  occurring at least twice; the job showed that this hides exactly those.)
+  A retired member's tags are not carried: it is obsolete.
 - **What to keep.** Corrected, superseded and expired members are retired,
   with the outcome kept in one clause when it matters ("the August filing
   arrangement was voided"). A questioned member is kept with its doubt
@@ -431,9 +435,8 @@ batch: the topic, the batch's place in its cluster, every member in full
 `reiterations`, `last_reiterated`, `expires` and `expired`, `corrected_by`,
 `superseded_by`, `questioned_by`, `summary`, `generation`, `covers_from`,
 `covers_to`), the content of every entry that challenged a member (fetched
-with one VALUES-bounded recall query), `suggested_tags` (the tag rule above,
-computed rather than counted by a model), `identifier_tags`, and its `index`
-in the run, by which the plan names it; plus the thresholds. It is written to
+with one VALUES-bounded recall query), and its `index` in the run, by which
+the plan names it; plus the thresholds. It is written to
 the state directory for inspection and handed to the session inside its
 prompt, on stdin.
 
@@ -470,14 +473,16 @@ payload before anything is written:
 - its `summarizes` and `retires` together must be exactly that batch's
   members — none left out, none twice, none from outside it — so whatever
   gets hidden passed the freeze age and the cluster gate, and an existing id
-  the model hallucinated (a recent entry, say) cannot be compacted;
-- it must keep at least one member.
+  the model hallucinated (a recent entry, say) cannot be compacted.
 
-An object failing any of it is dropped and logged; its batch comes round
-again. The job sets the rest itself rather than trusting it: the topic, and
-the tags — the batch's suggested tags without its identifier tags, plus the
-identifier tags of every member kept — so a summary can never hide a sender
-rule from triage. It writes what survives to
+A plan that only retires is valid: a batch can be all obsolete (a topic's
+oldest forty deadlines, all expired), and its summary then records the
+outcome — dropping it instead would bring the same batch round first on
+every run. An object failing any of the checks is dropped and logged; its
+batch comes round again. The job sets the rest itself rather than trusting
+it: the topic, and the tags — every tag of every member kept (the tag rule
+above) — so a summary can never hide a sender rule from triage, nor any kept
+entry from a `recall --tag` that found it before. It writes what survives to
 `/root/.retinue/memory/compaction-plan.json` and runs `memory.py compact` on
 it under the session's environment, whose frontier stamp `compact` checks and
 records. When `compact` refuses the plan (a member compacted or corrected

@@ -22,9 +22,9 @@ convention, not a boundary. The boundary is that the session can do nothing
 but answer: no Bash, no file access, no MCP servers, no project context. This
 process then holds the plan against the payload — every batch it names is one
 it was handed, every member of that batch appears exactly once, nothing from
-outside it — sets the tags itself (the batch's suggested tags plus the
-identifier tags of every member kept, so a sender rule never drops out of
-triage's reach) and runs `memory.py compact` on what survives. A model can
+outside it — sets the tags itself (every tag of every member kept, so no
+kept entry, a sender rule least of all, drops out of a `recall --tag` that
+found it before) and runs `memory.py compact` on what survives. A model can
 therefore write a poor summary, but it cannot compact an entry it was not
 handed, hide a sender rule, or act outside the plan.
 
@@ -246,17 +246,6 @@ def split_batches(members: list[dict], batch_size: int | None = None,
     return batches
 
 
-def suggested_tags(topic: str, members: list[dict]) -> list[str]:
-    """The scheme's tag rule, computed once rather than counted by a model:
-    the member tags occurring at least twice in the batch, plus the cluster
-    tag."""
-    counts: dict[str, int] = {}
-    for m in members:
-        for t in set(m["tags"]):
-            counts[t] = counts.get(t, 0) + 1
-    return sorted({t for t, n in counts.items() if n >= 2} | {topic})
-
-
 def plan_batches(entries: list[dict], max_batches: int | None = None
                  ) -> tuple[list[dict], list[dict]]:
     """(batches to plan this run, batches deferred by the cap).
@@ -264,10 +253,8 @@ def plan_batches(entries: list[dict], max_batches: int | None = None
     Round-robin over the clusters, largest first: every cluster's first
     (oldest) batch, then every second batch, and so on, so one sprawling
     topic does not take the whole run. Each batch: topic, its index in the
-    cluster, the cluster's size, members, suggested tags, and the identifier
-    tags among its members (which must survive on the summary for every
-    member it keeps — triage recalls sender rules by them). `index` is the
-    batch's place in the run, by which the session's plan names it."""
+    cluster, the cluster's size and members. `index` is the batch's place in
+    the run, by which the session's plan names it."""
     max_batches = MAX_BATCHES if max_batches is None else max_batches
     per_cluster = []
     for tag, members in assign_clusters(entries):
@@ -284,10 +271,6 @@ def plan_batches(entries: list[dict], max_batches: int | None = None
                     "batch": i + 1,
                     "of": len(batches),
                     "cluster_size": size,
-                    "suggested_tags": suggested_tags(tag, batches[i]),
-                    "identifier_tags": sorted({t for m in batches[i]
-                                               for t in m["tags"]
-                                               if _is_identifier(t)}),
                     "members": batches[i],
                 })
     return ordered[:max_batches], ordered[max_batches:]
@@ -398,7 +381,9 @@ Rules for each summary — docs/memory.md, "The compaction scheme":
 - `summarizes` lists the members whose substance the summary carries;
   `retires` the members judged obsolete — the only trace a retired entry
   keeps. Every member id of the batch appears in exactly one of the two;
-  none is left out, none appears twice, none comes from another batch.
+  none is left out, none appears twice, none comes from another batch. A
+  batch whose members are all obsolete gets a summary that only retires
+  them: its `content` states the outcome.
 - `relevance` is the expected durability of the summary's content, on the
   three anchors: 1.0 when it carries a standing rule or preference, 0.7 a
   decision or a lesson, 0.3 only incidents or status. Take the anchor of the
@@ -562,11 +547,16 @@ def scope_plan(plan: list, batches: list[dict]) -> tuple[list[dict], list[str]]:
     and the cluster gate hold for whatever gets hidden. An object failing
     any of it is dropped with its reason; its batch comes round again.
 
-    The rest the job sets rather than trusts: the topic, and the tags — the
-    batch's suggested tags without its identifier tags, plus the identifier
-    tags of every member kept, because triage recalls sender rules by them
-    and a summary missing one would hide the rule. Content and relevance
-    stay the session's; `compact` checks their form."""
+    The rest the job sets rather than trusts: the topic, and the tags —
+    every tag of every member kept, plus the topic. Recall finds a compacted
+    entry only through its summary, so a summary missing one of a kept
+    member's tags would hide that member from `recall --tag`: a sender rule
+    from triage (its `sender-…` tag typically occurs once in a batch), and
+    as well any entry filed under a tag it shares with no other member. A
+    retired member's tags are not carried; it is obsolete. A plan that only
+    retires is valid — a batch can be all obsolete, and its summary then
+    records the outcome. Content and relevance stay the session's;
+    `compact` checks their form."""
     by_index = {b["index"]: b for b in batches}
     items: list[dict] = []
     problems: list[str] = []
@@ -606,13 +596,8 @@ def scope_plan(plan: list, batches: list[dict]) -> tuple[list[dict], list[str]]:
                 + ([f"left out: {', '.join(missing)}"] if missing else [])
             problems.append(f"{where}: {'; '.join(parts)}")
             continue
-        if not lists["summarizes"]:
-            problems.append(f"{where}: keeps no member")
-            continue
-        kept_ids = sorted({t for i in lists["summarizes"] for t in members[i]["tags"]
-                           if _is_identifier(t)})
-        tags = sorted({t for t in batch["suggested_tags"] if not _is_identifier(t)}
-                      | set(kept_ids) | {batch["topic"]})
+        tags = sorted({t for i in lists["summarizes"] for t in members[i]["tags"]}
+                      | {batch["topic"]})
         items.append({
             "topic": batch["topic"],
             "content": obj.get("content"),

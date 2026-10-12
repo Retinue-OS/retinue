@@ -348,18 +348,28 @@ def test_clusters(mod):
 
 
 def test_tags(mod):
-    print("suggested tags")
+    print("tags: every tag of every member kept")
     ms = [member("1", days_ago(30), ["ludmila", "signal", "photo"]),
           member("2", days_ago(30), ["ludmila", "signal", "sender-ludmila-example-org"]),
-          member("3", days_ago(30), ["ludmila", "voice"])]
-    check("tags occurring twice plus the topic",
-          mod.suggested_tags("ludmila", ms), ["ludmila", "signal"])
-    check("the topic is always there",
-          mod.suggested_tags("zzz", ms[:1]), ["zzz"])
+          member("3", days_ago(30), ["ludmila", "iv-filing"])]
     planned, _ = mod.plan_batches(ms + [member(str(n), days_ago(30), ["ludmila"])
                                         for n in range(4, 7)], 10)
-    check("identifier tags listed for the batch",
-          planned[0]["identifier_tags"], ["sender-ludmila-example-org"])
+    ids = [m["id"] for m in planned[0]["members"]]
+
+    def tags(keep):
+        plan = [{"batch": 1, "content": "x", "relevance": 0.7, "summarizes": keep,
+                 "retires": [i for i in ids if i not in keep]}]
+        items, problems = mod.scope_plan(plan, planned)
+        return items[0]["tags"] if items else problems
+
+    # A tag one member alone carries is still how recall finds that member;
+    # the summary hiding it must carry the tag, or the entry drops out.
+    check("a tag only one kept member carries survives",
+          tags(ids), ["iv-filing", "ludmila", "photo", "sender-ludmila-example-org",
+                      "signal"])
+    check("a retired member's tags are not carried",
+          tags(["1"]), ["ludmila", "photo", "signal"])
+    check("the topic is always there", tags([]), ["ludmila"])
 
 
 # ---------------------------------------------------------------- main
@@ -454,8 +464,6 @@ def test_payload(mod):
             "content": "The IV now accepts e-mail; the letter rule may be obsolete.",
             "recorded_at": days_ago(5), "tags": ["insurance"]},
     })
-    check("suggested tags", b["suggested_tags"], ["deadline", "insurance"])
-    check("identifier tags", b["identifier_tags"], ["sender-iv-ch"])
     check("thresholds", payload["thresholds"], {
         "freeze_days": 14, "frozen_before": "2026-09-23T12:00:00Z",
         "min_cluster": 5, "batch_size": 40, "max_batches": 10})
@@ -625,11 +633,11 @@ def test_outcomes(mod):
 def test_scope(mod):
     print("scope: the plan is held to the payload")
     batches = [
-        {"index": 1, "topic": "insurance", "suggested_tags": ["insurance", "sender-iv-ch"],
+        {"index": 1, "topic": "insurance",
          "members": [{"id": "a", "tags": ["insurance", "sender-iv-ch"]},
                      {"id": "b", "tags": ["insurance", "sender-iv-ch"]},
                      {"id": "c", "tags": ["insurance", "sender-old-ch"]}]},
-        {"index": 2, "topic": "garden", "suggested_tags": ["garden"],
+        {"index": 2, "topic": "garden",
          "members": [{"id": "g1", "tags": ["garden"]}, {"id": "g2", "tags": ["garden"]}]},
     ]
 
@@ -640,7 +648,7 @@ def test_scope(mod):
     items, problems = mod.scope_plan([obj(1, ["a"], ["b", "c"]),
                                       obj(2, ["g1", "g2"], [])], batches)
     check("well-formed plan passes", (len(items), problems), (2, []))
-    check("tags: suggested, plus the identifiers of kept members only",
+    check("tags: those of kept members only",
           items[0]["tags"], ["insurance", "sender-iv-ch"])
     items, _ = mod.scope_plan([obj(1, ["c"], ["a", "b"])], batches)
     check("a sender tag on a retired member alone is not carried; one kept is",
@@ -664,8 +672,10 @@ def test_scope(mod):
           dropped([obj(7, ["a"], ["b", "c"])])[0], [])
     check("a batch planned twice keeps only the first",
           dropped([obj(2, ["g1", "g2"], []), obj(2, ["g1"], ["g2"])])[0], ["garden"])
-    check("a plan that keeps nothing is dropped (nothing to summarize)",
-          dropped([obj(2, [], ["g1", "g2"])])[0], [])
+    # An all-obsolete batch (expired deadlines, say) must be compactable, or
+    # it comes round first on every run and blocks its topic for good.
+    check("a plan that only retires passes (its summary is the outcome)",
+          dropped([obj(2, [], ["g1", "g2"])])[0], ["garden"])
     _, problems = dropped([obj(2, ["g1", "g2"], [])])
     check("an unplanned batch is reported", problems, ["batch 1 (insurance): not planned"])
     check("full urns are accepted as ids",
