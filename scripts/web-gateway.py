@@ -11166,8 +11166,6 @@ class Handler(BaseHTTPRequestHandler):
             cfg = _ec_config(account)
             detail = ec.get_pending_send(cfg, request_id)
         except ec.EmailError as exc:
-            if verb == "approve":
-                _report_failed_email_approval(account, request_id, str(exc))
             self._send_html(400, _HTML_HEAD + "<body><h1>Cannot load request</h1><p>"
                             + html.escape(str(exc)) + '</p><p><a href="/sends">Back</a></p>'
                             + "</body></html>")

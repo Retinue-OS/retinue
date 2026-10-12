@@ -212,6 +212,18 @@ def test_email_approval_failure_is_noted(wg):
     assert wg._load_conv(cid)["unread"] is True
 
 
+def test_email_page_load_failure_is_a_400(wg):
+    # Loading an approval page is no decision: a mailbox error there answers
+    # the 400 page and notes nothing.
+    handler = _FakeSendHandler()
+    with patch.object(wg.ec, "get_pending_send",
+                      side_effect=wg.ec.EmailError("IMAP login failed")):
+        with redirect_stdout(io.StringIO()):
+            wg.Handler._handle_send_single(handler, "default", "45")
+    assert handler.html and handler.html[0] == 400, handler.html
+    assert "IMAP login failed" in handler.html[1], handler.html
+
+
 def test_unconfirmed_link_is_absolute(wg):
     cid = wg._new_conv("user", "me", "Reply", "user", "x")["id"]
     entry = {"id": "e" * 32, "thread": cid, "recipient": "+1555"}
@@ -262,6 +274,7 @@ def main():
         test_no_thread_no_note(wg, gw)
         test_email_decisions_are_noted(wg)
         test_email_approval_failure_is_noted(wg)
+        test_email_page_load_failure_is_a_400(wg)
         test_unconfirmed_link_is_absolute(wg)
     print("all send-decision thread tests passed")
 

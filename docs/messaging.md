@@ -127,8 +127,9 @@ that thread as a *Retinue* message:
 The note's agent context names the request (`<gateway>/<id>` and its status),
 so the next turn in the thread knows what became of the message it proposed.
 A job outside a thread turn that opened a thread for its proposal links the
-send explicitly with `--thread <id>`; a send with no thread is simply not
-reported. Retractions are the agent's own act and are not noted.
+send explicitly with `--thread <id>` on the push CLI (`email_client.py` has no
+such flag: set `RETINUE_THREAD_ID=<id>` in its environment instead); a send
+with no thread is simply not reported. Retractions are the agent's own act and are not noted.
 
 ## Multiple gateways per channel
 
