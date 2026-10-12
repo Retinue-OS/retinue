@@ -33,6 +33,7 @@
   --accent: #6ea8fe;
   --high: #ff6b6b;
   --ok: #57c785;
+  --outbound: #f0b45e;   /* composers whose words leave the house (a chat's) */
   --line: rgba(231, 235, 242, .08);
   --radius: 16px;
 }

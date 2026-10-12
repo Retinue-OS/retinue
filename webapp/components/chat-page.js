@@ -1222,8 +1222,29 @@ class RetinueChatPage extends HTMLElement {
       draftTag +
       this._imgPreviewsHtml() +
       this._errRowHtml('chat') +
-      this._composerRowHtml('chat', 'Message …', true) +
+      this._toLineHtml() +
+      this._composerRowHtml('chat', this._recipient() ? `Message ${this._recipient()} …` : 'Message …', true) +
       `</div>`;
+  }
+
+  // Who the chat composer's words reach. The two composers sit side by side
+  // (or one swipe apart), and a turn meant for Ara that lands here goes to a
+  // person instead — so this field is marked as the way out of the house: a
+  // standing "To <name> · <channel>" line above it, the recipient in its
+  // placeholder and send label, and the outbound colour on the field and the
+  // send button, where the companion composer keeps Ara's accent blue.
+  _recipient() {
+    return (this._chat && this._chat.name) || '';
+  }
+
+  _toLineHtml() {
+    const name = this._recipient();
+    if (!name) return '';
+    const ch = this._chat.channel;
+    const via = esc((CHANNELS[ch] || { label: ch || '' }).label);
+    const who = this._chat.group ? `everyone in ${esc(name)}` : esc(name);
+    return `<div class="to-line" title="What you send here goes to ${who}${via ? ` on ${via}` : ''}, not to Ara.">` +
+      `<span aria-hidden="true">&#10148;</span> To <b>${who}</b>${via ? ` &middot; ${via}` : ''}</div>`;
   }
 
   _errRowHtml(target) {
@@ -1278,7 +1299,9 @@ class RetinueChatPage extends HTMLElement {
       ? `<button type="button" class="mic" data-mic="${target}" ` +
         `title="Record a voice message" aria-label="Record a voice message">&#127908;</button>`
       : '';
-    const sendBtn = `<button type="submit" class="send" title="Send" aria-label="Send">&#10148;</button>`;
+    const sendLabel = isChat && this._recipient() ? `Send to ${this._recipient()}` : 'Send';
+    const sendBtn = `<button type="submit" class="send" title="${esc(sendLabel)}" ` +
+      `aria-label="${esc(sendLabel)}">&#10148;</button>`;
     // The clear ✕ lives INSIDE the field, docked to its top-right corner: on
     // the send side, as the design asks, but within the field's own boundary,
     // so it reads — and taps — as part of the text box, visually and
@@ -2354,6 +2377,19 @@ const CSS = `
                background: rgba(110, 168, 254, .12); color: var(--accent, #6ea8fe);
                font-size: .74rem; font-weight: 600; }
   .row { display: flex; gap: 6px; align-items: flex-end; }
+  /* The outbound marking (see _toLineHtml): this composer reaches a person,
+     not Ara, so it wears the outbound colour where the companion's composer
+     wears the accent blue. A tint, not a fill — the text keeps its contrast. */
+  .to-line { display: block; margin: 0 4px 6px;
+             color: var(--outbound, #f0b45e); font-size: .74rem; overflow: hidden;
+             white-space: nowrap; text-overflow: ellipsis; }
+  .to-line b { font-weight: 650; overflow: hidden; text-overflow: ellipsis; }
+  .pane-chat .row textarea {
+    background: rgba(240, 180, 94, .12);
+    background: color-mix(in srgb, var(--outbound, #f0b45e) 12%, var(--card-2, #1c2230));
+    box-shadow: inset 0 0 0 1px rgba(240, 180, 94, .45); }
+  .pane-chat .row textarea:focus-visible { outline: 1px solid var(--outbound, #f0b45e); }
+  .pane-chat .send, .pane-chat .rec-send { background: var(--outbound, #f0b45e); color: #0b0d12; }
   /* The attach control, inside the field and dressed exactly as the
      conversations composer's clip — same size, same corner, same hover. Two
      composers, one place to reach for a paperclip. */
