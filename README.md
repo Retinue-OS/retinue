@@ -49,6 +49,57 @@ Defines these core compose services:
   For a worked look at the named-graph half of that design, with
   queries run against a live store and its limits stated,
   see [Provenance by path](https://github.com/Retinue-OS/retinue-os-chamber/blob/main/writing/provenance-by-path.md).
+- **`whatsapp-gateway`** and **`telegram-gateway`** — the messenger siblings
+  of `signal-gateway`, each owning one account's session in its own container
+  (WhatsApp as a linked device via neonize/whatsmeow; Telegram as the user's
+  own account via Telethon) and exposing the same thin `/send` +
+  `/pending-sends` API, outbound gated by the same allow/trust/verify send
+  policy. See [WhatsApp accounts](#whatsapp-accounts) and
+  [Telegram accounts](#telegram-accounts).
+- **`sms-gateway`**, with **`sms-server`**, **`sms-server-worker`**,
+  **`sms-db`** and the **`sms-config-check`** guard — SMS, opt-in behind the
+  `sms` compose profile (`docker compose --profile sms up -d`, or
+  `COMPOSE_PROFILES=sms` in `.env`): the channel gateway with the same `/send`
+  contract plus the webhook the phone delivers each received SMS to, a
+  self-hosted [android-sms-gateway](https://github.com/android-sms-gateway/server)
+  server the user's Android phone pairs with, its background worker, its
+  MariaDB, and a check that refuses to start them without their secrets.
+  Setup: [`docs/messaging.md`](docs/messaging.md), "SMS".
+- **`caldav-gateway`** — the calendar as a gateway: owns the CalDAV
+  credentials in its own container and reads and writes the user's real
+  calendar through a generic RFC 4791 client, writes gated like messenger
+  sends. See [Calendar (CalDAV)](#calendar-caldav).
+- **`litellm`** and **`litellm-db`** — the model gateway (internal-only, at
+  `http://litellm:4000`) that routes Claude Code subscription requests to
+  Anthropic and retries through OpenRouter on an upstream failure, and the
+  private Postgres behind its admin UI, model/key configuration and request
+  logs. The `retinue` service waits for `litellm` to report healthy before it
+  starts. See [Claude Code subscription first, OpenRouter
+  fallback](#claude-code-subscription-first-openrouter-fallback).
+- **`updater`** — sidecar exposing a token-gated `POST /update` (and a
+  `GET /status`) that runs an operator-configured rebuild recipe (by default
+  `git pull && docker compose build && docker compose up -d`, never a
+  request-supplied command) through the host's Docker socket, so the stack
+  can be rebuilt from the phone (when the override routes it) or from inside
+  the `retinue` container via `scripts/self-update.py`, without SSH. A
+  separate service so it survives the `retinue` container being recreated
+  mid-update.
+- **`volumes-init`** — one-shot init that pre-creates the messenger
+  mountpoint directories inside the shared chambers volume, which
+  `qlever-life` mounts read-only; idempotent, runs on every `up`.
+- **`egress-audit`**, **`egress-log-viewer`** and **`egress-anomaly-agent`**
+  — the egress audit trio, part of the default composition: a MITM proxy
+  (mitmproxy) that logs every outbound HTTP(S) request from the `retinue`
+  container, issuing per-host certificates signed by a deployment-specific CA
+  that the `retinue` entrypoint generates on first start and the `retinue`
+  service trusts (internal hosts bypass the proxy via `NO_PROXY`); a
+  read-only web viewer over those logs for the operator; and an agent that
+  tails the flow log, flags anomalies and can push high-severity alerts
+  through a configured command.
+
+That is the full set: [`docker-compose.yml`](docker-compose.yml) is the
+authoritative list, and everything except the SMS group is part of the default
+`docker compose up -d`.
 
 A deployment can add further services in its override — for example a
 `qlever-static/`-based endpoint for one large, rarely-changing N-Triples file
@@ -111,9 +162,19 @@ Ollama server or Ollama Cloud:
 ```dotenv
 ANTHROPIC_AUTH_TOKEN=ollama
 ANTHROPIC_API_KEY=
-ANTHROPIC_BASE_URL=http://ollama:11434
+ANTHROPIC_BASE_URL=http://host.docker.internal:11434
 RETINUE_CLAUDE_MODEL=qwen3.5
 ```
+
+`host.docker.internal` reaches an Ollama running on the Docker host — the
+stack ships no `ollama` service. Docker Desktop resolves that name by itself;
+a Linux Docker Engine needs `extra_hosts: ["host.docker.internal:host-gateway"]`
+on the `retinue` service in your override. Ollama must be reachable from the
+`retinue` container on port 11434, which a desktop install bound to
+`127.0.0.1` is not. The egress-audit proxy already bypasses
+`host.docker.internal` (it is in the `retinue` service's `NO_PROXY`); a host
+IP used instead has to be added there as well. Details, and the WSL2 case:
+[`docs/ollama.md`](docs/ollama.md).
 
 `ANTHROPIC_BASE_URL` may instead point at any Claude-compatible gateway. The
 optional `RETINUE_CLAUDE_MODEL` is passed as `--model` to every Claude Code
@@ -910,17 +971,33 @@ update it yourself with `git pull` on the host.
 ```
 retinue/
   CLAUDE.md            ← session instructions baked into the runtime image
-  agents/              ← core agent role definitions (Archivist, Academic, …)
-  chambers.example.json ← example chamber manifest (deployment provides chambers.json)
-  examples/chambers/   ← runnable example chambers (Westworld, Hitchhiker)
+  agents/              ← core persona definitions (Academic, Publisher; Secretary's style layer)
+  .claude/             ← core subagents (Archivist, Herald, Secretary), skills, harness settings
   .claude-plugin/      ← marketplace identity template (marketplace.json generated at runtime)
-  scripts/             ← operational scripts (ingestion, hooks, refresh)
+  .schedule.json       ← framework-owned base schedule (self-review, recurring projects, inbox sweep, news)
+  scripts/             ← operational scripts (entrypoint, web gateway, scheduler, gateways, ingestion, refresh, hooks)
+  webapp/              ← the dashboard PWA, served at the root of the web gateway
+  config/              ← the dashboard's conversation-model list (hand-editable JSON-LD)
+  docs/                ← design and operator docs (triple stores, memory, messaging, scheduling, attention, …)
+  tests/               ← standalone test scripts (no pytest; see CONTRIBUTING.md)
+  examples/chambers/   ← runnable example chambers (Westworld, Hitchhiker)
+  examples/attention-* ← the attention model's prototype, and its simulation on the real stack
+  chambers.example.json ← example chamber manifest (deployment provides chambers.json)
   Dockerfile           ← image for the `retinue` service
   signal-gateway/      ← image definition for the `signal-gateway` service
+  whatsapp-gateway/    ← image definition for the `whatsapp-gateway` service
+  telegram-gateway/    ← image definition for the `telegram-gateway` service
+  sms-gateway/         ← image definition for the `sms-gateway` service (`sms` profile)
+  caldav-gateway/      ← image definition for the `caldav-gateway` service
+  stt/                 ← image definition for the `stt` service (Whisper)
+  egress-audit/        ← image definition for the `egress-audit` proxy (mitmproxy + CA-waiting entrypoint)
+  litellm/             ← LiteLLM configuration for the `litellm` service
+  updater/             ← the `updater` sidecar: image and update-server.py
+  qlever-dir/          ← submodule: live SPARQL-over-directory service (`qlever-life`)
+  qlever-static/       ← single-file SPARQL service (optional, deployment override)
   docker-compose.yml   ← deployment-neutral base composition
   docker-compose.override.example.yml ← deployment-specific wiring template
-  qlever-dir/          ← submodule: live SPARQL-over-directory service
-  qlever-static/       ← single-file SPARQL service (optional, deployment override)
+  deploy/traefik/      ← Traefik file-provider config for client-certificate (mTLS) auth
 ```
 
 Domain agents are not defined here: each mounted chamber ships its own
