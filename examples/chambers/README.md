@@ -23,6 +23,7 @@ directory ships two runnable example chambers that double as the canonical
   .schedule.json                    ← optional recurring jobs (scheduler.py)
   .refresh.json                     ← optional external-data refresh (refresh.py)
   .news.json                        ← optional news feeds (news-fetch.py)
+  .qlever/converters.json           ← optional converters: non-RDF files → triples (docs/triple-stores.md)
   ...                               ← the chamber's data (e.g. .nt/.ttl, docs)
 ```
 
@@ -71,7 +72,14 @@ entry carries only deployment facts:
 - `url` (optional) — git URL to clone from.
 - `url_env` (optional) — name of an env var that overrides `url` when set.
 - `path` (optional) — a directory (relative to `/workspace`) to symlink in place
-  of cloning, used by these bundled examples and any host-mounted chamber.
+  of cloning, used by these bundled examples. A `path` chamber is **not indexed
+  by the life store**: the symlink's target lies outside the shared chambers
+  volume that `qlever-life` reads, so its RDF files and converter output never
+  reach the index, while its plugin and instructions work as usual. It fits a
+  chamber whose data need not be queryable; one whose data must be is declared
+  with `url`, or bind-mounted directly at `/workspace/chambers/<name>` and into
+  `qlever-life` — see "Mounting a chamber from the host" in the top-level
+  README and `docs/chambers.md`.
 
 ## Trying the examples
 

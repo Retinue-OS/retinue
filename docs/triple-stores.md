@@ -27,7 +27,11 @@ request, so the graph never reads empty in between. Only a structural change, or
 enough accumulated deltas to warrant compaction, triggers a full **blue-green**
 rebuild: the new index is built into an idle slot, health-checked, and only then
 does nginx swing traffic over. A failed build leaves the previous index serving.
-There is no downtime and no window in which the store is half-updated.
+There is no downtime and no window in which the store is half-updated. None of
+this reaches a chamber declared with `path` in `chambers.json`: the entrypoint
+only symlinks such a chamber into the volume from elsewhere in the `retinue`
+container, and inside `qlever-life` that link dangles, so neither its RDF files
+nor its converter output are ever indexed ([chambers.md](chambers.md)).
 
 Each file's triples land in a named graph derived from the file's path:
 

@@ -38,8 +38,11 @@ Defines these core compose services:
   input), so exactly one ASR model is loaded system-wide.
 - **`qlever-life`** — a live SPARQL endpoint over the shared chambers volume,
   served by [qlever-dir](https://github.com/retinue-os/qlever-dir) (included as a
-  submodule). Every chamber's RDF files are indexed equally; a file change is
-  applied to the live index within seconds. See
+  submodule). Every chamber's RDF files are indexed equally — except a chamber
+  declared with `path`, which is only symlinked into the volume from elsewhere
+  in the `retinue` container and so stays invisible to `qlever-life` (see
+  "Mounting a chamber from the host" below); a file change is applied to the
+  live index within seconds. See
   [`docs/triple-stores.md`](docs/triple-stores.md) for what this makes possible
   — querying Markdown frontmatter, sensor CSVs at scale, and why some data gets
   its own store. The dashboard publishes the store at `/sparql`, behind its own
@@ -891,8 +894,11 @@ remote-control client.
 4. The `qlever-life` service indexes every `.nt`/`.ttl`/`.n3` file in the shared
    chambers volume — plus any extension a chamber declares a converter for in
    `.qlever/converters.json`, which is how Markdown frontmatter becomes
-   queryable — all chambers equally, and serves it on `qlever-life:7001`
-   (network; publish a host port via the deployment override). It watches for
+   queryable — all chambers equally (the one exception: a chamber declared
+   with `path` is a symlink whose target lies outside the volume, so
+   `qlever-life` never sees its files; see "Mounting a chamber from the host"
+   below), and serves it on `qlever-life:7001` (network; publish a host port
+   via the deployment override). It watches for
    filesystem changes: an ordinary edit to one file — native RDF or a declared
    converter extension alike — is applied to the live index via SPARQL Update
    about two seconds later, so new data is queryable almost immediately. A
@@ -953,7 +959,10 @@ services:
 Both mounts are required: `retinue` needs the chamber for agent code and data,
 and `qlever-life` needs it so the chamber's RDF files are indexed by the live
 SPARQL store. The `qlever-life` mount uses the same bind-source but targets
-`/data/<chamber-name>` (read-only).
+`/data/<chamber-name>` (read-only). Declaring the chamber with `path` in
+`chambers.json` is not an alternative: that only symlinks a directory of the
+`retinue` container into the chambers volume, and the link's target does not
+exist in `qlever-life`, so such a chamber's data is never indexed.
 
 Then on the host:
 

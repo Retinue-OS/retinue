@@ -14,6 +14,20 @@ convention `.retinue/`, containing `.claude-plugin/plugin.json` plus `agents/`,
 subdirectory matters: plugin installation copies the plugin root into the Claude
 cache, and the subdirectory keeps the chamber's data out of that copy.
 
+A chamber declared with `path` is **not indexed by the life store**. The
+entrypoint mounts it as a symlink (`ln -s /workspace/<path>
+/workspace/chambers/<name>`): the link sits in the shared `chambers` volume,
+its target does not, and `qlever-life` mounts that volume (`chambers:/data:ro`),
+not the `retinue` container's filesystem — so there the link dangles, and the
+chamber's RDF files and converter output never reach the index. Everything
+else about such a chamber works (plugin, `INSTRUCTIONS.md`, `.schedule.json`,
+git hooks), which is what makes the gap easy to miss
+([retinue-os/retinue#30](https://github.com/retinue-os/retinue/issues/30)). A
+chamber whose data must be queryable is cloned from a `url`, or bind-mounted
+directly at `/workspace/chambers/<name>` — the "pre-mounted contents" case the
+entrypoint already handles — **and** at `/data/<name>` in `qlever-life`; the
+README's "Mounting a chamber from the host" shows the override.
+
 ## Plugin autodetection
 
 The entrypoint **autodetects** plugins: for each chamber that has

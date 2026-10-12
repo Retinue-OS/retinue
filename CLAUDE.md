@@ -106,10 +106,12 @@ plugin cache and sync loop: `docs/chambers.md`.
 ## SPARQL endpoints
 
 The framework ships the **life** store (`http://qlever-life:7001`): every
-`.nt`/`.ttl`/`.n3` file in every mounted chamber, each file's triples in a
-named graph `<file:relative/path>`; edits are queryable in seconds. Non-RDF
-files (Markdown frontmatter → projects, contacts) are indexed via chamber
-converters. Deployments may add stores; discover them all with
+`.nt`/`.ttl`/`.n3` file in every mounted chamber — except a chamber declared
+with `path`, which `qlever-life` cannot see (`docs/chambers.md`) — each file's
+triples in a named graph `<file:relative/path>`; edits are queryable in
+seconds. Non-RDF files (Markdown frontmatter → projects, contacts) are
+indexed via chamber converters. Deployments may add stores; discover them
+all with
 
 ```bash
 env | grep '^SPARQL_ENDPOINT_' | sort
