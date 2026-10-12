@@ -129,6 +129,20 @@ That keeps the "which channels are news vs. correspondence" question where it
 belongs — with whichever agent already reads that channel — instead of building
 a second inbound pipeline.
 
+**Messenger broadcast sources** have an automatic rail too, and it is the one
+to use for a whole channel rather than a single post: a Telegram, Signal or
+WhatsApp group (a Telegram broadcast channel counts as a group) flagged **news**
+in the triage policy has every post handed by its gateway to the web-gateway's
+`POST /internal/news` on arrival — credit-free, no model turn, no triage drain
+— and the Herald scores it on the next curation tick like any other item:
+
+```bash
+python3 /workspace/scripts/triage_policy.py news-add --channel telegram --group <chat_id>
+```
+
+`news-add.py` stays the door for the one-off find. See
+`docs/triage-delivery-gate.md` (*The news rail*).
+
 **Newsletters (e-mail)** are the automatic version of that ad-hoc path. An
 address or `*@domain` declared a **news sender** in the triage policy is filed by
 the credit-free e-mail gate on arrival — Subject as the title, a body excerpt as
