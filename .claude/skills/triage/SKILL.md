@@ -771,10 +771,13 @@ arriving through Phases 1–4, in a new thread — may raise the subject again.
 
 **Remind per conversation, not per message.** Several tracked messages often
 point at one conversation (a GitHub "review requested" and the review itself,
-a reminder and its original). Group the due entries by `conversation_id` first
-and post **at most one nudge per conversation per run**, then stamp
-`last_nudge` on **every** entry of that group — otherwise each entry fires its
-own identical nudge into the same thread.
+a reminder and its original). Group the due entries by their thread first —
+`conversation_id` for an individually proposed entry, `omnibus_conversation_id`
+for an `omnibus` one (two distinct fields; see *State & idempotency*); an entry
+carrying neither has no thread to nudge. Post **at most one nudge per
+conversation per run**, then stamp `last_nudge` on **every** entry of that
+group — otherwise each entry fires its own identical nudge into the same
+thread.
 
 **Check the subject is still live before reminding.** A proposal can go stale
 without the user touching the thread: the PR was merged or closed, the CI run
@@ -782,10 +785,13 @@ is green again, the invoice was paid, the event is past, a later message
 superseded it. Before nudging, verify the state where it is cheaply
 checkable (the GitHub API for a PR or workflow run, the Sent folder, the
 project file, a newer status entry on the same subject). If the subject is
-resolved, do **not** nudge: mark every entry of the group `resolved` with a
+resolved, do **not** nudge: mark its entries `resolved` with a
 `resolved_reason` naming the evidence, and archive the conversation with
 `conversation-push.py --thread <id> --archive` (no message, so nothing is
-pushed). When the state cannot be checked, nudge as usual.
+pushed). An omnibus thread carries several unrelated subjects, so check them
+entry by entry: resolve the settled ones, nudge for the rest, and archive the
+thread only once none is left. When the state cannot be checked, nudge as
+usual.
 
 **Write the nudge in the conversation's language.** A nudge is written into an
 existing thread, so it follows the language of that thread's own messages
