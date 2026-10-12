@@ -76,6 +76,7 @@ from email.utils import (formataddr, getaddresses, make_msgid, parseaddr,
                          parsedate_to_datetime)
 from html.parser import HTMLParser
 
+
 # imaplib caps literals at 10 kB by default; raise it for large attachments.
 imaplib._MAXLINE = 100 * 1024 * 1024
 
@@ -105,7 +106,14 @@ def die(msg):
 def _proxy_to_backend(url, argv):
     """Forward argv to the e-mail backend; mirror its stdout/stderr/exit code."""
     token = os.environ.get("EMAIL_BACKEND_TOKEN", "")
-    payload = json.dumps({"argv": list(argv)}).encode("utf-8")
+    body = {"argv": list(argv)}
+    # The dashboard thread this session answers travels with the call: the
+    # backend runs the command in its own environment, which has none, and a
+    # send it queues is linked to that thread (register_pending_send).
+    thread = _valid_thread(os.environ.get(THREAD_ENV))
+    if thread:
+        body["thread"] = thread
+    payload = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         url,
         data=payload,
@@ -1376,7 +1384,21 @@ def _uid_by_message_id(M, folder, message_id):
 VALID_CATEGORIES = ("verify", "trust", "allow")
 DEFAULT_SEND_CATEGORY = "verify"
 REQUEST_CATEGORY_HEADER = "X-Send-Request-Category"
-_REQUEST_HEADERS = (REQUEST_CATEGORY_HEADER,)
+# The dashboard thread that queued the request (scripts/send_origin.py), so the
+# web gateway can report the user's Allow/Deny back into it. Stripped with the
+# category before the message goes out.
+REQUEST_THREAD_HEADER = "X-Send-Request-Thread"
+_REQUEST_HEADERS = (REQUEST_CATEGORY_HEADER, REQUEST_THREAD_HEADER)
+# Same contract as scripts/send_origin.py, inlined: this module is also loaded
+# on its own (the web gateway imports it, tests load it by path).
+THREAD_ENV = "RETINUE_THREAD_ID"
+_THREAD_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _valid_thread(value):
+    """*value* as a dashboard thread id, or None when it is not one."""
+    value = str(value or "").strip().lower()
+    return value if _THREAD_ID_RE.fullmatch(value) else None
 
 # Headers the *IMAP server* injects into a stored draft, which must not travel
 # with the message when that draft is later submitted over SMTP.
@@ -1481,10 +1503,15 @@ def _recipients_of(msg):
 def register_pending_send(cfg, msg, category):
     """Save a message to Drafts as a pending send request.
 
-    The draft's IMAP UID is returned and used as the request id; only the
-    category is recorded (as a header) for informational display.
+    The draft's IMAP UID is returned and used as the request id; the category
+    is recorded (as a header) for informational display, and the originating
+    dashboard thread (RETINUE_THREAD_ID), when there is one, so the decision
+    can be reported back into it.
     """
     msg[REQUEST_CATEGORY_HEADER] = category
+    thread = _valid_thread(os.environ.get(THREAD_ENV))
+    if thread:
+        msg[REQUEST_THREAD_HEADER] = thread
     uid = _append(cfg, cfg.drafts_folder, msg, seen=False)
     if uid is None:
         die("saved pending draft but could not determine its IMAP UID "
@@ -1516,7 +1543,8 @@ def list_pending_sends(cfg):
         out = []
         for uid in data[0].split():
             uid = uid.decode() if isinstance(uid, (bytes, bytearray)) else uid
-            fields = f"FROM TO CC SUBJECT DATE {REQUEST_CATEGORY_HEADER}"
+            fields = (f"FROM TO CC SUBJECT DATE {REQUEST_CATEGORY_HEADER} "
+                      f"{REQUEST_THREAD_HEADER}")
             typ, fdata = M.uid("fetch", uid,
                                f"(BODY.PEEK[HEADER.FIELDS ({fields})])")
             if typ != "OK" or not fdata or fdata[0] is None:
@@ -1526,6 +1554,7 @@ def list_pending_sends(cfg):
             out.append({
                 "request_id": uid,
                 "category": (hdr.get(REQUEST_CATEGORY_HEADER) or "").strip(),
+                "thread": _valid_thread(hdr.get(REQUEST_THREAD_HEADER)),
                 "from": _decode(hdr.get("From")),
                 "to": _decode(hdr.get("To")),
                 "cc": _decode(hdr.get("Cc")),
@@ -1553,6 +1582,7 @@ def get_pending_send(cfg, request_id):
         return {
             "request_id": request_id,
             "category": (msg.get(REQUEST_CATEGORY_HEADER) or "").strip(),
+            "thread": _valid_thread(msg.get(REQUEST_THREAD_HEADER)),
             "from": _decode(msg.get("From")),
             "to": _decode(msg.get("To")),
             "cc": _decode(msg.get("Cc")),
@@ -1608,6 +1638,7 @@ def approve_pending_send(cfg, request_id):
         recipients = _recipients_of(msg)
         if not recipients:
             die(f"pending send request {request_id} has no recipients")
+        thread = _valid_thread(msg.get(REQUEST_THREAD_HEADER))
         for h in _REQUEST_HEADERS:
             del msg[h]
         del msg["Bcc"]  # never expose Bcc in the dispatched / stored copy
@@ -1619,7 +1650,7 @@ def approve_pending_send(cfg, request_id):
         M.expunge()
         return {"approved": request_id, "sent": True, "to": recipients,
                 "subject": _decode(msg.get("Subject")), "saved_to_sent": cfg.save_sent,
-                "stripped_headers": stripped}
+                "stripped_headers": stripped, "thread": thread}
     finally:
         M.logout()
 

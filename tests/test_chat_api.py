@@ -509,7 +509,7 @@ TURN_GATE: dict = {"hold": None}
 
 def _stub_send_message(prompt, display_question=None, session_key=None,
                        model=None, restart_message=None, resume=True,
-                       reply_attachments=False):
+                       reply_attachments=False, thread_id=None):
     TURNS.append({"prompt": prompt, "question": display_question,
                   "session": session_key, "resume": resume})
     hold = TURN_GATE.get("hold")

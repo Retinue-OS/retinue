@@ -28,6 +28,7 @@ import urllib.error
 import urllib.request
 
 import pending_retract
+import send_origin
 
 DEFAULT_URL = os.environ.get("SMS_GATEWAY_SEND_URL", "http://sms-gateway:8095/send")
 TOKEN = os.environ.get("SMS_GATEWAY_TOKEN", "").strip()
@@ -45,6 +46,7 @@ def main() -> int:
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this send; "
                              "bypasses the verify flow for 'trust'-category accounts")
+    send_origin.add_argument(parser)
     parser.add_argument("--retract", metavar="REQUEST_ID",
                         help="retract a queued send you created (the id printed when it "
                              "was queued) before the user approves it; nothing is sent")
@@ -68,6 +70,7 @@ def main() -> int:
         payload["recipient"] = os.environ["SMS_DEFAULT_RECIPIENT"].strip()
     if args.user_approved:
         payload["user_approved"] = True
+    send_origin.stamp(payload, args.thread)
 
     headers = {"Content-Type": "application/json"}
     if TOKEN:

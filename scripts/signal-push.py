@@ -42,6 +42,7 @@ import urllib.request
 from pathlib import Path
 
 import pending_retract
+import send_origin
 
 DEFAULT_URL = os.environ.get("SIGNAL_GATEWAY_SEND_URL", "http://signal-gateway:8090/send")
 TOKEN = os.environ.get("SIGNAL_GATEWAY_TOKEN", "").strip()
@@ -70,6 +71,7 @@ def main() -> int:
                         help="assert that the user has already approved this send; "
                              "bypasses the verify flow when this gateway's own "
                              "sending account is in the 'trust' category")
+    send_origin.add_argument(parser)
     parser.add_argument("--retract", metavar="REQUEST_ID",
                         help="retract a queued send you created (the id printed when it "
                              "was queued) before the user approves it; nothing is sent")
@@ -97,6 +99,7 @@ def main() -> int:
         payload["lang"] = args.lang
     if args.user_approved:
         payload["user_approved"] = True
+    send_origin.stamp(payload, args.thread)
     if args.image:
         payload["images"] = [_encode_image(Path(p)) for p in args.image]
 

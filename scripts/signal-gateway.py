@@ -2144,9 +2144,22 @@ def _lookup_existing_path(request_id: str) -> Path | None:
     return None
 
 
+
+# The dashboard thread a queued send came from (scripts/send_origin.py): kept on
+# the pending entry so the web-gateway can report the user's Allow/Deny back
+# into it. Anything that is not a thread id is dropped — the link is optional.
+_THREAD_ID_RE = re.compile(r"[0-9a-f]{32}")
+
+
+def _origin_thread(payload: dict) -> str | None:
+    value = str(payload.get("thread") or "").strip().lower()
+    return value if _THREAD_ID_RE.fullmatch(value) else None
+
+
 def _new_pending_send(recipient: str, message: str, lang: str | None,
                       images: list, voice: bool, category: str,
-                      author: str = "agent") -> str:
+                      author: str = "agent",
+                      thread: str | None = None) -> str:
     """Store a pending outbound send and return its request_id.
 
     ``author`` (kb:author) survives the approval round trip so the ledger
@@ -2162,6 +2175,7 @@ def _new_pending_send(recipient: str, message: str, lang: str | None,
         "images": images,
         "category": category,
         "author": author,
+        "thread": thread,
         "created": int(time.time()),
         "status": "pending",
     }
@@ -2755,7 +2769,8 @@ class _PushHandler(BaseHTTPRequestHandler):
         category = _outbound_policy_category()
         if not _send_is_direct(category, user_approved):
             request_id = _new_pending_send(recipient, message, lang, images, voice,
-                                           category, author=author)
+                                           category, author=author,
+                                           thread=_origin_thread(payload))
             approval_path = f"/sends/{_approval_slug(self.headers.get('Host'))}/{request_id}"
             approval_url = (SEND_APPROVAL_BASE_URL + approval_path) if SEND_APPROVAL_BASE_URL else approval_path
             print(f"[signal-gateway] pending send registered for {recipient} "

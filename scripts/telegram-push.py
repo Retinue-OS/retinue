@@ -32,6 +32,7 @@ import urllib.request
 from pathlib import Path
 
 import pending_retract
+import send_origin
 
 DEFAULT_URL = os.environ.get("TELEGRAM_GATEWAY_SEND_URL", "http://telegram-gateway:8093/send")
 TOKEN = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
@@ -58,6 +59,7 @@ def main() -> int:
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this send; "
                              "bypasses the verify flow for 'trust'-category accounts")
+    send_origin.add_argument(parser)
     parser.add_argument("--retract", metavar="REQUEST_ID",
                         help="retract a queued send you created (the id printed when it "
                              "was queued) before the user approves it; nothing is sent")
@@ -83,6 +85,7 @@ def main() -> int:
         payload["recipient"] = os.environ["TELEGRAM_DEFAULT_RECIPIENT"].strip()
     if args.user_approved:
         payload["user_approved"] = True
+    send_origin.stamp(payload, args.thread)
     if args.image:
         payload["images"] = [_encode_image(Path(p)) for p in args.image]
 
