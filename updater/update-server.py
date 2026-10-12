@@ -88,7 +88,10 @@ if _log_dir:
         os.makedirs(_log_dir, exist_ok=True)
     except OSError:
         pass
-# Generous ceiling for `git pull && docker compose build && docker compose up -d`
+# Ceiling for ONE step, not the whole recipe: it is passed to each
+# subprocess.run in _run_update's step loop, so the built-in three-step recipe
+# (`git pull && docker compose build && docker compose up -d`) may take up to
+# three times this before it is declared stuck (retinue-os/retinue#46).
 UPDATE_TIMEOUT = float(os.environ.get("UPDATE_TIMEOUT", "1800"))
 # The deployment-injected update recipe (see module docstring). Empty => the
 # framework's built-in default recipe. When set, it is run through a shell so a

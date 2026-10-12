@@ -1393,9 +1393,10 @@ _REQUEST_HEADERS = (REQUEST_CATEGORY_HEADER,)
 #
 # The header carries no delivery semantics for us — it is the provider's own
 # bookkeeping — so dropping it before submission is lossless and removes the
-# only difference between the (working) direct-send path and the (bouncing)
-# approval path. Override via SEND_STRIP_HEADERS (comma-separated; replaces
-# this list rather than adding to it).
+# one difference shown to make the (bouncing) approval path differ from the
+# (working) direct-send path; nothing proves it was the only one. Override via
+# SEND_STRIP_HEADERS (comma-separated; replaces this list rather than adding
+# to it).
 DEFAULT_STRIP_HEADERS = ("X-ZohoMail-Sender",)
 
 
