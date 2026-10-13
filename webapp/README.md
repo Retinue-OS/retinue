@@ -148,10 +148,12 @@ The wide layout itself is resizable, VS Code style (`layout.js`): the
 boundaries between conversations, news and the projects column are draggable
 splitters — double-click resets one, dragging news fully down closes it — and
 each card's header toggles between list and card view. Both preferences
-persist per device in localStorage. Every top-level page opens with the
+persist per device in localStorage. Every page opens with the
 navigation row (`components/nav.js`: Home · Chats · Threads · Projects · News
 · Contacts, then the pending-sends outbox icon and the settings gear), pinned
-while a list page scrolls. Device-level settings (notifications, the voice
+while a list page scrolls. On a drill-down (a chat, a project, an open
+thread) it starts with the back button: `<retinue-nav back>` dispatches
+`retinue-back` and the page listening on the row decides where back goes. Device-level settings (notifications, the voice
 timeouts, the running shell version with a manual update check, and — inside
 the Android shell only — a button into the shell's own settings) live on
 `settings.html`, reached via that gear. The address book (`contacts.html`,
@@ -228,8 +230,8 @@ docstring). Pieces:
   dictating, sending, or Ara staging a new draft). One tap emptying the box is
   only safe if the tap can be taken back, and a staged draft is not something
   the user can retype.
-  Back goes back where the chat was opened from within the
-  app, and to the home — the attention list the chat is a row of — for a chat
+  Back — the navigation row's button above the header — goes back where the
+  chat was opened from within the app, and to the home — the attention list the chat is a row of — for a chat
   opened cold (a notification, a bookmark). The header's ⋮ menu holds
   *Attention details* — the chat's attention sheet, with the contact card —
   and the **Archive** / **Mute** switches, the same `POST /chats/<id>/flags`
@@ -241,7 +243,8 @@ docstring). Pieces:
   at that width (re-learned whenever no field is focused, carried across a
   rotation with the keyboard up, dropped while pinch-zoomed) — the header
   and the companion's bar are hidden, and the pane being typed in is kept
-  scrolled to its newest message. The open chat polls on the conversations cadence,
+  scrolled to its newest message; the navigation row steps aside with them.
+  The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
   The companion pane is the chat's own conversation with Ara (see the

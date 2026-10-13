@@ -18,6 +18,10 @@
        components/shell.js, so a wake or Home press of the Android shell here
        goes to the home — unless an edit is unsaved. -->
   <script type="module" src="/components/project-page.js"></script>
+  <!-- The navigation row, with the back button at its start: a drill-down
+       is one tap from every other page, not only from where it was opened.
+       The page decides where back goes (it listens for retinue-back). -->
+  <script type="module" src="/components/nav.js"></script>
   <!-- Keeps the locked frame the height that is actually visible. -->
   <script type="module" src="/viewport.js"></script>
   <!-- The minimized pages: threads, chats and projects parked one tap away
@@ -26,6 +30,7 @@
 </head>
 <body>
   <main>
+    <retinue-nav back current="projects"></retinue-nav>
     <retinue-project-page></retinue-project-page>
     <retinue-shelf></retinue-shelf>
   </main>

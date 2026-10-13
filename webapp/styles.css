@@ -1,10 +1,12 @@
 /* Retinue dashboard shell. Minimalist, dark, app-like on small displays.
  *
  * Layout model:
- *  - Every top-level page (the home, the chats, threads, projects and news
- *    pages, settings) opens with the navigation row, <retinue-nav>: the way
- *    home and across, pinned to the top while a list page scrolls, so leaving
- *    a page never means scrolling to its end first.
+ *  - Every page (the home, the chats, threads, projects and news pages,
+ *    settings, and the drill-downs: a chat, a project, an open thread) opens
+ *    with the navigation row, <retinue-nav>: the way home and across, pinned
+ *    to the top while a list page scrolls, so leaving a page never means
+ *    scrolling to its end first. On a drill-down it starts with the back
+ *    button.
  *  - Dashboard (list mode): main is a flex column locked to the visible
  *    height (--frame-h from viewport.js, else 100dvh). The .deck / .col
  *    wrappers in index.html are display:contents here, so the cards stack in
@@ -14,9 +16,9 @@
  *    view. No news on the home: it lives on its own page. The full
  *    list pages (chats, conversations, news, projects) keep a scrolling
  *    document on the phone, under the pinned navigation.
- *  - Thread/composer open: the frame locks to exactly 100dvh and everything
- *    else hides, so the chat is immersive with an internally scrolled thread
- *    and a pinned composer. The thread viewer on the home is otherwise
+ *  - Thread/composer open: the frame locks to exactly 100dvh and every other
+ *    card hides — the navigation row stays, with its back button — so the
+ *    thread scrolls internally under it, above a pinned composer. The thread viewer on the home is otherwise
  *    invisible — the attention list is the list.
  *  - Wide screens (>=1000px and tall enough): a fixed app frame. The column
  *    becomes a real one, each region scrolling internally, boundaries
@@ -180,9 +182,24 @@ retinue-shelf { flex: none; order: 1; position: sticky; bottom: 0; z-index: 15;
                 margin-top: auto; background: var(--bg); }
 html[data-keyboard="1"] retinue-shelf { display: none; }
 
-/* Immersive chat: while a thread or the composer is open, lock the frame back
-   to the viewport and hand the whole screen to the conversation (the thread
-   bar carries the title and back button). */
+/* The navigation row on a drill-down steps aside for the phone keyboard too,
+   as the page's own header does: a thread or a chat being typed into needs
+   every line it can get. The chat page says when (its `typing` host
+   attribute: keyboard up, phone layout); the project page and an open thread
+   follow viewport.js's flag outside the wide layout, where there is room. A
+   list page's search field keeps its row. */
+main:has(retinue-chat-page[typing]) retinue-nav { display: none; }
+@media not ((min-width: 1000px) and (min-height: 480px)) {
+  html[data-keyboard="1"] main:has(retinue-project-page) retinue-nav,
+  html[data-keyboard="1"] main:has(retinue-conversations[data-view="thread"]) retinue-nav,
+  html[data-keyboard="1"] main:has(retinue-conversations[data-view="composer"]) retinue-nav {
+    display: none;
+  }
+}
+
+/* An open thread: while a thread or the composer is open, lock the frame back
+   to the viewport and hand the screen below the navigation row to the
+   conversation (the row carries the back button, the thread bar the title). */
 main:has(retinue-conversations[data-view="thread"]),
 main:has(retinue-conversations[data-view="composer"]) {
   height: 100vh;
@@ -194,9 +211,9 @@ main:has(retinue-conversations[data-view="composer"]) {
   overflow: hidden;
 }
 main:has(retinue-conversations[data-view="thread"])
-  :is(.top, retinue-nav, .splitter, .col-side),
+  :is(.top, .splitter, .col-side),
 main:has(retinue-conversations[data-view="composer"])
-  :is(.top, retinue-nav, .splitter, .col-side),
+  :is(.top, .splitter, .col-side),
 /* …and every other card sharing the main column. Matched by position rather
    than named one by one: the enumeration silently stopped covering the column
    the moment a card was added to it, which is how the chats list stayed on

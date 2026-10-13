@@ -159,6 +159,14 @@ class RetinueProjectPage extends HTMLElement {
         return !!ref && new URL(ref, location.href).origin === location.origin;
       } catch (_e) { return false; }
     })();
+    // The back button is the navigation row's (components/nav.js), at the
+    // top of the page; it hands the press here. While editing it is the
+    // editor's cancel, like the bar's ×.
+    this._nav = document.querySelector('retinue-nav');
+    if (this._nav && !this._onNavBack) {
+      this._onNavBack = () => (this._mode === 'edit' ? this._cancelEdit() : this._goBack());
+      this._nav.addEventListener('retinue-back', this._onNavBack);
+    }
     // The shelf (issue #282): this project is the page being shown, and a
     // restore handed over by its shelf item is applied once it is read.
     if (this._id && !this._shelfRelease) {
@@ -185,6 +193,9 @@ class RetinueProjectPage extends HTMLElement {
     this._offUnsaved = null;
     if (this._shelfRelease) this._shelfRelease();
     this._shelfRelease = null;
+    if (this._nav && this._onNavBack) this._nav.removeEventListener('retinue-back', this._onNavBack);
+    this._nav = null;
+    this._onNavBack = null;
     document.removeEventListener('visibilitychange', this._onVisible);
     window.removeEventListener('retinue-viewport', this._onViewport);
     if (this._applyTimer) clearTimeout(this._applyTimer);
@@ -474,12 +485,12 @@ class RetinueProjectPage extends HTMLElement {
   render() {
     let body;
     if (this._state === 'loading') {
-      body = `<div class="bar">${this._backHtml()}<span class="bar-title muted">&#8230;</span></div>`;
+      body = `<div class="bar"><span class="bar-title muted">&#8230;</span></div>`;
     } else if (this._state === 'missing') {
-      body = `<div class="bar">${this._backHtml()}<span class="bar-title">Project</span></div>`
+      body = `<div class="bar"><span class="bar-title">Project</span></div>`
         + '<p class="muted">This project could not be found. It may have been renamed or finished.</p>';
     } else if (this._state === 'offline') {
-      body = `<div class="bar">${this._backHtml()}<span class="bar-title">Project</span></div>`
+      body = `<div class="bar"><span class="bar-title">Project</span></div>`
         + '<p class="muted">Offline &ndash; no current data.</p>';
     } else if (this._mode === 'edit') {
       body = this._editorHtml();
@@ -516,12 +527,14 @@ class RetinueProjectPage extends HTMLElement {
       href: `/project.html?id=${encodeURIComponent(this._id)}`,
       location: { scrollTop: sc ? Math.round(sc.scrollTop) : 0 },
     });
-    if (this._fromApp && history.length > 1) history.back();
-    else location.href = '/';
+    this._goBack();
   }
 
-  _backHtml() {
-    return '<a class="back" href="/" data-back title="Back" aria-label="Back">&#8249;</a>';
+  // Back to wherever the project was opened from inside the app, or the home
+  // when it was opened cold (a push, a bookmark) — see _fromApp.
+  _goBack() {
+    if (this._fromApp && history.length > 1) history.back();
+    else location.href = '/';
   }
 
   _micHtml() {
@@ -536,7 +549,7 @@ class RetinueProjectPage extends HTMLElement {
     const { fields, body } = splitFrontmatter(it.markdown);
     const title = fields.get('title') || it.title || 'Project';
     // Editing should feel nearby but never shout: one muted pencil in the bar.
-    const bar = `<div class="bar">${this._backHtml()}`
+    const bar = `<div class="bar">`
       + `<span class="bar-title">${esc(title)}</span>`
       + `<button class="iconbtn" data-edit title="Edit this page" aria-label="Edit this page">&#9998;</button>`
       + `<button class="iconbtn" data-minimize title="Minimize to the shelf" aria-label="Minimize">`
@@ -679,14 +692,6 @@ class RetinueProjectPage extends HTMLElement {
   _wire() {
     const root = this.shadowRoot;
     const on = (sel, fn) => { const el = root.querySelector(sel); if (el) el.addEventListener('click', fn); };
-    // Back: a real link to the home (the fallback, and what a modified click
-    // opens) whose plain press returns to wherever the project was opened from.
-    on('[data-back]', (e) => {
-      if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
-      if (!this._fromApp || history.length <= 1) return;
-      e.preventDefault();
-      history.back();
-    });
     on('[data-edit]', () => this._startEdit());
     on('[data-minimize]', () => this._minimize());
     on('[data-cancel]', () => this._cancelEdit());
@@ -763,10 +768,6 @@ const CSS = `
 
   .bar { flex: none; display: flex; align-items: center; gap: 10px; padding: 2px 0 10px;
          border-bottom: 1px solid var(--line, rgba(231, 235, 242, .08)); }
-  .back { flex: none; width: 34px; height: 34px; border-radius: 50%;
-          background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); text-decoration: none;
-          font-size: 1.35rem; line-height: 1; display: inline-flex; align-items: center;
-          justify-content: center; padding: 0 2px 2px 0; -webkit-tap-highlight-color: transparent; }
   .bar-title { flex: 1; min-width: 0; font-weight: 650; font-size: 1.05rem;
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .iconbtn { flex: none; width: 34px; height: 34px; border-radius: 50%; background: transparent;
