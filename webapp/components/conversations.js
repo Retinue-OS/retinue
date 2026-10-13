@@ -572,8 +572,9 @@ class RetinueConversations extends HTMLElement {
     const body = this._active ? this._threadView()
       : this._composing ? this._composerView()
       : this._listView();
-    // Thread and composer views carry their own top bar (back button + title),
-    // so the card header would only repeat it — render it for the list alone.
+    // Thread and composer views carry their own top bar (title and actions;
+    // back is the navigation row's), so the card header would only repeat
+    // it — render it for the list alone.
     const header = mode === 'list'
       ? `<header><h2>${esc(this.heading)}</h2>` +
         `${this._unreadCount() ? `<span class="badge">${this._unreadCount()}</span>` : ''}` +
@@ -597,8 +598,9 @@ class RetinueConversations extends HTMLElement {
     ]));
   }
 
-  // An open thread: the conversation element, with a back button that this
-  // card answers by unwinding the history entry it pushed. It feeds the shelf
+  // An open thread: the conversation element. Back — the navigation row's
+  // button, or the element's own minimize — is answered by this card
+  // unwinding the history entry it pushed. It feeds the shelf
   // (issue #282): a minimize button parks it there, and leaving it while Ara
   // is still answering parks it by itself.
   _threadView() {

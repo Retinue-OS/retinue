@@ -153,8 +153,9 @@ navigation row (`components/nav.js`: Home · Chats · Threads · Projects · New
 · Contacts, then the pending-sends outbox icon and the settings gear), pinned
 while a list page scrolls. On a drill-down (a chat, a project, an open
 thread) it starts with the back button: `<retinue-nav back>` dispatches
-`retinue-back` and the page listening on the row decides where back goes. Device-level settings (notifications, the voice
-timeouts, the running shell version with a manual update check, and — inside
+`retinue-back` and the page listening on the row decides where back goes.
+Device-level settings (notifications, the voice timeouts, the running shell
+version with a manual update check, and — inside
 the Android shell only — a button into the shell's own settings) live on
 `settings.html`, reached via that gear. The address book (`contacts.html`,
 `components/contacts.js`; docs/contacts.md) is the *Contacts* tab — people,
@@ -231,8 +232,9 @@ docstring). Pieces:
   only safe if the tap can be taken back, and a staged draft is not something
   the user can retype.
   Back — the navigation row's button above the header — goes back where the
-  chat was opened from within the app, and to the home — the attention list the chat is a row of — for a chat
-  opened cold (a notification, a bookmark). The header's ⋮ menu holds
+  chat was opened from within the app, and to the home — the attention list
+  the chat is a row of — for a chat opened cold (a notification, a
+  bookmark). The header's ⋮ menu holds
   *Attention details* — the chat's attention sheet, with the contact card —
   and the **Archive** / **Mute** switches, the same `POST /chats/<id>/flags`
   the list's swipe actions use; a dot on the ⋮ shows an archived or muted

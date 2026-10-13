@@ -100,10 +100,23 @@ globalThis.addEventListener = (t, f) => { if (!winListeners.has(t)) winListeners
 globalThis.removeEventListener = () => {};
 const fire = (type) => { for (const f of winListeners.get(type) || []) f({ type }); };
 let backs = 0;
+// The address moves as a browser's does: no URL (null or '', as the card's
+// state-only stamps pass) keeps it, a fragment replaces the hash, and a path
+// replaces the address and drops the hash. A stub that cleared the hash on a
+// state-only stamp would close a deep link before any press could.
+const moveTo = (url) => {
+  if (url === null || url === undefined || url === '') return;
+  const s = String(url);
+  if (s.startsWith('#')) { location.hash = s; return; }
+  const u = new URL(s, 'http://dash' + location.pathname);
+  location.pathname = u.pathname;
+  location.search = u.search;
+  location.hash = u.hash;
+};
 globalThis.history = {
   length: 2,
-  pushState(_s, _t, url) { location.hash = String(url).startsWith('#') ? String(url) : ''; },
-  replaceState(_s, _t, url) { location.hash = String(url).startsWith('#') ? String(url) : ''; },
+  pushState(_s, _t, url) { moveTo(url); },
+  replaceState(_s, _t, url) { moveTo(url); },
   back() { backs++; location.hash = ''; fire('popstate'); },
 };
 globalThis.matchMedia = () => ({ matches: false, addEventListener() {}, removeEventListener() {}, addListener() {}, removeListener() {} });
@@ -248,6 +261,7 @@ await ok('a deep-linked thread closes in place, without leaving the page', () =>
   card.render = function () { this._reflectView(this._active ? 'thread' : (this._composing ? 'composer' : 'list')); };
   card.connectedCallback();
   assert.ok(navOnPage.hasAttribute('back'), 'opened on the thread: back');
+  assert.equal(location.hash, '#conversation-' + 'c'.repeat(32), 'the deep link stays until the press');
   backs = 0;
   navOnPage.dispatchEvent(new CustomEvent('retinue-back', {}));
   assert.equal(backs, 0, 'no history step out of the app');

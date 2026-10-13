@@ -18,8 +18,9 @@
  *    document on the phone, under the pinned navigation.
  *  - Thread/composer open: the frame locks to exactly 100dvh and every other
  *    card hides — the navigation row stays, with its back button — so the
- *    thread scrolls internally under it, above a pinned composer. The thread viewer on the home is otherwise
- *    invisible — the attention list is the list.
+ *    thread scrolls internally under it, above a pinned composer. The
+ *    thread viewer on the home is otherwise invisible — the attention list
+ *    is the list.
  *  - Wide screens (>=1000px and tall enough): a fixed app frame. The column
  *    becomes a real one, each region scrolling internally, boundaries
  *    draggable splitters (layout.js persists sizes per device, VS Code
@@ -104,8 +105,9 @@ main:has(> .deck) {
 
 /* The attention list takes the leftover height and scrolls inside it (the
    element's own .list rule). The thread viewer is invisible until a thread or
-   the composer is open (the immersive rules below), and then takes the
-   frame. An empty news feed (on its own page) hides the card; the explicit
+   the composer is open (the open-thread rules below), and then takes the
+   frame under the navigation row. An empty news feed (on its own page)
+   hides the card; the explicit
    display:none matters because the element's own :host{display:block}
    outranks the UA [hidden] rule. */
 retinue-attention { flex: 1; min-height: 0; }
