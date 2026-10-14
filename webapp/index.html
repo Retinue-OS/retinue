@@ -14,9 +14,10 @@
 
   <!-- Web components. Each is a standalone custom element that fetches its
        own data document. Edit this file to add, remove or reorder cards. -->
-  <!-- The navigation row every top-level page opens with: the home and the
-       chats, threads, projects, news and contacts pages beside it, plus the
-       pending sends and settings. -->
+  <!-- The navigation row every page opens with: the home and the chats,
+       threads, projects, news and contacts pages beside it, plus the pending
+       sends and settings. While a thread is open here it stays, with the
+       back button at its start (the conversations viewer sets it). -->
   <script type="module" src="/components/nav.js"></script>
   <!-- The home: one list of what wants attention — threads, chats and projects
        alike, each with its importance, urgency and delivery — over the
@@ -80,9 +81,9 @@
 
         <!-- The thread viewer (the same element the conversations page uses):
              invisible until a thread or the composer is opened by hash, then
-             it takes the whole display (see styles.css) so the chat with Ara
-             is immersive. Its list is never shown here — the attention list
-             above is the list. -->
+             it takes the display under the navigation row (see styles.css),
+             whose back button closes it. Its list is never shown here — the
+             attention list above is the list. -->
         <retinue-conversations viewer heading="Conversations"></retinue-conversations>
       </section>
     </div>

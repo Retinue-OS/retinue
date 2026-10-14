@@ -1,6 +1,6 @@
-// The dashboard's navigation: one row at the top of every top-level page —
-// the home (the attention list) and the pages beside it, plus the pending
-// sends and settings.
+// The dashboard's navigation: one row at the top of every page — the home
+// (the attention list), the pages beside it, the pending sends and settings,
+// and the drill-downs (a chat, a project, an open thread) as well.
 //
 // The way home used to be a "← Back to dashboard" link at the end of each list
 // page, so a long list had to be scrolled to its tail to leave it, and the
@@ -8,16 +8,26 @@
 // installed PWA has no browser chrome to fall back on, so this row is the way
 // out of a page, not a convenience: it is the first thing on the page and
 // stays pinned while a list page scrolls (the sticky placement is styles.css's,
-// which owns page layout). The drill-downs — a chat, a project, an open thread
-// — keep their own back button in their bar instead; they are immersive, and
-// back is the one move they need.
+// which owns page layout).
+//
+// The drill-downs used to be immersive, with no row and only a back button
+// in their own bar, so a chat opened from a push was a dead end: back to the
+// home, then across. They carry the row now, and their back button moved into
+// it: `back` puts a ‹ at the row's start. The row does not decide where back
+// goes — that differs per page (a chat opened cold goes home, a thread on the
+// home closes in place) — it dispatches `retinue-back` (bubbling, composed) on
+// itself, and the page listening on this element does the going. A modified
+// click follows the button's href, the home, like any link.
 //
 //   <retinue-nav current="chats"></retinue-nav>
+//   <retinue-nav back current="chats"></retinue-nav>   (a drill-down)
 //
 // `current` names the page (home · chats · threads · projects · news ·
 // contacts · sends · settings); without it the page is recognised by its
-// path. Plain links, so the row works offline from the service worker's shell
-// cache (the sends page is the gateway's own, so it needs the network).
+// path. `back` may come and go (the thread viewer on the home sets it while a
+// thread is open). Plain links, so the row works offline from the service
+// worker's shell cache (the sends page is the gateway's own, so it needs the
+// network).
 //
 // Contacts and the sends queue used to sit in an app dock at the foot of the
 // home, beside the phone's own dialer, SMS, mail and map buttons. Those four
@@ -27,16 +37,20 @@
 // a queue that wants action, so they are an icon one tap away, beside the gear.
 
 import { esc } from './base.js';
-// Every top-level page carries this row, so it brings the Android shell's
+// Every page carries this row, so it brings the Android shell's
 // fallback with it: a wake or Home press on a page that is not the home
-// goes there (components/shell.js).
-import './shell.js';
+// goes there (components/shell.js). Its links ask the same question a Home
+// press does: on a page holding unsent input (a typed message, an unsaved
+// project edit, a dictation on its way) a tap on a tab stays put and says
+// why, instead of dropping the input — the drill-downs that carry the row
+// now are where such input lives.
+import { shellEventHeld } from './shell.js';
 
 const PAGES = [
   { id: 'home', href: '/', label: 'Home', paths: ['/', '/index.html'] },
-  { id: 'chats', href: '/chats.html', label: 'Chats', paths: ['/chats.html'] },
+  { id: 'chats', href: '/chats.html', label: 'Chats', paths: ['/chats.html', '/chat.html'] },
   { id: 'threads', href: '/conversations.html', label: 'Threads', paths: ['/conversations.html'] },
-  { id: 'projects', href: '/projects.html', label: 'Projects', paths: ['/projects.html'] },
+  { id: 'projects', href: '/projects.html', label: 'Projects', paths: ['/projects.html', '/project.html'] },
   { id: 'news', href: '/news.html', label: 'News', paths: ['/news.html'] },
   { id: 'contacts', href: '/contacts.html', label: 'Contacts', paths: ['/contacts.html'] },
 ];
@@ -76,6 +90,13 @@ const CSS = `
           width: 32px; font-size: 1.05rem; border-bottom: 2px solid transparent; margin-bottom: -1px; }
   .icon:hover { color: var(--accent, #6ea8fe); }
   .icon[aria-current="page"] { color: var(--fg, #e7ebf2); border-bottom-color: var(--accent, #6ea8fe); }
+  /* The drill-downs' back button, at the row's start — the same round ‹ their
+     own bars carried before it moved here. */
+  .back { flex: none; align-self: center; width: 34px; height: 34px; margin: 0 6px 2px 0;
+          border-radius: 50%; background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2);
+          font-size: 1.35rem; line-height: 1; display: inline-flex; align-items: center;
+          justify-content: center; padding: 0 2px 2px 0; }
+  .back:hover { color: var(--accent, #6ea8fe); }
   /* Wide screens have the room: the places sit together on the left instead
      of spreading across a 1600px frame. */
   @media (min-width: 700px) { .tab { flex: 0 0 auto; padding: 8px 14px 9px; } }
@@ -89,16 +110,48 @@ function currentPage(attr) {
 }
 
 class RetinueNav extends HTMLElement {
-  connectedCallback() {
+  static get observedAttributes() { return ['back', 'current']; }
+
+  connectedCallback() { this._render(); }
+
+  attributeChangedCallback(name, before, after) {
+    if (before !== after && this.shadowRoot) this._render();
+  }
+
+  _render() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
     const cur = currentPage(this.getAttribute('current'));
     const link = (p, cls, inner) =>
       `<a class="${cls}" href="${p.href}"${p.id === cur ? ' aria-current="page"' : ''}` +
       `${cls === 'icon' ? ` title="${p.label}" aria-label="${p.label}"` : ''}>${inner}</a>`;
+    const back = this.hasAttribute('back')
+      ? '<a class="back" href="/" data-back title="Back" aria-label="Back">&#8249;</a>' : '';
     this.shadowRoot.innerHTML = `<style>${CSS}</style>` +
-      `<nav aria-label="Dashboard"><div class="tabs">` +
+      `<nav aria-label="Dashboard">${back}<div class="tabs">` +
       PAGES.map((p) => link(p, 'tab', esc(p.label))).join('') +
       `</div>${link(SENDS, 'icon', OUTBOX_SVG)}${link(SETTINGS, 'icon', '&#9881;')}</nav>`;
+    const btn = this.shadowRoot.querySelector('[data-back]');
+    if (btn) btn.addEventListener('click', (e) => this._onBack(e));
+    const nav = this.shadowRoot.querySelector('nav');
+    if (nav) nav.addEventListener('click', (e) => this._onLink(e));
+  }
+
+  // A tab or icon press on a page holding unsent input is held, with the
+  // shell's note, like a Home press (a modified click opens elsewhere and
+  // loses nothing). The back button is the page's to decide.
+  _onLink(e) {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
+    const a = e.target && e.target.closest ? e.target.closest('a') : null;
+    if (!a || a.hasAttribute('data-back')) return;
+    if (shellEventHeld('home')) e.preventDefault();
+  }
+
+  // A plain press hands back to the page; a modified one (new tab, new
+  // window) follows the link to the home, as any link would.
+  _onBack(e) {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
+    e.preventDefault();
+    this.dispatchEvent(new CustomEvent('retinue-back', { bubbles: true, composed: true }));
   }
 }
 

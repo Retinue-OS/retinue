@@ -33,7 +33,7 @@ lives in `webapp/` (baked into the image):
 - `webapp/sw.js` caches the shell so the dashboard opens with no
   connectivity.
 
-**Navigation is one row at the top of every top-level page**
+**Navigation is one row at the top of every page**
 (`webapp/components/nav.js`): *Home · Chats · Threads · Projects · News ·
 Contacts*, then an outbox icon for the pending sends (`/sends`, the approval
 queue — a queue that wants action, one tap away) and the settings gear, with
@@ -42,9 +42,18 @@ on the home, the list pages and settings, and it stays pinned while a list
 page scrolls, so leaving a page never means scrolling to its end — the list
 pages used to end in a "← Back to dashboard" link, and the home linked to
 them from the foot of the list. The drill-downs — a chat (`chat.html`), a
-project (`project.html`), an open thread — are immersive and carry no row;
-their bar's back button returns to where they were opened from, or, opened
-cold (a push, a bookmark), to the home. On a phone the home never scrolls as
+project (`project.html`), an open thread — carry the row too, so none of
+them is a dead end, and on them it starts with a back button (`<retinue-nav
+back>`). The row only reports the press (`retinue-back`); the page decides
+where it goes: back to where the drill-down was opened from inside the app,
+or, opened cold (a push, a bookmark), to the home; an open thread on the
+home or the Threads page closes in place, a project being edited cancels the
+edit. The page's own bar (title, Archive, minimize, model picker, menu)
+stays as a second row under it. On a page holding unsent input — a typed
+message, an unsaved project edit, a dictation on its way — a tap on a tab is
+held with the same note a Home press of the Android shell gets, instead of
+dropping the input. While the phone keyboard is up the row steps aside on a
+drill-down, as the page's own header does. On a phone the home never scrolls as
 a page (the attention list scrolls inside a locked frame, under the
 navigation); in the wide layout (`isWideFrame` in
 `webapp/components/base.js`) it fills a fixed frame and scrolls internally.

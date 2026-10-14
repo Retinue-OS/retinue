@@ -17,6 +17,8 @@
 //   for-project       no thread yet: a composer whose first message opens one
 //   project-title     linked to that project (the project page's "Discuss").
 //   back              show a back button; a tap dispatches `retinue-back`.
+//                     The dashboard's hosts leave it off: their back button
+//                     is the navigation row's (components/nav.js).
 //   bar="none"        no top bar (title, model picker, autoplay, archive) —
 //                     for a host whose own header carries those.
 //   bar="actions"     the bar's actions only — model picker and autoplay, no
@@ -2910,13 +2912,14 @@ const CSS = `
   .thread-bar.bar-slim { justify-content: flex-end; padding: 0 0 8px; }
   /* The host's lead (slot "bar-start") takes the left end; the cluster stays right. */
   .thread-bar.bar-slim ::slotted([slot="bar-start"]) { margin-right: auto; min-width: 0; }
-  /* A phone's thread bar cannot hold the back button, the picker, the
-     attention ⓘ, the speaker toggle, Archive and Minimize beside the title.
-     So on a phone the title row keeps the back button and the thread's own
-     actions (Archive, Minimize — never pushed off the edge), the title takes
-     two lines before it cuts, as in the list, and the settings go to a row
-     under it. That row wraps rather than clips, so a long model name or an
-     enlarged system font moves a control down instead of hiding it. */
+  /* A phone's thread bar cannot hold the picker, the attention ⓘ, the
+     speaker toggle, Archive and Minimize beside the title. So on a phone the
+     title row keeps the thread's own actions (Archive, Minimize — never
+     pushed off the edge) and the back button when the host asks for one, the
+     title takes two lines before it cuts, as in the list, and the settings go
+     to a row under it. That row wraps rather than clips, so a long model name
+     or an enlarged system font moves a control down instead of hiding it;
+     under a back button it is indented to start beneath the title. */
   @media (max-width: 480px) {
     .thread-bar:not(.bar-slim) { flex-wrap: wrap; row-gap: 8px; }
     .thread-bar:not(.bar-slim) .bar-title { white-space: normal; overflow-wrap: anywhere;
@@ -2924,7 +2927,8 @@ const CSS = `
                  line-height: 1.3; }
     .thread-bar:not(.bar-slim) .bar-thread { order: 0; }
     .thread-bar:not(.bar-slim) .bar-actions { order: 1; flex: 1 0 100%; flex-wrap: wrap;
-                 row-gap: 6px; padding-left: 44px; }
+                 row-gap: 6px; }
+    :host([back]) .thread-bar:not(.bar-slim) .bar-actions { padding-left: 44px; }
     .thread-bar:not(.bar-slim) .bar-actions [data-picker] { min-width: 0; max-width: 100%; }
     .bar-actions:empty, .bar-thread:empty { display: none; }
     /* The picker's host stays in the DOM for _syncPicker, so with no picker
@@ -2933,7 +2937,7 @@ const CSS = `
   }
   /* Very narrow (or zoomed) frames: the settings row uses the full width. */
   @media (max-width: 360px) {
-    .thread-bar:not(.bar-slim) .bar-actions { padding-left: 0; }
+    :host([back]) .thread-bar:not(.bar-slim) .bar-actions { padding-left: 0; }
   }
   .iconbtn { width: 34px; height: 34px; border-radius: 50%; background: transparent;
              border: 1px solid var(--line, rgba(231, 235, 242, .08)); color: var(--muted, #8b93a3);

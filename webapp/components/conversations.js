@@ -138,6 +138,21 @@ class RetinueConversations extends HTMLElement {
         if (id) this._openThread(id);
       });
     }
+    // The back button of an open thread is the navigation row's
+    // (components/nav.js), which this card shows it on while a thread or the
+    // composer is open (_reflectView). The row is a sibling, so its press
+    // never bubbles through this host: it gets a listener of its own, on the
+    // row itself — not on the document, where the element's own
+    // retinue-back (its minimize) would arrive a second time and unwind two
+    // entries. The row may not be upgraded yet; listeners and attributes
+    // work on it all the same.
+    const nav = document.querySelector('retinue-nav');
+    if (nav && nav !== this._nav) {
+      if (this._nav && this._onNavBack) this._nav.removeEventListener('retinue-back', this._onNavBack);
+      this._nav = nav;
+      this._onNavBack = () => { if (this.isConnected) this._openList(); };
+      nav.addEventListener('retinue-back', this._onNavBack);
+    }
     // The home answers the Android shell's wake and home events in place
     // (shell.js sends every other page here for them).
     if (this._viewer && !this._onShell) {
@@ -442,7 +457,7 @@ class RetinueConversations extends HTMLElement {
     this._composing = false;
     this._setComposeProject(undefined); // link consumed by this thread
     this._lastMode = 'thread';
-    this.setAttribute('data-view', 'thread');
+    this._reflectView('thread');
     this._changed();
   }
 
@@ -537,11 +552,17 @@ class RetinueConversations extends HTMLElement {
     this.render();
   }
 
+  // Reflect the view on the host so the page can react (styles.css hides
+  // every other card while a thread or the composer is open), and on the
+  // navigation row, whose back button belongs to an open thread.
+  _reflectView(mode) {
+    this.setAttribute('data-view', mode);
+    if (this._nav) this._nav.toggleAttribute('back', mode !== 'list');
+  }
+
   render() {
     const mode = this._active ? 'thread' : (this._composing ? 'composer' : 'list');
-    // Reflect the view on the host so the page can react (styles.css hides the
-    // navigation and every other card while a thread or the composer is open).
-    this.setAttribute('data-view', mode);
+    this._reflectView(mode);
     if (this._viewer && mode === 'list') {
       // Nothing to show: the home's attention list is the list.
       this.shadowRoot.innerHTML = '';
@@ -551,8 +572,9 @@ class RetinueConversations extends HTMLElement {
     const body = this._active ? this._threadView()
       : this._composing ? this._composerView()
       : this._listView();
-    // Thread and composer views carry their own top bar (back button + title),
-    // so the card header would only repeat it — render it for the list alone.
+    // Thread and composer views carry their own top bar (title and actions;
+    // back is the navigation row's), so the card header would only repeat
+    // it — render it for the list alone.
     const header = mode === 'list'
       ? `<header><h2>${esc(this.heading)}</h2>` +
         `${this._unreadCount() ? `<span class="badge">${this._unreadCount()}</span>` : ''}` +
@@ -576,8 +598,9 @@ class RetinueConversations extends HTMLElement {
     ]));
   }
 
-  // An open thread: the conversation element, with a back button that this
-  // card answers by unwinding the history entry it pushed. It feeds the shelf
+  // An open thread: the conversation element. Back — the navigation row's
+  // button, or the element's own minimize — is answered by this card
+  // unwinding the history entry it pushed. It feeds the shelf
   // (issue #282): a minimize button parks it there, and leaving it while Ara
   // is still answering parks it by itself.
   _threadView() {
@@ -587,7 +610,7 @@ class RetinueConversations extends HTMLElement {
       ? (this._listenNextMic ? ' continuous listen' : ' continuous') : '';
     this._listenNext = null;
     this._listenNextMic = false;
-    return `<retinue-conversation conversation-id="${esc(this._active)}" back shelf shelf-leave minimize${listen}>` +
+    return `<retinue-conversation conversation-id="${esc(this._active)}" shelf shelf-leave minimize${listen}>` +
       `</retinue-conversation>`;
   }
 
@@ -604,7 +627,7 @@ class RetinueConversations extends HTMLElement {
     this._composeListen = false;
     // `shelf` here too: the thread the first message opens goes on as this
     // element, and from then on it is a thread like any other.
-    return `<retinue-conversation back shelf shelf-leave minimize${project}></retinue-conversation>`;
+    return `<retinue-conversation shelf shelf-leave minimize${project}></retinue-conversation>`;
   }
 
   _listView() {

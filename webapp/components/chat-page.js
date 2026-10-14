@@ -284,6 +284,11 @@ class RetinueChatPage extends HTMLElement {
     // entry, and the home — the attention list the chat is a row of, with
     // the navigation to everything else — is the honest landing place.
     this._fromApp = this._openedFromApp();
+    // The back button is the navigation row's (components/nav.js), at the
+    // top of the page; it hands the press here, and _goBack decides.
+    this._nav = document.querySelector('retinue-nav');
+    this._onNavBack = () => this._goBack();
+    if (this._nav) this._nav.addEventListener('retinue-back', this._onNavBack);
     // Pane arrangement differs across the breakpoint; re-render on a flip
     // (drafts survive — they live in fields, mirrored on every input event).
     // Typing mode is phone-only, so the flip re-decides it too.
@@ -393,6 +398,8 @@ class RetinueChatPage extends HTMLElement {
     this._wide.removeEventListener('change', this._onFrame);
     if (this._onPop) window.removeEventListener('popstate', this._onPop);
     this._onPop = null;
+    if (this._nav) this._nav.removeEventListener('retinue-back', this._onNavBack);
+    this._nav = null;
     if (this._lightbox) this._dismissLightbox();
     Object.values(this._noteTimers).forEach((t) => clearTimeout(t));
     this._noteTimers = {};
@@ -764,7 +771,7 @@ class RetinueChatPage extends HTMLElement {
     // says which of them is open. So it displaces the peer's handle (the title
     // already names the peer), the group marker and member count, and even the
     // channel — which the avatar's own badge carries anyway. The header gives
-    // this line about 140px next to the back button, avatar and pane tabs, and
+    // this line about 140px next to the avatar, pane tabs and buttons, and
     // any pairing of those facts overflows it; what a truncated subtitle drops
     // is the tail, which is exactly the half that disambiguates. Hence one
     // rule for both group and 1:1, short enough to always fit.
@@ -774,7 +781,6 @@ class RetinueChatPage extends HTMLElement {
         ? `${ch} group${c.members ? ` &middot; ${Number(c.members)} members` : ''}`
         : `${ch} &middot; ${esc(key)}`);
     return `<header class="chat-head">` +
-      `<a class="back" href="${HOME_URL}" data-back title="Back" aria-label="Back">&#8249;</a>` +
       avatarHtml(c) +
       `<div class="head-txt"><div class="head-name">${esc(c.name)}</div>` +
       `<small class="head-sub">${sub}</small></div>` +
@@ -1342,17 +1348,6 @@ class RetinueChatPage extends HTMLElement {
   // ── Wiring ─────────────────────────────────────────────────────────────────
   _wire() {
     const root = this.shadowRoot;
-    // Back: a real link (its href is the fallback destination, and it still
-    // opens the home in a new tab on a modified click) whose plain press
-    // honours where the user actually came from — see _goBack.
-    const back = root.querySelector('[data-back]');
-    if (back) {
-      back.addEventListener('click', (e) => {
-        if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
-        e.preventDefault();
-        this._goBack();
-      });
-    }
     this._bindMenu();
     const min = root.querySelector('[data-minimize]');
     if (min) min.addEventListener('click', () => this._minimize());
@@ -2198,10 +2193,6 @@ const CSS = `
   /* ── Header ──────────────────────────────────────────────────────────────── */
   .chat-head { flex: none; display: flex; align-items: center; gap: 10px; padding: 2px 0 10px;
                border-bottom: 1px solid var(--line, rgba(231, 235, 242, .08)); }
-  .back { flex: none; width: 34px; height: 34px; border-radius: 50%;
-          background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); text-decoration: none;
-          font-size: 1.35rem; line-height: 1; display: inline-flex; align-items: center;
-          justify-content: center; padding: 0 2px 2px 0; -webkit-tap-highlight-color: transparent; }
   .av { flex: none; position: relative; width: 40px; height: 40px; border-radius: 50%;
         display: inline-flex; align-items: center; justify-content: center;
         color: rgba(255, 255, 255, .92); font-size: .85rem; font-weight: 700; }
