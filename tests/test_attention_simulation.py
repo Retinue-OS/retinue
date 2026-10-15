@@ -36,11 +36,11 @@ def main():
     # afternoon's scope: it tops Now at 17:00 without ringing.
     assert st["pushes"] == 5, st
     assert st["corrections"] == 3, st       # the lead time, the contact card, the permit
-    # The phone with the push opt-in's default setting (new & stalled
-    # conversations) shows the digests and the pushes, not Ara's replies in
-    # threads already under way; a digest replaces the one before it.
-    assert st["notified"] == st["pushes"] + st["digests"], st
-    assert all(f["phone"] is False for f in sim.feed if f["who"] == "reply"), "a reply reached the default phone"
+    # The phone with the push opt-in's defaults filters nothing of its own:
+    # it shows the digests, the pushes and Ara's replies — whatever the
+    # attention model let out; a digest replaces the one before it.
+    assert st["notified"] == st["pushes"] + st["digests"] + st["replies"], st
+    assert all(f["phone"] is True for f in sim.feed if f["who"] == "reply"), "a reply missed the phone"
     assert sum(1 for n in sim.tray if n["digest"]) == 1 and not any("[[chip" in n["body"] for n in sim.tray), sim.tray
     digests = [f["text"] for f in sim.feed if f.get("digest")]
     assert any("Anna Keller" in d and "Beat Frei" in d for d in digests), digests

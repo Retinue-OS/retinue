@@ -233,8 +233,12 @@ across a digest time (`tick.json` under `ATTENTION_DIR` keeps the mark) — up
 to three hours back.
 Repeats are a per-class policy: a family sender writing again while held in
 *Rest* breaks through; anyone else waits with their first message. The
-per-device notification modes of the settings page keep working as a second
-filter behind the model. `ATTENTION_PUSH_GATE=0` is the rollback: every
+decision is the model's alone: the per-device notification modes of #66 (new /
+stalled / reply) are **gone**, since behind the model they only suppressed,
+knowing nothing of VIP or critical, what it had just released — a second
+message into a chat with something unread counted as a *reply*, and the
+default setting dropped it. A device is notified or disabled, nothing in
+between. `ATTENTION_PUSH_GATE=0` is the rollback: every
 arrival pushes as before the model, while the list, the digest and the sweep
 keep working.
 
@@ -514,10 +518,14 @@ gateway endpoints: `GET /push/config`, `POST /push/subscribe`,
 `POST /push/unsubscribe`. The user manages the opt-in from the **settings
 page** (`settings.html`, reached via the gear in the navigation row), where
 `webapp/components/push.js` in `manage` mode shows this device's state —
-unsupported, blocked, off, or enabled with the delivery preferences and a
-disable button. The module also runs a silent re-registration on every
-dashboard load, so an already-granted device heals a rotated or server-reset
-subscription without visiting settings. Two caveats worth knowing: on **iOS**
+unsupported, blocked, off, or enabled with the one preference left (whether
+archived conversations notify here too) and a disable button. There is no
+per-device choice of *which* pushes arrive; that is the model's (see *The
+home*). The module also runs a silent re-registration on every dashboard load,
+so an already-granted device heals a rotated or server-reset subscription
+without visiting settings — a device the user disabled is skipped
+(`retinue_push_disabled` in its `localStorage`, which is what makes *Disable*
+outlast a reload). Two caveats worth knowing: on **iOS**
 push only works if the dashboard was added to the home screen (in a plain
 Safari tab the settings page says so), and if `pywebpush` is unavailable the
 whole feature reports itself disabled rather than failing — conversations

@@ -101,7 +101,8 @@ News feed (dashboard news page; see scripts/news_store.py):
 
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
-  POST /push/subscribe                -> register a PushSubscription (body is the
+  POST /push/subscribe                -> register a PushSubscription (body
+                                         {subscription, notify_archived}, or the
                                          browser's subscription JSON verbatim).
   POST /push/unsubscribe              -> drop one (body {endpoint}); idempotent.
 
@@ -3141,51 +3142,6 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
     )
 
 
-# A conversation counts as stalled once it has seen no activity — no message
-# and no read — for this long (#66's definition: inactive for more than 10 min).
-_STALLED_AFTER_SECONDS = 600
-
-
-def _conv_event_mode(conv: dict) -> str:
-    """Classify the agent turn just appended to a thread for push filtering.
-
-    Returns one of the event kinds `push_notify.notify` matches against each
-    device's notification_mode:
-
-      * "new"     — the first message of a thread the agent opened; the only
-                    event a `new_only` subscriber wants.
-      * "stalled" — a message landing after the thread was inactive for more
-                    than _STALLED_AFTER_SECONDS.
-      * "reply"   — any other turn of an active exchange; delivered only to
-                    "all" subscribers.
-
-    Called after the message was appended, so messages[-1] is the message being
-    pushed; the previous message and the user's last read are the activity
-    anchors. Anything unparseable degrades to "reply", the quietest class.
-    """
-    messages = conv.get("messages", [])
-    if len(messages) <= 1:
-        return "new" if conv.get("initiator") == "agent" else "reply"
-    anchors = []
-    for raw in (messages[-2].get("ts"), conv.get("read_at")):
-        try:
-            ts = datetime.fromisoformat(raw)
-        except (TypeError, ValueError):
-            continue
-        if ts.tzinfo is not None:
-            anchors.append(ts)
-    if anchors:
-        # The wall clock, which is what a thread's times are stamped with
-        # (_new_conv, _conv_add_message, read_at) — never the attention clock
-        # a simulated day or a test pins: measured against that, whether a
-        # reply counts as "stalled" depended on the hour the run happened at.
-        now = datetime.now(timezone.utc)
-        idle = (now - max(anchors)).total_seconds()
-        if idle > _STALLED_AFTER_SECONDS:
-            return "stalled"
-    return "reply"
-
-
 _CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
 
 
@@ -3194,11 +3150,11 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
 
     Called for every agent→user turn that lands unread: a thread Ara opens, a
     file an agent appends, and Ara's own reply (which arrives after her session
-    ends, long after the user may have closed the app). Which devices are
-    notified depends on each device's stored preferences: the event kind
-    (see _conv_event_mode) and — for archived threads, which notify by
-    default — an explicit opt-out. Best effort — a push failure never affects
-    the conversation itself.
+    ends, long after the user may have closed the app). Whether it is called
+    at all is the attention model's decision; every subscribed device is then
+    notified, bar an explicit per-device opt-out of archived threads (which
+    notify by default). Best effort — a push failure never affects the
+    conversation itself.
 
     Returns the number of subscribed devices the fan-out targets (not how
     many were actually reached, which the async fan-out doesn't wait to
@@ -3218,7 +3174,6 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
-                             mode=_conv_event_mode(conv),
                              archived=bool(conv.get("archived")),
                              urgency=urgency)
     return subscribers
@@ -7515,7 +7470,7 @@ def _rail_unknown_sender(payload: dict) -> bool | None:
 
 
 def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
-                            had_unread: bool, urgency: str | None = None) -> None:
+                            urgency: str | None = None) -> None:
     """Web-Push one arrival: title = chat, body = preview, tap-through = the
     chat page. Deterministic — no model turn is spent on notification."""
     if not push_notify.enabled():
@@ -7526,8 +7481,7 @@ def _chat_push_notification(chat_id: str, doc: dict, entry: dict,
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     url = "/chat.html?" + urllib.parse.urlencode({"id": chat_id})
-    push_notify.notify_async(title, body, url=url, tag=chat_id,
-                             mode="reply" if had_unread else "new", urgency=urgency)
+    push_notify.notify_async(title, body, url=url, tag=chat_id, urgency=urgency)
 
 
 # ── Contacts: people, in chambers ───────────────────────────────────────────
@@ -8198,7 +8152,7 @@ def _attention_push_item(item: dict, reason: str = "") -> int:
     body = " ".join(str(item.get("preview") or reason or "").split())[:160]
     tag = item["source_id"]
     push_notify.notify_async(title, body or "wants your attention", url=item["href"], tag=tag,
-                             mode="new", urgency="high")
+                             urgency="high")
     return push_notify.subscription_count()
 
 
@@ -8212,7 +8166,7 @@ def _attention_push_digest(digest: dict, now: datetime) -> int:
         return 0
     title, body = attention_policy.digest_text(digest, now)
     url = "/?" + urllib.parse.urlencode({"digest": digest["at"].isoformat()})
-    push_notify.notify_async(title, body, url=url, tag="attention-digest", mode="new",
+    push_notify.notify_async(title, body, url=url, tag="attention-digest",
                              urgency="normal", topic="digest")
     return push_notify.subscription_count()
 
@@ -9900,7 +9854,7 @@ class Handler(BaseHTTPRequestHandler):
         job_url = None
         accepted = False
         if direction == "in":
-            _, had_unread = _CHAT_STATE.mark_unread(chat_id, ts)
+            _CHAT_STATE.mark_unread(chat_id, ts)
             # A new message in an archived chat would otherwise land invisible;
             # muted is the explicit "keep it archived" opt-out. Decided inside
             # the state lock (see ChatState.unarchive_unless_muted): the
@@ -9926,8 +9880,9 @@ class Handler(BaseHTTPRequestHandler):
                     chat_id, doc, entry, payload.get("attention"),
                     vip=gate is not None and gate.get("vip") is True)
                 if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
-                    _chat_push_notification(chat_id, doc, entry, had_unread,
-                                            urgency="high" if decision["deliver"] == "push" else None)
+                    _chat_push_notification(
+                        chat_id, doc, entry,
+                        urgency="high" if decision["deliver"] == "push" else None)
                     pushed = True
                 else:
                     print(f"[web-gateway] attention: {chat_id} {decision['deliver']} — "
