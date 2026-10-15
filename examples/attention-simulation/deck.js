@@ -3,9 +3,10 @@
 // is the real dashboard served by the same gateway. A click inside the phone
 // pauses the story ("you are driving"); Resume plays on from where you are.
 // The phone's status bar carries the notification bell: the tray is what a
-// device with the push opt-in's default setting would show (the runner's
-// `phone`), a new notification drops a heads-up banner, and tapping one opens
-// its link in the phone as the service worker would.
+// device with the push opt-in's defaults would show — every push the
+// attention model lets out (the runner's `phone`) — a new notification drops
+// a heads-up banner, and tapping one opens its link in the phone as the
+// service worker would.
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const DAY = 1440;
@@ -157,7 +158,7 @@ class Deck {
     $('#shade').innerHTML = `<div class="shade-head"><b>Notifications</b><span class="muted">this phone: ${esc(setting || '')}</span>` +
       `${tray.length ? '<button data-act="clear-notes">Clear all</button>' : ''}</div><div class="notes">` +
       (tray.length ? tray.map((n) => noteHtml(n, true)).join('')
-        : '<div class="notes-empty">No notifications. The phone shows what the gateway pushes, through its default setting: new and stalled conversations.</div>') +
+        : '<div class="notes-empty">No notifications. The phone shows what the gateway pushes — the attention model decides that, and nothing on the device filters it again.</div>') +
       '</div>';
   }
   toggleShade(open) {
