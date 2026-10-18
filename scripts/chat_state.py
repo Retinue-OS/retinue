@@ -292,6 +292,13 @@ class ChatStateStore:
             # inbound message arrives and when the user acts on the home
             # screen; None for a chat the model has not seen.
             "attention": None,
+            # The newest message a sender's standing instruction was applied
+            # to (docs/contacts.md, "The instruction"): who it was for, the
+            # instruction as applied, whether the turn is still working, and
+            # its verdict — importance, deadline, what it did, what it
+            # flagged — with how the message was delivered. None for a chat
+            # no instructed message has arrived in. See `update_instructed`.
+            "instructed": None,
         }
 
     def _read(self, chat_id: str) -> dict:
@@ -469,6 +476,19 @@ class ChatStateStore:
         with self._lock:
             doc = self._read(chat_id)
             doc["attention"] = dict(block) if block else None
+            self._write(doc)
+            return doc
+
+    def update_instructed(self, chat_id: str, patch: dict, *,
+                          fresh: bool = False) -> dict:
+        """Merge ``patch`` into the chat's ``instructed`` block; ``fresh``
+        starts a new one (a new instructed message) instead of merging into
+        the last."""
+        with self._lock:
+            doc = self._read(chat_id)
+            base = {} if fresh else dict(doc.get("instructed") or {})
+            base.update(patch)
+            doc["instructed"] = base
             self._write(doc)
             return doc
 

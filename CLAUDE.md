@@ -222,9 +222,11 @@ book (`contacts`, default `contacts/`). Use `scripts/contacts.py` — `find
 <chamber>` (a contact always names its chamber; ask when unclear), `update <id>
 --add-handle`/`--add-email` rather than filing a second person. The person also
 carries the attention model's facts about them (sphere, importance prior, the
-modes they may interrupt) and the **VIP flag** (`--vip`: a model works their
-messages on every channel; their e-mail is whitelisted) — set these on the
-person, not per handle. The dashboard's contact card and its Contacts page (a
+modes they may interrupt), the **VIP flag** (`--vip`: a model works their
+messages on every channel; their e-mail is whitelisted) and the user's
+**instruction** (`--instruction "…"`: the brief a model works each of their
+messenger messages by; its verdict decides whether the message rings) — set
+these on the person, not per handle. The dashboard's contact card and its Contacts page (a
 tab of the navigation row) write the same files. Vocabulary and file format:
 `docs/contacts.md`.
 

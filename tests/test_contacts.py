@@ -6,7 +6,8 @@ Covers: manifest locations (a declared path, the default where none is
 declared, the opt-out, a declared path that would leave its chamber); handles of every kind (e-mail, SMS,
 messenger accounts) and their normalization; lookup by handle, phone and name;
 the uniqueness of accounts and addresses; lossless rewrites that keep lines the
-module did not write; the CLI; and the best-effort commit in the chamber repo.
+module did not write; the standing instruction and its projection into the
+gate; the CLI; and the best-effort commit in the chamber repo.
 
 Standalone (stdlib only):
 
@@ -200,6 +201,50 @@ def test_attention_and_vip(chambers, manifest):
     print("ok test_attention_and_vip")
 
 
+def test_instruction(chambers, manifest):
+    """A person carries the user's standing instruction (kb:instruction): kept
+    in their file, projected into the gate as the `instructed` class by their
+    messenger handles alone, and found again from a handle the way the gate
+    matched it."""
+    book = contacts.ContactBook(chambers, manifest)
+    brief = "Draft a reply to every message.\nRing me only if a visit moves to today."
+    spitex = book.create("work", "Spitex Team", [("signal", "+41790000077"), ("email", "team@spitex.example")],
+                         instruction="  " + brief + "  ")
+    assert spitex["instruction"] == brief, spitex
+    assert contacts.public(spitex)["instruction"] == brief
+    text = (chambers / spitex["path"]).read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#instruction> "Draft a reply to every message.\\nRing me' in text, text
+    # Not a VIP: the instruction is its own class, and the e-mail address is
+    # not whitelisted by it.
+    assert contacts.policy_projection(book) == ({}, set())
+    projected = contacts.instruction_projection(book)
+    assert projected == {"signal": {"+41790000077"}, "sms": {"+41790000077"}}, projected
+    # The lookup matches as the gate does — the projected form, any case.
+    assert contacts.instructed_person(book, "signal", "+41 79 000 00 77")["key"] == spitex["key"]
+    assert contacts.instructed_person(book, "sms", "0041790000077")["key"] == spitex["key"]
+    assert contacts.instructed_person(book, "whatsapp", "+41790000077") is None
+    # A handle filed before a normalization rule still finds its person.
+    old = book.create("work", "Old Filing", [("telegram", "@old_filing")], instruction="Flag everything.")
+    path = chambers / old["path"]
+    path.write_text(path.read_text(encoding="utf-8").replace('"@old_filing"', '"41791234567@s.whatsapp.net"')
+                    .replace('"telegram"', '"whatsapp"'), encoding="utf-8")
+    assert contacts.instructed_person(book, "whatsapp", "+41791234567")["key"] == old["key"]
+    book.delete(old["key"])
+    # Too long is refused; an empty one, and None, remove it; False leaves it.
+    try:
+        book.update(spitex["key"], instruction="x" * (contacts.INSTRUCTION_MAX + 1))
+        raise AssertionError("accepted an instruction past the cap")
+    except contacts.ContactError:
+        pass
+    assert book.update(spitex["key"], vip=True)["instruction"] == brief
+    assert book.update(spitex["key"], instruction="   ")["instruction"] is None
+    assert "kb#instruction" not in (chambers / spitex["path"]).read_text(encoding="utf-8")
+    assert contacts.instruction_projection(book) == {}
+    assert contacts.instructed_person(book, "signal", "+41790000077") is None
+    book.delete(spitex["key"])
+    print("ok test_instruction")
+
+
 def test_cli(chambers, manifest):
     env = dict(os.environ,
                TRIAGE_MESSENGER_DIR=str(chambers.parent / "policy" / "messenger"),
@@ -236,6 +281,26 @@ def test_cli(chambers, manifest):
     assert '"+41790000000"' in sms.read_text(encoding="utf-8")
     run("update", eva["id"], "--no-vip", "--importance", "", "--no-permits")
     assert '"eva@example.org"' not in Path(env["TRIAGE_EMAIL_WHITELIST_PATH"]).read_text(encoding="utf-8")
+    # An instruction, given to a team at once: one update, several ids, and
+    # the gate learns each member's handles as `instructed`.
+    max_ = run("add", "--chamber", "work", "--name", "Max Weber", "--handle", "signal:+41790000002")
+    lea = run("add", "--chamber", "work", "--name", "Lea Graf", "--handle", "telegram:@lea_graf",
+              "--instruction", "Draft a reply; ring me if it is about today.")
+    assert lea["instruction"] == "Draft a reply; ring me if it is about today.", lea
+    team = run("update", eva["id"], max_["id"], "--instruction-from", lea["id"])
+    assert [p["instruction"] for p in team] == [lea["instruction"]] * 2, team
+    signal = Path(env["TRIAGE_MESSENGER_DIR"]) / "signal" / "policy" / "policy.nt"
+    nt = signal.read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#triageInstructedHandle> "+41790000002"' in nt, nt
+    assert "kb#triageVipHandle" not in nt, "an instruction does not make anyone a VIP"
+    # A name or a handle belongs to one person; contradictory flags are
+    # refused; an unknown id changes nobody.
+    run("update", eva["id"], max_["id"], "--name", "Twins", code=2)
+    run("update", eva["id"], "--instruction", "x", "--no-instruction", code=2)
+    run("update", eva["id"], "nobody-here", "--no-instruction", code=2)
+    assert run("show", eva["id"])["instruction"] == lea["instruction"]
+    assert run("update", eva["id"], max_["id"], "--no-instruction")[0]["instruction"] is None
+    assert "triageInstructedHandle" not in signal.read_text(encoding="utf-8")
     print("ok test_cli")
 
 
@@ -278,6 +343,7 @@ def main():
         test_create_find_update(chambers, manifest)
         test_hand_written_person(chambers, manifest)
         test_attention_and_vip(chambers, manifest)
+        test_instruction(chambers, manifest)
         test_cli(chambers, manifest)
         test_commit(tmp)
     print("all contacts checks passed")

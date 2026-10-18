@@ -159,8 +159,8 @@ version with a manual update check, and — inside
 the Android shell only — a button into the shell's own settings) live on
 `settings.html`, reached via that gear. The address book (`contacts.html`,
 `components/contacts.js`; docs/contacts.md) is the *Contacts* tab — people,
-their handles on every channel, their attention settings and the VIP flag —
-over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
+their handles on every channel, their attention settings, the VIP flag and
+the instruction their messages are worked by — over the live `/contacts` API. The outbox icon opens the gateway's `/sends`
 page, the queue of messages waiting for approval: a queue that wants action,
 one tap away from every page.
 
@@ -274,7 +274,8 @@ The API, as the components consume it:
 
 - `GET /chats` — `{generated, chats: [ChatSummary]}`, ordered by last
   activity. A `ChatSummary` is `{id, channel, account, key, name, group,
-  members?, unread, archived, muted, companion, last, draft, messages}`.
+  members?, unread, archived, muted, companion, instructed, last, draft,
+  messages}`.
 
   A chat is one peer **on one account**, and `id` names both:
   `<channel>:~<account>:<chat-key>`, or `<channel>:<chat-key>` for history
@@ -291,11 +292,16 @@ The API, as the components consume it:
   the preview `{ts, direction, author?, sender_name?, text, kind}`, `draft`
   is the shared draft `{text, author, agent?, ts, version}` or null, and
   `companion` is the conversation id of this chat's companion thread (null
-  until one exists).
+  until one exists). `instructed` is null unless a sender's standing
+  instruction applied to a message here (docs/contacts.md, "The
+  instruction"): then `{state: working|done|failed, person, instruction, vip,
+  since, finished?, verdict?: {importance, due, actions, flags}, delivery?,
+  reason?, fallback?, failure?}` for the newest such message — what the chat
+  page shows above the composer while the turn works and after.
 
   Nothing here says whether Ara works a message on arrival: that follows the
-  **sender** (their VIP flag in the triage policy), not the chat, so it holds
-  wherever that person writes. See `docs/triage-delivery-gate.md`.
+  **sender** (their VIP flag or standing instruction), not the chat, so it
+  holds wherever that person writes. See `docs/triage-delivery-gate.md`.
 
   `messages` is the URL of the chat's message document — the client follows
   it and never constructs message URLs. `archived` and `muted` carry the

@@ -673,6 +673,11 @@ def _forward_to_inbox(text: str, sender: str, store_path,
         ts=received_at,
         gate={"forward": bool(gate.get("forward")),
               "vip": bool(gate.get("vip")),
+              # The user wrote this sender a standing instruction: the rail
+              # works the message by it, and its verdict decides the ring.
+              # An SMS sender is easily spoofed, which docs/contacts.md warns
+              # about before anyone writes one an instruction.
+              "instructed": bool(gate.get("instructed")),
               "reason": str(gate.get("reason") or "")},
         handover=True, timeout=RETINUE_POST_TIMEOUT,
     )
@@ -683,8 +688,8 @@ def _forward_to_inbox(text: str, sender: str, store_path,
     if rail is not None and rail.get("accepted") is True:
         rail_job = (rail.get("job_url") or "").strip() or None
         if rail_job:
-            print(f"[sms-gateway] the chat's companion turn took the SMS from {sender} (vip)",
-                  flush=True)
+            print(f"[sms-gateway] the chat's companion turn took the SMS from {sender} "
+                  f"({'vip' if gate.get('vip') else 'instructed'})", flush=True)
             _confirm_delivery(rail_job, store_path, sender, base=_chats.CHATS_INGEST_URL)
             return
         _mark_delivered(store_path)

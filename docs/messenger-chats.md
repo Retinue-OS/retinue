@@ -415,6 +415,19 @@ and what a model turn is *for*:
    `job_url`) is kept so the gateway's `confirm_delivery` / never-drop
    machinery works unchanged.
 
+   A sender can also carry the user's **standing instruction**
+   (docs/contacts.md, "The instruction"; the gate's `instructed` flag). Their
+   message buys the same companion turn, briefed by the instruction, and the
+   turn ends with a verdict (`chat-verdict.py`): an importance and, where the
+   message has one, a deadline. For a sender who is not also a VIP the arrival
+   pushes nothing; once the turn ends, the attention model decides from the
+   verdict whether the message rings, so a draft the instruction asked for is
+   already in the composer when the push opens the chat. A turn that fails,
+   sets no verdict or runs past `CHAT_INSTRUCTION_TIMEOUT` rings the message as
+   a VIP's would be. A VIP with an instruction rings on arrival, as ever, and
+   the same single turn works the message as instructed; the chat page shows
+   that a draft is on its way, then the verdict and what the turn flagged.
+
    As built, five things are worth naming:
 
    - **The gateway asks, it does not assume.** It calls the rail

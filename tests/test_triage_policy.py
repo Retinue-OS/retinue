@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -587,6 +589,56 @@ def test_contact_owned_members():
             assert tp.load_messenger_policy("whatsapp").vip_contacts == {"+41790000003"}
             # Every read-modify-write holds the file's lock (a sibling .lock).
             assert tp.messenger_policy_path("signal").with_name("policy.nt.lock").exists()
+        finally:
+            del os.environ["TRIAGE_MESSENGER_DIR"]
+            del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]
+
+
+def test_instructed_handles():
+    """A person with a standing instruction projects as `instructed`: its own
+    class beside VIP, sender-only, replaced wholesale by a sync, kept by every
+    hand edit, and never implied by the gate switched off."""
+    with tempfile.TemporaryDirectory() as tmp:
+        os.environ["TRIAGE_MESSENGER_DIR"] = str(Path(tmp) / "messenger")
+        os.environ["TRIAGE_EMAIL_WHITELIST_PATH"] = str(Path(tmp) / "email.nt")
+        try:
+            tp.sync_contacts({"signal": {"+41790000002"}}, set(),
+                             instructed_handles={"signal": {"+41790000002", "+41790000005"},
+                                                 "sms": {"+41790000005"}})
+            pol = tp.load_messenger_policy("signal")
+            assert pol.instructed_contacts == {"+41790000002", "+41790000005"}, pol
+            text = tp.messenger_policy_path("signal").read_text(encoding="utf-8")
+            assert ('<urn:retinue:triage:signal:contacts> <https://w3id.org/retinue/kb#triageInstructedHandle> '
+                    '"+41790000005" .') in text, text
+            # The two axes are independent: VIP and instructed, instructed
+            # alone, and neither — in a group exactly as in a 1:1.
+            both = tp.gate_decision("signal", "+41790000002")
+            assert (both["vip"], both["instructed"]) == (True, True), both
+            briefed = tp.gate_decision("signal", "+41790000005", "some-group")
+            assert (briefed["vip"], briefed["instructed"]) == (False, True), briefed
+            other = tp.gate_decision("signal", "+41790000009")
+            assert (other["vip"], other["instructed"]) == (False, False), other
+            assert tp.gate_decision("sms", "+41790000005")["instructed"] is True
+            # A hand edit knows nothing of the projection and keeps it.
+            tp._mutate_messenger("signal", vip_add=["+41790000001"], q_add=["grp"])
+            assert tp.load_messenger_policy("signal").instructed_contacts == {"+41790000002", "+41790000005"}
+            # Switched off, the gate makes everyone a VIP and nobody instructed:
+            # the web gateway reads a VIP's instruction off the address book.
+            off = tp.gate_decision("signal", "+41790000005", enabled=False)
+            assert (off["vip"], off["instructed"]) == (True, False), off
+            # The CLI's check says so on a line of its own.
+            proc = subprocess.run([sys.executable, str(SCRIPT), "check-handle", "--channel", "signal",
+                                   "+41790000005"], capture_output=True, text=True, env=os.environ)
+            assert proc.stdout.split() == ["not-vip", "instructed"], proc.stdout
+            # A sync without instructed handles clears the class only.
+            tp.sync_contacts({"signal": {"+41790000002"}}, set())
+            pol = tp.load_messenger_policy("signal")
+            assert pol.instructed_contacts == set() and pol.vip_contacts == {"+41790000002"}, pol
+            assert pol.vip == {"+41790000001"}, pol
+            # Another channel's projection gets its directory only when it has
+            # members, as VIPs do.
+            tp.sync_contacts({}, set(), instructed_handles={"telegram": {"@lea_graf"}})
+            assert tp.load_messenger_policy("telegram").instructed_contacts == {"@lea_graf"}
         finally:
             del os.environ["TRIAGE_MESSENGER_DIR"]
             del os.environ["TRIAGE_EMAIL_WHITELIST_PATH"]

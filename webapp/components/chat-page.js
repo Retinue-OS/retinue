@@ -63,7 +63,7 @@ import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visib
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
-import { openAttentionSheet } from './attention-sheet.js';
+import { openAttentionSheet, instructedSummary } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 // Registers <retinue-conversation>, the companion pane (see _companionHtml).
 // The chat mirror renders no Markdown of its own — what other people sent is
@@ -574,6 +574,11 @@ class RetinueChatPage extends HTMLElement {
           }
         }
       }
+      // A standing instruction working on the newest message — "a draft may
+      // be on its way", then what it did and flagged — updates its own line
+      // in place; a send since then retires it (_instructedFresh).
+      if (doc.chat) this._chat.instructed = doc.chat.instructed || null;
+      this._refreshInstructed();
     } catch (_err) {
       // Offline or store blip: keep the last rendered state; the next poll
       // reconciles.
@@ -1225,6 +1230,7 @@ class RetinueChatPage extends HTMLElement {
     return `<div class="composer">` +
       `<div class="chips" role="toolbar" aria-label="Quick patterns">${chips}</div>` +
       `<div class="note" data-note role="status" hidden></div>` +
+      this._instructedHtml() +
       draftTag +
       this._imgPreviewsHtml() +
       this._errRowHtml('chat') +
@@ -1474,6 +1480,41 @@ class RetinueChatPage extends HTMLElement {
   // Rebuild only the chat composer block (chips, previews, error line, input
   // row) in place — never the thread, whose scroll position and playing media
   // a full render would reset.
+  // The line a sender's standing instruction puts above the composer
+  // (docs/contacts.md, "The instruction"): while its turn works, that a draft
+  // may be on its way — the message has perhaps not rung yet, and the user
+  // who opened the chat anyway should not start typing over it; once done,
+  // the verdict, what the turn did, and anything it flagged.
+  _instructedHtml() {
+    const s = this._instructedFresh() ? instructedSummary(this._chat && this._chat.instructed) : null;
+    if (!s) return '<div class="instructed" data-instructed hidden></div>';
+    return `<div class="instructed${s.state === 'working' ? ' working' : ''}" data-instructed role="status">` +
+      `<div class="ins-head">&#9998; ${esc(s.head)}</div>` +
+      s.lines.map((l) => `<div>${esc(l)}</div>`).join('') +
+      s.flags.map((f) => `<div class="flag">&#9873; ${esc(f)}</div>`).join('') +
+      `</div>`;
+  }
+
+  // Worth showing: while the turn works, and afterwards until the user has
+  // sent something — by then they have dealt with it.
+  _instructedFresh() {
+    const ins = this._chat && this._chat.instructed;
+    if (!ins || !ins.state) return false;
+    if (ins.state === 'working') return true;
+    const since = ins.finished || ins.since;
+    if (!since) return true;
+    return !this._messages.some((m) => m && m.direction === 'out' && tsAfter(m.ts, since));
+  }
+
+  _refreshInstructed() {
+    const el = this.shadowRoot && this.shadowRoot.querySelector('[data-instructed]');
+    if (!el) return;
+    const tpl = document.createElement('template');
+    tpl.innerHTML = this._instructedHtml();
+    const next = tpl.content.firstElementChild;
+    if (next.outerHTML !== el.outerHTML) el.replaceWith(next);
+  }
+
   _refreshChatComposer() {
     const el = this.shadowRoot.querySelector('.pane-chat .composer');
     if (!el) { this.render(); return; }
@@ -2363,6 +2404,11 @@ const CSS = `
            -webkit-tap-highlight-color: transparent; }
   .qchip:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .note { color: var(--muted, #8b93a3); font-size: .76rem; font-style: italic; margin-bottom: 8px; }
+  .instructed { font-size: .76rem; color: var(--muted, #8b93a3); margin-bottom: 8px; padding: 4px 10px;
+                border-left: 2px solid var(--accent, #6ea8fe); line-height: 1.4; }
+  .instructed .ins-head { color: var(--fg, #e7ebf2); font-weight: 600; }
+  .instructed.working .ins-head::after { content: ' …'; }
+  .instructed .flag { color: #f5c542; }
   .draft-tag { display: inline-flex; align-items: center; gap: 6px; margin-bottom: 8px;
                padding: 3px 10px; border-radius: 999px; border: 1px solid var(--accent, #6ea8fe);
                background: rgba(110, 168, 254, .12); color: var(--accent, #6ea8fe);

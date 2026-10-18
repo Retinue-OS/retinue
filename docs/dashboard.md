@@ -131,15 +131,20 @@ a chamber ([contacts.md](contacts.md)). A new person needs the chamber it is
 kept in (a dropdown, pre-selecting the chamber the last contact was created in);
 the card also offers, one tap each, anyone the book already has for this handle
 or for the same number on another channel, and a change to a person reaches
-every chat of theirs. The card also carries the person's VIP switch. An empty
+every chat of theirs. The card also carries the person's VIP switch and their
+**instruction** — the standing brief a model works each of their messages by,
+whose verdict decides how loudly the message rings (docs/contacts.md, "The
+instruction"); *Copy from…* takes one another person carries. An empty
 name unlinks the handle — the person stays — and puts the sender back into
-screening.
+screening. For a chat whose newest message an instruction worked, the sheet
+shows an *Instruction* field: the turn's state, its verdict, what it did and
+what it flagged.
 
 The **Contacts page** (`contacts.html`, the *Contacts* tab of the navigation
 row) is the address book itself: every person, searchable by name
 and e-mail address, each editable in place — their handles on every channel,
-their spheres, importance prior, the Focus modes they may interrupt, and the VIP
-flag. A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
+their spheres, importance prior, the Focus modes they may interrupt, the VIP
+flag and the instruction (with *Copy instruction from…*, for a team). A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone

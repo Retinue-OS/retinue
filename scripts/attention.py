@@ -291,6 +291,11 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "sender": a.get("sender") or doc.get("sender"),
         "critical": bool(a.get("critical")),
         "vip": bool(a.get("vip")),
+        # Why a chat rings as a VIP's would: None for a VIP proper,
+        # "instruction" when the turn an instruction asked for did not finish
+        # in time and the message was rung rather than held back (the
+        # instructed rail's failure rule, docs/contacts.md).
+        "vip_from": a.get("vip_from"),
         "state": a.get("state") or ("done" if doc.get("archived") else "open"),
         "released": bool(a.get("released", False)),
         "snoozed_until": parse_dt(a.get("snoozed_until")),
@@ -315,6 +320,7 @@ def item_to_attention(item: dict) -> dict:
         "kind": item.get("kind_label"),
         "actor": item.get("actor"), "waiting_since": iso(item.get("waiting_since")), "sender": item.get("sender"),
         "critical": bool(item.get("critical")), "vip": bool(item.get("vip")),
+        "vip_from": item.get("vip_from"),
         "state": item.get("state", "open"), "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "boost": int(item.get("boost", 0)), "last_level": item.get("last_level"),
         "pushed": [iso(x) for x in item.get("pushed") or []], "pulled": bool(item.get("pulled", False)),
@@ -762,6 +768,8 @@ def mode_label(mode: dict) -> str:
 def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> str:
     if level(item, now) == "critical":
         return "critical rings in every mode"
+    if item.get("vip") and item.get("vip_from") == "instruction":
+        return "the turn your instruction asked for did not finish — rung rather than held"
     if item.get("vip"):
         return f"{item.get('sender') or 'the sender'} is a VIP"
     if about_project(item, mode.get("project")):
