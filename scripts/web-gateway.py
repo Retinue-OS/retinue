@@ -6703,7 +6703,7 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
     ``vip`` whether the sender is also a VIP. ``ring`` is set for a message
     whose ring waits on this turn — an instructed sender who is not a VIP —
     and carries what delivering it needs later (``had_unread``, and the
-    chat's ``last_read`` at arrival, which tells whether the user has read
+    chat's ``read_seq`` at arrival, which tells whether the user has read
     the message by then: _instructed_read_since); the ring is
     registered here, with its timeout, under the same lock that mints the
     job, so a repeated delivery of one message never registers a second."""
@@ -6760,7 +6760,7 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
             timer.daemon = True
             _INSTRUCTED_RINGS[job_id] = {"chat_id": chat_id, "entry": dict(entry),
                                          "had_unread": bool(ring.get("had_unread")),
-                                         "last_read": ring.get("last_read"),
+                                         "read_seq": int(ring.get("read_seq") or 0),
                                          "timer": timer, "job": job_id}
             arrival["ring"] = job_id
             timer.start()
@@ -6955,14 +6955,16 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
 def _instructed_read_since(doc: dict, ring: dict) -> bool:
     """Whether the user caught up on the chat past a held arrival while its
     turn worked: opened it, or answered from the composer or their phone —
-    each advances the read watermark past it. A message the watermark was
-    already past when it arrived — delivered late, stamped before an earlier
-    read — counts as seen only once the watermark has moved since."""
+    each a read since the arrival (``read_seq`` moved) that leaves the
+    watermark at or past the message. Counted by reads rather than by the
+    watermark moving, which keeps whole seconds: a message delivered late,
+    stamped behind a read the watermark already holds, is seen by the next
+    read even when that read falls in the same second."""
     last = doc.get("last_read")
-    if not last or "last_read" not in ring:
+    if not last or "read_seq" not in ring:
         return False
-    ts, before = ring["entry"].get("ts") or "", ring["last_read"]
-    return last >= ts and (not before or before < ts or last > before)
+    return (last >= (ring["entry"].get("ts") or "")
+            and int(doc.get("read_seq") or 0) > ring["read_seq"])
 
 
 def _attention_note_verdict(chat_id: str, verdict: dict) -> None:
@@ -10501,7 +10503,7 @@ class Handler(BaseHTTPRequestHandler):
                     # One turn, whichever the sender is: a VIP's, briefed by
                     # their instruction when they carry one, or an instructed
                     # sender's, whose ring waits on it.
-                    ring = ({"had_unread": had_unread, "last_read": doc.get("last_read")}
+                    ring = ({"had_unread": had_unread, "read_seq": doc.get("read_seq")}
                             if defer and not quiet else None)
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"), person=person,

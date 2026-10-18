@@ -246,6 +246,11 @@ class ChatStateStore:
             "account": parts[1],
             "key": parts[2],
             "last_read": None,
+            # How many reads advance_last_read has taken, whether or not the
+            # watermark moved: a read is an event even when its whole-second
+            # mark equals the one held (see the web gateway's
+            # _instructed_read_since).
+            "read_seq": 0,
             "draft": None,
             # What the newest clear removed, kept so it can be put back exactly
             # — see set_draft and undo_clear. None when nothing is recoverable.
@@ -519,6 +524,7 @@ class ChatStateStore:
             doc = self._read(chat_id)
             if doc["last_read"] is None or mark > doc["last_read"]:
                 doc["last_read"] = mark
+            doc["read_seq"] = int(doc.get("read_seq") or 0) + 1
             if doc.get("unread_since") and doc["last_read"] >= doc["unread_since"]:
                 doc["unread_since"] = None
             self._write(doc)

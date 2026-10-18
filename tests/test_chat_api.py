@@ -1589,6 +1589,33 @@ def test_instructed_arrival(base, wg):
         assert wg._CHAT_STATE.get(chat)["attention"]["state"] == "done", \
             f"the {late} reopened an item the reply settled"
 
+    # A message delivered late — stamped behind a read the watermark already
+    # holds — and read while the turn works, by a read whose whole-second
+    # mark equals the one held: the watermark cannot move, the read still
+    # counts.
+    mark = int(time.time()) + 20
+    status, _ = _http(base, "POST", rail,
+                      {"direction": "out", "channel": "telegram", "chat": "888001",
+                       "author": "device", "message_id": "late-mark", "text": "Ok.", "ts": mark})
+    assert status == 200
+    hold = threading.Event()
+    PUSHES.clear()
+    TURN_GATE.update(hold=hold, during=verdict(5))
+    try:
+        status, body = _http(base, "POST", rail,
+                             dict(event, message_id="late-1", text="Noch da?", ts=mark - 5))
+        assert status == 202 and body["pushed"] is False, body
+        _wait_for(lambda: (summary().get("instructed") or {}).get("message_id") == "late-1",
+                  "the turn to be noted")
+        status, _ = _http(base, "POST", f"/chats/{_quote(chat)}/read", {"ts": mark})
+        assert status == 200
+    finally:
+        hold.set()
+        TURN_GATE.update(hold=None, during=None)
+    _await_job(base, body["job_url"])
+    assert PUSHES == [], "a late message read in the watermark's own second rang"
+    assert summary()["instructed"]["delivery"] == "seen", summary()["instructed"]
+
     # A VIP with an instruction: rung on arrival, one turn briefed by the
     # instruction, and the verdict rings nothing more.
     PUSHES.clear()
