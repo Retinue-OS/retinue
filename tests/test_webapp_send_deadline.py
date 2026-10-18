@@ -18,6 +18,10 @@ that never answers:
   again counts as delivered — nothing is left to send twice;
 - a typed turn that times out keeps its words, once, without a bubble;
 - a send that fails outright (host unreachable, a refused status) says so;
+- a first turn into a thread the host mints (a chat's companion, which may
+  hold that turn already) is checked against what the thread held, both ways;
+- a dictation sent off screen gets the same re-read, and a note when kept;
+- a kept turn is matched to what was kept, never to the user's own words;
 - a read that never answers is given up too, so the poll goes on.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
@@ -108,8 +112,11 @@ async function until(cond, what) {
 
 // ── The gateway: threads that answer reads, and a reply POST that never does ─
 const A = 'a'.repeat(32), B = 'b'.repeat(32), C = 'c'.repeat(32), D = 'd'.repeat(32), E = 'e'.repeat(32);
+// F is a chat's companion, minted by the host (idempotent: it may hold turns
+// already); G is a thread a dictation is sent into while it is off screen.
+const F = 'f'.repeat(32), G = '0'.repeat(32);
 const threads = {};
-for (const id of [A, B, C, D, E]) {
+for (const id of [A, B, C, D, E, F, G]) {
   threads[id] = { id, title: 'Judith', pending: false, model: '', messages: [
     { role: 'user', text: 'Earlier question', ts: '2026-10-16T15:40:00Z' },
     { role: 'assistant', text: 'Earlier answer', ts: '2026-10-16T15:41:00Z' },
@@ -121,6 +128,8 @@ let hangReads = false;
 // How a reply POST fails at once instead of hanging: 'network' (no answer at
 // all, as when the browser cannot reach the host) or an HTTP status.
 let failWith = null;
+// What a dictation transcribes to.
+let transcript = '';
 const never = (opts) => new Promise((_resolve, reject) => {
   if (opts && opts.signal) opts.signal.addEventListener('abort', () => reject(new Error('AbortError')));
 });
@@ -139,6 +148,8 @@ globalThis.fetch = (url, opts = {}) => {
     return never(opts);
   }
   if (url === '/conversation-models') return answer({ models: [] });
+  if (url === '/chats/x/companion' && method === 'POST') return answer({ id: F });
+  if (url.startsWith('/conversations/transcribe') && method === 'POST') return answer({ text: transcript });
   return answer({});
 };
 
@@ -219,6 +230,79 @@ await ok('a send that fails outright says why, and keeps its words', async () =>
   await el._send('Bis morgen');
   assert.match(el._attachError, /refused the message \(502\)/, 'a refusal names its status');
   failWith = null;
+});
+
+await ok("a first turn into a host's thread is checked against what that thread held", async () => {
+  // The companion already holds this very turn from an earlier press, so a
+  // count from an empty thread would be wrong both ways.
+  threads[F].messages.push({ role: 'user', text: 'Proofread my draft before I send it.', ts: '2026-10-17T09:00:00Z' });
+  const fresh = () => {
+    const el = new Conv();
+    el._attrs.set('create-url', '/chats/x/companion');
+    el._attrs.set('no-autofocus', '');
+    el.connectedCallback();
+    return el;
+  };
+  // Stored, its answer lost: the thread holds it once more — delivered.
+  let el = fresh();
+  let n = posts.length;
+  land = true;
+  let sent = el.ask('Proofread my draft before I send it.');
+  await until(() => posts.length === n + 1, 'the turn went on the wire');
+  expire();
+  await sent;
+  land = false;
+  assert.equal(el._attachError, '', 'the thread holds it once more: it went out');
+  assert.ok(!draftText(el).includes('Proofread'), 'nothing is left to send twice');
+  // Not stored: the thread holds it no more often than before — kept.
+  el = fresh();
+  n = posts.length;
+  sent = el.ask('Proofread my draft before I send it.');
+  await until(() => posts.length === n + 1, 'the turn went on the wire');
+  expire();
+  await sent;
+  assert.match(el._attachError, /No answer from the server/, 'not taken for delivered');
+  assert.equal(draftText(el).split('Proofread my draft').length - 1, 1, 'the turn is kept, once');
+});
+
+await ok('a dictation sent off screen is checked against the thread, and says why it was kept', async () => {
+  const el = await mount(A);
+  const dictate = (words) => {
+    transcript = words;
+    el._recChunks = [new Blob(['audio'], { type: 'audio/webm' })];
+    el._recIntent = 'send';
+    return el._onRecordingStopped(G, null, '', null);
+  };
+  // Stored, its answer lost: delivered, nothing left in G's draft.
+  let n = posts.length;
+  land = true;
+  let job = dictate('Ruf mich morgen an.');
+  await until(() => posts.length === n + 1, 'the dictation went on the wire');
+  expire();
+  await job;
+  land = false;
+  const g = await mount(G);
+  assert.ok(!draftText(g).includes('Ruf mich'), 'a stored dictation is not kept for a second send');
+  g.disconnectedCallback();
+  // Not stored: kept in the draft, with the note saying so.
+  n = posts.length;
+  job = dictate('Bis später.');
+  await until(() => posts.length === n + 1, 'the dictation went on the wire');
+  expire();
+  await job;
+  const h = await mount(G);
+  assert.equal(draftText(h), 'Bis später.', 'the dictation is kept for a retry');
+  assert.ok(h.shadowRoot.innerHTML.includes('No answer from the server'), 'and the composer says why');
+});
+
+await ok("a kept turn is matched to what was kept, not to the user's own words", async () => {
+  const el = await mount(B);
+  el.fill('Please proofread this draft');
+  el._keepUnsent(B, 'proofread this draft', false);
+  assert.equal(draftText(el), 'Please proofread this draft proofread this draft',
+    "words of the user's that contain the turn do not swallow it");
+  el._keepUnsent(B, 'proofread this draft', false);
+  assert.equal(draftText(el), 'Please proofread this draft proofread this draft', 'kept once');
 });
 
 await ok('a read that never answers is given up, so the poll goes on', async () => {

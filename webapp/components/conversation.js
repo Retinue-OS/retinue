@@ -1779,10 +1779,11 @@ class RetinueConversation extends HTMLElement {
     }
     const sent = { text, files: fromDraft ? d.files.slice() : [], fromDraft };
     // How often the thread held these words before they went: a send that
-    // times out is checked against it (see arrivedAnyway). Only for the
-    // thread on screen — a first message has no thread to read yet.
+    // times out is checked against it (see arrivedAnyway). Counted from the
+    // thread on screen where there is one; otherwise read once the target is
+    // known, below.
     const before = (!isNewKey(key) && this._thread && String(this._thread.id) === key)
-      ? sameTurns(this._thread, text) : -1;
+      ? sameTurns(this._thread, text) : null;
     SENDS.set(key, sent);
     // The composer locks now, not once the send is over: nothing typed or
     // picked meanwhile can be lost to the clear below, and a composer
@@ -1804,8 +1805,9 @@ class RetinueConversation extends HTMLElement {
       // rather than return, so there is ONE way out of a turn that did not go
       // and no exit can forget what it owes the composer.
       const target = await targetFor(key, this.getAttribute('create-url'), this._newModel);
+      const base = before !== null ? before : await turnsBefore(target, text);
       const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel)
-        .catch((err) => arrivedAnyway(err, target, text, before));
+        .catch((err) => arrivedAnyway(err, target, text, base));
       delivered = true;
       if (fromDraft) clearSent(d, text, sent.files);
       this._attachError = '';
@@ -1840,22 +1842,9 @@ class RetinueConversation extends HTMLElement {
         landed = target;
       }
     } catch (err) {
-      // Why it turned back, in words the user can act on: a thread that could
-      // not be started asks for a retry, a model that would not store asks for
-      // the pick again, a send that got no answer says it may still turn up,
-      // and one the server refused or could not be reached for says so. Words
-      // back in the box with nothing said read as a send button that does
-      // nothing: with the dashboard unreachable, every press looked dead.
-      const why = String((err && err.message) || '');
-      const note = why === 'mint' ? "Couldn't start this conversation. Please try again."
-        : why === 'model' ? "The model choice wasn't saved. Please pick it again."
-        : why === 'timeout' ? "No answer from the server. The message is back in the box — "
-          + "if it doesn't show up above, send it again."
-        : /^\d{3}$/.test(why) ? `The server refused the message (${why}). It is still in the box.`
-        : "Couldn't reach the server. The message is still in the box — "
-          + 'send it again once the dashboard is reachable.';
+      // Why it turned back, in words the user can act on (sendFailureNote).
       const el = this._liveFor(key);
-      if (el) el._attachError = note;
+      if (el) el._attachError = sendFailureNote(err);
       this._keepUnsent(key, text, fromDraft);
       // A turn that did not go out has no answer coming: the loop stops.
       this._contDisengage();
@@ -1977,9 +1966,16 @@ class RetinueConversation extends HTMLElement {
   // tapped during another send from vanishing without trace.
   _keepUnsent(key, text, fromDraft) {
     if (fromDraft) return;
-    // Words already in the box (the same chip pressed while its first press
-    // was on the wire, which then failed) go in once.
-    if (!draftOf(key).text.includes(text.trim())) appendToDraft(key, text);
+    // A turn this already kept, and still in the box (the same chip pressed
+    // twice while another send was on the wire), goes in once. Matched
+    // against what was kept, never against what the user typed: words of
+    // theirs that happen to contain the turn are not the turn.
+    const d = draftOf(key);
+    const kept = d.kept || (d.kept = []);
+    if (!(kept.includes(text) && d.text.includes(text.trim()))) {
+      appendToDraft(key, text);
+      kept.push(text);
+    }
     const el = this._liveFor(key);
     if (el) { el._focusNext = true; el.render(); }
   }
@@ -2242,7 +2238,12 @@ class RetinueConversation extends HTMLElement {
             throw err;
           }
           const sentFiles = draftOf(key).files.slice();
-          const conv = await sendMessage(target, toSend, sentFiles, seed, model);
+          // As in _send: a send that times out is checked against the thread
+          // before the dictation is kept, or a retry would run it twice.
+          const before = await turnsBefore(target, toSend);
+          const conv = await sendMessage(target, toSend, sentFiles, seed, model)
+            .catch((err) => arrivedAnyway(err, target, toSend, before))
+            .catch((err) => { VOICE_ERRORS.set(key, sendFailureNote(err)); throw err; });
           clearSent(draftOf(key), toSend, sentFiles);
           const now = live();
           if (isNewKey(key)) {
@@ -2906,15 +2907,50 @@ function sameTurns(t, text) {
 // is rethrown as it came.
 async function arrivedAnyway(err, id, text, before) {
   if (!err || err.message !== 'timeout' || !id || before < 0) throw err;
-  let t = null;
+  const t = await readThread(id);
+  if (t && sameTurns(t, text) > before) return t;
+  throw err;
+}
+
+// Thread `id` as the server holds it now, or null: refused, or no answer
+// within the deadline.
+async function readThread(id) {
   try {
-    t = await within(REQUEST_TIMEOUT_MS, async (signal) => {
+    return await within(REQUEST_TIMEOUT_MS, async (signal) => {
       const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store', signal });
       return res.ok ? res.json() : null;
     });
-  } catch (_e) { /* not known: the timeout stands */ }
-  if (t && sameTurns(t, text) > before) return t;
-  throw err;
+  } catch (_e) {
+    return null;
+  }
+}
+
+// sameTurns for a thread not on screen — a first turn into a thread the host
+// minted (a chat's companion may hold turns already), or a dictation sent
+// off screen — read from the server; -1 when there is no thread to read (a
+// first message posted to the list) or the read fails, which arrivedAnyway
+// takes as "not known".
+async function turnsBefore(id, text) {
+  if (!id) return -1;
+  const t = await readThread(id);
+  return t ? sameTurns(t, text) : -1;
+}
+
+// Why a turn turned back, in words the user can act on: a thread that could
+// not be started asks for a retry, a model that would not store asks for the
+// pick again, a send that got no answer says it may still turn up, and one
+// the server refused or could not be reached for says so. Words back in the
+// box with nothing said read as a send button that does nothing: with the
+// dashboard unreachable, every press looked dead.
+function sendFailureNote(err) {
+  const why = String((err && err.message) || '');
+  return why === 'mint' ? "Couldn't start this conversation. Please try again."
+    : why === 'model' ? "The model choice wasn't saved. Please pick it again."
+    : why === 'timeout' ? "No answer from the server. The message is back in the box — "
+      + "if it doesn't show up above, send it again."
+    : /^\d{3}$/.test(why) ? `The server refused the message (${why}). It is still in the box.`
+    : "Couldn't reach the server. The message is still in the box — "
+      + 'send it again once the dashboard is reachable.';
 }
 
 async function sendMessage(id, text, files, seed, model) {
