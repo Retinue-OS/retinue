@@ -39,8 +39,10 @@ the ontology defaults (docs/ontology.md):
   ``dcterms:created``; spheres as ``kb:sphere`` / ``kb:tag`` pointing at
   ``urn:retinue:sphere:<word>``; what the attention model knows about them —
   their importance prior (``kb:importance``, 0–5) and the Focus modes they may
-  interrupt (``kb:permit <urn:retinue:mode:<id>>``); and whether they are a
+  interrupt (``kb:permit <urn:retinue:mode:<id>>``); whether they are a
   VIP (``kb:vip true``), whose messages a model works the moment they arrive;
+  and the user's standing **instruction** for them (``kb:instruction``, free
+  text), the brief a model works each of their messages by;
 - each messaging-service handle: a ``foaf:OnlineAccount`` linked by
   ``foaf:account``, with ``foaf:accountName``, ``foaf:accountServiceHomepage``
   and ``kb:channel`` (the literal the message ledger carries, so an account
@@ -69,6 +71,7 @@ Command line (agents)::
     contacts.py add --chamber private --name "Mara Keller" --email mara@example.org
     contacts.py update <id> --add-handle whatsapp:+41791234567
     contacts.py update <id> --vip --importance 4 --permit focused
+    contacts.py update <id> <id> --instruction "Draft a reply; ring if it is about today."
 
 Writes are committed and pushed in the owning chamber (best effort, like the
 dashboard's project edits).
@@ -128,6 +131,10 @@ _EMAIL_RE = re.compile(r"^[^@\s<>\"]+@[^@\s<>\"]+$")
 
 _HEADER = ("# Contact managed by scripts/contacts.py (docs/contacts.md).\n"
            "# Lines it did not write are kept on every rewrite: add your own freely.\n")
+
+# An instruction is a brief, not a document: it rides in every prompt a
+# message of this person's buys, so it is kept to what a brief needs.
+INSTRUCTION_MAX = 2000
 
 
 class ContactError(ValueError):
@@ -280,6 +287,8 @@ def _person_triples(record: dict) -> set[tuple[str, str, str]]:
         out.add((s, _iri(KB + "permit"), _iri(MODE_PREFIX + urllib.parse.quote(mode, safe=""))))
     if record.get("vip"):
         out.add((s, _iri(KB + "vip"), _lit("true", XSD_BOOLEAN)))
+    if record.get("instruction"):
+        out.add((s, _iri(KB + "instruction"), _lit(record["instruction"])))
     for address in record.get("emails") or []:
         out.add((s, _iri(VCARD + "hasEmail"), _iri("mailto:" + address)))
     for number in record.get("phones") or []:
@@ -312,7 +321,7 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
             continue
         record = {"iri": iri, "name": "", "sphere": None, "tags": [], "emails": [],
                   "phones": [], "accounts": [], "created": None, "importance": None,
-                  "permits": [], "vip": False}
+                  "permits": [], "vip": False, "instruction": None}
         tels = []
         for p, o in sorted(props):
             pred = _iri_value(p)
@@ -333,6 +342,8 @@ def _records_from(triples, path: Path, chamber: str, rel: str) -> list[dict]:
                 record["permits"].append(urllib.parse.unquote(_iri_value(o)[len(MODE_PREFIX):]))
             elif pred == KB + "vip":
                 record["vip"] = (_lit_value(o) or "").strip().lower() in ("true", "1")
+            elif pred == KB + "instruction" and not record["instruction"]:
+                record["instruction"] = (_lit_value(o) or "").strip() or None
             elif pred == VCARD + "hasEmail" and (_iri_value(o) or "").lower().startswith("mailto:"):
                 record["emails"].append(_iri_value(o)[7:].lower())
             elif pred == VCARD + "hasTelephone" and (_iri_value(o) or "").lower().startswith("tel:"):
@@ -377,6 +388,17 @@ def _importance(value) -> float | None:
     return number
 
 
+def _instruction(value) -> str | None:
+    """A standing instruction as the person keeps it: the user's own words,
+    trimmed, or None for none."""
+    if value is None:
+        return None
+    text = str(value).replace("\r\n", "\n").strip()
+    if len(text) > INSTRUCTION_MAX:
+        raise ContactError(f"an instruction is at most {INSTRUCTION_MAX} characters, not {len(text)}")
+    return text or None
+
+
 def _modes(values) -> list[str]:
     out = set()
     for value in values or ():
@@ -401,7 +423,8 @@ def public(record: dict) -> dict:
             "sphere": record.get("sphere"), "tags": list(record.get("tags") or []),
             "handles": handles_of(record), "phones": list(record.get("all_phones") or []),
             "importance": record.get("importance"), "permits": list(record.get("permits") or []),
-            "vip": bool(record.get("vip")), "created": record.get("created")}
+            "vip": bool(record.get("vip")), "instruction": record.get("instruction") or None,
+            "created": record.get("created")}
 
 
 def _slug(name: str) -> str:
@@ -589,7 +612,7 @@ class ContactBook:
 
     def create(self, chamber: str, name: str, handles=(), *, sphere: str | None = None,
                tags=(), created: str | None = None, importance=None, permits=(),
-               vip: bool = False) -> dict:
+               vip: bool = False, instruction: str | None = None) -> dict:
         name = " ".join(str(name or "").split())
         if not name:
             raise ContactError("a contact needs a name")
@@ -605,7 +628,8 @@ class ContactBook:
             uid = str(uuid.uuid4())
             record = _blank(PERSON_PREFIX + uid, name, sphere, tags,
                             created or datetime.now(timezone.utc).replace(microsecond=0).isoformat())
-            record.update(importance=_importance(importance), permits=_modes(permits), vip=bool(vip))
+            record.update(importance=_importance(importance), permits=_modes(permits), vip=bool(vip),
+                          instruction=_instruction(instruction))
             for pair in pairs:
                 _add_pair(record, pair)
             path = loc["dir"] / f"{_slug(name)}-{uid[:8]}.nt"
@@ -614,9 +638,10 @@ class ContactBook:
 
     def update(self, key: str, *, name: str | None = None, sphere: str | None | bool = False,
                tags=None, add=(), remove=(), importance=False, permits=None,
-               vip: bool | None = None) -> dict:
-        """Change a person. ``sphere=False`` / ``importance=False`` leave the
-        field; None clears it. ``tags`` / ``permits`` None leave them."""
+               vip: bool | None = None, instruction: str | None | bool = False) -> dict:
+        """Change a person. ``sphere=False`` / ``importance=False`` /
+        ``instruction=False`` leave the field; None (or an empty instruction)
+        clears it. ``tags`` / ``permits`` None leave them."""
         with self._lock:
             old = self.get(key)
             if old is None:
@@ -637,6 +662,8 @@ class ContactBook:
                 new["permits"] = _modes(permits)
             if vip is not None:
                 new["vip"] = bool(vip)
+            if instruction is not False:
+                new["instruction"] = _instruction(instruction)
             for channel, handle in (normalize_handle(c, h) for c, h in remove):
                 _remove_pair(new, (channel, handle))
             for channel, handle in (normalize_handle(c, h) for c, h in add):
@@ -670,7 +697,7 @@ def _blank(iri, name, sphere, tags, created) -> dict:
     return {"iri": iri, "name": name, "sphere": sphere,
             "tags": sorted({str(t).strip().lower() for t in tags if str(t).strip()} - {sphere}),
             "emails": [], "phones": [], "accounts": [], "created": created,
-            "importance": None, "permits": [], "vip": False}
+            "importance": None, "permits": [], "vip": False, "instruction": None}
 
 
 def _copy(record: dict) -> dict:
@@ -699,6 +726,21 @@ def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
 
 # ── The delivery gate ───────────────────────────────────────────────────────
 
+def _gate_handles(record: dict):
+    """Every messenger handle of one person as the delivery gate compares it:
+    their accounts, and their telephones for SMS."""
+    for channel, handle in record.get("accounts") or []:
+        # Filed handles predate some normalization rules; project the
+        # current form, which is the one the gateways deliver.
+        try:
+            channel, handle = normalize_handle(channel, handle)
+        except ContactError:
+            pass
+        yield channel, handle
+    for number in record.get("all_phones") or []:
+        yield SMS, number
+
+
 def policy_projection(book: ContactBook) -> tuple[dict[str, set[str]], set[str]]:
     """What the address book's VIP persons mean to the triage delivery gate:
     the handles of each on every messenger channel (their telephones count
@@ -709,18 +751,42 @@ def policy_projection(book: ContactBook) -> tuple[dict[str, set[str]], set[str]]
     for record in book.all():
         if not record.get("vip"):
             continue
-        for channel, handle in record.get("accounts") or []:
-            # Filed handles predate some normalization rules; project the
-            # current form, which is the one the gateways deliver.
-            try:
-                channel, handle = normalize_handle(channel, handle)
-            except ContactError:
-                pass
+        for channel, handle in _gate_handles(record):
             handles.setdefault(channel, set()).add(handle)
-        for number in record.get("all_phones") or []:
-            handles.setdefault(SMS, set()).add(number)
         emails |= set(record.get("emails") or [])
     return handles, emails
+
+
+def instruction_projection(book: ContactBook) -> dict[str, set[str]]:
+    """The messenger handles of every person the user wrote an instruction
+    for — the gate's ``instructed`` class: each message of theirs buys a turn
+    with the instruction as its brief. Only the handle reaches the gate; the
+    words stay with the person, where the turn reads them
+    (:func:`instructed_person`)."""
+    handles: dict[str, set[str]] = {}
+    for record in book.all():
+        if record.get("instruction"):
+            for channel, handle in _gate_handles(record):
+                handles.setdefault(channel, set()).add(handle)
+    return handles
+
+
+def instructed_person(book: ContactBook, channel: str, handle: str) -> dict | None:
+    """The person whose instruction applies to a message from this handle, or
+    None. Matched exactly as the gate matched it — the projected form,
+    compared case-insensitively — so a message the gate called instructed
+    finds the instruction it was called that for."""
+    try:
+        channel, handle = normalize_handle(channel, handle)
+    except ContactError:
+        return None
+    want = (channel, handle.strip().lower())
+    for record in book.all():
+        if not record.get("instruction"):
+            continue
+        if any((c, h.strip().lower()) == want for c, h in _gate_handles(record)):
+            return record
+    return None
 
 
 def sync_policy(book: ContactBook) -> list[str]:
@@ -728,7 +794,8 @@ def sync_policy(book: ContactBook) -> list[str]:
     contact-owned members). Idempotent and write-if-changed; returns the
     files it wrote."""
     import triage_policy
-    return triage_policy.sync_contacts(*policy_projection(book))
+    return triage_policy.sync_contacts(*policy_projection(book),
+                                       instructed_handles=instruction_projection(book))
 
 
 # ── Committing ──────────────────────────────────────────────────────────────
@@ -779,6 +846,8 @@ def _print(args, value) -> None:
                                     + (["VIP"] if row.get("vip") else [])))
         note = " [same phone number, other channel]" if row.get("match") == "phone" else ""
         print(f"[{row['id']}] {row['name']} ({row['chamber']}){' — ' + spheres if spheres else ''}{note}\n    {handles}")
+        if row.get("instruction"):
+            print("    instruction: " + " ".join(row["instruction"].split()))
 
 
 def main(argv=None) -> int:
@@ -807,11 +876,18 @@ def main(argv=None) -> int:
                        help="a Focus mode id they may interrupt (repeatable; replaces on update)")
         p.add_argument("--vip", action=argparse.BooleanOptionalAction, default=None,
                        help="a model works their messages the moment they arrive, on every channel")
+        p.add_argument("--instruction",
+                       help="the user's standing brief for their messages: a model works each one "
+                            "by it, and its verdict decides whether the message rings")
+        p.add_argument("--instruction-from", metavar="ID",
+                       help="copy the instruction another contact carries")
     p_add.add_argument("--chamber", required=True, help="the chamber the contact is stored in")
     p_add.add_argument("--email", action="append", default=[])
     p_add.add_argument("--phone", action="append", default=[], help="a telephone (also reachable by SMS)")
     p_add.add_argument("--handle", action="append", default=[], help="channel:handle (repeatable)")
-    p_upd.add_argument("id")
+    p_upd.add_argument("id", nargs="+",
+                       help="the contact; several to give a team the same facts (no name or handle changes then)")
+    p_upd.add_argument("--no-instruction", action="store_true", help="remove the instruction")
     p_upd.add_argument("--add-handle", action="append", default=[], help="channel:handle; email:… and sms:… too")
     p_upd.add_argument("--remove-handle", action="append", default=[])
     p_upd.add_argument("--add-email", action="append", default=[])
@@ -823,6 +899,25 @@ def main(argv=None) -> int:
     p_del.add_argument("id")
     args = ap.parse_args(argv)
     book = ContactBook(args.chambers_dir, args.manifest)
+
+    def instruction_arg():
+        """The instruction the flags ask for: False leaves it, None clears it."""
+        given = [f for f, on in (("--instruction", args.instruction is not None),
+                                 ("--instruction-from", args.instruction_from is not None),
+                                 ("--no-instruction", getattr(args, "no_instruction", False))) if on]
+        if len(given) > 1:
+            raise ContactError(f"{' and '.join(given)} contradict each other: give one")
+        if args.instruction_from is not None:
+            source = book.get(args.instruction_from)
+            if source is None:
+                raise ContactError(f"no contact {args.instruction_from!r}", 404)
+            if not source.get("instruction"):
+                raise ContactError(f"{source['name']} carries no instruction to copy")
+            return source["instruction"]
+        if getattr(args, "no_instruction", False):
+            return None
+        return False if args.instruction is None else args.instruction
+
     try:
         if args.cmd == "locations":
             _print(args, [{"chamber": l["chamber"], "path": l["path"]} for l in book.locations()])
@@ -851,9 +946,10 @@ def main(argv=None) -> int:
                 raise ContactError("--name is required")
             pairs = ([("email", e) for e in args.email] + [("sms", p) for p in args.phone]
                      + [parse_handle(h) for h in args.handle])
+            instruction = instruction_arg()
             record = book.create(args.chamber, args.name, pairs, sphere=args.sphere, tags=args.tag or (),
                                  importance=args.importance or None, permits=args.permit or (),
-                                 vip=bool(args.vip))
+                                 vip=bool(args.vip), instruction=instruction or None)
             sync_policy(book)
             commit(book.chambers_dir, record["path"], f"chore(contacts): add {record['name']}")
             _print(args, public(record))
@@ -862,14 +958,31 @@ def main(argv=None) -> int:
                    + [("sms", p) for p in args.add_phone])
             remove = ([parse_handle(h) for h in args.remove_handle] + [("email", e) for e in args.remove_email]
                       + [("sms", p) for p in args.remove_phone])
-            record = book.update(args.id, name=args.name,
-                                 sphere=args.sphere if args.sphere is not None else False,
-                                 tags=args.tag, add=add, remove=remove,
-                                 importance=False if args.importance is None else (args.importance or None),
-                                 permits=[] if args.no_permits else args.permit, vip=args.vip)
+            ids = list(dict.fromkeys(args.id))
+            # Several people take the same person-level facts — a team that
+            # shares one instruction, say. A name or a handle belongs to one
+            # person, so those changes name exactly one.
+            if len(ids) > 1 and (args.name is not None or add or remove):
+                raise ContactError("a name or a handle belongs to one person: update them one at a time")
+            instruction = instruction_arg()
+            # Every id is looked up before anything is written, so a typo in
+            # the third one does not leave the first two changed.
+            missing = [i for i in ids if book.get(i) is None]
+            if missing:
+                raise ContactError(f"no contact {missing[0]!r}", 404)
+            records = []
+            for key in ids:
+                record = book.update(key, name=args.name,
+                                     sphere=args.sphere if args.sphere is not None else False,
+                                     tags=args.tag, add=add, remove=remove,
+                                     importance=False if args.importance is None else (args.importance or None),
+                                     permits=[] if args.no_permits else args.permit, vip=args.vip,
+                                     instruction=instruction)
+                records.append(record)
             sync_policy(book)
-            commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
-            _print(args, public(record))
+            for record in records:
+                commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
+            _print(args, public(records[0]) if len(records) == 1 else [public(r) for r in records])
         elif args.cmd == "delete":
             record = book.delete(args.id)
             sync_policy(book)

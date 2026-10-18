@@ -10,8 +10,8 @@ metadata to the web-gateway's ``POST /internal/chats/inbound``, which updates
 the chat's state and the in-memory live overlay. Notification itself stays
 deterministic and credit-free — no model turn is spent telling the user a
 message arrived — but the rail is no longer only that: it **takes** the
-message (see ``handover`` below), and for a VIP sender it also starts a turn
-in that chat's companion thread.
+message (see ``handover`` below), and for a VIP or an instructed sender it
+also starts a turn in that chat's companion thread.
 
 An event asserts *which account* sent it and nothing about where that account
 lives: a gateway's address is configured on the reader's side (the
@@ -109,11 +109,12 @@ def notify_chat_event(
     ``*_ACCOUNT`` — how the web-gateway identifies which registry gateway sent
     the event, matched against the accounts the gateways it already knows
     report for themselves. ``gate`` carries the delivery-gate
-    verdict for inbound events (``{"forward": bool, "vip": bool, "reason":
-    str}``) so the web-gateway can keep held/no-action classes silent and can
-    see whose message the user asked to have worked on arrival. ``forward`` no
-    longer decides a turn — ``vip`` does, and it is a fact about the sender
-    alone, true in a group exactly as in a 1:1. ``files``
+    verdict for inbound events (``{"forward": bool, "vip": bool,
+    "instructed": bool, "reason": str}``) so the web-gateway can keep
+    held/no-action classes silent and can see whose message the user asked to
+    have worked on arrival. ``forward`` no longer decides a turn — ``vip`` and
+    ``instructed`` do, and both are facts about the sender alone, true in a
+    group exactly as in a 1:1. ``files``
     are the message's attachments in the ``POST /message`` shape
     (``{"filename", "content_type", "data"}``, base64) so a turn started there
     can open them; they ride along only for a forwarded message.

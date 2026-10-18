@@ -368,6 +368,9 @@ def chat_item(chat: dict, state: dict, profile: dict) -> dict:
         "stranger": stranger,
         "unknown_sender": chat_screened({"stranger": stranger, "sphere": sphere}),
         "contact": (state or {}).get("contact") or None,
+        # How a standing instruction is working, or worked, its newest
+        # message (the web gateway's _instructed_note), for the details sheet.
+        "instructed": (state or {}).get("instructed") or None,
         "group": bool(chat.get("group")),
         "count": int(chat.get("unread") or 0),
         "unread": int(chat.get("unread") or 0) > 0,

@@ -11,7 +11,7 @@
 //   POST /attention/permits            {sender, on}   a sender's permit in the mode in force
 //   POST /attention/admit              {sphere, on}   a Focus rule of the mode in force
 //   POST /attention/modes              {mode, tag_on | tag_off}  a word it admits wherever it stands
-//   POST /chats/<id>/contact           {name, sphere, tags}  the contact card
+//   POST /chats/<id>/contact           {name, sphere, tags, instruction}  the contact card
 // A chat whose sender the delivery gate did not recognise is screened — sphere
 // `unknown`, which no mode admits — and the sheet leads with the contact card
 // instead of the corrections: naming someone is the correction that matters.
@@ -60,6 +60,40 @@ export async function addSphere(name) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error || String(res.status));
   return data.added;
+}
+
+// How a sender's standing instruction is working, or worked, the newest
+// message it applied to (the chat's `instructed` block — the gateway's
+// _instructed_note), in a line or two: shared by this sheet and the chat page.
+// Returns null when there is nothing to say.
+export function instructedSummary(ins) {
+  if (!ins || !ins.state) return null;
+  const who = ins.person || 'this sender';
+  const rangAnyway = ins.delivery === 'rang' && ins.fallback;
+  if (ins.state === 'working') {
+    const early = rangAnyway ? ` It has rung already — ${ins.fallback}.` : '';
+    return { state: 'working', head: `Working on it by your instruction for ${who}`,
+      lines: [`A draft may be on its way to the composer.${early}`], flags: [] };
+  }
+  const v = ins.verdict || null;
+  const lines = [];
+  const failed = ins.state === 'failed';
+  if (failed) {
+    const why = String(ins.failure || 'the turn ended without a verdict');
+    lines.push(`${why.charAt(0).toUpperCase()}${why.slice(1)}.`);
+  } else if (v) {
+    let line = `Importance ${Number(v.importance).toLocaleString()}/5`;
+    if (v.due) line += ` · due ${fmtWhen(v.due)}`;
+    lines.push(line);
+    if ((v.actions || []).length) lines.push(v.actions.join(' · '));
+  }
+  const delivery = { rang: 'Rang', hold: 'Held for the digest', list: 'Listed, not rung', quiet: 'Kept quiet' }[ins.delivery];
+  if (ins.vip) lines.push('Rang on arrival — they are a VIP.');
+  else if (rangAnyway) lines.push(failed ? "Rang as a VIP's would." : `Rang as a VIP's would — ${ins.fallback}.`);
+  else if (delivery) lines.push(`${delivery}${ins.reason ? ` — ${ins.reason}` : ''}.`);
+  return { state: ins.state,
+    head: failed ? `Your instruction for ${who} was not carried through` : `Worked by your instruction for ${who}`,
+    lines, flags: (v && v.flags) || [] };
 }
 
 const LEAD_PRESETS = [
@@ -175,6 +209,10 @@ const CSS = `
   .card-form input[type="text"] { width: 100%; font-size: 14px; padding: 6px 8px;
     border-radius: 8px; border: 1px solid var(--line, rgba(231, 235, 242, .12));
     background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
+  .card-form textarea { width: 100%; min-height: 4.2em; resize: vertical; font: inherit; font-size: 13px;
+    padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line, rgba(231, 235, 242, .12));
+    background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); line-height: 1.35; }
+  .flag { color: #f5c542; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; }
   input.sphere-new { font-size: 12px; padding: 3px 6px; border-radius: 8px; width: 11em;
     border: 1px solid var(--accent, #6ea8fe); background: var(--card-2, #1c2230); color: var(--fg, #e7ebf2); }
@@ -193,6 +231,8 @@ class RetinueAttentionSheet extends HTMLElement {
     this.shadowRoot.addEventListener('input', (e) => {
       const el = e.target.closest('[data-set="contact-name"]');
       if (el && this._form) this._form.name = el.value;
+      const ins = e.target.closest('[data-set="contact-instruction"]');
+      if (ins && this._form) this._form.instruction = ins.value;
     });
   }
 
@@ -363,7 +403,8 @@ class RetinueAttentionSheet extends HTMLElement {
         const who = (book.suggestions || []).find((p) => p.id === el.getAttribute('data-person'));
         if (who) {
           this._form = { name: who.name, sphere: who.sphere || '', tags: [...(who.tags || [])],
-            permit: false, chamber: who.chamber, person: who.id, vip: Boolean(who.vip) };
+            permit: false, chamber: who.chamber, person: who.id, vip: Boolean(who.vip),
+            instruction: who.instruction || '' };
           this._saveContact();
         }
         break;
@@ -380,6 +421,12 @@ class RetinueAttentionSheet extends HTMLElement {
     const what = el.getAttribute('data-set');
     if (what === 'contact-chamber') {
       if (this._form) this._form.chamber = el.value;
+      return;
+    }
+    if (what === 'contact-instruction-from') {
+      const book = (this._data && this._data.contact_book) || {};
+      const from = (book.instructions || []).find((p) => p.id === el.value);
+      if (from && this._form) { this._form.instruction = from.instruction; this.render(); }
       return;
     }
     if (what === 'due') {
@@ -432,6 +479,11 @@ class RetinueAttentionSheet extends HTMLElement {
   _blankCard(item) {
     const card = (item && item.contact) || {};
     const book = (this._data && this._data.contact_book) || {};
+    // The person a save writes to: the one the card is filed under, else the
+    // one who already owns this handle (the gateway updates that person). The
+    // person-level facts start from theirs, so saving the card for another
+    // reason never clears a VIP flag or an instruction the form did not show.
+    const owner = book.person || (book.suggestions || []).find((p) => p.exact) || null;
     return {
       name: card.name || chatName(item),
       sphere: card.sphere || (item && item.sphere !== 'unknown' ? item.sphere : ''),
@@ -439,7 +491,8 @@ class RetinueAttentionSheet extends HTMLElement {
       permit: false,
       chamber: card.chamber || book.default || '',
       person: card.person || null,
-      vip: Boolean(book.person && book.person.vip),
+      vip: Boolean(owner && owner.vip),
+      instruction: (owner && owner.instruction) || '',
     };
   }
 
@@ -472,6 +525,7 @@ class RetinueAttentionSheet extends HTMLElement {
           chamber: name ? (form.chamber || null) : null,
           person: name ? (form.person || null) : null,
           ...(name && form.vip !== undefined ? { vip: Boolean(form.vip) } : {}),
+          ...(name && form.instruction !== undefined ? { instruction: String(form.instruction || '').trim() } : {}),
         }),
       });
       if (!res.ok) throw new Error(String(res.status));
@@ -513,6 +567,7 @@ class RetinueAttentionSheet extends HTMLElement {
         ? `<div class="f-value">${esc(card.name)}${card.sphere ? ` · <span style="color:${sphereColor(card.sphere)}">${esc(card.sphere)}</span>` : ''}` +
           `${(card.tags || []).length ? ` <span class="f-note">+ ${card.tags.map(esc).join(', ')}</span>` : ''}` +
           `${book.person && book.person.vip ? ' <span class="f-note">· VIP</span>' : ''}` +
+          `${book.person && book.person.instruction ? ' <span class="f-note">· has an instruction</span>' : ''}` +
           `${card.chamber ? ` <span class="f-note">· in ${esc(card.chamber)}</span>` : ''}` +
           ` <a class="f-note" href="/contacts.html">address book</a></div>`
         : item.unknown_sender
@@ -559,10 +614,40 @@ class RetinueAttentionSheet extends HTMLElement {
       `${form.permit ? '✓ ' : ''}May interrupt right now</button>` +
       `<button class="btn tiny${form.vip ? ' on' : ''}" data-act="contact-vip"${busy}>${form.vip ? '✓ ' : ''}VIP</button>` +
       `<span class="f-note">A VIP's messages are worked by a model the moment they arrive, on every channel of theirs.</span></div>` +
+      this._instructionForm(form, book, busy) +
       `<div class="f-ctl"><button class="btn primary" data-act="contact-save"${busy}>Save the contact</button>` +
       `<button class="btn" data-act="contact-cancel"${busy}>Cancel</button>` +
       `<span class="f-note">Their next message reaches triage as a known sender.</span></div>` +
       `</div></div>`;
+  }
+
+  // The person's standing instruction, on the card: a model works each of
+  // their messages by it, and its verdict decides whether a message rings.
+  _instructionForm(form, book, busy) {
+    const others = book.instructions || [];
+    const copy = others.length
+      ? `<select class="select" data-set="contact-instruction-from"${busy}><option value="">Copy from…</option>` +
+        others.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('') + `</select>`
+      : '';
+    return `<div><div class="f-k">instruction</div>` +
+      `<textarea data-set="contact-instruction" rows="3" maxlength="2000"${busy} ` +
+      `placeholder="How their messages are to be handled — e.g. draft a reply; add a moved visit to the calendar; ring me only if it is about today.">` +
+      `${esc(form.instruction || '')}</textarea>` +
+      (copy ? `<div class="f-ctl" style="margin-top:4px">${copy}</div>` : '') +
+      `<div class="f-note">A model works each of their messages by this — a reply staged in the draft, never sent; ` +
+      `the actions you name — and sets how important it is, which decides whether it rings once the work is done ` +
+      `(a VIP rings at once regardless). A failed or slow turn rings anyway.</div></div>`;
+  }
+
+  // What a standing instruction did with the chat's newest message.
+  _instructedField(item) {
+    const s = item.kind === 'chat' ? instructedSummary(item.instructed) : null;
+    if (!s) return '';
+    return `<div class="field"><div class="f-label">Instruction</div>` +
+      `<div class="f-value">${esc(s.head)}</div>` +
+      s.lines.map((l) => `<div class="f-note">${esc(l)}</div>`).join('') +
+      s.flags.map((f) => `<div class="f-note flag">⚑ ${esc(f)}</div>`).join('') +
+      `</div>`;
   }
 
   _dueOptions(item) {
@@ -694,6 +779,7 @@ class RetinueAttentionSheet extends HTMLElement {
         (item.preview ? `<div class="body">${esc(item.preview)}</div>` : '') +
         `<div class="fields">` +
         (item.unknown_sender || this._form ? contactField : '') +
+        this._instructedField(item) +
         `<div class="field"><div class="f-label">Importance</div><div class="f-value">${esc(item.importance_text)}</div>` +
         `<div class="f-ctl"><button class="btn tiny" data-act="imp" data-delta="-1"${busy}>−</button>` +
         `<button class="btn tiny" data-act="imp" data-delta="1"${busy}>+</button>` +

@@ -218,6 +218,11 @@ services:
       # falls back to the held/forward path it had before: the switch off,
       # without a revert (docs/messenger-chats.md, phase 4).
       - CHAT_ARRIVAL_TURNS=1
+      # How long (seconds, default 60) the ring of a message from a sender with
+      # a standing instruction may wait for the turn that works it by that
+      # instruction (docs/contacts.md, "The instruction"). Past it the message
+      # rings as a VIP's would; the turn goes on, and its draft still lands.
+      - CHAT_INSTRUCTION_TIMEOUT
       # Which TCP peers count as "arrived through the reverse proxy" for the
       # endpoints that act with the user's own authority: the chat send press
       # and approving a pending send. Defence in depth only — no send skips an

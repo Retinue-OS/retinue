@@ -81,6 +81,15 @@ message is worked by a model the moment it arrives. Their message rings in
 every mode, like critical; only a muted chat or a quieted/ignored group keeps
 it quiet.
 
+**The instructed sender** is the finer tool beside it: a person the user wrote
+a standing instruction for (`docs/contacts.md`, “The instruction”). A model
+works each of their messages by that brief and ends with a verdict — an
+importance and, where there is one, a deadline — and the message goes through
+the model above with those, like any other: the instruction adds no delivery
+path of its own, only a judgement the model then delivers by. Their ring waits
+for that turn; a turn that fails or runs past its timeout rings the message as
+a VIP's would be, and its reason line says so.
+
 **The stranger** is the one case where the model withholds a guess. A direct
 message from someone nothing vouches for — not a VIP, no contact card, no
 sphere the profile was taught for them — keeps the importance of any direct message — a person took the trouble — but

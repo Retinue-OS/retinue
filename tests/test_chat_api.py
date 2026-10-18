@@ -512,6 +512,11 @@ def _stub_send_message(prompt, display_question=None, session_key=None,
                        reply_attachments=False, thread_id=None):
     TURNS.append({"prompt": prompt, "question": display_question,
                   "session": session_key, "resume": resume})
+    # What the session does while it runs — an instructed turn setting its
+    # verdict, say.
+    during = TURN_GATE.get("during")
+    if during is not None:
+        during(prompt)
     hold = TURN_GATE.get("hold")
     if hold is not None:
         hold.wait(20)
@@ -1401,6 +1406,282 @@ def test_arrival_starts_a_companion_turn(base, wg):
     print("PASS test_arrival_starts_a_companion_turn")
 
 
+def test_instructed_arrival(base, wg):
+    """A sender with a standing instruction (docs/contacts.md, "The
+    instruction"): one companion turn works the message with the instruction
+    as its brief, and — for a sender who is not also a VIP — the ring waits
+    for that turn and follows its verdict. A turn that fails, sets no
+    verdict, or runs past the timeout rings the message as a VIP's would; a
+    VIP rings on arrival as ever and the verdict only records. The verdict
+    endpoint takes a verdict only from such a turn."""
+    rail = "/internal/chats/inbound"
+    agent = {"X-Conversation-Backend-Token": "agent-token"}
+    chambers = Path(wg._CONTACTS.chambers_dir)
+    (chambers / "private").mkdir(parents=True, exist_ok=True)
+    brief = "Draft a reply to every message. Ring me only if a visit moves to today."
+    spitex = wg._CONTACTS.create("private", "Spitex", [("telegram", "888001"), ("telegram", "888002")],
+                                 instruction=brief)
+    chat = "telegram:888001"
+    event = {"direction": "in", "channel": "telegram", "chat": "888001",
+             "sender": "888001", "sender_name": "Spitex", "group": False,
+             "message_id": "i1", "text": "Der Besuch morgen verschiebt sich auf 10 Uhr.",
+             "handover": True,
+             "gate": {"forward": True, "vip": False, "instructed": True, "reason": "open"}}
+
+    def verdict(importance, **extra):
+        def _set(_prompt):
+            status, body = _http(base, "POST", f"/internal/chats/{_quote(chat)}/verdict",
+                                 {"importance": importance, **extra}, headers=agent)
+            assert status == 200, body
+        return _set
+
+    def summary():
+        status, chats = _http(base, "GET", "/chats")
+        return next(c for c in chats["chats"] if c["id"] == chat)
+
+    # No turn is working on the chat yet: a verdict is refused, as is one
+    # without the agent token, and a malformed one says what is wrong.
+    status, body = _http(base, "POST", f"/internal/chats/{_quote(chat)}/verdict",
+                         {"importance": 3}, headers=agent)
+    assert status == 409, body
+    status, _ = _http(base, "POST", f"/internal/chats/{_quote(chat)}/verdict", {"importance": 3})
+    assert status == 403
+    status, body = _http(base, "POST", f"/internal/chats/{_quote(chat)}/verdict",
+                         {"importance": 9}, headers=agent)
+    assert status == 400 and "0–5" in body["error"], body
+
+    # The ring waits for the turn: nothing pushes on arrival, the chat says a
+    # draft may be on its way, and the verdict's delivery follows the turn.
+    PUSHES.clear()
+    TURNS.clear()
+    hold = threading.Event()
+    TURN_GATE.update(hold=hold, during=verdict(4, actions=["staged a reply"], flags=["asks for the door code"]))
+    try:
+        status, body = _http(base, "POST", rail, event)
+        assert status == 202 and body["accepted"] is True, body
+        assert body["pushed"] is False, "an instructed arrival rang before its turn"
+        _wait_for(lambda: len(TURNS) == 1, "the instructed turn to start")
+        _wait_for(lambda: (summary().get("instructed") or {}).get("verdict"), "the verdict to be noted")
+        ins = summary()["instructed"]
+        assert ins["state"] == "working" and ins["person"] == "Spitex", ins
+        assert ins["instruction"] == brief, ins
+        assert PUSHES == [], "the ring went out while the turn was still working"
+    finally:
+        hold.set()
+        TURN_GATE.update(hold=None, during=None)
+    done = _await_job(base, body["job_url"])
+    assert done["status"] == "done", done
+    assert len(PUSHES) == 1, PUSHES
+    ins = summary()["instructed"]
+    assert ins["state"] == "done" and ins["verdict"]["importance"] == 4, ins
+    assert ins["verdict"]["actions"] == ["staged a reply"], ins
+    assert ins["verdict"]["flags"] == ["asks for the door code"], ins
+    assert ins["delivery"] == "rang" and not ins.get("fallback"), ins
+    block = wg._CHAT_STATE.get(chat)["attention"]
+    assert block["importance"] == 4 and block["importance_from"] == "instruction", block
+    assert not block["vip"], "a verdict is no VIP"
+
+    # The prompt: the instruction is the brief, the limits the system holds
+    # are stated, the verdict command names this chat, and nothing calls the
+    # sender a VIP.
+    prompt = TURNS[0]["prompt"]
+    assert "<user_instruction>" in prompt and "Ring me only if a visit moves to today." in prompt
+    assert "chat-verdict.py --chat telegram:888001 --importance" in prompt, prompt
+    assert "--user-approved" in prompt and "never sent" in prompt
+    assert "credentials" in prompt and "sender:888001" in prompt
+    assert "until you set it, the user has not been told" in prompt
+    assert "marked this correspondent a VIP" not in prompt
+    assert "<external_message>Der Besuch morgen" in prompt
+    comp = summary()["companion"]
+    assert TURNS[0]["session"] == f"conv:{comp}"
+
+    # A low verdict, with the attention model gating pushes: listed, not rung.
+    wg.ATTENTION_PUSH_GATE = True
+    try:
+        PUSHES.clear()
+        TURN_GATE["during"] = verdict(0)
+        status, body = _http(base, "POST", rail, dict(event, message_id="i2", text="Danke!"))
+        assert status == 202, body
+        _await_job(base, body["job_url"])
+        assert PUSHES == [], "a verdict of 0 rang"
+        ins = summary()["instructed"]
+        assert ins["state"] == "done" and ins["delivery"] == "list", ins
+    finally:
+        wg.ATTENTION_PUSH_GATE = False
+        TURN_GATE["during"] = None
+
+    # A turn that ends without a verdict: rung as a VIP's would be — in every
+    # mode, so the attention gate on cannot hold it — and the reason says why.
+    wg.ATTENTION_PUSH_GATE = True
+    try:
+        PUSHES.clear()
+        status, body = _http(base, "POST", rail, dict(event, message_id="i3", text="Hallo?"))
+        _await_job(base, body["job_url"])
+        assert len(PUSHES) == 1, PUSHES
+        ins = summary()["instructed"]
+        assert ins["state"] == "failed" and ins["failure"] == "the turn ended without a verdict", ins
+        block = wg._CHAT_STATE.get(chat)["attention"]
+        assert block["vip"] is True and block["vip_from"] == "instruction", block
+        item = wg._attention_item(f"chat:{chat}", wg._ATTENTION.profile(), wg._attention_now())
+        reason = wg.attention_policy.admission_reason(
+            item, wg.attention_policy.mode_at(wg._ATTENTION.focus(), wg._attention_now()),
+            wg._ATTENTION.profile(), wg._attention_now())
+        assert "did not finish" in reason, reason
+    finally:
+        wg.ATTENTION_PUSH_GATE = False
+
+    # A turn that runs past the timeout: rung then, once; the verdict it sets
+    # afterwards is recorded and rings nothing more.
+    timeout = wg.CHAT_INSTRUCTION_TIMEOUT
+    wg.CHAT_INSTRUCTION_TIMEOUT = 0.3
+    hold = threading.Event()
+    PUSHES.clear()
+    TURN_GATE.update(hold=hold, during=verdict(2))
+    try:
+        status, body = _http(base, "POST", rail, dict(event, message_id="i4", text="Rückruf?"))
+        _wait_for(lambda: len(PUSHES) == 1, "the timeout to ring the message")
+        ins = summary()["instructed"]
+        assert ins["state"] == "working" and ins["delivery"] == "rang", ins
+        assert "ran past" in ins["fallback"], ins
+    finally:
+        hold.set()
+        TURN_GATE.update(hold=None, during=None)
+        wg.CHAT_INSTRUCTION_TIMEOUT = timeout
+    _await_job(base, body["job_url"])
+    assert len(PUSHES) == 1, "the late verdict rang the message a second time"
+    ins = summary()["instructed"]
+    assert ins["state"] == "done" and ins["verdict"]["importance"] == 2, ins
+    assert wg._CHAT_STATE.get(chat)["attention"]["importance"] == 2
+
+    # A VIP with an instruction: rung on arrival, one turn briefed by the
+    # instruction, and the verdict rings nothing more.
+    PUSHES.clear()
+    TURNS.clear()
+    TURN_GATE["during"] = verdict(1)
+    try:
+        status, body = _http(base, "POST", rail,
+                             dict(event, message_id="i5", text="Kurze Frage",
+                                  gate=dict(event["gate"], vip=True)))
+        assert status == 202 and body["pushed"] is True, body
+        _await_job(base, body["job_url"])
+    finally:
+        TURN_GATE["during"] = None
+    assert len(PUSHES) == 1 and len(TURNS) == 1, (PUSHES, TURNS)
+    assert "<user_instruction>" in TURNS[0]["prompt"]
+    assert "The message has already rung" in TURNS[0]["prompt"]
+    assert summary()["instructed"]["vip"] is True
+
+    # The gate still calls a sender instructed whose instruction was just
+    # removed: delivered as any message, no turn.
+    PUSHES.clear()
+    TURNS.clear()
+    status, body = _http(base, "POST", rail,
+                         dict(event, chat="888003", sender="888003", sender_name="Nobody",
+                              message_id="i6", text="hi"))
+    assert status == 200 and body["accepted"] is True and "job_url" not in body, body
+    assert body["pushed"] is True and TURNS == []
+
+    # No companion thread to be had: the rail cannot work the message, so it
+    # is not accepted — and the ring that was waiting for the turn goes out
+    # now, as a VIP's.
+    PUSHES.clear()
+    real_companion = wg._chat_companion
+
+    def _no_companion(_chat_id):
+        raise RuntimeError("the store is down")
+
+    wg._chat_companion = _no_companion
+    try:
+        status, body = _http(base, "POST", rail, dict(event, message_id="i7", text="Notfall"))
+        assert status == 200 and "accepted" not in body and "job_url" not in body, body
+        assert body["pushed"] is True and len(PUSHES) == 1, (body, PUSHES)
+    finally:
+        wg._chat_companion = real_companion
+
+    # A muted chat stays quiet, before the turn and after it; the message is
+    # still worked as instructed.
+    status, _ = _http(base, "POST", f"/chats/{_quote(chat)}/flags", {"muted": True})
+    assert status == 200
+    PUSHES.clear()
+    TURNS.clear()
+    TURN_GATE["during"] = verdict(5)
+    try:
+        status, body = _http(base, "POST", rail, dict(event, message_id="i8", text="Heute 15 Uhr?"))
+        assert status == 202 and body["pushed"] is False, body
+        _await_job(base, body["job_url"])
+    finally:
+        TURN_GATE["during"] = None
+        _http(base, "POST", f"/chats/{_quote(chat)}/flags", {"muted": False, "archived": False})
+    assert PUSHES == [] and len(TURNS) == 1, (PUSHES, TURNS)
+
+    # Two instructed people in one group: each instruction gets a turn — and a
+    # verdict — of its own, never one decided for the other; and an older
+    # turn settling later does not write over the newer message's status.
+    other = wg._CONTACTS.create("private", "Hausarzt", [("telegram", "888010")],
+                                instruction="INSTR-B: flag anything about results.")
+    group = "telegram:-100888"
+    grp = {"direction": "in", "channel": "telegram", "chat": "-100888", "group": True,
+           "chat_name": "Pflege", "handover": True,
+           "gate": {"forward": True, "vip": False, "instructed": True, "reason": "open"}}
+    a_waits, b_waits = threading.Event(), threading.Event()
+    seen_a = []
+
+    def during(prompt):
+        mine = "INSTR-B" in prompt
+        status, body = _http(base, "POST", f"/internal/chats/{_quote(group)}/verdict",
+                             {"importance": 1 if mine else 4}, headers=agent)
+        assert status == 200, body
+        if mine:
+            b_waits.wait(20)
+        elif not seen_a:
+            seen_a.append(prompt)
+            a_waits.wait(20)
+
+    def group_status():
+        status, chats = _http(base, "GET", "/chats")
+        return next(c for c in chats["chats"] if c["id"] == group).get("instructed") or {}
+
+    TURNS.clear()
+    TURN_GATE["during"] = during
+    try:
+        _, first = _http(base, "POST", rail, dict(grp, sender="888001", sender_name="Spitex",
+                                                  message_id="g-a1", text="Besuch 10 Uhr?"))
+        _wait_for(lambda: len(TURNS) == 1, "Spitex's turn to start")
+        _, second = _http(base, "POST", rail, dict(grp, sender="888010", sender_name="Praxis",
+                                                   message_id="g-b1", text="Befund ist da."))
+        _, third = _http(base, "POST", rail, dict(grp, sender="888001", sender_name="Spitex",
+                                                  message_id="g-a2", text="Und morgen?"))
+        # The status shows the newest instructed message, Spitex's second.
+        now = group_status()
+        assert now["message_id"] == "g-a2" and now["state"] == "working", now
+        a_waits.set()
+        _await_job(base, first["job_url"])
+        # Spitex's first turn settled, and the doctor's turn is running and
+        # has set its verdict: neither wrote over the newest message's status.
+        _wait_for(lambda: len(TURNS) == 2, "the doctor's turn to start")
+        now = group_status()
+        assert now["message_id"] == "g-a2" and now["state"] == "working", now
+        assert "verdict" not in now, now
+        b_waits.set()
+        assert _await_job(base, second["job_url"])["status"] == "done"
+        assert _await_job(base, third["job_url"])["status"] == "done"
+    finally:
+        a_waits.set()
+        b_waits.set()
+        TURN_GATE["during"] = None
+    assert len(TURNS) == 3, [t["prompt"][:80] for t in TURNS]
+    prompts = [t["prompt"] for t in TURNS]
+    assert [p.count("<user_instruction>") for p in prompts] == [1, 1, 1]
+    assert "INSTR-B" not in prompts[0] and "INSTR-B" in prompts[1] and "INSTR-B" not in prompts[2]
+    # The last turn was Spitex's second message, with Spitex's verdict.
+    last = group_status()
+    assert last["message_id"] == "g-a2" and last["state"] == "done", last
+    assert last["verdict"]["importance"] == 4, last
+    wg._CONTACTS.delete(other["key"])
+    wg._CONTACTS.delete(spitex["key"])
+    print("PASS test_instructed_arrival")
+
+
 def test_media_proxy(base, wg):
     req = urllib.request.Request(base + f"/chats/media/127.0.0.1/{MID_ATT}")
     with urllib.request.urlopen(req, timeout=10) as resp:
@@ -2014,6 +2295,7 @@ def main():
         test_media_proxy(base, wg)
         test_media_is_asked_for_not_guessed(base, wg, sib.server_address[1])
         test_arrival_starts_a_companion_turn(base, wg)
+        test_instructed_arrival(base, wg)
         test_archive_and_mute(base, wg)
         test_mute_races_an_arrival(base, wg)
         test_delete_chat(base, wg)

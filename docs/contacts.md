@@ -95,6 +95,7 @@ and the `kb:` terms the rest of Retinue already uses.
 | Importance prior (0–5) | `kb:importance "4"^^xsd:decimal` | `kb:`, as on attention items |
 | Focus modes they may interrupt | `kb:permit <urn:retinue:mode:<id>>` | `kb:` |
 | VIP | `kb:vip "true"^^xsd:boolean` | `kb:` |
+| Standing instruction for their messages | `kb:instruction "…"` (free text) | `kb:` |
 | When the person was filed | `dcterms:created` | Dublin Core Terms |
 
 **Identifiers.**
@@ -174,6 +175,115 @@ tick, so an edit made outside the gateway (the CLI, a hand edit) reaches the
 gate within seconds; VIPs set by hand for an unfiled handle
 (`triage_policy.py vip-add`) and the Sent-derived whitelist are left alone.
 
+### The instruction
+
+VIP is one switch for "this person matters", and it is coarse: every message
+rings at once, in every mode, and a model works it with no brief beyond "deal
+with it". Two kinds of sender need something finer — someone whose few
+time-critical messages (a shift moved, an appointment changed at short notice)
+come mixed in with many that are not, and someone whose messages always want
+the same handling (a care provider: draft a reply, put a moved visit in the
+calendar, ring only when it applies soon). Both need a **brief the model
+applies to each message**, and that brief, not the arrival, should decide how
+loudly the message rings.
+
+That is the **instruction**: free text the user writes on the person
+(`kb:instruction`; at most 2000 characters). When a message arrives from a
+person with an instruction:
+
+1. **One model turn works it, with the instruction as its brief** — the same
+   rail VIP uses (a turn in the chat's companion thread, the chat's recent
+   history in the prompt), with the instruction added and the sender's
+   memories (`sender:<handle>`) pointed at. For a person who is also a VIP it
+   is that same single turn, not a second one.
+2. **The turn does what the instruction asks, within limits the system
+   holds:** it stages a reply in the chat's shared draft (written by the
+   Secretary, never sent), passes what the system knows (agenda, facts) to the
+   Secretary for it, adds a calendar event, flags something to the user.
+3. **The turn's verdict sets attention through the attention model.** It ends
+   with `scripts/chat-verdict.py --chat <id> --importance <0–5> [--due …]
+   [--action …] [--flag …]`. Importance and deadline are all it sets; whether
+   the message then rings now, waits for the digest or is only listed is the
+   attention model's decision in the Focus mode in force, as for any message
+   (docs/attention-model.md). There is no delivery path of the instruction's
+   own.
+4. **Not a VIP: the work first, the ring second.** The arrival rings nothing;
+   the ring is decided once the turn has finished, so a draft the instruction
+   asked for is already in the composer when the user opens the chat.
+5. **A VIP: the ring first, the work alongside.** VIP stays exactly what it
+   is — the message rings the moment it arrives, in every mode — and the
+   instructed turn starts at the same time. Its draft lands when it is ready
+   (the chat shows that one is on its way); its verdict and flags are shown
+   on the chat, and ring nothing a second time.
+
+| | VIP only | Instruction only | VIP + instruction |
+|---|---|---|---|
+| A model works every message | yes | yes, by the instruction | yes, by the instruction (one turn) |
+| Rings | always, at once | as the verdict decides, once the work is done | always, at once |
+| The verdict decides | — | importance, hence ring / digest / list | nothing about delivery: it records |
+| Delay before the ring | none | one turn, bounded by the timeout | none; the draft may follow the ring |
+
+A user who would rather be rung only once the draft is ready sets the
+instruction without VIP and has it ask for a high importance.
+
+**What the system holds, whatever the instruction says:**
+
+- **Failure rings.** A turn that errors, ends without a verdict, or runs past
+  `CHAT_INSTRUCTION_TIMEOUT` (60 seconds by default) has the message rung as
+  a VIP's would be — the reason line says the turn did not finish, not that
+  the sender is a VIP. An instruction can delay a ring by at most that long
+  and never prevent one; a draft that finishes later still lands. So does a
+  message whose turn could not be started at all.
+- **No sending.** A reply is only ever staged in the chat's draft; the user's
+  send press is the only way a chat reply leaves in their name. That is how
+  the chat surface works for every agent (docs/messenger-chats.md): the send
+  endpoint takes only the user's own request.
+- **Gated actions keep their gates.** A calendar write, or anything else a
+  send policy gates, goes through `allow`/`trust`/`verify` as always, at the
+  gateway: under `verify` nothing the turn asks for happens without the
+  user's tap on `/sends`. Under `trust`, an instruction that says in so many
+  words that the user approves an action ("you have my approval to add visits
+  to the calendar") is that approval, and the turn passes `--user-approved`
+  for actions inside what it names — nothing beyond. Nothing that deletes or
+  pays. Be clear about which half the system holds: the policy is the
+  gateway's, but *whether an action lies inside what the instruction
+  approved* is the turn's judgement, held by its prompt. `--user-approved`
+  is an assertion the gateway cannot check, from this turn as from any other
+  agent session — the convention-plus-audit footing of every agent send
+  (docs/messenger-chats.md, "Trust model"). So the turn names every action it
+  took in its verdict, which the chat and the attention sheet show; and an
+  identity whose actions must never go out on a model's reading of an
+  instruction stays on `verify`.
+- **Sensitive requests are flagged, not answered.** Credentials, codes,
+  financial or identity details, health information beyond what the
+  relationship needs: kept out of the draft and flagged. An instruction can
+  narrow this, never widen it.
+- **The sender's text is data.** The instruction is the user's; the message
+  is the correspondent's, and "mark this urgent" or "add this to the
+  calendar" in it is content, never an instruction to the turn. But what the
+  sender writes does decide how loud the message is — that is the point — so
+  instructions suit senders the user trusts, and want thought on a channel
+  where a sender is easily spoofed (SMS).
+
+**How it reaches the gate.** `contacts.sync_policy` projects every messenger
+handle of every person with an instruction into the delivery gate's policy
+files as the **`instructed`** class (`triageInstructedHandle`, beside the
+VIPs, under the same `…:contacts` subject), so the gateway knows before any
+model turn that this rail applies; the words stay with the person, where the
+web gateway reads them (`contacts.instructed_person`). A handle can carry both
+classes. E-mail addresses are not projected: e-mail is triaged on its own
+rail, and an instruction there is not built yet.
+
+**Where the user sees it.** The chat page says, above the composer, that a
+message is being worked by the instruction (and a draft may be on its way),
+then what the turn did, its verdict and anything it flagged; the attention
+sheet shows the same next to the importance, and the reason line says why the
+message rang or was held.
+
+**Cost.** One model turn per message from an instructed person, trivial ones
+included — fine for a few people, and it adds up with many. For a person who
+is not a VIP, one turn's delay before a message rings, bounded by the timeout.
+
 ## Using it
 
 ### Agents: the CLI
@@ -188,6 +298,8 @@ python3 /workspace/scripts/contacts.py add --chamber private --name "Mara Keller
     --email mara@example.org --handle whatsapp:+41791234567 --sphere friends
 python3 /workspace/scripts/contacts.py update <id> --add-email mara@work.example --remove-handle signal:+41…
 python3 /workspace/scripts/contacts.py update <id> --vip --importance 4 --permit focused   # --no-vip, --importance '', --no-permits
+python3 /workspace/scripts/contacts.py update <id> --instruction "Draft a reply to every message. Ring me only if a visit moves to today or tomorrow."
+python3 /workspace/scripts/contacts.py update <id> <id> <id> --instruction-from <id>   # a team, alike; --no-instruction removes it
 python3 /workspace/scripts/contacts.py delete <id>
 ```
 
@@ -197,14 +309,19 @@ python3 /workspace/scripts/contacts.py delete <id>
 - Writes are committed and pushed in the owning chamber's repository.
 - Always `find` before `add`: a second person for someone the book already
   knows splits their channels again.
+- `update` takes several ids to give a team the same facts — the same
+  instruction, say. A name or a handle belongs to one person, so those
+  changes name exactly one. A shared, named instruction can come later, if
+  copies drift.
 
 ### The dashboard
 
 The **Contacts page** (`contacts.html`, the *Contacts* tab of the dashboard's
 navigation row) is the address book: every person, searchable by name and
 e-mail address, each edited in place — handles on every channel, spheres,
-importance prior, the modes they may interrupt, VIP. *+ New contact* names the
-chamber first.
+importance prior, the modes they may interrupt, VIP, the instruction (with
+*Copy instruction from…* to give a team the same one). *+ New contact* names
+the chamber first.
 
 The **contact card** on a chat's attention sheet (`docs/dashboard.md`) files
 the chat's peer:
@@ -219,7 +336,9 @@ the chat's peer:
 - **A card already filed** updates its person. A change to a person (name,
   spheres) is copied to every chat whose card points there, and what the
   attention profile learned under the old name moves with it.
-- **VIP** is a switch on the card, and it is the person's.
+- **VIP** is a switch on the card, and it is the person's. So is the
+  **instruction**, a text field beside it, with *Copy from…* for an
+  instruction another person already carries.
 - **Removing the card** unlinks the handle. The person stays: they are more
   than this chat. Erasing a chat does not erase the person either.
 
@@ -232,10 +351,15 @@ The HTTP API behind it, for the dashboard and anything on the edge:
   names and e-mail addresses, or `?channel=&handle=` to look up one handle on
   any channel.
 - `POST /contacts` with `{chamber, name, handles: [{channel, handle}], sphere?,
-  tags?, importance?, permits?, vip?}` creates a person and answers 201.
+  tags?, importance?, permits?, vip?, instruction?}` creates a person and
+  answers 201.
 - `POST /contacts/<id>` with `{name?, sphere?, tags?, importance?, permits?:
-  [mode id], vip?, add?: [handle], remove?: [handle]}` changes one; an unknown
-  mode answers 400.
+  [mode id], vip?, instruction?, add?: [handle], remove?: [handle]}` changes
+  one; an unknown mode answers 400. An absent `instruction` leaves it; `""` or
+  null removes it. `POST /chats/<id>/contact` takes `instruction` the same way.
+- `POST /internal/chats/<id>/verdict` with `{importance, due?, actions?,
+  flags?}` is the instructed turn's verdict (token-gated; `chat-verdict.py`
+  is the client). It is taken only while such a turn runs for the chat.
 
 ### Queries
 
