@@ -6487,11 +6487,12 @@ CHAT_INSTRUCTION_TIMEOUT = max(5.0, float(os.environ.get("CHAT_INSTRUCTION_TIMEO
 # the other finds nothing left to do, so a message is never rung twice.
 _INSTRUCTED_RINGS: dict[str, dict] = {}
 # The verdict the running instructed turn of a chat set, by chat id, and the
-# chats such a turn is running for — a verdict for a chat nobody is working
-# on as instructed is refused rather than kept for a turn it does not belong
-# to.
+# chats such a turn is running for, with the job ids of the arrivals it works
+# — a verdict for a chat nobody is working on as instructed is refused rather
+# than kept for a turn it does not belong to, and what a turn notes on the chat
+# is noted only while the chat's status still shows one of its own arrivals.
 _CHAT_VERDICTS: dict[str, dict] = {}
-_INSTRUCTED_TURNS: set[str] = set()
+_INSTRUCTED_TURNS: dict[str, set[str]] = {}
 
 
 def _who(arrivals: list[dict]) -> str:
@@ -6508,20 +6509,18 @@ def _instruction_brief(briefed: list[dict], chat_id: str) -> list[str]:
     (docs/contacts.md, "The instruction"): the user's words as the brief, the
     limits the system holds whatever those words say, and the verdict the
     turn must leave — which, for a sender who is not also a VIP, is what
-    decides whether the message rings at all."""
-    lines = []
-    seen = set()
-    for arrival in briefed:
-        key = (arrival.get("person_key"), arrival.get("instruction"))
-        if key in seen:
-            continue
-        seen.add(key)
-        name = arrival.get("person") or arrival.get("who") or "this sender"
-        lines.append(
-            f"The user's standing instruction for {name} — their own words, "
-            "written for exactly this, and the brief for this turn:\n"
-            "<user_instruction>\n" + html.escape(str(arrival["instruction"]))
-            + "\n</user_instruction>")
+    decides whether the message rings at all.
+
+    ``briefed`` all share one instruction: the worker takes one brief per
+    turn (_arrival_brief), so the one verdict is about one person's
+    messages."""
+    first = briefed[0]
+    name = first.get("person") or first.get("who") or "this sender"
+    lines = [
+        f"The user's standing instruction for {name} — their own words, "
+        "written for exactly this, and the brief for this turn:\n"
+        "<user_instruction>\n" + html.escape(str(first["instruction"]))
+        + "\n</user_instruction>"]
     handles = sorted({a.get("handle") for a in briefed if a.get("handle")})
     recall = " ".join(f"--tag {shlex.quote('sender:' + h)}" for h in handles) or "--tag <topic>"
     rang = all(a.get("vip") for a in briefed)
@@ -6546,8 +6545,9 @@ def _instruction_brief(briefed: list[dict], chat_id: str) -> list[str]:
         "life store. What the "
         "reply needs to say goes to the `secretary` with the exchange.",
         "2. Do what the instruction asks — and only that — within limits the "
-        "instruction cannot lift, because the system holds them whatever it "
-        "says:\n"
+        "instruction cannot lift, whatever it says. Some the gateways hold "
+        "for you; the scope of an approval is yours to hold, and you name "
+        "every action in the verdict, where the user sees it:\n"
         "   - A reply is staged in this chat's shared draft (`chat-draft.py`, "
         "the words written by the `secretary`) and never sent. The user's "
         "send press is the only way it leaves; an instruction that says "
@@ -6622,17 +6622,14 @@ def _chat_arrival_prompt(arrivals: list[dict], chat_id: str = "") -> str:
                       f"{html.escape(text) if text else '(no text)'}"
                       "</external_message>")
     who = _who(arrivals)
+    # One brief per turn (_arrival_brief): every arrival here carries the
+    # same instruction, or none does.
     briefed = [a for a in arrivals if a.get("instruction")]
-    plain = [a for a in arrivals if not a.get("instruction")]
     count = len(arrivals)
     if not briefed:
         why = ("The user marked this correspondent a VIP, which is them asking "
                "for exactly this: their messages worked the moment they land, "
                "wherever they land.")
-    elif plain:
-        why = (f"The user marked {_who(plain)} a VIP — their messages worked "
-               "the moment they land — and wrote a standing instruction for "
-               f"{_who(briefed)}, which is how theirs are to be worked.")
     else:
         why = (f"The user wrote a standing instruction for {_who(briefed)}: "
                "each of their messages is worked by it, and that is why this "
@@ -6651,15 +6648,12 @@ def _chat_arrival_prompt(arrivals: list[dict], chat_id: str = "") -> str:
     ]
     if briefed:
         lines += _instruction_brief(briefed, chat_id)
-        if not plain:
-            lines.append(
-                "Then answer here in one or two sentences: what arrived, what "
-                "the instruction had you do, and the verdict you set. This "
-                "note is what the user reads in the companion pane when they "
-                "open the chat, so it is a briefing, not a copy of the draft.")
-            return "\n\n".join(lines)
-        lines.append(f"For the messages from {_who(plain)}, who carry no "
-                     "instruction:")
+        lines.append(
+            "Then answer here in one or two sentences: what arrived, what "
+            "the instruction had you do, and the verdict you set. This "
+            "note is what the user reads in the companion pane when they "
+            "open the chat, so it is a briefing, not a copy of the draft.")
+        return "\n\n".join(lines)
     lines += [
         "What to do, in this order. Answering is only part of it — what the "
         "user gets from this is that the system *knows* what they were just "
@@ -6754,7 +6748,7 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
             # Noted under the lock, before the turn can see the arrival, so a
             # worker already running for this chat cannot settle it first
             # and then have this "working" written over its outcome.
-            _instructed_note(chat_id, fresh=True, state="working",
+            _instructed_note(chat_id, fresh=True, state="working", job=job_id,
                              person=arrival["person"], instruction=arrival["instruction"],
                              vip=bool(vip), since=entry.get("ts") or chat_state_mod.iso_z(),
                              message_id=entry.get("message_id"))
@@ -6764,9 +6758,10 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
             timer.daemon = True
             _INSTRUCTED_RINGS[job_id] = {"chat_id": chat_id, "entry": dict(entry),
                                          "had_unread": bool(ring.get("had_unread")),
-                                         "timer": timer}
+                                         "timer": timer, "job": job_id}
             arrival["ring"] = job_id
             timer.start()
+        arrival["job"] = job_id
         state = _CHAT_TURNS.setdefault(
             chat_id, {"running": False, "jobs": [], "arrivals": []})
         state["jobs"].append(job_id)
@@ -6797,14 +6792,23 @@ def _chat_arrival_worker(chat_id: str, cid: str) -> None:
                 # not grow one entry per chat ever seen.
                 _CHAT_TURNS.pop(chat_id, None)
                 return
-            jobs, arrivals = state["jobs"], state["arrivals"]
-            state["jobs"], state["arrivals"] = [], []
+            # One instruction per turn. The queued arrivals that share the
+            # first one's brief — a VIP's without one, or one person's under
+            # their instruction — are worked together; anyone else's wait for
+            # a turn of their own, so in a group one person's verdict never
+            # decides another person's message.
+            brief = _arrival_brief(state["arrivals"][0])
+            take = [i for i, a in enumerate(state["arrivals"]) if _arrival_brief(a) == brief]
+            jobs = [state["jobs"][i] for i in take]
+            arrivals = [state["arrivals"][i] for i in take]
+            state["jobs"] = [j for i, j in enumerate(state["jobs"]) if i not in take]
+            state["arrivals"] = [a for i, a in enumerate(state["arrivals"]) if i not in take]
             instructed = any(a.get("instruction") for a in arrivals)
             if instructed:
                 # A verdict belongs to the turn that is about to run, never to
                 # one before it.
                 _CHAT_VERDICTS.pop(chat_id, None)
-                _INSTRUCTED_TURNS.add(chat_id)
+                _INSTRUCTED_TURNS[chat_id] = set(jobs)
         prompt = _chat_arrival_prompt(arrivals, chat_id)
         stored = [f for a in arrivals for f in (a.get("files") or [])]
         if stored:
@@ -6817,7 +6821,7 @@ def _chat_arrival_worker(chat_id: str, cid: str) -> None:
                   flush=True)
         if instructed:
             with _chat_turns_lock:
-                _INSTRUCTED_TURNS.discard(chat_id)
+                _INSTRUCTED_TURNS.pop(chat_id, None)
                 verdict = _CHAT_VERDICTS.pop(chat_id, None)
             try:
                 _instructed_settle(chat_id, arrivals, ok, verdict)
@@ -6851,11 +6855,19 @@ def _instructed_person(channel: str, handle: str | None) -> dict | None:
         return None
 
 
-def _instructed_note(chat_id: str, *, fresh: bool = False, **fields) -> None:
+def _arrival_brief(arrival: dict) -> tuple:
+    """Which brief an arrival is worked under: its person's instruction, or
+    none (a VIP's plain turn). A turn works one brief at a time."""
+    return (arrival.get("person_key"), arrival.get("instruction"))
+
+
+def _instructed_note(chat_id: str, *, fresh: bool = False, jobs=None, **fields) -> None:
     """Record how an instruction is being applied on the chat's state, where
-    the chat page and the details sheet read it."""
+    the chat page and the details sheet read it. ``jobs`` names the arrivals
+    the note is about: it is written only while the chat's status still shows
+    one of them, never over a newer instructed message's."""
     try:
-        _CHAT_STATE.update_instructed(chat_id, fields, fresh=fresh)
+        _CHAT_STATE.update_instructed(chat_id, fields, fresh=fresh, only_jobs=jobs)
     except OSError as exc:
         print(f"[web-gateway] could not note the instruction on {chat_id} ({exc})", flush=True)
         return
@@ -6925,7 +6937,7 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
             out["until"] = decision["until"].isoformat()
     out["fallback"] = None if verdict is not None else why
     if note:
-        _instructed_note(chat_id, **out)
+        _instructed_note(chat_id, jobs={ring.get("job")}, **out)
     return out
 
 
@@ -6973,7 +6985,8 @@ def _instructed_settle(chat_id: str, arrivals: list[dict], ok: bool,
         # verdict is noted on the chat and changes no item.
     if usable is not None and late:
         _attention_note_verdict(chat_id, usable)
-    _instructed_note(chat_id, state="done" if why is None else "failed",
+    _instructed_note(chat_id, jobs={a.get("job") for a in briefed},
+                     state="done" if why is None else "failed",
                      finished=chat_state_mod.iso_z(), verdict=verdict, failure=why)
     if why:
         print(f"[web-gateway] instructed turn for {chat_id}: {why}", flush=True)
@@ -10081,15 +10094,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": str(exc)})
             return
         with _chat_turns_lock:
-            running = chat_id in _INSTRUCTED_TURNS
+            batch = _INSTRUCTED_TURNS.get(chat_id)
+            running = batch is not None
             if running:
                 _CHAT_VERDICTS[chat_id] = verdict
+                batch = set(batch)
         if not running:
             self._send_json(409, {
                 "error": "no turn working on this chat by a standing instruction: "
                          "a verdict belongs to that turn alone"})
             return
-        _instructed_note(chat_id, verdict=verdict)
+        _instructed_note(chat_id, jobs=batch, verdict=verdict)
         self._send_json(200, {"id": chat_id, "verdict": verdict})
 
     def _handle_chat_companion(self, raw_id: str) -> None:

@@ -239,11 +239,21 @@ instruction without VIP and has it ask for a high importance.
   the chat surface works for every agent (docs/messenger-chats.md): the send
   endpoint takes only the user's own request.
 - **Gated actions keep their gates.** A calendar write, or anything else a
-  send policy gates, goes through `allow`/`trust`/`verify` as always. Under
-  `trust`, an instruction that says in so many words that the user approves
-  an action ("you have my approval to add visits to the calendar") is that
-  approval, and the turn passes `--user-approved` for actions inside what it
-  names — nothing beyond. Nothing that deletes or pays.
+  send policy gates, goes through `allow`/`trust`/`verify` as always, at the
+  gateway: under `verify` nothing the turn asks for happens without the
+  user's tap on `/sends`. Under `trust`, an instruction that says in so many
+  words that the user approves an action ("you have my approval to add visits
+  to the calendar") is that approval, and the turn passes `--user-approved`
+  for actions inside what it names — nothing beyond. Nothing that deletes or
+  pays. Be clear about which half the system holds: the policy is the
+  gateway's, but *whether an action lies inside what the instruction
+  approved* is the turn's judgement, held by its prompt. `--user-approved`
+  is an assertion the gateway cannot check, from this turn as from any other
+  agent session — the convention-plus-audit footing of every agent send
+  (docs/messenger-chats.md, "Trust model"). So the turn names every action it
+  took in its verdict, which the chat and the attention sheet show; and an
+  identity whose actions must never go out on a model's reading of an
+  instruction stays on `verify`.
 - **Sensitive requests are flagged, not answered.** Credentials, codes,
   financial or identity details, health information beyond what the
   relationship needs: kept out of the draft and flagged. An instruction can

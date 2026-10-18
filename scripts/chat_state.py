@@ -480,12 +480,18 @@ class ChatStateStore:
             return doc
 
     def update_instructed(self, chat_id: str, patch: dict, *,
-                          fresh: bool = False) -> dict:
+                          fresh: bool = False, only_jobs=None) -> dict:
         """Merge ``patch`` into the chat's ``instructed`` block; ``fresh``
         starts a new one (a new instructed message) instead of merging into
-        the last."""
+        the last. ``only_jobs`` limits the merge to a block that still belongs
+        to one of those arrivals (its ``job``): the block shows the newest
+        instructed message, and the outcome of an older one that settles
+        later must not be written over it."""
         with self._lock:
             doc = self._read(chat_id)
+            if (not fresh and only_jobs is not None
+                    and (doc.get("instructed") or {}).get("job") not in only_jobs):
+                return doc
             base = {} if fresh else dict(doc.get("instructed") or {})
             base.update(patch)
             doc["instructed"] = base

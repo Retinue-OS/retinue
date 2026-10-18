@@ -1613,6 +1613,71 @@ def test_instructed_arrival(base, wg):
         TURN_GATE["during"] = None
         _http(base, "POST", f"/chats/{_quote(chat)}/flags", {"muted": False, "archived": False})
     assert PUSHES == [] and len(TURNS) == 1, (PUSHES, TURNS)
+
+    # Two instructed people in one group: each instruction gets a turn — and a
+    # verdict — of its own, never one decided for the other; and an older
+    # turn settling later does not write over the newer message's status.
+    other = wg._CONTACTS.create("private", "Hausarzt", [("telegram", "888010")],
+                                instruction="INSTR-B: flag anything about results.")
+    group = "telegram:-100888"
+    grp = {"direction": "in", "channel": "telegram", "chat": "-100888", "group": True,
+           "chat_name": "Pflege", "handover": True,
+           "gate": {"forward": True, "vip": False, "instructed": True, "reason": "open"}}
+    a_waits, b_waits = threading.Event(), threading.Event()
+    seen_a = []
+
+    def during(prompt):
+        mine = "INSTR-B" in prompt
+        status, body = _http(base, "POST", f"/internal/chats/{_quote(group)}/verdict",
+                             {"importance": 1 if mine else 4}, headers=agent)
+        assert status == 200, body
+        if mine:
+            b_waits.wait(20)
+        elif not seen_a:
+            seen_a.append(prompt)
+            a_waits.wait(20)
+
+    def group_status():
+        status, chats = _http(base, "GET", "/chats")
+        return next(c for c in chats["chats"] if c["id"] == group).get("instructed") or {}
+
+    TURNS.clear()
+    TURN_GATE["during"] = during
+    try:
+        _, first = _http(base, "POST", rail, dict(grp, sender="888001", sender_name="Spitex",
+                                                  message_id="g-a1", text="Besuch 10 Uhr?"))
+        _wait_for(lambda: len(TURNS) == 1, "Spitex's turn to start")
+        _, second = _http(base, "POST", rail, dict(grp, sender="888010", sender_name="Praxis",
+                                                   message_id="g-b1", text="Befund ist da."))
+        _, third = _http(base, "POST", rail, dict(grp, sender="888001", sender_name="Spitex",
+                                                  message_id="g-a2", text="Und morgen?"))
+        # The status shows the newest instructed message, Spitex's second.
+        now = group_status()
+        assert now["message_id"] == "g-a2" and now["state"] == "working", now
+        a_waits.set()
+        _await_job(base, first["job_url"])
+        # Spitex's first turn settled, and the doctor's turn is running and
+        # has set its verdict: neither wrote over the newest message's status.
+        _wait_for(lambda: len(TURNS) == 2, "the doctor's turn to start")
+        now = group_status()
+        assert now["message_id"] == "g-a2" and now["state"] == "working", now
+        assert "verdict" not in now, now
+        b_waits.set()
+        assert _await_job(base, second["job_url"])["status"] == "done"
+        assert _await_job(base, third["job_url"])["status"] == "done"
+    finally:
+        a_waits.set()
+        b_waits.set()
+        TURN_GATE["during"] = None
+    assert len(TURNS) == 3, [t["prompt"][:80] for t in TURNS]
+    prompts = [t["prompt"] for t in TURNS]
+    assert [p.count("<user_instruction>") for p in prompts] == [1, 1, 1]
+    assert "INSTR-B" not in prompts[0] and "INSTR-B" in prompts[1] and "INSTR-B" not in prompts[2]
+    # The last turn was Spitex's second message, with Spitex's verdict.
+    last = group_status()
+    assert last["message_id"] == "g-a2" and last["state"] == "done", last
+    assert last["verdict"]["importance"] == 4, last
+    wg._CONTACTS.delete(other["key"])
     wg._CONTACTS.delete(spitex["key"])
     print("PASS test_instructed_arrival")
 
