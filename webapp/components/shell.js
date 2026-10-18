@@ -89,8 +89,11 @@ export function hasUnsavedInput() {
   return !!unsavedHolder();
 }
 
-// A short note at the bottom of the page: why the press did nothing.
+// A short note at the bottom of the page: why the press did nothing. A Home
+// press repeated while it shows goes after all (see shellEventHeld).
+const NOTE_MS = 3500;
 let noteTimer = null;
+let homeHeldAt = 0;
 function holdNote(type) {
   if (typeof document === 'undefined' || !document.body) return;
   let el = document.getElementById('retinue-shell-note');
@@ -106,10 +109,17 @@ function holdNote(type) {
   }
   el.textContent = type === 'wake'
     ? 'Unsent input here — send or clear it, then wake again.'
-    : 'Unsent input here — send or clear it first.';
+    : 'Unsent input here — send or clear it, or press again to leave anyway.';
   el.hidden = false;
   if (noteTimer) clearTimeout(noteTimer);
-  noteTimer = setTimeout(() => { el.hidden = true; noteTimer = null; }, 3500);
+  noteTimer = setTimeout(() => { el.hidden = true; noteTimer = null; }, NOTE_MS);
+}
+
+function hideNote() {
+  if (noteTimer) clearTimeout(noteTimer);
+  noteTimer = null;
+  const el = typeof document !== 'undefined' && document.getElementById('retinue-shell-note');
+  if (el) el.hidden = true;
 }
 
 // Unsent input here: a Home press does nothing, and a wake goes nowhere —
@@ -117,9 +127,20 @@ function holdNote(type) {
 // could not be had back. Said so, and the input shown. True when the event
 // is held. The page that claims the events (the home) asks this too before
 // acting on one, so its own draft is as safe as any other page's.
+//
+// The hold stops a slip; it never keeps anyone on a page. A Home press (or
+// a press on a tab of the navigation row, which asks as one) made again
+// while the note still shows is let through: input that could be neither
+// sent nor cleared — a send that never came back, its composer locked —
+// once held every way off the page.
 export function shellEventHeld(type) {
   const holder = unsavedHolder();
   if (!holder) return false;
+  if (type === 'home') {
+    const again = homeHeldAt && Date.now() - homeHeldAt < NOTE_MS;
+    homeHeldAt = again ? 0 : Date.now();
+    if (again) { hideNote(); return false; }
+  }
   holdNote(type);
   if (holder.reveal) { try { holder.reveal(); } catch (_e) { /* the note still says it */ } }
   return true;
