@@ -17,6 +17,7 @@ that never answers:
 - a send whose answer was lost but which the thread holds when it is read
   again counts as delivered — nothing is left to send twice;
 - a typed turn that times out keeps its words, once, without a bubble;
+- a send that fails outright (host unreachable, a refused status) says so;
 - a read that never answers is given up too, so the poll goes on.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
@@ -106,9 +107,9 @@ async function until(cond, what) {
 }
 
 // ── The gateway: threads that answer reads, and a reply POST that never does ─
-const A = 'a'.repeat(32), B = 'b'.repeat(32), C = 'c'.repeat(32), D = 'd'.repeat(32);
+const A = 'a'.repeat(32), B = 'b'.repeat(32), C = 'c'.repeat(32), D = 'd'.repeat(32), E = 'e'.repeat(32);
 const threads = {};
-for (const id of [A, B, C, D]) {
+for (const id of [A, B, C, D, E]) {
   threads[id] = { id, title: 'Judith', pending: false, model: '', messages: [
     { role: 'user', text: 'Earlier question', ts: '2026-10-16T15:40:00Z' },
     { role: 'assistant', text: 'Earlier answer', ts: '2026-10-16T15:41:00Z' },
@@ -117,6 +118,9 @@ for (const id of [A, B, C, D]) {
 const posts = [];
 let land = false;        // the gateway stores the turn even though no answer comes back
 let hangReads = false;
+// How a reply POST fails at once instead of hanging: 'network' (no answer at
+// all, as when the browser cannot reach the host) or an HTTP status.
+let failWith = null;
 const never = (opts) => new Promise((_resolve, reject) => {
   if (opts && opts.signal) opts.signal.addEventListener('abort', () => reject(new Error('AbortError')));
 });
@@ -129,6 +133,8 @@ globalThis.fetch = (url, opts = {}) => {
   if (reply && method === 'POST') {
     const body = JSON.parse(opts.body);
     posts.push(body);
+    if (failWith === 'network') return Promise.reject(new TypeError('Failed to fetch'));
+    if (failWith) return Promise.resolve({ ok: false, status: failWith, json: async () => ({}) });
     if (land) threads[reply[1]].messages.push({ role: 'user', text: body.message.trim(), ts: new Date().toISOString() });
     return never(opts);
   }
@@ -199,6 +205,20 @@ await ok('a typed turn that times out keeps its words, once, without a bubble', 
   assert.ok(!el._busy, 'unlocked');
   assert.equal(draftText(el), 'Hoi Judith', 'the words stay, once');
   assert.match(el._attachError, /No answer from the server/);
+});
+
+await ok('a send that fails outright says why, and keeps its words', async () => {
+  const el = await mount(E);
+  el.fill('Bis morgen');
+  failWith = 'network';
+  await el._send('Bis morgen');
+  assert.ok(!el._busy, 'unlocked');
+  assert.equal(draftText(el), 'Bis morgen', 'the words stay');
+  assert.match(el._attachError, /Couldn't reach the server/, 'an unreachable host is named, not left silent');
+  failWith = 502;
+  await el._send('Bis morgen');
+  assert.match(el._attachError, /refused the message \(502\)/, 'a refusal names its status');
+  failWith = null;
 });
 
 await ok('a read that never answers is given up, so the poll goes on', async () => {

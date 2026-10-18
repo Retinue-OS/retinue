@@ -1843,18 +1843,19 @@ class RetinueConversation extends HTMLElement {
       // Why it turned back, in words the user can act on: a thread that could
       // not be started asks for a retry, a model that would not store asks for
       // the pick again, a send that got no answer says it may still turn up,
-      // and an ordinary send failure needs no note — the words are back in
-      // the box and the box is the invitation.
-      const why = err && err.message;
+      // and one the server refused or could not be reached for says so. Words
+      // back in the box with nothing said read as a send button that does
+      // nothing: with the dashboard unreachable, every press looked dead.
+      const why = String((err && err.message) || '');
       const note = why === 'mint' ? "Couldn't start this conversation. Please try again."
         : why === 'model' ? "The model choice wasn't saved. Please pick it again."
         : why === 'timeout' ? "No answer from the server. The message is back in the box — "
           + "if it doesn't show up above, send it again."
-        : '';
-      if (note) {
-        const el = this._liveFor(key);
-        if (el) el._attachError = note;
-      }
+        : /^\d{3}$/.test(why) ? `The server refused the message (${why}). It is still in the box.`
+        : "Couldn't reach the server. The message is still in the box — "
+          + 'send it again once the dashboard is reachable.';
+      const el = this._liveFor(key);
+      if (el) el._attachError = note;
       this._keepUnsent(key, text, fromDraft);
       // A turn that did not go out has no answer coming: the loop stops.
       this._contDisengage();
