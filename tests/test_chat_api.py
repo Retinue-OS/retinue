@@ -1553,6 +1553,42 @@ def test_instructed_arrival(base, wg):
     assert ins["state"] == "done" and ins["verdict"]["importance"] == 2, ins
     assert wg._CHAT_STATE.get(chat)["attention"]["importance"] == 2
 
+    # The user answers while the turn is still working: neither the verdict
+    # nor the timeout rings the message afterwards, and the item the reply
+    # settled stays settled.
+    for late in ("verdict", "timeout"):
+        timeout = wg.CHAT_INSTRUCTION_TIMEOUT
+        if late == "timeout":
+            wg.CHAT_INSTRUCTION_TIMEOUT = 3.0
+        hold = threading.Event()
+        PUSHES.clear()
+        TURN_GATE.update(hold=hold, during=verdict(5) if late == "verdict" else None)
+        try:
+            status, body = _http(base, "POST", rail,
+                                 dict(event, message_id=f"r-{late}", text="Kommst du heute?"))
+            assert status == 202 and body["pushed"] is False, body
+            _wait_for(lambda: (summary().get("instructed") or {}).get("message_id") == f"r-{late}",
+                      "the turn to be noted")
+            # The user's reply from their phone, echoed back on the rail.
+            status, _ = _http(base, "POST", rail,
+                              {"direction": "out", "channel": "telegram", "chat": "888001",
+                               "author": "device", "message_id": f"r-{late}-reply",
+                               "text": "Ja, um 15 Uhr.",
+                               "ts": time.time() + (1 if late == "verdict" else 3)})
+            assert status == 200
+            if late == "timeout":
+                time.sleep(3.5)  # past the timeout, with the turn still held
+        finally:
+            hold.set()
+            TURN_GATE.update(hold=None, during=None)
+            wg.CHAT_INSTRUCTION_TIMEOUT = timeout
+        _await_job(base, body["job_url"])
+        assert PUSHES == [], f"an answered message rang after the turn ({late})"
+        ins = summary()["instructed"]
+        assert ins["delivery"] == "seen", ins
+        assert wg._CHAT_STATE.get(chat)["attention"]["state"] == "done", \
+            f"the {late} reopened an item the reply settled"
+
     # A VIP with an instruction: rung on arrival, one turn briefed by the
     # instruction, and the verdict rings nothing more.
     PUSHES.clear()

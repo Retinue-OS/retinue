@@ -87,7 +87,8 @@ export function instructedSummary(ins) {
     lines.push(line);
     if ((v.actions || []).length) lines.push(v.actions.join(' · '));
   }
-  const delivery = { rang: 'Rang', hold: 'Held for the digest', list: 'Listed, not rung', quiet: 'Kept quiet' }[ins.delivery];
+  const delivery = { rang: 'Rang', hold: 'Held for the digest', list: 'Listed, not rung', quiet: 'Kept quiet',
+    seen: 'Not rung' }[ins.delivery];
   if (ins.vip) lines.push('Rang on arrival — they are a VIP.');
   else if (rangAnyway) lines.push(failed ? "Rang as a VIP's would." : `Rang as a VIP's would — ${ins.fallback}.`);
   else if (delivery) lines.push(`${delivery}${ins.reason ? ` — ${ins.reason}` : ''}.`);
