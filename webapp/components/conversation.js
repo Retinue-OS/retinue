@@ -145,6 +145,16 @@ const SHORT_FRAME = 520;
 // Keep the client cap in step with the gateway's CONVERSATION_MAX_ATTACHMENT_BYTES
 // (default 25 MiB) so oversized files are rejected before a doomed upload.
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+// How long a request of this element may go unanswered (see within). The
+// gateway stores a turn and answers at once — the reply itself comes by
+// polling — so silence this long means the request is lost: a phone that
+// changed networks under it, a WebView that froze it. fetch() has no deadline
+// of its own, and a send that never settled kept its composer locked for good,
+// and with it every way off the page (the unsaved-input guard counts a send on
+// the wire). Attachments get time on top for the upload, at a slow uplink's
+// pace, so a large file is never cut off while it is still going up.
+const REQUEST_TIMEOUT_MS = 30 * 1000;
+const UPLOAD_BYTES_PER_SECOND = 64 * 1024;
 // Where the read-aloud player remembers how far it got (see savePosition):
 // leaving the page kills the browser's speech, and this is what lets the
 // thread offer to carry on from that passage instead of from the top.
@@ -218,11 +228,15 @@ function pinModel(id, model) {
   const prev = MODEL_PINS.get(id) || Promise.resolve(true);
   const run = prev.then(async () => {
     try {
-      const res = await fetch(`/conversations/${encodeURIComponent(id)}/model`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model }),
+      // Bounded: a send waits for this pin (settledPins), so a pin that
+      // never answered would hold that send — and the composer — forever.
+      return await within(REQUEST_TIMEOUT_MS, async (signal) => {
+        const res = await fetch(`/conversations/${encodeURIComponent(id)}/model`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model }), signal,
+        });
+        return res.ok;
       });
-      return res.ok;
     } catch (_err) {
       return false;
     }
@@ -1120,7 +1134,12 @@ class RetinueConversation extends HTMLElement {
     if (this._id !== id || seq !== this._loadSeq) return false;
     const gen = pinGen(id);
     try {
-      const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store' });
+      // Bounded like a send: the poll waits for this read before it schedules
+      // the next, so a read that never answered stopped the thread updating.
+      const res = await within(REQUEST_TIMEOUT_MS, async (signal) => {
+        const r = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store', signal });
+        return { status: r.status, ok: r.ok, doc: r.ok ? await r.json() : null };
+      });
       if (this._id !== id || seq !== this._loadSeq) return false;
       if (res.status === 404) {
         // Deleted, or a stale link: nothing to show, poll or reply to — a
@@ -1143,8 +1162,7 @@ class RetinueConversation extends HTMLElement {
         return false;
       }
       if (!res.ok) throw new Error(String(res.status));
-      const t = await res.json();
-      if (this._id !== id || seq !== this._loadSeq) return false;
+      const t = res.doc;
       if (!t || (t.id && t.id !== id)) return false;
       // A pin stored while this read was under way: the read's model is
       // older than the picker's, which the pin's own read confirms. No pin
@@ -1442,7 +1460,18 @@ class RetinueConversation extends HTMLElement {
         `<small class="pending-help">${esc(this._pendingHelpText(t))}</small>` +
         `</div></div>`
       : '';
-    return msgs + pending;
+    // A turn the host sent (the chat page's Proofread and its siblings) was
+    // never in the composer, so while it is on the wire it shows here: with
+    // nothing but a locked, empty box to see, the press looked like it had
+    // done nothing, and was pressed again. A typed turn needs no such bubble
+    // — its words stay in the box, greyed, until they are out.
+    const out = SENDS.get(this._key());
+    const sending = out && !out.fromDraft && out.text.trim()
+      ? `<div class="msg me sending"><div class="msg-head"><small class="who">You</small>` +
+        `<small class="msg-meta">Sending &#8230;</small></div>` +
+        `<div class="bubble">${this._renderBubble(out.text)}</div></div>`
+      : '';
+    return msgs + sending + pending;
   }
 
   // The header meta after the sender name: for an answer bubble, the model
@@ -1740,9 +1769,20 @@ class RetinueConversation extends HTMLElement {
     // A message needs text or at least one attachment.
     if (!text.trim() && !(fromDraft && d.files.length)) return;
     // One send at a time. The host's controls stay live through it, so a
-    // second ask arriving now is kept rather than dropped (see _keepUnsent).
-    if (this._busy) { this._keepUnsent(key, text, fromDraft); return; }
-    const sent = { text, files: fromDraft ? d.files.slice() : [] };
+    // second ask arriving now is kept rather than dropped (see _keepUnsent) —
+    // unless it is the very turn on the wire, pressed again: that one is
+    // already going, and its bubble says so.
+    if (this._busy) {
+      const out = SENDS.get(key);
+      if (!(out && out.text === text)) this._keepUnsent(key, text, fromDraft);
+      return;
+    }
+    const sent = { text, files: fromDraft ? d.files.slice() : [], fromDraft };
+    // How often the thread held these words before they went: a send that
+    // times out is checked against it (see arrivedAnyway). Only for the
+    // thread on screen — a first message has no thread to read yet.
+    const before = (!isNewKey(key) && this._thread && String(this._thread.id) === key)
+      ? sameTurns(this._thread, text) : -1;
     SENDS.set(key, sent);
     // The composer locks now, not once the send is over: nothing typed or
     // picked meanwhile can be lost to the clear below, and a composer
@@ -1764,7 +1804,8 @@ class RetinueConversation extends HTMLElement {
       // rather than return, so there is ONE way out of a turn that did not go
       // and no exit can forget what it owes the composer.
       const target = await targetFor(key, this.getAttribute('create-url'), this._newModel);
-      const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel);
+      const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel)
+        .catch((err) => arrivedAnyway(err, target, text, before));
       delivered = true;
       if (fromDraft) clearSent(d, text, sent.files);
       this._attachError = '';
@@ -1801,16 +1842,18 @@ class RetinueConversation extends HTMLElement {
     } catch (err) {
       // Why it turned back, in words the user can act on: a thread that could
       // not be started asks for a retry, a model that would not store asks for
-      // the pick again, and an ordinary send failure needs no note — the words
-      // are back in the box and the box is the invitation.
+      // the pick again, a send that got no answer says it may still turn up,
+      // and an ordinary send failure needs no note — the words are back in
+      // the box and the box is the invitation.
       const why = err && err.message;
-      if (why === 'mint' || why === 'model') {
+      const note = why === 'mint' ? "Couldn't start this conversation. Please try again."
+        : why === 'model' ? "The model choice wasn't saved. Please pick it again."
+        : why === 'timeout' ? "No answer from the server. The message is back in the box — "
+          + "if it doesn't show up above, send it again."
+        : '';
+      if (note) {
         const el = this._liveFor(key);
-        if (el) {
-          el._attachError = why === 'mint'
-            ? "Couldn't start this conversation. Please try again."
-            : "The model choice wasn't saved. Please pick it again.";
-        }
+        if (el) el._attachError = note;
       }
       this._keepUnsent(key, text, fromDraft);
       // A turn that did not go out has no answer coming: the loop stops.
@@ -1933,7 +1976,9 @@ class RetinueConversation extends HTMLElement {
   // tapped during another send from vanishing without trace.
   _keepUnsent(key, text, fromDraft) {
     if (fromDraft) return;
-    appendToDraft(key, text);
+    // Words already in the box (the same chip pressed while its first press
+    // was on the wire, which then failed) go in once.
+    if (!draftOf(key).text.includes(text.trim())) appendToDraft(key, text);
     const el = this._liveFor(key);
     if (el) { el._focusNext = true; el.render(); }
   }
@@ -2818,12 +2863,57 @@ async function targetFor(key, createUrl, heldModel) {
 // is idempotent and carries no message, so the first turn is never spent on a
 // failed create: it is still in the draft, and the retry mints nothing new.
 async function mintThread(url) {
-  const res = await fetch(url, { method: 'POST' });
-  if (!res.ok) throw new Error(String(res.status));
-  const data = await res.json();
+  const data = await within(REQUEST_TIMEOUT_MS, async (signal) => {
+    const res = await fetch(url, { method: 'POST', signal });
+    if (!res.ok) throw new Error(String(res.status));
+    return res.json();
+  });
   const id = data && data.id;
   if (!id) throw new Error('no id');
   return String(id);
+}
+
+// Run `run(signal)` — a fetch and the read of its body — against a deadline:
+// past `ms` the request is aborted and the call throws Error('timeout').
+async function within(ms, run) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  try {
+    return await run(ctl.signal);
+  } catch (err) {
+    if (ctl.signal.aborted) throw new Error('timeout');
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// How many of the user's turns in thread document `t` carry exactly `text`
+// (as the gateway stores it: trimmed).
+function sameTurns(t, text) {
+  const want = String(text || '').trim();
+  return ((t && t.messages) || [])
+    .filter((m) => m.role === 'user' && String(m.text || '').trim() === want).length;
+}
+
+// A send that timed out may have been stored all the same: an answer can be
+// lost on its way back as well as the request on its way there, and sending
+// the words again would then run the turn twice. So the thread is read once:
+// holding the words more often than it did before the send (`before`, from
+// sameTurns), it is the send's answer after all. Anything else — the read
+// failing too, a thread the send had no count for (-1), any other error —
+// is rethrown as it came.
+async function arrivedAnyway(err, id, text, before) {
+  if (!err || err.message !== 'timeout' || !id || before < 0) throw err;
+  let t = null;
+  try {
+    t = await within(REQUEST_TIMEOUT_MS, async (signal) => {
+      const res = await fetch(`/conversations/${encodeURIComponent(id)}`, { cache: 'no-store', signal });
+      return res.ok ? res.json() : null;
+    });
+  } catch (_e) { /* not known: the timeout stands */ }
+  if (t && sameTurns(t, text) > before) return t;
+  throw err;
 }
 
 async function sendMessage(id, text, files, seed, model) {
@@ -2839,12 +2929,16 @@ async function sendMessage(id, text, files, seed, model) {
     body.attachments = files.map((f) => ({ filename: f.name, content_type: f.type, data: f.data }));
   }
   const url = id ? `/conversations/${encodeURIComponent(id)}/messages` : LIST_URL;
-  const res = await fetch(url, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+  const payload = JSON.stringify(body);
+  const ms = REQUEST_TIMEOUT_MS + Math.ceil(payload.length / UPLOAD_BYTES_PER_SECOND) * 1000;
+  return within(ms, async (signal) => {
+    const res = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: payload, signal,
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    return res.json();
   });
-  if (!res.ok) throw new Error(String(res.status));
-  return res.json();
 }
 
 const BAR_CSS = `
@@ -3079,6 +3173,7 @@ const CSS = `
   .pending-help { display: block; margin-top: 4px; font-size: .72rem; line-height: 1.35; color: var(--muted, #8b93a3); }
   .msg-head { display: flex; align-items: center; gap: 6px; }
   .msg.me .msg-head { flex-direction: row-reverse; }
+  .msg.sending .bubble { opacity: .6; }
   /* A finger-sized target that still sits in a one-line header: the negative
      margin lets the 30px hit area overhang the small text around it. */
   .speak { background: transparent; border: 0; cursor: pointer; padding: 0; margin: -7px 0;

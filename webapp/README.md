@@ -696,7 +696,8 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   list to its top. Any other page of the web app answers by loading
   `/?wake=1` or `/` — unless it holds unsent input (pages register a check
   with `registerUnsavedCheck` in `components/shell.js`), in which case
-  neither event navigates. The gateway's own pages (`/sends`, `/claude-auth`)
+  neither event navigates — until a Home press (or a tab press of the
+  navigation row) is made again while the note shows, which goes anyway. The gateway's own pages (`/sends`, `/claude-auth`)
   carry no `shell.js`, so the shell itself loads the home (or `/?wake=1`)
   when the page in front is not the dashboard's. A wake while the page is not
   loaded makes the shell load `/?wake=1` itself; the home drops the flag from

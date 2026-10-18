@@ -316,6 +316,11 @@ taps).
   draft. Tapping one switches to the companion pane with that prompt already
   running as the user's turn; the companion applies the result to the draft and
   answers in one line. No new machinery: a chip is a pre-filled companion turn.
+  While that turn is on its way it shows in the pane as a *Sending* bubble (it
+  is in no composer to see), and the same chip pressed again sends nothing. A
+  send the gateway does not answer within its deadline is given up: the pane
+  unlocks with the turn in its box and a note that it may still turn up —
+  unless a re-read of the thread finds it stored after all.
 
 ## The companion thread
 
