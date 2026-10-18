@@ -233,7 +233,10 @@ instruction without VIP and has it ask for a high importance.
   a VIP's would be — the reason line says the turn did not finish, not that
   the sender is a VIP. An instruction can delay a ring by at most that long
   and never prevent one; a draft that finishes later still lands. So does a
-  message whose turn could not be started at all.
+  message whose turn could not be started at all. Besides a muted chat, only
+  a message the user has already read or answered while the turn worked
+  stays quiet: a ring would tell them nothing new, and would reopen the item
+  their reply settled.
 - **No sending.** A reply is only ever staged in the chat's draft; the user's
   send press is the only way a chat reply leaves in their name. That is how
   the chat surface works for every agent (docs/messenger-chats.md): the send

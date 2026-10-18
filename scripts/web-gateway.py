@@ -6702,7 +6702,9 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
     message is to be worked by (contacts.instructed_person), None for none;
     ``vip`` whether the sender is also a VIP. ``ring`` is set for a message
     whose ring waits on this turn — an instructed sender who is not a VIP —
-    and carries what delivering it needs later (``had_unread``); the ring is
+    and carries what delivering it needs later (``had_unread``, and the
+    chat's ``read_seq`` at arrival, which tells whether the user has read
+    the message by then: _instructed_read_since); the ring is
     registered here, with its timeout, under the same lock that mints the
     job, so a repeated delivery of one message never registers a second."""
     if not CHAT_ARRIVAL_TURNS:
@@ -6758,6 +6760,7 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
             timer.daemon = True
             _INSTRUCTED_RINGS[job_id] = {"chat_id": chat_id, "entry": dict(entry),
                                          "had_unread": bool(ring.get("had_unread")),
+                                         "read_seq": int(ring.get("read_seq") or 0),
                                          "timer": timer, "job": job_id}
             arrival["ring"] = job_id
             timer.start()
@@ -6910,11 +6913,19 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
     """Put a held instructed arrival through the attention model now: with
     the verdict's importance and deadline, decided by the mode in force like
     any message; without one, as a VIP's — it rings, whatever the mode. A
-    chat muted meanwhile stays quiet, as it would have on arrival."""
+    chat muted meanwhile stays quiet, as it would have on arrival; so does a
+    message the user has already read or answered while the turn worked."""
     chat_id, entry = ring["chat_id"], ring["entry"]
     doc = _CHAT_STATE.get(chat_id)
     if doc.get("muted"):
         out = {"delivery": "quiet", "reason": "the chat is muted"}
+    elif _instructed_read_since(doc, ring):
+        # A ring would tell the user nothing new, and putting the message
+        # through the attention model now would reopen the item their reply
+        # just settled. The verdict still records on an item left open.
+        out = {"delivery": "seen", "reason": "you read the chat while the turn was working"}
+        if verdict is not None:
+            _attention_note_verdict(chat_id, verdict)
     else:
         if verdict is not None:
             spec = {"importance": verdict["importance"], "importance_from": "instruction"}
@@ -6939,6 +6950,21 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
     if note:
         _instructed_note(chat_id, jobs={ring.get("job")}, **out)
     return out
+
+
+def _instructed_read_since(doc: dict, ring: dict) -> bool:
+    """Whether the user caught up on the chat past a held arrival while its
+    turn worked: opened it, or answered from the composer or their phone —
+    each a read since the arrival (``read_seq`` moved) that leaves the
+    watermark at or past the message. Counted by reads rather than by the
+    watermark moving, which keeps whole seconds: a message delivered late,
+    stamped behind a read the watermark already holds, is seen by the next
+    read even when that read falls in the same second."""
+    last = doc.get("last_read")
+    if not last or "read_seq" not in ring:
+        return False
+    return (last >= (ring["entry"].get("ts") or "")
+            and int(doc.get("read_seq") or 0) > ring["read_seq"])
 
 
 def _attention_note_verdict(chat_id: str, verdict: dict) -> None:
@@ -10477,7 +10503,8 @@ class Handler(BaseHTTPRequestHandler):
                     # One turn, whichever the sender is: a VIP's, briefed by
                     # their instruction when they carry one, or an instructed
                     # sender's, whose ring waits on it.
-                    ring = {"had_unread": had_unread} if defer and not quiet else None
+                    ring = ({"had_unread": had_unread, "read_seq": doc.get("read_seq")}
+                            if defer and not quiet else None)
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"), person=person,
                         vip=vip, ring=ring)
