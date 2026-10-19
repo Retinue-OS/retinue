@@ -7,7 +7,7 @@ the plumbing around it that the web-gateway and the boot emitter share:
 - **The two small documents** under ``ATTENTION_DIR`` — ``focus.json`` (modes,
   the week of day plans, holidays, digest times, the manual override) and ``profile.json``
   (importance and sphere priors per sender or kind, lead times per kind,
-  permits per mode, the learned log) — plus ``projects.json``, the delivery
+  permits per mode, expiry per sender, the learned log) — plus ``projects.json``, the delivery
   state of projects, which have no document of their own in the gateway (their
   properties live in chamber frontmatter; only what the model does with them
   is kept here). Single-writer, one lock, atomic writes: the chat-state
@@ -133,6 +133,7 @@ class AttentionStore:
             profile.setdefault("tags", {})
             profile.setdefault("priors", {})
             profile.setdefault("permits", {})
+            profile.setdefault("expiry", {})
             profile.setdefault("learned", [])
             return profile
 

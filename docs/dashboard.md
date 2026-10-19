@@ -266,7 +266,8 @@ digest after it.
 (admitted spheres, admitting tags, threshold, blurb), the week, the holidays,
 the default digest times, the sphere vocabulary and the manual override — and
 `profile.json` — importance and sphere priors per sender or
-kind, lead times per kind, permits per mode, and the learned log; plus
+kind, lead times per kind, permits per mode, expiry per sender (below), and
+the learned log; plus
 `projects.json` with the delivery state of projects. `GET /attention/profile`
 returns both, `POST /attention/profile` replaces them, and `POST
 /attention/modes` changes the rules by patch (`attention.apply_rules`: a
@@ -277,6 +278,22 @@ times as `HH:MM` or minutes) — what the mode menu, the settings page and Ara
 write; a deployment edits the files or drives the mode from the menu. The
 shipped defaults are the brief's (`attention.default_focus()`,
 `default_profile()`).
+
+**Expiry.** Some messages are worthless minutes after they arrive — a
+one-time login code is the case. The profile's `expiry` maps a sender to
+minutes; each message from them stamps its chat's item with `expires_at`
+(arrival plus that span, restarted by every new message), and the gateway's
+minute tick (`_attention_expire`) settles an open item whose time is up: it
+is marked done (`done_how: "expired"`) and the chat archived, not muted, so
+the sender's next message brings it back and rings exactly as before. No
+model is involved — it is a clock, deterministic and free, and a deployment
+with no expiry pays nothing (the tick reads only the chat state documents,
+and only while some sender has one). Expiry decides when an item leaves the
+list, never whether it rings: that stays with importance, sphere and
+permits. Putting an expired item back (*Reopen*) unarchives the chat and
+clears its timer. Ara sets or clears it with `attention-set.py <chat item>
+--sender-expiry 10m` (`none` clears); the row in `GET /attention` carries
+`expires_at` and the sender's `expiry`.
 
 **The week.** The schedule is not one day repeated, and not seven: it is a
 few **day plans**, each a day's schedule (`[minute, mode]` or `[minute,

@@ -178,9 +178,11 @@ def heal_within(focus: dict) -> dict:
 
 
 def default_profile() -> dict:
-    """The attention profile (profile.json): importance priors, lead times, permits."""
+    """The attention profile (profile.json): importance priors, lead times,
+    permits, and how long a sender's messages stay worth anything (``expiry``,
+    minutes per sender — see expires_at)."""
     return {"priors": {}, "spheres": {}, "tags": {}, "leads": dict(DEFAULT_LEADS),
-            "permits": {mid: [] for mid in DEFAULT_MODES}, "learned": []}
+            "permits": {mid: [] for mid in DEFAULT_MODES}, "expiry": {}, "learned": []}
 
 
 def load_json(path: Path, default: dict) -> dict:
@@ -306,6 +308,10 @@ def item_from_doc(doc: dict, kind: str, profile: dict) -> dict:
         "digest_at": parse_dt(a.get("digest_at")),
         "done_at": a.get("done_at"),
         "done_how": a.get("done_how"),
+        # When the item settles itself, unread or not: a one-time code is
+        # worthless minutes after it arrives (the sender's ``expiry`` in the
+        # profile; see expires_at). None for anything that waits on the user.
+        "expires_at": parse_dt(a.get("expires_at")),
         "project": a.get("project") or doc.get("project") or None,
     }
 
@@ -326,6 +332,7 @@ def item_to_attention(item: dict) -> dict:
         "pushed": [iso(x) for x in item.get("pushed") or []], "pulled": bool(item.get("pulled", False)),
         "digest_at": iso(item.get("digest_at")),
         "done_at": item.get("done_at"), "done_how": item.get("done_how"),
+        "expires_at": iso(item.get("expires_at")),
         "project": item.get("project") or None,
     }
 
@@ -1568,6 +1575,28 @@ def reopen(item: dict) -> None:
     item["digest_at"] = None
     item["done_at"] = None
     item["done_how"] = None
+    # Put back by hand, it stays until the user is done with it: a timer
+    # that already ran out must not take it away again on the next tick.
+    item["expires_at"] = None
+
+
+def expires_at(sender: str | None, profile: dict, now: datetime) -> datetime | None:
+    """When a message from ``sender`` arriving ``now`` stops being worth
+    anything, from the profile's ``expiry`` (minutes per sender) — None for a
+    sender without one. Deterministic on purpose: a one-time code needs a
+    clock, not a model's judgement."""
+    minutes = (profile.get("expiry") or {}).get(sender) if sender else None
+    try:
+        minutes = float(minutes)
+    except (TypeError, ValueError):
+        return None
+    return now + timedelta(minutes=minutes) if minutes > 0 else None
+
+
+def expired(item: dict, now: datetime) -> bool:
+    """Is this open item past its expiry?"""
+    at = item.get("expires_at")
+    return item.get("state", "open") == "open" and at is not None and at <= now
 
 
 def shown_anyway(item: dict, mode: dict, profile: dict, now: datetime) -> bool:
