@@ -250,7 +250,13 @@ docstring). Pieces:
   thread keeps its room: the chips — one sideways-scrolling row on a phone —
   and a standing instruction's report (its flags first) share a region capped
   at a fifth of the pane that scrolls inside, the field grows to at most 30%
-  of it, and the send row is never pushed off the frame.
+  of it, and the send row is never pushed off the frame. A draft longer than
+  its box shows an expand control in the field's top-right corner: the field
+  then takes the whole pane at its full width (the thread and the chips step
+  aside, the mic and send sit under its corners) until the control is pressed
+  again, Escape is pressed, a recording starts or the draft is sent — and the
+  thread comes back where it was left. Pressing it never moves the focus, so
+  the phone keyboard stays as it was.
   The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.

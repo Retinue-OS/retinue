@@ -82,6 +82,15 @@ const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
 const MAX_COMP_FRACTION = 0.6;
 const KEY_STEP_PX = 32;
 const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
+// The expand control sits in the field's top-right corner, the clip in its
+// bottom-right: below this height the two would overlap.
+const EXPAND_MIN_PX = 72;
+const ICON_EXPAND = '<svg class="i-grow" viewBox="0 0 24 24" width="16" height="16" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
+const ICON_SHRINK = '<svg class="i-shrink" viewBox="0 0 24 24" width="16" height="16" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>';
 const NOTE_MS = 2600;
 // The conversations cadence: how often the open chat re-fetches its messages.
 const POLL_MS = 4000;
@@ -225,6 +234,8 @@ class RetinueChatPage extends HTMLElement {
     this._localSeq = 0;        // ids for optimistic (not yet confirmed) bubbles
     this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
     this._imgError = '';       // staged-image error line (limit hit, unreadable file)
+    this._threadPos = null;    // thread scrollTop while the draft is expanded (null: newest)
+    this._fieldObs = null;     // ResizeObserver on the chat field (the expand control)
     this._lightbox = null;     // {url, alt} while the image overlay is open
     this._helpOpen = false;    // the companion pane's help note is showing
     this._lbClosing = false;   // its history entry is being unwound
@@ -405,6 +416,8 @@ class RetinueChatPage extends HTMLElement {
     this._noteTimers = {};
     if (this._draftTimer) clearTimeout(this._draftTimer);
     if (this._pollTimer) clearInterval(this._pollTimer);
+    if (this._fieldObs) this._fieldObs.disconnect();
+    this._fieldObs = null;
     if (this._onVis) document.removeEventListener('visibilitychange', this._onVis);
     this._onVis = null;
     this._toggleMenu(false);
@@ -1297,6 +1310,38 @@ class RetinueChatPage extends HTMLElement {
       `<span aria-hidden="true">&#128206;</span></label>`;
   }
 
+  // The draft at full height. The field's cap — a share of the pane, so the
+  // thread stays in view (see the composer rules in CSS) — suits a line or
+  // two and not reading through a long draft before it goes out. This control,
+  // in the field's top-right corner while the draft is longer than its box,
+  // hands the field the whole pane (the thread and Ara's offers step aside)
+  // and gives it back; a send or a recording gives it back too, and so does
+  // Escape. A toggle, so one label with its pressed state; the icon says
+  // which way it goes.
+  _expandHtml() {
+    const open = this.hasAttribute('draft-expanded');
+    return `<button type="button" class="expand-inline" data-expand aria-pressed="${open}" ` +
+      `title="Expand the draft" aria-label="Expand the draft">${ICON_EXPAND}${ICON_SHRINK}</button>`;
+  }
+
+  _setDraftExpanded(on) {
+    if (on === this.hasAttribute('draft-expanded')) return;
+    const root = this.shadowRoot;
+    const thread = root.querySelector('[data-chat-thread]');
+    // A thread that is not displayed keeps no scroll position: note where the
+    // reader was, and put them back there — at the newest message if that is
+    // where they were, so what arrived meanwhile is in view.
+    if (on && thread) this._threadPos = this._atBottom() ? null : thread.scrollTop;
+    this.toggleAttribute('draft-expanded', on);
+    const btn = root.querySelector('[data-expand]');
+    if (btn) btn.setAttribute('aria-pressed', String(on));
+    if (this._grow) this._grow();
+    if (!on && thread) {
+      if (this._threadPos === null) this._scrollThread('[data-chat-thread]');
+      else thread.scrollTop = this._threadPos;
+    }
+  }
+
   // One composer's input row — or, while this target records or transcribes,
   // the shared recording/status row from voice.js in its place, so the text
   // field (and the phone keyboard) never reappears mid-flow: the same
@@ -1343,8 +1388,8 @@ class RetinueChatPage extends HTMLElement {
     // it. Keeping the two round controls in their fixed places is the point —
     // the mic is where the mic always is, whatever the field holds, so
     // dictating into an existing draft is just pressing it. The chat field
-    // additionally carries the clear ✕ and the paperclip.
-    const inField = isChat ? clearBtn + this._clipHtml() : clearBtn;
+    // additionally carries the clear ✕, the paperclip and the expand control.
+    const inField = isChat ? clearBtn + this._clipHtml() + this._expandHtml() : clearBtn;
     // `target` is 'chat' throughout now — it stays as the composer's DOM name
     // and the dictation target, which voice.js and _recTarget key on.
     const fieldCls = `field${withClear ? ' has-clear' : ''}` +
@@ -1579,15 +1624,30 @@ class RetinueChatPage extends HTMLElement {
     }
     const input = form.querySelector('textarea');
     const field = form.querySelector('[data-field]');
+    // The expand control shows while the draft is longer than its box, and the
+    // box is tall enough to hold it above the clip.
+    const fit = () => field.classList.toggle('can-expand',
+      input.scrollHeight > input.clientHeight + 1 && input.clientHeight >= EXPAND_MIN_PX);
     const grow = () => {
-      input.style.height = 'auto';
-      input.style.height =
-        `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+      if (this.hasAttribute('draft-expanded')) {
+        // Expanded, the field fills the pane by CSS; an inline height would pin it.
+        input.style.height = '';
+      } else {
+        input.style.height = 'auto';
+        input.style.height =
+          `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+      }
+      fit();
     };
     // Re-capped from the keyboard watch too: the visible height changes
     // without a keystroke when the keyboard comes up, and a multi-line draft
     // must not keep its keyboard-less height and push the send row off.
     this._grow = grow;
+    // The box also changes size with no keystroke and no keyboard (a rotation,
+    // the shelf coming or going), and with it whether the draft overflows.
+    if (this._fieldObs) this._fieldObs.disconnect();
+    this._fieldObs = typeof ResizeObserver === 'function' ? new ResizeObserver(fit) : null;
+    if (this._fieldObs) this._fieldObs.observe(input);
     input.addEventListener('input', () => {
       if (isChat) {
         this._draft = input.value;
@@ -1610,9 +1670,19 @@ class RetinueChatPage extends HTMLElement {
       if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
         form.requestSubmit();
+      } else if (e.key === 'Escape' && this.hasAttribute('draft-expanded')) {
+        e.preventDefault();
+        this._setDraftExpanded(false);
       }
     });
     grow();
+    const expand = form.querySelector('[data-expand]');
+    if (expand) {
+      // Pressed without taking the focus: a draft being typed keeps the phone
+      // keyboard, and one being read does not raise it.
+      expand.addEventListener('mousedown', (e) => e.preventDefault());
+      expand.addEventListener('click', () => this._setDraftExpanded(!this.hasAttribute('draft-expanded')));
+    }
     const clearBtn = form.querySelector('[data-clear]');
     if (clearBtn) {
       clearBtn.addEventListener('click', () => {
@@ -1641,8 +1711,12 @@ class RetinueChatPage extends HTMLElement {
     if (mic) {
       mic.addEventListener('click', () => {
         // The recording row replaces this one and the transcript lands in the
-        // field, so the offer is spent either way.
-        if (isChat) this._setUndo(null);
+        // field, so the offer is spent either way — and the field's expanded
+        // room would hold nothing but that one row.
+        if (isChat) {
+          this._setUndo(null);
+          this._setDraftExpanded(false);
+        }
         this._startRecording(target);
       });
     }
@@ -1657,8 +1731,9 @@ class RetinueChatPage extends HTMLElement {
         this._setDraftByAra(false);
         // Sending is moving on: an offer left over from an earlier clear must
         // not put that text back into a composer the user has just emptied on
-        // purpose.
+        // purpose. The thread comes back with the message just sent.
         this._setUndo(null);
+        this._setDraftExpanded(false);
       }
       input.value = '';
       field.classList.remove('has-text');
@@ -2420,7 +2495,24 @@ const CSS = `
      with their content are capped at a share of the pane — the offers and
      reports (.extras) at a fifth, scrolling inside, the field at 30% — and
      the thread keeps the rest: half the pane, less the few fixed lines (the
-     draft's tag, the recipient). The send row is never what gives way. */
+     draft's tag, the recipient). The send row is never what gives way. A
+     draft longer than its box is read at full height through the field's
+     expand control (_expandHtml): the field takes the pane, and the thread
+     and the offers step aside until it is given back. */
+  :host([draft-expanded]) .pane-chat :is(.thread, .extras) { display: none; }
+  :host([draft-expanded]) .pane-chat .composer { flex: 1; min-height: 0; display: flex;
+                                                 flex-direction: column; }
+  :host([draft-expanded]) .pane-chat .draft-tag { align-self: flex-start; }
+  /* Expanded, the field spans the row and the mic and send sit under its
+     corners — still bottom left and bottom right, where they always are — so
+     a long draft is read at the pane's full width rather than between them. */
+  :host([draft-expanded]) .pane-chat form.row { flex: 1; min-height: 0; display: grid;
+                                                grid-template: minmax(0, 1fr) auto / auto 1fr auto;
+                                                align-items: end; }
+  :host([draft-expanded]) .pane-chat .field { grid-area: 1 / 1 / 2 / -1; align-self: stretch; }
+  :host([draft-expanded]) .pane-chat .mic { grid-area: 2 / 1; }
+  :host([draft-expanded]) .pane-chat .send { grid-area: 2 / 3; }
+  :host([draft-expanded]) .pane-chat .row textarea { max-height: none; }
   .composer { flex: none; margin-top: 4px; padding: 10px 2px 2px;
               border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
   /* The spacing below the last visible part is the region's own padding, and
@@ -2531,6 +2623,19 @@ const CSS = `
                  -webkit-tap-highlight-color: transparent; }
   .field.has-clip .undo-inline { right: 39px; }
   .undo-inline:hover { background: rgba(110, 168, 254, .2); }
+  /* The expand control: the top-right corner, above the clip and inside the
+     right padding the clip and the ✕ already hold, so it covers no text. It
+     is there while the draft overflows its box (.can-expand), and always while
+     the field is expanded — it is the way back. */
+  .expand-inline { position: absolute; top: 5px; right: 5px; width: 30px; height: 30px;
+                   display: none; align-items: center; justify-content: center;
+                   border: 0; border-radius: 50%; padding: 0; cursor: pointer;
+                   background: transparent; color: var(--muted, #8b93a3);
+                   -webkit-tap-highlight-color: transparent; }
+  .field.can-expand .expand-inline, :host([draft-expanded]) .expand-inline { display: inline-flex; }
+  .expand-inline:hover { color: var(--accent, #6ea8fe); background: rgba(110, 168, 254, .2); }
+  .expand-inline .i-shrink, :host([draft-expanded]) .expand-inline .i-grow { display: none; }
+  :host([draft-expanded]) .expand-inline .i-shrink { display: block; }
   /* One slot, two controls: the ✕ while there is text to clear, the undo while
      a clear is still recoverable and the box is empty. Text always wins — once
      the user is writing again there is nothing to undo. */
