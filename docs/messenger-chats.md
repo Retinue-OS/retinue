@@ -316,6 +316,11 @@ taps).
   draft. Tapping one switches to the companion pane with that prompt already
   running as the user's turn; the companion applies the result to the draft and
   answers in one line. No new machinery: a chip is a pre-filled companion turn.
+  While that turn is on its way it shows in the pane as a *Sending* bubble (it
+  is in no composer to see), and the same chip pressed again sends nothing. A
+  send the gateway does not answer within its deadline is given up: the pane
+  unlocks with the turn in its box and a note that it may still turn up —
+  unless a re-read of the thread finds it stored after all.
 
 ## The companion thread
 
@@ -414,6 +419,19 @@ and what a model turn is *for*:
    appends" to "the channel itself"), and the job-status contract (`202` +
    `job_url`) is kept so the gateway's `confirm_delivery` / never-drop
    machinery works unchanged.
+
+   A sender can also carry the user's **standing instruction**
+   (docs/contacts.md, "The instruction"; the gate's `instructed` flag). Their
+   message buys the same companion turn, briefed by the instruction, and the
+   turn ends with a verdict (`chat-verdict.py`): an importance and, where the
+   message has one, a deadline. For a sender who is not also a VIP the arrival
+   pushes nothing; once the turn ends, the attention model decides from the
+   verdict whether the message rings, so a draft the instruction asked for is
+   already in the composer when the push opens the chat. A turn that fails,
+   sets no verdict or runs past `CHAT_INSTRUCTION_TIMEOUT` rings the message as
+   a VIP's would be. A VIP with an instruction rings on arrival, as ever, and
+   the same single turn works the message as instructed; the chat page shows
+   that a draft is on its way, then the verdict and what the turn flagged.
 
    As built, five things are worth naming:
 

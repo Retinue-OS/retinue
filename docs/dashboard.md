@@ -52,7 +52,8 @@ edit. The page's own bar (title, Archive, minimize, model picker, menu)
 stays as a second row under it. On a page holding unsent input — a typed
 message, an unsaved project edit, a dictation on its way — a tap on a tab is
 held with the same note a Home press of the Android shell gets, instead of
-dropping the input. While the phone keyboard is up the row steps aside on a
+dropping the input; pressed again while the note shows, it goes — the hold
+stops a slip, it never keeps anyone on a page. While the phone keyboard is up the row steps aside on a
 drill-down, as the page's own header does. On a phone the home never scrolls as
 a page (the attention list scrolls inside a locked frame, under the
 navigation); in the wide layout (`isWideFrame` in
@@ -131,15 +132,20 @@ a chamber ([contacts.md](contacts.md)). A new person needs the chamber it is
 kept in (a dropdown, pre-selecting the chamber the last contact was created in);
 the card also offers, one tap each, anyone the book already has for this handle
 or for the same number on another channel, and a change to a person reaches
-every chat of theirs. The card also carries the person's VIP switch. An empty
+every chat of theirs. The card also carries the person's VIP switch and their
+**instruction** — the standing brief a model works each of their messages by,
+whose verdict decides how loudly the message rings (docs/contacts.md, "The
+instruction"); *Copy from…* takes one another person carries. An empty
 name unlinks the handle — the person stays — and puts the sender back into
-screening.
+screening. For a chat whose newest message an instruction worked, the sheet
+shows an *Instruction* field: the turn's state, its verdict, what it did and
+what it flagged.
 
 The **Contacts page** (`contacts.html`, the *Contacts* tab of the navigation
 row) is the address book itself: every person, searchable by name
 and e-mail address, each editable in place — their handles on every channel,
-their spheres, importance prior, the Focus modes they may interrupt, and the VIP
-flag. A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
+their spheres, importance prior, the Focus modes they may interrupt, the VIP
+flag and the instruction (with *Copy instruction from…*, for a team). A new contact names the chamber it is kept in. Rows open where the item lives: a thread in place (the conversations
 element on the home is a `viewer` — invisible until a `#conversation-<id>`
 hash opens a thread or `#new` the composer), a chat on `chat.html`, a project
 on `project.html`. The old chats, conversations and projects cards are gone
@@ -264,7 +270,8 @@ digest after it.
 (admitted spheres, admitting tags, threshold, blurb), the week, the holidays,
 the default digest times, the sphere vocabulary and the manual override — and
 `profile.json` — importance and sphere priors per sender or
-kind, lead times per kind, permits per mode, and the learned log; plus
+kind, lead times per kind, permits per mode, expiry per sender (below), and
+the learned log; plus
 `projects.json` with the delivery state of projects. `GET /attention/profile`
 returns both, `POST /attention/profile` replaces them, and `POST
 /attention/modes` changes the rules by patch (`attention.apply_rules`: a
@@ -275,6 +282,22 @@ times as `HH:MM` or minutes) — what the mode menu, the settings page and Ara
 write; a deployment edits the files or drives the mode from the menu. The
 shipped defaults are the brief's (`attention.default_focus()`,
 `default_profile()`).
+
+**Expiry.** Some messages are worthless minutes after they arrive — a
+one-time login code is the case. The profile's `expiry` maps a sender to
+minutes; each message from them stamps its chat's item with `expires_at`
+(arrival plus that span, restarted by every new message), and the gateway's
+minute tick (`_attention_expire`) settles an open item whose time is up: it
+is marked done (`done_how: "expired"`) and the chat archived, not muted, so
+the sender's next message brings it back and rings exactly as before. No
+model is involved — it is a clock, deterministic and free, and a deployment
+with no expiry pays nothing (the tick reads only the chat state documents,
+and only while some sender has one). Expiry decides when an item leaves the
+list, never whether it rings: that stays with importance, sphere and
+permits. Putting an expired item back (*Reopen*) unarchives the chat and
+clears its timer. Ara sets or clears it with `attention-set.py <chat item>
+--sender-expiry 10m` (`none` clears); the row in `GET /attention` carries
+`expires_at` and the sender's `expiry`.
 
 **The week.** The schedule is not one day repeated, and not seven: it is a
 few **day plans**, each a day's schedule (`[minute, mode]` or `[minute,
@@ -773,7 +796,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 |---|---|
 | User agent | ` RetinueShell/1 (Android)` appended. |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings()`, behind Settings → Phone shell (shown only when the object exists). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/` — unless they hold unsent input (the draft of the conversation on screen, a dictation or send under way, an unsaved project edit or chat draft): then neither event navigates, a short note says why, and the composer holding it is brought into view. A draft left in a thread no longer on screen does not hold the press. |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/` — unless they hold unsent input (the draft of the conversation on screen, a dictation or send under way, an unsaved project edit or chat draft): then neither event navigates, a short note says why, and the composer holding it is brought into view. A Home press made again while the note shows navigates after all (a wake does not). A draft left in a thread no longer on screen does not hold the press. |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |

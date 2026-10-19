@@ -1362,6 +1362,62 @@ def test_tick_makes_up_what_it_missed(base, wg):
     print("ok test_tick_makes_up_what_it_missed")
 
 
+def test_sender_expiry(base, wg):
+    """A sender whose messages expire (one-time codes): each message settles
+    itself that long after it arrived — done, the chat archived but not muted
+    — and the next one rings as before, with its own timer. A clock, not a
+    model; a sender without an expiry is untouched."""
+    _mode(base, "chores")
+    code, friend = "+41790000077", "+41790000078"
+    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    _clock(wg, monday.replace(hour=9, minute=0))
+    _inbound(base, code, "SwissID", "Code: 11111111", "2026-09-07T09:00:00Z")
+    _inbound(base, friend, "Lena", "Lunch?", "2026-09-07T09:00:00Z")
+    cid, fid = "chat:signal:" + code, "chat:signal:" + friend
+    status, out = _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": "10m"}, AGENT)
+    assert status == 200 and out["item"]["expiry"] == 10, out["item"]
+    assert out["item"]["expires_at"].startswith("2026-09-07T09:10"), out["item"]
+    status, prof = _http(base, "GET", "/attention/profile")
+    assert prof["profile"]["expiry"] == {"SwissID": 10}, prof["profile"].get("expiry")
+    # A new code restarts the timer.
+    _clock(wg, monday.replace(hour=9, minute=5))
+    _inbound(base, code, "SwissID", "Code: 22222222", "2026-09-07T09:05:00Z")
+    assert wg._CHAT_STATE.get("signal:" + code)["attention"]["expires_at"].startswith("2026-09-07T09:15")
+    wg._attention_tick_state.update(minute=None, emitted=False, ended=None)
+    report = wg._attention_tick(monday.replace(hour=9, minute=14))
+    assert report.get("expired", []) == [] and _find(_sections(base), cid)[0] is not None, report
+    report = wg._attention_tick(monday.replace(hour=9, minute=15))
+    assert report.get("expired") == ["signal:" + code], report
+    doc = wg._CHAT_STATE.get("signal:" + code)
+    assert doc["attention"]["state"] == "done" and doc["attention"]["done_how"] == "expired", doc["attention"]
+    assert doc["archived"] is True and doc["muted"] is False
+    assert _find(_sections(base), cid)[0] is None
+    assert _find(_sections(base), fid)[0] is not None, "a sender without an expiry stays"
+    # The next code brings the chat back, open, and rings in Chores as before.
+    _clock(wg, monday.replace(hour=11, minute=0))
+    PUSHES.clear()
+    body = _inbound(base, code, "SwissID", "Code: 33333333", "2026-09-07T11:00:00Z")
+    doc = wg._CHAT_STATE.get("signal:" + code)
+    assert doc["archived"] is False and doc["attention"]["state"] == "open", doc
+    assert doc["attention"]["expires_at"].startswith("2026-09-07T11:10")
+    assert _find(_sections(base), cid)[0] is not None
+    # Put back by hand, an expired item stays put.
+    wg._attention_tick(monday.replace(hour=11, minute=10))
+    status, out = _http(base, "POST", "/attention/items/reopen", {"id": cid})
+    assert status == 200 and out["item"]["expires_at"] is None, out["item"]
+    wg._attention_tick(monday.replace(hour=11, minute=30))
+    assert _find(_sections(base), cid)[0] is not None
+    # Cleared: the next message has no timer.
+    status, out = _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": None}, AGENT)
+    assert status == 200 and out["item"]["expiry"] is None and out["item"]["expires_at"] is None, out["item"]
+    _inbound(base, code, "SwissID", "Code: 44444444", "2026-09-07T11:40:00Z")
+    assert wg._CHAT_STATE.get("signal:" + code)["attention"]["expires_at"] is None
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    _http(base, "POST", "/attention/items/done", {"id": fid})
+    _clock(wg, None)
+    print("ok test_sender_expiry")
+
+
 def main():
     sparql = _serve(_MockSparql)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1404,6 +1460,7 @@ def main():
         test_broken_focus_document(base, wg)
         test_project_frontmatter_moves(base, wg)
         test_tick_makes_up_what_it_missed(base, wg)
+        test_sender_expiry(base, wg)
         server.shutdown()
     sparql.shutdown()
     print("all attention API checks passed")

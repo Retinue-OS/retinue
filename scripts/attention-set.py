@@ -17,11 +17,15 @@ message, which arrives on the rail before any model has read it:
     attention-set.py thread:42ecb0113a3d48ac87be514cfaf99a7c --actor Publisher
     attention-set.py urn:retinue:project:vat-q3 --importance 5 --lead 4w
     attention-set.py chat:… --done        # nothing to do here; drop it from the list
+    attention-set.py chat:sms:~+41790000000:41798070708 --sender-expiry 10m
 
 Item ids are the ones the dashboard uses: ``thread:<id>``, ``chat:<chat id>``
 (the id GET /chats shows, or the rail's <channel>:~<account>:<key>), or a
 project's URI. ``--sender-sphere`` also remembers the sphere for the chat's
-sender, so their next message starts there. The gateway re-evaluates at once:
+sender, so their next message starts there. ``--sender-expiry SPAN`` makes the
+sender's messages settle themselves SPAN after each arrival — marked done and
+the chat archived, unmuted, so the next one rings as before — the rule for
+one-time codes; ``--sender-expiry none`` clears it. The gateway re-evaluates at once:
 a raised importance can ring, and the reply says what was decided. A sphere
 or tag must be one of the deployment's spheres (attention-spheres.py lists
 them); an unknown one is refused before anything is sent.
@@ -38,6 +42,7 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import attention  # noqa: E402
 import attention_cli  # noqa: E402
 
 _PORT = os.environ.get("WEB_GATEWAY_PORT", "8080")
@@ -65,6 +70,8 @@ def main() -> int:
     parser.add_argument("--actor", metavar="NAME", help="who it waits on; 'you' hands it back")
     parser.add_argument("--sender-sphere", action="store_true",
                         help="remember --sphere for this chat's sender in the profile")
+    parser.add_argument("--sender-expiry", metavar="SPAN",
+                        help="settle this sender's messages SPAN after each arrival (10m, 2h); 'none' clears")
     parser.add_argument("--done", dest="state", action="store_const", const="done",
                         help="mark the item handled")
     parser.add_argument("--reopen", dest="state", action="store_const", const="open")
@@ -99,6 +106,14 @@ def main() -> int:
         payload["critical"] = args.critical
     if args.sender_sphere:
         payload["sender_sphere"] = True
+    if args.sender_expiry is not None:
+        if args.sender_expiry.lower() == "none":
+            payload["sender_expiry"] = None
+        elif not attention.parse_lead(args.sender_expiry):
+            print("attention-set: --sender-expiry takes a span like 10m, 2h or 'none'", file=sys.stderr)
+            return 2
+        else:
+            payload["sender_expiry"] = args.sender_expiry
     if len(payload) == 1:
         print("attention-set: nothing to set", file=sys.stderr)
         return 2

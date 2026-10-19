@@ -48,7 +48,10 @@ Two kinds of policy live here:
       - **Sender** (a handle): VIP or not. A VIP's message is worked by a model
         the moment it arrives — filed, linked to a project, remembered, answered
         in draft — wherever it arrives, a group included. Anyone else's message
-        simply shows up in the chat, which is delivery enough.
+        simply shows up in the chat, which is delivery enough. Independently, a
+        sender can be **instructed**: the user wrote a brief for the person,
+        each message of theirs is worked by it, and the verdict of that turn
+        decides whether the message rings (a VIP rings regardless).
       - **Group** (three independent flags): ``news`` — its messages are also
         forwarded to the news feed (Herald), a rail parallel to the chat;
         ``quieted`` — the message is stored and shown but nothing is owed to a
@@ -73,7 +76,8 @@ the file's :func:`policy_lock`, so neither can drop the other's change. The
 (`scripts/contacts.py`, docs/contacts.md) can be a VIP; the person, not a
 handle, is then the truth, and :func:`sync_contacts` projects every handle of
 every VIP person into these files — messenger accounts as VIP handles, e-mail
-addresses as whitelisted addresses. They are written under a subject of their
+addresses as whitelisted addresses — and every messenger handle of every
+person who carries an instruction as an instructed handle. They are written under a subject of their
 own (``…:contacts``), so the projection is rewritten wholesale without touching
 what was set by hand or learned from the Sent folder, and a reader that does
 not know the split (a gateway built before it) still sees every member: the
@@ -117,6 +121,14 @@ P_NEWS_WILDCARD = KB + "triageNewsWildcard"
 # it holds in a group exactly as in a 1:1 — being one of forty people in a room
 # does not make what this person says any less worth reading.
 P_VIP_HANDLE = KB + "triageVipHandle"
+# The instructed axis: a person the user wrote a standing instruction for
+# (kb:instruction on the contact). Each message of theirs buys one model turn
+# that works it by that brief, and the turn's verdict — not the arrival —
+# decides whether it rings. Sender-only like VIP, and independent of it: a
+# handle can carry both, which means "ring at once, and work it as briefed".
+# Only ever projected from the address book (the words live with the person,
+# so there is nothing to set by hand here); see sync_contacts.
+P_INSTRUCTED_HANDLE = KB + "triageInstructedHandle"
 # Group flags — three orthogonal axes (see module docstring).
 P_IGNORED_GROUP = KB + "triageIgnoredGroup"
 P_QUIETED_GROUP = KB + "triageQuietedGroup"
@@ -150,11 +162,14 @@ EmailPolicy = namedtuple(
     defaults=(frozenset(),) * 7,
 )
 
-# The loaded messenger policy: the three group-flag sets plus the one sender set
-# that still decides anything — set by hand (`vip`) or projected from the VIP
-# persons of the address book (`vip_contacts`); a sender is a VIP if either says so.
-MessengerPolicy = namedtuple("MessengerPolicy", "ignored quieted news vip vip_contacts",
-                             defaults=(frozenset(),))
+# The loaded messenger policy: the three group-flag sets plus the sender sets
+# that still decide anything — VIP, set by hand (`vip`) or projected from the
+# VIP persons of the address book (`vip_contacts`), a sender being a VIP if
+# either says so; and the handles of the persons who carry an instruction
+# (`instructed_contacts`, projected only).
+MessengerPolicy = namedtuple("MessengerPolicy",
+                             "ignored quieted news vip vip_contacts instructed_contacts",
+                             defaults=(frozenset(), frozenset()))
 
 
 def _channel_subject(channel: str) -> str:
@@ -559,19 +574,22 @@ def load_messenger_policy(
     news: set[str] = set()
     vip: set[str] = set()
     vip_contacts: set[str] = set()
+    instructed: set[str] = set()
     for subj, pred, lit in _parse(path):
         val = lit.strip()
         if not val:
             continue
         if pred == P_VIP_HANDLE:
             (vip_contacts if subj.endswith(CONTACTS_SUFFIX) else vip).add(_norm_handle(val))
+        elif pred == P_INSTRUCTED_HANDLE:
+            instructed.add(_norm_handle(val))
         elif pred in (P_IGNORED_GROUP, P_BLOCKED_GROUP):
             ignored.add(val)
         elif pred == P_QUIETED_GROUP:
             quieted.add(val)
         elif pred == P_NEWS_GROUP:
             news.add(val)
-    return MessengerPolicy(ignored, quieted, news, vip, vip_contacts)
+    return MessengerPolicy(ignored, quieted, news, vip, vip_contacts, instructed)
 
 
 def render_messenger_policy(channel: str, pol: MessengerPolicy) -> str:
@@ -581,6 +599,8 @@ def render_messenger_policy(channel: str, pol: MessengerPolicy) -> str:
     lines += [_triple(subj, P_QUIETED_GROUP, g) for g in pol.quieted]
     lines += [_triple(subj, P_NEWS_GROUP, g) for g in pol.news]
     lines += [_triple(subj + CONTACTS_SUFFIX, P_VIP_HANDLE, h) for h in pol.vip_contacts]
+    lines += [_triple(subj + CONTACTS_SUFFIX, P_INSTRUCTED_HANDLE, h)
+              for h in pol.instructed_contacts]
     lines.sort()
     return "".join(line + "\n" for line in lines)
 
@@ -619,6 +639,12 @@ def gate_decision(
       group-independent by design — a VIP writing in a group of forty is still
       the person the user wanted to hear from — and independent of every other
       flag here, which govern attention, not handling.
+    - ``instructed`` — this **sender** carries the user's standing instruction
+      (a person in the address book with ``kb:instruction``): each message of
+      theirs is worked by one model turn with that instruction as its brief,
+      and for a non-VIP the turn's verdict is what decides whether it rings.
+      Sender-only and independent of ``vip``; a handle carrying both rings at
+      once, as a VIP, and is worked as instructed in the same single turn.
     - ``reason`` — a short label for the gateway log.
 
     Attention rail (news and vip are orthogonal — news is driven only by
@@ -644,12 +670,16 @@ def gate_decision(
         # to decide that, the translation is that the switch treats everyone as
         # a VIP — otherwise turning the gate off would quietly turn *off* the
         # handling it exists to force on.
+        # Not `instructed`, which nobody is for want of a policy to read: as a
+        # VIP everyone already gets the turn, and the web gateway reads a
+        # VIP's instruction off the address book itself.
         return {"forward": True, "delivered_if_held": True, "news": False,
-                "vip": True, "reason": "gate-disabled"}
+                "vip": True, "instructed": False, "reason": "gate-disabled"}
     pol = load_messenger_policy(channel, path=path)
     grp = group_id.strip() if group_id else None
     news = bool(grp and grp in pol.news)
     vip = _norm_handle(sender) in (set(pol.vip) | set(pol.vip_contacts))
+    instructed = _norm_handle(sender) in pol.instructed_contacts
 
     if grp and grp in pol.ignored:
         dec = {"forward": False, "delivered_if_held": True,
@@ -662,6 +692,7 @@ def gate_decision(
 
     dec["news"] = news
     dec["vip"] = vip
+    dec["instructed"] = instructed
     return dec
 
 
@@ -739,7 +770,8 @@ def _mutate_messenger_locked(channel, *, ig_add=(), ig_del=(), q_add=(), q_del=(
     quieted -= {g.strip() for g in ig_add if g.strip()}
     write_if_changed(
         render_messenger_policy(
-            channel, MessengerPolicy(ignored, quieted, news, vip, pol.vip_contacts)
+            channel, MessengerPolicy(ignored, quieted, news, vip, pol.vip_contacts,
+                                     pol.instructed_contacts)
         ),
         messenger_policy_path(channel),
     )
@@ -756,27 +788,33 @@ def messenger_policy_channels() -> list[str]:
         return []
 
 
-def sync_contacts(vip_handles: dict[str, set[str]], emails: set[str]) -> list[str]:
+def sync_contacts(vip_handles: dict[str, set[str]], emails: set[str],
+                  instructed_handles: dict[str, set[str]] | None = None) -> list[str]:
     """Project the address book's VIP persons into the gate: ``vip_handles``
     maps a channel to the handles of every VIP person on it, ``emails`` holds
-    their addresses. Replaces the contact-owned members wholesale — hand-set
-    VIPs and the Sent-derived whitelist stay as they are — and writes a file
-    only when its bytes change. A channel with no policy directory yet is
-    written only when it has members and is one of MESSENGER_CHANNELS.
-    Returns the files written."""
+    their addresses, and ``instructed_handles`` maps a channel to the handles
+    of every person who carries an instruction (None: nobody does). Replaces
+    the contact-owned members wholesale — hand-set VIPs and the Sent-derived
+    whitelist stay as they are — and writes a file only when its bytes
+    change. A channel with no policy directory yet is written only when it has
+    members and is one of MESSENGER_CHANNELS. Returns the files written."""
+    instructed_handles = instructed_handles or {}
     written = []
     # A channel no gateway reads (a person's Matrix account, say) gets no
     # policy directory of its own: only the ones already there, and the
     # messenger services the framework runs gateways for.
     channels = set(messenger_policy_channels()) | (
-        {c for c, hs in vip_handles.items() if hs} & set(MESSENGER_CHANNELS))
+        {c for table in (vip_handles, instructed_handles) for c, hs in table.items() if hs}
+        & set(MESSENGER_CHANNELS))
     for channel in sorted(channels):
         want = {_norm_handle(h) for h in vip_handles.get(channel, ()) if h.strip()}
+        briefed = {_norm_handle(h) for h in instructed_handles.get(channel, ()) if h.strip()}
         path = messenger_policy_path(channel)
         with policy_lock(path):
             pol = load_messenger_policy(channel, path=path)
-            if set(pol.vip_contacts) != want and write_if_changed(
-                    render_messenger_policy(channel, pol._replace(vip_contacts=want)), path):
+            if (set(pol.vip_contacts), set(pol.instructed_contacts)) != (want, briefed) and write_if_changed(
+                    render_messenger_policy(channel, pol._replace(vip_contacts=want,
+                                                                  instructed_contacts=briefed)), path):
                 written.append(str(path))
     want = {e.strip().lower() for e in emails if e.strip()}
     with policy_lock(email_whitelist_path()):
@@ -866,6 +904,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"vip\t{h}")
         for h in sorted(set(pol.vip_contacts) - set(pol.vip)):
             print(f"vip\t{h}\t(address book)")
+        for h in sorted(pol.instructed_contacts):
+            print(f"instructed\t{h}\t(address book)")
         for g in sorted(pol.ignored):
             print(f"ignore\t{g}")
         for g in sorted(pol.quieted):
@@ -893,6 +933,10 @@ def main(argv: list[str] | None = None) -> int:
         pol = load_messenger_policy(args.channel)
         vip = _norm_handle(args.handle) in (set(pol.vip) | set(pol.vip_contacts))
         print("vip" if vip else "not-vip")
+        # The second question, asked only when it is answered yes: is there a
+        # brief the turn works their messages by?
+        if _norm_handle(args.handle) in pol.instructed_contacts:
+            print("instructed")
         return 0 if vip else 3
     return 0
 

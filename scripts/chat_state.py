@@ -246,6 +246,11 @@ class ChatStateStore:
             "account": parts[1],
             "key": parts[2],
             "last_read": None,
+            # How many reads advance_last_read has taken, whether or not the
+            # watermark moved: a read is an event even when its whole-second
+            # mark equals the one held (see the web gateway's
+            # _instructed_read_since).
+            "read_seq": 0,
             "draft": None,
             # What the newest clear removed, kept so it can be put back exactly
             # — see set_draft and undo_clear. None when nothing is recoverable.
@@ -292,6 +297,13 @@ class ChatStateStore:
             # inbound message arrives and when the user acts on the home
             # screen; None for a chat the model has not seen.
             "attention": None,
+            # The newest message a sender's standing instruction was applied
+            # to (docs/contacts.md, "The instruction"): who it was for, the
+            # instruction as applied, whether the turn is still working, and
+            # its verdict — importance, deadline, what it did, what it
+            # flagged — with how the message was delivered. None for a chat
+            # no instructed message has arrived in. See `update_instructed`.
+            "instructed": None,
         }
 
     def _read(self, chat_id: str) -> dict:
@@ -472,6 +484,25 @@ class ChatStateStore:
             self._write(doc)
             return doc
 
+    def update_instructed(self, chat_id: str, patch: dict, *,
+                          fresh: bool = False, only_jobs=None) -> dict:
+        """Merge ``patch`` into the chat's ``instructed`` block; ``fresh``
+        starts a new one (a new instructed message) instead of merging into
+        the last. ``only_jobs`` limits the merge to a block that still belongs
+        to one of those arrivals (its ``job``): the block shows the newest
+        instructed message, and the outcome of an older one that settles
+        later must not be written over it."""
+        with self._lock:
+            doc = self._read(chat_id)
+            if (not fresh and only_jobs is not None
+                    and (doc.get("instructed") or {}).get("job") not in only_jobs):
+                return doc
+            base = {} if fresh else dict(doc.get("instructed") or {})
+            base.update(patch)
+            doc["instructed"] = base
+            self._write(doc)
+            return doc
+
     def set_companion(self, chat_id: str, conv_id: str | None) -> dict:
         """Record — or clear, with None — this chat's companion conversation.
 
@@ -493,6 +524,7 @@ class ChatStateStore:
             doc = self._read(chat_id)
             if doc["last_read"] is None or mark > doc["last_read"]:
                 doc["last_read"] = mark
+            doc["read_seq"] = int(doc.get("read_seq") or 0) + 1
             if doc.get("unread_since") and doc["last_read"] >= doc["unread_since"]:
                 doc["unread_since"] = None
             self._write(doc)
