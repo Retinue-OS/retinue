@@ -8449,6 +8449,16 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
     return attention_store.fold_projects(items), degraded
 
 
+def _attention_chat_row_from_state(chat_id: str, state: dict) -> dict:
+    """A chat's row as far as its state document tells it — no store query,
+    no preview: enough to rebuild and persist its attention item."""
+    channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+    return {"id": chat_id, "name": _chat_display_name(state, channel, key),
+            "channel": channel, "key": key, "unread": 0, "last": {},
+            "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
+            "group": state.get("group")}
+
+
 def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
     """One item by its id (``thread:<cid>``, ``chat:<chat id>``, a project
     URI), assembled the same way the list is. A chat or project whose live
@@ -8470,11 +8480,7 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
         if row is None:
             if not state.get("attention"):
                 return None
-            channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
-            row = {"id": chat_id, "name": _chat_display_name(state, channel, key),
-                   "channel": channel, "key": key, "unread": 0, "last": {},
-                   "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
-                   "group": state.get("group")}
+            row = _attention_chat_row_from_state(chat_id, state)
         return attention_store.chat_item(row, state, profile)
     states = _ATTENTION.projects()
     row = None
@@ -8489,8 +8495,10 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
     return attention_store.project_item(row, states.get(item_id), profile, now, _OWNER_ACTOR)
 
 
-def _attention_persist(item: dict) -> None:
-    """Store the item's attention block back where the item lives."""
+def _attention_persist(item: dict, attended: int | None = None) -> None:
+    """Store the item's attention block back where the item lives.
+    ``attended``: for a chat block decided from an arrival, that arrival's
+    ``inbound_seq`` (see ChatStateStore.archive_unless_arrived)."""
     block = attention_store.block_for(item)
     kind = item.get("kind")
     if kind == "thread":
@@ -8500,7 +8508,7 @@ def _attention_persist(item: dict) -> None:
                 conv["attention"] = block
                 _save_conv(conv)
     elif kind == "chat":
-        _CHAT_STATE.set_attention(item["source_id"], block)
+        _CHAT_STATE.set_attention(item["source_id"], block, attended=attended)
         _chats_cache_invalidate()
     else:
         _ATTENTION.save_project(item["source_id"], block)
@@ -8670,7 +8678,7 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
                         "reason": attention_policy.repeat_policy(item, mode)["reason"]}
         else:
             decision = attention_policy.on_arrival(item, focus, profile, now)
-        _attention_persist(item)
+        _attention_persist(item, attended=doc.get("inbound_seq"))
         return decision, item
 
 
@@ -8782,27 +8790,59 @@ def _attention_expire(now: datetime) -> list[str]:
     it away is noise; a clock does this, not a model.
 
     Reads the chat state documents only — no store query — and only while
-    some sender has an expiry, so a deployment without one pays nothing."""
+    some sender has an expiry, so a deployment without one pays nothing. The
+    scan is a snapshot taken outside the lock; each chat it finds is settled
+    by _attention_settle_expired, which decides again from what is stored."""
     if not (_ATTENTION.profile().get("expiry") or {}):
         return []
     settled = []
     for chat_id, doc in _CHAT_STATE.all().items():
-        block = doc.get("attention") or {}
-        if block.get("state", "open") != "open" or not block.get("expires_at"):
-            continue
-        try:
-            at = attention_policy.parse_dt(block["expires_at"])
-        except (TypeError, ValueError):
-            continue
-        if at is None or at > now:
-            continue
-        if not doc.get("archived"):
-            _CHAT_STATE.set_flags(chat_id, archived=True)
-            _chats_cache_invalidate()
-        if _attention_mark(f"chat:{chat_id}", "done", "expired"):
+        if _attention_chat_expired(doc, now) and _attention_settle_expired(chat_id, now):
             settled.append(chat_id)
             print(f"[web-gateway] attention: chat {chat_id} expired", flush=True)
     return settled
+
+
+def _attention_chat_expired(doc: dict, now: datetime) -> bool:
+    """Whether a chat state document holds an open item whose timer ran out."""
+    block = doc.get("attention") or {}
+    if block.get("state", "open") != "open" or not block.get("expires_at"):
+        return False
+    try:
+        at = attention_policy.parse_dt(block["expires_at"])
+    except (TypeError, ValueError):
+        return False
+    return at is not None and at <= now
+
+
+def _attention_settle_expired(chat_id: str, now: datetime) -> bool:
+    """Mark one expired chat done and archive it, deciding from the state
+    document as it is now, under the attention lock — an arrival decides
+    under the same lock (_attention_arrive_chat), so a new code that has
+    restarted the timer or reopened the item since the scan is seen and left
+    alone. What the lock cannot cover is an arrival on its way in: the rail
+    unarchives the chat before the model decides, and an instructed sender's
+    message waits for its turn. Such a message has been counted
+    (``inbound_seq``) but not taken in, and the archive is skipped for it
+    (ChatStateStore.archive_unless_arrived): the old code is still done, the
+    new message stays on the screen. Builds the item from the document, not
+    the store's chat row (_attention_item), so settling costs no query."""
+    with _attention_lock:
+        state = _CHAT_STATE.get(chat_id)
+        if not _attention_chat_expired(state, now):
+            return False
+        item = attention_store.chat_item(_attention_chat_row_from_state(chat_id, state), state,
+                                         _ATTENTION.profile())
+        item["state"] = "done"
+        item["done_at"] = now.isoformat()
+        item["done_how"] = "expired"
+        _attention_persist(item)
+        _, archived = _CHAT_STATE.archive_unless_arrived(chat_id)
+        _chats_cache_invalidate()
+        if not archived:
+            print(f"[web-gateway] attention: chat {chat_id} expired; a newer message "
+                  "is on its way in, so it stays unarchived", flush=True)
+        return True
 
 
 def _attention_set_sender_expiry(item: dict, profile: dict, value, now: datetime) -> bool:

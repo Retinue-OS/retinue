@@ -289,7 +289,12 @@ minutes; each message from them stamps its chat's item with `expires_at`
 (arrival plus that span, restarted by every new message), and the gateway's
 minute tick (`_attention_expire`) settles an open item whose time is up: it
 is marked done (`done_how: "expired"`) and the chat archived, not muted, so
-the sender's next message brings it back and rings exactly as before. No
+the sender's next message brings it back and rings exactly as before. A
+message still on its way into the model when the timer fires (the rail has
+counted it in the chat state's `inbound_seq`, the attention block has not
+taken it in yet — `attended_seq` — e.g. while an instructed sender's turn
+works) keeps the chat unarchived: the old item is done, the new message stays
+in view. No
 model is involved — it is a clock, deterministic and free, and a deployment
 with no expiry pays nothing (the tick reads only the chat state documents,
 and only while some sender has one). Expiry decides when an item leaves the
