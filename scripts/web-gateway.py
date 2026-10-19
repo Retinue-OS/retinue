@@ -8586,6 +8586,9 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
         block["vip_from"] = vip_from if vip else None
         state = dict(doc, attention=block)
         item = attention_store.chat_item(row, state, profile)
+        # Every message restarts the sender's timer, if they have one: the
+        # new code is the one that matters (_attention_expire).
+        item["expires_at"] = attention_policy.expires_at(item.get("sender"), profile, now)
         if was_held and attention_policy.repeat_policy(item, mode)["escalate"]:
             item["released"] = True
             item["last_level"] = attention_policy.level(item, now)
@@ -8607,7 +8610,8 @@ def _attention_rename_sender(profile: dict, was: str, now_name: str) -> list[str
     number. Existing knowledge under the new name wins: it is about the
     person, not about the handle they arrived on."""
     moved = []
-    for key, label in (("priors", "importance prior"), ("spheres", "sphere"), ("tags", "further spheres")):
+    for key, label in (("priors", "importance prior"), ("spheres", "sphere"), ("tags", "further spheres"),
+                       ("expiry", "expiry")):
         table = profile.get(key) or {}
         if was in table:
             value = table.pop(was)
@@ -8696,6 +8700,38 @@ def _attention_emit(items: list[dict]) -> None:
         print(f"[web-gateway] attention: emit failed ({exc})", flush=True)
 
 
+def _attention_expire(now: datetime) -> list[str]:
+    """Settle the chats whose sender's messages expire (the profile's
+    ``expiry``, minutes per sender) once their time is up: the item is marked
+    done (``expired``) and the chat archived — not muted, so the sender's next
+    message brings it back, ringing as before. A one-time code is worthless
+    minutes after it arrives, and leaving it on the list until someone swipes
+    it away is noise; a clock does this, not a model.
+
+    Reads the chat state documents only — no store query — and only while
+    some sender has an expiry, so a deployment without one pays nothing."""
+    if not (_ATTENTION.profile().get("expiry") or {}):
+        return []
+    settled = []
+    for chat_id, doc in _CHAT_STATE.all().items():
+        block = doc.get("attention") or {}
+        if block.get("state", "open") != "open" or not block.get("expires_at"):
+            continue
+        try:
+            at = attention_policy.parse_dt(block["expires_at"])
+        except (TypeError, ValueError):
+            continue
+        if at is None or at > now:
+            continue
+        if not doc.get("archived"):
+            _CHAT_STATE.set_flags(chat_id, archived=True)
+            _chats_cache_invalidate()
+        if _attention_mark(f"chat:{chat_id}", "done", "expired"):
+            settled.append(chat_id)
+            print(f"[web-gateway] attention: chat {chat_id} expired", flush=True)
+    return settled
+
+
 def _attention_tick_minutes(stamp: datetime) -> list[datetime]:
     """The minutes this tick answers for: every one since the last it handled
     — a slow store query, a failed run or a restart can pass a digest time by
@@ -8727,6 +8763,12 @@ def _attention_tick(now: datetime | None = None) -> dict:
     stamp = now.replace(second=0, microsecond=0)
     if _attention_tick_state["minute"] == stamp:
         return {}
+    # Every minute, before the early return below: an expiry is measured in
+    # minutes, not in digest times.
+    expired = _attention_expire(now)
+    if expired:
+        # What the store says is open has changed even on a quiet minute.
+        _attention_tick_state["emitted"] = False
     minutes = _attention_tick_minutes(stamp)
     with _attention_lock:
         focus = _ATTENTION.focus()
@@ -8748,7 +8790,8 @@ def _attention_tick(now: datetime | None = None) -> dict:
             return {}
         key = stamp.strftime("%Y-%m-%d %H:%M")
         items, _degraded = _attention_items(profile, now)
-        report: dict = {"at": key, "events": sorted(events), "pushed": [], "digest": 0}
+        report: dict = {"at": key, "events": sorted(events), "pushed": [], "digest": 0,
+                        "expired": expired}
         if events & {"digest", "mode", "break", "end"}:
             label = (f"{ended} ended {now:%H:%M}" if ended
                      else f"Break {now:%H:%M}" if "break" in events else None)
@@ -8811,6 +8854,10 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "actor": item.get("actor") or "you", "waiting_since": iso(item.get("waiting_since")),
         "state": item.get("state", "open"), "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "pulled": bool(item.get("pulled")),
+        # When it settles itself (the sender's expiry, _attention_expire),
+        # and the rule in minutes, so the sheet can say "expires 14:32".
+        "expires_at": iso(item.get("expires_at")),
+        "expiry": (profile.get("expiry") or {}).get(sender) if sender else None,
         "own": bool(item.get("own")),
         # A chat whose newest message was worked by a standing instruction:
         # who it was for, the turn's state and its verdict (_instructed_note).
@@ -10705,6 +10752,11 @@ class Handler(BaseHTTPRequestHandler):
                 item["done_at"] = now.isoformat()
                 item["done_how"] = "marked"
             elif action == "reopen":
+                if item.get("kind") == "chat" and item.get("done_how") == "expired":
+                    # The expiry archived the chat (_attention_expire); an
+                    # archived chat is no item, so putting it back undoes that.
+                    _CHAT_STATE.set_flags(item["source_id"], archived=False)
+                    _chats_cache_invalidate()
                 attention_policy.reopen(item)
             elif action == "correct":
                 patch = {}
@@ -10950,6 +11002,18 @@ class Handler(BaseHTTPRequestHandler):
             revised.update({k: item[k] for k in ("source_id", "preview", "href", "channel", "agent", "count", "unread",
                                                  "frontmatter")
                             if k in item})
+            if "sender_expiry" in payload and item.get("sender"):
+                # How long this sender's messages are worth anything, in
+                # minutes; null or 0 clears it. This message's own timer is
+                # set from the same rule, counted from now.
+                minutes = attention_policy.parse_lead(payload["sender_expiry"])
+                table = profile.setdefault("expiry", {})
+                if minutes:
+                    table[item["sender"]] = minutes
+                else:
+                    table.pop(item["sender"], None)
+                _ATTENTION.save_profile(profile)
+                revised["expires_at"] = attention_policy.expires_at(item["sender"], profile, now)
             if payload.get("sender_sphere") and item.get("sender") and block.get("sphere"):
                 # The sender's spheres, not only this message's: the main one
                 # and, where given, the further ones.
