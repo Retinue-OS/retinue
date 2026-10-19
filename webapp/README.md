@@ -246,6 +246,11 @@ docstring). Pieces:
   rotation with the keyboard up, dropped while pinch-zoomed) — the header
   and the companion's bar are hidden, and the pane being typed in is kept
   scrolled to its newest message; the navigation row steps aside with them.
+  However short the frame (the Android shell's, above its launcher bar), the
+  thread keeps its room: the chips — one sideways-scrolling row on a phone —
+  and a standing instruction's report (its flags first) share a region capped
+  at a fifth of the pane that scrolls inside, the field grows to at most 30%
+  of it, and the send row is never pushed off the frame.
   The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.

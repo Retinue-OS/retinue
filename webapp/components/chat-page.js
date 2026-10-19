@@ -1227,10 +1227,16 @@ class RetinueChatPage extends HTMLElement {
     const chips = QUICK_PATTERNS.map((p) =>
       `<button type="button" class="qchip" data-quick="${p.id}">${esc(p.label)}</button>`
     ).join('');
+    // Ara's offers and reports — the chips and what a standing instruction
+    // did — share one region that scrolls once it reaches its share of the
+    // pane (.extras); what concerns the send itself (its note, the draft's
+    // author, staged images, an error, the recipient) stays with the field.
     return `<div class="composer">` +
+      `<div class="extras">` +
       `<div class="chips" role="toolbar" aria-label="Quick patterns">${chips}</div>` +
-      `<div class="note" data-note role="status" hidden></div>` +
       this._instructedHtml() +
+      `</div>` +
+      `<div class="note" data-note role="status" hidden></div>` +
       draftTag +
       this._imgPreviewsHtml() +
       this._errRowHtml('chat') +
@@ -1484,14 +1490,17 @@ class RetinueChatPage extends HTMLElement {
   // (docs/contacts.md, "The instruction"): while its turn works, that a draft
   // may be on its way — the message has perhaps not rung yet, and the user
   // who opened the chat anyway should not start typing over it; once done,
-  // the verdict, what the turn did, and anything it flagged.
+  // the verdict, what the turn did, and anything it flagged. The flags come
+  // straight after the head: the line sits in a region that may show only its
+  // first lines (.extras), and what the user is asked to check matters more
+  // than the report of what was done.
   _instructedHtml() {
     const s = this._instructedFresh() ? instructedSummary(this._chat && this._chat.instructed) : null;
     if (!s) return '<div class="instructed" data-instructed hidden></div>';
     return `<div class="instructed${s.state === 'working' ? ' working' : ''}" data-instructed role="status">` +
       `<div class="ins-head">&#9998; ${esc(s.head)}</div>` +
-      s.lines.map((l) => `<div>${esc(l)}</div>`).join('') +
       s.flags.map((f) => `<div class="flag">&#9873; ${esc(f)}</div>`).join('') +
+      s.lines.map((l) => `<div>${esc(l)}</div>`).join('') +
       `</div>`;
   }
 
@@ -2287,6 +2296,10 @@ const CSS = `
   .pane { flex: 0 0 100%; min-width: 0; scroll-snap-align: start; scroll-snap-stop: always;
           display: flex; flex-direction: column; min-height: 0; }
   .pane-splitter { display: none; }
+  /* The chat pane is a size container: the composer's parts that grow with
+     their content take shares of it (cqh, see the composer rules), so the
+     thread above them always keeps the rest. */
+  .pane-chat { container-type: size; }
   .pane-companion { padding-top: 8px; }
   /* The companion's lead in its bar: the name (wide layout only — on a phone
      the tab names the pane) and the help button, whose note opens above. */
@@ -2309,6 +2322,9 @@ const CSS = `
                       min-width: 280px; max-width: 60%; }
     .pane-tabs { display: none; }
     .comp-who { display: inline; }
+    /* A wide pane has the room to show every chip, and a mouse no easy way
+       to scroll a row sideways. */
+    .chips { flex-wrap: wrap; }
     /* Same look and hit area as the dashboard's splitters (styles.css). */
     .pane-splitter { display: block; flex: none; position: relative; z-index: 2; width: 14px;
                      cursor: col-resize; touch-action: none; user-select: none;
@@ -2395,16 +2411,37 @@ const CSS = `
   .lightbox .lb-close:hover { background: rgba(255, 255, 255, .28); }
 
   /* ── Composer ────────────────────────────────────────────────────────────── */
+  /* Everything the composer holds sits between the thread and the bottom of
+     the frame, and at full height — the chips wrapped over three rows, a
+     standing instruction's report, a long staged draft — it can take all of a
+     phone's pane (the Android shell's frame, above its launcher bar, more
+     so): the thread shrank to a sliver that could be neither read nor
+     scrolled, and the send row slid under the shelf. So the parts that grow
+     with their content are capped at a share of the pane — the offers and
+     reports (.extras) at a fifth, scrolling inside, the field at 30% — and
+     the thread keeps the rest: half the pane, less the few fixed lines (the
+     draft's tag, the recipient). The send row is never what gives way. */
   .composer { flex: none; margin-top: 4px; padding: 10px 2px 2px;
               border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-  .qchip { border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 999px;
+  /* The spacing below the last visible part is the region's own padding, and
+     the fade lies over exactly that: blank while everything fits, it softens
+     the cut edge into a hint that there is more below when it does not. */
+  .extras { max-height: 20cqh; overflow-y: auto; overscroll-behavior-y: contain;
+            padding-bottom: 8px;
+            -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 8px), transparent);
+            mask-image: linear-gradient(to bottom, #000 calc(100% - 8px), transparent); }
+  /* One row on the phone, scrolling sideways like the shelf; a sideways swipe
+     that runs off its end does not carry on into switching panes. */
+  .chips { display: flex; gap: 6px; overflow-x: auto;
+           overscroll-behavior-x: contain; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
+  .qchip { flex: none; border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 999px;
            background: var(--card-2, #1c2230); color: var(--muted, #8b93a3); cursor: pointer;
-           padding: 4px 12px; font: inherit; font-size: .76rem;
+           padding: 4px 12px; font: inherit; font-size: .76rem; white-space: nowrap;
            -webkit-tap-highlight-color: transparent; }
   .qchip:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .note { color: var(--muted, #8b93a3); font-size: .76rem; font-style: italic; margin-bottom: 8px; }
-  .instructed { font-size: .76rem; color: var(--muted, #8b93a3); margin-bottom: 8px; padding: 4px 10px;
+  .instructed { font-size: .76rem; color: var(--muted, #8b93a3); margin-top: 8px; padding: 4px 10px;
                 border-left: 2px solid var(--accent, #6ea8fe); line-height: 1.4; }
   .instructed .ins-head { color: var(--fg, #e7ebf2); font-weight: 600; }
   .instructed.working .ins-head::after { content: ' …'; }
@@ -2447,7 +2484,10 @@ const CSS = `
             background: var(--high, #ff6b6b); color: #fff; font-size: .66rem;
             -webkit-tap-highlight-color: transparent; }
   .field { flex: 1; min-width: 0; position: relative; display: flex; }
-  .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 35vh;
+  /* The autosize in _wireComposer caps the field at 35% of the visible
+     height; the pane's share (above) is the tighter cap wherever container
+     units exist, and 35vh stands where they do not. */
+  .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 35vh; max-height: 30cqh;
                   background: var(--card-2, #1c2230); border: 0; border-radius: 20px;
                   padding: 9px 14px; color: var(--fg, #e7ebf2); font: inherit; line-height: 1.35;
                   resize: none; overflow-y: auto; }
