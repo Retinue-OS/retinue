@@ -1418,6 +1418,38 @@ def test_sender_expiry(base, wg):
     print("ok test_sender_expiry")
 
 
+def test_sender_expiry_from_sheet(base, wg):
+    """The details sheet sets the same rule (POST /attention/items/expiry):
+    minutes or a span, null clears; only a chat's sender has one, and
+    something that is not a span is refused rather than read as 'clear'."""
+    code = "+41790000079"
+    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    _clock(wg, monday.replace(hour=9, minute=0))
+    _inbound(base, code, "PostFinance", "Code: 123456", "2026-09-07T09:00:00Z")
+    cid = "chat:signal:" + code
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": 5})
+    assert status == 200 and out["item"]["expiry"] == 5, (status, out)
+    assert out["item"]["expires_at"].startswith("2026-09-07T09:05"), out["item"]
+    assert wg._CHAT_STATE.get("signal:" + code)["attention"]["expires_at"].startswith("2026-09-07T09:05")
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": "1h"})
+    assert status == 200 and out["item"]["expiry"] == 60, out["item"]
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": "soon"})
+    assert status == 400, out
+    status, prof = _http(base, "GET", "/attention/profile")
+    assert prof["profile"]["expiry"].get("PostFinance") == 60, prof["profile"].get("expiry")
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": None})
+    assert status == 200 and out["item"]["expiry"] is None and out["item"]["expires_at"] is None, out["item"]
+    status, prof = _http(base, "GET", "/attention/profile")
+    assert "PostFinance" not in prof["profile"]["expiry"], prof["profile"]["expiry"]
+    tid = "thread:" + _open(base, "Not a chat", "A thread has no sender to remember it for.")["id"]
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": tid, "expiry": 10})
+    assert status == 400, out
+    _http(base, "POST", "/attention/items/done", {"id": tid})
+    _http(base, "POST", "/attention/items/done", {"id": cid})
+    _clock(wg, None)
+    print("ok test_sender_expiry_from_sheet")
+
+
 def main():
     sparql = _serve(_MockSparql)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1461,6 +1493,7 @@ def main():
         test_project_frontmatter_moves(base, wg)
         test_tick_makes_up_what_it_missed(base, wg)
         test_sender_expiry(base, wg)
+        test_sender_expiry_from_sheet(base, wg)
         server.shutdown()
     sparql.shutdown()
     print("all attention API checks passed")

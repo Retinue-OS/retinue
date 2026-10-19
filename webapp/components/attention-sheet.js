@@ -7,7 +7,7 @@
 // the page body on demand (a fixed overlay, so it floats over whatever page
 // opened it) and talks to the gateway's attention API:
 //   GET  /attention/item?id=…          the item as the list shows it, explained
-//   POST /attention/items/<action>     later | pull | done | reopen | correct
+//   POST /attention/items/<action>     later | pull | done | reopen | correct | expiry
 //   POST /attention/permits            {sender, on}   a sender's permit in the mode in force
 //   POST /attention/admit              {sphere, on}   a Focus rule of the mode in force
 //   POST /attention/modes              {mode, tag_on | tag_off}  a word it admits wherever it stands
@@ -101,6 +101,10 @@ const LEAD_PRESETS = [
   [60, '1 h'], [120, '2 h'], [360, '6 h'], [1440, '1 day'], [2880, '2 days'], [4320, '3 days'],
   [10080, '1 week'], [20160, '2 weeks'], [40320, '4 weeks'],
 ];
+
+// How long a chat's sender's messages are worth anything (the profile's
+// `expiry`): one-time codes settle themselves minutes after they arrive.
+const EXPIRY_PRESETS = [[5, '5 min'], [10, '10 min'], [30, '30 min'], [60, '1 h'], [360, '6 h'], [1440, '1 day']];
 
 export function fmtDuration(minutes) {
   const m = Math.round(minutes);
@@ -437,6 +441,8 @@ class RetinueAttentionSheet extends HTMLElement {
       if (el.value) { this._picking = false; this._act('correct', { due: new Date(el.value).toISOString() }); }
     } else if (what === 'lead') {
       this._act('correct', { lead: Number(el.value) });
+    } else if (what === 'expiry') {
+      this._act('expiry', { expiry: el.value === 'none' ? null : Number(el.value) });
     } else if (what === 'sphere') {
       if (el.value === NEW_SPHERE) { this._newSphere = 'item'; this.render(); return; }
       this._act('correct', { sphere: el.value });
@@ -640,6 +646,27 @@ class RetinueAttentionSheet extends HTMLElement {
       `(a VIP rings at once regardless). A failed or slow turn rings anyway.</div></div>`;
   }
 
+  // The sender's expiry: when their messages settle themselves — marked
+  // handled and the chat archived, unmuted, so the next one rings as before.
+  // A rule about the sender, like the permit; only a chat has one.
+  _expiryField(item, busy) {
+    if (item.kind !== 'chat' || !item.sender) return '';
+    const cur = item.expiry ? Math.round(item.expiry) : null;
+    const sel = `<select class="select" data-set="expiry"${busy}>` +
+      `<option value="none"${cur ? '' : ' selected'}>never</option>` +
+      EXPIRY_PRESETS.map(([v, l]) => `<option value="${v}"${cur === v ? ' selected' : ''}>${l}</option>`).join('') +
+      (cur && !EXPIRY_PRESETS.some(([v]) => v === cur) ? `<option value="${cur}" selected>${esc(fmtDuration(cur))}</option>` : '') +
+      '</select>';
+    let value;
+    if (item.state !== 'open' && item.done_how === 'expired') value = 'Expired — settled by the timer.';
+    else if (item.expires_at) value = `Settles itself at ${fmtWhen(item.expires_at)}.`;
+    else if (cur) value = `Their messages settle themselves ${fmtDuration(cur)} after arriving; this one stays.`;
+    else value = 'Stays until you handle it.';
+    return `<div class="field"><div class="f-label">Expiry</div><div class="f-value">${esc(value)}</div>` +
+      `<div class="f-ctl"><span class="f-k">after</span> ${sel}` +
+      `<span class="f-note">remembered for ${esc(item.sender)} — each message restarts it; ringing untouched</span></div></div>`;
+  }
+
   // What a standing instruction did with the chat's newest message.
   _instructedField(item) {
     const s = item.kind === 'chat' ? instructedSummary(item.instructed) : null;
@@ -792,6 +819,7 @@ class RetinueAttentionSheet extends HTMLElement {
         `<div class="f-ctl">${furtherBtns}<span class="f-note">further spheres — each counts for a mode like the first</span></div></div>` +
         `<div class="field"><div class="f-label">Delivery</div><div class="f-value">level <span class="lvl" style="color:${LEVEL_COLORS[lvl] || '#9aa5b1'}">${esc(lvl)}</span> · ${esc(item.delivery)}</div>` +
         `<div class="f-ctl">${permitBtn}${admitBtn}<span class="f-note">a Focus rule of ${esc(mode.name)} — importance untouched</span></div></div>` +
+        this._expiryField(item, busy) +
         (item.unknown_sender || this._form ? '' : contactField) +
         `</div>${actions}${learned}${effect}` +
         (this._error ? `<div class="err">${esc(this._error)}</div>` : '');
