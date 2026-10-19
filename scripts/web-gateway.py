@@ -5970,8 +5970,13 @@ def _chat_display_name(doc: dict, channel: str, key: str) -> str:
 # `_chat_display_name` already falls back on; a name the rail or a contact card
 # set is never touched. Throttled and single-flight, so polls stay cheap and an
 # unreachable gateway costs one short timeout per interval, not per request.
+# A Telegram gateway whose store is still empty answers from the account's
+# dialog list instead, which it may wait up to 30s for — so it is given that
+# long rather than the short timeout, or the chats a fresh login most needs
+# named would never be.
 CHAT_NAME_BACKFILL_SECONDS = float(os.environ.get("CHAT_NAME_BACKFILL_SECONDS", "300"))
 CHAT_NAME_BACKFILL_TIMEOUT = float(os.environ.get("CHAT_NAME_BACKFILL_TIMEOUT", "3"))
+CHAT_NAME_BACKFILL_TELEGRAM_TIMEOUT = float(os.environ.get("CHAT_NAME_BACKFILL_TELEGRAM_TIMEOUT", "35"))
 _name_backfill_lock = threading.Lock()
 _name_backfill = {"at": 0.0, "running": False}
 
@@ -6007,24 +6012,36 @@ def _backfill_chat_names(chat_ids) -> int:
         slug, gw, _err = _chat_gateway(doc, channel, account)
         if gw is None:
             continue
-        by_slug.setdefault(slug, (gw, []))[1].append((chat_id, key))
+        by_slug.setdefault(slug, (gw, channel, []))[2].append((chat_id, key))
     named = 0
-    for slug, (gw, chats) in by_slug.items():
+    for slug, (gw, channel, chats) in by_slug.items():
+        timeout = (CHAT_NAME_BACKFILL_TELEGRAM_TIMEOUT if channel == "telegram"
+                   else CHAT_NAME_BACKFILL_TIMEOUT)
         try:
-            with _gateway_request(gw, "/recent-chats", CHAT_NAME_BACKFILL_TIMEOUT) as resp:
+            with _gateway_request(gw, "/recent-chats", timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:  # noqa: BLE001 - a gateway without the store just names nothing
             print(f"[web-gateway] chat names: recent-chats of {slug} unavailable ({exc})", flush=True)
             continue
-        names = {}
+        # Every identity an entry offers, each normalised only as far as is safe
+        # for its kind: a phone number (WhatsApp, SMS, Signal's `number`) is
+        # compared by its bare user part, an opaque id (Signal's `uuid`,
+        # Telegram's marked `chat_id`) only exactly. WhatsApp's `jid` adds
+        # nothing — its `number` is already the JID's user part.
+        by_number, by_id = {}, {}
         for entry in (body.get("recent_chats") if isinstance(body, dict) else None) or []:
             if not isinstance(entry, dict) or entry.get("is_group"):
                 continue
-            number, name = _peer_number(entry.get("number")), str(entry.get("name") or "").strip()
-            if number and name:
-                names.setdefault(number, name)
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            if number := _peer_number(entry.get("number")):
+                by_number.setdefault(number, name)
+            for field in ("uuid", "chat_id"):
+                if ident := str(entry.get(field) or "").strip():
+                    by_id.setdefault(ident, name)
         for chat_id, key in chats:
-            name = names.get(_peer_number(key))
+            name = by_id.get(key) or by_number.get(_peer_number(key))
             if name:
                 _CHAT_STATE.note_message(chat_id, sender=key, sender_name=name)
                 named += 1
