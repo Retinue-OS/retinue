@@ -6540,7 +6540,7 @@ _CHAT_ARRIVAL_JOBS_MAX = 4096
 CHAT_INSTRUCTION_TIMEOUT = max(5.0, float(os.environ.get("CHAT_INSTRUCTION_TIMEOUT", "60")))
 
 # The rings waiting on a turn, by the arrival's job id: {chat_id, entry,
-# had_unread, timer}. Whichever comes first — the turn's verdict, its failure,
+# read_seq, timer}. Whichever comes first — the turn's verdict, its failure,
 # the timeout — takes the ring out under _chat_turns_lock and delivers it;
 # the other finds nothing left to do, so a message is never rung twice.
 _INSTRUCTED_RINGS: dict[str, dict] = {}
@@ -6760,9 +6760,9 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
     message is to be worked by (contacts.instructed_person), None for none;
     ``vip`` whether the sender is also a VIP. ``ring`` is set for a message
     whose ring waits on this turn — an instructed sender who is not a VIP —
-    and carries what delivering it needs later (``had_unread``, and the
-    chat's ``read_seq`` at arrival, which tells whether the user has read
-    the message by then: _instructed_read_since); the ring is
+    and carries what delivering it needs later (the chat's ``read_seq`` at
+    arrival, which tells whether the user has read the message by then:
+    _instructed_read_since); the ring is
     registered here, with its timeout, under the same lock that mints the
     job, so a repeated delivery of one message never registers a second."""
     if not CHAT_ARRIVAL_TURNS:
@@ -6817,7 +6817,6 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
                                     args=(job_id,))
             timer.daemon = True
             _INSTRUCTED_RINGS[job_id] = {"chat_id": chat_id, "entry": dict(entry),
-                                         "had_unread": bool(ring.get("had_unread")),
                                          "read_seq": int(ring.get("read_seq") or 0),
                                          "timer": timer, "job": job_id}
             arrival["ring"] = job_id
@@ -6994,7 +6993,7 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
             decision, _item = _attention_arrive_chat(chat_id, doc, entry, None, vip=True,
                                                      vip_from="instruction")
         if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
-            _chat_push_notification(chat_id, doc, entry, ring.get("had_unread", False),
+            _chat_push_notification(chat_id, doc, entry,
                                     urgency="high" if decision["deliver"] == "push" else None)
             delivery = "rang"
         else:
@@ -10608,7 +10607,7 @@ class Handler(BaseHTTPRequestHandler):
                     # One turn, whichever the sender is: a VIP's, briefed by
                     # their instruction when they carry one, or an instructed
                     # sender's, whose ring waits on it.
-                    ring = ({"had_unread": had_unread, "read_seq": doc.get("read_seq")}
+                    ring = ({"read_seq": doc.get("read_seq")}
                             if defer and not quiet else None)
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"), person=person,
@@ -10624,7 +10623,7 @@ class Handler(BaseHTTPRequestHandler):
                         # now, as a VIP's: the failure rule — a broken turn
                         # never swallows the message.
                         outcome = _instructed_deliver(
-                            {"chat_id": chat_id, "entry": entry, "had_unread": had_unread},
+                            {"chat_id": chat_id, "entry": entry},
                             None, "no turn could be started", note=False)
                         pushed = outcome["delivery"] == "rang"
         elif author in ("user", "device"):
