@@ -1254,7 +1254,7 @@ _CONV_MODEL_RE = re.compile(r"^/conversations/([0-9a-f]{32})/model/?$")
 # The attention model's writes: the mode, the rules, and the actions on one
 # item (its id travels in the body — chat ids and project URIs carry
 # characters no path segment should).
-_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|admit|spheres|profile|seen|later|pull|done|reopen|correct)/?$")
+_ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|admit|spheres|profile|seen|later|pull|done|reopen|correct|expiry)/?$")
 
 # ── Push notifications ─────────────────────────────────────────────────────────
 # The unread badge only exists while the dashboard is open, which is precisely
@@ -8805,6 +8805,24 @@ def _attention_expire(now: datetime) -> list[str]:
     return settled
 
 
+def _attention_set_sender_expiry(item: dict, profile: dict, value, now: datetime) -> bool:
+    """Set or clear how long the item's sender's messages are worth anything
+    (the profile's ``expiry``, minutes; null or 0 clears it) and restart this
+    item's own timer from the same rule, counted from now. Saves the profile;
+    the caller persists the item. False when ``value`` is not a span."""
+    minutes = attention_policy.parse_lead(value)
+    if value not in (None, "", 0) and minutes is None:
+        return False
+    table = profile.setdefault("expiry", {})
+    if minutes:
+        table[item["sender"]] = minutes
+    else:
+        table.pop(item["sender"], None)
+    _ATTENTION.save_profile(profile)
+    item["expires_at"] = attention_policy.expires_at(item["sender"], profile, now)
+    return True
+
+
 def _attention_tick_minutes(stamp: datetime) -> list[datetime]:
     """The minutes this tick answers for: every one since the last it handled
     — a slow store query, a failed run or a restart can pass a digest time by
@@ -10832,6 +10850,16 @@ class Handler(BaseHTTPRequestHandler):
                     _CHAT_STATE.set_flags(item["source_id"], archived=False)
                     _chats_cache_invalidate()
                 attention_policy.reopen(item)
+            elif action == "expiry":
+                # The sender's expiry, from the sheet: {id, expiry: minutes or
+                # a span, null clears}. A rule about the sender, like a permit,
+                # so it changes no importance and rings nothing.
+                if item.get("kind") != "chat" or not item.get("sender"):
+                    self._send_json(400, {"error": "only a chat's sender has an expiry"})
+                    return
+                if not _attention_set_sender_expiry(item, profile, payload.get("expiry"), now):
+                    self._send_json(400, {"error": "expiry is minutes, a span like 10m, or null"})
+                    return
             elif action == "correct":
                 patch = {}
                 for key in ("importance", "lead", "sphere", "tags", "critical"):
@@ -11077,17 +11105,9 @@ class Handler(BaseHTTPRequestHandler):
                                                  "frontmatter")
                             if k in item})
             if "sender_expiry" in payload and item.get("sender"):
-                # How long this sender's messages are worth anything, in
-                # minutes; null or 0 clears it. This message's own timer is
-                # set from the same rule, counted from now.
-                minutes = attention_policy.parse_lead(payload["sender_expiry"])
-                table = profile.setdefault("expiry", {})
-                if minutes:
-                    table[item["sender"]] = minutes
-                else:
-                    table.pop(item["sender"], None)
-                _ATTENTION.save_profile(profile)
-                revised["expires_at"] = attention_policy.expires_at(item["sender"], profile, now)
+                if not _attention_set_sender_expiry(revised, profile, payload["sender_expiry"], now):
+                    self._send_json(400, {"error": "sender_expiry is a span like 10m, 2h, or null"})
+                    return
             if payload.get("sender_sphere") and item.get("sender") and block.get("sphere"):
                 # The sender's spheres, not only this message's: the main one
                 # and, where given, the further ones.

@@ -295,9 +295,11 @@ with no expiry pays nothing (the tick reads only the chat state documents,
 and only while some sender has one). Expiry decides when an item leaves the
 list, never whether it rings: that stays with importance, sphere and
 permits. Putting an expired item back (*Reopen*) unarchives the chat and
-clears its timer. Ara sets or clears it with `attention-set.py <chat item>
+clears its timer. The user sets or clears it in a chat item's details sheet
+(the *Expiry* field: a few presets from 5 minutes to a day, or *never*; `POST
+/attention/items/expiry`), Ara with `attention-set.py <chat item>
 --sender-expiry 10m` (`none` clears); the row in `GET /attention` carries
-`expires_at` and the sender's `expiry`.
+`expires_at` and the sender's `expiry`, and the sheet shows both.
 
 **The week.** The schedule is not one day repeated, and not seven: it is a
 few **day plans**, each a day's schedule (`[minute, mode]` or `[minute,
@@ -338,7 +340,8 @@ default 15, and expired by a write on the project page), `GET /attention/item?id
 follows the schedule), `POST
 /attention/items/later {id, when: next|tomorrow}`, `…/pull`, `…/done`,
 `…/reopen`, `…/correct {id, importance?, due?, lead?, sphere?, tags?,
-critical?}`, `POST /attention/permits {sender, mode?, on}`, `POST
+critical?}`, `…/expiry {id, expiry: minutes | span | null}` (a chat's
+sender), `POST /attention/permits {sender, mode?, on}`, `POST
 /attention/admit {sphere, mode?, on}`, `POST /attention/modes {mode?, …}`
 (the rule patch above); and the token-gated `POST
 /internal/attention/set {id, …}` for agents (`attention-set.py`). Item ids are
