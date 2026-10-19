@@ -6001,6 +6001,100 @@ def _chat_display_name(doc: dict, channel: str, key: str) -> str:
     return key
 
 
+# Names the rail never passed by. The rail is the only writer of a chat's
+# name, so a 1:1 chat whose peer has not written since the chat state began
+# (or whose last arrival carried no profile name) shows its raw key — a bare
+# `…@lid` — although the owning gateway remembers the peer's published profile
+# name in its recent-chats store. The chat list asks that store for such chats
+# in the background and files what it finds as the peer's roster entry, which
+# `_chat_display_name` already falls back on; a name the rail or a contact card
+# set is never touched. Throttled and single-flight, so polls stay cheap and an
+# unreachable gateway costs one short timeout per interval, not per request.
+CHAT_NAME_BACKFILL_SECONDS = float(os.environ.get("CHAT_NAME_BACKFILL_SECONDS", "300"))
+CHAT_NAME_BACKFILL_TIMEOUT = float(os.environ.get("CHAT_NAME_BACKFILL_TIMEOUT", "3"))
+_name_backfill_lock = threading.Lock()
+_name_backfill = {"at": 0.0, "running": False}
+
+
+def _chat_is_nameless(doc: dict, channel: str, key: str) -> bool:
+    """Whether a chat would show its raw key for want of a peer name."""
+    if doc.get("group") or _chat_is_group(channel, key):
+        return False
+    return _chat_display_name(doc, channel, key) == key
+
+
+def _peer_number(key: str) -> str:
+    """A chat key or recent-chats number reduced to the bare peer identity:
+    the JID user part (`…@lid`, `…@s.whatsapp.net`) without a leading `+`."""
+    return str(key or "").split("@", 1)[0].strip().lstrip("+")
+
+
+def _backfill_chat_names(chat_ids) -> int:
+    """Name nameless 1:1 chats from their gateway's recent-chats store.
+
+    Returns how many chats got a name. Each chat is asked of the gateway its
+    sends go out as, so a peer is only named from the account that holds the
+    conversation."""
+    by_slug: dict[str, tuple[dict, list]] = {}
+    for chat_id in chat_ids:
+        ref = chat_state_mod.split_chat_ref(chat_id)
+        if ref is None:
+            continue
+        channel, account, key = ref
+        doc = _CHAT_STATE.get(chat_id)
+        if not _chat_is_nameless(doc, channel, key):
+            continue
+        slug, gw, _err = _chat_gateway(doc, channel, account)
+        if gw is None:
+            continue
+        by_slug.setdefault(slug, (gw, []))[1].append((chat_id, key))
+    named = 0
+    for slug, (gw, chats) in by_slug.items():
+        try:
+            with _gateway_request(gw, "/recent-chats", CHAT_NAME_BACKFILL_TIMEOUT) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - a gateway without the store just names nothing
+            print(f"[web-gateway] chat names: recent-chats of {slug} unavailable ({exc})", flush=True)
+            continue
+        names = {}
+        for entry in (body.get("recent_chats") if isinstance(body, dict) else None) or []:
+            if not isinstance(entry, dict) or entry.get("is_group"):
+                continue
+            number, name = _peer_number(entry.get("number")), str(entry.get("name") or "").strip()
+            if number and name:
+                names.setdefault(number, name)
+        for chat_id, key in chats:
+            name = names.get(_peer_number(key))
+            if name:
+                _CHAT_STATE.note_message(chat_id, sender=key, sender_name=name)
+                named += 1
+    return named
+
+
+def _schedule_chat_name_backfill(chat_ids) -> None:
+    """Run `_backfill_chat_names` in the background, at most once an interval."""
+    chat_ids = list(chat_ids)
+    if not chat_ids or CHAT_NAME_BACKFILL_SECONDS <= 0:
+        return
+    with _name_backfill_lock:
+        now = time.monotonic()
+        if _name_backfill["running"] or (_name_backfill["at"]
+                                         and now - _name_backfill["at"] < CHAT_NAME_BACKFILL_SECONDS):
+            return
+        _name_backfill.update(running=True, at=now)
+
+    def run():
+        try:
+            _backfill_chat_names(chat_ids)
+        except Exception as exc:  # noqa: BLE001 - a cosmetic pass must never take the list down
+            print(f"[web-gateway] chat names: backfill failed ({exc})", flush=True)
+        finally:
+            with _name_backfill_lock:
+                _name_backfill["running"] = False
+
+    threading.Thread(target=run, name="chat-name-backfill", daemon=True).start()
+
+
 # The SPARQL-derived skeleton (chat list + unread counts) reused between
 # dashboard polls; state and overlay are merged fresh on every request. Any
 # write that changes the skeleton's truth expires it early — expires, not
@@ -6270,6 +6364,7 @@ def _chats_payload() -> dict:
             overlay_by_chat.setdefault(cid, []).append(entry)
 
     chats = []
+    nameless = []
     for chat_id in set(skeleton) | set(overlay_by_chat):
         parts = chat_state_mod.split_chat_id(chat_id)
         if parts is None:
@@ -6321,6 +6416,8 @@ def _chats_payload() -> dict:
                     roster=roster)
         if last is None:
             continue
+        if _chat_is_nameless(doc, channel, key):
+            nameless.append(chat_id)
         group = doc.get("group")
         if group is None:
             group = _chat_is_group(channel, key)
@@ -6359,6 +6456,7 @@ def _chats_payload() -> dict:
             "messages": _chat_messages_url(chat_id),
         })
     chats.sort(key=lambda c: c["last"]["ts"], reverse=True)
+    _schedule_chat_name_backfill(nameless)
     return {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "chats": chats,
