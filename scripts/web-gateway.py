@@ -10860,7 +10860,7 @@ class Handler(BaseHTTPRequestHandler):
                 if item.get("kind") != "chat" or not item.get("sender"):
                     self._send_json(400, {"error": "only a chat's sender has an expiry"})
                     return
-                if not _attention_set_sender_expiry(item, profile, payload.get("expiry"), now):
+                if "expiry" not in payload or not _attention_set_sender_expiry(item, profile, payload["expiry"], now):
                     self._send_json(400, {"error": "expiry is minutes or a span like 10m (1 minute to 7 days), or null"})
                     return
             elif action == "correct":

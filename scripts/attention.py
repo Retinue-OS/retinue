@@ -259,7 +259,10 @@ def parse_expiry(value) -> float | None:
     non-finite or out-of-range number); clearing is the caller's ``null``."""
     if isinstance(value, bool) or value is None or value == "":
         return None
-    minutes = parse_lead(value)
+    try:
+        minutes = parse_lead(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return None
     if minutes is None or not math.isfinite(minutes):
         return None
     return minutes if EXPIRY_MIN <= minutes <= EXPIRY_MAX else None

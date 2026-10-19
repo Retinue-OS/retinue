@@ -1463,13 +1463,16 @@ def test_sender_expiry_bounds(base, wg):
     cid = "chat:signal:" + code
     status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": 10})
     assert status == 200 and out["item"]["expiry"] == 10, (status, out)
-    for bad in (1e9, float("inf"), "99999999w", "8d", 0, "0", 0.5, "", True):
+    for bad in (1e9, float("inf"), 10 ** 400, "99999999w", "8d", 0, "0", 0.5, "", True):
         status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": bad})
         assert status == 400, (bad, status, out)
         status, out = _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": bad}, AGENT)
         assert status == 400, (bad, status, out)
         status, prof = _http(base, "GET", "/attention/profile")
         assert prof["profile"]["expiry"].get("UBS") == 10, (bad, prof["profile"]["expiry"])
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid})
+    _, prof = _http(base, "GET", "/attention/profile")
+    assert status == 400 and prof["profile"]["expiry"].get("UBS") == 10, "a missing expiry is no 'clear'"
     status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": "7d"})
     assert status == 200 and out["item"]["expiry"] == 7 * 24 * 60, out["item"]
     status, out = _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": "1m"}, AGENT)
