@@ -6835,6 +6835,7 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
             timer.daemon = True
             _INSTRUCTED_RINGS[job_id] = {"chat_id": chat_id, "entry": dict(entry),
                                          "read_seq": int(ring.get("read_seq") or 0),
+                                         "inbound_seq": ring.get("inbound_seq"),
                                          "timer": timer, "job": job_id}
             arrival["ring"] = job_id
             timer.start()
@@ -7005,10 +7006,12 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
             spec = {"importance": verdict["importance"], "importance_from": "instruction"}
             if verdict.get("due"):
                 spec["due"] = verdict["due"]
-            decision, _item = _attention_arrive_chat(chat_id, doc, entry, spec)
+            decision, _item = _attention_arrive_chat(chat_id, doc, entry, spec,
+                                                     attended=ring.get("inbound_seq"))
         else:
             decision, _item = _attention_arrive_chat(chat_id, doc, entry, None, vip=True,
-                                                     vip_from="instruction")
+                                                     vip_from="instruction",
+                                                     attended=ring.get("inbound_seq"))
         if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
             _chat_push_notification(chat_id, doc, entry,
                                     urgency="high" if decision["deliver"] == "push" else None)
@@ -8624,7 +8627,8 @@ def _attention_append(conv: dict, message: str, payload: dict) -> tuple[int, dic
 
 
 def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
-                           vip: bool = False, vip_from: str | None = None) -> tuple[dict, dict]:
+                           vip: bool = False, vip_from: str | None = None,
+                           attended: int | None = None) -> tuple[dict, dict]:
     """Run the model over one inbound chat message. The per-class repeat
     policy applies to a chat that is already held: a family sender writing
     again in Rest breaks through, anyone else waits with the first message.
@@ -8632,7 +8636,10 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
     they are the people the user asked to hear from the moment they write.
     ``vip_from="instruction"`` rings a message that way for another reason —
     the turn a standing instruction asked for did not finish — so its reason
-    line says that instead of calling the sender a VIP."""
+    line says that instead of calling the sender a VIP. ``attended`` is this
+    arrival's own ``inbound_seq``, as its mark_unread counted it — not the
+    document's, which a newer arrival may already have advanced past a
+    message the model has not seen (ChatStateStore.archive_unless_arrived)."""
     with _attention_lock:
         now = _attention_now()
         focus = _ATTENTION.focus()
@@ -8678,7 +8685,7 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
                         "reason": attention_policy.repeat_policy(item, mode)["reason"]}
         else:
             decision = attention_policy.on_arrival(item, focus, profile, now)
-        _attention_persist(item, attended=doc.get("inbound_seq"))
+        _attention_persist(item, attended=attended)
         return decision, item
 
 
@@ -10590,7 +10597,9 @@ class Handler(BaseHTTPRequestHandler):
         job_url = None
         accepted = False
         if direction == "in":
-            _CHAT_STATE.mark_unread(chat_id, ts)
+            # This arrival's place in the chat's count, for the attention
+            # block that takes it in (_attention_arrive_chat's ``attended``).
+            inbound_seq = _CHAT_STATE.mark_unread(chat_id, ts)[0].get("inbound_seq")
             # A new message in an archived chat would otherwise land invisible;
             # muted is the explicit "keep it archived" opt-out. Decided inside
             # the state lock (see ChatState.unarchive_unless_muted): the
@@ -10635,7 +10644,8 @@ class Handler(BaseHTTPRequestHandler):
                 # sender's message is not decided here at all: its turn's
                 # verdict decides it (_instructed_settle).
                 decision, _item = _attention_arrive_chat(
-                    chat_id, doc, entry, payload.get("attention"), vip=vip)
+                    chat_id, doc, entry, payload.get("attention"), vip=vip,
+                    attended=inbound_seq)
                 if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
                     _chat_push_notification(
                         chat_id, doc, entry,
@@ -10682,7 +10692,7 @@ class Handler(BaseHTTPRequestHandler):
                     # One turn, whichever the sender is: a VIP's, briefed by
                     # their instruction when they carry one, or an instructed
                     # sender's, whose ring waits on it.
-                    ring = ({"read_seq": doc.get("read_seq")}
+                    ring = ({"read_seq": doc.get("read_seq"), "inbound_seq": inbound_seq}
                             if defer and not quiet else None)
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"), person=person,
@@ -10698,7 +10708,7 @@ class Handler(BaseHTTPRequestHandler):
                         # now, as a VIP's: the failure rule — a broken turn
                         # never swallows the message.
                         outcome = _instructed_deliver(
-                            {"chat_id": chat_id, "entry": entry},
+                            {"chat_id": chat_id, "entry": entry, "inbound_seq": inbound_seq},
                             None, "no turn could be started", note=False)
                         pushed = outcome["delivery"] == "rang"
         elif author in ("user", "device"):

@@ -1460,21 +1460,33 @@ def _sender_expiry_races(base, wg, monday):
     wg._CHAT_STATE.set_flags(key, archived=True)
     entry = {"text": "Code: 3", "sender": bank, "sender_name": "Bank"}
 
+    seqs = []
+
     def half_arrival():
-        wg._CHAT_STATE.mark_unread(key, "2026-09-07T12:20:00Z")
+        seqs.append(wg._CHAT_STATE.mark_unread(key, "2026-09-07T12:20:00Z")[0]["inbound_seq"])
         wg._CHAT_STATE.unarchive_unless_muted(key)
     settled = expire_with(half_arrival, monday.replace(hour=12, minute=20))
     doc = wg._CHAT_STATE.get(key)
     assert settled == [key] and queries == [], (settled, queries)
     assert doc["attention"]["state"] == "done" and doc["archived"] is False, doc
-    # ... and once the model takes it in, it is open with its own timer.
+    # ... and once the model takes it in, it is open with its own timer. A
+    # newer message counted meanwhile (held, or its turn still working) is
+    # not taken in by that: the arrival records its own count, not the
+    # document's, so the next timer still leaves the chat in view.
+    newer = wg._CHAT_STATE.mark_unread(key, "2026-09-07T12:21:00Z")[0]["inbound_seq"]
     _clock(wg, monday.replace(hour=12, minute=20))
-    wg._attention_arrive_chat(key, doc, entry)
+    wg._attention_arrive_chat(key, wg._CHAT_STATE.get(key), entry, attended=seqs[0])
     doc = wg._CHAT_STATE.get(key)
     assert doc["attention"]["state"] == "open" and doc["archived"] is False, doc
     assert doc["attention"]["expires_at"].startswith("2026-09-07T12:30"), doc["attention"]
-    # With nothing in flight the timer archives as before — still no query.
     settled = expire_with(lambda: None, monday.replace(hour=12, minute=30))
+    doc = wg._CHAT_STATE.get(key)
+    assert settled == [key] and doc["archived"] is False, doc
+    # Once the newer one is taken in too, nothing is in flight and the
+    # timer archives as before — still no query.
+    _clock(wg, monday.replace(hour=12, minute=30))
+    wg._attention_arrive_chat(key, wg._CHAT_STATE.get(key), entry, attended=newer)
+    settled = expire_with(lambda: None, monday.replace(hour=12, minute=40))
     doc = wg._CHAT_STATE.get(key)
     assert settled == [key] and queries == [], (settled, queries)
     assert doc["attention"]["done_how"] == "expired" and doc["archived"] is True, doc
