@@ -8807,11 +8807,13 @@ def _attention_expire(now: datetime) -> list[str]:
 
 def _attention_set_sender_expiry(item: dict, profile: dict, value, now: datetime) -> bool:
     """Set or clear how long the item's sender's messages are worth anything
-    (the profile's ``expiry``, minutes; null or 0 clears it) and restart this
+    (the profile's ``expiry``, minutes; null clears it) and restart this
     item's own timer from the same rule, counted from now. Saves the profile;
-    the caller persists the item. False when ``value`` is not a span."""
-    minutes = attention_policy.parse_lead(value)
-    if value not in (None, "", 0) and minutes is None:
+    the caller persists the item. False — the profile untouched — when
+    ``value`` is neither null nor minutes or a span within the bounds
+    (attention.parse_expiry); an empty string is refused, not read as clear."""
+    minutes = None if value is None else attention_policy.parse_expiry(value)
+    if value is not None and minutes is None:
         return False
     table = profile.setdefault("expiry", {})
     if minutes:
@@ -8943,7 +8945,8 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "urgency": x["urgency"], "delivery": x["delivery"],
         "reason": attention_policy.admission_reason(item, mode, profile, now),
         "actor": item.get("actor") or "you", "waiting_since": iso(item.get("waiting_since")),
-        "state": item.get("state", "open"), "released": bool(item.get("released")),
+        "state": item.get("state", "open"), "done_how": item.get("done_how"),
+        "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "pulled": bool(item.get("pulled")),
         # When it settles itself (the sender's expiry, _attention_expire),
         # and the rule in minutes, so the sheet can say "expires 14:32".
@@ -10858,7 +10861,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(400, {"error": "only a chat's sender has an expiry"})
                     return
                 if not _attention_set_sender_expiry(item, profile, payload.get("expiry"), now):
-                    self._send_json(400, {"error": "expiry is minutes, a span like 10m, or null"})
+                    self._send_json(400, {"error": "expiry is minutes or a span like 10m (1 minute to 7 days), or null"})
                     return
             elif action == "correct":
                 patch = {}
@@ -11106,7 +11109,7 @@ class Handler(BaseHTTPRequestHandler):
                             if k in item})
             if "sender_expiry" in payload and item.get("sender"):
                 if not _attention_set_sender_expiry(revised, profile, payload["sender_expiry"], now):
-                    self._send_json(400, {"error": "sender_expiry is a span like 10m, 2h, or null"})
+                    self._send_json(400, {"error": "sender_expiry is minutes or a span like 10m (1 minute to 7 days), or null"})
                     return
             if payload.get("sender_sphere") and item.get("sender") and block.get("sphere"):
                 # The sender's spheres, not only this message's: the main one

@@ -110,7 +110,7 @@ persistent volume) holds:
 | `POST /attention/spheres` `{add}` / `{remove}` / `{sphere, within}` | grow, prune or nest the sphere vocabulary — a word, normalised to an id (`Board Games` → `board-games`, any script); removal is refused while a mode admits it, and the spheres a removed one held move up to the one it lay within. `{sphere, within}` puts a sphere within another (`within: null` lets it stand alone), so whatever admits the outer admits it too; loops are refused, and held items are re-evaluated (`scripts/attention-spheres.py`) |
 | `POST /chats/<id>/contact` `{name, sphere?, tags?, permit?}` | the contact card for a screened stranger: names the chat, moves the bare handle's priors and permits onto the name, sets the sphere and tags on the item and writes the address book. An empty name removes the card |
 | `GET /attention/profile`, `POST /attention/profile` | read and replace the profile and the focus rules |
-| `POST /internal/attention/set` `{id, …, sender_sphere?, sender_expiry?}` | an agent declares or revises an item's properties (token-gated; `scripts/attention-set.py`); `sender_expiry` (`10m`, `2h`; `null` clears) makes the sender's messages settle themselves that long after each arrival |
+| `POST /internal/attention/set` `{id, …, sender_sphere?, sender_expiry?}` | an agent declares or revises an item's properties (token-gated; `scripts/attention-set.py`); `sender_expiry` (minutes or `10m`, `2h`, one minute to seven days; `null` clears) makes the sender's messages settle themselves that long after each arrival |
 
 Item ids are the existing ones (`thread:<id>`, `chat:<id>`, the project URI)
 and travel in the body — chat ids and project URIs carry characters no path

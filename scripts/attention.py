@@ -18,6 +18,7 @@ Schedules work in minutes of the local day of the ``now`` they are given.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from datetime import date, datetime, timedelta
@@ -242,6 +243,26 @@ def parse_lead(text) -> float | None:
     if not m:
         return None
     return float(m.group(1)) * _LEAD_UNITS[m.group(2).lower()]
+
+
+# A sender's expiry is for one-time codes and the like: at least a minute, at
+# most a week. Anything outside is refused rather than stored, since an
+# unbounded span (1e9w, Infinity) overflows the clock at every arrival.
+EXPIRY_MIN = 1.0
+EXPIRY_MAX = 7 * DAY
+
+
+def parse_expiry(value) -> float | None:
+    """A sender's expiry as the sheet and agents send it — minutes as a
+    number, or a span like ``10m``/``2h`` — in minutes, within EXPIRY_MIN and
+    EXPIRY_MAX. None when it is not one (an empty string, a bool, 0, a
+    non-finite or out-of-range number); clearing is the caller's ``null``."""
+    if isinstance(value, bool) or value is None or value == "":
+        return None
+    minutes = parse_lead(value)
+    if minutes is None or not math.isfinite(minutes):
+        return None
+    return minutes if EXPIRY_MIN <= minutes <= EXPIRY_MAX else None
 
 
 def parse_due(text, now: datetime) -> datetime | None:
@@ -1588,9 +1609,11 @@ def expires_at(sender: str | None, profile: dict, now: datetime) -> datetime | N
     minutes = (profile.get("expiry") or {}).get(sender) if sender else None
     try:
         minutes = float(minutes)
-    except (TypeError, ValueError):
+        # A value stored before the bounds (or by hand) must not break every
+        # arrival from that sender: no timer rather than an overflow.
+        return now + timedelta(minutes=minutes) if math.isfinite(minutes) and minutes > 0 else None
+    except (TypeError, ValueError, OverflowError):
         return None
-    return now + timedelta(minutes=minutes) if minutes > 0 else None
 
 
 def expired(item: dict, now: datetime) -> bool:
