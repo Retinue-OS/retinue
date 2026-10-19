@@ -140,9 +140,9 @@ it is configured and where it is tested: `docs/dashboard.md`, "The home".*
   and `profile.json` under `ATTENTION_DIR`.
 - Push obeys the mode: `_push_conv_notification` and `_chat_push_notification`
   ask `attention.on_arrival` first; a held item badges but does not push. The
-  per-device `notification_mode` keeps working as a second filter until slice 2
-  replaces it with the mode (issue #66's four choices collapse to *follow the
-  mode* / *everything* / *off*).
+  per-device `notification_mode` kept working as a second filter behind the
+  model until slice 2 retired it (issue #66's four choices collapse to
+  *notified* / *disabled*).
 - `webapp/components/attention.js` from the prototype's list: rows with the
   preview and the three-field line, the mode chip and menu, the collapsed Held
   and Waiting sections, the details sheet with the corrections. `index.html`
@@ -163,8 +163,10 @@ it is configured and where it is tested: `docs/dashboard.md`, "The home".*
   mode; a manual change is a breakpoint immediately. *Built.*
 - The repeat policy per sender class, applied on the notify rail
   (`attention.repeat_policy`). *Built.*
-- The per-device notification mode stays as a second filter for now;
-  retiring it is the one item of this slice still open.
+- The per-device notification mode is **retired** (`push_notify.py`,
+  `webapp/components/push.js`): the event kinds it filtered on — new,
+  stalled, reply — are gone with it, and the model's decision is the only
+  one. A device is either notified or disabled. *Built.*
 
 **3 — learning**
 
@@ -201,7 +203,9 @@ transcript cleanup does.
    (first from the list's footer, which put them — and each page's way back
    — at the end of a list).
 3. The per-device notification modes stay as the second filter behind the
-   model until a later slice retires them.
+   model until a later slice retires them — retired in slice 2: a filter by
+   event kind, behind a model that decides from what an item is about, only
+   dropped what the model had released.
 4. What a message is worth before anyone has judged it: a person writing
    directly is *active* (held for the next digest; rung at once where they
    hold a permit), a group is chatter (passive, listed). An agent thread

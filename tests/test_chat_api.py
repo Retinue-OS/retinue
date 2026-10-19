@@ -10,8 +10,8 @@ direct user-send contract and serving token-gated media). Covers:
   (webapp/README.md on the chats-ui branch), including ?before paging and the
   media-URL rewrite to the authenticated proxy;
 - the notify rail (POST /internal/chats/inbound): open-vs-token auth, the
-  un-archive-unless-muted rule, held-gate and muted silence, push mode
-  new-vs-reply, and echoes advancing the read watermark;
+  un-archive-unless-muted rule, held-gate and muted silence, a follow-up
+  arrival pushing like the first, and echoes advancing the read watermark;
 - the forward path landing in the chat, not in triage: an arrival whose caller
   offers to hand it over is accepted — the chat has it, the gateway stops, held
   classes included — and a turn runs on top of that only for a **VIP sender**,
@@ -753,16 +753,18 @@ def test_rail_auth_and_notifications(base, wg):
     # caller that has not offered to hand the message over keeps it (see
     # test_arrival_starts_a_companion_turn).
     assert status == 200 and body["pushed"] is True
-    # First unread → mode "new"; the push targets the chat page.
+    # The arrival pushes, tagged with the chat and pointing at its page.
     assert len(PUSHES) == 1
     args, kw = PUSHES[0]
     assert args[0] == "Luca"          # the rail's sender_name became the name
     assert "ciao!" in args[1]
-    assert kw["mode"] == "new" and kw["tag"] == cid
+    assert kw["tag"] == cid
     assert kw["url"].startswith("/chat.html?id=")
-    # Still unread → the next arrival is a "reply".
+    assert "mode" not in kw, "the per-device event kinds are gone (push_notify.py)"
+    # A second arrival while the first is still unread pushes just the same:
+    # that is the follow-up the retired device filter used to swallow.
     status, _ = _http(base, "POST", rail, dict(event, message_id="e2", text="?"))
-    assert PUSHES[-1][1]["mode"] == "reply"
+    assert len(PUSHES) == 2 and PUSHES[-1][1]["tag"] == cid
     # The overlay alone puts the chat in the list — the store knows nothing of
     # it yet — with the unread count and the last preview from the rail.
     status, body = _http(base, "GET", "/chats")
