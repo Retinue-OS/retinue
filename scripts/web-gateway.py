@@ -4689,11 +4689,16 @@ def send_message(message: str, display_question: str | None = None,
                 # under CONVERSATIONS_DIR) is where files pushed into a thread —
                 # including the user's own — are stored; without it, opening such
                 # an attachment hits a permission prompt while a composer upload
-                # works, which looks like flaky behaviour.
+                # works, which looks like flaky behaviour. MESSAGE_FILES_DIR holds
+                # the files a messenger message carried (a chat arrival, a
+                # POST /message): the turn is handed their paths, so it must be
+                # able to open them, or a photo goes unanswered.
+                MESSAGE_FILES_DIR.mkdir(parents=True, exist_ok=True)
                 cmd = [CLAUDE_BIN, "-p", "--output-format=json",
                        "--permission-mode", CLAUDE_PERMISSION_MODE,
                        "--add-dir", "/root/.claude/uploads",
-                       "--add-dir", str(CONVERSATION_ATTACHMENTS_DIR)]
+                       "--add-dir", str(CONVERSATION_ATTACHMENTS_DIR),
+                       "--add-dir", str(MESSAGE_FILES_DIR)]
                 if run_model:
                     cmd += ["--model", run_model]
                 if resume_id:
