@@ -529,6 +529,30 @@ def test_messenger_page_is_unchanged():
         assert "<th>Event</th>" not in out
 
 
+def test_email_outcome_page_ends_like_a_messenger_send():
+    """An approved e-mail lands on the same status page an approved messenger
+    send does: green check, then on to the next request or the window closes."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        result = {"approved": "42", "sent": True, "from": "Ari <ari@example.org>",
+                  "to": ["a@example.com", "b@example.com"], "subject": "Lunch"}
+        out = wg._render_email_send_outcome_html(result, "ari", "42", None)
+        assert "<h1>E-mail send</h1>" in out
+        assert "<th>Recipients</th><td>a@example.com, b@example.com</td>" in out
+        assert "<th>Subject</th><td>Lunch</td>" in out
+        assert 'class="check"' in out and '<p id="st-note" class="meta">Sent.</p>' in out
+        assert "setTimeout(advance,1500)" in out and "window.close()" in out
+        assert "var nextUrl=null;" in out and "var pollUrl=null;" in out
+        # The messenger's approved page runs the very same script.
+        messenger = wg._render_channel_send_html(_detail("approved"), "whatsapp-gateway",
+                                                 "a" * 32, None)
+        script = lambda html: html[html.index("function advance()"):html.index("</script>")]
+        assert script(out) == script(messenger)
+        with_next = wg._render_email_send_outcome_html(result, "ari", "42",
+                                                       "/sends/signal-gateway/bbb")
+        assert 'var nextUrl="/sends/signal-gateway/bbb";' in with_next
+
+
 def main() -> int:
     tests = [test_sending_page_polls_with_spinner,
              test_sending_page_with_next_shows_button,
@@ -554,7 +578,8 @@ def main() -> int:
              test_agenda_read_asks_the_gateway_for_the_right_window,
              test_unparsable_times_fall_back_to_the_raw_value,
              test_index_row_names_the_event_time,
-             test_messenger_page_is_unchanged]
+             test_messenger_page_is_unchanged,
+             test_email_outcome_page_ends_like_a_messenger_send]
     failures = 0
     for test in tests:
         try:

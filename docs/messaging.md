@@ -80,6 +80,13 @@ link in the same message (the `dashboard-composing` skill, rule 5). A report
 that names `/sends` without the link makes the user find the page and the entry
 themselves — and a queued send nobody approves is a message never sent.
 
+Every channel, e-mail included, ends an **Allow** the same way: the page shows
+the outcome (a spinner while a messenger gateway delivers, then a green check,
+or the gateway's error, which stays on screen), and a moment after success
+moves on — to the next pending send, or, with none left, it closes the window
+(falling back to the `/sends` list where the browser will not close it).
+**Deny** goes straight on to the next pending send.
+
 ### Retracting a queued send
 
 Until the user decides, the agent that queued a send may take it back — the

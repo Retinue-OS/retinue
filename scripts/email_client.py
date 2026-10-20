@@ -1648,7 +1648,8 @@ def approve_pending_send(cfg, request_id):
             _append(cfg, cfg.sent_folder, msg, seen=True)
         M.uid("store", uid, "+FLAGS", "(\\Deleted)")
         M.expunge()
-        return {"approved": request_id, "sent": True, "to": recipients,
+        return {"approved": request_id, "sent": True, "from": _decode(msg.get("From")),
+                "to": recipients,
                 "subject": _decode(msg.get("Subject")), "saved_to_sent": cfg.save_sent,
                 "stripped_headers": stripped, "thread": thread}
     finally:

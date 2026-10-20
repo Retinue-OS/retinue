@@ -113,7 +113,7 @@ def test_approve_logs_stripped_headers(wg):
     with patch.object(wg.ec, "approve_pending_send", return_value=result):
         with redirect_stdout(buf):
             wg.Handler._handle_send_action(fake, "default", "42", "approve")
-    assert fake.redirected_to == "/sends/next", fake.redirected_to
+    assert fake.redirected_to == "/sends/default/42", fake.redirected_to
     logged = buf.getvalue()
     assert "42" in logged and "X-ZohoMail-Sender" in logged, logged
 
@@ -126,8 +126,34 @@ def test_approve_silent_when_nothing_stripped(wg):
     with patch.object(wg.ec, "approve_pending_send", return_value=result):
         with redirect_stdout(buf):
             wg.Handler._handle_send_action(fake, "default", "43", "approve")
-    assert fake.redirected_to == "/sends/next", fake.redirected_to
+    assert fake.redirected_to == "/sends/default/43", fake.redirected_to
     assert buf.getvalue() == "", buf.getvalue()
+
+
+def test_approved_email_lands_on_its_outcome_page(wg):
+    """After the redirect the draft is gone; the send's own page shows what the
+    approval returned instead of a 404, and leaves a still-pending request
+    as the next one."""
+    fake = _FakeSendHandler()
+    result = {"approved": "45", "sent": True, "from": "Ari <ari@example.org>",
+              "to": ["a@example.com"], "subject": "Lunch", "stripped_headers": []}
+    with patch.object(wg.ec, "approve_pending_send", return_value=result):
+        wg.Handler._handle_send_action(fake, "default", "45", "approve")
+    assert fake.redirected_to == "/sends/default/45", fake.redirected_to
+    page = _FakeSendHandler()
+    later = [{"account": "signal-gateway", "request_id": "bbb"}]
+    with patch.object(wg.ec, "get_pending_send", return_value=None), \
+            patch.object(wg, "_all_pending", return_value=later):
+        wg.Handler._handle_send_single(page, "default", "45")
+    status, body = page.html
+    assert status == 200, page.html
+    assert "<th>Subject</th><td>Lunch</td>" in body and 'class="check"' in body
+    assert 'var nextUrl="/sends/signal-gateway/bbb";' in body
+    # A request that was never approved here is still simply not found.
+    missing = _FakeSendHandler()
+    with patch.object(wg.ec, "get_pending_send", return_value=None):
+        wg.Handler._handle_send_single(missing, "default", "46")
+    assert missing.html[0] == 404, missing.html
 
 
 def test_reject_path_unaffected(wg):
@@ -147,6 +173,7 @@ def main():
         test_in_container_caller_cannot_approve(wg)
         test_approve_logs_stripped_headers(wg)
         test_approve_silent_when_nothing_stripped(wg)
+        test_approved_email_lands_on_its_outcome_page(wg)
         test_reject_path_unaffected(wg)
     print("all send-action stripped-header tests passed")
 

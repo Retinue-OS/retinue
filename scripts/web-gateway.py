@@ -3317,6 +3317,25 @@ _SEND_STATUS_RE = re.compile(r"^/sends/([^/]+)/([^/]+)/status/?$")
 _GATEWAY_HEALTH_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/health/?$")
 _GATEWAY_QR_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/qr/?$")
 
+# E-mail sends approved here, keyed (account, request_id), so the redirect after
+# approval lands on the send's own page as a channel send does: the draft is
+# gone once sent, and what the approval returned is all there is left to show.
+_approved_email_sends: dict[tuple[str, str], dict] = {}
+_approved_email_sends_lock = threading.Lock()
+_APPROVED_EMAIL_SENDS_MAX = 200
+
+
+def _remember_approved_email_send(account: str, request_id: str, result: dict) -> None:
+    with _approved_email_sends_lock:
+        _approved_email_sends[(account, request_id)] = result
+        while len(_approved_email_sends) > _APPROVED_EMAIL_SENDS_MAX:
+            _approved_email_sends.pop(next(iter(_approved_email_sends)))
+
+
+def _approved_email_send(account: str, request_id: str) -> dict | None:
+    with _approved_email_sends_lock:
+        return _approved_email_sends.get((account, request_id))
+
 
 def _ec_config(account: str):
     acc = None if account in (None, "", "default") else account
@@ -3473,6 +3492,29 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
           "</script>\n"
         + "</body>\n</html>\n"
     )
+
+
+def _render_email_send_outcome_html(result: dict, account: str, request_id: str,
+                                    next_url: str | None) -> str:
+    """The page an approved e-mail lands on: the status page a channel send ends
+    on, so both confirm the send and then move on alike — to the next pending
+    request, or by closing the window. E-mail goes out while the approval
+    request is handled, so the outcome is final by the time this renders."""
+    acc = html.escape(account)
+    frm = html.escape(result.get("from") or account)
+    # Every address it went to, Cc and Bcc included — the approval's result
+    # does not keep the header they came from.
+    recipients = html.escape(", ".join(result.get("to") or []))
+    subj = html.escape(result.get("subject") or "(no subject)")
+    meta_rows = [
+        f"<tr><th>From</th><td>{frm} <span class=\"meta\">({acc})</span></td></tr>",
+        f"<tr><th>Recipients</th><td>{recipients}</td></tr>",
+        f"<tr><th>Subject</th><td>{subj}</td></tr>",
+    ]
+    return _render_send_status_html(
+        title=f"E-mail send {html.escape(request_id)}", heading="E-mail send",
+        meta_rows=meta_rows, body_html="", status="approved", notes=_MESSAGE_SEND_NOTES,
+        error="", next_url=next_url, poll_url=None)
 
 
 # ── Pending-send detail rendering ────────────────────────────────────────────
@@ -3852,6 +3894,132 @@ _AGENDA_CSS = ("<style>\n"
                "</style>\n")
 
 
+# What a messenger send's status page says at each step; an approved e-mail
+# lands on the same page, so it shares these.
+_MESSAGE_SEND_NOTES = {
+    "pending": "Delivering in the background…",
+    "done": "Sent.",
+    "rejected": "The message was discarded without sending.",
+    "retracted": "The agent retracted this message before approval; nothing was sent.",
+    "error": "The gateway could not deliver the message: ",
+}
+
+
+def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
+                             body_html: str, status: str, notes: dict, error: str,
+                             next_url: str | None, poll_url: str | None) -> str:
+    """Render the status page of a decided send — every channel, e-mail included,
+    so all of them end the same way once the user has decided.
+
+    A "sending" entry shows a spinner and polls `poll_url` (the JSON status
+    endpoint) client-side — no full-page refresh flicker. Success flips the
+    spinner to a green check and auto-advances a moment later: to the next
+    pending request when one exists, else the page tries to close itself
+    (falling back to /sends — window.close() only works for script-opened
+    windows). The next-request button is rendered only when a next request
+    actually exists; a failure shows the gateway's real error and stays put so
+    the user can read it.
+
+    `title` and `heading` come HTML-escaped; `notes` holds the pending, done,
+    rejected, retracted and error texts in the request's own terms.
+    """
+    if status == "sending":
+        icon = '<div class="spin" role="status" aria-label="sending"></div>'
+        note = notes["pending"]
+    elif status == "approved":
+        icon = '<div class="check">✓</div>'
+        note = notes["done"]
+    elif status == "rejected":
+        icon = '<div class="cross">✕</div>'
+        note = notes["rejected"]
+    elif status == "retracted":
+        icon = '<div class="cross">✕</div>'
+        note = notes["retracted"]
+    else:  # "error"
+        icon = '<div class="cross">✕</div>'
+        note = notes["error"] + (error or "unknown error")
+    return (
+        _HTML_HEAD
+        + f"<title>Retinue — {title}</title>\n"
+        # No-JS fallback only: with scripting available the page polls
+        # instead of reloading.
+        + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
+           if status == "sending" else "")
+        + "<style>\n"
+          "  .st-row{display:flex;align-items:center;gap:.9rem;margin:1.1rem 0}\n"
+          "  .spin{width:34px;height:34px;border:4px solid var(--line);"
+          "border-top-color:var(--accent);border-radius:50%;animation:st-spin 1s linear infinite}\n"
+          "  @keyframes st-spin{to{transform:rotate(360deg)}}\n"
+          "  .check,.cross{width:38px;height:38px;border-radius:50%;display:flex;"
+          "align-items:center;justify-content:center;font-size:1.35rem;font-weight:700}\n"
+          "  .check{background:var(--ok);color:#0b0d12}\n"
+          "  .cross{background:var(--high);color:#0b0d12}\n"
+          "</style>\n"
+        + "<body>\n"
+        + f"<h1>{heading}</h1>\n"
+        + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
+        + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
+        + body_html
+        + f'<div class="st-row"><div id="st-icon">{icon}</div>'
+        + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
+        + '<div class="actions">\n'
+        + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
+        + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
+        + "</div>\n"
+        + "<script>\n"
+          "(function(){\n"
+        + f"  var status={json.dumps(status)};\n"
+        + f"  var nextUrl={json.dumps(next_url)};\n"
+        + f"  var pollUrl={json.dumps(poll_url)};\n"
+        + f"  var noteDone={json.dumps(notes['done'])};\n"
+        + f"  var noteRejected={json.dumps(notes['rejected'])};\n"
+        + f"  var noteRetracted={json.dumps(notes['retracted'])};\n"
+        + f"  var noteError={json.dumps(notes['error'])};\n"
+        + "  var icon=document.getElementById('st-icon');\n"
+          "  var note=document.getElementById('st-note');\n"
+          "  var nextBtn=document.getElementById('st-next');\n"
+          "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
+          "  function advance(){\n"
+          "    if(nextUrl){location=nextUrl;return;}\n"
+          "    window.close();\n"
+          "    setTimeout(function(){location='/sends';},400);\n"
+          "  }\n"
+          "  function terminal(st,err){\n"
+          "    if(st==='approved'){\n"
+          "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
+          "      note.textContent=noteDone;\n"
+          "      setTimeout(advance,1500);\n"
+          "    }else if(st==='rejected'){\n"
+          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+          "      note.textContent=noteRejected;\n"
+          "      showNext();\n"
+          "    }else if(st==='retracted'){\n"
+          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+          "      note.textContent=noteRetracted;\n"
+          "      showNext();\n"
+          "    }else{\n"
+          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+          "      note.textContent=noteError+(err||'unknown error');\n"
+          "      showNext();\n"
+          "    }\n"
+          "  }\n"
+          "  function poll(){\n"
+          "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
+          "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
+          "        if('next' in b){nextUrl=b.next;}\n"
+          "        terminal(b.status,b.error);\n"
+          "      }else{setTimeout(poll,1500);}\n"
+          "    }).catch(function(){setTimeout(poll,3000);});\n"
+          "  }\n"
+          "  if(status==='sending'){setTimeout(poll,1200);}\n"
+          "  else if(status==='approved'){setTimeout(advance,1500);}\n"
+          "  else{showNext();}\n"
+          "})();\n"
+          "</script>\n"
+        + "</body>\n</html>\n"
+    )
+
+
 def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None,
                               agenda: dict | None = None) -> str:
     """Render the page for a channel pending send — a messenger message
@@ -3904,12 +4072,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         body_html = (f'<pre class="msg-body">{description}</pre>\n' if description
                      else '<p class="meta">No description.</p>\n')
         noun = "Event"
-        note_pending = "Adding to the calendar…"
-        note_done = "Added to the calendar."
-        note_rejected = "The event was discarded; nothing was added to the calendar."
-        note_retracted = ("The agent retracted this event before approval; "
-                          "nothing was added to the calendar.")
-        note_error = "The gateway could not create the event: "
+        notes = {
+            "pending": "Adding to the calendar…",
+            "done": "Added to the calendar.",
+            "rejected": "The event was discarded; nothing was added to the calendar.",
+            "retracted": ("The agent retracted this event before approval; "
+                          "nothing was added to the calendar."),
+            "error": "The gateway could not create the event: ",
+        }
     else:
         # A gateway that stores its text as "body" (the e-mail-shaped entry) is
         # read too, so no channel renders an empty box.
@@ -3921,117 +4091,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         ]
         body_html = f'<pre class="msg-body">{msg}</pre>\n'
         noun = "Send"
-        note_pending = "Delivering in the background…"
-        note_done = "Sent."
-        note_rejected = "The message was discarded without sending."
-        note_retracted = ("The agent retracted this message before approval; "
-                          "nothing was sent.")
-        note_error = "The gateway could not deliver the message: "
+        notes = _MESSAGE_SEND_NOTES
     status = detail.get("status") or "pending"
     if status != "pending":
-        # Status page: a "sending" entry shows a spinner and polls the JSON
-        # status endpoint client-side — no full-page refresh flicker. Success
-        # flips the spinner to a green check and auto-advances a moment later:
-        # to the next pending request when one exists, else the page tries to
-        # close itself (falling back to /sends — window.close() only works for
-        # script-opened windows). The next-request button is rendered only when
-        # a next request actually exists; a failure shows the gateway's real
-        # error and stays put so the user can read it.
-        if status == "sending":
-            icon = '<div class="spin" role="status" aria-label="sending"></div>'
-            note = note_pending
-        elif status == "approved":
-            icon = '<div class="check">✓</div>'
-            note = note_done
-        elif status == "rejected":
-            icon = '<div class="cross">✕</div>'
-            note = note_rejected
-        elif status == "retracted":
-            icon = '<div class="cross">✕</div>'
-            note = note_retracted
-        else:  # "error"
-            icon = '<div class="cross">✕</div>'
-            note = note_error + (detail.get("error") or "unknown error")
-        return (
-            _HTML_HEAD
-            + f"<title>Retinue — {label_e} {noun} {rid}</title>\n"
-            # No-JS fallback only: with scripting available the page polls
-            # instead of reloading.
-            + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
-               if status == "sending" else "")
-            + "<style>\n"
-              "  .st-row{display:flex;align-items:center;gap:.9rem;margin:1.1rem 0}\n"
-              "  .spin{width:34px;height:34px;border:4px solid var(--line);"
-              "border-top-color:var(--accent);border-radius:50%;animation:st-spin 1s linear infinite}\n"
-              "  @keyframes st-spin{to{transform:rotate(360deg)}}\n"
-              "  .check,.cross{width:38px;height:38px;border-radius:50%;display:flex;"
-              "align-items:center;justify-content:center;font-size:1.35rem;font-weight:700}\n"
-              "  .check{background:var(--ok);color:#0b0d12}\n"
-              "  .cross{background:var(--high);color:#0b0d12}\n"
-              "</style>\n"
-            + "<body>\n"
-            + f"<h1>{label_e} {noun.lower()}</h1>\n"
-            + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
-            + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-            + body_html
-            + f'<div class="st-row"><div id="st-icon">{icon}</div>'
-            + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
-            + '<div class="actions">\n'
-            + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
-            + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
-            + "</div>\n"
-            + "<script>\n"
-              "(function(){\n"
-            + f"  var status={json.dumps(status)};\n"
-            + f"  var nextUrl={json.dumps(next_url)};\n"
-            + f"  var pollUrl={json.dumps(f'/sends/{channel}/{request_id}/status')};\n"
-            + f"  var noteDone={json.dumps(note_done)};\n"
-            + f"  var noteRejected={json.dumps(note_rejected)};\n"
-            + f"  var noteRetracted={json.dumps(note_retracted)};\n"
-            + f"  var noteError={json.dumps(note_error)};\n"
-            + "  var icon=document.getElementById('st-icon');\n"
-              "  var note=document.getElementById('st-note');\n"
-              "  var nextBtn=document.getElementById('st-next');\n"
-              "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
-              "  function advance(){\n"
-              "    if(nextUrl){location=nextUrl;return;}\n"
-              "    window.close();\n"
-              "    setTimeout(function(){location='/sends';},400);\n"
-              "  }\n"
-              "  function terminal(st,err){\n"
-              "    if(st==='approved'){\n"
-              "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-              "      note.textContent=noteDone;\n"
-              "      setTimeout(advance,1500);\n"
-              "    }else if(st==='rejected'){\n"
-              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent=noteRejected;\n"
-              "      showNext();\n"
-              "    }else if(st==='retracted'){\n"
-              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent=noteRetracted;\n"
-              "      showNext();\n"
-              "    }else{\n"
-              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent=noteError+(err||'unknown error');\n"
-              "      showNext();\n"
-              "    }\n"
-              "  }\n"
-              "  function poll(){\n"
-              "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
-              "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
-              "        if('next' in b){nextUrl=b.next;}\n"
-              "        terminal(b.status,b.error);\n"
-              "      }else{setTimeout(poll,1500);}\n"
-              "    }).catch(function(){setTimeout(poll,3000);});\n"
-              "  }\n"
-              "  if(status==='sending'){setTimeout(poll,1200);}\n"
-              "  else if(status==='approved'){setTimeout(advance,1500);}\n"
-              "  else{showNext();}\n"
-              "})();\n"
-              "</script>\n"
-            + "</body>\n</html>\n"
-        )
+        return _render_send_status_html(
+            title=f"{label_e} {noun} {rid}", heading=f"{label_e} {noun.lower()}",
+            meta_rows=meta_rows, body_html=body_html, status=status, notes=notes,
+            error=detail.get("error") or "", next_url=next_url,
+            poll_url=f"/sends/{channel}/{request_id}/status")
     return (
         _HTML_HEAD
         + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
@@ -9547,8 +9614,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001 - the decision itself already stands
                 print(f"[web-gateway] reporting send decision {account}/"
                       f"{request_id} failed: {exc!r}", flush=True)
-        # Move on to the next pending request for quick one-click processing.
-        self._redirect("/sends/next")
+        if verb == "approve":
+            # Land on the send's own page, as a channel approval does: it
+            # confirms the send, then moves on to the next pending request or
+            # closes the window.
+            _remember_approved_email_send(account, request_id, decided or {})
+            self._redirect(f"/sends/{account}/{request_id}")
+        else:
+            self._redirect("/sends/next")
 
     def _handle_channel_send_action(self, channel: str, request_id: str, verb: str) -> None:
         """Proxy approve/reject for a channel pending send to its gateway."""
@@ -11893,6 +11966,16 @@ class Handler(BaseHTTPRequestHandler):
                             + "</body></html>")
             return
         if detail is None:
+            approved = _approved_email_send(account, request_id)
+            if approved is not None:
+                # Sent a moment ago: what follows is the next still-pending
+                # request, if any.
+                pending = _all_pending()
+                next_url = (f"/sends/{pending[0]['account']}/{pending[0]['request_id']}"
+                            if pending else None)
+                self._send_html(200, _render_email_send_outcome_html(
+                    approved, account, request_id, next_url))
+                return
             self._send_html(404, _HTML_HEAD + "<body><h1>Request not found</h1>"
                             + '<p><a href="/sends">Back to pending sends</a></p></body></html>')
             return
