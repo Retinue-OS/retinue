@@ -13,7 +13,8 @@
 //
 // Safety: the input is HTML-escaped before any markup is generated, and only
 // http(s)/mailto/tel URLs ever become links (never javascript:). The output is
-// therefore safe to assign to innerHTML.
+// therefore safe to assign to innerHTML. Links to the dashboard's own origin
+// open in place; every other web link opens in a new tab (see anchor()).
 //
 // Rendering hooks let a host specialize without forking the renderer: the
 // conversations card passes a `quote` hook that adds its copy-to-clipboard
@@ -32,8 +33,24 @@ const SEP = String.fromCharCode(1); // sentinel absent from escaped text
 // no longer see either, because the anchor is stashed by then.
 const URL_TAIL_RE = /[.,;:!?)\]*]+$/;
 
+// A link into the dashboard itself — another thread, /sends/…, a project page —
+// navigates in place. In a standalone PWA a target="_blank" link is handed to a
+// browsing context outside the app window, so Ara's link to another thread would
+// open the browser instead of the app (and the back gesture would then leave
+// the PWA instead of returning to the thread). Same-origin is the test, so a
+// link to /#conversation-<id> on the home page is a plain fragment change the
+// conversations card already answers. Anything else opens in a new tab.
+function isOwnOrigin(url) {
+  if (typeof location === 'undefined' || !location.origin) return false;
+  try {
+    return new URL(url, location.href).origin === location.origin;
+  } catch (_e) {
+    return false;
+  }
+}
+
 function anchor(url, label) {
-  const external = !/^mailto:|^tel:/i.test(url);
+  const external = !/^mailto:|^tel:/i.test(url) && !isOwnOrigin(url);
   const attrs = external ? ' target="_blank" rel="noopener noreferrer"' : '';
   return `<a href="${url}"${attrs}>${label}</a>`;
 }

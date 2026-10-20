@@ -17,7 +17,10 @@ The dashboard renders everything through one shared Markdown renderer
 (`webapp/components/markdown.js`). Two inline affordances carry these
 principles:
 
-- **Links** — `[label](url)`: navigate. Standard Markdown; opens in a new tab.
+- **Links** — `[label](url)`: navigate. Standard Markdown. A link into the
+  dashboard itself (its own origin, i.e. `CONVERSATION_BASE_URL` — another
+  thread, `/sends/…`, a project page) opens in place, inside the app; any
+  other link opens in a new tab.
 - **Reply chips** — `[[chip: Label | prefill text]]`: a click-to-fill button
   styled as an inline link. Clicking one drops the *prefill text* into the
   composer for the user to review and send themselves — it never auto-sends.
