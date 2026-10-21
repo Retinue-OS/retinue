@@ -1,0 +1,100 @@
+name: Check qlever-dir release
+
+# The qlever-dir submodule is pinned to qlever-dir releases, whose versions
+# follow QLever's (see "Versioning" in qlever-dir's README). When a newer
+# release is published, open a PR that moves the submodule to it.
+
+on:
+  schedule:
+    # Daily at 09:00 UTC, an hour after qlever-dir's own QLever check
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get pinned and latest release
+        id: versions
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PINNED_SHA=$(git ls-tree HEAD qlever-dir | awk '{print $3}')
+          if ! echo "$PINNED_SHA" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "Could not read the qlever-dir submodule commit" >&2
+            exit 1
+          fi
+          LATEST=$(gh api repos/Retinue-OS/qlever-dir/releases/latest --jq '.tag_name')
+          if ! echo "$LATEST" | grep -qE '^v[0-9]+(\.[0-9]+)+$'; then
+            echo "Unexpected qlever-dir release tag: $LATEST" >&2
+            exit 1
+          fi
+          LATEST_SHA=$(gh api "repos/Retinue-OS/qlever-dir/commits/${LATEST}" --jq '.sha')
+          # Only move forward: a pin already at or past the release (or on a
+          # diverged commit) is left alone.
+          STATUS=$(gh api "repos/Retinue-OS/qlever-dir/compare/${PINNED_SHA}...${LATEST_SHA}" --jq '.status')
+          PINNED=$(gh api "repos/Retinue-OS/qlever-dir/tags?per_page=100" \
+            --jq "[.[] | select(.commit.sha == \"${PINNED_SHA}\") | .name][0] // \"${PINNED_SHA:0:7}\"")
+          {
+            echo "pinned=$PINNED"
+            echo "latest=$LATEST"
+            echo "latest_sha=$LATEST_SHA"
+            echo "needs_update=$([ "$STATUS" = "ahead" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Pinned: $PINNED ($PINNED_SHA), latest release: $LATEST ($LATEST_SHA), $STATUS"
+
+      - name: Create bump PR
+        if: steps.versions.outputs.needs_update == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PINNED: ${{ steps.versions.outputs.pinned }}
+          LATEST: ${{ steps.versions.outputs.latest }}
+          LATEST_SHA: ${{ steps.versions.outputs.latest_sha }}
+        run: |
+          BRANCH="bump/qlever-dir-${LATEST}"
+
+          # Skip if a PR for this release exists, open or closed: closing a
+          # bump PR unmerged means "skip this release".
+          if [ "$(gh pr list --state all --head "$BRANCH" --json number --jq 'length')" -gt 0 ]; then
+            echo "::notice::A PR for $BRANCH already exists (open or closed), skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git checkout -b "$BRANCH"
+          # Move the submodule pointer without cloning the submodule
+          git update-index --cacheinfo "160000,${LATEST_SHA},qlever-dir"
+          git commit -m "chore(qlever-dir): bump from ${PINNED} to ${LATEST}"
+          git push origin "$BRANCH"
+
+          BODY=$(cat <<EOF
+          Automated bump found by the daily qlever-dir release check.
+
+          - **Previous:** ${PINNED}
+          - **New:** ${LATEST}
+          - **Release notes:** https://github.com/Retinue-OS/qlever-dir/releases/tag/${LATEST}
+
+          After merging, rebuild the life store (\`docker compose up -d --build qlever-life\`).
+          EOF
+          )
+          NEW_PR=$(gh pr create \
+            --title "chore(qlever-dir): bump from ${PINNED} to ${LATEST}" \
+            --body "$BODY" \
+            --base main \
+            --head "$BRANCH")
+
+          # Close older bump PRs this one supersedes
+          gh pr list --state open --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"bump/qlever-dir-\")) | select(.headRefName != \"$BRANCH\") | .number" \
+            | while read -r N; do
+                gh pr close "$N" --delete-branch --comment "Superseded by $NEW_PR."
+              done

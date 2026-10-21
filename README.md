@@ -38,7 +38,8 @@ Defines these core compose services:
   input), so exactly one ASR model is loaded system-wide.
 - **`qlever-life`** — a live SPARQL endpoint over the shared chambers volume,
   served by [qlever-dir](https://github.com/retinue-os/qlever-dir) (included as a
-  submodule). Every chamber's RDF files are indexed equally; a file change is
+  submodule, pinned to a qlever-dir release; a daily workflow opens a PR for
+  each new one). Every chamber's RDF files are indexed equally; a file change is
   applied to the live index within seconds. See
   [`docs/triple-stores.md`](docs/triple-stores.md) for what this makes possible
   — querying Markdown frontmatter, sensor CSVs at scale, and why some data gets
