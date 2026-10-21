@@ -479,5 +479,5 @@ whole store.
 - `README.md` — startup sequence, chamber mounting (a host-mounted chamber needs
   a mount for `qlever-life` too, or its data won't be indexed)
 - [qlever-dir](https://github.com/retinue-os/qlever-dir) — the indexing service,
-  included as a submodule
+  run from its released image
 - `.claude/agents/archivist.md` — ingestion conventions and the ontology table

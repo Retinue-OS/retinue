@@ -28,7 +28,7 @@ jobs:
       - name: Get pinned version
         id: pinned
         run: |
-          VERSION=$(grep -oP "^\s*image: ${IMAGE//./\\.}:\K[0-9]+(\.[0-9]+)+(?=@)" docker-compose.yml)
+          VERSION=$(grep -oP "^\s*image: ${IMAGE//./\\.}:\K[0-9]+(\.[0-9]+)+(?=@)" docker-compose.yml || true)
           if [ -z "$VERSION" ]; then
             echo "Could not read the pinned qlever-dir image from docker-compose.yml" >&2
             exit 1
