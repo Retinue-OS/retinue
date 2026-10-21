@@ -37,8 +37,9 @@ Defines these core compose services:
   `signal-gateway` (inbound voice notes) and the web gateway (dashboard voice
   input), so exactly one ASR model is loaded system-wide.
 - **`qlever-life`** — a live SPARQL endpoint over the shared chambers volume,
-  served by [qlever-dir](https://github.com/retinue-os/qlever-dir) (included as a
-  submodule). Every chamber's RDF files are indexed equally; a file change is
+  served by [qlever-dir](https://github.com/retinue-os/qlever-dir) (its
+  released image, pinned by version and digest; a daily workflow opens a PR
+  for each new release). Every chamber's RDF files are indexed equally; a file change is
   applied to the live index within seconds. See
   [`docs/triple-stores.md`](docs/triple-stores.md) for what this makes possible
   — querying Markdown frontmatter, sensor CSVs at scale, and why some data gets
@@ -74,15 +75,9 @@ Your chamber data lives in separate repositories and is cloned into the shared
 ## Installation
 
 ```bash
-git clone --recurse-submodules https://github.com/retinue-os/retinue.git
+git clone https://github.com/retinue-os/retinue.git
 cd retinue
 cp .env.example .env
-```
-
-If you already cloned without `--recurse-submodules`:
-
-```bash
-git submodule update --init
 ```
 
 Edit `.env` and fill in your values:
@@ -919,7 +914,6 @@ retinue/
   signal-gateway/      ← image definition for the `signal-gateway` service
   docker-compose.yml   ← deployment-neutral base composition
   docker-compose.override.example.yml ← deployment-specific wiring template
-  qlever-dir/          ← submodule: live SPARQL-over-directory service
   qlever-static/       ← single-file SPARQL service (optional, deployment override)
 ```
 
@@ -932,7 +926,7 @@ Claude Code plugin).
 To pick up changes to agents, scripts, or dependencies:
 
 ```bash
-git pull --recurse-submodules
+git pull
 docker compose build
 docker compose up -d
 ```
