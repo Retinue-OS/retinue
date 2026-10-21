@@ -466,7 +466,7 @@ class RetinueChatPage extends HTMLElement {
         this._draftByAra = draft.author === 'agent';
       }
       this._state = 'ok';
-      try { document.title = `Retinue — ${this._chat.name}`; } catch (_e) { /* ignore */ }
+      try { document.title = `${document.title.split(' — ')[0]} — ${this._chat.name}`; } catch (_e) { /* ignore */ }
       const restore = this._shelfRestore;
       this._shelfRestore = null;
       if (restore && restore.pane) this._pane = restore.pane === 'companion' ? 'companion' : 'chat';

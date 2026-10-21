@@ -279,6 +279,7 @@ import send_origin
 import inbound_store
 import session_env
 import gateway_auth
+import instance_branding
 import messenger_gateways
 import news_store
 import push_notify
@@ -1382,6 +1383,31 @@ def _news_ingest_authorized(provided: str) -> bool:
     return hmac.compare_digest(provided, NEWS_INGEST_TOKEN)
 
 
+# Recoloured icons, keyed by (path, colour): the recolouring is a pure-Python
+# pixel pass, so it runs once per icon per configured colour, not per request.
+_BRANDED_ICON_CACHE: dict[tuple[str, str], bytes] = {}
+
+
+def _branding_transform(rel: str):
+    """The instance-branding rewrite for a shell file, or None (scripts/instance_branding.py)."""
+    if not instance_branding.branded():
+        return None
+    if rel == "manifest.webmanifest":
+        return instance_branding.brand_manifest
+    if rel.endswith(".html") and "/" not in rel:
+        return instance_branding.brand_html
+    if rel.startswith("icons/") and rel.endswith(".png") and instance_branding.accent_color():
+        key = (rel, instance_branding.signature())
+
+        def recolor(data: bytes) -> bytes:
+            cached = _BRANDED_ICON_CACHE.get(key)
+            if cached is None:
+                cached = _BRANDED_ICON_CACHE[key] = instance_branding.recolor_png(data)
+            return cached
+        return recolor
+    return None
+
+
 def _shell_hash() -> str:
     """Return a short content hash identifying the current shell-asset set.
 
@@ -1405,6 +1431,9 @@ def _shell_hash() -> str:
             entries.append(f"{p.relative_to(WEBAPP_DIR)}:{st.st_size}:{st.st_mtime_ns}")
     except OSError:
         return "static"
+    # The branding is applied on the response, not on disk, so it joins the
+    # signature explicitly: a changed name or colour must evict cached icons.
+    entries.append(f"branding:{instance_branding.signature()}")
     signature = "\n".join(entries)
     cached = _SHELL_HASH_CACHE.get(signature)
     if cached is not None:
@@ -3177,7 +3206,7 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
         print(f"[web-gateway] no device subscribed to push — thread {cid} "
               "notifies nobody", flush=True)
         return 0
-    title = conv.get("title") or "Retinue"
+    title = conv.get("title") or instance_branding.display_name()
     # The notification shows words, not the chip markup the thread renders.
     body = " ".join(_CHIP_MARKUP_RE.sub("", str(text or "")).split())
     if len(body) > 160:
@@ -9214,9 +9243,12 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache") -> bool:
+    def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
+                           transform=None) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
+        ``transform`` rewrites the bytes on the response only (the instance
+        branding); the file on disk is never touched.
         Returns True if a file was sent, False otherwise (caller emits 404)."""
         try:
             full = path.resolve()
@@ -9228,6 +9260,8 @@ class Handler(BaseHTTPRequestHandler):
             data = full.read_bytes()
         except (OSError, ValueError):
             return False
+        if transform is not None:
+            data = transform(data)
         ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -9299,7 +9333,8 @@ class Handler(BaseHTTPRequestHandler):
         Curated data lives under DASHBOARD_DATA_DIR and is served at /data/."""
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
-            return self._serve_static_file(WEBAPP_DIR / "index.html", WEBAPP_DIR)
+            return self._serve_static_file(WEBAPP_DIR / "index.html", WEBAPP_DIR,
+                                           transform=instance_branding.brand_html)
         if path == "/sw.js":
             return self._serve_service_worker()
         if path.startswith("/data/"):
@@ -9308,7 +9343,8 @@ class Handler(BaseHTTPRequestHandler):
         rel = path.lstrip("/")
         if not rel:
             return False
-        return self._serve_static_file(WEBAPP_DIR / rel, WEBAPP_DIR)
+        return self._serve_static_file(WEBAPP_DIR / rel, WEBAPP_DIR,
+                                       transform=_branding_transform(rel))
 
     def _handle_sparql(self) -> None:
         """/sparql, GET or POST — see "The life store, published" above."""
@@ -9354,7 +9390,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "no query: send query=<SPARQL> as a form, "
                                            "or the query as an application/sparql-query body"})
         elif "text/html" in (self.headers.get("Accept") or "").lower():
-            if not self._serve_static_file(WEBAPP_DIR / "sparql.html", WEBAPP_DIR):
+            if not self._serve_static_file(WEBAPP_DIR / "sparql.html", WEBAPP_DIR,
+                                           transform=instance_branding.brand_html):
                 self._send_json(404, {"error": "not found"})
         else:
             payload = _sparql_service_description().encode("utf-8")
