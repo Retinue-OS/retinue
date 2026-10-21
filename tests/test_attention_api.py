@@ -1414,8 +1414,83 @@ def test_sender_expiry(base, wg):
     assert wg._CHAT_STATE.get("signal:" + code)["attention"]["expires_at"] is None
     _http(base, "POST", "/attention/items/done", {"id": cid})
     _http(base, "POST", "/attention/items/done", {"id": fid})
+    _sender_expiry_races(base, wg, monday)
     _clock(wg, None)
     print("ok test_sender_expiry")
+
+
+def _sender_expiry_races(base, wg, monday):
+    """Expiry settles from a snapshot taken outside the attention lock; an
+    arrival landing between that scan and the settlement must win, and the
+    settlement must not query the store."""
+    bank = "+41790000080"
+    key, cid = "signal:" + bank, "chat:signal:" + bank
+    _clock(wg, monday.replace(hour=12, minute=0))
+    _inbound(base, bank, "Bank", "Code: 1", "2026-09-07T12:00:00Z")
+    status, _ = _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": "10m"}, AGENT)
+    assert status == 200
+    real_all, real_payload = wg._CHAT_STATE.all, wg._chats_payload
+    queries = []
+
+    def no_query():
+        queries.append(1)
+        raise AssertionError("expiry must not query the store")
+
+    def expire_with(interleave, at):
+        def scan():
+            snapshot = real_all()
+            interleave()
+            return snapshot
+        wg._CHAT_STATE.all, wg._chats_payload = scan, no_query
+        try:
+            return wg._attention_expire(at)
+        finally:
+            wg._CHAT_STATE.all, wg._chats_payload = real_all, real_payload
+
+    # A whole arrival between scan and settlement: a new code with a new timer.
+    _clock(wg, monday.replace(hour=12, minute=10))
+    settled = expire_with(lambda: _inbound(base, bank, "Bank", "Code: 2", "2026-09-07T12:10:00Z"),
+                          monday.replace(hour=12, minute=10))
+    doc = wg._CHAT_STATE.get(key)
+    assert settled == [] and queries == [], (settled, queries)
+    assert doc["attention"]["state"] == "open" and doc["archived"] is False, doc
+    assert doc["attention"]["expires_at"].startswith("2026-09-07T12:20"), doc["attention"]
+    # An arrival still on its way in — counted and unarchived by the rail, not
+    # yet decided by the model: the old code settles, the chat stays visible.
+    wg._CHAT_STATE.set_flags(key, archived=True)
+    entry = {"text": "Code: 3", "sender": bank, "sender_name": "Bank"}
+
+    seqs = []
+
+    def half_arrival():
+        seqs.append(wg._CHAT_STATE.mark_unread(key, "2026-09-07T12:20:00Z")[0]["inbound_seq"])
+        wg._CHAT_STATE.unarchive_unless_muted(key)
+    settled = expire_with(half_arrival, monday.replace(hour=12, minute=20))
+    doc = wg._CHAT_STATE.get(key)
+    assert settled == [key] and queries == [], (settled, queries)
+    assert doc["attention"]["state"] == "done" and doc["archived"] is False, doc
+    # ... and once the model takes it in, it is open with its own timer. A
+    # newer message counted meanwhile (held, or its turn still working) is
+    # not taken in by that: the arrival records its own count, not the
+    # document's, so the next timer still leaves the chat in view.
+    newer = wg._CHAT_STATE.mark_unread(key, "2026-09-07T12:21:00Z")[0]["inbound_seq"]
+    _clock(wg, monday.replace(hour=12, minute=20))
+    wg._attention_arrive_chat(key, wg._CHAT_STATE.get(key), entry, attended=seqs[0])
+    doc = wg._CHAT_STATE.get(key)
+    assert doc["attention"]["state"] == "open" and doc["archived"] is False, doc
+    assert doc["attention"]["expires_at"].startswith("2026-09-07T12:30"), doc["attention"]
+    settled = expire_with(lambda: None, monday.replace(hour=12, minute=30))
+    doc = wg._CHAT_STATE.get(key)
+    assert settled == [key] and doc["archived"] is False, doc
+    # Once the newer one is taken in too, nothing is in flight and the
+    # timer archives as before — still no query.
+    _clock(wg, monday.replace(hour=12, minute=30))
+    wg._attention_arrive_chat(key, wg._CHAT_STATE.get(key), entry, attended=newer)
+    settled = expire_with(lambda: None, monday.replace(hour=12, minute=40))
+    doc = wg._CHAT_STATE.get(key)
+    assert settled == [key] and queries == [], (settled, queries)
+    assert doc["attention"]["done_how"] == "expired" and doc["archived"] is True, doc
+    _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": None}, AGENT)
 
 
 def test_sender_expiry_from_sheet(base, wg):

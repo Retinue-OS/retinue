@@ -6835,6 +6835,7 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
             timer.daemon = True
             _INSTRUCTED_RINGS[job_id] = {"chat_id": chat_id, "entry": dict(entry),
                                          "read_seq": int(ring.get("read_seq") or 0),
+                                         "inbound_seq": ring.get("inbound_seq"),
                                          "timer": timer, "job": job_id}
             arrival["ring"] = job_id
             timer.start()
@@ -7005,10 +7006,12 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
             spec = {"importance": verdict["importance"], "importance_from": "instruction"}
             if verdict.get("due"):
                 spec["due"] = verdict["due"]
-            decision, _item = _attention_arrive_chat(chat_id, doc, entry, spec)
+            decision, _item = _attention_arrive_chat(chat_id, doc, entry, spec,
+                                                     attended=ring.get("inbound_seq"))
         else:
             decision, _item = _attention_arrive_chat(chat_id, doc, entry, None, vip=True,
-                                                     vip_from="instruction")
+                                                     vip_from="instruction",
+                                                     attended=ring.get("inbound_seq"))
         if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
             _chat_push_notification(chat_id, doc, entry,
                                     urgency="high" if decision["deliver"] == "push" else None)
@@ -8449,6 +8452,16 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
     return attention_store.fold_projects(items), degraded
 
 
+def _attention_chat_row_from_state(chat_id: str, state: dict) -> dict:
+    """A chat's row as far as its state document tells it — no store query,
+    no preview: enough to rebuild and persist its attention item."""
+    channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+    return {"id": chat_id, "name": _chat_display_name(state, channel, key),
+            "channel": channel, "key": key, "unread": 0, "last": {},
+            "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
+            "group": state.get("group")}
+
+
 def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
     """One item by its id (``thread:<cid>``, ``chat:<chat id>``, a project
     URI), assembled the same way the list is. A chat or project whose live
@@ -8470,11 +8483,7 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
         if row is None:
             if not state.get("attention"):
                 return None
-            channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
-            row = {"id": chat_id, "name": _chat_display_name(state, channel, key),
-                   "channel": channel, "key": key, "unread": 0, "last": {},
-                   "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
-                   "group": state.get("group")}
+            row = _attention_chat_row_from_state(chat_id, state)
         return attention_store.chat_item(row, state, profile)
     states = _ATTENTION.projects()
     row = None
@@ -8489,8 +8498,10 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
     return attention_store.project_item(row, states.get(item_id), profile, now, _OWNER_ACTOR)
 
 
-def _attention_persist(item: dict) -> None:
-    """Store the item's attention block back where the item lives."""
+def _attention_persist(item: dict, attended: int | None = None) -> None:
+    """Store the item's attention block back where the item lives.
+    ``attended``: for a chat block decided from an arrival, that arrival's
+    ``inbound_seq`` (see ChatStateStore.archive_unless_arrived)."""
     block = attention_store.block_for(item)
     kind = item.get("kind")
     if kind == "thread":
@@ -8500,7 +8511,7 @@ def _attention_persist(item: dict) -> None:
                 conv["attention"] = block
                 _save_conv(conv)
     elif kind == "chat":
-        _CHAT_STATE.set_attention(item["source_id"], block)
+        _CHAT_STATE.set_attention(item["source_id"], block, attended=attended)
         _chats_cache_invalidate()
     else:
         _ATTENTION.save_project(item["source_id"], block)
@@ -8616,7 +8627,8 @@ def _attention_append(conv: dict, message: str, payload: dict) -> tuple[int, dic
 
 
 def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
-                           vip: bool = False, vip_from: str | None = None) -> tuple[dict, dict]:
+                           vip: bool = False, vip_from: str | None = None,
+                           attended: int | None = None) -> tuple[dict, dict]:
     """Run the model over one inbound chat message. The per-class repeat
     policy applies to a chat that is already held: a family sender writing
     again in Rest breaks through, anyone else waits with the first message.
@@ -8624,7 +8636,10 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
     they are the people the user asked to hear from the moment they write.
     ``vip_from="instruction"`` rings a message that way for another reason —
     the turn a standing instruction asked for did not finish — so its reason
-    line says that instead of calling the sender a VIP."""
+    line says that instead of calling the sender a VIP. ``attended`` is this
+    arrival's own ``inbound_seq``, as its mark_unread counted it — not the
+    document's, which a newer arrival may already have advanced past a
+    message the model has not seen (ChatStateStore.archive_unless_arrived)."""
     with _attention_lock:
         now = _attention_now()
         focus = _ATTENTION.focus()
@@ -8670,7 +8685,7 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
                         "reason": attention_policy.repeat_policy(item, mode)["reason"]}
         else:
             decision = attention_policy.on_arrival(item, focus, profile, now)
-        _attention_persist(item)
+        _attention_persist(item, attended=attended)
         return decision, item
 
 
@@ -8782,27 +8797,59 @@ def _attention_expire(now: datetime) -> list[str]:
     it away is noise; a clock does this, not a model.
 
     Reads the chat state documents only — no store query — and only while
-    some sender has an expiry, so a deployment without one pays nothing."""
+    some sender has an expiry, so a deployment without one pays nothing. The
+    scan is a snapshot taken outside the lock; each chat it finds is settled
+    by _attention_settle_expired, which decides again from what is stored."""
     if not (_ATTENTION.profile().get("expiry") or {}):
         return []
     settled = []
     for chat_id, doc in _CHAT_STATE.all().items():
-        block = doc.get("attention") or {}
-        if block.get("state", "open") != "open" or not block.get("expires_at"):
-            continue
-        try:
-            at = attention_policy.parse_dt(block["expires_at"])
-        except (TypeError, ValueError):
-            continue
-        if at is None or at > now:
-            continue
-        if not doc.get("archived"):
-            _CHAT_STATE.set_flags(chat_id, archived=True)
-            _chats_cache_invalidate()
-        if _attention_mark(f"chat:{chat_id}", "done", "expired"):
+        if _attention_chat_expired(doc, now) and _attention_settle_expired(chat_id, now):
             settled.append(chat_id)
             print(f"[web-gateway] attention: chat {chat_id} expired", flush=True)
     return settled
+
+
+def _attention_chat_expired(doc: dict, now: datetime) -> bool:
+    """Whether a chat state document holds an open item whose timer ran out."""
+    block = doc.get("attention") or {}
+    if block.get("state", "open") != "open" or not block.get("expires_at"):
+        return False
+    try:
+        at = attention_policy.parse_dt(block["expires_at"])
+    except (TypeError, ValueError):
+        return False
+    return at is not None and at <= now
+
+
+def _attention_settle_expired(chat_id: str, now: datetime) -> bool:
+    """Mark one expired chat done and archive it, deciding from the state
+    document as it is now, under the attention lock — an arrival decides
+    under the same lock (_attention_arrive_chat), so a new code that has
+    restarted the timer or reopened the item since the scan is seen and left
+    alone. What the lock cannot cover is an arrival on its way in: the rail
+    unarchives the chat before the model decides, and an instructed sender's
+    message waits for its turn. Such a message has been counted
+    (``inbound_seq``) but not taken in, and the archive is skipped for it
+    (ChatStateStore.archive_unless_arrived): the old code is still done, the
+    new message stays on the screen. Builds the item from the document, not
+    the store's chat row (_attention_item), so settling costs no query."""
+    with _attention_lock:
+        state = _CHAT_STATE.get(chat_id)
+        if not _attention_chat_expired(state, now):
+            return False
+        item = attention_store.chat_item(_attention_chat_row_from_state(chat_id, state), state,
+                                         _ATTENTION.profile())
+        item["state"] = "done"
+        item["done_at"] = now.isoformat()
+        item["done_how"] = "expired"
+        _attention_persist(item)
+        _, archived = _CHAT_STATE.archive_unless_arrived(chat_id)
+        _chats_cache_invalidate()
+        if not archived:
+            print(f"[web-gateway] attention: chat {chat_id} expired; a newer message "
+                  "is on its way in, so it stays unarchived", flush=True)
+        return True
 
 
 def _attention_set_sender_expiry(item: dict, profile: dict, value, now: datetime) -> bool:
@@ -10550,7 +10597,9 @@ class Handler(BaseHTTPRequestHandler):
         job_url = None
         accepted = False
         if direction == "in":
-            _CHAT_STATE.mark_unread(chat_id, ts)
+            # This arrival's place in the chat's count, for the attention
+            # block that takes it in (_attention_arrive_chat's ``attended``).
+            inbound_seq = _CHAT_STATE.mark_unread(chat_id, ts)[0].get("inbound_seq")
             # A new message in an archived chat would otherwise land invisible;
             # muted is the explicit "keep it archived" opt-out. Decided inside
             # the state lock (see ChatState.unarchive_unless_muted): the
@@ -10595,7 +10644,8 @@ class Handler(BaseHTTPRequestHandler):
                 # sender's message is not decided here at all: its turn's
                 # verdict decides it (_instructed_settle).
                 decision, _item = _attention_arrive_chat(
-                    chat_id, doc, entry, payload.get("attention"), vip=vip)
+                    chat_id, doc, entry, payload.get("attention"), vip=vip,
+                    attended=inbound_seq)
                 if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
                     _chat_push_notification(
                         chat_id, doc, entry,
@@ -10642,7 +10692,7 @@ class Handler(BaseHTTPRequestHandler):
                     # One turn, whichever the sender is: a VIP's, briefed by
                     # their instruction when they carry one, or an instructed
                     # sender's, whose ring waits on it.
-                    ring = ({"read_seq": doc.get("read_seq")}
+                    ring = ({"read_seq": doc.get("read_seq"), "inbound_seq": inbound_seq}
                             if defer and not quiet else None)
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"), person=person,
@@ -10658,7 +10708,7 @@ class Handler(BaseHTTPRequestHandler):
                         # now, as a VIP's: the failure rule — a broken turn
                         # never swallows the message.
                         outcome = _instructed_deliver(
-                            {"chat_id": chat_id, "entry": entry},
+                            {"chat_id": chat_id, "entry": entry, "inbound_seq": inbound_seq},
                             None, "no turn could be started", note=False)
                         pushed = outcome["delivery"] == "rang"
         elif author in ("user", "device"):
