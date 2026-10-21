@@ -303,8 +303,11 @@ permits. Putting an expired item back (*Reopen*) unarchives the chat and
 clears its timer. The user sets or clears it in a chat item's details sheet
 (the *Expiry* field: a few presets from 5 minutes to a day, or *never*; `POST
 /attention/items/expiry`), Ara with `attention-set.py <chat item>
---sender-expiry 10m` (`none` clears); the row in `GET /attention` carries
-`expires_at` and the sender's `expiry`, and the sheet shows both.
+--sender-expiry 10m` (`none` clears). Both take one contract: minutes as a
+number or a span (`10m`, `2h`), between one minute and seven days, or `null`
+to clear — anything else, an empty string included, is refused and the
+profile left as it was. The row in `GET /attention` carries `expires_at`,
+the sender's `expiry` and `done_how`, and the sheet shows them.
 
 **The week.** The schedule is not one day repeated, and not seven: it is a
 few **day plans**, each a day's schedule (`[minute, mode]` or `[minute,

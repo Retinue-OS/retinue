@@ -1525,6 +1525,57 @@ def test_sender_expiry_from_sheet(base, wg):
     print("ok test_sender_expiry_from_sheet")
 
 
+def test_sender_expiry_bounds(base, wg):
+    """One contract for both doors: minutes or a span, one minute to a week,
+    or null. Anything else — huge, Infinity, zero, an empty string — is refused
+    before the profile is touched, and a bad value already stored gives no
+    timer rather than breaking the sender's arrivals. An expired item's row
+    says so (done_how), so the sheet does not promise a past settle time."""
+    code = "+41790000080"
+    monday = datetime(2026, 9, 7, tzinfo=timezone.utc)
+    _clock(wg, monday.replace(hour=9, minute=0))
+    _inbound(base, code, "UBS", "Code: 654321", "2026-09-07T09:00:00Z")
+    cid = "chat:signal:" + code
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": 10})
+    assert status == 200 and out["item"]["expiry"] == 10, (status, out)
+    for bad in (1e9, float("inf"), 10 ** 400, "99999999w", "8d", 0, "0", 0.5, "", True):
+        status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": bad})
+        assert status == 400, (bad, status, out)
+        status, out = _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": bad}, AGENT)
+        assert status == 400, (bad, status, out)
+        status, prof = _http(base, "GET", "/attention/profile")
+        assert prof["profile"]["expiry"].get("UBS") == 10, (bad, prof["profile"]["expiry"])
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid})
+    _, prof = _http(base, "GET", "/attention/profile")
+    assert status == 400 and prof["profile"]["expiry"].get("UBS") == 10, "a missing expiry is no 'clear'"
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": "7d"})
+    assert status == 200 and out["item"]["expiry"] == 7 * 24 * 60, out["item"]
+    status, out = _http(base, "POST", "/internal/attention/set", {"id": cid, "sender_expiry": "1m"}, AGENT)
+    assert status == 200 and out["item"]["expiry"] == 1, out["item"]
+    # A value stored before the bounds: no timer, and arrivals still work.
+    now = monday.replace(hour=9, minute=1)
+    for stored in (1e300, float("inf"), float("nan"), "junk"):
+        assert wg.attention_policy.expires_at("UBS", {"expiry": {"UBS": stored}}, now) is None, stored
+    profile = wg._ATTENTION.profile()
+    profile["expiry"]["UBS"] = 1e300
+    wg._ATTENTION.save_profile(profile)
+    _clock(wg, now)
+    _inbound(base, code, "UBS", "Code: 111111", "2026-09-07T09:01:00Z")
+    assert wg._CHAT_STATE.get("signal:" + code)["attention"]["expires_at"] is None
+    # Expired by the timer: the row carries done_how.
+    status, out = _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": 5})
+    assert status == 200 and out["item"]["done_how"] is None, out["item"]
+    wg._attention_tick_state.update(minute=None, emitted=False, ended=None)
+    report = wg._attention_tick(monday.replace(hour=9, minute=6))
+    assert report.get("expired") == ["signal:" + code], report
+    item = wg._attention_item(cid, wg._ATTENTION.profile(), monday.replace(hour=9, minute=6))
+    row = wg._attention_row(item, wg._ATTENTION.focus(), wg._ATTENTION.profile(), monday.replace(hour=9, minute=6))
+    assert row["state"] == "done" and row["done_how"] == "expired", row
+    _http(base, "POST", "/attention/items/expiry", {"id": cid, "expiry": None})
+    _clock(wg, None)
+    print("ok test_sender_expiry_bounds")
+
+
 def main():
     sparql = _serve(_MockSparql)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1569,6 +1620,7 @@ def main():
         test_tick_makes_up_what_it_missed(base, wg)
         test_sender_expiry(base, wg)
         test_sender_expiry_from_sheet(base, wg)
+        test_sender_expiry_bounds(base, wg)
         server.shutdown()
     sparql.shutdown()
     print("all attention API checks passed")
