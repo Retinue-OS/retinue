@@ -439,8 +439,6 @@ through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
 plus `retinue_label` still names a route; `retinue_picker: false` hides one.
-An Ollama primary (`LITELLM_PRIMARY_MODEL=ollama/…`) drops leftover Claude
-catalog seeds so the picker cannot offer a model the backend does not serve.
 Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from

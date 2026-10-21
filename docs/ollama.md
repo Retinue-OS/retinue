@@ -139,8 +139,9 @@ an `extra_hosts` override, not Docker's default `host-gateway`.
 
 The dashboard list is `GET /conversation-models`. With LiteLLM it is
 built from `GET /model/info` and `GET /v1/models`. Plumbing aliases
-(`retinue-claude`, wildcards) stay hidden. An Ollama primary also
-drops leftover Claude catalog seeds.
+(`retinue-claude`, wildcards) stay hidden, and so do unflagged Claude
+catalog rows. A leftover route still flagged `retinue_picker: true` is
+hidden by setting it to `false`.
 
 If the picker still shows only Claude ids, set an explicit list. That
 wins over LiteLLM:
