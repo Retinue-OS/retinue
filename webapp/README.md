@@ -522,7 +522,10 @@ generated and only `http(s)`/`mailto:`/`tel:` URLs become links, so the output
 is safe for `innerHTML`. A link to the dashboard's own origin (Ara's link to
 another thread, an approval page) navigates in place, so it stays in the PWA
 window and the back gesture returns to where it was tapped; every other web
-link opens in a new tab. Hosts can specialize rendering via hooks — the
+link opens in a new tab. A press on such a link that would load another page
+while this one holds unsent input is held with a note, like a tab of the
+navigation row (pressing again leaves anyway); another thread on the same page
+is a fragment change that loses nothing, so it is never held. Hosts can specialize rendering via hooks — the
 conversations card uses the blockquote hook to keep its copy-to-clipboard
 button on Ara's ready-to-send drafts.
 

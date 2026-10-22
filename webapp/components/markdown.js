@@ -14,13 +14,15 @@
 // Safety: the input is HTML-escaped before any markup is generated, and only
 // http(s)/mailto/tel URLs ever become links (never javascript:). The output is
 // therefore safe to assign to innerHTML. Links to the dashboard's own origin
-// open in place; every other web link opens in a new tab (see anchor()).
+// open in place, guarded against dropping unsent input (onInAppClick); every
+// other web link opens in a new tab (see anchor()).
 //
 // Rendering hooks let a host specialize without forking the renderer: the
 // conversations card passes a `quote` hook that adds its copy-to-clipboard
 // button to blockquotes.
 
 import { esc } from './base.js';
+import { shellEventHeld } from './shell.js';
 
 // ── Inline pass ───────────────────────────────────────────────────────────────
 
@@ -50,10 +52,31 @@ function isOwnOrigin(url) {
 }
 
 function anchor(url, label) {
-  const external = !/^mailto:|^tel:/i.test(url) && !isOwnOrigin(url);
-  const attrs = external ? ' target="_blank" rel="noopener noreferrer"' : '';
-  return `<a href="${url}"${attrs}>${label}</a>`;
+  if (/^mailto:|^tel:/i.test(url)) return `<a href="${url}">${label}</a>`;
+  if (isOwnOrigin(url)) return `<a href="${url}" data-in-app>${label}</a>`;
+  return `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`;
 }
+
+// An in-app link that loads another page drops what this one holds unsent (a
+// typed draft, a dictation on its way, an unsaved project edit) — the new tab
+// used to keep it. So a plain press asks what a tab of the navigation row asks
+// (shell.js): held, with a note, while such input is here, and let through when
+// pressed again while the note shows. Another thread on this same page is only
+// a fragment change and loses nothing (drafts are kept per thread), so it is
+// never held. One listener on the document sees the links in every shadow root
+// through composedPath().
+function onInAppClick(e) {
+  if (e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = e.composedPath().find((n) => n && typeof n.hasAttribute === 'function'
+    && n.hasAttribute('data-in-app'));
+  if (!a) return;
+  let dest;
+  try { dest = new URL(a.href, location.href); } catch (_e) { return; }
+  if (dest.hash && dest.pathname === location.pathname && dest.search === location.search) return;
+  if (shellEventHeld('home')) e.preventDefault();
+}
+
+if (typeof document !== 'undefined') document.addEventListener('click', onInAppClick);
 
 // Render inline Markdown on one text segment. The text is escaped first, so
 // the result is safe. Bare domains without a scheme are deliberately NOT
