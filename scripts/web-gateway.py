@@ -3317,6 +3317,25 @@ _SEND_STATUS_RE = re.compile(r"^/sends/([^/]+)/([^/]+)/status/?$")
 _GATEWAY_HEALTH_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/health/?$")
 _GATEWAY_QR_RE = re.compile(r"^/gateways/([A-Za-z0-9._-]+)/qr/?$")
 
+# E-mail sends approved here, keyed (account, request_id), so the redirect after
+# approval lands on the send's own page as a channel send does: the draft is
+# gone once sent, and what the approval returned is all there is left to show.
+_approved_email_sends: dict[tuple[str, str], dict] = {}
+_approved_email_sends_lock = threading.Lock()
+_APPROVED_EMAIL_SENDS_MAX = 200
+
+
+def _remember_approved_email_send(account: str, request_id: str, result: dict) -> None:
+    with _approved_email_sends_lock:
+        _approved_email_sends[(account, request_id)] = result
+        while len(_approved_email_sends) > _APPROVED_EMAIL_SENDS_MAX:
+            _approved_email_sends.pop(next(iter(_approved_email_sends)))
+
+
+def _approved_email_send(account: str, request_id: str) -> dict | None:
+    with _approved_email_sends_lock:
+        return _approved_email_sends.get((account, request_id))
+
 
 def _ec_config(account: str):
     acc = None if account in (None, "", "default") else account
@@ -3473,6 +3492,29 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
           "</script>\n"
         + "</body>\n</html>\n"
     )
+
+
+def _render_email_send_outcome_html(result: dict, account: str, request_id: str,
+                                    next_url: str | None) -> str:
+    """The page an approved e-mail lands on: the status page a channel send ends
+    on, so both confirm the send and then move on alike — to the next pending
+    request, or by closing the window. E-mail goes out while the approval
+    request is handled, so the outcome is final by the time this renders."""
+    acc = html.escape(account)
+    frm = html.escape(result.get("from") or account)
+    # Every address it went to, Cc and Bcc included — the approval's result
+    # does not keep the header they came from.
+    recipients = html.escape(", ".join(result.get("to") or []))
+    subj = html.escape(result.get("subject") or "(no subject)")
+    meta_rows = [
+        f"<tr><th>From</th><td>{frm} <span class=\"meta\">({acc})</span></td></tr>",
+        f"<tr><th>Recipients</th><td>{recipients}</td></tr>",
+        f"<tr><th>Subject</th><td>{subj}</td></tr>",
+    ]
+    return _render_send_status_html(
+        title=f"E-mail send {html.escape(request_id)}", heading="E-mail send",
+        meta_rows=meta_rows, body_html="", status="approved", notes=_MESSAGE_SEND_NOTES,
+        error="", next_url=next_url, poll_url=None)
 
 
 # ── Pending-send detail rendering ────────────────────────────────────────────
@@ -3852,6 +3894,132 @@ _AGENDA_CSS = ("<style>\n"
                "</style>\n")
 
 
+# What a messenger send's status page says at each step; an approved e-mail
+# lands on the same page, so it shares these.
+_MESSAGE_SEND_NOTES = {
+    "pending": "Delivering in the background…",
+    "done": "Sent.",
+    "rejected": "The message was discarded without sending.",
+    "retracted": "The agent retracted this message before approval; nothing was sent.",
+    "error": "The gateway could not deliver the message: ",
+}
+
+
+def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
+                             body_html: str, status: str, notes: dict, error: str,
+                             next_url: str | None, poll_url: str | None) -> str:
+    """Render the status page of a decided send — every channel, e-mail included,
+    so all of them end the same way once the user has decided.
+
+    A "sending" entry shows a spinner and polls `poll_url` (the JSON status
+    endpoint) client-side — no full-page refresh flicker. Success flips the
+    spinner to a green check and auto-advances a moment later: to the next
+    pending request when one exists, else the page tries to close itself
+    (falling back to /sends — window.close() only works for script-opened
+    windows). The next-request button is rendered only when a next request
+    actually exists; a failure shows the gateway's real error and stays put so
+    the user can read it.
+
+    `title` and `heading` come HTML-escaped; `notes` holds the pending, done,
+    rejected, retracted and error texts in the request's own terms.
+    """
+    if status == "sending":
+        icon = '<div class="spin" role="status" aria-label="sending"></div>'
+        note = notes["pending"]
+    elif status == "approved":
+        icon = '<div class="check">✓</div>'
+        note = notes["done"]
+    elif status == "rejected":
+        icon = '<div class="cross">✕</div>'
+        note = notes["rejected"]
+    elif status == "retracted":
+        icon = '<div class="cross">✕</div>'
+        note = notes["retracted"]
+    else:  # "error"
+        icon = '<div class="cross">✕</div>'
+        note = notes["error"] + (error or "unknown error")
+    return (
+        _HTML_HEAD
+        + f"<title>Retinue — {title}</title>\n"
+        # No-JS fallback only: with scripting available the page polls
+        # instead of reloading.
+        + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
+           if status == "sending" else "")
+        + "<style>\n"
+          "  .st-row{display:flex;align-items:center;gap:.9rem;margin:1.1rem 0}\n"
+          "  .spin{width:34px;height:34px;border:4px solid var(--line);"
+          "border-top-color:var(--accent);border-radius:50%;animation:st-spin 1s linear infinite}\n"
+          "  @keyframes st-spin{to{transform:rotate(360deg)}}\n"
+          "  .check,.cross{width:38px;height:38px;border-radius:50%;display:flex;"
+          "align-items:center;justify-content:center;font-size:1.35rem;font-weight:700}\n"
+          "  .check{background:var(--ok);color:#0b0d12}\n"
+          "  .cross{background:var(--high);color:#0b0d12}\n"
+          "</style>\n"
+        + "<body>\n"
+        + f"<h1>{heading}</h1>\n"
+        + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
+        + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
+        + body_html
+        + f'<div class="st-row"><div id="st-icon">{icon}</div>'
+        + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
+        + '<div class="actions">\n'
+        + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
+        + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
+        + "</div>\n"
+        + "<script>\n"
+          "(function(){\n"
+        + f"  var status={json.dumps(status)};\n"
+        + f"  var nextUrl={json.dumps(next_url)};\n"
+        + f"  var pollUrl={json.dumps(poll_url)};\n"
+        + f"  var noteDone={json.dumps(notes['done'])};\n"
+        + f"  var noteRejected={json.dumps(notes['rejected'])};\n"
+        + f"  var noteRetracted={json.dumps(notes['retracted'])};\n"
+        + f"  var noteError={json.dumps(notes['error'])};\n"
+        + "  var icon=document.getElementById('st-icon');\n"
+          "  var note=document.getElementById('st-note');\n"
+          "  var nextBtn=document.getElementById('st-next');\n"
+          "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
+          "  function advance(){\n"
+          "    if(nextUrl){location=nextUrl;return;}\n"
+          "    window.close();\n"
+          "    setTimeout(function(){location='/sends';},400);\n"
+          "  }\n"
+          "  function terminal(st,err){\n"
+          "    if(st==='approved'){\n"
+          "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
+          "      note.textContent=noteDone;\n"
+          "      setTimeout(advance,1500);\n"
+          "    }else if(st==='rejected'){\n"
+          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+          "      note.textContent=noteRejected;\n"
+          "      showNext();\n"
+          "    }else if(st==='retracted'){\n"
+          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+          "      note.textContent=noteRetracted;\n"
+          "      showNext();\n"
+          "    }else{\n"
+          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
+          "      note.textContent=noteError+(err||'unknown error');\n"
+          "      showNext();\n"
+          "    }\n"
+          "  }\n"
+          "  function poll(){\n"
+          "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
+          "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
+          "        if('next' in b){nextUrl=b.next;}\n"
+          "        terminal(b.status,b.error);\n"
+          "      }else{setTimeout(poll,1500);}\n"
+          "    }).catch(function(){setTimeout(poll,3000);});\n"
+          "  }\n"
+          "  if(status==='sending'){setTimeout(poll,1200);}\n"
+          "  else if(status==='approved'){setTimeout(advance,1500);}\n"
+          "  else{showNext();}\n"
+          "})();\n"
+          "</script>\n"
+        + "</body>\n</html>\n"
+    )
+
+
 def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_url: str | None,
                               agenda: dict | None = None) -> str:
     """Render the page for a channel pending send — a messenger message
@@ -3904,12 +4072,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         body_html = (f'<pre class="msg-body">{description}</pre>\n' if description
                      else '<p class="meta">No description.</p>\n')
         noun = "Event"
-        note_pending = "Adding to the calendar…"
-        note_done = "Added to the calendar."
-        note_rejected = "The event was discarded; nothing was added to the calendar."
-        note_retracted = ("The agent retracted this event before approval; "
-                          "nothing was added to the calendar.")
-        note_error = "The gateway could not create the event: "
+        notes = {
+            "pending": "Adding to the calendar…",
+            "done": "Added to the calendar.",
+            "rejected": "The event was discarded; nothing was added to the calendar.",
+            "retracted": ("The agent retracted this event before approval; "
+                          "nothing was added to the calendar."),
+            "error": "The gateway could not create the event: ",
+        }
     else:
         # A gateway that stores its text as "body" (the e-mail-shaped entry) is
         # read too, so no channel renders an empty box.
@@ -3921,117 +4091,14 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
         ]
         body_html = f'<pre class="msg-body">{msg}</pre>\n'
         noun = "Send"
-        note_pending = "Delivering in the background…"
-        note_done = "Sent."
-        note_rejected = "The message was discarded without sending."
-        note_retracted = ("The agent retracted this message before approval; "
-                          "nothing was sent.")
-        note_error = "The gateway could not deliver the message: "
+        notes = _MESSAGE_SEND_NOTES
     status = detail.get("status") or "pending"
     if status != "pending":
-        # Status page: a "sending" entry shows a spinner and polls the JSON
-        # status endpoint client-side — no full-page refresh flicker. Success
-        # flips the spinner to a green check and auto-advances a moment later:
-        # to the next pending request when one exists, else the page tries to
-        # close itself (falling back to /sends — window.close() only works for
-        # script-opened windows). The next-request button is rendered only when
-        # a next request actually exists; a failure shows the gateway's real
-        # error and stays put so the user can read it.
-        if status == "sending":
-            icon = '<div class="spin" role="status" aria-label="sending"></div>'
-            note = note_pending
-        elif status == "approved":
-            icon = '<div class="check">✓</div>'
-            note = note_done
-        elif status == "rejected":
-            icon = '<div class="cross">✕</div>'
-            note = note_rejected
-        elif status == "retracted":
-            icon = '<div class="cross">✕</div>'
-            note = note_retracted
-        else:  # "error"
-            icon = '<div class="cross">✕</div>'
-            note = note_error + (detail.get("error") or "unknown error")
-        return (
-            _HTML_HEAD
-            + f"<title>Retinue — {label_e} {noun} {rid}</title>\n"
-            # No-JS fallback only: with scripting available the page polls
-            # instead of reloading.
-            + ('<noscript><meta http-equiv="refresh" content="2"></noscript>\n'
-               if status == "sending" else "")
-            + "<style>\n"
-              "  .st-row{display:flex;align-items:center;gap:.9rem;margin:1.1rem 0}\n"
-              "  .spin{width:34px;height:34px;border:4px solid var(--line);"
-              "border-top-color:var(--accent);border-radius:50%;animation:st-spin 1s linear infinite}\n"
-              "  @keyframes st-spin{to{transform:rotate(360deg)}}\n"
-              "  .check,.cross{width:38px;height:38px;border-radius:50%;display:flex;"
-              "align-items:center;justify-content:center;font-size:1.35rem;font-weight:700}\n"
-              "  .check{background:var(--ok);color:#0b0d12}\n"
-              "  .cross{background:var(--high);color:#0b0d12}\n"
-              "</style>\n"
-            + "<body>\n"
-            + f"<h1>{label_e} {noun.lower()}</h1>\n"
-            + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
-            + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
-            + body_html
-            + f'<div class="st-row"><div id="st-icon">{icon}</div>'
-            + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
-            + '<div class="actions">\n'
-            + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
-            + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
-            + "</div>\n"
-            + "<script>\n"
-              "(function(){\n"
-            + f"  var status={json.dumps(status)};\n"
-            + f"  var nextUrl={json.dumps(next_url)};\n"
-            + f"  var pollUrl={json.dumps(f'/sends/{channel}/{request_id}/status')};\n"
-            + f"  var noteDone={json.dumps(note_done)};\n"
-            + f"  var noteRejected={json.dumps(note_rejected)};\n"
-            + f"  var noteRetracted={json.dumps(note_retracted)};\n"
-            + f"  var noteError={json.dumps(note_error)};\n"
-            + "  var icon=document.getElementById('st-icon');\n"
-              "  var note=document.getElementById('st-note');\n"
-              "  var nextBtn=document.getElementById('st-next');\n"
-              "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
-              "  function advance(){\n"
-              "    if(nextUrl){location=nextUrl;return;}\n"
-              "    window.close();\n"
-              "    setTimeout(function(){location='/sends';},400);\n"
-              "  }\n"
-              "  function terminal(st,err){\n"
-              "    if(st==='approved'){\n"
-              "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-              "      note.textContent=noteDone;\n"
-              "      setTimeout(advance,1500);\n"
-              "    }else if(st==='rejected'){\n"
-              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent=noteRejected;\n"
-              "      showNext();\n"
-              "    }else if(st==='retracted'){\n"
-              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent=noteRetracted;\n"
-              "      showNext();\n"
-              "    }else{\n"
-              "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-              "      note.textContent=noteError+(err||'unknown error');\n"
-              "      showNext();\n"
-              "    }\n"
-              "  }\n"
-              "  function poll(){\n"
-              "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
-              "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
-              "        if('next' in b){nextUrl=b.next;}\n"
-              "        terminal(b.status,b.error);\n"
-              "      }else{setTimeout(poll,1500);}\n"
-              "    }).catch(function(){setTimeout(poll,3000);});\n"
-              "  }\n"
-              "  if(status==='sending'){setTimeout(poll,1200);}\n"
-              "  else if(status==='approved'){setTimeout(advance,1500);}\n"
-              "  else{showNext();}\n"
-              "})();\n"
-              "</script>\n"
-            + "</body>\n</html>\n"
-        )
+        return _render_send_status_html(
+            title=f"{label_e} {noun} {rid}", heading=f"{label_e} {noun.lower()}",
+            meta_rows=meta_rows, body_html=body_html, status=status, notes=notes,
+            error=detail.get("error") or "", next_url=next_url,
+            poll_url=f"/sends/{channel}/{request_id}/status")
     return (
         _HTML_HEAD
         + f"<title>Retinue — Approve {label_e} {noun} {rid}</title>\n"
@@ -6835,6 +6902,7 @@ def _start_chat_arrival_turn(chat_id: str, entry: dict, *,
             timer.daemon = True
             _INSTRUCTED_RINGS[job_id] = {"chat_id": chat_id, "entry": dict(entry),
                                          "read_seq": int(ring.get("read_seq") or 0),
+                                         "inbound_seq": ring.get("inbound_seq"),
                                          "timer": timer, "job": job_id}
             arrival["ring"] = job_id
             timer.start()
@@ -7005,10 +7073,12 @@ def _instructed_deliver(ring: dict, verdict: dict | None, why: str, *,
             spec = {"importance": verdict["importance"], "importance_from": "instruction"}
             if verdict.get("due"):
                 spec["due"] = verdict["due"]
-            decision, _item = _attention_arrive_chat(chat_id, doc, entry, spec)
+            decision, _item = _attention_arrive_chat(chat_id, doc, entry, spec,
+                                                     attended=ring.get("inbound_seq"))
         else:
             decision, _item = _attention_arrive_chat(chat_id, doc, entry, None, vip=True,
-                                                     vip_from="instruction")
+                                                     vip_from="instruction",
+                                                     attended=ring.get("inbound_seq"))
         if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
             _chat_push_notification(chat_id, doc, entry,
                                     urgency="high" if decision["deliver"] == "push" else None)
@@ -8449,6 +8519,16 @@ def _attention_items(profile: dict, now: datetime) -> tuple[list[dict], list[str
     return attention_store.fold_projects(items), degraded
 
 
+def _attention_chat_row_from_state(chat_id: str, state: dict) -> dict:
+    """A chat's row as far as its state document tells it — no store query,
+    no preview: enough to rebuild and persist its attention item."""
+    channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
+    return {"id": chat_id, "name": _chat_display_name(state, channel, key),
+            "channel": channel, "key": key, "unread": 0, "last": {},
+            "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
+            "group": state.get("group")}
+
+
 def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
     """One item by its id (``thread:<cid>``, ``chat:<chat id>``, a project
     URI), assembled the same way the list is. A chat or project whose live
@@ -8470,11 +8550,7 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
         if row is None:
             if not state.get("attention"):
                 return None
-            channel, key = chat_state_mod.split_chat_id(chat_id) or ("", chat_id)
-            row = {"id": chat_id, "name": _chat_display_name(state, channel, key),
-                   "channel": channel, "key": key, "unread": 0, "last": {},
-                   "archived": bool(state.get("archived")), "muted": bool(state.get("muted")),
-                   "group": state.get("group")}
+            row = _attention_chat_row_from_state(chat_id, state)
         return attention_store.chat_item(row, state, profile)
     states = _ATTENTION.projects()
     row = None
@@ -8489,8 +8565,10 @@ def _attention_item(item_id: str, profile: dict, now: datetime) -> dict | None:
     return attention_store.project_item(row, states.get(item_id), profile, now, _OWNER_ACTOR)
 
 
-def _attention_persist(item: dict) -> None:
-    """Store the item's attention block back where the item lives."""
+def _attention_persist(item: dict, attended: int | None = None) -> None:
+    """Store the item's attention block back where the item lives.
+    ``attended``: for a chat block decided from an arrival, that arrival's
+    ``inbound_seq`` (see ChatStateStore.archive_unless_arrived)."""
     block = attention_store.block_for(item)
     kind = item.get("kind")
     if kind == "thread":
@@ -8500,7 +8578,7 @@ def _attention_persist(item: dict) -> None:
                 conv["attention"] = block
                 _save_conv(conv)
     elif kind == "chat":
-        _CHAT_STATE.set_attention(item["source_id"], block)
+        _CHAT_STATE.set_attention(item["source_id"], block, attended=attended)
         _chats_cache_invalidate()
     else:
         _ATTENTION.save_project(item["source_id"], block)
@@ -8616,7 +8694,8 @@ def _attention_append(conv: dict, message: str, payload: dict) -> tuple[int, dic
 
 
 def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
-                           vip: bool = False, vip_from: str | None = None) -> tuple[dict, dict]:
+                           vip: bool = False, vip_from: str | None = None,
+                           attended: int | None = None) -> tuple[dict, dict]:
     """Run the model over one inbound chat message. The per-class repeat
     policy applies to a chat that is already held: a family sender writing
     again in Rest breaks through, anyone else waits with the first message.
@@ -8624,7 +8703,10 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
     they are the people the user asked to hear from the moment they write.
     ``vip_from="instruction"`` rings a message that way for another reason —
     the turn a standing instruction asked for did not finish — so its reason
-    line says that instead of calling the sender a VIP."""
+    line says that instead of calling the sender a VIP. ``attended`` is this
+    arrival's own ``inbound_seq``, as its mark_unread counted it — not the
+    document's, which a newer arrival may already have advanced past a
+    message the model has not seen (ChatStateStore.archive_unless_arrived)."""
     with _attention_lock:
         now = _attention_now()
         focus = _ATTENTION.focus()
@@ -8670,7 +8752,7 @@ def _attention_arrive_chat(chat_id: str, doc: dict, entry: dict, spec=None,
                         "reason": attention_policy.repeat_policy(item, mode)["reason"]}
         else:
             decision = attention_policy.on_arrival(item, focus, profile, now)
-        _attention_persist(item)
+        _attention_persist(item, attended=attended)
         return decision, item
 
 
@@ -8782,36 +8864,70 @@ def _attention_expire(now: datetime) -> list[str]:
     it away is noise; a clock does this, not a model.
 
     Reads the chat state documents only — no store query — and only while
-    some sender has an expiry, so a deployment without one pays nothing."""
+    some sender has an expiry, so a deployment without one pays nothing. The
+    scan is a snapshot taken outside the lock; each chat it finds is settled
+    by _attention_settle_expired, which decides again from what is stored."""
     if not (_ATTENTION.profile().get("expiry") or {}):
         return []
     settled = []
     for chat_id, doc in _CHAT_STATE.all().items():
-        block = doc.get("attention") or {}
-        if block.get("state", "open") != "open" or not block.get("expires_at"):
-            continue
-        try:
-            at = attention_policy.parse_dt(block["expires_at"])
-        except (TypeError, ValueError):
-            continue
-        if at is None or at > now:
-            continue
-        if not doc.get("archived"):
-            _CHAT_STATE.set_flags(chat_id, archived=True)
-            _chats_cache_invalidate()
-        if _attention_mark(f"chat:{chat_id}", "done", "expired"):
+        if _attention_chat_expired(doc, now) and _attention_settle_expired(chat_id, now):
             settled.append(chat_id)
             print(f"[web-gateway] attention: chat {chat_id} expired", flush=True)
     return settled
 
 
+def _attention_chat_expired(doc: dict, now: datetime) -> bool:
+    """Whether a chat state document holds an open item whose timer ran out."""
+    block = doc.get("attention") or {}
+    if block.get("state", "open") != "open" or not block.get("expires_at"):
+        return False
+    try:
+        at = attention_policy.parse_dt(block["expires_at"])
+    except (TypeError, ValueError):
+        return False
+    return at is not None and at <= now
+
+
+def _attention_settle_expired(chat_id: str, now: datetime) -> bool:
+    """Mark one expired chat done and archive it, deciding from the state
+    document as it is now, under the attention lock — an arrival decides
+    under the same lock (_attention_arrive_chat), so a new code that has
+    restarted the timer or reopened the item since the scan is seen and left
+    alone. What the lock cannot cover is an arrival on its way in: the rail
+    unarchives the chat before the model decides, and an instructed sender's
+    message waits for its turn. Such a message has been counted
+    (``inbound_seq``) but not taken in, and the archive is skipped for it
+    (ChatStateStore.archive_unless_arrived): the old code is still done, the
+    new message stays on the screen. Builds the item from the document, not
+    the store's chat row (_attention_item), so settling costs no query."""
+    with _attention_lock:
+        state = _CHAT_STATE.get(chat_id)
+        if not _attention_chat_expired(state, now):
+            return False
+        item = attention_store.chat_item(_attention_chat_row_from_state(chat_id, state), state,
+                                         _ATTENTION.profile())
+        item["state"] = "done"
+        item["done_at"] = now.isoformat()
+        item["done_how"] = "expired"
+        _attention_persist(item)
+        _, archived = _CHAT_STATE.archive_unless_arrived(chat_id)
+        _chats_cache_invalidate()
+        if not archived:
+            print(f"[web-gateway] attention: chat {chat_id} expired; a newer message "
+                  "is on its way in, so it stays unarchived", flush=True)
+        return True
+
+
 def _attention_set_sender_expiry(item: dict, profile: dict, value, now: datetime) -> bool:
     """Set or clear how long the item's sender's messages are worth anything
-    (the profile's ``expiry``, minutes; null or 0 clears it) and restart this
+    (the profile's ``expiry``, minutes; null clears it) and restart this
     item's own timer from the same rule, counted from now. Saves the profile;
-    the caller persists the item. False when ``value`` is not a span."""
-    minutes = attention_policy.parse_lead(value)
-    if value not in (None, "", 0) and minutes is None:
+    the caller persists the item. False — the profile untouched — when
+    ``value`` is neither null nor minutes or a span within the bounds
+    (attention.parse_expiry); an empty string is refused, not read as clear."""
+    minutes = None if value is None else attention_policy.parse_expiry(value)
+    if value is not None and minutes is None:
         return False
     table = profile.setdefault("expiry", {})
     if minutes:
@@ -8943,7 +9059,8 @@ def _attention_row(item: dict, focus: dict, profile: dict, now: datetime) -> dic
         "urgency": x["urgency"], "delivery": x["delivery"],
         "reason": attention_policy.admission_reason(item, mode, profile, now),
         "actor": item.get("actor") or "you", "waiting_since": iso(item.get("waiting_since")),
-        "state": item.get("state", "open"), "released": bool(item.get("released")),
+        "state": item.get("state", "open"), "done_how": item.get("done_how"),
+        "released": bool(item.get("released")),
         "snoozed_until": iso(item.get("snoozed_until")), "pulled": bool(item.get("pulled")),
         # When it settles itself (the sender's expiry, _attention_expire),
         # and the rule in minutes, so the sheet can say "expires 14:32".
@@ -9547,8 +9664,14 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001 - the decision itself already stands
                 print(f"[web-gateway] reporting send decision {account}/"
                       f"{request_id} failed: {exc!r}", flush=True)
-        # Move on to the next pending request for quick one-click processing.
-        self._redirect("/sends/next")
+        if verb == "approve":
+            # Land on the send's own page, as a channel approval does: it
+            # confirms the send, then moves on to the next pending request or
+            # closes the window.
+            _remember_approved_email_send(account, request_id, decided or {})
+            self._redirect(f"/sends/{account}/{request_id}")
+        else:
+            self._redirect("/sends/next")
 
     def _handle_channel_send_action(self, channel: str, request_id: str, verb: str) -> None:
         """Proxy approve/reject for a channel pending send to its gateway."""
@@ -10550,7 +10673,9 @@ class Handler(BaseHTTPRequestHandler):
         job_url = None
         accepted = False
         if direction == "in":
-            _CHAT_STATE.mark_unread(chat_id, ts)
+            # This arrival's place in the chat's count, for the attention
+            # block that takes it in (_attention_arrive_chat's ``attended``).
+            inbound_seq = _CHAT_STATE.mark_unread(chat_id, ts)[0].get("inbound_seq")
             # A new message in an archived chat would otherwise land invisible;
             # muted is the explicit "keep it archived" opt-out. Decided inside
             # the state lock (see ChatState.unarchive_unless_muted): the
@@ -10595,7 +10720,8 @@ class Handler(BaseHTTPRequestHandler):
                 # sender's message is not decided here at all: its turn's
                 # verdict decides it (_instructed_settle).
                 decision, _item = _attention_arrive_chat(
-                    chat_id, doc, entry, payload.get("attention"), vip=vip)
+                    chat_id, doc, entry, payload.get("attention"), vip=vip,
+                    attended=inbound_seq)
                 if decision["deliver"] == "push" or not ATTENTION_PUSH_GATE:
                     _chat_push_notification(
                         chat_id, doc, entry,
@@ -10642,7 +10768,7 @@ class Handler(BaseHTTPRequestHandler):
                     # One turn, whichever the sender is: a VIP's, briefed by
                     # their instruction when they carry one, or an instructed
                     # sender's, whose ring waits on it.
-                    ring = ({"read_seq": doc.get("read_seq")}
+                    ring = ({"read_seq": doc.get("read_seq"), "inbound_seq": inbound_seq}
                             if defer and not quiet else None)
                     job_url = _start_chat_arrival_turn(
                         chat_id, entry, files=payload.get("files"), person=person,
@@ -10658,7 +10784,7 @@ class Handler(BaseHTTPRequestHandler):
                         # now, as a VIP's: the failure rule — a broken turn
                         # never swallows the message.
                         outcome = _instructed_deliver(
-                            {"chat_id": chat_id, "entry": entry},
+                            {"chat_id": chat_id, "entry": entry, "inbound_seq": inbound_seq},
                             None, "no turn could be started", note=False)
                         pushed = outcome["delivery"] == "rang"
         elif author in ("user", "device"):
@@ -10857,8 +10983,8 @@ class Handler(BaseHTTPRequestHandler):
                 if item.get("kind") != "chat" or not item.get("sender"):
                     self._send_json(400, {"error": "only a chat's sender has an expiry"})
                     return
-                if not _attention_set_sender_expiry(item, profile, payload.get("expiry"), now):
-                    self._send_json(400, {"error": "expiry is minutes, a span like 10m, or null"})
+                if "expiry" not in payload or not _attention_set_sender_expiry(item, profile, payload["expiry"], now):
+                    self._send_json(400, {"error": "expiry is minutes or a span like 10m (1 minute to 7 days), or null"})
                     return
             elif action == "correct":
                 patch = {}
@@ -11106,7 +11232,7 @@ class Handler(BaseHTTPRequestHandler):
                             if k in item})
             if "sender_expiry" in payload and item.get("sender"):
                 if not _attention_set_sender_expiry(revised, profile, payload["sender_expiry"], now):
-                    self._send_json(400, {"error": "sender_expiry is a span like 10m, 2h, or null"})
+                    self._send_json(400, {"error": "sender_expiry is minutes or a span like 10m (1 minute to 7 days), or null"})
                     return
             if payload.get("sender_sphere") and item.get("sender") and block.get("sphere"):
                 # The sender's spheres, not only this message's: the main one
@@ -11893,6 +12019,16 @@ class Handler(BaseHTTPRequestHandler):
                             + "</body></html>")
             return
         if detail is None:
+            approved = _approved_email_send(account, request_id)
+            if approved is not None:
+                # Sent a moment ago: what follows is the next still-pending
+                # request, if any.
+                pending = _all_pending()
+                next_url = (f"/sends/{pending[0]['account']}/{pending[0]['request_id']}"
+                            if pending else None)
+                self._send_html(200, _render_email_send_outcome_html(
+                    approved, account, request_id, next_url))
+                return
             self._send_html(404, _HTML_HEAD + "<body><h1>Request not found</h1>"
                             + '<p><a href="/sends">Back to pending sends</a></p></body></html>')
             return

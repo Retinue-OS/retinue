@@ -289,7 +289,12 @@ minutes; each message from them stamps its chat's item with `expires_at`
 (arrival plus that span, restarted by every new message), and the gateway's
 minute tick (`_attention_expire`) settles an open item whose time is up: it
 is marked done (`done_how: "expired"`) and the chat archived, not muted, so
-the sender's next message brings it back and rings exactly as before. No
+the sender's next message brings it back and rings exactly as before. A
+message still on its way into the model when the timer fires (the rail has
+counted it in the chat state's `inbound_seq`, the attention block has not
+taken it in yet — `attended_seq` — e.g. while an instructed sender's turn
+works) keeps the chat unarchived: the old item is done, the new message stays
+in view. No
 model is involved — it is a clock, deterministic and free, and a deployment
 with no expiry pays nothing (the tick reads only the chat state documents,
 and only while some sender has one). Expiry decides when an item leaves the
@@ -298,8 +303,11 @@ permits. Putting an expired item back (*Reopen*) unarchives the chat and
 clears its timer. The user sets or clears it in a chat item's details sheet
 (the *Expiry* field: a few presets from 5 minutes to a day, or *never*; `POST
 /attention/items/expiry`), Ara with `attention-set.py <chat item>
---sender-expiry 10m` (`none` clears); the row in `GET /attention` carries
-`expires_at` and the sender's `expiry`, and the sheet shows both.
+--sender-expiry 10m` (`none` clears). Both take one contract: minutes as a
+number or a span (`10m`, `2h`), between one minute and seven days, or `null`
+to clear — anything else, an empty string included, is refused and the
+profile left as it was. The row in `GET /attention` carries `expires_at`,
+the sender's `expiry` and `done_how`, and the sheet shows them.
 
 **The week.** The schedule is not one day repeated, and not seven: it is a
 few **day plans**, each a day's schedule (`[minute, mode]` or `[minute,

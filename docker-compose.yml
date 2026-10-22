@@ -1203,7 +1203,10 @@ services:
     restart: "no"
 
   qlever-life:
-    build: ./qlever-dir
+    # The released qlever-dir image, pinned by version and digest; versions
+    # follow QLever's. .github/workflows/check-qlever-dir.yml opens a PR for
+    # each new release.
+    image: ghcr.io/retinue-os/qlever-dir:0.6.0@sha256:cadaa89c6d1ad6dc863161e2a4c797aaee0effd20179303a8647cac55efeeb91
     depends_on:
       volumes-init:
         condition: service_completed_successfully

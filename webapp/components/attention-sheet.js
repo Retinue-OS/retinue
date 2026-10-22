@@ -659,7 +659,7 @@ class RetinueAttentionSheet extends HTMLElement {
       '</select>';
     let value;
     if (item.state !== 'open' && item.done_how === 'expired') value = 'Expired — settled by the timer.';
-    else if (item.expires_at) value = `Settles itself at ${fmtWhen(item.expires_at)}.`;
+    else if (item.state === 'open' && item.expires_at) value = `Settles itself at ${fmtWhen(item.expires_at)}.`;
     else if (cur) value = `Their messages settle themselves ${fmtDuration(cur)} after arriving; this one stays.`;
     else value = 'Stays until you handle it.';
     return `<div class="field"><div class="f-label">Expiry</div><div class="f-value">${esc(value)}</div>` +

@@ -109,8 +109,9 @@ def main() -> int:
     if args.sender_expiry is not None:
         if args.sender_expiry.lower() == "none":
             payload["sender_expiry"] = None
-        elif not attention.parse_lead(args.sender_expiry):
-            print("attention-set: --sender-expiry takes a span like 10m, 2h or 'none'", file=sys.stderr)
+        elif attention.parse_expiry(args.sender_expiry) is None:
+            print("attention-set: --sender-expiry takes a span like 10m or 2h (1 minute to 7 days), "
+                  "or 'none'", file=sys.stderr)
             return 2
         else:
             payload["sender_expiry"] = args.sender_expiry

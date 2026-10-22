@@ -17,8 +17,8 @@ This document explains what that buys you, with concrete examples.
 There is no database to write to. No SPARQL UPDATE, no admin UI, no import job.
 You edit a file, commit it, and the store catches up.
 
-The `qlever-life` service (built from the [qlever-dir](https://github.com/retinue-os/qlever-dir)
-submodule) mounts the shared chambers volume read-only at `/data` and indexes
+The `qlever-life` service (the released [qlever-dir](https://github.com/retinue-os/qlever-dir)
+image) mounts the shared chambers volume read-only at `/data` and indexes
 **every** RDF file it finds — `.nt`, `.ttl`, `.n3` — across every mounted
 chamber. It watches the tree with inotify. An ordinary content change to a
 single file is applied **straight to the live index** via SPARQL Update a couple
@@ -204,9 +204,10 @@ else in the store.
 > A converter-extension edit now takes the same fast path as a native RDF one:
 > it is applied incrementally, so an edited project file is queryable a couple
 > of seconds later rather than after a rebuild. Both properties depend on the
-> pinned `qlever-dir` submodule — check `git -C qlever-dir log -1` before
-> trusting either claim about your own deployment, since a stale pin behaves
-> exactly like the paragraph above.
+> pinned qlever-dir image — check the `qlever-life` image version in
+> `docker-compose.yml` against qlever-dir's releases before trusting either
+> claim about your own deployment, since a stale pin behaves exactly like the
+> paragraph above.
 
 ### Big CSVs from sensors → a decade of readings, one query away
 
@@ -478,5 +479,5 @@ whole store.
 - `README.md` — startup sequence, chamber mounting (a host-mounted chamber needs
   a mount for `qlever-life` too, or its data won't be indexed)
 - [qlever-dir](https://github.com/retinue-os/qlever-dir) — the indexing service,
-  included as a submodule
+  run from its released image
 - `.claude/agents/archivist.md` — ingestion conventions and the ontology table

@@ -273,6 +273,16 @@ class ChatStateStore:
             # chat, cleared when the user catches up. Its presence is what
             # classifies the next notification as "reply" rather than "new".
             "unread_since": None,
+            # How many inbound messages have landed (see mark_unread), and how
+            # many of them the attention model had taken in when it last wrote
+            # this chat's block (set_attention's ``attended``). The two differ
+            # while an arrival is on its way into the model — between the
+            # rail's unarchive and the arrival's decision, or for minutes
+            # while an instructed sender's turn works — and an expiry timer
+            # must not archive a message it has never seen (see
+            # archive_unless_arrived).
+            "inbound_seq": 0,
+            "attended_seq": 0,
             # Whether the last arrival's sender is one the dashboard knows
             # nothing about from the rail: True for a direct message from
             # anyone who is not a VIP, False for a VIP, None for a group or
@@ -476,11 +486,18 @@ class ChatStateStore:
             self._write(doc)
             return doc
 
-    def set_attention(self, chat_id: str, block: dict | None) -> dict:
-        """Store — or clear, with None — the attention block of a chat."""
+    def set_attention(self, chat_id: str, block: dict | None, *,
+                      attended: int | None = None) -> dict:
+        """Store — or clear, with None — the attention block of a chat.
+
+        ``attended`` is the ``inbound_seq`` of the newest arrival this block
+        was decided from, passed by the arrival that wrote it; it only moves
+        forward, so an older arrival settling late cannot claim a newer one."""
         with self._lock:
             doc = self._read(chat_id)
             doc["attention"] = dict(block) if block else None
+            if attended is not None and int(attended) > int(doc.get("attended_seq") or 0):
+                doc["attended_seq"] = int(attended)
             self._write(doc)
             return doc
 
@@ -535,15 +552,37 @@ class ChatStateStore:
 
         ``had_unread`` says whether the chat already held unread messages
         *before* this one — the notification-mode split (False = "new",
-        True = "reply") without querying the store on the hot path."""
+        True = "reply") without querying the store on the hot path.
+
+        Every call counts the arrival (``inbound_seq``), read or not."""
         mark = iso_z(ts)
         with self._lock:
             doc = self._read(chat_id)
             had_unread = bool(doc.get("unread_since"))
             if not had_unread:
                 doc["unread_since"] = mark
-                self._write(doc)
+            doc["inbound_seq"] = int(doc.get("inbound_seq") or 0) + 1
+            self._write(doc)
             return doc, had_unread
+
+    def archive_unless_arrived(self, chat_id: str) -> tuple[dict, bool]:
+        """Archive a chat on its attention timer's behalf — unless a message
+        has landed that the attention model has not taken in yet
+        (``inbound_seq`` ahead of ``attended_seq``). Returns ``(doc,
+        archived)``; True also when it was archived already.
+
+        One decision under the lock, like :meth:`unarchive_unless_muted`, and
+        its mirror image: an arrival counts itself (mark_unread) before it
+        unarchives, so either this sees the count and leaves the chat be, or
+        it archives first and the arrival's unarchive brings the chat back."""
+        with self._lock:
+            doc = self._read(chat_id)
+            if int(doc.get("inbound_seq") or 0) > int(doc.get("attended_seq") or 0):
+                return doc, False
+            if not doc.get("archived"):
+                doc["archived"] = True
+                self._write(doc)
+            return doc, True
 
     def unarchive_unless_muted(self, chat_id: str) -> dict:
         """Bring an archived chat back for a new message — unless it is muted.
