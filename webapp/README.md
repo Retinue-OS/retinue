@@ -246,17 +246,19 @@ docstring). Pieces:
   rotation with the keyboard up, dropped while pinch-zoomed) — the header
   and the companion's bar are hidden, and the pane being typed in is kept
   scrolled to its newest message; the navigation row steps aside with them.
-  However short the frame (the Android shell's, above its launcher bar), the
-  thread keeps its room: the chips — one sideways-scrolling row on a phone —
+  On a short frame (the Android shell's, above its launcher bar) the thread
+  keeps its room: the chips — one sideways-scrolling row on a touch screen —
   and a standing instruction's report (its flags first) share a region capped
-  at a fifth of the pane that scrolls inside, the field grows to at most 30%
-  of it, and the send row is never pushed off the frame. A draft longer than
-  its box shows an expand control in the field's top-right corner: the field
-  then takes the whole pane at its full width (the thread and the chips step
-  aside, the mic and send sit under its corners) until the control is pressed
-  again, Escape is pressed, a recording starts or the draft is sent — and the
-  thread comes back where it was left. Pressing it never moves the focus, so
-  the phone keyboard stays as it was.
+  at a fifth of the pane that scrolls inside and steps aside while the
+  keyboard is up, and the field grows to at most 30% of the pane; the thread
+  gives way before the send row does. A draft longer than its box shows an
+  expand control in the field's top-right corner: the field then takes the
+  whole pane at its full width (the thread and the chips step aside, the mic
+  and send sit under its corners) until the control is pressed again, Escape
+  is pressed, a recording starts or the draft is sent. Shrunk again by the
+  control or Escape, the thread is back at the message it was left at; while
+  it is hidden nothing arriving is marked read. A tap on the control leaves
+  the focus where it was, so the phone keyboard stays as it was.
   The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
