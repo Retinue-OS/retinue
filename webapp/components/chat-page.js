@@ -82,6 +82,15 @@ const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
 const MAX_COMP_FRACTION = 0.6;
 const KEY_STEP_PX = 32;
 const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
+// The expand control sits in the field's top-right corner, the clip in its
+// bottom-right: below this height the two would overlap.
+const EXPAND_MIN_PX = 72;
+const ICON_EXPAND = '<svg class="i-grow" viewBox="0 0 24 24" width="16" height="16" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>';
+const ICON_SHRINK = '<svg class="i-shrink" viewBox="0 0 24 24" width="16" height="16" fill="none" ' +
+  'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/></svg>';
 const NOTE_MS = 2600;
 // The conversations cadence: how often the open chat re-fetches its messages.
 const POLL_MS = 4000;
@@ -225,6 +234,9 @@ class RetinueChatPage extends HTMLElement {
     this._localSeq = 0;        // ids for optimistic (not yet confirmed) bubbles
     this._outImages = [];      // staged composer images: {blob, url, content_type, width, height, name}
     this._imgError = '';       // staged-image error line (limit hit, unreadable file)
+    this._threadLoc = null;    // the thread's place while the draft is expanded (_mirrorLocation)
+    this._expandKeydown = null; // window keydown handler (Escape) while it is
+    this._fieldObs = null;     // ResizeObserver on the chat field (the expand control)
     this._lightbox = null;     // {url, alt} while the image overlay is open
     this._helpOpen = false;    // the companion pane's help note is showing
     this._lbClosing = false;   // its history entry is being unwound
@@ -405,6 +417,10 @@ class RetinueChatPage extends HTMLElement {
     this._noteTimers = {};
     if (this._draftTimer) clearTimeout(this._draftTimer);
     if (this._pollTimer) clearInterval(this._pollTimer);
+    if (this._fieldObs) this._fieldObs.disconnect();
+    this._fieldObs = null;
+    if (this._expandKeydown) window.removeEventListener('keydown', this._expandKeydown, true);
+    this._expandKeydown = null;
     if (this._onVis) document.removeEventListener('visibilitychange', this._onVis);
     this._onVis = null;
     this._toggleMenu(false);
@@ -492,7 +508,11 @@ class RetinueChatPage extends HTMLElement {
     return m ? m.ts : '';
   }
 
+  // Whether the user is looking at the newest message. Never while the draft
+  // is expanded: the thread is not displayed then, and its zeroed scroll
+  // measures would read as the bottom — marking arrivals read that nobody saw.
   _atBottom() {
+    if (this.hasAttribute('draft-expanded')) return false;
     const t = this.shadowRoot.querySelector('[data-chat-thread]');
     return !!t && t.scrollHeight - t.scrollTop - t.clientHeight < NEAR_BOTTOM_PX;
   }
@@ -1110,6 +1130,9 @@ class RetinueChatPage extends HTMLElement {
 
   // The first mirror message still in view and its offset, or the bottom.
   _mirrorLocation() {
+    // While the draft is expanded the thread is not displayed and has no
+    // place of its own: the one it had when the draft took the pane stands.
+    if (this.hasAttribute('draft-expanded') && this._threadLoc) return this._threadLoc;
     const t = this.shadowRoot && this.shadowRoot.querySelector('[data-chat-thread]');
     if (!t || this._atBottom()) return { bottom: true };
     const top = t.getBoundingClientRect().top;
@@ -1121,15 +1144,21 @@ class RetinueChatPage extends HTMLElement {
   }
 
   _applyShelfRestore(loc) {
-    const t = this.shadowRoot.querySelector('[data-chat-thread]');
-    const m = loc.mirror;
-    if (t && m && m.anchor) {
-      const el = [...t.querySelectorAll('[data-mid]')].find((n) => n.getAttribute('data-mid') === m.anchor);
-      if (el) t.scrollTop += el.getBoundingClientRect().top - t.getBoundingClientRect().top - (m.offset || 0);
-    }
+    this._scrollMirrorTo(loc.mirror);
     // The companion reads its thread after this; it applies the place then.
     const comp = this._companionEl();
     if (comp && loc.companion) comp._shelfRestore = loc.companion;
+  }
+
+  // Put the mirror back at a place _mirrorLocation took: the anchored message
+  // at its offset (a reflow since — a rotation, the splitter — does not move
+  // the reader to another message), or the newest.
+  _scrollMirrorTo(m) {
+    const t = this.shadowRoot.querySelector('[data-chat-thread]');
+    if (!t || !m) return;
+    if (m.bottom) { t.scrollTop = t.scrollHeight; return; }
+    const el = m.anchor && [...t.querySelectorAll('[data-mid]')].find((n) => n.getAttribute('data-mid') === m.anchor);
+    if (el) t.scrollTop += el.getBoundingClientRect().top - t.getBoundingClientRect().top - (m.offset || 0);
   }
 
   // ── Leaving the chat ───────────────────────────────────────────────────────
@@ -1227,10 +1256,16 @@ class RetinueChatPage extends HTMLElement {
     const chips = QUICK_PATTERNS.map((p) =>
       `<button type="button" class="qchip" data-quick="${p.id}">${esc(p.label)}</button>`
     ).join('');
+    // Ara's offers and reports — the chips and what a standing instruction
+    // did — share one region that scrolls once it reaches its share of the
+    // pane (.extras); what concerns the send itself (its note, the draft's
+    // author, staged images, an error, the recipient) stays with the field.
     return `<div class="composer">` +
+      `<div class="extras">` +
       `<div class="chips" role="toolbar" aria-label="Quick patterns">${chips}</div>` +
-      `<div class="note" data-note role="status" hidden></div>` +
       this._instructedHtml() +
+      `</div>` +
+      `<div class="note" data-note role="status" hidden></div>` +
       draftTag +
       this._imgPreviewsHtml() +
       this._errRowHtml('chat') +
@@ -1291,6 +1326,72 @@ class RetinueChatPage extends HTMLElement {
       `<span aria-hidden="true">&#128206;</span></label>`;
   }
 
+  // The draft at full height. The field's cap — a share of the pane, so the
+  // thread stays in view (see the composer rules in CSS) — suits a line or
+  // two and not reading through a long draft before it goes out. This control,
+  // in the field's top-right corner while the draft is longer than its box,
+  // hands the field the whole pane (the thread and Ara's offers step aside)
+  // and gives it back; a send or a recording gives it back too, and so does
+  // Escape. Its label says what a press does now, as the icon does.
+  _expandHtml() {
+    const label = this._expandLabel();
+    return `<button type="button" class="expand-inline" data-expand title="${label}" ` +
+      `aria-label="${label}">${ICON_EXPAND}${ICON_SHRINK}</button>`;
+  }
+
+  _expandLabel() {
+    return this.hasAttribute('draft-expanded') ? 'Shrink the draft' : 'Expand the draft';
+  }
+
+  _setDraftExpanded(on) {
+    if (on === this.hasAttribute('draft-expanded')) return;
+    const root = this.shadowRoot;
+    const btn = root.querySelector('[data-expand]');
+    // A thread that is not displayed keeps no place of its own: note the
+    // reader's, as the shelf does, before it goes.
+    if (on) this._threadLoc = this._mirrorLocation();
+    this.toggleAttribute('draft-expanded', on);
+    if (btn) {
+      const label = this._expandLabel();
+      btn.title = label;
+      btn.setAttribute('aria-label', label);
+    }
+    if (this._grow) this._grow();
+    // Escape gives the room back wherever on the page the focus is: a tap on
+    // the control leaves it where it was, which need not be the field. One
+    // Escape closes one thing, though — an open menu or sheet takes it first,
+    // and so does anything else focused (the shelf's menu). Heard in the
+    // capture phase, so it sees them open before their own handlers shut them.
+    if (on && !this._expandKeydown) {
+      this._expandKeydown = (e) => {
+        if (e.key !== 'Escape' || this._menuAway) return;
+        if (document.querySelector('retinue-attention-sheet:not([hidden])')) return;
+        const path = e.composedPath();
+        if (!path.includes(this) && path[0] !== document.body) return;
+        e.preventDefault();
+        this._setDraftExpanded(false);
+      };
+      window.addEventListener('keydown', this._expandKeydown, true);
+    } else if (!on && this._expandKeydown) {
+      window.removeEventListener('keydown', this._expandKeydown, true);
+      this._expandKeydown = null;
+    }
+    if (on) return;
+    // Back to the place the reader left. Back at the newest message, what
+    // arrived meanwhile is in view now, and only now read.
+    const loc = this._threadLoc || { bottom: true };
+    this._threadLoc = null;
+    this._scrollMirrorTo(loc);
+    if (loc.bottom) this._postRead(this._newestTs());
+    // Pressed from the keyboard on a draft that fits again, the control goes
+    // with the overflow; the focus goes to the field rather than nowhere.
+    const field = root.querySelector('[data-field]');
+    if (btn && root.activeElement === btn && field && !field.classList.contains('can-expand')) {
+      const ta = field.querySelector('textarea');
+      if (ta) ta.focus();
+    }
+  }
+
   // One composer's input row — or, while this target records or transcribes,
   // the shared recording/status row from voice.js in its place, so the text
   // field (and the phone keyboard) never reappears mid-flow: the same
@@ -1337,8 +1438,8 @@ class RetinueChatPage extends HTMLElement {
     // it. Keeping the two round controls in their fixed places is the point —
     // the mic is where the mic always is, whatever the field holds, so
     // dictating into an existing draft is just pressing it. The chat field
-    // additionally carries the clear ✕ and the paperclip.
-    const inField = isChat ? clearBtn + this._clipHtml() : clearBtn;
+    // additionally carries the clear ✕, the paperclip and the expand control.
+    const inField = isChat ? clearBtn + this._clipHtml() + this._expandHtml() : clearBtn;
     // `target` is 'chat' throughout now — it stays as the composer's DOM name
     // and the dictation target, which voice.js and _recTarget key on.
     const fieldCls = `field${withClear ? ' has-clear' : ''}` +
@@ -1484,14 +1585,17 @@ class RetinueChatPage extends HTMLElement {
   // (docs/contacts.md, "The instruction"): while its turn works, that a draft
   // may be on its way — the message has perhaps not rung yet, and the user
   // who opened the chat anyway should not start typing over it; once done,
-  // the verdict, what the turn did, and anything it flagged.
+  // the verdict, what the turn did, and anything it flagged. The flags come
+  // straight after the head: the line sits in a region that may show only its
+  // first lines (.extras), and what the user is asked to check matters more
+  // than the report of what was done.
   _instructedHtml() {
     const s = this._instructedFresh() ? instructedSummary(this._chat && this._chat.instructed) : null;
     if (!s) return '<div class="instructed" data-instructed hidden></div>';
     return `<div class="instructed${s.state === 'working' ? ' working' : ''}" data-instructed role="status">` +
       `<div class="ins-head">&#9998; ${esc(s.head)}</div>` +
-      s.lines.map((l) => `<div>${esc(l)}</div>`).join('') +
       s.flags.map((f) => `<div class="flag">&#9873; ${esc(f)}</div>`).join('') +
+      s.lines.map((l) => `<div>${esc(l)}</div>`).join('') +
       `</div>`;
   }
 
@@ -1570,15 +1674,30 @@ class RetinueChatPage extends HTMLElement {
     }
     const input = form.querySelector('textarea');
     const field = form.querySelector('[data-field]');
+    // The expand control shows while the draft is longer than its box, and the
+    // box is tall enough to hold it above the clip.
+    const fit = () => field.classList.toggle('can-expand',
+      input.scrollHeight > input.clientHeight + 1 && input.clientHeight >= EXPAND_MIN_PX);
     const grow = () => {
-      input.style.height = 'auto';
-      input.style.height =
-        `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+      if (this.hasAttribute('draft-expanded')) {
+        // Expanded, the field fills the pane by CSS; an inline height would pin it.
+        input.style.height = '';
+      } else {
+        input.style.height = 'auto';
+        input.style.height =
+          `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+      }
+      fit();
     };
     // Re-capped from the keyboard watch too: the visible height changes
     // without a keystroke when the keyboard comes up, and a multi-line draft
     // must not keep its keyboard-less height and push the send row off.
     this._grow = grow;
+    // The box also changes size with no keystroke and no keyboard (a rotation,
+    // the shelf coming or going), and with it whether the draft overflows.
+    if (this._fieldObs) this._fieldObs.disconnect();
+    this._fieldObs = typeof ResizeObserver === 'function' ? new ResizeObserver(fit) : null;
+    if (this._fieldObs) this._fieldObs.observe(input);
     input.addEventListener('input', () => {
       if (isChat) {
         this._draft = input.value;
@@ -1604,6 +1723,13 @@ class RetinueChatPage extends HTMLElement {
       }
     });
     grow();
+    const expand = form.querySelector('[data-expand]');
+    if (expand) {
+      // Pressed without taking the focus: a draft being typed keeps the phone
+      // keyboard, and one being read does not raise it.
+      expand.addEventListener('mousedown', (e) => e.preventDefault());
+      expand.addEventListener('click', () => this._setDraftExpanded(!this.hasAttribute('draft-expanded')));
+    }
     const clearBtn = form.querySelector('[data-clear]');
     if (clearBtn) {
       clearBtn.addEventListener('click', () => {
@@ -1632,8 +1758,12 @@ class RetinueChatPage extends HTMLElement {
     if (mic) {
       mic.addEventListener('click', () => {
         // The recording row replaces this one and the transcript lands in the
-        // field, so the offer is spent either way.
-        if (isChat) this._setUndo(null);
+        // field, so the offer is spent either way — and the field's expanded
+        // room would hold nothing but that one row.
+        if (isChat) {
+          this._setUndo(null);
+          this._setDraftExpanded(false);
+        }
         this._startRecording(target);
       });
     }
@@ -1648,8 +1778,9 @@ class RetinueChatPage extends HTMLElement {
         this._setDraftByAra(false);
         // Sending is moving on: an offer left over from an earlier clear must
         // not put that text back into a composer the user has just emptied on
-        // purpose.
+        // purpose. The thread comes back with the message just sent.
         this._setUndo(null);
+        this._setDraftExpanded(false);
       }
       input.value = '';
       field.classList.remove('has-text');
@@ -2278,6 +2409,9 @@ const CSS = `
   :host([typing]) .chat-head { display: none; }
   :host([typing]) retinue-conversation::part(bar) { display: none; }
   :host([typing]) .comp-help { display: none; }
+  /* Ara's offers and reports too: in a frame the keyboard has halved, staged
+     images and the draft's tag would otherwise leave the thread nothing. */
+  :host([typing]) .extras { display: none; }
 
   /* ── Panes: swipe strip on the phone, columns behind a splitter when wide ── */
   .panes { flex: 1; min-height: 0; display: flex;
@@ -2287,6 +2421,10 @@ const CSS = `
   .pane { flex: 0 0 100%; min-width: 0; scroll-snap-align: start; scroll-snap-stop: always;
           display: flex; flex-direction: column; min-height: 0; }
   .pane-splitter { display: none; }
+  /* The chat pane is a size container: the composer's parts that grow with
+     their content take shares of it (cqh, see the composer rules), so the
+     thread above them always keeps the rest. */
+  .pane-chat { container-type: size; }
   .pane-companion { padding-top: 8px; }
   /* The companion's lead in its bar: the name (wide layout only — on a phone
      the tab names the pane) and the help button, whose note opens above. */
@@ -2309,6 +2447,9 @@ const CSS = `
                       min-width: 280px; max-width: 60%; }
     .pane-tabs { display: none; }
     .comp-who { display: inline; }
+    /* A wide pane has the room to show every chip, and a mouse no easy way
+       to scroll a row sideways. */
+    .chips { flex-wrap: wrap; }
     /* Same look and hit area as the dashboard's splitters (styles.css). */
     .pane-splitter { display: block; flex: none; position: relative; z-index: 2; width: 14px;
                      cursor: col-resize; touch-action: none; user-select: none;
@@ -2395,16 +2536,58 @@ const CSS = `
   .lightbox .lb-close:hover { background: rgba(255, 255, 255, .28); }
 
   /* ── Composer ────────────────────────────────────────────────────────────── */
+  /* Everything the composer holds sits between the thread and the bottom of
+     the frame, and at full height — the chips wrapped over three rows, a
+     standing instruction's report, a long staged draft — it can take all of a
+     phone's pane (the Android shell's frame, above its launcher bar, more
+     so): the thread shrank to a sliver that could be neither read nor
+     scrolled, and the send row slid under the shelf. So the parts that grow
+     with their content are capped at a share of the pane — the offers and
+     reports (.extras) at a fifth, scrolling inside, the field at 30% — and
+     the thread keeps the rest: half the pane, less the few fixed lines (the
+     draft's tag, the recipient, staged images). The thread gives way before
+     the send row does; with the keyboard up the offers step aside too. A
+     draft longer than its box is read at full height through the field's
+     expand control (_expandHtml): the field takes the pane, and the thread
+     and the offers step aside until it is given back. */
+  :host([draft-expanded]) .pane-chat :is(.thread, .extras) { display: none; }
+  :host([draft-expanded]) .pane-chat .composer { flex: 1; min-height: 0; display: flex;
+                                                 flex-direction: column; }
+  :host([draft-expanded]) .pane-chat .draft-tag { align-self: flex-start; }
+  /* Expanded, the field spans the row and the mic and send sit under its
+     corners — still bottom left and bottom right, where they always are — so
+     a long draft is read at the pane's full width rather than between them. */
+  :host([draft-expanded]) .pane-chat form.row { flex: 1; min-height: 0; display: grid;
+                                                grid-template: minmax(0, 1fr) auto / auto 1fr auto;
+                                                align-items: end; }
+  :host([draft-expanded]) .pane-chat .field { grid-area: 1 / 1 / 2 / -1; align-self: stretch; }
+  :host([draft-expanded]) .pane-chat .mic { grid-area: 2 / 1; }
+  :host([draft-expanded]) .pane-chat .send { grid-area: 2 / 3; }
+  :host([draft-expanded]) .pane-chat .row textarea { max-height: none; }
   .composer { flex: none; margin-top: 4px; padding: 10px 2px 2px;
               border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
-  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-  .qchip { border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 999px;
+  /* The spacing below the last visible part is the region's own padding, and
+     the fade lies over exactly that: blank while everything fits, it softens
+     the cut edge into a hint that there is more below when it does not. */
+  .extras { max-height: 20vh; max-height: 20cqh; overflow-y: auto; overscroll-behavior-y: contain;
+            padding-bottom: 8px;
+            -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 8px), transparent);
+            mask-image: linear-gradient(to bottom, #000 calc(100% - 8px), transparent); }
+  /* One row on the phone, scrolling sideways like the shelf; a sideways swipe
+     that runs off its end does not carry on into switching panes. */
+  .chips { display: flex; gap: 6px; overflow-x: auto;
+           overscroll-behavior-x: contain; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
+  /* A mouse has no easy way to scroll a row sideways: there the chips wrap,
+     as they do in the wide layout, and the region scrolls under the wheel. */
+  @media (hover: hover) and (pointer: fine) { .chips { flex-wrap: wrap; } }
+  .qchip { flex: none; border: 1px solid var(--line, rgba(231, 235, 242, .12)); border-radius: 999px;
            background: var(--card-2, #1c2230); color: var(--muted, #8b93a3); cursor: pointer;
-           padding: 4px 12px; font: inherit; font-size: .76rem;
+           padding: 4px 12px; font: inherit; font-size: .76rem; white-space: nowrap;
            -webkit-tap-highlight-color: transparent; }
   .qchip:hover { border-color: var(--accent, #6ea8fe); color: var(--accent, #6ea8fe); }
   .note { color: var(--muted, #8b93a3); font-size: .76rem; font-style: italic; margin-bottom: 8px; }
-  .instructed { font-size: .76rem; color: var(--muted, #8b93a3); margin-bottom: 8px; padding: 4px 10px;
+  .instructed { font-size: .76rem; color: var(--muted, #8b93a3); margin-top: 8px; padding: 4px 10px;
                 border-left: 2px solid var(--accent, #6ea8fe); line-height: 1.4; }
   .instructed .ins-head { color: var(--fg, #e7ebf2); font-weight: 600; }
   .instructed.working .ins-head::after { content: ' …'; }
@@ -2447,7 +2630,10 @@ const CSS = `
             background: var(--high, #ff6b6b); color: #fff; font-size: .66rem;
             -webkit-tap-highlight-color: transparent; }
   .field { flex: 1; min-width: 0; position: relative; display: flex; }
-  .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 35vh;
+  /* The autosize in _wireComposer caps the field at 35% of the visible
+     height; the pane's share (above) is the tighter cap wherever container
+     units exist, and 35vh stands where they do not. */
+  .row textarea { flex: 1; min-width: 0; min-height: 40px; max-height: 35vh; max-height: 30cqh;
                   background: var(--card-2, #1c2230); border: 0; border-radius: 20px;
                   padding: 9px 14px; color: var(--fg, #e7ebf2); font: inherit; line-height: 1.35;
                   resize: none; overflow-y: auto; }
@@ -2491,6 +2677,19 @@ const CSS = `
                  -webkit-tap-highlight-color: transparent; }
   .field.has-clip .undo-inline { right: 39px; }
   .undo-inline:hover { background: rgba(110, 168, 254, .2); }
+  /* The expand control: the top-right corner, above the clip and inside the
+     right padding the clip and the ✕ already hold, so it covers no text. It
+     is there while the draft overflows its box (.can-expand), and always while
+     the field is expanded — it is the way back. */
+  .expand-inline { position: absolute; top: 5px; right: 5px; width: 30px; height: 30px;
+                   display: none; align-items: center; justify-content: center;
+                   border: 0; border-radius: 50%; padding: 0; cursor: pointer;
+                   background: transparent; color: var(--muted, #8b93a3);
+                   -webkit-tap-highlight-color: transparent; }
+  .field.can-expand .expand-inline, :host([draft-expanded]) .expand-inline { display: inline-flex; }
+  .expand-inline:hover { color: var(--accent, #6ea8fe); background: rgba(110, 168, 254, .2); }
+  .expand-inline .i-shrink, :host([draft-expanded]) .expand-inline .i-grow { display: none; }
+  :host([draft-expanded]) .expand-inline .i-shrink { display: block; }
   /* One slot, two controls: the ✕ while there is text to clear, the undo while
      a clear is still recoverable and the box is empty. Text always wins — once
      the user is writing again there is nothing to undo. */
