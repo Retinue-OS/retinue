@@ -10,6 +10,9 @@ What these pin down:
 - a colour recolours every stock icon into a valid PNG of the same size whose
   accent pixels are the new colour and whose background stays untouched —
   i.e. the decoder really handles the filter types the shipped icons use;
+- a colour also becomes the dashboard accent: the --accent definition and
+  every rgba() tint of the stock accent, in styles.css and all components,
+  leaving no stock accent behind;
 - an invalid colour, and the stock colour itself, count as "no colour";
 - the signature moves with either variable, so the service-worker cache
   name moves too.
@@ -86,6 +89,21 @@ def test_recolor_every_stock_icon():
                 assert after[i:i + 3] == bytes(ib.STOCK_BACKGROUND)
     assert ib.recolor_png(b"not a png") == b"not a png"
     print("ok: every stock icon recolours into a valid PNG")
+
+
+def test_color_reaches_the_stylesheets():
+    _env(color="#f59e0b")
+    css = ib.brand_css((WEBAPP / "styles.css").read_bytes()).decode()
+    assert "--accent: #f59e0b;" in css
+    for path in [WEBAPP / "styles.css", *sorted((WEBAPP / "components").glob("*.js"))]:
+        out = ib.brand_css(path.read_bytes()).decode()
+        assert not ib._ACCENT_RGB_RE.search(out), path.name
+        assert not ib._ACCENT_DEF_RE.search(out), path.name
+    tints = ib.brand_css(b".x { background: rgba(110, 168, 254, .2); }")
+    assert tints == b".x { background: rgba(245, 158, 11, .2); }"
+    _env()
+    assert ib.brand_css(b"rgba(110, 168, 254, .2)") == b"rgba(110, 168, 254, .2)"
+    print("ok: the colour becomes the dashboard accent")
 
 
 def test_signature_moves():

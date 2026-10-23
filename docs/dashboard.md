@@ -799,9 +799,14 @@ deployment needs neither (`scripts/instance_branding.py`):
   `Retinue (Admin)`; push notifications without a thread title fall back to it,
   and the Ask-Ara connector answers as `Ara (Admin)` unless `ARA_MCP_IDENTITY`
   says otherwise.
-- **`RETINUE_INSTANCE_COLOR`** — the icons' accent as `#rrggbb` (or `#rgb`).
-  The stock icons (blue ring on near-black) are recoloured on the response; an
-  invalid value is ignored.
+- **`RETINUE_INSTANCE_COLOR`** — the accent as `#rrggbb` (or `#rgb`), for the
+  icons and the dashboard alike. The stock icons (blue ring on near-black) are
+  recoloured, and the dashboard's accent with them: the `--accent` definition
+  in `styles.css` plus the `rgba(110, 168, 254, …)` tints the components'
+  shadow styles hard-code — send buttons, links, focus rings, hovers. Mode,
+  sphere and status colours (`--high`, `--ok`, `--outbound`) are left alone;
+  they carry meaning. The send glyph stays dark, so choose a light or medium
+  tone. An invalid value is ignored.
 
 Both are applied when the gateway serves the file — the baked webapp is never
 edited — and both are folded into the service worker's shell hash, so a change

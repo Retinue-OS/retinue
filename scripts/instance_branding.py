@@ -13,9 +13,12 @@ tell them apart; a single-instance deployment needs neither:
                              It also becomes the Ask-Ara connector's default
                              identity, "Ara (Admin)", unless ARA_MCP_IDENTITY
                              names one explicitly (scripts/ara-mcp-server.py).
-    RETINUE_INSTANCE_COLOR   the icon's accent colour as #rrggbb (or #rgb).
-                             The baked icons are recoloured on the fly; an
-                             invalid value is ignored, keeping the stock blue.
+    RETINUE_INSTANCE_COLOR   the accent colour as #rrggbb (or #rgb): the icons'
+                             ring and the dashboard's own accent (send buttons,
+                             links, focus rings, highlights). An invalid value
+                             is ignored, keeping the stock blue. The send
+                             button's glyph stays dark, so pick a light or
+                             medium tone.
 
 Everything here works on the response only: the baked files under webapp/ are
 never mutated, exactly like the service worker's shell-hash substitution. The
@@ -40,6 +43,11 @@ STOCK_BACKGROUND = (0x0B, 0x0D, 0x12)
 _COLOR_RE = re.compile(r"#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _TITLE_RE = re.compile(r"<title>Retinue")
+# The stock accent as the stylesheets spell it: the --accent definition in
+# styles.css, and the rgba() tints the components' shadow styles hard-code
+# (custom properties cannot be put into rgba(), so those carry the triple).
+_ACCENT_DEF_RE = re.compile(r"(--accent:\s*)#6ea8fe", re.IGNORECASE)
+_ACCENT_RGB_RE = re.compile(r"rgba\(\s*110\s*,\s*168\s*,\s*254\s*,")
 
 
 def instance_name() -> str:
@@ -94,6 +102,20 @@ def brand_html(raw: bytes) -> bytes:
         return raw
     text = raw.decode("utf-8")
     return _TITLE_RE.sub(lambda _m: "<title>" + display_name(), text, count=1).encode("utf-8")
+
+
+def brand_css(raw: bytes) -> bytes:
+    """Return a stylesheet or component module with this instance's accent.
+
+    Rewrites the root --accent definition and every rgba() tint of the stock
+    accent; everything that reads var(--accent) follows from the former."""
+    rgb = accent_color()
+    if not rgb:
+        return raw
+    text = raw.decode("utf-8")
+    text = _ACCENT_DEF_RE.sub(lambda m: m.group(1) + "#%02x%02x%02x" % rgb, text)
+    text = _ACCENT_RGB_RE.sub("rgba(%d, %d, %d," % rgb, text)
+    return text.encode("utf-8")
 
 
 def recolor_png(raw: bytes, accent: tuple[int, int, int] | None = None) -> bytes:

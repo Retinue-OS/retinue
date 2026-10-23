@@ -346,8 +346,8 @@ services:
       - CONVERSATION_BACKEND_TOKEN
       - CONVERSATION_BASE_URL
       # Optional instance branding, for running more than one deployment: a
-      # label for the PWA, page titles and Ask-Ara identity, and an icon accent
-      # colour (#rrggbb). See scripts/instance_branding.py.
+      # label for the PWA, page titles and Ask-Ara identity, and an accent
+      # colour (#rrggbb) for icons and dashboard. See scripts/instance_branding.py.
       - RETINUE_INSTANCE_NAME
       - RETINUE_INSTANCE_COLOR
       - SEND_APPROVAL_BASE_URL

@@ -1396,6 +1396,8 @@ def _branding_transform(rel: str):
         return instance_branding.brand_manifest
     if rel.endswith(".html") and "/" not in rel:
         return instance_branding.brand_html
+    if rel == "styles.css" or (rel.startswith("components/") and rel.endswith(".js")):
+        return instance_branding.brand_css
     if rel.startswith("icons/") and rel.endswith(".png") and instance_branding.accent_color():
         key = (rel, instance_branding.signature())
 
