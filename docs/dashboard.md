@@ -485,6 +485,18 @@ message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
 
+A file row has two links: its name opens the file (`?inline=1`, answered with
+`Content-Disposition: inline` for `_INLINE_SAFE_TYPES`), and ↓ saves a copy
+(`attachment`); a type the gateway does not serve inline gets the save link
+alone. Both URLs end in the file's own name —
+`…/attachments/<att-id>/<filename>` — a segment the route ignores (the
+header always carries the stored name). It is there for clients that name a
+saved file after the URL rather than the header: Android's
+`URLUtil.guessFileName`, which the shell's WebView downloads go through,
+takes a name only from a bare `attachment; filename="…"` — neither `inline`
+nor the trailing `filename*` (RFC 6266, for non-ASCII names) gets through —
+and without it saved `<att-id>.pdf`.
+
 Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
 AVIF — never SVG, which is script in the dashboard's origin) also **preview in
 the bubble**: a lazy-loaded `<img>` at its true aspect ratio, capped in width

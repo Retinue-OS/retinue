@@ -1508,11 +1508,22 @@ class RetinueConversation extends HTMLElement {
   // _imagePreviewHtml): the thread's own attachment, same-origin behind the
   // dashboard's auth — not a remote fetch, so markdown.js's rule for rendered
   // content is untouched. SVG is not in the inline set, so it stays a file row.
+  //
+  // The URL ends in the file's own name, a segment the gateway ignores. A
+  // client that names a saved file after the URL rather than the response's
+  // Content-Disposition — Android's URLUtil.guessFileName, which the shell's
+  // WebView downloads go through, takes a name only from a bare
+  // `attachment; filename="…"`, so neither `inline` nor the trailing
+  // `filename*` the gateway sends gets through — then saves invoice.pdf
+  // instead of <att-id>.pdf. `.` and `..` would be resolved away as path
+  // steps, so those names fall back.
   _attachmentsHtml(cid, atts) {
     if (!Array.isArray(atts) || !atts.length) return '';
     const items = atts.map((a) => {
-      const url = `/conversations/${encodeURIComponent(cid)}/attachments/${encodeURIComponent(a.id)}`;
       const name = a.filename || 'attachment';
+      const seg = /^\.{1,2}$/.test(name) ? 'attachment' : name;
+      const url = `/conversations/${encodeURIComponent(cid)}/attachments/${encodeURIComponent(a.id)}` +
+        `/${encodeURIComponent(seg)}`;
       const size = fmtSize(a.size);
       const type = String(a.content_type || '').split(';')[0].trim().toLowerCase();
       const viewable = INLINE_SAFE_TYPES.has(type);
