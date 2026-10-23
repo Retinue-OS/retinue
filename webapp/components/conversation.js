@@ -1511,12 +1511,12 @@ class RetinueConversation extends HTMLElement {
   //
   // The URL ends in the file's own name, a segment the gateway ignores. A
   // client that names a saved file after the URL rather than the response's
-  // Content-Disposition — Android's URLUtil.guessFileName, which the shell's
-  // WebView downloads go through, takes a name only from a bare
-  // `attachment; filename="…"`, so neither `inline` nor the trailing
-  // `filename*` the gateway sends gets through — then saves invoice.pdf
-  // instead of <att-id>.pdf. `.` and `..` would be resolved away as path
-  // steps, so those names fall back.
+  // Content-Disposition — Android's URLUtil.guessFileName, which takes a name
+  // only from a bare `attachment; filename="…"`, so neither `inline` nor the
+  // trailing `filename*` the gateway sends gets through, and which the
+  // Android shell named its downloads with until it read the header itself —
+  // then saves invoice.pdf instead of <att-id>.pdf. `.` and `..` would be
+  // resolved away as path steps, so those names fall back.
   _attachmentsHtml(cid, atts) {
     if (!Array.isArray(atts) || !atts.length) return '';
     const items = atts.map((a) => {

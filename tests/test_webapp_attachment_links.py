@@ -3,10 +3,10 @@
 
 Both links of a file row end in the file's own name, a segment the gateway
 ignores. The Android shell's WebView hands every file it cannot show to its
-download listener, which names the saved file with URLUtil.guessFileName —
-and that takes a name only from a bare `attachment; filename="…"`, so with
-the gateway's `inline` or trailing `filename*` it fell back to the URL's
-last segment and saved `<att-id>.pdf`.
+download listener, which named the saved file with URLUtil.guessFileName
+until it read the header itself — and that takes a name only from a bare
+`attachment; filename="…"`, so with the gateway's `inline` or trailing
+`filename*` it fell back to the URL's last segment and saved `<att-id>.pdf`.
 These checks pin, under Node with a scripted DOM:
 
 - a viewable file (a PDF) gets a view link (`?inline=1`) and a save link,

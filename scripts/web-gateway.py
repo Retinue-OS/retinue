@@ -9252,11 +9252,11 @@ class Handler(BaseHTTPRequestHandler):
         The dashboard links ``…/attachments/<att-id>/<filename>``; the route
         ignores that last segment, and the name sent is always the stored one.
         It is there for clients that name a saved file after the URL instead
-        of the Content-Disposition: Android's ``URLUtil.guessFileName`` (the
-        shell's WebView downloads) takes a name only from a bare
-        ``attachment; filename="…"``, so neither ``inline`` nor the trailing
-        ``filename*`` below gets through, and without it saved
-        ``<att-id>.pdf``.
+        of the Content-Disposition: Android's ``URLUtil.guessFileName`` takes a
+        name only from a bare ``attachment; filename="…"``, so neither
+        ``inline`` nor the trailing ``filename*`` below gets through, and the
+        Android shell, which named its downloads with it until it read the
+        header itself, saved ``<att-id>.pdf``.
 
         Only files referenced by that thread's stored metadata are served, and
         the on-disk path is rebuilt from validated hex ids (never the client
