@@ -178,7 +178,7 @@ class RetinueSparqlDoc extends HTMLElement {
       a.append(code);
     }
     const title = this.querySelector('h1');
-    if (title) document.title = `Retinue — ${title.textContent}`;
+    if (title) document.title = `${document.title.split(' — ')[0]} — ${title.textContent}`;
   }
 
   // The example, in place: the code block gives way to an editor holding the
