@@ -41,6 +41,8 @@ const SHELL_ASSETS = [
   '/components/markdown.js',
   '/components/voice.js',
   '/components/clipboard.js',
+  '/components/drafts.js',
+  '/components/dictation.js',
   '/components/conversation.js',
   '/components/conversations.js',
   '/components/projects.js',
@@ -80,6 +82,188 @@ self.addEventListener('message', (e) => {
   if (e.data && e.data.type === 'get-version' && e.ports && e.ports[0]) {
     e.ports[0].postMessage({ version: SHELL.replace(/^retinue-shell-/, '') });
   }
+});
+
+// ── Dictation ────────────────────────────────────────────────────────────────
+// A dictation is transcribed here, not in the page that recorded it, so it is
+// finished whether or not that page is still open (components/dictation.js
+// is the page's side). A job is kept, audio and all, under the place it was
+// recorded for — the draft key of components/drafts.js — and its result stays
+// until a page showing that place has taken it: the page that recorded it,
+// if it is still there, else the next one to open the place. Each job has one
+// owner, a live client; a page that goes releases its jobs, and a job whose
+// owner is gone is anybody's who asks for its place.
+//
+// Messages (page → worker):
+//   {type:'dictation', id, key, url, blob, orphan?}  start a job; acknowledged
+//       with 'dictation-started', answered with 'dictation-done' {id, key,
+//       text, error} to the owner once it is done. `orphan` (a recording
+//       handed off as its page unloads) starts it with no owner at all.
+//   {type:'dictation-adopt', keys} + a port  take over the jobs under these
+//       places whose owner is gone, restart any this worker was stopped in
+//       the middle of, and answer on the port with {jobs} — every job under
+//       them the asker owns now, with text or error once done.
+//   {type:'dictation-taken', id}  the result is in the place's draft: forget it.
+//   {type:'dictation-release'}  the asker is going: its jobs have no owner.
+const DICT_DB = 'retinue-dictation';
+const DICT_STORE = 'jobs';
+const DICT_TIMEOUT_MS = 4 * 60 * 1000;
+const DICT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// The jobs this worker instance is running, by id, with the run's token: a
+// job still marked running but absent here was being run by a worker that
+// has been stopped since, and is started again.
+const DICT_RUNNING = new Map();
+// Every store operation runs after the one before it, so a 'taken' never
+// overtakes the 'dictation' it answers.
+let dictQueue = Promise.resolve();
+
+function dictOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DICT_DB, 1);
+    req.onupgradeneeded = () => { req.result.createObjectStore(DICT_STORE, { keyPath: 'id' }); };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+// Run fn(store) in one transaction; resolves to what the request it returns
+// yielded, once the transaction is complete.
+function dictTx(mode, fn) {
+  const run = dictQueue.then(async () => {
+    const db = await dictOpen();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(DICT_STORE, mode);
+        let out;
+        const req = fn(tx.objectStore(DICT_STORE));
+        if (req) req.onsuccess = () => { out = req.result; };
+        tx.oncomplete = () => resolve(out);
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      });
+    } finally {
+      db.close();
+    }
+  });
+  dictQueue = run.catch(() => {});
+  return run;
+}
+
+const dictGet = (id) => dictTx('readonly', (s) => s.get(id));
+const dictPut = (rec) => dictTx('readwrite', (s) => s.put(rec));
+const dictAll = () => dictTx('readonly', (s) => s.getAll());
+
+async function dictOwnerAlive(owner) {
+  if (!owner) return false;
+  try { return !!(await self.clients.get(owner)); } catch (_e) { return false; }
+}
+
+async function dictNotify(rec) {
+  if (!rec || !rec.owner) return;
+  try {
+    const c = await self.clients.get(rec.owner);
+    if (c) c.postMessage({ type: 'dictation-done', id: rec.id, key: rec.key, text: rec.text || '', error: rec.error || '' });
+  } catch (_e) { /* the owner went: the result waits for the place */ }
+}
+
+// Transcribe job `rec` and store the outcome — unless the job was taken
+// meanwhile, or another run of it superseded this one.
+async function dictRun(rec) {
+  const token = Math.random().toString(36).slice(2);
+  DICT_RUNNING.set(rec.id, token);
+  await dictPut({ ...rec, run: token });
+  let text = '';
+  let error = '';
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), DICT_TIMEOUT_MS);
+  try {
+    const res = await fetch(rec.url, {
+      method: 'POST',
+      headers: { 'Content-Type': (rec.blob && rec.blob.type) || 'application/octet-stream' },
+      body: rec.blob,
+      signal: ctl.signal,
+    });
+    if (!res.ok) throw new Error(String(res.status));
+    const data = await res.json();
+    text = String((data && data.text) || '').trim();
+  } catch (err) {
+    error = (err && err.message) || 'failed';
+  } finally {
+    clearTimeout(timer);
+  }
+  if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
+  const now = await dictGet(rec.id).catch(() => null);
+  if (!now || now.run !== token) return;
+  // The audio is spent once there is a transcript; a failed one is kept no
+  // longer either — the note asks for the dictation again.
+  const done = { ...now, state: 'done', text, error, blob: null };
+  await dictPut(done);
+  await dictNotify(done);
+}
+
+async function dictStart(d, source) {
+  const owner = d.orphan ? '' : ((source && source.id) || '');
+  if (source && !d.orphan) {
+    try { source.postMessage({ type: 'dictation-started', id: d.id }); } catch (_e) { /* ignore */ }
+  }
+  const rec = { id: d.id, key: d.key, url: d.url, blob: d.blob, owner, state: 'running', at: Date.now() };
+  await dictRun(rec);
+}
+
+async function dictAdopt(keys, asker, port) {
+  const want = new Set(keys);
+  const all = (await dictAll().catch(() => [])) || [];
+  const mine = [];
+  const restart = [];
+  for (const rec of all) {
+    if (Date.now() - (rec.at || 0) > DICT_MAX_AGE_MS) {
+      await dictTx('readwrite', (s) => s.delete(rec.id)).catch(() => {});
+      continue;
+    }
+    if (!want.has(rec.key)) continue;
+    if (rec.owner !== asker && await dictOwnerAlive(rec.owner)) continue;
+    // Re-read before the write: a run may have finished meanwhile.
+    const cur = await dictGet(rec.id).catch(() => null);
+    if (!cur) continue;
+    if (cur.owner !== asker) await dictPut({ ...cur, owner: asker });
+    const taken = { ...cur, owner: asker };
+    mine.push({ id: taken.id, key: taken.key, state: taken.state, text: taken.text || '', error: taken.error || '' });
+    if (taken.state === 'running' && !DICT_RUNNING.has(taken.id) && taken.blob) restart.push(taken);
+  }
+  if (port) port.postMessage({ jobs: mine });
+  await Promise.all(restart.map((rec) => dictRun(rec)));
+}
+
+async function dictRelease(owner) {
+  if (!owner) return;
+  const all = (await dictAll().catch(() => [])) || [];
+  for (const rec of all) {
+    if (rec.owner !== owner) continue;
+    const cur = await dictGet(rec.id).catch(() => null);
+    if (cur && cur.owner === owner) await dictPut({ ...cur, owner: '' });
+  }
+}
+
+self.addEventListener('message', (e) => {
+  const d = e.data;
+  if (!d || typeof d.type !== 'string' || !d.type.startsWith('dictation')) return;
+  const source = e.source || null;
+  const asker = (source && source.id) || '';
+  let job = null;
+  if (d.type === 'dictation') {
+    // Only the dashboard's own transcription endpoint, and only audio.
+    if (!d.id || !d.key || typeof d.url !== 'string' || !d.url.startsWith('/conversations/transcribe')) return;
+    if (!(d.blob instanceof Blob)) return;
+    job = dictStart(d, source);
+  } else if (d.type === 'dictation-adopt' && Array.isArray(d.keys)) {
+    job = dictAdopt(d.keys.map(String), asker, e.ports && e.ports[0]);
+  } else if (d.type === 'dictation-taken' && d.id) {
+    DICT_RUNNING.delete(d.id);
+    job = dictTx('readwrite', (s) => s.delete(d.id));
+  } else if (d.type === 'dictation-release') {
+    job = dictRelease(asker);
+  }
+  if (job) e.waitUntil(job.catch(() => {}));
 });
 
 // ── Web Push ─────────────────────────────────────────────────────────────────
