@@ -569,20 +569,6 @@ def _is_claude_catalog(mid: str, item: dict | None = None) -> bool:
     return "claude" in blob or upstream.startswith("anthropic/")
 
 
-def _ollama_backend_active(models: list[dict], listed_ids: list[str] | None) -> bool:
-    """Whether this deployment is serving Ollama, so leftover Claude seeds hide."""
-    primary = (
-        os.environ.get("LITELLM_PRIMARY_MODEL", "")
-        or os.environ.get("RETINUE_CLAUDE_MODEL", "")
-        or os.environ.get("ANTHROPIC_MODEL", "")
-    ).strip().lower()
-    if primary.startswith("ollama/"):
-        return True
-    if any(str(m.get("id") or "").startswith("ollama/") for m in models):
-        return True
-    return any(str(i).startswith("ollama/") for i in (listed_ids or []))
-
-
 def _litellm_model_id(item: dict) -> str:
     mid = str(item.get("model_name") or "").strip()
     if mid:
@@ -668,9 +654,7 @@ def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) 
     non-Claude) backend needs — those routes are rarely pre-flagged, and a
     leftover Claude seed must not hide them. Wildcard names are dropped even
     if flagged (a pattern is not a model id). Plumbing aliases stay hidden.
-    Duplicate names collapse to the first occurrence. When any Ollama model
-    is advertised, leftover Claude/Anthropic catalog rows are dropped even
-    if they still carry the picker flag.
+    Duplicate names collapse to the first occurrence.
 
     Same-label flagged routes collapse too. A picker route also surfaces under
     its target id (`claude-opus-5` and `anthropic/claude-opus-5` are two names
@@ -728,8 +712,6 @@ def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) 
                 advertised.append({"id": mid, "label": _pretty_model_label(mid)})
                 have.add(mid)
     models = flagged + [m for m in advertised if m["id"] not in {x["id"] for x in flagged}]
-    if _ollama_backend_active(models, listed_ids):
-        models = [m for m in models if not _is_claude_catalog(m["id"])]
     return models
 
 

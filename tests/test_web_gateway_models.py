@@ -122,23 +122,6 @@ def test_coerce_intersects_v1_models_when_unflagged(wg):
     ], models
 
 
-def test_ollama_backend_hides_leftover_claude_flags(wg):
-    parsed = _model_info_response(
-        _route("claude-opus-5", picker=True, label="Opus (deepest reasoning)"),
-        _route("claude-sonnet-5", picker=True, label="Sonnet (balanced)"),
-        _route("claude-haiku-4-5", picker=True, label="Haiku (fastest)"),
-        _route("ollama/qwen3.6"),
-    )
-    models = wg._coerce_litellm_models(parsed)
-    assert models == [{"id": "ollama/qwen3.6", "label": "qwen3.6"}], models
-    # Primary pinned to Ollama even when the proxy has not expanded tags yet.
-    os.environ["LITELLM_PRIMARY_MODEL"] = "ollama/qwen3.6"
-    only_claude = _model_info_response(
-        _route("claude-opus-5", picker=True, label="Opus (deepest reasoning)"))
-    assert wg._coerce_litellm_models(only_claude) == []
-    os.environ.pop("LITELLM_PRIMARY_MODEL")
-
-
 def test_coerce_ollama_tags(wg):
     tags = {
         "models": [
@@ -439,7 +422,6 @@ def main() -> None:
         test_coerce_litellm_models(wg)
         test_coerce_unflagged_advertised_models(wg)
         test_coerce_intersects_v1_models_when_unflagged(wg)
-        test_ollama_backend_hides_leftover_claude_flags(wg)
         test_coerce_ollama_tags(wg)
         test_fetch_ollama_bypasses_http_proxy_for_local_host(wg)
         test_fetch_ollama_keeps_proxy_for_remote_host(wg)
