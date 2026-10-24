@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_auth  # noqa: E402
+import agent_models  # noqa: E402
 import news_store as store  # noqa: E402
 import session_env  # noqa: E402
 
@@ -126,6 +127,9 @@ def main() -> int:
            build_prompt(path, len(items), len(feedback))]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
+    # Per-agent model overrides for the Herald this session dispatches
+    # (scripts/agent_models.py); [] when none is set.
+    cmd[-1:-1] = agent_models.cli_args()
     # The allowlisted environment (scripts/session_env.py), never a copy of
     # this process's own: under the scheduler that is already clean, but run
     # by hand from a session it would not be. It also stamps the session's

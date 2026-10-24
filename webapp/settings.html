@@ -84,6 +84,23 @@
       </label>
     </section>
 
+    <!-- Which model each subagent runs on. Server-side (shared by every
+         device): the gateway hands the choices to every spawned session as a
+         --agents override, so a change reaches the next dispatch without a
+         restart (scripts/agent_models.py). The list of models is the thread
+         picker's. -->
+    <section class="scard" data-agent-models hidden>
+      <h2>Agent models</h2>
+      <p class="hint">Which model each of Ara's subagents runs on. "Built-in"
+        is the model its definition pins. A change applies to the next
+        dispatch. Agents that call tools (the Archivist, the Herald, chamber
+        agents) need a model that supports tool use; small local tags tend
+        to fail there and are safest on reading-only agents such as the
+        Secretary.</p>
+      <div data-agent-models-rows></div>
+      <p class="hint" data-agent-models-note hidden></p>
+    </section>
+
     <section class="scard">
       <h2>System</h2>
       <ul class="linklist">
@@ -126,6 +143,81 @@
     noSpeech.addEventListener('change', () =>
       showVoice(setVoiceTimeouts({ noSpeechMs: Number(noSpeech.value) * 1000 })));
     showVoice(voiceTimeouts());
+
+    // Agent models (GET/POST /agent-models): one dropdown per subagent, built
+    // from the same model list the thread picker offers. A choice is saved on
+    // change and the card re-rendered from the server's answer, so what is
+    // shown is always what the next dispatch will run. The card stays hidden
+    // when the gateway offers nothing to choose from (the picker's rule) or
+    // the endpoint is unavailable (an older gateway).
+    const agentCard = document.querySelector('[data-agent-models]');
+    const agentRows = document.querySelector('[data-agent-models-rows]');
+    const agentNote = document.querySelector('[data-agent-models-note]');
+    const renderAgents = (data) => {
+      const models = Array.isArray(data.models) ? data.models : [];
+      const agents = Array.isArray(data.agents) ? data.agents : [];
+      if (!agents.length || models.length < 2) { agentCard.hidden = true; return; }
+      agentCard.hidden = false;
+      agentRows.replaceChildren();
+      for (const a of agents) {
+        const label = document.createElement('label');
+        label.className = 'num-setting agent-model';
+        const name = document.createElement('span');
+        name.textContent = a.label;
+        name.title = a.description || '';
+        label.appendChild(name);
+        const select = document.createElement('select');
+        select.dataset.agent = a.id;
+        const builtin = document.createElement('option');
+        builtin.value = '';
+        builtin.textContent = `Built-in${a.builtin ? ` (${a.builtin})` : ''}`
+          + (a.env_default && a.chosen === null ? ` — deployment: ${a.env_default}` : '');
+        select.appendChild(builtin);
+        let present = !a.model;
+        for (const m of models) {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.label || m.id;
+          if (m.id === a.model) { opt.selected = true; present = true; }
+          select.appendChild(opt);
+        }
+        if (!present) {
+          // The effective model is not on the offered list (set via the env
+          // variable, or dropped upstream since): show it rather than lie.
+          const opt = document.createElement('option');
+          opt.value = a.model; opt.textContent = a.model; opt.selected = true;
+          select.appendChild(opt);
+        }
+        select.disabled = !a.overridable;
+        if (!a.overridable) name.title = 'This agent’s definition cannot be overridden.';
+        select.addEventListener('change', async () => {
+          select.disabled = true;
+          try {
+            const res = await fetch('/agent-models', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ agent: a.id, model: select.value }),
+            });
+            const body = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+            agentNote.hidden = true;
+            renderAgents(body);
+          } catch (err) {
+            agentNote.textContent = `Could not save: ${err.message}`;
+            agentNote.hidden = false;
+            select.disabled = false;
+          }
+        });
+        label.appendChild(select);
+        agentRows.appendChild(label);
+      }
+    };
+    (async () => {
+      try {
+        const res = await fetch('/agent-models', { cache: 'no-store' });
+        if (!res.ok) return;
+        renderAgents(await res.json());
+      } catch (_err) { /* card stays hidden */ }
+    })();
 
     // The phone shell's own settings, where the page runs inside it.
     if (inShell()) {

@@ -170,6 +170,12 @@ retinue-sparql-workbench .yasgui .controlbar { display: none; }
 .shelf-size input, .num-setting input { width: 5.5em; min-height: 40px; padding: 0 10px; border-radius: 10px;
                     border: 1px solid var(--line); background: var(--card-2); color: var(--fg);
                     font: inherit; }
+/* One subagent's model dropdown on the Agent models card. */
+.agent-model + .agent-model { margin-top: 8px; }
+.agent-model select { max-width: 60%; min-height: 40px; padding: 0 10px; border-radius: 10px;
+                      border: 1px solid var(--line); background: var(--card-2); color: var(--fg);
+                      font: inherit; }
+.agent-model select:disabled { opacity: .55; }
 .setting-btn { min-height: 40px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--accent);
                background: var(--card-2); color: var(--fg); font: inherit; cursor: pointer; }
 .setting-btn:hover { background: var(--accent); color: var(--bg); }

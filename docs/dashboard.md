@@ -433,8 +433,9 @@ is created and switchable mid-thread from a dropdown in the thread bar, effectiv
 from the next turn. A messenger chat's companion thread (the chat page's Ara
 pane) offers the same dropdown in its bar, so the tier answering there is as
 visible and as switchable as anywhere else. The picker governs **Ara's own turn only** — dispatched
-subagents (the Archivist and any chamber-provided subagents) always run on their
-own hard-wired models regardless of the selection. In a deployment that routes
+subagents (the Archivist and any chamber-provided subagents) run on their
+own pinned models regardless of the selection; those pins are changed on the
+settings page instead (see **Agent models** below). In a deployment that routes
 through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
@@ -470,6 +471,46 @@ the offered list is ignored (the thread falls back to the default), so a client
 can never inject an arbitrary `--model`. The picker hides itself when fewer than
 two models are offered. Model tiers and per-thread escalation:
 `docs/model-routing.md`.
+
+## Agent models (the settings page)
+
+Every subagent pins its model in its definition (`model:` in the frontmatter
+of `.claude/agents/*.md`, or of a chamber plugin's `agents/*.md`), and those
+files are baked into the image. **Settings › Agent models** is the knob over
+them: one dropdown per dispatchable agent, offering the same list as the
+thread picker (`GET /conversation-models`, so an Ollama tag the picker shows
+is offered here too), with "Built-in" as the first entry. The card is
+server-side state shared by every device, not a per-device preference.
+
+Mechanism (`scripts/agent_models.py`): Claude Code's `--agents <file>` flag
+defines agents for one session and takes precedence over the same name from
+`.claude/agents/` or a plugin — as a *replacement*, not a merge. So an
+override is the agent's own file re-read (frontmatter plus body) and handed
+back with only `model` swapped; the agent's description, tools and prompt are
+untouched. Every framework spawner (`web-gateway.py`, `scheduler.py`, the
+base-job scripts, the MCP connector) appends `agent_models.cli_args()` to its
+`claude -p` command — `[]` when nothing is overridden — and the generated file
+is rewritten only when the choices change, so a new choice reaches the very
+next dispatch with no restart.
+
+Two sources, the dashboard winning: `RETINUE_AGENT_MODELS` (deployment
+default; a JSON object or `agent=model,…`) and the file the card writes
+(`RETINUE_AGENT_MODELS_FILE`, default `/root/.retinue/agent-models.json`,
+where choosing "Built-in" is an explicit entry that also cancels the env
+default for that agent). Agent ids are what the Agent tool takes: the
+frontmatter `name` for core agents, `<plugin>:<name>` for plugin agents.
+`POST /agent-models` accepts only agents discovery lists and models on the
+offered list — the thread picker's gate — so a client can never inject an
+arbitrary definition. An agent whose frontmatter carries nested YAML
+(`hooks:`, `mcpServers:`) is listed but fixed: the no-dependency frontmatter
+parser would mangle it, so it is left as the only definition. Memory stamps
+and the bubble's model name follow the model actually used, so experiments
+stay traceable.
+
+Agents that call tools (the Archivist, the Herald, chamber agents such as
+Ari) need a model with tool support; `docs/ollama.md` records which local
+tags fail there. The Secretary and the archivist-reader only read and return
+text and are the safest place to try a small local model.
 
 ## Attachments
 

@@ -155,6 +155,17 @@ keep the dropdown aligned with pulled models. Recreate the `retinue`
 service after changing the env var (the list is read at process start
 and cached briefly).
 
+## Subagents on local tags
+
+The picker above governs Ara's own turns. The subagents Ara dispatches (the
+Secretary, Herald, Archivist, chamber agents) pin their own models; the
+dashboard's **Settings › Agent models** card (or `RETINUE_AGENT_MODELS`)
+overrides those per agent, offering the same list — `docs/dashboard.md`,
+"Agent models". The caveats in this document apply doubly: an agent that
+calls tools needs a tag with a tools capability, and a dispatched agent's
+prompt is its whole definition plus the dispatch context, which an 8k-context
+tag will overflow. Start with the Secretary (read-only, returns text).
+
 ## Checking a tag before you chat
 
 From a host that can reach Ollama:

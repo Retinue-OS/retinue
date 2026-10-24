@@ -278,8 +278,10 @@ gate, is the trust signal) — has its own document: `docs/memory.md`.
 
 ## Non-goals
 
-- No change to subagent models: workers keep pinning their own model in
-  frontmatter; the tier variables govern Ara's own turns only.
+- No change to subagent models *through the tiers*: workers keep pinning their
+  own model in frontmatter and the tier variables govern Ara's own turns only.
+  A pin is overridden per agent on the settings page or via
+  `RETINUE_AGENT_MODELS` (`docs/dashboard.md`, "Agent models"), never by a tier.
 - No pre-classifier: a gate model that reads every message to pick a tier costs
   an extra call on all traffic. Escalation-by-re-run is cheaper and simpler.
 - No second door: transparency is about who signed the answer, never about

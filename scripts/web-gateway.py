@@ -99,6 +99,15 @@ News feed (dashboard news page; see scripts/news_store.py):
                                          signal: up|down|read|hide|note). Nudges
                                          that item now and logs it for the Herald.
 
+Agent models (Settings › Agent models; see scripts/agent_models.py):
+  GET  /agent-models                  -> {"agents": [...], "models": [...]} — every
+                                         dispatchable subagent with its built-in
+                                         model and the effective override, plus
+                                         the offered model list (the picker's).
+  POST /agent-models                  -> {agent, model} pins one subagent to a
+                                         model ("" = built-in). Reaches the next
+                                         spawned session, no restart.
+
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
   POST /push/subscribe                -> register a PushSubscription (body
@@ -272,6 +281,7 @@ import attention as attention_policy
 import attention_store
 import build_stamp
 import claude_auth
+import agent_models
 import chat_state as chat_state_mod
 import contacts as contacts_mod
 import email_client as ec
@@ -4705,6 +4715,10 @@ def send_message(message: str, display_question: str | None = None,
                        "--add-dir", str(MESSAGE_FILES_DIR)]
                 if run_model:
                     cmd += ["--model", run_model]
+                # Per-agent model overrides (Settings › Agent models, or
+                # RETINUE_AGENT_MODELS): the subagents this turn may dispatch,
+                # redefined with only their model swapped — scripts/agent_models.py.
+                cmd += agent_models.cli_args()
                 if resume_id:
                     cmd += ["--resume", resume_id]
                 # End option parsing with "--" so a user-supplied message that
@@ -9508,6 +9522,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0].rstrip("/") == "/news/preferences":
             self._handle_news_preferences_write()
             return
+        if self.path.split("?", 1)[0].rstrip("/") == "/agent-models":
+            self._handle_agent_models_write()
+            return
         attention_match = _ATTENTION_POST_RE.match(self.path)
         if attention_match:
             self._handle_attention_post(attention_match.group(1))
@@ -11258,6 +11275,48 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, _news_preferences_payload())
 
+    def _handle_agent_models_write(self) -> None:
+        """Pin one subagent to a model, or hand it back its built-in one.
+
+        Body {agent, model}; an empty model is the explicit "built-in" choice
+        (it also cancels a RETINUE_AGENT_MODELS default for that agent). The
+        agent must be one discovery lists and overridable; the model must be
+        on the offered list — the same gate the thread picker applies, with
+        one cache refresh so a model just added upstream is accepted. The
+        choice reaches the next spawned session: scripts/agent_models.py
+        regenerates the --agents file on demand, no restart."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        agent = payload.get("agent")
+        model = payload.get("model", "")
+        if model is None:
+            model = ""
+        if not isinstance(agent, str) or not agent or not isinstance(model, str):
+            self._send_json(400, {"error": "agent (and an optional model) are required"})
+            return
+        known = {row["id"]: row for row in agent_models.status()}
+        row = known.get(agent)
+        if row is None:
+            self._send_json(404, {"error": f"unknown agent {agent!r}"})
+            return
+        if not row["overridable"]:
+            self._send_json(409, {"error": f"{agent} cannot be overridden"})
+            return
+        if model and not (agent_models.valid_model_id(model)
+                          and _model_offered(model, refresh=True)):
+            self._send_json(400, {"error": f"model {model!r} is not on the offered list"})
+            return
+        try:
+            agent_models.write_setting(agent, model)
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save agent models",
+                                  "detail": str(exc)})
+            return
+        self._send_json(200, {"agents": agent_models.status(),
+                              "models": _conversation_models()})
+
     def _handle_transcribe(self) -> None:
         """Voice input: proxy uploaded audio to the shared STT service.
 
@@ -11840,6 +11899,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if conv_path in ("/news/preferences", "/news/preferences/"):
             self._send_json(200, _news_preferences_payload())
+            return
+        if conv_path in ("/agent-models", "/agent-models/"):
+            # Settings › Agent models: every dispatchable subagent with its
+            # built-in model and the effective override, plus the same model
+            # list the thread picker offers (scripts/agent_models.py).
+            self._send_json(200, {"agents": agent_models.status(),
+                                  "models": _conversation_models()})
             return
         if conv_path in ("/attention", "/attention/"):
             self._handle_attention_get()

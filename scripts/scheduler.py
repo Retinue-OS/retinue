@@ -106,6 +106,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
 import session_env  # noqa: E402
 
@@ -369,6 +370,9 @@ def run_job(job: dict) -> None:
         model = job_model(job)
         if model:
             cmd[2:2] = ["--model", model]
+        # Per-agent model overrides for the subagents the job dispatches
+        # (scripts/agent_models.py); [] when none is set.
+        cmd[-1:-1] = agent_models.cli_args()
         kind = "prompt"
     else:
         cmd = job["command"]

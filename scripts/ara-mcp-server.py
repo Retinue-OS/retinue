@@ -100,6 +100,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
 import session_env  # noqa: E402
 
@@ -495,6 +496,9 @@ def _run_once(prompt: str, model: str,
     cmd = [CLAUDE_BIN, "-p", "--output-format=json"]
     if model:
         cmd += ["--model", model]
+    # Per-agent model overrides for the subagents the answer may dispatch
+    # (scripts/agent_models.py); [] when none is set.
+    cmd += agent_models.cli_args()
     for tool in FORBIDDEN_TOOLS:
         cmd += ["--disallowed-tools", tool]
     # The session's environment comes from the allowlist in
