@@ -2198,9 +2198,12 @@ class RetinueConversation extends HTMLElement {
       // The prompt may have been up a while. Torn down meanwhile (the user
       // left) or pointed at another thread, this element releases the
       // microphone it just got instead of recording off screen — as does a
-      // take of the continuous loop whose page went into the background.
+      // take of the continuous loop whose page went into the background, and
+      // one whose page was left while the prompt was up (_handOffRecording
+      // put the state back to idle).
       const continuous = this._contOn();
-      if (!this.isConnected || this._key() !== key || (continuous && document.hidden)) {
+      if (!this.isConnected || this._key() !== key || this._recState !== 'acquiring' ||
+          (continuous && document.hidden)) {
         stream.getTracks().forEach((tr) => tr.stop());
         this._recState = 'idle';
         this._micHold(false);

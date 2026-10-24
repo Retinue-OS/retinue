@@ -149,9 +149,21 @@ function dictTx(mode, fn) {
   return run;
 }
 
-const dictGet = (id) => dictTx('readonly', (s) => s.get(id));
-const dictPut = (rec) => dictTx('readwrite', (s) => s.put(rec));
 const dictAll = () => dictTx('readonly', (s) => s.getAll());
+// Read job `id` and write what fn(record or null) returns, in ONE
+// transaction — nothing can change the record in between. fn returning null
+// writes nothing. Resolves to what was written, or null.
+function dictUpdate(id, fn) {
+  let written = null;
+  return dictTx('readwrite', (s) => {
+    const get = s.get(id);
+    get.onsuccess = () => {
+      const next = fn(get.result || null);
+      if (next) { written = next; s.put(next); }
+    };
+    return null;
+  }).then(() => written);
+}
 
 async function dictOwnerAlive(owner) {
   if (!owner) return false;
@@ -167,20 +179,29 @@ async function dictNotify(rec) {
 }
 
 // Transcribe job `rec` and store the outcome — unless the job was taken
-// meanwhile, or another run of it superseded this one.
-async function dictRun(rec) {
+// meanwhile, or another run of it superseded this one. A new job is stored
+// first; a restart (`again`) goes on from the stored record, and is dropped
+// if that record has gone (taken) or finished meanwhile.
+async function dictRun(rec, again) {
   const token = Math.random().toString(36).slice(2);
   DICT_RUNNING.set(rec.id, token);
-  await dictPut({ ...rec, run: token });
+  const live = await dictUpdate(rec.id, (cur) => {
+    if (again ? (!cur || cur.state !== 'running') : !!cur) return null;
+    return { ...(cur || rec), run: token };
+  }).catch(() => null);
+  if (!live) {
+    if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
+    return;
+  }
   let text = '';
   let error = '';
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), DICT_TIMEOUT_MS);
   try {
-    const res = await fetch(rec.url, {
+    const res = await fetch(live.url, {
       method: 'POST',
-      headers: { 'Content-Type': (rec.blob && rec.blob.type) || 'application/octet-stream' },
-      body: rec.blob,
+      headers: { 'Content-Type': (live.blob && live.blob.type) || 'application/octet-stream' },
+      body: live.blob,
       signal: ctl.signal,
     });
     if (!res.ok) throw new Error(String(res.status));
@@ -192,13 +213,12 @@ async function dictRun(rec) {
     clearTimeout(timer);
   }
   if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
-  const now = await dictGet(rec.id).catch(() => null);
-  if (!now || now.run !== token) return;
   // The audio is spent once there is a transcript; a failed one is kept no
-  // longer either — the note asks for the dictation again.
-  const done = { ...now, state: 'done', text, error, blob: null };
-  await dictPut(done);
-  await dictNotify(done);
+  // longer either — the note asks for the dictation again. The owner is
+  // whoever holds the job at this moment (an adopt may have moved it).
+  const done = await dictUpdate(rec.id, (cur) => (cur && cur.run === token
+    ? { ...cur, state: 'done', text, error, blob: null } : null)).catch(() => null);
+  if (done) await dictNotify(done);
 }
 
 async function dictStart(d, source) {
@@ -222,16 +242,20 @@ async function dictAdopt(keys, asker, port) {
     }
     if (!want.has(rec.key)) continue;
     if (rec.owner !== asker && await dictOwnerAlive(rec.owner)) continue;
-    // Re-read before the write: a run may have finished meanwhile.
-    const cur = await dictGet(rec.id).catch(() => null);
-    if (!cur) continue;
-    if (cur.owner !== asker) await dictPut({ ...cur, owner: asker });
-    const taken = { ...cur, owner: asker };
+    // Taken over in one read-and-write: a run finishing in between would
+    // otherwise be overwritten with the stale record read before it.
+    let taken = null;
+    await dictUpdate(rec.id, (cur) => {
+      if (!cur) return null;
+      taken = { ...cur, owner: asker };
+      return cur.owner === asker ? null : taken;
+    }).catch(() => { taken = null; });
+    if (!taken) continue;
     mine.push({ id: taken.id, key: taken.key, state: taken.state, text: taken.text || '', error: taken.error || '' });
     if (taken.state === 'running' && !DICT_RUNNING.has(taken.id) && taken.blob) restart.push(taken);
   }
   if (port) port.postMessage({ jobs: mine });
-  await Promise.all(restart.map((rec) => dictRun(rec)));
+  await Promise.all(restart.map((rec) => dictRun(rec, true)));
 }
 
 async function dictRelease(owner) {
@@ -239,8 +263,7 @@ async function dictRelease(owner) {
   const all = (await dictAll().catch(() => [])) || [];
   for (const rec of all) {
     if (rec.owner !== owner) continue;
-    const cur = await dictGet(rec.id).catch(() => null);
-    if (cur && cur.owner === owner) await dictPut({ ...cur, owner: '' });
+    await dictUpdate(rec.id, (cur) => (cur && cur.owner === owner ? { ...cur, owner: '' } : null)).catch(() => {});
   }
 }
 

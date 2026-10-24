@@ -504,9 +504,13 @@ class RetinueChatPage extends HTMLElement {
       let unsaved = false;
       if (!this._restoredLocal) {
         this._restoredLocal = true;
-        unsaved = this._restoreLocal();
-        this._restoreImages();
-        this._adoptDictations();
+        // Whatever is kept on the device, a bad record there must not keep
+        // the chat from opening.
+        try {
+          unsaved = this._restoreLocal();
+          this._restoreImages();
+          this._adoptDictations();
+        } catch (_e) { unsaved = false; }
       }
       this._state = 'ok';
       try { document.title = `Retinue — ${this._chat.name}`; } catch (_e) { /* ignore */ }

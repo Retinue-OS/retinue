@@ -39,6 +39,9 @@ const GIVE_UP_MS = 5 * 60 * 1000;
 // A worker that has not taken a job up by then (an older version, still in
 // charge while a new one installs) leaves it to the page.
 const ACK_MS = 4000;
+// A recording handed off by the page just left may reach the worker after
+// the next page's first ask for its place: that page asks once more.
+const ADOPT_RECHECK_MS = 2000;
 
 const WAITING = new Map();   // job id -> {key, resolve, reject, timer, acked}
 // Jobs settled here: a resync answered before the worker heard they were
@@ -47,6 +50,7 @@ const SETTLED = new Set();
 const ADOPTERS = new Map();  // key -> onJob
 let resyncTimer = null;
 let listening = false;
+let awaitingController = false;
 
 function sw() {
   try {
@@ -199,15 +203,32 @@ export function transcribe(key, blob, url) {
     return fetchText(blob, url);
   }
   // Not taken up in time: the page does it itself, and the worker is told to
-  // forget the job should it get to it after all — one transcript, not two.
+  // forget the job should it get to it after all — one transcript, not two
+  // (a resync listing it meanwhile must not hand it out either: settled).
   WAITING.get(id).ackTimer = setTimeout(() => {
     const w = WAITING.get(id);
     if (!w || w.acked) return;
     drop(id);
+    SETTLED.add(id);
     post({ type: 'dictation-taken', id });
     fetchText(blob, url).then(w.resolve, w.reject);
   }, ACK_MS);
   return p;
+}
+
+// No controller yet (a hard reload bypasses the worker; the very first
+// visit): the places registered so far are asked for once one takes over.
+function whenControlled() {
+  if (awaitingController) return;
+  try {
+    const c = navigator.serviceWorker;
+    if (!c) return;
+    awaitingController = true;
+    c.addEventListener('controllerchange', () => {
+      awaitingController = false;
+      if (sw()) { listen(); resync(); }
+    }, { once: true });
+  } catch (_e) { /* no worker here */ }
 }
 
 export function handOff(key, blob, url) {
@@ -218,7 +239,9 @@ export function handOff(key, blob, url) {
 export function adopt(key, onJob) {
   if (!key || typeof onJob !== 'function') return;
   ADOPTERS.set(key, onJob);
-  if (!sw()) return;
+  if (!sw()) { whenControlled(); return; }
   listen();
-  ask([key]).then((jobs) => jobs.forEach(take));
+  const look = () => ask([key]).then((jobs) => jobs.forEach(take));
+  look();
+  setTimeout(() => { if (ADOPTERS.get(key) === onJob && sw()) look(); }, ADOPT_RECHECK_MS);
 }
