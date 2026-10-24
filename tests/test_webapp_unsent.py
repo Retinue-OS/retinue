@@ -33,7 +33,8 @@ pages of one device — one localStorage, one IndexedDB, one service worker
 - a page frozen in the back-forward cache whose dictation another page took
   meanwhile settles that job as taken elsewhere and shows the device's draft;
 - a project's command bar and an unsaved edit of its file come back, the edit
-  over the version it was started from, so a save still detects a conflict.
+  over the version it was started from, so a save still detects a conflict;
+  back while editing leaves the page and keeps the edit, it no longer drops it.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes.
@@ -648,6 +649,13 @@ await ok("a project's command bar and its unsaved edit come back; the edit keeps
   p2._startEdit();
   p2._draft = '---\ntitle: P\n---\nBody, edited\n';
   p2._keepEdit();
+  // Back while editing goes back, as on any page; the edit is kept, not
+  // dropped (the editor's × is the one way to drop it).
+  p2._onBack();
+  assert.equal(location.href, '/', 'back went back');
+  assert.equal(p2._mode, 'edit', 'the editor was not cancelled under the user');
+  assert.equal(stored('project-edit:urn:p').text, '---\ntitle: P\n---\nBody, edited\n', 'the edit is kept');
+  location.href = 'http://dash/';
   leave(pages.two);
   // Meanwhile the file changes elsewhere.
   project = { ...project, markdown: '---\ntitle: P\n---\nBody (agent)\n', sha256: 'v2' };

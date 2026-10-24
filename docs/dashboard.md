@@ -47,8 +47,10 @@ them is a dead end, and on them it starts with a back button (`<retinue-nav
 back>`). The row only reports the press (`retinue-back`); the page decides
 where it goes: back to where the drill-down was opened from inside the app,
 or, opened cold (a push, a bookmark), to the home; an open thread on the
-home or the Threads page closes in place, a project being edited cancels the
-edit. The page's own bar (title, Archive, minimize, model picker, menu)
+home or the Threads page closes in place. A project being edited goes back
+like any other page — the edit is kept on the device and the editor opens
+again with it on the next visit; only the editor's own × drops the changes
+(back used to cancel the edit). The page's own bar (title, Archive, minimize, model picker, menu)
 stays as a second row under it. A tab always goes, whatever the page
 holds: a typed message, an unsaved project edit or a dictation on its way is
 kept on the device and waits in its field for the user to come back to the

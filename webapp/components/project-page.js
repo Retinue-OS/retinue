@@ -188,11 +188,10 @@ class RetinueProjectPage extends HTMLElement {
       } catch (_e) { return false; }
     })();
     // The back button is the navigation row's (components/nav.js), at the
-    // top of the page; it hands the press here. While editing it is the
-    // editor's cancel, like the bar's ×.
+    // top of the page; it hands the press here (_onBack).
     this._nav = document.querySelector('retinue-nav');
     if (this._nav && !this._onNavBack) {
-      this._onNavBack = () => (this._mode === 'edit' ? this._cancelEdit() : this._goBack());
+      this._onNavBack = () => this._onBack();
       this._nav.addEventListener('retinue-back', this._onNavBack);
     }
     // The shelf (issue #282): this project is the page being shown, and a
@@ -368,6 +367,15 @@ class RetinueProjectPage extends HTMLElement {
     this.render();
   }
 
+  // Back goes back, editing or not — the edit is kept on the device and the
+  // editor opens again with it on the next visit (_reopenEdit). It used to be
+  // the editor's cancel while editing, which dropped the changes; the bar's ×
+  // is the one deliberate way to do that now.
+  _onBack() {
+    this._goBack();
+  }
+
+  // The editor's ×: the changes are dropped, for good.
   _cancelEdit() {
     this._mode = 'view';
     this._editError = '';
