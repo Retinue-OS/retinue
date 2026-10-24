@@ -4,9 +4,9 @@
 
 fetch() has no deadline of its own. A send whose request never settled — a
 phone that changed networks under it, a WebView that froze it — kept its
-composer locked for good: the field and the send button disabled, and every
-way off the page held by the unsaved-input guard, which counts a send on the
-wire. A chat page's Proofread pressed into that lock only landed its words in
+composer locked for good: the field and the send button disabled (and, while
+an unsaved-input guard still held navigation, every way off the page with
+it). A chat page's Proofread pressed into that lock only landed its words in
 the locked box. These checks pin, under Node with a scripted DOM and a fetch
 that never answers:
 

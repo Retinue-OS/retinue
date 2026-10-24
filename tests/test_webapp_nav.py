@@ -13,9 +13,10 @@ These checks pin that contract under Node with a scripted DOM:
 - a plain press dispatches `retinue-back` and navigates nowhere; a modified
   press (new tab) is left to the link;
 - a drill-down's path underlines its list (Chats on a chat);
-- a tab press on a page holding unsent input is held, as a Home press of
-  the Android shell is — and pressed again while the note shows, it goes:
-  the hold stops a slip, it never keeps anyone on a page;
+- a tab press is a plain link and always goes — on a page holding unsent
+  input too: that input is kept on the device and waits in its field, so
+  nothing is held and no note pops up at the bottom of the screen; the
+  Android shell's Home press and wake navigate the same way;
 - the conversations card shows the button only while a thread or the
   composer is open, and a press on the row unwinds exactly one entry — the
   element's own `retinue-back` (its minimize) still reaches the host once,
@@ -96,10 +97,11 @@ globalThis.document = {
   body: { appendChild(el) { note = el; } },
 };
 globalThis.window = globalThis;
-globalThis.location = { hash: '', pathname: '/', search: '', href: 'http://dash/' };
+const assigned = [];
+globalThis.location = { hash: '', pathname: '/', search: '', href: 'http://dash/', assign: (u) => { assigned.push(u); } };
 globalThis.addEventListener = (t, f) => { if (!winListeners.has(t)) winListeners.set(t, []); winListeners.get(t).push(f); };
 globalThis.removeEventListener = () => {};
-const fire = (type) => { for (const f of winListeners.get(type) || []) f({ type }); };
+const fire = (type, detail) => { for (const f of winListeners.get(type) || []) f({ type, detail }); };
 let backs = 0;
 // The address moves as a browser's does: no URL (null or '', as the card's
 // state-only stamps pass) keeps it, a fragment replaces the hash, and a path
@@ -129,7 +131,7 @@ globalThis.fetch = () => new Promise(() => {});   // the card's poll never answe
 globalThis.setInterval = () => 0;
 globalThis.clearInterval = () => {};
 
-const { registerUnsavedCheck } = await import('./shell.js');
+const shell = await import('./shell.js');
 await import('./nav.js');
 await import('./conversations.js');
 const Nav = registry.get('retinue-nav');
@@ -201,55 +203,28 @@ await ok("a drill-down's path underlines its list", () => {
   location.pathname = '/';
 });
 
-await ok('a tab press with unsent input on the page is held, without it it goes', () => {
+await ok('a tab press is a plain link: nothing holds it, nothing pops up', () => {
   const nav = mountNav({ back: '', current: 'chats' });
+  assert.ok(!('registerUnsavedCheck' in shell) && !('shellEventHeld' in shell),
+    'there is no guard left to register with');
   const row = nav.shadowRoot.querySelector('nav');
   const tab = { closest: () => ({ hasAttribute: () => false }) };
-  const free = press({ target: tab });
-  row.fire('click', free);
-  assert.ok(!free.prevented, 'nothing held: the link follows');
-  const off = registerUnsavedCheck(() => true);
-  const held = press({ target: tab });
-  row.fire('click', held);
-  assert.ok(held.prevented, 'unsent input: the tab stays put');
-  assert.ok(note && /Unsent input/.test(note.textContent), 'and says why');
-  const back = press({ target: { closest: () => ({ hasAttribute: (n) => n === 'data-back' }) } });
-  row.fire('click', back);
-  assert.ok(!back.prevented, 'the back button is the page\'s to decide, not the guard\'s');
-  off();
+  const ev = press({ target: tab });
+  row.fire('click', ev);
+  assert.ok(!ev.prevented, 'the link follows');
+  assert.ok(!(row._l.get('click') || []).length, "the row wires no click handler of its own: the links are the browser's");
+  assert.ok(!/press again/.test(html(nav)), 'and says nothing about pressing again');
+  assert.equal(note, null, 'no note was ever put on the page');
 });
 
-await ok('pressed again while the note shows, a held tab goes; a fresh press is held again', () => {
-  const nav = mountNav({ back: '', current: 'chats' });
-  const row = nav.shadowRoot.querySelector('nav');
-  const tab = { closest: () => ({ hasAttribute: () => false }) };
-  const off = registerUnsavedCheck(() => true);
-  const realNow = Date.now;
-  // Well after the hold of the check above, which ran on the real clock.
-  let t = realNow() + 60000;
-  Date.now = () => t;
-  try {
-    const first = press({ target: tab });
-    row.fire('click', first);
-    assert.ok(first.prevented, 'the first press is held');
-    assert.match(note.textContent, /press again/, 'and the note says how to go anyway');
-    t += 1500;
-    const again = press({ target: tab });
-    row.fire('click', again);
-    assert.ok(!again.prevented, 'pressed again while the note shows: the tab follows');
-    assert.ok(note.hidden, 'and the note is gone');
-    t += 500;
-    const fresh = press({ target: tab });
-    row.fire('click', fresh);
-    assert.ok(fresh.prevented, 'the next press starts over: held');
-    t += 10000;
-    const late = press({ target: tab });
-    row.fire('click', late);
-    assert.ok(late.prevented, 'a press long after the note is a first press again');
-  } finally {
-    Date.now = realNow;
-    off();
-  }
+await ok("the shell's Home press and wake navigate, whatever the page holds", () => {
+  // The home claims the events for itself; every other page goes there.
+  assigned.length = 0;
+  fire('retinue-shell', { type: 'home' });
+  fire('retinue-shell', { type: 'wake' });
+  fire('retinue-shell', { type: 'other' });
+  assert.deepEqual(assigned, ['/', '/?wake=1']);
+  assert.equal(note, null, 'no note');
 });
 
 await ok('the conversations card shows back only while a thread or the composer is open', () => {

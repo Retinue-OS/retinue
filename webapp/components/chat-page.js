@@ -70,7 +70,11 @@ import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 // shown as sent (linkify below) — so the Markdown renderer and its styles
 // belong to the element now, not to this page.
 import './conversation.js';
-import { registerUnsavedCheck } from './shell.js';
+// Leaving the page never waits on the composer: what it holds is kept on the
+// device (drafts.js) and a dictation is finished by the service worker
+// (dictation.js), both waiting in the composer when the user comes back.
+import { loadDraft, saveDraft, loadFiles, saveFiles } from './drafts.js';
+import { transcribe, handOff, adopt } from './dictation.js';
 
 const LIST_URL = '/chats';
 // Where the back control lands a visitor who has no app history behind them.
@@ -99,6 +103,14 @@ const POLL_MS = 4000;
 const COMP_PENDING_POLL_MS = 1500;
 // Idle time after the last keystroke before the draft is saved server-side.
 const DRAFT_SAVE_MS = 1000;
+// A send this small goes out as a keepalive request, which the browser
+// finishes even if the page is left meanwhile (the platform caps those at
+// 64 KiB in flight); one carrying images is cut off by a navigation, so the
+// composer is kept until the next visit can tell whether it went.
+const KEEPALIVE_BYTES = 32 * 1024;
+// The recorder hands over its audio in slices this long, so a page left with
+// the mic live has all but the last fraction of a second to hand on.
+const REC_SLICE_MS = 250;
 // Sticking distance: within this many px of the bottom counts as "at bottom".
 const NEAR_BOTTOM_PX = 40;
 // Outgoing images — the caps mirror the send endpoint (which answers 400 on
@@ -212,6 +224,12 @@ function fmtDay(iso) {
   return t.toLocaleDateString(undefined, opts);
 }
 
+// A staged image as it is kept on the device: everything but its object URL,
+// which belongs to the page that made it.
+function imageRecord(im) {
+  return { blob: im.blob, content_type: im.content_type, width: im.width, height: im.height, name: im.name };
+}
+
 class RetinueChatPage extends HTMLElement {
   constructor() {
     super();
@@ -278,16 +296,16 @@ class RetinueChatPage extends HTMLElement {
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
-    // What a wake or a Home press from the Android shell must not navigate
-    // away from (shell.js): a draft not yet stored (saves are debounced), a
-    // dictation recording or being transcribed, images staged for a send.
-    // The companion thread's own input is the conversation module's check.
-    if (!this._offUnsaved) {
-      this._offUnsaved = registerUnsavedCheck(() => this._draft !== this._draftSaved ||
-        !!this._draftInflight || this._recState !== 'idle' ||
-        Object.keys(this._voiceJobs).length > 0 || this._outImages.length > 0);
-    }
     this._id = new URLSearchParams(location.search).get('id') || '';
+    // Leaving with input in the composer: the words not yet saved go to the
+    // server as the page unloads, and stay on the device in case they do not
+    // get there (_keepLocal); a live recording is handed on to be transcribed
+    // into the draft; a send on the wire is marked so the next visit can tell
+    // whether it went. The companion's input is <retinue-conversation>'s own.
+    if (!this._onLeave) {
+      this._onLeave = () => this._leaving();
+      window.addEventListener('pagehide', this._onLeave);
+    }
     // Where "back" leads. A same-origin referrer means the chat was opened
     // from inside the app (a row on the home, the chats list, another chat),
     // so there is an entry to return to and the user expects the place they
@@ -400,8 +418,8 @@ class RetinueChatPage extends HTMLElement {
   }
 
   disconnectedCallback() {
-    if (this._offUnsaved) this._offUnsaved();
-    this._offUnsaved = null;
+    if (this._onLeave) window.removeEventListener('pagehide', this._onLeave);
+    this._onLeave = null;
     if (this._onPageHide) window.removeEventListener('pagehide', this._onPageHide);
     this._onPageHide = null;
     if (this._shelfRelease) this._shelfRelease();
@@ -481,6 +499,19 @@ class RetinueChatPage extends HTMLElement {
         this._draft = draft.text;
         this._draftByAra = draft.author === 'agent';
       }
+      // What an earlier visit left in the composer and the server may not
+      // have got: its words, its images, its dictations (once per page).
+      let unsaved = false;
+      if (!this._restoredLocal) {
+        this._restoredLocal = true;
+        // Whatever is kept on the device, a bad record there must not keep
+        // the chat from opening.
+        try {
+          unsaved = this._restoreLocal();
+          this._restoreImages();
+          this._adoptDictations();
+        } catch (_e) { unsaved = false; }
+      }
       this._state = 'ok';
       try { document.title = `Retinue — ${this._chat.name}`; } catch (_e) { /* ignore */ }
       const restore = this._shelfRestore;
@@ -488,6 +519,11 @@ class RetinueChatPage extends HTMLElement {
       if (restore && restore.pane) this._pane = restore.pane === 'companion' ? 'companion' : 'chat';
       this.render();
       if (restore) this._applyShelfRestore(restore);
+      if (unsaved) this._scheduleDraftSave();
+      if (this._leftSend) {
+        this._showNote('The page was left while this message was being sent. It is back in the box '
+          + '&mdash; if it shows up in the chat, there is no need to send it again.');
+      }
       // Open means read: the shelf item (if any) has nothing unread any more.
       shelf.observe(this._shelfKey(), { unread: 0, title: this._chat.name || '', avatar: this._avatar() });
       // Opening the chat reads it: advance the watermark to the newest
@@ -664,6 +700,150 @@ class RetinueChatPage extends HTMLElement {
     }
   }
 
+  // ── Kept on the device: what leaving must not cost ─────────────────────────
+  _localKey() { return `chat:${this._id}`; }
+
+  // The composer's words while the server does not have them yet (a save is
+  // debounced, or failed offline), with the draft version they were written
+  // over. Nothing unsaved, nothing kept.
+  _keepLocal(sending) {
+    if (!this._id) return;
+    const unsaved = this._draft !== this._draftSaved;
+    saveDraft(this._localKey(), unsaved || sending
+      ? { text: this._draft, version: this._draftVersion, byAra: this._draftByAra, sending: sending || null }
+      : null);
+  }
+
+  // Back on the chat: words an earlier visit kept go back in the box when
+  // the server's draft has not moved past them since, or holds nothing —
+  // never over a different draft someone else has saved meanwhile (the page
+  // treats that as "updated elsewhere" while it is open, too). A message
+  // with images that was still going up when the page was left goes back in
+  // the box too, images and all, unless the chat shows it sent — then its
+  // images, kept first in line, are dropped (_restoreImages). Returns true
+  // when the box holds words the server has yet to be told about.
+  _restoreLocal() {
+    const kept = loadDraft(this._localKey());
+    if (!kept || typeof kept.text !== 'string') return false;
+    let text = kept.text;
+    let force = false;
+    const s = kept.sending && typeof kept.sending === 'object' ? kept.sending : null;
+    if (s && !this._sentSince(s)) {
+      text = [String(s.text || '').trim(), text.trim()].filter(Boolean).join(' ');
+      force = true;
+      this._leftSend = true;
+    } else if (s) {
+      this._sentImages = Number(s.images) || 0;
+    }
+    const server = this._draftSaved;
+    const same = (kept.version || 0) === (this._draftVersion || 0);
+    if (text === server || !(force || same || (!server && text.trim()))) {
+      saveDraft(this._localKey(), null);
+      return false;
+    }
+    this._draft = text;
+    this._draftByAra = !!kept.byAra && same && !force;
+    this._keepLocal();
+    return true;
+  }
+
+  // Whether the chat holds a message of the user's like the one in flight
+  // when the page was left — sent at most a minute (of clock skew) before it.
+  _sentSince(s) {
+    const at = Date.parse(s.at || '') - 60 * 1000;
+    const want = String(s.text || '').trim();
+    return this._messages.some((m) => m.direction === 'out' && Date.parse(m.ts || '') >= at &&
+      (want ? String(m.text || '').trim() === want : (m.attachments || []).length > 0));
+  }
+
+  // The staged images, kept on the device. While a send carrying images is
+  // on the wire those stay kept too, first in line, until it is answered: a
+  // page left meanwhile has them back on the next visit, or drops them there
+  // once the chat shows them sent.
+  _keepImages() {
+    if (!this._id) return;
+    const inFlight = (this._sendingNow && this._sendingNow.images) || [];
+    saveFiles(this._localKey(), inFlight.concat(this._outImages).map(imageRecord));
+  }
+
+  async _restoreImages() {
+    let kept = await loadFiles(this._localKey());
+    const sent = this._sentImages || 0;
+    this._sentImages = 0;
+    if (sent) kept = kept.slice(sent);
+    const fresh = kept.filter((im) => im && im.blob).map((im) => ({ ...im, url: URL.createObjectURL(im.blob) }));
+    if (fresh.length) this._outImages = fresh.concat(this._outImages).slice(0, MAX_IMAGES_PER_SEND);
+    if (sent || fresh.length) this._keepImages();
+    if (fresh.length && this._state === 'ok') this._refreshChatComposer();
+  }
+
+  // Dictations an earlier visit left for this chat's composer, still being
+  // transcribed or done: each owns the composer row until its text is in the
+  // draft, for review.
+  _adoptDictations() {
+    if (this._adopting) return;
+    this._adopting = true;
+    adopt(this._localKey(), (job) => {
+      this._adopted = (this._adopted || 0) + 1;
+      this._voiceJobs.chat = this._voiceJobs.chat || { sending: false, phase: 'transcribing', adopted: true };
+      if (this._state === 'ok') this._refreshChatComposer();
+      job.then((text) => {
+        if (text) {
+          const cur = this._draft;
+          this._draft = cur ? `${cur.replace(/\s*$/, '')} ${text}` : text;
+          this._keepLocal();
+          this._scheduleDraftSave();
+        } else {
+          this._voiceErrors.chat = 'No speech was detected in the recording.';
+        }
+      }, (err) => {
+        if (!(err && err.message === 'elsewhere')) {
+          this._voiceErrors.chat = "Couldn't transcribe the recording. Please try again.";
+        }
+      }).finally(() => {
+        this._adopted -= 1;
+        if (!this._adopted && this._voiceJobs.chat && this._voiceJobs.chat.adopted) delete this._voiceJobs.chat;
+        if (this._state === 'ok') this._refreshChatComposer();
+      });
+    });
+  }
+
+  // The page is going. Unsaved words go to the server one last time (as a
+  // keepalive request, which outlives the page) and stay on the device in
+  // case they do not get there; a live recording is handed on; a send on the
+  // wire is marked for the next visit, which looks for it in the chat
+  // (_restoreLocal) — that it went out as a keepalive request is no proof it
+  // arrived: the browser finishes those, but not offline.
+  _leaving() {
+    if (this._recState === 'recording' && !this._recAborted) this._handOffRecording();
+    const out = this._sendingNow;
+    this._keepLocal(out ? { text: out.text, at: out.at, images: out.images.length } : null);
+    if (this._draft !== this._draftSaved && !this._undoing && this._id) {
+      try {
+        fetch(`/chats/${encodeURIComponent(this._id)}/draft`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: this._draft, version: this._draftVersion }),
+          keepalive: true,
+        }).catch(() => {});
+      } catch (_e) { /* the device copy stands */ }
+    }
+  }
+
+  // The mic is live as the page goes: what the recorder has handed over so
+  // far (it records in slices) goes to the service worker, and the
+  // transcript waits in this chat's draft — leaving acts as ✓.
+  _handOffRecording() {
+    const chunks = this._recChunks || [];
+    this._recAborted = true;
+    this._recChunks = [];
+    this._stopRecording();
+    this._stopStream();
+    if (!chunks.length || this._recTarget !== 'chat') return;
+    const type = (this._mediaRecorder && this._mediaRecorder.mimeType) || chunks[0].type || 'audio/webm';
+    handOff(this._localKey(), new Blob(chunks, { type }), '/conversations/transcribe');
+  }
+
   // ── Shared draft: debounced, version-guarded saves ─────────────────────────
   _scheduleDraftSave() {
     if (this._draftTimer) clearTimeout(this._draftTimer);
@@ -718,11 +898,13 @@ class RetinueChatPage extends HTMLElement {
         } else {
           this._draftSaved = server;
         }
+        this._keepLocal();
         return;
       }
       if (!res.ok) throw new Error(String(res.status));
       this._draftVersion = data.version || this._draftVersion;
       this._draftSaved = text;
+      this._keepLocal();
     } catch (_err) {
       // Offline: the draft stays local; the next edit (or blur) retries.
     }
@@ -1702,7 +1884,9 @@ class RetinueChatPage extends HTMLElement {
       if (isChat) {
         this._draft = input.value;
         // The shared draft follows the keystrokes, debounced — an agent (and
-        // another device) reads it from the chat state.
+        // another device) reads it from the chat state; until it is saved,
+        // the device holds it (_keepLocal).
+        this._keepLocal();
         this._scheduleDraftSave();
       } else {
         this._draft = input.value;
@@ -1821,7 +2005,9 @@ class RetinueChatPage extends HTMLElement {
         if (e.data && e.data.size) this._recChunks.push(e.data);
       });
       mr.addEventListener('stop', () => this._onRecordingStopped());
-      mr.start();
+      // In slices, so a page left with the mic live has the audio in hand
+      // (_handOffRecording).
+      mr.start(REC_SLICE_MS);
       this._recState = 'recording';
       this.render();
       this._wave.start(stream);
@@ -1890,15 +2076,10 @@ class RetinueChatPage extends HTMLElement {
     try {
       // Same endpoint and cleanup pass as the conversation composer. No
       // thread context is sent — chat ids are not conversation ids; the live
-      // chat API can add its own context parameter later.
-      const res = await fetch('/conversations/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': type || 'application/octet-stream' },
-        body: new Blob(chunks, { type }),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const data = await res.json();
-      const text = ((data && data.text) || '').trim();
+      // chat API can add its own context parameter later. The service worker
+      // runs it (dictation.js), so a page left meanwhile still gets the text
+      // into this chat's draft, for review.
+      const text = await transcribe(this._localKey(), new Blob(chunks, { type }), '/conversations/transcribe');
       if (text) {
         // Append to anything already typed — dictating into a staged agent
         // draft edits it exactly like typing (the marker stays until the
@@ -1906,12 +2087,17 @@ class RetinueChatPage extends HTMLElement {
         const cur = this._draft;
         const next = cur ? `${cur.replace(/\s*$/, '')} ${text}` : text;
         this._draft = next;
+        this._keepLocal();
         if (intent === 'send') toSend = next;
       } else {
         this._voiceErrors[target] = 'No speech was detected in the recording.';
       }
-    } catch (_err) {
-      this._voiceErrors[target] = "Couldn't transcribe the recording. Please try again.";
+    } catch (err) {
+      // Taken by another page while this one was frozen (dictation.js,
+      // 'elsewhere'): the text is in the shared draft by now, not an error.
+      if (!(err && err.message === 'elsewhere')) {
+        this._voiceErrors[target] = "Couldn't transcribe the recording. Please try again.";
+      }
     }
     delete this._voiceJobs[target];
     if (toSend) {
@@ -2091,6 +2277,7 @@ class RetinueChatPage extends HTMLElement {
         this._imgError = `Couldn't read "${file.name}".`;
       }
     }
+    this._keepImages();
     this._refreshChatComposer();
     // Back to the field to type the caption (the conversations composer's
     // behaviour after attaching).
@@ -2101,6 +2288,7 @@ class RetinueChatPage extends HTMLElement {
   _removeImage(index) {
     const [im] = this._outImages.splice(index, 1);
     if (im) { try { URL.revokeObjectURL(im.url); } catch (_e) { /* ignore */ } }
+    this._keepImages();
     this._imgError = '';
     this._refreshChatComposer();
   }
@@ -2189,6 +2377,15 @@ class RetinueChatPage extends HTMLElement {
     const images = this._outImages;
     this._outImages = [];
     this._imgError = '';
+    // Words alone go out as a keepalive request, which the browser finishes
+    // even if the page is left now (offline it fails like any other, so the
+    // next visit still looks for the message in the chat). Images make the
+    // request too large for that, so they stay kept on the device until it
+    // is answered (see _keepImages): a page left meanwhile finds them, and
+    // the words, on the next visit (_leaving, _restoreLocal).
+    const keepalive = !images.length && text.length * 3 <= KEEPALIVE_BYTES;
+    const sending = { text, at: new Date().toISOString(), keepalive, images };
+    this._sendingNow = sending;
     if (images.length) {
       const ta = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
       const hadFocus = !!ta && this.shadowRoot.activeElement === ta;
@@ -2236,6 +2433,7 @@ class RetinueChatPage extends HTMLElement {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
+        keepalive,
       });
       if (!res.ok) throw new Error(String(res.status));
       const msg = await res.json();
@@ -2267,6 +2465,7 @@ class RetinueChatPage extends HTMLElement {
       // this send; mirror both (the next draft save re-anchors its version
       // through the guard's one-shot retry).
       this._draftSaved = '';
+      this._keepLocal();
       this._postRead(msg.ts);
     } catch (_err) {
       // Not sent: take the bubble down, give words and images back to the
@@ -2284,16 +2483,21 @@ class RetinueChatPage extends HTMLElement {
       if (images.length) {
         this._outImages = images.concat(this._outImages);
         this._draft = text;
+        this._keepLocal();
         this._refreshChatComposer();
       } else {
         this._restoreComposer(text);
       }
       this._showNote("Couldn't send &mdash; check the connection and try again.");
+    } finally {
+      if (this._sendingNow === sending) this._sendingNow = null;
+      if (images.length) this._keepImages();
     }
   }
 
   _restoreComposer(text) {
     this._draft = text;
+    this._keepLocal();
     const form = this.shadowRoot.querySelector('[data-composer="chat"]');
     const input = form && form.querySelector('textarea');
     if (!input) return;
