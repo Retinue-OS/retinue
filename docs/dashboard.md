@@ -483,6 +483,20 @@ message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
 
+A file row has two links: its name opens the file (`?inline=1`, answered with
+`Content-Disposition: inline` for `_INLINE_SAFE_TYPES`), and ↓ saves a copy
+(`attachment`); a type the gateway does not serve inline gets the save link
+alone. Both URLs end in the file's own name —
+`…/attachments/<att-id>/<filename>` — a segment the route ignores (the
+header always carries the stored name). It is there for clients that name a
+saved file after the URL rather than the header: Android's
+`URLUtil.guessFileName` takes a name only from a bare
+`attachment; filename="…"` — neither `inline` nor the trailing `filename*`
+(RFC 6266, for non-ASCII names) gets through — and the shell, which named its
+downloads with it until it read the header itself, saved `<att-id>.pdf`.
+Inside the shell the two links stay distinct even though its WebView renders
+no PDF: see "Files" under "Inside the Android shell".
+
 Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
 AVIF — never SVG, which is script in the dashboard's origin) also **preview in
 the bubble**: a lazy-loaded `<img>` at its true aspect ratio, capped in width
@@ -809,6 +823,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
+| Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a file row's name link (`?inline=1`) — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
 "focus-existing"}`, so a second launch of the installed PWA brings its open
