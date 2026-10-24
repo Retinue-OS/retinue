@@ -180,9 +180,10 @@ async function dictNotify(rec) {
 
 // Transcribe job `rec` and store the outcome — unless the job was taken
 // meanwhile, or another run of it superseded this one. A new job is stored
-// first; a restart (`again`) goes on from the stored record, and is dropped
-// if that record has gone (taken) or finished meanwhile.
-async function dictRun(rec, again) {
+// first (and `onStored` told, so the page is acknowledged only for a job
+// that is safe here); a restart (`again`) goes on from the stored record,
+// and is dropped if that record has gone (taken) or finished meanwhile.
+async function dictRun(rec, again, onStored) {
   const token = Math.random().toString(36).slice(2);
   DICT_RUNNING.set(rec.id, token);
   const live = await dictUpdate(rec.id, (cur) => {
@@ -193,6 +194,7 @@ async function dictRun(rec, again) {
     if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
     return;
   }
+  if (onStored) onStored();
   let text = '';
   let error = '';
   const ctl = new AbortController();
@@ -212,22 +214,26 @@ async function dictRun(rec, again) {
   } finally {
     clearTimeout(timer);
   }
-  if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
   // The audio is spent once there is a transcript; a failed one is kept no
   // longer either — the note asks for the dictation again. The owner is
-  // whoever holds the job at this moment (an adopt may have moved it).
+  // whoever holds the job at this moment (an adopt may have moved it). The
+  // run counts as running until the outcome is stored, so no adopt in between
+  // starts it over.
   const done = await dictUpdate(rec.id, (cur) => (cur && cur.run === token
     ? { ...cur, state: 'done', text, error, blob: null } : null)).catch(() => null);
+  if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);
   if (done) await dictNotify(done);
 }
 
 async function dictStart(d, source) {
   const owner = d.orphan ? '' : ((source && source.id) || '');
-  if (source && !d.orphan) {
-    try { source.postMessage({ type: 'dictation-started', id: d.id }); } catch (_e) { /* ignore */ }
-  }
   const rec = { id: d.id, key: d.key, url: d.url, blob: d.blob, owner, state: 'running', at: Date.now() };
-  await dictRun(rec);
+  // Acknowledged once stored, not before: a page whose job could not be
+  // stored here (storage refused) hears nothing and transcribes it itself.
+  await dictRun(rec, false, () => {
+    if (!source || d.orphan) return;
+    try { source.postMessage({ type: 'dictation-started', id: d.id }); } catch (_e) { /* ignore */ }
+  });
 }
 
 async function dictAdopt(keys, asker, port) {

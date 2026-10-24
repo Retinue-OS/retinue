@@ -171,6 +171,13 @@ class RetinueProjectPage extends HTMLElement {
       this._onLeave = () => this._leaving();
       window.addEventListener('pagehide', this._onLeave);
     }
+    // Back from the back-forward cache: another page may have written the
+    // command bar's draft on the device meanwhile (a dictation of this page's
+    // taken there) — this page's copy is the older one.
+    if (!this._onShow) {
+      this._onShow = (e) => { if (e && e.persisted) this._refreshCmd(); };
+      window.addEventListener('pageshow', this._onShow);
+    }
     // Where "back" leads, as on the chat page: opened from inside the app (a
     // row on the home, the projects list) there is an entry to return to;
     // opened cold (a push, a bookmark) the home is the landing place.
@@ -212,6 +219,8 @@ class RetinueProjectPage extends HTMLElement {
   disconnectedCallback() {
     if (this._onLeave) window.removeEventListener('pagehide', this._onLeave);
     this._onLeave = null;
+    if (this._onShow) window.removeEventListener('pageshow', this._onShow);
+    this._onShow = null;
     if (this._shelfRelease) this._shelfRelease();
     this._shelfRelease = null;
     if (this._nav && this._onNavBack) this._nav.removeEventListener('retinue-back', this._onNavBack);
@@ -259,6 +268,15 @@ class RetinueProjectPage extends HTMLElement {
     saveDraft(this._cmdKey(), text.trim() ? { text } : null);
   }
 
+  // The command bar's draft as the device holds it now, into this page.
+  _refreshCmd() {
+    const kept = loadDraft(this._cmdKey());
+    const text = kept && typeof kept.text === 'string' ? kept.text : '';
+    if (text === this._cmd) return;
+    this._cmd = text;
+    if (this._mode === 'view') this.render();
+  }
+
   _keepEdit() {
     if (!this._id) return;
     const unsaved = this._mode === 'edit' && this._item && this._draft !== this._item.markdown;
@@ -294,8 +312,9 @@ class RetinueProjectPage extends HTMLElement {
         } else {
           this._cmdError = 'No speech was detected in the recording.';
         }
-      }, () => {
-        this._cmdError = "Couldn't transcribe the recording. Please try again.";
+      }, (err) => {
+        if (err && err.message === 'elsewhere') this._refreshCmd();
+        else this._cmdError = "Couldn't transcribe the recording. Please try again.";
       }).finally(() => {
         this._adopted -= 1;
         if (!this._adopted && this._voiceJob && this._voiceJob.adopted) this._voiceJob = null;
@@ -565,8 +584,11 @@ class RetinueProjectPage extends HTMLElement {
       } else {
         this._cmdError = 'No speech was detected in the recording.';
       }
-    } catch (_err) {
-      this._cmdError = "Couldn't transcribe the recording. Please try again.";
+    } catch (err) {
+      // Taken by another page while this one was frozen (dictation.js,
+      // 'elsewhere'): its text is in the bar's draft on the device.
+      if (err && err.message === 'elsewhere') this._refreshCmd();
+      else this._cmdError = "Couldn't transcribe the recording. Please try again.";
     }
     if (toSend) {
       // Send path: the status row stays in place of the text field until the

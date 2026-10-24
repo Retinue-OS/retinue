@@ -178,8 +178,11 @@ const KEEPALIVE_BYTES = 32 * 1024;
 // the mic live has all but the last fraction of a second to hand the worker.
 const REC_SLICE_MS = 250;
 // How long a turn left on the wire by an earlier page is given to arrive
-// before the thread is read for it a second time (settleLeftSend).
+// before the thread is read for it a second time (settleLeftSend), and how
+// far a stored timestamp may trail the server's clock when such a turn is
+// looked for by when it was sent.
 const LEFT_SEND_RECHECK_MS = 2500;
+const CLOCK_SKEW_MS = 60 * 1000;
 // Where the read-aloud player remembers how far it got (see savePosition):
 // leaving the page kills the browser's speech, and this is what lets the
 // thread offer to carry on from that passage instead of from the top.
@@ -198,13 +201,18 @@ const INLINE_SAFE_TYPES = new Set([
 const IMG_PREVIEW_MAX_W = 360;
 const IMG_PREVIEW_MAX_H = 420;
 // The draft key of a composer that has no thread yet: one per context, so a
-// plain composer and each project's composer keep their own text, files,
+// plain composer, each project's composer and each host-minted composer (a
+// chat's companion, keyed by its `create-url`) keep their own text, files,
 // model choice and dictation — the text typed towards a plain new thread
 // follows the user to the next plain composer, and a dictation for one
-// project can never send or clear what was typed towards another.
+// project or one chat can never send or clear what was typed towards
+// another. Drafts are kept on the device under these keys, so two surfaces
+// that share one would share one box across pages.
 const NEW_KEY = 'new';
-function newKey(seed) {
-  return seed && seed.project ? `${NEW_KEY}:${seed.project}` : NEW_KEY;
+function newKey(seed, createUrl) {
+  if (seed && seed.project) return `${NEW_KEY}:${seed.project}`;
+  if (createUrl) return `${NEW_KEY}:@${createUrl}`;
+  return NEW_KEY;
 }
 function isNewKey(key) {
   return key === NEW_KEY || String(key).startsWith(`${NEW_KEY}:`);
@@ -364,6 +372,13 @@ addEventListener('pagehide', () => {
   for (const key of DRAFTS.keys()) keepDraft(key);
   for (const el of MIC_HOLDS) el._handOffRecording();
 });
+// Back from the back-forward cache: while this page was frozen another page
+// may have written these drafts on the device (a dictation of this page's
+// taken there, the words sent from there) — what it holds in memory is the
+// older copy, and must not be written back over the newer one.
+addEventListener('pageshow', (e) => {
+  if (e && e.persisted) for (const key of DRAFTS.keys()) refreshDraft(key);
+});
 
 // The offered model list, fetched once and shared. A failure (or a
 // single-model list) simply leaves every picker hidden.
@@ -392,10 +407,24 @@ function draftOf(key) {
     const kept = loadDraft(storeKey(key)) || {};
     d = { text: String(kept.text || ''), files: [], model: String(kept.model || '') };
     DRAFTS.set(key, d);
-    restoreFiles(key, d);
+    d.filesReady = restoreFiles(key, d);
     if (kept.sending && kept.sending.text) settleLeftSend(key, d, kept.sending);
   }
   return d;
+}
+
+// The draft under `key` as the device holds it now, into this page's copy:
+// another page wrote it meanwhile (see pageshow above, and 'elsewhere' in
+// dictation.js). Only the text: files are not written by a dictation.
+function refreshDraft(key) {
+  const d = DRAFTS.get(key);
+  if (!d) return;
+  const kept = loadDraft(storeKey(key));
+  const text = kept ? String(kept.text || '') : '';
+  if (text === d.text) return;
+  d.text = text;
+  const el = LIVE.get(key);
+  if (el && el.isConnected) el.render();
 }
 
 function storeKey(key) { return `conv:${key}`; }
@@ -422,10 +451,14 @@ function keepDraft(key) {
   const d = DRAFTS.get(key);
   if (!d) return;
   const out = SENDS.get(key) || (VOICE_JOBS.get(key) && VOICE_JOBS.get(key).out) || null;
+  // A turn an earlier page left that could not be settled yet (settleLeftSend)
+  // keeps its mark while its words are still in the box.
+  const left = d.leftSend && d.text.startsWith(String(d.leftSend.text || '').replace(/\s*$/, '')) ? d.leftSend : null;
   const sending = out && out.posted && out.fromDraft
     ? { text: out.text, files: out.files.map((f) => f.name), target: out.target || '',
-        before: Number.isFinite(out.before) ? out.before : -1, keepalive: !!out.keepalive }
-    : null;
+        before: Number.isFinite(out.before) ? out.before : -1, keepalive: !!out.keepalive,
+        at: out.at || '', project: out.project || '' }
+    : left;
   const has = (d.text && d.text.trim()) || d.model || sending;
   saveDraft(storeKey(key), has ? { text: d.text, model: d.model, sending } : null);
 }
@@ -438,7 +471,7 @@ function keepFiles(key) {
 // The attachments kept for this draft, put back in front of anything picked
 // since the page opened.
 function restoreFiles(key, d) {
-  loadFiles(storeKey(key)).then((files) => {
+  return loadFiles(storeKey(key)).then((files) => {
     if (!files.length) return;
     const have = new Set(d.files);
     d.files = files.filter((f) => f && !have.has(f)).concat(d.files);
@@ -451,32 +484,41 @@ function restoreFiles(key, d) {
 
 // A turn an earlier page sent from this draft and left before it was
 // answered. Its words stayed in the draft; whether they went is read off the
-// thread — holding them more often than before the send, it got them — while
-// the composer stays locked, as for any send on the wire. A keepalive request
-// may still be on its way when the next page reads, so one not found yet is
-// looked for once more a moment later. A first message has no thread to
-// read: one that went out as a keepalive request (no attachments) is taken
-// as delivered, the browser finishes those; one that did not stays in the
-// box, with a note that it may have gone all the same.
+// thread while the composer stays locked, as for any send on the wire: the
+// thread holds the words more often than before the send, or — when that
+// count could not be taken at send time (offline then) — holds them in a
+// turn from the moment of the send on. A keepalive request may still be on
+// its way when the next page reads, so one not found yet is looked for once
+// more a moment later. A first message has no thread to read: the thread it
+// opened, if it did, is looked for among those the user opened from the
+// moment of the send on. That the request went out as a keepalive one is
+// never taken for delivery: the browser finishes those, but not offline.
+// Not found, the words stay in the box with a note; not knowable (the
+// server unreachable now), with a note that says so — and the mark stays,
+// so the next visit looks again.
 async function settleLeftSend(key, d, s) {
   const text = String(s.text || '');
   const lock = { text, files: [], fromDraft: true, posted: false };
   SENDS.set(key, lock);
   let went = null;
   try {
-    if (s.target && s.before >= 0) {
+    // The kept attachments must be in hand before the sent ones can be told
+    // apart from them below.
+    await d.filesReady;
+    if (s.target) {
       for (let tries = s.keepalive ? 2 : 1; tries > 0 && !went; tries -= 1) {
         if (went === false) await new Promise((r) => setTimeout(r, LEFT_SEND_RECHECK_MS));
         const t = await readThread(s.target);
-        if (t) went = sameTurns(t, text) > s.before;
+        if (t) went = s.before >= 0 ? sameTurns(t, text) > s.before : hasTurnSince(t, text, s.at);
       }
-    } else if (s.keepalive) {
-      went = true;
+    } else {
+      went = await openedThreadSince(text, s.at, s.project);
     }
   } finally {
     if (SENDS.get(key) === lock) SENDS.delete(key);
   }
   const k = keyOf(d) || key;
+  d.leftSend = went === null ? s : null;
   if (went) {
     const names = Array.isArray(s.files) ? s.files : [];
     clearSent(d, text, d.files.filter((f) => names.includes(f.name)));
@@ -489,6 +531,40 @@ async function settleLeftSend(key, d, s) {
   keepDraft(k);
   const el = LIVE.get(k);
   if (el) el.render();
+}
+
+// Whether thread document `t` holds a turn of the user's with exactly `text`
+// (trimmed, as the gateway stores it) from `at` on, less the clock skew; with
+// no usable `at`, whether it holds one at all.
+function hasTurnSince(t, text, at) {
+  const want = String(text || '').trim();
+  const since = Date.parse(at || '') - CLOCK_SKEW_MS;
+  return ((t && t.messages) || []).some((m) => m.role === 'user' && String(m.text || '').trim() === want &&
+    (!Number.isFinite(since) || Date.parse(m.ts || '') >= since));
+}
+
+// A first message sent from a composer: did it open a thread? The threads the
+// user opened from `at` on (less the skew) for the same project are read and
+// looked through for the turn. True/false when the list could be read, null
+// when it could not — or when there is no time to go by.
+async function openedThreadSince(text, at, project) {
+  const since = Date.parse(at || '') - CLOCK_SKEW_MS;
+  if (!Number.isFinite(since)) return null;
+  let list = null;
+  try {
+    list = await within(REQUEST_TIMEOUT_MS, async (signal) => {
+      const res = await fetch(LIST_URL, { cache: 'no-store', signal });
+      return res.ok ? res.json() : null;
+    });
+  } catch (_e) { return null; }
+  if (!list || !Array.isArray(list.conversations)) return null;
+  const opened = list.conversations.filter((c) => c && c.id && (c.initiator || 'user') === 'user' &&
+    String(c.project || '') === String(project || '') && Date.parse(c.created || '') >= since);
+  for (const c of opened) {
+    const t = await readThread(c.id);
+    if (t && hasTurnSince(t, text, at)) return true;
+  }
+  return false;
 }
 
 // A chip's prefill or a dictation APPENDS to what is there: it augments the
@@ -544,8 +620,9 @@ function adoptDictations(key) {
     job.then((text) => {
       if (text) { appendToDraft(key, text); VOICE_ERRORS.delete(key); }
       else VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
-    }, () => {
-      VOICE_ERRORS.set(key, "Couldn't transcribe the recording. Please try again.");
+    }, (err) => {
+      if (err && err.message === 'elsewhere') refreshDraft(key);
+      else VOICE_ERRORS.set(key, "Couldn't transcribe the recording. Please try again.");
     }).finally(() => {
       const n = (ADOPTED.get(key) || 1) - 1;
       if (n > 0) ADOPTED.set(key, n); else ADOPTED.delete(key);
@@ -1241,7 +1318,7 @@ class RetinueConversation extends HTMLElement {
     return !!((d.text && d.text.trim()) || d.files.length);
   }
 
-  _key() { return this._id || newKey(this._seed()); }
+  _key() { return this._id || newKey(this._seed(), this.getAttribute('create-url')); }
   // Locked while this conversation's send or archive is on the wire —
   // whichever element instance started it, as both are tracked by key.
   get _busy() { return SENDS.has(this._key()) || ARCHIVES.has(this._key()); }
@@ -1971,10 +2048,11 @@ class RetinueConversation extends HTMLElement {
       // On the wire from here: should the page be left before the answer, the
       // draft is written with this turn marked (keepDraft), and the next page
       // settles it against the thread.
-      Object.assign(sent, { posted: true, target, before: base });
+      Object.assign(sent, { posted: true, target, before: base, at: new Date().toISOString(), project: this._seed().project });
       const conv = await sendMessage(target, text, sent.files, this._seed(), this._newModel, sent)
         .catch((err) => arrivedAnyway(err, target, text, base));
       delivered = true;
+      d.leftSend = null;  // whatever an earlier page left, this send is the one that went
       if (fromDraft) clearSent(d, text, sent.files);
       this._attachError = '';
       VOICE_ERRORS.delete(key); // a failed dictation's note, moot once a send went out
@@ -2018,6 +2096,10 @@ class RetinueConversation extends HTMLElement {
       if (kept && kept !== this) kept._contDisengage();
     } finally {
       SENDS.delete(key);
+      // The draft was written while the turn was on the wire, marked as such
+      // (keepDraft): written again now that it is over, or a page killed
+      // before the next keystroke would settle a turn that is not on any wire.
+      keepDraft(key);
       // Unlock, render and poll where the send landed — or, when it did not
       // go out, wherever the kept draft shows now (see _liveFor). A detached
       // or re-pointed instance is left alone: this send is no longer its
@@ -2382,8 +2464,11 @@ class RetinueConversation extends HTMLElement {
       } else {
         VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
       }
-    } catch (_err) {
-      VOICE_ERRORS.set(key, "Couldn't transcribe the recording. Please try again.");
+    } catch (err) {
+      // Taken by another page while this one was frozen (dictation.js,
+      // 'elsewhere'): its text is in the draft on the device, not an error.
+      if (err && err.message === 'elsewhere') refreshDraft(key);
+      else VOICE_ERRORS.set(key, "Couldn't transcribe the recording. Please try again.");
     }
     // The element this job reports into is whatever is live under its key —
     // except a composer that adopts the thread its dictation just opened: it
@@ -2429,11 +2514,13 @@ class RetinueConversation extends HTMLElement {
           // before the dictation is kept, or a retry would run it twice.
           const before = await turnsBefore(target, toSend);
           // …and a page left while it is on the wire marks it in the draft.
-          const out = { text: toSend, files: sentFiles, fromDraft: true, posted: true, target, before };
+          const out = { text: toSend, files: sentFiles, fromDraft: true, posted: true, target, before,
+            at: new Date().toISOString(), project: (seed && seed.project) || '' };
           if (VOICE_JOBS.get(key)) VOICE_JOBS.get(key).out = out;
           const conv = await sendMessage(target, toSend, sentFiles, seed, model, out)
             .catch((err) => arrivedAnyway(err, target, toSend, before))
             .catch((err) => { VOICE_ERRORS.set(key, sendFailureNote(err)); throw err; });
+          draftOf(key).leftSend = null;
           clearSent(draftOf(key), toSend, sentFiles);
           const now = live();
           if (isNewKey(key)) {
@@ -2449,6 +2536,7 @@ class RetinueConversation extends HTMLElement {
       }
     }
     VOICE_JOBS.delete(key);
+    keepDraft(key);  // as after _send: no turn of this job's is on the wire now
     const el = adopted || live();
     // The loop's take did not get through (nothing heard, a failed
     // transcription or send): the loop stops on the note in the composer.

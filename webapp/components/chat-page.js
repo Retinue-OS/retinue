@@ -796,8 +796,10 @@ class RetinueChatPage extends HTMLElement {
         } else {
           this._voiceErrors.chat = 'No speech was detected in the recording.';
         }
-      }, () => {
-        this._voiceErrors.chat = "Couldn't transcribe the recording. Please try again.";
+      }, (err) => {
+        if (!(err && err.message === 'elsewhere')) {
+          this._voiceErrors.chat = "Couldn't transcribe the recording. Please try again.";
+        }
       }).finally(() => {
         this._adopted -= 1;
         if (!this._adopted && this._voiceJobs.chat && this._voiceJobs.chat.adopted) delete this._voiceJobs.chat;
@@ -808,12 +810,14 @@ class RetinueChatPage extends HTMLElement {
 
   // The page is going. Unsaved words go to the server one last time (as a
   // keepalive request, which outlives the page) and stay on the device in
-  // case they do not get there; a live recording is handed on; a send with
-  // images on the wire is marked for the next visit (_restoreLocal).
+  // case they do not get there; a live recording is handed on; a send on the
+  // wire is marked for the next visit, which looks for it in the chat
+  // (_restoreLocal) — that it went out as a keepalive request is no proof it
+  // arrived: the browser finishes those, but not offline.
   _leaving() {
     if (this._recState === 'recording' && !this._recAborted) this._handOffRecording();
     const out = this._sendingNow;
-    this._keepLocal(out && !out.keepalive ? { text: out.text, at: out.at, images: out.images.length } : null);
+    this._keepLocal(out ? { text: out.text, at: out.at, images: out.images.length } : null);
     if (this._draft !== this._draftSaved && !this._undoing && this._id) {
       try {
         fetch(`/chats/${encodeURIComponent(this._id)}/draft`, {
@@ -2088,8 +2092,12 @@ class RetinueChatPage extends HTMLElement {
       } else {
         this._voiceErrors[target] = 'No speech was detected in the recording.';
       }
-    } catch (_err) {
-      this._voiceErrors[target] = "Couldn't transcribe the recording. Please try again.";
+    } catch (err) {
+      // Taken by another page while this one was frozen (dictation.js,
+      // 'elsewhere'): the text is in the shared draft by now, not an error.
+      if (!(err && err.message === 'elsewhere')) {
+        this._voiceErrors[target] = "Couldn't transcribe the recording. Please try again.";
+      }
     }
     delete this._voiceJobs[target];
     if (toSend) {
@@ -2370,10 +2378,11 @@ class RetinueChatPage extends HTMLElement {
     this._outImages = [];
     this._imgError = '';
     // Words alone go out as a keepalive request, which the browser finishes
-    // even if the page is left now. Images make the request too large for
-    // that, so they stay kept on the device until it is answered (see
-    // _keepImages): a page left meanwhile finds them, and the words, on the
-    // next visit (_leaving, _restoreLocal).
+    // even if the page is left now (offline it fails like any other, so the
+    // next visit still looks for the message in the chat). Images make the
+    // request too large for that, so they stay kept on the device until it
+    // is answered (see _keepImages): a page left meanwhile finds them, and
+    // the words, on the next visit (_leaving, _restoreLocal).
     const keepalive = !images.length && text.length * 3 <= KEEPALIVE_BYTES;
     const sending = { text, at: new Date().toISOString(), keepalive, images };
     this._sendingNow = sending;

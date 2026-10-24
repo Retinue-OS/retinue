@@ -26,6 +26,12 @@
 //                               back-forward cache, a worker restarted under
 //                               a running job) arrive the same way.
 //
+// A promise rejects with Error('elsewhere') when the job is gone from the
+// worker without this page having taken it: the page was frozen (the
+// back-forward cache) and another page showing the place took the text into
+// the draft on the device meanwhile. Not a failure — the host re-reads that
+// draft instead of showing an error.
+//
 // A job belongs to one live page at a time (the worker records the client
 // that owns it), so two tabs on the same place never both take one
 // transcript; a page that goes releases what it owns. Without a controlling
@@ -40,8 +46,10 @@ const GIVE_UP_MS = 5 * 60 * 1000;
 // charge while a new one installs) leaves it to the page.
 const ACK_MS = 4000;
 // A recording handed off by the page just left may reach the worker after
-// the next page's first ask for its place: that page asks once more.
+// the next page's first ask for its place: that page asks once more. An ask
+// the worker did not answer (a cold start on a slow phone) is made again.
 const ADOPT_RECHECK_MS = 2000;
+const ADOPT_RETRY_MS = 5000;
 
 const WAITING = new Map();   // job id -> {key, resolve, reject, timer, acked}
 // Jobs settled here: a resync answered before the worker heard they were
@@ -153,22 +161,25 @@ function stopResync() {
 // whose page is gone, restarts any it was running when it was stopped, and
 // answers with every job of theirs this page now owns — finished ones with
 // their text. A message lost on the way (a worker stopped between storing a
-// result and posting it) is made good the same way.
+// result and posting it) is made good the same way. Resolves to null when
+// there was no answer (no worker, or none within the deadline) — which says
+// nothing about the jobs.
 function ask(keys) {
   const c = sw();
-  if (!c || !keys.length) return Promise.resolve([]);
+  if (!c) return Promise.resolve(null);
+  if (!keys.length) return Promise.resolve([]);
   return new Promise((resolve) => {
     const ch = new MessageChannel();
-    const timer = setTimeout(() => resolve([]), 5000);
+    const timer = setTimeout(() => resolve(null), 5000);
     ch.port1.onmessage = (e) => {
       clearTimeout(timer);
-      resolve(Array.isArray(e.data && e.data.jobs) ? e.data.jobs : []);
+      resolve(Array.isArray(e.data && e.data.jobs) ? e.data.jobs : null);
     };
     try {
       c.controller.postMessage({ type: 'dictation-adopt', keys }, [ch.port2]);
     } catch (_e) {
       clearTimeout(timer);
-      resolve([]);
+      resolve(null);
     }
   });
 }
@@ -177,7 +188,18 @@ async function resync() {
   const keys = new Set(ADOPTERS.keys());
   for (const w of WAITING.values()) keys.add(w.key);
   const jobs = await ask([...keys]);
+  if (!jobs) return;
   for (const job of jobs) take(job);
+  // A job this page waits on that the worker no longer lists under its place
+  // is gone: taken by another page while this one was frozen, or expired. Only
+  // one the worker is known to have had (acknowledged, or handed over by it) —
+  // one just posted may not be stored yet, and has the ACK timer.
+  const listed = new Set(jobs.map((j) => j.id));
+  for (const [id, w] of [...WAITING]) {
+    if (!w.acked || !keys.has(w.key) || listed.has(id)) continue;
+    const gone = drop(id);
+    if (gone) { SETTLED.add(id); gone.reject(new Error('elsewhere')); }
+  }
 }
 
 // A job the worker says this page owns: one already waited on settles when it
@@ -188,6 +210,7 @@ function take(job) {
     const onJob = ADOPTERS.get(job.key);
     if (!onJob) return;
     const p = wait(job.id, job.key);
+    WAITING.get(job.id).acked = true;  // the worker has it: it said so
     try { onJob(p); } catch (_e) { /* the host's problem; the job still settles */ }
   }
   if (job.state === 'done') settle(job.id, job.text, job.error);
@@ -241,7 +264,11 @@ export function adopt(key, onJob) {
   ADOPTERS.set(key, onJob);
   if (!sw()) { whenControlled(); return; }
   listen();
-  const look = () => ask([key]).then((jobs) => jobs.forEach(take));
-  look();
-  setTimeout(() => { if (ADOPTERS.get(key) === onJob && sw()) look(); }, ADOPT_RECHECK_MS);
+  const mine = () => ADOPTERS.get(key) === onJob && sw();
+  const look = (retries) => ask([key]).then((jobs) => {
+    if (jobs) jobs.forEach(take);
+    else if (retries > 0) setTimeout(() => { if (mine()) look(retries - 1); }, ADOPT_RETRY_MS);
+  });
+  look(2);
+  setTimeout(() => { if (mine()) look(0); }, ADOPT_RECHECK_MS);
 }

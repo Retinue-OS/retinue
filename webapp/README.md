@@ -569,14 +569,17 @@ load of this device and browser:
   the page's own fetch, as before.
 - **Sends on the wire.** A turn small enough (all text-only turns in
   practice) goes out as a `keepalive` request, which the browser finishes even
-  when the page is left meanwhile. A conversation turn still on the wire as
-  the page goes is written into its draft, marked, and settled when the thread
-  is next shown: dropped from the box once the thread holds it (read twice, a
-  moment apart, as a keepalive request may still be landing), left in it with
-  a note when it does not. A chat message carrying images is too large for a
-  keepalive request; its words and images go back in the box on the next
-  visit unless the chat shows it sent. A project command is taken as
-  delivered.
+  when the page is left meanwhile — but not offline, so that is never taken
+  for delivery. A conversation turn still on the wire as the page goes is
+  written into its draft, marked with when and where it went, and settled when
+  the composer is next shown: dropped from the box once the thread holds it
+  (read twice, a moment apart, as a keepalive request may still be landing),
+  left in it with a note when it does not; when the server cannot be asked at
+  all, the note hedges and the mark stays for the next visit to look again.
+  A first message, which has no thread to read, is looked for in the threads
+  the user opened from that moment on. A chat message is looked for in the chat's own mirror on the
+  next visit; one carrying images is too large for a keepalive request and is
+  the likelier to need it. A project command is taken as delivered.
 
 The page-side guard that held a tab or a Home press on such a page is gone,
 and with it the note that popped up at the bottom of the screen asking for a

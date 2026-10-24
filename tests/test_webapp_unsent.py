@@ -25,7 +25,13 @@ pages of one device — one localStorage, one IndexedDB, one service worker
   page's own fetch, and the job never comes back twice;
 - a send still on the wire when the page goes is a keepalive request, kept
   in the draft and settled on the next page: dropped once the thread holds
-  it, left in the box with a note when it does not;
+  it, left in the box with a note when it does not — a first message, which
+  has no thread to read, by the thread it opened; keepalive alone is never
+  taken for delivery; a send that completed leaves no marker behind;
+- a composer with no thread keeps its own draft per host (a chat's companion
+  never shows the home composer's words);
+- a page frozen in the back-forward cache whose dictation another page took
+  meanwhile settles that job as taken elsewhere and shows the device's draft;
 - a project's command bar and an unsaved edit of its file come back, the edit
   over the version it was started from, so a save still detects a conflict.
 
@@ -176,6 +182,9 @@ function leave(p) {
   p.alive = false;
   clients.delete(p.client.id);
 }
+// Into the back-forward cache (pagehide, the page kept), and back out of it.
+function freeze(p) { page(p.name); p.win.fire('pagehide', { persisted: true }); }
+function thaw(p) { page(p.name); p.win.fire('pageshow', { persisted: true }); }
 Object.defineProperty(globalThis, 'navigator', { get: () => cur.navigator, configurable: true });
 globalThis.addEventListener = (t, f) => cur.win.on(t, f);
 globalThis.removeEventListener = (t, f) => cur.win.off(t, f);
@@ -241,9 +250,9 @@ async function within(ms, cond, what) {
 
 // ── The gateway, as the pages see it ─────────────────────────────────────────
 const A = 'a'.repeat(32), B = 'b'.repeat(32), C = 'c'.repeat(32), D = 'd'.repeat(32), E = 'e'.repeat(32);
-const F = 'f'.repeat(32), G = '0'.repeat(32), H = '1'.repeat(32);
+const F = 'f'.repeat(32), G = '0'.repeat(32), H = '1'.repeat(32), L = '2'.repeat(32), M = '3'.repeat(32), N = '4'.repeat(32);
 const threads = {};
-for (const id of [A, B, C, D, E, F, G, H]) {
+for (const id of [A, B, C, D, E, F, G, H, L, M, N]) {
   threads[id] = { id, title: 'T', pending: false, model: '', messages: [
     { role: 'user', text: 'Earlier', ts: '2026-10-16T15:40:00Z' },
     { role: 'assistant', text: 'Answer', ts: '2026-10-16T15:41:00Z' },
@@ -251,6 +260,8 @@ for (const id of [A, B, C, D, E, F, G, H]) {
 }
 const posts = [];
 let land = false;
+let resolveSends = false;   // a reply POST answers with the thread (else it hangs)
+let listed = [];            // GET /conversations
 const pageTranscribes = [];
 const never = () => new Promise(() => {});
 const answer = (body, status = 200) => Promise.resolve({ ok: status < 300, status, json: async () => JSON.parse(JSON.stringify(body)) });
@@ -265,8 +276,10 @@ globalThis.fetch = (url, opts = {}) => {
     const body = JSON.parse(opts.body);
     posts.push({ url, body, keepalive: !!opts.keepalive });
     if (land) threads[reply[1]].messages.push({ role: 'user', text: body.message.trim(), ts: new Date().toISOString() });
-    return never();
+    return resolveSends ? answer(threads[reply[1]]) : never();
   }
+  if (url === '/conversations' && method === 'POST') { posts.push({ url, body: JSON.parse(opts.body), keepalive: !!opts.keepalive }); return never(); }
+  if (url === '/conversations' && method === 'GET') return listed ? answer({ conversations: listed }) : answer({}, 502);
   if (url.startsWith('/conversations/transcribe')) { pageTranscribes.push(url); return answer({ text: 'Vom Seitenabruf.' }); }
   if (url === '/conversation-models') return answer({ models: [] });
   if (url.startsWith('/projects/item') && method === 'GET') return answer(project);
@@ -324,6 +337,15 @@ async function mount(p, id) {
   el._attrs.set('no-autofocus', '');
   el.connectedCallback();
   await until(() => el.thread, 'the thread is read');
+  return el;
+}
+// A composer with no thread yet: plain, or a host's (create-url).
+function mountNew(p, attrs = {}) {
+  page(p.name);
+  const el = new (customElements.get('retinue-conversation'))();
+  el._attrs.set('no-autofocus', '');
+  for (const [k, v] of Object.entries(attrs)) el._attrs.set(k, v);
+  el.connectedCallback();
   return el;
 }
 // What the composer's box holds, or null while a job owns the row.
@@ -497,6 +519,122 @@ await ok('a worker that does not take a job up leaves it to the page, once', asy
   }
 });
 
+await ok('a composer with no thread keeps its own draft per host', async () => {
+  const home = mountNew(page('two'));
+  home.fill('Für die Startseite');
+  const companion = mountNew(page('two'), { 'create-url': '/chats/x/companion' });
+  assert.equal(companion._key(), 'new:@/chats/x/companion', 'keyed by the thread it would mint');
+  assert.equal(draftText(companion), '', "the home composer's words are not in a chat's companion");
+  companion.fill('Für den Chat');
+  assert.equal(draftText(home), 'Für die Startseite', 'nor the other way round');
+  assert.equal(stored('conv:new').text, 'Für die Startseite');
+  assert.equal(stored('conv:new:@/chats/x/companion').text, 'Für den Chat');
+  home.disconnectedCallback();
+  companion.disconnectedCallback();
+  // Cleared for the next check, which opens a plain composer of its own.
+  one.drafts.saveDraft('conv:new', null);
+  one.drafts.saveDraft('conv:new:@/chats/x/companion', null);
+});
+
+await ok('a first message left on the wire is looked for by the thread it opened, never assumed sent', async () => {
+  page('six');
+  await import('./six/conversation.js');
+  const c6 = mountNew(page('six'));
+  c6.fill('Erste Nachricht');
+  c6._send('Erste Nachricht');
+  await until(() => posts.some((p) => p.url === '/conversations'), 'the first message is on the wire');
+  assert.ok(posts.at(-1).keepalive, 'as a keepalive request');
+  leave(pages.six);
+  const kept = stored('conv:new');
+  assert.ok(kept.sending && kept.sending.keepalive && !kept.sending.target && kept.sending.at, 'marked, with when');
+  // The server cannot be asked (offline): the words stay, the note hedges,
+  // and the mark stays for the next visit to look again.
+  listed = null;
+  page('seven');
+  await import('./seven/conversation.js');
+  const c7 = mountNew(page('seven'));
+  await until(() => !c7._busy, 'settled');
+  assert.equal(draftText(c7), 'Erste Nachricht', 'still in the box');
+  assert.ok(c7.shadowRoot.innerHTML.includes('if it turns up in the thread'), 'with the hedged note');
+  assert.ok(stored('conv:new').sending, 'the mark stays');
+  leave(pages.seven);
+  // Next visit, online: the thread it opened is there, created after the send.
+  threads[M].messages.push({ role: 'user', text: 'Erste Nachricht', ts: new Date().toISOString() });
+  listed = [{ id: N, initiator: 'user', project: null, created: new Date(Date.now() - 3600 * 1000).toISOString() },
+            { id: M, initiator: 'user', project: null, created: new Date().toISOString() }];
+  page('eight');
+  await import('./eight/conversation.js');
+  const c8 = mountNew(page('eight'));
+  await until(() => !c8._busy, 'settled');
+  assert.equal(draftText(c8), '', 'found: nothing left to send twice');
+  assert.ok(!stored('conv:new') || !stored('conv:new').sending, 'and the mark is gone');
+  c8.disconnectedCallback();
+  listed = [];
+});
+
+await ok('a left send that was checked and not found is not checked again', async () => {
+  // Page seven's composer above holds the words with the mark; a visit that
+  // CAN ask and finds nothing drops the mark — the words stay, once.
+  page('ten');
+  await import('./ten/conversation.js');
+  const c10 = mountNew(page('ten'));
+  c10.fill('Zweite Nachricht');
+  const before = posts.length;
+  c10._send('Zweite Nachricht');
+  await until(() => posts.length === before + 1 && posts.at(-1).url === '/conversations', 'on the wire');
+  leave(pages.ten);
+  listed = [];
+  page('eleven');
+  await import('./eleven/conversation.js');
+  const c11 = mountNew(page('eleven'));
+  await until(() => !c11._busy, 'settled');
+  assert.equal(draftText(c11), 'Zweite Nachricht', 'in the box');
+  assert.ok(c11.shadowRoot.innerHTML.includes('before this message went out'), 'checked: not found');
+  assert.ok(!stored('conv:new').sending, 'no mark left to check again');
+  c11.disconnectedCallback();
+});
+
+await ok('a send that completed leaves no marker behind', async () => {
+  resolveSends = true;
+  const el = await mount(page('two'), L);
+  el.fill('Fertig gesendet');
+  await el._send('Fertig gesendet');
+  assert.equal(draftText(el), '');
+  const kept = stored(`conv:${L}`);
+  assert.ok(!kept || !kept.sending, 'a page killed now would not settle a turn that is on no wire');
+  resolveSends = false;
+  el.disconnectedCallback();
+});
+
+await ok('frozen in the back-forward cache, a page whose dictation another page took shows that text', async () => {
+  page('nine');
+  await import('./nine/conversation.js');
+  const k9 = await mount(page('nine'), N);
+  k9._recChunks = [new Blob(['audio'], { type: 'audio/webm' })];
+  k9._mediaRecorder = { mimeType: 'audio/webm' };
+  k9._recIntent = 'review';
+  const n = swFetches.length;
+  const job = k9._onRecordingStopped(N, null, '', null);
+  await until(() => swFetches.length === n + 1, 'the worker transcribes');
+  freeze(pages.nine);
+  // Its jobs are released as it goes (a navigation takes far longer than
+  // the worker needs to hear that). Meanwhile another page shows the thread
+  // and takes the transcript.
+  await until(() => jobs().some((j) => j.key === `conv:${N}` && j.owner === ''), 'released');
+  const k2 = await mount(page('two'), N);
+  await until(() => k2.shadowRoot.innerHTML.includes('Transcribing'), 'the other page owns the job now');
+  swFetches[n].answer('Aus dem Eis.');
+  await until(() => draftText(k2) === 'Aus dem Eis.', 'its text landed there');
+  await until(() => !jobs().some((j) => j.key === `conv:${N}`), 'and the worker forgot it');
+  // The frozen page comes back: its job is gone, its draft is the device's.
+  thaw(pages.nine);
+  await job;
+  await until(() => draftText(k9) === 'Aus dem Eis.', 'the frozen page shows the text, not an error');
+  assert.ok(!k9.shadowRoot.innerHTML.includes("Couldn't transcribe"), 'no error');
+  k2.disconnectedCallback();
+  k9.disconnectedCallback();
+});
+
 await ok("a project's command bar and its unsaved edit come back; the edit keeps its base", async () => {
   project = { id: 'urn:p', title: 'P', path: 'p.md', markdown: '---\ntitle: P\n---\nBody\n', sha256: 'v1' };
   page('two');
@@ -540,7 +678,7 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         # One copy of the components per page: separate module instances, as
         # two page loads have, over the one device the harness provides.
-        for page in ("one", "two", "three", "four", "five"):
+        for page in ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven"):
             dst = os.path.join(tmp, page)
             os.makedirs(dst)
             for name in os.listdir(COMPONENTS):
