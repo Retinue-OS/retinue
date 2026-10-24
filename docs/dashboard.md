@@ -479,8 +479,10 @@ of `.claude/agents/*.md`, or of a chamber plugin's `agents/*.md`), and those
 files are baked into the image. **Settings › Agent models** is the knob over
 them: one dropdown per dispatchable agent, offering the same list as the
 thread picker (`GET /conversation-models`, so an Ollama tag the picker shows
-is offered here too), with "Built-in" as the first entry. The card is
-server-side state shared by every device, not a per-device preference.
+is offered here too), with "Built-in" as the first entry and, where
+`RETINUE_AGENT_MODELS` sets one for the agent, "Deployment default" second.
+The card is server-side state shared by every device, not a per-device
+preference.
 
 Mechanism (`scripts/agent_models.py`): Claude Code's `--agents <file>` flag
 defines agents for one session and takes precedence over the same name from
@@ -491,26 +493,51 @@ untouched. Every framework spawner (`web-gateway.py`, `scheduler.py`, the
 base-job scripts, the MCP connector) appends `agent_models.cli_args()` to its
 `claude -p` command — `[]` when nothing is overridden — and the generated file
 is rewritten only when the choices change, so a new choice reaches the very
-next dispatch with no restart.
+next dispatch of those sessions with no restart. `cli_args()` never raises: an
+override that cannot be applied leaves the spawn as it was. **Interactive
+sessions are not covered** — the remote-control main session `entrypoint.sh`
+starts, and the ones the spawn-session skill starts: Claude accepts an
+`--agents` file only with `-p`, so the subagents they dispatch keep their
+pinned models.
 
 Two sources, the dashboard winning: `RETINUE_AGENT_MODELS` (deployment
 default; a JSON object or `agent=model,…`) and the file the card writes
 (`RETINUE_AGENT_MODELS_FILE`, default `/root/.retinue/agent-models.json`,
 where choosing "Built-in" is an explicit entry that also cancels the env
-default for that agent). Agent ids are what the Agent tool takes: the
-frontmatter `name` for core agents, `<plugin>:<name>` for plugin agents.
+default for that agent, and choosing "Deployment default" —
+`POST /agent-models {agent, reset: true}` — removes the agent's entry).
+Agent ids are what the Agent tool takes: the frontmatter `name` for core
+agents, `<plugin>:<name>` for plugin agents; a plugin the retinue marketplace
+no longer lists (a removed chamber) is skipped, as Claude skips it.
 `POST /agent-models` accepts only agents discovery lists and models on the
 offered list — the thread picker's gate — so a client can never inject an
-arbitrary definition. An agent whose frontmatter carries nested YAML
-(`hooks:`, `mcpServers:`) is listed but fixed: the no-dependency frontmatter
-parser would mangle it, so it is left as the only definition. Memory stamps
-and the bubble's model name follow the model actually used, so experiments
-stay traceable.
+arbitrary definition.
 
-Agents that call tools (the Archivist, the Herald, chamber agents such as
-Ari) need a model with tool support; `docs/ollama.md` records which local
-tags fail there. The Secretary and the archivist-reader only read and return
-text and are the safest place to try a small local model.
+Some agents are listed but **fixed**, left as the only definition: Claude
+validates an `--agents` value as a whole and refuses to start on one bad
+field (where it merely warns about the same field in an agent file), so an
+agent is redefined only when every field is one the no-dependency
+frontmatter parser carries faithfully. Nested YAML (`hooks:`,
+`mcpServers:`), a field or value it does not know (an unrecognised `effort`
+or `permissionMode`, `maxTurns: 0`), or a prompt using the plugin
+placeholders Claude expands only when it loads the file itself
+(`${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, `${CLAUDE_PROJECT_DIR}`,
+`${user_config.…}`) make the agent fixed. A plugin agent's `permissionMode`
+and `initialPrompt`, which Claude ignores in plugin files, are left out of
+its redefinition, so a model change does not switch them on.
+
+An override does not change attribution: a subagent's memories carry the
+dispatching session's stamp (`RETINUE_SESSION_MODEL`, `docs/memory.md`), and
+the bubble names the turn's costliest model, usually Ara's own — the
+subagent's model shows only in the turn's `modelUsage`.
+
+Every core agent calls tools — even the Secretary (Read/Glob/Grep for its
+persona and style files) and the archivist-reader (Read for the document) —
+so an overriding model needs tool support, behind a route that does not drop
+`tools`; `docs/ollama.md` records which local tags fail there, and its
+`ollama/*` route (tools dropped, 512 output tokens) suits Ara's chat turns,
+not subagents. The Secretary and the archivist-reader have no write or shell
+tools, so a failed experiment there does the least harm.
 
 ## Attachments
 

@@ -105,8 +105,10 @@ Agent models (Settings › Agent models; see scripts/agent_models.py):
                                          model and the effective override, plus
                                          the offered model list (the picker's).
   POST /agent-models                  -> {agent, model} pins one subagent to a
-                                         model ("" = built-in). Reaches the next
-                                         spawned session, no restart.
+                                         model ("" = built-in); {agent, reset:
+                                         true} returns it to the deployment
+                                         default. Reaches the next spawned
+                                         claude -p session, no restart.
 
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
@@ -11279,17 +11281,20 @@ class Handler(BaseHTTPRequestHandler):
         """Pin one subagent to a model, or hand it back its built-in one.
 
         Body {agent, model}; an empty model is the explicit "built-in" choice
-        (it also cancels a RETINUE_AGENT_MODELS default for that agent). The
-        agent must be one discovery lists and overridable; the model must be
-        on the offered list — the same gate the thread picker applies, with
-        one cache refresh so a model just added upstream is accepted. The
-        choice reaches the next spawned session: scripts/agent_models.py
-        regenerates the --agents file on demand, no restart."""
+        (it also cancels a RETINUE_AGENT_MODELS default for that agent), and
+        {agent, reset: true} drops the dashboard's choice so the agent follows
+        that deployment default again. The agent must be one discovery lists
+        and, unless resetting, overridable; the model must be on the offered
+        list — the same gate the thread picker applies, with one cache
+        refresh so a model just added upstream is accepted. The choice
+        reaches the next spawned session: scripts/agent_models.py regenerates
+        the --agents file on demand, no restart."""
         payload = self._read_json_body()
         if payload is None:
             self._send_json(400, {"error": "invalid JSON"})
             return
         agent = payload.get("agent")
+        reset = payload.get("reset") is True
         model = payload.get("model", "")
         if model is None:
             model = ""
@@ -11301,15 +11306,15 @@ class Handler(BaseHTTPRequestHandler):
         if row is None:
             self._send_json(404, {"error": f"unknown agent {agent!r}"})
             return
-        if not row["overridable"]:
+        if not reset and not row["overridable"]:
             self._send_json(409, {"error": f"{agent} cannot be overridden"})
             return
-        if model and not (agent_models.valid_model_id(model)
-                          and _model_offered(model, refresh=True)):
+        if not reset and model and not (agent_models.valid_model_id(model)
+                                        and _model_offered(model, refresh=True)):
             self._send_json(400, {"error": f"model {model!r} is not on the offered list"})
             return
         try:
-            agent_models.write_setting(agent, model)
+            agent_models.write_setting(agent, None if reset else model)
         except OSError as exc:
             self._send_json(500, {"error": "could not save agent models",
                                   "detail": str(exc)})

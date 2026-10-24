@@ -24,25 +24,38 @@ Two sources, dashboard over deployment:
   the persistent volume) — what the dashboard's Settings page writes:
   `{"agents": {"secretary": "ollama/qwen3.6:latest", "herald": ""}}`. An
   empty value is an explicit "built-in" that also cancels the env default for
-  that agent.
+  that agent; an agent missing from the file follows the env default.
 
 Every framework spawner (`web-gateway.py`, `scheduler.py`, the base-job
 scripts, the MCP connector) appends `cli_args()` to its `claude -p` command:
 `[]` when nothing is overridden, else `["--agents", <generated file>]`. The
 generated file is rewritten only when its content changes and is read at
 each spawn, so a change on the Settings page reaches the very next dispatch
-with no restart.
+of those sessions with no restart. Interactive sessions — the remote-control
+main session `entrypoint.sh` starts, the ones the spawn-session skill starts —
+are not covered: Claude takes an `--agents` file only with `-p`, so the
+subagents they dispatch keep their built-in models. `cli_args()` never
+raises: an override that cannot be applied leaves the spawn as it was.
 
 Agent names are what the Agent tool takes: the frontmatter `name` for core
 agents, `<plugin>:<name>` for plugin agents (`ari:ari`). Plugin agents are
 discovered through `~/.claude/plugins/installed_plugins.json`, the same
-registry `sync-plugins.py` reads.
+registry `sync-plugins.py` reads; a plugin the retinue marketplace no longer
+lists (a chamber removed from the deployment) is skipped, as Claude skips it.
 
 Frontmatter is parsed without a YAML library (none is in the image): one
-`key: value` per line, `tools`/`disallowedTools`/`skills` split on commas. An
-agent whose frontmatter carries anything this parser cannot carry faithfully
-(a nested `hooks:` or `mcpServers:` block, a YAML list) is left alone with a
-warning rather than redefined with half its settings missing.
+`key: value` per line, quotes and trailing `# comments` removed as YAML
+would, `tools`/`disallowedTools`/`skills` split on commas, an empty value
+treated as absent. Claude validates an `--agents` value as a whole and
+refuses to start on a single bad field, where it only warns about the same
+field in an agent file, so every carried value is checked here first. An
+agent this module cannot carry faithfully — a nested `hooks:` or
+`mcpServers:` block, a YAML list, a field or value it does not know, a prompt
+using the plugin placeholders (`${CLAUDE_PLUGIN_ROOT}` …) that Claude expands
+only when it loads the file itself — is left alone with a warning rather than
+redefined with half its settings missing. For a plugin agent the fields
+Claude ignores in plugin files (`permissionMode`, `initialPrompt`) are left
+out, so the redefinition does not switch them on.
 """
 from __future__ import annotations
 
@@ -53,24 +66,49 @@ import sys
 import tempfile
 from pathlib import Path
 
-CORE_AGENTS_DIR = Path(os.environ.get("RETINUE_CORE_AGENTS_DIR",
-                                      "/workspace/.claude/agents"))
-INSTALLED_PLUGINS = Path(os.environ.get(
+
+def _env_path(name: str, default: str) -> Path:
+    # An empty value means the default, never Path("") (the cwd).
+    return Path(os.environ.get(name) or default)
+
+
+CORE_AGENTS_DIR = _env_path("RETINUE_CORE_AGENTS_DIR", "/workspace/.claude/agents")
+INSTALLED_PLUGINS = _env_path(
     "RETINUE_INSTALLED_PLUGINS",
-    str(Path.home() / ".claude" / "plugins" / "installed_plugins.json")))
-SETTINGS_FILE = Path(os.environ.get("RETINUE_AGENT_MODELS_FILE",
-                                    "/root/.retinue/agent-models.json"))
+    str(Path.home() / ".claude" / "plugins" / "installed_plugins.json"))
+MARKETPLACE = _env_path("RETINUE_MARKETPLACE",
+                        "/workspace/.claude-plugin/marketplace.json")
+MARKETPLACE_NAME = "retinue"
+SETTINGS_FILE = _env_path("RETINUE_AGENT_MODELS_FILE",
+                          "/root/.retinue/agent-models.json")
 ENV_VAR = "RETINUE_AGENT_MODELS"
 
 # Frontmatter keys carried into a --agents definition, with how each is typed.
 # `name` is the JSON key, not a field; `color`/`experimental` are ignored by
 # Claude anyway. Anything else present makes the agent non-overridable.
 _LIST_KEYS = ("tools", "disallowedTools", "skills")
-_STR_KEYS = ("description", "model", "permissionMode", "effort", "memory",
-             "isolation", "initialPrompt")
-_INT_KEYS = ("maxTurns", "autoCompactWindow")
+_STR_KEYS = ("description", "model", "initialPrompt")
+_INT_KEYS = ("maxTurns",)
 _BOOL_KEYS = ("background", "omitClaudeMd")
 _DROP_KEYS = ("name", "color", "experimental")
+# Enumerated fields, with the values Claude's --agents schema accepts. A value
+# outside the list (a typo Claude would only warn about in the file, or a mode
+# a newer Claude added) makes the agent non-overridable rather than the whole
+# --agents value invalid.
+_ENUM_KEYS = {
+    "permissionMode": ("default", "acceptEdits", "bypassPermissions", "plan",
+                       "dontAsk", "auto"),
+    "memory": ("user", "project", "local"),
+    "isolation": ("worktree",),
+}
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+_KNOWN_KEYS = frozenset(_LIST_KEYS + _STR_KEYS + _INT_KEYS + _BOOL_KEYS
+                        + tuple(_ENUM_KEYS) + ("effort",))
+# Ignored by Claude in a plugin's agent file; honoured in --agents.
+_PLUGIN_IGNORED_KEYS = ("permissionMode", "initialPrompt")
+# Expanded by Claude when it loads a plugin agent file, never in --agents.
+_PLACEHOLDER_RE = re.compile(
+    r"\$\{(?:CLAUDE_PLUGIN_ROOT|CLAUDE_PLUGIN_DATA|CLAUDE_PROJECT_DIR|user_config\.)")
 
 _MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][\w.:/@-]{0,199}$")
 
@@ -81,11 +119,37 @@ def _warn(msg: str) -> None:
 
 # --- agent discovery ---------------------------------------------------------
 
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:  # ValueError: not UTF-8
+        _warn(f"cannot read {path}: {exc}")
+        return None
+
+
 def _split_frontmatter(text: str) -> tuple[str, str] | None:
     m = re.match(r"\A---\r?\n(.*?)\r?\n---\r?\n?(.*)\Z", text, re.S)
     if not m:
         return None
     return m.group(1), m.group(2)
+
+
+def _scalar(value: str) -> str:
+    """A flat YAML scalar as a YAML loader reads it: surrounding quotes
+    removed (with their escapes), an unquoted trailing ` # comment` dropped."""
+    value = value.strip()
+    m = re.match(r'"((?:[^"\\]|\\.)*)"', value)
+    if m:
+        try:
+            return json.loads(f'"{m.group(1)}"')
+        except ValueError:
+            return m.group(1)
+    m = re.match(r"'((?:[^']|'')*)'", value)
+    if m:
+        return m.group(1).replace("''", "'")
+    if value.startswith("#"):
+        return ""
+    return value.split(" #", 1)[0].rstrip()
 
 
 def parse_frontmatter(block: str) -> dict | None:
@@ -107,40 +171,59 @@ def parse_frontmatter(block: str) -> dict | None:
     return out
 
 
-def _coerce(fields: dict) -> dict | None:
-    """Frontmatter scalars → the typed fields a --agents definition takes."""
+def _coerce(fields: dict, plugin: bool = False) -> dict | None:
+    """Frontmatter scalars → the typed fields a --agents definition takes, or
+    None when one of them would not pass Claude's --agents schema."""
     definition: dict = {}
-    for key, value in fields.items():
+    for key, raw in fields.items():
         if key in _DROP_KEYS:
+            continue
+        if key not in _KNOWN_KEYS:
+            return None
+        value = _scalar(raw)
+        if not value or (plugin and key in _PLUGIN_IGNORED_KEYS):
+            # An empty YAML value is null, which Claude treats as absent.
             continue
         if key in _LIST_KEYS:
             if value.startswith("[") and value.endswith("]"):
                 value = value[1:-1]
-            definition[key] = [v.strip().strip("'\"") for v in value.split(",")
-                               if v.strip()]
+            # Commas inside a rule's parentheses (`Agent(a, b)`) do not split.
+            items = [_scalar(v) for v in re.split(r",(?![^()]*\))", value)]
+            definition[key] = [v for v in items if v]
         elif key in _STR_KEYS:
-            definition[key] = value.strip("'\"")
+            definition[key] = value
         elif key in _INT_KEYS:
             try:
-                definition[key] = int(value)
+                number = int(value)
             except ValueError:
                 return None
+            if number <= 0:
+                return None
+            definition[key] = number
         elif key in _BOOL_KEYS:
             if value.lower() not in ("true", "false"):
                 return None
             definition[key] = value.lower() == "true"
+        elif key == "effort":
+            # Claude's file loader lowercases a level and reads an integer.
+            if value.isdigit():
+                definition[key] = int(value)
+            elif value.lower() in _EFFORT_LEVELS:
+                definition[key] = value.lower()
+            else:
+                return None
         else:
-            return None
+            if value not in _ENUM_KEYS[key]:
+                return None
+            definition[key] = value
     return definition
 
 
-def read_agent_file(path: Path) -> tuple[str, dict] | None:
+def read_agent_file(path: Path, plugin: bool = False) -> tuple[str, dict] | None:
     """(name, definition) for one agent file, or None when it cannot be
     carried into a --agents definition faithfully."""
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError as exc:
-        _warn(f"cannot read {path}: {exc}")
+    text = _read_text(path)
+    if text is None:
         return None
     parts = _split_frontmatter(text)
     if parts is None:
@@ -149,19 +232,37 @@ def read_agent_file(path: Path) -> tuple[str, dict] | None:
     if fields is None:
         _warn(f"{path}: nested frontmatter, not overridable")
         return None
-    name = fields.get("name", "").strip() or path.stem
-    definition = _coerce(fields)
+    name = _scalar(fields.get("name", "")) or path.stem
+    definition = _coerce(fields, plugin=plugin)
     if definition is None:
-        _warn(f"{path}: unsupported frontmatter field, not overridable")
+        _warn(f"{path}: unsupported frontmatter field or value, not overridable")
         return None
     if not definition.get("description"):
+        return None
+    if _PLACEHOLDER_RE.search(parts[1]):
+        _warn(f"{path}: prompt uses plugin placeholders, not overridable")
         return None
     definition["prompt"] = parts[1]
     return name, definition
 
 
+def _marketplace_plugins() -> set[str] | None:
+    """Plugin names the retinue marketplace lists, or None when unreadable."""
+    try:
+        doc = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entries = doc.get("plugins") if isinstance(doc, dict) else None
+    if not isinstance(entries, list):
+        return None
+    return {str(e.get("name")) for e in entries if isinstance(e, dict)}
+
+
 def _plugin_agent_dirs() -> list[tuple[str, Path]]:
-    """(plugin name, agents dir) for every user-scope installed plugin."""
+    """(plugin name, agents dir) for every installed plugin Claude loads.
+
+    The user-scope record is the one `sync-plugins.py` installs, so it is
+    preferred; a retinue plugin the marketplace no longer lists is skipped."""
     try:
         data = json.loads(INSTALLED_PLUGINS.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -170,11 +271,16 @@ def _plugin_agent_dirs() -> list[tuple[str, Path]]:
     plugins = data.get("plugins") if isinstance(data, dict) else None
     if not isinstance(plugins, dict):
         return []
+    catalog = _marketplace_plugins()
     for key, records in plugins.items():
-        plugin = str(key).split("@", 1)[0]
-        for record in records if isinstance(records, list) else []:
-            if not isinstance(record, dict) or not record.get("installPath"):
-                continue
+        plugin, _, marketplace = str(key).partition("@")
+        if marketplace == MARKETPLACE_NAME and catalog is not None \
+                and plugin not in catalog:
+            continue
+        records = [r for r in records if isinstance(r, dict) and r.get("installPath")] \
+            if isinstance(records, list) else []
+        records.sort(key=lambda r: r.get("scope") != "user")
+        for record in records:
             agents_dir = Path(record["installPath"]) / "agents"
             if agents_dir.is_dir():
                 out.append((plugin, agents_dir))
@@ -189,21 +295,16 @@ def discover() -> list[dict]:
     seen: set[str] = set()
 
     def _add(path: Path, scope: str | None, source: str) -> None:
-        parsed = read_agent_file(path)
+        parsed = read_agent_file(path, plugin=scope is not None)
         if parsed is None:
             # Still list it, so the Settings page can say why it is fixed.
-            text = ""
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError:
-                pass
-            parts = _split_frontmatter(text)
+            parts = _split_frontmatter(_read_text(path) or "")
             fields = {}
             if parts:
                 for raw in parts[0].splitlines():
                     k, sep, v = raw.partition(":")
                     if sep and raw[:1] not in (" ", "\t"):
-                        fields[k.strip()] = v.strip()
+                        fields[k.strip()] = _scalar(v)
             name = fields.get("name") or path.stem
             definition = None
             builtin = fields.get("model", "")
@@ -295,11 +396,15 @@ def read_settings() -> dict[str, str]:
     return out
 
 
-def write_setting(agent: str, model: str) -> dict[str, str]:
-    """Record one choice (empty model = built-in, which also cancels the env
-    default for that agent). Atomic replace; returns the stored map."""
+def write_setting(agent: str, model: str | None) -> dict[str, str]:
+    """Record one choice: a model, "" for the built-in one (which also cancels
+    the env default for that agent), or None to drop the choice so the agent
+    follows the env default again. Atomic replace; returns the stored map."""
     current = read_settings()
-    current[agent] = model
+    if model is None:
+        current.pop(agent, None)
+    else:
+        current[agent] = model
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(SETTINGS_FILE.parent), prefix=".agent-models-")
     try:
@@ -352,16 +457,25 @@ def cli_args() -> list[str]:
     """`["--agents", <file>]` for a `claude -p` command, or `[]`.
 
     The file is rewritten only when its content changes, under an atomic
-    replace, so concurrent spawns always read a complete document."""
+    replace, so concurrent spawns always read a complete document. Never
+    raises: an override is optional, a spawn is not."""
+    try:
+        return _cli_args()
+    except Exception as exc:  # noqa: BLE001 — no spawner may fail over this
+        _warn(f"overrides skipped ({exc}); subagents keep their built-in models")
+        return []
+
+
+def _cli_args() -> list[str]:
     defs = definitions()
-    path = generated_path()
     if not defs:
         return []
+    path = generated_path()
     content = json.dumps(defs, ensure_ascii=False, sort_keys=True)
     try:
         if path.read_text(encoding="utf-8") == content:
             return ["--agents", str(path)]
-    except OSError:
+    except (OSError, ValueError):
         pass
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -377,7 +491,8 @@ def cli_args() -> list[str]:
 
 def status() -> list[dict]:
     """What the Settings page shows: every agent with its built-in model, the
-    env default, the dashboard choice and the effective model."""
+    env default, the dashboard choice and the effective model ("" = built-in,
+    always so for an agent that cannot be overridden)."""
     env = parse_env(os.environ.get(ENV_VAR))
     chosen = read_settings()
     rows = []
@@ -385,16 +500,17 @@ def status() -> list[dict]:
         aid = agent["id"]
         pick = chosen.get(aid)
         effective = pick if pick else ("" if pick == "" else env.get(aid, ""))
+        overridable = agent["definition"] is not None
         rows.append({
             "id": aid,
             "label": agent["label"],
             "description": agent["description"],
             "builtin": agent["builtin"],
             "source": agent["source"],
-            "overridable": agent["definition"] is not None,
+            "overridable": overridable,
             "env_default": env.get(aid, ""),
             "chosen": pick if pick is not None else None,
-            "model": effective,
+            "model": effective if overridable else "",
         })
     return rows
 

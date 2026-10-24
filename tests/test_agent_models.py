@@ -3,9 +3,12 @@
 
 Covers discovery of core and plugin agents, the two sources and their
 precedence (dashboard file over env default, an empty choice cancelling the
-env default), the generated --agents file (content, rewrite-if-changed,
-nothing when no override is set), and the refusal to redefine an agent whose
-frontmatter the flat parser cannot carry.
+env default, a reset restoring it), the generated --agents file (content,
+rewrite-if-changed, nothing when no override is set), the refusal to redefine
+an agent whose frontmatter the flat parser cannot carry or whose values
+Claude's --agents schema would reject, plugin semantics (ignored fields,
+placeholders, plugins the marketplace no longer lists), and that nothing in
+the module can make a spawner fail.
 
 Standalone, no third-party deps:
 
@@ -66,8 +69,12 @@ def _load(tmp: Path, env_models: str | None = None):
     installed = tmp / "installed_plugins.json"
     installed.write_text(json.dumps({"version": 2, "plugins": {
         "ari@retinue": [{"scope": "user", "installPath": str(plugin_dir)}]}}))
+    marketplace = tmp / "marketplace.json"
+    marketplace.write_text(json.dumps({"name": "retinue", "plugins": [
+        {"name": "ari", "source": "./chambers/ari/.retinue"}]}))
     os.environ["RETINUE_CORE_AGENTS_DIR"] = str(core)
     os.environ["RETINUE_INSTALLED_PLUGINS"] = str(installed)
+    os.environ["RETINUE_MARKETPLACE"] = str(marketplace)
     os.environ["RETINUE_AGENT_MODELS_FILE"] = str(tmp / "state" / "agent-models.json")
     if env_models is None:
         os.environ.pop("RETINUE_AGENT_MODELS", None)
@@ -160,6 +167,167 @@ def test_model_id_validation():
         assert not am.valid_model_id("has space")
         assert not am.valid_model_id("-leading-dash")
         assert not am.valid_model_id(42)
+
+
+# What Claude's --agents schema accepts, mirrored from the CLI: a value outside
+# it makes the whole flag invalid and every spawn fail.
+_SCHEMA = {
+    "description": lambda v: isinstance(v, str) and v != "",
+    "prompt": lambda v: isinstance(v, str),
+    "model": lambda v: isinstance(v, str) and v.strip() != "",
+    "tools": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+    "disallowedTools": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+    "skills": lambda v: isinstance(v, list) and all(isinstance(x, str) for x in v),
+    "effort": lambda v: v in ("low", "medium", "high", "xhigh", "max")
+              or (isinstance(v, int) and not isinstance(v, bool)),
+    "permissionMode": lambda v: v in ("default", "acceptEdits", "bypassPermissions",
+                                      "plan", "dontAsk", "auto"),
+    "maxTurns": lambda v: isinstance(v, int) and not isinstance(v, bool) and v > 0,
+    "initialPrompt": lambda v: isinstance(v, str),
+    "memory": lambda v: v in ("user", "project", "local"),
+    "background": lambda v: isinstance(v, bool),
+    "omitClaudeMd": lambda v: isinstance(v, bool),
+    "isolation": lambda v: v == "worktree",
+}
+
+
+def _assert_schema_valid(defs: dict) -> None:
+    for name, definition in defs.items():
+        assert not name.startswith("-"), name
+        for key in ("description", "prompt"):
+            assert key in definition, (name, key)
+        for key, value in definition.items():
+            assert key in _SCHEMA and _SCHEMA[key](value), (name, key, value)
+
+
+def _agent(name: str, extra: str, body: str = "Prompt.\n") -> str:
+    return f"---\nname: {name}\ndescription: Agent {name}.\nmodel: opus\n{extra}---\n\n{body}"
+
+
+def test_values_are_checked_like_the_schema():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        am = _load(tmp)
+        core = tmp / "agents"
+        files = {
+            # Tolerated by Claude's file loader, normalised here.
+            "upper": "effort: High  # deep thinking\ntools: Read, Grep  # read-only\n",
+            "number": "effort: 3\nmaxTurns: '12'\n",
+            "empty": "memory:\npermissionMode:\ntools:\n",
+            "rules": "tools: [Agent(worker, researcher), \"Read\"]\nbackground: True\n",
+            # Rejected by the --agents schema: the agent stays fixed.
+            "badeffort": "effort: turbo\n",
+            "zeroturns": "maxTurns: 0\n",
+            "badmode": "permissionMode: sometimes\n",
+            "badmemory": "memory: none\n",
+            "window": "autoCompactWindow: 5\n",
+        }
+        for name, extra in files.items():
+            (core / f"{name}.md").write_text(_agent(name, extra), encoding="utf-8")
+        (core / "quoted.md").write_text(
+            '---\nname: "quoted"   # the YAML name\ndescription: \'Quoted: it\'\'s "yes"\'\n'
+            'model: opus\n---\nBody.\n', encoding="utf-8")
+        rows = {a["id"]: a for a in am.discover()}
+        assert rows["upper"]["definition"]["effort"] == "high"
+        assert rows["upper"]["definition"]["tools"] == ["Read", "Grep"]
+        assert rows["number"]["definition"]["effort"] == 3
+        assert rows["number"]["definition"]["maxTurns"] == 12
+        assert "memory" not in rows["empty"]["definition"]
+        assert "permissionMode" not in rows["empty"]["definition"]
+        assert "tools" not in rows["empty"]["definition"], "an empty tools: means all tools"
+        assert rows["rules"]["definition"]["tools"] == ["Agent(worker, researcher)", "Read"]
+        assert rows["rules"]["definition"]["background"] is True
+        for fixed in ("badeffort", "zeroturns", "badmode", "badmemory", "window"):
+            assert rows[fixed]["definition"] is None, fixed
+        assert "quoted" in rows and '"quoted"' not in rows, set(rows)
+        assert rows["quoted"]["description"] == 'Quoted: it\'s "yes"'
+
+        everyone = ",".join(f"{aid}=claude-haiku-5-5" for aid in rows)
+        os.environ["RETINUE_AGENT_MODELS"] = everyone
+        defs = am.definitions()
+        assert set(defs) == {aid for aid, a in rows.items() if a["definition"]}, set(defs)
+        _assert_schema_valid(defs)
+
+
+def test_plugin_semantics():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        am = _load(tmp)
+        agents_dir = tmp / "plugins" / "ari" / "0.1.0" / "agents"
+        (agents_dir / "bold.md").write_text(_agent(
+            "bold", "permissionMode: bypassPermissions\ninitialPrompt: Say hi\n"),
+            encoding="utf-8")
+        (agents_dir / "rooted.md").write_text(_agent(
+            "rooted", "", "Run ${CLAUDE_PLUGIN_ROOT}/bin/tool first.\n"), encoding="utf-8")
+        # A chamber removed from the deployment: still installed, no longer
+        # in the marketplace, so Claude does not load it.
+        gone_dir = tmp / "plugins" / "gone" / "1.0.0"
+        (gone_dir / "agents").mkdir(parents=True)
+        (gone_dir / "agents" / "ghost.md").write_text(_agent("ghost", ""), encoding="utf-8")
+        # Two records for one plugin: the user-scope one is what sync-plugins installs.
+        stale_dir = tmp / "plugins" / "ari" / "0.0.1"
+        (stale_dir / "agents").mkdir(parents=True)
+        (stale_dir / "agents" / "old.md").write_text(_agent("old", ""), encoding="utf-8")
+        installed = Path(os.environ["RETINUE_INSTALLED_PLUGINS"])
+        installed.write_text(json.dumps({"version": 2, "plugins": {
+            "ari@retinue": [
+                {"scope": "project", "projectPath": "/elsewhere", "installPath": str(stale_dir)},
+                {"scope": "user", "installPath": str(agents_dir.parent)}],
+            "gone@retinue": [{"scope": "user", "installPath": str(gone_dir)}]}}))
+        rows = {a["id"]: a for a in am.discover()}
+        assert "gone:ghost" not in rows and "ari:old" not in rows, set(rows)
+        bold = rows["ari:bold"]["definition"]
+        assert "permissionMode" not in bold and "initialPrompt" not in bold, bold
+        assert rows["ari:rooted"]["definition"] is None
+        # A core agent keeps the fields Claude honours there.
+        (tmp / "agents" / "core.md").write_text(_agent(
+            "core", "permissionMode: plan\n"), encoding="utf-8")
+        core_def = {a["id"]: a for a in am.discover()}["core"]["definition"]
+        assert core_def["permissionMode"] == "plan"
+        # Without a readable marketplace nothing is filtered out.
+        Path(os.environ["RETINUE_MARKETPLACE"]).unlink()
+        assert "gone:ghost" in {a["id"] for a in am.discover()}
+
+
+def test_never_raises_into_a_spawner():
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        am = _load(tmp, "secretary=claude-haiku-5-5")
+        (tmp / "agents" / "latin.md").write_bytes(
+            b"---\nname: latin\ndescription: Caf\xe9.\nmodel: opus\n---\nBody.\n")
+        rows = {a["id"]: a for a in am.status()}
+        assert rows["latin"]["overridable"] is False
+        args = am.cli_args()
+        assert args and args[0] == "--agents", args
+
+        def boom():
+            raise RuntimeError("discovery broke")
+        am.definitions = boom
+        assert am.cli_args() == []
+
+        # An empty RETINUE_AGENT_MODELS_FILE means the default, not the cwd.
+        os.environ["RETINUE_AGENT_MODELS_FILE"] = ""
+        spec = importlib.util.spec_from_file_location("agent_models_empty", SCRIPT)
+        am2 = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(am2)
+        assert str(am2.SETTINGS_FILE) == "/root/.retinue/agent-models.json"
+        assert am2.generated_path().name == "agent-models.generated.json"
+
+
+def test_reset_and_fixed_agents():
+    with tempfile.TemporaryDirectory() as d:
+        am = _load(Path(d), "secretary=claude-haiku-5-5,hooked=claude-haiku-5-5")
+        am.write_setting("secretary", "ollama/gemma4:12b")
+        am.write_setting("secretary", None)
+        status = {r["id"]: r for r in am.status()}
+        assert status["secretary"]["chosen"] is None
+        assert status["secretary"]["model"] == "claude-haiku-5-5", "back to the env default"
+        stored = json.loads(Path(os.environ["RETINUE_AGENT_MODELS_FILE"]).read_text())
+        assert stored == {"agents": {}}
+        # A fixed agent runs on its built-in model, so that is what is shown.
+        assert status["hooked"]["overridable"] is False
+        assert status["hooked"]["model"] == ""
+        assert status["hooked"]["env_default"] == "claude-haiku-5-5"
 
 
 if __name__ == "__main__":

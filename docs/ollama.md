@@ -161,10 +161,14 @@ The picker above governs Ara's own turns. The subagents Ara dispatches (the
 Secretary, Herald, Archivist, chamber agents) pin their own models; the
 dashboard's **Settings › Agent models** card (or `RETINUE_AGENT_MODELS`)
 overrides those per agent, offering the same list — `docs/dashboard.md`,
-"Agent models". The caveats in this document apply doubly: an agent that
-calls tools needs a tag with a tools capability, and a dispatched agent's
-prompt is its whole definition plus the dispatch context, which an 8k-context
-tag will overflow. Start with the Secretary (read-only, returns text).
+"Agent models". The caveats in this document apply doubly: every subagent
+reads through tools (the Secretary its persona and style files), so it needs
+a tag with a tools capability, behind a route that keeps `tools` — the
+`ollama/*` route above drops them and caps output at 512 tokens, which suits
+a chat bubble, not a subagent — and a dispatched agent's prompt is its whole
+definition plus the dispatch context, which an 8k-context tag will overflow.
+Start with the Secretary: it has no write or shell tools, so a failed
+experiment does the least harm.
 
 ## Checking a tag before you chat
 
