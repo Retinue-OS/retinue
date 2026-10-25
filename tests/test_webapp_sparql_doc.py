@@ -120,7 +120,7 @@ def main() -> int:
         print("SKIP: node is not installed; the SPARQL page test needs it")
         return 0
     with tempfile.TemporaryDirectory() as tmp:
-        for name in ("base.js", "markdown.js", "shell.js", "sparql.js"):
+        for name in ("base.js", "markdown.js", "sparql.js"):
             shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
         shutil.copy(ONTOLOGY, os.path.join(tmp, "ontology.md"))
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
