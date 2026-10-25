@@ -13,6 +13,7 @@ What these pin down:
 - a colour also becomes the dashboard accent: the --accent definition and
   every rgba() tint of the stock accent, in styles.css and all components,
   leaving no stock accent behind;
+- a label is escaped into the title, never served as markup;
 - an invalid colour, and the stock colour itself, count as "no colour";
 - the signature moves with either variable, so the service-worker cache
   name moves too.
@@ -58,7 +59,24 @@ def test_name_reaches_manifest_and_title():
     assert data["icons"], "the rest of the manifest survives"
     page = ib.brand_html((WEBAPP / "news.html").read_bytes()).decode()
     assert "<title>Retinue (Admin) — News</title>" in page
+    # The gateway's generated pages (_send_html) carry the same brand.
+    for raw, want in [("<title>Retinue — Pending Sends</title>",
+                       "<title>Retinue (Admin) — Pending Sends</title>"),
+                      ("<title>Retinue Conversation</title>",
+                       "<title>Retinue (Admin) Conversation</title>")]:
+        assert ib.brand_html(raw.encode()).decode() == want, raw
     print("ok: the name reaches the manifest and the page title")
+
+
+def test_name_is_escaped_in_titles():
+    _env(name="</title><script>alert(1)</script>")
+    page = ib.brand_html(b"<title>Retinue \xe2\x80\x94 News</title>").decode()
+    assert "<script>" not in page, page
+    assert page.startswith("<title>Retinue (&lt;/title&gt;&lt;script&gt;"), page
+    # JSON escapes on its own: the manifest keeps the label verbatim.
+    data = json.loads(ib.brand_manifest((WEBAPP / "manifest.webmanifest").read_bytes()))
+    assert data["short_name"] == "</title><script>alert(1)</script>"
+    print("ok: a label is text, never markup, in a page title")
 
 
 def test_color_parsing():

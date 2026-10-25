@@ -1435,7 +1435,9 @@ def _shell_hash() -> str:
         return "static"
     # The branding is applied on the response, not on disk, so it joins the
     # signature explicitly: a changed name or colour must evict cached icons.
-    entries.append(f"branding:{instance_branding.signature()}")
+    # Only when set, so an unbranded deployment keeps the hash it always had.
+    if instance_branding.branded():
+        entries.append(f"branding:{instance_branding.signature()}")
     signature = "\n".join(entries)
     cached = _SHELL_HASH_CACHE.get(signature)
     if cached is not None:
@@ -9230,8 +9232,9 @@ class Handler(BaseHTTPRequestHandler):
         page whose permalink anchors do not exist yet — and lets an approval
         page be re-served from history after the request it approves is gone.
         The static shell (webapp/) is served elsewhere and stays cacheable.
+        Their <title> names the instance like the shell pages do.
         """
-        payload = body.encode("utf-8")
+        payload = instance_branding.brand_html(body.encode("utf-8"))
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))

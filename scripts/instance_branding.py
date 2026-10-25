@@ -29,6 +29,7 @@ stay smooth.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -101,7 +102,9 @@ def brand_html(raw: bytes) -> bytes:
     if not instance_name():
         return raw
     text = raw.decode("utf-8")
-    return _TITLE_RE.sub(lambda _m: "<title>" + display_name(), text, count=1).encode("utf-8")
+    # The label is configuration, not markup: escaped like any other text.
+    title = "<title>" + html.escape(display_name(), quote=False)
+    return _TITLE_RE.sub(lambda _m: title, text, count=1).encode("utf-8")
 
 
 def brand_css(raw: bytes) -> bytes:
