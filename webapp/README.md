@@ -596,7 +596,12 @@ goes through the one shared renderer in `components/markdown.js` (paragraphs,
 headings, fenced code, blockquotes, nested and task lists, pipe tables, links,
 bold/italic/strike/inline code). Input is HTML-escaped before any markup is
 generated and only `http(s)`/`mailto:`/`tel:` URLs become links, so the output
-is safe for `innerHTML`. Hosts can specialize rendering via hooks — the
+is safe for `innerHTML`. A link to the dashboard's own origin (Ara's link to
+another thread, an approval page) navigates in place, so it stays in the PWA
+window and the back gesture returns to where it was tapped; every other web
+link opens in a new tab. Like a tab of the navigation row, such a press is
+never held: what the page holds unsent waits in its field (see "Unsent
+input"). Hosts can specialize rendering via hooks — the
 conversations card uses the blockquote hook to keep its copy-to-clipboard
 button on Ara's ready-to-send drafts.
 
