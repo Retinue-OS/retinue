@@ -47,13 +47,20 @@ them is a dead end, and on them it starts with a back button (`<retinue-nav
 back>`). The row only reports the press (`retinue-back`); the page decides
 where it goes: back to where the drill-down was opened from inside the app,
 or, opened cold (a push, a bookmark), to the home; an open thread on the
-home or the Threads page closes in place, a project being edited cancels the
-edit. The page's own bar (title, Archive, minimize, model picker, menu)
-stays as a second row under it. On a page holding unsent input — a typed
-message, an unsaved project edit, a dictation on its way — a tap on a tab is
-held with the same note a Home press of the Android shell gets, instead of
-dropping the input; pressed again while the note shows, it goes — the hold
-stops a slip, it never keeps anyone on a page. While the phone keyboard is up the row steps aside on a
+home or the Threads page closes in place. A project being edited goes back
+like any other page — the edit is kept on the device and the editor opens
+again with it on the next visit; only the editor's own × drops the changes
+(back used to cancel the edit). The page's own bar (title, Archive, minimize, model picker, menu)
+stays as a second row under it. A tab always goes, whatever the page
+holds: a typed message, an unsaved project edit or a dictation on its way is
+kept on the device and waits in its field for the user to come back to the
+same place (`webapp/components/drafts.js`), and a dictation still being
+recorded or transcribed is finished by the service worker, its text landing
+in that field (`webapp/components/dictation.js`; webapp README, "Unsent
+input"). The tap used to be held instead, with a note popping up at the
+bottom asking for a second press — which the phone keyboard, coming up with
+the note, made impossible by hiding the row; pop-up notes at the bottom of
+the screen are an anti-pattern here. While the phone keyboard is up the row steps aside on a
 drill-down, as the page's own header does. On a phone the home never scrolls as
 a page (the attention list scrolls inside a locked frame, under the
 navigation); in the wide layout (`isWideFrame` in
@@ -918,7 +925,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 |---|---|
 | User agent | ` RetinueShell/1 (Android)` appended. |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings()`, behind Settings → Phone shell (shown only when the object exists). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/` — unless they hold unsent input (the draft of the conversation on screen, a dictation or send under way, an unsaved project edit or chat draft): then neither event navigates, a short note says why, and the composer holding it is brought into view. A Home press made again while the note shows navigates after all (a wake does not). A draft left in a thread no longer on screen does not hold the press. |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |

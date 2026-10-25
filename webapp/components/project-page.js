@@ -25,9 +25,19 @@ import { esc, fmtAge, visibleHeight } from './base.js';
 import { renderMarkdown, renderInline, MD_CSS } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { shelf, goLive, takeRestore } from './shelf-store.js';
-import { registerUnsavedCheck } from './shell.js';
+// Leaving the page never waits on what is typed here: the command bar's text
+// and an unsaved edit are kept on the device (drafts.js) and a dictation is
+// finished by the service worker (dictation.js), all of it back in its field
+// when the user returns.
+import { loadDraft, saveDraft } from './drafts.js';
+import { transcribe, handOff, adopt } from './dictation.js';
 
 const APPLY_POLL_MS = 3000;
+// The recorder hands over its audio in slices this long, so a page left with
+// the mic live has all but the last fraction of a second to hand on.
+const REC_SLICE_MS = 250;
+// The platform caps keepalive request bodies at 64 KiB in flight per page.
+const KEEPALIVE_BYTES = 32 * 1024;
 // Frontmatter keys that are rendered elsewhere (or meaningless to the user)
 // and therefore left out of the meta chips.
 const HIDDEN_FM_KEYS = new Set(['id', 'title']);
@@ -120,6 +130,7 @@ class RetinueProjectPage extends HTMLElement {
     this._state = 'loading'; // loading | ok | missing | offline
     this._mode = 'view';     // view | edit
     this._draft = '';        // editor content while in edit mode
+    this._editBase = '';     // the sha the edit was started from (the save's base)
     this._saving = false;
     this._editError = '';    // save failure / conflict message
     this._cmd = '';          // quick-command draft
@@ -146,10 +157,27 @@ class RetinueProjectPage extends HTMLElement {
 
   connectedCallback() {
     if (!this.shadowRoot) this.attachShadow({ mode: 'open' });
-    // What a wake or a Home press from the Android shell must not navigate
-    // away from (shell.js): an edit not yet saved, a change request typed or
-    // on the wire, a dictation recording or being transcribed.
-    if (!this._offUnsaved) this._offUnsaved = registerUnsavedCheck(() => this._unsaved());
+    // What an earlier visit left here: the command bar's text, an edit not
+    // yet saved (reopened once the project is read, see load), dictations
+    // for the command bar. Leaving keeps what is here now (_leaving).
+    if (this._id && !this._restored) {
+      this._restored = true;
+      const cmd = loadDraft(this._cmdKey());
+      if (cmd && typeof cmd.text === 'string' && !this._cmd) this._cmd = cmd.text;
+      this._keptEdit = loadDraft(this._editKey());
+      this._adoptDictations();
+    }
+    if (!this._onLeave) {
+      this._onLeave = () => this._leaving();
+      window.addEventListener('pagehide', this._onLeave);
+    }
+    // Back from the back-forward cache: another page may have written the
+    // command bar's draft on the device meanwhile (a dictation of this page's
+    // taken there) — this page's copy is the older one.
+    if (!this._onShow) {
+      this._onShow = (e) => { if (e && e.persisted) this._refreshCmd(); };
+      window.addEventListener('pageshow', this._onShow);
+    }
     // Where "back" leads, as on the chat page: opened from inside the app (a
     // row on the home, the projects list) there is an entry to return to;
     // opened cold (a push, a bookmark) the home is the landing place.
@@ -160,11 +188,10 @@ class RetinueProjectPage extends HTMLElement {
       } catch (_e) { return false; }
     })();
     // The back button is the navigation row's (components/nav.js), at the
-    // top of the page; it hands the press here. While editing it is the
-    // editor's cancel, like the bar's ×.
+    // top of the page; it hands the press here (_onBack).
     this._nav = document.querySelector('retinue-nav');
     if (this._nav && !this._onNavBack) {
-      this._onNavBack = () => (this._mode === 'edit' ? this._cancelEdit() : this._goBack());
+      this._onNavBack = () => this._onBack();
       this._nav.addEventListener('retinue-back', this._onNavBack);
     }
     // The shelf (issue #282): this project is the page being shown, and a
@@ -189,8 +216,10 @@ class RetinueProjectPage extends HTMLElement {
   }
 
   disconnectedCallback() {
-    if (this._offUnsaved) this._offUnsaved();
-    this._offUnsaved = null;
+    if (this._onLeave) window.removeEventListener('pagehide', this._onLeave);
+    this._onLeave = null;
+    if (this._onShow) window.removeEventListener('pageshow', this._onShow);
+    this._onShow = null;
     if (this._shelfRelease) this._shelfRelease();
     this._shelfRelease = null;
     if (this._nav && this._onNavBack) this._nav.removeEventListener('retinue-back', this._onNavBack);
@@ -214,12 +243,100 @@ class RetinueProjectPage extends HTMLElement {
       if (!res.ok) throw new Error(String(res.status));
       this._item = await res.json();
       this._state = 'ok';
+      this._reopenEdit();
     } catch (_err) {
       // Keep showing the last loaded state if we have one; otherwise offline.
       if (!this._item) this._state = 'offline';
     }
     await threads;
     this.render();
+  }
+
+  // ── Kept on the device: what leaving must not cost ─────────────────────────
+  _cmdKey() { return `project-cmd:${this._id}`; }
+  _editKey() { return `project-edit:${this._id}`; }
+
+  _keepCmd() {
+    if (!this._id) return;
+    // A command on the wire as the page goes as a keepalive request is one the
+    // browser finishes: what is kept is only what was typed after it.
+    let text = this._cmd || '';
+    if (this._sendingCmd && text.trim().startsWith(this._sendingCmd)) {
+      text = text.trim().slice(this._sendingCmd.length).trimStart();
+    }
+    saveDraft(this._cmdKey(), text.trim() ? { text } : null);
+  }
+
+  // The command bar's draft as the device holds it now, into this page.
+  _refreshCmd() {
+    const kept = loadDraft(this._cmdKey());
+    const text = kept && typeof kept.text === 'string' ? kept.text : '';
+    if (text === this._cmd) return;
+    this._cmd = text;
+    if (this._mode === 'view') this.render();
+  }
+
+  _keepEdit() {
+    if (!this._id) return;
+    const unsaved = this._mode === 'edit' && this._item && this._draft !== this._item.markdown;
+    saveDraft(this._editKey(), unsaved ? { text: this._draft, base: this._editBase } : null);
+  }
+
+  // An edit an earlier visit left unsaved opens again, as it was left, over
+  // the version it was started from: a save checks that base, so a change
+  // made to the file meanwhile surfaces as the usual conflict instead of
+  // being overwritten.
+  _reopenEdit() {
+    const kept = this._keptEdit;
+    this._keptEdit = null;
+    if (!kept || typeof kept.text !== 'string' || this._mode === 'edit') return;
+    if (kept.text === this._item.markdown) { saveDraft(this._editKey(), null); return; }
+    this._mode = 'edit';
+    this._draft = kept.text;
+    this._editBase = kept.base || this._item.sha256;
+    this._editError = '';
+  }
+
+  // Dictations an earlier visit left for the command bar: each owns the bar
+  // (as a status line) until its text is in the field, for review.
+  _adoptDictations() {
+    adopt(this._cmdKey(), (job) => {
+      this._adopted = (this._adopted || 0) + 1;
+      if (!this._voiceJob) this._voiceJob = { sending: false, phase: 'transcribing', adopted: true };
+      this.render();
+      job.then((text) => {
+        if (text) {
+          this._cmd = this._cmd ? `${this._cmd.replace(/\s*$/, '')} ${text}` : text;
+          this._keepCmd();
+        } else {
+          this._cmdError = 'No speech was detected in the recording.';
+        }
+      }, (err) => {
+        if (err && err.message === 'elsewhere') this._refreshCmd();
+        else this._cmdError = "Couldn't transcribe the recording. Please try again.";
+      }).finally(() => {
+        this._adopted -= 1;
+        if (!this._adopted && this._voiceJob && this._voiceJob.adopted) this._voiceJob = null;
+        if (this._mode === 'view') this.render();
+      });
+    });
+  }
+
+  // The page is going: what is typed is written as it stands (it is written
+  // as it changes, too), and a live recording is handed on — leaving acts as
+  // ✓, the transcript waiting in the command bar.
+  _leaving() {
+    this._keepCmd();
+    this._keepEdit();
+    if (this._recState !== 'recording' || this._recAborted) return;
+    const chunks = this._recChunks || [];
+    this._recAborted = true;
+    this._recChunks = [];
+    this._stopRecording();
+    this._stopStream();
+    if (!chunks.length) return;
+    const type = (this._mediaRecorder && this._mediaRecorder.mimeType) || chunks[0].type || 'audio/webm';
+    handOff(this._cmdKey(), new Blob(chunks, { type }), '/conversations/transcribe');
   }
 
   // The discussions linked to this project (archived ones included, shown
@@ -245,19 +362,24 @@ class RetinueProjectPage extends HTMLElement {
     this._finishRecording('review');
     this._mode = 'edit';
     this._draft = this._item.markdown;
+    this._editBase = this._item.sha256;
     this._editError = '';
     this.render();
   }
 
-  _unsaved() {
-    const editing = this._mode === 'edit' && this._item && this._draft !== this._item.markdown;
-    return !!(editing || this._saving || (this._cmd || '').trim() || this._sending ||
-      this._recState !== 'idle' || this._voiceJob);
+  // Back goes back, editing or not — the edit is kept on the device and the
+  // editor opens again with it on the next visit (_reopenEdit). It used to be
+  // the editor's cancel while editing, which dropped the changes; the bar's ×
+  // is the one deliberate way to do that now.
+  _onBack() {
+    this._goBack();
   }
 
+  // The editor's ×: the changes are dropped, for good.
   _cancelEdit() {
     this._mode = 'view';
     this._editError = '';
+    this._keepEdit();
     this.render();
     this.load(); // pick up anything that changed while the editor was open
   }
@@ -271,13 +393,15 @@ class RetinueProjectPage extends HTMLElement {
       const res = await fetch('/projects/item', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          id: this._item.id, content: this._draft, base_sha: this._item.sha256,
+          id: this._item.id, content: this._draft, base_sha: this._editBase || this._item.sha256,
         }),
       });
       const body = await res.json().catch(() => ({}));
       if (res.status === 409) {
         // Adopt the server's sha so a deliberate second Save overwrites.
         this._item.sha256 = body.sha256 || this._item.sha256;
+        this._editBase = this._item.sha256;
+        this._keepEdit();
         this._editError = 'This project changed in the background while you were '
           + 'editing. Save again to overwrite that change, or Cancel to see it.';
         return;
@@ -286,6 +410,7 @@ class RetinueProjectPage extends HTMLElement {
       this._item.markdown = this._draft;
       this._item.sha256 = body.sha256 || '';
       this._mode = 'view';
+      this._keepEdit();
     } catch (_err) {
       this._editError = "Couldn't save — check the connection and try again.";
     } finally {
@@ -299,7 +424,12 @@ class RetinueProjectPage extends HTMLElement {
   async _sendCommand(text) {
     const cmd = (text || '').trim();
     if (!cmd || this._sending || !this._item) return;
+    // A keepalive request: should the page be left while it is on the wire,
+    // the browser still delivers it, and the bar keeps only what was typed
+    // after it (_keepCmd). A command too long for one is kept whole.
+    const keepalive = cmd.length * 3 <= KEEPALIVE_BYTES;
     this._sending = true;
+    this._sendingCmd = keepalive ? cmd : '';
     this._cmdError = '';
     this.render();
     try {
@@ -312,16 +442,20 @@ class RetinueProjectPage extends HTMLElement {
           project_title: this._item.title,
           title: `Edit: ${this._item.title}`,
         }),
+        keepalive,
       });
       if (!res.ok) throw new Error(String(res.status));
       const conv = await res.json();
       this._cmd = '';
+      this._sendingCmd = '';
+      this._keepCmd();
       this._apply = { cid: conv.id, status: 'working', reply: '' };
       this._pollApply();
     } catch (_err) {
       this._cmdError = "Couldn't reach Ara — check the connection and try again.";
     } finally {
       this._sending = false;
+      this._sendingCmd = '';
       this.render();
     }
   }
@@ -380,7 +514,9 @@ class RetinueProjectPage extends HTMLElement {
         if (e.data && e.data.size) this._recChunks.push(e.data);
       });
       mr.addEventListener('stop', () => this._onRecordingStopped());
-      mr.start();
+      // In slices, so a page left with the mic live has the audio in hand
+      // (_leaving).
+      mr.start(REC_SLICE_MS);
       this._recState = 'recording';
       this._cmdError = '';
       this.render();
@@ -445,23 +581,22 @@ class RetinueProjectPage extends HTMLElement {
     this.render();
     let toSend = '';
     try {
-      const res = await fetch('/conversations/transcribe', {
-        method: 'POST',
-        headers: { 'Content-Type': type || 'application/octet-stream' },
-        body: new Blob(chunks, { type }),
-      });
-      if (!res.ok) throw new Error(String(res.status));
-      const data = await res.json();
-      const text = ((data && data.text) || '').trim();
+      // The service worker transcribes (dictation.js): a page left meanwhile
+      // still gets the text into this command bar, for review.
+      const text = await transcribe(this._cmdKey(), new Blob(chunks, { type }), '/conversations/transcribe');
       if (text) {
         // Append to anything already typed, like a dictation in the composer.
         this._cmd = this._cmd ? `${this._cmd.replace(/\s*$/, '')} ${text}` : text;
+        this._keepCmd();
         if (intent === 'send') toSend = this._cmd;
       } else {
         this._cmdError = 'No speech was detected in the recording.';
       }
-    } catch (_err) {
-      this._cmdError = "Couldn't transcribe the recording. Please try again.";
+    } catch (err) {
+      // Taken by another page while this one was frozen (dictation.js,
+      // 'elsewhere'): its text is in the bar's draft on the device.
+      if (err && err.message === 'elsewhere') this._refreshCmd();
+      else this._cmdError = "Couldn't transcribe the recording. Please try again.";
     }
     if (toSend) {
       // Send path: the status row stays in place of the text field until the
@@ -709,7 +844,7 @@ class RetinueProjectPage extends HTMLElement {
     on('[data-rec-send]', () => this._finishRecording('send'));
     const editor = root.querySelector('.editor');
     if (editor) {
-      editor.addEventListener('input', () => { this._draft = editor.value; });
+      editor.addEventListener('input', () => { this._draft = editor.value; this._keepEdit(); });
     }
     const form = root.querySelector('[data-cmd-form]');
     if (form) {
@@ -721,7 +856,7 @@ class RetinueProjectPage extends HTMLElement {
         input.style.height = `${Math.min(input.scrollHeight, Math.round(visibleHeight() * 0.3))}px`;
       };
       this._grow = grow;  // re-run when the visible height changes
-      input.addEventListener('input', () => { this._cmd = input.value; grow(); });
+      input.addEventListener('input', () => { this._cmd = input.value; this._keepCmd(); grow(); });
       // Cmd/Ctrl+Enter sends, as in the conversation composer; plain Enter
       // breaks the line in this multi-line field.
       input.addEventListener('keydown', (e) => {
