@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
 import session_env  # noqa: E402
 
@@ -398,6 +399,9 @@ def main() -> int:
            "--permission-mode", PERMISSION_MODE, build_prompt(scan)]
     if CLAUDE_MODEL:
         cmd[2:2] = ["--model", CLAUDE_MODEL]
+    # Per-agent model overrides for the Archivist this session dispatches
+    # (scripts/agent_models.py); [] when none is set.
+    cmd[-1:-1] = agent_models.cli_args()
     env = session_env.build(model=CLAUDE_MODEL)
     claude_auth.ensure_fresh_credentials(
         log=lambda msg: print(f"[inbox-sweep] {msg}", file=sys.stderr))

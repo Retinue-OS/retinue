@@ -786,6 +786,12 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   when the page in front is not the dashboard's. A wake while the page is not
   loaded makes the shell load `/?wake=1` itself; the home drops the flag from
   the address on load.
+- **Files**: the WebView renders no PDF, so a file row's view link
+  (`?inline=1`, answered `Content-Disposition: inline`) reaches the shell,
+  which opens it in the phone's viewer app from a private copy; the ↓ link
+  (`attachment`) saves it to Downloads. The shell names the file from that
+  header; the URL ends in the name too, for anything that names a file after
+  its URL.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;
