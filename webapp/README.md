@@ -246,6 +246,19 @@ docstring). Pieces:
   rotation with the keyboard up, dropped while pinch-zoomed) — the header
   and the companion's bar are hidden, and the pane being typed in is kept
   scrolled to its newest message; the navigation row steps aside with them.
+  On a short frame (the Android shell's, above its launcher bar) the thread
+  keeps its room: the chips — one sideways-scrolling row on a touch screen —
+  and a standing instruction's report (its flags first) share a region capped
+  at a fifth of the pane that scrolls inside and steps aside while the
+  keyboard is up, and the field grows to at most 30% of the pane; the thread
+  gives way before the send row does. A draft longer than its box shows an
+  expand control in the field's top-right corner: the field then takes the
+  whole pane at its full width (the thread and the chips step aside, the mic
+  and send sit under its corners) until the control is pressed again, Escape
+  is pressed, a recording starts or the draft is sent. Shrunk again by the
+  control or Escape, the thread is back at the message it was left at; while
+  it is hidden nothing arriving is marked read. A tap on the control leaves
+  the focus where it was, so the phone keyboard stays as it was.
   The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
@@ -708,6 +721,12 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   when the page in front is not the dashboard's. A wake while the page is not
   loaded makes the shell load `/?wake=1` itself; the home drops the flag from
   the address on load.
+- **Files**: the WebView renders no PDF, so a file row's view link
+  (`?inline=1`, answered `Content-Disposition: inline`) reaches the shell,
+  which opens it in the phone's viewer app from a private copy; the ↓ link
+  (`attachment`) saves it to Downloads. The shell names the file from that
+  header; the URL ends in the name too, for anything that names a file after
+  its URL.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;

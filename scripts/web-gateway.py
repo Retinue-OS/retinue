@@ -99,6 +99,17 @@ News feed (dashboard news page; see scripts/news_store.py):
                                          signal: up|down|read|hide|note). Nudges
                                          that item now and logs it for the Herald.
 
+Agent models (Settings › Agent models; see scripts/agent_models.py):
+  GET  /agent-models                  -> {"agents": [...], "models": [...]} — every
+                                         dispatchable subagent with its built-in
+                                         model and the effective override, plus
+                                         the offered model list (the picker's).
+  POST /agent-models                  -> {agent, model} pins one subagent to a
+                                         model ("" = built-in); {agent, reset:
+                                         true} returns it to the deployment
+                                         default. Reaches the next spawned
+                                         claude -p session, no restart.
+
 Push notifications (dashboard PWA; see scripts/push_notify.py):
   GET  /push/config                   -> {"enabled": bool, "publicKey": <VAPID>}
   POST /push/subscribe                -> register a PushSubscription (body
@@ -272,6 +283,7 @@ import attention as attention_policy
 import attention_store
 import build_stamp
 import claude_auth
+import agent_models
 import chat_state as chat_state_mod
 import contacts as contacts_mod
 import email_client as ec
@@ -570,20 +582,6 @@ def _is_claude_catalog(mid: str, item: dict | None = None) -> bool:
     return "claude" in blob or upstream.startswith("anthropic/")
 
 
-def _ollama_backend_active(models: list[dict], listed_ids: list[str] | None) -> bool:
-    """Whether this deployment is serving Ollama, so leftover Claude seeds hide."""
-    primary = (
-        os.environ.get("LITELLM_PRIMARY_MODEL", "")
-        or os.environ.get("RETINUE_CLAUDE_MODEL", "")
-        or os.environ.get("ANTHROPIC_MODEL", "")
-    ).strip().lower()
-    if primary.startswith("ollama/"):
-        return True
-    if any(str(m.get("id") or "").startswith("ollama/") for m in models):
-        return True
-    return any(str(i).startswith("ollama/") for i in (listed_ids or []))
-
-
 def _litellm_model_id(item: dict) -> str:
     mid = str(item.get("model_name") or "").strip()
     if mid:
@@ -669,9 +667,7 @@ def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) 
     non-Claude) backend needs — those routes are rarely pre-flagged, and a
     leftover Claude seed must not hide them. Wildcard names are dropped even
     if flagged (a pattern is not a model id). Plumbing aliases stay hidden.
-    Duplicate names collapse to the first occurrence. When any Ollama model
-    is advertised, leftover Claude/Anthropic catalog rows are dropped even
-    if they still carry the picker flag.
+    Duplicate names collapse to the first occurrence.
 
     Same-label flagged routes collapse too. A picker route also surfaces under
     its target id (`claude-opus-5` and `anthropic/claude-opus-5` are two names
@@ -729,8 +725,6 @@ def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) 
                 advertised.append({"id": mid, "label": _pretty_model_label(mid)})
                 have.add(mid)
     models = flagged + [m for m in advertised if m["id"] not in {x["id"] for x in flagged}]
-    if _ollama_backend_active(models, listed_ids):
-        models = [m for m in models if not _is_claude_catalog(m["id"])]
     return models
 
 
@@ -1244,7 +1238,9 @@ PRESENTATION_LINT_MIN_KEEP = 0.6
 _CONV_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _ATT_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _CONV_GET_RE = re.compile(r"^/conversations/([0-9a-f]{32})/?$")
-_CONV_ATT_RE = re.compile(r"^/conversations/([0-9a-f]{32})/attachments/([0-9a-f]{32})/?$")
+# An optional last segment carries the file's name for clients that name a
+# saved file after the URL (see _serve_conversation_attachment); it is ignored.
+_CONV_ATT_RE = re.compile(r"^/conversations/([0-9a-f]{32})/attachments/([0-9a-f]{32})(?:/[^/]+)?/?$")
 _CONV_MSG_RE = re.compile(r"^/conversations/([0-9a-f]{32})/messages/?$")
 _INTERNAL_CONV_MSG_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/messages/?$")
 _INTERNAL_CONV_FLAGS_RE = re.compile(r"^/internal/conversations/([0-9a-f]{32})/flags/?$")
@@ -4756,6 +4752,10 @@ def send_message(message: str, display_question: str | None = None,
                        "--add-dir", str(MESSAGE_FILES_DIR)]
                 if run_model:
                     cmd += ["--model", run_model]
+                # Per-agent model overrides (Settings › Agent models, or
+                # RETINUE_AGENT_MODELS): the subagents this turn may dispatch,
+                # redefined with only their model swapped — scripts/agent_models.py.
+                cmd += agent_models.cli_args()
                 if resume_id:
                     cmd += ["--resume", resume_id]
                 # End option parsing with "--" so a user-supplied message that
@@ -9286,6 +9286,15 @@ class Handler(BaseHTTPRequestHandler):
         leaves ``invoice(1).pdf`` behind. It is honoured only for
         ``_INLINE_SAFE_TYPES``; anything else falls back to a download.
 
+        The dashboard links ``…/attachments/<att-id>/<filename>``; the route
+        ignores that last segment, and the name sent is always the stored one.
+        It is there for clients that name a saved file after the URL instead
+        of the Content-Disposition: Android's ``URLUtil.guessFileName`` takes a
+        name only from a bare ``attachment; filename="…"``, so neither
+        ``inline`` nor the trailing ``filename*`` below gets through, and the
+        Android shell, which named its downloads with it until it read the
+        header itself, saved ``<att-id>.pdf``.
+
         Only files referenced by that thread's stored metadata are served, and
         the on-disk path is rebuilt from validated hex ids (never the client
         path), so this cannot be used to read arbitrary files. Access control is
@@ -9567,6 +9576,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path.split("?", 1)[0].rstrip("/") == "/news/preferences":
             self._handle_news_preferences_write()
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/agent-models":
+            self._handle_agent_models_write()
             return
         attention_match = _ATTENTION_POST_RE.match(self.path)
         if attention_match:
@@ -11318,6 +11330,51 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, _news_preferences_payload())
 
+    def _handle_agent_models_write(self) -> None:
+        """Pin one subagent to a model, or hand it back its built-in one.
+
+        Body {agent, model}; an empty model is the explicit "built-in" choice
+        (it also cancels a RETINUE_AGENT_MODELS default for that agent), and
+        {agent, reset: true} drops the dashboard's choice so the agent follows
+        that deployment default again. The agent must be one discovery lists
+        and, unless resetting, overridable; the model must be on the offered
+        list — the same gate the thread picker applies, with one cache
+        refresh so a model just added upstream is accepted. The choice
+        reaches the next spawned session: scripts/agent_models.py regenerates
+        the --agents file on demand, no restart."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        agent = payload.get("agent")
+        reset = payload.get("reset") is True
+        model = payload.get("model", "")
+        if model is None:
+            model = ""
+        if not isinstance(agent, str) or not agent or not isinstance(model, str):
+            self._send_json(400, {"error": "agent (and an optional model) are required"})
+            return
+        known = {row["id"]: row for row in agent_models.status()}
+        row = known.get(agent)
+        if row is None:
+            self._send_json(404, {"error": f"unknown agent {agent!r}"})
+            return
+        if not reset and not row["overridable"]:
+            self._send_json(409, {"error": f"{agent} cannot be overridden"})
+            return
+        if not reset and model and not (agent_models.valid_model_id(model)
+                                        and _model_offered(model, refresh=True)):
+            self._send_json(400, {"error": f"model {model!r} is not on the offered list"})
+            return
+        try:
+            agent_models.write_setting(agent, None if reset else model)
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save agent models",
+                                  "detail": str(exc)})
+            return
+        self._send_json(200, {"agents": agent_models.status(),
+                              "models": _conversation_models()})
+
     def _handle_transcribe(self) -> None:
         """Voice input: proxy uploaded audio to the shared STT service.
 
@@ -11900,6 +11957,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         if conv_path in ("/news/preferences", "/news/preferences/"):
             self._send_json(200, _news_preferences_payload())
+            return
+        if conv_path in ("/agent-models", "/agent-models/"):
+            # Settings › Agent models: every dispatchable subagent with its
+            # built-in model and the effective override, plus the same model
+            # list the thread picker offers (scripts/agent_models.py).
+            self._send_json(200, {"agents": agent_models.status(),
+                                  "models": _conversation_models()})
             return
         if conv_path in ("/attention", "/attention/"):
             self._handle_attention_get()

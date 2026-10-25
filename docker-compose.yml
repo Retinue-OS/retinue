@@ -273,6 +273,11 @@ services:
       # door in front of the user can be strong while dispatch stays cheap.
       - RETINUE_DASHBOARD_MODEL
       - RETINUE_TRIAGE_MODEL
+      # Per-subagent model overrides (scripts/agent_models.py): the deployment
+      # default; the dashboard's Settings › Agent models card writes the file
+      # (RETINUE_AGENT_MODELS_FILE, default on the persistent /root volume).
+      - RETINUE_AGENT_MODELS
+      - RETINUE_AGENT_MODELS_FILE
       - RETINUE_CONVERSATION_MODELS
       - RETINUE_CONVERSATION_MODELS_FILE
       - RETINUE_LITELLM_URL
