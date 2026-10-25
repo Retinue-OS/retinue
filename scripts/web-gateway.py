@@ -4614,6 +4614,55 @@ def _envelope_model_name(data: dict) -> str | None:
     return _short_model_name(resolved) or None
 
 
+def _usage_snapshot(data: dict) -> dict:
+    """The cumulative usage a `claude -p` envelope reports, for the next turn.
+
+    A resumed session's `total_cost_usd` and `modelUsage` cover every turn of
+    the session so far, not just the one that produced this envelope. Stored
+    with the session entry, this is the baseline the next turn subtracts."""
+    models = {}
+    usage = data.get("modelUsage")
+    if isinstance(usage, dict):
+        for mid, entry in usage.items():
+            if isinstance(entry, dict):
+                models[mid] = {k: entry[k] for k in ("costUSD", "outputTokens")
+                               if isinstance(entry.get(k), (int, float))}
+    total = data.get("total_cost_usd")
+    return {"total_cost_usd": total if isinstance(total, (int, float)) else None,
+            "models": models}
+
+
+def _turn_usage(data: dict, baseline: dict | None) -> dict:
+    """This turn's share of an envelope's usage: cumulative minus `baseline`.
+
+    Returns an envelope-shaped dict (`total_cost_usd`, `modelUsage`) that
+    _envelope_model_name reads like the original. Without a baseline (a new
+    session, or a state entry written before baselines were stored) the
+    envelope is returned as-is. Models with no usage this turn are dropped, so
+    an earlier turn's model cannot win the header."""
+    if not isinstance(baseline, dict):
+        return data
+    prev_models = baseline.get("models") or {}
+    usage = data.get("modelUsage")
+    turn_models = {}
+    if isinstance(usage, dict):
+        for mid, entry in usage.items():
+            if not isinstance(entry, dict):
+                continue
+            prev = prev_models.get(mid) or {}
+            delta = dict(entry)
+            for k in ("costUSD", "outputTokens"):
+                if isinstance(entry.get(k), (int, float)):
+                    delta[k] = max(0, entry[k] - (prev.get(k) or 0))
+            if delta.get("costUSD") or delta.get("outputTokens"):
+                turn_models[mid] = delta
+    total = data.get("total_cost_usd")
+    prev_total = baseline.get("total_cost_usd")
+    if isinstance(total, (int, float)) and isinstance(prev_total, (int, float)):
+        total = max(0.0, total - prev_total)
+    return {"total_cost_usd": total, "modelUsage": turn_models}
+
+
 def send_message(message: str, display_question: str | None = None,
                  session_key: str = DEFAULT_SESSION_KEY,
                  model: str | None = None,
@@ -4846,8 +4895,13 @@ def send_message(message: str, display_question: str | None = None,
             new_state = {
                 "session_id": data.get("session_id", state.get("session_id")),
                 "last_activity": _now_ts(),
+                "usage": _usage_snapshot(data),
             }
             _update_session_entry(session_key, new_state)
+            # A resumed session reports usage summed over all its turns; the
+            # bubble gets only this turn's share (an escalated re-run resumes
+            # from the same point, so the same baseline applies).
+            turn = _turn_usage(data, state.get("usage") if run_resume else None)
 
             response_text = data.get("result", "")
             out: dict = {
@@ -4860,10 +4914,10 @@ def send_message(message: str, display_question: str | None = None,
                 # overhead is folded into that agent's cost rather than shown
                 # separately. It is a list-price estimate, not what the
                 # subscription bills, so the UI marks it "~$".
-                "cost_usd": data.get("total_cost_usd"),
+                "cost_usd": turn.get("total_cost_usd"),
                 # Short model name for the header (e.g. "Sonnet"), derived from
-                # the dominant-cost entry of the per-model usage breakdown.
-                "model_name": _envelope_model_name(data),
+                # the dominant-cost entry of this turn's per-model usage.
+                "model_name": _envelope_model_name(turn),
             }
             if escalated:
                 out["escalated"] = True

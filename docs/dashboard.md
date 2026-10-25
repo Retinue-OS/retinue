@@ -529,7 +529,11 @@ its redefinition, so a model change does not switch them on.
 An override does not change attribution: a subagent's memories carry the
 dispatching session's stamp (`RETINUE_SESSION_MODEL`, `docs/memory.md`), and
 the bubble names the turn's costliest model, usually Ara's own — the
-subagent's model shows only in the turn's `modelUsage`.
+subagent's model shows only in the turn's `modelUsage`. A resumed session's
+envelope sums usage over all its turns, so the gateway stores each turn's
+totals with the session entry and labels and prices the next bubble from the
+difference — otherwise a model switch mid-thread would be credited to the
+earlier model, and every cost after the first would be a running total.
 
 Every core agent calls tools — even the Secretary (Read/Glob/Grep for its
 persona and style files) and the archivist-reader (Read for the document) —
