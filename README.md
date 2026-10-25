@@ -151,8 +151,6 @@ when an Ollama URL is configured (`RETINUE_OLLAMA_URL`, `OLLAMA_API_BASE`,
 Ollama itself via `GET /api/tags` and those live tags replace LiteLLM's
 `ollama/*` entries. `retinue_picker` / `retinue_label` can still name or hide
 a route; they are not required.
-When the primary model is Ollama, leftover Claude catalog seeds are omitted
-so the picker only offers models the backend can serve.
 
 ```dotenv
 ANTHROPIC_AUTH_TOKEN=

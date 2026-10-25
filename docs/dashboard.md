@@ -47,13 +47,20 @@ them is a dead end, and on them it starts with a back button (`<retinue-nav
 back>`). The row only reports the press (`retinue-back`); the page decides
 where it goes: back to where the drill-down was opened from inside the app,
 or, opened cold (a push, a bookmark), to the home; an open thread on the
-home or the Threads page closes in place, a project being edited cancels the
-edit. The page's own bar (title, Archive, minimize, model picker, menu)
-stays as a second row under it. On a page holding unsent input — a typed
-message, an unsaved project edit, a dictation on its way — a tap on a tab is
-held with the same note a Home press of the Android shell gets, instead of
-dropping the input; pressed again while the note shows, it goes — the hold
-stops a slip, it never keeps anyone on a page. While the phone keyboard is up the row steps aside on a
+home or the Threads page closes in place. A project being edited goes back
+like any other page — the edit is kept on the device and the editor opens
+again with it on the next visit; only the editor's own × drops the changes
+(back used to cancel the edit). The page's own bar (title, Archive, minimize, model picker, menu)
+stays as a second row under it. A tab always goes, whatever the page
+holds: a typed message, an unsaved project edit or a dictation on its way is
+kept on the device and waits in its field for the user to come back to the
+same place (`webapp/components/drafts.js`), and a dictation still being
+recorded or transcribed is finished by the service worker, its text landing
+in that field (`webapp/components/dictation.js`; webapp README, "Unsent
+input"). The tap used to be held instead, with a note popping up at the
+bottom asking for a second press — which the phone keyboard, coming up with
+the note, made impossible by hiding the row; pop-up notes at the bottom of
+the screen are an anti-pattern here. While the phone keyboard is up the row steps aside on a
 drill-down, as the page's own header does. On a phone the home never scrolls as
 a page (the attention list scrolls inside a locked frame, under the
 navigation); in the wide layout (`isWideFrame` in
@@ -433,14 +440,13 @@ is created and switchable mid-thread from a dropdown in the thread bar, effectiv
 from the next turn. A messenger chat's companion thread (the chat page's Ara
 pane) offers the same dropdown in its bar, so the tier answering there is as
 visible and as switchable as anywhere else. The picker governs **Ara's own turn only** — dispatched
-subagents (the Archivist and any chamber-provided subagents) always run on their
-own hard-wired models regardless of the selection. In a deployment that routes
+subagents (the Archivist and any chamber-provided subagents) run on their
+own pinned models regardless of the selection; those pins are changed on the
+settings page instead (see **Agent models** below). In a deployment that routes
 through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
 plus `retinue_label` still names a route; `retinue_picker: false` hides one.
-An Ollama primary (`LITELLM_PRIMARY_MODEL=ollama/…`) drops leftover Claude
-catalog seeds so the picker cannot offer a model the backend does not serve.
 Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
@@ -473,6 +479,77 @@ can never inject an arbitrary `--model`. The picker hides itself when fewer than
 two models are offered. Model tiers and per-thread escalation:
 `docs/model-routing.md`.
 
+## Agent models (the settings page)
+
+Every subagent pins its model in its definition (`model:` in the frontmatter
+of `.claude/agents/*.md`, or of a chamber plugin's `agents/*.md`), and those
+files are baked into the image. **Settings › Agent models** is the knob over
+them: one dropdown per dispatchable agent, offering the same list as the
+thread picker (`GET /conversation-models`, so an Ollama tag the picker shows
+is offered here too), with "Built-in" as the first entry and, where
+`RETINUE_AGENT_MODELS` sets one for the agent, "Deployment default" second.
+The card is server-side state shared by every device, not a per-device
+preference.
+
+Mechanism (`scripts/agent_models.py`): Claude Code's `--agents <file>` flag
+defines agents for one session and takes precedence over the same name from
+`.claude/agents/` or a plugin — as a *replacement*, not a merge. So an
+override is the agent's own file re-read (frontmatter plus body) and handed
+back with only `model` swapped; the agent's description, tools and prompt are
+untouched. Every framework spawner (`web-gateway.py`, `scheduler.py`, the
+base-job scripts, the MCP connector) appends `agent_models.cli_args()` to its
+`claude -p` command — `[]` when nothing is overridden — and the generated file
+is rewritten only when the choices change, so a new choice reaches the very
+next dispatch of those sessions with no restart. `cli_args()` never raises: an
+override that cannot be applied leaves the spawn as it was. **Interactive
+sessions are not covered** — the remote-control main session `entrypoint.sh`
+starts, and the ones the spawn-session skill starts: Claude accepts an
+`--agents` file only with `-p`, so the subagents they dispatch keep their
+pinned models.
+
+Two sources, the dashboard winning: `RETINUE_AGENT_MODELS` (deployment
+default; a JSON object or `agent=model,…`) and the file the card writes
+(`RETINUE_AGENT_MODELS_FILE`, default `/root/.retinue/agent-models.json`,
+where choosing "Built-in" is an explicit entry that also cancels the env
+default for that agent, and choosing "Deployment default" —
+`POST /agent-models {agent, reset: true}` — removes the agent's entry).
+Agent ids are what the Agent tool takes: the frontmatter `name` for core
+agents, `<plugin>:<name>` for plugin agents; a plugin the retinue marketplace
+no longer lists (a removed chamber) is skipped, as Claude skips it.
+`POST /agent-models` accepts only agents discovery lists and models on the
+offered list — the thread picker's gate — so a client can never inject an
+arbitrary definition.
+
+Some agents are listed but **fixed**, left as the only definition: Claude
+validates an `--agents` value as a whole and refuses to start on one bad
+field (where it merely warns about the same field in an agent file), so an
+agent is redefined only when every field is one the no-dependency
+frontmatter parser carries faithfully. Nested YAML (`hooks:`,
+`mcpServers:`), a field or value it does not know (an unrecognised `effort`
+or `permissionMode`, `maxTurns: 0`), or a prompt using the plugin
+placeholders Claude expands only when it loads the file itself
+(`${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}`, `${CLAUDE_PROJECT_DIR}`,
+`${user_config.…}`) make the agent fixed. A plugin agent's `permissionMode`
+and `initialPrompt`, which Claude ignores in plugin files, are left out of
+its redefinition, so a model change does not switch them on.
+
+An override does not change attribution: a subagent's memories carry the
+dispatching session's stamp (`RETINUE_SESSION_MODEL`, `docs/memory.md`), and
+the bubble names the turn's costliest model, usually Ara's own — the
+subagent's model shows only in the turn's `modelUsage`. A resumed session's
+envelope sums usage over all its turns, so the gateway stores each turn's
+totals with the session entry and labels and prices the next bubble from the
+difference — otherwise a model switch mid-thread would be credited to the
+earlier model, and every cost after the first would be a running total.
+
+Every core agent calls tools — even the Secretary (Read/Glob/Grep for its
+persona and style files) and the archivist-reader (Read for the document) —
+so an overriding model needs tool support, behind a route that does not drop
+`tools`; `docs/ollama.md` records which local tags fail there, and its
+`ollama/*` route (tools dropped, 512 output tokens) suits Ara's chat turns,
+not subagents. The Secretary and the archivist-reader have no write or shell
+tools, so a failed experiment there does the least harm.
+
 ## Attachments
 
 A thread can carry **file attachments** the user downloads straight from
@@ -484,6 +561,20 @@ untrusted filenames never touch the filesystem) and rendered as a link in the
 message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
+
+A file row has two links: its name opens the file (`?inline=1`, answered with
+`Content-Disposition: inline` for `_INLINE_SAFE_TYPES`), and ↓ saves a copy
+(`attachment`); a type the gateway does not serve inline gets the save link
+alone. Both URLs end in the file's own name —
+`…/attachments/<att-id>/<filename>` — a segment the route ignores (the
+header always carries the stored name). It is there for clients that name a
+saved file after the URL rather than the header: Android's
+`URLUtil.guessFileName` takes a name only from a bare
+`attachment; filename="…"` — neither `inline` nor the trailing `filename*`
+(RFC 6266, for non-ASCII names) gets through — and the shell, which named its
+downloads with it until it read the header itself, saved `<att-id>.pdf`.
+Inside the shell the two links stay distinct even though its WebView renders
+no PDF: see "Files" under "Inside the Android shell".
 
 Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
 AVIF — never SVG, which is script in the dashboard's origin) also **preview in
@@ -787,6 +878,33 @@ re-decode when a guess falls outside that set) lives entirely in the service via
 (defence-in-depth; the service is not published to the host). Downloaded model
 weights persist in the `stt-models` volume.
 
+## Several instances: name and colour
+
+Every deployment serves the same baked manifest and icons, so two installed
+PWAs (a main and an admin instance, say) look identical on the home screen and
+in the task switcher. Two optional variables brand an instance; a single
+deployment needs neither (`scripts/instance_branding.py`):
+
+- **`RETINUE_INSTANCE_NAME`** — a short label (`Admin`). The manifest's
+  `short_name` becomes the label, its `name` and every page `<title>`
+  `Retinue (Admin)`; push notifications without a thread title fall back to it,
+  and the Ask-Ara connector answers as `Ara (Admin)` unless `ARA_MCP_IDENTITY`
+  says otherwise.
+- **`RETINUE_INSTANCE_COLOR`** — the accent as `#rrggbb` (or `#rgb`), for the
+  icons and the dashboard alike. The stock icons (blue ring on near-black) are
+  recoloured, and the dashboard's accent with them: the `--accent` definition
+  in `styles.css` plus the `rgba(110, 168, 254, …)` tints the components'
+  shadow styles hard-code — send buttons, links, focus rings, hovers. Mode,
+  sphere and status colours (`--high`, `--ok`, `--outbound`) are left alone;
+  they carry meaning. The send glyph stays dark, so choose a light or medium
+  tone. An invalid value is ignored.
+
+Both are applied when the gateway serves the file — the baked webapp is never
+edited — and both are folded into the service worker's shell hash, so a change
+reaches installed clients like any shell edit. An already-installed PWA may
+keep its old home-screen label and icon until the browser refreshes the
+manifest (Chrome checks about daily); reinstalling applies it at once.
+
 ## Inside the Android shell
 
 The Android app (`ara-android`, its own repository) is a specialised browser
@@ -807,10 +925,11 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 |---|---|
 | User agent | ` RetinueShell/1 (Android)` appended. |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings()`, behind Settings → Phone shell (shown only when the object exists). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/` — unless they hold unsent input (the draft of the conversation on screen, a dictation or send under way, an unsaved project edit or chat draft): then neither event navigates, a short note says why, and the composer holding it is brought into view. A Home press made again while the note shows navigates after all (a wake does not). A draft left in a thread no longer on screen does not hold the press. |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
+| Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a file row's name link (`?inline=1`) — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
 "focus-existing"}`, so a second launch of the installed PWA brings its open

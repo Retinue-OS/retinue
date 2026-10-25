@@ -89,3 +89,8 @@ single-instance deployment needs neither:
   (`the company: invoices, the board, staff`). It is stated in the handshake
   *and* handed to the answering session, so an out-of-remit question comes back
   as "not held here, that belongs to …" rather than as a confident wrong answer.
+
+A deployment that already names itself for the dashboard
+(`RETINUE_INSTANCE_NAME`, see `docs/dashboard.md`, "Several instances") gets
+`Ara (<name>)` as its identity without setting `ARA_MCP_IDENTITY`; an explicit
+`ARA_MCP_IDENTITY` still wins.

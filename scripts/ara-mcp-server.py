@@ -64,7 +64,8 @@ in the tool descriptions and in the answering prompt, so the choice is made on
 subject matter instead of order.
 
 Configuration (environment):
-    ARA_MCP_IDENTITY          what this instance calls itself (default "Ara")
+    ARA_MCP_IDENTITY          what this instance calls itself (default "Ara",
+                              or "Ara (<RETINUE_INSTANCE_NAME>)" when set)
     ARA_MCP_SCOPE_HINT        one line on what it covers, for clients with
                               several instances attached (default: unset)
     ARA_MCP_PORT              listen port (default 8110)
@@ -100,10 +101,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
 import session_env  # noqa: E402
 
-IDENTITY = os.environ.get("ARA_MCP_IDENTITY", "").strip() or "Ara"
+# An instance named for the dashboard (RETINUE_INSTANCE_NAME, see
+# scripts/instance_branding.py) answers under that name unless told otherwise.
+_INSTANCE_NAME = os.environ.get("RETINUE_INSTANCE_NAME", "").strip()
+IDENTITY = (os.environ.get("ARA_MCP_IDENTITY", "").strip()
+            or (f"Ara ({_INSTANCE_NAME})" if _INSTANCE_NAME else "Ara"))
 SCOPE_HINT = os.environ.get("ARA_MCP_SCOPE_HINT", "").strip()
 PORT = int(os.environ.get("ARA_MCP_PORT", "8110"))
 WORKDIR = os.environ.get("ARA_MCP_WORKDIR", "/workspace")
@@ -495,6 +501,9 @@ def _run_once(prompt: str, model: str,
     cmd = [CLAUDE_BIN, "-p", "--output-format=json"]
     if model:
         cmd += ["--model", model]
+    # Per-agent model overrides for the subagents the answer may dispatch
+    # (scripts/agent_models.py); [] when none is set.
+    cmd += agent_models.cli_args()
     for tool in FORBIDDEN_TOOLS:
         cmd += ["--disallowed-tools", tool]
     # The session's environment comes from the allowlist in

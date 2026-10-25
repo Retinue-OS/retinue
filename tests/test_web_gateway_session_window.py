@@ -12,7 +12,8 @@ resume-shaped prompt that assumed the session already had it.
 Covers: the per-kind idle windows and their env overrides; the refusal
 signature is recognised while an unrelated failure is not; a refused resume
 respawns without --resume and with the caller's restart prompt; a non-resume
-failure is not retried; and the state file creates its parent directory so it
+failure is not retried; a resumed turn's bubble is priced and labelled from
+its own share of the session's cumulative usage; and the state file creates its parent directory so it
 can live on the persistent volume.
 
     python3 tests/test_web_gateway_session_window.py
@@ -153,6 +154,42 @@ def check_other_failure_is_not_retried(gw):
     print("PASS an unrelated failure is reported, not retried")
 
 
+def _usage_ok(session_id, total, usage):
+    return _Result(stdout=json.dumps({"session_id": session_id, "result": "done",
+                                      "total_cost_usd": total,
+                                      "modelUsage": usage}))
+
+
+def check_resumed_turn_is_labelled_and_priced_alone(gw):
+    """A resumed envelope sums the whole session; the bubble shows one turn."""
+    key = "conv:usage"
+    sonnet = {"claude-sonnet-5": {"costUSD": 0.05, "outputTokens": 200}}
+    both = {"claude-sonnet-5": {"costUSD": 0.05, "outputTokens": 200},
+            "claude-haiku-4-5": {"costUSD": 0.01, "outputTokens": 40}}
+    _spy(gw, [_usage_ok("s-usage", 0.05, sonnet),
+              _usage_ok("s-usage", 0.06, both)])
+
+    first = gw.send_message("one", session_key=key)
+    assert first["session_action"] == "new", first
+    assert first["cost_usd"] == 0.05 and first["model_name"] == "Sonnet", first
+    stored = gw._get_session_entry(key)["usage"]
+    assert stored == {"total_cost_usd": 0.05, "models": sonnet}, stored
+
+    second = gw.send_message("two", session_key=key)
+    assert second["session_action"] == "resumed", second
+    assert abs(second["cost_usd"] - 0.01) < 1e-9, second
+    assert second["model_name"] == "Haiku", second
+    assert gw._get_session_entry(key)["usage"]["total_cost_usd"] == 0.06
+
+    # A refused resume starts a new session: its envelope is its own, so the
+    # stale baseline must not be subtracted from it.
+    _spy(gw, [_Result(1, stderr=_REFUSAL), _usage_ok("s-fresh", 0.02, sonnet)])
+    third = gw.send_message("three", session_key=key, restart_message="all")
+    assert third["session_action"] == "restarted", third
+    assert third["cost_usd"] == 0.02 and third["model_name"] == "Sonnet", third
+    print("PASS a resumed turn is labelled and priced from its own usage")
+
+
 def check_state_file_creates_its_directory(gw):
     """The deployment points STATE_FILE at /root/.retinue/, which may not exist."""
     path = Path(gw.STATE_FILE)
@@ -169,6 +206,7 @@ def main():
         check_refusal_is_recognised(gw)
         check_refused_resume_restarts_with_full_prompt(gw)
         check_other_failure_is_not_retried(gw)
+        check_resumed_turn_is_labelled_and_priced_alone(gw)
         check_state_file_creates_its_directory(gw)
     print("all session-window checks passed")
 

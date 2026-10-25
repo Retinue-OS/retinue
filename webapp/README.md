@@ -24,7 +24,8 @@ a Progressive Web App on the phone home screen.
   `retinue-created`, `retinue-sent`, `retinue-archived`, `retinue-open`,
   `retinue-thread`); drafts, dictation jobs and the reader outlive one
   instance, so a thread left and reopened has its text, and a reading goes
-  on. A host can shape the frame without forking the thread: `bar="none"` or
+  on — and drafts and dictations outlive the page as well (see "Unsent
+  input"). A host can shape the frame without forking the thread: `bar="none"` or
   `bar="actions"` for a header of its own, `continuous` to open it in
   continuous conversation (see "Voice conversations"), `stamp="clock"` beside a
   clock-stamped timeline, `no-autofocus` where the host keeps it mounted
@@ -246,6 +247,19 @@ docstring). Pieces:
   rotation with the keyboard up, dropped while pinch-zoomed) — the header
   and the companion's bar are hidden, and the pane being typed in is kept
   scrolled to its newest message; the navigation row steps aside with them.
+  On a short frame (the Android shell's, above its launcher bar) the thread
+  keeps its room: the chips — one sideways-scrolling row on a touch screen —
+  and a standing instruction's report (its flags first) share a region capped
+  at a fifth of the pane that scrolls inside and steps aside while the
+  keyboard is up, and the field grows to at most 30% of the pane; the thread
+  gives way before the send row does. A draft longer than its box shows an
+  expand control in the field's top-right corner: the field then takes the
+  whole pane at its full width (the thread and the chips step aside, the mic
+  and send sit under its corners) until the control is pressed again, Escape
+  is pressed, a recording starts or the draft is sent. Shrunk again by the
+  control or Escape, the thread is back at the message it was left at; while
+  it is hidden nothing arriving is marked read. A tap on the control leaves
+  the focus where it was, so the phone keyboard stays as it was.
   The open chat polls on the conversations cadence,
   appending only unseen messages, and posts the read watermark on open, on
   arrivals while at the bottom, and when the page becomes visible again.
@@ -509,8 +523,71 @@ page, the project page) feeds its facts as it reads and marks the key as the
 current page — and reads only the items no page in the tab is showing
 (`GET /conversations/<id>`, `GET /chats`), every 4 s while one is waiting on
 Ara and every 20 s otherwise, never in a hidden tab. A thread's unsent draft
-still lives only in page memory, so it survives a minimize within the same page
-but not a reload.
+is kept on the device (see "Unsent input"), so it survives a minimize, a
+reload and a later visit alike.
+
+## Unsent input
+
+Leaving a page is never held back by what it holds. A tab of the navigation
+row is a plain link, and the Android shell's Home press and wake always
+navigate. What the user put in waits where they left it instead, and is in
+its field again when they come back to the same place — on any later page
+load of this device and browser:
+
+- **Drafts** (`components/drafts.js`). Every composer, command bar and editor
+  writes what it holds to `localStorage` as it changes (`retinue-draft:<key>`:
+  `conv:<thread id | new | new:<project>>` for the conversation composer,
+  `chat:<chat id>` for a messenger chat's composer, `project-cmd:<id>` and
+  `project-edit:<id>` for a project's command bar and raw editor), and reads
+  it back when its place opens again. Synchronous storage, so a write made as
+  the page unloads (`pagehide`) is not lost; written on every change, so a page
+  the system kills without an unload loses nothing either. Attachments (a
+  thread's picked files, a chat's staged images) are too large for it and go
+  to IndexedDB (`retinue-drafts`) when they are picked or dropped. A project
+  edit is kept with the file version it was started from, so saving it on a
+  later visit still answers 409 when the file changed meanwhile. A chat's
+  composer text also goes to the server's shared draft as the page unloads (a
+  keepalive request); the device copy is put back only while the server's
+  draft has not moved past it. A draft nobody came back to within a month is
+  dropped.
+- **Dictation** (`components/dictation.js`, and the "Dictation" section of
+  `sw.js`). Transcription runs in the service worker, not in the page that
+  recorded it: a page that is left takes its fetches with it. The worker
+  keeps each job, audio and all, in IndexedDB (`retinue-dictation`) under the
+  place it was recorded for, and its result until a page showing that place
+  takes it — the page that recorded it if it is still open, else the next one
+  to open the place, whose box shows "Transcribing …" while the job still
+  runs. A job has one owner, a live client: a page that goes releases its
+  jobs, and a second tab on the same place takes nothing that is not its own.
+  Recorders run in 250 ms slices, so a page left with the mic live hands the
+  worker everything said up to the last fraction of a second, and leaving acts
+  as **✓**: the transcript waits in the draft for review. A dictation sent
+  with **➤** whose page is gone before its transcript is in lands in the draft
+  too, unsent — the context a send needs left with that page. Without a
+  controlling worker (the very first load, a browser without one), and with
+  an older worker that does not take the job up within 4 s, transcription is
+  the page's own fetch, as before.
+- **Sends on the wire.** A turn small enough (all text-only turns in
+  practice) goes out as a `keepalive` request, which the browser finishes even
+  when the page is left meanwhile — but not offline, so that is never taken
+  for delivery. A conversation turn still on the wire as the page goes is
+  written into its draft, marked with when and where it went, and settled when
+  the composer is next shown: dropped from the box once the thread holds it
+  (read twice, a moment apart, as a keepalive request may still be landing),
+  left in it with a note when it does not; when the server cannot be asked at
+  all, the note hedges and the mark stays for the next visit to look again.
+  A first message, which has no thread to read, is looked for in the threads
+  the user opened from that moment on. A chat message is looked for in the chat's own mirror on the
+  next visit; one carrying images is too large for a keepalive request and is
+  the likelier to need it. A project command is taken as delivered.
+
+The page-side guard that held a tab or a Home press on such a page is gone,
+and with it the note that popped up at the bottom of the screen asking for a
+second press — on a phone the keyboard came up with that note and hid the
+navigation, so the second press could not even be made. Pop-up notes at the
+bottom of the screen are an anti-pattern here. Shell updates still wait for
+a moment that costs nothing (`components/update.js`): a reload under a user
+who is writing is not one they asked for.
 
 ## Markdown rendering
 
@@ -609,11 +686,14 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   showing only a status line until the send completes (the textarea never
   reappears mid-flow, so the phone keyboard stays down). The transcript lands
   in the conversation where **✓**/**➤** was tapped; navigating away from the
-  conversation acts as **✓**, so the transcript waits in that thread's draft.
+  conversation acts as **✓**, so the transcript waits in that thread's draft —
+  and so does leaving the page, recording or transcribing: the service worker
+  finishes the job (see "Unsent input").
   Transcription is a background job of its one conversation: every other
   thread keeps a fully usable row (text and voice) meanwhile, and is not
   re-rendered or refocused when the job — or its reply — arrives. Either way
-  the audio blob is POSTed to `/conversations/transcribe`, which the web gateway proxies
+  the audio blob is POSTed to `/conversations/transcribe` (by the service
+  worker, `components/dictation.js`), which the web gateway proxies
   to the shared STT service (`scripts/stt-service.py`) owning the Whisper model
   (so this image ships no ASR stack). Requires `STT_SERVICE_URL` (set in
   `docker-compose.yml`); when unset the endpoint returns 503 and the mic button
@@ -706,14 +786,18 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   opens continuous conversation (above), a home press closes an open thread or
   sheet back to `/` (every view entry unwound, not just one) and scrolls the
   list to its top. Any other page of the web app answers by loading
-  `/?wake=1` or `/` — unless it holds unsent input (pages register a check
-  with `registerUnsavedCheck` in `components/shell.js`), in which case
-  neither event navigates — until a Home press (or a tab press of the
-  navigation row) is made again while the note shows, which goes anyway. The gateway's own pages (`/sends`, `/claude-auth`)
+  `/?wake=1` or `/` — always: unsent input on the page waits in its field
+  for the user to come back (see "Unsent input"). The gateway's own pages (`/sends`, `/claude-auth`)
   carry no `shell.js`, so the shell itself loads the home (or `/?wake=1`)
   when the page in front is not the dashboard's. A wake while the page is not
   loaded makes the shell load `/?wake=1` itself; the home drops the flag from
   the address on load.
+- **Files**: the WebView renders no PDF, so a file row's view link
+  (`?inline=1`, answered `Content-Disposition: inline`) reaches the shell,
+  which opens it in the phone's viewer app from a private copy; the ↓ link
+  (`attachment`) saves it to Downloads. The shell names the file from that
+  header; the URL ends in the name too, for anything that names a file after
+  its URL.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;
