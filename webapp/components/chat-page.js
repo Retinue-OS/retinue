@@ -747,13 +747,23 @@ class RetinueChatPage extends HTMLElement {
     return true;
   }
 
-  // Whether the chat holds a message of the user's like the one in flight
-  // when the page was left — sent at most a minute (of clock skew) before it.
+  // Whether the chat holds the message that was in flight when the page was
+  // left: more of the user's messages like it than when it was sent (`seen`,
+  // counted then). Counting, not finding one: the same words sent twice
+  // within the minute would otherwise take the first for the second.
   _sentSince(s) {
+    return this._sentLike(s) > (Number(s.seen) || 0);
+  }
+
+  // The user's messages in the chat like send `s` — the same words (or, for
+  // images alone, any with attachments), at most a minute (of clock skew)
+  // before it. The page's own optimistic bubbles are not the chat's.
+  _sentLike(s) {
     const at = Date.parse(s.at || '') - 60 * 1000;
     const want = String(s.text || '').trim();
-    return this._messages.some((m) => m.direction === 'out' && Date.parse(m.ts || '') >= at &&
-      (want ? String(m.text || '').trim() === want : (m.attachments || []).length > 0));
+    return this._messages.filter((m) => m.direction === 'out' && !String(m.id || '').startsWith('local-') &&
+      Date.parse(m.ts || '') >= at &&
+      (want ? String(m.text || '').trim() === want : (m.attachments || []).length > 0)).length;
   }
 
   // The staged images, kept on the device. While a send carrying images is
@@ -817,7 +827,7 @@ class RetinueChatPage extends HTMLElement {
   _leaving() {
     if (this._recState === 'recording' && !this._recAborted) this._handOffRecording();
     const out = this._sendingNow;
-    this._keepLocal(out ? { text: out.text, at: out.at, images: out.images.length } : null);
+    this._keepLocal(out ? { text: out.text, at: out.at, images: out.images.length, seen: out.seen } : null);
     if (this._draft !== this._draftSaved && !this._undoing && this._id) {
       try {
         fetch(`/chats/${encodeURIComponent(this._id)}/draft`, {
@@ -2385,6 +2395,7 @@ class RetinueChatPage extends HTMLElement {
     // the words, on the next visit (_leaving, _restoreLocal).
     const keepalive = !images.length && text.length * 3 <= KEEPALIVE_BYTES;
     const sending = { text, at: new Date().toISOString(), keepalive, images };
+    sending.seen = this._sentLike(sending);
     this._sendingNow = sending;
     if (images.length) {
       const ta = this.shadowRoot.querySelector('[data-composer="chat"] textarea');
