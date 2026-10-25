@@ -871,6 +871,33 @@ re-decode when a guess falls outside that set) lives entirely in the service via
 (defence-in-depth; the service is not published to the host). Downloaded model
 weights persist in the `stt-models` volume.
 
+## Several instances: name and colour
+
+Every deployment serves the same baked manifest and icons, so two installed
+PWAs (a main and an admin instance, say) look identical on the home screen and
+in the task switcher. Two optional variables brand an instance; a single
+deployment needs neither (`scripts/instance_branding.py`):
+
+- **`RETINUE_INSTANCE_NAME`** — a short label (`Admin`). The manifest's
+  `short_name` becomes the label, its `name` and every page `<title>`
+  `Retinue (Admin)`; push notifications without a thread title fall back to it,
+  and the Ask-Ara connector answers as `Ara (Admin)` unless `ARA_MCP_IDENTITY`
+  says otherwise.
+- **`RETINUE_INSTANCE_COLOR`** — the accent as `#rrggbb` (or `#rgb`), for the
+  icons and the dashboard alike. The stock icons (blue ring on near-black) are
+  recoloured, and the dashboard's accent with them: the `--accent` definition
+  in `styles.css` plus the `rgba(110, 168, 254, …)` tints the components'
+  shadow styles hard-code — send buttons, links, focus rings, hovers. Mode,
+  sphere and status colours (`--high`, `--ok`, `--outbound`) are left alone;
+  they carry meaning. The send glyph stays dark, so choose a light or medium
+  tone. An invalid value is ignored.
+
+Both are applied when the gateway serves the file — the baked webapp is never
+edited — and both are folded into the service worker's shell hash, so a change
+reaches installed clients like any shell edit. An already-installed PWA may
+keep its old home-screen label and icon until the browser refreshes the
+manifest (Chrome checks about daily); reinstalling applies it at once.
+
 ## Inside the Android shell
 
 The Android app (`ara-android`, its own repository) is a specialised browser

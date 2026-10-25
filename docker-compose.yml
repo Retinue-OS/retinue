@@ -350,6 +350,11 @@ services:
       # chat-surface tunables (all optional, documented in web-gateway.py).
       - CONVERSATION_BACKEND_TOKEN
       - CONVERSATION_BASE_URL
+      # Optional instance branding, for running more than one deployment: a
+      # label for the PWA, page titles and Ask-Ara identity, and an accent
+      # colour (#rrggbb) for icons and dashboard. See scripts/instance_branding.py.
+      - RETINUE_INSTANCE_NAME
+      - RETINUE_INSTANCE_COLOR
       - SEND_APPROVAL_BASE_URL
       # Zone the approval pages render event times in; the containers run on
       # UTC, so without it a mis-zoned calendar entry reads as correct there.

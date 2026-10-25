@@ -76,6 +76,17 @@ const LIST_URL = '/chats';
 // Where the back control lands a visitor who has no app history behind them.
 const CHATS_URL = '/chats.html';
 const HOME_URL = '/';
+// The brand part of the served <title> ("Retinue", or "Retinue (Admin)" on a
+// named instance, scripts/instance_branding.py), read once before any rewrite:
+// only what follows the last " — " is this page's own, and a label may itself
+// contain one.
+const TITLE_BRAND = (() => {
+  try {
+    const t = document.title;
+    const i = t.lastIndexOf(' — ');
+    return (i < 0 ? t : t.slice(0, i)) || 'Retinue';
+  } catch (_e) { return 'Retinue'; }
+})();
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
 const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
@@ -482,7 +493,7 @@ class RetinueChatPage extends HTMLElement {
         this._draftByAra = draft.author === 'agent';
       }
       this._state = 'ok';
-      try { document.title = `Retinue — ${this._chat.name}`; } catch (_e) { /* ignore */ }
+      try { document.title = `${TITLE_BRAND} — ${this._chat.name}`; } catch (_e) { /* ignore */ }
       const restore = this._shelfRestore;
       this._shelfRestore = null;
       if (restore && restore.pane) this._pane = restore.pane === 'companion' ? 'companion' : 'chat';
