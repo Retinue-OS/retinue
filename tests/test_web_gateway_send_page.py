@@ -104,7 +104,7 @@ def test_approved_page_shows_check_and_advances():
         # With nothing left, back to the page the link was tapped on: the
         # latest history entry that is not a /sends page.
         assert "nav.traverseTo(entries[i].key)" in out
-        assert "if(/^\\/sends(\\/|$)/.test(path))continue;" in out
+        assert "if(u.origin!==location.origin||/^\\/sends(\\/|$)/.test(u.pathname))continue;" in out
         # Opened on its own: close, else the dashboard — never the /sends list.
         assert "window.close()" in out and "location.replace('/')" in out
         assert "location='/sends'" not in out

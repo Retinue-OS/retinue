@@ -3425,10 +3425,11 @@ def _all_pending() -> list[dict]:
 
 # The way out of the /sends pages once nothing is left to decide: back to the
 # page the approval link was tapped on — the dashboard opens it in place
-# (#359), so that is the latest history entry that is not a /sends page
-# (Navigation API), however many approval and status pages followed it. A
-# page opened on its own (a link from another app) has none, so it closes;
-# where the browser refuses that, the dashboard — never the empty /sends list.
+# (#359), so that is the latest same-origin history entry that is not a
+# /sends page (Navigation API), however many approval and status pages
+# followed it. A page opened on its own (a link from another app, another
+# site before it in the tab) has none, so it closes; where the browser
+# refuses that, the dashboard — never the empty /sends list.
 _SENDS_LEAVE_JS = (
     "  function closeOrHome(){\n"
     "    window.close();\n"
@@ -3439,9 +3440,9 @@ _SENDS_LEAVE_JS = (
     "    if(nav&&nav.currentEntry&&nav.entries){\n"
     "      var entries=nav.entries();\n"
     "      for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
-    "        var path;\n"
-    "        try{path=new URL(entries[i].url).pathname;}catch(e){continue;}\n"
-    "        if(/^\\/sends(\\/|$)/.test(path))continue;\n"
+    "        var u;\n"
+    "        try{u=new URL(entries[i].url);}catch(e){continue;}\n"
+    "        if(u.origin!==location.origin||/^\\/sends(\\/|$)/.test(u.pathname))continue;\n"
     "        var t=nav.traverseTo(entries[i].key);\n"
     "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
     "        return;\n"
