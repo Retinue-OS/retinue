@@ -88,7 +88,7 @@ approval link was tapped on (a dashboard link opens in place, so that page is
 in the window's history). A page opened on its own, from another app, has
 nothing to go back to: it closes itself, or lands on the dashboard where the
 browser will not close it — never on the empty `/sends` list. **Deny** goes
-straight on to the next pending send.
+straight on to the next pending send, or, with none left, back the same way.
 
 ### Retracting a queued send
 

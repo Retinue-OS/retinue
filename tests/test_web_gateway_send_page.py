@@ -559,6 +559,22 @@ def test_email_outcome_page_ends_like_a_messenger_send():
         assert 'var nextUrl="/sends/signal-gateway/bbb";' in with_next
 
 
+def test_empty_list_after_a_decision_goes_back():
+    """Deny lands on /sends/next; with nothing left it goes back where the
+    approval link was tapped, the way an Allow does — the plain list does not."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        after = wg._render_sends_index_html([], leave=True)
+        assert "No pending send requests." in after          # the no-script view
+        assert wg._SENDS_LEAVE_JS in after and "  leave();\n" in after
+        plain = wg._render_sends_index_html([])
+        assert "<script>" not in plain and "leave()" not in plain
+        # The status page runs the very same way out.
+        status = wg._render_channel_send_html(_detail("approved"), "whatsapp-gateway",
+                                              "a" * 32, None)
+        assert wg._SENDS_LEAVE_JS in status
+
+
 def main() -> int:
     tests = [test_sending_page_polls_with_spinner,
              test_sending_page_with_next_shows_button,
@@ -585,7 +601,8 @@ def main() -> int:
              test_unparsable_times_fall_back_to_the_raw_value,
              test_index_row_names_the_event_time,
              test_messenger_page_is_unchanged,
-             test_email_outcome_page_ends_like_a_messenger_send]
+             test_email_outcome_page_ends_like_a_messenger_send,
+             test_empty_list_after_a_decision_goes_back]
     failures = 0
     for test in tests:
         try:

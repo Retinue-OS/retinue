@@ -3423,7 +3423,40 @@ def _all_pending() -> list[dict]:
     return items
 
 
-def _render_sends_index_html(pending: list[dict]) -> str:
+# The way out of the /sends pages once nothing is left to decide: back to the
+# page the approval link was tapped on — the dashboard opens it in place
+# (#359), so that is the latest history entry that is not a /sends page
+# (Navigation API), however many approval and status pages followed it. A
+# page opened on its own (a link from another app) has none, so it closes;
+# where the browser refuses that, the dashboard — never the empty /sends list.
+_SENDS_LEAVE_JS = (
+    "  function closeOrHome(){\n"
+    "    window.close();\n"
+    "    setTimeout(function(){location.replace('/');},400);\n"
+    "  }\n"
+    "  function leave(){\n"
+    "    var nav=window.navigation;\n"
+    "    if(nav&&nav.currentEntry&&nav.entries){\n"
+    "      var entries=nav.entries();\n"
+    "      for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
+    "        var path;\n"
+    "        try{path=new URL(entries[i].url).pathname;}catch(e){continue;}\n"
+    "        if(/^\\/sends(\\/|$)/.test(path))continue;\n"
+    "        var t=nav.traverseTo(entries[i].key);\n"
+    "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
+    "        return;\n"
+    "      }\n"
+    "    }\n"
+    "    closeOrHome();\n"
+    "  }\n"
+)
+
+
+def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
+    """The list of pending sends. With `leave`, the empty list a decision lands
+    on when nothing is left to decide goes straight back to where the approval
+    link was tapped (_SENDS_LEAVE_JS); the list itself is only what shows
+    without scripting."""
     if pending:
         rows = []
         for p in pending:
@@ -3452,6 +3485,8 @@ def _render_sends_index_html(pending: list[dict]) -> str:
         + "<h1>Pending Sends</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/conversation">Session log</a></nav>\n'
         + body + "\n"
+        + ("<script>\n(function(){\n" + _SENDS_LEAVE_JS + "  leave();\n})();\n</script>\n"
+           if leave else "")
         + "</body>\n</html>\n"
     )
 
@@ -4015,30 +4050,8 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
           "    if(nextUrl){location=nextUrl;return;}\n"
           "    leave();\n"
           "  }\n"
-          # Back to the page the approval link was tapped on: the latest
-          # history entry before this run of /sends pages (Navigation API).
-          # A page opened on its own has none, so it closes; where the
-          # browser refuses that, the dashboard — never the empty /sends list.
-          "  function closeOrHome(){\n"
-          "    window.close();\n"
-          "    setTimeout(function(){location.replace('/');},400);\n"
-          "  }\n"
-          "  function leave(){\n"
-          "    var nav=window.navigation;\n"
-          "    if(nav&&nav.currentEntry&&nav.entries){\n"
-          "      var entries=nav.entries();\n"
-          "      for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
-          "        var path;\n"
-          "        try{path=new URL(entries[i].url).pathname;}catch(e){continue;}\n"
-          "        if(/^\\/sends(\\/|$)/.test(path))continue;\n"
-          "        var t=nav.traverseTo(entries[i].key);\n"
-          "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
-          "        return;\n"
-          "      }\n"
-          "    }\n"
-          "    closeOrHome();\n"
-          "  }\n"
-          "  function terminal(st,err){\n"
+        + _SENDS_LEAVE_JS
+        + "  function terminal(st,err){\n"
           "    if(st==='approved'){\n"
           "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
           "      note.textContent=noteDone;\n"
@@ -12146,7 +12159,9 @@ class Handler(BaseHTTPRequestHandler):
                 first = pending[0]
                 self._redirect(f"/sends/{first['account']}/{first['request_id']}")
             else:
-                self._send_html(200, _render_sends_index_html([]))
+                # Only a decision redirects here (Deny): with nothing left,
+                # back to where the approval link was tapped, as after Allow.
+                self._send_html(200, _render_sends_index_html([], leave=True))
         elif _SEND_SINGLE_RE.match(self.path):
             m = _SEND_SINGLE_RE.match(self.path)
             self._handle_send_single(m.group(1), m.group(2))
