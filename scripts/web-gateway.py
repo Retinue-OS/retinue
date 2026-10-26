@@ -3943,11 +3943,14 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
     A "sending" entry shows a spinner and polls `poll_url` (the JSON status
     endpoint) client-side — no full-page refresh flicker. Success flips the
     spinner to a green check and auto-advances a moment later: to the next
-    pending request when one exists, else the page tries to close itself
-    (falling back to /sends — window.close() only works for script-opened
-    windows). The next-request button is rendered only when a next request
-    actually exists; a failure shows the gateway's real error and stays put so
-    the user can read it.
+    pending request when one exists, else back to the page the approval link
+    was tapped on — the dashboard opens it in place (#359), so that page is
+    in the window's history, before however many /sends pages followed. A
+    page opened on its own (a link from another app) has nothing to go back
+    to, so it tries to close itself, and lands on the dashboard where the
+    browser refuses. The next-request button is rendered only when a next
+    request actually exists; a failure shows the gateway's real error and
+    stays put so the user can read it.
 
     `title` and `heading` come HTML-escaped; `notes` holds the pending, done,
     rejected, retracted and error texts in the request's own terms.
@@ -4010,8 +4013,30 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
           "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
           "  function advance(){\n"
           "    if(nextUrl){location=nextUrl;return;}\n"
+          "    leave();\n"
+          "  }\n"
+          # Back to the page the approval link was tapped on: the latest
+          # history entry before this run of /sends pages (Navigation API).
+          # A page opened on its own has none, so it closes; where the
+          # browser refuses that, the dashboard — never the empty /sends list.
+          "  function closeOrHome(){\n"
           "    window.close();\n"
-          "    setTimeout(function(){location='/sends';},400);\n"
+          "    setTimeout(function(){location.replace('/');},400);\n"
+          "  }\n"
+          "  function leave(){\n"
+          "    var nav=window.navigation;\n"
+          "    if(nav&&nav.currentEntry&&nav.entries){\n"
+          "      var entries=nav.entries();\n"
+          "      for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
+          "        var path;\n"
+          "        try{path=new URL(entries[i].url).pathname;}catch(e){continue;}\n"
+          "        if(/^\\/sends(\\/|$)/.test(path))continue;\n"
+          "        var t=nav.traverseTo(entries[i].key);\n"
+          "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
+          "        return;\n"
+          "      }\n"
+          "    }\n"
+          "    closeOrHome();\n"
           "  }\n"
           "  function terminal(st,err){\n"
           "    if(st==='approved'){\n"

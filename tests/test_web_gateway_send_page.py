@@ -101,7 +101,13 @@ def test_approved_page_shows_check_and_advances():
         out = wg._render_channel_send_html(_detail("approved"), "whatsapp-gateway", "a" * 32, None)
         assert 'class="check"' in out and "✓" in out       # green check
         assert "setTimeout(advance,1500)" in out           # brief pause, then close/advance
-        assert "window.close()" in out
+        # With nothing left, back to the page the link was tapped on: the
+        # latest history entry that is not a /sends page.
+        assert "nav.traverseTo(entries[i].key)" in out
+        assert "if(/^\\/sends(\\/|$)/.test(path))continue;" in out
+        # Opened on its own: close, else the dashboard — never the /sends list.
+        assert "window.close()" in out and "location.replace('/')" in out
+        assert "location='/sends'" not in out
 
 
 def test_error_page_shows_gateway_error():
