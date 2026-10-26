@@ -83,9 +83,12 @@ themselves — and a queued send nobody approves is a message never sent.
 Every channel, e-mail included, ends an **Allow** the same way: the page shows
 the outcome (a spinner while a messenger gateway delivers, then a green check,
 or the gateway's error, which stays on screen), and a moment after success
-moves on — to the next pending send, or, with none left, it closes the window
-(falling back to the `/sends` list where the browser will not close it).
-**Deny** goes straight on to the next pending send.
+moves on — to the next pending send, or, with none left, back to the page the
+approval link was tapped on (a dashboard link opens in place, so that page is
+in the window's history). A page opened on its own, from another app, has
+nothing to go back to: it closes itself, or lands on the dashboard where the
+browser will not close it — never on the empty `/sends` list. **Deny** goes
+straight on to the next pending send, or, with none left, back the same way.
 
 ### Retracting a queued send
 
