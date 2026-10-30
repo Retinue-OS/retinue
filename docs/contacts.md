@@ -116,13 +116,26 @@ and the `kb:` terms the rest of Retinue already uses.
 | `sms` | `vcard:hasTelephone <tel:…>` (E.164 only) | — |
 | `signal` | `foaf:OnlineAccount`, homepage `https://signal.org/` | for a phone handle: `tel:`, and `sgnl://signal.me/#p/<E.164>` |
 | `whatsapp` | `foaf:OnlineAccount`, homepage `https://www.whatsapp.com/` | for a phone handle: `tel:`, and `https://wa.me/<digits>` |
-| `telegram` | `foaf:OnlineAccount`, homepage `https://telegram.org/` | for a username: `https://t.me/<name>` |
+| `telegram` | `foaf:OnlineAccount`, homepage `https://telegram.org/`; a username or phone is filed with the user id next to it | for a username: `https://t.me/<name>` |
 | anything else (`matrix`, `threema`, …) | `foaf:OnlineAccount` | for a phone handle: `tel:` |
 
 **Normalization.** Phone numbers lose punctuation, and a leading `00` becomes
 `+`. A national number without a country code (`079 …`) is refused rather than
 guessed. Handles that are not phone numbers (a WhatsApp LID, a Telegram user id)
 are kept exactly as the channel spells them.
+A Telegram username is filed as `@` plus its lowercase form, however it was
+typed.
+
+**Telegram ids.** Telegram delivers a message under the sender's numeric user
+id only — never the username or phone number. The delivery gate, the chat card
+and the instruction all compare that id, so a person filed as `@mara_k` alone
+would never match a message of theirs. `add`, `update --add-handle` and the
+dashboard's contact API therefore ask the Telegram gateway (`GET /resolve?q=`)
+for the id of every username or phone they file, and file it next to the
+handle; a name Telegram does not know, or an unreachable gateway, is refused
+rather than filed unreachable. A Telegram id typed directly needs no lookup.
+Contacts filed before this rule get their ids with `contacts.py telegram-ids`.
+Removing a username does not remove its id: remove both.
 
 **Uniqueness.** An account or an e-mail address belongs to at most one person
 across all chambers: `add` answers 409 with the owner's name. A telephone can be

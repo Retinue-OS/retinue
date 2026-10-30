@@ -91,6 +91,50 @@ def test_handles():
     print("ok test_handles")
 
 
+def test_telegram_ids(chambers, manifest):
+    # One spelling per username: with or without @, any case.
+    for spelled in ("@Mara_K", "mara_k", " @mara_k "):
+        assert contacts.normalize_handle("telegram", spelled) == ("telegram", "@mara_k")
+    assert contacts.normalize_handle("telegram", "123456789") == ("telegram", "123456789")
+    assert contacts.normalize_handle("telegram", "-1001234") == ("telegram", "-1001234")
+    assert contacts.normalize_handle("telegram", "0041 79 123 45 67") == ("telegram", "+41791234567")
+    try:
+        contacts.normalize_handle("telegram", "@no way")
+        raise AssertionError("accepted a username with a space")
+    except contacts.ContactError:
+        pass
+
+    # Telegram delivers the sender's id only: a name or phone gets its id
+    # filed next to it; an id needs no lookup; an unknown name is refused.
+    known = {"@mara_k": 4242, "+41791234567": 4243}
+    asked = []
+
+    def lookup(q):
+        asked.append(q)
+        return {"id": known[q]} if q in known else None
+
+    pairs = [("telegram", "@mara_k"), ("email", "m@x.ch"), ("telegram", "99")]
+    assert contacts.with_telegram_ids(pairs, lookup) == pairs + [("telegram", "4242")]
+    assert asked == ["@mara_k"]
+    assert contacts.with_telegram_ids([("telegram", "+41791234567")], lookup) == [
+        ("telegram", "+41791234567"), ("telegram", "4243")]
+    try:
+        contacts.with_telegram_ids([("telegram", "@nobody")], lookup)
+        raise AssertionError("filed an unknown username")
+    except contacts.ContactError as exc:
+        assert exc.status == 404
+
+    # Filed with its id, the person is who the gate and the instruction match.
+    book = contacts.ContactBook(chambers, manifest)
+    record = book.create("private", "Mara", contacts.with_telegram_ids(
+        [contacts.parse_handle("telegram:@Mara_K")], lookup), instruction="Ring for anything urgent.")
+    assert contacts.instructed_person(book, "telegram", "4242")["name"] == "Mara"
+    assert book.find("telegram", "4242")["name"] == "Mara"
+    assert "4242" in contacts.instruction_projection(book)["telegram"]
+    book.delete(record["key"])
+    print("ok test_telegram_ids")
+
+
 def test_create_find_update(chambers, manifest):
     book = contacts.ContactBook(chambers, manifest)
     mara = book.create("private", "Mara Keller", [("email", "mara@example.org"), ("signal", "+41791234567")],
@@ -284,7 +328,7 @@ def test_cli(chambers, manifest):
     # An instruction, given to a team at once: one update, several ids, and
     # the gate learns each member's handles as `instructed`.
     max_ = run("add", "--chamber", "work", "--name", "Max Weber", "--handle", "signal:+41790000002")
-    lea = run("add", "--chamber", "work", "--name", "Lea Graf", "--handle", "telegram:@lea_graf",
+    lea = run("add", "--chamber", "work", "--name", "Lea Graf", "--handle", "telegram:7311",
               "--instruction", "Draft a reply; ring me if it is about today.")
     assert lea["instruction"] == "Draft a reply; ring me if it is about today.", lea
     team = run("update", eva["id"], max_["id"], "--instruction-from", lea["id"])
@@ -340,6 +384,7 @@ def main():
         chambers, manifest = _setup(tmp)
         test_locations(chambers, manifest)
         test_handles()
+        test_telegram_ids(chambers, manifest)
         test_create_find_update(chambers, manifest)
         test_hand_written_person(chambers, manifest)
         test_attention_and_vip(chambers, manifest)

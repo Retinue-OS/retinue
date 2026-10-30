@@ -806,6 +806,31 @@ def _list_contacts() -> list:
     return fut.result(timeout=30)
 
 
+async def _async_resolve_user(query: str) -> dict | None:
+    """The user an @username or phone number names, or None. Only people:
+    a group or channel is no address-book handle."""
+    try:
+        entity = await _resolve_entity(query)
+    except (ValueError, TypeError):
+        return None
+    if type(entity).__name__ != "User":
+        return None
+    name = (" ".join(p for p in (getattr(entity, "first_name", None),
+                                 getattr(entity, "last_name", None)) if p).strip()
+            or getattr(entity, "username", None) or None)
+    return {"id": getattr(entity, "id", None), "username": getattr(entity, "username", None),
+            "phone": getattr(entity, "phone", None), "name": name}
+
+
+def _resolve_user(query: str) -> dict | None:
+    """Resolve a username or phone to the numeric id inbound events carry —
+    what the address book must file for a contact to match (docs/contacts.md)."""
+    if _client is None or _LOOP is None:
+        raise RuntimeError("Telegram client is not connected yet")
+    fut = asyncio.run_coroutine_threadsafe(_async_resolve_user(query), _LOOP)
+    return fut.result(timeout=30)
+
+
 def _inbound_media_files(path, mime: str | None, name: str | None = None) -> tuple[list[dict], list[str]]:
     """Read a downloaded inbound medium as a durable ref + forward-ready files.
 
@@ -2222,6 +2247,29 @@ class _PushHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 print(f"[telegram-gateway] contacts lookup failed: {exc}", flush=True)
                 self._reply(502, {"error": f"contacts lookup failed: {exc}"})
+            return
+        if self.path.split("?", 1)[0].rstrip("/") == "/resolve":
+            # ?q=@username or a phone → the user's numeric id. Inbound events
+            # carry only the id, so the address book files it next to the
+            # name a person was entered by (scripts/contacts.py).
+            if not self._authorized():
+                self._reply(401, {"error": "unauthorized"})
+                return
+            from urllib.parse import parse_qs, urlsplit
+            query = ((parse_qs(urlsplit(self.path).query).get("q") or [""])[0]).strip()
+            if not query:
+                self._reply(400, {"error": "q is required"})
+                return
+            try:
+                user = _resolve_user(query)
+            except Exception as exc:
+                print(f"[telegram-gateway] resolve failed: {exc}", flush=True)
+                self._reply(502, {"error": f"resolve failed: {exc}"})
+                return
+            if user is None:
+                self._reply(404, {"error": f"no Telegram user {query!r}"})
+                return
+            self._reply(200, user)
             return
         m = _PENDING_SEND_RE.match(self.path)
         if m and not m.group(2):

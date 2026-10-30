@@ -123,6 +123,9 @@ SERVICE_HOMEPAGES = {
 }
 EMAIL = "email"
 SMS = "sms"
+TELEGRAM = "telegram"
+_TG_ID_RE = re.compile(r"^-?[0-9]+$")
+_TG_USERNAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
 _CHANNEL_RE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 _PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
 _WA_PN_SUFFIX = "@s.whatsapp.net"
@@ -174,6 +177,13 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
         value = normalize_phone(value)
         if not _PHONE_RE.match(value):
             raise ContactError(f"not an E.164 phone number: {handle!r}")
+    elif channel == TELEGRAM and not _TG_ID_RE.match(value) and not _PHONE_RE.match(normalize_phone(value)):
+        # A username is case-insensitive and written with or without its @:
+        # one spelling, so the same person is not filed twice.
+        name = value[1:] if value.startswith("@") else value
+        if not _TG_USERNAME_RE.match(name):
+            raise ContactError(f"not a Telegram username, user id or phone number: {handle!r}")
+        value = "@" + name.lower()
     else:
         if channel == "whatsapp" and value.lower().endswith(_WA_PN_SUFFIX):
             # A phone-number JID (a chat key) is the number itself; a LID JID
@@ -204,11 +214,50 @@ def _im_uri(channel: str, handle: str) -> str | None:
         return "sgnl://signal.me/#p/" + handle
     if channel == "whatsapp" and _PHONE_RE.match(handle):
         return "https://wa.me/" + handle[1:]
-    if channel == "telegram":
+    if channel == TELEGRAM:
         name = handle[1:] if handle.startswith("@") else handle
-        if re.match(r"^[A-Za-z][A-Za-z0-9_]{3,31}$", name):
+        if _TG_USERNAME_RE.match(name):
             return "https://t.me/" + name
     return None
+
+
+def _telegram_lookup(query: str) -> dict | None:
+    """Ask the Telegram gateway who a username or phone is (GET /resolve)."""
+    import urllib.error
+    import urllib.request
+    base = os.environ.get("TELEGRAM_GATEWAY_BASE_URL", "http://telegram-gateway:8093").rstrip("/")
+    token = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
+    request = urllib.request.Request(base + "/resolve?" + urllib.parse.urlencode({"q": query}),
+                                     headers={"Authorization": f"Bearer {token}"} if token else {})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise ContactError(f"the Telegram gateway could not resolve {query}: HTTP {exc.code}", 502)
+    except (OSError, ValueError) as exc:
+        raise ContactError(f"the Telegram gateway could not resolve {query}: {exc}", 502)
+
+
+def with_telegram_ids(pairs, lookup=_telegram_lookup) -> list[tuple[str, str]]:
+    """``pairs``, plus the numeric user id of every Telegram username or phone
+    among them. Telegram delivers a message under the sender's id only, so a
+    person filed by name or number alone would never match one: the delivery
+    gate, the chat card and the instruction all compare the id. The name stays
+    too — it is what a person recognizes, and it gives the t.me link. A name
+    Telegram does not know is refused rather than filed unreachable."""
+    out = list(pairs)
+    for channel, handle in pairs:
+        if channel != TELEGRAM or _TG_ID_RE.match(handle):
+            continue
+        user = lookup(handle)
+        if not user or user.get("id") is None:
+            raise ContactError(f"Telegram knows no user {handle}", 404)
+        pair = (TELEGRAM, str(user["id"]))
+        if pair not in out:
+            out.append(pair)
+    return out
 
 
 # ── N-Triples, just enough ──────────────────────────────────────────────────
@@ -897,6 +946,8 @@ def main(argv=None) -> int:
     p_upd.add_argument("--no-permits", action="store_true", help="clear every Focus-mode permit")
     p_del = sub.add_parser("delete")
     p_del.add_argument("id")
+    sub.add_parser("telegram-ids", help="file the user id next to every Telegram username or phone "
+                                        "filed without one (a contact filed before ids were resolved)")
     args = ap.parse_args(argv)
     book = ContactBook(args.chambers_dir, args.manifest)
 
@@ -944,8 +995,8 @@ def main(argv=None) -> int:
         elif args.cmd == "add":
             if not args.name:
                 raise ContactError("--name is required")
-            pairs = ([("email", e) for e in args.email] + [("sms", p) for p in args.phone]
-                     + [parse_handle(h) for h in args.handle])
+            pairs = with_telegram_ids([("email", e) for e in args.email] + [("sms", p) for p in args.phone]
+                                      + [parse_handle(h) for h in args.handle])
             instruction = instruction_arg()
             record = book.create(args.chamber, args.name, pairs, sphere=args.sphere, tags=args.tag or (),
                                  importance=args.importance or None, permits=args.permit or (),
@@ -954,8 +1005,9 @@ def main(argv=None) -> int:
             commit(book.chambers_dir, record["path"], f"chore(contacts): add {record['name']}")
             _print(args, public(record))
         elif args.cmd == "update":
-            add = ([parse_handle(h) for h in args.add_handle] + [("email", e) for e in args.add_email]
-                   + [("sms", p) for p in args.add_phone])
+            add = with_telegram_ids([parse_handle(h) for h in args.add_handle]
+                                    + [("email", e) for e in args.add_email]
+                                    + [("sms", p) for p in args.add_phone])
             remove = ([parse_handle(h) for h in args.remove_handle] + [("email", e) for e in args.remove_email]
                       + [("sms", p) for p in args.remove_phone])
             ids = list(dict.fromkeys(args.id))
@@ -983,6 +1035,17 @@ def main(argv=None) -> int:
             for record in records:
                 commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
             _print(args, public(records[0]) if len(records) == 1 else [public(r) for r in records])
+        elif args.cmd == "telegram-ids":
+            changed = []
+            for record in book.all():
+                have = [(c, h) for c, h in record["accounts"] if c == TELEGRAM]
+                add = [p for p in with_telegram_ids(have) if p not in have]
+                if add:
+                    changed.append(book.update(record["key"], add=add))
+            sync_policy(book)
+            for record in changed:
+                commit(book.chambers_dir, record["path"], f"chore(contacts): Telegram id for {record['name']}")
+            _print(args, [public(r) for r in changed])
         elif args.cmd == "delete":
             record = book.delete(args.id)
             sync_policy(book)
