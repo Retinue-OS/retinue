@@ -10360,6 +10360,15 @@ class Handler(BaseHTTPRequestHandler):
         if instruction is not False and instruction is not None and not isinstance(instruction, str):
             self._send_json(400, {"error": "instruction must be a string (empty removes it)"})
             return
+        # Handles are read, and a Telegram name resolved to its id over the
+        # network, before the lock: a slow gateway must not stall the dashboard.
+        try:
+            handles = contacts_mod.with_telegram_ids(pairs("handles"))
+            add = contacts_mod.with_telegram_ids(pairs("add"))
+            remove = pairs("remove")
+        except contacts_mod.ContactError as exc:
+            self._send_json(exc.status, {"error": str(exc)})
+            return
         with _attention_lock:
             focus = _ATTENTION.focus()
             profile = _ATTENTION.profile()
@@ -10374,7 +10383,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if key is None:
                     record = _CONTACTS.create(str(payload.get("chamber") or ""), str(payload.get("name") or ""),
-                                              pairs("handles"), sphere=sphere or None, tags=tags or (),
+                                              handles, sphere=sphere or None, tags=tags or (),
                                               importance=None if importance is False else importance,
                                               permits=permits or (), vip=bool(vip),
                                               instruction=instruction or None)
@@ -10384,7 +10393,7 @@ class Handler(BaseHTTPRequestHandler):
                     before = _CONTACTS.get(key)
                     name = payload.get("name")
                     record = _CONTACTS.update(key, name=None if name is None else str(name), sphere=sphere,
-                                              tags=tags, add=pairs("add"), remove=pairs("remove"),
+                                              tags=tags, add=add, remove=remove,
                                               importance=importance, permits=permits,
                                               vip=None if vip is None else bool(vip),
                                               instruction=instruction)
