@@ -113,7 +113,7 @@ and the `kb:` terms the rest of Retinue already uses.
 | Channel | Stored as | Also derived |
 |---|---|---|
 | `email` | `vcard:hasEmail <mailto:…>` (lowercased) | — |
-| `sms` | `vcard:hasTelephone <tel:…>` (E.164 only) | — |
+| `sms` | a number: `vcard:hasTelephone <tel:…>` (E.164); a sender id or short code: `foaf:OnlineAccount` | — |
 | `signal` | `foaf:OnlineAccount`, homepage `https://signal.org/` | for a phone handle: `tel:`, and `sgnl://signal.me/#p/<E.164>` |
 | `whatsapp` | `foaf:OnlineAccount`, homepage `https://www.whatsapp.com/` | for a phone handle: `tel:`, and `https://wa.me/<digits>` |
 | `telegram` | `foaf:OnlineAccount`, homepage `https://telegram.org/` | for a username: `https://t.me/<name>` |
@@ -124,9 +124,20 @@ and the `kb:` terms the rest of Retinue already uses.
 guessed. Handles that are not phone numbers (a WhatsApp LID, a Telegram user id)
 are kept exactly as the channel spells them.
 
+**SMS senders that are no number.** Banks, couriers and carriers send from an
+alphanumeric sender id (`HBL`, `DHL`) or a short code (`4636`). Such a sender
+is filed as an account on the `sms` channel (`--handle sms:HBL`), in the shape
+the SMS gateway delivers it: up to 16 letters, digits, spaces and `._&-`, with
+at least one letter, or a short code of 3–6 digits. It gives the person no
+telephone, since nothing can be sent back to it, and it is found and matched
+case-insensitively, as the delivery gate matches it. So a sender like this can
+carry spheres, permits, VIP and an instruction like any person. Keep in mind
+that a sender id is trivially spoofed: anyone can send an SMS that says it is
+from `HBL`.
+
 **Uniqueness.** An account or an e-mail address belongs to at most one person
-across all chambers: `add` answers 409 with the owner's name. A telephone can be
-shared (a family landline).
+across all chambers: `add` answers 409 with the owner's name. An SMS sender id
+counts as an account. A telephone can be shared (a family landline).
 
 ### Example
 

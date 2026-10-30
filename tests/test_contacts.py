@@ -82,7 +82,12 @@ def test_handles():
     assert contacts.normalize_handle("whatsapp", "41791234567@s.whatsapp.net") == ("whatsapp", "+41791234567")
     assert contacts.normalize_handle("matrix", "@mara:example.org") == ("matrix", "@mara:example.org")
     assert contacts.parse_handle("telegram:@mara_k") == ("telegram", "@mara_k")
-    for bad in (("email", "no-at-sign"), ("sms", "not a number"), ("Not A Channel", "x"), ("signal", " ")):
+    # An SMS sender that is no number: an alphanumeric sender id or a short code.
+    assert contacts.normalize_handle("sms", " HBL ") == ("sms", "HBL")
+    assert contacts.normalize_handle("sms", "Post  CH") == ("sms", "Post CH")
+    assert contacts.normalize_handle("sms", "4636") == ("sms", "4636")
+    for bad in (("email", "no-at-sign"), ("sms", "not a number at all"), ("sms", "079 123 45 67"),
+                ("sms", "<b>HBL</b>"), ("sms", "12"), ("Not A Channel", "x"), ("signal", " ")):
         try:
             contacts.normalize_handle(*bad)
             raise AssertionError(f"accepted {bad}")
@@ -120,6 +125,22 @@ def test_create_find_update(chambers, manifest):
             assert exc.status == 409
     home = book.create("work", "Mara's flatmate", [("sms", "+41791234567")])
     assert home["phones"] == ["+41791234567"]
+    # An alphanumeric SMS sender is an account of its own: no telephone, found
+    # case-insensitively (as the gate matches it), and claimed by one person.
+    bank = book.create("work", "HBL", [("sms", "HBL")])
+    assert bank["accounts"] == [("sms", "HBL")] and bank["phones"] == [], bank
+    text = (chambers / bank["path"]).read_text(encoding="utf-8")
+    assert '<https://w3id.org/retinue/kb#channel> "sms"' in text and "<tel:" not in text, text
+    assert book.find("sms", "hbl")["key"] == bank["key"]
+    assert {"channel": "sms", "handle": "HBL"} in contacts.public(book.get(bank["key"]))["handles"]
+    assert ("sms", "HBL") in set(contacts._gate_handles(book.get(bank["key"])))
+    try:
+        book.create("private", "Someone", [("sms", "HBL")])
+        raise AssertionError("a sender id was claimed twice")
+    except contacts.ContactError as exc:
+        assert exc.status == 409
+    assert book.update(bank["key"], remove=[("sms", "HBL")])["accounts"] == []
+    book.delete(bank["key"])
     # A line somebody else wrote survives every rewrite.
     path = chambers / mara["path"]
     extra = f'<{mara["iri"]}> <http://www.w3.org/2006/vcard/ns#bday> "1990-04-01" .'
