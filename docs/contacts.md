@@ -124,7 +124,9 @@ and the `kb:` terms the rest of Retinue already uses.
 guessed. Handles that are not phone numbers (a WhatsApp LID, a Telegram user id)
 are kept exactly as the channel spells them.
 A Telegram username is filed as `@` plus its lowercase form, however it was
-typed.
+typed. A handle filed before a rule like this one existed keeps its old
+spelling. A lookup, a removal and the uniqueness check compare it in today's
+spelling, and filing the handle again rewrites it that way.
 
 **Telegram ids.** Telegram delivers a message under the sender's numeric user
 id only — never the username or phone number. The delivery gate, the chat card
@@ -133,8 +135,14 @@ would never match a message of theirs. `add`, `update --add-handle` and the
 dashboard's contact API therefore ask the Telegram gateway (`GET /resolve?q=`)
 for the id of every username or phone they file, and file it next to the
 handle; a name Telegram does not know, or an unreachable gateway, is refused
-rather than filed unreachable. A Telegram id typed directly needs no lookup.
+rather than filed unreachable. Telegram finds a phone number only among the
+account's own contacts; a number it cannot find is refused like an unknown name.
+A Telegram id typed directly needs no lookup.
 Contacts filed before this rule get their ids with `contacts.py telegram-ids`.
+It looks every name up before it writes anything, so an unreachable gateway
+changes no contact. What it cannot do — a name Telegram no longer knows, a
+handle that is no username or number, an id another person already holds — it
+reports, and exits 2; every other contact is written all the same.
 Removing a username does not remove its id: remove both.
 
 **Uniqueness.** An account or an e-mail address belongs to at most one person

@@ -205,6 +205,16 @@ def parse_handle(spec: str) -> tuple[str, str]:
     return normalize_handle(channel, handle)
 
 
+def _canonical(channel: str, handle: str) -> tuple[str, str]:
+    """A filed handle in today's spelling — the form a lookup compares. Filed
+    handles predate some normalization rules (a Telegram username kept as it
+    was typed, ``@Mara_K``); one that no longer normalizes is compared as filed."""
+    try:
+        return normalize_handle(channel, handle)
+    except ContactError:
+        return channel, handle
+
+
 def account_iri(channel: str, handle: str) -> str:
     return ACCOUNT_PREFIX + urllib.parse.quote(f"{channel}:{handle}", safe="")
 
@@ -253,7 +263,9 @@ def with_telegram_ids(pairs, lookup=_telegram_lookup) -> list[tuple[str, str]]:
             continue
         user = lookup(handle)
         if not user or user.get("id") is None:
-            raise ContactError(f"Telegram knows no user {handle}", 404)
+            # Telegram finds a number only among the account's own contacts.
+            where = " among the account's Telegram contacts" if _PHONE_RE.match(handle) else ""
+            raise ContactError(f"Telegram knows no user {handle}{where}", 404)
         pair = (TELEGRAM, str(user["id"]))
         if pair not in out:
             out.append(pair)
@@ -607,7 +619,7 @@ class ContactBook:
                 return record
             if channel == SMS and handle in record["all_phones"]:
                 return record
-            if (channel, handle) in record["accounts"]:
+            if any(_canonical(*account) == (channel, handle) for account in record["accounts"]):
                 return record
         return None
 
@@ -760,7 +772,8 @@ def _add_pair(record: dict, pair: tuple[str, str]) -> None:
     elif channel == SMS:
         record["phones"] = sorted(set(record["phones"]) | {handle})
     else:
-        record["accounts"] = sorted(set(record["accounts"]) | {pair})
+        # The pair is normalized; an older spelling of the same handle gives way.
+        record["accounts"] = sorted({a for a in record["accounts"] if _canonical(*a) != pair} | {pair})
 
 
 def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
@@ -770,7 +783,7 @@ def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
     elif channel == SMS:
         record["phones"] = [p for p in record["phones"] if p != handle]
     else:
-        record["accounts"] = [a for a in record["accounts"] if a != pair]
+        record["accounts"] = [a for a in record["accounts"] if _canonical(*a) != pair]
 
 
 # ── The delivery gate ───────────────────────────────────────────────────────
@@ -779,13 +792,8 @@ def _gate_handles(record: dict):
     """Every messenger handle of one person as the delivery gate compares it:
     their accounts, and their telephones for SMS."""
     for channel, handle in record.get("accounts") or []:
-        # Filed handles predate some normalization rules; project the
-        # current form, which is the one the gateways deliver.
-        try:
-            channel, handle = normalize_handle(channel, handle)
-        except ContactError:
-            pass
-        yield channel, handle
+        # Project the current form, which is the one the gateways deliver.
+        yield _canonical(channel, handle)
     for number in record.get("all_phones") or []:
         yield SMS, number
 
@@ -1036,16 +1044,48 @@ def main(argv=None) -> int:
                 commit(book.chambers_dir, record["path"], f"chore(contacts): update {record['name']}")
             _print(args, public(records[0]) if len(records) == 1 else [public(r) for r in records])
         elif args.cmd == "telegram-ids":
-            changed = []
+            # Every lookup comes before any write, so a gateway that fails
+            # halfway leaves every contact as it was. What cannot be done — a
+            # name Telegram does not know, a handle that is no name at all, an
+            # id someone else already holds — is reported; the rest is
+            # written, synced and committed.
+            plan, problems = [], []
             for record in book.all():
-                have = [(c, h) for c, h in record["accounts"] if c == TELEGRAM]
-                add = [p for p in with_telegram_ids(have) if p not in have]
+                have = []
+                for channel, handle in record["accounts"]:
+                    if channel != TELEGRAM:
+                        continue
+                    try:
+                        pair = normalize_handle(channel, handle)
+                    except ContactError as exc:  # filed before handles were checked
+                        problems.append(f"{record['name']} ({record['key']}): {exc}")
+                        continue
+                    if pair not in have:
+                        have.append(pair)
+                try:
+                    add = [p for p in with_telegram_ids(have) if p not in have]
+                except ContactError as exc:
+                    if exc.status != 404:
+                        raise
+                    problems.append(f"{record['name']} ({record['key']}): {exc}")
+                    continue
                 if add:
+                    plan.append((record, add))
+            changed = []
+            for record, add in plan:
+                try:
                     changed.append(book.update(record["key"], add=add))
-            sync_policy(book)
+                except ContactError as exc:
+                    problems.append(f"{record['name']} ({record['key']}): {exc}")
+            if changed:
+                sync_policy(book)
             for record in changed:
                 commit(book.chambers_dir, record["path"], f"chore(contacts): Telegram id for {record['name']}")
             _print(args, [public(r) for r in changed])
+            for problem in problems:
+                print(f"contacts: {problem}", file=sys.stderr)
+            if problems:
+                return 2
         elif args.cmd == "delete":
             record = book.delete(args.id)
             sync_policy(book)

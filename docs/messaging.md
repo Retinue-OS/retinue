@@ -216,7 +216,9 @@ Resolve a name with `scripts/telegram-contacts.py` — same recent-chats-first,
 contact-directory-fallback contract as `signal-contacts.py` (the user client has
 both). `GET /resolve?q=<@username|phone>` answers a user's numeric id, the
 only identity inbound messages carry; the address book files it next to a
-username (docs/contacts.md, "Telegram ids"). Outbound is gated by `TELEGRAM_SEND_POLICY`, keyed — like
+username (docs/contacts.md, "Telegram ids"). A phone number resolves only for
+someone among the account's contacts; a name that is no user (unknown, or a
+group or channel) answers 404, a failing client 502. Outbound is gated by `TELEGRAM_SEND_POLICY`, keyed — like
 `EMAIL_SEND_POLICY` — by the **sending identity** (this account,
 `TELEGRAM_ACCOUNT`), not the recipient chat; since it is the user's own account,
 the fail-safe default means every send needs approval unless a policy entry grants

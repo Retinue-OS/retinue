@@ -683,10 +683,12 @@ def _poll_retinue_job(job_url: str, lang: str, sender: str | None) -> tuple[str,
 async def _resolve_entity(recipient: str):
     """Resolve a recipient (numeric id, @username, phone, or 'me') to an entity."""
     r = str(recipient).strip()
-    try:
-        return await _client.get_entity(int(r))
-    except (ValueError, TypeError):
-        return await _client.get_entity(r)
+    if not r.startswith("+"):  # int() reads a phone number as an id too
+        try:
+            return await _client.get_entity(int(r))
+        except (ValueError, TypeError):
+            pass
+    return await _client.get_entity(r)
 
 
 def _sent_message(obj):
@@ -808,10 +810,15 @@ def _list_contacts() -> list:
 
 async def _async_resolve_user(query: str) -> dict | None:
     """The user an @username or phone number names, or None. Only people:
-    a group or channel is no address-book handle."""
+    a group or channel is no address-book handle. A phone number is found
+    among the account's own contacts only (Telethon's lookup by number)."""
+    from telethon.errors import BadRequestError  # noqa: PLC0415 - localized bridge dep
     try:
         entity = await _resolve_entity(query)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, BadRequestError):
+        # A 400 is about the query, not the gateway: Telegram answers a name
+        # nobody uses with USERNAME_INVALID as well as USERNAME_NOT_OCCUPIED
+        # (which Telethon raises as ValueError).
         return None
     if type(entity).__name__ != "User":
         return None
