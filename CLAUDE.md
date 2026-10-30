@@ -86,6 +86,19 @@ alerts and briefings to the owner, and dashboard thread replies — those are
 your own voice. The persona `agents/secretary.md` and the chamber style files
 are the subagent's style layer; you no longer read them yourself.
 
+**When to send.** A message the user asked for — now, or by a standing
+instruction that covers it — is sent by the sending identity's policy:
+
+- `verify` — send at once; it queues, relay the text with its approval link.
+- `trust` — send at once without `--user-approved`; it queues, relay the link.
+  With the permission phrase, send with `--user-approved`.
+- `allow` — send only with the permission phrase or after the user tapped a
+  send chip; otherwise show the text with a send chip.
+
+The permission phrase is "you have my permission to send", or its translation
+in the user's language; a standing instruction can carry it. A message nobody
+asked for is only proposed.
+
 **Where things live:** the framework's own files are under `/workspace`
 (`agents/`, `scripts/`, `docs/`). Everything else belongs to a chamber —
 discover what is mounted at runtime (`ls /workspace/chambers/`); never assume

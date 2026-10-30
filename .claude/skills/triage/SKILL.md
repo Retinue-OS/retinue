@@ -594,7 +594,9 @@ is the user's to give) — the contract in `.claude/agents/secretary.md`. Its
 `BASIS` line says which facts decided, and names any that were missing.
 
 **3. Open the thread around what came back**, one of three shapes. A `REPLY`
-becomes a proposal with send / adjust / discard chips. A `DECISION NEEDED`
+becomes a proposal with send / adjust / discard chips — nobody asked for it
+yet, so nothing is queued unless a standing instruction covers it (`CLAUDE.md`,
+**When to send**). A `DECISION NEEDED`
 becomes a question with one chip per returned option — and **no draft at
 all**: the user answers by chip, and the reply is composed on a second
 dispatch once they have. A `NO MESSAGE` owes the sender nothing: propose the
@@ -854,15 +856,28 @@ Ara picks up each thread, carries out what was approved, then writes status
 
 **A chip the user picked is an answer, not a reply.** When the thread asked a
 `DECISION NEEDED` question, their choice is the fact that was missing — feed it
-back to the `secretary` (message, sender, context, and now the user's answer)
-and post the text it returns into the thread as a proposal, with the same
-send / adjust / discard chips. **Only `send` sends.** An answer to a question
-and an adjustment are both instructions about what the reply should say, not
-approval of words the user has not yet seen; the same holds for a proposal the
-user adjusted rather than approved — their instruction goes to the secretary,
-whose text comes back for approval like any other. No session composes the
+back to the `secretary` (message, sender, context, and now the user's answer).
+An answer to a question and an adjustment are both instructions about what the
+reply should say; the same holds for a proposal the user adjusted rather than
+approved — their instruction goes to the secretary. No session composes the
 outgoing words itself, on any tier, and no text reaches a recipient that the
-user has not seen and approved.
+user has not approved. What happens to the secretary's text follows the
+sending identity's send policy (`CLAUDE.md`, **When to send**, which also
+defines the permission phrase):
+
+- **`verify`, and `trust` without the permission phrase** — the approval page
+  *is* the approval round; never add a second one in the thread. Queue the
+  send at once (on `trust` without `--user-approved`) and post the
+  secretary's text into the thread together with the approval link the push
+  script printed, plus an adjust / discard chip. An adjustment retracts the
+  queued request (`--retract <id>`, `email_client.py retract`), re-dispatches
+  the secretary and queues the new text with its new link; a discard retracts
+  it. Record the request id in the status file.
+- **`trust` with the permission phrase** — send with `--user-approved`, post
+  what went out, and resolve.
+- **`allow`** — send only with the permission phrase or after the user tapped
+  `send`; otherwise post the text as a proposal with send / adjust / discard
+  chips.
 
 **A `CANNOT COMPOSE:` line is never sendable text.** When the secretary
 returns one — a missing convention, an unreadable style layer — post what is
@@ -897,12 +912,12 @@ Then carry out the disposition:
   the threading headers (`In-Reply-To`/`References`) from the source — an
   unthreaded reply defeats the already-answered check and gets re-proposed as a
   duplicate. `flag --read` **before** sending; respect `EMAIL_SEND_POLICY`
-  (`--user-approved` only for approved `trust` addresses; `verify` always goes
-  through web approval). On a direct send `reply` returns `sent_uid` +
-  `message_id`: **record them in the status file** so a later run can verify the
-  send instead of trusting the `resolved` flag. A `verify` reply becomes
-  `resolved` only once its pending send is approved — until then it stays
-  non-terminal.
+  (how the user's answer is sent — queued, or sent with `--user-approved` —
+  is decided above; `verify` always goes through web approval). On a direct
+  send `reply` returns `sent_uid` + `message_id`: **record them in the status
+  file** so a later run can verify the send instead of trusting the `resolved`
+  flag. A queued reply becomes `resolved` only once its pending send is
+  approved — until then it stays non-terminal.
 
   For a **messenger** reply, the thread's agent context (replayed in the
   engage prompt: "Reply via: … --reply-to <token>") carries the exact send
