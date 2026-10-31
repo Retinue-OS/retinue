@@ -562,12 +562,14 @@ message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
 
-A file row has two links: its name opens the file (`?inline=1`, answered with
-`Content-Disposition: inline` for `_INLINE_SAFE_TYPES`), and ↓ saves a copy
-(`attachment`); a type the gateway does not serve inline gets the save link
-alone. Both URLs end in the file's own name —
-`…/attachments/<att-id>/<filename>` — a segment the route ignores (the
-header always carries the stored name). It is there for clients that name a
+A file row has two links: its name opens the file to view — in the
+dashboard's file viewer (below) or, for a PDF a frame would not show whole,
+as the bare file; either way the file is fetched with `?inline=1`, answered
+with `Content-Disposition: inline` for `_INLINE_SAFE_TYPES` — and ↓ saves a
+copy (`attachment`); a type the gateway does not serve inline gets the save
+link alone. Both attachment URLs end in the file's own name —
+`…/attachments/<att-id>/<filename>`, which is also the viewer's `src` — a
+segment the route ignores (the header always carries the stored name). It is there for clients that name a
 saved file after the URL rather than the header: Android's
 `URLUtil.guessFileName` takes a name only from a bare
 `attachment; filename="…"` — neither `inline` nor the trailing `filename*`
@@ -598,8 +600,11 @@ back:
 
 - in the Android shell, the phone's viewer app (see "Files" under "Inside the
   Android shell");
-- in a browser with no PDF viewer (`navigator.pdfViewerEnabled === false`,
-  Chrome on Android), its own PDF tab or a download;
+- in a browser with no PDF viewer of its own (`navigator.pdfViewerEnabled
+  === false`), and on Android, where no browser draws a PDF in a frame even
+  when it reports a viewer (Chrome's `AndroidHandlePdfInIframe`, on by default
+  on Android laptops, shows an "Open" placeholder instead): the browser's own
+  PDF view or a download;
 - on iOS and iPadOS, WebKit's full PDF view: a frame there shows only a
   picture of the first page (WebKit's `UseImageDocumentForSubframePDF`),
   although `pdfViewerEnabled` is true. In a Safari tab that view has the

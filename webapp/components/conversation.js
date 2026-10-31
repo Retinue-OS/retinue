@@ -201,7 +201,7 @@ const INLINE_SAFE_TYPES = new Set([
 // so the way back to the thread stays on screen. A PDF goes there only where a
 // frame shows all of it (framesWholePdf, base.js); elsewhere the bare
 // `?inline=1` file is the better view, and the way back is the platform's own:
-// the Android shell opens it in the phone's viewer app, Chrome on Android in
+// the Android shell opens it in the phone's viewer app, an Android browser in
 // its own viewer or as a download, iOS in WebKit's full PDF view.
 function viewerHref(url, name, type) {
   const bare = `${url}?inline=1`;
@@ -1751,12 +1751,15 @@ class RetinueConversation extends HTMLElement {
     return `<small class="msg-meta">${bits.join('<span class="m-sep">·</span>')}</small>`;
   }
 
-  // Render any files a message carries. Both links hit the gateway's per-thread
-  // attachment endpoint; `?inline=1` asks for a Content-Disposition the browser
-  // renders in place rather than saving. Viewing is the primary tap: a download
-  // writes a fresh copy to storage every time, so re-reading one invoice leaves
-  // invoice(1).pdf, invoice(2).pdf behind. Types the gateway refuses to serve
-  // inline get the download link alone — an inline href would save anyway.
+  // Render any files a message carries. The save link hits the gateway's
+  // per-thread attachment endpoint; the view link opens the file viewer around
+  // it (viewerHref), or the endpoint itself for a PDF a frame would not show
+  // whole. Either way the file is fetched with `?inline=1`, which asks for a
+  // Content-Disposition the browser renders in place rather than saving.
+  // Viewing is the primary tap: a download writes a fresh copy to storage
+  // every time, so re-reading one invoice leaves invoice(1).pdf,
+  // invoice(2).pdf behind. Types the gateway refuses to serve inline get the
+  // download link alone — an inline href would save anyway.
   // Images the gateway serves inline also preview in the bubble (see
   // _imagePreviewHtml): the thread's own attachment, same-origin behind the
   // dashboard's auth — not a remote fetch, so markdown.js's rule for rendered

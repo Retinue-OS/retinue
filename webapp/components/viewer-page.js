@@ -22,9 +22,9 @@
 // Images and text show everywhere. A PDF only where a frame shows the whole
 // document (framesWholePdf, base.js): a thread links a PDF here only then, and
 // keeps the bare link elsewhere — on iOS (where a frame shows page one only),
-// in Chrome on Android (no viewer in a page) and in the Android shell (which
-// opens it in the phone's viewer app). Reached anyway, the viewer offers Open
-// and Save in place of the frame.
+// on Android (no browser there draws a PDF in a frame) and in the Android
+// shell (which opens it in the phone's viewer app). Reached anyway, the viewer
+// offers Open and Save in place of the frame.
 
 import { esc, framesWholePdf } from './base.js';
 
@@ -57,12 +57,14 @@ const CSS = `
   .stage { flex: 1; min-height: 0; display: flex; border-radius: 12px; overflow: hidden;
            background: var(--card, #141925); border: 1px solid var(--line, rgba(231, 235, 242, .08)); }
   iframe { flex: 1; width: 100%; height: 100%; border: 0; background: #fff; }
-  /* An image fits the width and scrolls down, as a phone's own image view
-     shows it: fitted to the height too, a long receipt or screenshot would be
-     an unreadable strip. Auto margins centre a small one and give way to 0 on
-     an overflowing one, so its top stays in reach. */
+  /* An image is shown whole, as a browser's own image view shows it. A long
+     one (isLongImage: a receipt, a scrolled screenshot) fits the width and
+     scrolls down instead: shown whole it would be an unreadable strip. Auto
+     margins centre a small image and give way to 0 on an overflowing one, so
+     its top stays in reach. */
   .img { flex: 1; min-height: 0; overflow: auto; display: flex; }
-  .img img { max-width: 100%; margin: auto; }
+  .img img { max-width: 100%; max-height: 100%; margin: auto; object-fit: contain; }
+  .img img.long { max-height: none; }
   .note { margin: auto; padding: 24px; text-align: center; color: var(--muted, #8b93a3); line-height: 1.5; }
   .note .acts { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
 `;
@@ -90,6 +92,14 @@ export function parseViewerParams(search) {
 
 function safeDecode(s) {
   try { return decodeURIComponent(s); } catch (_) { return s; }
+}
+
+// An image too long to read when shown whole: more than two and a half times
+// as tall as it is wide — a receipt, a scrolled screenshot; a phone's own
+// screenshot (about 2.2) is still read whole. Its own shape decides, not the
+// stage's: against a wide stage every portrait photo would count as long.
+export function isLongImage(width, height) {
+  return width > 0 && height > 2.5 * width;
 }
 
 class RetinueViewerPage extends HTMLElement {
@@ -152,6 +162,11 @@ class RetinueViewerPage extends HTMLElement {
     this.shadowRoot.innerHTML = `<style>${CSS}</style>` +
       `<div class="bar"><h1 class="name" title="${esc(p.name)}">${esc(p.name)}</h1>${save}</div>` +
       `<div class="stage">${stage}</div>`;
+    const img = this.shadowRoot.querySelector('.img img');
+    if (img) {
+      const mark = () => img.classList.toggle('long', isLongImage(img.naturalWidth, img.naturalHeight));
+      if (img.complete) mark(); else img.addEventListener('load', mark, { once: true });
+    }
   }
 }
 

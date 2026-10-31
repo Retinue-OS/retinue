@@ -51,16 +51,24 @@ export function onFrameChange(fn) {
 // ── Files ─────────────────────────────────────────────────────────────────────
 // Whether a PDF in a frame of a page (an <iframe>) shows the whole document, as
 // the browser's own viewer would — what the file viewer (viewer.html) needs to
-// be worth opening. Not where the browser has no PDF viewer at all
-// (navigator.pdfViewerEnabled false: Chrome on Android, the Android shell's
-// WebView), and not on iOS or iPadOS: WebKit there reports a viewer but draws a
-// PDF in a frame as a picture of its first page (UseImageDocumentForSubframePDF),
-// and every browser on those systems is WebKit. iPadOS asks for desktop sites
-// with a Mac user agent, so a "Macintosh" with a touch screen is an iPad.
+// be worth opening. Not where the browser has no PDF viewer of its own
+// (navigator.pdfViewerEnabled false), and not on two systems that say they
+// have one but draw no whole PDF in a frame:
+//  - Android: no Android build of Chromium draws a PDF in a frame. Chrome
+//    there reports no viewer, except with AndroidHandlePdfInIframe (on by
+//    default on Android laptops), where the frame gets an "Open" placeholder
+//    instead. Android laptops send a ChromeOS user agent, but their client
+//    hints name the platform.
+//  - iOS and iPadOS: WebKit draws a framed PDF as a picture of its first page
+//    (UseImageDocumentForSubframePDF), and every browser there is WebKit.
+//    iPadOS asks for desktop sites with a Mac user agent, so a "Macintosh"
+//    with a touch screen is an iPad.
 export function framesWholePdf() {
   if (typeof navigator === 'undefined') return false;
   if (navigator.pdfViewerEnabled === false) return false;
   const ua = navigator.userAgent || '';
+  const platform = (navigator.userAgentData && navigator.userAgentData.platform) || '';
+  if (/\bAndroid\b/.test(ua) || platform === 'Android') return false;
   const appleTouch = /\biP(?:hone|ad|od)\b/.test(ua) ||
     (/\bMacintosh\b/.test(ua) && navigator.maxTouchPoints > 1);
   return !appleTouch;

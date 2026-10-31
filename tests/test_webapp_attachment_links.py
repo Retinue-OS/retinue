@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Behavioural tests for a thread's attachment links (webapp/components/conversation.js).
+"""Behavioural tests for a thread's attachment links (webapp/components/conversation.js)
+and the file viewer they open (webapp/components/viewer-page.js, webapp/viewer.html).
 
-Both links of a file row end in the file's own name, a segment the gateway
+Both attachment URLs of a file row (the view link's `src` or bare inline
+link, and the save link) end in the file's own name, a segment the gateway
 ignores. The Android shell's WebView hands every file it cannot show to its
 download listener, which named the saved file with URLUtil.guessFileName
 until it read the header itself — and that takes a name only from a bare
@@ -14,8 +16,14 @@ These checks pin, under Node with a scripted DOM:
   which keeps the navigation row — and so the way back — on screen;
 - a PDF keeps the bare `?inline=1` link where a frame would not show it
   whole: in the Android shell (the phone's viewer app opens it), in a
-  browser with no PDF viewer (Chrome on Android) and on iOS/iPadOS (WebKit
-  draws a framed PDF as its first page); images go to the viewer there too;
+  browser with no PDF viewer, on Android (no browser there draws a framed
+  PDF, even one that reports a viewer; Android laptops are known by their
+  client hints) and on iOS/iPadOS (WebKit draws a framed PDF as its first
+  page); images go to the viewer there too;
+- the viewer page itself: Open and Save in place of a frame on those
+  systems, the frame elsewhere, the instance's brand kept in the title, the
+  way back (history only when the dashboard is behind it, else home), long
+  images told from ordinary ones, and `frame-src 'self'` on viewer.html;
 - the viewer accepts only this dashboard's attachment paths, exactly as the
   browser will request them (no `..`, `%2e%2e`, backslash, tab or extra
   segment resolving elsewhere), and only the types the gateway serves inline;
@@ -149,6 +157,23 @@ ok('iOS and iPadOS, which frame only page one of a PDF, get the bare PDF', () =>
   });
 });
 
+const ANDROID_PHONE = 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36';
+const CROS = 'Mozilla/5.0 (X11; CrOS x86_64 14541.0.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
+ok('Android, which draws no PDF in a frame even when it reports a viewer, gets the bare PDF', () => {
+  withNav({ userAgent: ANDROID_PHONE, maxTouchPoints: 5, pdfViewerEnabled: true }, () => {
+    assert.deepEqual(hrefs(pdfRow()), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`]);
+    assert.equal(viewer(hrefs(pngRow())[1]).src, `${BASE}/chart.png`);
+  });
+  // An Android laptop sends a ChromeOS user agent; its client hints say Android.
+  withNav({ userAgent: CROS, userAgentData: { platform: 'Android' }, pdfViewerEnabled: true }, () => {
+    assert.deepEqual(hrefs(pdfRow()), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`]);
+  });
+  // A Chromebook is not Android: its Chrome frames the whole PDF.
+  withNav({ userAgent: CROS, userAgentData: { platform: 'Chrome OS' }, pdfViewerEnabled: true }, () => {
+    assert.equal(viewer(hrefs(pdfRow())[0]).src, `${BASE}/invoice.pdf`);
+  });
+});
+
 ok('a name outside ASCII is percent-encoded into the segment', () => {
   const html = row({ filename: 'Rechnung März #3.pdf', content_type: 'application/pdf; charset=binary' });
   const [view, save] = hrefs(html);
@@ -183,7 +208,12 @@ ok("an image's preview loads from the named URL and opens in the viewer", () => 
   assert.equal(save, `${BASE}/chart.png`);
 });
 
-const { parseViewerParams } = await import('./viewer-page.js');
+// The served <title> of a named instance, as the gateway brands viewer.html;
+// the viewer reads its brand from it once, when the module loads.
+document.title = 'Retinue (Admin) — File';
+const { parseViewerParams, isLongImage } = await import('./viewer-page.js');
+const Viewer = registry.get('retinue-viewer-page');
+assert.ok(Viewer, 'the viewer element registered itself');
 const qs = (o) => '?' + new URLSearchParams(o);
 
 ok('the viewer reads what a view link carries', () => {
@@ -217,6 +247,90 @@ ok('every name a file row can carry passes the viewer', () => {
     const p = parseViewerParams(u.search);
     assert.ok(p, filename);
     assert.equal(p.name, filename);
+  }
+});
+
+// ── The viewer page at run time ─────────────────────────────────────────────
+// Render it for `search` on a device with these navigator fields; the shadow
+// root may be handed in to see what the page does with its image.
+function renderViewer(search, fields, root) {
+  location.search = search;
+  let html = '';
+  withNav(fields, () => {
+    const v = new Viewer();
+    if (root) v.shadowRoot = root;
+    v.connectedCallback();
+    html = v.shadowRoot.innerHTML;
+  });
+  return html;
+}
+const pdfSearch = qs({ src: `${BASE}/invoice.pdf`, name: 'invoice.pdf', type: 'application/pdf' });
+const IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
+const MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15';
+
+ok('reached on a system that frames no whole PDF, the viewer offers Open and Save, not a frame', () => {
+  for (const fields of [{ userAgent: IPHONE, maxTouchPoints: 5, pdfViewerEnabled: true },
+                        { userAgent: MAC, maxTouchPoints: 5, pdfViewerEnabled: true },
+                        { userAgent: ANDROID_PHONE, maxTouchPoints: 5, pdfViewerEnabled: true },
+                        { userAgent: 'node', pdfViewerEnabled: false }]) {
+    const html = renderViewer(pdfSearch, fields);
+    assert.ok(html.includes('cannot show the whole PDF') && !html.includes('<iframe'), fields.userAgent);
+    assert.ok(html.includes(`href="${BASE}/invoice.pdf?inline=1">Open</a>`), fields.userAgent);
+  }
+  const html = renderViewer(pdfSearch, { userAgent: MAC, maxTouchPoints: 0, pdfViewerEnabled: true });
+  assert.ok(html.includes(`<iframe src="${BASE}/invoice.pdf?inline=1"`) && !html.includes('cannot show'), html);
+  assert.ok(!/<iframe[^>]*sandbox/.test(html), 'a PDF frame is not sandboxed: that would keep the PDF viewer out');
+  const text = renderViewer(qs({ src: `${BASE}/notes.txt`, name: 'notes.txt', type: 'text/plain' }), {});
+  assert.ok(/<iframe[^>]*sandbox=""/.test(text), 'a text frame is sandboxed');
+});
+
+ok("the viewer's title keeps the instance's brand", () => {
+  renderViewer(pdfSearch, { userAgent: MAC, maxTouchPoints: 0 });
+  assert.equal(document.title, 'Retinue (Admin) — invoice.pdf');
+});
+
+ok('viewer.html keeps other sites out of its frame', () => {
+  assert.ok(fs.readFileSync('./viewer.html', 'utf8').includes(`<meta http-equiv="Content-Security-Policy" content="frame-src 'self'">`));
+});
+
+ok('back goes through history only when the dashboard is behind the viewer, else home', () => {
+  const v = new Viewer();
+  const backTo = (referrer, navigation, length) => {
+    let backs = 0;
+    document.referrer = referrer;
+    globalThis.navigation = navigation;
+    Object.assign(history, { length, back() { backs++; } });
+    Object.assign(location, { origin: 'http://dash', href: 'http://dash/viewer.html' });
+    v._goBack();
+    return backs ? 'back' : location.href;
+  };
+  try {
+    assert.equal(backTo('http://dash/', { canGoBack: true }, 3), 'back');
+    // Its tab's first entry, the home ahead of it: history.length says 2.
+    assert.equal(backTo('http://dash/', { canGoBack: false }, 2), '/');
+    assert.equal(backTo('http://dash/', { canGoBack: true }, 1), 'back');
+    assert.equal(backTo('http://dash/', undefined, 2), 'back', 'no Navigation API: the history length decides');
+    assert.equal(backTo('http://dash/', undefined, 1), '/');
+    assert.equal(backTo('', { canGoBack: true }, 3), '/', 'opened cold');
+    assert.equal(backTo('https://elsewhere.example/', { canGoBack: true }, 3), '/', 'opened from another site');
+  } finally { delete globalThis.navigation; document.referrer = ''; }
+});
+
+ok('a long image fits the width; an ordinary one is shown whole', () => {
+  assert.equal(isLongImage(400, 2400), true, 'a receipt');
+  assert.equal(isLongImage(1170, 6000), true, 'a scrolled screenshot');
+  assert.equal(isLongImage(1170, 2532), false, "a phone's own screenshot");
+  assert.equal(isLongImage(3024, 4032), false, 'a portrait photo');
+  assert.equal(isLongImage(6000, 4000), false, 'a landscape photo');
+  assert.equal(isLongImage(0, 0), false, 'not loaded');
+  // The page marks the image once it knows its size.
+  for (const [w, h, long] of [[400, 2400, true], [3024, 4032, false]]) {
+    const marks = [];
+    const img = { complete: true, naturalWidth: w, naturalHeight: h,
+                  classList: { toggle: (c, on) => marks.push([c, on]) }, addEventListener() {} };
+    const root = { innerHTML: '', querySelector: (sel) => (sel === '.img img' ? img : null) };
+    renderViewer(qs({ src: `${BASE}/r.png`, name: 'r.png', type: 'image/png' }), {}, root);
+    assert.deepEqual(marks, [['long', long]], `${w}x${h}`);
   }
 });
 
@@ -264,7 +378,8 @@ def main() -> int:
         for name in os.listdir(COMPONENTS):
             if name.endswith(".js"):
                 shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
-        shutil.copy(os.path.join(COMPONENTS, "..", "sw.js"), os.path.join(tmp, "sw.js"))
+        for name in ("sw.js", "viewer.html"):
+            shutil.copy(os.path.join(COMPONENTS, "..", name), os.path.join(tmp, name))
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
             fh.write('{"type":"module"}')
         with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:
