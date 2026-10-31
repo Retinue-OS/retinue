@@ -14,7 +14,9 @@ a Progressive Web App on the phone home screen.
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
   buttons on quotes and code, click-to-fill chips, attachments — images the
   gateway serves inline get a preview in the bubble, sized from the dimensions it
-  recorded at store time — model and cost meta), the pending state while Ara answers, the composer with text,
+  recorded at store time; a file's view link opens the file viewer,
+  `viewer.html` / `components/viewer-page.js`, which keeps the navigation row
+  and its ‹ above the PDF or image — model and cost meta), the pending state while Ara answers, the composer with text,
   file attachments (picked or pasted) and voice dictation, the model picker,
   and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
   any host). Given a

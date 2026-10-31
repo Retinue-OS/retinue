@@ -576,10 +576,24 @@ downloads with it until it read the header itself, saved `<att-id>.pdf`.
 Inside the shell the two links stay distinct even though its WebView renders
 no PDF: see "Files" under "Inside the Android shell".
 
+The view link does not navigate to the bare file: it opens the dashboard's
+**file viewer**, `/viewer.html?src=<attachment path>&name=…&type=…`
+(`components/viewer-page.js`), which shows the file in a frame under the
+navigation row and a bar with its name and ↓ Save. The browser's own PDF or
+image view carries no navigation, so in an installed PWA — no browser chrome —
+a PDF opened that way had no way back to the thread. The viewer's ‹ returns
+through history when it was opened from the dashboard, and goes home when
+opened cold. It takes only this dashboard's attachment paths and the inline
+types, so it cannot be pointed elsewhere. A browser with no built-in PDF viewer
+(`navigator.pdfViewerEnabled === false`, Chrome on Android) gets Open and Save
+buttons in place of an empty frame. Inside the Android shell the view link
+stays the bare `?inline=1` URL, which the shell opens in the phone's viewer
+app.
+
 Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
 AVIF — never SVG, which is script in the dashboard's origin) also **preview in
 the bubble**: a lazy-loaded `<img>` at its true aspect ratio, capped in width
-and height, linking to the full view (`?inline=1`), with the name row and the
+and height, linking to the full view (the file viewer above), with the name row and the
 ↓ save link beneath. The gateway records an image's intrinsic size when it
 stores it, so the preview's box is reserved before the bytes arrive and a
 thread never jumps while it loads (older records without a size get a fixed

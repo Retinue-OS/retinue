@@ -31,6 +31,7 @@ const SHELL_ASSETS = [
   '/chat.html',
   '/settings.html',
   '/contacts.html',
+  '/viewer.html',
   '/styles.css',
   '/layout.js',
   '/viewport.js',
@@ -59,6 +60,7 @@ const SHELL_ASSETS = [
   '/components/contacts.js',
   '/components/shelf.js',
   '/components/shelf-store.js',
+  '/components/viewer-page.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];

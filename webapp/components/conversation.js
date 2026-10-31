@@ -196,6 +196,15 @@ const INLINE_SAFE_TYPES = new Set([
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
   'application/pdf', 'text/plain',
 ]);
+// Where a file row's view link goes: the dashboard's file viewer around the
+// attachment (viewer.html, components/viewer-page.js), so the way back to the
+// thread stays on screen — except inside the Android shell, which hands the
+// bare `?inline=1` URL to the phone's viewer app (see _attachmentsHtml).
+function viewerHref(url, name, type) {
+  if (typeof window !== 'undefined' && window.RetinueShell) return `${url}?inline=1`;
+  const q = new URLSearchParams({ src: url, name, type });
+  return `/viewer.html?${q}`;
+}
 // The inline preview of an image attachment: at most this wide, and never
 // taller than the second bound (the width shrinks to keep the true ratio).
 const IMG_PREVIEW_MAX_W = 360;
@@ -1770,12 +1779,18 @@ class RetinueConversation extends HTMLElement {
       // link is handed to a browsing context outside the app window, with no
       // history behind it — the back gesture then leaves the PWA instead of
       // returning to the thread. Navigating in place keeps the viewer on the
-      // dashboard's own history stack.
+      // dashboard's own history stack. And the view opens in the dashboard's
+      // file viewer (viewer.html), not on the bare file: the browser's own
+      // PDF or image view carries no navigation, so an installed PWA had no
+      // button back to the thread. Inside the Android shell the bare link
+      // stays — its WebView renders no PDF, and its download listener opens
+      // the file in the phone's viewer app (docs/dashboard.md).
+      const view = viewable ? viewerHref(url, name, type) : '';
       const open = viewable
-        ? `<a class="attach" href="${esc(url)}?inline=1">`
+        ? `<a class="attach" href="${esc(view)}">`
         : `<a class="attach" href="${esc(url)}" download="${esc(name)}">`;
       const preview = viewable && type.startsWith('image/')
-        ? this._imagePreviewHtml(`${url}?inline=1`, name, a) : '';
+        ? this._imagePreviewHtml(view, `${url}?inline=1`, name, a) : '';
       return preview + `<div class="attach-row${preview ? ' a-caption' : ''}">` + open +
         (preview ? '' : `<span class="a-icon" aria-hidden="true">\u{1F4CE}</span>`) +
         `<span class="a-name">${esc(name)}</span>` +
@@ -1798,7 +1813,7 @@ class RetinueConversation extends HTMLElement {
   // upscales, and max-width:100% clamps it inside a narrower bubble with the
   // height following the ratio. Older records without a size get a fixed
   // frame instead (.no-dims).
-  _imagePreviewHtml(href, name, a) {
+  _imagePreviewHtml(href, src, name, a) {
     const w = Number(a.width);
     const h = Number(a.height);
     const hasDims = w > 0 && h > 0;
@@ -1807,7 +1822,7 @@ class RetinueConversation extends HTMLElement {
         `width: ${Math.max(1, Math.round(Math.min(IMG_PREVIEW_MAX_W, w, IMG_PREVIEW_MAX_H * w / h)))}px"`
       : '';
     return `<a class="a-imglink" href="${esc(href)}" aria-label="View ${esc(name)}">` +
-      `<img class="a-img${hasDims ? '' : ' no-dims'}" src="${esc(href)}" alt="${esc(name)}"` +
+      `<img class="a-img${hasDims ? '' : ' no-dims'}" src="${esc(src)}" alt="${esc(name)}"` +
       `${box} loading="lazy" decoding="async"></a>`;
   }
 

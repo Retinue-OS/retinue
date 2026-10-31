@@ -9,8 +9,12 @@ until it read the header itself — and that takes a name only from a bare
 `filename*` it fell back to the URL's last segment and saved `<att-id>.pdf`.
 These checks pin, under Node with a scripted DOM:
 
-- a viewable file (a PDF) gets a view link (`?inline=1`) and a save link,
-  both ending in its name;
+- a viewable file (a PDF) gets a view link and a save link, both ending in
+  its name; the view link opens the dashboard's file viewer (viewer.html),
+  which keeps the navigation row — and so the way back — on screen, except
+  inside the Android shell, which keeps the bare `?inline=1` link;
+- the viewer accepts only this dashboard's attachment paths and the types the
+  gateway serves inline;
 - a name outside ASCII is percent-encoded into that segment;
 - a name that is a path step (`.`, `..`) falls back to `attachment`;
 - a file the gateway does not serve inline gets the save link alone, with
@@ -82,24 +86,44 @@ const downloads = (html) => [...html.matchAll(/download="([^"]*)"/g)].map((m) =>
 let passed = 0;
 function ok(name, fn) { fn(); passed++; console.log('  ok  ' + name); }
 
-ok('a PDF: view and save links both end in its name', () => {
+const unesc = (h) => h.replace(/&amp;/g, '&');
+const viewer = (h) => {
+  const u = new URL(unesc(h), 'http://dash');
+  assert.equal(u.pathname, '/viewer.html', h);
+  return Object.fromEntries(u.searchParams);
+};
+
+ok('a PDF: the view link opens the viewer, the save link the file; both end in its name', () => {
   const html = row({ filename: 'invoice.pdf', content_type: 'application/pdf' });
-  assert.deepEqual(hrefs(html), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`]);
+  const [view, save] = hrefs(html);
+  assert.deepEqual(viewer(view), { src: `${BASE}/invoice.pdf`, name: 'invoice.pdf', type: 'application/pdf' });
+  assert.equal(save, `${BASE}/invoice.pdf`);
   assert.deepEqual(downloads(html), ['invoice.pdf']);
   assert.ok(html.includes('<span class="a-name">invoice.pdf</span>'), html);
 });
 
+ok('inside the Android shell the view link stays the bare inline file', () => {
+  globalThis.RetinueShell = { platform: 'android' };
+  try {
+    const html = row({ filename: 'invoice.pdf', content_type: 'application/pdf' });
+    assert.deepEqual(hrefs(html), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`]);
+  } finally { delete globalThis.RetinueShell; }
+});
+
 ok('a name outside ASCII is percent-encoded into the segment', () => {
   const html = row({ filename: 'Rechnung März #3.pdf', content_type: 'application/pdf; charset=binary' });
-  assert.deepEqual(hrefs(html), [
-    `${BASE}/Rechnung%20M%C3%A4rz%20%233.pdf?inline=1`, `${BASE}/Rechnung%20M%C3%A4rz%20%233.pdf`,
-  ]);
+  const [view, save] = hrefs(html);
+  assert.equal(viewer(view).src, `${BASE}/Rechnung%20M%C3%A4rz%20%233.pdf`);
+  assert.equal(viewer(view).name, 'Rechnung März #3.pdf');
+  assert.equal(save, `${BASE}/Rechnung%20M%C3%A4rz%20%233.pdf`);
 });
 
 ok('a path-step name falls back to "attachment"', () => {
   for (const filename of ['.', '..']) {
     const html = row({ filename, content_type: 'application/pdf' });
-    assert.deepEqual(hrefs(html), [`${BASE}/attachment?inline=1`, `${BASE}/attachment`], filename);
+    const [view, save] = hrefs(html);
+    assert.equal(viewer(view).src, `${BASE}/attachment`, filename);
+    assert.equal(save, `${BASE}/attachment`, filename);
   }
   const html = row({ filename: '...', content_type: 'application/pdf' });
   assert.equal(hrefs(html)[1], `${BASE}/...`, 'three dots are a name, not a step');
@@ -111,10 +135,35 @@ ok('a file the gateway does not serve inline gets the save link alone', () => {
   assert.deepEqual(downloads(html), ['notes.docx']);
 });
 
-ok("an image's preview loads from the named URL", () => {
+ok("an image's preview loads from the named URL and opens in the viewer", () => {
   const html = row({ filename: 'chart.png', content_type: 'image/png', width: 400, height: 200 });
   assert.ok(html.includes(`src="${BASE}/chart.png?inline=1"`), html);
-  assert.deepEqual(hrefs(html), [`${BASE}/chart.png?inline=1`, `${BASE}/chart.png?inline=1`, `${BASE}/chart.png`]);
+  const [preview, view, save] = hrefs(html);
+  assert.equal(preview, view, 'the preview and the name open the same view');
+  assert.deepEqual(viewer(view), { src: `${BASE}/chart.png`, name: 'chart.png', type: 'image/png' });
+  assert.equal(save, `${BASE}/chart.png`);
+});
+
+const { parseViewerParams } = await import('./viewer-page.js');
+const qs = (o) => '?' + new URLSearchParams(o);
+
+ok('the viewer reads what a view link carries', () => {
+  assert.deepEqual(parseViewerParams(qs({ src: `${BASE}/invoice.pdf`, name: 'invoice.pdf', type: 'application/pdf' })),
+    { src: `${BASE}/invoice.pdf`, name: 'invoice.pdf', kind: 'pdf' });
+  assert.equal(parseViewerParams(qs({ src: `${BASE}/a.png`, type: 'image/png' })).kind, 'image');
+  assert.equal(parseViewerParams(qs({ src: `${BASE}/a.txt`, type: 'text/plain; charset=utf-8' })).kind, 'text');
+  assert.equal(parseViewerParams(qs({ src: `${BASE}/M%C3%A4rz.pdf`, type: 'application/pdf' })).name, 'März.pdf',
+    'without a name, the URL segment stands in');
+});
+
+ok('the viewer refuses anything but an inline-safe attachment of this dashboard', () => {
+  for (const src of ['https://evil.example/x.pdf', '//evil.example/x.pdf', 'javascript:alert(1)',
+    `${BASE}/x.pdf?inline=1`, '/conversations/../etc/passwd', `/data/${ID}`, '']) {
+    assert.equal(parseViewerParams(qs({ src, type: 'application/pdf' })), null, src);
+  }
+  for (const type of ['image/svg+xml', 'text/html', '']) {
+    assert.equal(parseViewerParams(qs({ src: `${BASE}/x`, type })), null, type);
+  }
 });
 
 console.log(`${passed} attachment link checks passed`);
