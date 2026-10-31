@@ -576,19 +576,36 @@ downloads with it until it read the header itself, saved `<att-id>.pdf`.
 Inside the shell the two links stay distinct even though its WebView renders
 no PDF: see "Files" under "Inside the Android shell".
 
-The view link does not navigate to the bare file: it opens the dashboard's
-**file viewer**, `/viewer.html?src=<attachment path>&name=…&type=…`
-(`components/viewer-page.js`), which shows the file in a frame under the
-navigation row and a bar with its name and ↓ Save. The browser's own PDF or
-image view carries no navigation, so in an installed PWA — no browser chrome —
-a PDF opened that way had no way back to the thread. The viewer's ‹ returns
-through history when it was opened from the dashboard, and goes home when
-opened cold. It takes only this dashboard's attachment paths and the inline
-types, so it cannot be pointed elsewhere. A browser with no built-in PDF viewer
-(`navigator.pdfViewerEnabled === false`, Chrome on Android) gets Open and Save
-buttons in place of an empty frame. Inside the Android shell the view link
-stays the bare `?inline=1` URL, which the shell opens in the phone's viewer
-app.
+The view link opens the dashboard's **file viewer**,
+`/viewer.html?src=<attachment path>&name=…&type=…`
+(`components/viewer-page.js`): the file in a frame under the navigation row,
+with its name and ↓ Save above it. The browser's own PDF or image view carries
+no navigation, so in an installed PWA — no browser chrome — a file opened bare
+had no way back to the thread but a gesture or a keyboard shortcut. The
+viewer's ‹ goes back through history when the dashboard opened it (the
+Navigation API's `canGoBack`, else the history length), and home when it was
+opened cold. It shows nothing but a thread attachment exactly as a file row
+links it — `src` is checked as the browser will request it, so no `..` or
+other spelling of a path step leads to another route of the origin — and only
+the inline types; its `frame-src 'self'` keeps a link inside a PDF from
+loading another site into the frame. The service worker serves the page from
+its cache whatever the query, so it opens offline too, ‹ and all.
+
+Images and text open in the viewer everywhere. A PDF does only where a frame
+shows the whole document (`framesWholePdf` in `components/base.js`);
+elsewhere its row keeps the bare `?inline=1` link and the platform's own way
+back:
+
+- in the Android shell, the phone's viewer app (see "Files" under "Inside the
+  Android shell");
+- in a browser with no PDF viewer (`navigator.pdfViewerEnabled === false`,
+  Chrome on Android), its own PDF tab or a download;
+- on iOS and iPadOS, WebKit's full PDF view: a frame there shows only a
+  picture of the first page (WebKit's `UseImageDocumentForSubframePDF`),
+  although `pdfViewerEnabled` is true. In a Safari tab that view has the
+  browser's back button; in an app installed to the home screen it still has
+  none — drawing the PDF in the page itself (pdf.js) would be the way to give
+  it one.
 
 Images the gateway serves inline (`_INLINE_SAFE_TYPES`: PNG, JPEG, GIF, WebP,
 AVIF — never SVG, which is script in the dashboard's origin) also **preview in
@@ -943,7 +960,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
-| Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a file row's name link (`?inline=1`) — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
+| Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
 "focus-existing"}`, so a second launch of the installed PWA brings its open

@@ -11,10 +11,16 @@ These checks pin, under Node with a scripted DOM:
 
 - a viewable file (a PDF) gets a view link and a save link, both ending in
   its name; the view link opens the dashboard's file viewer (viewer.html),
-  which keeps the navigation row — and so the way back — on screen, except
-  inside the Android shell, which keeps the bare `?inline=1` link;
-- the viewer accepts only this dashboard's attachment paths and the types the
-  gateway serves inline;
+  which keeps the navigation row — and so the way back — on screen;
+- a PDF keeps the bare `?inline=1` link where a frame would not show it
+  whole: in the Android shell (the phone's viewer app opens it), in a
+  browser with no PDF viewer (Chrome on Android) and on iOS/iPadOS (WebKit
+  draws a framed PDF as its first page); images go to the viewer there too;
+- the viewer accepts only this dashboard's attachment paths, exactly as the
+  browser will request them (no `..`, `%2e%2e`, backslash, tab or extra
+  segment resolving elsewhere), and only the types the gateway serves inline;
+- the service worker answers a viewer link from its cached page whatever the
+  query, so the viewer and its way back open offline too;
 - a name outside ASCII is percent-encoded into that segment;
 - a name that is a path step (`.`, `..`) falls back to `attachment`;
 - a file the gateway does not serve inline gets the save link alone, with
@@ -35,6 +41,8 @@ COMPONENTS = os.path.join(HERE, "..", "webapp", "components")
 
 HARNESS = r"""
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
 
 // ── A scripted DOM: just enough for the element module to load ───────────────
 const registry = new Map();
@@ -102,12 +110,43 @@ ok('a PDF: the view link opens the viewer, the save link the file; both end in i
   assert.ok(html.includes('<span class="a-name">invoice.pdf</span>'), html);
 });
 
-ok('inside the Android shell the view link stays the bare inline file', () => {
+// Run `fn` with these navigator fields set, then put them back.
+function withNav(fields, fn) {
+  const before = Object.fromEntries(Object.keys(fields).map((k) => [k, navigator[k]]));
+  Object.assign(navigator, fields);
+  try { fn(); } finally { Object.assign(navigator, before); }
+}
+const pdfRow = () => row({ filename: 'invoice.pdf', content_type: 'application/pdf' });
+const pngRow = () => row({ filename: 'chart.png', content_type: 'image/png', width: 400, height: 200 });
+
+ok('inside the Android shell a PDF keeps the bare inline link; an image opens the viewer', () => {
   globalThis.RetinueShell = { platform: 'android' };
   try {
-    const html = row({ filename: 'invoice.pdf', content_type: 'application/pdf' });
-    assert.deepEqual(hrefs(html), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`]);
+    assert.deepEqual(hrefs(pdfRow()), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`]);
+    assert.equal(viewer(hrefs(pngRow())[1]).src, `${BASE}/chart.png`);
   } finally { delete globalThis.RetinueShell; }
+});
+
+ok('a browser with no PDF viewer (Chrome on Android) gets the bare PDF; images still the viewer', () => {
+  withNav({ pdfViewerEnabled: false }, () => {
+    assert.deepEqual(hrefs(pdfRow()), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`]);
+    assert.equal(viewer(hrefs(pngRow())[1]).src, `${BASE}/chart.png`);
+  });
+});
+
+ok('iOS and iPadOS, which frame only page one of a PDF, get the bare PDF', () => {
+  const iphone = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
+  const ipadDesktop = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15';
+  for (const [userAgent, maxTouchPoints] of [[iphone, 5], [ipadDesktop, 5]]) {
+    withNav({ userAgent, maxTouchPoints, pdfViewerEnabled: true }, () => {
+      assert.deepEqual(hrefs(pdfRow()), [`${BASE}/invoice.pdf?inline=1`, `${BASE}/invoice.pdf`], userAgent);
+      assert.equal(viewer(hrefs(pngRow())[1]).src, `${BASE}/chart.png`, userAgent);
+    });
+  }
+  // A Mac without a touch screen is a Mac: Safari there frames the whole PDF.
+  withNav({ userAgent: ipadDesktop, maxTouchPoints: 0, pdfViewerEnabled: true }, () => {
+    assert.equal(viewer(hrefs(pdfRow())[0]).src, `${BASE}/invoice.pdf`);
+  });
 });
 
 ok('a name outside ASCII is percent-encoded into the segment', () => {
@@ -158,12 +197,55 @@ ok('the viewer reads what a view link carries', () => {
 
 ok('the viewer refuses anything but an inline-safe attachment of this dashboard', () => {
   for (const src of ['https://evil.example/x.pdf', '//evil.example/x.pdf', 'javascript:alert(1)',
-    `${BASE}/x.pdf?inline=1`, '/conversations/../etc/passwd', `/data/${ID}`, '']) {
-    assert.equal(parseViewerParams(qs({ src, type: 'application/pdf' })), null, src);
+    `${BASE}/x.pdf?inline=1`, `${BASE}/x.pdf#p`, '/conversations/../etc/passwd', `/data/${ID}`, '',
+    // Dot segments in every spelling the URL parser resolves: each would leave
+    // the attachment for another route of this origin once the frame loads it.
+    `${BASE}/../../../../news`, `${BASE}/%2e%2e`, `${BASE}/.%2E`, `${BASE}/..`, `${BASE}/.`,
+    `${BASE}/..\\..\\..\\..\\news`, `${BASE}/\n..`, `${BASE}/..\t`, `${BASE}/x/../../../../news`,
+    `${BASE}/x/y`, `${BASE}/`, `${BASE.toUpperCase()}/x`, `${BASE}/a b`]) {
+    assert.equal(parseViewerParams(qs({ src, type: 'application/pdf' })), null, JSON.stringify(src));
   }
   for (const type of ['image/svg+xml', 'text/html', '']) {
     assert.equal(parseViewerParams(qs({ src: `${BASE}/x`, type })), null, type);
   }
+});
+
+ok('every name a file row can carry passes the viewer', () => {
+  for (const filename of ["it's (final)!*~.pdf", 'Rechnung März #3.pdf', '...', '%2e%2e', 'a\\b.pdf', 'x?y=1.pdf']) {
+    const view = hrefs(row({ filename, content_type: 'application/pdf' }))[0];
+    const u = new URL(unesc(view), 'http://dash');
+    const p = parseViewerParams(u.search);
+    assert.ok(p, filename);
+    assert.equal(p.name, filename);
+  }
+});
+
+// ── The service worker: the real sw.js, in a context of its own ──────────────
+const swFetch = [];
+const swMatched = [];
+const swContext = {
+  self: { addEventListener: (t, f) => { if (t === 'fetch') swFetch.push(f); },
+          clients: { claim: async () => {}, matchAll: async () => [] }, skipWaiting: () => {} },
+  caches: { match: async (key) => { swMatched.push(String(key)); return { cached: String(key) }; },
+            open: async () => ({ addAll: async () => {}, put: async () => {} }), keys: async () => [] },
+  location: { origin: 'http://dash' }, URL, console, setTimeout, clearTimeout,
+  fetch: async () => { throw new Error('offline'); },
+};
+vm.createContext(swContext);
+vm.runInContext(fs.readFileSync('./sw.js', 'utf8'), swContext);
+assert.equal(swFetch.length, 1, 'sw.js registered one fetch handler');
+// Offline (fetch fails): a viewer link, query and all, is a navigation the
+// worker must answer from the page it cached at install.
+let swAnswer = null;
+{
+  let answered = null;
+  const link = `http://dash/viewer.html?${new URLSearchParams({ src: `${BASE}/invoice.pdf`, name: 'invoice.pdf', type: 'application/pdf' })}`;
+  swFetch[0]({ request: { url: link, method: 'GET', mode: 'navigate' }, respondWith: (p) => { answered = p; } });
+  swAnswer = answered && await answered;
+}
+ok('the service worker serves a viewer link from its cached page, whatever the query', () => {
+  assert.deepEqual(swAnswer, { cached: '/viewer.html' }, 'the worker answered the viewer link from its cache');
+  assert.deepEqual(swMatched, ['/viewer.html'], 'matched by path, not by the full URL with its query');
 });
 
 console.log(`${passed} attachment link checks passed`);
@@ -182,6 +264,7 @@ def main() -> int:
         for name in os.listdir(COMPONENTS):
             if name.endswith(".js"):
                 shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
+        shutil.copy(os.path.join(COMPONENTS, "..", "sw.js"), os.path.join(tmp, "sw.js"))
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
             fh.write('{"type":"module"}')
         with open(os.path.join(tmp, "harness.mjs"), "w", encoding="utf-8") as fh:

@@ -2,33 +2,46 @@
 // dashboard, under the navigation row and a bar with its name and a save link.
 //
 // A file row's view link used to navigate straight to the attachment URL
-// (`?inline=1`), so the browser's own PDF or image viewer took the whole
+// (`?inline=1`), so the browser's own PDF or image view took the whole
 // window. In a tab that is fine — the browser's back button is there — but an
 // installed PWA has no browser chrome, and the bare file carries none of the
-// dashboard's: the only way back was the platform's back gesture, where there
-// is one. Here the file sits in a frame of the dashboard's own page, so the
-// row's ‹ (and every tab beside it) is always one tap away.
+// dashboard's: the only way back was the platform's back gesture or a keyboard
+// shortcut, where there is one. Here the file sits in a frame of the
+// dashboard's own page, so the row's ‹ (and every tab beside it) is always one
+// tap away.
 //
 //   /viewer.html?src=<attachment path>&name=<file name>&type=<media type>
 //
-// `src` must be a thread attachment path of this dashboard
-// (/conversations/<id>/attachments/<att-id>[/<name>]) — anything else is
-// refused, so the page cannot be pointed at another origin or a script URL.
-// `name` is shown as text only; `type` picks how the file is drawn and is
-// checked against the types the gateway serves inline.
+// `src` must be one thread attachment of this dashboard, exactly as a file row
+// links it (/conversations/<id>/attachments/<att-id>[/<name>]): checked as the
+// browser will request it, so no other origin, script URL or other route of
+// this one gets in — not even through a `..` the URL parser would resolve.
+// `name` is shown as text only; `type` picks how the file is drawn and must be
+// one the gateway serves inline.
 //
-// A browser without a built-in PDF viewer (navigator.pdfViewerEnabled false —
-// Chrome on Android) would draw an empty frame, so it gets the Open and Save
-// links instead; Open hands the file to the browser as before. The Android
-// shell never comes here: its WebView renders no PDF and its download
-// listener opens the phone's viewer app, so its rows keep the direct link
-// (conversation.js).
+// Images and text show everywhere. A PDF only where a frame shows the whole
+// document (framesWholePdf, base.js): a thread links a PDF here only then, and
+// keeps the bare link elsewhere — on iOS (where a frame shows page one only),
+// in Chrome on Android (no viewer in a page) and in the Android shell (which
+// opens it in the phone's viewer app). Reached anyway, the viewer offers Open
+// and Save in place of the frame.
 
-import { esc } from './base.js';
+import { esc, framesWholePdf } from './base.js';
 
-const SRC_RE = /^\/conversations\/[0-9a-f]{32}\/attachments\/[0-9a-f]{32}(\/[^?#]*)?$/;
+const SRC_RE = /^\/conversations\/[0-9a-f]{32}\/attachments\/[0-9a-f]{32}(?:\/[^/\\?#]+)?$/;
 const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif']);
 const HOME_URL = '/';
+// The brand part of the served <title> ("Retinue", or "Retinue (Admin)" on a
+// named instance, scripts/instance_branding.py), read once before any rewrite:
+// only what follows the last " — " is this page's own, and a label may itself
+// contain one.
+const TITLE_BRAND = (() => {
+  try {
+    const t = document.title;
+    const i = t.lastIndexOf(' — ');
+    return (i < 0 ? t : t.slice(0, i)) || 'Retinue';
+  } catch (_e) { return 'Retinue'; }
+})();
 
 const CSS = `
   :host { display: flex; flex-direction: column; min-height: 0; gap: 8px; }
@@ -44,8 +57,12 @@ const CSS = `
   .stage { flex: 1; min-height: 0; display: flex; border-radius: 12px; overflow: hidden;
            background: var(--card, #141925); border: 1px solid var(--line, rgba(231, 235, 242, .08)); }
   iframe { flex: 1; width: 100%; height: 100%; border: 0; background: #fff; }
-  .img { flex: 1; min-height: 0; overflow: auto; display: flex; align-items: center; justify-content: center; }
-  .img img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  /* An image fits the width and scrolls down, as a phone's own image view
+     shows it: fitted to the height too, a long receipt or screenshot would be
+     an unreadable strip. Auto margins centre a small one and give way to 0 on
+     an overflowing one, so its top stays in reach. */
+  .img { flex: 1; min-height: 0; overflow: auto; display: flex; }
+  .img img { max-width: 100%; margin: auto; }
   .note { margin: auto; padding: 24px; text-align: center; color: var(--muted, #8b93a3); line-height: 1.5; }
   .note .acts { display: flex; gap: 8px; justify-content: center; margin-top: 12px; }
 `;
@@ -55,6 +72,12 @@ export function parseViewerParams(search) {
   const q = new URLSearchParams(search || '');
   const src = q.get('src') || '';
   if (!SRC_RE.test(src)) return null;
+  // The pattern sees the raw string, the frame loads what the URL parser makes
+  // of it — and that drops tabs and newlines, reads "\" as "/" and resolves
+  // ".." and "%2e%2e". Only a path it leaves exactly as it is is safe.
+  try {
+    if (new URL(src, 'https://viewer.invalid').pathname !== src) return null;
+  } catch (_) { return null; }
   const type = (q.get('type') || '').split(';')[0].trim().toLowerCase();
   const kind = type === 'application/pdf' ? 'pdf'
     : IMAGE_TYPES.has(type) ? 'image'
@@ -83,14 +106,22 @@ class RetinueViewerPage extends HTMLElement {
     this._nav = null;
   }
 
-  // Back to where the file was opened from — the thread, with its scroll and
-  // open state, from the history entry (or the back/forward cache). A viewer
-  // opened cold (a pasted link, a fresh window) has nothing of the
-  // dashboard's behind it, so it goes home instead of leaving the app.
+  // Back to where the file was opened from: the thread's own history entry.
+  // From the back/forward cache it is exactly as it was left; loaded afresh,
+  // it reopens the thread from its URL at the newest message, as after any
+  // page left from a thread. A viewer opened cold (a pasted link, a fresh
+  // window) has nothing of the dashboard's behind it, so it goes home instead
+  // of leaving the app.
   _goBack() {
     let fromApp = false;
     try { fromApp = !!document.referrer && new URL(document.referrer).origin === location.origin; } catch (_) { /* no referrer */ }
-    if (fromApp && history.length > 1) { history.back(); return; }
+    // history.length counts the entries ahead of this one too: a viewer that is
+    // its tab's first entry (opened in a new tab, sent home, come back to with
+    // the browser's back) would call back() into nothing. The Navigation API
+    // knows whether an entry lies behind; without it, the count has to do.
+    const nav = window.navigation;
+    const behind = nav && typeof nav.canGoBack === 'boolean' ? nav.canGoBack : history.length > 1;
+    if (fromApp && behind) { history.back(); return; }
     location.href = HOME_URL;
   }
 
@@ -101,19 +132,20 @@ class RetinueViewerPage extends HTMLElement {
         `<div class="stage"><p class="note">This file cannot be shown here.</p></div>`;
       return;
     }
-    document.title = `Retinue — ${p.name}`;
+    document.title = `${TITLE_BRAND} — ${p.name}`;
     const view = `${p.src}?inline=1`;
     const save = `<a class="btn" href="${esc(p.src)}" download="${esc(p.name)}" title="Save a copy">↓ Save</a>`;
-    const open = `<a class="btn" href="${esc(view)}">Open</a>`;
     let stage;
     if (p.kind === 'image') {
       stage = `<div class="img"><img src="${esc(view)}" alt="${esc(p.name)}"></div>`;
-    } else if (p.kind === 'pdf' && navigator.pdfViewerEnabled === false) {
-      stage = `<div class="note">This browser cannot show a PDF inside the page.` +
-        `<div class="acts">${open}${save}</div></div>`;
+    } else if (p.kind === 'pdf' && !framesWholePdf()) {
+      stage = `<div class="note">This browser cannot show the whole PDF inside the page.` +
+        `<div class="acts"><a class="btn" href="${esc(view)}">Open</a>${save}</div></div>`;
     } else {
       // No sandbox on a PDF: a sandboxed frame keeps the browser's PDF viewer
-      // out. The file is the thread's own, served nosniff with its stored type.
+      // out. The file is the thread's own, served nosniff with its stored type,
+      // and the page's frame-src (viewer.html) keeps a link inside the PDF from
+      // loading another site into this frame.
       const sandbox = p.kind === 'text' ? ' sandbox=""' : '';
       stage = `<iframe src="${esc(view)}" title="${esc(p.name)}"${sandbox}></iframe>`;
     }

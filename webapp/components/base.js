@@ -48,6 +48,24 @@ export function onFrameChange(fn) {
   return () => mq.removeEventListener('change', handler);
 }
 
+// ── Files ─────────────────────────────────────────────────────────────────────
+// Whether a PDF in a frame of a page (an <iframe>) shows the whole document, as
+// the browser's own viewer would — what the file viewer (viewer.html) needs to
+// be worth opening. Not where the browser has no PDF viewer at all
+// (navigator.pdfViewerEnabled false: Chrome on Android, the Android shell's
+// WebView), and not on iOS or iPadOS: WebKit there reports a viewer but draws a
+// PDF in a frame as a picture of its first page (UseImageDocumentForSubframePDF),
+// and every browser on those systems is WebKit. iPadOS asks for desktop sites
+// with a Mac user agent, so a "Macintosh" with a touch screen is an iPad.
+export function framesWholePdf() {
+  if (typeof navigator === 'undefined') return false;
+  if (navigator.pdfViewerEnabled === false) return false;
+  const ua = navigator.userAgent || '';
+  const appleTouch = /\biP(?:hone|ad|od)\b/.test(ua) ||
+    (/\bMacintosh\b/.test(ua) && navigator.maxTouchPoints > 1);
+  return !appleTouch;
+}
+
 // ── Focus and presses ─────────────────────────────────────────────────────────
 // The element that actually has focus, followed through shadow roots (every
 // card and page component renders into one).

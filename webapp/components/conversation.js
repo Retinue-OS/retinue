@@ -120,7 +120,7 @@
 //   POST /conversations/transcribe      dictation audio → {text, lang}
 //   GET  /conversation-models           the offered models (once per page)
 
-import { esc, fmtAge, softKeyboard, visibleHeight } from './base.js';
+import { esc, fmtAge, framesWholePdf, softKeyboard, visibleHeight } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
@@ -196,12 +196,17 @@ const INLINE_SAFE_TYPES = new Set([
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
   'application/pdf', 'text/plain',
 ]);
-// Where a file row's view link goes: the dashboard's file viewer around the
-// attachment (viewer.html, components/viewer-page.js), so the way back to the
-// thread stays on screen — except inside the Android shell, which hands the
-// bare `?inline=1` URL to the phone's viewer app (see _attachmentsHtml).
+// Where a file row's view link goes (see _attachmentsHtml): the dashboard's
+// file viewer around the attachment (viewer.html, components/viewer-page.js),
+// so the way back to the thread stays on screen. A PDF goes there only where a
+// frame shows all of it (framesWholePdf, base.js); elsewhere the bare
+// `?inline=1` file is the better view, and the way back is the platform's own:
+// the Android shell opens it in the phone's viewer app, Chrome on Android in
+// its own viewer or as a download, iOS in WebKit's full PDF view.
 function viewerHref(url, name, type) {
-  if (typeof window !== 'undefined' && window.RetinueShell) return `${url}?inline=1`;
+  const bare = `${url}?inline=1`;
+  if (type === 'application/pdf' &&
+      ((typeof window !== 'undefined' && window.RetinueShell) || !framesWholePdf())) return bare;
   const q = new URLSearchParams({ src: url, name, type });
   return `/viewer.html?${q}`;
 }
@@ -1782,9 +1787,8 @@ class RetinueConversation extends HTMLElement {
       // dashboard's own history stack. And the view opens in the dashboard's
       // file viewer (viewer.html), not on the bare file: the browser's own
       // PDF or image view carries no navigation, so an installed PWA had no
-      // button back to the thread. Inside the Android shell the bare link
-      // stays — its WebView renders no PDF, and its download listener opens
-      // the file in the phone's viewer app (docs/dashboard.md).
+      // button back to the thread. A PDF keeps the bare link where a frame
+      // would not show it whole (viewerHref).
       const view = viewable ? viewerHref(url, name, type) : '';
       const open = viewable
         ? `<a class="attach" href="${esc(view)}">`

@@ -2,6 +2,11 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <!-- The frame holds the thread's own file, and only that: a link inside a
+       PDF must not load another site under this page's navigation row and
+       address (WebKit's PDF view follows a link in the frame it draws in;
+       Chrome's and Firefox's send it to the whole tab). -->
+  <meta http-equiv="Content-Security-Policy" content="frame-src 'self'">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#0b0d12">
