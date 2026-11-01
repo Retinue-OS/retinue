@@ -489,8 +489,132 @@ def test_derive_process_group(root):
     check("the file is filed regardless", (c / "data/raw/2026/11/01/a.sensor.json").is_file(), True)
 
 
+def test_recover_claims(root):
+    print("claimed files left by a dead watcher are put back (N2)")
+    h = Harness(root)
+    h.box.mkdir()
+    lab = h.chamber("lab", [accept(derive=False)], repo=False)
+    # What a watcher killed between claim() and file_one() leaves behind.
+    (h.box / ".intake-deadbeef-a.sensor.json").write_text(json.dumps({"n": 1}))
+    (h.box / ".intake-cafebabe-b.pdf").write_text("claimed")
+    (h.box / "b.pdf").write_text("newer drop under the same name")
+    (h.box / "sub").mkdir()
+    (h.box / "sub" / ".intake-01234567-c.txt").write_text("c")
+    # One that cannot be put back: both names are taken by directories.
+    (h.box / ".intake-89abcdef-d.txt").write_text("d")
+    (h.box / "d.txt").mkdir()
+    (h.box / "recovered-d.txt").mkdir()
+    h.watcher.tick()
+    names = sorted(p.name for p in h.box.iterdir())
+    check("put back under their names on the first pass",
+          names, sorted([".inbox.json", ".intake-89abcdef-d.txt", "a.sensor.json", "b.pdf",
+                         "recovered-b.pdf", "d.txt", "recovered-d.txt", "sub"]))
+    check("…the one whose name was taken again as recovered-<name>",
+          (h.box / "recovered-b.pdf").read_text(), "claimed")
+    check("…the newer drop untouched", (h.box / "b.pdf").read_text(), "newer drop under the same name")
+    check("…in subdirectories too", [p.name for p in (h.box / "sub").iterdir()], ["c.txt"])
+    check("the one that cannot be put back is reported",
+          len(h.alerts) == 1 and ".intake-89abcdef-d.txt" in h.alerts[0], True)
+    h.now += 4
+    h.watcher.tick()
+    check("…and only once", len(h.alerts), 1)
+    check("a recovered accepted file is then filed as usual",
+          (lab / "data/raw/2026/11/01/a.sensor.json").is_file(), True)
+    # A failing put-back during normal work alerts too.
+    h.alerts.clear()
+    h.drop("e.sensor.json", {"n": 2})
+    real_rename = h.mod.os.rename
+    h.mod.os = types.SimpleNamespace(**{**{k: getattr(os, k) for k in dir(os) if not k.startswith("__")},
+                                        "rename": real_rename})
+    real_copy = h.mod.shutil.copyfileobj
+
+    def copy_grow_and_block(src, dst, *a):
+        real_copy(src, dst, *a)
+        claimed = next(p for p in h.box.iterdir()
+                       if p.name.startswith(".intake-") and p.name.endswith("e.sensor.json"))
+        with open(claimed, "ab") as f:
+            f.write(b"x")  # replaced under us -> release()
+        h.mod.os.rename = lambda *_a: (_ for _ in ()).throw(OSError(13, "Permission denied"))
+    h.mod.shutil = types.SimpleNamespace(copyfileobj=copy_grow_and_block)
+    h.settle()
+    h.mod.os.rename = real_rename
+    h.mod.shutil = types.SimpleNamespace(copyfileobj=real_copy)
+    check("a put-back that fails is reported, naming the hidden file",
+          len(h.alerts) == 1 and ".intake-" in h.alerts[0] and "e.sensor.json" in h.alerts[0], True)
+
+
+def test_push_never_rebases_dirty_tree(root):
+    print("a dirty tree is never rebased (N3)")
+    h = Harness(root)
+    h.box.mkdir()
+    c = h.chamber("lab", [accept(derive=False)])
+    remote = h.root / "lab.git"
+    (c / "notes.md").write_text("line 1\n")
+    git(c, "add", "-A"); git(c, "commit", "-q", "-m", "notes"); git(c, "push", "-q")
+    # The remote moves on in notes.md…
+    other = h.root / "other"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(remote), str(other)], check=True)
+    git(other, "config", "user.name", "T"); git(other, "config", "user.email", "t@example.com")
+    (other / "notes.md").write_text("line 1 (remote)\n")
+    git(other, "add", "-A"); git(other, "commit", "-q", "-m", "remote edit"); git(other, "push", "-q")
+    # …while the user has an uncommitted edit to the same file here.
+    (c / "notes.md").write_text("line 1 (mine, unsaved)\n")
+    logs = []
+    h.mod.log = lambda m: logs.append(m)
+    h.drop("a.sensor.json", {"n": 1})
+    h.settle()
+    st = json.loads(h.mod.STATE_PATH.read_text())["chambers"][str(c)]
+    check("the intake's own files are committed", "a.sensor.json" in git(c, "log", "--name-only",
+                                                                           "--format=", "-1"), True)
+    check("the push was rejected and stays due", (st["push_due"], st["failures"]), (True, 1))
+    check("the user's edit is exactly as it was",
+          (c / "notes.md").read_text(), "line 1 (mine, unsaved)\n")
+    check("no conflict markers, no rebase in progress, no stash",
+          ("<<<<" in (c / "notes.md").read_text(), (c / ".git" / "rebase-merge").exists(),
+           git(c, "stash", "list").strip()), (False, False, ""))
+    check("the status is still a plain modification", git(c, "status", "--porcelain").strip(),
+          "M notes.md")
+    check("…and the log says why", any("uncommitted edits" in m and "notes.md" in m for m in logs), True)
+    # The chamber's normal sync happens: the user commits and reconciles.
+    git(c, "add", "-A"); git(c, "commit", "-q", "-m", "my edit")
+    res = subprocess.run(["git", "-C", str(c), "pull", "--rebase"], capture_output=True, text=True)
+    (c / "notes.md").write_text("line 1 (merged)\n")
+    git(c, "add", "notes.md")
+    subprocess.run(["git", "-C", str(c), "-c", "core.editor=true", "rebase", "--continue"],
+                   check=True, capture_output=True)
+    h.now += 600
+    h.watcher.tick()
+    st = json.loads(h.mod.STATE_PATH.read_text())["chambers"][str(c)]
+    check("once the tree is clean and reconciled, the due push goes out",
+          (st["push_due"], st["failures"],
+           git(c, "rev-parse", "HEAD") == git(c, "rev-parse", "origin/main")), (False, 0, True))
+
+    print("a clean tree is rebased; a conflict is aborted and reported at once")
+    h.alerts.clear()
+    git(other, "pull", "-q", "--rebase")
+    (other / "notes.md").write_text("line 1 (remote again)\n")
+    git(other, "add", "-A"); git(other, "commit", "-q", "-m", "remote edit 2"); git(other, "push", "-q")
+    # A local commit (somebody else's, committed) conflicting with it, tree clean.
+    (c / "notes.md").write_text("line 1 (local commit)\n")
+    git(c, "add", "-A"); git(c, "commit", "-q", "-m", "local edit")
+    before = git(c, "rev-parse", "HEAD")
+    h.drop("b.sensor.json", {"n": 2})
+    h.now += 600
+    h.settle()
+    st = json.loads(h.mod.STATE_PATH.read_text())["chambers"][str(c)]
+    check("the conflicting rebase was aborted: tree clean, HEAD moved only by our commit",
+          (git(c, "status", "--porcelain").strip(), (c / ".git" / "rebase-merge").exists(),
+           git(c, "rev-parse", "HEAD~1") == before), ("", False, True))
+    check("the push stays due", st["push_due"], True)
+    check("the user is told at once, not after three tries",
+          len(h.alerts) == 1 and "conflict" in h.alerts[0], True)
+    h.now += 600
+    h.watcher.tick()
+    check("…and only once", len(h.alerts), 1)
+
+
 def main():
-    for test in (test_basics, test_ambiguous_and_own_manifest, test_filing_derive_commit,
+    for test in (test_recover_claims, test_push_never_rebases_dirty_tree, test_basics, test_ambiguous_and_own_manifest, test_filing_derive_commit,
                  test_failure_and_restart, test_quarantine, test_sweep_overlap,
                  test_replaced_under_us, test_push_retry_and_alert,
                  test_derive_process_group):

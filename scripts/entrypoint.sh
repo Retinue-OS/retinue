@@ -539,17 +539,12 @@ case "$MODE" in
     # Files whose type a chamber declares (`accepts` in its .inbox.json) are
     # taken out of the letterbox within seconds, filed and committed, without
     # a model; the rest wait for the inbox sweep (scripts/letterbox-intake.py).
-    # Supervised: the watcher is what keeps the sweep and the typed intake
-    # from working on one file, so it must not stay dead. A crash is
-    # restarted after a short pause; a clean exit (none is expected) too.
+    # Supervised by its own script (not a subshell here: this file runs under
+    # `set -e`, which a `( … ) &` inherits, and the first crash would end the
+    # loop): restarted with backoff, given up on and reported after repeated
+    # immediate exits (scripts/letterbox-supervise.sh).
     echo "[claude] Starting letterbox intake watcher..."
-    (
-      while true; do
-        python3 /workspace/scripts/letterbox-intake.py --watch
-        echo "[letterbox][warn] intake watcher exited ($?); restarting in 10s" >&2
-        sleep 10
-      done
-    ) &
+    bash /workspace/scripts/letterbox-supervise.sh &
     # Start the Claude.ai session only where it can actually connect. With a
     # base URL configured that takes two things: the deployment must hold a
     # Claude.ai sign-in at all (RETINUE_GATEWAY_USES_CLAUDE_OAUTH, as before),

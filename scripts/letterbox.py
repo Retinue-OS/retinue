@@ -101,6 +101,69 @@ def quarantine_name(name: str) -> str:
     return QUARANTINE_PREFIX + name
 
 
+def find_denied(root: Path) -> list[Path]:
+    """Every entry under a denied name in the letterbox (no symlinks followed,
+    hidden directories not descended into), the root's own manifest excepted."""
+    found: list[Path] = []
+    if not root.is_dir():
+        return found
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        here = Path(dirpath)
+        keep = []
+        for d in dirnames:
+            if os.path.islink(os.path.join(dirpath, d)):
+                continue
+            if denied(d):
+                found.append(here / d)
+            elif not ignored(d):
+                keep.append(d)
+        dirnames[:] = keep
+        for name in filenames:
+            if denied(name) and not (name == ".inbox.json" and here == root):
+                found.append(here / name)
+    return found
+
+
+def quarantine(root: Path, paths: list[Path], log=None) -> tuple[list[str], list[str]]:
+    """Rename every entry in ``paths`` to its quarantine name. Returns the
+    relative paths renamed and those that could not be. Shared by the intake
+    watcher and the inbox sweep, so a planted ``CLAUDE.md`` is out of the way
+    before any session reads a file beside it, whichever of the two runs."""
+    import secrets
+    say = log or (lambda msg: print(f"[letterbox] {msg}", file=sys.stderr))
+    done: list[str] = []
+    failed: list[str] = []
+    for p in paths:
+        rel = p.relative_to(root).as_posix()
+        q = p.with_name(quarantine_name(p.name))
+        try:
+            if q.exists() or q.is_symlink():
+                q = p.with_name(quarantine_name(f"{secrets.token_hex(3)}-{p.name}"))
+            os.rename(p, q)
+        except OSError as exc:
+            say(f"QUARANTINE: could not rename {rel}: {exc}")
+            failed.append(rel)
+            continue
+        say(f"QUARANTINE: {rel} -> {q.name} (a name the framework would read; never filed)")
+        done.append(rel)
+    return done, failed
+
+
+def alert(title: str, text: str, log=None) -> bool:
+    """A dashboard thread for the user (conversation-push.py); best-effort."""
+    import subprocess
+    say = log or (lambda msg: print(f"[letterbox] {msg}", file=sys.stderr))
+    try:
+        res = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "conversation-push.py"),
+             "--title", title, "--importance", "3", text],
+            capture_output=True, text=True, timeout=60)
+        return res.returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        say(f"could not open a dashboard thread: {exc}")
+        return False
+
+
 def is_letterbox(path: "str | os.PathLike[str]") -> bool:
     """Whether ``path`` is the letterbox directory."""
     try:

@@ -408,11 +408,14 @@ picks up a subdirectory's `CLAUDE.md` once a file in that subtree is read); a
 extend the requester allowlist. So `letterbox.DENIED_NAMES` — `CLAUDE.md`,
 `CLAUDE.local.md`, `AGENTS.md`, `.claude`, `.mcp.json`, `requirements.txt`,
 `accepted-requesters.txt`, the dot-manifests, `.git` and its siblings;
-matched case-insensitively — are refused by the share (403), never listed by
-the sweep, and **quarantined** by the intake watcher when they arrive by a
-route the share does not see (a sync peer): on sight the entry is renamed to
-`.quarantined-<name>` (hidden, so skipped by everything), and the user is told
-once per name in a dashboard thread. A quarantined file is never read by the
+matched case-insensitively — are refused by the share (403) and
+**quarantined** when they arrive by a route the share does not see (a sync
+peer): the entry is renamed to `.quarantined-<name>` (hidden, so skipped by
+everything), and the user is told once per name in a dashboard thread. The
+intake watcher does that every few seconds; the sweep does it itself, before
+it spawns a session over the letterbox, so the guarantee does not depend on
+the watcher being up — and when an entry cannot be renamed, the sweep does not
+dispatch the letterbox at all and says so. A quarantined file is never read by the
 framework; the user renames it to what it is, or deletes it.
 
 ### Typed intake (`accepts`)
@@ -435,8 +438,11 @@ in its `.inbox.json`:
 }
 ```
 
-`scripts/letterbox-intake.py --watch` (forked by the entrypoint under a
-restart loop, so it does not stay dead; no model, no credits) polls the
+`scripts/letterbox-intake.py --watch` (no model, no credits; started by the
+entrypoint through `scripts/letterbox-supervise.sh`, which restarts it with a
+doubling wait after a crash and, after five immediate exits in a row — a
+configuration error — stops and opens a dashboard thread rather than loop
+forever) polls the
 letterbox every `LETTERBOX_POLL_SECONDS` (2) — polling, not inotify, because a
 sync tool on the host writes into a bind mount, and the scheduler's ticks are
 minutes apart:
@@ -463,7 +469,11 @@ minutes apart:
    file that is scanned afresh. The claimed file is opened once and its
    identity (size, mtime, inode) checked against the scan after the copy and
    again before the letterbox copy is deleted; a file replaced under the
-   watcher is put back under its name, unfiled, and looked at again.
+   watcher is put back under its name, unfiled, and looked at again. A
+   watcher killed with a file claimed leaves it under that hidden name; the
+   next watcher puts every such file back on its first pass (as
+   `recovered-<name>` when the name is taken again), and reports one it
+   cannot.
    Filing moves it to `<chamber>/<path>/<YYYY>/<MM>/<DD>/<name>`, the UTC date
    it was first seen. The same name already there with identical content is a
    resend: the letterbox copy is deleted. Different content keeps both, the
@@ -480,10 +490,16 @@ minutes apart:
    along — at most once per `LETTERBOX_COMMIT_INTERVAL` seconds (600) per
    chamber. What is due is recorded in
    `/root/.retinue/letterbox-intake/state.json` before the file moves, and the
-   watcher commits it as soon as the interval is up. The push rebases on the
-   remote first (`git pull --rebase --autostash`); a push that still fails
-   stays due (`push_due`) and is retried every interval with nothing new
-   having to arrive. So a failed commit or push, or a restart in between,
+   watcher commits it as soon as the interval is up. The push never rebases
+   a dirty tree: the chamber is shared with Ara, the subagents and the user,
+   and an unattended rebase over somebody's uncommitted edit can leave
+   conflict markers behind. With uncommitted tracked changes present the
+   push goes out plain, and a non-fast-forward rejection just keeps it due
+   for the chamber's normal sync to resolve; with a clean tree it fetches
+   and rebases first (no autostash), and a conflict is aborted — tree left
+   as it was — and reported at once. A push that fails stays due
+   (`push_due`) and is retried every interval with nothing new having to
+   arrive. So a failed commit or push, or a restart in between,
    delays the commit or the push but never loses either. After three
    consecutive failures of the commit or the push the user is told once in a
    dashboard thread (and again only after a success and three new failures);

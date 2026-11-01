@@ -398,13 +398,53 @@ def build_prompt(scan: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def secure_letterbox(root: Path) -> bool:
+    """Quarantine every denied entry in the letterbox before a session is
+    spawned over it. Skipping such a file from the listing is not enough:
+    Claude Code loads a subdirectory's CLAUDE.md once a file beside it is
+    read, so the file must be gone (renamed hidden) before the Archivist
+    opens anything there. The intake watcher does the same every few
+    seconds; this is the sweep's own guarantee, in case the watcher is
+    down. Returns False — do not dispatch the letterbox — when an entry
+    could not be renamed."""
+    denied = letterbox.find_denied(root)
+    if not denied:
+        return True
+    say = lambda m: print(f"[inbox-sweep] {m}", file=sys.stderr)  # noqa: E731
+    done, failed = letterbox.quarantine(root, denied, log=say)
+    if done:
+        names = ", ".join(f"`{n}`" for n in done)
+        letterbox.alert("Letterbox: a file with a reserved name was quarantined",
+                        f"Something put {names} into the letterbox. Files of that name are "
+                        "read by the framework or by Claude Code as instructions or "
+                        "configuration, so it was renamed with the prefix "
+                        f"`{letterbox.QUARANTINE_PREFIX}` and left there, unread. If it was "
+                        "yours, rename it to what it is; if not, check what writes into the "
+                        "letterbox folder.", log=say)
+    if failed:
+        names = ", ".join(f"`{n}`" for n in failed)
+        say(f"letterbox not dispatched: {len(failed)} reserved name(s) could not be quarantined")
+        letterbox.alert("Letterbox: a reserved name cannot be quarantined",
+                        f"{names} in the letterbox carries a name the framework reads, and it "
+                        "could not be renamed out of the way. Nothing in the letterbox is "
+                        "filed until it is removed.", log=say)
+        return False
+    return True
+
+
 def main() -> int:
     scan = []
     accepts = letterbox.load_accepts(
         CHAMBERS_DIR, log=lambda m: print(f"[inbox-sweep] {m}", file=sys.stderr))
+    letterbox_ok = None
     for inbox in declared_inboxes():
-        files = pending_files(inbox["path"],
-                              accepts if letterbox.is_letterbox(inbox["chamber_dir"]) else None)
+        in_letterbox = letterbox.is_letterbox(inbox["chamber_dir"])
+        if in_letterbox:
+            if letterbox_ok is None:
+                letterbox_ok = secure_letterbox(inbox["chamber_dir"])
+            if not letterbox_ok:
+                continue
+        files = pending_files(inbox["path"], accepts if in_letterbox else None)
         if files:
             scan.append({**inbox, "files": files})
 

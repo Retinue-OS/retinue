@@ -78,6 +78,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -101,6 +102,7 @@ DERIVE_TIMEOUT = float(os.environ.get("LETTERBOX_DERIVE_TIMEOUT", "120"))
 # Consecutive commit-or-push failures before the user hears of it.
 ALERT_AFTER_FAILURES = 3
 CLAIM_PREFIX = ".intake-"
+_CLAIM_RE = re.compile(r"^\.intake-[0-9a-f]{8}-(.+)$")
 SCRIPTS_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 
 # Seams for the tests.
@@ -122,32 +124,19 @@ def _sig(st: os.stat_result) -> Sig:
     return (st.st_size, st.st_mtime_ns, st.st_ino)
 
 
-def scan(root: Path) -> tuple[dict[str, Sig], list[Path]]:
-    """Documents in the letterbox (relative path -> signature), and every
-    entry under a denied name that must be quarantined."""
+def scan(root: Path) -> dict[str, Sig]:
+    """Documents in the letterbox: relative path -> signature."""
     found: dict[str, Sig] = {}
-    denied: list[Path] = []
     if not root.is_dir():
-        return found, denied
+        return found
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         here = Path(dirpath)
-        keep = []
-        for d in dirnames:
-            if os.path.islink(os.path.join(dirpath, d)):
-                continue
-            if letterbox.denied(d):
-                denied.append(here / d)
-            elif not letterbox.ignored(d):
-                keep.append(d)
-        dirnames[:] = keep
+        dirnames[:] = [d for d in dirnames if not letterbox.ignored(d)
+                       and not os.path.islink(os.path.join(dirpath, d))]
         for name in filenames:
-            p = here / name
-            if letterbox.denied(name):
-                if name != ".inbox.json" or here != root:  # ours, at the root
-                    denied.append(p)
-                continue
             if letterbox.ignored(name):
                 continue
+            p = here / name
             try:
                 if p.is_symlink() or not p.is_file():
                     continue
@@ -155,7 +144,7 @@ def scan(root: Path) -> tuple[dict[str, Sig], list[Path]]:
             except OSError:
                 continue
             found[p.relative_to(root).as_posix()] = _sig(st)
-    return found, denied
+    return found
 
 
 def _sha256(path: Path) -> str:
@@ -383,8 +372,9 @@ def commit_due(now: float) -> None:
             push(chamber)
 
 
-def _failed(chamber: Path, what: str, detail: str) -> None:
-    """One more consecutive failure; the user hears of the third."""
+def _failed(chamber: Path, what: str, detail: str, urgent: bool = False) -> None:
+    """One more consecutive failure; the user hears of the third (of the
+    first, when ``urgent`` — a conflict nobody but a human can resolve)."""
     state = load_state()
     entry = _chamber_state(state, chamber)
     entry["failures"] = int(entry["failures"]) + 1
@@ -392,7 +382,7 @@ def _failed(chamber: Path, what: str, detail: str) -> None:
     n = entry["failures"]
     log(f"{chamber.name}: {what} failed ({detail}); {n} in a row, retrying in "
         f"{COMMIT_INTERVAL:.0f}s")
-    if n >= ALERT_AFTER_FAILURES and not entry["alerted"]:
+    if (urgent or n >= ALERT_AFTER_FAILURES) and not entry["alerted"]:
         entry["alerted"] = True
         save_state(state)
         alert(f"Letterbox: {chamber.name} cannot be {what}ed",
@@ -450,17 +440,79 @@ def commit(chamber: Path) -> bool:
     return push(chamber)
 
 
-def push(chamber: Path) -> bool:
-    """Rebase on the remote and push. Stays due until it succeeds."""
+def _tracked_modifications(chamber: Path) -> list[str]:
+    """Tracked paths with uncommitted changes (not untracked files)."""
     try:
-        res = _git(chamber, "pull", "--rebase", "--autostash", timeout=120)
-        if res.returncode != 0:
-            raise RuntimeError(f"git pull --rebase: {(res.stderr or res.stdout).strip()}")
+        out = _git(chamber, "status", "--porcelain=v1", "-z")
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if out.returncode != 0:
+        return []
+    found = []
+    fields = out.stdout.split("\0")
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if entry[:2] != "??":
+            found.append(entry[3:])
+        if entry[0] in "RC":
+            i += 1
+    return found
+
+
+def _conflicted(chamber: Path) -> bool:
+    """A rebase in progress, or unmerged paths in the tree."""
+    git_dir = chamber / ".git"
+    if (git_dir / "rebase-merge").exists() or (git_dir / "rebase-apply").exists():
+        return True
+    try:
+        out = _git(chamber, "status", "--porcelain=v1", "-z")
+    except (subprocess.SubprocessError, OSError):
+        return False
+    for entry in out.stdout.split("\0"):
+        if len(entry) >= 2 and ("U" in entry[:2] or entry[:2] in ("AA", "DD")):
+            return True
+    return False
+
+
+def push(chamber: Path) -> bool:
+    """Push the chamber; rebase on the remote first only when the working
+    tree is clean. Stays due until it succeeds.
+
+    The tree is shared: Ara, the subagents and the user edit it too. An
+    unattended `pull --rebase --autostash` over somebody's uncommitted edit
+    can leave conflict markers and a stash behind and still exit 0 — so a
+    dirty tree is pushed plain, and a non-fast-forward rejection just keeps
+    the push due for the chamber's normal sync to resolve. A clean tree is
+    fetched and rebased (no autostash); any conflict is aborted and the user
+    told at once, the push staying due."""
+    dirty_tracked = _tracked_modifications(chamber)
+    try:
+        if _conflicted(chamber):
+            raise RuntimeError("a rebase or merge is already in progress in the chamber")
+        if not dirty_tracked:
+            res = _git(chamber, "fetch", timeout=120)
+            if res.returncode != 0:
+                raise RuntimeError(f"git fetch: {(res.stderr or res.stdout).strip()}")
+            res = _git(chamber, "rebase", "@{upstream}", timeout=120)
+            if res.returncode != 0 or _conflicted(chamber):
+                _run(["git", "-C", str(chamber), "rebase", "--abort"],
+                     capture_output=True, timeout=60)
+                detail = (res.stderr or res.stdout).strip()[-500:]
+                _failed(chamber, "push", f"rebase on the remote conflicts: {detail}",
+                        urgent=True)
+                return False
         res = _git(chamber, "push", timeout=120)
         if res.returncode != 0:
-            raise RuntimeError(f"git push: {(res.stderr or res.stdout).strip()}")
+            why = (res.stderr or res.stdout).strip()
+            if dirty_tracked:
+                why = (f"the remote has moved and the working tree has uncommitted edits "
+                       f"({', '.join(dirty_tracked[:5])}), so nothing was rebased; {why}")
+            raise RuntimeError(f"git push: {why}")
     except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
-        _run(["git", "-C", str(chamber), "rebase", "--abort"], capture_output=True, timeout=60)
         _failed(chamber, "push", str(exc))
         return False
     _succeeded(chamber, push_due=False)
@@ -479,28 +531,18 @@ def alert(title: str, text: str) -> None:
 
 # ── Quarantine ───────────────────────────────────────────────────────────────
 
-def quarantine(root: Path, paths: list[Path]) -> None:
-    """Rename every entry under a denied name to its quarantine name, and
-    tell the user once per name."""
+def quarantine(root: Path) -> None:
+    """Rename every entry under a denied name to its quarantine name
+    (letterbox.quarantine, shared with the sweep), and tell the user once
+    per name."""
+    paths = letterbox.find_denied(root)
     if not paths:
         return
     state = load_state()
     told = set(state.get("quarantined") or [])
-    new = []
-    for p in paths:
-        q = p.with_name(letterbox.quarantine_name(p.name))
-        rel = p.relative_to(root).as_posix()
-        try:
-            if q.exists():
-                q = p.with_name(letterbox.quarantine_name(f"{secrets.token_hex(3)}-{p.name}"))
-            os.rename(p, q)
-        except OSError as exc:
-            log(f"QUARANTINE: could not rename {rel}: {exc}")
-            continue
-        log(f"QUARANTINE: {rel} -> {q.name} (a name the framework would read; never filed)")
-        if rel not in told:
-            new.append(rel)
-            told.add(rel)
+    done, failed = letterbox.quarantine(root, paths, log=log)
+    new = [rel for rel in done + failed if rel not in told]
+    told.update(new)
     if new:
         state["quarantined"] = sorted(told)
         save_state(state)
@@ -523,12 +565,35 @@ class Watcher:
         # is not matched again every poll until it changes.
         self.files: dict[str, dict] = {}
         self.accepts_key = None
+        self.recovered = False
+
+    def recover_claims(self) -> None:
+        """Put back every file a previous watcher claimed and did not finish
+        with — killed between the claim and the filing, say. A claimed file is
+        hidden from the share and the sweep, so one left behind would be lost
+        for good."""
+        if not self.root.is_dir():
+            return
+        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=False):
+            here = Path(dirpath)
+            dirnames[:] = [d for d in dirnames if not letterbox.ignored(d)
+                           and not os.path.islink(os.path.join(dirpath, d))]
+            for name in filenames:
+                m = _CLAIM_RE.match(name)
+                if not m:
+                    continue
+                original = here / m.group(1)
+                log(f"{name}: left claimed by an earlier watcher; putting it back")
+                self.release(here / name, original)
 
     def tick(self) -> None:
         now = _now()
         letterbox.ensure_manifest(self.root)
-        current, denied = scan(self.root)
-        quarantine(self.root, denied)
+        if not self.recovered:
+            self.recovered = True
+            self.recover_claims()
+        quarantine(self.root)
+        current = scan(self.root)
         for rel in list(self.files):
             if rel not in current:
                 del self.files[rel]
@@ -598,12 +663,18 @@ class Watcher:
         return claimed
 
     def release(self, claimed: Path, path: Path) -> None:
-        """Put a claimed file back under a visible name."""
+        """Put a claimed file back under a visible name; the user hears of
+        one that cannot be, since it is invisible to everything else."""
         back = path if not path.exists() else path.with_name(f"recovered-{path.name}")
         try:
             os.rename(claimed, back)
         except OSError as exc:
             log(f"{claimed.name}: could not put back as {back.name}: {exc}")
+            rel = claimed.relative_to(self.root).as_posix()
+            alert("Letterbox: a file is stuck under a working name",
+                  f"The intake watcher had taken `{rel}` in hand and could not put it back as "
+                  f"`{back.name}` ({exc}). It is still in the letterbox under that hidden "
+                  "name, invisible to the share and the sweep, until it is renamed by hand.")
 
 
 def main(argv: list[str] | None = None) -> int:
