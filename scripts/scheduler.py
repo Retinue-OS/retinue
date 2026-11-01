@@ -94,7 +94,6 @@ Environment:
                                  field overrides both)
 """
 
-import glob
 import json
 import os
 import re
@@ -242,8 +241,8 @@ def load_jobs() -> list[dict]:
     # shadow a base job id (first-seen wins, and the duplicate is logged).
     manifests = [str(BASE_SCHEDULE)] if BASE_SCHEDULE.is_file() else []
     # Never the letterbox's: it is written from outside (scripts/letterbox.py).
-    manifests += sorted(m for m in glob.glob(str(CHAMBERS_DIR / "*" / ".schedule.json"))
-                        if not letterbox.is_letterbox(Path(m).parent))
+    manifests += [str(c / ".schedule.json") for c in letterbox.mounted_chambers(CHAMBERS_DIR)
+                  if (c / ".schedule.json").is_file()]
     for manifest in manifests:
         try:
             with open(manifest, encoding="utf-8") as fh:

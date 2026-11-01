@@ -17,10 +17,12 @@ Traefik's forward-auth asks the gateway's ``/auth`` (scripts/gateway_auth.py)
 What the share refuses, because the folder is written from outside and read
 by the framework:
 
-- **Hidden names** (any path segment starting with a dot) — 403. The
+- **Hidden names** (any path segment starting with a dot) and **names the
+  framework reads** (``letterbox.DENIED_NAMES``: ``CLAUDE.md``, ``AGENTS.md``,
+  ``requirements.txt``, ``accepted-requesters.txt``, …) — 403. The
   letterbox's own ``.inbox.json`` stays out of reach, so do side files like
-  macOS's ``._*``, and nobody can plant a dot-manifest the framework would
-  read.
+  macOS's ``._*``, and nobody can plant a file that the next session, or the
+  entrypoint, would take as instructions or configuration.
 - **Paths out of the root** — ``..``, symlinks: 403/404.
 - **Rendering on this origin.** A GET always answers as a download
   (``Content-Disposition: attachment``, ``application/octet-stream``,
@@ -34,14 +36,21 @@ half a file.
 from __future__ import annotations
 
 import email.utils
+import errno
 import os
+import re
 import secrets
 import shutil
+import sys
 import urllib.parse
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import letterbox  # noqa: E402
+
 PREFIX = "/inbox"
+_CHUNK_SIZE_RE = re.compile(rb"^[0-9A-Fa-f]{1,16}$")
 MAX_UPLOAD = int(os.environ.get("LETTERBOX_MAX_UPLOAD", str(1024 * 1024 * 1024)))
 METHODS = "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE"
 
@@ -73,6 +82,8 @@ def _segments(url_path: str) -> list[str]:
             raise _Refused(403, "invalid path")
         if seg.startswith("."):
             raise _Refused(403, "hidden names are not accepted")
+        if letterbox.denied(seg):
+            raise _Refused(403, "that name is reserved")
         segs.append(seg)
     return segs
 
@@ -130,10 +141,12 @@ def _read_body(handler, limit: int, sink) -> None:
         total = 0
         while True:
             line = handler.rfile.readline(1024)
-            try:
-                size = int(line.split(b";", 1)[0].strip() or b"0", 16)
-            except ValueError:
-                raise _Refused(400, "malformed chunked body") from None
+            # Strictly hex digits: int(…, 16) would also take a sign or an
+            # underscore, and a negative first chunk would walk past the cap.
+            m = _CHUNK_SIZE_RE.match(line.split(b";", 1)[0].strip())
+            if not m:
+                raise _Refused(400, "malformed chunked body")
+            size = int(m.group(0), 16)
             if size == 0:
                 while handler.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
                     pass  # trailers
@@ -143,13 +156,17 @@ def _read_body(handler, limit: int, sink) -> None:
                 raise _Refused(413, "upload too large")
             _copy(handler.rfile, sink, size)
             handler.rfile.readline(8)  # the CRLF after the chunk
-    raw = (handler.headers.get("Content-Length") or "0").strip()
-    if not raw.isascii() or not raw.isdigit():
-        raise _Refused(400, "Content-Length is not a number")
-    length = int(raw) if len(raw) <= 18 else limit + 1
+    length = _content_length(handler)
     if length > limit:
         raise _Refused(413, "upload too large")
     _copy(handler.rfile, sink, length)
+
+
+def _content_length(handler) -> int:
+    raw = (handler.headers.get("Content-Length") or "0").strip()
+    if not raw.isascii() or not raw.isdigit():
+        raise _Refused(400, "Content-Length is not a number")
+    return int(raw) if len(raw) <= 18 else MAX_UPLOAD + 1
 
 
 def _copy(src, dst, n: int) -> None:
@@ -184,10 +201,32 @@ def serve(handler, root: Path) -> None:
         fn = _METHODS.get(method)
         if fn is None:
             raise _Refused(405, "method not supported")
-        fn(handler, root)
+        try:
+            fn(handler, root)
+        except _Refused:
+            raise
+        except ValueError as exc:
+            # A header or a path the parsers refused: the client's fault.
+            raise _Refused(400, f"bad request: {exc}") from None
+        except OSError as exc:
+            # A full, read-only or vanished mount must still get an answer, or
+            # the client sees a dropped connection and retries forever.
+            raise _Refused(_os_status(exc), f"{exc.strerror or exc}") from None
     except _Refused as r:
         _send(handler, r.status, (r.text + "\n").encode() if r.text else b"",
               headers={"Allow": METHODS} if r.status == 405 else None)
+
+
+def _os_status(exc: OSError) -> int:
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return 507  # Insufficient Storage (RFC 4918)
+    if exc.errno in (errno.ENOENT, errno.ENOTDIR):
+        return 409
+    if exc.errno in (errno.EEXIST, errno.ENOTEMPTY, errno.EISDIR):
+        return 409
+    if exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+        return 403
+    return 500
 
 
 def _options(handler, root: Path) -> None:
@@ -197,7 +236,7 @@ def _options(handler, root: Path) -> None:
 def _propfind(handler, root: Path) -> None:
     # The request body (which properties) is read and ignored: every answer
     # carries the same few live properties.
-    n = int((handler.headers.get("Content-Length") or "0").strip() or 0)
+    n = _content_length(handler)
     if n:
         handler.rfile.read(min(n, 1024 * 1024))
     segs = _segments(handler.path)
@@ -280,7 +319,7 @@ def _delete(handler, root: Path) -> None:
 
 
 def _mkcol(handler, root: Path) -> None:
-    if int((handler.headers.get("Content-Length") or "0").strip() or 0):
+    if _content_length(handler):
         raise _Refused(415, "MKCOL takes no body")
     segs = _segments(handler.path)
     if not segs:

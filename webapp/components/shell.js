@@ -69,8 +69,8 @@ export function openShellSettings() {
 }
 
 // ── Health Connect (RetinueShell/2) ─────────────────────────────────────────
-// The shell reads the phone's Health Connect store and POSTs the changes to
-// /api/health-connect/changes itself (docs/dashboard.md, "Inside the Android
+// The shell reads the phone's Health Connect store and uploads the changes
+// itself, by WebDAV PUT to /inbox/ (docs/dashboard.md, "Inside the Android
 // shell"); the page only starts a deliberate sync, shows the last result and
 // edits the two auto-sync settings. The bridge returns strings: "true"/"false"
 // and a JSON status document.

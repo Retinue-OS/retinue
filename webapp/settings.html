@@ -64,8 +64,8 @@
         client certificate, the launcher bar, and the wake phrase.</p>
       <button type="button" class="setting-btn" data-shell-open>Open phone shell settings</button>
       <!-- Health Connect (RetinueShell/2): only where the shell reports it
-           available. The shell does the sync and the upload itself
-           (POST /api/health-connect/changes); this block starts a deliberate
+           available. The shell does the sync and the upload itself (WebDAV
+           PUT to /inbox/); this block starts a deliberate
            one and edits the auto-sync settings the shell keeps. -->
       <div class="health-sync" data-health-sync hidden>
         <p class="hint">Health data from the phone's Health Connect (watch,

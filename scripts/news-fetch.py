@@ -70,8 +70,8 @@ def discover_manifests() -> list[Path]:
     if not CHAMBERS_DIR.is_dir():
         return []
     # Never the letterbox's: it is written from outside (scripts/letterbox.py).
-    return sorted(p for p in CHAMBERS_DIR.glob("*/.news.json")
-                  if p.is_file() and not letterbox.is_letterbox(p.parent))
+    return [c / ".news.json" for c in letterbox.mounted_chambers(CHAMBERS_DIR)
+            if (c / ".news.json").is_file()]
 
 
 def read_manifest(path: Path) -> list[dict]:

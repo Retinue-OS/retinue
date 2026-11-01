@@ -187,7 +187,14 @@ def load_manifests() -> list[tuple[Path, dict, list[dict]]]:
     loaded: list[tuple[Path, dict, list[dict]]] = []
     if not CHAMBERS_DIR.is_dir():
         return loaded
-    for chamber in sorted(CHAMBERS_DIR.iterdir()):
+    # The letterbox's manifest is fixed and never read from disk: outsiders
+    # write there, and a peer editing the file into `"source": "any"`
+    # destinations, or no inboxes at all, must change nothing.
+    box = letterbox.LETTERBOX_DIR
+    if box.is_dir():
+        data = letterbox.manifest()
+        loaded.append((box, data, []))
+    for chamber in letterbox.mounted_chambers(CHAMBERS_DIR):
         manifest = chamber / ".inbox.json"
         if not manifest.is_file():
             continue
@@ -232,6 +239,7 @@ def chamber_inboxes(chamber: Path, inboxes: list) -> list[dict]:
             continue
         found.append({
             "chamber": chamber.name,
+            "chamber_dir": chamber,
             "id": str(entry.get("id") or rel),
             "path": path,
             "rel": rel,
@@ -240,13 +248,16 @@ def chamber_inboxes(chamber: Path, inboxes: list) -> list[dict]:
     return found
 
 
-def pending_files(inbox_path: Path) -> list[Path]:
+def pending_files(inbox_path: Path, accepts: list[dict] | None = None) -> list[Path]:
     """Files awaiting filing, in a stable order.
 
     Symlinks are skipped, file or directory: whatever they point at is not
     something the user dropped into the letterbox, and following one would
     hand the Archivist a file from outside the inbox. Hidden files and
-    directories are skipped too (see `is_hidden`).
+    directories are skipped too (see `is_hidden`). In the letterbox, files a
+    chamber's `accepts` declaration takes (``accepts``, from
+    letterbox.load_accepts) are the intake watcher's and are left out, so
+    the two never work on one file.
     """
     if inbox_path.is_symlink() or not inbox_path.is_dir():
         return []
@@ -260,6 +271,8 @@ def pending_files(inbox_path: Path) -> list[Path]:
                 continue
             p = Path(dirpath) / name
             if p.is_symlink() or not p.is_file():
+                continue
+            if accepts and letterbox.accepted_by(accepts, p):
                 continue
             found.append(p)
     return sorted(found)
@@ -387,8 +400,11 @@ def build_prompt(scan: list[dict]) -> str:
 
 def main() -> int:
     scan = []
+    accepts = letterbox.load_accepts(
+        CHAMBERS_DIR, log=lambda m: print(f"[inbox-sweep] {m}", file=sys.stderr))
     for inbox in declared_inboxes():
-        files = pending_files(inbox["path"])
+        files = pending_files(inbox["path"],
+                              accepts if letterbox.is_letterbox(inbox["chamber_dir"]) else None)
         if files:
             scan.append({**inbox, "files": files})
 

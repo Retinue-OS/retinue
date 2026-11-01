@@ -525,12 +525,8 @@ class ContactBook:
         """Every chamber: each directory mounted under CHAMBERS_DIR, except the
         framework's generated output and the letterbox (scripts/letterbox.py),
         which keeps nobody. Manifest order first, then by name."""
-        try:
-            mounted = {p.name for p in self.chambers_dir.iterdir()
-                       if p.is_dir() and p.name != GENERATED and not p.name.startswith(".")
-                       and not letterbox.is_letterbox(p)}
-        except OSError:
-            return []
+        mounted = {p.name for p in letterbox.mounted_chambers(self.chambers_dir)
+                   if p.name != GENERATED}
         listed = [str(e["name"]) for e in self._manifest_entries() if str(e["name"]) in mounted]
         return list(dict.fromkeys(listed)) + sorted(mounted - set(listed))
 

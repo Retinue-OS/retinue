@@ -12,7 +12,11 @@ and talks to it with http.client:
   the cap;
 - GET answers as a download that cannot render on the dashboard's origin;
 - MKCOL, MOVE (Overwrite: F), DELETE;
-- hidden names, `..` and the share root itself are refused.
+- hidden names, `..` and the share root itself are refused;
+- the review fixes: reserved names (letterbox.DENIED_NAMES) are 403 in any
+  case, a signed or underscored chunk size is a 400 rather than a way past
+  the cap, and a malformed Content-Length or a failing filesystem still gets
+  an answer (400 / 507 / 403) instead of a dropped connection.
 
     python3 tests/test_webdav_share.py
 """
@@ -144,6 +148,62 @@ def main():
         check("DELETE the share: 403", req(port, "DELETE", "/inbox/")[0], 403)
         check("POST: 405", req(port, "POST", "/inbox/x", b"x")[0], 405)
         check("manifest untouched", (ROOT / ".inbox.json").read_text(), "{}")
+
+        # Finding 1: names the framework reads.
+        for name in ("CLAUDE.md", "claude.md", "AGENTS.md", "CLAUDE.local.md",
+                     "requirements.txt", "accepted-requesters.txt", "sub/CLAUDE.md"):
+            s, _, _ = req(port, "PUT", f"/inbox/{name}", b"x")
+            check(f"PUT {name}: 403", s, 403)
+        req(port, "MKCOL", "/inbox/d")
+        s, _, _ = req(port, "MOVE", "/inbox/chunked%20name.json",
+                      headers={"Destination": "/inbox/d/CLAUDE.md"})
+        check("MOVE onto a reserved name: 403", (s, (ROOT / "chunked name.json").is_file()), (403, True))
+        check("MKCOL a reserved name: 403", req(port, "MKCOL", "/inbox/.claude")[0], 403)
+        check("nothing reserved landed",
+              [p.name for p in ROOT.rglob("*") if p.name.lower() in ("claude.md", "agents.md",
+                                                                       "requirements.txt")], [])
+
+        # Finding 4: a negative chunk size walked past MAX_UPLOAD.
+        for bad in (b"-7fffffff", b"1_0", b"+10", b"0x10", b"1" * 17):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            c.putrequest("PUT", "/inbox/neg.bin")
+            c.putheader("Transfer-Encoding", "chunked")
+            c.endheaders()
+            c.send(bad + b"\r\nabc\r\n0\r\n\r\n")
+            try:
+                r = c.getresponse(); r.read(); status = r.status
+            except http.client.HTTPException:
+                status = None
+            c.close()
+            check(f"chunk size {bad.decode()!r}: 400", status, 400)
+        check("…and nothing stored", (ROOT / "neg.bin").exists(), False)
+
+        # Finding 5: always an answer.
+        s, _, _ = req(port, "PUT", "/inbox/cl.bin", b"abc", headers={"Content-Length": "abc"})
+        check("Content-Length not a number on PUT: 400", s, 400)
+        s, _, _ = req(port, "PROPFIND", "/inbox/", headers={"Content-Length": "-1"})
+        check("…on PROPFIND: 400", s, 400)
+        s, _, _ = req(port, "MKCOL", "/inbox/m2", headers={"Content-Length": "x"})
+        check("…on MKCOL: 400", s, 400)
+        import errno as _errno
+        real_replace = webdav_share.os.replace
+        webdav_share.os.replace = lambda *a: (_ for _ in ()).throw(OSError(_errno.ENOSPC, "No space left"))
+        s, _, _ = req(port, "PUT", "/inbox/full.bin", b"abc")
+        check("a full volume: 507", s, 507)
+        s, _, _ = req(port, "MOVE", "/inbox/chunked%20name.json", headers={"Destination": "/inbox/moved.json"})
+        check("…on MOVE too", s, 507)
+        webdav_share.os.replace = lambda *a: (_ for _ in ()).throw(OSError(_errno.EROFS, "Read-only"))
+        s, _, _ = req(port, "PUT", "/inbox/ro.bin", b"abc")
+        check("a read-only volume: 403", s, 403)
+        webdav_share.os.replace = real_replace
+        real_rmtree = webdav_share.shutil.rmtree
+        webdav_share.shutil.rmtree = lambda *a, **k: (_ for _ in ()).throw(OSError(_errno.EACCES, "denied"))
+        check("DELETE a collection that cannot be removed: 403", req(port, "DELETE", "/inbox/d")[0], 403)
+        webdav_share.shutil.rmtree = real_rmtree
+        check("no upload temp left behind by the failures",
+              [p.name for p in ROOT.iterdir() if ".upload-" in p.name], [])
+        s, _, _ = req(port, "GET", "/inbox/chunked%20name.json")
+        check("the share still answers afterwards", s, 200)
         srv.shutdown()
 
     if failures:

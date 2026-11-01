@@ -36,9 +36,11 @@ marketplace.
 
 from __future__ import annotations
 
-import glob
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import letterbox  # noqa: E402
 from pathlib import Path
 
 KB = "https://w3id.org/retinue/kb#"
@@ -46,8 +48,6 @@ RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 ACTOR_PREFIX = "urn:retinue:actor:"
 
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
-# The letterbox (scripts/letterbox.py) is written from outside: no agents.
-LETTERBOX_DIR = Path(os.environ.get("LETTERBOX_DIR") or CHAMBERS_DIR / "inbox")
 WORKSPACE = Path(os.environ.get("RETINUE_WORKSPACE") or "/workspace")
 
 # Ara is the main-session persona, defined in CLAUDE.md rather than as an agent
@@ -75,9 +75,10 @@ def _agent_dirs() -> list[Path]:
         WORKSPACE / "agents",              # core personas (no frontmatter)
         WORKSPACE / ".claude" / "agents",  # core subagent (archivist)
         # chamber agents provided as plugins
-        *(Path(p) for p in sorted(
-            glob.glob(str(CHAMBERS_DIR / "*" / ".retinue" / "agents"))
-        ) if Path(p).parent.parent.resolve() != LETTERBOX_DIR.resolve()),
+        # chamber agents provided as plugins — never from the letterbox, which
+        # outsiders write to (scripts/letterbox.py, mounted_chambers)
+        *(c / ".retinue" / "agents" for c in letterbox.mounted_chambers(CHAMBERS_DIR)
+          if (c / ".retinue" / "agents").is_dir()),
     ]
 
 

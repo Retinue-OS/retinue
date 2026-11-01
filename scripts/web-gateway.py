@@ -1847,10 +1847,12 @@ def _session_is_fresh(state: dict, session_key: str | None = None) -> bool:
 
 def _allowlist_paths() -> list[Path]:
     # A single explicit file wins; otherwise every chamber may contribute an
-    # accepted-requesters.txt — all chambers are equal.
+    # accepted-requesters.txt — all chambers are equal. Never the letterbox,
+    # which outsiders write to (scripts/letterbox.py, mounted_chambers).
     if REQUESTER_ALLOWLIST_PATH:
         return [Path(REQUESTER_ALLOWLIST_PATH)]
-    return sorted(CHAMBERS_DIR.glob("*/accepted-requesters.txt"))
+    return [c / "accepted-requesters.txt" for c in letterbox.mounted_chambers(CHAMBERS_DIR)
+            if (c / "accepted-requesters.txt").is_file()]
 
 
 def _load_requester_allowlist() -> set[str]:

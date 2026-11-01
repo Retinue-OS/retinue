@@ -960,10 +960,14 @@ with `Host(…) && PathPrefix(`/inbox`)`) and scopes that user to it — comment
 example in `docker-compose.override.example.yml`. Nothing here adds a login.
 
 The share refuses hidden names (any segment starting with a dot — so its
-`.inbox.json` is out of reach, and no dot-manifest can be planted), `..` and
-symlinks, and answers every GET as a sandboxed download
+`.inbox.json` is out of reach, and no dot-manifest can be planted) and the
+names the framework reads (`letterbox.DENIED_NAMES`: `CLAUDE.md`, `AGENTS.md`,
+`requirements.txt`, `accepted-requesters.txt`, …; docs/scheduling.md,
+"Reserved names"), `..` and symlinks — all 403 — and answers every GET as a
+sandboxed download
 (`application/octet-stream`, `attachment`, `nosniff`), so an uploaded HTML file
 never runs on the dashboard's origin. An upload is written to a hidden sibling
 and renamed into place when complete, so the intake watcher never sees half a
-file. Changes to the share are Tier 3 like the rest of the gateway's serving
+file. Every request gets an answer: a malformed header is a 400, a full
+letterbox volume a 507, a read-only one a 403. Changes to the share are Tier 3 like the rest of the gateway's serving
 logic.
