@@ -221,7 +221,10 @@ A third, `inbox-sweep`, empties letterboxes: it dispatches the Archivist for
 every chamber whose `.inbox.json` declares an inbox that is not empty. **An
 inbox is a letterbox, not a shelf** — a file the user drops in is taken out,
 filed and deleted; the only file left lying there is one the Archivist could
-not classify and has flagged for the user.
+not classify and has flagged for the user. The built-in **letterbox**
+(`chambers/inbox`) takes drops over WebDAV (`/inbox/` on the dashboard) or a
+sync tool; file types a chamber declares in `accepts` are filed from it within
+seconds by a watcher, the rest go to the Archivist.
 
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 

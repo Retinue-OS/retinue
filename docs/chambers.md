@@ -98,3 +98,13 @@ Keep such a file to orchestrator-level facts, in `CLAUDE.md`'s voice:
 - **Routing** — which of its subagents handles what.
 - **Branch policy for its paths** — which are Tier 1 (direct to `main`), which
   need in-conversation consent (Tier 2), which need a PR (Tier 3).
+
+## The letterbox and `.inbox.json`
+
+A chamber's `.inbox.json` declares its inboxes and filing destinations, and,
+with `accepts`, file types it takes in by declaration from the framework's
+built-in **letterbox** — the inbox chamber at `/workspace/chambers/inbox`
+that WebDAV uploads (`/inbox/` on the dashboard) and sync tools drop into.
+"inbox" is reserved as a chamber name for it. The full contract, the
+letterbox and typed intake: docs/scheduling.md, "Draining chamber inboxes".
+

@@ -89,6 +89,13 @@ commit, push or message anyone.
   chambers only into an `"any"` destination of the receiving chamber.
 - You never fetch. You work on files already sitting in an inbox; retrieving
   external data is `scripts/refresh.py`'s job.
+- **The letterbox** (`/workspace/chambers/inbox`, the framework's built-in
+  inbox chamber — files dropped over WebDAV or by a sync tool) belongs to no
+  chamber: its files may go into a destination of **any** chamber, whatever
+  its `source` policy. It is no git repository — move the file into the
+  receiving chamber (copy, then delete the letterbox copy), commit there.
+  Files a chamber declares by type (`accepts`) never reach you: a watcher
+  files them within seconds (docs/scheduling.md).
 
 ## Getting facts into the store: converters first
 

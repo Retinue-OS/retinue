@@ -31,6 +31,7 @@ const SHELL_ASSETS = [
   '/chat.html',
   '/settings.html',
   '/contacts.html',
+  '/sync-health',
   '/styles.css',
   '/layout.js',
   '/viewport.js',
@@ -372,6 +373,9 @@ self.addEventListener('fetch', (e) => {
   // Push config carries the server's current VAPID key; a stale cached copy
   // would silently produce subscriptions this server cannot send to.
   if (url.pathname.startsWith('/push/')) return;
+
+  // The letterbox's WebDAV share is files in flight, not the app.
+  if (url.pathname === '/inbox' || url.pathname.startsWith('/inbox/')) return;
 
   // The SPARQL endpoint answers live from the store (its page, served at the
   // same path, needs the store anyway), and the docs it renders are the

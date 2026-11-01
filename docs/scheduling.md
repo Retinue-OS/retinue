@@ -354,7 +354,9 @@ The manifest, the files and their names are all treated as untrusted:
   **hidden entries**: a dot-prefixed file is bookkeeping (`.gitkeep`), an OS or
   editor side file (`._x`, `.~lock.x#`) or a transfer still in flight
   (Syncthing's `.syncthing.*.tmp`), and a dot-prefixed directory (`.git`,
-  `.stfolder`) is never descended into. A document meant for filing needs a
+  `.stfolder`) is never descended into. Uploads still in flight under a
+  visible name (`*.part`, `*.partial`, `*.crdownload`, `~$*`) are skipped too
+  (`letterbox.ignored`). A document meant for filing needs a
   visible name. The sweep's symlink check is a snapshot, so the Archivist
   repeats it, without following links, immediately before it opens or moves
   each file.
@@ -364,3 +366,148 @@ The manifest, the files and their names are all treated as untrusted:
   Archivist hands long or unstructured documents to `archivist-reader`, a
   subagent with only the Read tool, so a document that tries to instruct its
   reader has nothing to act with.
+
+### The built-in letterbox
+
+Every deployment has one inbox chamber of its own: the **letterbox** at the
+fixed container path `/workspace/chambers/inbox` (`LETTERBOX_DIR`;
+`scripts/letterbox.py`). `docker-compose.yml` mounts a named volume there; a
+deployment may mount a host folder instead — handy when it is fed by Syncthing
+or a similar sync tool (`docker-compose.override.example.yml`). Files also
+arrive over WebDAV at `/inbox/` on the dashboard origin (docs/dashboard.md,
+"The letterbox share") — the phone shell's uploads among them.
+
+It is a chamber only in that the sweep treats its **root** as an inbox. Its
+`.inbox.json` is **fixed and never read**: the sweep uses
+`letterbox.manifest()` in process, and the entrypoint (and the intake watcher)
+overwrites the file on disk with that same text, so a WebDAV client listing
+the folder sees what it is while a sync peer editing it changes nothing. It is
+no git repository and holds nothing of its own — "inbox" is therefore a
+reserved chamber name. For the sweep two rules differ:
+
+- its root is admitted as an inbox path (any other chamber's root is still
+  refused);
+- it belongs to no chamber, so it counts as **every chamber's own inbox**: its
+  files may be filed into a destination of any chamber, whatever that
+  destination's `source` policy. It is dispatched whenever some chamber
+  declares a destination at all.
+
+Being writable from outside, it is read as documents only. The framework's
+Python enumerates chambers through one helper, `letterbox.mounted_chambers()`,
+which leaves it out — so `.schedule.json`, `.refresh.json`, `.news.json`, a
+`.retinue/` plugin or `INSTRUCTIONS.md`, a `requirements.txt`,
+`accepted-requesters.txt` and an `accepts` list are never read from it, and
+the contacts address book never lands there (the entrypoint's shell loops skip
+it by path). Its volume is not mounted into `qlever-life`: what merely passes
+through is not indexed.
+
+**Reserved names.** A `CLAUDE.md` dropped into the folder would be loaded as
+instructions by the first session that reads a file beside it (Claude Code
+picks up a subdirectory's `CLAUDE.md` once a file in that subtree is read); a
+`requirements.txt` would be installed, an `accepted-requesters.txt` would
+extend the requester allowlist. So `letterbox.DENIED_NAMES` — `CLAUDE.md`,
+`CLAUDE.local.md`, `AGENTS.md`, `.claude`, `.mcp.json`, `requirements.txt`,
+`accepted-requesters.txt`, the dot-manifests, `.git` and its siblings;
+matched case-insensitively — are refused by the share (403) and
+**quarantined** when they arrive by a route the share does not see (a sync
+peer): the entry is renamed to `.quarantined-<name>` (hidden, so skipped by
+everything), and the user is told once per name in a dashboard thread. The
+intake watcher does that every few seconds; the sweep does it itself, before
+it spawns a session over the letterbox, so the guarantee does not depend on
+the watcher being up — and when an entry cannot be renamed, the sweep does not
+dispatch the letterbox at all and says so. A quarantined file is never read by the
+framework; the user renames it to what it is, or deletes it.
+
+### Typed intake (`accepts`)
+
+Some files arriving in the letterbox are machine output of a known type —
+sensor batches, exports a device writes every few minutes — that need no
+judgement and should not wait an hour for the sweep. A chamber declares those
+in its `.inbox.json`:
+
+```json
+{
+  "accepts": [
+    {
+      "name": "sensor-batch",
+      "match": { "glob": "*.sensor.json", "json": { "schema": "example-sensor/1" } },
+      "path": "data/sensor/raw/",
+      "on_receive": "python3 .retinue/scripts/derive.py"
+    }
+  ]
+}
+```
+
+`scripts/letterbox-intake.py --watch` (no model, no credits; started by the
+entrypoint through `scripts/letterbox-supervise.sh`, which restarts it with a
+doubling wait after a crash and, after five immediate exits in a row — a
+configuration error — stops and opens a dashboard thread rather than loop
+forever) polls the
+letterbox every `LETTERBOX_POLL_SECONDS` (2) — polling, not inotify, because a
+sync tool on the host writes into a bind mount, and the scheduler's ticks are
+minutes apart:
+
+1. It skips what the sweep skips (hidden names, uploads in flight) and takes a
+   file only once its size and mtime have held still for
+   `LETTERBOX_STABLE_SECONDS` (3).
+2. It matches the file against every mounted chamber's `accepts`:
+   `match.glob` on the file name (`fnmatch`, case-sensitive) and, where given,
+   `match.json` — every key equal at the top level of the parsed file, read
+   only up to `LETTERBOX_JSON_MATCH_MAX` bytes (32 MiB); a larger or unparsable
+   file does not match.
+   - **No match**: left for the sweep, i.e. the Archivist. (The sweep, for its
+     part, leaves out every letterbox file that *does* match a valid
+     declaration, so the two never work on one file — even while the watcher
+     is down, such a file waits for it rather than reaching a model.)
+   - **More than one**: left in place, logged and reported to the user once in
+     a dashboard thread — two declarations claiming one file is a
+     configuration error, not something to guess around.
+   - **Exactly one**: filed.
+3. Exactly one match: the file is first **claimed** — renamed to a hidden
+   `.intake-<token>-<name>`, so neither the sweep nor the share sees it while
+   it is filed, and a client writing the original name again creates a new
+   file that is scanned afresh. The claimed file is opened once and its
+   identity (size, mtime, inode) checked against the scan after the copy and
+   again before the letterbox copy is deleted; a file replaced under the
+   watcher is put back under its name, unfiled, and looked at again. A
+   watcher killed with a file claimed leaves it under that hidden name; the
+   next watcher puts every such file back on its first pass (as
+   `recovered-<name>`, `recovered-<name>-2`, … when the name is taken — never
+   onto an existing file, so two stranded claims of one original both come
+   back), and reports one it cannot.
+   Filing moves it to `<chamber>/<path>/<YYYY>/<MM>/<DD>/<name>`, the UTC date
+   it was first seen. The same name already there with identical content is a
+   resend: the letterbox copy is deleted. Different content keeps both, the
+   newcomer as `<stem>-2.<rest>` (the counter before the first dot, so a
+   compound suffix like `.sensor.json` survives).
+4. `on_receive`, if declared, runs with the chamber root as cwd and the filed
+   file's absolute path as its last argument, in its own process group under
+   `LETTERBOX_DERIVE_TIMEOUT` (120 s) — the whole group is killed on timeout,
+   not only the shell that started it — and the allowlisted session
+   environment. A failure is logged; the file stays filed.
+5. The filed file and whatever `on_receive` changed (read off `git status`
+   before and after it) are committed and pushed as Tier 1 operational output
+   — only those paths, so other staged work in the chamber is never swept
+   along — at most once per `LETTERBOX_COMMIT_INTERVAL` seconds (600) per
+   chamber. What is due is recorded in
+   `/root/.retinue/letterbox-intake/state.json` before the file moves, and the
+   watcher commits it as soon as the interval is up. The push never rebases
+   a dirty tree: the chamber is shared with Ara, the subagents and the user,
+   and an unattended rebase over somebody's uncommitted edit can leave
+   conflict markers behind. With uncommitted tracked changes present the
+   push goes out plain, and a non-fast-forward rejection just keeps it due
+   for the chamber's normal sync to resolve; with a clean tree it fetches
+   and rebases first (no autostash), and a conflict is aborted — tree left
+   as it was — and reported at once. A push that fails stays due
+   (`push_due`) and is retried every interval with nothing new having to
+   arrive. So a failed commit or push, or a restart in between,
+   delays the commit or the push but never loses either. After three
+   consecutive failures of the commit or the push the user is told once in a
+   dashboard thread (and again only after a success and three new failures);
+   the files are on disk in the chamber the whole time. A chamber that is not
+   a git repository of its own is never committed to.
+
+`path` must stay inside the chamber (the same check as destinations); an
+invalid entry is skipped with a warning, the chamber's other entries still
+count. A chamber declaring `accepts` needs no `inboxes` of its own.
+
