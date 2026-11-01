@@ -46,6 +46,8 @@ RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 ACTOR_PREFIX = "urn:retinue:actor:"
 
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
+# The letterbox (scripts/letterbox.py) is written from outside: no agents.
+LETTERBOX_DIR = Path(os.environ.get("LETTERBOX_DIR") or CHAMBERS_DIR / "inbox")
 WORKSPACE = Path(os.environ.get("RETINUE_WORKSPACE") or "/workspace")
 
 # Ara is the main-session persona, defined in CLAUDE.md rather than as an agent
@@ -75,7 +77,7 @@ def _agent_dirs() -> list[Path]:
         # chamber agents provided as plugins
         *(Path(p) for p in sorted(
             glob.glob(str(CHAMBERS_DIR / "*" / ".retinue" / "agents"))
-        )),
+        ) if Path(p).parent.parent.resolve() != LETTERBOX_DIR.resolve()),
     ]
 
 

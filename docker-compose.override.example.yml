@@ -22,6 +22,12 @@ services:
       # - /abs/host/path/to/ari:/workspace/chambers/ari
       # NOTE: also add the same bind-mount to qlever-life below (as /data/<name>:ro)
       # so the chamber's RDF files are indexed by the live SPARQL store.
+      # Example: the built-in letterbox (/workspace/chambers/inbox — a named
+      # volume by default) as a host folder instead. Handy when the folder is
+      # fed by Syncthing or a similar sync tool: whatever lands there is filed
+      # like a WebDAV upload to /inbox/. Do NOT add it to qlever-life — the
+      # letterbox is a pass-through, not data.
+      # - /abs/host/path/to/letterbox:/workspace/chambers/inbox
     environment:
       # Chamber repository URLs referenced by chambers.json `url_env` entries.
       # Set the matching variables in .env. Example for "url_env": "MY_CHAMBER_REPO":
@@ -120,6 +126,24 @@ services:
       # - "traefik.http.services.ara-mcp.loadbalancer.server.port=8110"
       # - "traefik.http.routers.ara-mcp.tls.certresolver=myresolver"
       # - "traefik.http.routers.ara-mcp.tls.options=retinue-mtls@file"
+
+      # ── Optional: the letterbox share on a host name of its own ─────────────
+      # The WebDAV share of the letterbox is served at /inbox/ on the dashboard
+      # router above already, behind the same certificate/basic-auth. Give it a
+      # host of its own only to hand a sync app or scanner a credential that
+      # opens the share and nothing else: a user scoped to that host, and a
+      # router that only routes /inbox there.
+      #
+      #   TRAEFIK_BASIC_AUTH_USERS=owner:$$apr1$$...,scanner:$$apr1$$...
+      #   GATEWAY_BASIC_AUTH_SCOPES=scanner:inbox.example.com
+      #
+      # The client then uses https://inbox.example.com/inbox/ as its WebDAV URL.
+      # - "traefik.http.routers.letterbox.rule=Host(`inbox.example.com`) && PathPrefix(`/inbox`)"
+      # - "traefik.http.routers.letterbox.entrypoints=web,websecure"
+      # - "traefik.http.routers.letterbox.middlewares=agents-clientcert,agents-auth"
+      # - "traefik.http.routers.letterbox.service=agents"
+      # - "traefik.http.routers.letterbox.tls.certresolver=myresolver"
+      # - "traefik.http.routers.letterbox.tls.options=retinue-mtls@file"
 
   # Optional: expose the updater sidecar's POST /update on the same public
   # host, so a phone can trigger a full rebuild/restart without SSHing into

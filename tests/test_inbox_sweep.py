@@ -320,8 +320,31 @@ def test_hidden(mod, tmp: Path):
           ["letter.pdf"])
 
 
+def test_letterbox(mod, tmp: Path):
+    print("the letterbox: root inbox, files for any chamber")
+    h = Harness(mod, tmp)
+    box = h.chamber("inbox", {"inboxes": [{"id": "letterbox", "path": "."}],
+                              "destinations": []})
+    mod.letterbox.LETTERBOX_DIR = box
+    (box / "scan.pdf").write_text("x")
+    (box / "upload.pdf.part").write_text("x")
+    check("no chamber to file into: nothing spawned", h.tick(), False)
+    # A chamber with only `manifest` destinations still takes letterbox files.
+    h.chamber("docs", inbox_manifest())
+    check("its root is an inbox once a destination exists anywhere", h.tick(), True)
+    check("the prompt lists the dropped file", "scan.pdf" in h.spawns[-1], True)
+    check("…not an upload still in flight", "upload.pdf.part" in h.spawns[-1], False)
+    check("…and says letterbox files may go to any chamber",
+          "any chamber" in h.spawns[-1], True)
+    other = h.chamber("other", {"inboxes": [{"id": "root", "path": "."}],
+                                "destinations": [{"path": "filed/", "source": "manifest"}]})
+    (other / "x.pdf").write_text("x")
+    found = [i["chamber"] for i in mod.declared_inboxes()]
+    check("any other chamber's root is still refused as an inbox", "other" in found, False)
+
+
 def main():
-    for test in (test_gate, test_duplicate_ids, test_state_write,
+    for test in (test_letterbox, test_gate, test_duplicate_ids, test_state_write,
                  test_failed_session, test_killed_session,
                  test_manifests, test_nowhere_to_file, test_prompt_escaping,
                  test_symlinks,

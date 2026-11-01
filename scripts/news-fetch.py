@@ -47,6 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import news_store as store  # noqa: E402
+import letterbox  # noqa: E402
 
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR", "/workspace/chambers"))
 FETCH_TIMEOUT = float(os.environ.get("NEWS_FETCH_TIMEOUT", "20"))
@@ -68,7 +69,9 @@ def log(msg: str) -> None:
 def discover_manifests() -> list[Path]:
     if not CHAMBERS_DIR.is_dir():
         return []
-    return sorted(p for p in CHAMBERS_DIR.glob("*/.news.json") if p.is_file())
+    # Never the letterbox's: it is written from outside (scripts/letterbox.py).
+    return sorted(p for p in CHAMBERS_DIR.glob("*/.news.json")
+                  if p.is_file() and not letterbox.is_letterbox(p.parent))
 
 
 def read_manifest(path: Path) -> list[dict]:

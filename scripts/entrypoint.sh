@@ -10,7 +10,13 @@ set -euo pipefail
 # Chamber locations.
 CHAMBERS_DIR="${CHAMBERS_DIR:-/workspace/chambers}"
 CHAMBERS_MANIFEST="${CHAMBERS_MANIFEST:-/workspace/chambers.json}"
-export CHAMBERS_DIR CHAMBERS_MANIFEST
+# The built-in letterbox (scripts/letterbox.py): an inbox chamber at a fixed
+# path, a named volume or a host folder (docker-compose.yml). Written from
+# outside, so it is read as documents only — every per-chamber hook below
+# (plugins, instructions, requirements, hooks, refresh manifests) skips it.
+LETTERBOX_DIR="${LETTERBOX_DIR:-$CHAMBERS_DIR/inbox}"
+export CHAMBERS_DIR CHAMBERS_MANIFEST LETTERBOX_DIR
+is_letterbox() { [[ "${1%/}" == "${LETTERBOX_DIR%/}" ]]; }
 
 # Retinue keeps its own session memory in the life store (scripts/memory.py,
 # CLAUDE.md "Memory"); Claude Code's built-in auto memory would be a second,
@@ -112,6 +118,12 @@ while IFS= read -r entry; do
   fi
 done < <(jq -c '.chambers[]' "$CHAMBERS_MANIFEST")
 
+# The letterbox needs its manifest declaring its root an inbox, so the inbox
+# sweep empties it; a host folder mounted there arrives without one.
+mkdir -p "$LETTERBOX_DIR"
+python3 /workspace/scripts/letterbox.py ensure || \
+  echo "[letterbox][warn] Could not write the letterbox manifest." >&2
+
 cd /workspace
 
 # ── Generate the plugin marketplace by autodetecting chamber plugins ─
@@ -127,6 +139,7 @@ generate_marketplace() {
   local dir pj pname pdesc cname
   for dir in "$CHAMBERS_DIR"/*/; do
     [[ -d "$dir" ]] || continue
+    is_letterbox "$dir" && continue
     pj="${dir}.retinue/.claude-plugin/plugin.json"
     [[ -f "$pj" ]] || continue
     cname="$(basename "$dir")"
@@ -169,6 +182,7 @@ generate_chamber_instructions() {
     echo "\`.retinue/INSTRUCTIONS.md\`. Do not edit here — edit the chamber source."
     for dir in "$CHAMBERS_DIR"/*/; do
       [[ -d "$dir" ]] || continue
+      is_letterbox "$dir" && continue
       f="${dir}.retinue/INSTRUCTIONS.md"
       [[ -f "$f" ]] || continue
       cname="$(basename "$dir")"
@@ -230,6 +244,7 @@ fi
 # ── Install Python dependencies from every chamber's requirements.txt ─
 REQ_FILES=()
 for dir in "$CHAMBERS_DIR"/*/; do
+  is_letterbox "$dir" && continue
   [[ -f "${dir}requirements.txt" ]] && REQ_FILES+=("${dir}requirements.txt")
 done
 if (( ${#REQ_FILES[@]} > 0 )); then
@@ -299,6 +314,7 @@ export PATH="$GIT_SHIM_DIR:$PATH"
 
 # ── Git hooks (every chamber that is a git repository) ──────────────
 for dir in "$CHAMBERS_DIR"/*/; do
+  is_letterbox "$dir" && continue
   [[ -d "${dir}.git" ]] || continue
   (cd "$dir" && bash /workspace/scripts/install-hooks.sh 2>/dev/null) || true
 done
@@ -431,6 +447,7 @@ _remote_control_reachable() {
 # ── Refresh external data sources (background, non-blocking) ────────
 # Any chamber may declare refreshable sources in its .refresh.json.
 for dir in "$CHAMBERS_DIR"/*/; do
+  is_letterbox "$dir" && continue
   [[ -f "${dir}.refresh.json" ]] || continue
   echo "[refresh] Manifest found in $(basename "$dir") — starting background refresh dispatcher ..."
   mkdir -p "${dir}.refresh"
@@ -519,6 +536,11 @@ case "$MODE" in
     # fresh `claude -p`, which picks up a resynced plugin on its next run.
     echo "[claude] Starting chamber plugin watcher..."
     python3 /workspace/scripts/sync-plugins.py --watch &
+    # Files whose type a chamber declares (`accepts` in its .inbox.json) are
+    # taken out of the letterbox within seconds, filed and committed, without
+    # a model; the rest wait for the inbox sweep (scripts/letterbox-intake.py).
+    echo "[claude] Starting letterbox intake watcher..."
+    python3 /workspace/scripts/letterbox-intake.py --watch &
     # Start the Claude.ai session only where it can actually connect. With a
     # base URL configured that takes two things: the deployment must hold a
     # Claude.ai sign-in at all (RETINUE_GATEWAY_USES_CLAUDE_OAUTH, as before),
