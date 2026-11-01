@@ -472,8 +472,9 @@ minutes apart:
    watcher is put back under its name, unfiled, and looked at again. A
    watcher killed with a file claimed leaves it under that hidden name; the
    next watcher puts every such file back on its first pass (as
-   `recovered-<name>` when the name is taken again), and reports one it
-   cannot.
+   `recovered-<name>`, `recovered-<name>-2`, … when the name is taken — never
+   onto an existing file, so two stranded claims of one original both come
+   back), and reports one it cannot.
    Filing moves it to `<chamber>/<path>/<YYYY>/<MM>/<DD>/<name>`, the UTC date
    it was first seen. The same name already there with identical content is a
    resend: the letterbox copy is deleted. Different content keeps both, the

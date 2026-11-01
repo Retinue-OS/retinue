@@ -500,15 +500,20 @@ def test_recover_claims(root):
     (h.box / "b.pdf").write_text("newer drop under the same name")
     (h.box / "sub").mkdir()
     (h.box / "sub" / ".intake-01234567-c.txt").write_text("c")
-    # One that cannot be put back: both names are taken by directories.
+    # One that cannot be put back (the filesystem refuses).
     (h.box / ".intake-89abcdef-d.txt").write_text("d")
-    (h.box / "d.txt").mkdir()
-    (h.box / "recovered-d.txt").mkdir()
+    real_put = h.mod._rename_no_clobber
+
+    def refusing(src, dst):
+        if src.name.endswith("-d.txt"):
+            raise OSError(13, "Permission denied")
+        return real_put(src, dst)
+    h.mod._rename_no_clobber = refusing
     h.watcher.tick()
     names = sorted(p.name for p in h.box.iterdir())
     check("put back under their names on the first pass",
           names, sorted([".inbox.json", ".intake-89abcdef-d.txt", "a.sensor.json", "b.pdf",
-                         "recovered-b.pdf", "d.txt", "recovered-d.txt", "sub"]))
+                         "recovered-b.pdf", "sub"]))
     check("…the one whose name was taken again as recovered-<name>",
           (h.box / "recovered-b.pdf").read_text(), "claimed")
     check("…the newer drop untouched", (h.box / "b.pdf").read_text(), "newer drop under the same name")
@@ -517,15 +522,13 @@ def test_recover_claims(root):
           len(h.alerts) == 1 and ".intake-89abcdef-d.txt" in h.alerts[0], True)
     h.now += 4
     h.watcher.tick()
+    h.mod._rename_no_clobber = real_put
     check("…and only once", len(h.alerts), 1)
     check("a recovered accepted file is then filed as usual",
           (lab / "data/raw/2026/11/01/a.sensor.json").is_file(), True)
     # A failing put-back during normal work alerts too.
     h.alerts.clear()
     h.drop("e.sensor.json", {"n": 2})
-    real_rename = h.mod.os.rename
-    h.mod.os = types.SimpleNamespace(**{**{k: getattr(os, k) for k in dir(os) if not k.startswith("__")},
-                                        "rename": real_rename})
     real_copy = h.mod.shutil.copyfileobj
 
     def copy_grow_and_block(src, dst, *a):
@@ -534,13 +537,65 @@ def test_recover_claims(root):
                        if p.name.startswith(".intake-") and p.name.endswith("e.sensor.json"))
         with open(claimed, "ab") as f:
             f.write(b"x")  # replaced under us -> release()
-        h.mod.os.rename = lambda *_a: (_ for _ in ()).throw(OSError(13, "Permission denied"))
+        h.mod._rename_no_clobber = lambda *_a: (_ for _ in ()).throw(OSError(13, "Permission denied"))
     h.mod.shutil = types.SimpleNamespace(copyfileobj=copy_grow_and_block)
     h.settle()
-    h.mod.os.rename = real_rename
+    h.mod._rename_no_clobber = real_put
     h.mod.shutil = types.SimpleNamespace(copyfileobj=real_copy)
     check("a put-back that fails is reported, naming the hidden file",
           len(h.alerts) == 1 and ".intake-" in h.alerts[0] and "e.sensor.json" in h.alerts[0], True)
+
+
+def test_recover_claims_never_clobber(root):
+    print("two stranded claims of one original both come back (N2 gap)")
+    h = Harness(root)
+    h.box.mkdir()
+    # Only a JSON drop with n=1 is accepted, so an older `recovered-…` file
+    # of other content is not claimed itself.
+    h.chamber("lab", [accept(json_match={"n": 1}, derive=False)], repo=False)
+    (h.box / ".intake-aaaaaaaa-x.json").write_text("claim A")
+    (h.box / ".intake-bbbbbbbb-x.json").write_text("claim B")
+    (h.box / "x.json").write_text("current drop")
+    # And an older recovery already lying there, from an earlier incident.
+    (h.box / ".intake-cccccccc-y.pdf").write_text("claim C")
+    (h.box / "y.pdf").write_text("current y")
+    (h.box / "recovered-y.pdf").write_text("older recovery of y")
+    h.watcher.tick()
+    names = sorted(p.name for p in h.box.iterdir())
+    check("nothing hidden is left, nothing was replaced",
+          names, sorted([".inbox.json", "x.json", "recovered-x.json", "recovered-x-2.json",
+                         "y.pdf", "recovered-y.pdf", "recovered-y-2.pdf"]))
+    contents = {p.name: p.read_text() for p in h.box.iterdir() if p.name != ".inbox.json"}
+    check("the current drops are untouched",
+          (contents["x.json"], contents["y.pdf"]), ("current drop", "current y"))
+    check("both claims of x survive, distinct",
+          sorted([contents["recovered-x.json"], contents["recovered-x-2.json"]]),
+          ["claim A", "claim B"])
+    check("the older recovery of y was not overwritten",
+          (contents["recovered-y.pdf"], contents["recovered-y-2.pdf"]),
+          ("older recovery of y", "claim C"))
+    check("no alert: every file found a name", h.alerts, [])
+
+    # The same during normal work: a release colliding with an older recovered-.
+    h.drop("z.sensor.json", {"n": 1})
+    (h.box / "recovered-z.sensor.json").write_text("older")
+    real_copy = h.mod.shutil.copyfileobj
+
+    def grow(src, dst, *a):
+        real_copy(src, dst, *a)
+        claimed = next(p for p in h.box.iterdir()
+                       if p.name.startswith(".intake-") and p.name.endswith("z.sensor.json"))
+        with open(claimed, "ab") as f:
+            f.write(b"x")  # replaced under us -> release()
+        (h.box / "z.sensor.json").write_text("a newer drop meanwhile")  # the name is taken again
+    h.mod.shutil = types.SimpleNamespace(copyfileobj=grow)
+    h.settle()
+    h.mod.shutil = types.SimpleNamespace(copyfileobj=real_copy)
+    contents = {p.name: p.read_text() for p in h.box.iterdir() if "sensor" in p.name}
+    check("a release that collides twice takes the next suffix, replacing nothing",
+          (contents.get("z.sensor.json"), contents.get("recovered-z.sensor.json"),
+           "recovered-z-2.sensor.json" in contents),
+          ("a newer drop meanwhile", "older", True))
 
 
 def test_push_never_rebases_dirty_tree(root):
@@ -614,7 +669,8 @@ def test_push_never_rebases_dirty_tree(root):
 
 
 def main():
-    for test in (test_recover_claims, test_push_never_rebases_dirty_tree, test_basics, test_ambiguous_and_own_manifest, test_filing_derive_commit,
+    for test in (test_recover_claims, test_recover_claims_never_clobber,
+                 test_push_never_rebases_dirty_tree, test_basics, test_ambiguous_and_own_manifest, test_filing_derive_commit,
                  test_failure_and_restart, test_quarantine, test_sweep_overlap,
                  test_replaced_under_us, test_push_retry_and_alert,
                  test_derive_process_group):

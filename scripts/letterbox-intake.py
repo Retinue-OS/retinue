@@ -75,6 +75,7 @@ commits) for tests and by hand.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -274,6 +275,26 @@ def _derive(accept: dict, target: Path) -> bool:
         log(f"{chamber.name}: on_receive exited {proc.returncode} on {target.name}: {tail}")
         return False
     return True
+
+
+def _rename_no_clobber(src: Path, dst: Path) -> None:
+    """Rename ``src`` to ``dst`` only if ``dst`` does not exist: a hard link
+    (which refuses an existing target atomically) then the unlink; where the
+    filesystem has no links, a check followed by the rename. Raises
+    FileExistsError when ``dst`` is taken."""
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if exc.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV,
+                             errno.EMLINK):
+            raise
+        if dst.exists() or dst.is_symlink():
+            raise FileExistsError(errno.EEXIST, "exists", str(dst)) from None
+        os.rename(src, dst)
+        return
+    os.unlink(src)
 
 
 class Replaced(Exception):
@@ -663,18 +684,33 @@ class Watcher:
         return claimed
 
     def release(self, claimed: Path, path: Path) -> None:
-        """Put a claimed file back under a visible name; the user hears of
-        one that cannot be, since it is invisible to everything else."""
-        back = path if not path.exists() else path.with_name(f"recovered-{path.name}")
-        try:
-            os.rename(claimed, back)
-        except OSError as exc:
-            log(f"{claimed.name}: could not put back as {back.name}: {exc}")
-            rel = claimed.relative_to(self.root).as_posix()
-            alert("Letterbox: a file is stuck under a working name",
-                  f"The intake watcher had taken `{rel}` in hand and could not put it back as "
-                  f"`{back.name}` ({exc}). It is still in the letterbox under that hidden "
-                  "name, invisible to the share and the sweep, until it is renamed by hand.")
+        """Put a claimed file back under a visible name — its own if free,
+        else ``recovered-<name>``, ``recovered-<name>-2``, … — never onto an
+        existing file: two stranded claims of one original must both come
+        back, and an older ``recovered-`` must not be replaced. The user
+        hears of one that cannot be put back, since it is invisible to
+        everything else."""
+        recovered = path.with_name(f"recovered-{path.name}")
+        candidates = [path, recovered] + [_suffixed(recovered, n) for n in range(2, 1000)]
+        last_exc: OSError | None = None
+        for back in candidates:
+            try:
+                _rename_no_clobber(claimed, back)
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                last_exc = exc
+                break
+            if back != path:
+                log(f"{claimed.name}: put back as {back.name} ({path.name} is taken)")
+            return
+        rel = claimed.relative_to(self.root).as_posix()
+        why = str(last_exc) if last_exc else "every recovery name is taken"
+        log(f"{claimed.name}: could not put back as {path.name}: {why}")
+        alert("Letterbox: a file is stuck under a working name",
+              f"The intake watcher had taken `{rel}` in hand and could not put it back as "
+              f"`{path.name}` ({why}). It is still in the letterbox under that hidden "
+              "name, invisible to the share and the sweep, until it is renamed by hand.")
 
 
 def main(argv: list[str] | None = None) -> int:
