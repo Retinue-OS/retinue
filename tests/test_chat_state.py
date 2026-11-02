@@ -284,6 +284,22 @@ def test_flags_and_note_message():
         print("PASS test_flags_and_note_message")
 
 
+def test_contact_name_survives_note_message():
+    with tempfile.TemporaryDirectory() as tmp:
+        store = cs.ChatStateStore(tmp)
+        cid = "whatsapp:+41790000000"
+        store.note_message(cid, name="Elo")
+        store.set_contact(cid, name="Eleonore Muster")
+        doc = store.note_message(cid, name="Elo", sender="+41790000000",
+                                 sender_name="Elo")
+        assert doc["name"] == "Eleonore Muster", "profile name must not rename a filed contact"
+        assert doc["roster"]["+41790000000"] == "Elo"
+        # Clearing the card hands the name back to the channel.
+        store.set_contact(cid, name="")
+        assert store.note_message(cid, name="Elo")["name"] == "Elo"
+        print("PASS test_contact_name_survives_note_message")
+
+
 def test_companion_link():
     with tempfile.TemporaryDirectory() as tmp:
         store = cs.ChatStateStore(tmp)
@@ -368,6 +384,7 @@ if __name__ == "__main__":
     test_last_read_forward_only_and_unread_modes()
     test_archive_unless_arrived()
     test_flags_and_note_message()
+    test_contact_name_survives_note_message()
     test_companion_link()
     test_overlay_merge_dedup_expiry()
     test_iso_z_normalizes()

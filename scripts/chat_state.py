@@ -402,7 +402,9 @@ class ChatStateStore:
         route back through the exact gateway account the chat lives on."""
         with self._lock:
             doc = self._read(chat_id)
-            if name:
+            if name and not doc.get("contact"):
+                # A filed card names the chat (set_contact); the profile name
+                # the channel passes by only fills in for a chat without one.
                 doc["name"] = name
             if group is not None:
                 doc["group"] = bool(group)
