@@ -94,7 +94,6 @@ Environment:
                                  field overrides both)
 """
 
-import glob
 import json
 import os
 import re
@@ -109,6 +108,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agent_models  # noqa: E402
 import claude_auth  # noqa: E402
 import session_env  # noqa: E402
+import letterbox  # noqa: E402
 
 CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 # Framework-owned base manifest, always loaded alongside the per-chamber ones.
@@ -240,7 +240,9 @@ def load_jobs() -> list[dict]:
     # Framework base manifest first, then every chamber's. A chamber cannot
     # shadow a base job id (first-seen wins, and the duplicate is logged).
     manifests = [str(BASE_SCHEDULE)] if BASE_SCHEDULE.is_file() else []
-    manifests += sorted(glob.glob(str(CHAMBERS_DIR / "*" / ".schedule.json")))
+    # Never the letterbox's: it is written from outside (scripts/letterbox.py).
+    manifests += [str(c / ".schedule.json") for c in letterbox.mounted_chambers(CHAMBERS_DIR)
+                  if (c / ".schedule.json").is_file()]
     for manifest in manifests:
         try:
             with open(manifest, encoding="utf-8") as fh:

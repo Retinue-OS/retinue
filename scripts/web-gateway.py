@@ -292,10 +292,12 @@ import inbound_store
 import session_env
 import gateway_auth
 import instance_branding
+import letterbox
 import messenger_gateways
 import news_store
 import push_notify
 import triage_policy
+import webdav_share
 
 
 # Claude Code ships as an npm package whose auto-updater briefly swaps the
@@ -1845,10 +1847,12 @@ def _session_is_fresh(state: dict, session_key: str | None = None) -> bool:
 
 def _allowlist_paths() -> list[Path]:
     # A single explicit file wins; otherwise every chamber may contribute an
-    # accepted-requesters.txt — all chambers are equal.
+    # accepted-requesters.txt — all chambers are equal. Never the letterbox,
+    # which outsiders write to (scripts/letterbox.py, mounted_chambers).
     if REQUESTER_ALLOWLIST_PATH:
         return [Path(REQUESTER_ALLOWLIST_PATH)]
-    return sorted(CHAMBERS_DIR.glob("*/accepted-requesters.txt"))
+    return [c / "accepted-requesters.txt" for c in letterbox.mounted_chambers(CHAMBERS_DIR)
+            if (c / "accepted-requesters.txt").is_file()]
 
 
 def _load_requester_allowlist() -> set[str]:
@@ -9444,6 +9448,12 @@ class Handler(BaseHTTPRequestHandler):
                                            transform=instance_branding.brand_html)
         if path == "/sw.js":
             return self._serve_service_worker()
+        if path in ("/sync-health", "/sync-health/"):
+            # The link target for "update your health data" (docs/dashboard.md,
+            # "Inside the Android shell"): a static page. GET never changes
+            # state; inside the shell the page's own script starts the sync.
+            return self._serve_static_file(WEBAPP_DIR / "sync-health.html", WEBAPP_DIR,
+                                           transform=instance_branding.brand_html)
         if path.startswith("/data/"):
             rel = path[len("/data/"):]
             return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
@@ -9572,7 +9582,48 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return True
 
+    # ── The letterbox share (/inbox/, WebDAV) ─────────────────────────────────
+    # Every method under /inbox goes to scripts/webdav_share.py, rooted at the
+    # built-in letterbox (scripts/letterbox.py). Behind the same edge auth as
+    # the rest of the dashboard; the share adds no login of its own.
+
+    def _serve_inbox(self) -> bool:
+        if not webdav_share.handles(self.path):
+            return False
+        webdav_share.serve(self, letterbox.LETTERBOX_DIR)
+        return True
+
+    def do_PUT(self):
+        if not self._serve_inbox():
+            self._send_json(405, {"error": "method not allowed"})
+
+    def do_DELETE(self):
+        if not self._serve_inbox():
+            self._send_json(405, {"error": "method not allowed"})
+
+    def do_MKCOL(self):
+        if not self._serve_inbox():
+            self._send_json(405, {"error": "method not allowed"})
+
+    def do_MOVE(self):
+        if not self._serve_inbox():
+            self._send_json(405, {"error": "method not allowed"})
+
+    def do_PROPFIND(self):
+        if not self._serve_inbox():
+            self._send_json(405, {"error": "method not allowed"})
+
+    def do_OPTIONS(self):
+        if not self._serve_inbox():
+            self._send_json(405, {"error": "method not allowed"})
+
+    def do_HEAD(self):
+        if not self._serve_inbox():
+            self.send_error(501, "Unsupported method ('HEAD')")
+
     def do_POST(self):
+        if self._serve_inbox():
+            return
         if self.path.split("?", 1)[0] in ("/sparql", "/sparql/"):
             self._handle_sparql()
             return
@@ -10360,6 +10411,15 @@ class Handler(BaseHTTPRequestHandler):
         if instruction is not False and instruction is not None and not isinstance(instruction, str):
             self._send_json(400, {"error": "instruction must be a string (empty removes it)"})
             return
+        # Handles are read, and a Telegram name resolved to its id over the
+        # network, before the lock: a slow gateway must not stall the dashboard.
+        try:
+            handles = contacts_mod.with_telegram_ids(pairs("handles"))
+            add = contacts_mod.with_telegram_ids(pairs("add"))
+            remove = pairs("remove")
+        except contacts_mod.ContactError as exc:
+            self._send_json(exc.status, {"error": str(exc)})
+            return
         with _attention_lock:
             focus = _ATTENTION.focus()
             profile = _ATTENTION.profile()
@@ -10374,7 +10434,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if key is None:
                     record = _CONTACTS.create(str(payload.get("chamber") or ""), str(payload.get("name") or ""),
-                                              pairs("handles"), sphere=sphere or None, tags=tags or (),
+                                              handles, sphere=sphere or None, tags=tags or (),
                                               importance=None if importance is False else importance,
                                               permits=permits or (), vip=bool(vip),
                                               instruction=instruction or None)
@@ -10384,7 +10444,7 @@ class Handler(BaseHTTPRequestHandler):
                     before = _CONTACTS.get(key)
                     name = payload.get("name")
                     record = _CONTACTS.update(key, name=None if name is None else str(name), sphere=sphere,
-                                              tags=tags, add=pairs("add"), remove=pairs("remove"),
+                                              tags=tags, add=add, remove=remove,
                                               importance=importance, permits=permits,
                                               vip=None if vip is None else bool(vip),
                                               instruction=instruction)
@@ -11967,6 +12027,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header(k, v)
             self.send_header("Content-Length", "0")
             self.end_headers()
+            return
+        if self._serve_inbox():
             return
         if self.path == "/health":
             state = _load_state()
