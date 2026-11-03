@@ -16,7 +16,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # neonize bundles the platform-native whatsmeow shared library in its wheel.
 # requests: HTTP client to the retinue/STT services. langdetect: answer-language
 # hint for control-mode replies.
-RUN pip install --no-cache-dir neonize==0.4.3.post0 requests langdetect
+#
+# The pin carries the whatsmeow build, and with it the WhatsApp Web client
+# version the bridge announces. WhatsApp retires old versions server-side: once
+# it does, every connect fails with "Client outdated (405)" and no restart helps
+# — only a newer neonize does (0.4.3.post0 was cut off on 2026-11-02).
+RUN pip install --no-cache-dir neonize==0.10.0 requests langdetect
 
 # Session store persists on the whatsapp-data volume (see docker-compose.yml).
 RUN mkdir -p /root/.local/share/whatsapp
