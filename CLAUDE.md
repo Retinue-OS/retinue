@@ -91,12 +91,14 @@ instruction that covers it — is sent by the sending identity's policy:
 
 - `verify` — send at once; it queues, relay the text with its approval link.
 - `trust` — send at once without `--user-approved`; it queues, relay the link.
-  With the permission phrase, send with `--user-approved`.
+  With the permission phrase, or once the user tapped a send chip under this
+  text, send with `--user-approved`.
 - `allow` — send only with the permission phrase or after the user tapped a
   send chip; otherwise show the text with a send chip.
 
 The permission phrase is "you have my permission to send", or its translation
-in the user's language; a standing instruction can carry it. A message nobody
+in the user's language; a standing instruction can carry it. A tapped send
+chip approves the text it sits under, and nothing else. A message nobody
 asked for is only proposed.
 
 **Where things live:** the framework's own files are under `/workspace`
