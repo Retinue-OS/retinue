@@ -10,10 +10,11 @@
 //     version, setVoiceActive(bool), openSettings()}, and from RetinueShell/2
 //     the Health Connect members (healthConnectAvailable(), healthSync(),
 //     healthSyncStatus(), setHealthSyncInterval(minutes),
-//     setHealthAutoSync(bool));
+//     setHealthAutoSync(bool)), and from RetinueShell/3 placeCall(number);
 //   - the shell dispatches `retinue-shell` window events, detail.type `wake`
-//     (the wake phrase), `home` (a Home press while the shell is in front) or
-//     `health-sync` (a Health Connect sync started, done, failed or skipped).
+//     (the wake phrase), `home` (a Home press while the shell is in front),
+//     `health-sync` (a Health Connect sync started, done, failed or skipped)
+//     or `call` (what became of a placeCall).
 //
 // Every member is feature-detected: an older shell lacks the newer ones, and
 // a call that throws is treated as a shell without it.
@@ -158,6 +159,36 @@ export function onHealthSync(cb) {
   const listener = (e) => {
     const d = e && e.detail;
     if (d && d.type === 'health-sync') cb(d);
+  };
+  window.addEventListener('retinue-shell', listener);
+  return () => window.removeEventListener('retinue-shell', listener);
+}
+
+// ── Phone calls (RetinueShell/3) ────────────────────────────────────────────
+// The shell places a call without a tap — only while a voice conversation is
+// engaged (setVoiceActive), and only when the user switched "Call directly by
+// voice" on in its settings; otherwise, and for emergency numbers always
+// (Android lets no app call those directly), it opens the dialer with the
+// number. The outcome comes back as a `call` event.
+
+export function canPlaceCall() {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  return !!(s && typeof s.placeCall === 'function');
+}
+
+// Hand the shell a number to call; false when this shell cannot.
+export function placeCall(number) {
+  return shellInvoke('placeCall', String(number))[0];
+}
+
+// Subscribe to the shell's `call` events: cb(detail) with detail.state
+// `placed`, `dialer` (reason `emergency`, `disabled` or `no-permission`) or
+// `refused` (reason). Returns the unsubscribe function.
+export function onCall(cb) {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (e) => {
+    const d = e && e.detail;
+    if (d && d.type === 'call') cb(d);
   };
   window.addEventListener('retinue-shell', listener);
   return () => window.removeEventListener('retinue-shell', listener);

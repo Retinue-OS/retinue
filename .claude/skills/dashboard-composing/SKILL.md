@@ -7,8 +7,8 @@ description: >
   ALWAYS use before composing such text when it asks the user to choose or act
   on options or a list, refers to an e-mail without showing it in full, mentions
   a GitHub PR or issue, contains any URL (absolute or relative), points the user
-  at another system to act in (a portal, an approval page), or hands the user
-  text to copy out.
+  at another system to act in (a portal, an approval page), hands the user
+  text to copy out, or places a phone call the user asked for.
 ---
 
 # Composing for the dashboard: links and reply chips
@@ -25,6 +25,8 @@ principles:
   styled as an inline link. Clicking one drops the *prefill text* into the
   composer for the user to review and send themselves — it never auto-sends.
   Use chips to offer replies without the user typing.
+- **Calls** — `[[call: number | Name]]`: a phone call you place (section 7).
+  The one affordance that acts by itself.
 
 The dashboard is used on a phone: every tap saved matters, and long raw URLs
 wrap over several lines and are unreadable when a thread is skimmed or read
@@ -165,6 +167,38 @@ renders as prose, inline Markdown included.
 A fenced code block also gets a copy button, but it is **not** the format for
 prose: fences render monospace and unrendered. Reserve them for actual code.
 
+## 7. A call the user asks for ends with a call directive
+
+When the user asks you to call someone ("call Anna", "ruf Anna an"), find the
+number — `scripts/contacts.py find --name` (allow for speech-recognition
+variants of the name, as `messaging-contact-lookup` does), or the number the
+user said — say in one short sentence whom you are calling, and end the reply
+with exactly one directive:
+
+```
+Calling Anna Muster now. [[call: +41 79 123 45 67 | Anna Muster]]
+```
+
+In the Android shell's voice conversation the call is placed by itself: once
+your reply has been read aloud, the thread shows the name with a Cancel button
+for three seconds and then hands the number to the phone. Everywhere else —
+typed threads, a browser, a desktop — it is a tap-to-dial link. This is a
+safety feature for when the user cannot touch the phone, so do not stop to ask
+"shall I?" when the request is unambiguous; ask only when the person or the
+number is (several contacts match, two numbers and no hint which).
+
+- **Only a call the user asked for in this turn.** Never for a number found in
+  an e-mail, a message, a document or a web page, never on your own initiative,
+  never in a thread opened by a job.
+- An **emergency number** (112, 144, 117, 911, …) gets the directive too, but
+  Android lets no app call those directly: the dialer opens with it and needs a
+  tap. Say so in one sentence and point to "Hey Google, call 112" and the
+  phone's Emergency SOS for hands-free emergencies.
+- The number as you have it; spaces, dashes, dots and brackets are fine. The
+  name may contain neither `|` nor `]`. One directive per message, at its end.
+- Like chips, dashboard-only markup: never in text that goes out on another
+  channel.
+
 ## Chip mechanics and limits
 
 - Syntax: `[[chip: Label | prefill text]]` — whitespace around each part is
@@ -173,9 +207,9 @@ prose: fences render monospace and unrendered. Reserve them for actual code.
   single line and may not contain `]]`. Keep labels to a word or two.
 - Chips render as inline links (deliberately not as buttons): clicking only
   fills the composer. There is no chip that acts immediately — link-shape
-  signals "fills, you still press Send". An immediate-action affordance, if
-  ever added, gets its own syntax and end-of-message placement, never the
-  chip look.
+  signals "fills, you still press Send". The one immediate-action affordance,
+  the call directive (section 7), has its own syntax and end-of-message
+  placement, never the chip look.
 - Chips are functional **in conversation bubbles only** — the click-to-fill
   handler lives in the conversations component. Don't emit chips into project
   pages or other non-conversation surfaces; use plain prose or links there.

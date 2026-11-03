@@ -3185,6 +3185,9 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
 
 
 _CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
+# [[call: <number> | <name>]] (webapp/components/markdown.js): words for the
+# name, or the number when there is none.
+_CALL_MARKUP_RE = re.compile(r"\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^\]]*?)\s*)?\]\]", re.I)
 
 
 def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:
@@ -3212,7 +3215,9 @@ def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -
         return 0
     title = conv.get("title") or instance_branding.display_name()
     # The notification shows words, not the chip markup the thread renders.
-    body = " ".join(_CHIP_MARKUP_RE.sub("", str(text or "")).split())
+    body = _CALL_MARKUP_RE.sub(lambda m: m.group(2) or m.group(1),
+                               _CHIP_MARKUP_RE.sub("", str(text or "")))
+    body = " ".join(body.split())
     if len(body) > 160:
         body = body[:157].rstrip() + "…"
     push_notify.notify_async(title, body, url=f"/#conversation-{cid}", tag=cid,
@@ -5139,7 +5144,9 @@ _LINT_SYSTEM_PROMPT = (
     "phone dashboard. The dashboard renders Markdown plus one extra "
     "affordance, the reply chip: [[chip: Label | prefill text]] — an inline "
     "click-to-fill button; clicking it drops the prefill into the composer "
-    "for the user to review and send themselves, it never auto-sends.\n\n"
+    "for the user to review and send themselves, it never auto-sends. A "
+    "[[call: number | name]] token is a phone call the assistant places; "
+    "never add, change or remove one.\n\n"
     "Return the message below with ONLY these presentation rules enforced, "
     "changing nothing else:\n\n"
     "1. Options get chips. When the message asks the user to choose, confirm "
