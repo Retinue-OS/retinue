@@ -1471,7 +1471,9 @@ def _start_bridge() -> None:
         def _on_connect_failure(_client, event):  # noqa: ANN001
             reason = _attr(event, "Reason", "reason")
             detail = _attr(event, "Message", "message") or ""
-            _set_conn(connected=False,
+            # whatsmeow dispatches a 405 as ClientOutdatedEv instead of this
+            # event, so a connect failure here is another cause: clear the flag.
+            _set_conn(connected=False, client_outdated=False,
                       error=f"WhatsApp refused the connection (reason {reason}) {detail}".strip())
             print(f"[whatsapp-gateway] connect failure: reason={reason} {detail}", flush=True)
     except ImportError:
@@ -3058,7 +3060,7 @@ def main() -> None:
             _set_conn(connected=False)
             print("[whatsapp-gateway] bridge connection ended; reconnecting in 5s", flush=True)
         except Exception as exc:  # noqa: BLE001
-            _set_conn(connected=False, error=str(exc)[:500])
+            _set_conn(connected=False, client_outdated=False, error=str(exc)[:500])
             print(f"[whatsapp-gateway] bridge error: {exc}\n{traceback.format_exc()}", flush=True)
         time.sleep(5)
 
