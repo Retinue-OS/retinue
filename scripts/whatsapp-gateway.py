@@ -512,6 +512,7 @@ _conn: dict = {
     "linked": None,       # device pairing known-good (None = not yet known)
     "logged_out": False,  # the phone unlinked this device — re-pairing needed
     "pairing": False,     # a pairing QR is currently being offered
+    "client_outdated": False,  # WhatsApp refused this bridge version (405)
     "error": None,
     "last_change": None,
     "iq_ok": None,        # last IQ probe verdict (None until the first probe)
@@ -639,6 +640,7 @@ def _health_snapshot() -> dict:
         "linked": state["linked"],
         "logged_out": state["logged_out"],
         "pairing": state["pairing"],
+        "client_outdated": state["client_outdated"],
         "iq_ok": state["iq_ok"],
         "qr_available": qr_available,
         # Whether scanning a pairing QR is the remedy. False for an IQ wedge —
@@ -1418,7 +1420,8 @@ def _start_bridge() -> None:
 
     @client.event(ConnectedEv)
     def _on_connected(_client, _event):  # noqa: ANN001
-        _set_conn(connected=True, linked=True, logged_out=False, pairing=False, error=None)
+        _set_conn(connected=True, linked=True, logged_out=False, pairing=False,
+                  client_outdated=False, error=None)
         print(f"[whatsapp-gateway] connected (account={WHATSAPP_ACCOUNT_LABEL}, mode={WHATSAPP_GATEWAY_MODE})", flush=True)
 
     @client.event(PairStatusEv)
@@ -1437,10 +1440,44 @@ def _start_bridge() -> None:
 
         @client.event(DisconnectedEv)
         def _on_disconnected(_client, _event):  # noqa: ANN001
-            _set_conn(connected=False, error="bridge disconnected from WhatsApp")
+            # Keep a more specific cause (client outdated, connect failure) —
+            # the socket EOF that follows it would otherwise mask it.
+            with _CONN_LOCK:
+                specific = _conn["client_outdated"] or _conn["error"] not in (None, "bridge disconnected from WhatsApp")
+            _set_conn(connected=False, **({} if specific else {"error": "bridge disconnected from WhatsApp"}))
             print("[whatsapp-gateway] disconnected from WhatsApp", flush=True)
     except ImportError:
         print("[whatsapp-gateway] neonize has no DisconnectedEv; health relies on Connected/LoggedOut only", flush=True)
+
+    # A 405 is permanent for this build: whatsmeow does not retry it and a
+    # restart replays it, so say so on /health instead of a bare "disconnected".
+    try:
+        from neonize.events import ClientOutdatedEv  # noqa: PLC0415
+
+        @client.event(ClientOutdatedEv)
+        def _on_client_outdated(_client, _event):  # noqa: ANN001
+            _set_conn(connected=False, client_outdated=True,
+                      error="WhatsApp rejected this client as outdated (405) — "
+                            "rebuild the gateway with a newer neonize")
+            print("[whatsapp-gateway] client outdated (405) — WhatsApp no longer accepts this "
+                  "bridge version; a restart will not help, update neonize", flush=True)
+    except ImportError:
+        pass
+
+    try:
+        from neonize.events import ConnectFailureEv  # noqa: PLC0415
+
+        @client.event(ConnectFailureEv)
+        def _on_connect_failure(_client, event):  # noqa: ANN001
+            reason = _attr(event, "Reason", "reason")
+            detail = _attr(event, "Message", "message") or ""
+            # whatsmeow dispatches a 405 as ClientOutdatedEv instead of this
+            # event, so a connect failure here is another cause: clear the flag.
+            _set_conn(connected=False, client_outdated=False,
+                      error=f"WhatsApp refused the connection (reason {reason}) {detail}".strip())
+            print(f"[whatsapp-gateway] connect failure: reason={reason} {detail}", flush=True)
+    except ImportError:
+        pass
 
     try:
         from neonize.events import LoggedOutEv  # noqa: PLC0415
@@ -3023,7 +3060,7 @@ def main() -> None:
             _set_conn(connected=False)
             print("[whatsapp-gateway] bridge connection ended; reconnecting in 5s", flush=True)
         except Exception as exc:  # noqa: BLE001
-            _set_conn(connected=False, error=str(exc)[:500])
+            _set_conn(connected=False, client_outdated=False, error=str(exc)[:500])
             print(f"[whatsapp-gateway] bridge error: {exc}\n{traceback.format_exc()}", flush=True)
         time.sleep(5)
 
