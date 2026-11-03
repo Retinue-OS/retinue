@@ -157,9 +157,10 @@ def test_sender_is_reduced_to_a_real_sender_shape():
 
 def test_short_codes_are_not_phone_numbers():
     """A short code (up to six digits) is one-way like an alphanumeric id: it
-    gets no reply token, and /send refuses it before any approval is asked."""
+    gets no reply token, no reply command in the triage prompt, and /send
+    refuses it before any approval is asked."""
     with tempfile.TemporaryDirectory() as tmp:
-        gw = _load(tmp)
+        gw = _load(tmp, token="t")
         for number in ("+41791112233", "0791112233", "2125551234", "1234567", "+12345"):
             assert gw._is_phone_number(gw._normalize_sender(number)), number
         for sender in ("4636", "12345", "123456", "72 000", "HBL", "Swisscom", "", None):
@@ -169,7 +170,33 @@ def test_short_codes_are_not_phone_numbers():
         gw._attach_reply_tokens(msgs)
         assert "reply_token" not in msgs[0] and msgs[0].get("no_reply"), msgs[0]
         assert msgs[1].get("reply_token"), msgs[1]
-    print("ok: a short code gets no reply token; numbers of seven digits or more do")
+
+        # The live forward: no reply command for a short code.
+        posted = []
+
+        class _Resp:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {}
+        gw._chats.notify_chat_event = lambda **kw: None
+        gw.requests.post = lambda url, json=None, timeout=None: (posted.append(json), _Resp())[1]
+        path = gw._persist_inbound("Your code is 4711", "72000", "m3", None)
+        gw._forward_to_inbox("Your code is 4711", "72000", path, "m3")
+        prompt = posted[0]["message"]
+        assert "--reply-to" not in prompt and "No reply is possible" in prompt, prompt
+
+        # /send: refused with a 400, and nothing is queued for approval.
+        server, base = _serve(gw)
+        try:
+            send = json.dumps({"recipient": "123456", "message": "x"}).encode()
+            status, answer = _post(f"{base}/send", send, {"Authorization": "Bearer t"})
+            assert status == 400 and "not a phone number" in answer.get("error", ""), (status, answer)
+            assert gw._list_pending_sends_store() == [] and gw._pending_sends == {}
+        finally:
+            server.shutdown()
+    print("ok: a short code gets no reply route and cannot be sent to; numbers of seven digits or more can")
 
 
 def test_crash_before_persist_leaves_the_retry_recordable():
