@@ -53,9 +53,11 @@ Handles
 Code speaks of *handles*: ``(channel, handle)`` pairs, whatever the channel.
 ``email`` maps to ``vcard:hasEmail``, ``sms`` to ``vcard:hasTelephone`` (an SMS
 number is a telephone, not an account), every other channel to an account. An
-account whose name is an E.164 number also gives the person that telephone.
-An account or an e-mail address belongs to at most one person across all
-chambers; telephones may be shared (a family landline).
+SMS sender that is no number — an alphanumeric sender id ("HBL", "DHL") or a
+short code — is an account on the ``sms`` channel: it reaches nobody, it only
+names who wrote. An account whose name is an E.164 number also gives the
+person that telephone. An account or an e-mail address belongs to at most one
+person across all chambers; telephones may be shared (a family landline).
 
 Library use (the web-gateway's contact card)::
 
@@ -134,6 +136,12 @@ _PHONE_RE = re.compile(r"^\+[0-9]{6,20}$")
 _WA_PN_SUFFIX = "@s.whatsapp.net"
 _PHONE_PUNCT_RE = re.compile(r"[\s\-().\u00a0/]")
 _EMAIL_RE = re.compile(r"^[^@\s<>\"]+@[^@\s<>\"]+$")
+# An SMS sender that is no phone number, in the shape sms-gateway.py's
+# _normalize_sender delivers it: an alphanumeric sender id of at most 16
+# characters with a letter in it ("HBL", "Swisscom"), or a short code. A
+# longer run of digits is a national number, refused rather than guessed.
+_SMS_SENDER_ID_RE = re.compile(r"^(?=.*[A-Za-z])[A-Za-z0-9 ._&-]{1,16}$")
+_SMS_SHORT_CODE_RE = re.compile(r"^[0-9]{3,6}$")
 
 _HEADER = ("# Contact managed by scripts/contacts.py (docs/contacts.md).\n"
            "# Lines it did not write are kept on every rewrite: add your own freely.\n")
@@ -179,7 +187,9 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
     elif channel == SMS:
         value = normalize_phone(value)
         if not _PHONE_RE.match(value):
-            raise ContactError(f"not an E.164 phone number: {handle!r}")
+            value = " ".join(value.split())
+            if not is_sms_sender_id(value):
+                raise ContactError(f"not an E.164 phone number, nor an SMS sender id: {handle!r}")
     elif channel == TELEGRAM and not _TG_ID_RE.match(value) and not _PHONE_RE.match(normalize_phone(value)):
         # A username is case-insensitive and written with or without its @:
         # one spelling, so the same person is not filed twice.
@@ -200,6 +210,17 @@ def normalize_handle(channel: str, handle: str) -> tuple[str, str]:
     return channel, value
 
 
+def is_sms_sender_id(handle: str) -> bool:
+    """Whether an SMS handle names a sender that is no phone number — an
+    alphanumeric sender id or a short code, which cannot be written back to."""
+    return bool(_SMS_SENDER_ID_RE.match(handle) or _SMS_SHORT_CODE_RE.match(handle))
+
+
+def _is_telephone(channel: str, handle: str) -> bool:
+    """Whether a pair is stored as a telephone rather than as an account."""
+    return channel == SMS and not is_sms_sender_id(handle)
+
+
 def parse_handle(spec: str) -> tuple[str, str]:
     """``channel:handle`` (the CLI's and a chat id's shape) → a normalized pair."""
     channel, sep, handle = str(spec or "").partition(":")
@@ -216,6 +237,15 @@ def _canonical(channel: str, handle: str) -> tuple[str, str]:
         return normalize_handle(channel, handle)
     except ContactError:
         return channel, handle
+
+
+def _match_key(channel: str, handle: str) -> tuple[str, str]:
+    """What two account handles are compared by: the canonical spelling, and an
+    SMS sender id case-folded, as the delivery gate matches it ("HBL", "hbl")."""
+    channel, handle = _canonical(channel, handle)
+    if channel == SMS and is_sms_sender_id(handle):
+        return channel, handle.casefold()
+    return channel, handle
 
 
 def account_iri(channel: str, handle: str) -> str:
@@ -615,12 +645,13 @@ class ContactBook:
     def find(self, channel: str, handle: str) -> dict | None:
         """The person this handle belongs to, if anyone's."""
         channel, handle = normalize_handle(channel, handle)
+        key = _match_key(channel, handle)  # a sender id compares case-insensitively
         for record in self.all():
             if channel == EMAIL and handle in record["emails"]:
                 return record
             if channel == SMS and handle in record["all_phones"]:
                 return record
-            if any(_canonical(*account) == (channel, handle) for account in record["accounts"]):
+            if any(_match_key(*account) == key for account in record["accounts"]):
                 return record
         return None
 
@@ -650,7 +681,7 @@ class ContactBook:
     # Writing
 
     def _claimed(self, channel: str, handle: str, but: str | None = None) -> dict | None:
-        if channel == SMS:
+        if _is_telephone(channel, handle):
             return None  # telephones may be shared
         owner = self.find(channel, handle)
         return owner if owner and owner["iri"] != but else None
@@ -770,21 +801,23 @@ def _add_pair(record: dict, pair: tuple[str, str]) -> None:
     channel, handle = pair
     if channel == EMAIL:
         record["emails"] = sorted(set(record["emails"]) | {handle})
-    elif channel == SMS:
+    elif _is_telephone(channel, handle):
         record["phones"] = sorted(set(record["phones"]) | {handle})
     else:
         # The pair is normalized; an older spelling of the same handle gives way.
-        record["accounts"] = sorted({a for a in record["accounts"] if _canonical(*a) != pair} | {pair})
+        key = _match_key(*pair)
+        record["accounts"] = sorted({a for a in record["accounts"] if _match_key(*a) != key} | {pair})
 
 
 def _remove_pair(record: dict, pair: tuple[str, str]) -> None:
     channel, handle = pair
     if channel == EMAIL:
         record["emails"] = [e for e in record["emails"] if e != handle]
-    elif channel == SMS:
+    elif _is_telephone(channel, handle):
         record["phones"] = [p for p in record["phones"] if p != handle]
     else:
-        record["accounts"] = [a for a in record["accounts"] if _canonical(*a) != pair]
+        key = _match_key(*pair)
+        record["accounts"] = [a for a in record["accounts"] if _match_key(*a) != key]
 
 
 # ── The delivery gate ───────────────────────────────────────────────────────
