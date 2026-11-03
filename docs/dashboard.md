@@ -959,10 +959,12 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 
 | Direction | What |
 |---|---|
-| User agent | ` RetinueShell/1 (Android)` appended. |
+| User agent | ` RetinueShell/2 (Android)` appended (` RetinueShell/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
 | `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings()`, behind Settings → Phone shell (shown only when the object exists). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake` or `home`. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
+| Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool}`; `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home` or `health-sync`. A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`); it is information only — no page navigates on it. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
+| `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
 | Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
@@ -973,3 +975,35 @@ window to the front as it is — an open thread, a draft or a recording under
 way are kept; `navigate-existing` would load `/` over them. Known gap: Web
 Push does not reach a page inside an Android WebView, so notifications still
 need the PWA installed in Chrome alongside.
+
+## The letterbox share (`/inbox/`)
+
+The built-in letterbox (`/workspace/chambers/inbox`, docs/scheduling.md,
+"The built-in letterbox") is shared over **WebDAV** at `/inbox/` on the
+dashboard origin, by the gateway itself (`scripts/webdav_share.py`): OPTIONS,
+PROPFIND (depth 0 and 1), GET/HEAD, PUT (with a `Content-Length` or chunked;
+`LETTERBOX_MAX_UPLOAD`, default 1 GiB), DELETE, MKCOL and MOVE — class 1, no
+locks. That is what the phone shell's Health Connect upload uses, and it is
+enough for `curl -T file https://<origin>/inbox/`, scanners and the WebDAV
+clients of file managers and sync apps.
+
+**Auth is the dashboard's, unchanged**: the router's forward-auth to `/auth`
+(`scripts/gateway_auth.py`) — the client certificate, or a basic-auth user,
+host-scoped by `GATEWAY_BASIC_AUTH_SCOPES`. Scoping works per host, so a
+deployment that wants to hand a sync app or scanner a credential that opens the
+share and nothing else gives the share a host name of its own (a Traefik router
+with `Host(…) && PathPrefix(`/inbox`)`) and scopes that user to it — commented
+example in `docker-compose.override.example.yml`. Nothing here adds a login.
+
+The share refuses hidden names (any segment starting with a dot — so its
+`.inbox.json` is out of reach, and no dot-manifest can be planted) and the
+names the framework reads (`letterbox.DENIED_NAMES`: `CLAUDE.md`, `AGENTS.md`,
+`requirements.txt`, `accepted-requesters.txt`, …; docs/scheduling.md,
+"Reserved names"), `..` and symlinks — all 403 — and answers every GET as a
+sandboxed download
+(`application/octet-stream`, `attachment`, `nosniff`), so an uploaded HTML file
+never runs on the dashboard's origin. An upload is written to a hidden sibling
+and renamed into place when complete, so the intake watcher never sees half a
+file. Every request gets an answer: a malformed header is a 400, a full
+letterbox volume a 507, a read-only one a 403. Changes to the share are Tier 3 like the rest of the gateway's serving
+logic.

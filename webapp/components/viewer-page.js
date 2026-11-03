@@ -26,10 +26,9 @@
 // shell (which opens it in the phone's viewer app). Reached anyway, the viewer
 // offers Open and Save in place of the frame.
 
-import { esc, framesWholePdf } from './base.js';
+import { esc, framesWholePdf, INLINE_SAFE_TYPES } from './base.js';
 
 const SRC_RE = /^\/conversations\/[0-9a-f]{32}\/attachments\/[0-9a-f]{32}(?:\/[^/\\?#]+)?$/;
-const IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif']);
 const HOME_URL = '/';
 // The brand part of the served <title> ("Retinue", or "Retinue (Admin)" on a
 // named instance, scripts/instance_branding.py), read once before any rewrite:
@@ -81,10 +80,10 @@ export function parseViewerParams(search) {
     if (new URL(src, 'https://viewer.invalid').pathname !== src) return null;
   } catch (_) { return null; }
   const type = (q.get('type') || '').split(';')[0].trim().toLowerCase();
-  const kind = type === 'application/pdf' ? 'pdf'
-    : IMAGE_TYPES.has(type) ? 'image'
-      : type === 'text/plain' ? 'text' : '';
-  if (!kind) return null;
+  if (!INLINE_SAFE_TYPES.has(type)) return null;
+  // Any other type the gateway serves inline is drawn as text: in a frame
+  // sandboxed against script, like text/plain.
+  const kind = type === 'application/pdf' ? 'pdf' : type.startsWith('image/') ? 'image' : 'text';
   // Without a name, the URL's own last segment (percent-encoded) stands in.
   const name = q.get('name') || safeDecode(src.split('/')[5] || '') || 'attachment';
   return { src, name, kind };

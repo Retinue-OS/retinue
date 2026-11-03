@@ -92,6 +92,9 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import letterbox  # noqa: E402
+
 DEFAULT_PATH = "contacts"
 # The framework's own derived output under CHAMBERS_DIR — in no chamber's
 # repository, so no place for a person.
@@ -520,12 +523,10 @@ class ContactBook:
 
     def chambers(self) -> list[str]:
         """Every chamber: each directory mounted under CHAMBERS_DIR, except the
-        framework's generated output. Manifest order first, then by name."""
-        try:
-            mounted = {p.name for p in self.chambers_dir.iterdir()
-                       if p.is_dir() and p.name != GENERATED and not p.name.startswith(".")}
-        except OSError:
-            return []
+        framework's generated output and the letterbox (scripts/letterbox.py),
+        which keeps nobody. Manifest order first, then by name."""
+        mounted = {p.name for p in letterbox.mounted_chambers(self.chambers_dir)
+                   if p.name != GENERATED}
         listed = [str(e["name"]) for e in self._manifest_entries() if str(e["name"]) in mounted]
         return list(dict.fromkeys(listed)) + sorted(mounted - set(listed))
 

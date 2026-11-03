@@ -91,12 +91,14 @@ instruction that covers it — is sent by the sending identity's policy:
 
 - `verify` — send at once; it queues, relay the text with its approval link.
 - `trust` — send at once without `--user-approved`; it queues, relay the link.
-  With the permission phrase, send with `--user-approved`.
+  With the permission phrase, or once the user tapped a send chip under this
+  text, send with `--user-approved`.
 - `allow` — send only with the permission phrase or after the user tapped a
   send chip; otherwise show the text with a send chip.
 
 The permission phrase is "you have my permission to send", or its translation
-in the user's language; a standing instruction can carry it. A message nobody
+in the user's language; a standing instruction can carry it. A tapped send
+chip approves the text it sits under, and nothing else. A message nobody
 asked for is only proposed.
 
 **Where things live:** the framework's own files are under `/workspace`
@@ -221,7 +223,10 @@ A third, `inbox-sweep`, empties letterboxes: it dispatches the Archivist for
 every chamber whose `.inbox.json` declares an inbox that is not empty. **An
 inbox is a letterbox, not a shelf** — a file the user drops in is taken out,
 filed and deleted; the only file left lying there is one the Archivist could
-not classify and has flagged for the user.
+not classify and has flagged for the user. The built-in **letterbox**
+(`chambers/inbox`) takes drops over WebDAV (`/inbox/` on the dashboard) or a
+sync tool; file types a chamber declares in `accepts` are filed from it within
+seconds by a watcher, the rest go to the Archivist.
 
 Manifest formats, the gates, and the full wake semantics: `docs/scheduling.md`.
 

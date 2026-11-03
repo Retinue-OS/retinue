@@ -63,6 +63,24 @@
       <p class="hint">The Android app around this dashboard: its address and
         client certificate, the launcher bar, and the wake phrase.</p>
       <button type="button" class="setting-btn" data-shell-open>Open phone shell settings</button>
+      <!-- Health Connect (RetinueShell/2): only where the shell reports it
+           available. The shell does the sync and the upload itself (WebDAV
+           PUT to /inbox/); this block starts a deliberate
+           one and edits the auto-sync settings the shell keeps. -->
+      <div class="health-sync" data-health-sync hidden>
+        <p class="hint">Health data from the phone's Health Connect (watch,
+          ring, blood-pressure app) is sent to your health records when the
+          app comes to the front, at most once per interval below. An update
+          started here always runs.</p>
+        <button type="button" class="setting-btn" data-health-sync-now>Update health data now</button>
+        <p class="health-sync-line" data-health-sync-line aria-live="polite"></p>
+        <label class="num-setting">Update when the app comes to the front
+          <input type="checkbox" data-health-auto>
+        </label>
+        <label class="num-setting">At most every (minutes)
+          <input type="number" min="1" max="1440" step="1" inputmode="numeric" data-health-interval>
+        </label>
+      </div>
     </section>
 
     <section class="scard">
@@ -122,7 +140,11 @@
   <script type="module">
     import { shelfSize, setShelfSize, subscribe } from '/components/shelf-store.js';
     import { voiceTimeouts, setVoiceTimeouts } from '/components/continuous.js';
-    import { inShell, openShellSettings } from '/components/shell.js';
+    import {
+      inShell, openShellSettings, healthConnectAvailable, healthSync, healthSyncStatus,
+      setHealthSyncInterval, setHealthAutoSync, onHealthSync, describeHealthSync,
+      describeHealthSyncEvent,
+    } from '/components/shell.js';
 
     // The shelf size (components/shelf-store.js): kept per device and browser
     // like the shelf; lowering it makes room at once, quiet items first.
@@ -228,6 +250,51 @@
     if (inShell()) {
       document.querySelector('[data-shell-settings]').hidden = false;
       document.querySelector('[data-shell-open]').addEventListener('click', () => openShellSettings());
+    }
+
+    // Health Connect, where the shell has it (components/shell.js): the last
+    // sync from healthSyncStatus(), kept current by the shell's health-sync
+    // events; the button starts a deliberate sync; the toggle and interval
+    // are the shell's own settings, re-read after every write so what shows
+    // is what the shell holds.
+    if (inShell() && healthConnectAvailable()) {
+      const box = document.querySelector('[data-health-sync]');
+      const now = document.querySelector('[data-health-sync-now]');
+      const line = document.querySelector('[data-health-sync-line]');
+      const auto = document.querySelector('[data-health-auto]');
+      const interval = document.querySelector('[data-health-interval]');
+      box.hidden = false;
+      const showStatus = () => {
+        const st = healthSyncStatus();
+        if (!st) return;
+        line.textContent = describeHealthSync(st);
+        auto.checked = !!st.auto_on_resume;
+        if (document.activeElement !== interval && Number.isFinite(st.min_interval_minutes)) {
+          interval.value = String(st.min_interval_minutes);
+        }
+      };
+      now.addEventListener('click', () => {
+        if (!healthSync()) { line.textContent = 'This phone shell cannot update health data.'; return; }
+        now.disabled = true;
+        line.textContent = 'Updating health data…';
+      });
+      auto.addEventListener('change', () => { setHealthAutoSync(auto.checked); showStatus(); });
+      interval.addEventListener('change', () => {
+        const minutes = Math.round(Number(interval.value));
+        if (Number.isFinite(minutes) && minutes >= 1) setHealthSyncInterval(minutes);
+        showStatus();
+      });
+      onHealthSync((d) => {
+        if (d.state !== 'started') now.disabled = false;
+        if (d.state === 'started' || d.state === 'skipped') {
+          line.textContent = describeHealthSyncEvent(d);
+        } else {
+          showStatus();
+          if (d.state === 'error' && !line.textContent) line.textContent = describeHealthSyncEvent(d);
+        }
+      });
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) showStatus(); });
+      showStatus();
     }
   </script>
   <script>

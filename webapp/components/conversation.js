@@ -120,7 +120,7 @@
 //   POST /conversations/transcribe      dictation audio → {text, lang}
 //   GET  /conversation-models           the offered models (once per page)
 
-import { esc, fmtAge, framesWholePdf, softKeyboard, visibleHeight } from './base.js';
+import { esc, fmtAge, framesWholePdf, INLINE_SAFE_TYPES, softKeyboard, visibleHeight } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
@@ -189,13 +189,6 @@ const CLOCK_SKEW_MS = 60 * 1000;
 const POSITION_KEY = 'retinue-voice-position';
 const POSITION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const AUTOPLAY_KEY = 'retinue-voice-autoplay';
-// Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
-// browser shows in place instead of saving. Mirrors _INLINE_SAFE_TYPES in
-// web-gateway.py — offering "view" for anything else would just download it.
-const INLINE_SAFE_TYPES = new Set([
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
-  'application/pdf', 'text/plain',
-]);
 // Where a file row's view link goes (see _attachmentsHtml): the dashboard's
 // file viewer around the attachment (viewer.html, components/viewer-page.js),
 // so the way back to the thread stays on screen. A PDF goes there only where a

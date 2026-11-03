@@ -49,6 +49,16 @@ export function onFrameChange(fn) {
 }
 
 // ── Files ─────────────────────────────────────────────────────────────────────
+// Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
+// browser shows in place instead of saving. Mirrors _INLINE_SAFE_TYPES in
+// web-gateway.py — offering "view" for anything else would just download it.
+// One list for a thread's file rows (conversation.js) and the file viewer
+// (viewer-page.js), so the viewer accepts every type a row sends it.
+export const INLINE_SAFE_TYPES = new Set([
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
+  'application/pdf', 'text/plain',
+]);
+
 // Whether a PDF in a frame of a page (an <iframe>) shows the whole document, as
 // the browser's own viewer would — what the file viewer (viewer.html) needs to
 // be worth opening. Not where the browser has no PDF viewer of its own

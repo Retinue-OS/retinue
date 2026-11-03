@@ -179,6 +179,17 @@ retinue-sparql-workbench .yasgui .controlbar { display: none; }
 .setting-btn { min-height: 40px; padding: 0 16px; border-radius: 10px; border: 1px solid var(--accent);
                background: var(--card-2); color: var(--fg); font: inherit; cursor: pointer; }
 .setting-btn:hover { background: var(--accent); color: var(--bg); }
+.setting-btn:disabled { opacity: .55; cursor: default; }
+.setting-btn:disabled:hover { background: var(--card-2); color: var(--fg); }
+.num-setting input[type="checkbox"] { width: 22px; min-height: 22px; padding: 0; accent-color: var(--accent); }
+/* The Health Connect block on the Phone shell card, and the /sync-health page. */
+.health-sync { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.health-sync .setting-btn + .num-setting, .health-sync .health-sync-line + .num-setting { margin-top: 10px; }
+.health-sync-line { color: var(--fg); font-size: .9rem; margin: 8px 0 0; }
+.health-sync-line:empty { display: none; }
+.health-sync-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 12px 0 0; }
+.health-sync-actions a.setting-btn { display: inline-flex; align-items: center; text-decoration: none; }
+.health-sync-actions[hidden], .health-sync-actions [hidden] { display: none; }
 
 /* The shelf of minimized pages (components/shelf.js): the last child of main
    on every page. In a locked frame (the home, an open thread, a chat, a

@@ -61,6 +61,10 @@ a Progressive Web App on the phone home screen.
 - `/sparql`             → the life store, read-only (a query), or `sparql.html`
                           (a browser without one) — see `docs/dashboard.md`
 - `/docs/<name>.md`     → `DOCS_DIR/<name>.md`, the framework docs that page renders
+- `/sync-health`        → `sync-health.html`, the target of "update your health
+                          data" links (see "Inside the Android shell")
+- `/inbox/…`            → the letterbox's WebDAV share (`scripts/webdav_share.py`),
+                          not a page — see `docs/dashboard.md`
 - everything else       → `WEBAPP_DIR/<path>` (shell assets)
 
 `vendor/` is not committed: `scripts/vendor-yasgui.sh webapp/vendor/yasgui`
@@ -771,7 +775,8 @@ cannot do — the home-screen role, a wake phrase, native speech output, the
 client certificate. Everything that is Retinue stays here, so it behaves the
 same in the shell, in Chrome and on a desktop. The contract between them:
 
-- **User agent**: the shell appends ` RetinueShell/1 (Android)`.
+- **User agent**: the shell appends ` RetinueShell/2 (Android)` (`/1` before
+  the Health Connect members below).
 - **`window.RetinueShell`**, installed at document start on the configured
   origin only: `platform`, `version`, `setVoiceActive(bool)` and
   `openSettings()`. `setVoiceActive(true)` means "a voice conversation is
@@ -801,6 +806,14 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   dashboard's file viewer, as anywhere else. The shell names the file from that
   header; the URL ends in the name too, for anything that names a file after
   its URL.
+- **Health Connect** (RetinueShell/2): `healthConnectAvailable()`,
+  `healthSync()`, `healthSyncStatus()`, `setHealthSyncInterval(minutes)`,
+  `setHealthAutoSync(bool)` and `health-sync` events. Settings → Phone shell
+  shows "Update health data now", the last result, the auto-sync toggle and
+  interval when the shell reports Health Connect available; `sync-health.html`
+  (`/sync-health`, `#sync` starts a sync) is the link target for threads. The
+  shell uploads by WebDAV `PUT` to `/inbox/` — the page never handles the
+  data. `components/shell.js` wraps all of it, feature-detected.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;

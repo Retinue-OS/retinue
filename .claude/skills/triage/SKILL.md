@@ -603,7 +603,7 @@ dispatch once they have. A `NO MESSAGE` owes the sender nothing: propose the
 work it names (the calendar entry, the forward) with its own chips, or — when
 it corrects the disposition to `archive`/`delete` — drop the item into the
 omnibus instead of opening a thread at all. Whichever shape, the original is
-quoted above it, and nothing is sent.
+quoted above it, and nothing is sent unless a standing instruction covers it.
 
     # facts settled it — propose the reply
     python3 /workspace/scripts/conversation-push.py --title "Reply to <name>" \
@@ -865,16 +865,17 @@ user has not approved. What happens to the secretary's text follows the
 sending identity's send policy (`CLAUDE.md`, **When to send**, which also
 defines the permission phrase):
 
-- **`verify`, and `trust` without the permission phrase** — the approval page
-  *is* the approval round; never add a second one in the thread. Queue the
-  send at once (on `trust` without `--user-approved`) and post the
-  secretary's text into the thread together with the approval link the push
-  script printed, plus an adjust / discard chip. An adjustment retracts the
-  queued request (`--retract <id>`, `email_client.py retract`), re-dispatches
-  the secretary and queues the new text with its new link; a discard retracts
-  it. Record the request id in the status file.
-- **`trust` with the permission phrase** — send with `--user-approved`, post
-  what went out, and resolve.
+- **`verify`, and `trust` with neither the permission phrase nor a tapped
+  `send` under this text** — the approval page *is* the approval round; never
+  add a second one in the thread. Queue the send at once (on `trust` without
+  `--user-approved`) and post the secretary's text into the thread together
+  with the approval link the push script printed, plus an adjust / discard
+  chip. An adjustment retracts the queued request (`--retract <id>`,
+  `email_client.py retract --request-id <id>`), re-dispatches the secretary
+  and queues the new text with its new link; a discard retracts it. Record
+  the request id in the status file.
+- **`trust` with the permission phrase, or after the user tapped `send` under
+  this text** — send with `--user-approved`, post what went out, and resolve.
 - **`allow`** — send only with the permission phrase or after the user tapped
   `send`; otherwise post the text as a proposal with send / adjust / discard
   chips.
@@ -925,10 +926,10 @@ Then carry out the disposition:
   to the conversation the message arrived in; **never resolve the sender's
   name to an address when a token is present** (the messaging-contact-lookup
   path is only the fallback for a thread that carries no token). The send
-  still passes the channel's `*_SEND_POLICY`: the user's in-thread approval
-  justifies `--user-approved` for a `trust` account, while `verify` queues at
-  `/sends` and — as with e-mail — the item stays non-terminal until that send
-  is approved.
+  still passes the channel's `*_SEND_POLICY`: a `send` the user tapped under
+  this text, or the permission phrase, justifies `--user-approved` for a
+  `trust` account (as decided above), while `verify` queues at `/sends` and —
+  as with e-mail — the item stays non-terminal until that send is approved.
 - **Action** → do the concrete thing; if it advanced a project, append to its
   log. Then resolve the message (status `resolved` + move, below) **in the
   same turn**, even when the action happened elsewhere — a mail to a third
