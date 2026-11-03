@@ -14,7 +14,10 @@ a Progressive Web App on the phone home screen.
   `<retinue-conversation>`: the thread with its bubbles (Markdown, copy
   buttons on quotes and code, click-to-fill chips, attachments — images the
   gateway serves inline get a preview in the bubble, sized from the dimensions it
-  recorded at store time — model and cost meta), the pending state while Ara answers, the composer with text,
+  recorded at store time; a file's view link opens the file viewer,
+  `viewer.html` / `components/viewer-page.js`, which keeps the navigation row
+  and its ‹ above the image, text or PDF — a PDF only where a frame shows it
+  whole, see docs/dashboard.md "Attachments" — model and cost meta), the pending state while Ara answers, the composer with text,
   file attachments (picked or pasted) and voice dictation, the model picker,
   and the read-aloud player (`<retinue-read-aloud>`, its bar, placeable by
   any host). Given a
@@ -796,10 +799,11 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   when the page in front is not the dashboard's. A wake while the page is not
   loaded makes the shell load `/?wake=1` itself; the home drops the flag from
   the address on load.
-- **Files**: the WebView renders no PDF, so a file row's view link
+- **Files**: the WebView renders no PDF, so a PDF row's view link
   (`?inline=1`, answered `Content-Disposition: inline`) reaches the shell,
   which opens it in the phone's viewer app from a private copy; the ↓ link
-  (`attachment`) saves it to Downloads. The shell names the file from that
+  (`attachment`) saves it to Downloads. Images and text open in the
+  dashboard's file viewer, as anywhere else. The shell names the file from that
   header; the URL ends in the name too, for anything that names a file after
   its URL.
 - **Health Connect** (RetinueShell/2): `healthConnectAvailable()`,

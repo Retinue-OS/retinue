@@ -120,7 +120,7 @@
 //   POST /conversations/transcribe      dictation audio → {text, lang}
 //   GET  /conversation-models           the offered models (once per page)
 
-import { esc, fmtAge, softKeyboard, visibleHeight } from './base.js';
+import { esc, fmtAge, framesWholePdf, INLINE_SAFE_TYPES, softKeyboard, visibleHeight } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
@@ -189,13 +189,20 @@ const CLOCK_SKEW_MS = 60 * 1000;
 const POSITION_KEY = 'retinue-voice-position';
 const POSITION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const AUTOPLAY_KEY = 'retinue-voice-autoplay';
-// Types the gateway will serve with `Content-Disposition: inline`, i.e. that the
-// browser shows in place instead of saving. Mirrors _INLINE_SAFE_TYPES in
-// web-gateway.py — offering "view" for anything else would just download it.
-const INLINE_SAFE_TYPES = new Set([
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/avif',
-  'application/pdf', 'text/plain',
-]);
+// Where a file row's view link goes (see _attachmentsHtml): the dashboard's
+// file viewer around the attachment (viewer.html, components/viewer-page.js),
+// so the way back to the thread stays on screen. A PDF goes there only where a
+// frame shows all of it (framesWholePdf, base.js); elsewhere the bare
+// `?inline=1` file is the better view, and the way back is the platform's own:
+// the Android shell opens it in the phone's viewer app, an Android browser in
+// its own viewer or as a download, iOS in WebKit's full PDF view.
+function viewerHref(url, name, type) {
+  const bare = `${url}?inline=1`;
+  if (type === 'application/pdf' &&
+      ((typeof window !== 'undefined' && window.RetinueShell) || !framesWholePdf())) return bare;
+  const q = new URLSearchParams({ src: url, name, type });
+  return `/viewer.html?${q}`;
+}
 // The inline preview of an image attachment: at most this wide, and never
 // taller than the second bound (the width shrinks to keep the true ratio).
 const IMG_PREVIEW_MAX_W = 360;
@@ -1737,12 +1744,15 @@ class RetinueConversation extends HTMLElement {
     return `<small class="msg-meta">${bits.join('<span class="m-sep">·</span>')}</small>`;
   }
 
-  // Render any files a message carries. Both links hit the gateway's per-thread
-  // attachment endpoint; `?inline=1` asks for a Content-Disposition the browser
-  // renders in place rather than saving. Viewing is the primary tap: a download
-  // writes a fresh copy to storage every time, so re-reading one invoice leaves
-  // invoice(1).pdf, invoice(2).pdf behind. Types the gateway refuses to serve
-  // inline get the download link alone — an inline href would save anyway.
+  // Render any files a message carries. The save link hits the gateway's
+  // per-thread attachment endpoint; the view link opens the file viewer around
+  // it (viewerHref), or the endpoint itself for a PDF a frame would not show
+  // whole. Either way the file is fetched with `?inline=1`, which asks for a
+  // Content-Disposition the browser renders in place rather than saving.
+  // Viewing is the primary tap: a download writes a fresh copy to storage
+  // every time, so re-reading one invoice leaves invoice(1).pdf,
+  // invoice(2).pdf behind. Types the gateway refuses to serve inline get the
+  // download link alone — an inline href would save anyway.
   // Images the gateway serves inline also preview in the bubble (see
   // _imagePreviewHtml): the thread's own attachment, same-origin behind the
   // dashboard's auth — not a remote fetch, so markdown.js's rule for rendered
@@ -1770,12 +1780,17 @@ class RetinueConversation extends HTMLElement {
       // link is handed to a browsing context outside the app window, with no
       // history behind it — the back gesture then leaves the PWA instead of
       // returning to the thread. Navigating in place keeps the viewer on the
-      // dashboard's own history stack.
+      // dashboard's own history stack. And the view opens in the dashboard's
+      // file viewer (viewer.html), not on the bare file: the browser's own
+      // PDF or image view carries no navigation, so an installed PWA had no
+      // button back to the thread. A PDF keeps the bare link where a frame
+      // would not show it whole (viewerHref).
+      const view = viewable ? viewerHref(url, name, type) : '';
       const open = viewable
-        ? `<a class="attach" href="${esc(url)}?inline=1">`
+        ? `<a class="attach" href="${esc(view)}">`
         : `<a class="attach" href="${esc(url)}" download="${esc(name)}">`;
       const preview = viewable && type.startsWith('image/')
-        ? this._imagePreviewHtml(`${url}?inline=1`, name, a) : '';
+        ? this._imagePreviewHtml(view, `${url}?inline=1`, name, a) : '';
       return preview + `<div class="attach-row${preview ? ' a-caption' : ''}">` + open +
         (preview ? '' : `<span class="a-icon" aria-hidden="true">\u{1F4CE}</span>`) +
         `<span class="a-name">${esc(name)}</span>` +
@@ -1798,7 +1813,7 @@ class RetinueConversation extends HTMLElement {
   // upscales, and max-width:100% clamps it inside a narrower bubble with the
   // height following the ratio. Older records without a size get a fixed
   // frame instead (.no-dims).
-  _imagePreviewHtml(href, name, a) {
+  _imagePreviewHtml(href, src, name, a) {
     const w = Number(a.width);
     const h = Number(a.height);
     const hasDims = w > 0 && h > 0;
@@ -1807,7 +1822,7 @@ class RetinueConversation extends HTMLElement {
         `width: ${Math.max(1, Math.round(Math.min(IMG_PREVIEW_MAX_W, w, IMG_PREVIEW_MAX_H * w / h)))}px"`
       : '';
     return `<a class="a-imglink" href="${esc(href)}" aria-label="View ${esc(name)}">` +
-      `<img class="a-img${hasDims ? '' : ' no-dims'}" src="${esc(href)}" alt="${esc(name)}"` +
+      `<img class="a-img${hasDims ? '' : ' no-dims'}" src="${esc(src)}" alt="${esc(name)}"` +
       `${box} loading="lazy" decoding="async"></a>`;
   }
 

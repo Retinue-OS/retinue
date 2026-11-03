@@ -31,6 +31,7 @@ const SHELL_ASSETS = [
   '/chat.html',
   '/settings.html',
   '/contacts.html',
+  '/viewer.html',
   '/sync-health',
   '/styles.css',
   '/layout.js',
@@ -60,6 +61,7 @@ const SHELL_ASSETS = [
   '/components/contacts.js',
   '/components/shelf.js',
   '/components/shelf-store.js',
+  '/components/viewer-page.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];
@@ -409,9 +411,11 @@ self.addEventListener('fetch', (e) => {
   }
 
   // The project and chat pages carry their subject id in the query string,
-  // and the home its deep links (?item=, the digest's ?digest=); match the
-  // cached shell regardless so they open offline too.
-  if (url.pathname === '/project.html' || url.pathname === '/chat.html' || url.pathname === '/') {
+  // the file viewer its file (?src=…), and the home its deep links (?item=,
+  // the digest's ?digest=); match the cached shell regardless so they open
+  // offline too — the viewer with its way back, even when the file cannot load.
+  if (url.pathname === '/project.html' || url.pathname === '/chat.html' ||
+      url.pathname === '/viewer.html' || url.pathname === '/') {
     e.respondWith(caches.match(url.pathname).then((res) => res || fetch(e.request)));
     return;
   }
