@@ -155,6 +155,23 @@ def test_sender_is_reduced_to_a_real_sender_shape():
     print("ok: senders are reduced to a phone number or a short alphanumeric id")
 
 
+def test_short_codes_are_not_phone_numbers():
+    """A short code (up to six digits) is one-way like an alphanumeric id: it
+    gets no reply token, and /send refuses it before any approval is asked."""
+    with tempfile.TemporaryDirectory() as tmp:
+        gw = _load(tmp)
+        for number in ("+41791112233", "0791112233", "2125551234", "1234567", "+12345"):
+            assert gw._is_phone_number(gw._normalize_sender(number)), number
+        for sender in ("4636", "12345", "123456", "72 000", "HBL", "Swisscom", "", None):
+            assert not gw._is_phone_number(gw._normalize_sender(sender)), sender
+        msgs = [{"sender": "123456", "chat": "123456", "message_id": "m1"},
+                {"sender": "+41791112233", "chat": "+41791112233", "message_id": "m2"}]
+        gw._attach_reply_tokens(msgs)
+        assert "reply_token" not in msgs[0] and msgs[0].get("no_reply"), msgs[0]
+        assert msgs[1].get("reply_token"), msgs[1]
+    print("ok: a short code gets no reply token; numbers of seven digits or more do")
+
+
 def test_crash_before_persist_leaves_the_retry_recordable():
     """Only a recorded delivery is durably 'seen': a claim that never reached
     the ledger (a crash, a failed write) must not turn the retry into a

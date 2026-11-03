@@ -208,7 +208,7 @@ def _attach_reply_tokens(messages: list) -> None:
         if origin and _is_phone_number(str(origin)):
             msg["reply_token"] = REPLY_TOKENS.mint(str(origin), channel="sms")
         elif origin:
-            msg["no_reply"] = "alphanumeric sender id; SMS cannot be sent back to it"
+            msg["no_reply"] = "alphanumeric sender id or short code; SMS cannot be sent back to it"
         msg["thread_key"] = _ibstore.thread_key(
             "sms", SMS_ACCOUNT, msg.get("chat"), msg.get("message_id"),
             subject=msg.get("subject"))
@@ -438,10 +438,19 @@ def _normalize_sender(raw) -> str | None:
     return cleaned[:SMS_SENDER_MAX_CHARS].strip() or None
 
 
+# A normalized sender that can be written back to: an international number
+# (its "+" kept by _normalize_sender), or a national one of at least seven
+# digits. A shorter run of digits is a short code ("4636", "72000"), one-way
+# like an alphanumeric id — the range contacts.py files as a sender account
+# (_SMS_SHORT_CODE_RE, 3–6 digits), so a contact's short code is never offered
+# a reply here.
+_REPLYABLE_SENDER_RE = re.compile(r"\+[0-9]{5,}|[0-9]{7,}")
+
+
 def _is_phone_number(sender: str | None) -> bool:
     """Whether a normalized sender can be written back to. Alphanumeric ids
     and short codes are one-way: the server's send API takes phone numbers."""
-    return bool(sender) and bool(re.fullmatch(r"\+?[0-9]{5,}", sender))
+    return bool(sender) and bool(_REPLYABLE_SENDER_RE.fullmatch(sender))
 
 
 def _parse_sms_received(event: dict) -> dict | None:
