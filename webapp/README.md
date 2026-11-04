@@ -754,7 +754,16 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `wake` event), which reopens the thread used in the mode within the last
   15 minutes, else that voice composer. Both flags are dropped from the
   address once read and open the mic by themselves only inside the shell;
-  elsewhere the conversation offers a **Start talking** button. The pure parts — the detector's state machine and the wake's
+  elsewhere the conversation offers a **Start talking** button. An answer
+  that ends in a call directive (`[[call: <number> | <name>]]`) places the
+  call instead of opening the mic, in a shell with `placeCall`: the name and
+  a **Cancel** button for 5 s with the mic open — speech cancels, and always
+  goes to Ara as the next turn with a `cancelled_call` note, so she places the
+  call again when the words did not mean to stop it (no words at all: it goes
+  ahead at once); `| no-voice-cancel` keeps the mic shut, honoured only
+  on a second attempt at the number — then the shell dials on speaker
+  (docs/dashboard.md, "Inside the Android shell"); everywhere else the
+  directive is a tap-to-dial link. The pure parts — the detector's state machine and the wake's
   choice of thread — are `components/continuous.js`
   (`tests/test_webapp_continuous.py`).
 

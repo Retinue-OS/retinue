@@ -899,6 +899,28 @@ carries the loop on: another message pushed into a thread in the mode may be
 read aloud, but never opens the mic. A mic the loop wants while the page is
 hidden (a wake in the background, an answer read in a pocket) waits up to
 60 s for the page to come back.
+An answer to the loop's own turn that ends in a **call directive**
+(`[[call: <number> | <name>]]`, `.claude/skills/dashboard-composing` §7)
+places the call where the mic would open, when the page runs in a shell that
+can (`placeCall`, below): once the answer has been read, the composer shows
+the name with a **Cancel** button for 5 s while the mic is open as for any
+take. Speech (the detector's `speech`, so in any language) cancels the call,
+and the take goes on to Ara as the next turn — always, whatever ends it,
+carrying `cancelled_call: {number, name}`, from which the gateway writes a
+fixed agent-only note (`_cancelled_call_context`): the call was not made;
+unless the words mean to stop it, place it again as a second attempt with
+`no-voice-cancel`. A cancelling take whose transcript is empty is no turn:
+the call goes ahead at once, with Cancel by touch only. Cancel itself (by
+touch) cancels for good.
+Nobody speaking, the take is dropped, the mic released (up to 2 s), the number
+handed to the shell, and the voice flag let go once the shell has answered
+(10 s at most). The flag `| no-voice-cancel` as a third part keeps the mic
+shut for those 5 s — for a loud room or an emergency — but only on a second
+attempt: unless an earlier reply in the thread carried a directive for the
+same number (`calledBefore`), the flag is ignored. Leaving the thread or
+stopping the loop drops the call. Anywhere else — a typed thread, an older reply, a message pushed
+into the thread, a browser — the directive is only a tap-to-dial `tel:` link
+(`webapp/components/markdown.js`, `callOf`; `tests/test_webapp_call_directive.py`).
 Entry points: the toggle, `/#new?voice=1` (the composer in the mode — its
 first take opens the thread, which continues in it) and a wake (`/?wake=1`
 or the shell's `wake` event), which opens the thread used in the mode within
@@ -967,6 +989,7 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
 | Speech output | A `speechSynthesis` / `SpeechSynthesisUtterance` stand-in over the native TTS when the WebView has none; `webapp/components/speech.js` is unchanged. |
+| Phone calls (RetinueShell/3) | `placeCall(number)` on `window.RetinueShell`: the shell calls the number without a tap (`ACTION_CALL`, on speakerphone — the user may not be holding the phone) when Settings → Phone calls → *Call directly by voice* is on, Android's phone-call permission is granted, and a voice conversation is engaged (`setVoiceActive(true)`) — never outside one, so no page can dial behind the user's back. It answers with a `retinue-shell` event `{type: "call", state, reason}`: `placed`; `dialer` — the dialer opened with the number instead, for an emergency number (Android lets no app call those directly; `reason: "emergency"`), with the setting off (`disabled`) or without the permission (`no-permission`); or `refused` (`invalid-number`, `not-in-voice`, `no-telephony`, `failed`). The web side (`shell.js`: `canPlaceCall`, `placeCall`, `onCall`) uses it only for the call directive of the continuous loop's own answer (above). |
 | Files | A file the WebView cannot show (a PDF, anything served as `attachment`) reaches the shell's download listener, which follows the `Content-Disposition` as a browser does. `inline` — a PDF row's name link (`?inline=1`; images and text open in the dashboard's file viewer, see "Attachments") — means *view*: the shell opens it in the phone's app for the type from a private copy, so no copy lands in Downloads (none installed: it saves it there and says so). Anything else — the ↓ link — is saved to Downloads. The name is the header's (`filename*`, then `filename`); the attachment URL ends in it too (see "Attachments"). |
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:

@@ -9,7 +9,8 @@
 //           nested -/*/1. lists (with [ ]/[x] task items), pipe tables,
 //           horizontal rules
 //   inline: [label](url), bare http(s)/www URLs, **bold**, *italic*,
-//           ~~strikethrough~~, `code`
+//           ~~strikethrough~~, `code`, and two of the dashboard's own:
+//           [[chip: …]] (click-to-fill) and [[call: …]] (tap-to-dial)
 //
 // Safety: the input is HTML-escaped before any markup is generated, and only
 // http(s)/mailto/tel URLs ever become links (never javascript:). The output is
@@ -32,6 +33,56 @@ const SEP = String.fromCharCode(1); // sentinel absent from escaped text
 // swallow the closing ** into the href — a dead link, and one the bold pass can
 // no longer see either, because the anchor is stashed by then.
 const URL_TAIL_RE = /[.,;:!?)\]*]+$/;
+
+// [[call: <number> | <name> | no-voice-cancel]] — a call Ara offers or, in
+// the phone shell's voice conversation, places (conversation.js). The number
+// is written as people write numbers (spaces, dashes, dots, slashes,
+// parentheses); the name is optional, and so is the flag, which asks for a
+// call speech cannot cancel (a loud room, an emergency) — honoured only on a
+// second attempt at the number (calledBefore). Shared with the thread, which
+// finds the directive in a reply.
+const CALL_RE = /\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|\s*(no-voice-cancel)\s*)?\]\]/;
+
+// The dialable form of a written number: `+` and digits (plus `*`/`#`), 3–20
+// digits. Null when it is not one. The trunk zero some write in brackets after
+// the country code (+41 (0)79 …) is not dialled with it.
+export function callNumber(raw) {
+  const n = String(raw == null ? '' : raw)
+    .replace(/^(\+\d{1,3})\s*\(0\)/, '$1')
+    .replace(/[\s().\/-]/g, '');
+  if (!/^\+?[0-9*#]+$/.test(n)) return null;
+  const digits = n.replace(/[^0-9]/g, '').length;
+  return digits >= 3 && digits <= 20 ? n : null;
+}
+
+// The last call directive in a message, as {number, name, voiceCancel}, or
+// null. The last, because a reply that mentions a number first and then
+// places the call puts the directive at its end.
+export function callOf(text) {
+  const re = new RegExp(CALL_RE.source, 'gi');
+  let found = null;
+  for (const m of String(text == null ? '' : text).matchAll(re)) {
+    const number = callNumber(m[1]);
+    if (number) found = { number, name: (m[2] || '').trim(), voiceCancel: !m[3] };
+  }
+  return found;
+}
+
+// Whether a reply before `messages[index]` already placed (or tried to
+// place) a call to `number`: the condition for a call speech cannot cancel.
+// A first attempt is always cancellable by voice, so a mistaken directive
+// never dials without the chance to say no.
+export function calledBefore(messages, index, number) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = Math.min(index, list.length) - 1; i >= 0; i -= 1) {
+    const m = list[i];
+    if (m && m.role !== 'user') {
+      const c = callOf(m.text);
+      if (c && c.number === number) return true;
+    }
+  }
+  return false;
+}
 
 // A link into the dashboard itself — another thread, /sends/…, a project page —
 // navigates in place. In a standalone PWA a target="_blank" link is handed to a
@@ -91,6 +142,16 @@ export function renderInline(text) {
   s = s.replace(chip(/\[\[chip:\s*([^|\]]+?)\s*\]\]/),
     (m, code, text) => (code ? m : stash(
       `<button type="button" class="md-chip" data-fill="${text}">${text}</button>`)));
+  // [[call: +41 79 123 45 67 | Name]] — in a bubble a tap-to-dial link; in the
+  // phone shell's voice conversation the thread places the call itself. The
+  // label is the name (the number when there is none) behind a phone glyph,
+  // no words, so it reads the same in whatever language the message is in.
+  s = s.replace(chip(CALL_RE), (m, code, raw, name) => {
+    if (code) return m;
+    const num = callNumber(raw);
+    if (!num) return m;
+    return stash(`<a class="md-call" href="tel:${num}">\u{1F4DE} ${name || raw.trim()}</a>`);
+  });
   // `code` before any link: a code span is literal, so a URL inside one
   // (`https://schema.org/`) stays code instead of becoming a link with the
   // backticks left standing around it. Stashed, so no later pass — links,
