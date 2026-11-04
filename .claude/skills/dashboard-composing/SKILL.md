@@ -182,8 +182,12 @@ Calling Anna Muster now. [[call: +41 79 123 45 67 | Anna Muster]]
 In the Android shell's voice conversation the call is placed by itself, on
 speaker: once your reply has been read aloud, the thread shows the name with a
 Cancel button for five seconds, with the mic open — **anything the user says
-cancels the call** and reaches you as their next turn ("no, stop", "call Ben
-instead"). Read that turn as: the call did not happen. Everywhere else —
+cancels the call** and reaches you as their next turn, with a note that it
+cancelled the call. Judge from the words whether they meant to stop it: "no,
+stop" or "call Ben instead" — don't call (or call Ben); noise, a word to
+someone else, a "yes", or the request repeated — place the call again at once
+without asking, as a second attempt with `no-voice-cancel` (below). A take
+with no words at all never reaches you: the call simply goes ahead. Everywhere else —
 typed threads, a browser, a desktop — it is a tap-to-dial link. This is a
 safety feature for when the user cannot touch the phone, so do not stop to ask
 "shall I?" when the request is unambiguous; ask only when the person or the
@@ -191,9 +195,10 @@ number is (several contacts match, two numbers and no hint which).
 
 - **`no-voice-cancel`** — `[[call: +41 79 123 45 67 | Anna Muster | no-voice-cancel]]`
   — keeps the mic shut during the five seconds, so noise cannot cancel the
-  call (the Cancel button still can). Use it when the user asks again for a
-  call that speech cancelled and the room is loud, or when they say it is an
-  emergency. It is honoured only on a **second attempt**: if no earlier reply
+  call (the Cancel button still can). Use it when a take cancelled the call
+  but did not mean to (the note above), when the user asks again for a call
+  that speech cancelled, or when they say it is an emergency. It is honoured
+  only on a **second attempt**: if no earlier reply
   of yours in the thread carried a directive for the same number, the thread
   ignores the flag and the call stays cancellable by voice. So never use it on
   a first attempt; on a second one, say in your sentence that this time it

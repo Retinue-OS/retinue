@@ -905,7 +905,13 @@ places the call where the mic would open, when the page runs in a shell that
 can (`placeCall`, below): once the answer has been read, the composer shows
 the name with a **Cancel** button for 5 s while the mic is open as for any
 take. Speech (the detector's `speech`, so in any language) cancels the call,
-and the take goes on to Ara as the next turn; Cancel does the same by touch.
+and the take goes on to Ara as the next turn — always, whatever ends it,
+carrying `cancelled_call: {number, name}`, from which the gateway writes a
+fixed agent-only note (`_cancelled_call_context`): the call was not made;
+unless the words mean to stop it, place it again as a second attempt with
+`no-voice-cancel`. A cancelling take whose transcript is empty is no turn:
+the call goes ahead at once, with Cancel by touch only. Cancel itself (by
+touch) cancels for good.
 Nobody speaking, the take is dropped, the mic released (up to 2 s), the number
 handed to the shell, and the voice flag let go once the shell has answered
 (10 s at most). The flag `| no-voice-cancel` as a third part keeps the mic

@@ -2873,6 +2873,38 @@ def _conv_context_note(msg: dict) -> str:
             "not shown to the user:\n" + ctx + "]")
 
 
+_CANCELLED_CALL_NUMBER_RE = re.compile(r"\+?[0-9*#]{3,24}")
+
+
+def _cancelled_call_context(value) -> str | None:
+    """The note for a voice take that cancelled a call by being spoken.
+
+    In the phone shell's voice conversation a call Ara placed waits 5 s with
+    the mic open, and any speech cancels it (webapp/components/conversation.js,
+    CANCELLED_CALLS); the take that did is sent in any case, carrying
+    `cancelled_call: {number, name}`. Only its words can tell whether the user
+    meant to stop the call, so Ara is told — in wording fixed here, the
+    client supplying nothing but a validated number and a short name."""
+    if not isinstance(value, dict):
+        return None
+    number = str(value.get("number") or "").strip()
+    if not _CANCELLED_CALL_NUMBER_RE.fullmatch(number):
+        return None
+    name = " ".join(str(value.get("name") or "").replace("|", " ").replace("]", " ").split())[:80]
+    who = f"{name} ({number})" if name else number
+    return (
+        f"This voice take cancelled the call to {who}: it was heard while the "
+        "call waited to be placed, so the call was NOT made. Judge from the "
+        "words whether the user meant to stop it. If not — background noise, a "
+        "word to someone else, an affirmation, or a request that still wants "
+        "the call — place it again at once without asking: this is a second "
+        "attempt, so end your reply with "
+        f"[[call: {number} | {name} | no-voice-cancel]] and say it cannot be "
+        "stopped by voice this time. If they did mean to stop it (or asked for "
+        "something else instead), do not call; act on what they said."
+    )
+
+
 # How a message's author is named when a transcript is replayed to Ara.
 _CONV_ROLE_LABEL = {"user": "User", "assistant": "You (Ara)", "agent": "Retinue agent"}
 
@@ -11674,7 +11706,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "empty message"})
             return
         conv = _conv_add_message(cid, "user", message, unread=False,
-                                 attachments=attachments)
+                                 attachments=attachments,
+                                 context=_cancelled_call_context(payload.get("cancelled_call")))
         if conv is None:
             self._send_json(404, {"error": "not found"})
             return
