@@ -121,7 +121,7 @@
 //   GET  /conversation-models           the offered models (once per page)
 
 import { esc, fmtAge, framesWholePdf, INLINE_SAFE_TYPES, softKeyboard, visibleHeight } from './base.js';
-import { renderMarkdown, MD_CSS, callOf } from './markdown.js';
+import { renderMarkdown, MD_CSS, callOf, calledBefore } from './markdown.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { Reader, speechAvailable } from './speech.js';
@@ -147,8 +147,11 @@ const CONT_PENDING_MS = 60 * 1000;
 const CONT_IDLE_MS = 90 * 1000;
 const CONT_WATCH_MS = 5 * 1000;
 // A call the loop places ([[call: …]] in the answer, see _contCall) waits
-// this long after the answer was read, on screen with a Cancel button.
-const CALL_DELAY_MS = 3000;
+// this long after the answer was read, on screen with a Cancel button and,
+// unless the directive says otherwise, the mic open: speech cancels it.
+const CALL_DELAY_MS = 5000;
+// How long the call waits for that mic to close again before it dials.
+const CALL_MIC_RELEASE_MS = 2000;
 // How long the loop holds the shell's voice flag for the shell's answer to a
 // call it was handed — the shell places calls only while the flag is up.
 const CALL_ANSWER_MS = 10 * 1000;
@@ -689,7 +692,7 @@ function plainForSpeech(text) {
     .replace(/```[\s\S]*?```/g, ' ')
     .replace(/`([^`]+)`/g, '$1')
     .replace(/\[\[chip:\s*([^|\]]+?)\s*(?:\|[^\]]*)?\]\]/gi, '$1')
-    .replace(/\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^\]]*?)\s*)?\]\]/gi, (_m, num, name) => name || num)
+    .replace(/\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]/gi, (_m, num, name) => name || num)
     .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
     .replace(/\[([^\]]+)\]\((?:[^)]+)\)/g, '$1')
     .replace(/\bhttps?:\/\/([^\s/)]+)[^\s)]*/g, '$1')
@@ -1998,7 +2001,7 @@ class RetinueConversation extends HTMLElement {
     // the DOM for the entire flow, so the phone keyboard never pops up
     // mid-dictation.
     if (this._recState === 'recording' && this._recKey === key) {
-      return `<div class="composer">` + chipRow + errRow + recordingRowHtml() + `</div>`;
+      return `<div class="composer">` + chipRow + errRow + this._callRowHtml() + recordingRowHtml() + `</div>`;
     }
     const job = VOICE_JOBS.get(key) || (ADOPTED.has(key) ? { sending: false, phase: 'transcribing' } : null);
     if (job) {
@@ -2006,12 +2009,7 @@ class RetinueConversation extends HTMLElement {
         : (job.sending ? 'Transcribing & sending …' : 'Transcribing …');
       return `<div class="composer">` + chipRow + errRow + statusRowHtml(label) + `</div>`;
     }
-    if (this._calling) {
-      const who = esc(this._calling.name || this._calling.number);
-      return `<div class="composer">` +
-        `<div class="call-row"><span class="call-who"><span aria-hidden="true">\u{1F4DE}</span> ${who}</span>` +
-        `<button type="button" class="call-cancel" data-call-cancel>Cancel</button></div></div>`;
-    }
+    if (this._calling) return `<div class="composer">` + this._callRowHtml() + `</div>`;
     const micTitle = this._contOn() ? 'Talk — continuous conversation' : 'Record a voice message';
     // Opened in the mode without a gesture behind it: the first take starts
     // from a tap, which is also what lets the page play the chime.
@@ -2477,6 +2475,7 @@ class RetinueConversation extends HTMLElement {
       const goes = !aborted && intent === 'send' && chunks.length;
       const here = this.isConnected && this._key() === key;
       if (goes && here) this._contEngage();
+      else if (this._placingCall && here) { /* the call holds the loop (_contCallPlace) */ }
       else {
         this._contDisengage();
         const el = goes ? LIVE.get(key) : null;
@@ -2653,6 +2652,7 @@ class RetinueConversation extends HTMLElement {
     this._contClearPending();
     if (CONT_CALL && CONT_CALL.conv === this._id) CONT_CALL = null;
     this._contCallCancel();
+    this._placingCall = false;
     if (this._contWatchTimer) clearInterval(this._contWatchTimer);
     this._contWatchTimer = null;
     if (ENGAGED.delete(this)) syncShellVoice();
@@ -2683,7 +2683,8 @@ class RetinueConversation extends HTMLElement {
   // reading of her answer playing.
   _contBusy() {
     const key = this._key();
-    if (this._recState !== 'idle' || VOICE_JOBS.has(key) || ADOPTED.has(key) || SENDS.has(key) || this._contPending || this._calling) return true;
+    if (this._recState !== 'idle' || VOICE_JOBS.has(key) || ADOPTED.has(key) || SENDS.has(key) || this._contPending) return true;
+    if (this._calling || this._placingCall) return true;
     if (this._id && this._thread && this._thread.pending) return true;
     return !!(CONT_READ && CONT_READ.conv === this._id && READER.state === 'playing');
   }
@@ -2741,37 +2742,66 @@ class RetinueConversation extends HTMLElement {
   // CALL_DELAY_MS, then handed to the shell, which calls (or opens the dialer,
   // see shell.js). The answer itself said who is being called, aloud, in the
   // user's language; this row adds no words of its own but the name.
+  // Meanwhile the mic is open as for any take: speech cancels the call, and
+  // the take goes on to Ara as the user's next turn ("no, stop", "call Ben
+  // instead"), whatever language it is in. A directive with no-voice-cancel
+  // on a second attempt (see _maybeAutoplay) leaves the mic shut, for a room
+  // too loud to tell a voice from the noise — Cancel still works.
   _contCall() {
     const call = CONT_CALL;
     CONT_CALL = null;
     this._contArmed = false;
-    this._calling = { number: call.number, name: call.name };
+    this._calling = { number: call.number, name: call.name, voiceCancel: call.voiceCancel };
     this._callTimer = setTimeout(() => this._contCallPlace(), CALL_DELAY_MS);
     this.render();
+    if (call.voiceCancel && canRecord()) this._startRecording();
+  }
+
+  _callRowHtml() {
+    if (!this._calling) return '';
+    const who = esc(this._calling.name || this._calling.number);
+    return `<div class="call-row"><span class="call-who"><span aria-hidden="true">\u{1F4DE}</span> ${who}</span>` +
+      `<button type="button" class="call-cancel" data-call-cancel>Cancel</button></div>`;
   }
 
   _contCallPlace() {
     const call = this._calling;
     this._callTimer = null;
     this._calling = null;
-    this.render();
     if (!call) return;
-    // The shell takes a call only while the voice flag is up, so the loop
-    // lets go of it once the shell has answered (or did not, in time).
+    // The call needs the microphone: the take that listened for a cancel is
+    // dropped first (nothing was said in it, or there would be no call), and
+    // the loop stays engaged meanwhile (_onRecordingStopped), as the shell
+    // takes a call only while the voice flag is up. It lets go once the
+    // shell has answered, or did not in time.
+    this._placingCall = true;
+    this.render();
+    const since = Date.now();
     let done = null;
     const finish = () => {
       if (!done) return;
       clearTimeout(done.timer);
       done.off();
       done = null;
+      this._placingCall = false;
       this._contDisengage();
     };
-    done = { off: onCall(finish), timer: setTimeout(finish, CALL_ANSWER_MS) };
-    if (!placeCall(call.number)) finish();
+    const dial = () => {
+      if (!this._placingCall) return;
+      if (this._recState !== 'idle' && Date.now() - since < CALL_MIC_RELEASE_MS) {
+        this._abortRecording();
+        setTimeout(dial, 100);
+        return;
+      }
+      done = { off: onCall(finish), timer: setTimeout(finish, CALL_ANSWER_MS) };
+      if (!placeCall(call.number)) finish();
+    };
+    dial();
   }
 
-  // Cancel pressed (or the loop stopped): no call. Pressed, the conversation
-  // goes on — the mic opens for what the user wants instead.
+  // Cancel pressed, speech heard, or the loop stopped: no call. Pressed, the
+  // conversation goes on — the mic opens for what the user wants instead (a
+  // take already listening simply goes on).
   _contCallCancel({ listen = false } = {}) {
     if (this._callTimer) clearTimeout(this._callTimer);
     this._callTimer = null;
@@ -2875,7 +2905,11 @@ class RetinueConversation extends HTMLElement {
 
   _onVad(ev, mr) {
     if (this._mediaRecorder !== mr) return;
-    if (ev.type === 'speech') this._vadHeard = true;
+    if (ev.type === 'speech') {
+      this._vadHeard = true;
+      // Speech while a call waits to be placed cancels it (_contCall).
+      if (this._calling) this._contCallCancel();
+    }
     // What began as speech was the room getting louder (continuous.js).
     else if (ev.type === 'noise') this._vadHeard = false;
     // A pause after speech ends the take and sends it. Any other end goes
@@ -3054,6 +3088,9 @@ class RetinueConversation extends HTMLElement {
     // thread) stays a link to tap.
     if (loop) {
       const call = canPlaceCall() ? callOf(m.text) : null;
+      // A call speech cannot cancel only on a second attempt at the number.
+      if (call && !call.voiceCancel &&
+          !calledBefore(t.messages, (t.messages || []).indexOf(m), call.number)) call.voiceCancel = true;
       CONT_CALL = call ? { conv: cid, ts: m.ts, ...call } : null;
     }
     // Named before the reading starts: an engine that refuses at once

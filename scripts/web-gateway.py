@@ -3185,9 +3185,9 @@ def _conv_engage_prompt(conv: dict, fresh: bool,
 
 
 _CHIP_MARKUP_RE = re.compile(r"\[\[chip:[^\]]*\]\]\s*(?:·\s*)?")
-# [[call: <number> | <name>]] (webapp/components/markdown.js): words for the
-# name, or the number when there is none.
-_CALL_MARKUP_RE = re.compile(r"\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^\]]*?)\s*)?\]\]", re.I)
+# [[call: <number> | <name> | no-voice-cancel]] (webapp/components/markdown.js):
+# words for the name, or the number when there is none.
+_CALL_MARKUP_RE = re.compile(r"\[\[call:\s*([^|\]]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|[^\]]*)?\]\]", re.I)
 
 
 def _push_conv_notification(conv: dict, text: str, urgency: str | None = None) -> int:

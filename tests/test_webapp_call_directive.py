@@ -29,7 +29,7 @@ import assert from 'node:assert/strict';
 globalThis.HTMLElement = class {};
 globalThis.document = { addEventListener: () => {}, getElementById: () => null };
 
-const { renderInline, callOf, callNumber } = await import('./markdown.js');
+const { renderInline, callOf, callNumber, calledBefore } = await import('./markdown.js');
 
 let passed = 0;
 const ok = (name, fn) => { fn(); passed += 1; console.log(`ok - ${name}`); };
@@ -78,11 +78,39 @@ ok('quoted as code it stays code', () => {
 
 ok('callOf finds the last valid directive', () => {
   assert.deepEqual(callOf('[[call: 0441234567 | A]] then [[CALL: +41 79 123 45 67 | B ]]'),
-    { number: '+41791234567', name: 'B' });
+    { number: '+41791234567', name: 'B', voiceCancel: true });
   assert.deepEqual(callOf('[[call: 0441234567]] [[call: 12 | bad]]'),
-    { number: '0441234567', name: '' });
+    { number: '0441234567', name: '', voiceCancel: true });
   assert.equal(callOf('Call Anna on +41 79 123 45 67.'), null);
   assert.equal(callOf(null), null);
+});
+
+ok('no-voice-cancel is read, and never shows', () => {
+  assert.deepEqual(callOf('Calling again. [[call: 0441234567 | Anna | no-voice-cancel]]'),
+    { number: '0441234567', name: 'Anna', voiceCancel: false });
+  assert.deepEqual(callOf('[[call: 0441234567 | no-voice-cancel]]'),
+    { number: '0441234567', name: 'no-voice-cancel', voiceCancel: true });
+  assert.deepEqual(callOf('[[call: 0441234567 | | no-voice-cancel]]'),
+    { number: '0441234567', name: '', voiceCancel: false });
+  assert.equal(renderInline('[[call: 0441234567 | Anna | no-voice-cancel]]'),
+    `<a class="md-call" href="tel:0441234567">${PHONE}Anna</a>`);
+  // Any other third part is not a call directive.
+  assert.equal(callOf('[[call: 0441234567 | Anna | now]]'), null);
+});
+
+ok('calledBefore: only an earlier reply to the same number counts', () => {
+  const msgs = [
+    { role: 'user', text: 'Call Anna' },
+    { role: 'assistant', text: 'Calling Anna. [[call: +41 79 123 45 67 | Anna]]' },
+    { role: 'user', text: 'Call Anna, it is loud here' },
+    { role: 'assistant', text: 'Again. [[call: +41791234567 | Anna | no-voice-cancel]]' },
+  ];
+  assert.equal(calledBefore(msgs, 3, '+41791234567'), true);
+  assert.equal(calledBefore(msgs, 1, '+41791234567'), false);
+  assert.equal(calledBefore(msgs, 3, '0441234567'), false);
+  // The user saying a directive is not an attempt.
+  assert.equal(calledBefore([{ role: 'user', text: '[[call: 0441234567]]' }, {}], 1, '0441234567'), false);
+  assert.equal(calledBefore(null, 3, '0441234567'), false);
 });
 
 console.log(`${passed} checks passed`);

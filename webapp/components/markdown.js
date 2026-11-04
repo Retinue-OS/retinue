@@ -34,11 +34,14 @@ const SEP = String.fromCharCode(1); // sentinel absent from escaped text
 // no longer see either, because the anchor is stashed by then.
 const URL_TAIL_RE = /[.,;:!?)\]*]+$/;
 
-// [[call: <number> | <name>]] — a call Ara offers or, in the phone shell's
-// voice conversation, places (conversation.js). The number is written as
-// people write numbers (spaces, dashes, dots, slashes, parentheses); the name
-// is optional. Shared with the thread, which finds the directive in a reply.
-const CALL_RE = /\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^\]]*?)\s*)?\]\]/;
+// [[call: <number> | <name> | no-voice-cancel]] — a call Ara offers or, in
+// the phone shell's voice conversation, places (conversation.js). The number
+// is written as people write numbers (spaces, dashes, dots, slashes,
+// parentheses); the name is optional, and so is the flag, which asks for a
+// call speech cannot cancel (a loud room, an emergency) — honoured only on a
+// second attempt at the number (calledBefore). Shared with the thread, which
+// finds the directive in a reply.
+const CALL_RE = /\[\[call:\s*([+0-9*#][0-9*# ().\/-]*?)\s*(?:\|\s*([^|\]]*?)\s*)?(?:\|\s*(no-voice-cancel)\s*)?\]\]/;
 
 // The dialable form of a written number: `+` and digits (plus `*`/`#`), 3–20
 // digits. Null when it is not one. The trunk zero some write in brackets after
@@ -52,17 +55,33 @@ export function callNumber(raw) {
   return digits >= 3 && digits <= 20 ? n : null;
 }
 
-// The last call directive in a message, as {number, name}, or null. The last,
-// because a reply that mentions a number first and then places the call puts
-// the directive at its end.
+// The last call directive in a message, as {number, name, voiceCancel}, or
+// null. The last, because a reply that mentions a number first and then
+// places the call puts the directive at its end.
 export function callOf(text) {
   const re = new RegExp(CALL_RE.source, 'gi');
   let found = null;
   for (const m of String(text == null ? '' : text).matchAll(re)) {
     const number = callNumber(m[1]);
-    if (number) found = { number, name: (m[2] || '').trim() };
+    if (number) found = { number, name: (m[2] || '').trim(), voiceCancel: !m[3] };
   }
   return found;
+}
+
+// Whether a reply before `messages[index]` already placed (or tried to
+// place) a call to `number`: the condition for a call speech cannot cancel.
+// A first attempt is always cancellable by voice, so a mistaken directive
+// never dials without the chance to say no.
+export function calledBefore(messages, index, number) {
+  const list = Array.isArray(messages) ? messages : [];
+  for (let i = Math.min(index, list.length) - 1; i >= 0; i -= 1) {
+    const m = list[i];
+    if (m && m.role !== 'user') {
+      const c = callOf(m.text);
+      if (c && c.number === number) return true;
+    }
+  }
+  return false;
 }
 
 // A link into the dashboard itself — another thread, /sends/…, a project page —
