@@ -4,21 +4,32 @@
 One person may run several Retinue deployments — a main one, an admin one, a
 demo — and install each one's dashboard as a PWA. Every deployment serves the
 same baked manifest and icons, so the home screen shows identical "Retinue"
-icons and the task switcher shows identical windows. Two optional variables
+icons and the task switcher shows identical windows. Two optional settings
 tell them apart; a single-instance deployment needs neither:
 
-    RETINUE_INSTANCE_NAME    a short label for this instance ("Admin"). The
-                             PWA's home-screen label becomes the label, its
-                             full name and the page titles "Retinue (Admin)".
-                             It also becomes the Ask-Ara connector's default
-                             identity, "Ara (Admin)", unless ARA_MCP_IDENTITY
-                             names one explicitly (scripts/ara-mcp-server.py).
-    RETINUE_INSTANCE_COLOR   the accent colour as #rrggbb (or #rgb): the icons'
-                             ring and the dashboard's own accent (send buttons,
-                             links, focus rings, highlights). An invalid value
-                             is ignored, keeping the stock blue. The send
-                             button's glyph stays dark, so pick a light or
-                             medium tone.
+    name    a short label for this instance ("Admin"). The PWA's home-screen
+            label becomes the label, its full name and the page titles
+            "Retinue (Admin)". It also becomes the Ask-Ara connector's default
+            identity, "Ara (Admin)", unless ARA_MCP_IDENTITY names one
+            explicitly (scripts/ara-mcp-server.py), and it is what the Android
+            shell lists this instance under: the shell reads the manifest's
+            short_name and shows it in its endpoint menu.
+    color   the accent colour as #rrggbb (or #rgb): the icons' ring and the
+            dashboard's own accent (send buttons, links, focus rings,
+            highlights). An invalid value is ignored, keeping the stock blue.
+            The send button's glyph stays dark, so pick a light or medium tone.
+
+Two sources, dashboard over deployment, as for the agent models:
+
+    RETINUE_INSTANCE_NAME / RETINUE_INSTANCE_COLOR   the deployment defaults.
+    RETINUE_INSTANCE_FILE (default /root/.retinue/instance.json, the persistent
+    volume)   what the dashboard's Settings › Instance card writes:
+              {"name": "Admin", "color": "#f59e0b"}. A key that is present
+              and not empty wins over the variable; one that is absent or
+              empty leaves the variable in force. The file is re-read when it
+              changes (stat per lookup, cheap), so a save on the Settings page
+              reaches the next response — and, through the service worker's
+              shell hash, every client.
 
 Everything here works on the response only: the baked files under webapp/ are
 never mutated, exactly like the service worker's shell-hash substitution. The
@@ -34,9 +45,20 @@ import json
 import os
 import re
 import struct
+import tempfile
 import zlib
+from pathlib import Path
 
 DEFAULT_NAME = "Retinue"
+
+# The dashboard's choices (see the module docstring); the variables are the defaults.
+DEFAULT_SETTINGS_FILE = "/root/.retinue/instance.json"
+ENV_NAME = "RETINUE_INSTANCE_NAME"
+ENV_COLOR = "RETINUE_INSTANCE_COLOR"
+
+# A label is one short line: what fits a home-screen icon and a menu entry.
+MAX_NAME_LENGTH = 40
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 # The accent of the stock icons in webapp/icons/ (and the background they sit on).
 STOCK_ACCENT = (0x6E, 0xA8, 0xFE)
 STOCK_BACKGROUND = (0x0B, 0x0D, 0x12)
@@ -51,9 +73,84 @@ _ACCENT_DEF_RE = re.compile(r"(--accent:\s*)#6ea8fe", re.IGNORECASE)
 _ACCENT_RGB_RE = re.compile(r"rgba\(\s*110\s*,\s*168\s*,\s*254\s*,")
 
 
+def settings_path() -> Path:
+    """Where the dashboard's choices live (RETINUE_INSTANCE_FILE, read per call so tests can point elsewhere)."""
+    return Path(os.environ.get("RETINUE_INSTANCE_FILE") or DEFAULT_SETTINGS_FILE)
+
+
+# The stored choices, re-read when the file's identity or mtime changes.
+_STORED_CACHE: dict = {"key": None, "data": {}}
+
+
+def stored() -> dict:
+    """The dashboard's stored choices, {} when none (or unreadable). Cached by the file's mtime."""
+    path = settings_path()
+    try:
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (str(path), None, None)
+    if _STORED_CACHE["key"] == key:
+        return _STORED_CACHE["data"]
+    data: dict = {}
+    if key[1] is not None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = raw
+        except (OSError, ValueError):
+            data = {}
+    _STORED_CACHE["key"] = key
+    _STORED_CACHE["data"] = data
+    return data
+
+
+def valid_name(raw) -> str | None:
+    """[raw] as a label: one line, trimmed, at most MAX_NAME_LENGTH characters; None for nothing usable."""
+    if not isinstance(raw, str):
+        return None
+    label = " ".join(_CONTROL_RE.sub(" ", raw).split())
+    if not label:
+        return None
+    return label[:MAX_NAME_LENGTH]
+
+
+def normalize_color(raw) -> str | None:
+    """[raw] as "#rrggbb" (lowercase), or None for anything that is not a colour."""
+    if not isinstance(raw, str):
+        return None
+    m = _COLOR_RE.fullmatch(raw.strip())
+    if not m:
+        return None
+    hexval = m.group(1).lower()
+    if len(hexval) == 3:
+        hexval = "".join(ch * 2 for ch in hexval)
+    return "#" + hexval
+
+
+def stored_name() -> str:
+    """The label the dashboard set, or ""."""
+    return valid_name(stored().get("name")) or ""
+
+
+def stored_color() -> str:
+    """The colour the dashboard set ("#rrggbb"), or ""."""
+    return normalize_color(stored().get("color")) or ""
+
+
+def env_name() -> str:
+    """The deployment's default label (RETINUE_INSTANCE_NAME), or ""."""
+    return valid_name(os.environ.get(ENV_NAME, "")) or ""
+
+
+def env_color() -> str:
+    """The deployment's default colour (RETINUE_INSTANCE_COLOR) as "#rrggbb", or ""."""
+    return normalize_color(os.environ.get(ENV_COLOR, "")) or ""
+
+
 def instance_name() -> str:
-    """The configured instance label, or "" for an unbranded deployment."""
-    return os.environ.get("RETINUE_INSTANCE_NAME", "").strip()
+    """The instance label in force — the dashboard's, else the deployment's — or "" for an unbranded deployment."""
+    return stored_name() or env_name()
 
 
 def display_name() -> str:
@@ -63,15 +160,67 @@ def display_name() -> str:
 
 
 def accent_color() -> tuple[int, int, int] | None:
-    """The configured accent as an RGB triple, or None for the stock icons."""
-    m = _COLOR_RE.fullmatch(os.environ.get("RETINUE_INSTANCE_COLOR", "").strip())
-    if not m:
+    """The accent in force — the dashboard's, else the deployment's — as an RGB triple, or None for the stock icons."""
+    hexval = (stored_color() or env_color()).lstrip("#")
+    if not hexval:
         return None
-    hexval = m.group(1)
-    if len(hexval) == 3:
-        hexval = "".join(ch * 2 for ch in hexval)
     rgb = tuple(int(hexval[i:i + 2], 16) for i in (0, 2, 4))
     return None if rgb == STOCK_ACCENT else rgb
+
+
+def accent_hex() -> str:
+    """The accent in force as "#rrggbb", or "" for the stock colour."""
+    rgb = accent_color()
+    return "#%02x%02x%02x" % rgb if rgb else ""
+
+
+def status() -> dict:
+    """What the Settings › Instance card shows: the stored choices, the deployment defaults and what is in force."""
+    return {
+        "name": stored_name(),
+        "color": stored_color(),
+        "defaults": {"name": env_name(), "color": env_color()},
+        "effective": {"name": instance_name(), "color": accent_hex(), "display_name": display_name()},
+        "stock_color": "#%02x%02x%02x" % STOCK_ACCENT,
+        "max_name_length": MAX_NAME_LENGTH,
+    }
+
+
+def write_setting(name: str | None = None, color: str | None = None) -> dict:
+    """Store the dashboard's choices: a value given replaces the stored one ("" clears it, so the
+    deployment default is in force again), None leaves it alone. Atomic (temp file + rename), so a
+    reader never sees half a document. Returns status(). Raises ValueError for a colour that is not
+    one; OSError when the file cannot be written."""
+    data = dict(stored())
+    if name is not None:
+        label = valid_name(name)
+        if label:
+            data["name"] = label
+        else:
+            data.pop("name", None)
+    if color is not None:
+        if color.strip():
+            value = normalize_color(color)
+            if value is None:
+                raise ValueError(f"not a colour: {color!r}")
+            data["color"] = value
+        else:
+            data.pop("color", None)
+    path = settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".instance-", suffix=".json", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return status()
 
 
 def branded() -> bool:

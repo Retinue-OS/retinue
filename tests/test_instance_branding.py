@@ -16,17 +16,28 @@ What these pin down:
 - a label is escaped into the title, never served as markup;
 - an invalid colour, and the stock colour itself, count as "no colour";
 - the signature moves with either variable, so the service-worker cache
-  name moves too.
+  name moves too;
+- the dashboard's stored choices (Settings › Instance, RETINUE_INSTANCE_FILE)
+  win over the variables while set, hand back to them when cleared, are
+  validated (one short line; a real colour), written atomically and re-read
+  when the file changes.
 
     python3 tests/test_instance_branding.py
 """
 import json
 import os
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+# The stored choices live in a scratch file here, never in the real one.
+_TMP = Path(tempfile.mkdtemp(prefix="instance-branding-test-"))
+os.environ["RETINUE_INSTANCE_FILE"] = str(_TMP / "instance.json")
+
 import instance_branding as ib  # noqa: E402
 
 WEBAPP = REPO_ROOT / "webapp"
@@ -36,6 +47,11 @@ ICONS = ["icon-192.png", "icon-512.png", "icon-maskable-512.png"]
 def _env(name="", color=""):
     os.environ["RETINUE_INSTANCE_NAME"] = name
     os.environ["RETINUE_INSTANCE_COLOR"] = color
+    # The variables are the defaults: a test of them starts without stored choices.
+    try:
+        ib.settings_path().unlink()
+    except FileNotFoundError:
+        pass
 
 
 def test_unbranded_is_identity():
@@ -133,6 +149,79 @@ def test_signature_moves():
     c = ib.signature()
     assert len({a, b, c}) == 3
     print("ok: the signature moves with name and colour")
+
+
+def test_stored_choices_win_over_the_variables():
+    _env(name="Env", color="#112233")
+    assert ib.status() == {
+        "name": "", "color": "",
+        "defaults": {"name": "Env", "color": "#112233"},
+        "effective": {"name": "Env", "color": "#112233", "display_name": "Retinue (Env)"},
+        "stock_color": "#6ea8fe", "max_name_length": 40,
+    }
+    before = ib.signature()
+    # The dashboard's name wins; the colour it has not set stays the variable's.
+    st = ib.write_setting(name="  Admin  ")
+    assert st["name"] == "Admin" and st["effective"]["name"] == "Admin"
+    assert st["effective"]["color"] == "#112233"
+    assert ib.instance_name() == "Admin" and ib.display_name() == "Retinue (Admin)"
+    data = json.loads(ib.brand_manifest((WEBAPP / "manifest.webmanifest").read_bytes()))
+    assert data["short_name"] == "Admin"
+    assert ib.signature() != before
+    # The colour, in either spelling, normalised; the stock colour counts as none.
+    st = ib.write_setting(color="F90")
+    assert st["color"] == "#ff9900" and ib.accent_color() == (0xFF, 0x99, 0x00)
+    ib.write_setting(color="#6ea8fe")
+    assert ib.accent_color() is None and ib.accent_hex() == ""
+    assert ib.status()["color"] == "#6ea8fe"
+    # Clearing hands back to the variables; a key not given is left alone.
+    st = ib.write_setting(color="")
+    assert st["color"] == "" and st["effective"]["color"] == "#112233"
+    assert st["name"] == "Admin"
+    st = ib.write_setting(name="")
+    assert st["name"] == "" and st["effective"]["name"] == "Env"
+    assert json.loads(ib.settings_path().read_text()) == {}
+    print("ok: the dashboard's choices win over the variables and hand back when cleared")
+
+
+def test_stored_choices_are_validated():
+    _env()
+    # A label is one short line: control characters and runs of space go, the length is capped.
+    st = ib.write_setting(name="Ad\nmin\t  one" + "x" * 100)
+    assert st["name"].startswith("Ad min one") and len(st["name"]) == 40
+    assert ib.valid_name("   ") is None and ib.valid_name(None) is None and ib.valid_name(12) is None
+    # A colour that is not one is refused, and nothing changes.
+    ib.write_setting(color="#f59e0b")
+    for bad in ("orange", "#12345", "rgb(1,2,3)"):
+        try:
+            ib.write_setting(color=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    assert ib.status()["color"] == "#f59e0b"
+    assert ib.normalize_color("#ABC") == "#aabbcc" and ib.normalize_color(None) is None
+    # A document that is not an object, or no file at all, counts as nothing stored.
+    ib.settings_path().write_text("[1, 2]")
+    assert ib.stored() == {} and ib.status()["name"] == ""
+    ib.settings_path().write_text("not json")
+    assert ib.stored() == {}
+    ib.settings_path().unlink()
+    assert ib.stored() == {} and not ib.branded()
+    print("ok: stored choices are validated and a broken file counts as none")
+
+
+def test_stored_file_is_reread_when_it_changes():
+    _env()
+    ib.write_setting(name="One")
+    assert ib.instance_name() == "One"
+    # Another process (another gateway worker) writes the file: the next lookup sees it.
+    time.sleep(0.01)
+    ib.settings_path().write_text(json.dumps({"name": "Two", "color": "#f59e0b"}))
+    assert ib.instance_name() == "Two" and ib.accent_hex() == "#f59e0b"
+    assert "Two" in ib.signature()
+    ib.settings_path().unlink()
+    print("ok: a changed file is re-read")
 
 
 if __name__ == "__main__":

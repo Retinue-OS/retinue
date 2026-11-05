@@ -918,28 +918,42 @@ weights persist in the `stt-models` volume.
 
 Every deployment serves the same baked manifest and icons, so two installed
 PWAs (a main and an admin instance, say) look identical on the home screen and
-in the task switcher. Two optional variables brand an instance; a single
+in the task switcher. Two optional settings brand an instance; a single
 deployment needs neither (`scripts/instance_branding.py`):
 
-- **`RETINUE_INSTANCE_NAME`** — a short label (`Admin`). The manifest's
-  `short_name` becomes the label, its `name` and every page `<title>`
-  `Retinue (Admin)`; push notifications without a thread title fall back to it,
-  and the Ask-Ara connector answers as `Ara (Admin)` unless `ARA_MCP_IDENTITY`
-  says otherwise.
-- **`RETINUE_INSTANCE_COLOR`** — the accent as `#rrggbb` (or `#rgb`), for the
-  icons and the dashboard alike. The stock icons (blue ring on near-black) are
-  recoloured, and the dashboard's accent with them: the `--accent` definition
-  in `styles.css` plus the `rgba(110, 168, 254, …)` tints the components'
-  shadow styles hard-code — send buttons, links, focus rings, hovers. Mode,
-  sphere and status colours (`--high`, `--ok`, `--outbound`) are left alone;
-  they carry meaning. The send glyph stays dark, so choose a light or medium
-  tone. An invalid value is ignored.
+- **Name** — a short label (`Admin`, at most 40 characters, one line). The
+  manifest's `short_name` becomes the label, its `name` and every page
+  `<title>` `Retinue (Admin)`; push notifications without a thread title fall
+  back to it, the Ask-Ara connector answers as `Ara (Admin)` unless
+  `ARA_MCP_IDENTITY` says otherwise, and the Android shell lists the instance
+  under it: the shell reads each endpoint's manifest `short_name` and shows
+  that in its endpoint menu — there is no label of the shell's own (see
+  "Inside the Android shell").
+- **Accent colour** — `#rrggbb` (or `#rgb`), for the icons and the dashboard
+  alike. The stock icons (blue ring on near-black) are recoloured, and the
+  dashboard's accent with them: the `--accent` definition in `styles.css` plus
+  the `rgba(110, 168, 254, …)` tints the components' shadow styles hard-code —
+  send buttons, links, focus rings, hovers. Mode, sphere and status colours
+  (`--high`, `--ok`, `--outbound`) are left alone; they carry meaning. The send
+  glyph stays dark, so choose a light or medium tone. An invalid value is
+  ignored.
+
+Two sources, dashboard over deployment, as for the agent models:
+**Settings › Instance** (`GET`/`POST /instance`, server-side and shared by
+every device) writes `RETINUE_INSTANCE_FILE` (default
+`/root/.retinue/instance.json`, the persistent volume); the variables
+`RETINUE_INSTANCE_NAME` and `RETINUE_INSTANCE_COLOR` are the deployment
+defaults, in force wherever the card holds nothing (its *Stock colour* button
+and an emptied name field hand back to them). The card shows the default as
+the name field's placeholder.
 
 Both are applied when the gateway serves the file — the baked webapp is never
 edited — and both are folded into the service worker's shell hash, so a change
-reaches installed clients like any shell edit. An already-installed PWA may
-keep its old home-screen label and icon until the browser refreshes the
-manifest (Chrome checks about daily); reinstalling applies it at once.
+reaches installed clients like any shell edit, and a change on the Settings
+page reaches the very next response. An already-installed PWA may keep its old
+home-screen label and icon until the browser refreshes the manifest (Chrome
+checks about daily); reinstalling applies it at once. The Android shell is not
+held up by that: it fetches the manifest itself.
 
 ## Inside the Android shell
 
@@ -959,10 +973,11 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 
 | Direction | What |
 |---|---|
-| User agent | ` RetinueShell/2 (Android)` appended (` RetinueShell/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
-| `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings()`, behind Settings → Phone shell (shown only when the object exists). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
-| Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool}`; `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home` or `health-sync`. A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`); it is information only — no page navigates on it. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
+| User agent | ` RetinueShell/3 (Android)` appended (` RetinueShell/2` before the endpoint members, `/1` before the Health Connect members; the page feature-detects every member rather than parsing the version). |
+| `window.RetinueShell` | Installed at document start, configured origin only: `platform`, `version`, `setVoiceActive(bool)` and `openSettings(section?)`, behind Settings → Phone shell (shown only when the object exists; the card is the first on the page there). `setVoiceActive(true)` means *a voice conversation is engaged: keep the screen on and pause the wake phrase*. The page asserts it before it asks for the mic (the wake detector must release it first) and keeps it asserted for as long as a continuous conversation is going — through transcription, Ara's answer and its reading, not only while the mic is open — and sends `false` once the loop stops (mode off, no speech, leaving the thread, an error). Wake detection being paused for the whole conversation is intended. |
+| Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the Settings page's Phone shell card lists them in a menu and switches between them. `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the shell's endpoint list, or the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays native. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
+| Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync` or `endpoints`. A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it and `endpoints` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |

@@ -63,6 +63,9 @@ a Progressive Web App on the phone home screen.
 - `/docs/<name>.md`     → `DOCS_DIR/<name>.md`, the framework docs that page renders
 - `/sync-health`        → `sync-health.html`, the target of "update your health
                           data" links (see "Inside the Android shell")
+- `/instance`           → GET/POST, the instance's name and accent colour the
+                          Settings page stores (`scripts/instance_branding.py`,
+                          docs/dashboard.md "Several instances")
 - `/inbox/…`            → the letterbox's WebDAV share (`scripts/webdav_share.py`),
                           not a page — see `docs/dashboard.md`
 - everything else       → `WEBAPP_DIR/<path>` (shell assets)
@@ -775,18 +778,27 @@ cannot do — the home-screen role, a wake phrase, native speech output, the
 client certificate. Everything that is Retinue stays here, so it behaves the
 same in the shell, in Chrome and on a desktop. The contract between them:
 
-- **User agent**: the shell appends ` RetinueShell/2 (Android)` (`/1` before
-  the Health Connect members below).
+- **User agent**: the shell appends ` RetinueShell/3 (Android)` (`/2` before
+  the endpoint members, `/1` before the Health Connect members below).
 - **`window.RetinueShell`**, installed at document start on the configured
   origin only: `platform`, `version`, `setVoiceActive(bool)` and
-  `openSettings()`. `setVoiceActive(true)` means "a voice conversation is
+  `openSettings(section?)`. `setVoiceActive(true)` means "a voice conversation is
   engaged: keep the screen on, pause the wake phrase". The page asserts it
   before asking for the mic (so the wake detector lets go of it first) and
   holds it for as long as a continuous conversation is engaged — Ara's
   thinking and reading time included — then sends `false` once the loop
   stops (mode off, no speech, leaving, an error). Settings → Phone shell —
-  shown only when the object exists — calls `openSettings()`.
-  `components/shell.js` wraps both.
+  shown only when the object exists, and first on the page there — calls
+  `openSettings()`. `components/shell.js` wraps both.
+- **Endpoints** (RetinueShell/3): the shell keeps a list of Retinue servers
+  and shows one. `endpoints()` → `[{id, label, current}]` as a JSON string,
+  the label being the instance's own name (its manifest `short_name`, which
+  Settings › Instance sets); `selectEndpoint(id)` switches (the page is left
+  for the other dashboard); `openSettings('endpoints')` opens the shell's
+  endpoint list or, with one endpoint, its editor. The Phone shell card shows
+  the menu and *Edit endpoints*; the page never writes an address, certificate
+  or password — those stay in the shell. An `endpoints` event says the list
+  changed while the page is open.
 - **Shell → page**: `window.dispatchEvent(new CustomEvent('retinue-shell',
   {detail: {type}}))` with `type` `wake` (the wake phrase) or `home` (a Home
   press while the shell is in front). The home answers both in place: a wake
@@ -813,7 +825,11 @@ same in the shell, in Chrome and on a desktop. The contract between them:
   interval when the shell reports Health Connect available; `sync-health.html`
   (`/sync-health`, `#sync` starts a sync) is the link target for threads. The
   shell uploads by WebDAV `PUT` to `/inbox/` — the page never handles the
-  data. `components/shell.js` wraps all of it, feature-detected.
+  data. From RetinueShell/3 the status carries `enabled`, the current
+  endpoint's own health switch: off, both pages show one line and the way to
+  the shell's endpoint editor instead of the controls, and a sync asked for is
+  `skipped` with reason `disabled`. `components/shell.js` wraps all of it,
+  feature-detected.
 - **Speech output**: Android's WebView has no Web Speech API, so the shell
   installs a `speechSynthesis` / `SpeechSynthesisUtterance` stand-in backed by
   the native TTS where the page has none. `components/speech.js` is unchanged;

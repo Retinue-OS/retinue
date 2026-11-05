@@ -31,6 +31,55 @@
       <h1>Settings</h1>
     </header>
 
+    <!-- Only inside the Android shell (window.RetinueShell, components/shell.js),
+         and first there: which Retinue this phone shows, and the phone's own
+         settings. The endpoints (address, certificate, sign-in, health data)
+         are set up in the shell, never from here — a page must not be able to
+         point the shell, its microphone and its certificate at another host —
+         so this card lists them under their own names (the instances' manifest
+         short_name, fetched by the shell), switches between them, and opens the
+         shell's editor. -->
+    <section class="scard" data-shell-settings hidden>
+      <h2>Phone shell</h2>
+      <p class="hint">The Android app around this dashboard. Which Retinue it
+        shows, and the phone's own settings: endpoints, launcher bar, wake
+        phrase, updates.</p>
+      <label class="num-setting endpoint-pick" data-endpoint-pick hidden>Retinue
+        <select data-endpoint-select aria-label="Retinue endpoint"></select>
+      </label>
+      <div class="shell-actions">
+        <button type="button" class="setting-btn" data-shell-endpoints hidden>Edit endpoints</button>
+        <button type="button" class="setting-btn" data-shell-open>Phone shell settings</button>
+      </div>
+      <!-- Health Connect (RetinueShell/2): only where the shell reports it
+           available. The shell does the sync and the upload itself (WebDAV
+           PUT to /inbox/); this block starts a deliberate one and edits the
+           auto-sync settings the shell keeps. From RetinueShell/3 each
+           endpoint has its own upload switch, set in the shell's editor: off,
+           the controls give way to one line and the way to the editor. -->
+      <div class="health-sync" data-health-sync hidden>
+        <div data-health-controls>
+          <p class="hint">Health data from the phone's Health Connect (watch,
+            ring, blood-pressure app) is sent to your health records when the
+            app comes to the front, at most once per interval below. An update
+            started here always runs.</p>
+          <button type="button" class="setting-btn" data-health-sync-now>Update health data now</button>
+          <p class="health-sync-line" data-health-sync-line aria-live="polite"></p>
+          <label class="num-setting">Update when the app comes to the front
+            <input type="checkbox" data-health-auto>
+          </label>
+          <label class="num-setting">At most every (minutes)
+            <input type="number" min="1" max="1440" step="1" inputmode="numeric" data-health-interval>
+          </label>
+        </div>
+        <div data-health-disabled hidden>
+          <p class="hint">Health data is not uploaded to this Retinue. The switch
+            is on the endpoint, in the phone shell.</p>
+          <button type="button" class="setting-btn" data-health-edit-endpoint>Edit endpoint</button>
+        </div>
+      </div>
+    </section>
+
     <section class="scard">
       <h2>Notifications</h2>
       <p class="hint">Web Push to this device: Ara notifies you when a
@@ -53,34 +102,6 @@
       <label class="num-setting">Mic closes with no speech after (seconds)
         <input type="number" min="2" max="30" step="1" inputmode="decimal" data-voice-nospeech>
       </label>
-    </section>
-
-    <!-- Only inside the Android shell (window.RetinueShell, components/shell.js):
-         what needs native APIs — the base URL, the client certificate, the
-         launcher bar and the wake phrase — is set there, not here. -->
-    <section class="scard" data-shell-settings hidden>
-      <h2>Phone shell</h2>
-      <p class="hint">The Android app around this dashboard: its address and
-        client certificate, the launcher bar, and the wake phrase.</p>
-      <button type="button" class="setting-btn" data-shell-open>Open phone shell settings</button>
-      <!-- Health Connect (RetinueShell/2): only where the shell reports it
-           available. The shell does the sync and the upload itself (WebDAV
-           PUT to /inbox/); this block starts a deliberate
-           one and edits the auto-sync settings the shell keeps. -->
-      <div class="health-sync" data-health-sync hidden>
-        <p class="hint">Health data from the phone's Health Connect (watch,
-          ring, blood-pressure app) is sent to your health records when the
-          app comes to the front, at most once per interval below. An update
-          started here always runs.</p>
-        <button type="button" class="setting-btn" data-health-sync-now>Update health data now</button>
-        <p class="health-sync-line" data-health-sync-line aria-live="polite"></p>
-        <label class="num-setting">Update when the app comes to the front
-          <input type="checkbox" data-health-auto>
-        </label>
-        <label class="num-setting">At most every (minutes)
-          <input type="number" min="1" max="1440" step="1" inputmode="numeric" data-health-interval>
-        </label>
-      </div>
     </section>
 
     <section class="scard">
@@ -108,6 +129,31 @@
          dispatch without a restart (scripts/agent_models.py). The
          remote-control session is interactive and keeps the built-in models.
          The list of models is the thread picker's. -->
+    <!-- How this instance presents itself: its name and accent colour.
+         Server-side (shared by every device): the manifest, the page titles,
+         the icons and the dashboard accent follow on the next response
+         (scripts/instance_branding.py); RETINUE_INSTANCE_NAME / _COLOR are the
+         deployment defaults. The Android shell lists this instance under the
+         name, read from the manifest's short_name. -->
+    <section class="scard" data-instance hidden>
+      <h2>Instance</h2>
+      <p class="hint">How this Retinue presents itself, on every device: a short
+        name for the home-screen icon, the page titles and the phone shell's
+        endpoint menu, and the accent colour of the icons and the dashboard. An
+        installed home-screen icon picks up a new name or colour when the
+        browser next checks the manifest, about daily.</p>
+      <label class="num-setting instance-name">Name
+        <input type="text" autocomplete="off" spellcheck="false" maxlength="40" data-instance-name>
+      </label>
+      <label class="num-setting instance-color">Accent colour
+        <input type="color" data-instance-color>
+      </label>
+      <div class="shell-actions">
+        <button type="button" class="setting-btn" data-instance-stock-color>Stock colour</button>
+      </div>
+      <p class="hint" data-instance-note hidden></p>
+    </section>
+
     <section class="scard" data-agent-models hidden>
       <h2>Agent models</h2>
       <p class="hint">Which model each of Ara's subagents runs on in dashboard
@@ -143,7 +189,8 @@
     import {
       inShell, openShellSettings, healthConnectAvailable, healthSync, healthSyncStatus,
       setHealthSyncInterval, setHealthAutoSync, onHealthSync, describeHealthSync,
-      describeHealthSyncEvent,
+      describeHealthSyncEvent, healthUploadEnabled,
+      hasShellEndpoints, shellEndpoints, selectShellEndpoint, onShellEndpoints,
     } from '/components/shell.js';
 
     // The shelf size (components/shelf-store.js): kept per device and browser
@@ -246,10 +293,40 @@
       } catch (_err) { /* card stays hidden */ }
     })();
 
-    // The phone shell's own settings, where the page runs inside it.
+    // The phone shell, where the page runs inside it: its settings, and from
+    // RetinueShell/3 the endpoint menu — the shell's list, under the
+    // instances' own names; changing the choice switches, so this page is
+    // left for the other server's — and the way into the shell's editor.
     if (inShell()) {
       document.querySelector('[data-shell-settings]').hidden = false;
       document.querySelector('[data-shell-open]').addEventListener('click', () => openShellSettings());
+      if (hasShellEndpoints()) {
+        const pick = document.querySelector('[data-endpoint-pick]');
+        const select = document.querySelector('[data-endpoint-select]');
+        const edit = document.querySelector('[data-shell-endpoints]');
+        edit.hidden = false;
+        edit.addEventListener('click', () => openShellSettings('endpoints'));
+        const renderEndpoints = () => {
+          const list = shellEndpoints();
+          pick.hidden = list.length === 0;
+          select.disabled = false;
+          select.replaceChildren();
+          for (const e of list) {
+            const opt = document.createElement('option');
+            opt.value = e.id; opt.textContent = e.label; opt.selected = e.current;
+            select.appendChild(opt);
+          }
+        };
+        select.addEventListener('change', () => {
+          const id = select.value;
+          const current = shellEndpoints().find((e) => e.current);
+          if (!id || (current && current.id === id)) return;
+          select.disabled = true;
+          if (!selectShellEndpoint(id)) renderEndpoints();
+        });
+        onShellEndpoints(renderEndpoints);
+        renderEndpoints();
+      }
     }
 
     // Health Connect, where the shell has it (components/shell.js): the last
@@ -259,14 +336,22 @@
     // is what the shell holds.
     if (inShell() && healthConnectAvailable()) {
       const box = document.querySelector('[data-health-sync]');
+      const controls = document.querySelector('[data-health-controls]');
+      const disabled = document.querySelector('[data-health-disabled]');
       const now = document.querySelector('[data-health-sync-now]');
       const line = document.querySelector('[data-health-sync-line]');
       const auto = document.querySelector('[data-health-auto]');
       const interval = document.querySelector('[data-health-interval]');
       box.hidden = false;
+      document.querySelector('[data-health-edit-endpoint]').addEventListener('click', () => openShellSettings('endpoints'));
       const showStatus = () => {
         const st = healthSyncStatus();
         if (!st) return;
+        // The endpoint's own switch (RetinueShell/3): off, the controls give way.
+        const enabled = healthUploadEnabled(st);
+        controls.hidden = !enabled;
+        disabled.hidden = enabled;
+        if (!enabled) return;
         line.textContent = describeHealthSync(st);
         auto.checked = !!st.auto_on_resume;
         if (document.activeElement !== interval && Number.isFinite(st.min_interval_minutes)) {
@@ -294,8 +379,58 @@
         }
       });
       document.addEventListener('visibilitychange', () => { if (!document.hidden) showStatus(); });
+      // The endpoint list changed (edited in the shell): so may the switch.
+      onShellEndpoints(showStatus);
       showStatus();
     }
+
+    // Instance (GET/POST /instance): the name and the accent colour this
+    // deployment presents itself with, shared by every device. Each field saves
+    // on change and the card re-renders from the server's answer, so what is
+    // shown is what is in force; the deployment default shows as the
+    // placeholder. Hidden where the gateway has no endpoint (an older one).
+    const instanceCard = document.querySelector('[data-instance]');
+    const instanceName = document.querySelector('[data-instance-name]');
+    const instanceColor = document.querySelector('[data-instance-color]');
+    const instanceStock = document.querySelector('[data-instance-stock-color]');
+    const instanceNote = document.querySelector('[data-instance-note]');
+    let stockColor = '#6ea8fe';
+    const renderInstance = (data) => {
+      instanceCard.hidden = false;
+      stockColor = data.stock_color || stockColor;
+      if (document.activeElement !== instanceName) instanceName.value = data.name || '';
+      instanceName.placeholder = (data.defaults && data.defaults.name) || 'Retinue';
+      if (Number.isFinite(data.max_name_length)) instanceName.maxLength = data.max_name_length;
+      instanceColor.value = (data.effective && data.effective.color) || stockColor;
+      instanceStock.disabled = !data.color;
+    };
+    const saveInstance = async (body) => {
+      instanceName.disabled = instanceColor.disabled = instanceStock.disabled = true;
+      try {
+        const res = await fetch('/instance', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        instanceNote.hidden = true;
+        renderInstance(data);
+      } catch (err) {
+        instanceNote.textContent = `Could not save: ${err.message}`;
+        instanceNote.hidden = false;
+      } finally {
+        instanceName.disabled = instanceColor.disabled = false;
+      }
+    };
+    instanceName.addEventListener('change', () => saveInstance({ name: instanceName.value }));
+    instanceColor.addEventListener('change', () => saveInstance({ color: instanceColor.value }));
+    instanceStock.addEventListener('click', () => saveInstance({ color: '' }));
+    (async () => {
+      try {
+        const res = await fetch('/instance', { cache: 'no-store' });
+        if (!res.ok) return;
+        renderInstance(await res.json());
+      } catch (_err) { /* card stays hidden */ }
+    })();
   </script>
   <script>
     // Register the service worker so this page is available offline too.
