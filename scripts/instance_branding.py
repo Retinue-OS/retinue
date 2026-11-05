@@ -46,6 +46,7 @@ import os
 import re
 import struct
 import tempfile
+import threading
 import zlib
 from pathlib import Path
 
@@ -78,20 +79,33 @@ def settings_path() -> Path:
     return Path(os.environ.get("RETINUE_INSTANCE_FILE") or DEFAULT_SETTINGS_FILE)
 
 
-# The stored choices, re-read when the file's identity or mtime changes.
-_STORED_CACHE: dict = {"key": None, "data": {}}
+# The stored choices, re-read when the file's identity (inode), mtime or size
+# changes. A save replaces the file (a new inode), so it is seen even when it
+# lands within the filesystem's mtime granularity of the last one.
+# One (key, data) pair, replaced in one assignment so a reader never pairs a new key with old data.
+_STORED_CACHE: list = [(None, {})]
+
+# One save at a time: two devices saving the name and the colour at once must
+# not each write back the document they read, dropping the other's change. The
+# gateway is the only writer, so a lock in its process is enough.
+_WRITE_LOCK = threading.Lock()
+
+
+def _file_key(path: Path) -> tuple:
+    try:
+        st = path.stat()
+        return (str(path), st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (str(path), None, None, None)
 
 
 def stored() -> dict:
-    """The dashboard's stored choices, {} when none (or unreadable). Cached by the file's mtime."""
+    """The dashboard's stored choices, {} when none (or unreadable). Cached by the file's identity and mtime."""
     path = settings_path()
-    try:
-        st = path.stat()
-        key = (str(path), st.st_mtime_ns, st.st_size)
-    except OSError:
-        key = (str(path), None, None)
-    if _STORED_CACHE["key"] == key:
-        return _STORED_CACHE["data"]
+    key = _file_key(path)
+    cached_key, cached = _STORED_CACHE[0]
+    if cached_key == key:
+        return cached
     data: dict = {}
     if key[1] is not None:
         try:
@@ -100,8 +114,7 @@ def stored() -> dict:
                 data = raw
         except (OSError, ValueError):
             data = {}
-    _STORED_CACHE["key"] = key
-    _STORED_CACHE["data"] = data
+    _STORED_CACHE[0] = (key, data)
     return data
 
 
@@ -189,8 +202,15 @@ def status() -> dict:
 def write_setting(name: str | None = None, color: str | None = None) -> dict:
     """Store the dashboard's choices: a value given replaces the stored one ("" clears it, so the
     deployment default is in force again), None leaves it alone. Atomic (temp file + rename), so a
-    reader never sees half a document. Returns status(). Raises ValueError for a colour that is not
-    one; OSError when the file cannot be written."""
+    reader never sees half a document, and serialised, so two saves at once do not lose either.
+    Returns status(). Raises ValueError for a colour that is not one; OSError when the file cannot
+    be written."""
+    with _WRITE_LOCK:
+        _write_setting_locked(name, color)
+    return status()
+
+
+def _write_setting_locked(name: str | None, color: str | None) -> None:
     data = dict(stored())
     if name is not None:
         label = valid_name(name)
@@ -220,7 +240,8 @@ def write_setting(name: str | None = None, color: str | None = None) -> dict:
         except OSError:
             pass
         raise
-    return status()
+    # What was just written is what is stored: no need to read it back.
+    _STORED_CACHE[0] = (_file_key(path), data)
 
 
 def branded() -> bool:

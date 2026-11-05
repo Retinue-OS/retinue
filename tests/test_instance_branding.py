@@ -224,6 +224,40 @@ def test_stored_file_is_reread_when_it_changes():
     print("ok: a changed file is re-read")
 
 
+def test_saves_in_quick_succession_are_all_seen():
+    _env()
+    # Same size, back to back: well within the filesystem's mtime granularity.
+    for color in ("#111111", "#222222", "#333333"):
+        assert ib.write_setting(color=color)["color"] == color
+        assert ib.accent_hex() == color
+    ib.settings_path().unlink()
+    print("ok: saves in quick succession are all seen")
+
+
+def test_concurrent_saves_lose_nothing():
+    import threading
+
+    _env()
+    # Two devices at once, one setting the name and one the colour: both land.
+    for _ in range(20):
+        ib.write_setting(name="", color="")
+        start = threading.Barrier(2)
+
+        def save(**kw):
+            start.wait()
+            ib.write_setting(**kw)
+
+        threads = [threading.Thread(target=save, kwargs={"name": "Admin"}),
+                   threading.Thread(target=save, kwargs={"color": "#f59e0b"})]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert json.loads(ib.settings_path().read_text()) == {"name": "Admin", "color": "#f59e0b"}
+    ib.settings_path().unlink()
+    print("ok: concurrent saves lose nothing")
+
+
 if __name__ == "__main__":
     for fn in [v for k, v in sorted(globals().items()) if k.startswith("test_")]:
         fn()

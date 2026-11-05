@@ -123,12 +123,6 @@
       </label>
     </section>
 
-    <!-- Which model each subagent runs on. Server-side (shared by every
-         device): every claude -p session the framework spawns gets the
-         choices as an --agents override, so a change reaches its next
-         dispatch without a restart (scripts/agent_models.py). The
-         remote-control session is interactive and keeps the built-in models.
-         The list of models is the thread picker's. -->
     <!-- How this instance presents itself: its name and accent colour.
          Server-side (shared by every device): the manifest, the page titles,
          the icons and the dashboard accent follow on the next response
@@ -154,6 +148,12 @@
       <p class="hint" data-instance-note hidden></p>
     </section>
 
+    <!-- Which model each subagent runs on. Server-side (shared by every
+         device): every claude -p session the framework spawns gets the
+         choices as an --agents override, so a change reaches its next
+         dispatch without a restart (scripts/agent_models.py). The
+         remote-control session is interactive and keeps the built-in models.
+         The list of models is the thread picker's. -->
     <section class="scard" data-agent-models hidden>
       <h2>Agent models</h2>
       <p class="hint">Which model each of Ara's subagents runs on in dashboard
@@ -395,6 +395,8 @@
     const instanceStock = document.querySelector('[data-instance-stock-color]');
     const instanceNote = document.querySelector('[data-instance-note]');
     let stockColor = '#6ea8fe';
+    // A colour is stored (the Stock colour button has something to clear).
+    let storedColor = false;
     const renderInstance = (data) => {
       instanceCard.hidden = false;
       stockColor = data.stock_color || stockColor;
@@ -402,7 +404,8 @@
       instanceName.placeholder = (data.defaults && data.defaults.name) || 'Retinue';
       if (Number.isFinite(data.max_name_length)) instanceName.maxLength = data.max_name_length;
       instanceColor.value = (data.effective && data.effective.color) || stockColor;
-      instanceStock.disabled = !data.color;
+      storedColor = !!data.color;
+      instanceStock.disabled = !storedColor;
     };
     const saveInstance = async (body) => {
       instanceName.disabled = instanceColor.disabled = instanceStock.disabled = true;
@@ -418,7 +421,10 @@
         instanceNote.textContent = `Could not save: ${err.message}`;
         instanceNote.hidden = false;
       } finally {
+        // On success renderInstance has set these from the answer; on failure
+        // they go back to what was in force before the attempt.
         instanceName.disabled = instanceColor.disabled = false;
+        instanceStock.disabled = !storedColor;
       }
     };
     instanceName.addEventListener('change', () => saveInstance({ name: instanceName.value }));
