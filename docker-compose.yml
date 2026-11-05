@@ -358,9 +358,12 @@ services:
       - CONVERSATION_BASE_URL
       # Optional instance branding, for running more than one deployment: a
       # label for the PWA, page titles and Ask-Ara identity, and an accent
-      # colour (#rrggbb) for icons and dashboard. See scripts/instance_branding.py.
+      # colour (#rrggbb) for icons and dashboard: the deployment defaults; the
+      # dashboard's Settings › Instance choices live in RETINUE_INSTANCE_FILE
+      # (default on the persistent /root volume). See scripts/instance_branding.py.
       - RETINUE_INSTANCE_NAME
       - RETINUE_INSTANCE_COLOR
+      - RETINUE_INSTANCE_FILE
       - SEND_APPROVAL_BASE_URL
       # Zone the approval pages render event times in; the containers run on
       # UTC, so without it a mis-zoned calendar entry reads as correct there.

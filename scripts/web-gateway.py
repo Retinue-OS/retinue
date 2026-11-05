@@ -9724,6 +9724,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("?", 1)[0].rstrip("/") == "/agent-models":
             self._handle_agent_models_write()
             return
+        if self.path.split("?", 1)[0].rstrip("/") == "/instance":
+            self._handle_instance_write()
+            return
         attention_match = _ATTENTION_POST_RE.match(self.path)
         if attention_match:
             self._handle_attention_post(attention_match.group(1))
@@ -11528,6 +11531,41 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"agents": agent_models.status(),
                               "models": _conversation_models()})
 
+    def _handle_instance_write(self) -> None:
+        """Settings › Instance: the instance's name and accent colour.
+
+        Body {name?, color?}: a key given is stored ("" clears it, so the
+        deployment default — RETINUE_INSTANCE_NAME / _COLOR — is in force
+        again), a key left out is left alone. Server-side and shared by every
+        device: the manifest, the page titles, the icons and the dashboard
+        accent follow on the next response (scripts/instance_branding.py), the
+        service worker's shell hash moves with them, and the Android shell
+        reads the new name from the manifest for its endpoint menu."""
+        payload = self._read_json_body()
+        if payload is None:
+            self._send_json(400, {"error": "invalid JSON"})
+            return
+        name = payload.get("name")
+        color = payload.get("color")
+        if name is None and color is None:
+            self._send_json(400, {"error": "name or color is required"})
+            return
+        if (name is not None and not isinstance(name, str)) or (color is not None and not isinstance(color, str)):
+            self._send_json(400, {"error": "name and color are strings"})
+            return
+        try:
+            result = instance_branding.write_setting(name=name, color=color)
+        except ValueError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        except OSError as exc:
+            self._send_json(500, {"error": "could not save the instance settings",
+                                  "detail": str(exc)})
+            return
+        # Recoloured icons are keyed by colour; the old colour's are not coming back.
+        _BRANDED_ICON_CACHE.clear()
+        self._send_json(200, result)
+
     def _handle_transcribe(self) -> None:
         """Voice input: proxy uploaded audio to the shared STT service.
 
@@ -12119,6 +12157,11 @@ class Handler(BaseHTTPRequestHandler):
             # list the thread picker offers (scripts/agent_models.py).
             self._send_json(200, {"agents": agent_models.status(),
                                   "models": _conversation_models()})
+            return
+        if conv_path in ("/instance", "/instance/"):
+            # Settings › Instance: the name and colour stored by the dashboard,
+            # the deployment defaults, and what is in force (scripts/instance_branding.py).
+            self._send_json(200, instance_branding.status())
             return
         if conv_path in ("/attention", "/attention/"):
             self._handle_attention_get()

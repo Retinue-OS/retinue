@@ -7,13 +7,15 @@
 // nothing here does anything:
 //   - the user agent ends in ` RetinueShell/<n> (Android)`;
 //   - `window.RetinueShell` is installed at document start: {platform,
-//     version, setVoiceActive(bool), openSettings()}, and from RetinueShell/2
-//     the Health Connect members (healthConnectAvailable(), healthSync(),
-//     healthSyncStatus(), setHealthSyncInterval(minutes),
-//     setHealthAutoSync(bool));
+//     version, setVoiceActive(bool), openSettings(section?)}, from
+//     RetinueShell/2 the Health Connect members (healthConnectAvailable(),
+//     healthSync(), healthSyncStatus(), setHealthSyncInterval(minutes),
+//     setHealthAutoSync(bool)), and from RetinueShell/3 the endpoint members
+//     (endpoints(), selectEndpoint(id); openSettings takes a section);
 //   - the shell dispatches `retinue-shell` window events, detail.type `wake`
-//     (the wake phrase), `home` (a Home press while the shell is in front) or
-//     `health-sync` (a Health Connect sync started, done, failed or skipped).
+//     (the wake phrase), `home` (a Home press while the shell is in front),
+//     `health-sync` (a Health Connect sync started, done, failed or skipped)
+//     or `endpoints` (the shell's endpoint list changed).
 //
 // Every member is feature-detected: an older shell lacks the newer ones, and
 // a call that throws is treated as a shell without it.
@@ -60,12 +62,65 @@ export function setVoiceActive(on) {
   } catch (_e) { /* ignore */ }
 }
 
-export function openShellSettings() {
+// Open the phone shell's own settings; `section` names a part of them
+// ('endpoints': the endpoint list, or straight into the editor when there is
+// one endpoint). A shell before RetinueShell/3 ignores the argument.
+export function openShellSettings(section) {
   try {
     const s = window.RetinueShell;
-    if (s && typeof s.openSettings === 'function') { s.openSettings(); return true; }
+    if (s && typeof s.openSettings === 'function') {
+      if (section) s.openSettings(String(section)); else s.openSettings();
+      return true;
+    }
   } catch (_e) { /* ignore */ }
   return false;
+}
+
+// ── Endpoints (RetinueShell/3) ──────────────────────────────────────────────
+// The Retinue servers the phone knows, as the shell lists them: [{id, label,
+// current}], the label being the instance's own name (the manifest's
+// short_name, fetched by the shell) with the host appended only to tell two
+// equal names apart. No URLs: this page knows its own origin, and the other
+// servers are none of its business. Switching and editing are the shell's;
+// the page asks and is left when the switch happens.
+
+// True when this shell has the endpoint members at all.
+export function hasShellEndpoints() {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  return !!s && typeof s.endpoints === 'function' && typeof s.selectEndpoint === 'function';
+}
+
+// [{id, label, current}], [] for a shell without the member.
+export function shellEndpoints() {
+  const [called, raw] = shellInvoke('endpoints');
+  if (!called || raw == null) return [];
+  try {
+    const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(list)) return [];
+    return list
+      .filter((e) => e && typeof e === 'object' && typeof e.id === 'string' && e.id)
+      .map((e) => ({ id: e.id, label: typeof e.label === 'string' && e.label ? e.label : e.id, current: !!e.current }));
+  } catch (_e) { return []; }
+}
+
+// Ask the shell to show the endpoint `id`; it loads that server's dashboard,
+// so this page is left. False when this shell cannot switch.
+export function selectShellEndpoint(id) {
+  if (typeof id !== 'string' || !id) return false;
+  return shellInvoke('selectEndpoint', id)[0];
+}
+
+// Subscribe to the shell's `endpoints` events (the list changed while this
+// page is open: an endpoint was added, renamed or removed in the shell's
+// settings). Returns the unsubscribe function.
+export function onShellEndpoints(cb) {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (e) => {
+    const d = e && e.detail;
+    if (d && d.type === 'endpoints') cb();
+  };
+  window.addEventListener('retinue-shell', listener);
+  return () => window.removeEventListener('retinue-shell', listener);
 }
 
 // ── Health Connect (RetinueShell/2) ─────────────────────────────────────────
@@ -95,7 +150,11 @@ export function healthSync() {
 }
 
 // {available, permissions, last_sync_at, last_result, last_error, last_count,
-// min_interval_minutes, auto_on_resume}, or null.
+// min_interval_minutes, auto_on_resume, enabled}, or null. `enabled` is the
+// current endpoint's own health switch (RetinueShell/3; absent in older
+// shells, which upload for their one server): false means nothing is read or
+// sent for this server, not even on request, until it is turned on in the
+// shell's endpoint editor.
 export function healthSyncStatus() {
   const [called, raw] = shellInvoke('healthSyncStatus');
   if (!called || raw == null) return null;
@@ -113,10 +172,17 @@ export function setHealthAutoSync(on) {
   return shellInvoke('setHealthAutoSync', !!on)[0];
 }
 
+// The shell uploads health data for the current endpoint at all (see
+// healthSyncStatus): true for a shell that does not say.
+export function healthUploadEnabled(st) {
+  return !st || st.enabled !== false;
+}
+
 // One line for the last sync, shared by Settings and /sync-health: when, and
 // how it went. `st` is healthSyncStatus()'s document.
 export function describeHealthSync(st) {
   if (!st) return '';
+  if (!healthUploadEnabled(st)) return 'Health data is not uploaded to this Retinue. Turn it on for this endpoint in the phone shell\u2019s settings.';
   if (st.permissions === 'none') return 'Health Connect access not granted yet — the phone shell asks on the next update.';
   if (!st.last_sync_at) return 'No update yet.';
   const when = new Date(st.last_sync_at);
@@ -144,6 +210,7 @@ export function describeHealthSyncEvent(d) {
       'no-permission': 'Health Connect access is not granted',
       unavailable: 'Health Connect is not available on this phone',
       'no-backend-support': 'this dashboard does not accept health data',
+      disabled: 'health data is not uploaded to this Retinue (off for this endpoint in the phone shell)',
     }[d.reason];
     return `Health data update skipped${why ? `: ${why}` : ''}.`;
   }
