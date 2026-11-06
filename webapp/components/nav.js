@@ -27,7 +27,9 @@
 // path. `back` may come and go (the thread viewer on the home sets it while a
 // thread is open). Plain links, so the row works offline from the service
 // worker's shell cache (the sends page is the gateway's own, so it needs the
-// network).
+// network). One exception: inside the Android app with a settings page of its
+// own (RetinueShell/4), a plain press on the gear opens that page, which has
+// the phone's settings and this instance's (components/shell.js).
 //
 // Contacts and the sends queue used to sit in an app dock at the foot of the
 // home, beside the phone's own dialer, SMS, mail and map buttons. Those four
@@ -46,7 +48,7 @@ import { esc } from './base.js';
 // used to be held on such a page, with a note at the bottom asking for a
 // second tap — which the phone keyboard, coming up with the note, hid along
 // with the row.
-import './shell.js';
+import { hasShellSettingsPage, openShellSettings } from './shell.js';
 
 const PAGES = [
   { id: 'home', href: '/', label: 'Home', paths: ['/', '/index.html'] },
@@ -134,6 +136,16 @@ class RetinueNav extends HTMLElement {
       `</div>${link(SENDS, 'icon', OUTBOX_SVG)}${link(SETTINGS, 'icon', '&#9881;')}</nav>`;
     const btn = this.shadowRoot.querySelector('[data-back]');
     if (btn) btn.addEventListener('click', (e) => this._onBack(e));
+    const gear = this.shadowRoot.querySelector(`a[href="${SETTINGS.href}"]`);
+    if (gear) gear.addEventListener('click', (e) => this._onSettings(e));
+  }
+
+  // Inside the app with its own settings page, the gear opens that page; a
+  // modified press, or a page the app cannot open, follows the link.
+  _onSettings(e) {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button) return;
+    if (!hasShellSettingsPage()) return;
+    if (openShellSettings()) e.preventDefault();
   }
 
   // A plain press hands back to the page; a modified one (new tab, new

@@ -62,6 +62,19 @@ export function setVoiceActive(on) {
   } catch (_e) { /* ignore */ }
 }
 
+// ── The app's own settings page (RetinueShell/4) ───────────────────────────
+// The Android app has a settings page of its own: this app's settings (which
+// Retinue it shows and its endpoints, voice timeouts and shelf size for every
+// endpoint, wake phrase, launcher bar, updates), then those for the endpoint
+// on screen (health data), then this instance's, which it embeds from
+// settings-instance.html. Inside such an app the dashboard's gear opens it
+// (nav.js) and the dashboard's Settings page keeps only the way there and the
+// instance section.
+export function hasShellSettingsPage() {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  return !!s && s.settingsPage === true && typeof s.openSettings === 'function';
+}
+
 // Open the phone shell's own settings; `section` names a part of them
 // ('endpoints': the endpoint list, or straight into the editor when there is
 // one endpoint). A shell before RetinueShell/3 ignores the argument.

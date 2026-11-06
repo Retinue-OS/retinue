@@ -23,6 +23,10 @@
   <!-- The minimized pages: threads, chats and projects parked one tap away
        (issue #282). Every page carries it as the last child of <main>. -->
   <script type="module" src="/components/shelf.js"></script>
+  <!-- This instance: name and colour, agent models, system pages — the same
+       on every device. Also what the Android app embeds as the last section
+       of its own settings page (settings-instance.html). -->
+  <script type="module" src="/components/instance-settings.js"></script>
 </head>
 <body>
   <main class="settings">
@@ -31,9 +35,24 @@
       <h1>Settings</h1>
     </header>
 
-    <!-- Only inside the Android shell (window.RetinueShell, components/shell.js),
-         and first there: which Retinue this phone shows, and the phone's own
-         settings. The endpoints (address, certificate, sign-in, health data)
+    <!-- Inside the Android app (RetinueShell/4 and later): the app has a
+         settings page of its own, with this app's settings, the ones for the
+         endpoint on screen (health data) and this instance's, in that order.
+         The gear opens it directly; this card is for arriving here anyway. -->
+    <section class="scard" data-app-settings hidden>
+      <h2>This app</h2>
+      <p class="hint">The Android app's settings page has everything of this
+        phone: which Retinue it shows and its endpoints, voice and shelf,
+        health data, wake phrase, launcher bar and updates, followed by this
+        instance's settings.</p>
+      <div class="shell-actions">
+        <button type="button" class="setting-btn" data-app-settings-open>App settings</button>
+      </div>
+    </section>
+
+    <!-- Only inside an Android app without its own settings page
+         (RetinueShell/3; components/shell.js), and first there: which Retinue
+         this phone shows, and the phone's own settings. The endpoints (address, certificate, sign-in, health data)
          are set up in the shell, never from here — a page must not be able to
          point the shell, its microphone and its certificate at another host —
          so this card lists them under their own names (the instances' manifest
@@ -80,7 +99,12 @@
       </div>
     </section>
 
-    <section class="scard">
+    <!-- This browser: what is kept per device and browser. Inside the Android
+         app these belong to the app (its settings page; components/
+         device-store.js) and the group is not shown. -->
+    <h2 class="settings-group" data-device-group>This browser</h2>
+
+    <section class="scard" data-device-card>
       <h2>Notifications</h2>
       <p class="hint">Web Push to this device: Ara notifies you when a
         conversation needs a decision or an answer arrives while the dashboard
@@ -89,7 +113,7 @@
       <retinue-push-optin manage></retinue-push-optin>
     </section>
 
-    <section class="scard">
+    <section class="scard" data-device-card>
       <h2>Voice</h2>
       <p class="hint">Continuous conversation (the loop button in a thread's
         bar) reads Ara's answers aloud, then opens the mic. A pause as long as
@@ -104,14 +128,14 @@
       </label>
     </section>
 
-    <section class="scard">
+    <section class="scard" data-device-card>
       <h2>Layout</h2>
       <p class="hint">On a wide screen the dashboard's columns are resizable —
         drag the dividers, double-click one to reset it. Each card's header
         switches between list and card view. Both are remembered per device.</p>
     </section>
 
-    <section class="scard">
+    <section class="scard" data-device-card>
       <h2>Shelf</h2>
       <p class="hint">Threads, chats and projects you minimize — or leave while
         Ara is still answering — wait on the shelf at the foot of every page.
@@ -123,63 +147,17 @@
       </label>
     </section>
 
-    <!-- How this instance presents itself: its name and accent colour.
-         Server-side (shared by every device): the manifest, the page titles,
-         the icons and the dashboard accent follow on the next response
-         (scripts/instance_branding.py); RETINUE_INSTANCE_NAME / _COLOR are the
-         deployment defaults. The Android shell lists this instance under the
-         name, read from the manifest's short_name. -->
-    <section class="scard" data-instance hidden>
-      <h2>Instance</h2>
-      <p class="hint">How this Retinue presents itself, on every device: a short
-        name for the home-screen icon, the page titles and the phone shell's
-        endpoint menu, and the accent colour of the icons and the dashboard. An
-        installed home-screen icon picks up a new name or colour when the
-        browser next checks the manifest, about daily.</p>
-      <label class="num-setting instance-name">Name
-        <input type="text" autocomplete="off" spellcheck="false" maxlength="40" data-instance-name>
-      </label>
-      <label class="num-setting instance-color">Accent colour
-        <input type="color" data-instance-color>
-      </label>
-      <div class="shell-actions">
-        <button type="button" class="setting-btn" data-instance-stock-color>Stock colour</button>
-      </div>
-      <p class="hint" data-instance-note hidden></p>
-    </section>
-
-    <!-- Which model each subagent runs on. Server-side (shared by every
-         device): every claude -p session the framework spawns gets the
-         choices as an --agents override, so a change reaches its next
-         dispatch without a restart (scripts/agent_models.py). The
-         remote-control session is interactive and keeps the built-in models.
-         The list of models is the thread picker's. -->
-    <section class="scard" data-agent-models hidden>
-      <h2>Agent models</h2>
-      <p class="hint">Which model each of Ara's subagents runs on in dashboard
-        threads, messenger turns, scheduled jobs and Ask-Ara answers; a change
-        applies to their next dispatch. The Claude-app session keeps the
-        built-in models. "Built-in" is the model the agent's definition pins.
-        Every agent calls tools — even the Secretary reads its style files —
-        so pick a model that supports tool use; small local tags often do
-        not.</p>
-      <div data-agent-models-rows></div>
-      <p class="hint" data-agent-models-note hidden></p>
-    </section>
-
-    <section class="scard">
-      <h2>System</h2>
-      <ul class="linklist">
-        <li><a href="/gateways">Messenger gateways &mdash; connection status &amp; pairing</a></li>
-        <li><a href="/claude-auth">Claude sign-in &mdash; account status &amp; browser re-login</a></li>
-        <li><a href="/sends">Pending sends &mdash; messages waiting for approval</a></li>
-        <li><a href="/sparql">Life store &mdash; SPARQL endpoint, ontology &amp; runnable example queries</a></li>
-      </ul>
+    <section class="scard" data-device-card>
+      <h2>Dashboard version</h2>
       <!-- Updates apply on their own (the app reloads once a new version is
            installed); this row is the manual fallback and shows which shell
            version this device is running. -->
-      <retinue-update-check style="margin-top:12px"></retinue-update-check>
+      <retinue-update-check></retinue-update-check>
     </section>
+
+    <!-- This instance: the same on every device (components/instance-settings.js). -->
+    <h2 class="settings-group">This instance</h2>
+    <retinue-instance-settings></retinue-instance-settings>
     <retinue-shelf></retinue-shelf>
   </main>
 
@@ -191,10 +169,23 @@
       setHealthSyncInterval, setHealthAutoSync, onHealthSync, describeHealthSync,
       describeHealthSyncEvent, healthUploadEnabled,
       hasShellEndpoints, shellEndpoints, selectShellEndpoint, onShellEndpoints,
+      hasShellSettingsPage,
     } from '/components/shell.js';
 
+    // Inside an Android app with a settings page of its own (RetinueShell/4):
+    // everything of the phone is there, including the per-device values this
+    // page would otherwise show (the app holds them for every endpoint), so
+    // only the way there and this instance's settings remain here.
+    const appPage = hasShellSettingsPage();
+    if (appPage) {
+      document.querySelector('[data-app-settings]').hidden = false;
+      document.querySelector('[data-app-settings-open]').addEventListener('click', () => openShellSettings());
+      for (const el of document.querySelectorAll('[data-device-group], [data-device-card]')) el.hidden = true;
+    }
+
     // The shelf size (components/shelf-store.js): kept per device and browser
-    // like the shelf; lowering it makes room at once, quiet items first.
+    // (inside the app: by the app, for every endpoint); lowering it makes room
+    // at once, quiet items first.
     const input = document.querySelector('[data-shelf-size]');
     const show = () => { if (document.activeElement !== input) input.value = String(shelfSize()); };
     input.addEventListener('change', () => { input.value = String(setShelfSize(input.value)); });
@@ -215,89 +206,12 @@
       showVoice(setVoiceTimeouts({ noSpeechMs: Number(noSpeech.value) * 1000 })));
     showVoice(voiceTimeouts());
 
-    // Agent models (GET/POST /agent-models): one dropdown per subagent, built
-    // from the same model list the thread picker offers, after "Built-in" and,
-    // where RETINUE_AGENT_MODELS sets one, "Deployment default". A choice is
-    // saved on change and the card re-rendered from the server's answer, so
-    // what is shown is what the next spawned dispatch will run. The card stays
-    // hidden when the gateway offers no model or the endpoint is unavailable
-    // (an older gateway).
-    const agentCard = document.querySelector('[data-agent-models]');
-    const agentRows = document.querySelector('[data-agent-models-rows]');
-    const agentNote = document.querySelector('[data-agent-models-note]');
-    const renderAgents = (data) => {
-      const models = Array.isArray(data.models) ? data.models : [];
-      const agents = Array.isArray(data.agents) ? data.agents : [];
-      if (!agents.length || !models.length) { agentCard.hidden = true; return; }
-      agentCard.hidden = false;
-      agentRows.replaceChildren();
-      for (const a of agents) {
-        const label = document.createElement('label');
-        label.className = 'num-setting agent-model';
-        const name = document.createElement('span');
-        name.textContent = a.label;
-        name.title = a.description || '';
-        label.appendChild(name);
-        const select = document.createElement('select');
-        select.dataset.agent = a.id;
-        const addOption = (value, text, selected, reset = false) => {
-          const opt = document.createElement('option');
-          opt.value = value; opt.textContent = text; opt.selected = selected;
-          if (reset) opt.dataset.reset = '1';
-          select.appendChild(opt);
-        };
-        // A fixed agent runs on its built-in model whatever is stored for it.
-        const pick = a.overridable ? a.chosen : '';
-        const deployment = a.overridable ? a.env_default : '';
-        addOption('', `Built-in${a.builtin ? ` (${a.builtin})` : ''}`,
-          pick === '' || (pick === null && !deployment));
-        // No dashboard choice: the agent follows RETINUE_AGENT_MODELS.
-        if (deployment) addOption('', `Deployment default (${deployment})`, pick === null, true);
-        let present = !pick;
-        for (const m of models) {
-          if (pick && m.id === pick) present = true;
-          addOption(m.id, m.label || m.id, !!pick && m.id === pick);
-        }
-        // A stored choice no longer on the offered list (dropped upstream
-        // since): show it rather than lie.
-        if (!present) addOption(pick, pick, true);
-        select.disabled = !a.overridable;
-        if (!a.overridable) name.title = 'This agent’s definition cannot be overridden.';
-        select.addEventListener('change', async () => {
-          select.disabled = true;
-          try {
-            const res = await fetch('/agent-models', {
-              method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(select.selectedOptions[0]?.dataset.reset
-                ? { agent: a.id, reset: true } : { agent: a.id, model: select.value }),
-            });
-            const body = await res.json().catch(() => ({}));
-            if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
-            agentNote.hidden = true;
-            renderAgents(body);
-          } catch (err) {
-            agentNote.textContent = `Could not save: ${err.message}`;
-            agentNote.hidden = false;
-            select.disabled = false;
-          }
-        });
-        label.appendChild(select);
-        agentRows.appendChild(label);
-      }
-    };
-    (async () => {
-      try {
-        const res = await fetch('/agent-models', { cache: 'no-store' });
-        if (!res.ok) return;
-        renderAgents(await res.json());
-      } catch (_err) { /* card stays hidden */ }
-    })();
-
-    // The phone shell, where the page runs inside it: its settings, and from
-    // RetinueShell/3 the endpoint menu — the shell's list, under the
-    // instances' own names; changing the choice switches, so this page is
-    // left for the other server's — and the way into the shell's editor.
-    if (inShell()) {
+    // An app without a page of its own (RetinueShell/3 and older): the Phone
+    // shell card as before — its settings, and from RetinueShell/3 the
+    // endpoint menu (the shell's list, under the instances' own names;
+    // changing the choice switches, so this page is left for the other
+    // server's) and the way into the shell's editor.
+    if (inShell() && !appPage) {
       document.querySelector('[data-shell-settings]').hidden = false;
       document.querySelector('[data-shell-open]').addEventListener('click', () => openShellSettings());
       if (hasShellEndpoints()) {
@@ -329,12 +243,14 @@
       }
     }
 
-    // Health Connect, where the shell has it (components/shell.js): the last
+    // Health Connect, where an app without a page of its own has it (with one,
+    // health data is on the app's page, next to the endpoint's switch;
+    // components/shell.js): the last
     // sync from healthSyncStatus(), kept current by the shell's health-sync
     // events; the button starts a deliberate sync; the toggle and interval
     // are the shell's own settings, re-read after every write so what shows
     // is what the shell holds.
-    if (inShell() && healthConnectAvailable()) {
+    if (inShell() && !appPage && healthConnectAvailable()) {
       const box = document.querySelector('[data-health-sync]');
       const controls = document.querySelector('[data-health-controls]');
       const disabled = document.querySelector('[data-health-disabled]');
@@ -384,59 +300,6 @@
       showStatus();
     }
 
-    // Instance (GET/POST /instance): the name and the accent colour this
-    // deployment presents itself with, shared by every device. Each field saves
-    // on change and the card re-renders from the server's answer, so what is
-    // shown is what is in force; the deployment default shows as the
-    // placeholder. Hidden where the gateway has no endpoint (an older one).
-    const instanceCard = document.querySelector('[data-instance]');
-    const instanceName = document.querySelector('[data-instance-name]');
-    const instanceColor = document.querySelector('[data-instance-color]');
-    const instanceStock = document.querySelector('[data-instance-stock-color]');
-    const instanceNote = document.querySelector('[data-instance-note]');
-    let stockColor = '#6ea8fe';
-    // A colour is stored (the Stock colour button has something to clear).
-    let storedColor = false;
-    const renderInstance = (data) => {
-      instanceCard.hidden = false;
-      stockColor = data.stock_color || stockColor;
-      if (document.activeElement !== instanceName) instanceName.value = data.name || '';
-      instanceName.placeholder = (data.defaults && data.defaults.name) || 'Retinue';
-      if (Number.isFinite(data.max_name_length)) instanceName.maxLength = data.max_name_length;
-      instanceColor.value = (data.effective && data.effective.color) || stockColor;
-      storedColor = !!data.color;
-      instanceStock.disabled = !storedColor;
-    };
-    const saveInstance = async (body) => {
-      instanceName.disabled = instanceColor.disabled = instanceStock.disabled = true;
-      try {
-        const res = await fetch('/instance', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        instanceNote.hidden = true;
-        renderInstance(data);
-      } catch (err) {
-        instanceNote.textContent = `Could not save: ${err.message}`;
-        instanceNote.hidden = false;
-      } finally {
-        // On success renderInstance has set these from the answer; on failure
-        // they go back to what was in force before the attempt.
-        instanceName.disabled = instanceColor.disabled = false;
-        instanceStock.disabled = !storedColor;
-      }
-    };
-    instanceName.addEventListener('change', () => saveInstance({ name: instanceName.value }));
-    instanceColor.addEventListener('change', () => saveInstance({ color: instanceColor.value }));
-    instanceStock.addEventListener('click', () => saveInstance({ color: '' }));
-    (async () => {
-      try {
-        const res = await fetch('/instance', { cache: 'no-store' });
-        if (!res.ok) return;
-        renderInstance(await res.json());
-      } catch (_err) { /* card stays hidden */ }
-    })();
   </script>
   <script>
     // Register the service worker so this page is available offline too.

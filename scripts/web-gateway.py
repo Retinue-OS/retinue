@@ -1385,6 +1385,12 @@ def _news_ingest_authorized(provided: str) -> bool:
 # pixel pass, so it runs once per icon per configured colour, not per request.
 _BRANDED_ICON_CACHE: dict[tuple[str, str], bytes] = {}
 
+# Where the Android app serves its own settings page from (a reserved address
+# the app answers itself, inside its WebView; ara-android's settings/AppPage).
+# That page embeds settings-instance.html, so it is the one other origin
+# allowed to frame it.
+APP_SETTINGS_ORIGIN = "https://appassets.androidplatform.net"
+
 
 def _branding_transform(rel: str):
     """The instance-branding rewrite for a shell file, or None (scripts/instance_branding.py)."""
@@ -9346,11 +9352,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
-                           transform=None) -> bool:
+                           transform=None, headers: dict | None = None) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
         ``transform`` rewrites the bytes on the response only (the instance
-        branding); the file on disk is never touched.
+        branding); the file on disk is never touched. ``headers`` are sent
+        as well (a page's framing policy).
         Returns True if a file was sent, False otherwise (caller emits 404)."""
         try:
             full = path.resolve()
@@ -9369,6 +9376,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
         return True
@@ -9454,6 +9463,15 @@ class Handler(BaseHTTPRequestHandler):
             # state; inside the shell the page's own script starts the sync.
             return self._serve_static_file(WEBAPP_DIR / "sync-health.html", WEBAPP_DIR,
                                            transform=instance_branding.brand_html)
+        if path == "/settings-instance.html":
+            # This instance's settings on their own, for the Android app to
+            # embed in its settings page (docs/dashboard.md, "Inside the
+            # Android shell"). Only this origin and the app's own page, served
+            # by the app at a reserved address, may frame it.
+            return self._serve_static_file(
+                WEBAPP_DIR / "settings-instance.html", WEBAPP_DIR,
+                transform=instance_branding.brand_html,
+                headers={"Content-Security-Policy": f"frame-ancestors 'self' {APP_SETTINGS_ORIGIN}"})
         if path.startswith("/data/"):
             rel = path[len("/data/"):]
             return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
