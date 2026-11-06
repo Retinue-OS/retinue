@@ -5158,8 +5158,10 @@ _LINT_SYSTEM_PROMPT = (
     "already carries chips for its options, leave them exactly as they are.\n"
     "2. No bare URLs. Every URL becomes [short label](url) with a meaningful "
     "label. A bare domain (example.ch) becomes [example.ch](https://example.ch). "
-    "A relative path (/sends, /gateways) becomes an absolute link using the "
-    "base URL given above, linked by name.\n"
+    "A bare relative path (/sends, /gateways) becomes a link by name with "
+    "that same root-relative target, e.g. [the gateways page](/gateways); a "
+    "Markdown link whose target already starts with a single / is fine as "
+    "it is.\n"
     "3. Never invent a URL or a fact. If the message tells the user to act "
     "somewhere but carries no URL for it, leave that sentence unchanged.\n\n"
     "Keep the message's language, wording, structure and content exactly — do "
@@ -5193,11 +5195,9 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     # no scheme, no bare domain, no relative path — has nothing to lint.
     if len(raw) < 40 and not _LINT_URLISH_RE.search(raw):
         return text
-    parts = []
-    if CONVERSATION_BASE_URL:
-        parts.append("Dashboard base URL for relative paths: "
-                     + CONVERSATION_BASE_URL)
-    parts.append("Message to lint:\n" + raw)
+    # No base URL is handed over: the renderer links a root-relative target
+    # in place, so relative dashboard paths stay relative.
+    parts = ["Message to lint:\n" + raw]
     cmd = [
         "claude", "-p", "--output-format=json",
         "--model", PRESENTATION_LINT_MODEL,
