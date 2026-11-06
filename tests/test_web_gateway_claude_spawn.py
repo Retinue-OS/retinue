@@ -267,6 +267,134 @@ def test_thread_turn_collects_reply_attachments(wg):
     assert not Path(manifests[0]).exists(), "manifest left behind"
 
 
+def test_thread_turn_collects_shell_actions(wg):
+    """A thread turn's session lists shell actions (scripts/shell-type.py) in
+    its own manifest; the valid ones come back as reply_shell_actions, the
+    invalid ones are dropped, and the manifest is gone afterwards. A turn that
+    is not a thread turn gets no manifest at all."""
+    manifests = []
+    good = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False}
+
+    def act_and_answer(cmd, **kwargs):
+        manifest = kwargs["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"]
+        manifests.append(manifest)
+        Path(manifest).write_text(
+            json.dumps(good) + "\n" + json.dumps({"kind": "nope", "id": "b" * 32}) + "\n",
+            encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "typing it", "session_id": "s-7"}),
+            stderr="")
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = act_and_answer
+    with _daemon_environment():
+        out = wg.send_message("type hello", session_key="env-shell",
+                              model="sonnet", reply_attachments=True)
+    assert out.get("reply_shell_actions") == [good], out
+    assert not Path(manifests[0]).exists(), "manifest left behind"
+
+    spawns = _capture_spawns(wg, json.dumps({"result": "hi", "session_id": "s-8"}))
+    with _daemon_environment():
+        wg.send_message("hello", session_key="env-shell-2", model="sonnet")
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in spawns[0][1]["env"], "not a thread turn"
+
+
+def test_shell_actions_ride_on_the_stored_reply(wg):
+    """The thread worker stores the turn's shell actions on Ara's reply, and a
+    replayed transcript tells later turns what was handed over."""
+    conv = wg._new_conv("user", "reto", "t", "user", "type hello on the quest")
+    action = {"kind": "keyboard-type", "id": "c" * 32, "text": "hello", "enter": True}
+    secret = {"kind": "keyboard-secret", "id": "d" * 32, "label": "Meta account",
+              "enter": False}
+    real = wg.send_message
+    wg.send_message = lambda *a, **k: {"response": "Typing it now.",
+                                       "reply_shell_actions": [action, secret]}
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=False)
+    finally:
+        wg.send_message = real
+    stored = wg._load_conv(conv["id"])
+    reply = stored["messages"][-1]
+    assert reply["role"] == "assistant" and reply["shell_actions"] == [action, secret], reply
+    note = wg._conv_render_messages(stored, stored["messages"])
+    assert "type 5 characters + Enter: 'hello'" in note, note
+    assert "password-manager field for 'Meta account'" in note, note
+
+
+def test_sensitive_text_masked_purged_and_never_logged(wg):
+    """A sensitive typing action: stored for the phone, never in a replayed
+    transcript nor in the gateway's log, deleted once reported typed, and in
+    any case gone from every read after the TTL."""
+    import contextlib
+    import io
+    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it")
+    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": True,
+            "sensitive": True}
+    real = wg.send_message
+    wg.send_message = lambda *a, **k: {"response": "Typing it now.",
+                                       "reply_shell_actions": [dict(sens)]}
+    log = io.StringIO()
+    try:
+        with _daemon_environment(), contextlib.redirect_stdout(log):
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=False)
+    finally:
+        wg.send_message = real
+    assert "4711" not in log.getvalue().replace("my PIN is 4711, type it", ""), \
+        "the sensitive text reached the log"
+    stored = wg._load_conv(conv["id"])
+    reply = stored["messages"][-1]
+    assert reply["shell_actions"][0]["text"] == "4711", "the phone still gets it"
+    note = wg._conv_render_messages(stored, [reply])
+    assert "4711" not in note and "sensitive text" in note, note
+    # The user's message shows its id, so Ara can offer to redact it.
+    user_msg = stored["messages"][0]
+    assert f"[message id: {user_msg['id']}]" in wg._conv_render_messages(stored, [user_msg])
+
+    # Reported typed: deleted from the file at once.
+    assert wg._conv_persist_purge(conv["id"], {sens["id"]}) is not None
+    raw = (wg.CONVERSATIONS_DIR / f"{conv['id']}.json").read_text()
+    assert "4711" not in raw.replace("my PIN is 4711, type it", ""), raw
+    gone = wg._load_conv(conv["id"])["messages"][-1]["shell_actions"][0]
+    assert gone["text"] is None and gone["purged"] is True, gone
+
+    # Not reported: no read after the TTL returns it, file rewritten or not.
+    conv2 = wg._new_conv("user", "reto", "t2", "user", "type the code")
+    wg._conv_add_message(conv2["id"], "assistant", "ok",
+                         shell_actions_=[dict(sens, id="f" * 32)])
+    path = wg.CONVERSATIONS_DIR / f"{conv2['id']}.json"
+    data = json.loads(path.read_text())
+    data["messages"][-1]["ts"] = "2000-01-01T00:00:00+00:00"   # long expired
+    path.write_text(json.dumps(data))
+    served = wg._load_conv(conv2["id"])["messages"][-1]["shell_actions"][0]
+    assert served["text"] is None and served["purged"], served
+    wg._conv_persist_purge(conv2["id"])
+    assert "4711" not in path.read_text()
+    print("ok: a sensitive text rides to the phone, never into a transcript or the "
+          "log, and is purged once typed or after the TTL")
+
+
+def test_redact_a_user_message(wg):
+    conv = wg._new_conv("user", "reto", "t", "user", "my password is hunter2")
+    stored = wg._load_conv(conv["id"])
+    mid = stored["messages"][0]["id"]
+    wg._conv_add_message(conv["id"], "assistant", "Typed.")
+    ara_id = wg._load_conv(conv["id"])["messages"][-1]["id"]
+    out, why = wg._conv_redact_message(conv["id"], ara_id)
+    assert out is None and "user's own" in why, why
+    out, why = wg._conv_redact_message(conv["id"], "0" * 12)
+    assert out is None and why == "no such message", why
+    out, why = wg._conv_redact_message(conv["id"], mid)
+    assert out is not None and why == "", why
+    raw = (wg.CONVERSATIONS_DIR / f"{conv['id']}.json").read_text()
+    assert "hunter2" not in raw, raw
+    m = wg._load_conv(conv["id"])["messages"][0]
+    assert m["text"] == wg.REDACTED_TEXT and m["redacted"] is True
+    note = wg._conv_render_messages(wg._load_conv(conv["id"]), [m])
+    assert "hunter2" not in note and "[message id:" not in note, note
+    print("ok: a user message is redacted for good, by its id, and only a user's")
+
+
 def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
     """With a frontier tier configured, a router-tier turn is handed the flag;
     the re-run on the frontier tier is not."""
@@ -332,6 +460,32 @@ def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
                           spawns[1][1]["env"]["RETINUE_REPLY_ATTACHMENTS_FILE"])
     assert junior_m != senior_m, "each spawn needs its own manifest"
     assert not Path(junior_m).exists() and not Path(senior_m).exists()
+
+    # Shell actions likewise: junior's are discarded with her reply.
+    spawns.clear()
+    junior_action = {"kind": "keyboard-key", "id": "e" * 32, "key": "enter"}
+    senior_action = {"kind": "keyboard-key", "id": "f" * 32, "key": "tab"}
+
+    def act_escalate_then_answer(cmd, **kwargs):
+        spawns.append((cmd, kwargs))
+        manifest = Path(kwargs["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"])
+        if len(spawns) == 1:
+            manifest.write_text(json.dumps(junior_action) + "\n", encoding="utf-8")
+            Path(kwargs["env"]["RETINUE_ESCALATE_FILE"]).touch()
+        else:
+            manifest.write_text(json.dumps(senior_action) + "\n", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "senior", "session_id": "s-9"}),
+            stderr="")
+
+    wg_tiered.subprocess.run = act_escalate_then_answer
+    with _daemon_environment():
+        out = wg_tiered.send_message("type", session_key="env-tiered-4",
+                                     reply_attachments=True)
+    assert out.get("escalated") is True, out
+    assert out.get("reply_shell_actions") == [senior_action], out
+    for _, kw in spawns:
+        assert not Path(kw["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"]).exists()
 
 
 def _run_thread_turn(wg, *, escalated: bool = False, **conv_kwargs) -> str | None:
@@ -438,6 +592,10 @@ def main():
         test_refreshes_credentials_once_before_the_first_attempt(wg)
         test_dashboard_turn_env_is_allowlisted(wg)
         test_thread_turn_collects_reply_attachments(wg)
+        test_thread_turn_collects_shell_actions(wg)
+        test_shell_actions_ride_on_the_stored_reply(wg)
+        test_sensitive_text_masked_purged_and_never_logged(wg)
+        test_redact_a_user_message(wg)
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
 
         wg_short = _load_gateway(

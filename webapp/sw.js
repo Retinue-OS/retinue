@@ -59,6 +59,7 @@ const SHELL_ASSETS = [
   '/components/speech.js',
   '/components/continuous.js',
   '/components/shell.js',
+  '/components/shell-keyboard.js',
   '/components/push.js',
   '/components/update.js',
   '/components/nav.js',

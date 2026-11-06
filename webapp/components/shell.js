@@ -15,7 +15,10 @@
 //   - the shell dispatches `retinue-shell` window events, detail.type `wake`
 //     (the wake phrase), `home` (a Home press while the shell is in front),
 //     `health-sync` (a Health Connect sync started, done, failed or skipped)
-//     or `endpoints` (the shell's endpoint list changed).
+//     or `endpoints` (the shell's endpoint list changed); from RetinueShell/5
+//     the keyboard members (keyboardStatus(), keyboardType(text, opts),
+//     keyboardKey(name), keyboardSecret(opts), keyboardOpen()) and its
+//     `keyboard` events.
 //
 // Every member is feature-detected: an older shell lacks the newer ones, and
 // a call that throws is treated as a shell without it.
@@ -238,6 +241,73 @@ export function onHealthSync(cb) {
   const listener = (e) => {
     const d = e && e.detail;
     if (d && d.type === 'health-sync') cb(d);
+  };
+  window.addEventListener('retinue-shell', listener);
+  return () => window.removeEventListener('retinue-shell', listener);
+}
+
+// ── Keyboard (RetinueShell/5) ──────────────────────────────────────────────
+// The shell can be paired with another device — a VR headset, a TV, a
+// computer — as a Bluetooth keyboard, and type into it. Ara's replies carry
+// what to type as shell actions (scripts/shell-type.py); conversation.js
+// hands them to these members (shell-keyboard.js holds the policy). A secret
+// never passes through the page: keyboardSecret() opens a native field in
+// the shell that the user's password manager fills, and the page hears only
+// `secret-typed` or `secret-cancelled`.
+
+// True when this shell has the keyboard members at all.
+export function hasKeyboard() {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  return !!s && typeof s.keyboardStatus === 'function' && typeof s.keyboardType === 'function';
+}
+
+// {available, enabled, connected, host: {name, address} | null, layout}, or
+// null for a shell without the member.
+export function keyboardStatus() {
+  const [called, raw] = shellInvoke('keyboardStatus');
+  if (!called || raw == null) return null;
+  try {
+    const st = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    return st && typeof st === 'object' ? st : null;
+  } catch (_e) { return null; }
+}
+
+// Type `text` on the connected device (then Enter, if asked). The outcome
+// comes as a `keyboard` event carrying `id`. False when the call could not
+// be made.
+export function keyboardType(text, { id = '', enter = false } = {}) {
+  if (typeof text !== 'string' || !text) return false;
+  return shellInvoke('keyboardType', text, JSON.stringify({ id: String(id), enter: !!enter }))[0];
+}
+
+// Press one named key: enter, tab, backspace, escape, up, down, left, right,
+// home, end, delete, space.
+export function keyboardKey(name) {
+  if (typeof name !== 'string' || !name) return false;
+  return shellInvoke('keyboardKey', name)[0];
+}
+
+// Ask the user for a secret in the shell's own native field (autofill from
+// their password manager), labelled `label`; the shell types it and
+// forgets it.
+export function keyboardSecret({ id = '', label = '', enter = false } = {}) {
+  return shellInvoke('keyboardSecret', JSON.stringify({ id: String(id), label: String(label), enter: !!enter }))[0];
+}
+
+// Open the shell's keyboard screen: pairing, the device, live typing.
+export function keyboardOpen() {
+  return shellInvoke('keyboardOpen')[0];
+}
+
+// Subscribe to the shell's `keyboard` events: cb(detail) with detail.state
+// `typed` (count), `error` (error), `secret-typed`, `secret-cancelled` or
+// `status` (the connection changed), and the action's `id` where there is
+// one. Returns the unsubscribe function.
+export function onKeyboard(cb) {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (e) => {
+    const d = e && e.detail;
+    if (d && d.type === 'keyboard') cb(d);
   };
   window.addEventListener('retinue-shell', listener);
   return () => window.removeEventListener('retinue-shell', listener);
