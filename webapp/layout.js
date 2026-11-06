@@ -10,9 +10,10 @@
 //
 // Sizes live as CSS custom properties on <main>; styles.css supplies the
 // defaults when a property is unset, so this module only ever *overrides* the
-// stylesheet, never replaces it. Chosen sizes persist per device in
-// localStorage and are re-applied on load. CSS min/max clamps on the columns
-// keep a persisted size sane when the window shrinks.
+// stylesheet, never replaces it. Chosen sizes persist per device (in
+// localStorage, or inside the Android app by the app, for every endpoint:
+// components/device-store.js) and are re-applied on load. CSS min/max clamps
+// on the columns keep a persisted size sane when the window shrinks.
 //
 // Interactions, matching editor conventions:
 //   drag         resize (pointer events, so mouse/pen/touch all work)
@@ -27,6 +28,7 @@
 // otherwise. The module is dashboard-only (loaded by index.html alone).
 
 import { WIDE_FRAME } from './components/base.js';
+import { deviceGet, deviceSet } from './components/device-store.js';
 
 const STORE_KEY = 'retinue.layout.v1';
 const SNAP_CLOSED_PX = 60;   // dragging chats shorter than this closes it
@@ -41,12 +43,12 @@ const colMain = document.querySelector('.col-main');
 const wide = matchMedia(WIDE_FRAME);
 
 function loadSizes() {
-  try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; }
+  try { return JSON.parse(deviceGet(STORE_KEY)) || {}; }
   catch (_e) { return {}; }
 }
 
 function saveSizes(sizes) {
-  try { localStorage.setItem(STORE_KEY, JSON.stringify(sizes)); }
+  try { deviceSet(STORE_KEY, JSON.stringify(sizes)); }
   catch (_e) { /* private mode: resizing still works for the session */ }
 }
 

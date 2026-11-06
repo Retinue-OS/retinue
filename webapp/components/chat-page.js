@@ -60,6 +60,7 @@
 // hers; the send press stays the user's.
 
 import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
+import { deviceGet, deviceSet } from './device-store.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
 import { avatarHtml, colorFor, initials, CHANNELS } from './chats.js';
@@ -932,13 +933,15 @@ class RetinueChatPage extends HTMLElement {
   }
 
   // ── Splitter persistence (wide layout) ─────────────────────────────────────
+  // Per device (in localStorage, or inside the Android app by the app, for
+  // every endpoint: device-store.js).
   _loadSizes() {
-    try { return JSON.parse(localStorage.getItem(STORE_KEY)) || {}; }
+    try { return JSON.parse(deviceGet(STORE_KEY)) || {}; }
     catch (_e) { return {}; }
   }
 
   _saveSizes() {
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(this._sizes)); }
+    try { deviceSet(STORE_KEY, JSON.stringify(this._sizes)); }
     catch (_e) { /* private mode: resizing still works for the session */ }
   }
 

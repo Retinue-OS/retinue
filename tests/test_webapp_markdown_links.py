@@ -93,7 +93,7 @@ def main() -> int:
         print("SKIP: node is not installed; the Markdown link test needs it")
         return 0
     with tempfile.TemporaryDirectory() as tmp:
-        for name in ("base.js", "markdown.js"):
+        for name in ("base.js", "device-store.js", "markdown.js"):
             shutil.copy(os.path.join(COMPONENTS, name), os.path.join(tmp, name))
         with open(os.path.join(tmp, "package.json"), "w", encoding="utf-8") as fh:
             fh.write('{"type":"module"}')

@@ -8,6 +8,8 @@
 // Subclasses override body(data) -> HTML string, and optionally css() -> extra
 // CSS string.
 
+import { deviceGet, deviceSet } from './device-store.js';
+
 export function esc(s) {
   return String(s == null ? '' : s)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -136,17 +138,18 @@ export function onPressOutside(el, fn, { capture = false } = {}) {
 // ── List/cards view preference ────────────────────────────────────────────────
 // Each list card (conversations, projects, news) can present its rows either as
 // reflowing tiles ("cards") or as a single full-width column ("list"). The
-// choice is a per-device preference, persisted in localStorage per card key.
+// choice is a per-device preference, persisted per card key (in localStorage,
+// or inside the Android app by the app, for every endpoint: device-store.js).
 // On phones the tile grid collapses to one column anyway, so the toggle is only
 // rendered in the wide layout (see VIEW_TOGGLE_CSS) — small devices keep the
 // one presentation that makes sense there.
 export function viewPref(key) {
-  try { return localStorage.getItem(`retinue.view.${key}`) || 'cards'; }
+  try { return deviceGet(`retinue.view.${key}`) || 'cards'; }
   catch (_e) { return 'cards'; }
 }
 
 export function setViewPref(key, view) {
-  try { localStorage.setItem(`retinue.view.${key}`, view); } catch (_e) { /* private mode */ }
+  try { deviceSet(`retinue.view.${key}`, view); } catch (_e) { /* private mode */ }
 }
 
 // The header control both list cards share. Clicks carry data-setview; the

@@ -6,7 +6,12 @@
 // One shelf per device and browser, shared by all its windows and tabs: the
 // state lives in localStorage, every change is a read-modify-write of the
 // whole document, and other tabs learn of it through the `storage` event.
-// Nothing is synced across devices — like open windows.
+// Nothing is synced across devices — like open windows. The shelf's size is
+// a per-device preference (components/device-store.js): inside the Android
+// app it is the app's, the same for every endpoint, while the items stay with
+// the endpoint they belong to.
+
+import { appHoldsDeviceSettings, deviceGet, deviceSet, onDeviceChange } from './device-store.js';
 //
 // The item model. Membership and status are separate properties:
 //
@@ -243,6 +248,10 @@ function writeState(s) {
 }
 
 export function shelfSize() {
+  if (appHoldsDeviceSettings()) {
+    const v = deviceGet(SIZE_KEY);
+    return v == null ? DEFAULT_SIZE : clampSize(v);
+  }
   const ls = storage();
   if (!ls) return MEMORY.size;
   try {
@@ -254,8 +263,12 @@ export function shelfSize() {
 export function setShelfSize(n) {
   const v = clampSize(n);
   MEMORY.size = v;
-  const ls = storage();
-  if (ls) { try { ls.setItem(SIZE_KEY, String(v)); } catch (_e) { /* ignore */ } }
+  if (appHoldsDeviceSettings()) {
+    deviceSet(SIZE_KEY, String(v));
+  } else {
+    const ls = storage();
+    if (ls) { try { ls.setItem(SIZE_KEY, String(v)); } catch (_e) { /* ignore */ } }
+  }
   dispatch({ type: 'resize' }, true);
   return v;
 }
@@ -283,6 +296,11 @@ if (typeof window !== 'undefined' && typeof window.addEventListener === 'functio
   window.addEventListener('storage', (e) => {
     if (!e || e.key === null || e.key === STATE_KEY || e.key === SIZE_KEY) notify();
   });
+  // The app's settings page (or another endpoint's page) set the size: the
+  // shelf makes room at once, as when it is set here.
+  onDeviceChange((keys) => {
+    if (!keys.length || keys.includes(SIZE_KEY)) dispatch({ type: 'resize' }, true);
+  }, { tabs: false });
 }
 
 // Keys shown by a page in this tab right now: the shelf marks them as the
