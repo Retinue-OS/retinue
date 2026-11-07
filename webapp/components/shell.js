@@ -17,7 +17,7 @@
 //     `health-sync` (a Health Connect sync started, done, failed or skipped)
 //     or `endpoints` (the shell's endpoint list changed); from RetinueShell/5
 //     the keyboard members (keyboardStatus(), keyboardType(text, opts),
-//     keyboardKey(name), keyboardSecret(opts), keyboardOpen()) and its
+//     keyboardKey(name, opts), keyboardSecret(opts), keyboardOpen()) and its
 //     `keyboard` events.
 //
 // Every member is feature-detected: an older shell lacks the newer ones, and
@@ -281,10 +281,11 @@ export function keyboardType(text, { id = '', enter = false } = {}) {
 }
 
 // Press one named key: enter, tab, backspace, escape, up, down, left, right,
-// home, end, delete, space.
-export function keyboardKey(name) {
+// home, end, delete, space. The outcome comes as a `keyboard` event carrying
+// `id`.
+export function keyboardKey(name, { id = '' } = {}) {
   if (typeof name !== 'string' || !name) return false;
-  return shellInvoke('keyboardKey', name)[0];
+  return shellInvoke('keyboardKey', name, JSON.stringify({ id: String(id) }))[0];
 }
 
 // Ask the user for a secret in the shell's own native field (autofill from

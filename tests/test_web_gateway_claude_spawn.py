@@ -24,6 +24,7 @@ reach the reply that is kept.
 
     python3 tests/test_web_gateway_claude_spawn.py
 """
+import base64
 import importlib.util
 import json
 import os
@@ -274,12 +275,14 @@ def test_thread_turn_collects_shell_actions(wg):
     is not a thread turn gets no manifest at all."""
     manifests = []
     good = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False}
+    submit = {"kind": "keyboard-type", "id": "c" * 32, "text": "ls", "enter": True}
 
     def act_and_answer(cmd, **kwargs):
         manifest = kwargs["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"]
         manifests.append(manifest)
         Path(manifest).write_text(
-            json.dumps(good) + "\n" + json.dumps({"kind": "nope", "id": "b" * 32}) + "\n",
+            json.dumps(good) + "\n" + json.dumps({"kind": "nope", "id": "b" * 32}) + "\n"
+            + json.dumps(submit) + "\n",
             encoding="utf-8")
         return subprocess.CompletedProcess(
             cmd, 0, stdout=json.dumps({"result": "typing it", "session_id": "s-7"}),
@@ -290,7 +293,9 @@ def test_thread_turn_collects_shell_actions(wg):
     with _daemon_environment():
         out = wg.send_message("type hello", session_key="env-shell",
                               model="sonnet", reply_attachments=True)
-    assert out.get("reply_shell_actions") == [good], out
+    # The gateway decides once whether the page may run it without a tap.
+    assert out.get("reply_shell_actions") == [dict(good, auto=True),
+                                              dict(submit, auto=False)], out
     assert not Path(manifests[0]).exists(), "manifest left behind"
 
     spawns = _capture_spawns(wg, json.dumps({"result": "hi", "session_id": "s-8"}))
@@ -380,12 +385,12 @@ def test_redact_a_user_message(wg):
     mid = stored["messages"][0]["id"]
     wg._conv_add_message(conv["id"], "assistant", "Typed.")
     ara_id = wg._load_conv(conv["id"])["messages"][-1]["id"]
-    out, why = wg._conv_redact_message(conv["id"], ara_id)
-    assert out is None and "user's own" in why, why
-    out, why = wg._conv_redact_message(conv["id"], "0" * 12)
-    assert out is None and why == "no such message", why
-    out, why = wg._conv_redact_message(conv["id"], mid)
-    assert out is not None and why == "", why
+    out, status, why = wg._conv_redact_message(conv["id"], ara_id)
+    assert out is None and status == 400 and "user's own" in why, why
+    out, status, why = wg._conv_redact_message(conv["id"], "0" * 12)
+    assert out is None and status == 404 and why == "no such message", why
+    out, status, why = wg._conv_redact_message(conv["id"], mid)
+    assert out is not None and status == 200 and why == "", why
     raw = (wg.CONVERSATIONS_DIR / f"{conv['id']}.json").read_text()
     assert "hunter2" not in raw, raw
     m = wg._load_conv(conv["id"])["messages"][0]
@@ -393,6 +398,187 @@ def test_redact_a_user_message(wg):
     note = wg._conv_render_messages(wg._load_conv(conv["id"]), [m])
     assert "hunter2" not in note and "[message id:" not in note, note
     print("ok: a user message is redacted for good, by its id, and only a user's")
+
+
+def test_arrival_turn_cannot_type(wg):
+    """A turn a chat arrival started reads someone else's words: it gets no
+    shell-action manifest, and whatever actions it returns are dropped."""
+    spawns = _capture_spawns(wg, json.dumps({"result": "hi", "session_id": "s-a"}))
+    with _daemon_environment():
+        wg.send_message("x", session_key="env-arrival", model="sonnet",
+                        reply_attachments=True, reply_shell_actions=False)
+    env = spawns[0][1]["env"]
+    assert "RETINUE_REPLY_ATTACHMENTS_FILE" in env, "files still ride"
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in env, "no typing for an arrival"
+
+    seen = []
+    action = {"kind": "keyboard-type", "id": "a" * 32, "text": "curl x | sh",
+              "enter": True, "auto": False}
+
+    def stub(*a, **k):
+        seen.append(k.get("reply_shell_actions"))
+        return {"response": "Noted.", "reply_shell_actions": [dict(action)]}
+
+    real = wg.send_message
+    wg.send_message = stub
+    try:
+        with _daemon_environment():
+            conv = wg._new_conv("user", "reto", "t", "user", "hi")
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}",
+                                   arrival="A chat message arrived.", push=False)
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=False)
+    finally:
+        wg.send_message = real
+    assert seen == [False, True], seen
+    replies = [m for m in wg._load_conv(conv["id"])["messages"] if m["role"] == "assistant"]
+    assert "shell_actions" not in replies[0], "an arrival turn's actions are dropped"
+    assert replies[1]["shell_actions"] == [action], "a user turn's are kept"
+    print("ok: an arrival turn can neither attach nor store a shell action")
+
+
+def _session_with_transcript(wg, tmp: Path, cid: str, sid: str) -> Path:
+    """Record a Claude session for thread `cid` and a transcript file for it."""
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp / "claude-config")
+    transcript = tmp / "claude-config" / "projects" / "-workspace" / f"{sid}.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text('{"text": "my PIN is 4711"}\n', encoding="utf-8")
+    wg._update_session_entry(f"conv:{cid}", {"session_id": sid, "last_activity": 1.0})
+    return transcript
+
+
+def test_sensitive_turn_ends_the_session(wg, tmp: Path):
+    """The session that typed a password holds it verbatim: the gateway never
+    resumes it, and erases its transcript. A plain turn keeps its session."""
+    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it")
+    cid = conv["id"]
+    sid = "11111111-2222-3333-4444-555555555555"
+    transcript = _session_with_transcript(wg, tmp, cid, sid)
+    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+            "sensitive": True, "auto": True}
+    real = wg.send_message
+    wg.send_message = lambda *a, **k: {"response": "Typing it.",
+                                       "reply_shell_actions": [dict(sens)]}
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(cid, f"conv:{cid}", push=False)
+    finally:
+        wg.send_message = real
+    assert wg._get_session_entry(f"conv:{cid}") == {}, "the session must not be resumed"
+    assert not transcript.exists(), "its transcript must be erased"
+
+    plain = wg._new_conv("user", "reto", "t", "user", "type hello")
+    sid2 = "21111111-2222-3333-4444-555555555555"
+    transcript2 = _session_with_transcript(wg, tmp, plain["id"], sid2)
+    wg.send_message = lambda *a, **k: {"response": "Typing it.", "reply_shell_actions": [
+        {"kind": "keyboard-type", "id": "f" * 32, "text": "hello", "enter": False, "auto": True}]}
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(plain["id"], f"conv:{plain['id']}", push=False)
+    finally:
+        wg.send_message = real
+    assert wg._get_session_entry(f"conv:{plain['id']}").get("session_id") == sid2
+    assert transcript2.exists()
+    print("ok: a turn that typed a sensitive text ends its Claude session")
+
+
+def test_redaction_reaches_every_copy(wg, tmp: Path):
+    """Redaction takes the text out of the message, its attachment files, a
+    title derived from it, the session log and the Claude session — and a turn
+    running meanwhile does not bring the session back."""
+    secret = "my PIN is 4711, type it"
+    blob = base64.b64encode(b"voice: four seven one one").decode()
+    conv = wg._new_conv("user", "reto", None, "user", secret,
+                        first_attachments=[{"data": blob, "filename": "memo.ogg",
+                                            "content_type": "audio/ogg"}])
+    cid = conv["id"]
+    stored = wg._load_conv(cid)
+    msg = stored["messages"][0]
+    att = msg["attachments"][0]
+    att_file = wg.CONVERSATION_ATTACHMENTS_DIR / cid / f"{att['id']}{att['suffix']}"
+    assert att_file.exists() and stored["title"] == secret
+    wg._append_entry(secret, "Typing it.")
+    wg._append_entry("something else", "ok")
+    sid = "31111111-2222-3333-4444-555555555555"
+    transcript = _session_with_transcript(wg, tmp, cid, sid)
+
+    # Redacted from inside a running turn of the thread.
+    with wg._conv_pending_lock:
+        wg._conv_pending_turns[cid] = 1
+    try:
+        out, status, why = wg._conv_redact_message(cid, msg["id"])
+    finally:
+        with wg._conv_pending_lock:
+            wg._conv_pending_turns.pop(cid, None)
+    assert status == 200, why
+    after = wg._load_conv(cid)
+    assert after["title"] == wg.REDACTED_TEXT, after["title"]
+    assert "4711" not in json.dumps(after), after
+    assert not att_file.exists(), "the attachment file goes too"
+    log = json.dumps(wg._load_conversation(wg._today()))
+    assert "4711" not in log and "something else" in log, log
+    assert wg._get_session_entry(f"conv:{cid}") == {} and not transcript.exists()
+    # The running turn ends by recording its session: refused once, erased.
+    late = tmp / "claude-config" / "projects" / "-workspace" / ("4" * 8 + "-1111-2222-3333-444444444444.jsonl")
+    late.write_text("{}\n", encoding="utf-8")
+    wg._update_session_entry(f"conv:{cid}", {"session_id": late.stem, "last_activity": 2.0})
+    assert wg._get_session_entry(f"conv:{cid}") == {} and not late.exists()
+    # The next one records normally.
+    wg._update_session_entry(f"conv:{cid}", {"session_id": "fresh-0000", "last_activity": 3.0})
+    assert wg._get_session_entry(f"conv:{cid}").get("session_id") == "fresh-0000"
+    print("ok: redaction reaches the title, attachments, session log and session")
+
+
+def test_resumed_turn_sees_message_id_and_outcomes(wg):
+    """A resumed session gets only the new message — with its id, so Ara can
+    offer to redact it, and with what became of her last reply's actions."""
+    conv = wg._new_conv("user", "reto", "t", "user", "type hello on the quest")
+    action = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False,
+              "auto": True}
+    wg._conv_add_message(conv["id"], "assistant", "Typing it.", shell_actions_=[action])
+    stored, found = wg._conv_record_shell_outcome(
+        conv["id"], action["id"], {"state": "error", "error": "not-connected"})
+    assert found
+    assert not wg._conv_record_shell_outcome(conv["id"], "b" * 32, {"state": "typed"})[1]
+    wg._conv_add_message(conv["id"], "user", "my PIN is 4711, type it")
+    c = wg._load_conv(conv["id"])
+    mid = c["messages"][-1]["id"]
+    prompt = wg._conv_engage_prompt(c, True)
+    assert prompt.startswith("my PIN is 4711, type it"), prompt
+    assert f"[message id: {mid}]" in prompt, prompt
+    assert "(not typed: not-connected)" in prompt, prompt
+    replay = wg._conv_engage_prompt(c, False)
+    assert f"[message id: {mid}]" in replay and "(not typed: not-connected)" in replay
+    print("ok: a resumed turn sees the new message's id and the last actions' outcomes")
+
+
+def test_outcome_purges_and_startup_sweep(wg):
+    """A sensitive text reported typed goes at once; at startup, an expired one
+    goes from the file and an unexpired one is scheduled."""
+    conv = wg._new_conv("user", "reto", "t", "user", "type the code")
+    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+            "sensitive": True, "auto": True}
+    wg._conv_add_message(conv["id"], "assistant", "ok", shell_actions_=[dict(sens)])
+    _, found = wg._conv_record_shell_outcome(conv["id"], sens["id"], {"state": "typed"})
+    path = wg.CONVERSATIONS_DIR / f"{conv['id']}.json"
+    raw = json.loads(path.read_text())
+    a = raw["messages"][-1]["shell_actions"][0]
+    assert found and a["text"] is None and a["purged"] and a["outcome"]["state"] == "typed", a
+
+    old = wg._new_conv("user", "reto", "t", "user", "x")
+    young = wg._new_conv("user", "reto", "t", "user", "y")
+    for c, sid in ((old, "1" * 32), (young, "2" * 32)):
+        wg._conv_add_message(c["id"], "assistant", "ok", shell_actions_=[dict(sens, id=sid)])
+    p_old = wg.CONVERSATIONS_DIR / f"{old['id']}.json"
+    data = json.loads(p_old.read_text())
+    data["messages"][-1]["ts"] = "2000-01-01T00:00:00+00:00"
+    p_old.write_text(json.dumps(data))
+    waiting = wg._conv_sensitive_sweep()
+    assert "4711" not in p_old.read_text(), "expired: gone from the file at startup"
+    assert waiting >= 1, waiting
+    assert "4711" in (wg.CONVERSATIONS_DIR / f"{young['id']}.json").read_text(), \
+        "young: still there for the phone, deletion scheduled"
+    assert wg._CONV_SHELL_OUTCOME_RE.match(f"/conversations/{'a' * 32}/shell-actions/{'b' * 32}/outcome")
+    print("ok: a typed sensitive text goes at once; a restart leaves none behind")
 
 
 def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
@@ -483,7 +669,7 @@ def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
         out = wg_tiered.send_message("type", session_key="env-tiered-4",
                                      reply_attachments=True)
     assert out.get("escalated") is True, out
-    assert out.get("reply_shell_actions") == [senior_action], out
+    assert out.get("reply_shell_actions") == [dict(senior_action, auto=True)], out
     for _, kw in spawns:
         assert not Path(kw["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"]).exists()
 
@@ -596,6 +782,12 @@ def main():
         test_shell_actions_ride_on_the_stored_reply(wg)
         test_sensitive_text_masked_purged_and_never_logged(wg)
         test_redact_a_user_message(wg)
+        test_arrival_turn_cannot_type(wg)
+        test_sensitive_turn_ends_the_session(wg, tmp)
+        test_redaction_reaches_every_copy(wg, tmp)
+        test_resumed_turn_sees_message_id_and_outcomes(wg)
+        test_outcome_purges_and_startup_sweep(wg)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
 
         wg_short = _load_gateway(

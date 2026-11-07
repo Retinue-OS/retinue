@@ -1522,7 +1522,8 @@ class RetinueConversation extends HTMLElement {
     return JSON.stringify([
       (t.messages || []).map((m) => [m.role, m.text, m.ts, (m.attachments || []).length,
         m.model_name || '', m.cost_usd ?? '', m.agent || '',
-        kbd.actionsOf(m).map((a) => [a.id, (this._kbdOutcome.get(a.id) || {}).state || '', kbd.isPurged(a) ? 'x' : ''].join(':')).join(',')]),
+        kbd.actionsOf(m).map((a) => [a.id, (this._kbdOutcome.get(a.id) || {}).state || '',
+          (kbd.storedOutcome(a) || {}).state || '', kbd.isPurged(a) ? 'x' : ''].join(':')).join(',')]),
       !!t.pending,
       t.pending_since || '',
       t.pending_status || '',
@@ -1748,7 +1749,9 @@ class RetinueConversation extends HTMLElement {
     }
     const host = kbd.hostName();
     return actions.map((a) => {
-      const out = this._kbdOutcome.get(a.id) || (kbd.isDone(a.id) ? { state: 'sent' } : null);
+      // What happened here this visit, else what the gateway kept.
+      const out = this._kbdOutcome.get(a.id) || kbd.storedOutcome(a)
+        || (kbd.isDone(a.id) ? { state: 'sent' } : null);
       const [line, fixable] = kbd.describeOutcome(out, host);
       if (kbd.isPurged(a)) {
         // Nothing left to type: a sensitive text the gateway deleted.
@@ -1813,10 +1816,12 @@ class RetinueConversation extends HTMLElement {
     const a = d.id ? this._findShellAction(d.id) : null;
     if (!a) return;
     this._setKbdOutcome(d.id, d);
-    // A sensitive text, typed: the gateway deletes it now; the next read
-    // brings the purged action and the row says "Text deleted".
-    if (d.state === 'typed' && kbd.isSensitive(a)) {
-      kbd.markTyped(this._id, a).then((ok) => { if (ok) { this._threadSig = ''; this._load(); } });
+    // The outcome goes to the gateway, for Ara's later turns. A sensitive
+    // text reported typed is deleted there at once; the next read brings
+    // the purged action and the row says "Text deleted".
+    if (kbd.isFinal(d)) {
+      const purge = d.state === 'typed' && kbd.isSensitive(a);
+      kbd.reportOutcome(this._id, a, d).then((ok) => { if (ok && purge) { this._threadSig = ''; this._load(); } });
     }
   }
 

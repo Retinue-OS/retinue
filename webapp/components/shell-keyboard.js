@@ -11,22 +11,29 @@
 //
 // The policy, in one place:
 //   - Nothing runs outside the shell; the row only says the app is needed.
-//   - A typing action (type, key) runs by itself ONCE: only when its message
+//   - A typing action (type, key) runs by itself ONCE: only when the gateway
+//     marked it `auto` (shell_actions.runs_by_itself), only when its message
 //     arrived live in the thread open on this device (never on opening a
 //     thread, a reload or a history read), only while it is younger than
 //     AUTO_RUN_MAX_AGE_MS, and only if this device has not run it before.
 //     Ara writes one only on the user's explicit request, so the arrival is
 //     the moment the user is waiting for.
+//   - Whatever presses Enter always waits for a tap: `enter`, the Enter key,
+//     and a text with a line break (the app types it as Shift+Enter, which
+//     submits in a terminal or a one-line field). The gateway never marks
+//     those `auto`; the page checks again.
 //   - A sensitive text (a password, PIN or code Ara typed on request) is
-//     never shown: the row says "••••••", with no way to reveal it. Once
-//     typed the page tells the gateway (markTyped), which deletes the text
-//     from the stored reply; it is gone after two minutes anyway. A purged
-//     text cannot be retyped ("Text deleted").
+//     never shown: the row says "••••••", with no way to reveal it.
+//   - Every outcome goes back to the gateway (reportOutcome), which keeps it
+//     on the action for Ara's later turns; a sensitive text reported typed is
+//     deleted from the stored reply at once, and after two minutes anyway. A
+//     purged text cannot be retyped ("Text deleted").
 //   - A password-manager field never runs by itself: the user taps, the shell
 //     opens its own native field, the user's password manager fills it. That
 //     secret never reaches the page, the server or Ara.
-//   - Every run is remembered by id (localStorage on this origin), so nothing
-//     is typed twice by itself; Retype is always a deliberate tap.
+//   - Every run is remembered by id (localStorage on this origin), so this
+//     device types nothing twice by itself; Retype is always a deliberate
+//     tap. (Only the Ara app's one WebView can type at all.)
 //
 // Kept free of DOM work at import time, so the suite can run it under Node
 // (tests/test_webapp_shell_keyboard.py).
@@ -82,12 +89,21 @@ export function claim(id) {
 // `live`: the message arrived while the thread was open here (conversation.js
 // knows); `now`: ms epoch. Pure but for the done list.
 export function shouldAutoRun(action, message, { live = false, now = Date.now(), inShell = hasKeyboard() } = {}) {
-  if (!inShell || !live || !action) return false;
+  if (!inShell || !live || !action || action.auto !== true) return false;
   if (action.kind !== 'keyboard-type' && action.kind !== 'keyboard-key') return false;
-  if (isPurged(action)) return false;
+  if (pressesEnter(action) || isPurged(action)) return false;
   const ts = Date.parse(message && message.ts);
   if (!Number.isFinite(ts) || now - ts > AUTO_RUN_MAX_AGE_MS || now - ts < -AUTO_RUN_MAX_AGE_MS) return false;
   return !isDone(action.id);
+}
+
+// Whether the action presses Enter: `enter`, the Enter key, or a line break
+// in the text (typed as Shift+Enter). Such an action never runs by itself.
+export function pressesEnter(a) {
+  if (!a) return false;
+  if (a.kind === 'keyboard-key') return a.key === 'enter';
+  if (a.kind === 'keyboard-type') return !!a.enter || (typeof a.text === 'string' && /[\r\n]/.test(a.text));
+  return !!a.enter;
 }
 
 // Hand one action to the shell. Returns false when the shell could not take
@@ -95,7 +111,7 @@ export function shouldAutoRun(action, message, { live = false, now = Date.now(),
 export function run(action) {
   if (!action || isPurged(action)) return false;
   if (action.kind === 'keyboard-type') return keyboardType(action.text, { id: action.id, enter: !!action.enter });
-  if (action.kind === 'keyboard-key') return keyboardKey(action.key);
+  if (action.kind === 'keyboard-key') return keyboardKey(action.key, { id: action.id });
   if (action.kind === 'keyboard-secret') return keyboardSecret({ id: action.id, label: action.label, enter: !!action.enter });
   return false;
 }
@@ -110,16 +126,34 @@ export function isSensitive(a) {
   return !!a && a.kind === 'keyboard-type' && a.sensitive === true;
 }
 
-// Tell the gateway a sensitive action was typed, so it deletes the text from
-// the stored reply now rather than at the two-minute mark. Best effort: the
-// deadline holds regardless.
-export async function markTyped(threadId, action, fetchImpl = (typeof fetch === 'function' ? fetch : null)) {
-  if (!isSensitive(action) || !threadId || !fetchImpl) return false;
+// The outcome states the gateway keeps (shell_actions.OUTCOME_STATES).
+const FINAL_STATES = new Set(['typed', 'error', 'secret-typed', 'secret-cancelled']);
+
+export function isFinal(d) {
+  return !!d && FINAL_STATES.has(d.state);
+}
+
+// Tell the gateway what became of an action — a `keyboard` event `d` with a
+// final state. It keeps the outcome for Ara's later turns, and deletes a
+// sensitive text reported typed from the stored reply now rather than at the
+// two-minute mark. Best effort: the deadline holds regardless.
+export async function reportOutcome(threadId, action, d, fetchImpl = (typeof fetch === 'function' ? fetch : null)) {
+  if (!action || !threadId || !fetchImpl || !isFinal(d)) return false;
+  const body = { state: d.state };
+  if (d.state === 'error' && d.error) body.error = String(d.error);
   try {
-    const res = await fetchImpl(`/conversations/${encodeURIComponent(threadId)}/shell-actions/${encodeURIComponent(action.id)}/done`,
-      { method: 'POST' });
+    const res = await fetchImpl(`/conversations/${encodeURIComponent(threadId)}/shell-actions/${encodeURIComponent(action.id)}/outcome`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     return !!(res && res.ok);
   } catch (_e) { return false; }
+}
+
+// The outcome the gateway keeps on an action ({state, error?}), as a local
+// outcome for the row, or null.
+export function storedOutcome(a) {
+  const o = a && a.outcome;
+  return o && typeof o === 'object' && FINAL_STATES.has(o.state)
+    ? { state: o.state, error: typeof o.error === 'string' ? o.error : undefined } : null;
 }
 
 // ── Wording ────────────────────────────────────────────────────────────────

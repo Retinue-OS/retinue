@@ -42,8 +42,10 @@ KINDS = ("keyboard-type", "keyboard-key", "keyboard-secret")
 KEYS = ("enter", "tab", "backspace", "escape", "up", "down", "left", "right",
         "home", "end", "delete", "space")
 
-# The longest text one action types. Typing runs at a pace the receiving
-# device keeps up with (a few ms per key), so this is already ~half a minute.
+# The longest text one action types. The app paces its key reports so the
+# receiving device keeps up (12 ms after each of the two or three reports a
+# character takes), so this is already one and a half to two and a half
+# minutes of typing.
 MAX_TEXT = 4000
 # A sensitive text is kept no longer than this after its reply was written —
 # the same window in which the page runs a typing action by itself.
@@ -56,6 +58,13 @@ MAX_LABEL = 80
 MAX_ACTIONS = 10
 # A manifest bigger than this is not one.
 MAX_MANIFEST_BYTES = 64 * 1024
+
+# What the page may report about an action (POST
+# /conversations/<id>/shell-actions/<action id>/outcome): the states of the
+# app's `keyboard` events, and the error keys the app gives (RetinueShell/5).
+OUTCOME_STATES = ("typed", "error", "secret-typed", "secret-cancelled")
+OUTCOME_ERRORS = ("not-enabled", "not-connected", "too-long", "unsupported-char",
+                  "busy", "failed")
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # Control characters other than newline and tab cannot be typed on a
@@ -112,6 +121,34 @@ def normalize(raw: object) -> dict:
     return out
 
 
+def normalize_outcome(raw: object) -> "dict | None":
+    """A reported outcome in its stored form ({state} or {state, error}), or
+    None when it is not one. An unknown error key is stored as `failed`."""
+    if not isinstance(raw, dict) or raw.get("state") not in OUTCOME_STATES:
+        return None
+    out = {"state": raw["state"]}
+    if out["state"] == "error":
+        err = raw.get("error")
+        out["error"] = err if err in OUTCOME_ERRORS else "failed"
+    return out
+
+
+def runs_by_itself(action: dict) -> bool:
+    """Whether the page may run `action` without a tap when its reply arrives
+    live (webapp/components/shell-keyboard.js, shouldAutoRun, applies the
+    same rule). Never a password-manager field, nothing that presses Enter —
+    `enter`, the Enter key, or a line break in the text, which the app types
+    as Shift+Enter and which submits in a terminal or a one-line field."""
+    kind = action.get("kind") if isinstance(action, dict) else None
+    if kind == "keyboard-key":
+        return action.get("key") != "enter"
+    if kind == "keyboard-type":
+        text = action.get("text")
+        return (isinstance(text, str) and bool(text) and not action.get("enter")
+                and "\n" not in text)
+    return False
+
+
 def parse_manifest(raw: str) -> tuple[list[dict], list[str]]:
     """The valid actions of a manifest (one JSON object per line), and the
     reasons the others were dropped. Duplicate ids keep the first."""
@@ -159,7 +196,7 @@ def purge_sensitive(message: dict, now: float, *, ids: "set[str] | None" = None)
                 continue
         else:
             if expired is None:
-                expired = _age_seconds(message.get("ts"), now) >= SENSITIVE_TTL_SECONDS
+                expired = age_seconds(message.get("ts"), now) >= SENSITIVE_TTL_SECONDS
             if not expired:
                 continue
         a["text"] = PURGED
@@ -168,7 +205,7 @@ def purge_sensitive(message: dict, now: float, *, ids: "set[str] | None" = None)
     return changed
 
 
-def _age_seconds(ts: object, now: float) -> float:
+def age_seconds(ts: object, now: float) -> float:
     from datetime import datetime
     try:
         when = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp()
@@ -177,21 +214,35 @@ def _age_seconds(ts: object, now: float) -> float:
     return now - when
 
 
+def outcome_phrase(action: dict) -> str:
+    """What became of `action`, as the page reported it."""
+    o = action.get("outcome") if isinstance(action, dict) else None
+    state = o.get("state") if isinstance(o, dict) else None
+    if state in ("typed", "secret-typed"):
+        return "typed"
+    if state == "secret-cancelled":
+        return "cancelled by the user"
+    if state == "error":
+        return f"not typed: {o.get('error') or 'failed'}"
+    return "no outcome reported yet"
+
+
 def describe(action: dict) -> str:
-    """One line for a replayed transcript. Never the text of a sensitive
-    action (nor, having none, of a secret)."""
+    """One line for a transcript shown to Ara, with the outcome the page
+    reported. Never the text of a sensitive action (nor, having none, of a
+    secret)."""
     kind = action.get("kind")
+    outcome = outcome_phrase(action)
     if kind == "keyboard-type":
         enter = " + Enter" if action.get("enter") else ""
         if action.get("sensitive"):
-            state = ("typed" if action.get("outcome") == "typed"
-                     else "deleted" if action.get("purged") else "pending")
-            return f"- a sensitive text{enter} ({state}; not shown)"
+            deleted = "deleted, " if action.get("purged") else ""
+            return f"- a sensitive text{enter} ({outcome}; {deleted}not shown)"
         return (f"- type {len(action.get('text') or '')} characters{enter}"
-                f": {action.get('text', '')!r}")
+                f": {action.get('text', '')!r} ({outcome})")
     if kind == "keyboard-key":
-        return f"- press {action.get('key')}"
+        return f"- press {action.get('key')} ({outcome})"
     if kind == "keyboard-secret":
         enter = " + Enter" if action.get("enter") else ""
-        return f"- password-manager field for {action.get('label')!r}{enter}"
+        return f"- password-manager field for {action.get('label')!r}{enter} ({outcome})"
     return ""

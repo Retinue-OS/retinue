@@ -16,27 +16,35 @@ writing; when the reply reaches the user's phone, the app types it there.
 Rules (CLAUDE.md, "Dashboard"):
 - Only on the user's explicit request ("type the text above", "type: …").
   When "the text above" could mean more than one passage, ask first.
-- No Enter unless the user asked for it (`--enter`, `--key enter`).
+- No Enter unless the user asked for it (`--enter`, `--key enter`). A line
+  break in the text counts as one: the app types it as Shift+Enter, a new
+  line in a chat app but a submit in a terminal or a one-line field.
 - A password, PIN or one-time code — one the user dictated, or one you
   fetched (an SMS code) — goes with `--sensitive`: the dashboard shows it
-  masked, transcripts replayed to later turns never carry it, and the gateway
-  deletes it from the stored reply once typed, at the latest after two
-  minutes. Never repeat it in your reply text. If the user dictated it, offer
-  to redact that message afterwards (conversation-push.py --redact-message).
+  masked, transcripts shown to later turns never carry it, the gateway
+  deletes it from the stored reply once typed (at the latest after two
+  minutes), and this thread's Claude session is not resumed after this turn,
+  so the next one starts from the masked thread. Never repeat it in your
+  reply text. If the user dictated it, offer to redact that message
+  afterwards (conversation-push.py --redact-message), which also takes it out
+  of the session log and ends the session again.
 - `--secret "<label>"` is the convenient path for a password the user keeps
   in a password manager: the app opens a native field on the phone that
-  Android autofill fills, types it and forgets it. You learn only whether it
-  was typed.
+  Android autofill fills, types it and forgets it.
 
-The app runs typing actions by itself when the reply arrives live in the open
-thread (once, and only within a couple of minutes); a password-manager field
-always waits for the user's tap. Your reply text should say what will be typed.
+The app runs a typing action by itself when the reply arrives live in the open
+thread (once, and only within a couple of minutes) — unless it presses Enter
+(`--enter`, `--key enter`, a line break in the text): that, and a
+password-manager field, always waits for the user's tap. Your reply text
+should say what will be typed. Later turns see what became of each action
+(typed, not typed and why, cancelled), as the page reports it.
 
 Like `conversation-push.py --reply-attach`, this makes no request: it appends
 to the turn's manifest (RETINUE_REPLY_SHELL_ACTIONS_FILE, set by the gateway
-for dashboard-thread turns only), and the gateway stores the actions on the
-reply when the turn ends — a discarded reply (an escalated junior turn) takes
-its actions with it. Outside such a turn the call fails.
+for dashboard-thread turns the user started), and the gateway stores the
+actions on the reply when the turn ends — a discarded reply (an escalated
+junior turn) takes its actions with it. Outside such a turn — and in a turn a
+chat arrival started, which reads someone else's words — the call fails.
 """
 from __future__ import annotations
 
@@ -83,8 +91,8 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest = os.environ.get(shell_actions.MANIFEST_VAR, "").strip()
     if not manifest:
-        print(f"shell-type: {shell_actions.MANIFEST_VAR} is not set — this is not a "
-              "dashboard thread turn, so there is no reply to carry the action",
+        print(f"shell-type: {shell_actions.MANIFEST_VAR} is not set — only a dashboard "
+              "thread turn the user started has a reply that can carry the action",
               file=sys.stderr)
         return 2
 
@@ -115,7 +123,9 @@ def main(argv: list[str] | None = None) -> int:
         what = (f"a secret field for {action['label']!r}"
                 + (" + Enter" if action["enter"] else ""))
     print(f"shell-type: {what} will ride on your reply; the Ara app types it on "
-          "the paired device")
+          "the paired device"
+          + ("" if shell_actions.runs_by_itself(action)
+             else " once the user taps it"))
     if action.get("sensitive"):
         print("shell-type: do not repeat it in your reply; offer to redact the user's "
               "message if they dictated it")

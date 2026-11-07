@@ -49,7 +49,7 @@ function installShell(status = { available: true, enabled: true, connected: true
     platform: 'android',
     keyboardStatus: () => JSON.stringify(status),
     keyboardType: (text, opts) => { calls.push(['type', text, JSON.parse(opts)]); },
-    keyboardKey: (name) => { calls.push(['key', name]); },
+    keyboardKey: (name, opts) => { calls.push(['key', name, JSON.parse(opts)]); },
     keyboardSecret: (opts) => { calls.push(['secret', JSON.parse(opts)]); },
     keyboardOpen: () => { calls.push(['open']); },
   };
@@ -59,8 +59,9 @@ function installShell(status = { available: true, enabled: true, connected: true
 const now = Date.parse('2026-11-06T15:00:00Z');
 const fresh = { ts: '2026-11-06T14:59:30Z' };
 const stale = { ts: '2026-11-06T14:50:00Z' };
-const typeA = { kind: 'keyboard-type', id: 'a'.repeat(32), text: 'Hallo Quest', enter: false };
+const typeA = { kind: 'keyboard-type', id: 'a'.repeat(32), text: 'Hallo Quest', enter: false, auto: true };
 const keyB = { kind: 'keyboard-key', id: 'b'.repeat(32), key: 'enter' };
+const keyTab = { kind: 'keyboard-key', id: '9'.repeat(32), key: 'tab', auto: true };
 const secretC = { kind: 'keyboard-secret', id: 'c'.repeat(32), label: 'Meta account', enter: true };
 
 await ok('outside the shell: no keyboard, nothing runs', () => {
@@ -84,7 +85,7 @@ await ok('a typing action runs by itself only live, young and once', () => {
   assert.equal(kbd.shouldAutoRun(typeA, stale, { live: true, now }), false, 'too old');
   assert.equal(kbd.shouldAutoRun(typeA, { ts: 'garbage' }, { live: true, now }), false);
   assert.equal(kbd.shouldAutoRun(typeA, fresh, { live: true, now }), true);
-  assert.equal(kbd.shouldAutoRun(keyB, fresh, { live: true, now }), true);
+  assert.equal(kbd.shouldAutoRun(keyTab, fresh, { live: true, now }), true);
   assert.equal(kbd.claim(typeA.id), true);
   assert.equal(kbd.claim(typeA.id), false, 'a second tab must lose');
   assert.equal(kbd.shouldAutoRun(typeA, fresh, { live: true, now }), false, 'done before');
@@ -94,6 +95,22 @@ await ok('a secret never runs by itself', () => {
   store.clear();
   installShell();
   assert.equal(kbd.shouldAutoRun(secretC, fresh, { live: true, now }), false);
+  assert.equal(kbd.shouldAutoRun({ ...secretC, auto: true }, fresh, { live: true, now }), false);
+});
+
+await ok('only what the gateway marked auto runs by itself, and never what presses Enter', () => {
+  store.clear();
+  installShell();
+  const { auto: _a, ...unmarked } = typeA;
+  assert.equal(kbd.shouldAutoRun(unmarked, fresh, { live: true, now }), false, 'no auto mark');
+  assert.equal(kbd.shouldAutoRun({ ...typeA, auto: false }, fresh, { live: true, now }), false);
+  // Even marked, the page checks again.
+  assert.equal(kbd.shouldAutoRun({ ...typeA, enter: true }, fresh, { live: true, now }), false, 'Enter');
+  assert.equal(kbd.shouldAutoRun({ ...typeA, text: 'ls\nrm -rf ~' }, fresh, { live: true, now }), false, 'line break');
+  assert.equal(kbd.shouldAutoRun({ ...keyB, auto: true }, fresh, { live: true, now }), false, 'the Enter key');
+  assert.equal(kbd.pressesEnter({ ...typeA, text: 'a\rb' }), true);
+  assert.equal(kbd.pressesEnter(typeA), false);
+  assert.equal(kbd.pressesEnter(keyTab), false);
 });
 
 await ok('run() calls the shell with the contract arguments; a secret carries no text', () => {
@@ -103,7 +120,7 @@ await ok('run() calls the shell with the contract arguments; a secret carries no
   assert.equal(kbd.run(secretC), true);
   assert.deepEqual(calls, [
     ['type', 'Hallo Quest', { id: typeA.id, enter: false }],
-    ['key', 'enter'],
+    ['key', 'enter', { id: keyB.id }],
     ['secret', { id: secretC.id, label: 'Meta account', enter: true }],
   ]);
   assert.equal(shell.keyboardOpen(), true);
@@ -161,13 +178,27 @@ await ok('a sensitive text is masked, reported typed, and gone once purged', asy
   assert.equal(kbd.shouldAutoRun(purged, fresh, { live: true, now }), false);
   assert.equal(kbd.describeAction({ ...typeA, text: null, purged: true }), 'Text deleted');
   assert.deepEqual(kbd.describeOutcome({ state: 'deleted' }), ['Text deleted', false]);
-  // markTyped posts to the done endpoint for sensitive actions only.
+});
+
+await ok('every final outcome is reported to the gateway; the stored one comes back', async () => {
   const posted = [];
-  const fakeFetch = async (url, opts) => { posted.push([url, opts.method]); return { ok: true }; };
-  assert.equal(await kbd.markTyped('f'.repeat(32), sens, fakeFetch), true);
-  assert.deepEqual(posted, [[`/conversations/${'f'.repeat(32)}/shell-actions/${sens.id}/done`, 'POST']]);
-  assert.equal(await kbd.markTyped('f'.repeat(32), typeA, fakeFetch), false);
-  assert.equal(posted.length, 1);
+  const fakeFetch = async (url, opts) => { posted.push([url, opts.method, JSON.parse(opts.body)]); return { ok: true }; };
+  const tid = 'f'.repeat(32);
+  assert.equal(await kbd.reportOutcome(tid, typeA, { state: 'typed', count: 11 }, fakeFetch), true);
+  assert.equal(await kbd.reportOutcome(tid, keyB, { state: 'error', error: 'not-connected' }, fakeFetch), true);
+  assert.equal(await kbd.reportOutcome(tid, secretC, { state: 'secret-cancelled' }, fakeFetch), true);
+  assert.equal(await kbd.reportOutcome(tid, typeA, { state: 'status' }, fakeFetch), false, 'not final');
+  assert.equal(await kbd.reportOutcome(tid, typeA, { state: 'pending' }, fakeFetch), false);
+  assert.deepEqual(posted, [
+    [`/conversations/${tid}/shell-actions/${typeA.id}/outcome`, 'POST', { state: 'typed' }],
+    [`/conversations/${tid}/shell-actions/${keyB.id}/outcome`, 'POST', { state: 'error', error: 'not-connected' }],
+    [`/conversations/${tid}/shell-actions/${secretC.id}/outcome`, 'POST', { state: 'secret-cancelled' }],
+  ]);
+  const failing = async () => { throw new Error('offline'); };
+  assert.equal(await kbd.reportOutcome(tid, typeA, { state: 'typed' }, failing), false);
+  assert.deepEqual(kbd.storedOutcome({ ...typeA, outcome: { state: 'typed', at: 'x' } }), { state: 'typed', error: undefined });
+  assert.equal(kbd.storedOutcome({ ...typeA, outcome: { state: 'bogus' } }), null);
+  assert.equal(kbd.storedOutcome(typeA), null);
 });
 
 console.log(`${passed} shell-keyboard checks passed`);

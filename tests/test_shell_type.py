@@ -110,7 +110,7 @@ def test_purge_and_describe():
          "sensitive": True}
     plain = {"kind": "keyboard-type", "id": "b" * 32, "text": "hello", "enter": False}
     msg = {"ts": "2026-11-06T15:00:00+00:00", "shell_actions": [dict(a), dict(plain)]}
-    t0 = sa._age_seconds(msg["ts"], 0) * -1  # epoch of ts
+    t0 = sa.age_seconds(msg["ts"], 0) * -1  # epoch of ts
     assert not sa.purge_sensitive(msg, t0 + 60), "young: kept"
     assert msg["shell_actions"][0]["text"] == "hunter2"
     assert sa.purge_sensitive(msg, t0 + sa.SENSITIVE_TTL_SECONDS)
@@ -124,9 +124,38 @@ def test_purge_and_describe():
         "an unreadable time counts as expired"
     line = sa.describe(a)
     assert "hunter2" not in line and "sensitive" in line, line
+    assert "no outcome reported yet" in line, line
     assert "'hello'" in sa.describe(plain)
+    typed = dict(gone, outcome={"state": "typed", "at": "x"})
+    assert "(typed; deleted, not shown)" in sa.describe(typed), sa.describe(typed)
+    failed = dict(plain, outcome={"state": "error", "error": "not-connected"})
+    assert sa.describe(failed).endswith("(not typed: not-connected)"), sa.describe(failed)
+    sec = {"kind": "keyboard-secret", "id": "c" * 32, "label": "Wi-Fi", "enter": False,
+           "outcome": {"state": "secret-cancelled"}}
+    assert "cancelled by the user" in sa.describe(sec), sa.describe(sec)
     print("ok: sensitive text is purged after the TTL or by id, never plain text; "
-          "the transcript line never carries it")
+          "the transcript line never carries it, and says what became of each action")
+
+
+def test_outcome_and_auto_run():
+    assert sa.normalize_outcome({"state": "typed", "count": 5}) == {"state": "typed"}
+    assert sa.normalize_outcome({"state": "error", "error": "busy"}) == \
+        {"state": "error", "error": "busy"}
+    assert sa.normalize_outcome({"state": "error", "error": "<script>"}) == \
+        {"state": "error", "error": "failed"}, "an unknown error key is not stored"
+    for bad in (None, [], {}, {"state": "pending"}, {"state": "status"}):
+        assert sa.normalize_outcome(bad) is None, bad
+    t = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False}
+    assert sa.runs_by_itself(t)
+    assert not sa.runs_by_itself(dict(t, enter=True)), "Enter waits for a tap"
+    assert not sa.runs_by_itself(dict(t, text="ls\nrm -rf ~")), \
+        "a line break is Shift+Enter: waits for a tap"
+    assert sa.runs_by_itself({"kind": "keyboard-key", "id": "b" * 32, "key": "tab"})
+    assert not sa.runs_by_itself({"kind": "keyboard-key", "id": "b" * 32, "key": "enter"})
+    assert not sa.runs_by_itself({"kind": "keyboard-secret", "id": "c" * 32,
+                                  "label": "x", "enter": False})
+    print("ok: outcomes are validated; nothing that presses Enter, and no secret, "
+          "runs by itself")
 
 
 def test_parse_manifest():
@@ -164,6 +193,7 @@ def main():
         test_parse_manifest()
         test_sensitive(tmp)
         test_purge_and_describe()
+        test_outcome_and_auto_run()
     print("all shell-type tests passed")
 
 
