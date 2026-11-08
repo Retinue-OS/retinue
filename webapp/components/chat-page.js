@@ -97,6 +97,15 @@ const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
 const MAX_COMP_FRACTION = 0.6;
 const KEY_STEP_PX = 32;
+// The grip between the thread and the composer (_gripHtml): its height, the
+// thread it always leaves above, how far past the composer's own height a
+// drag must go before it counts (closer in, the composer is back at its
+// own), and what tells a tap from a drag and two taps from one.
+const GRIP_PX = 16;
+const MIN_THREAD_PX = 56;
+const GRIP_SNAP_PX = 12;
+const GRIP_SLOP_PX = 4;
+const GRIP_DOUBLE_TAP_MS = 350;
 const TEXTAREA_MAX_HEIGHT_RATIO = 0.35;
 // The expand control sits in the field's top-right corner, the clip in its
 // bottom-right: below this height the two would overlap.
@@ -397,7 +406,9 @@ class RetinueChatPage extends HTMLElement {
         this.toggleAttribute('typing', up);
         if (up) this._toggleMenu(false);
       }
-      if (this._grow) this._grow();
+      // Each keyboard state keeps its own grip position; applying it re-caps
+      // the field as well (_grow).
+      this._applyComposerSize();
       if (up) this._scrollFocusedPane();
     };
     const onIn = () => { if (this.hasAttribute('typing')) this._scrollFocusedPane(); };
@@ -961,6 +972,152 @@ class RetinueChatPage extends HTMLElement {
     return Math.min(Math.max(px, MIN_COMP_PX), max);
   }
 
+  // ── The grip between the thread and the composer ──────────────────────────
+  // With the phone keyboard up the frame is about half the screen, and the
+  // composer gives the quick-pattern chips up for the field (typing mode,
+  // .extras). The grip hands the choice to the user: dragged up, the composer
+  // takes the height it is given — the chips and reports back in view, the
+  // field filling what is left — and the thread above keeps the rest, never
+  // less than MIN_THREAD_PX. Dragged back down to the composer's own height,
+  // or tapped twice, it is the composer it was.
+  //
+  // A keyboard-up frame and a keyboard-down one are different screens, so
+  // each keeps its own position (`typing` / `rest`), per device beside the
+  // splitter's. The height is a custom property and a host attribute, both
+  // outside what a render replaces.
+  _composerSlot() {
+    return this.hasAttribute('typing') ? 'typing' : 'rest';
+  }
+
+  _applyComposerSize() {
+    const all = this._sizes.composer;
+    const h = all && typeof all === 'object' ? all[this._composerSlot()] : null;
+    const on = typeof h === 'number' && h > 0;
+    if (on) this.style.setProperty('--composer-h', `${Math.round(h)}px`);
+    else this.style.removeProperty('--composer-h');
+    if (on !== this.hasAttribute('composer-sized')) this.toggleAttribute('composer-sized', on);
+    if (this._grow) this._grow();
+  }
+
+  // `px` null gives the slot back to the composer's own height. Not saved
+  // here: a drag saves once, when it ends.
+  _setComposerHeight(slot, px) {
+    const all = (this._sizes.composer && typeof this._sizes.composer === 'object')
+      ? this._sizes.composer : {};
+    if (px === null) delete all[slot];
+    else all[slot] = px;
+    if (Object.keys(all).length) this._sizes.composer = all;
+    else delete this._sizes.composer;
+    this._applyComposerSize();
+  }
+
+  // The composer at its own height — what the grip measures a drag from. A
+  // sized composer is measured with the size lifted for the reading (both
+  // layouts are forced in one task, so nothing paints between).
+  _composerOwnHeight(composer) {
+    if (!this.hasAttribute('composer-sized')) return composer.getBoundingClientRect().height;
+    this.removeAttribute('composer-sized');
+    const h = composer.getBoundingClientRect().height;
+    this.setAttribute('composer-sized', '');
+    return h;
+  }
+
+  // What a drag or an arrow key measures against: the composer's own height,
+  // and the most that still leaves the thread its minimum.
+  _composerBounds(composer) {
+    const pane = composer.parentElement;
+    return {
+      own: this._composerOwnHeight(composer),
+      max: pane ? pane.clientHeight - GRIP_PX - MIN_THREAD_PX : Infinity,
+    };
+  }
+
+  // The height asked for, as what the slot keeps: the composer's own (null)
+  // unless it goes clearly past it, and never past the maximum.
+  _composerTarget(px, { own, max }) {
+    if (px <= own + GRIP_SNAP_PX) return null;
+    return Math.round(Math.max(0, Math.min(px, max)));
+  }
+
+  _wireGrip() {
+    const root = this.shadowRoot;
+    const grip = root.querySelector('[data-grip]');
+    if (!grip) return;
+    const composer = () => root.querySelector('.pane-chat .composer');
+    // Pressed without taking the focus: the field keeps it, and the phone its
+    // keyboard — which is what the grip is for. Not by cancelling the
+    // pointerdown, which leaves focus to move all the same.
+    grip.addEventListener('mousedown', (e) => e.preventDefault());
+    // Whether the last press dragged, and when the last tap was.
+    let moved = false;
+    let lastTap = 0;
+    grip.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      const box = composer();
+      if (!box) return;
+      const slot = this._composerSlot();
+      const startY = e.clientY;
+      const startH = box.getBoundingClientRect().height;
+      const bounds = this._composerBounds(box);
+      // Reading the newest message when the drag starts, the thread keeps it
+      // in view as it shrinks or grows.
+      const stick = this._atBottom();
+      moved = false;
+      try { grip.setPointerCapture(e.pointerId); } catch (_e) { /* already up */ }
+      grip.classList.add('dragging');
+      const move = (ev) => {
+        const dy = ev.clientY - startY;
+        if (!moved && Math.abs(dy) < GRIP_SLOP_PX) return;
+        moved = true;
+        this._setComposerHeight(slot, this._composerTarget(startH - dy, bounds));
+        if (stick) this._scrollThread('[data-chat-thread]');
+      };
+      const up = (ev) => {
+        grip.classList.remove('dragging');
+        grip.removeEventListener('pointermove', move);
+        grip.removeEventListener('pointerup', up);
+        grip.removeEventListener('pointercancel', up);
+        if (moved) this._saveSizes();
+      };
+      grip.addEventListener('pointermove', move);
+      grip.addEventListener('pointerup', up);
+      grip.addEventListener('pointercancel', up);
+    });
+    // Two taps in a row reset — double-click and double-tap alike, since
+    // dblclick is not dependable on a touch screen. Counted on click, not on
+    // pointerup: a touch screen sends the tap's mousedown after the pointerup,
+    // hit-tested afresh, and a composer already shrunk there would have it
+    // land on the thread, which takes the focus from the field.
+    grip.addEventListener('click', () => {
+      if (moved) { lastTap = 0; return; }
+      const now = Date.now();
+      if (now - lastTap > GRIP_DOUBLE_TAP_MS) { lastTap = now; return; }
+      lastTap = 0;
+      const stick = this._atBottom();
+      this._setComposerHeight(this._composerSlot(), null);
+      this._saveSizes();
+      if (stick) this._scrollThread('[data-chat-thread]');
+    });
+    // From the keyboard: arrows step it, Enter resets — the splitter's set,
+    // turned upright.
+    grip.addEventListener('keydown', (e) => {
+      let delta = 0;
+      if (e.key === 'ArrowUp') delta = KEY_STEP_PX;
+      else if (e.key === 'ArrowDown') delta = -KEY_STEP_PX;
+      else if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const box = composer();
+      if (!box) return;
+      const stick = this._atBottom();
+      const slot = this._composerSlot();
+      this._setComposerHeight(slot, delta
+        ? this._composerTarget(box.getBoundingClientRect().height + delta, this._composerBounds(box))
+        : null);
+      this._saveSizes();
+      if (stick) this._scrollThread('[data-chat-thread]');
+    });
+  }
+
   // ── Rendering ──────────────────────────────────────────────────────────────
   render() {
     let body;
@@ -1150,6 +1307,7 @@ class RetinueChatPage extends HTMLElement {
     return `<div class="panes" data-panes>` +
       `<section class="pane pane-chat" aria-label="Chat">` +
       `<div class="thread" data-chat-thread>${this._chatThreadHtml()}</div>` +
+      this._gripHtml() +
       this._chatComposerHtml() +
       `</section>` +
       `<div class="pane-splitter" data-splitter role="separator" aria-orientation="vertical" ` +
@@ -1453,6 +1611,14 @@ class RetinueChatPage extends HTMLElement {
     this._lbPrevFocus = null;
   }
 
+  // Outside the composer block, so a composer refresh leaves it (and a drag
+  // on it) alone. See _wireGrip.
+  _gripHtml() {
+    return `<div class="grip" data-grip role="separator" aria-orientation="horizontal" ` +
+      `aria-label="Resize the composer" tabindex="0" ` +
+      `title="Drag to resize &middot; double-click to reset"></div>`;
+  }
+
   _chatComposerHtml() {
     const draftTag = this._draftByAra
       ? `<div class="draft-tag" data-draft-tag ` +
@@ -1698,6 +1864,7 @@ class RetinueChatPage extends HTMLElement {
     // The chat composer is the only one this page wires: the companion's
     // belongs to <retinue-conversation>, inside its own shadow root.
     this._wireChatComposer();
+    this._wireGrip();
 
     // Image lightbox: delegated on the thread container, so bubbles appended
     // by polls and sends are covered without per-message wiring.
@@ -1885,13 +2052,27 @@ class RetinueChatPage extends HTMLElement {
     const fit = () => field.classList.toggle('can-expand',
       input.scrollHeight > input.clientHeight + 1 && input.clientHeight >= EXPAND_MIN_PX);
     const grow = () => {
+      const cap = () => Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO);
       if (this.hasAttribute('draft-expanded')) {
         // Expanded, the field fills the pane by CSS; an inline height would pin it.
         input.style.height = '';
+        input.style.minHeight = '';
+      } else if (this.hasAttribute('composer-sized')) {
+        // Sized by the grip, the field fills what the composer has left by
+        // CSS, and the draft's own height is its floor: the composer is never
+        // shorter than its contents, so a long draft keeps its lines rather
+        // than giving them to the chips — under the same caps as unsized, so
+        // sizing never grows a draft's box by itself. Measured at no height,
+        // where scrollHeight is the text's own.
+        input.style.minHeight = '';
+        input.style.height = '0px';
+        const want = Math.min(input.scrollHeight, cap());
+        input.style.height = '';
+        input.style.minHeight = `min(${want}px, 30cqh)`;
       } else {
+        input.style.minHeight = '';
         input.style.height = 'auto';
-        input.style.height =
-          `${Math.min(input.scrollHeight, Math.round(visibleHeight() * TEXTAREA_MAX_HEIGHT_RATIO))}px`;
+        input.style.height = `${Math.min(input.scrollHeight, cap())}px`;
       }
       fit();
     };
@@ -2639,8 +2820,10 @@ const CSS = `
   :host([typing]) retinue-conversation::part(bar) { display: none; }
   :host([typing]) .comp-help { display: none; }
   /* Ara's offers and reports too: in a frame the keyboard has halved, staged
-     images and the draft's tag would otherwise leave the thread nothing. */
+     images and the draft's tag would otherwise leave the thread nothing —
+     unless the user has given the composer that room with the grip. */
   :host([typing]) .extras { display: none; }
+  :host([typing][composer-sized]:not([draft-expanded])) .pane-chat .extras { display: block; }
 
   /* ── Panes: swipe strip on the phone, columns behind a splitter when wide ── */
   .panes { flex: 1; min-height: 0; display: flex;
@@ -2775,7 +2958,8 @@ const CSS = `
      reports (.extras) at a fifth, scrolling inside, the field at 30% — and
      the thread keeps the rest: half the pane, less the few fixed lines (the
      draft's tag, the recipient, staged images). The thread gives way before
-     the send row does; with the keyboard up the offers step aside too. A
+     the send row does; with the keyboard up the offers step aside too,
+     unless the grip has given the composer the room (_wireGrip). A
      draft longer than its box is read at full height through the field's
      expand control (_expandHtml): the field takes the pane, and the thread
      and the offers step aside until it is given back. */
@@ -2793,8 +2977,37 @@ const CSS = `
   :host([draft-expanded]) .pane-chat .mic { grid-area: 2 / 1; }
   :host([draft-expanded]) .pane-chat .send { grid-area: 2 / 3; }
   :host([draft-expanded]) .pane-chat .row textarea { max-height: none; }
-  .composer { flex: none; margin-top: 4px; padding: 10px 2px 2px;
-              border-top: 1px solid var(--line, rgba(231, 235, 242, .08)); }
+  :host([draft-expanded]) .pane-chat .grip { display: none; }
+  :host([draft-expanded]) .pane-chat .composer { padding-top: 10px; }
+  /* The grip (_gripHtml, _wireGrip): the line between the thread and the
+     composer, with a handle on it. Its hit area reaches up over the thread's
+     bottom padding, so a thumb finds it without it costing a row. */
+  .grip { flex: none; position: relative; z-index: 1; height: ${GRIP_PX}px; cursor: row-resize;
+          touch-action: none; user-select: none; -webkit-user-select: none;
+          -webkit-tap-highlight-color: transparent;
+          background: linear-gradient(var(--line, rgba(231, 235, 242, .08)),
+                                      var(--line, rgba(231, 235, 242, .08)))
+                      center / 100% 1px no-repeat; }
+  .grip::before { content: ""; position: absolute; left: 50%; top: 50%; width: 36px; height: 4px;
+                  margin: -2px 0 0 -18px; border-radius: 2px;
+                  background: var(--muted, #8b93a3); opacity: .55; }
+  .grip::after { content: ""; position: absolute; left: 0; right: 0; top: -10px; bottom: 0; }
+  .grip:hover::before, .grip:focus-visible::before, .grip.dragging::before {
+    background: var(--accent, #6ea8fe); opacity: 1; }
+  .grip:focus-visible { outline: none; }
+  .composer { flex: none; padding: 2px 2px 2px; }
+  /* Sized by the grip: the composer is as tall as it was dragged — never
+     shorter than its contents (the automatic minimum of a flex item), never
+     so tall that the thread has less than its minimum — and the field takes
+     what its parts leave, with the mic and send at its bottom corners. */
+  :host([composer-sized]:not([draft-expanded])) .pane-chat .composer {
+    flex: 0 0 min(var(--composer-h, 0px), calc(100cqh - ${GRIP_PX + MIN_THREAD_PX}px));
+    display: flex; flex-direction: column; justify-content: flex-end; }
+  :host([composer-sized]:not([draft-expanded])) .pane-chat .composer > * { flex: none; }
+  :host([composer-sized]:not([draft-expanded])) .pane-chat .draft-tag { align-self: flex-start; }
+  :host([composer-sized]:not([draft-expanded])) .pane-chat form.row { flex: 1 0 auto; }
+  :host([composer-sized]:not([draft-expanded])) .pane-chat .field { align-self: stretch; }
+  :host([composer-sized]:not([draft-expanded])) .pane-chat .row textarea { max-height: none; }
   /* The spacing below the last visible part is the region's own padding, and
      the fade lies over exactly that: blank while everything fits, it softens
      the cut edge into a hint that there is more below when it does not. */
