@@ -352,7 +352,7 @@ a shared one, or one with a single remit, a mood to follow makes no sense.
 *Focus modes* card under Settings › This instance, `POST /attention/modes
 {enabled}`, or `scripts/attention-week.py off` / `on`. Off, one mode is in
 force at every moment (`attention.FOCUS_OFF_MODE`: every sphere admitted,
-anything time-sensitive rings, the rest waits for a digest); the schedule
+anything time-sensitive rings, active items wait for a digest, passive ones are listed); the schedule
 changes nothing, a hand-set mode is refused (409) and a stored one released,
 the digests go out at the document's `digest_times` every day, and the
 home's header shows no mode and opens no menu, the sheet no Focus rules.

@@ -38,7 +38,8 @@ const TEMPLATE = `
       hand from the home's header: what may ring depends on the mode in force.
       Useful on a personal instance; on a shared one, or one with a single
       remit, turn them off — then anything time-sensitive rings at any time,
-      the rest waits for the digests. The week and the modes are kept for
+      active items wait for the next digest and passive ones are only
+      listed. The week and the modes are kept for
       when they are turned back on.</p>
     <label class="num-setting">Follow focus modes on this instance
       <input type="checkbox" data-focus-enabled>

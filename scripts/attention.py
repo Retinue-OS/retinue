@@ -1244,10 +1244,13 @@ def apply_rules(focus: dict, patch: dict, spheres: list[str], today: date | None
     if patch.get("enabled") is not None:
         if not isinstance(patch["enabled"], bool):
             raise ValueError("enabled is true or false")
-        if patch["enabled"] != focus_enabled(focus):
-            focus["enabled"] = patch["enabled"]
-            if not patch["enabled"]:
-                focus.update(manual=None, subject=None, manual_until=None, breaks=[])
+        was = focus_enabled(focus)
+        focus["enabled"] = patch["enabled"]
+        if not patch["enabled"] or not was:
+            # Off, there is no hand-set mode — and one a hand-edited file
+            # left behind must not come back when focus is turned on.
+            focus.update(manual=None, subject=None, manual_until=None, breaks=[])
+        if patch["enabled"] != was:
             changes.append("focus modes on" if patch["enabled"] else "focus modes off")
     mode_id = patch.get("mode")
     if mode_id is not None:

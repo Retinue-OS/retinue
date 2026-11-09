@@ -1192,7 +1192,15 @@ def test_focus_can_be_turned_off(base, wg):
     _clock(wg, night)
     _mode(base, None)
     assert _sections(base)["mode"]["id"] == "rest"
+    # Held by Rest, then focus turned off: the breakpoint's digest carries
+    # it, and it does not ring a second time on its own.
+    waited = _open(base, "Overnight", "Needs an answer by 07:00.",
+                   {"importance": 4, "sphere": "customers", "due": (night + timedelta(hours=8)).isoformat(), "lead": "12h"})
+    assert waited["attention"]["delivery"] == "hold", waited["attention"]
+    PUSHES.clear()
     status, out = _http(base, "POST", "/attention/modes", {"enabled": False})
+    assert len(PUSHES) == 1, PUSHES                                   # the digest alone
+    assert out["pushed"] == [], out
     assert status == 200 and out["changed"] == ["focus modes off"] and out["focus"]["enabled"] is False, out
     assert out["mode"]["enabled"] is False and out["mode"]["id"] == "focus-off", out["mode"]
     body = _sections(base)

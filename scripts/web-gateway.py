@@ -11316,11 +11316,16 @@ class Handler(BaseHTTPRequestHandler):
             items, degraded = _attention_items(profile, now)
         self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
 
-    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str) -> list[str]:
-        """After a rule change, push what it releases; returns their ids."""
+    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str,
+                           skip: set | None = None) -> list[str]:
+        """After a rule change, push what it releases; returns their ids.
+        ``skip``: items a digest has just carried, which must not ring again
+        one by one."""
         items, _degraded = _attention_items(profile, now)
         pushed = []
         for item in items:
+            if skip and item["id"] in skip:
+                continue
             effect = attention_policy.reevaluate(item, focus, profile, now, why)
             if effect is None:
                 continue
@@ -11374,8 +11379,11 @@ class Handler(BaseHTTPRequestHandler):
                 # Focus turned on or off is a change of mode like any other:
                 # a breakpoint, what was held arriving as one digest.
                 items, _degraded = _attention_items(profile, now)
-                _attention_breakpoint(items, focus, now, "focus turned " + ("on" if payload["enabled"] else "off"))
-            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule")
+                digest = _attention_breakpoint(items, focus, now, "focus turned " + ("on" if payload["enabled"] else "off"))
+                carried = {i["id"] for i in (digest or {}).get("items") or []}
+            else:
+                carried = set()
+            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule", skip=carried)
         self._send_json(200, {"changed": changes, "mode": _attention_mode_summary(focus, now),
                               "focus": focus, "pushed": pushed})
 

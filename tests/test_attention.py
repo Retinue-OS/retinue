@@ -553,9 +553,11 @@ def test_focus_off():
         pass
     assert A.mode_at(dict(focus, manual="rest"), at(9))["id"] == "focus-off"
     assert A.breakpoint([dict(calm, id="c")], focus, at(12))["digest"]       # never Rest: digests go out
+    # A hand-set mode a hand-edited file left behind does not come back on.
+    focus["manual"] = "rest"
     # Back on: the week as it was.
     assert A.apply_rules(focus, {"enabled": True}, ["customers"]) == ["focus modes on"]
-    assert A.mode_at(focus, at(9))["id"] == "focused"
+    assert A.mode_at(focus, at(9))["id"] == "focused" and focus["manual"] is None
     try:
         A.apply_rules(focus, {"enabled": "no"}, ["customers"])
         raise AssertionError("enabled must be a bool")
