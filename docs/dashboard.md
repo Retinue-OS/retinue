@@ -346,6 +346,20 @@ to one is released — so a hand-edited or older file can never make every
 attention call fail. The mode menu's *Follow the schedule* row names today's
 plan, and the holiday when there is one.
 
+**Focus is optional, per instance.** The modes suit a personal instance; on
+a shared one, or one with a single remit, a mood to follow makes no sense.
+`focus.json` `enabled` (on unless set to `false`) is the switch: the
+*Focus modes* card under Settings › This instance, `POST /attention/modes
+{enabled}`, or `scripts/attention-week.py off` / `on`. Off, one mode is in
+force at every moment (`attention.FOCUS_OFF_MODE`: every sphere admitted,
+anything time-sensitive rings, the rest waits for a digest); the schedule
+changes nothing, a hand-set mode is refused (409) and a stored one released,
+the digests go out at the document's `digest_times` every day, and the
+home's header shows no mode and opens no menu, the sheet no Focus rules.
+Turning it off or on is a breakpoint like a mode change. The modes, the week,
+the holidays and the permits stay as they were, for when it is turned on
+again; `GET /attention` says which with `focus_enabled` (and `mode.enabled`).
+
 **The API** (behind the dashboard's auth like the rest): `GET /attention`
 (the sections, the mode, the next breakpoint, `degraded` naming a source the
 store could not answer for — read without the lock inbound messages and the
@@ -964,7 +978,8 @@ held up by that: it fetches the manifest itself.
   notifications, the voice timeouts, the layout, the shelf size, and the
   dashboard version with a manual update check.
 - **This instance** — what is the same on every device: the instance's name
-  and colour (see above), the agent models, the system pages
+  and colour (see above), whether it follows focus modes (see "The home"),
+  the agent models, the system pages
   (`components/instance-settings.js`, `<retinue-instance-settings>`).
 
 Inside the Android app there is one settings page for the user, the app's own

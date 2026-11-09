@@ -521,6 +521,48 @@ def test_a_sphere_within_another():
     assert kept["within"] == {"acme": "customers"}
 
 
+def test_focus_off():
+    """Focus is optional per instance: off, one mode is in force at all
+    times — every sphere admitted, time-sensitive rings — no schedule or
+    hand-set mode changes it, and the digests follow the document's times."""
+    focus = A.default_focus()
+    assert A.focus_enabled(focus) and A.focus_enabled({})      # on unless said otherwise
+    A.set_manual(focus, "focused", None, at(9))
+    assert A.apply_rules(focus, {"enabled": False}, ["customers"]) == ["focus modes off"]
+    assert focus["manual"] is None and A.apply_rules(focus, {"enabled": False}, ["customers"]) == []
+    for h in (3, 9, 13, 20):                                     # rest, focused, focused on customers, social
+        mode = A.mode_at(focus, at(h))
+        assert mode["id"] == "focus-off" and mode["threshold"] == "time-sensitive", (h, mode)
+    mode = A.mode_at(focus, at(3))
+    urgent = item(sphere="friends", importance=4.0, due=at(10), lead=timedelta(hours=12))
+    calm = item(sphere="customers", importance=2.0)
+    assert A.breaks_through(urgent, mode, A.default_profile(), at(3))     # Rest would hold it
+    assert not A.breaks_through(calm, mode, A.default_profile(), at(3))
+    assert A.admitted_by(calm, mode) == {"by": "focus-off", "what": ""}
+    assert A.admission_reason(urgent, mode, A.default_profile(), at(3)).startswith("focus is off")
+    # No mode changes: breakpoints are the document's digest times only.
+    assert A.scheduled_until(focus, at(9)) is None
+    assert A.digest_times_on(focus, at(0, d=2).date()) == A.DEFAULT_DIGEST_TIMES    # a Saturday too
+    assert A.next_breakpoint(focus, at(8, 1)) == at(12)
+    assert "mode" not in A.due_events(focus, at(13)) and "digest" in A.due_events(focus, at(12))
+    # The hold-by-hand menu is refused, and a stale override in the file is ignored.
+    try:
+        A.set_manual(focus, "focused", None, at(9))
+        raise AssertionError("set_manual must refuse with focus off")
+    except ValueError:
+        pass
+    assert A.mode_at(dict(focus, manual="rest"), at(9))["id"] == "focus-off"
+    assert A.breakpoint([dict(calm, id="c")], focus, at(12))["digest"]       # never Rest: digests go out
+    # Back on: the week as it was.
+    assert A.apply_rules(focus, {"enabled": True}, ["customers"]) == ["focus modes on"]
+    assert A.mode_at(focus, at(9))["id"] == "focused"
+    try:
+        A.apply_rules(focus, {"enabled": "no"}, ["customers"])
+        raise AssertionError("enabled must be a bool")
+    except ValueError:
+        pass
+
+
 def test_zone():
     """The schedule's zone: ATTENTION_TZ, else RETINUE_DISPLAY_TZ (what the
     compose file passes), else TZ — never UTC by accident when the owner's

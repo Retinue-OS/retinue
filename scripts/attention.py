@@ -72,6 +72,20 @@ DEFAULT_MODES = {
     "chores":  {"id": "chores",  "name": "Chores",       "admits": ["customers", "admin", "health", "friends", "family", "system"], "admit_tags": [], "threshold": "time-sensitive", "only_admitted": False, "blurb": "interruptions welcome: anything urgent rings"},
     "social":  {"id": "social",  "name": "Social",       "admits": ["friends", "family"],                                 "admit_tags": ["health"], "threshold": "time-sensitive", "only_admitted": False, "blurb": "people, not subjects: friends and family may break through"},
 }
+# Focus is optional, per instance (focus.json ``enabled``, on by default). A
+# personal instance lives by its modes; a shared one, or one with a single
+# remit, has no mood to follow, and its schedule and hand-set modes would
+# only hold things back for no reason. With focus off, this one mode is in
+# force at every moment instead: it admits every sphere and rings from
+# time-sensitive — what Chores does for the spheres it lists — so the level
+# alone decides what rings. No schedule changes it and nothing can be set
+# by hand; digests still go out at the document's own digest times. The
+# modes, the week and the permits are kept untouched, ready for when focus
+# is turned back on.
+FOCUS_OFF_MODE = {"id": "focus-off", "name": "Focus off", "admits": [], "admit_tags": [],
+                  "threshold": "time-sensitive", "only_admitted": False, "admit_all": True,
+                  "blurb": "no focus modes on this instance: anything time-sensitive rings"}
+
 # A day's schedule: minute of the local day → mode id, optionally the sphere
 # Focused is on.
 DEFAULT_SCHEDULE = [[0, "rest"], [7 * 60, "chores"], [8 * 60, "focused"], [12 * 60, "chores"], [13 * 60, "focused", "customers"], [17 * 60, "chores"], [18 * 60, "social"], [22 * 60, "rest"]]
@@ -98,11 +112,12 @@ DEFAULT_WEEK = [
 
 
 def default_focus() -> dict:
-    """The focus document the gateway keeps (focus.json): modes, the week of
+    """The focus document the gateway keeps (focus.json): whether focus is
+    on for this instance at all (``enabled``, see FOCUS_OFF_MODE), modes, the week of
     day plans, the holidays, the default digest times, the manual override
     with its subject, its end (``manual_until``) and its suggested
     breakpoints (``breaks``)."""
-    return {"manual": None, "subject": None, "manual_until": None, "breaks": [],
+    return {"enabled": True, "manual": None, "subject": None, "manual_until": None, "breaks": [],
             "modes": json.loads(json.dumps(DEFAULT_MODES)),
             "week": json.loads(json.dumps(DEFAULT_WEEK)), "holidays": [],
             "digest_times": list(DEFAULT_DIGEST_TIMES)}
@@ -160,6 +175,12 @@ def heal_focus(focus: dict) -> dict:
         focus.update(manual=None, subject=None, manual_until=None, breaks=[])
     heal_within(focus)
     return focus
+
+
+def focus_enabled(focus: dict) -> bool:
+    """Whether this instance follows focus modes. Only an explicit ``false``
+    turns them off: a document from before the switch has them on."""
+    return focus.get("enabled", True) is not False
 
 
 def heal_within(focus: dict) -> dict:
@@ -534,7 +555,10 @@ def day_schedule(focus: dict, day: date) -> list[list]:
 
 
 def digest_times_on(focus: dict, day: date) -> list[int]:
-    """A date's digest times: its plan's own, else the document's."""
+    """A date's digest times: its plan's own, else the document's — with
+    focus off, the document's on every day, the week having no say."""
+    if not focus_enabled(focus):
+        return sorted(focus.get("digest_times") or DEFAULT_DIGEST_TIMES)
     plan = day_plan(focus, day)
     return sorted(plan.get("digest_times") or focus.get("digest_times") or DEFAULT_DIGEST_TIMES)
 
@@ -543,7 +567,10 @@ def _mode_changes(focus: dict, day: date) -> list[int]:
     """The minutes of a date at which the scheduled mode changes in a way that
     is a breakpoint: the entry differs from the one before it (at midnight,
     from the evening before), and the one before is not Rest — the step out
-    of Rest is not a breakpoint, the morning digest opens the day."""
+    of Rest is not a breakpoint, the morning digest opens the day. With
+    focus off the mode never changes."""
+    if not focus_enabled(focus):
+        return []
     before = _entries(day_plan(focus, day - timedelta(days=1)))[-1]
     out = []
     for entry in day_schedule(focus, day):
@@ -556,7 +583,9 @@ def _mode_changes(focus: dict, day: date) -> list[int]:
 def scheduled_until(focus: dict, now: datetime) -> datetime | None:
     """When the schedule next puts a different mode (or scope) in force —
     looking past midnight, since an evening's Rest runs into the next
-    day's; None when the week never changes it."""
+    day's; None when the week never changes it, or focus is off."""
+    if not focus_enabled(focus):
+        return None
     current = scheduled_entry(focus, now)[1:]
     m = minute_of_day(now)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -632,7 +661,9 @@ def set_manual(focus: dict, mode_id: str | None, subject: dict | None, now: date
     ``mode_id`` None, release it to the schedule. ``breaks`` takes the
     suggested breakpoints of a long one (by default, as suggested). Returns
     whether the change is a breakpoint: every change is, except a switch
-    into Focused."""
+    into Focused. With focus off there is no mode to set: ValueError."""
+    if mode_id and not focus_enabled(focus):
+        raise ValueError("focus is off on this instance")
     focus["manual_until"] = None
     focus["breaks"] = []
     if not mode_id:
@@ -658,12 +689,18 @@ def set_manual(focus: dict, mode_id: str | None, subject: dict | None, now: date
     return mode_id not in QUIET_ENTRY
 
 
+def manual_of(focus: dict) -> str | None:
+    """The mode set by hand, if any — none while focus is off, whatever a
+    hand-edited document still carries."""
+    return focus.get("manual") if focus_enabled(focus) else None
+
+
 def manual_until(focus: dict) -> datetime | None:
-    return parse_dt(focus.get("manual_until")) if focus.get("manual") else None
+    return parse_dt(focus.get("manual_until")) if manual_of(focus) else None
 
 
 def manual_breaks(focus: dict) -> list[datetime]:
-    return [parse_dt(b) for b in focus.get("breaks") or []] if focus.get("manual") else []
+    return [parse_dt(b) for b in focus.get("breaks") or []] if manual_of(focus) else []
 
 
 def manual_expired(focus: dict, now: datetime) -> bool:
@@ -678,7 +715,7 @@ def scope_of(focus: dict, now: datetime) -> dict | None:
     (``{"kind": "sphere", "id": …}``) or a project (``{"kind": "project",
     "id": <uri>, "title": …}``; a bare string is a sphere); by schedule, the
     entry's third element as a sphere. None when the mode has no scope."""
-    if focus.get("manual"):
+    if manual_of(focus):
         subject = focus.get("subject")
         if isinstance(subject, str) and subject:
             return {"kind": "sphere", "id": subject, "title": subject}
@@ -697,8 +734,11 @@ def mode_at(focus: dict, now: datetime) -> dict:
     one is returned as a copy: ``admits`` becomes that one sphere, or none
     with ``project`` set — the mood stays, the scope stands in for the rule's
     list — and ``subject`` carries the scope so the title can say so. The
-    stored rule is never touched; releasing the override drops its scope."""
-    mode = focus["modes"][focus.get("manual") or scheduled_id(focus, now)]
+    stored rule is never touched; releasing the override drops its scope.
+    With focus off it is always FOCUS_OFF_MODE."""
+    if not focus_enabled(focus):
+        return json.loads(json.dumps({**FOCUS_OFF_MODE, "within": focus.get("within") or {}}))
+    mode = focus["modes"][manual_of(focus) or scheduled_id(focus, now)]
     # The sphere nesting travels with the mode, so every admission check
     # that reads the mode also reads which sphere lies within which.
     within = focus.get("within")
@@ -742,8 +782,8 @@ def admitted(item: dict, mode: dict, profile: dict) -> bool:
     mode's ``admits`` or ``admit_tags`` — a customer who is also a friend
     rings in Social as in Focused on customers — and, with Focused on a
     project, when it is about that project. A VIP's message is admitted
-    everywhere (see breaks_through)."""
-    if item.get("vip"):
+    everywhere (see breaks_through). With focus off everything is."""
+    if item.get("vip") or mode.get("admit_all"):
         return True
     words = set(mode["admits"]) | set(mode.get("admit_tags", []))
     if any(s in words for s in spheres_of(item, mode.get("within"))):
@@ -773,10 +813,14 @@ def admitted_by(item: dict, mode: dict) -> dict | None:
     rule for everything it holds, which the sheet must not offer as if it
     were about this item alone.
 
+    - ``focus-off`` — focus is off on this instance: no rule to change.
+
     None when no rule admits it (a permit is the sender's, not a rule of the
     mode, and the sheet has its own switch for it)."""
     if item.get("vip"):
         return {"by": "vip", "what": item.get("sender") or ""}
+    if mode.get("admit_all"):
+        return {"by": "focus-off", "what": ""}
     if about_project(item, mode.get("project")):
         return {"by": "project", "what": mode["project"]}
     spheres = spheres_of(item, mode.get("within"))
@@ -803,6 +847,8 @@ def admission_reason(item: dict, mode: dict, profile: dict, now: datetime) -> st
         return "the turn your instruction asked for did not finish — rung rather than held"
     if item.get("vip"):
         return f"{item.get('sender') or 'the sender'} is a VIP"
+    if mode.get("admit_all"):
+        return "focus is off: anything time-sensitive rings"
     if about_project(item, mode.get("project")):
         return f"{mode_label(mode)}: this is about it"
     spheres = spheres_of(item, mode.get("within"))
@@ -880,7 +926,7 @@ def next_breakpoint(focus: dict, now: datetime) -> datetime:
     for offset in range(8):
         day = now.date() + timedelta(days=offset)
         candidates = list(digest_times_on(focus, day))
-        if not focus.get("manual"):
+        if not manual_of(focus):
             candidates += _mode_changes(focus, day)
         if offset == 0:
             candidates = [t for t in candidates if t > m]
@@ -907,7 +953,7 @@ def due_events(focus: dict, now: datetime) -> set[str]:
     else:
         if m in digest_times_on(focus, now.date()):
             events.add("digest")
-        if not focus.get("manual") and m in _mode_changes(focus, now.date()):
+        if not manual_of(focus) and m in _mode_changes(focus, now.date()):
             events.add("mode")
     if m % SWEEP_EVERY_MINUTES == 0:
         events.add("sweep")
@@ -1188,9 +1234,21 @@ def apply_rules(focus: dict, patch: dict, spheres: list[str], today: date | None
     that claims ``holiday``, so one must.
 
     ``digest_times`` without ``plan``: the default digest times, for plans
-    that name none.
+    that name none — and, with focus off, the digest times of every day.
+
+    ``enabled`` (bool): whether this instance follows focus modes at all.
+    Turning it off releases a mode set by hand; the modes, the week and the
+    holidays are kept as they are, for when it is turned back on.
     """
     changes: list[str] = []
+    if patch.get("enabled") is not None:
+        if not isinstance(patch["enabled"], bool):
+            raise ValueError("enabled is true or false")
+        if patch["enabled"] != focus_enabled(focus):
+            focus["enabled"] = patch["enabled"]
+            if not patch["enabled"]:
+                focus.update(manual=None, subject=None, manual_until=None, breaks=[])
+            changes.append("focus modes on" if patch["enabled"] else "focus modes off")
     mode_id = patch.get("mode")
     if mode_id is not None:
         mode = focus["modes"].get(str(mode_id))

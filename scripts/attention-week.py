@@ -17,6 +17,14 @@ new schedule. This is how an agent makes the change the user asks for:
     attention-week.py plan Workday --days mon-fri       # Friday back; the emptied plan goes
     attention-week.py plan "Day off" --digests "09:00, 18:00"
     attention-week.py digests "08:00, 12:00, 17:00, 21:00"   # for plans that name none
+    attention-week.py off                               # no focus modes on this instance
+    attention-week.py on                                # back to the week as it was
+
+Focus is optional per instance: a shared instance, or one with a single
+remit, has no use for moods. Off, one mode is in force at all times — every
+sphere admitted, anything time-sensitive rings — the digests go out at the
+default digest times, and the week, the modes and the permits are kept for
+when it is turned on again.
 
 Days: mon … sun, ranges (mon-fri, fri-mon), weekdays, weekend, daily,
 holiday. A schedule entry is "HH:MM mode" or "HH:MM focused <sphere>"; modes
@@ -49,6 +57,8 @@ def _hhmm(minute: int) -> str:
 
 def show() -> int:
     focus = _call("GET", "/attention/profile")["focus"]
+    if not policy.focus_enabled(focus):
+        print("Focus is off on this instance (attention-week.py on turns it on); the week below waits.")
     default_digests = focus.get("digest_times") or policy.DEFAULT_DIGEST_TIMES
     for plan in policy.week_of(focus):
         days = ", ".join(plan.get("days") or [])
@@ -89,10 +99,14 @@ def main() -> int:
     plan.add_argument("--rename", metavar="NEW")
     dig = sub.add_parser("digests", help="the default digest times, for plans that name none")
     dig.add_argument("times", help='"08:00, 12:00, 17:00, 21:00"')
+    sub.add_parser("on", help="follow focus modes on this instance (the default)")
+    sub.add_parser("off", help="no focus modes on this instance: the level alone decides what rings")
     args = ap.parse_args()
 
     if args.cmd is None:
         return show()
+    if args.cmd in ("on", "off"):
+        return change({"enabled": args.cmd == "on"})
     if args.cmd == "holiday":
         if args.action == "add":
             return change({"holiday_add": f"{args.what} {args.name}".strip() if args.name else args.what})
