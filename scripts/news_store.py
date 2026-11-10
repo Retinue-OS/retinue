@@ -301,7 +301,7 @@ def ranked(scope: str = "feed", limit: int | None = None,
 
 PREFERENCES_TEMPLATE = """# News preferences
 
-What Reto cares about, as learned from feedback on the news feed. Maintained by
+What the owner cares about, as learned from feedback on the news feed. Maintained by
 the Herald agent — every line here should be traceable to something the user
 did (a 👍, a 👎, a note), not to a guess.
 

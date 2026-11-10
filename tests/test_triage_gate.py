@@ -133,13 +133,13 @@ def test_frequent_spawns_only_for_whitelisted():
         gate = _fresh(tmp)
         # Whitelist one exact address and one domain wildcard.
         gate.tp.write_if_changed(
-            gate.tp.render_email_whitelist({"boss@work.com"}, {"*@factsmission.com"}),
+            gate.tp.render_email_whitelist({"boss@work.com"}, {"*@owner.example"}),
             gate.tp.email_whitelist_path(),
         )
         inbox = [
             {"from": "Boss <boss@work.com>", "subject": "hi", "message_id": "<1>"},
             {"from": "spam@random.io", "subject": "sale", "message_id": "<2>"},
-            {"from": "Reto <reto@factsmission.com>", "subject": "re", "message_id": "<3>"},
+            {"from": "Owner <owner@owner.example>", "subject": "re", "message_id": "<3>"},
         ]
         gate.inbox_messages = lambda: inbox
         rec = Recorder()

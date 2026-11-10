@@ -540,7 +540,7 @@ def test_email_outcome_page_ends_like_a_messenger_send():
     send does: green check, then on to the next request or the window closes."""
     with tempfile.TemporaryDirectory() as tmp:
         wg = _load_gateway(Path(tmp))
-        result = {"approved": "42", "sent": True, "from": "Ari <ari@example.org>",
+        result = {"approved": "42", "sent": True, "from": "Agent <agent@example.org>",
                   "to": ["a@example.com", "b@example.com"], "subject": "Lunch"}
         out = wg._render_email_send_outcome_html(result, "ari", "42", None)
         assert "<h1>E-mail send</h1>" in out
