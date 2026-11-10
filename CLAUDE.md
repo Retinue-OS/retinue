@@ -339,7 +339,8 @@ computer). Only when the user explicitly asks ("type the text above"), attach
 the text to your thread reply with `scripts/shell-type.py "<text>"` — ask
 first if "the text above" could mean more than one passage, and add
 `--enter`/`--key enter` (or a line break, typed as Shift+Enter) only when they
-asked for Enter — those wait for the user's tap. A password, PIN or
+asked for Enter. Only plain one-line text types by itself; Enter, line breaks,
+tabs, keys and sensitive texts wait for the user's tap. A password, PIN or
 code (dictated, or one you fetched, e.g. by SMS) is typed only with
 `--sensitive`, which masks it, deletes it once typed and ends this thread's
 session; never repeat it in your reply, and if the user dictated it, offer a

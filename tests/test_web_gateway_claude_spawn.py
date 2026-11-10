@@ -293,9 +293,9 @@ def test_thread_turn_collects_shell_actions(wg):
     with _daemon_environment():
         out = wg.send_message("type hello", session_key="env-shell",
                               model="sonnet", reply_attachments=True)
-    # The gateway decides once whether the page may run it without a tap.
-    assert out.get("reply_shell_actions") == [dict(good, auto=True),
-                                              dict(submit, auto=False)], out
+    # Validated and canonical; whether the page may run them without a tap is
+    # the thread worker's decision (it knows the thread and the turn).
+    assert out.get("reply_shell_actions") == [good, submit], out
     assert not Path(manifests[0]).exists(), "manifest left behind"
 
     spawns = _capture_spawns(wg, json.dumps({"result": "hi", "session_id": "s-8"}))
@@ -307,7 +307,8 @@ def test_thread_turn_collects_shell_actions(wg):
 def test_shell_actions_ride_on_the_stored_reply(wg):
     """The thread worker stores the turn's shell actions on Ara's reply, and a
     replayed transcript tells later turns what was handed over."""
-    conv = wg._new_conv("user", "reto", "t", "user", "type hello on the quest")
+    conv = wg._new_conv("user", "reto", "t", "user", "type hello on the quest",
+                        via_edge=True)
     action = {"kind": "keyboard-type", "id": "c" * 32, "text": "hello", "enter": True}
     secret = {"kind": "keyboard-secret", "id": "d" * 32, "label": "Meta account",
               "enter": False}
@@ -321,7 +322,8 @@ def test_shell_actions_ride_on_the_stored_reply(wg):
         wg.send_message = real
     stored = wg._load_conv(conv["id"])
     reply = stored["messages"][-1]
-    assert reply["role"] == "assistant" and reply["shell_actions"] == [action, secret], reply
+    assert reply["role"] == "assistant" and reply["shell_actions"] == [
+        dict(action, auto=False), dict(secret, auto=False)], reply
     note = wg._conv_render_messages(stored, stored["messages"])
     assert "type 5 characters + Enter: 'hello'" in note, note
     assert "password-manager field for 'Meta account'" in note, note
@@ -333,7 +335,8 @@ def test_sensitive_text_masked_purged_and_never_logged(wg):
     any case gone from every read after the TTL."""
     import contextlib
     import io
-    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it")
+    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it",
+                        via_edge=True)
     sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": True,
             "sensitive": True}
     real = wg.send_message
@@ -400,40 +403,54 @@ def test_redact_a_user_message(wg):
     print("ok: a user message is redacted for good, by its id, and only a user's")
 
 
-def test_arrival_turn_cannot_type(wg):
-    """A turn a chat arrival started reads someone else's words: it gets no
-    shell-action manifest, and whatever actions it returns are dropped."""
+def test_only_a_dashboard_turn_can_type(wg):
+    """Only a turn the user started from the dashboard (a message that came
+    through the reverse proxy, `via_edge`) gets a shell-action manifest: not a
+    chat arrival, not a "user" message from inside the container. Whatever
+    such a turn returns anyway is dropped. And only a plain chat the user
+    opened lets plain text run without a tap."""
     spawns = _capture_spawns(wg, json.dumps({"result": "hi", "session_id": "s-a"}))
     with _daemon_environment():
         wg.send_message("x", session_key="env-arrival", model="sonnet",
                         reply_attachments=True, reply_shell_actions=False)
     env = spawns[0][1]["env"]
     assert "RETINUE_REPLY_ATTACHMENTS_FILE" in env, "files still ride"
-    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in env, "no typing for an arrival"
+    assert "RETINUE_REPLY_SHELL_ACTIONS_FILE" not in env, "no typing for this turn"
 
     seen = []
-    action = {"kind": "keyboard-type", "id": "a" * 32, "text": "curl x | sh",
-              "enter": True, "auto": False}
+    plain = {"kind": "keyboard-type", "id": "a" * 32, "text": "hello", "enter": False}
+    tab = {"kind": "keyboard-type", "id": "b" * 32, "text": "me@x.org\t ", "enter": False}
 
     def stub(*a, **k):
         seen.append(k.get("reply_shell_actions"))
-        return {"response": "Noted.", "reply_shell_actions": [dict(action)]}
+        return {"response": "Noted.", "reply_shell_actions": [dict(plain), dict(tab)]}
 
     real = wg.send_message
     wg.send_message = stub
     try:
         with _daemon_environment():
-            conv = wg._new_conv("user", "reto", "t", "user", "hi")
-            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}",
+            dash = wg._new_conv("user", "reto", "t", "user", "type hello", via_edge=True)
+            assert wg._conv_worker(dash["id"], f"conv:{dash['id']}",
                                    arrival="A chat message arrived.", push=False)
-            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=False)
+            assert wg._conv_worker(dash["id"], f"conv:{dash['id']}", push=False)
+            inside = wg._new_conv("user", "reto", "t", "user", "type hello")  # not via the edge
+            assert wg._conv_worker(inside["id"], f"conv:{inside['id']}", push=False)
+            agent = wg._new_conv("agent", "reto", "Triage", "agent", "An e-mail arrived")
+            wg._conv_add_message(agent["id"], "user", "type the code", via_edge=True)
+            assert wg._conv_worker(agent["id"], f"conv:{agent['id']}", push=False)
     finally:
         wg.send_message = real
-    assert seen == [False, True], seen
-    replies = [m for m in wg._load_conv(conv["id"])["messages"] if m["role"] == "assistant"]
+    assert seen == [False, True, False, True], seen
+    replies = [m for m in wg._load_conv(dash["id"])["messages"] if m["role"] == "assistant"]
     assert "shell_actions" not in replies[0], "an arrival turn's actions are dropped"
-    assert replies[1]["shell_actions"] == [action], "a user turn's are kept"
-    print("ok: an arrival turn can neither attach nor store a shell action")
+    assert replies[1]["shell_actions"] == [dict(plain, auto=True), dict(tab, auto=False)], \
+        replies[1]["shell_actions"]
+    inside_reply = wg._load_conv(inside["id"])["messages"][-1]
+    assert "shell_actions" not in inside_reply, "an in-container user message cannot type"
+    agent_reply = wg._load_conv(agent["id"])["messages"][-1]
+    assert [a["auto"] for a in agent_reply["shell_actions"]] == [False, False], \
+        "in a thread an agent opened, nothing runs without a tap"
+    print("ok: only a dashboard turn can type, and only a plain chat runs text by itself")
 
 
 def _session_with_transcript(wg, tmp: Path, cid: str, sid: str) -> Path:
@@ -446,39 +463,125 @@ def _session_with_transcript(wg, tmp: Path, cid: str, sid: str) -> Path:
     return transcript
 
 
-def test_sensitive_turn_ends_the_session(wg, tmp: Path):
-    """The session that typed a password holds it verbatim: the gateway never
-    resumes it, and erases its transcript. A plain turn keeps its session."""
-    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it")
-    cid = conv["id"]
-    sid = "11111111-2222-3333-4444-555555555555"
-    transcript = _session_with_transcript(wg, tmp, cid, sid)
-    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
-            "sensitive": True, "auto": True}
-    real = wg.send_message
-    wg.send_message = lambda *a, **k: {"response": "Typing it.",
-                                       "reply_shell_actions": [dict(sens)]}
-    try:
-        with _daemon_environment():
-            assert wg._conv_worker(cid, f"conv:{cid}", push=False)
-    finally:
-        wg.send_message = real
-    assert wg._get_session_entry(f"conv:{cid}") == {}, "the session must not be resumed"
-    assert not transcript.exists(), "its transcript must be erased"
+def _sensitive_run(sid: str, *, rc: int = 0, escalate: bool = False):
+    """A fake `claude` run that attaches a sensitive action (as shell-type.py
+    --sensitive would) and reports session `sid`."""
+    def run(cmd, **kwargs):
+        env = kwargs["env"]
+        Path(env["RETINUE_REPLY_SHELL_ACTIONS_FILE"]).write_text(json.dumps(
+            {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+             "sensitive": True}) + "\n", encoding="utf-8")
+        if escalate:
+            Path(env["RETINUE_ESCALATE_FILE"]).touch()
+        return subprocess.CompletedProcess(
+            cmd, rc, stdout=json.dumps({"result": "Typing it.", "session_id": sid}),
+            stderr="" if rc == 0 else "boom")
+    return run
 
-    plain = wg._new_conv("user", "reto", "t", "user", "type hello")
-    sid2 = "21111111-2222-3333-4444-555555555555"
-    transcript2 = _session_with_transcript(wg, tmp, plain["id"], sid2)
-    wg.send_message = lambda *a, **k: {"response": "Typing it.", "reply_shell_actions": [
-        {"kind": "keyboard-type", "id": "f" * 32, "text": "hello", "enter": False, "auto": True}]}
-    try:
-        with _daemon_environment():
-            assert wg._conv_worker(plain["id"], f"conv:{plain['id']}", push=False)
-    finally:
-        wg.send_message = real
-    assert wg._get_session_entry(f"conv:{plain['id']}").get("session_id") == sid2
-    assert transcript2.exists()
-    print("ok: a turn that typed a sensitive text ends its Claude session")
+
+def test_sensitive_turn_never_resumable(wg, tmp: Path):
+    """A turn that attached a sensitive text never leaves a resumable session:
+    send_message drops it under the session lock — so a turn queued behind it
+    cannot resume it — with every session the key had, and erases their
+    transcripts; on a failed run too. A plain turn keeps its session and
+    remembers the one it replaced."""
+    key = "conv:" + "1" * 32
+    old = _session_with_transcript(wg, tmp, "1" * 32, "11111111-0000-0000-0000-000000000000")
+    new = old.parent / "22222222-0000-0000-0000-000000000000.jsonl"
+    new.write_text("{}\n", encoding="utf-8")
+    _capture_spawns(wg, "")
+    wg.subprocess.run = _sensitive_run(new.stem)
+    with _daemon_environment():
+        out = wg.send_message("my PIN is 4711, type it", session_key=key, model="sonnet",
+                              reply_attachments=True)
+    assert out.get("session_reset") is True, out
+    assert wg._get_session_entry(key) == {}, "nothing to resume"
+    assert not old.exists() and not new.exists(), "every transcript erased"
+    assert out["reply_shell_actions"][0]["sensitive"] is True, "the phone still gets it"
+
+    # Failed run: the same.
+    key2 = "conv:" + "2" * 32
+    old2 = _session_with_transcript(wg, tmp, "2" * 32, "33333333-0000-0000-0000-000000000000")
+    wg.subprocess.run = _sensitive_run("44444444-0000-0000-0000-000000000000", rc=1)
+    with _daemon_environment():
+        out = wg.send_message("my PIN is 4711", session_key=key2, model="sonnet",
+                              reply_attachments=True)
+    assert "error" in out and wg._get_session_entry(key2) == {} and not old2.exists(), out
+
+    # A plain turn: recorded, with the session it replaced remembered.
+    key3 = "conv:" + "3" * 32
+    _session_with_transcript(wg, tmp, "3" * 32, "55555555-0000-0000-0000-000000000000")
+    wg._record_turn_session(key3, {"session_id": "66666666-0000-0000-0000-000000000000",
+                                   "last_activity": 2.0})
+    entry = wg._get_session_entry(key3)
+    assert entry["session_id"].startswith("6666") and \
+        entry["previous_session_ids"] == ["55555555-0000-0000-0000-000000000000"], entry
+    print("ok: a sensitive turn's session is never resumable, failed or not")
+
+
+def test_escalated_junior_sensitive_and_fresh_session(wg_tiered, tmp: Path):
+    """Junior attached a sensitive text, then escalated: her reply is discarded
+    but her session typed it, so the turn's session is dropped all the same —
+    and her own fresh session's transcript erased."""
+    wg = wg_tiered
+    key = "conv:" + "4" * 32
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp / "claude-config")
+    proj = tmp / "claude-config" / "projects" / "-workspace"
+    proj.mkdir(parents=True, exist_ok=True)
+    junior_t = proj / "77777777-0000-0000-0000-000000000000.jsonl"
+    junior_t.write_text("{}\n", encoding="utf-8")
+    runs = []
+
+    def run(cmd, **kwargs):
+        runs.append(cmd)
+        if len(runs) == 1:
+            return _sensitive_run(junior_t.stem, escalate=True)(cmd, **kwargs)
+        return subprocess.CompletedProcess(
+            cmd, 0, stdout=json.dumps({"result": "senior", "session_id": "88888888-0000-0000-0000-000000000000"}),
+            stderr="")
+
+    _capture_spawns(wg, "")
+    wg.subprocess.run = run
+    with _daemon_environment():
+        out = wg.send_message("type my PIN", session_key=key, reply_attachments=True)
+    assert out.get("escalated") and out.get("session_reset"), out
+    assert "reply_shell_actions" not in out, "junior's actions go with her reply"
+    assert wg._get_session_entry(key) == {}
+    assert not junior_t.exists(), "junior's fresh session is erased"
+    print("ok: an escalated junior's sensitive action still ends the session")
+
+
+def test_a_new_session_gets_the_whole_thread(wg):
+    """A turn whose stored session went while it waited (reset, expired) starts
+    a new one — with the whole thread (restart_message), not the resumed
+    session's fragment."""
+    spawns = _capture_spawns(wg, json.dumps({"result": "ok", "session_id": "s-new"}))
+    with _daemon_environment():
+        wg.send_message("only the new bit", session_key="conv:" + "5" * 32, model="sonnet",
+                        restart_message="THE WHOLE THREAD", reply_attachments=True)
+    assert spawns[0][0][-1] == "THE WHOLE THREAD", spawns[0][0][-3:]
+    # A thread's prompt is built once the lock is held, for the session as it
+    # is then: what the turn read before waiting does not reach the model.
+    spawns.clear()
+    built = []
+
+    def build(fresh):
+        built.append(fresh)
+        return f"built fresh={fresh}"
+
+    with _daemon_environment():
+        wg.send_message("stale", session_key="conv:" + "6" * 32, model="sonnet",
+                        restart_message="stale too", prompt_builder=build)
+    assert spawns[0][0][-1] == "built fresh=False" and built == [False], (built, spawns[0][0][-1])
+    wg._record_turn_session("conv:" + "6" * 32, {"session_id": "s-6", "last_activity": wg._now_ts()})
+    spawns.clear(); built.clear()
+    with _daemon_environment():
+        wg.send_message("stale", session_key="conv:" + "6" * 32, model="sonnet",
+                        prompt_builder=build)
+    cmd = spawns[0][0]
+    assert cmd[cmd.index("--resume") + 1] == "s-6" and cmd[-1] == "built fresh=True", cmd[-4:]
+    assert built == [True, False], "and the whole thread, should the resume be refused"
+    print("ok: a new session is shown the whole thread, built under the lock")
 
 
 def test_redaction_reaches_every_copy(wg, tmp: Path):
@@ -525,7 +628,67 @@ def test_redaction_reaches_every_copy(wg, tmp: Path):
     # The next one records normally.
     wg._update_session_entry(f"conv:{cid}", {"session_id": "fresh-0000", "last_activity": 3.0})
     assert wg._get_session_entry(f"conv:{cid}").get("session_id") == "fresh-0000"
+    # A turn running when the redaction landed logs its question afterwards:
+    # it is logged redacted.
+    wg._append_entry(secret, "Typed, and deleted your message.")
+    log = json.dumps(wg._load_conversation(wg._today()))
+    assert "4711" not in log, log
     print("ok: redaction reaches the title, attachments, session log and session")
+
+
+def test_redaction_erases_every_session_the_thread_had(wg, tmp: Path):
+    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 1234")
+    cid = conv["id"]
+    first = _session_with_transcript(wg, tmp, cid, "99999999-0000-0000-0000-000000000001")
+    second = first.parent / "99999999-0000-0000-0000-000000000002.jsonl"
+    second.write_text("{}\n", encoding="utf-8")
+    # The first session expired and was replaced; it still holds the PIN.
+    wg._record_turn_session(f"conv:{cid}", {"session_id": second.stem, "last_activity": 9.0})
+    mid = wg._load_conv(cid)["messages"][0]["id"]
+    assert wg._conv_redact_message(cid, mid)[1] == 200
+    assert not first.exists() and not second.exists(), "both transcripts erased"
+    print("ok: redaction erases every session a thread had")
+
+
+def test_legacy_messages_can_be_redacted(wg):
+    """A message stored before messages had ids gets a stable derived one."""
+    conv = wg._new_conv("user", "reto", "t", "user", "old one: 0000")
+    path = wg.CONVERSATIONS_DIR / f"{conv['id']}.json"
+    data = json.loads(path.read_text())
+    data["messages"][0].pop("id")
+    path.write_text(json.dumps(data))
+    c = wg._load_conv(conv["id"])
+    derived = wg._conv_message_id(c["messages"][0])
+    assert derived == wg._conv_message_id(wg._load_conv(conv["id"])["messages"][0]), "stable"
+    assert f"[message id: {derived}]" in wg._conv_render_messages(c, c["messages"])
+    out, status, why = wg._conv_redact_message(conv["id"], derived)
+    assert status == 200, why
+    assert "0000" not in path.read_text()
+    print("ok: a legacy message is redacted by its derived id")
+
+
+def test_sensitive_reply_neutral_title(wg):
+    """A title derived from the user's message may carry the very text typed:
+    a reply with a sensitive action replaces it, before any push."""
+    conv = wg._new_conv("user", "reto", None, "user", "Type my PIN 4711 on the TV",
+                        via_edge=True)
+    sens = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+            "sensitive": True}
+    pushed = []
+    real_send, real_push = wg.send_message, wg._push_conv_notification
+    wg.send_message = lambda *a, **k: {"response": "Typing it.", "reply_shell_actions": [dict(sens)]}
+    wg._push_conv_notification = lambda c, text, *a, **k: pushed.append(c.get("title")) or 1
+    try:
+        with _daemon_environment():
+            assert wg._conv_worker(conv["id"], f"conv:{conv['id']}", push=True)
+    finally:
+        wg.send_message, wg._push_conv_notification = real_send, real_push
+    after = wg._load_conv(conv["id"])
+    assert after["title"] == wg.SENSITIVE_THREAD_TITLE and "4711" not in after["title"]
+    assert pushed == [wg.SENSITIVE_THREAD_TITLE], pushed
+    assert after["messages"][-1]["shell_actions"][0]["auto"] is False, "a sensitive text waits for a tap"
+    print("ok: a sensitive reply gets a neutral title before it is pushed")
+
 
 
 def test_resumed_turn_sees_message_id_and_outcomes(wg):
@@ -578,6 +741,18 @@ def test_outcome_purges_and_startup_sweep(wg):
     assert "4711" in (wg.CONVERSATIONS_DIR / f"{young['id']}.json").read_text(), \
         "young: still there for the phone, deletion scheduled"
     assert wg._CONV_SHELL_OUTCOME_RE.match(f"/conversations/{'a' * 32}/shell-actions/{'b' * 32}/outcome")
+    # Two in one thread: the purge of the first schedules the second.
+    two = wg._new_conv("user", "reto", "t", "user", "z")
+    wg._conv_add_message(two["id"], "assistant", "a", shell_actions_=[dict(sens, id="3" * 32)])
+    wg._conv_add_message(two["id"], "assistant", "b", shell_actions_=[dict(sens, id="4" * 32)])
+    p_two = wg.CONVERSATIONS_DIR / f"{two['id']}.json"
+    data = json.loads(p_two.read_text())
+    data["messages"][-2]["ts"] = "2000-01-01T00:00:00+00:00"   # the first, expired
+    p_two.write_text(json.dumps(data))
+    assert wg._conv_purge_and_reschedule(two["id"]) is True, "the second is still due"
+    stored = json.loads(p_two.read_text())["messages"]
+    assert stored[-2]["shell_actions"][0]["text"] is None
+    assert stored[-1]["shell_actions"][0]["text"] == "4711"
     print("ok: a typed sensitive text goes at once; a restart leaves none behind")
 
 
@@ -669,7 +844,7 @@ def test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered):
         out = wg_tiered.send_message("type", session_key="env-tiered-4",
                                      reply_attachments=True)
     assert out.get("escalated") is True, out
-    assert out.get("reply_shell_actions") == [dict(senior_action, auto=True)], out
+    assert out.get("reply_shell_actions") == [senior_action], out
     for _, kw in spawns:
         assert not Path(kw["env"]["RETINUE_REPLY_SHELL_ACTIONS_FILE"]).exists()
 
@@ -752,6 +927,7 @@ def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     _, kwargs = spawns[0]
     _assert_allowlisted(kwargs["env"])
     assert kwargs["env"]["RETINUE_SESSION_MODEL"] == wg.TRANSCRIPT_CLEANUP_MODEL
+    assert "--no-session-persistence" in spawns[0][0], "a dictation keeps no transcript"
 
     spawns.clear()
     text = "Approve or deny the pending send at /sends/signal-gateway/abc when you can."
@@ -764,6 +940,7 @@ def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     _, kwargs = spawns[0]
     _assert_allowlisted(kwargs["env"])
     assert kwargs["env"]["RETINUE_SESSION_MODEL"] == wg.PRESENTATION_LINT_MODEL
+    assert "--no-session-persistence" in spawns[0][0]
 
 
 def main():
@@ -782,9 +959,13 @@ def main():
         test_shell_actions_ride_on_the_stored_reply(wg)
         test_sensitive_text_masked_purged_and_never_logged(wg)
         test_redact_a_user_message(wg)
-        test_arrival_turn_cannot_type(wg)
-        test_sensitive_turn_ends_the_session(wg, tmp)
+        test_only_a_dashboard_turn_can_type(wg)
+        test_sensitive_turn_never_resumable(wg, tmp)
+        test_a_new_session_gets_the_whole_thread(wg)
         test_redaction_reaches_every_copy(wg, tmp)
+        test_redaction_erases_every_session_the_thread_had(wg, tmp)
+        test_legacy_messages_can_be_redacted(wg)
+        test_sensitive_reply_neutral_title(wg)
         test_resumed_turn_sees_message_id_and_outcomes(wg)
         test_outcome_purges_and_startup_sweep(wg)
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
@@ -798,6 +979,8 @@ def main():
             tmp / "c", {"RETINUE_ROUTER_MODEL": "haiku",
                         "RETINUE_FRONTIER_MODEL": "opus"})
         test_dashboard_turn_below_frontier_gets_the_escalation_flag(wg_tiered)
+        test_escalated_junior_sensitive_and_fresh_session(wg_tiered, tmp)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
         # Three distinct tiers, so every assertion below names exactly one.
         wg_dashboard = _load_gateway(

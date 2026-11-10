@@ -150,12 +150,60 @@ def test_outcome_and_auto_run():
     assert not sa.runs_by_itself(dict(t, enter=True)), "Enter waits for a tap"
     assert not sa.runs_by_itself(dict(t, text="ls\nrm -rf ~")), \
         "a line break is Shift+Enter: waits for a tap"
-    assert sa.runs_by_itself({"kind": "keyboard-key", "id": "b" * 32, "key": "tab"})
-    assert not sa.runs_by_itself({"kind": "keyboard-key", "id": "b" * 32, "key": "enter"})
+    assert not sa.runs_by_itself(dict(t, text="me@x.org\t\t ")), \
+        "a tab moves to a form's button: waits for a tap"
+    assert not sa.runs_by_itself(dict(t, sensitive=True)), "a sensitive text waits for a tap"
+    for key in sa.KEYS:
+        assert not sa.runs_by_itself({"kind": "keyboard-key", "id": "b" * 32, "key": key}), key
     assert not sa.runs_by_itself({"kind": "keyboard-secret", "id": "c" * 32,
                                   "label": "x", "enter": False})
-    print("ok: outcomes are validated; nothing that presses Enter, and no secret, "
-          "runs by itself")
+    assert sa.normalize_outcome({"state": "error", "error": "cancelled"}) == \
+        {"state": "error", "error": "cancelled"}
+    assert "stopped by the user" in sa.describe(dict(t, outcome={"state": "error", "error": "cancelled"}))
+    print("ok: outcomes are validated; only plain one-line text runs by itself")
+
+
+def test_separators_and_labels(tmp: Path):
+    """Line and paragraph separators and bidi controls never reach a text;
+    a label is one plain line; the CLI writes ASCII JSON lines, so nothing in
+    a text can split one, and refuses an eleventh action instead of the
+    gateway dropping it."""
+    for bad in ("a\u2028b", "a\u2029b", "a\u0085b", "x\u202ey", "\u2066y"):
+        try:
+            sa.normalize({"kind": "keyboard-type", "id": "a" * 32, "text": bad})
+        except sa.InvalidAction:
+            pass
+        else:
+            raise AssertionError(f"accepted {bad!r}")
+    label = sa.normalize({"kind": "keyboard-secret", "id": "a" * 32,
+                          "label": "Meta\u202e account\u2028\x85x"})["label"]
+    assert label == "Meta account x", label
+    m = tmp / "m-ascii"
+    assert _run(["Grüezi — 你好"], m).returncode == 0
+    raw = m.read_bytes()
+    assert raw.isascii() and raw.count(b"\n") == 1, raw
+    assert _lines(m)[0]["text"] == "Grüezi — 你好"
+    # A text that would once have split a manifest line (U+2028) is refused at the CLI.
+    assert _run(["a\u2028b"], m).returncode == 2
+    m2 = tmp / "m-many"
+    for i in range(sa.MAX_ACTIONS):
+        assert _run([f"t{i}"], m2).returncode == 0
+    r = _run(["one too many"], m2)
+    assert r.returncode == 2 and "at most" in r.stderr, r.stderr
+    assert len(_lines(m2)) == sa.MAX_ACTIONS
+    # MAX_ACTIONS texts of MAX_TEXT non-ASCII characters fit the manifest cap.
+    big = "\n".join(json.dumps({"kind": "keyboard-type", "id": f"{i:032x}",
+                                "text": "ü" * sa.MAX_TEXT, "enter": False})
+                    for i in range(sa.MAX_ACTIONS))
+    assert len(big.encode()) < sa.MAX_MANIFEST_BYTES, len(big.encode())
+    actions, problems = sa.parse_manifest(big)
+    assert len(actions) == sa.MAX_ACTIONS and not problems
+    # The gateway splits on "\n" only: a raw U+2028 inside a JSON string is no line break.
+    line = '{"kind": "keyboard-secret", "id": "%s", "label": "a\u2028b"}' % ("d" * 32)
+    actions, problems = sa.parse_manifest(line)
+    assert len(actions) == 1 and not problems, (actions, problems)
+    print("ok: separators and bidi controls are refused, labels cleaned, manifests "
+          "ASCII and bounded at the CLI")
 
 
 def test_parse_manifest():
@@ -194,6 +242,7 @@ def main():
         test_sensitive(tmp)
         test_purge_and_describe()
         test_outcome_and_auto_run()
+        test_separators_and_labels(tmp)
     print("all shell-type tests passed")
 
 

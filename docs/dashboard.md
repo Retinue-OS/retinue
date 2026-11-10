@@ -1027,8 +1027,8 @@ The contract the two sides share (web side: `webapp/components/shell.js`):
 | Endpoints (RetinueShell/3) | The shell holds a list of Retinue servers (address, client certificate, sign-in, health switch) and shows one; the app's settings page lists, edits and switches them (RetinueShell/3: the Settings page's Phone shell card lists them in a menu and switches between them). `endpoints()` → a JSON string `[{"id": str, "label": str, "current": bool}]` — the label is the instance's own name, the manifest `short_name` the shell fetched with that endpoint's certificate or password (the host while it is unknown; the host appended when two names collide); no URLs, the other servers being none of the current page's business. `selectEndpoint(id)` asks the shell to show that server (it loads that dashboard's start page, so the page is left). `openSettings("endpoints")` opens the app's settings at the endpoint list, or at the editor straight away with one endpoint. The page may ask; it can never write an address, certificate or password — whatever origin the shell is pointed at receives its bridge, microphone, certificate and password, so that stays in the app. An `endpoints` event (`detail.type`) says the list changed while a page is open; the card re-renders. The shell's one base URL of earlier builds is the first endpoint after an update. |
 | Health Connect (RetinueShell/2) | Further members on `window.RetinueShell`: `healthConnectAvailable()` → `"true"`/`"false"`; `healthSync()` — a deliberate sync now, returns at once (a deliberate sync always runs, whatever the interval); `healthSyncStatus()` → a JSON string `{"available": bool, "permissions": "granted"\|"partial"\|"none", "last_sync_at": ISO\|null, "last_result": "ok"\|"error"\|"skipped"\|null, "last_error": str\|null, "last_count": int\|null, "min_interval_minutes": int, "auto_on_resume": bool, "enabled": bool}` (`enabled`, RetinueShell/3: the current endpoint's own health switch, set in the shell's editor — off, nothing is read or sent for that server, a sync asked for is `skipped` with reason `disabled`, and the card shows one line and *Edit endpoint* instead of the controls; an older shell omits the field and uploads for its one server); `setHealthSyncInterval(minutes)`; `setHealthAutoSync(bool)`. The shell reads the phone's Health Connect store through its Changes API and uploads what it returns, unaltered, as one JSON file per delivery by **WebDAV `PUT` to `/inbox/<name>`** — the letterbox share below, with the WebView's own client certificate and cookies — where a chamber that declares the file type in its `accepts` takes it (docs/scheduling.md); the framework knows nothing about the data. On resume the shell syncs on its own at most every `min_interval_minutes` (default 5) while `auto_on_resume` holds. From RetinueShell/4 the app's settings page has these controls, beside the endpoint's switch, and the dashboard shows none; with RetinueShell/3, Settings → Phone shell shows, only where `healthConnectAvailable()` is true, "Update health data now", the last sync (from `healthSyncStatus()` and the events), the auto-sync toggle and the interval. Every member is feature-detected (`webapp/components/shell.js`): an older shell simply shows none of it. |
 | Settings page and per-device preferences (RetinueShell/4) | `settingsPage: true`: the app has a settings page of its own (see "The settings page"), and the gear opens it. `deviceSettings()` → a JSON string `{key: value}` of the per-device preferences the app holds for every endpoint; `setDeviceSetting(key, value)` writes one (`null` removes it; a key the app does not take is ignored). `components/device-store.js` is the only caller. |
-| Keyboard (RetinueShell/5) | The shell can be paired with another device — a VR headset, a TV, a computer — as a **Bluetooth keyboard** (Android's `BluetoothHidDevice`), and type into it; pairing, the device's keyboard layout and a live keyboard are the app's own screen. `keyboardStatus()` → a JSON string `{"available": bool, "enabled": bool, "connected": bool, "host": {"name", "address"}\|null, "layout": str}`. `keyboardType(text, optsJson)` types `text` (opts `{"id", "enter"}`) — a line break as **Shift+Enter** (a new line in chat apps and text areas, but a submit in a terminal or a one-line field), a tab as Tab; `keyboardKey(name, optsJson)` (opts `{"id"}`) presses one of `enter`, `tab`, `backspace`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `delete`, `space`; `keyboardSecret(optsJson)` (opts `{"id", "label", "enter"}`) opens a **native** field in the shell, labelled, that the user's password manager fills by autofill (or the user types) — the shell types it, wipes it, and the secret never reaches the page, the server or Ara; `keyboardOpen()` opens the app's keyboard screen. Outcomes come as `keyboard` events (below). Callers: `components/shell-keyboard.js` through `shell.js`; what drives them is a reply's shell actions (see "Shell actions"). |
-| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints`, `device-settings` (with `keys`, the per-device preferences that changed) or `keyboard` (RetinueShell/5: `state` `typed` with `count`, `error` with `error` — `not-enabled`, `not-connected`, `too-long`, `unsupported-char`, `busy`, `failed` —, `secret-typed`, `secret-cancelled`, or `status` when the connection changed; `id` names the action where there is one). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints`, `device-settings` and `keyboard` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
+| Keyboard (RetinueShell/5) | The shell can be paired with another device — a VR headset, a TV, a computer — as a **Bluetooth keyboard** (Android's `BluetoothHidDevice`), and type into it; pairing, the device's keyboard layout and a live keyboard are the app's own screen. `keyboardStatus()` → a JSON string `{"available": bool, "enabled": bool, "connected": bool, "host": {"name"}\|null, "layout": str}` (the device's name only — its Bluetooth address stays in the app). `keyboardType(text, optsJson)` types `text` (opts `{"id", "enter"}`) — a line break as **Shift+Enter** (a new line in chat apps and text areas, but a submit in a terminal or a one-line field), a tab as Tab; `keyboardKey(name, optsJson)` (opts `{"id"}`) presses one of `enter`, `tab`, `backspace`, `escape`, `up`, `down`, `left`, `right`, `home`, `end`, `delete`, `space`; `keyboardSecret(optsJson)` (opts `{"id", "label", "enter"}`) opens a **native** field in the shell, labelled and naming the device it types into, that the user's password manager fills by autofill (or the user types) — the shell types it and overwrites its own copy, and the secret never reaches the page, the server or Ara; `keyboardOpen()` opens the app's keyboard screen; `keyboardCancel()` stops what is being typed (its outcome: `error` `cancelled`). The shell types only while it is in front (otherwise `error` `not-in-front`), into the device the user connected — it does not follow another one that connects by itself. An `id` is echoed in the request's events when it is 1–64 of `A–Z a–z 0–9 . _ : -`, and dropped otherwise; every request with one gets exactly one final event. Outcomes come as `keyboard` events (below). Callers: `components/shell-keyboard.js` through `shell.js`; what drives them is a reply's shell actions (see "Shell actions"). |
+| Shell → page | `window.dispatchEvent(new CustomEvent('retinue-shell', {detail: {type}}))`, `type` `wake`, `home`, `health-sync`, `endpoints`, `device-settings` (with `keys`, the per-device preferences that changed) or `keyboard` (RetinueShell/5: `state` `typed` with `count` (a key press too), `error` with `error` — `not-enabled`, `not-connected`, `not-in-front`, `too-long`, `unsupported-char`, `busy`, `cancelled`, `failed` —, `secret-typed`, `secret-cancelled`, or `status` when the connection changed; `id` names the action where there is one). A `health-sync` event carries `state`: `started`, `done` (with `count`), `error` (with `error`) or `skipped` (with `reason`: `interval`, `no-permission`, `unavailable`, `no-backend-support`, `disabled`); it, `endpoints`, `device-settings` and `keyboard` are information only — no page navigates on them. The home answers in place: `wake` opens continuous conversation (the thread used in the mode in the last 15 minutes, else a new one), `home` unwinds every open thread or composer back to the list at `/`, closes a sheet and scrolls the list to its top. Other dashboard pages answer by loading `/?wake=1` or `/`, always: unsent input on the page (a draft, an unsaved project edit, a dictation or send under way) never holds either back — it is kept on the device and waits in its field, a dictation finished by the service worker (webapp README, "Unsent input"). |
 | Pages without the web app's code | The gateway's own pages (`/sends`, `/claude-auth`) do not load `components/shell.js`, so nothing on them answers `wake` or `home`. The shell handles that itself: when the page in front is not one of the dashboard's, a Home press loads `/` and a wake loads `/?wake=1` instead of dispatching the event. |
 | `/sync-health` | The link target for "update your health data" in threads: `https://<dashboard origin>/sync-health#sync` (the origin is `CONVERSATION_BASE_URL`'s). Same origin, so the shell opens it in place. A static page — a GET never changes server state; the fragment is the instruction, and the server never sees it. In the shell with `#sync` it calls `healthSync()`, says "Health data update triggered", and after a moment goes back (`history.back()`, or `/` when opened cold); a `done` arriving first is shown before it leaves, an `error` or `skipped` stays on screen with *Update now* and *Back*. The fragment is dropped from the address once read, so a reload starts nothing. In the shell without `#sync`: a short explanation, the last sync and *Update now*. In a browser on Android: the Ara app is needed, and an **Open in Ara app** link — an intent link the page builds from `location`, never from configuration: `intent://open?url=<percent-encoded https://<origin>/sync-health#sync>#Intent;scheme=retinue-shell;package=os.retinue.ara;S.browser_fallback_url=<percent-encoded https://<origin>/sync-health>;end`. The app opens the URL only when its origin is exactly the one it is configured for, and otherwise says so and connects nowhere (no Android App Links, no Play services). On a desktop: the explanation only. The page loads `shell.js`, so `wake` and `home` work on it, and it is in the service worker's shell cache like every page. |
 | Cold wake | With no page loaded the shell loads `/?wake=1`; the home treats it as a wake and drops the flag from the address. A wake should reach the page once it is resumed; one that arrives while the page is hidden still waits (up to 60 s) for it to come to the front before the mic opens. |
@@ -1046,75 +1046,99 @@ phone types it there.
 - **Agent side.** Inside a dashboard-thread turn, `scripts/shell-type.py`
   attaches an action to the reply being written — `"text"` (`--enter` to press
   Enter after it), `--key <name>`, or `--secret "<label>"` — by appending one
-  JSON line to the turn's manifest, `RETINUE_REPLY_SHELL_ACTIONS_FILE`. It is
-  the sibling of `conversation-push.py --reply-attach`
+  ASCII JSON line to the turn's manifest, `RETINUE_REPLY_SHELL_ACTIONS_FILE`.
+  It is the sibling of `conversation-push.py --reply-attach`
   (RETINUE_REPLY_ATTACHMENTS_FILE) and follows the same rules: a fresh
   manifest per spawn, only the kept run's is read, so an escalated junior's
   actions go with her discarded reply; outside a thread turn the CLI refuses.
-  Only a turn the **user** started gets the manifest: a turn a chat arrival
-  started reads someone else's words, so it gets none (the CLI refuses), and
-  the gateway drops any action such a turn produced anyway.
-  `scripts/shell_actions.py` validates in both places (kinds, a 32-hex `id`,
-  text ≤ 4000 characters without control characters, a known key, a label
-  ≤ 80; at most 10 per reply).
+  Only a turn the **user** started **from the dashboard** gets the manifest
+  (`_conv_turn_may_type`): its message came through the reverse proxy
+  (`via_edge`, set by the dashboard's own endpoints), so neither a chat
+  arrival — someone else's words — nor a "user" message an in-container
+  agent posted can make the phone type; the gateway drops any action such a
+  turn produced anyway. `scripts/shell_actions.py` validates in both places
+  (kinds, a 32-hex `id`, text ≤ 4000 characters without control characters,
+  line or paragraph separators or bidi controls, a known key, a one-line
+  label ≤ 80; at most 10 per reply, which the CLI enforces as it writes).
 - **Stored** on the reply as `shell_actions`:
   `{kind: "keyboard-type", id, text, enter, sensitive}`, `{kind:
   "keyboard-key", id, key}`, `{kind: "keyboard-secret", id, label, enter}`,
-  each with `auto` — whether the page may run it without a tap
-  (`shell_actions.runs_by_itself`: never a password-manager field, nothing
-  that presses Enter) — and, once the page reports it, `outcome` (`{state:
-  typed | error | secret-typed | secret-cancelled, error?, at}`, `POST
-  /conversations/<id>/shell-actions/<action id>/outcome`). Transcripts shown
-  to later turns note each action with its outcome (`shell_actions.describe`);
-  a resumed session is told the outcomes of its own last reply's actions.
+  each with `auto` — whether the page may run it without a tap, decided by
+  the gateway: only in a plain chat the user opened (`_conv_allows_auto_run`;
+  never in a companion thread or a thread an agent opened, whose turns carry
+  other people's words), and only plain one-line text
+  (`shell_actions.runs_by_itself`: no Enter, line break or tab, no key, no
+  sensitive text, no password-manager field) — and, once the page reports
+  it, `outcome` (`{state: typed | error | secret-typed | secret-cancelled,
+  error?, at}`, `POST /conversations/<id>/shell-actions/<action id>/outcome`).
+  Transcripts shown to later turns note each action with its outcome
+  (`shell_actions.describe`); a resumed session is told the outcomes of its
+  own last reply's actions.
 - **Passwords, PINs and codes** can be typed two ways:
   - `shell-type.py --sensitive "<text>"` — one the user dictated, or one Ara
     fetched (an SMS code). The text reaches the phone, but the dashboard
-    shows it only as `••••••` (no reveal), a replayed transcript never
-    carries it (`shell_actions.describe`), and it is **deleted from the stored
-    reply** as soon as the page reports it typed (the `outcome` call above)
-    and in any case after `SENSITIVE_TTL_SECONDS` (two minutes): every read
-    of a thread (`_load_conv`) purges an expired text before anything sees
-    it, a timer rewrites the file, and a startup sweep
-    (`_conv_sensitive_sweep`) does both for whatever a restart left. A
-    purged action keeps `kind`, `id`, `enter`, `sensitive` and gets `purged:
-    true`, `text: null`; the row says *Text deleted* and nothing can retype
-    it. The turn's Claude session holds the text verbatim (the user's
-    message, Ara's own command), so it is **never resumed**: the gateway
-    drops the binding and erases its transcript (`_reset_session`), and the
-    next turn starts afresh from the stored thread. Ara never repeats such a
-    text in her reply. When the user dictated it, she offers to **redact**
-    that message: `conversation-push.py --thread <id> --redact-message
-    <message id>` (every user message shows its `[message id: …]` to Ara;
-    `POST /internal/conversations/<id>/redact`, token-gated) replaces its
-    text with *[deleted by request]* for good — only after the user
-    approves. Redaction also deletes the message's attachment files, a
-    thread title derived from it, the session-log entry whose question it
-    was, and ends the thread's Claude session again (a turn running at that
-    moment has its session refused once). What no redaction reaches: the
-    model provider processed the text, and push notifications already
-    delivered.
+    shows it only as `••••••` (no reveal) and types it only on the user's
+    tap, a replayed transcript never carries it (`shell_actions.describe`),
+    and it is **deleted from the stored reply** as soon as the page reports
+    it typed (the `outcome` call above) and in any case after
+    `SENSITIVE_TTL_SECONDS` (two minutes): every read of a thread
+    (`_load_conv`) purges an expired text before anything sees it, a timer
+    per due text rewrites the file, a startup sweep
+    (`_conv_sensitive_sweep`) does both for whatever a restart left, and the
+    page drops its own copy at the same mark. A purged action keeps `kind`,
+    `id`, `enter`, `sensitive` and gets `purged: true`, `text: null`; the row
+    says *Text deleted* and nothing can retype it. A thread title derived
+    from one of the user's messages becomes *Typing on a paired device*, so
+    the thread list and pushes do not carry it.
+  - The turn's Claude session holds the text verbatim (the user's message,
+    Ara's own command), so it is **never resumed**: `send_message` decides
+    so under the thread's session lock, before any queued turn can resume it
+    — whether the run succeeded or failed, and for a sensitive action in an
+    escalated junior's discarded run too — and drops the binding with every
+    session id the thread ever had, erasing their transcripts
+    (`_record_turn_session`, `previous_session_ids`). The next turn starts a
+    fresh session, shown the thread as stored: Ara's command and the typed
+    text are masked there, but **the user's own message still reads as they
+    wrote it until it is redacted.** Ara never repeats such a text in her
+    reply. When the user dictated it, she offers to **redact** that message:
+    `conversation-push.py --thread <id> --redact-message <message id>` (every
+    user message shows its `[message id: …]` to Ara — one stored before
+    messages had ids gets one derived from its time and role; `POST
+    /internal/conversations/<id>/redact`, token-gated) replaces its text with
+    *[deleted by request]* for good — only after the user approves.
+    Redaction also deletes the message's attachment files, a thread title
+    derived from it, the session-log entries whose question it was — also
+    one a turn running at that moment writes later — and every Claude
+    session the thread has had (a turn running at that moment has its
+    session refused once). The one-shot model calls that see the user's
+    words (dictation cleanup, the presentation lint) keep no transcript
+    (`--no-session-persistence`). What no redaction reaches: the model
+    provider processed the text, and push notifications already delivered.
   - `--secret "<label>"` — the convenient path for a password the user keeps
     in a password manager. It carries a label only; the shell asks for the
-    secret in its own native field (autofill), types it and forgets it. Ara
-    and the server learn only `secret-typed` or `secret-cancelled`.
+    secret in its own native field (autofill), naming the device it types
+    into, types it and overwrites its own copy. Ara and the server learn only
+    `secret-typed` or `secret-cancelled`.
 - **Page side** (`components/shell-keyboard.js`, rendered by
   `conversation.js` under the bubble). Outside the shell the row only says the
   Ara app is needed. Inside it, each action gets a button — *Type N
   characters on <device>*, *Type ••••••*, *Retype*, *Password from manager:
-  <label>* — and the
-  outcome line from the `keyboard` events (*Typed on Quest 3 ✓*, *Not typed:
-  no device connected* with *Open keyboard*), which the page also reports to
-  the gateway; after a reload the row shows the stored outcome. A
-  `keyboard-type` or `keyboard-key` action runs **by itself once**: only when
-  the gateway marked it `auto`, only when its message arrives live in the
-  thread open on this device (not on opening the thread, a reload or a
-  history read), only within two minutes of the message's time, and only if
-  this device has not run its `id` before (a bounded list in localStorage —
-  only the app's one WebView can type at all). Whatever presses Enter —
-  `enter`, the Enter key, a line break in the text — always waits for the
-  user's tap, and so does a password-manager field. Retype is always a tap,
-  and impossible once a sensitive text is deleted.
+  <label>* — and the outcome line from the `keyboard` events (*Typed on
+  Quest 3 ✓*, *Not typed: no device connected* with *Open keyboard*); after
+  a reload the row shows the stored outcome. Actions run **one after
+  another** — the next starts on the previous one's final event, the app
+  refusing a second one while it types — and *Stop* ends the one running and
+  drops the rest. The outcomes are reported to the gateway from the module,
+  not the thread view, so leaving the thread mid-text loses none. A
+  `keyboard-type` action runs **by itself once**: only when the gateway
+  marked it `auto`, only when its message arrives live in the thread open
+  and visible on this device (not on opening the thread, a reload, a history
+  read, or coming back to a page that was hidden — what arrived meanwhile
+  waits for a tap), only within two minutes of the message's time, and only
+  if this device has not run its `id` before (a bounded list in localStorage
+  — only the app's one WebView can type at all). Everything else waits for
+  the user's tap, and the page checks the rule again (`needsTap`). Retype is
+  always a tap, and impossible once a sensitive text is deleted.
 
 `manifest.webmanifest` declares `launch_handler: {client_mode:
 "focus-existing"}`, so a second launch of the installed PWA brings its open

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 import uuid
 
 MANIFEST_VAR = "RETINUE_REPLY_SHELL_ACTIONS_FILE"
@@ -56,20 +57,24 @@ MAX_LABEL = 80
 # How many actions one reply may carry; the rest of a runaway manifest is
 # dropped.
 MAX_ACTIONS = 10
-# A manifest bigger than this is not one.
-MAX_MANIFEST_BYTES = 64 * 1024
+# A manifest bigger than this is not one: MAX_ACTIONS lines of a MAX_TEXT
+# text written as \\uXXXX escapes (shell-type.py writes ASCII JSON) fit.
+MAX_MANIFEST_BYTES = 512 * 1024
 
 # What the page may report about an action (POST
 # /conversations/<id>/shell-actions/<action id>/outcome): the states of the
 # app's `keyboard` events, and the error keys the app gives (RetinueShell/5).
 OUTCOME_STATES = ("typed", "error", "secret-typed", "secret-cancelled")
-OUTCOME_ERRORS = ("not-enabled", "not-connected", "too-long", "unsupported-char",
-                  "busy", "failed")
+OUTCOME_ERRORS = ("not-enabled", "not-connected", "not-in-front", "too-long",
+                  "unsupported-char", "busy", "cancelled", "failed")
 
 _ID_RE = re.compile(r"^[0-9a-f]{32}$")
 # Control characters other than newline and tab cannot be typed on a
 # keyboard; refusing them keeps escape sequences out of the target device.
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+# So are the C1 controls, the Unicode line and paragraph separators (which
+# would also split a manifest line) and the bidi controls.
+_CONTROL_RE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 
 
 class InvalidAction(ValueError):
@@ -113,7 +118,13 @@ def normalize(raw: object) -> dict:
         label = raw.get("label")
         if not isinstance(label, str) or not label.strip():
             raise InvalidAction("keyboard-secret needs a label")
+        # One plain line: control, format (bidi) and separator characters
+        # become spaces, so a label cannot spoof or break the phone's dialog.
+        label = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp") else c
+                        for c in label)
         label = " ".join(label.split())
+        if not label:
+            raise InvalidAction("keyboard-secret needs a label")
         if len(label) > MAX_LABEL:
             raise InvalidAction(f"label is longer than {MAX_LABEL} characters")
         out["label"] = label
@@ -135,18 +146,18 @@ def normalize_outcome(raw: object) -> "dict | None":
 
 def runs_by_itself(action: dict) -> bool:
     """Whether the page may run `action` without a tap when its reply arrives
-    live (webapp/components/shell-keyboard.js, shouldAutoRun, applies the
-    same rule). Never a password-manager field, nothing that presses Enter —
-    `enter`, the Enter key, or a line break in the text, which the app types
-    as Shift+Enter and which submits in a terminal or a one-line field."""
-    kind = action.get("kind") if isinstance(action, dict) else None
-    if kind == "keyboard-key":
-        return action.get("key") != "enter"
-    if kind == "keyboard-type":
-        text = action.get("text")
-        return (isinstance(text, str) and bool(text) and not action.get("enter")
-                and "\n" not in text)
-    return False
+    live (webapp/components/shell-keyboard.js, needsTap, applies the same
+    rule; the gateway also requires a thread the user opened). Only plain
+    text on one line: nothing that can submit or act — `enter`, a line break
+    (typed as Shift+Enter, which submits in a terminal or a one-line field),
+    a tab (which moves to a form's button) or any single key (Space presses
+    a focused button) — and no sensitive text, which goes nowhere the user
+    has not just confirmed. Never a password-manager field."""
+    if not isinstance(action, dict) or action.get("kind") != "keyboard-type":
+        return False
+    text = action.get("text")
+    return (isinstance(text, str) and bool(text) and not action.get("enter")
+            and not action.get("sensitive") and not re.search(r"[\r\n\t]", text))
 
 
 def parse_manifest(raw: str) -> tuple[list[dict], list[str]]:
@@ -155,7 +166,8 @@ def parse_manifest(raw: str) -> tuple[list[dict], list[str]]:
     actions: list[dict] = []
     problems: list[str] = []
     seen: set[str] = set()
-    for n, line in enumerate(raw.splitlines(), 1):
+    # "\n" only: str.splitlines() also splits at U+2028 and friends.
+    for n, line in enumerate(raw.split("\n"), 1):
         line = line.strip()
         if not line:
             continue
@@ -223,7 +235,8 @@ def outcome_phrase(action: dict) -> str:
     if state == "secret-cancelled":
         return "cancelled by the user"
     if state == "error":
-        return f"not typed: {o.get('error') or 'failed'}"
+        why = o.get("error") or "failed"
+        return "stopped by the user" if why == "cancelled" else f"not typed: {why}"
     return "no outcome reported yet"
 
 

@@ -17,7 +17,8 @@
 //     `health-sync` (a Health Connect sync started, done, failed or skipped)
 //     or `endpoints` (the shell's endpoint list changed); from RetinueShell/5
 //     the keyboard members (keyboardStatus(), keyboardType(text, opts),
-//     keyboardKey(name, opts), keyboardSecret(opts), keyboardOpen()) and its
+//     keyboardKey(name, opts), keyboardSecret(opts), keyboardOpen(),
+//     keyboardCancel()) and its
 //     `keyboard` events.
 //
 // Every member is feature-detected: an older shell lacks the newer ones, and
@@ -298,6 +299,12 @@ export function keyboardSecret({ id = '', label = '', enter = false } = {}) {
 // Open the shell's keyboard screen: pairing, the device, live typing.
 export function keyboardOpen() {
   return shellInvoke('keyboardOpen')[0];
+}
+
+// Stop what the shell is typing; its outcome comes as an `error` event with
+// `cancelled`. False for a shell without the member.
+export function keyboardCancel() {
+  return shellInvoke('keyboardCancel')[0];
 }
 
 // Subscribe to the shell's `keyboard` events: cb(detail) with detail.state
