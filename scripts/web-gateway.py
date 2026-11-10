@@ -395,7 +395,7 @@ def _default_thread_model() -> str:
 # Each turn is its own `claude -p` process — a resumed one keeps the transcript,
 # not a model — so which model answers a thread is a free per-turn choice:
 # pickable at creation and switchable mid-thread, effective from the next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
-# Medic, Archivist, Ari) run on their own hard-wired models regardless.
+# Archivist, chamber subagents) run on their own hard-wired models regardless.
 #
 # The list of offered models comes from LiteLLM when the deployment routes
 # through it: the gateway reads GET <RETINUE_LITELLM_URL>/model/info (default:
@@ -3506,7 +3506,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
     acc = html.escape(account)
     rid = html.escape(detail.get("request_id", ""))
     subj = html.escape(detail.get("subject") or "(no subject)")
-    # Which identity sends this mail (e.g. "Your Name <you@…>" vs Ari's mailbox).
+    # Which identity sends this mail (e.g. "Your Name <you@…>" vs an agent persona's own mailbox).
     # It matters whether a message goes out as the user's business address or as
     # an agent persona, so surface it prominently at the top of the approval card.
     frm = html.escape(detail.get("from") or account)
@@ -5271,7 +5271,7 @@ _OWNER_ACTOR = os.environ.get("RETINUE_OWNER_ACTOR", "").strip() or "urn:retinue
 # (chambers/_generated/attention/items.nt) states currentActor, importance,
 # sphere and tag for the same project IRI, derived from this very query; read
 # back, it gave a project two actors, the fold below kept whichever binding
-# came first, and a humanized label ("Reto") written out as an actor IRI
+# came first, and a humanized label (the owner's name) written out as an actor IRI
 # re-entered as the actor and was emitted again — a loop that pinned projects
 # to "waiting on" their own owner. agent-self-review.py scopes the same way.
 _PROJECTS_SPARQL = """

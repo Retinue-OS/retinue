@@ -54,13 +54,13 @@ nothing new.
   mailbox passwords, the LiteLLM master and picker keys, the repo token and
   any secret added to `.env` later are absent by construction, and e-mail
   reaches the mailbox only through the web gateway's backend, where the send
-  policy is applied. Two credentials pass on purpose, and a session can read
-  them: the model credential (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
+  policy is applied. One credential passes on purpose, plus what a deployment names, and a
+  session can read them: the model credential (`ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
   and `ANTHROPIC_CUSTOM_HEADERS` when it carries a LiteLLM virtual key),
-  without which a spawned session cannot run at all, and — until the fetch
-  moves into a sidecar — the Garmin login (`GARMIN_EMAIL` /
-  `GARMIN_PASSWORD`), because `refresh.py --ensure` runs `sync-garmin.py`
-  inside the agent's own process. The `retinue` service also no longer loads
+  without which a spawned session cannot run at all, and whatever a
+  deployment names in `RETINUE_SESSION_ENV_EXTRA` for its chambers' own
+  scripts (a data source's login, say, because `refresh.py --ensure` runs a
+  chamber's fetch inside the agent's own process). The `retinue` service also no longer loads
   `.env` wholesale, so a secret meant for another service never enters the
   agent container at all. The remote-control main session is not spawned
   this way and keeps the entrypoint's narrower scrub (mail credentials and

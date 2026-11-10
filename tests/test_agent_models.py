@@ -37,12 +37,12 @@ Body of the prompt, with `code` and — dashes.
 """
 
 PLUGIN_AGENT = """---
-name: ari
+name: scout
 description: A bear with a mailbox.
 model: sonnet
 ---
 
-Ari's prompt.
+Scout's prompt.
 """
 
 NESTED_AGENT = """---
@@ -63,15 +63,15 @@ def _load(tmp: Path, env_models: str | None = None):
     core.mkdir(exist_ok=True)
     (core / "secretary.md").write_text(CORE_AGENT, encoding="utf-8")
     (core / "hooked.md").write_text(NESTED_AGENT, encoding="utf-8")
-    plugin_dir = tmp / "plugins" / "ari" / "0.1.0"
+    plugin_dir = tmp / "plugins" / "scout" / "0.1.0"
     (plugin_dir / "agents").mkdir(parents=True, exist_ok=True)
-    (plugin_dir / "agents" / "ari.md").write_text(PLUGIN_AGENT, encoding="utf-8")
+    (plugin_dir / "agents" / "scout.md").write_text(PLUGIN_AGENT, encoding="utf-8")
     installed = tmp / "installed_plugins.json"
     installed.write_text(json.dumps({"version": 2, "plugins": {
-        "ari@retinue": [{"scope": "user", "installPath": str(plugin_dir)}]}}))
+        "scout@retinue": [{"scope": "user", "installPath": str(plugin_dir)}]}}))
     marketplace = tmp / "marketplace.json"
     marketplace.write_text(json.dumps({"name": "retinue", "plugins": [
-        {"name": "ari", "source": "./chambers/ari/.retinue"}]}))
+        {"name": "scout", "source": "./chambers/scout/.retinue"}]}))
     os.environ["RETINUE_CORE_AGENTS_DIR"] = str(core)
     os.environ["RETINUE_INSTALLED_PLUGINS"] = str(installed)
     os.environ["RETINUE_MARKETPLACE"] = str(marketplace)
@@ -90,13 +90,13 @@ def test_discovery():
     with tempfile.TemporaryDirectory() as d:
         am = _load(Path(d))
         rows = {a["id"]: a for a in am.discover()}
-        assert set(rows) == {"secretary", "hooked", "ari:ari"}, set(rows)
+        assert set(rows) == {"secretary", "hooked", "scout:scout"}, set(rows)
         assert rows["secretary"]["builtin"] == "opus"
         assert rows["secretary"]["definition"]["tools"] == ["Read", "Glob", "Grep"]
         assert rows["secretary"]["definition"]["prompt"].startswith("\n# Secretary")
         assert "name" not in rows["secretary"]["definition"]
-        assert rows["ari:ari"]["source"] == "plugin:ari"
-        assert rows["ari:ari"]["definition"]["model"] == "sonnet"
+        assert rows["scout:scout"]["source"] == "plugin:scout"
+        assert rows["scout:scout"]["definition"]["model"] == "sonnet"
         assert rows["hooked"]["definition"] is None, "nested frontmatter must not be redefined"
         assert rows["hooked"]["builtin"] == "haiku"
 
@@ -110,19 +110,19 @@ def test_no_override_means_no_flag():
 
 def test_env_source_and_generated_file():
     with tempfile.TemporaryDirectory() as d:
-        am = _load(Path(d), "secretary=claude-haiku-5-5, ari:ari=ollama/qwen3.6:latest, bogus")
+        am = _load(Path(d), "secretary=claude-haiku-5-5, scout:scout=ollama/qwen3.6:latest, bogus")
         assert am.overrides() == {"secretary": "claude-haiku-5-5",
-                                  "ari:ari": "ollama/qwen3.6:latest"}
+                                  "scout:scout": "ollama/qwen3.6:latest"}
         args = am.cli_args()
         assert args[0] == "--agents" and Path(args[1]).is_file(), args
         defs = json.loads(Path(args[1]).read_text(encoding="utf-8"))
-        assert set(defs) == {"secretary", "ari:ari"}
+        assert set(defs) == {"secretary", "scout:scout"}
         assert defs["secretary"]["model"] == "claude-haiku-5-5"
         assert defs["secretary"]["description"] == "Composes messages."
         assert defs["secretary"]["tools"] == ["Read", "Glob", "Grep"]
         assert "— dashes" in defs["secretary"]["prompt"]
-        assert defs["ari:ari"]["model"] == "ollama/qwen3.6:latest"
-        assert "tools" not in defs["ari:ari"]
+        assert defs["scout:scout"]["model"] == "ollama/qwen3.6:latest"
+        assert "tools" not in defs["scout:scout"]
         # Unchanged content is not rewritten.
         before = os.stat(args[1]).st_mtime_ns
         am.cli_args()
@@ -137,25 +137,25 @@ def test_env_source_and_generated_file():
 
 def test_dashboard_file_wins_and_cancels():
     with tempfile.TemporaryDirectory() as d:
-        am = _load(Path(d), "secretary=claude-haiku-5-5,ari:ari=claude-haiku-5-5")
+        am = _load(Path(d), "secretary=claude-haiku-5-5,scout:scout=claude-haiku-5-5")
         am.write_setting("secretary", "ollama/gemma4:12b")
-        am.write_setting("ari:ari", "")
+        am.write_setting("scout:scout", "")
         assert am.overrides() == {"secretary": "ollama/gemma4:12b"}
         status = {r["id"]: r for r in am.status()}
         assert status["secretary"]["model"] == "ollama/gemma4:12b"
         assert status["secretary"]["chosen"] == "ollama/gemma4:12b"
         assert status["secretary"]["env_default"] == "claude-haiku-5-5"
-        assert status["ari:ari"]["model"] == ""  # built-in, env default cancelled
-        assert status["ari:ari"]["chosen"] == ""
+        assert status["scout:scout"]["model"] == ""  # built-in, env default cancelled
+        assert status["scout:scout"]["chosen"] == ""
         assert status["hooked"]["overridable"] is False
         assert status["hooked"]["chosen"] is None
         stored = json.loads(Path(os.environ["RETINUE_AGENT_MODELS_FILE"]).read_text())
-        assert stored == {"agents": {"secretary": "ollama/gemma4:12b", "ari:ari": ""}}
+        assert stored == {"agents": {"secretary": "ollama/gemma4:12b", "scout:scout": ""}}
         # A corrupt settings file is ignored, not fatal.
         Path(os.environ["RETINUE_AGENT_MODELS_FILE"]).write_text("{not json")
         assert am.read_settings() == {}
         assert am.overrides() == {"secretary": "claude-haiku-5-5",
-                                  "ari:ari": "claude-haiku-5-5"}
+                                  "scout:scout": "claude-haiku-5-5"}
 
 
 def test_model_id_validation():
@@ -253,7 +253,7 @@ def test_plugin_semantics():
     with tempfile.TemporaryDirectory() as d:
         tmp = Path(d)
         am = _load(tmp)
-        agents_dir = tmp / "plugins" / "ari" / "0.1.0" / "agents"
+        agents_dir = tmp / "plugins" / "scout" / "0.1.0" / "agents"
         (agents_dir / "bold.md").write_text(_agent(
             "bold", "permissionMode: bypassPermissions\ninitialPrompt: Say hi\n"),
             encoding="utf-8")
@@ -265,20 +265,20 @@ def test_plugin_semantics():
         (gone_dir / "agents").mkdir(parents=True)
         (gone_dir / "agents" / "ghost.md").write_text(_agent("ghost", ""), encoding="utf-8")
         # Two records for one plugin: the user-scope one is what sync-plugins installs.
-        stale_dir = tmp / "plugins" / "ari" / "0.0.1"
+        stale_dir = tmp / "plugins" / "scout" / "0.0.1"
         (stale_dir / "agents").mkdir(parents=True)
         (stale_dir / "agents" / "old.md").write_text(_agent("old", ""), encoding="utf-8")
         installed = Path(os.environ["RETINUE_INSTALLED_PLUGINS"])
         installed.write_text(json.dumps({"version": 2, "plugins": {
-            "ari@retinue": [
+            "scout@retinue": [
                 {"scope": "project", "projectPath": "/elsewhere", "installPath": str(stale_dir)},
                 {"scope": "user", "installPath": str(agents_dir.parent)}],
             "gone@retinue": [{"scope": "user", "installPath": str(gone_dir)}]}}))
         rows = {a["id"]: a for a in am.discover()}
-        assert "gone:ghost" not in rows and "ari:old" not in rows, set(rows)
-        bold = rows["ari:bold"]["definition"]
+        assert "gone:ghost" not in rows and "scout:old" not in rows, set(rows)
+        bold = rows["scout:bold"]["definition"]
         assert "permissionMode" not in bold and "initialPrompt" not in bold, bold
-        assert rows["ari:rooted"]["definition"] is None
+        assert rows["scout:rooted"]["definition"] is None
         # A core agent keeps the fields Claude honours there.
         (tmp / "agents" / "core.md").write_text(_agent(
             "core", "permissionMode: plan\n"), encoding="utf-8")

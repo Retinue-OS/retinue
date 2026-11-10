@@ -14,7 +14,7 @@ queues the message as a pending send that must be approved on the web gateway's
 queued send this prints the approval URL.
 
 Examples:
-    telegram-push.py "Ari: reply to Mara failed — check scheduler.log"
+    telegram-push.py "Agent: reply to Mara failed — check scheduler.log"
     telegram-push.py --recipient 123456789 --image /tmp/chart.png "Today's summary"
 
 Configuration (environment):

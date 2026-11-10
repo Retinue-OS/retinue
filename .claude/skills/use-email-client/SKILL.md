@@ -97,7 +97,7 @@ category:
 
 | Category | Behaviour of `send` |
 |---|---|
-| `allow` | Sends directly, no confirmation (e.g. Ari's own mailbox). |
+| `allow` | Sends directly, no confirmation (e.g. an agent persona's own mailbox). |
 | `trust` | Sends directly **only** when you pass `--user-approved` (you assert the user approved this exact send). Without that flag it falls back to the `verify` flow. |
 | `verify` | **Never** sends directly. Saves the message as a pending draft and returns an `approval_url`; the user approves or denies it on the web gateway. |
 

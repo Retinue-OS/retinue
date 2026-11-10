@@ -102,11 +102,11 @@ def build_prompt(rows: list[dict]) -> str:
         "  - If you can complete the next action now, do it and update the "
         "project file (set current_actor away from the agent, or resolved: true "
         "when done).",
-        "  - If it needs Reto's input, open a dashboard conversation with a "
+        "  - If it needs the owner's input, open a dashboard conversation with a "
         "concrete proposal (conversation-push.py). Do not nag: no thread for "
         "work you can simply do.",
         "  - Route each project to its owning agent: handle Ara's directly; "
-        "dispatch the owning subagent (Ari, Coach, Medic, ...) for theirs and "
+        "dispatch the owning chamber subagent for theirs and "
         "relay/escalate as usual.",
         "",
         "Projects pending on an AI agent:",
