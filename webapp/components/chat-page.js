@@ -997,6 +997,31 @@ class RetinueChatPage extends HTMLElement {
     else this.style.removeProperty('--composer-h');
     if (on !== this.hasAttribute('composer-sized')) this.toggleAttribute('composer-sized', on);
     if (this._grow) this._grow();
+    const grip = this.shadowRoot && this.shadowRoot.querySelector('[data-grip]');
+    if (grip && this.shadowRoot.activeElement === grip) this._gripAria();
+  }
+
+  // What the separator says it is at — a focusable separator carries a value
+  // (ARIA): the composer's share of the chat pane in percent, between its own
+  // height and the most the grip gives it. Refreshed when the grip is shown,
+  // focused or moved, which is when a screen reader reads it, rather than on
+  // every viewport step: reading it forces a layout.
+  _gripAria() {
+    const root = this.shadowRoot;
+    const grip = root && root.querySelector('[data-grip]');
+    const box = root && root.querySelector('.pane-chat .composer');
+    const pane = box && box.parentElement;
+    if (!grip || !pane || !pane.clientHeight) return;
+    const pct = (px) => Math.max(0, Math.min(100, Math.round((px / pane.clientHeight) * 100)));
+    const { own, max } = this._composerBounds(box);
+    const lo = pct(own);
+    const hi = Math.max(lo, pct(max));
+    const now = Math.min(hi, Math.max(lo, pct(box.getBoundingClientRect().height)));
+    grip.setAttribute('aria-valuemin', String(lo));
+    grip.setAttribute('aria-valuemax', String(hi));
+    grip.setAttribute('aria-valuenow', String(now));
+    grip.setAttribute('aria-valuetext', this.hasAttribute('composer-sized')
+      ? `Composer at ${now}% of the chat pane` : 'Composer at its own height');
   }
 
   // `px` null gives the slot back to the composer's own height. Not saved
@@ -1077,7 +1102,7 @@ class RetinueChatPage extends HTMLElement {
         grip.removeEventListener('pointermove', move);
         grip.removeEventListener('pointerup', up);
         grip.removeEventListener('pointercancel', up);
-        if (moved) this._saveSizes();
+        if (moved) { this._saveSizes(); this._gripAria(); }
       };
       grip.addEventListener('pointermove', move);
       grip.addEventListener('pointerup', up);
@@ -1096,10 +1121,14 @@ class RetinueChatPage extends HTMLElement {
       const stick = this._atBottom();
       this._setComposerHeight(this._composerSlot(), null);
       this._saveSizes();
+      this._gripAria();
       if (stick) this._scrollThread('[data-chat-thread]');
     });
+    grip.addEventListener('focus', () => this._gripAria());
+    // Its first value once the layout it describes is there.
+    requestAnimationFrame(() => this._gripAria());
     // From the keyboard: arrows step it, Enter resets — the splitter's set,
-    // turned upright.
+    // turned upright (the value follows through _applyComposerSize).
     grip.addEventListener('keydown', (e) => {
       let delta = 0;
       if (e.key === 'ArrowUp') delta = KEY_STEP_PX;
