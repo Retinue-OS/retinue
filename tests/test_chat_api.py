@@ -914,6 +914,32 @@ def test_send_images(base, wg):
     status, only = _http(base, "POST", send_path,
                          {"images": [{"content_type": "image/png", "data": png_b64}]})
     assert status == 200 and only["text"] == "" and only["attachments"]
+    # Any file rides the same list — a PDF, a video — and its name travels to
+    # the gateway, which sends the document under it.
+    status, doc = _http(base, "POST", send_path,
+                        {"images": [{"content_type": "application/pdf",
+                                     "filename": " report.pdf ", "data": png_b64},
+                                    {"content_type": "video/mp4",
+                                     "filename": "clip.mp4", "data": png_b64}]})
+    assert status == 200 and doc["attachments"], doc
+    assert STATE["sent"][-1]["images"] == [
+        {"content_type": "application/pdf", "filename": "report.pdf", "data": png_b64},
+        {"content_type": "video/mp4", "filename": "clip.mp4", "data": png_b64}]
+    n = len(STATE["sent"])
+    status, body = _http(base, "POST", send_path,
+                         {"images": [{"filename": 7, "data": png_b64}]})
+    assert status == 400 and "filename" in body["error"]
+    # The attachments of one send are also capped together: the channel
+    # gateway takes them as one body.
+    old_total = wg.CHAT_SEND_MAX_BYTES
+    wg.CHAT_SEND_MAX_BYTES = 12
+    try:
+        status, body = _http(base, "POST", send_path,
+                             {"images": [{"data": png_b64}, {"data": png_b64}]})
+        assert status == 400 and "too large" in body["error"]
+    finally:
+        wg.CHAT_SEND_MAX_BYTES = old_total
+    assert len(STATE["sent"]) == n, "rejected sends must never reach the gateway"
     print("PASS test_send_images")
 
 def test_control_gateway_refused(base, wg):

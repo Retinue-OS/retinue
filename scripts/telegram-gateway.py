@@ -1961,7 +1961,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
     timeout.
 
     What the send produced — the channel's message id, the send time, and the
-    ledger media references for any images — is written onto the entry beside
+    ledger media references for any attachments — is written onto the entry beside
     the status. The status alone used to be all that survived, so an approved
     send's identity was simply lost; the chat surface needs it, because a chat
     send is now queued and approved rather than skipping the queue, and it
@@ -2050,32 +2050,22 @@ def _complete_pending_send(request_id: str, approved: bool,
 
 # ── Outbound push ─────────────────────────────────────────────────────────────
 
-def _decode_image(image: dict) -> Path:
-    """Materialize one inbound base64 image to a temp file for sending."""
-    if not isinstance(image, dict):
-        raise ValueError("each images entry must be an object with base64 'data'")
-    data_b64 = image.get("data")
-    if not data_b64:
-        raise ValueError("image entry missing base64 'data'")
-    try:
-        raw = base64.b64decode(data_b64, validate=True)
-    except ValueError as exc:  # binascii.Error subclasses ValueError
-        raise ValueError(f"invalid base64 image data: {exc}") from exc
-    suffix = Path(image.get("filename") or "image.jpg").suffix or ".jpg"
-    fd, out = tempfile.mkstemp(suffix=suffix, prefix="tg-push-", dir=str(TELEGRAM_TMP_DIR))
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(raw)
-    return Path(out)
+def _decode_attachment(entry: dict) -> tuple[Path, str, str | None]:
+    """Materialize one /send attachment — a file of any type — for the channel.
+
+    Returns ``(path, content_type, name)``; see
+    :func:`inbound_store.materialize_outbound`."""
+    return _ibstore.materialize_outbound(entry, TELEGRAM_TMP_DIR)
 
 
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
           author: str = "agent") -> tuple[str | None, float | None, list[str]]:
-    """Send an outbound message: text body plus optional image attachments.
+    """Send an outbound message: text body plus optional attachments (files of any type).
 
     `lang`/`voice` are accepted for parity with the other gateways' _push
     signature (persisted in the pending store) but are ignored here. ``author``
-    is carried through to the ledger record; each image is also persisted into
+    is carried through to the ledger record; each attachment is also persisted into
     the ledger media store (inbox mode) so the sent message mirrors with its
     media. Returns ``(message_id, sent_at, media_refs)``; the /send response
     surfaces all three (see :func:`_tg_send`).
@@ -2083,17 +2073,15 @@ def _push(recipient: str, message: str, lang: str | None = None,
     images = images or []
     message = (message or "").strip()
     if not message and not images:
-        raise ValueError("push requires a non-empty message or at least one image")
+        raise ValueError("push requires a non-empty message or at least one attachment")
     temp_paths: list[Path] = []
     media_refs: list[str] = []
     try:
         for image in images:
-            path = _decode_image(image)
+            path, ctype, name = _decode_attachment(image)
             temp_paths.append(path)
             if TELEGRAM_GATEWAY_MODE == "inbox":
-                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
-                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
-                ref = _store_media_ref(path.read_bytes(), ctype)
+                ref = _store_media_ref(path.read_bytes(), ctype, name)
                 if ref:
                     media_refs.append(ref)
         msg_id, sent_at = _tg_send(recipient, message or None,
@@ -2102,7 +2090,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
         return msg_id, sent_at, media_refs
     finally:
         for path in temp_paths:
-            path.unlink(missing_ok=True)
+            _ibstore.discard_outbound(path)
 
 
 def _erase_chat(chat: str, account: str | None) -> dict:
@@ -2347,7 +2335,9 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "empty body"})
             return
         if length > MAX_PUSH_BODY_BYTES:
-            self._reply(413, {"error": "payload too large"})
+            self._reply(413, {"error": "payload too large: one send carries at most "
+                                       f"about {MAX_PUSH_BODY_BYTES * 3 // 4 // (1024 * 1024)} MB "
+                                       "of attachments"})
             return
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -2375,6 +2365,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "no recipient given and TELEGRAM_DEFAULT_RECIPIENT is unset"})
             return
         message = payload.get("message") or payload.get("text") or ""
+        # "images" is the key's historical name: each entry is a file of any
+        # type — an image, a video, a PDF — as {data, filename?, content_type?}.
         images = payload.get("images") or []
         if not isinstance(images, list):
             self._reply(400, {"error": "'images' must be a list"})
@@ -2428,7 +2420,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         # account's policy allows directly. Authorship is provenance, so it is
         # reported rather than branched on.
         print(f"[telegram-gateway] sent to {recipient} (author={author})"
-              + (f" ({len(images)} image(s))" if images else ""), flush=True)
+              + (f" ({len(images)} attachment(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
         # Surface the recorded ledger identity — id, timestamp and the stored
         # media references — so the caller (the dashboard's chat view) can show

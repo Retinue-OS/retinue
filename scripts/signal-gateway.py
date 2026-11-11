@@ -2012,24 +2012,14 @@ def _strip_markdown(text: str) -> str:
 # Lets retinue (Ara) initiate Signal messages — alerts, escalations, daily
 # briefings — rather than only replying to inbound ones. A push carries a text
 # body, a spoken rendering of that body (Piper, same pipeline as replies), and
-# any number of images.
+# any number of attached files (images, videos, documents).
 
-def _decode_image(image: dict) -> Path:
-    """Materialize one inbound base64 image to a temp file for signal-cli."""
-    if not isinstance(image, dict):
-        raise ValueError("each images entry must be an object with base64 'data'")
-    data_b64 = image.get("data")
-    if not data_b64:
-        raise ValueError("image entry missing base64 'data'")
-    try:
-        raw = base64.b64decode(data_b64, validate=True)
-    except ValueError as exc:  # binascii.Error subclasses ValueError
-        raise ValueError(f"invalid base64 image data: {exc}") from exc
-    suffix = Path(image.get("filename") or "image.jpg").suffix or ".jpg"
-    fd, out = tempfile.mkstemp(suffix=suffix, prefix="signal-push-")
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(raw)
-    return Path(out)
+def _decode_attachment(entry: dict) -> tuple[Path, str, str | None]:
+    """Materialize one /send attachment — a file of any type — for the channel.
+
+    Returns ``(path, content_type, name)``; see
+    :func:`inbound_store.materialize_outbound`."""
+    return _ibstore.materialize_outbound(entry)
 
 
 # ── Outbound send-control ─────────────────────────────────────────────────────
@@ -2213,7 +2203,7 @@ def _get_pending_send_detail(request_id: str) -> dict | None:
 
 
 def _list_pending_sends_store() -> list:
-    """List all pending sends from disk (omits image data for compactness)."""
+    """List all pending sends from disk (omits attachment data for compactness)."""
     items = []
     try:
         for path in sorted(SIGNAL_PENDING_SENDS_DIR.glob("*.json")):
@@ -2242,7 +2232,7 @@ def _execute_approved_send(path: Path, entry: dict) -> None:
     timeout.
 
     What the send produced — the channel's message id, the send time, and the
-    ledger media references for any images — is written onto the entry beside
+    ledger media references for any attachments — is written onto the entry beside
     the status. The status alone used to be all that survived, so an approved
     send's identity was simply lost; the chat surface needs it, because a chat
     send is now queued and approved rather than skipping the queue, and it
@@ -2332,11 +2322,11 @@ def _complete_pending_send(request_id: str, approved: bool,
 def _push(recipient: str, message: str, lang: str | None = None,
           images: list[dict] | None = None, voice: bool = True,
           author: str = "agent") -> tuple[str | None, float | None, list[str]]:
-    """Send an outbound message: text body + spoken audio + optional images.
+    """Send an outbound message: text body + spoken audio + optional attachments.
 
-    Images precede the voice note. When voice synthesis fails the message is
-    still delivered as text (plus any images) rather than lost. ``author`` is
-    carried through to the ledger record; each image is also persisted into
+    Attachments (files of any type) precede the voice note. When voice synthesis fails the message is
+    still delivered as text (plus any attachments) rather than lost. ``author`` is
+    carried through to the ledger record; each attachment is also persisted into
     the ledger media store (inbox mode) so the sent message mirrors with its
     media — the spoken rendering is deliberately not stored, since the text it
     reads out already is. Returns ``(message_id, sent_at, media_refs)``; the
@@ -2345,20 +2335,18 @@ def _push(recipient: str, message: str, lang: str | None = None,
     images = images or []
     message = (message or "").strip()
     if not message and not images:
-        raise ValueError("push requires a non-empty message or at least one image")
+        raise ValueError("push requires a non-empty message or at least one attachment")
 
     attachments: list[Path] = []
     temp_paths: list[Path] = []
     media_refs: list[str] = []
     try:
         for image in images:
-            path = _decode_image(image)
+            path, ctype, name = _decode_attachment(image)
             temp_paths.append(path)
             attachments.append(path)
             if SIGNAL_GATEWAY_MODE == "inbox":
-                ctype = ((image.get("content_type") if isinstance(image, dict) else None)
-                         or mimetypes.guess_type(str(path))[0] or "image/jpeg")
-                ref = _store_media_ref(path.read_bytes(), ctype)
+                ref = _store_media_ref(path.read_bytes(), ctype, name)
                 if ref:
                     media_refs.append(ref)
 
@@ -2384,7 +2372,7 @@ def _push(recipient: str, message: str, lang: str | None = None,
         return msg_id, ts, media_refs
     finally:
         for path in temp_paths:
-            path.unlink(missing_ok=True)
+            _ibstore.discard_outbound(path)
 
 
 # ── Re-link flow ──────────────────────────────────────────────────────────────
@@ -2726,7 +2714,9 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "empty body"})
             return
         if length > MAX_PUSH_BODY_BYTES:
-            self._reply(413, {"error": "payload too large"})
+            self._reply(413, {"error": "payload too large: one send carries at most "
+                                       f"about {MAX_PUSH_BODY_BYTES * 3 // 4 // (1024 * 1024)} MB "
+                                       "of attachments"})
             return
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -2754,6 +2744,8 @@ class _PushHandler(BaseHTTPRequestHandler):
             self._reply(400, {"error": "no recipient given and SIGNAL_DEFAULT_RECIPIENT is unset"})
             return
         message = payload.get("message") or payload.get("text") or ""
+        # "images" is the key's historical name: each entry is a file of any
+        # type — an image, a video, a PDF — as {data, filename?, content_type?}.
         images = payload.get("images") or []
         if not isinstance(images, list):
             self._reply(400, {"error": "'images' must be a list"})
@@ -2807,7 +2799,7 @@ class _PushHandler(BaseHTTPRequestHandler):
         # account's policy allows directly. Authorship is provenance, so it is
         # reported rather than branched on.
         print(f"[signal-gateway] sent to {recipient} (author={author})"
-              + (f" ({len(images)} image(s))" if images else ""), flush=True)
+              + (f" ({len(images)} attachment(s))" if images else ""), flush=True)
         body = {"status": "sent", "recipient": recipient}
         # Surface the recorded ledger identity — id, timestamp and the stored
         # media references — so the caller (the dashboard's chat view) can show

@@ -15,7 +15,7 @@ queued send this prints the approval URL.
 
 Examples:
     telegram-push.py "Agent: reply to Mara failed — check scheduler.log"
-    telegram-push.py --recipient 123456789 --image /tmp/chart.png "Today's summary"
+    telegram-push.py --recipient 123456789 --attach /tmp/chart.png "Today's summary"
 
 Configuration (environment):
     TELEGRAM_GATEWAY_SEND_URL   default http://telegram-gateway:8093/send
@@ -25,6 +25,7 @@ Configuration (environment):
 import argparse
 import base64
 import json
+import mimetypes
 import os
 import sys
 import urllib.error
@@ -39,11 +40,16 @@ TOKEN = os.environ.get("TELEGRAM_GATEWAY_TOKEN", "").strip()
 DEFAULT_TIMEOUT = float(os.environ.get("TELEGRAM_GATEWAY_TIMEOUT", "60"))
 
 
-def _encode_image(path: Path) -> dict:
+def _encode_attachment(path: Path) -> dict:
+    """One file — an image, a video, a PDF, anything — as a /send attachment."""
     if not path.is_file():
-        raise SystemExit(f"telegram-push: image not found: {path}")
+        raise SystemExit(f"telegram-push: attachment not found: {path}")
     data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return {"filename": path.name, "data": data}
+    entry = {"filename": path.name, "data": data}
+    content_type = mimetypes.guess_type(path.name)[0]
+    if content_type:
+        entry["content_type"] = content_type
+    return entry
 
 
 def main() -> int:
@@ -54,8 +60,10 @@ def main() -> int:
     parser.add_argument("--reply-to", metavar="TOKEN",
                         help="reply-token from a forwarded inbox message; addresses the reply "
                              "back to the exact conversation it arrived in. Overrides --recipient.")
-    parser.add_argument("--image", action="append", default=[], metavar="PATH",
-                        help="attach an image (repeatable)")
+    parser.add_argument("--attach", "--image", dest="attach", action="append", default=[],
+                        metavar="PATH",
+                        help="attach a file of any type — an image, a video, a PDF "
+                             "(repeatable; --image is the older name of this flag)")
     parser.add_argument("--user-approved", action="store_true",
                         help="assert that the user has already approved this send; "
                              "bypasses the verify flow for 'trust'-category accounts")
@@ -71,8 +79,8 @@ def main() -> int:
         return pending_retract.retract("telegram-push", args.url, args.retract, TOKEN,
                                        args.timeout)
 
-    if not args.message and not args.image:
-        parser.error("provide a message and/or at least one --image")
+    if not args.message and not args.attach:
+        parser.error("provide a message and/or at least one --attach")
 
     payload: dict = {"message": args.message}
     if args.reply_to:
@@ -86,8 +94,9 @@ def main() -> int:
     if args.user_approved:
         payload["user_approved"] = True
     send_origin.stamp(payload, args.thread)
-    if args.image:
-        payload["images"] = [_encode_image(Path(p)) for p in args.image]
+    if args.attach:
+        # "images" is the wire key's historical name; it carries any file.
+        payload["images"] = [_encode_attachment(Path(p)) for p in args.attach]
 
     headers = {"Content-Type": "application/json"}
     if TOKEN:

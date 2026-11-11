@@ -3,7 +3,7 @@
 // A screenshot copied to the clipboard, an image copied out of a web page or
 // a document, a file copied in a file manager: the browser hands all of them
 // to a `paste` event as files. The two composers that stage attachments (the
-// conversation composer, any file; the chat page, images) read them through
+// conversation composer, any file; the chat page, any file too, images downscaled) read them through
 // this module so a paste stages exactly what the paperclip would have — the
 // same limits, the same chips or previews, the same errors.
 //

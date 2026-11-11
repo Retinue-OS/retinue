@@ -251,7 +251,8 @@ tab of the navigation row) write the same files. Vocabulary and file format:
 ## Messaging (Signal, WhatsApp, Telegram, SMS, e-mail)
 
 Outbound pushes go through the thin CLIs — `scripts/signal-push.py`,
-`whatsapp-push.py`, `telegram-push.py` (text, `--image`; Signal also speaks a
+`whatsapp-push.py`, `telegram-push.py` (text, `--attach` for a file of any
+type — image, video, PDF; Signal also speaks a
 voice rendering; `--url` picks the account's gateway) and, where the opt-in
 SMS channel runs, `sms-push.py` (text only). The message text for a
 human comes from the `secretary` subagent (see **Routing**) — dispatch, then
