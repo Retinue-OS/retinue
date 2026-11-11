@@ -53,6 +53,7 @@ const SHELL_ASSETS = [
   '/components/conversations.js',
   '/components/projects.js',
   '/components/project-page.js',
+  '/components/thread-list.js',
   '/components/chats.js',
   '/components/chat-page.js',
   '/components/news.js',

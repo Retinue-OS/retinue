@@ -745,8 +745,10 @@ marked as such and hidden from the default conversation list (they stay under
 the Edits filter); "Discuss with Ara" on a project page starts a normal,
 visible thread whose engage prompt points Ara at the project file. The link
 runs both ways: such a thread carries an "About: <project>" chip back to the
-project page, and the project page lists the project's threads (open ones
-first, archived folded) so an ongoing discussion is picked up, not restarted.
+project page, and the project page lists the project's threads under
+Active/Archived tabs (the thread list widget, `components/thread-list.js`) so
+an ongoing discussion is picked up, not restarted, and a closed one is still
+found.
 
 ## The life store page (`/sparql`)
 

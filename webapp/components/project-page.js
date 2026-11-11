@@ -31,6 +31,7 @@ import { shelf, goLive, takeRestore } from './shelf-store.js';
 // when the user returns.
 import { loadDraft, saveDraft } from './drafts.js';
 import { transcribe, handOff, adopt } from './dictation.js';
+import { threadListHtml, wireThreadList, THREAD_LIST_CSS } from './thread-list.js';
 
 const APPLY_POLL_MS = 3000;
 // The recorder hands over its audio in slices this long, so a page left with
@@ -153,6 +154,7 @@ class RetinueProjectPage extends HTMLElement {
     this._wave = new Waveform(this);
     // Frontmatter lists the user expanded — kept across re-renders.
     this._openLists = new Set();
+    this._threadList = {};   // the thread list's selected tab, across re-renders
   }
 
   connectedCallback() {
@@ -339,8 +341,8 @@ class RetinueProjectPage extends HTMLElement {
     handOff(this._cmdKey(), new Blob(chunks, { type }), '/conversations/transcribe');
   }
 
-  // The discussions linked to this project (archived ones included, shown
-  // folded). Edit-command threads are left out: each is one applied change,
+  // The discussions linked to this project (archived ones included, under
+  // their own tab). Edit-command threads are left out: each is one applied change,
   // reachable from its own confirmation and under the Edits filter.
   async _loadThreads() {
     try {
@@ -746,29 +748,9 @@ class RetinueProjectPage extends HTMLElement {
       + lists.join('') + `</div>`;
   }
 
-  // The project's conversations: open ones as rows, archived ones folded.
+  // The project's conversations, under Active/Archived tabs (thread-list.js).
   _threadsHtml() {
-    const active = this._threads.filter((t) => !t.archived);
-    const archived = this._threads.filter((t) => t.archived);
-    if (!active.length && !archived.length) return '';
-    const row = (t) => {
-      const age = fmtAge(t.updated);
-      const unread = t.unread ? '<span class="dot" aria-label="Unread"></span>' : '';
-      return `<a class="thread-row" href="/conversations.html#conversation-${esc(t.id)}">`
-        + `${unread}<span class="t-title">${esc(t.title || 'Conversation')}</span>`
-        + (age ? `<span class="t-age">${esc(age)}</span>` : '')
-        + `</a>`;
-    };
-    const key = 'threads:archived';
-    const open = this._openLists.has(key) ? ' open' : '';
-    const folded = archived.length
-      ? `<details class="list" data-list="${key}"${open}>`
-        + `<summary><b>Archived</b> <span class="count">${archived.length}</span></summary>`
-        + `<div class="thread-rows">${archived.map(row).join('')}</div></details>`
-      : '';
-    return `<div class="threads"><div class="threads-head">Threads</div>`
-      + (active.length ? `<div class="thread-rows">${active.map(row).join('')}</div>` : '')
-      + folded + `</div>`;
+    return threadListHtml(this._threads, this._threadList);
   }
 
   _applyHtml() {
@@ -839,6 +821,7 @@ class RetinueProjectPage extends HTMLElement {
         else this._openLists.delete(d.dataset.list);
       });
     });
+    wireThreadList(root, this._threadList);
     on('[data-rec-abort]', () => this._abortRecording());
     on('[data-rec-check]', () => this._finishRecording('review'));
     on('[data-rec-send]', () => this._finishRecording('send'));
@@ -937,19 +920,7 @@ const CSS = `
   .list ul { margin: 0; padding: 0 11px 8px 26px; }
   .list li { padding: 2px 0; overflow-wrap: anywhere; }
 
-  .threads { display: flex; flex-direction: column; gap: 6px; padding: 10px 0 2px; }
-  .threads-head { font-size: .72rem; font-weight: 600; color: var(--muted, #8b93a3);
-                  text-transform: uppercase; letter-spacing: .04em; }
-  .thread-rows { display: flex; flex-direction: column; gap: 4px; }
-  .list .thread-rows { padding: 0 6px 6px; }
-  .thread-row { display: flex; align-items: center; gap: 8px; padding: 7px 12px;
-                border-radius: 12px; background: var(--card-2, #1c2230); text-decoration: none;
-                color: var(--fg, #e7ebf2); font-size: .86rem;
-                -webkit-tap-highlight-color: transparent; }
-  .thread-row:hover { outline: 1px solid var(--accent, #6ea8fe); }
-  .t-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .t-age { flex: none; color: var(--muted, #8b93a3); font-size: .72rem; }
-  .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent, #6ea8fe); }
+  ${THREAD_LIST_CSS}
 
   .body { padding: 10px 2px 14px; }
 
