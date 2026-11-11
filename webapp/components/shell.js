@@ -262,8 +262,9 @@ export function hasKeyboard() {
   return !!s && typeof s.keyboardStatus === 'function' && typeof s.keyboardType === 'function';
 }
 
-// {available, enabled, connected, host: {name, address} | null, layout}, or
-// null for a shell without the member.
+// {available, enabled, connected, host: {name} | null, layout}, or null for a
+// shell without the member. The host is named only: its Bluetooth address
+// stays in the app.
 export function keyboardStatus() {
   const [called, raw] = shellInvoke('keyboardStatus');
   if (!called || raw == null) return null;

@@ -188,6 +188,28 @@ await ok('Stop ends the one typing and drops the rest, reported as cancelled', a
   assert.deepEqual(heard.map((h) => h[0]).sort(), [keyTab.id, typeA.id].sort());
 });
 
+await ok('a tap shows what it types: the text, and every Enter it presses', () => {
+  assert.equal(kbd.visibleText({ ...typeA, text: 'ls -la\nrm x\tz' }), 'ls -la⏎\nrm x⇥z');
+  assert.equal(kbd.visibleText({ ...typeA, sensitive: true }), null, 'never a sensitive text');
+  assert.equal(kbd.visibleText(keyB), null);
+  assert.equal(kbd.enterCount({ ...typeA, text: 'a\nb\r\nc', enter: true }), 3);
+  assert.equal(kbd.enterCount(keyB), 1);
+  assert.equal(kbd.enterCount(typeA), 0);
+  assert.equal(kbd.describeAction({ ...typeA, text: 'ls -la\n' }), 'Type 7 characters + Enter',
+    'a line break says Enter even without the flag');
+  assert.equal(kbd.describeAction({ ...typeA, text: 'a\nb', enter: true }), 'Type 3 characters + Enter ×2');
+});
+
+await ok('Stop closes an open password dialog, and the queue moves on', async () => {
+  const calls = installShell();
+  kbd.run(secretC, { threadId: tid });
+  kbd.run(typeA, { threadId: tid });
+  assert.equal(kbd.cancel(), true);
+  assert.deepEqual(calls.at(-1), ['cancel']);
+  event('secret-cancelled', secretC.id);
+  assert.equal(kbd.isRunning(), false, 'what waited was dropped, the dialog answered');
+});
+
 await ok('a throwing shell counts as no call', () => {
   window.RetinueShell = { keyboardStatus: () => '{}', keyboardType: () => { throw new Error('x'); } };
   assert.equal(kbd.run(typeA), false);

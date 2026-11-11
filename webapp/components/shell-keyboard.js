@@ -24,14 +24,17 @@
 //     (moves to a form's button), any single key (Space presses a focused
 //     button), a sensitive text, a password-manager field. The gateway never
 //     marks those `auto`; the page checks again.
-//   - A sensitive text (a password, PIN or code Ara typed on request) is
-//     never shown: the row says "••••••", with no way to reveal it. It is
+//   - What a tap types is shown before it: the text itself (visibleText,
+//     line breaks and tabs marked), and in the label every Enter it presses
+//     (enterCount — a line break is one). Only a sensitive text is not:
+//     the row says "••••••", with no way to reveal it. It is
 //     gone two minutes after its reply — from the gateway, and from this
 //     page's copy too (expireSensitive), offline or hidden included — and as
 //     soon as it is reported typed. A deleted text cannot be retyped.
 //   - Actions run one after another (the app refuses a second one while it
 //     types): the next starts on the previous one's final `keyboard` event.
-//     Stop (cancel) ends the current one and drops the rest.
+//     Stop (cancel) ends the current one — a typing text, or an open password
+//     dialog; never a password being typed — and drops the rest.
 //   - Every outcome goes back to the gateway (reportOutcome) from here, not
 //     from the thread view, which may have closed meanwhile; the gateway
 //     keeps it on the action for Ara's later turns.
@@ -187,7 +190,8 @@ let reporterOff = null;
 // shell, a lost event): a text at the app's pace with room to spare, a key,
 // a password dialog the user is filling.
 function watchdogMs(a) {
-  if (a.kind === 'keyboard-type') return 30000 + 60 * (a.text || '').length;
+  // Up to six reports a character (a dead key with Shift), 12 ms each, and more.
+  if (a.kind === 'keyboard-type') return 30000 + 100 * (a.text || '').length;
   if (a.kind === 'keyboard-secret') return 10 * 60 * 1000;
   return 15000;
 }
@@ -275,7 +279,17 @@ export function cancel() {
     notify(entry, 'error', { error: 'cancelled' });
     report(entry, d);
   }
-  return current ? keyboardCancel() : false;
+  if (!current) return false;
+  // A password dialog open on the phone is closed by the shell, which answers
+  // `secret-cancelled`; one that does not answer is given up on soon, not after
+  // the dialog's ten minutes. (A secret being typed is not the page's to stop:
+  // only the phone's own Stop can, so the page learns nothing from cutting it.)
+  if (current.action.kind === 'keyboard-secret') {
+    const entry = current;
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => { if (current === entry) advance(); }, 5000);
+  }
+  return keyboardCancel();
 }
 
 // Whether something is typing or waiting to.
@@ -329,14 +343,38 @@ export function hostName(st = keyboardStatus()) {
   return h && typeof h.name === 'string' && h.name.trim() ? h.name.trim() : '';
 }
 
+// How many times typing `a` presses Enter: each line break in its text
+// (typed as Shift+Enter, which submits in a terminal or a one-line field)
+// and the Enter after it.
+export function enterCount(a) {
+  if (!a) return 0;
+  if (a.kind === 'keyboard-key') return a.key === 'enter' ? 1 : 0;
+  const breaks = a.kind === 'keyboard-type' && typeof a.text === 'string'
+    ? (a.text.match(/\r\n|\r|\n/g) || []).length : 0;
+  return breaks + (a.enter ? 1 : 0);
+}
+
+function enterSuffix(a) {
+  const n = enterCount(a);
+  return n === 0 ? '' : n === 1 ? ' + Enter' : ` + Enter ×${n}`;
+}
+
+// The text a tap types, as the row shows it before the tap: line breaks
+// marked ⏎ (each one presses Enter), tabs ⇥. Null when there is none to show
+// — a sensitive text, a deleted one, a key, a secret.
+export function visibleText(a) {
+  if (!a || a.kind !== 'keyboard-type' || isSensitive(a) || isPurged(a)) return null;
+  return a.text.replace(/\r\n|\r|\n/g, '⏎\n').replace(/\t/g, '⇥');
+}
+
 // What the action will do, as a short label.
 export function describeAction(a) {
   if (!a) return '';
   if (a.kind === 'keyboard-type') {
-    if (isSensitive(a)) return `Type ••••••${a.enter ? ' + Enter' : ''}`;
+    if (isSensitive(a)) return `Type ••••••${enterSuffix(a)}`;
     if (isPurged(a)) return 'Text deleted';
     const n = (a.text || '').length;
-    return `Type ${n} character${n === 1 ? '' : 's'}${a.enter ? ' + Enter' : ''}`;
+    return `Type ${n} character${n === 1 ? '' : 's'}${enterSuffix(a)}`;
   }
   if (a.kind === 'keyboard-key') return `Press ${keyName(a.key)}`;
   if (a.kind === 'keyboard-secret') return `Password from manager: ${a.label || 'secret'}`;

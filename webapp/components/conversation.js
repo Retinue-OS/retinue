@@ -1781,10 +1781,16 @@ class RetinueConversation extends HTMLElement {
           `${kbd.isSensitive(a) ? 'Typed: •••••• · ' : ''}Text deleted</small>${stop}</div>`;
       }
       const secret = a.kind === 'keyboard-secret';
+      const n = kbd.enterCount(a);
+      const enters = n === 0 ? '' : n === 1 ? ' + Enter' : ` + Enter ×${n}`;
       const label = secret ? kbd.describeAction(a)
-        : (out ? (kbd.isSensitive(a) ? 'Retype ••••••' : 'Retype')
+        : (out ? `${kbd.isSensitive(a) ? 'Retype ••••••' : 'Retype'}${enters}`
           : `${kbd.describeAction(a)}${host ? ` on ${host}` : ''}`);
-      return `<div class="kbd-row">` +
+      // What a tap types, before the tap: the text itself, every line break
+      // marked (each presses Enter).
+      const shown = kbd.visibleText(a);
+      const textBlock = shown !== null ? `<pre class="kbd-text">${esc(shown)}</pre>` : '';
+      return textBlock + `<div class="kbd-row">` +
         `<button type="button" class="kbd-btn${secret ? ' kbd-secret' : ''}" data-kbd-run="${esc(a.id)}"${running ? ' disabled' : ''}>` +
         `<span aria-hidden="true">⌨️</span> ${esc(label)}</button>` +
         (line ? `<small class="kbd-note">${esc(line)}</small>` : '') + stop +
@@ -3634,6 +3640,9 @@ const CSS = `
              color: inherit; font: inherit; font-size: .82rem; cursor: pointer; }
   .kbd-btn:hover { background: rgba(110, 168, 254, .2); }
   .kbd-btn:disabled { opacity: .55; cursor: default; }
+  .kbd-text { margin: 8px 0 0; padding: 6px 8px; border-radius: 6px; max-height: 12em; overflow: auto;
+              white-space: pre-wrap; word-break: break-word; font: .8rem/1.35 ui-monospace, monospace;
+              background: rgba(110, 168, 254, .08); border: 1px solid rgba(110, 168, 254, .25); }
   .kbd-btn.kbd-secret { font-weight: 600; }
   .kbd-note { color: var(--muted, #8b93a3); font-size: .74rem; }
   .kbd-link { background: none; border: 0; padding: 0; color: var(--accent, #6ea8fe); font: inherit;

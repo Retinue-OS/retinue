@@ -510,7 +510,8 @@ TURN_GATE: dict = {"hold": None}
 def _stub_send_message(prompt, display_question=None, session_key=None,
                        model=None, restart_message=None, resume=True,
                        reply_attachments=False, reply_shell_actions=None,
-                       thread_id=None, prompt_builder=None):
+                       thread_id=None, prompt_builder=None,
+                       display_message_id=None):
     TURNS.append({"prompt": prompt, "question": display_question,
                   "session": session_key, "resume": resume})
     # What the session does while it runs — an instructed turn setting its

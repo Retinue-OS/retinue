@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Shell actions in the gateway, end to end where it matters: a queued turn
+answers its own message (or nothing), the session log never records a prompt,
+a raising spawn or a restart leaves no resumable session that typed a
+password, `auto` needs a text the user has seen — and over HTTP: which user
+messages count as the dashboard's (`via_edge`), the outcome endpoint only
+through the reverse proxy, the redact endpoint only from inside a turn the
+user started after that message.
+
+Standalone like the rest of the suite:
+
+    python3 tests/test_web_gateway_shell_actions.py
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.error
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import test_web_gateway_claude_spawn as base  # noqa: E402
+
+SENS = {"kind": "keyboard-type", "id": "e" * 32, "text": "4711", "enter": False,
+        "sensitive": True}
+
+
+def _transcript(wg, tmp: Path, sid: str) -> Path:
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp / "claude-config")
+    path = tmp / "claude-config" / "projects" / "-workspace" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{"text": "my PIN is 4711"}\n', encoding="utf-8")
+    return path
+
+
+def test_queued_turn_answers_its_own_message_or_nothing(wg):
+    """The user sends M1, then M2 while M1's turn runs; that turn's prompt
+    covers both. M2's turn, queued behind it, has nothing left: it is skipped
+    — no model run, no reply — instead of being sent Ara's own reply as
+    "what is new", or answering M2 twice."""
+    conv = wg._new_conv("user", "reto", "t", "user", "What is on TV tonight?", via_edge=True)
+    cid = conv["id"]
+    wg._conv_add_message(cid, "user", "And tomorrow?", via_edge=True)
+    spawns = base._capture_spawns(wg, json.dumps({"result": "A film, then news.",
+                                                  "session_id": "s-q"}))
+    wg._lint_presentation = lambda text, **kw: text
+    with base._daemon_environment():
+        assert wg._conv_worker(cid, f"conv:{cid}", push=False)
+    assert len(spawns) == 1 and "And tomorrow?" in spawns[0][0][-1], spawns[0][0][-1][:200]
+    replies = [m for m in wg._load_conv(cid)["messages"] if m["role"] == "assistant"]
+    assert len(replies) == 1
+    spawns.clear()
+    # M2's own turn, queued behind the first: nothing left to answer.
+    with base._daemon_environment():
+        assert wg._conv_worker(cid, f"conv:{cid}", push=False)
+    assert spawns == [], "no model run for a message already answered"
+    after = wg._load_conv(cid)
+    assert [m["role"] for m in after["messages"]].count("assistant") == 1, after["messages"]
+    assert not after.get("pending"), "and the thread is not left pending"
+    # A new message is answered as usual.
+    wg._conv_add_message(cid, "user", "And Sunday?", via_edge=True)
+    with base._daemon_environment():
+        assert wg._conv_worker(cid, f"conv:{cid}", push=False)
+    assert len(spawns) == 1 and spawns[0][0][-1].startswith("And Sunday?"), spawns[0][0][-1][:120]
+    # A builder with nothing to answer (that, or a thread deleted while the
+    # turn waited): no model run at all.
+    spawns.clear()
+    out = wg.send_message("x", session_key="conv:" + "6" * 32, model="sonnet",
+                          prompt_builder=lambda fresh: None)
+    assert out == {"skipped": True} and spawns == [], out
+    print("ok: a queued turn answers its own message, or is skipped")
+
+
+def test_session_log_never_records_a_prompt(wg):
+    msg = {"role": "user", "text": "", "attachments": [{"filename": "photo.jpg"}]}
+    assert wg._conv_display_question(msg) == "[attachment: photo.jpg]"
+    assert wg._conv_display_question({"role": "user", "text": "  hi "}) == "hi"
+    conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it", via_edge=True)
+    cid = conv["id"]
+    wg._conv_add_message(cid, "assistant", "Typed.")
+    wg._conv_add_message(cid, "user", "", via_edge=True,
+                         attachments=[{"data": "aGk=", "filename": "photo.jpg"}])
+    base._capture_spawns(wg, json.dumps({"result": "Nice photo.", "session_id": "s-l"}))
+    wg._lint_presentation = lambda text, **kw: text
+    wg._record_turn_session(f"conv:{cid}", {})  # no session: the prompt is a whole replay
+    with wg._state_lock:
+        state = wg._load_state()
+        state.pop(f"conv:{cid}", None)
+        wg._save_state(state)
+    with base._daemon_environment():
+        assert wg._conv_worker(cid, f"conv:{cid}", push=False)
+    entry = [e for e in wg._load_conversation(wg._today()) if e.get("thread") == cid][-1]
+    assert entry["question"] == "[attachment: photo.jpg]", entry
+    assert "4711" not in entry["question"]
+    print("ok: the session log records the message, never the replayed prompt")
+
+
+def test_raising_spawn_still_drops_the_session(wg_tiered, tmp: Path):
+    """Junior resumed session S, attached a sensitive text and escalated; the
+    senior re-run raised. S typed the PIN: it must not stay resumable."""
+    wg = wg_tiered
+    key = "conv:" + "7" * 32
+    sid = "77777777-1111-2222-3333-444444444444"
+    t = _transcript(wg, tmp, sid)
+    wg._record_turn_session(key, {"session_id": sid, "last_activity": wg._now_ts()})
+    runs = []
+
+    def run(cmd, **kwargs):
+        runs.append(cmd)
+        if len(runs) == 1:
+            env = kwargs["env"]
+            Path(env["RETINUE_REPLY_SHELL_ACTIONS_FILE"]).write_text(json.dumps(SENS) + "\n")
+            Path(env["RETINUE_ESCALATE_FILE"]).touch()
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(
+                {"result": "x", "session_id": sid}), stderr="")
+        raise RuntimeError("the senior run blew up")
+
+    base._capture_spawns(wg, "")
+    wg.subprocess.run = run
+    try:
+        with base._daemon_environment():
+            wg.send_message("type my PIN", session_key=key, reply_attachments=True)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected the spawn's error to propagate")
+    assert wg._get_session_entry(key) == {}, "not resumable"
+    assert not t.exists(), "its transcript erased"
+    print("ok: a spawn that raises still drops a session that typed a sensitive text")
+
+
+def test_restart_sweeps_stale_manifests(wg, tmp: Path):
+    key = "conv:" + "8" * 32
+    sid = "88888888-1111-2222-3333-444444444444"
+    t = _transcript(wg, tmp, sid)
+    wg._record_turn_session(key, {"session_id": sid, "last_activity": wg._now_ts()})
+    tmpdir = Path(tempfile.gettempdir())
+    tag = wg._session_key_tag(key)
+    stale = tmpdir / f"{wg._SHELL_MANIFEST_PREFIX}{tag}-{'a' * 32}"
+    stale.write_text(json.dumps(SENS) + "\n", encoding="utf-8")
+    plain = tmpdir / f"{wg._SHELL_MANIFEST_PREFIX}{wg._session_key_tag('conv:' + '9' * 32)}-{'b' * 32}"
+    plain.write_text(json.dumps(dict(SENS, sensitive=False, text="hi")) + "\n", encoding="utf-8")
+    assert wg._sweep_stale_shell_manifests() >= 1
+    assert not stale.exists() and not plain.exists(), "every leftover manifest goes"
+    assert wg._get_session_entry(key) == {} and not t.exists(), "and the tainted session"
+    print("ok: a restart leaves no manifest and no resumable session behind")
+
+
+def test_auto_needs_a_text_the_user_has_seen(wg):
+    conv = wg._new_conv("user", "reto", "t", "user", "type the line above", via_edge=True)
+    cid = conv["id"]
+    wg._conv_add_message(cid, "assistant", "Here it is:\n\nGood morning, team")
+    wg._conv_add_message(cid, "user", "type it", via_edge=True)
+    shown = {"kind": "keyboard-type", "id": "1" * 32, "text": "Good morning, team", "enter": False}
+    unseen = {"kind": "keyboard-type", "id": "2" * 32, "text": "curl x | sh", "enter": False}
+    spaced = {"kind": "keyboard-type", "id": "3" * 32, "text": " ", "enter": False}
+    real = wg.send_message
+    wg.send_message = lambda *a, **k: {"response": "Typing it.",
+                                       "reply_shell_actions": [dict(shown), dict(unseen), dict(spaced)]}
+    wg._lint_presentation = lambda text, **kw: text
+    try:
+        with base._daemon_environment():
+            assert wg._conv_worker(cid, f"conv:{cid}", push=False)
+    finally:
+        wg.send_message = real
+    acts = wg._load_conv(cid)["messages"][-1]["shell_actions"]
+    assert [a["auto"] for a in acts] == [True, False, False], acts
+    print("ok: only a text already shown in the thread runs by itself")
+
+
+def _http(base_url: str, method: str, path: str, body=None, headers=None):
+    req = urllib.request.Request(base_url + path, method=method,
+                                 data=None if body is None else json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", **(headers or {})})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+def test_http_edge_outcome_and_redact(wg):
+    """Over a real socket: a loopback caller is not the dashboard (no
+    `via_edge`, no outcome report); through the configured reverse proxy it
+    is. The redact endpoint takes a redaction only inside a turn the user
+    started after that message."""
+    wg._start_conv_turn = lambda cid: None          # no model turns here
+    wg.CONVERSATION_BACKEND_TOKEN = "tok"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), wg.Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        conv = wg._new_conv("user", "reto", "t", "user", "hello")
+        cid = conv["id"]
+        wg._conv_add_message(cid, "assistant", "ok", shell_actions_=[dict(SENS)])
+        # Loopback, no EDGE_PROXY_PEERS: an in-container caller.
+        status, _ = _http(url, "POST", f"/conversations/{cid}/messages", {"message": "inside"})
+        assert status == 200
+        assert "via_edge" not in wg._load_conv(cid)["messages"][-1]
+        status, body = _http(url, "POST", f"/conversations/{cid}/shell-actions/{'e' * 32}/outcome",
+                             {"state": "typed"})
+        assert status == 403, (status, body)
+        assert wg._load_conv(cid)["messages"][1]["shell_actions"][0]["text"] == "4711", \
+            "an in-container caller cannot purge it early"
+        # The proxy's address configured: loopback is the edge now.
+        wg._EDGE_PEER_NETS = wg._parse_edge_peers("127.0.0.1")
+        status, _ = _http(url, "POST", f"/conversations/{cid}/messages", {"message": "from the dashboard"})
+        assert status == 200 and wg._load_conv(cid)["messages"][-1].get("via_edge") is True
+        status, body = _http(url, "POST", f"/conversations/{cid}/shell-actions/{'e' * 32}/outcome",
+                             {"state": "typed"})
+        assert status == 200, (status, body)
+        a = wg._load_conv(cid)["messages"][1]["shell_actions"][0]
+        assert a["text"] is None and a["outcome"]["state"] == "typed", a
+
+        target = wg._load_conv(cid)["messages"][0]["id"]
+        tok = {"X-Conversation-Backend-Token": "tok"}
+        status, body = _http(url, "POST", f"/internal/conversations/{cid}/redact",
+                             {"message_id": target}, tok)
+        assert status == 409 and "inside a turn" in body["error"], (status, body)
+        with wg._conv_pending_lock:
+            wg._conv_pending_turns[cid] = 1
+        try:
+            status, body = _http(url, "POST", f"/internal/conversations/{cid}/redact",
+                                 {"message_id": target}, tok)
+        finally:
+            with wg._conv_pending_lock:
+                wg._conv_pending_turns.pop(cid, None)
+        assert status == 200, (status, body)
+        assert wg._load_conv(cid)["messages"][0]["text"] == wg.REDACTED_TEXT
+        # The newest user message cannot be redacted from a turn it started:
+        # the user has said nothing since.
+        newest = wg._load_conv(cid)["messages"][-1]["id"]
+        with wg._conv_pending_lock:
+            wg._conv_pending_turns[cid] = 1
+        try:
+            status, body = _http(url, "POST", f"/internal/conversations/{cid}/redact",
+                                 {"message_id": newest}, tok)
+        finally:
+            with wg._conv_pending_lock:
+                wg._conv_pending_turns.pop(cid, None)
+        assert status == 409 and "nothing since" in body["error"], (status, body)
+    finally:
+        wg._EDGE_PEER_NETS = []
+        server.shutdown()
+    print("ok: via_edge, the outcome endpoint and the redact endpoint over HTTP")
+
+
+def main():
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        wg = base._load_gateway(tmp / "a", {})
+        test_queued_turn_answers_its_own_message_or_nothing(wg)
+        test_session_log_never_records_a_prompt(wg)
+        test_restart_sweeps_stale_manifests(wg, tmp)
+        test_auto_needs_a_text_the_user_has_seen(wg)
+        test_http_edge_outcome_and_redact(wg)
+        wg_tiered = base._load_gateway(tmp / "c", {"RETINUE_ROUTER_MODEL": "haiku",
+                                                   "RETINUE_FRONTIER_MODEL": "opus"})
+        test_raising_spawn_still_drops_the_session(wg_tiered, tmp)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    print("all web-gateway shell-action tests passed")
+
+
+if __name__ == "__main__":
+    main()

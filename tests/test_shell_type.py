@@ -160,6 +160,9 @@ def test_outcome_and_auto_run():
     assert sa.normalize_outcome({"state": "error", "error": "cancelled"}) == \
         {"state": "error", "error": "cancelled"}
     assert "stopped by the user" in sa.describe(dict(t, outcome={"state": "error", "error": "cancelled"}))
+    for spaced in (" ", "  ", " a", "a ", "\u00a0x"):
+        assert not sa.runs_by_itself(dict(t, text=spaced)), repr(spaced)
+    assert sa.runs_by_itself(dict(t, text="a b"))
     print("ok: outcomes are validated; only plain one-line text runs by itself")
 
 
@@ -202,6 +205,12 @@ def test_separators_and_labels(tmp: Path):
     line = '{"kind": "keyboard-secret", "id": "%s", "label": "a\u2028b"}' % ("d" * 32)
     actions, problems = sa.parse_manifest(line)
     assert len(actions) == 1 and not problems, (actions, problems)
+    # `echo` ends what it pipes with a line break: dropped, not an Enter.
+    m3 = tmp / "m-stdin"
+    assert _run(["-"], m3, stdin="ls -la\n").returncode == 0
+    assert _run(["-"], m3, stdin="two\r\n\n").returncode == 0
+    got = _lines(m3)
+    assert got[0]["text"] == "ls -la" and got[1]["text"] == "two\n", got
     print("ok: separators and bidi controls are refused, labels cleaned, manifests "
           "ASCII and bounded at the CLI")
 

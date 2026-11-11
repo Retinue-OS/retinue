@@ -599,8 +599,12 @@ def test_redaction_reaches_every_copy(wg, tmp: Path):
     att = msg["attachments"][0]
     att_file = wg.CONVERSATION_ATTACHMENTS_DIR / cid / f"{att['id']}{att['suffix']}"
     assert att_file.exists() and stored["title"] == secret
-    wg._append_entry(secret, "Typing it.")
-    wg._append_entry("something else", "ok")
+    # As a dashboard turn logs them: naming their thread and message.
+    wg._append_entry(secret, "Typing it.", thread_id=cid, message_id=msg["id"])
+    wg._append_entry("something else", "ok", thread_id=cid, message_id="0" * 12)
+    other = wg._new_conv("user", "reto", "t", "user", "yes")
+    wg._append_entry(secret, "same words, another thread", thread_id=other["id"],
+                     message_id=wg._load_conv(other["id"])["messages"][0]["id"])
     sid = "31111111-2222-3333-4444-555555555555"
     transcript = _session_with_transcript(wg, tmp, cid, sid)
 
@@ -617,8 +621,11 @@ def test_redaction_reaches_every_copy(wg, tmp: Path):
     assert after["title"] == wg.REDACTED_TEXT, after["title"]
     assert "4711" not in json.dumps(after), after
     assert not att_file.exists(), "the attachment file goes too"
-    log = json.dumps(wg._load_conversation(wg._today()))
-    assert "4711" not in log and "something else" in log, log
+    log = wg._load_conversation(wg._today())
+    mine = [e for e in log if e.get("thread") == cid]
+    assert "4711" not in json.dumps(mine) and "something else" in json.dumps(mine), mine
+    theirs = [e for e in log if e.get("thread") == other["id"]]
+    assert theirs and theirs[0]["question"] == secret, "keyed by message: another thread's entry stays"
     assert wg._get_session_entry(f"conv:{cid}") == {} and not transcript.exists()
     # The running turn ends by recording its session: refused once, erased.
     late = tmp / "claude-config" / "projects" / "-workspace" / ("4" * 8 + "-1111-2222-3333-444444444444.jsonl")
@@ -630,9 +637,11 @@ def test_redaction_reaches_every_copy(wg, tmp: Path):
     assert wg._get_session_entry(f"conv:{cid}").get("session_id") == "fresh-0000"
     # A turn running when the redaction landed logs its question afterwards:
     # it is logged redacted.
-    wg._append_entry(secret, "Typed, and deleted your message.")
-    log = json.dumps(wg._load_conversation(wg._today()))
-    assert "4711" not in log, log
+    wg._append_entry(secret, "Typed, and deleted your message.", thread_id=cid,
+                     message_id=msg["id"])
+    late_entry = [e for e in wg._load_conversation(wg._today())
+                  if e.get("thread") == cid][-1]
+    assert late_entry["question"] == wg.REDACTED_TEXT, late_entry
     print("ok: redaction reaches the title, attachments, session log and session")
 
 

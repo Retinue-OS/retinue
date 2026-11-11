@@ -156,8 +156,14 @@ def runs_by_itself(action: dict) -> bool:
     if not isinstance(action, dict) or action.get("kind") != "keyboard-type":
         return False
     text = action.get("text")
-    return (isinstance(text, str) and bool(text) and not action.get("enter")
-            and not action.get("sensitive") and not re.search(r"[\r\n\t]", text))
+    # Nor text that is only whitespace or starts or ends with it (a space
+    # presses a focused button too). What plain characters do on the device
+    # is the device's: a letter can be an app's shortcut — which is why the
+    # gateway also requires the text to be one the user has already seen in
+    # the thread (_conv_text_was_shown).
+    return (isinstance(text, str) and bool(text.strip()) and text.strip() == text
+            and not action.get("enter") and not action.get("sensitive")
+            and not re.search(r"[\r\n\t]", text))
 
 
 def parse_manifest(raw: str) -> tuple[list[dict], list[str]]:

@@ -11,7 +11,8 @@ writing; when the reply reaches the user's phone, the app types it there.
     shell-type.py --key enter               # press one key
     shell-type.py --sensitive "<PIN>"       # a password, PIN or code: see below
     shell-type.py --secret "Meta account"   # a password from the user's manager
-    printf '%s' "$TEXT" | shell-type.py -   # text from stdin
+    printf '%s' "$TEXT" | shell-type.py -   # text from stdin (one trailing
+                                            # line break, as echo adds, is dropped)
 
 Rules (CLAUDE.md, "Dashboard"):
 - Only on the user's explicit request ("type the text above", "type: …").
@@ -102,7 +103,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.text is not None:
-        text = sys.stdin.read() if args.text == "-" else args.text
+        text = args.text
+        if text == "-":
+            text = sys.stdin.read()
+            # `echo` ends what it pipes with a line break; typed, it would be
+            # an Enter nobody asked for (--enter is how to ask).
+            for end in ("\r\n", "\n"):
+                if text.endswith(end):
+                    text = text[: -len(end)]
+                    break
         raw = {"kind": "keyboard-type", "text": text, "enter": args.enter,
                "sensitive": args.sensitive}
     elif args.key is not None:
