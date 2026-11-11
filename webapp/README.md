@@ -269,13 +269,18 @@ docstring). Pieces:
   gives way before the send row does. A **grip** on the line between the
   thread and the composer hands that split to the user: dragged up, the
   composer takes the height it is given — the chips and the report stay in
-  view even with the keyboard up, the field fills what is left, and the
-  thread keeps at least a few lines; dragged back down to the composer's own
+  view even with the keyboard up (snapping in once the drag is nearer the
+  composer with them than without), the field fills what is left, and the
+  thread keeps a strip of at least one message wherever the composer's own
+  contents leave room for it; dragged back down to the composer's own
   height, or tapped twice (Enter from the keyboard, arrows to step), it is
   the composer it was. The keyboard-up and keyboard-down frames each keep
-  their own position, per device beside the splitter's, and a press on the
-  grip leaves the focus where it was, so the phone keyboard stays up through
-  a drag. A draft longer than its box shows an
+  their own position, per device beside the splitter's. A press on the grip
+  leaves the focus where it was, so the phone keyboard stays up through a
+  drag, and a press that dragged is never also a tap on whatever has moved
+  under the finger. The grip is a separator with a value (the composer's
+  share of the pane), stepped and reset from the keyboard as above. A draft
+  longer than its box shows an
   expand control in the field's top-right corner: the field then takes the
   whole pane at its full width (the thread and the chips step aside, the mic
   and send sit under its corners) until the control is pressed again, Escape
