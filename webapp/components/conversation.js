@@ -129,6 +129,7 @@ import { openAttentionSheet } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 import {
   isContinuous, setContinuous, touchContinuous, forgetContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
+  modeEntries, endedByAra, noteAraOff,
   chime, primeAudio,
 } from './continuous.js';
 import { setVoiceActive } from './shell.js';
@@ -1419,6 +1420,7 @@ class RetinueConversation extends HTMLElement {
       const wasPending = !!(this._thread && this._thread.pending);
       this._thread = t;
       this._missing = false;
+      this._contEndedByAra(t);
       this._shelfObserve(t);
       if (t.unread) this._markRead();
       this._maybeAutoplay(t);
@@ -1478,6 +1480,10 @@ class RetinueConversation extends HTMLElement {
     const root = this.shadowRoot;
     const t = this._thread;
     if (!root || !t) return;
+    // Ara ended the mode (_contEndedByAra): the bar's toggle and the input
+    // row change with it, so the frame is rebuilt — the user is not in the
+    // middle of a take any more, which is what a partial update protects.
+    if (this._contModeChanged) { this._contModeChanged = false; this.render(); return; }
     // A cold start renders the frame before the thread is read, so the
     // message container, or the reply row that waits for the first read,
     // may not exist yet — only a full render introduces them.
@@ -2589,6 +2595,25 @@ class RetinueConversation extends HTMLElement {
   // ➤ end it early.
   _contOn() {
     return this._id ? isContinuous(this._id) : this._contNew;
+  }
+
+  // The user asked Ara to end the mode (by voice, in this thread): she
+  // stamps the thread (conversation-push.py --end-continuous), and the
+  // mode ends here as if the loop button had been tapped — the mic closes,
+  // a take in progress is dropped or kept for review as on leaving, and
+  // the shell's voice flag is released. Switched on again after the stamp,
+  // it stays on (endedByAra).
+  _contEndedByAra(t) {
+    if (!this._id || !t || !t.continuous_off) return;
+    const ends = endedByAra(modeEntries()[this._id], t.continuous_off);
+    if (ends) setContinuous(this._id, false);
+    noteAraOff(this._id, t.continuous_off);
+    if (!ends) return;
+    this._listenOnOpen = false;
+    this._contStopListening();
+    this._contDisengage();
+    this._contReady = false;
+    this._contModeChanged = true;
   }
 
   // What a host calls when a wake finds this conversation on screen: the
