@@ -149,7 +149,8 @@ def check_policy_text(cp) -> None:
         assert name in directives, f"{name} is stated, not left to default-src"
     # Where reports go (tests/test_web_gateway_csp_report.py) is no source.
     assert directives.pop("report-uri") == ["/csp-report"]
-    assert directives.pop("report-to") == ["csp"]
+    # Not report-to: Chromium would then ignore report-uri (content_policy.py).
+    assert "report-to" not in directives
     for sources in directives.values():
         for source in sources:
             # Nothing of another origin, no scheme a script could come from.

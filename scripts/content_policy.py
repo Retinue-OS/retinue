@@ -41,13 +41,17 @@ DEFAULT_MODE = "report"
 
 # Where the browser sends what it reports: the gateway's own endpoint
 # (POST /csp-report), on this origin and behind the dashboard's sign-in like
-# every other path. `report-uri` is for the browsers that do not know the
-# Reporting API; one that does (Chromium, and so the Android shell's
-# WebView) takes `report-to` and the group the Reporting-Endpoints header
-# names instead, and ignores `report-uri`. Both are sent in enforce mode too,
-# so what the policy blocks keeps being seen.
+# every other path, named by `report-uri`, in enforce mode too, so what the
+# policy blocks keeps being seen.
+#
+# Not `report-to`, though the endpoint takes its format as well: Chromium
+# (and so the Android shell's WebView) ignores `report-uri` as soon as a
+# policy names a `report-to` group, and leaves delivery to the Reporting API,
+# which batches reports and sends them when it sees fit. Tried in headless
+# Chromium, that delivered nothing within a minute, with the endpoint named
+# relative or absolute, while `report-uri` alone arrives at once. A week of
+# report mode that hears nothing from Chromium would read as a clean week.
 REPORT_PATH = "/csp-report"
-REPORT_GROUP = "csp"
 
 # The policy, directive by directive, each source with the page that needs it.
 # What a page does not load is not allowed: a source added here is one more
@@ -116,7 +120,6 @@ def policy() -> str:
     """The policy as it is sent: the directives, then where reports go."""
     parts = [f"{name} {' '.join(sources)}" for name, sources in DIRECTIVES]
     parts.append(f"report-uri {REPORT_PATH}")
-    parts.append(f"report-to {REPORT_GROUP}")
     return "; ".join(parts)
 
 
@@ -131,8 +134,8 @@ def header_name(current: str | None = None) -> str | None:
 
 
 def headers() -> list[tuple[str, str]]:
-    """The headers an HTML response carries: the policy in the mode in force,
-    and the Reporting API endpoint its report-to names. Empty when off.
+    """The headers an HTML response carries: the policy in the mode in force.
+    Empty when off.
 
     The policy is a header of its own beside any other a page carries: the
     instance settings page's framing policy (frame-ancestors) stays a
@@ -141,8 +144,7 @@ def headers() -> list[tuple[str, str]]:
     name = header_name()
     if name is None:
         return []
-    return [(name, policy()),
-            ("Reporting-Endpoints", f'{REPORT_GROUP}="{REPORT_PATH}"')]
+    return [(name, policy())]
 
 
 def signature() -> str:
@@ -163,9 +165,9 @@ def signature() -> str:
 # cut off (a page's query names a thread or a file; a blocked URL's may carry
 # anything), which also makes the same violation on two threads one entry.
 
-# The two formats: application/csp-report (report-uri, every browser that
-# knows no Reporting API) and application/reports+json (report-to,
-# Chromium). Neither is a type a page of another site can post without a
+# The two formats: application/csp-report (report-uri, what the policy names)
+# and application/reports+json (report-to, the Reporting API's; taken too,
+# so the policy can move to it once its delivery can be relied on). Neither is a type a page of another site can post without a
 # CORS preflight, which this origin never answers, so a page elsewhere
 # cannot fill the file with reports through the user's sign-in.
 FORMATS = ("application/csp-report", "application/reports+json")

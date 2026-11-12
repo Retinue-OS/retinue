@@ -15,8 +15,8 @@ Runs the gateway's real request handler on a loopback port and pins:
   are refused with a fixed answer and keep nothing;
 - no answer reflects what was posted;
 - GET /csp-report lists what was kept, with the mode and the policy;
-- the policy names the endpoint (report-uri and report-to) and every page
-  names the Reporting API endpoint, in report and in enforce mode.
+- the policy names the endpoint (report-uri, and not report-to, which would
+  make Chromium drop it), in report and in enforce mode.
 
     python3 tests/test_web_gateway_csp_report.py
 """
@@ -133,13 +133,11 @@ def main() -> int:
                 name = ("Content-Security-Policy-Report-Only" if mode == "report"
                         else "Content-Security-Policy")
                 value = headers.get(name)
-                assert value and value.endswith("; report-uri /csp-report; report-to csp"), value
-                assert headers.get("Reporting-Endpoints") == 'csp="/csp-report"'
-            os.environ["RETINUE_CSP"] = "off"
-            _, headers, _ = client.request("GET", "/settings.html")
-            assert headers.get("Reporting-Endpoints") is None
+                assert value and value.endswith("; report-uri /csp-report"), value
+                # report-to would make Chromium drop report-uri (content_policy.py).
+                assert "report-to" not in value and headers.get("Reporting-Endpoints") is None
             os.environ.pop("RETINUE_CSP", None)
-            print("ok: the policy and every page name the report endpoint, in report and enforce mode")
+            print("ok: every page's policy names the report endpoint, in report and enforce mode")
 
             assert client.kept()["violations"] == []
 
