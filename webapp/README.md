@@ -605,9 +605,16 @@ load of this device and browser:
   jobs, and a second tab on the same place takes nothing that is not its own.
   Recorders run in 250 ms slices, so a page left with the mic live hands the
   worker everything said up to the last fraction of a second, and leaving acts
-  as **✓**: the transcript waits in the draft for review. A dictation sent
-  with **➤** whose page is gone before its transcript is in lands in the draft
-  too, unsent — the context a send needs left with that page. Without a
+  as **✓**: the transcript waits in the draft for review. A dictation the
+  user *sent* — **➤**, or a take of the continuous loop that ended on a pause
+  — is a message to the thread it was recorded in, as if typed there: should
+  its page be gone before the transcript is in, the worker posts it into that
+  thread itself (the thread fixed when recording started, never whatever is on
+  screen by then), and the next page showing the thread just reads it back.
+  A send the worker could not make, or may not have made (no answer, a worker
+  stopped in the middle), is never retried blindly: its text waits in the
+  draft with a note. A first message (no thread yet) waits in its composer's
+  draft, as before. Without a
   controlling worker (the very first load, a browser without one), and with
   an older worker that does not take the job up within 4 s, transcription is
   the page's own fetch, as before.
@@ -796,8 +803,12 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `wake` event), which reopens the thread used in the mode within the last
   15 minutes, else that voice composer. Both flags are dropped from the
   address once read and open the mic by themselves only inside the shell;
-  elsewhere the conversation offers a **Start talking** button. The pure parts — the detector's state machine and the wake's
-  choice of thread — are `components/continuous.js`
+  elsewhere the conversation offers a **Start talking** button. Closing it:
+  the toggle, or Ara — told by voice to switch the mode off, she stamps the
+  thread (`conversation-push.py --end-continuous` → `continuous_off`), and
+  every device showing it in the mode leaves it on its next read; a toggle
+  pressed after her stamp is the user's and stays on (docs/dashboard.md). The pure parts — the detector's state machine, the wake's
+  choice of thread and whether Ara's stamp ends the mode — are `components/continuous.js`
   (`tests/test_webapp_continuous.py`).
 
 ## Installing on Android

@@ -1,7 +1,8 @@
 // <retinue-instance-settings> — the settings of this instance, the same for
 // every device: how it presents itself (name and accent colour, GET/POST
-// /instance), which model each subagent runs on (GET/POST /agent-models), and
-// the system pages (gateways, Claude sign-in, pending sends, the life store).
+// /instance), whether it follows focus modes (GET /attention/profile, POST
+// /attention/modes {enabled}), which model each subagent runs on (GET/POST
+// /agent-models), and the system pages (gateways, Claude sign-in, pending sends, the life store).
 //
 // Two pages show it: the Settings page (settings.html, its "This instance"
 // section) and settings-instance.html, which the Android app embeds as the
@@ -29,6 +30,21 @@ const TEMPLATE = `
       <button type="button" class="setting-btn" data-instance-stock-color>Stock colour</button>
     </div>
     <p class="hint" data-instance-note hidden></p>
+  </section>
+
+  <section class="scard" data-focus hidden>
+    <h2>Focus modes</h2>
+    <p class="hint">Rest, Focused, Chores and Social, by schedule or set by
+      hand from the home's header: what may ring depends on the mode in force.
+      Useful on a personal instance; on a shared one, or one with a single
+      remit, turn them off — then anything time-sensitive rings at any time,
+      active items wait for the next digest and passive ones are only
+      listed. The week and the modes are kept for
+      when they are turned back on.</p>
+    <label class="num-setting">Follow focus modes on this instance
+      <input type="checkbox" data-focus-enabled>
+    </label>
+    <p class="hint" data-focus-note hidden></p>
   </section>
 
   <section class="scard" data-agent-models hidden>
@@ -61,6 +77,7 @@ class RetinueInstanceSettings extends HTMLElement {
     this._wired = true;
     this.innerHTML = TEMPLATE;
     this._wireInstance();
+    this._wireFocus();
     this._wireAgentModels();
   }
 
@@ -116,6 +133,49 @@ class RetinueInstanceSettings extends HTMLElement {
         const res = await fetch('/instance', { cache: 'no-store' });
         if (!res.ok) return;
         render(await res.json());
+      } catch (_err) { /* card stays hidden */ }
+    })();
+  }
+
+  // Focus modes on or off (focus.json `enabled`, on unless set to false):
+  // read from GET /attention/profile, written through the same patch the
+  // Focus rules take (POST /attention/modes {enabled}); the switch shows what
+  // the server answered.
+  _wireFocus() {
+    const card = this.querySelector('[data-focus]');
+    const box = this.querySelector('[data-focus-enabled]');
+    const note = this.querySelector('[data-focus-note]');
+    const render = (focus) => {
+      card.hidden = false;
+      box.checked = !focus || focus.enabled !== false;
+      box.disabled = false;
+      this._changed();
+    };
+    box.addEventListener('change', async () => {
+      const wanted = box.checked;
+      box.disabled = true;
+      try {
+        const res = await fetch('/attention/modes', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: wanted }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        note.hidden = true;
+        render(data.focus);
+      } catch (err) {
+        box.checked = !wanted;
+        box.disabled = false;
+        note.textContent = `Could not save: ${err.message}`;
+        note.hidden = false;
+        this._changed();
+      }
+    });
+    (async () => {
+      try {
+        const res = await fetch('/attention/profile', { cache: 'no-store' });
+        if (!res.ok) return;
+        render((await res.json()).focus);
       } catch (_err) { /* card stays hidden */ }
     })();
   }

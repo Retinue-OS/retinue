@@ -71,7 +71,13 @@ Projects (dashboard project pages):
                                          (either or both). Same token gate. The
                                          only way to set `muted`, which is what
                                          keeps a thread archived when new
-                                         messages are filed into it.
+                                         messages are filed into it. Also
+                                         {continuous_off: true}: the user asked
+                                         Ara (by voice) to end continuous
+                                         conversation; the thread is stamped
+                                         `continuous_off` (now, ISO) and every
+                                         device showing it in the mode leaves
+                                         it on its next read.
 
 The life store (behind the dashboard's sign-in; read-only):
   GET|POST /sparql                    -> SPARQL 1.1 Protocol: query=<SPARQL>
@@ -1388,6 +1394,9 @@ def _news_ingest_authorized(provided: str) -> bool:
 
 # Recoloured icons, keyed by (path, colour): the recolouring is a pure-Python
 # pixel pass, so it runs once per icon per configured colour, not per request.
+# The pages and the manifest name them with the colour as a version
+# (/icons/icon-192.png?v=cb6cfe); the query is not read here, the colour in
+# force is what is served.
 _BRANDED_ICON_CACHE: dict[tuple[str, str], bytes] = {}
 
 # Where the Android app serves its own settings page from (a reserved address
@@ -9497,10 +9506,13 @@ def _attention_day(focus: dict, day) -> dict:
 
 def _attention_mode_summary(focus: dict, now: datetime) -> dict:
     mode = attention_policy.mode_at(focus, now)
-    scheduled_id = attention_policy.scheduled_id(focus, now)
-    scheduled = focus["modes"][scheduled_id]
+    enabled = attention_policy.focus_enabled(focus)
+    # With focus off nothing is scheduled: the one mode is in force for good.
+    scheduled = focus["modes"][attention_policy.scheduled_id(focus, now)] if enabled else mode
     until = attention_policy.scheduled_until(focus, now)
+    manual = bool(attention_policy.manual_of(focus))
     return {
+        "enabled": enabled,
         "id": mode["id"], "name": mode["name"], "blurb": mode.get("blurb", ""),
         "threshold": mode["threshold"], "admits": list(mode["admits"]),
         "admit_tags": list(mode.get("admit_tags") or []),
@@ -9508,9 +9520,9 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
         "with_subject": bool(mode.get("with_subject")),
         "subject": mode.get("subject"),
         "label": attention_policy.mode_label(mode),
-        "manual": bool(focus.get("manual")),
-        "manual_until": focus.get("manual_until") if focus.get("manual") else None,
-        "breaks": [b for b in (focus.get("breaks") or []) if focus.get("manual")],
+        "manual": manual,
+        "manual_until": focus.get("manual_until") if manual else None,
+        "breaks": [b for b in (focus.get("breaks") or []) if manual],
         "scheduled": {"id": scheduled["id"], "name": scheduled["name"],
                       "until": until.isoformat() if until else None},
         "day": _attention_day(focus, now.date()),
@@ -9549,6 +9561,9 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
         "now": now.isoformat(),
         "timezone": str(now.tzinfo),
         "mode": _attention_mode_summary(focus, now),
+        # Whether this instance follows focus modes at all (focus.json
+        # `enabled`): off, the home shows no mode chip and no menu.
+        "focus_enabled": attention_policy.focus_enabled(focus),
         "modes": [{"id": m["id"], "name": m["name"], "blurb": m.get("blurb", ""),
                    "threshold": m["threshold"], "admits": list(m["admits"]),
                    "admit_tags": list(m.get("admit_tags") or []),
@@ -9858,13 +9873,16 @@ class Handler(BaseHTTPRequestHandler):
         the browser to install the new worker and drop the stale cache. The file
         (baked, read-only) is never mutated on disk — the substitution is done on
         the response only. Served no-cache so the worker itself is always
-        revalidated."""
+        revalidated. With an instance colour in force, its icon paths (the
+        precache list, the notification icon) carry the colour like every
+        other icon reference (instance_branding.brand_icon_refs)."""
         sw = WEBAPP_DIR / "sw.js"
         try:
             text = sw.read_text(encoding="utf-8")
         except OSError:
             return False
-        body = text.replace("__SHELL_HASH__", _shell_hash()).encode("utf-8")
+        text = instance_branding.brand_icon_refs(text.replace("__SHELL_HASH__", _shell_hash()))
+        body = text.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/javascript; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -10638,7 +10656,8 @@ class Handler(BaseHTTPRequestHandler):
                     learned += attention_policy.correct(item, profile, patch, now)
                     effect = attention_policy.reevaluate(item, focus, profile, now, "the contact card")
                 _attention_persist(item)
-            if name and payload.get("permit"):
+            if name and payload.get("permit") and attention_policy.focus_enabled(focus):
+                # With focus off there is no mode to hold a permit for.
                 mode_id = attention_policy.mode_at(focus, now)["id"]
                 if attention_policy.set_permit(profile, name, mode_id, True, now, focus["modes"]):
                     learned.append(f"{name} may interrupt in {focus['modes'][mode_id]['name']}")
@@ -11554,6 +11573,9 @@ class Handler(BaseHTTPRequestHandler):
         digest goes out — except a switch into Focused: that holds on to
         what waits, and only what the focus lets through rings."""
         mode_id = payload.get("mode")
+        if mode_id and not attention_policy.focus_enabled(focus):
+            self._send_json(409, {"error": "focus is off on this instance — turn it on in Settings first"})
+            return
         if mode_id is not None and mode_id != "" and mode_id not in focus["modes"]:
             self._send_json(400, {"error": "unknown mode"})
             return
@@ -11601,11 +11623,16 @@ class Handler(BaseHTTPRequestHandler):
             items, degraded = _attention_items(profile, now)
         self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
 
-    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str) -> list[str]:
-        """After a rule change, push what it releases; returns their ids."""
+    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str,
+                           skip: set | None = None) -> list[str]:
+        """After a rule change, push what it releases; returns their ids.
+        ``skip``: items a digest has just carried, which must not ring again
+        one by one."""
         items, _degraded = _attention_items(profile, now)
         pushed = []
         for item in items:
+            if skip and item["id"] in skip:
+                continue
             effect = attention_policy.reevaluate(item, focus, profile, now, why)
             if effect is None:
                 continue
@@ -11655,7 +11682,15 @@ class Handler(BaseHTTPRequestHandler):
         pushed: list[str] = []
         if changes:
             _ATTENTION.save_focus(focus)
-            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule")
+            if payload.get("enabled") is not None and any(c.startswith("focus modes ") for c in changes):
+                # Focus turned on or off is a change of mode like any other:
+                # a breakpoint, what was held arriving as one digest.
+                items, _degraded = _attention_items(profile, now)
+                digest = _attention_breakpoint(items, focus, now, "focus turned " + ("on" if payload["enabled"] else "off"))
+                carried = {i["id"] for i in (digest or {}).get("items") or []}
+            else:
+                carried = set()
+            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule", skip=carried)
         self._send_json(200, {"changed": changes, "mode": _attention_mode_summary(focus, now),
                               "focus": focus, "pushed": pushed})
 
@@ -12096,6 +12131,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         flags = {key: bool(payload[key])
                  for key in ("archived", "muted") if key in payload}
+        # Ending continuous conversation is an event, not a state: the stamp
+        # says when Ara was asked to, and a device leaves the mode if it was
+        # switched on before that moment (webapp/components/conversation.js,
+        # _contEndedByAra). Switching it on again later is the user's call.
+        if payload.get("continuous_off") is True:
+            flags["continuous_off"] = datetime.now(timezone.utc).isoformat()
         if not flags:
             self._send_json(400, {"error": "no flags given"})
             return
