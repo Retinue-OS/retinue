@@ -40,6 +40,7 @@ CHAMBERS_DIR = Path(os.environ.get("CHAMBERS_DIR") or "/workspace/chambers")
 CONVERSATIONS_DIR = Path(os.environ.get("CONVERSATIONS_DIR") or "/root/.retinue/conversations")
 SOURCES = ("chats", "threads", "memory", "projects")
 EXCERPT = 220
+MAX_DAYS = 36500  # keeps timedelta from overflowing on absurd windows
 
 
 def _load(name: str):
@@ -237,10 +238,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--limit", type=int, default=12, help="lines per source (default 12)")
     args = ap.parse_args(argv)
 
+    # An empty needle is a substring of every text, so a blank term (typically
+    # an unset shell variable) would list everything in the window as a match.
+    term = args.term.strip()
+    if not term:
+        ap.error("term must not be blank")
+    # Beyond roughly a century the window predates any record, and a larger
+    # value would overflow timedelta and die with a traceback instead.
+    if not 0 < args.days <= MAX_DAYS:
+        ap.error(f"--days must be above 0 and at most {MAX_DAYS}")
+
     since = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=args.days)
-    needles = [fold(args.term.strip())]
-    names, handles = contact_handles(args.term, CHAMBERS_DIR)
-    handles.add(_bare(args.term))
+    needles = [fold(term)]
+    names, handles = contact_handles(term, CHAMBERS_DIR)
+    handles.add(_bare(term))
     messenger = Path(os.environ.get("TRIAGE_MESSENGER_DIR") or CHAMBERS_DIR / "_generated" / "messenger")
     scanners = {
         "chats": lambda: scan_chats(messenger, since, needles, handles),
@@ -248,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         "memory": lambda: scan_memory(CHAMBERS_DIR / "_generated" / "memory", since, needles, names),
         "projects": lambda: scan_projects(CHAMBERS_DIR, since, needles, names),
     }
-    print(f"recent: «{args.term}» since {since:%Y-%m-%d %H:%M}Z"
+    print(f"recent: «{term}» since {since:%Y-%m-%d %H:%M}Z"
           + (f" — contact: {', '.join(names)}" if names else ""))
     for src in args.source or SOURCES:
         rows = sorted(scanners[src](), key=lambda r: r[0], reverse=True)

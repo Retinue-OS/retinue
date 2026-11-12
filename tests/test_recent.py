@@ -157,6 +157,20 @@ def main():
         assert "café C:\\users\\Brändle x" in out, out
 
         assert recent.fold("BRÄNDLE") == "brandle"
+
+        # A blank term or an absurd window is a usage error, not a match-all
+        # listing or a traceback.
+        for bad in (["  "], [""], ["x", "--days", "1e9"], ["x", "--days", "0"],
+                    ["x", "--days", "-1"], ["x", "--days", "nan"]):
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                    recent.main(bad)
+            except SystemExit as exc:
+                assert exc.code == 2, (bad, exc.code)
+            else:
+                raise AssertionError(f"accepted {bad}")
+            assert "error:" in err.getvalue(), (bad, err.getvalue())
     print("ok")
 
 
