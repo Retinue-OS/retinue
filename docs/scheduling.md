@@ -7,7 +7,7 @@ memory-compact jobs, or debugging why a resting project did not wake.*
 
 ## Data refresh (`.refresh.json`)
 
-External data sources (e.g. Garmin) are kept up to date by the generic refresh
+External data sources (a wearable's cloud account, a bank export) are kept up to date by the generic refresh
 dispatcher at `/workspace/scripts/refresh.py`. `--ensure <source-id>` is a
 no-op when the source was updated within its configured `max_age_seconds`;
 when stale it fetches synchronously, commits the result, and pushes — so the
@@ -21,14 +21,21 @@ per chamber. Example:
 {
   "sources": [
     {
-      "id": "garmin",
-      "command": "python3 /workspace/scripts/sync-garmin.py",
+      "id": "wearable",
+      "command": "python3 .retinue/scripts/wearable/sync.py",
       "max_age_seconds": 86400,
-      "lock_path": "/tmp/refresh-garmin.lock"
+      "lock_path": "/tmp/refresh-wearable.lock"
     }
   ]
 }
 ```
+
+The command is the chamber's own: it runs with the chamber as working
+directory and `CHAMBER_DIR` set to it, so the fetch script lives in the
+chamber (here `.retinue/scripts/wearable/sync.py`) and the framework knows
+nothing about the source. Credentials the command needs are the
+deployment's to pass and to name in `RETINUE_SESSION_ENV_EXTRA`
+(`contributing.md`, "Session environment").
 
 Per-source state (last successful run) is stored in
 `chambers/<chamber>/.refresh/<id>.json`. On container start the dispatcher runs

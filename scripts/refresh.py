@@ -10,13 +10,16 @@ Manifest format  (<chamber>/.refresh.json):
   {
     "sources": [
       {
-        "id": "garmin",
-        "command": "python3 /workspace/scripts/sync-garmin.py",
+        "id": "wearable",
+        "command": "python3 .retinue/scripts/wearable/sync.py",
         "max_age_seconds": 86400,
-        "lock_path": "/tmp/refresh-garmin.lock"
+        "lock_path": "/tmp/refresh-wearable.lock"
       }
     ]
   }
+
+The command runs with the chamber as its working directory and CHAMBER_DIR
+set to it, so a chamber ships its own fetch script and names it relatively.
 
 Per-source state files  (<chamber>/.refresh/<source-id>.json):
   {
@@ -26,7 +29,7 @@ Per-source state files  (<chamber>/.refresh/<source-id>.json):
 
 Usage:
   python3 scripts/refresh.py --data-dir /workspace/chambers/<name>            # run all stale sources
-  python3 scripts/refresh.py --data-dir /workspace/chambers/<name> --ensure garmin
+  python3 scripts/refresh.py --data-dir /workspace/chambers/<name> --ensure wearable
 """
 
 import argparse
@@ -80,7 +83,7 @@ def save_state(data_dir: Path, source_id: str, status: str) -> None:
 
 # After a failed run we still record last_run, but we must NOT then treat the
 # source as "fresh" for the full max_age_seconds window — that silently
-# suppressed retries for a day (e.g. a Garmin login that needed MFA failed at
+# suppressed retries for a day (e.g. a login that needed an e-mailed passcode failed at
 # 09:00 and nothing tried again until the next morning). Back off only briefly
 # so a transient failure is retried soon; override per-source with
 # "error_retry_seconds".

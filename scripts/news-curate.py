@@ -8,7 +8,7 @@ feedback nobody has folded into the preferences yet — does it spawn a single
 `claude -p` session, which dispatches the **Herald** subagent.
 
 That keeps the loop honest: a quiet news day costs nothing, and the model is
-only asked the question it is actually good at ("does Reto care about this?"),
+only asked the question it is actually good at ("does the owner care about this?"),
 never the ranking arithmetic, which is a formula in `news_store.py`.
 
 The payload (unscored items, pending feedback, current preferences) is written

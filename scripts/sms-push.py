@@ -11,7 +11,7 @@ must be approved on the web gateway's /sends page; a `trust` account sends
 directly only with --user-approved. On a queued send this prints the approval URL.
 
 Examples:
-    sms-push.py "Ari: reply to Mara failed — check scheduler.log"
+    sms-push.py "Agent: reply to Mara failed — check scheduler.log"
     sms-push.py --recipient +41791234567 "Running ten minutes late"
     sms-push.py --reply-to <token> "Thanks, see you then"
 

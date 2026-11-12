@@ -15,7 +15,7 @@ send this prints the approval URL instead of confirming delivery.
 
 Examples:
     # Simple text alert to the default recipient
-    whatsapp-push.py "Ari: failed to send reply to Mara — check scheduler.log"
+    whatsapp-push.py "Agent: failed to send reply to Mara — check scheduler.log"
 
     # With an image attachment, to a specific number
     whatsapp-push.py --recipient +15551234567 --image /tmp/chart.png "Today's summary"
