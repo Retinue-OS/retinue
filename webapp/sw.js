@@ -36,6 +36,7 @@ const SHELL_ASSETS = [
   '/styles.css',
   '/layout.js',
   '/viewport.js',
+  '/sw-register.js',
   '/manifest.webmanifest',
   '/components/base.js',
   '/components/attention.js',
@@ -68,6 +69,8 @@ const SHELL_ASSETS = [
   '/components/device-store.js',
   '/components/instance-settings.js',
   '/components/viewer-page.js',
+  '/components/settings-page.js',
+  '/components/sync-health-page.js',
   '/icons/icon-192.png',
   '/icons/icon-512.png'
 ];

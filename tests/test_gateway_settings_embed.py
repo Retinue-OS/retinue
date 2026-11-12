@@ -91,8 +91,11 @@ def main() -> int:
         html = page.body.decode("utf-8")
         assert "<title>Retinue (Admin) — Instance settings</title>" in html, "branded like every page"
         assert '<base target="_top">' in html, "links leave the frame"
-        # The page posts its height to the same origin the policy admits.
-        assert f"'{gw.APP_SETTINGS_ORIGIN}'" in html
+        # The page posts its height to the same origin the policy admits, from
+        # its own module (no inline script: the page's Content-Security-Policy).
+        assert '<script type="module" src="/components/settings-instance-page.js">' in html
+        script = (WEBAPP / "components" / "settings-instance-page.js").read_text(encoding="utf-8")
+        assert f"'{gw.APP_SETTINGS_ORIGIN}'" in script
         assert "<retinue-instance-settings>" in html
         print("ok: the embed page is served with a framing policy for this origin and the app only")
 

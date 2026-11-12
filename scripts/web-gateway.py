@@ -3815,41 +3815,20 @@ def _all_pending() -> list[dict]:
     return items
 
 
-# The way out of the /sends pages once nothing is left to decide: back to the
-# page the approval link was tapped on — the dashboard opens it in place
-# (#359), so that is the latest same-origin history entry that is not a
-# /sends page (Navigation API), however many approval and status pages
-# followed it. A page opened on its own (a link from another app, another
-# site before it in the tab) has none, so it closes; where the browser
-# refuses that, the dashboard — never the empty /sends list.
-_SENDS_LEAVE_JS = (
-    "  function closeOrHome(){\n"
-    "    window.close();\n"
-    "    setTimeout(function(){location.replace('/');},400);\n"
-    "  }\n"
-    "  function leave(){\n"
-    "    var nav=window.navigation;\n"
-    "    if(nav&&nav.currentEntry&&nav.entries){\n"
-    "      var entries=nav.entries();\n"
-    "      for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
-    "        var u;\n"
-    "        try{u=new URL(entries[i].url);}catch(e){continue;}\n"
-    "        if(u.origin!==location.origin||/^\\/sends(\\/|$)/.test(u.pathname))continue;\n"
-    "        var t=nav.traverseTo(entries[i].key);\n"
-    "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
-    "        return;\n"
-    "      }\n"
-    "    }\n"
-    "    closeOrHome();\n"
-    "  }\n"
-)
+# The script of the /sends pages (webapp/gateway/sends.js): the way out once
+# nothing is left to decide, the approval card's button lock and the status
+# page's polling. A file of the dashboard's own, never script in the page,
+# since the pages' Content-Security-Policy runs scripts only from such files
+# (docs/dashboard.md, "The Content-Security-Policy"); what a page needs to
+# know is written into its markup, which the script reads.
+_SENDS_SCRIPT = '<script src="/gateway/sends.js"></script>\n'
 
 
 def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
     """The list of pending sends. With `leave`, the empty list a decision lands
     on when nothing is left to decide goes straight back to where the approval
-    link was tapped (_SENDS_LEAVE_JS); the list itself is only what shows
-    without scripting."""
+    link was tapped (``data-sends-leave``, read by _SENDS_SCRIPT); the list
+    itself is only what shows without scripting."""
     if pending:
         rows = []
         for p in pending:
@@ -3874,12 +3853,11 @@ def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
     return (
         _HTML_HEAD
         + "<title>Retinue — Pending Sends</title>\n"
-        + "<body>\n"
+        + ("<body data-sends-leave>\n" if leave else "<body>\n")
         + "<h1>Pending Sends</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/conversation">Session log</a></nav>\n'
         + body + "\n"
-        + ("<script>\n(function(){\n" + _SENDS_LEAVE_JS + "  leave();\n})();\n</script>\n"
-           if leave else "")
+        + (_SENDS_SCRIPT if leave else "")
         + "</body>\n</html>\n"
     )
 
@@ -3926,27 +3904,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
           f'<button type="submit" id="btn-reject" class="btn btn-deny">Deny</button></form>\n'
         + f'  <a href="{skip}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-          "  function lockButtons(activeLabel){\n"
-          "    ['btn-approve','btn-reject'].forEach(function(id){\n"
-          "      var btn=document.getElementById(id);\n"
-          "      if(!btn)return;\n"
-          "      btn.disabled=true;\n"
-          "      btn.style.opacity='0.5';\n"
-          "      btn.style.cursor='not-allowed';\n"
-          "    });\n"
-          "    var skip=document.getElementById('btn-skip');\n"
-          "    if(skip){skip.style.pointerEvents='none';skip.style.opacity='0.5';}\n"
-          "    var active=document.getElementById(activeLabel);\n"
-          "    if(active){active.textContent='Processing...';}\n"
-          "  }\n"
-          "  var fa=document.getElementById('form-approve');\n"
-          "  if(fa){fa.addEventListener('submit',function(){lockButtons('btn-approve');});}\n"
-          "  var fr=document.getElementById('form-reject');\n"
-          "  if(fr){fr.addEventListener('submit',function(){lockButtons('btn-reject');});}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -4420,62 +4378,25 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
         + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
-        + f'<div class="st-row"><div id="st-icon">{icon}</div>'
+        # What the script needs to know, for it to read (_SENDS_SCRIPT): the
+        # status, where to go next, where to poll, and the notes to show.
+        + '<div class="st-row" id="st-row"'
+        + "".join(f' {name}="{html.escape(value, quote=True)}"'
+                  for name, value in (("data-status", status),
+                                      ("data-next", next_url),
+                                      ("data-poll", poll_url),
+                                      ("data-note-done", notes["done"]),
+                                      ("data-note-rejected", notes["rejected"]),
+                                      ("data-note-retracted", notes["retracted"]),
+                                      ("data-note-error", notes["error"]))
+                  if value)
+        + f'><div id="st-icon">{icon}</div>'
         + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
         + '<div class="actions">\n'
         + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
         + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-        + f"  var status={json.dumps(status)};\n"
-        + f"  var nextUrl={json.dumps(next_url)};\n"
-        + f"  var pollUrl={json.dumps(poll_url)};\n"
-        + f"  var noteDone={json.dumps(notes['done'])};\n"
-        + f"  var noteRejected={json.dumps(notes['rejected'])};\n"
-        + f"  var noteRetracted={json.dumps(notes['retracted'])};\n"
-        + f"  var noteError={json.dumps(notes['error'])};\n"
-        + "  var icon=document.getElementById('st-icon');\n"
-          "  var note=document.getElementById('st-note');\n"
-          "  var nextBtn=document.getElementById('st-next');\n"
-          "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
-          "  function advance(){\n"
-          "    if(nextUrl){location=nextUrl;return;}\n"
-          "    leave();\n"
-          "  }\n"
-        + _SENDS_LEAVE_JS
-        + "  function terminal(st,err){\n"
-          "    if(st==='approved'){\n"
-          "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-          "      note.textContent=noteDone;\n"
-          "      setTimeout(advance,1500);\n"
-          "    }else if(st==='rejected'){\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteRejected;\n"
-          "      showNext();\n"
-          "    }else if(st==='retracted'){\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteRetracted;\n"
-          "      showNext();\n"
-          "    }else{\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteError+(err||'unknown error');\n"
-          "      showNext();\n"
-          "    }\n"
-          "  }\n"
-          "  function poll(){\n"
-          "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
-          "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
-          "        if('next' in b){nextUrl=b.next;}\n"
-          "        terminal(b.status,b.error);\n"
-          "      }else{setTimeout(poll,1500);}\n"
-          "    }).catch(function(){setTimeout(poll,3000);});\n"
-          "  }\n"
-          "  if(status==='sending'){setTimeout(poll,1200);}\n"
-          "  else if(status==='approved'){setTimeout(advance,1500);}\n"
-          "  else{showNext();}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -4576,27 +4497,7 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
           f'<button type="submit" id="btn-reject" class="btn btn-deny">Deny</button></form>\n'
         + skip_btn
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-          "  function lockButtons(activeLabel){\n"
-          "    ['btn-approve','btn-reject'].forEach(function(id){\n"
-          "      var btn=document.getElementById(id);\n"
-          "      if(!btn)return;\n"
-          "      btn.disabled=true;\n"
-          "      btn.style.opacity='0.5';\n"
-          "      btn.style.cursor='not-allowed';\n"
-          "    });\n"
-          "    var skip=document.getElementById('btn-skip');\n"
-          "    if(skip){skip.style.pointerEvents='none';skip.style.opacity='0.5';}\n"
-          "    var active=document.getElementById(activeLabel);\n"
-          "    if(active){active.textContent='Processing...';}\n"
-          "  }\n"
-          "  var fa=document.getElementById('form-approve');\n"
-          "  if(fa){fa.addEventListener('submit',function(){lockButtons('btn-approve');});}\n"
-          "  var fr=document.getElementById('form-reject');\n"
-          "  if(fr){fr.addEventListener('submit',function(){lockButtons('btn-reject');});}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -4714,11 +4615,10 @@ def _render_gateways_html(statuses: list[dict]) -> str:
                 '<div class="qr-wrap">'
                 # Hidden until a refresh actually delivers an image: while the
                 # gateway is still generating the code, /qr answers JSON and a
-                # visible <img> would render as a broken-image icon.
+                # visible <img> would render as a broken-image icon. The page's
+                # script shows it once one loads (webapp/gateway/gateways.js).
                 f'<img class="qr" alt="pairing QR for {label_e}" src="/gateways/{slug}/qr" '
-                'style="display:none" '
-                "onload=\"this.style.display=''\" "
-                'onerror="this.style.display=\'none\'">'
+                'style="display:none">'
                 '<p class="qr-note meta">If no code shows yet, the gateway is still generating one — '
                 'this page refreshes automatically.</p>'
                 f"<p>{html.escape(_pairing_hint(slug))}</p>"
@@ -4742,18 +4642,12 @@ def _render_gateways_html(statuses: list[dict]) -> str:
         cards.append('<section class="gw-card">' + "\n".join(rows) + "</section>")
     if not cards:
         cards.append("<section><p>No messenger gateways are configured in this deployment.</p></section>")
-    refresh_js = (
-        "<script>\n"
-        "setInterval(function(){\n"
-        "  document.querySelectorAll('img.qr').forEach(function(img){\n"
-        "    var u=new URL(img.getAttribute('src'),location);\n"
-        "    u.searchParams.set('ts',Date.now());\n"
-        "    img.src=u.toString();\n"
-        "  });\n"
-        "}, 20000);\n"
-        "setTimeout(function(){location.reload();}, 60000);\n"
-        "</script>\n"
-    ) if any_qr else '<meta http-equiv="refresh" content="60">\n'
+    # With a code to scan, the page's script (a file of the dashboard's own:
+    # docs/dashboard.md, "The Content-Security-Policy") shows each code once
+    # it loads, fetches a fresh one every 20 s and reloads the page after a
+    # minute; without one, a plain refresh does.
+    refresh_js = ('<script src="/gateway/gateways.js"></script>\n' if any_qr
+                  else '<meta http-equiv="refresh" content="60">\n')
     return (
         _HTML_HEAD
         + "<title>Retinue — Messenger Gateways</title>\n"
@@ -4944,45 +4838,10 @@ def _render_claude_auth_html(status: dict) -> str:
         "from any shell in the container.</p></section>"
     )
 
-    flow_js = (
-        "<script>\n"
-        "var attempt=null;\n"
-        "function setResult(msg,bad){var el=document.getElementById('result');"
-        "if(!el)return;el.textContent=msg;el.style.color=bad?'var(--high)':'var(--ok)';}\n"
-        # Grace period before polling: the container needs a moment to go
-        # down, or the first poll still reaches the old gateway and reloads
-        # straight into the dying one.
-        "function pollBack(){setTimeout(function(){setInterval(function(){"
-        "fetch('/claude-auth/status',{cache:'no-store'}).then(function(r){"
-        "if(r.ok)location.reload();}).catch(function(){});},3000);},8000);}\n"
-        "var startBtn=document.getElementById('start');\n"
-        "if(startBtn)startBtn.onclick=function(){var b=this;b.disabled=true;"
-        "fetch('/claude-auth/login/start',{method:'POST'})"
-        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
-        ".then(function(x){if(!x.r.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
-        "attempt=x.d.attempt;document.getElementById('authlink').href=x.d.url;"
-        "document.getElementById('flow').style.display='';b.style.display='none';"
-        "setResult('');})"
-        ".catch(function(e){setResult('Could not start the sign-in: '+e.message,true);"
-        "b.disabled=false;});};\n"
-        "var finishBtn=document.getElementById('finish');\n"
-        "if(finishBtn)finishBtn.onclick=function(){var b=this;"
-        "var code=document.getElementById('code').value.trim();"
-        "if(!code){setResult('Paste the code first.',true);return;}\n"
-        "b.disabled=true;"
-        "fetch('/claude-auth/login/finish',{method:'POST',"
-        "headers:{'Content-Type':'application/json'},"
-        "body:JSON.stringify({attempt:attempt,code:code,"
-        "restart:document.getElementById('restart').checked})})"
-        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
-        ".then(function(x){if(!x.r.ok||!x.d.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
-        "if(x.d.restarting){setResult('Signed in. Restarting the agent container — "
-        "this page reconnects automatically…');pollBack();}"
-        "else{setResult('Signed in. Reloading…');"
-        "setTimeout(function(){location.reload();},1200);}})"
-        ".catch(function(e){setResult('Sign-in failed: '+e.message,true);b.disabled=false;});};\n"
-        "</script>\n"
-    )
+    # The sign-in flow's script (webapp/gateway/claude-auth.js): a file of the
+    # dashboard's own, since the pages' Content-Security-Policy runs scripts
+    # only from such files (docs/dashboard.md, "The Content-Security-Policy").
+    flow_js = '<script src="/gateway/claude-auth.js"></script>\n'
 
     return (
         _HTML_HEAD
