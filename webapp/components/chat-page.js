@@ -146,10 +146,18 @@ const IMAGE_MAX_EDGE = 1600;
 const IMAGE_JPEG_QUALITY = 0.85;
 
 // How long a cleared draft stays recoverable. Long enough to notice the box is
-// empty and reach for the undo, short enough that the control is not still
-// sitting there when the user comes back to a chat they left minutes ago —
-// where it would offer to restore text they have long since abandoned.
-const UNDO_CLEAR_MS = 12000;
+// empty, wonder why, and reach for the undo — 12 s proved too short in use: a
+// mis-tap is typically noticed only after looking back at the chat, by which
+// time the arrow was gone. Still well inside the server's own stash lifetime
+// (chat_state.UNDO_CLEAR_MAX_AGE, 300 s), so an offered undo can always land,
+// and short enough that the control is not still sitting there when the user
+// comes back to a chat they left minutes ago.
+const UNDO_CLEAR_MS = 60000;
+// The ✕ takes two taps: the first arms it, the second (within this window)
+// clears. A single tap near the field's corner — aiming for the text to place
+// the caret — emptied a staged draft in use, twice in a row; the second tap
+// costs a deliberate clear almost nothing.
+const CLEAR_ARM_MS = 3000;
 
 // Quick patterns: canned companion prompts over the current draft/thread.
 // A chip is nothing but a pre-filled companion turn (see the design doc) —
@@ -459,6 +467,7 @@ class RetinueChatPage extends HTMLElement {
     this._nav = null;
     if (this._lightbox) this._dismissLightbox();
     Object.values(this._noteTimers).forEach((t) => clearTimeout(t));
+    if (this._clearArmTimer) clearTimeout(this._clearArmTimer);
     this._noteTimers = {};
     if (this._draftTimer) clearTimeout(this._draftTimer);
     if (this._pollTimer) clearInterval(this._pollTimer);
@@ -2182,6 +2191,12 @@ class RetinueChatPage extends HTMLElement {
     this._fieldObs = typeof ResizeObserver === 'function' ? new ResizeObserver(fit) : null;
     if (this._fieldObs) this._fieldObs.observe(input);
     input.addEventListener('input', () => {
+      // An input event that takes the whole box at once — select-all and
+      // delete, cut, a keyboard's clear — is a clear like the ✕'s and is
+      // offered back the same way. Backspacing out the last character is not:
+      // there the user is plainly erasing by hand.
+      const wipedOut = isChat && !input.value && (this._draft || '').trim().length > 1;
+      const wiped = wipedOut ? { text: this._draft, byAra: this._draftByAra } : null;
       if (isChat) {
         this._draft = input.value;
         // The shared draft follows the keystrokes, debounced — an agent (and
@@ -2193,9 +2208,17 @@ class RetinueChatPage extends HTMLElement {
         this._draft = input.value;
       }
       field.classList.toggle('has-text', !!input.value);
-      // Anything typed (or dictated in) means the user has moved on; the offer
-      // does not come back if they then delete it again.
-      if (isChat && this._undo) this._setUndo(null);
+      if (wiped) {
+        // Saved at once, not debounced: the undo restores the server's stash,
+        // which exists only once the emptied draft has been written.
+        this._setDraftByAra(false);
+        this._saveDraft();
+        this._setUndo(wiped);
+      } else if (isChat && this._undo) {
+        // Anything typed (or dictated in) means the user has moved on; the
+        // offer does not come back if they then delete it again.
+        this._setUndo(null);
+      }
       grow();
     });
     if (isChat) {
@@ -2217,11 +2240,32 @@ class RetinueChatPage extends HTMLElement {
     }
     const clearBtn = form.querySelector('[data-clear]');
     if (clearBtn) {
+      // Pressed without taking the focus, so arming it does not blur the field
+      // (and put the phone keyboard away) under a user who meant to keep typing.
+      clearBtn.addEventListener('mousedown', (e) => e.preventDefault());
       clearBtn.addEventListener('click', () => {
-        // One tap to an empty box — the deliberate divergence from the real
-        // clients. It also dismisses the staged-draft marker (the draft is
-        // rejected, not sent) and clears the server-side draft with it. All of
-        // which is why the tap is offered back: see _setUndo.
+        // Two taps to an empty box (see CLEAR_ARM_MS): the first only arms
+        // the ✕, which turns red and says so; it disarms by itself.
+        if (!clearBtn.classList.contains('armed')) {
+          clearBtn.classList.add('armed');
+          clearBtn.setAttribute('aria-label', 'Tap again to clear');
+          clearBtn.title = 'Tap again to clear';
+          clearTimeout(this._clearArmTimer);
+          this._clearArmTimer = setTimeout(() => {
+            clearBtn.classList.remove('armed');
+            clearBtn.setAttribute('aria-label', 'Clear message');
+            clearBtn.title = 'Clear message';
+          }, CLEAR_ARM_MS);
+          return;
+        }
+        clearTimeout(this._clearArmTimer);
+        clearBtn.classList.remove('armed');
+        clearBtn.setAttribute('aria-label', 'Clear message');
+        clearBtn.title = 'Clear message';
+        // The confirming tap empties the box — the deliberate divergence from
+        // the real clients. It also dismisses the staged-draft marker (the
+        // draft is rejected, not sent) and clears the server-side draft with
+        // it. All of which is why the clear is offered back: see _setUndo.
         const prev = input.value;
         const wasAra = this._draftByAra;
         input.value = '';
@@ -3211,6 +3255,8 @@ const CSS = `
      nearer to it. */
   .field.has-clip .clear-inline { right: 39px; }
   .clear-inline:hover { color: var(--high, #ff6b6b); background: rgba(255, 107, 107, .14); }
+  /* Armed by a first tap: red and filled, so the second tap is a decision. */
+  .clear-inline.armed { color: #fff; background: var(--high, #ff6b6b); }
   /* The undo occupies the ✕'s slot, in the accent colour — it offers something
      back rather than taking it away, and it should read as the one thing worth
      tapping in an unexpectedly empty box. */
