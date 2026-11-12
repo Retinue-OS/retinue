@@ -13,7 +13,8 @@ nothing; and the gateway-side parser keeps valid lines, drops bad ones and
 duplicate ids, and caps the count; the documented --file form passes a text
 as written (a line `EOF` and quotes included), and no example puts one in
 quotes or a heredoc; --file refuses what it cannot read or combine and
-deletes a sensitive text's file, also when the call is refused.
+deletes a sensitive text's file, also when the call is refused; and the
+bridge contract in docs/dashboard.md names every case the phone asks about.
 
     python3 tests/test_shell_type.py
 """
@@ -238,6 +239,19 @@ def test_outcome_and_auto_run():
         assert not sa.runs_by_itself(dict(t, text=c + "a")), repr(c)
     # Inside the text, whitespace other than a tab or a line break is plain.
     assert sa.runs_by_itself(dict(t, text="a" + chr(0x3000) + "b"))
+    # The bridge contract says when the phone asks, and the phone's rule
+    # (KeyboardLogic.onlyWrites) also covers an empty text and whitespace at
+    # either end: a description that lists only Enter, line breaks, tabs and
+    # keys tells a reader that `git push ` types at once, when it waits up to
+    # 25 s for a tap and may end as `cancelled`.
+    dashboard = (REPO_ROOT / "docs" / "dashboard.md").read_text(encoding="utf-8")
+    row = next(line for line in dashboard.splitlines()
+               if line.startswith("| Keyboard (RetinueShell/5) |"))
+    asks = row[row.index("Before anything that can act on the device"):]
+    asks = asks[:asks.index("the shell asks on the phone itself")]
+    for case in ("Enter", "a line break", "a tab", "an empty text",
+                 "whitespace at either end", "any key"):
+        assert case in asks, (case, asks)
     print("ok: outcomes are validated; only plain one-line text runs by itself")
 
 

@@ -278,8 +278,10 @@ def _phrase(o: object) -> str:
         why = o.get("error") or "failed"
         if why == "cancelled":
             # The page's Stop and a confirmation on the phone (asked before
-            # Enter, a line break, a tab or a key) that the user declined or
-            # did not answer in time end the same way on the wire. Saying
+            # anything but plain one-line text: Enter, a line break, a tab,
+            # whitespace at either end, an empty text, or a key) that the
+            # user declined or did not answer in time end the same way on
+            # the wire. Saying
             # "stopped by the user" would tell Ara the user refused, when
             # they may not have looked at the phone.
             return ("not typed: cancelled — stopped, or declined or not "
