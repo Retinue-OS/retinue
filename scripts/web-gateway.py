@@ -1188,7 +1188,8 @@ TRANSCRIBE_TIMEOUT = float(os.environ.get("TRANSCRIBE_TIMEOUT", "120"))
 # the dashboard — unlike Signal, where the agent reads the transcript and answers
 # what was meant — every recognition error is the user's to repair by hand. We
 # run the transcript through a small model first, with the thread so far and the
-# user's contact names as context (that is what fixes mangled names). Best
+# dictation vocabulary (names from the life store: people, organisations,
+# medications) as context — that is what fixes mangled names. Best
 # effort: any failure returns the raw transcript unchanged.
 TRANSCRIPT_CLEANUP = os.environ.get("TRANSCRIPT_CLEANUP", "1").strip().lower() not in ("0", "false", "no")
 # An explicit TRANSCRIPT_CLEANUP_MODEL always wins; otherwise fall back to
