@@ -1849,6 +1849,17 @@ _MD_TAG_RE = re.compile(r'(<[^>]*>)')
 # Elements whose text is never linked: a link already is one, and code is
 # shown as written.
 _MD_NO_LINK_RE = re.compile(r'<(/?)(a|code|pre)\b', re.IGNORECASE)
+# An image of markdown-it's output, and its attributes (each value escaped by
+# markdown-it). An answer is model output, so an image in it would be fetched
+# from wherever the model pointed, and the page's Content-Security-Policy
+# (img-src, scripts/content_policy.py) blocks any image from another origin
+# or a data: URL anyway. The log shows an image as a link to it instead, as
+# the dashboard's own Markdown renderer does (webapp/components/markdown.js).
+_MD_IMG_RE = re.compile(r'<img\s')
+_MD_ATTR_RE = re.compile(r'([a-z]+)="([^"]*)"')
+# Where such a link may point: the web, or a path on this origin (a second
+# slash or a backslash would make it another origin), as markdown.js allows.
+_MD_IMG_LINK_RE = re.compile(r'(?i)(?:https?://|/(?![/\\]))')
 
 # ── Async job store ───────────────────────────────────────────────────────────
 # POST /message can request async handling; the request returns a job handle
@@ -1923,7 +1934,9 @@ def _render_answer(raw: str) -> str:
     out: list[str] = []
     depth = {"a": 0, "code": 0, "pre": 0}
     for i, part in enumerate(_MD_TAG_RE.split(rendered)):
-        if i % 2:  # a tag
+        if i % 2 and _MD_IMG_RE.match(part):
+            out.append(_image_as_link(part, inside_link=depth["a"] > 0))
+        elif i % 2:  # a tag
             m = _MD_NO_LINK_RE.match(part)
             if m and not part.endswith("/>"):
                 name = m.group(2).lower()
@@ -1934,6 +1947,20 @@ def _render_answer(raw: str) -> str:
         else:
             out.append(part)
     return "".join(out)
+
+
+def _image_as_link(tag: str, inside_link: bool) -> str:
+    """markdown-it's <img> ``tag`` as a link to the image, its alt text (or
+    the URL) as the link's text; only the text inside another link, or where
+    the URL is neither a web address nor a path on this origin. The values
+    are markdown-it's, already escaped for an attribute and for text."""
+    attrs = dict(_MD_ATTR_RE.findall(tag))
+    src = attrs.get("src", "")
+    text = attrs.get("alt") or src
+    if inside_link or not _MD_IMG_LINK_RE.match(src):
+        return attrs.get("alt", "")
+    title = f' title="{attrs["title"]}"' if "title" in attrs else ""
+    return f'<a href="{src}"{title}>{text}</a>'
 
 
 def _linkify_text(text: str) -> str:
@@ -10032,7 +10059,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             new = content_policy.record(CSP_REPORTS_FILE, violations)
-        except OSError as exc:
+        # ValueError as well: the fields are cleaned of what UTF-8 cannot
+        # encode, but should one slip through, the reports are lost, never
+        # the answer.
+        except (OSError, ValueError) as exc:
             print(f"[web-gateway] CSP reports not kept: {exc}", flush=True)
             new = []
         for v in new:

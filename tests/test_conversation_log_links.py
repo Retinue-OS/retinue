@@ -7,8 +7,9 @@ on the rendered HTML, so it must only ever touch text between tags: a URL in
 an attribute (an image's src, alt or title, a link's href) is part of the
 tag, and rewriting it there broke the tag apart. This pins:
 
-- an image whose src, alt or title holds a URL keeps exactly those
-  attributes, and the page gains no link from them;
+- an image is shown as a link to it, never loaded (the page's
+  Content-Security-Policy would block it), and a URL in its src, alt or
+  title gains no link of its own;
 - a bare URL in text is still linked, with the trailing punctuation of the
   sentence left outside the link, and the URL escaped for the attribute;
 - a URL inside a code span, a code block or a link is left alone;
@@ -79,16 +80,44 @@ def _parse(markup: str) -> _Tags:
     return p
 
 
-def test_image_attributes_stay_as_they_are(wg):
+def test_image_is_a_link_with_its_attributes(wg):
     out = wg._render_answer(
         '![a https://alt.example/x](https://img.example/p.png "see https://t.example")')
     p = _parse(out)
-    imgs = [a for t, a in p.tags if t == "img"]
-    assert imgs == [{"src": "https://img.example/p.png", "alt": "a https://alt.example/x",
-                     "title": "see https://t.example"}], (imgs, out)
-    assert p.links == [], out
-    assert [t for t, _ in p.tags] == ["p", "img"], out
-    print("PASS test_image_attributes_stay_as_they_are")
+    # The image is a link to it, carrying its URL and title exactly; the URLs
+    # in its alt text and title gain no link of their own.
+    assert [t for t, _ in p.tags] == ["p", "a"], out
+    assert p.tags[1][1] == {"href": "https://img.example/p.png",
+                            "title": "see https://t.example"}, out
+    assert p.links == [("https://img.example/p.png", "a https://alt.example/x")], out
+    print("PASS test_image_is_a_link_with_its_attributes")
+
+
+def test_no_image_is_loaded(wg):
+    """The session log page loads no image an answer names: its
+    Content-Security-Policy (img-src) would block one from another origin or
+    a data: URL, so the page shows a link to it instead, as the dashboard's
+    Markdown renderer does (webapp/components/markdown.js)."""
+    answer = ("![remote](https://example.org/x.png) "
+              "![](https://example.org/q.png?a=1&b=2) "
+              "![inline](data:image/png;base64,iVBORw0KGgo=) "
+              "![here](/data/x.png) ![other](//elsewhere.example/x.png) "
+              "[![nested](https://example.org/n.png)](https://target.example/)")
+    out = wg._render_answer(answer)
+    p = _parse(out)
+    assert not [a for t, a in p.tags if t == "img"], out
+    assert p.links == [("https://example.org/x.png", "remote"),
+                       ("https://example.org/q.png?a=1&b=2", "https://example.org/q.png?a=1&b=2"),
+                       ("/data/x.png", "here"),
+                       ("https://target.example/", "nested")], out
+    # A data: image and one on another origin's relative form are their alt text.
+    assert "inline" in out and "other" in out and "data:" not in out and "//elsewhere" not in out
+    # The whole page, as GET /conversation/<date> builds it.
+    page = wg._render_day_html(
+        [{"anchor": "a1", "timestamp": "2026-09-02T10:00:00", "question": "Show me",
+          "answer": answer}], "2026-09-02", ["2026-09-02"])
+    assert not [a for t, a in _parse(page).tags if t == "img"], page
+    print("PASS test_no_image_is_loaded")
 
 
 def test_bare_url_in_text_is_linked(wg):
@@ -137,7 +166,8 @@ def test_text_stays_text(wg):
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load_gateway(Path(tmp))
-        test_image_attributes_stay_as_they_are(gw)
+        test_image_is_a_link_with_its_attributes(gw)
+        test_no_image_is_loaded(gw)
         test_bare_url_in_text_is_linked(gw)
         test_code_and_links_are_left_alone(gw)
         test_text_stays_text(gw)

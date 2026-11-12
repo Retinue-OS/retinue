@@ -79,7 +79,9 @@ DIRECTIVES = (
     # (_shape_chat_attachments); the data: media of webapp/data/chats/ are a
     # test corpus, never served as records. Nor is a web link loaded: the
     # chat page shows a remote attachment as a link to open, never as an
-    # image or a player (chat-page.js, mediaUrl).
+    # image or a player (chat-page.js, mediaUrl), and the session log shows
+    # an image an answer names as a link or its alt text (web-gateway.py,
+    # _image_as_link), as webapp/components/markdown.js does.
     ("img-src", ("'self'", "blob:")),
     # Audio and video: this origin only (messenger media through the media
     # proxy, the briefing card's audio).
@@ -199,7 +201,10 @@ REPORTS_PER_DELIVERY = 50
 VIOLATIONS_LIMIT = 200
 _FIELD_MAX = 300
 
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+# Control characters and line separators would break the one-line log entry;
+# a lone surrogate (JSON's \u escapes can name half of a UTF-16 pair, and
+# json.loads keeps it) is no text at all and cannot be written as UTF-8.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029\ud800-\udfff]")
 _DIRECTIVE_RE = re.compile(r"[a-z][a-z-]{0,39}")
 _LOCK = threading.Lock()
 
@@ -304,7 +309,8 @@ def _load(path: Path) -> dict:
 def record(path: Path, violations: list[dict], now: float | None = None) -> list[dict]:
     """Count ``violations`` into the file at ``path``; the ones seen for the
     first time come back, for the log. A file that cannot be written loses
-    the reports, never the request: an OSError is the caller's to log."""
+    the reports, never the request: an OSError (or a ValueError, should a
+    field ever hold what UTF-8 cannot encode) is the caller's to log."""
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now if now is not None else time.time()))
     new = []
     with _LOCK:
@@ -330,8 +336,13 @@ def record(path: Path, violations: list[dict], now: float | None = None) -> list
                 entry["source"] = v["source"]
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
-        os.replace(tmp, path)
+        # A write that fails half-way leaves no partial file behind.
+        try:
+            tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+            os.replace(tmp, path)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
     return new
 
 

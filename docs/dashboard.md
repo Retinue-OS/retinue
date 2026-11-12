@@ -119,7 +119,10 @@ attributes; restricting styles is not the aim). Images and media come from
 this origin; `blob:` images are the chat page's previews of images about to
 be sent. No image or medium is loaded from another origin: the chat page
 shows an attachment that is a web link as a link to open (see
-"Attachments"). The one frame is the file viewer's; no page loads a font.
+"Attachments"), and the session log shows an image an answer names (a web
+address or a `data:` URL) as a link to it, or as its alt text, never as an
+image, as the dashboard's Markdown renderer does. The one frame is the file
+viewer's; no page loads a font.
 One page gets more, for itself alone (`PAGE_SOURCES` in the module):
 `/sparql` (also served as `/sparql.html`) adds `data:` to `img-src`, for the
 icons in YASGUI's stylesheet. It needs nothing else: the vendored YASGUI

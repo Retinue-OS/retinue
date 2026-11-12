@@ -230,6 +230,27 @@ def main() -> int:
             assert " " not in row["blocked"] and len(row["blocked"]) <= 300, row
             print("ok: every field is kept as one short line")
 
+            # ── A lone surrogate is no text: taken, dropped, the file still JSON ──
+            # JSON's \u escapes can name half of a UTF-16 pair; json.loads
+            # keeps it, and it cannot be written as UTF-8.
+            for ctype, body in (
+                    ("application/csp-report",
+                     b'{"csp-report": {"document-uri": "https://dash.example/lone.html\\ud800",'
+                     b' "effective-directive": "script-src", "blocked-uri": "inline"}}'),
+                    ("application/reports+json",
+                     b'[{"type": "csp-violation", "url": "https://dash.example/lone.html",'
+                     b' "body": {"documentURL": "https://dash.example/lone.html",'
+                     b' "effectiveDirective": "img-src", "blockedURL": "x\\udfff"}}]')):
+                status, _, answer = client.post(ctype, body)
+                assert status == 204 and answer == b"", (ctype, status, answer)
+            stored = json.loads(wg.CSP_REPORTS_FILE.read_text(encoding="utf-8"))
+            rows = {(v["document"], v["directive"], v["blocked"]) for v in stored["violations"]}
+            assert ("/lone.html", "script-src", "inline") in rows, rows
+            assert ("/lone.html", "img-src", "x") in rows, rows
+            assert not wg.CSP_REPORTS_FILE.with_name(wg.CSP_REPORTS_FILE.name + ".tmp").exists()
+            print("ok: a lone surrogate in a report is dropped; the report is kept and the "
+                  "file stays valid JSON")
+
             # ── The cap ──────────────────────────────────────────────────────
             cp.VIOLATIONS_LIMIT = len(client.kept()["violations"]) + 2
             for i in range(5):
