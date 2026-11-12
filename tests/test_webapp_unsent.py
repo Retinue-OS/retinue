@@ -307,6 +307,7 @@ globalThis.fetch = (url, opts = {}) => {
 // Its transcription requests are held until the test answers them.
 const swFetches = [];
 let swIgnoresDictation = false;
+let swSendDeadlineShort = false;
 const swMessage = [];
 const sandbox = {
   self: {
@@ -316,10 +317,16 @@ const sandbox = {
   },
   caches: { open: async () => ({ addAll: async () => {}, match: async () => null, put: async () => {} }),
             keys: async () => [], match: async () => null, delete: async () => true },
-  // The worker's 30 s deadline on a send into a thread is made short; every
-  // other timer is as it is.
+  // The worker's 30 s deadline on a send into a thread is made short only
+  // while a check wants it to run out (swSendDeadlineShort); every other timer
+  // is as it is. Shortened for every send, it also ran out under the checks
+  // that answer the request in time: one of them answers only after a page
+  // has been mounted and has read its thread, which on a busy runner takes
+  // longer than the short deadline, so the request was aborted first and the
+  // job came back as 'maybe' — whose text the page rightly puts in the box,
+  // with a note.
   indexedDB, Blob, AbortController, URL, console, clearTimeout,
-  setTimeout: (fn, ms, ...rest) => setTimeout(fn, ms === 30000 ? 30 : ms, ...rest),
+  setTimeout: (fn, ms, ...rest) => setTimeout(fn, ms === 30000 && swSendDeadlineShort ? 30 : ms, ...rest),
   location: { origin: 'http://dash' },
   fetch: (url, opts = {}) => new Promise((resolve, reject) => {
     // `answer` is a transcript; `respond` the status of a message the worker
@@ -734,6 +741,7 @@ await ok('a sent dictation whose page went is posted by the worker, and the page
   assert.equal(req.opts.method, 'POST');
   const got = takeOutcome(R1);
   await until(() => jobs().find((j) => j.key === `conv:${R1}`)?.owner === 'client-adopter', 'taken over while on the wire');
+  assert.ok(!req.opts.signal.aborted, 'answered within the deadline');
   req.respond(200);
   await until(() => got.length === 1, 'the outcome arrived');
   assert.deepEqual({ ...got[0], at: 0 }, { text: 'Gesendet.', sent: true, unsent: '', send: true, at: 0 });
@@ -742,6 +750,7 @@ await ok('a sent dictation whose page went is posted by the worker, and the page
 
 await ok('a send the thread refused comes back unsent, with its text, and is not posted again', async () => {
   const req = await leftSent('rec2', R2, 'Abgelehnt.');
+  assert.ok(!req.opts.signal.aborted, 'answered within the deadline');
   req.respond(500);
   await until(() => jobs().find((j) => j.key === `conv:${R2}`)?.state === 'done', 'settled');
   const got = takeOutcome(R2);
@@ -751,7 +760,13 @@ await ok('a send the thread refused comes back unsent, with its text, and is not
 });
 
 await ok('a send with no answer in time comes back as maybe sent, and is not posted again', async () => {
-  const req = await leftSent('rec3', R3, 'Keine Antwort.');
+  swSendDeadlineShort = true;
+  let req;
+  try {
+    req = await leftSent('rec3', R3, 'Keine Antwort.');
+  } finally {
+    swSendDeadlineShort = false;
+  }
   assert.ok(req.opts.signal, 'the request carries a deadline');
   await until(() => jobs().find((j) => j.key === `conv:${R3}`)?.state === 'done', 'the deadline passed');
   const got = takeOutcome(R3);
@@ -807,6 +822,10 @@ await ok('a thread open while the worker posts a sent dictation shows it, with n
   const el = await mountOn('c1', S4);
   await until(() => jobs().find((j) => j.key === `conv:${S4}`)?.owner === 'client-c1', 'the thread took the job');
   threads[S4].messages.push({ role: 'user', text: 'Im Verlauf.', ts: new Date().toISOString() });
+  // Answered in time: a request past its deadline is one that may or may not
+  // have gone, whose text the page rightly puts in the box with a note (the
+  // next check).
+  assert.ok(!req.opts.signal.aborted, 'answered within the deadline');
   req.respond(200);
   await until(() => el.thread.messages.some((m) => m.text === 'Im Verlauf.'), 'the thread was read again');
   await until(() => !jobs().some((j) => j.key === `conv:${S4}`), 'taken');
