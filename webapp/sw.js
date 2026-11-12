@@ -115,7 +115,9 @@ self.addEventListener('message', (e) => {
 //       `send` only: the call the take cancelled in the continuous loop
 //       (components/conversation.js, CANCELLED_CALLS), sent along as
 //       `cancelled_call` as the page's own send would — while the take is
-//       fresh (DICT_CALL_FRESH_MS).
+//       fresh (DICT_CALL_FRESH_MS). 'dictation-done' also carries `at` (when
+//       the job was started) and `textAt` (when its transcript came, for the
+//       run that started it; none for a restart).
 //   {type:'dictation-adopt', keys} + a port  take over the jobs under these
 //       places whose owner is gone, restart any this worker was stopped in
 //       the middle of, and answer on the port with {jobs} — every job under
@@ -134,8 +136,12 @@ const DICT_SEND_TIMEOUT_MS = 30 * 1000;
 // A sent take's cancelled call (`call`) goes along only while the take is this
 // fresh: one sent later — a restart of a job the worker was stopped in, for
 // whichever page asks — goes out as words alone, or Ara could place a call
-// nobody is waiting for. The page keeps the same window for an adopted take
-// (components/conversation.js, CALL_FRESH_MS).
+// nobody is waiting for. Fresh counts from the transcript (`textAt`) for the
+// run that started the job, which sends it the moment it is in however long
+// the transcription took (up to DICT_TIMEOUT_MS), and from the recording
+// (`at`) for a restart, which sets no `textAt`: a take the worker was stopped
+// in is as old as its recording. The page keeps the same window for an
+// adopted take (components/conversation.js, CALL_FRESH_MS).
 const DICT_CALL_FRESH_MS = 90 * 1000;
 
 // ── Sent dictations ──────────────────────────────────────────────────────────
@@ -167,7 +173,7 @@ function dictCall(call) {
 async function dictSend(rec) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), DICT_SEND_TIMEOUT_MS);
-  const call = rec.call && Date.now() - (rec.at || 0) < DICT_CALL_FRESH_MS ? rec.call : null;
+  const call = rec.call && Date.now() - (rec.textAt || rec.at || 0) < DICT_CALL_FRESH_MS ? rec.call : null;
   try {
     const res = await fetch(rec.send, {
       method: 'POST',
@@ -243,7 +249,8 @@ async function dictOwnerAlive(owner) {
 function dictResult(type, rec) {
   return {
     type, id: rec.id, key: rec.key, state: rec.state, text: rec.text || '', error: rec.error || '',
-    sent: !!rec.sent, unsent: rec.unsent || '', send: !!rec.send, at: rec.at || 0, call: rec.call || null,
+    sent: !!rec.sent, unsent: rec.unsent || '', send: !!rec.send, at: rec.at || 0, textAt: rec.textAt || 0,
+    call: rec.call || null,
   };
 }
 
@@ -307,14 +314,18 @@ async function dictRun(rec, again, onStored) {
   // whoever holds the job at this moment (an adopt may have moved it). The
   // run counts as running until the outcome is stored, so no adopt in between
   // starts it over — nor, while the worker sends it, hands its text out.
+  // When the transcript came, for the run that started the job only: the
+  // freshness of its cancelled call counts from here (DICT_CALL_FRESH_MS). A
+  // restart's comes late by however long the worker was stopped.
   let selfSend = false;
+  const stamp = again ? {} : { textAt: Date.now() };
   const done = await dictUpdate(rec.id, (cur) => {
     if (!(cur && cur.run === token)) return null;
     const pageSends = !!(cur.owner && cur.owner === cur.origin && originAlive);
     selfSend = !!(cur.send && text && !error && !pageSends);
     return selfSend
-      ? { ...cur, phase: 'sending', text, error, blob: null }
-      : { ...cur, state: 'done', text, error, blob: null };
+      ? { ...cur, ...stamp, phase: 'sending', text, error, blob: null }
+      : { ...cur, ...stamp, state: 'done', text, error, blob: null };
   }).catch(() => null);
   if (!done || !selfSend) {
     if (DICT_RUNNING.get(rec.id) === token) DICT_RUNNING.delete(rec.id);

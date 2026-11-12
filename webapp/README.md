@@ -614,9 +614,11 @@ load of this device and browser:
   A take that cancelled a call in the continuous loop carries that call to
   the worker (`call`), whose send sends it along as `cancelled_call`, as the
   page's own would (docs/dashboard.md, "Inside the Android shell") — while
-  the take is fresh: one sent more than 90 s after it was recorded (a
-  worker restart, a page opened later that takes it over) goes as words
-  alone, so no call is placed again that nobody is waiting for.
+  the take is fresh: one sent more than 90 s after its transcript came (a
+  page opened later that takes it over), or after it was recorded where the
+  worker was stopped in the middle and restarted it, goes as words alone,
+  so no call is placed again that nobody is waiting for. A slow
+  transcription the worker sends the moment it is in keeps its call.
   A send the worker could not make, or may not have made (no answer, a worker
   stopped in the middle), is never retried blindly: its text waits in the
   draft with a note. A first message (no thread yet) waits in its composer's

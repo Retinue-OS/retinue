@@ -26,7 +26,9 @@ never sends what is in the box unseen; a take sent by touch, or one the
 page cannot hear, cancels the call and its transcript decides; a call waiting
 with the mic shut, or one resumed after an empty transcript while the page
 was hidden, is dropped; no-voice-cancel in the name's place is the flag;
-and only Ara's own answer places a
+a take left by an earlier page carries its call while it is fresh, counted
+from its transcript; a cancelling take that meets another send on the wire
+leaves no call for a later turn; and only Ara's own answer places a
 call, never a message an agent pushed into the thread nor her reply to a
 chat arrival, in the same poll as the answer or while it is read.
 
@@ -375,9 +377,11 @@ const SW = {
   },
 };
 // A sent take an earlier page left under thread `id` with its transcript in
-// but not yet sent, recorded `age` ms ago, the call it cancelled with it.
-const leftTake = (id, text, age, call) => swLeft.push({ id: `left-${id}-${swLeft.length}`, key: `conv:${id}`,
-  state: 'done', text, error: '', send: true, sent: false, unsent: '', at: Date.now() - age, call: call || null });
+// but not yet sent, recorded `age` ms ago, the call it cancelled with it;
+// its transcript came `textAge` ms ago (none: the worker never said when).
+const leftTake = (id, text, age, call, textAge) => swLeft.push({ id: `left-${id}-${swLeft.length}`, key: `conv:${id}`,
+  state: 'done', text, error: '', send: true, sent: false, unsent: '', at: Date.now() - age,
+  textAt: textAge === undefined ? 0 : Date.now() - textAge, call: call || null });
 Object.defineProperty(globalThis, 'navigator', { value: {
   get serviceWorker() { return swOn ? SW : undefined; },
   userAgent: 'node RetinueShell/6 (Android)',
@@ -431,6 +435,8 @@ const posts = [];
 let transcript = '';
 // While set, a transcription waits for it (a promise) before it answers.
 let transcribing = null;
+// While set, a message POST waits for it (a promise) before it answers.
+let postGate = null;
 let clock = Date.parse('2026-11-12T10:00:00Z');
 const ts = () => new Date(clock += 60000).toISOString();
 const answer = (body) => Promise.resolve({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(body)) });
@@ -439,7 +445,10 @@ globalThis.fetch = (url, opts = {}) => {
   const read = /^\/conversations\/([0-9a-f]{32})$/.exec(url);
   if (read && method === 'GET') return answer(threads[read[1]]);
   const reply = /^\/conversations\/([0-9a-f]{32})\/messages$/.exec(url);
-  if (reply && method === 'POST') { posts.push(JSON.parse(opts.body)); return answer(threads[reply[1]]); }
+  if (reply && method === 'POST') {
+    posts.push(JSON.parse(opts.body));
+    return Promise.resolve(postGate).then(() => answer(threads[reply[1]]));
+  }
   if (url.startsWith('/conversations/transcribe') && method === 'POST') {
     return (transcribing || Promise.resolve()).then(() => answer({ text: transcript }));
   }
@@ -484,7 +493,7 @@ const notPlaced = (el) => { el.render(); return el.shadowRoot.innerHTML.includes
 let passed = 0;
 async function ok(name, fn) {
   placed.length = 0; posts.length = 0; micFails = false; webAudio = true; level = 0; transcript = '';
-  shellAnswer = { state: 'placed' }; speakMs = 30; said.length = 0; transcribing = null;
+  shellAnswer = { state: 'placed' }; speakMs = 30; said.length = 0; transcribing = null; postGate = null;
   swOn = false; swOutcome = { sent: true }; swJobs.length = 0; swLeft.length = 0; swHold = null;
   try { await fn(); } finally { swOn = false; }
   passed += 1;
@@ -805,6 +814,15 @@ await ok("a cancelling take an earlier page left is sent by the next one, with i
   el.disconnectedCallback();
 });
 
+await ok('...fresh counted from its transcript, where a slow one came long after the recording', async () => {
+  swOn = true;
+  const el = await spoken({ role: 'assistant', text: NOTED },
+    (e) => leftTake(e.thread.id, 'yes, go ahead', 200 * 1000, CANCELLED, 5000));
+  await until(() => posts.length === 1, 'the page that took the take over sends it');
+  assert.deepEqual(posts[0].cancelled_call, CANCELLED, 'with the call it cancelled');
+  el.disconnectedCallback();
+});
+
 await ok('...but an old one goes out as words alone, and no call is placed with the mic shut', async () => {
   swOn = true;
   // Its page died before it could send it; days later the thread is opened
@@ -845,6 +863,44 @@ await ok("a take another page left does not borrow the call this page's own take
   await until(() => posts.length === 2, "this page's take goes out");
   assert.equal(posts[1].message, 'no, call Ben instead');
   assert.deepEqual(posts[1].cancelled_call, CANCELLED, 'with the call it cancelled');
+  await wait(6000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok("a cancelling take that meets an adopted send on the wire leaves no call for a later turn", async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  swOn = true;
+  swOutcome = {};   // this page is there: it sends its own take
+  let release;
+  swHold = new Promise((r) => { release = r; });
+  await wait(500);
+  transcript = 'no, stop';
+  level = 0.3;
+  await until(() => !el._calling, 'speech cancelled the call');
+  await wait(800);
+  level = 0;
+  await until(() => swJobs.length === 1, "this page's take is being transcribed");
+  // A take another tab left on the thread is adopted and sent, and is still
+  // on the wire when this page's own transcript comes in.
+  let open;
+  postGate = new Promise((r) => { open = r; });
+  leftTake(el.thread.id, 'and remind me at six', 5000, null);
+  dispatchEvent({ type: 'pageshow', persisted: true });
+  await until(() => posts.length === 1, 'the left take is on the wire');
+  release();
+  await until(() => swJobs[0].done, "this page's transcript is in");
+  await wait(500);
+  assert.equal(posts.length, 1, "this page's take does not go out over the send on the wire");
+  open();
+  postGate = null;
+  await wait(500);
+  assert.ok([...store.values()].some((v) => v.includes('no, stop')), 'it waits in the box');
+  swOn = false;
+  await el._send('what is the weather tomorrow?', { fromDraft: false });
+  assert.equal(posts[posts.length - 1].message, 'what is the weather tomorrow?');
+  assert.equal(posts[posts.length - 1].cancelled_call, undefined, 'a later turn carries no cancelled call');
   await wait(6000);
   assert.equal(placed.length, 0, 'no call');
   el.disconnectedCallback();

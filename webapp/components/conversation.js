@@ -149,7 +149,8 @@ const CONT_IDLE_MS = 90 * 1000;
 const CONT_WATCH_MS = 5 * 1000;
 // A take that cancelled a call tells Ara so (`cancelled_call`) only while
 // the conversation it answered can still be going on: one sent later than
-// this after it was recorded — a page that died before sending it, its
+// this after its transcript came (after it was recorded, where the worker
+// restarted it) — a page that died before sending it, its
 // take adopted by a page opened since — goes out as words alone, or Ara
 // could place a call nobody is waiting for, with the mic shut. The worker
 // keeps the same window for the sends it makes (sw.js, DICT_CALL_FRESH_MS).
@@ -654,7 +655,7 @@ function adoptDictations(key) {
     ADOPTED.set(key, (ADOPTED.get(key) || 0) + 1);
     const el = LIVE.get(key);
     if (el) el.render();
-    job.then(async ({ text, sent, unsent, send, at, call }) => {
+    job.then(async ({ text, sent, unsent, send, at, textAt, call }) => {
       if (sent) { VOICE_ERRORS.delete(key); refreshSent(key); return; }
       // A sent dictation whose page went after the transcript was in but
       // before that page could send it: the send is this page's. Unless the
@@ -667,10 +668,12 @@ function adoptDictations(key) {
         if (t && el.isConnected) {
           VOICE_ERRORS.delete(key);
           // A take that cancelled a call tells Ara so from here too, while
-          // it is fresh (CALL_FRESH_MS). Its own call, handed to this send
-          // alone: CANCELLED_CALLS[key] belongs to a take of this page's,
-          // which may be on its way right now and is left untouched.
-          const fresh = call && Date.now() - (at || 0) < CALL_FRESH_MS;
+          // it is fresh (CALL_FRESH_MS) — counted from its transcript, as
+          // the worker counts it, or from its recording where the worker
+          // restarted it. Its own call, handed to this send alone:
+          // CANCELLED_CALLS[key] belongs to a take of this page's, which may
+          // be on its way right now and is left untouched.
+          const fresh = call && Date.now() - (textAt || at || 0) < CALL_FRESH_MS;
           await el._send(text, { fromDraft: false, call: fresh ? { number: call.number, name: call.name } : null });
           return;
         }
@@ -2592,7 +2595,7 @@ class RetinueConversation extends HTMLElement {
       // one sent into a thread is sent there by the worker (sw.js, "Sent
       // dictations") — the thread it was recorded in, whatever is on screen.
       // A take that cancelled a call carries it there too, so Ara hears of
-      // the call whichever of the two sends it (sendMessage).
+      // the call whichever of the two sends it (the page's send below).
       const send = intent === 'send' ? sendUrlFor(key) : '';
       const cancelled = send ? CANCELLED_CALLS.get(key) : null;
       const got = await transcribe(storeKey(key), blob, transcribeUrl(key),
@@ -2639,6 +2642,14 @@ class RetinueConversation extends HTMLElement {
     // reference, where the key would no longer find it.
     let adopted = null;
     if (toSend) {
+      // The call this take cancelled is its own, spent here and handed to
+      // its send alone. A send that turns back (one already on the wire —
+      // an adopted take, say — a refused pin, a thread that could not be
+      // started) leaves the take in the box, its call cancelled as for a
+      // take kept for review: nothing is left for a later, unrelated turn
+      // to carry.
+      const call = CANCELLED_CALLS.get(key) || null;
+      CANCELLED_CALLS.delete(key);
       // Send path: the status row stays in place of the textarea until the
       // send completes, so the keyboard never appears. On failure the draft
       // stays in place, which then shows up (unfocused) for a manual retry.
@@ -2646,7 +2657,7 @@ class RetinueConversation extends HTMLElement {
       if (live()) live().render();
       const el = live();
       if (!isNewKey(key) && el) {
-        await el._send(toSend);
+        await el._send(toSend, { call });
       } else {
         // Off screen, or a first message: the send goes out with the context
         // captured when the recording started. The key names that context —
@@ -2680,7 +2691,10 @@ class RetinueConversation extends HTMLElement {
           const out = { text: toSend, files: sentFiles, fromDraft: true, posted: true, target, before,
             at: new Date().toISOString(), project: (seed && seed.project) || '' };
           if (VOICE_JOBS.get(key)) VOICE_JOBS.get(key).out = out;
-          const conv = await sendMessage(target, toSend, sentFiles, seed, model, out)
+          // A first message has no thread a call could have been placed
+          // from: none goes with it (sendMessage, too, sends none without an
+          // id, and a minted thread is a new one).
+          const conv = await sendMessage(target, toSend, sentFiles, seed, model, out, isNewKey(key) ? null : call)
             .catch((err) => arrivedAnyway(err, target, toSend, before))
             .catch((err) => { VOICE_ERRORS.set(key, sendFailureNote(err)); throw err; });
           draftOf(key).leftSend = null;

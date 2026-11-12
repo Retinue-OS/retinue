@@ -43,12 +43,16 @@
 //                               back-forward cache, a worker restarted under
 //                               a running job) arrive the same way. With
 //                               `outcome`, the promise resolves to {text,
-//                               sent, unsent, send, at, call?} as for a sent
-//                               transcribe(); `send` with neither of the
-//                               others is a sent dictation whose page went
-//                               after it had the text but before it could
-//                               send it — the adopter's to send, with the
-//                               cancelled `call` it was recorded with, if any.
+//                               sent, unsent, send, at, textAt, call?} as
+//                               for a sent transcribe(); `send` with neither
+//                               of the others is a sent dictation whose page
+//                               went after it had the text but before it
+//                               could send it — the adopter's to send, with
+//                               the cancelled `call` it was recorded with, if
+//                               any.
+//                               `at` is when the job was started, `textAt`
+//                               when its transcript came (0 when the worker
+//                               restarted it, or never said).
 //
 // A promise rejects with Error('elsewhere') when the job is gone from the
 // worker without this page having taken it: the page was frozen (the
@@ -129,7 +133,7 @@ function callOf(call) {
 // Settle the job `id` this page waits on, and tell the worker it was taken —
 // a task later, once the host's continuation (which writes the text into the
 // draft, synchronously) has run.
-function settle(id, text, error, sent, unsent, send, at, call) {
+function settle(id, text, error, sent, unsent, send, at, call, textAt) {
   const w = drop(id);
   if (!w) return;
   SETTLED.add(id);
@@ -138,7 +142,7 @@ function settle(id, text, error, sent, unsent, send, at, call) {
   else if (w.outcome) {
     const c = callOf(call);
     w.resolve({ text: t, sent: !!sent, unsent: String(unsent || ''), send: !!send, at: Number(at) || 0,
-      ...(c ? { call: c } : {}) });
+      textAt: Number(textAt) || 0, ...(c ? { call: c } : {}) });
   }
   else w.resolve(t);
   setTimeout(() => post({ type: 'dictation-taken', id }), 0);
@@ -174,7 +178,7 @@ function listen() {
   c.addEventListener('message', (e) => {
     const d = e && e.data;
     if (!d) return;
-    if (d.type === 'dictation-done') settle(d.id, d.text, d.error, d.sent, d.unsent, d.send, d.at, d.call);
+    if (d.type === 'dictation-done') settle(d.id, d.text, d.error, d.sent, d.unsent, d.send, d.at, d.call, d.textAt);
     else if (d.type === 'dictation-started' && WAITING.has(d.id)) WAITING.get(d.id).acked = true;
   });
   // Leaving: what this page owns is anybody's who shows the place next. A
@@ -252,7 +256,7 @@ function take(job) {
     WAITING.get(job.id).acked = true;  // the worker has it: it said so
     try { onJob(p); } catch (_e) { /* the host's problem; the job still settles */ }
   }
-  if (job.state === 'done') settle(job.id, job.text, job.error, job.sent, job.unsent, job.send, job.at, job.call);
+  if (job.state === 'done') settle(job.id, job.text, job.error, job.sent, job.unsent, job.send, job.at, job.call, job.textAt);
 }
 
 export function transcribe(key, blob, url, { send = '', call = null } = {}) {
