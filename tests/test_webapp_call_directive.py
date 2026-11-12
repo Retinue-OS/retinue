@@ -7,17 +7,19 @@ finds it with callOf() and places the call (conversation.js, _contCall). This
 pins the parts a wrong number would come from: how a written number becomes
 a dialable one (separators dropped, the bracketed trunk zero after a country
 code dropped, too short or too long refused), that the last directive in a
-message is the one placed, that one quoted as code stays code, and that the
-label is the name — or the number — behind a glyph, with no words in any
-language.
+message is the one placed, that one quoted as code (a span, a ``` or ~~~
+fence, an unclosed fence) stays code, and that the label is the name — or
+the number — behind a glyph, with no words in any language.
 
 A second harness drives the thread itself (conversation.js), with a shell
 that places calls, a scripted mic and detector, and time run ten times
 faster: a call is placed even when the no-speech timeout (or the mic) gives
-out before its 5 s are up; its row shows the number beside the name; a user
-who is writing gets no call, and a take that cancelled one never sends what
-is in the box unseen; and only Ara's own answer places a call, never a
-message an agent pushed into the thread.
+out before its 5 s are up; its row shows the number beside the name; a call
+the shell refuses, or never answers, says in the composer that it was not
+placed; a user who is writing gets no call, and a take that cancelled one
+never sends what is in the box unseen; and only Ara's own answer places a
+call, never a message an agent pushed into the thread nor her reply to a
+chat arrival, in the same poll as the answer or while it is read.
 
 Standalone like the rest of the suite. Needs `node` on PATH; without it the
 test reports a skip and passes.
@@ -109,6 +111,16 @@ ok('no-voice-cancel is read, and never shows', () => {
 ok('a directive quoted as code is an example, not a call', () => {
   assert.equal(callOf('Write it so: `[[call: +41 79 123 45 67 | Anna Muster]]`'), null);
   assert.equal(callOf('For example:\n```\n[[call: 0441234567 | Anna]]\n```\nThat is all.'), null);
+  // A ~~~ fence, and a fence never closed, render as code all the same.
+  assert.equal(callOf('For example:\n~~~\n[[call: 0441234567 | Anna]]\n~~~\nThat is all.'), null);
+  assert.equal(callOf('For example:\n```text\n[[call: 0441234567 | Anna]]'), null);
+  assert.equal(callOf('For example:\n~~~\n[[call: 0441234567 | Anna]]\nand so on'), null);
+  // A fence closes on the next fence line of either kind, as in the bubble,
+  // so what follows it is prose again.
+  assert.deepEqual(callOf('Like so:\n~~~\n[[call: 112]]\n```\nCalling Anna. [[call: 0441234567 | Anna]]'),
+    { number: '0441234567', name: 'Anna', voiceCancel: true });
+  assert.deepEqual(callOf('Like so: ```[[call: 112]]``` Calling Anna. [[call: 0441234567 | Anna]]'),
+    { number: '0441234567', name: 'Anna', voiceCancel: true });
   assert.deepEqual(callOf('Like `[[call: 0441234567 | Example]]`. Calling Anna. [[call: +41 79 123 45 67 | Anna]]'),
     { number: '+41791234567', name: 'Anna', voiceCancel: true });
   assert.deepEqual(callOf('Calling Anna. [[call: 0441234567 | Anna]] Written `[[call: 112]]`.'),
@@ -136,6 +148,12 @@ ok('calledBefore: only an earlier reply to the same number counts', () => {
     { role: 'assistant', text: 'Write `[[call: 0441234567]]` to call.' },
     { role: 'assistant', text: '[[call: 0441234567 | Anna | no-voice-cancel]]' },
   ], 3, '0441234567'), false);
+  // Nor is her reply to a chat arrival, which the loop never places.
+  assert.equal(calledBefore([
+    { role: 'user', text: 'Call Anna' },
+    { role: 'assistant', arrival: true, text: 'Noted. [[call: 0441234567 | Anna]]' },
+    { role: 'assistant', text: '[[call: 0441234567 | Anna | no-voice-cancel]]' },
+  ], 2, '0441234567'), false);
 });
 
 console.log(`${passed} checks passed`);
@@ -226,12 +244,16 @@ globalThis.sessionStorage = { getItem() { return null; }, setItem() {}, removeIt
 
 // ── The phone: a shell that places calls, a mic, a speech engine ────────────
 const placed = [];
+// What the shell answers a placeCall with: the event's state and reason, or
+// null for a shell that never answers.
+let shellAnswer = { state: 'placed' };
 globalThis.RetinueShell = {
   platform: 'android', version: 6,
   setVoiceActive() {}, openSettings() {},
   placeCall(number) {
     placed.push(number);
-    setTimeout(() => dispatchEvent(new CustomEvent('retinue-shell', { detail: { type: 'call', state: 'placed', number } })), 50);
+    const a = shellAnswer;
+    if (a) setTimeout(() => dispatchEvent(new CustomEvent('retinue-shell', { detail: { type: 'call', number, ...a } })), 50);
   },
 };
 let micFails = false;
@@ -270,12 +292,17 @@ class FakeAudioContext {
   }
 }
 Object.defineProperty(globalThis, 'AudioContext', { get: () => (webAudio ? FakeAudioContext : undefined), configurable: true });
-// Speech: every utterance is read at once.
+// Speech: every utterance is read in `speakMs`, and what was read is kept.
+let speakMs = 30;
+const said = [];
 globalThis.SpeechSynthesisUtterance = class { constructor(text) { this.text = text; } };
 globalThis.speechSynthesis = {
   speaking: false, pending: false, paused: false,
   getVoices: () => [], cancel() {}, resume() {},
-  speak(u) { setTimeout(() => { if (u.onstart) u.onstart(); if (u.onend) u.onend(); }, 30); },
+  speak(u) {
+    said.push(u.text);
+    setTimeout(() => { if (u.onstart) u.onstart(); if (u.onend) u.onend(); }, speakMs);
+  },
 };
 
 // ── The gateway ──────────────────────────────────────────────────────────────
@@ -303,7 +330,8 @@ assert.ok(Conv, 'the element registered itself');
 let n = 0;
 const ANNA = 'Calling Anna now. [[call: +41 79 123 45 67 | Anna Muster]]';
 // A thread in continuous mode whose loop is armed by the user's spoken turn;
-// `answer` is what arrives for it. `before` runs once the thread is open.
+// `answerMsg` is what arrives for it (a list: several messages in one poll).
+// `before` runs once the thread is open.
 async function spoken(answerMsg, before) {
   const id = String(++n).padStart(32, '0');
   threads[id] = { id, title: 'Anna', pending: false, model: '', messages: [
@@ -318,15 +346,19 @@ async function spoken(answerMsg, before) {
   await until(() => el.thread, 'the thread is read');
   if (before) before(el);
   el._contEngage();
-  threads[id].messages.push({ role: 'user', text: 'Call Anna', ts: ts() }, { ...answerMsg, ts: ts() });
+  threads[id].messages.push({ role: 'user', text: 'Call Anna', ts: ts() },
+    ...[].concat(answerMsg).map((a) => ({ ...a, ts: ts() })));
   await el._load();
   return el;
 }
 const callRow = (el) => { el.render(); return el.shadowRoot.innerHTML.includes('class="call-row"'); };
+const NOT_PLACED = 'The call to +41791234567 could not be placed.';
+const notPlaced = (el) => { el.render(); return el.shadowRoot.innerHTML.includes(NOT_PLACED); };
 
 let passed = 0;
 async function ok(name, fn) {
   placed.length = 0; posts.length = 0; micFails = false; webAudio = true; level = 0; transcript = '';
+  shellAnswer = { state: 'placed' }; speakMs = 30; said.length = 0;
   await fn();
   passed += 1;
   console.log(`ok - ${name}`);
@@ -341,6 +373,77 @@ await ok('the call row shows the name and the number to be dialled', async () =>
   el.render();
   assert.ok(el.shadowRoot.innerHTML.includes('Anna Muster · +41791234567'), el.shadowRoot.innerHTML);
   await until(() => placed.length === 1, 'and is placed');
+  await until(() => !el._placingCall, 'the shell answered');
+  assert.ok(!notPlaced(el), 'a placed call needs no note');
+  el.disconnectedCallback();
+});
+
+await ok('a call the shell refuses says so, with the number', async () => {
+  shellAnswer = { state: 'refused', reason: 'no-telephony' };
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => placed.length === 1, 'the call is handed to the shell');
+  await until(() => !el._placingCall, 'the shell answered');
+  assert.ok(notPlaced(el), el.shadowRoot.innerHTML);
+  assert.ok(!el._contArmed, 'the loop stopped');
+  el.disconnectedCallback();
+});
+
+await ok('so does a call the shell never answers', async () => {
+  shellAnswer = null;
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => placed.length === 1, 'the call is handed to the shell');
+  assert.ok(!notPlaced(el), 'no note while the answer may still come');
+  await until(() => !el._placingCall, 'the wait for an answer ran out');
+  assert.ok(notPlaced(el), el.shadowRoot.innerHTML);
+  el.disconnectedCallback();
+});
+
+await ok('the dialer opened with the number needs no note', async () => {
+  shellAnswer = { state: 'dialer', reason: 'disabled' };
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => placed.length === 1, 'the call is handed to the shell');
+  await until(() => !el._placingCall, 'the shell answered');
+  assert.ok(!notPlaced(el), el.shadowRoot.innerHTML);
+  el.disconnectedCallback();
+});
+
+// Ara's reply to a chat message that arrived in a companion thread meanwhile
+// answers the correspondent, whose text may have steered it.
+const ARRIVAL = { role: 'assistant', arrival: true, text: 'Noted for Ben. [[call: +1 900 555 0100 | Bank]]' };
+const NOTED = 'Noted, I will remind you tonight.';
+
+await ok('a reply to a chat arrival in the same poll as the answer places no call', async () => {
+  const el = await spoken([{ role: 'assistant', text: NOTED }, ARRIVAL]);
+  await until(() => said.some((s) => s.includes('remind you tonight')), 'the answer to the user is the one read');
+  await wait(7000);
+  assert.ok(!el._calling && !callRow(el), 'no call row');
+  assert.equal(placed.length, 0, 'no call');
+  assert.ok(!said.some((s) => s.includes('Noted for Ben')), 'nor is the arrival reply read over it');
+  el.disconnectedCallback();
+});
+
+await ok('nor does one that lands while the answer is read', async () => {
+  speakMs = 3000;
+  const el = await spoken({ role: 'assistant', text: NOTED });
+  await until(() => said.some((s) => s.includes('remind you tonight')), 'the answer is being read');
+  threads[el.thread.id].messages.push({ ...ARRIVAL, ts: ts() });
+  await el._load();
+  speakMs = 30;
+  await wait(7000);
+  assert.ok(!el._calling && !callRow(el), 'no call row');
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok("a reply to a chat arrival does not take the place of the answer's own call", async () => {
+  speakMs = 3000;
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  await until(() => said.length, 'the answer is being read');
+  threads[el.thread.id].messages.push({ ...ARRIVAL, ts: ts() });
+  await el._load();
+  speakMs = 30;
+  await until(() => placed.length === 1, 'the answer places its call');
+  assert.deepEqual(placed, ['+41791234567']);
   el.disconnectedCallback();
 });
 

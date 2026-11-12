@@ -61,12 +61,19 @@ export function callNumber(raw) {
 // null. The last, because a reply that mentions a number first and then
 // places the call puts the directive at its end. One quoted as code (a fence,
 // then a code span, the order the bubble renders them in) is an example the
-// bubble shows literally, so it is no call either.
+// bubble shows literally, so it is no call either. Fences are found line by
+// line, as the block pass finds them: an opening ``` or ~~~ line runs to the
+// next fence line of either kind, or to the end of the text when none closes
+// it, so a ~~~ block or an unclosed one quotes the directive just as well.
 export function callOf(text) {
   const re = new RegExp(CALL_RE.source, 'gi');
-  const prose = String(text == null ? '' : text)
-    .replace(/```[\s\S]*?```/g, ' ')
-    .replace(/`[^`]+`/g, ' ');
+  const kept = [];
+  let fenced = false;
+  for (const line of String(text == null ? '' : text).split('\n')) {
+    if (FENCE_RE.test(line)) fenced = !fenced;
+    else if (!fenced) kept.push(line);
+  }
+  const prose = kept.join('\n').replace(/`[^`]+`/g, ' ');
   let found = null;
   for (const m of prose.matchAll(re)) {
     const number = callNumber(m[1]);
@@ -79,12 +86,13 @@ export function callOf(text) {
 // tried to place) a call to `number`: the condition for a call speech cannot
 // cancel. A first attempt is always cancellable by voice, so a mistaken
 // directive never dials without the chance to say no. Only Ara's own answers
-// count: a message an agent pushed into the thread is not an attempt of hers.
+// count: a message an agent pushed into the thread is not an attempt of hers,
+// nor is her reply to a chat arrival (`arrival`), which the loop never places.
 export function calledBefore(messages, index, number) {
   const list = Array.isArray(messages) ? messages : [];
   for (let i = Math.min(index, list.length) - 1; i >= 0; i -= 1) {
     const m = list[i];
-    if (m && m.role === 'assistant') {
+    if (m && m.role === 'assistant' && !m.arrival) {
       const c = callOf(m.text);
       if (c && c.number === number) return true;
     }

@@ -919,14 +919,22 @@ that would carry text or files from the box goes to review instead, like any
 take, and the call stays cancelled. Cancel itself (by touch) cancels for good.
 Nobody speaking, the take is dropped, the mic released (up to 2 s), the number
 handed to the shell, and the voice flag let go once the shell has answered
-(10 s at most). The flag `| no-voice-cancel` as a third part keeps the mic
+(10 s at most). A call the shell refuses, or does not answer in that time,
+leaves a note in the composer that the call to the number could not be
+placed; a call placed, or the dialer opened with the number, needs none. The
+flag `| no-voice-cancel` as a third part keeps the mic
 shut for those 5 s — for a loud room or an emergency — but only on a second
 attempt: unless an earlier answer of Ara's in the thread carried a directive
 for the same number (`calledBefore`), the flag is ignored. A directive quoted
-as code (a span or a fence) is an example, never a call. Leaving the thread or
+as code (a span, or a ``` or ~~~ fence, closed or not) is an example, never a
+call. Leaving the thread or
 stopping the loop drops the call. Anywhere else — a typed thread, an older reply, a message pushed
-into the thread (an agent's included), a browser — the directive is only a tap-to-dial `tel:` link
+into the thread (an agent's included), Ara's reply to a chat message that
+arrived in a companion thread meanwhile (stored with `arrival: true`, never the
+loop's answer nor an earlier attempt), a browser — the directive is only a tap-to-dial `tel:` link
 (`webapp/components/markdown.js`, `callOf`; `tests/test_webapp_call_directive.py`).
+The presentation lint never delivers a result whose call directives differ
+from the original's (`docs/model-routing.md`, phase 4).
 Entry points: the toggle, `/#new?voice=1` (the composer in the mode — its
 first take opens the thread, which continues in it) and a wake (`/?wake=1`
 or the shell's `wake` event), which opens the thread used in the mode within

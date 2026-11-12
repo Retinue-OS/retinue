@@ -2816,13 +2816,22 @@ class RetinueConversation extends HTMLElement {
     this.render();
     const since = Date.now();
     let done = null;
-    const finish = () => {
+    // `detail` is the shell's answer; none means it could not be asked or
+    // did not answer in time. The user heard Ara say she was calling, so a
+    // call that was not placed says so in the composer, with the number to
+    // dial by hand; a call placed, or the dialer opened with the number,
+    // needs no word.
+    const finish = (detail) => {
       if (!done) return;
       clearTimeout(done.timer);
       done.off();
       done = null;
       this._placingCall = false;
+      if (!detail || detail.state === 'refused') {
+        VOICE_ERRORS.set(this._key(), `The call to ${call.number} could not be placed.`);
+      }
       this._contDisengage();
+      this.render();
     };
     const dial = () => {
       if (!this._placingCall) return;
@@ -3130,20 +3139,25 @@ class RetinueConversation extends HTMLElement {
     // only on the element the user is looking at.
     const cont = this._contOn() && LIVE.get(cid) === this && this.isConnected;
     if (!fresh.length || (!autoplay && !cont)) return;
-    const m = fresh[fresh.length - 1];
     // Only an answer to this element's own turn (it is armed, _contEngage)
     // is the loop's reading, whose end opens the mic. Anything else pushed
     // into the thread is read in the mode, never opening the mic — and never
-    // over the loop's own reading.
-    const loop = cont && this._contArmed;
+    // over the loop's own reading. Ara's reply to a chat message that arrived
+    // in a companion thread meanwhile (`arrival`, set by the gateway) answers
+    // the correspondent, not the user, so it is never the loop's answer, even
+    // when it lands while the loop waits or in the same poll as the answer:
+    // the correspondent's text may have steered it, call directive and all.
+    const own = cont && this._contArmed ? fresh.filter((r) => !r.arrival) : [];
+    const loop = own.length > 0;
+    const m = loop ? own[own.length - 1] : fresh[fresh.length - 1];
     if (!loop && CONT_READ && CONT_READ.conv === cid) return;
     // An answer to a spoken turn that places a call, in a shell that can: the
     // call comes where the mic would open. Only the loop's own answer — a
     // directive anywhere else (an older reply, a message pushed into the
-    // thread, an agent's message arriving while the answer is awaited) stays
-    // a link to tap.
+    // thread, an agent's message arriving while the answer is awaited, a
+    // reply to a chat arrival) stays a link to tap.
     if (loop) {
-      const call = canPlaceCall() && m.role === 'assistant' ? callOf(m.text) : null;
+      const call = canPlaceCall() && m.role === 'assistant' && !m.arrival ? callOf(m.text) : null;
       // A call speech cannot cancel only on a second attempt at the number.
       if (call && !call.voiceCancel &&
           !calledBefore(t.messages, (t.messages || []).indexOf(m), call.number)) call.voiceCancel = true;

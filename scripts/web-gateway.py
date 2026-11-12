@@ -2575,7 +2575,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
                       cost_usd: float | None = None,
                       agent: str | None = None,
                       context: str | None = None,
-                      wake: bool = False) -> dict | None:
+                      wake: bool = False,
+                      arrival: bool = False) -> dict | None:
     """Append a message to a thread and update its flags. Returns the thread.
 
     `model_name`/`cost_usd` carry the answering turn's metadata (short model
@@ -2587,6 +2588,13 @@ def _conv_add_message(cid: str, role: str, text: str, *,
     the user — see _conv_context_note. `stored_attachments` is metadata of
     files already written to the thread's store (_store_reply_files), appended
     after whatever `attachments` stores.
+
+    `arrival` marks Ara's reply to a turn nobody in the thread asked for: a
+    chat message that arrived in a companion thread's chat (_conv_worker's
+    `arrival`). The dashboard's voice loop takes only a reply without it as
+    the answer to the user's spoken turn, so a call directive that a
+    correspondent's text steered into such a reply is never placed
+    (webapp/components/conversation.js, _maybeAutoplay).
 
     `wake` marks an append that carries something new for the user (an agent
     filing an inbound message into an existing thread). Such an append
@@ -2617,6 +2625,8 @@ def _conv_add_message(cid: str, role: str, text: str, *,
             message["agent"] = agent
         if context:
             message["context"] = context
+        if arrival:
+            message["arrival"] = True
         conv.setdefault("messages", []).append(message)
         conv["updated"] = now
         if wake and conv.get("archived") and not conv.get("muted"):
@@ -3350,7 +3360,8 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
                              pending=bool(still_running),
                              stored_attachments=reply_atts,
                              model_name=result.get("model_name"),
-                             cost_usd=result.get("cost_usd"))
+                             cost_usd=result.get("cost_usd"),
+                             arrival=bool(arrival))
     if conv is None:
         # Nothing was stored, so nothing has accounted for whatever prompted
         # this turn. Saying otherwise would let a gateway mark an inbound
@@ -5274,6 +5285,16 @@ def _lint_presentation(text: str, *, kind: str = "chat") -> str:
     if (not linted
             or len(linted) < len(raw) * PRESENTATION_LINT_MIN_KEEP
             or len(linted) > len(raw) * PRESENTATION_LINT_MAX_GROWTH + 200):
+        return text
+    # A call directive is a phone call the voice loop places, and the lint
+    # reads the reply raw, quoted mail or web text included. That it never
+    # adds, changes or removes one is therefore not left to its prompt: a
+    # result whose directives differ from the original's in any way is not
+    # delivered.
+    if ([m.group(0) for m in attention_store.CALL_MARKUP_RE.finditer(raw)]
+            != [m.group(0) for m in attention_store.CALL_MARKUP_RE.finditer(linted)]):
+        print("[web-gateway] presentation lint changed a call directive — "
+              "delivering the text unchanged", flush=True)
         return text
     return linted
 

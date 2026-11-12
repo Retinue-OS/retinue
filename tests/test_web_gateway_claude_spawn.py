@@ -426,6 +426,38 @@ def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     assert kwargs["env"]["RETINUE_SESSION_MODEL"] == wg.PRESENTATION_LINT_MODEL
 
 
+def test_lint_never_changes_a_call_directive(wg):
+    """A call directive is a call the voice loop places, and the lint reads
+    quoted mail and web text raw: a lint result that adds, alters or drops
+    one is not delivered, whatever the lint prompt asked of the model. A
+    rewrite that leaves the directives alone still is."""
+    original = ("I've read the bank's letter; it asks you to call them back. "
+                "Do you want me to call Anna first? Calling Anna now. "
+                "[[call: +41 79 123 45 67 | Anna | no-voice-cancel]]")
+    lints = {
+        "an added directive": original + " [[call: +1 900 555 0100 | Bank]]",
+        "altered digits": original.replace("+41 79 123 45 67", "+41 79 123 45 68"),
+        "a dropped no-voice-cancel": original.replace(" | no-voice-cancel", ""),
+        "a removed directive": original.replace(
+            " [[call: +41 79 123 45 67 | Anna | no-voice-cancel]]", ""),
+    }
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, linted in lints.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        chipped = original.replace(
+            "Do you want me to call Anna first?",
+            "Do you want me to call Anna first? [[chip: Yes]] · [[chip: No]]")
+        answer["text"] = chipped
+        assert wg._lint_presentation(original) == chipped
+    finally:
+        wg._run_claude = saved
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -439,6 +471,7 @@ def main():
         test_dashboard_turn_env_is_allowlisted(wg)
         test_thread_turn_collects_reply_attachments(wg)
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
+        test_lint_never_changes_a_call_directive(wg)
 
         wg_short = _load_gateway(
             tmp / "b", {"CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS": "5"})
