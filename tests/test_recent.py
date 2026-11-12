@@ -72,6 +72,25 @@ def _memory_cases(mem: Path, now: dt.datetime) -> None:
                ("expires", f'"{soon}"^^<http://www.w3.org/2001/XMLSchema#dateTime>')), encoding="utf-8")
 
 
+    # A member compacted into a standing summary is replaced by it, not listed
+    # beside it.
+    s1, m1 = f"{stamp(now)}-dsum01", f"{stamp(now - day)}-dmem01"
+    (mem / f"compaction-{stamp(now)}-d0d0d0.nt").write_text(
+        _entry(s1, "Dora summary of notes.", now)
+        + f"<urn:retinue:memory:{m1}> <https://w3id.org/retinue/kb#compactedInto>"
+          f" <urn:retinue:memory:{s1}> .\n", encoding="utf-8")
+    (mem / f"{m1}.nt").write_text(_entry(m1, "Dora member note.", now - day), encoding="utf-8")
+    # A summary that a later entry corrects stands no more: its member is
+    # current again and the summary is not.
+    s2, m2, f2 = (f"{stamp(now)}-{x}" for x in ("esum01", "emem01", "efix01"))
+    (mem / f"compaction-{stamp(now)}-e0e0e0.nt").write_text(
+        _entry(s2, "Egon summary of notes.", now, ("correctedBy", f"<urn:retinue:memory:{f2}>"))
+        + f"<urn:retinue:memory:{m2}> <https://w3id.org/retinue/kb#compactedInto>"
+          f" <urn:retinue:memory:{s2}> .\n", encoding="utf-8")
+    (mem / f"{m2}.nt").write_text(_entry(m2, "Egon member note.", now - day), encoding="utf-8")
+    (mem / f"{f2}.nt").write_text(_entry(f2, "Fix for the summary.", now), encoding="utf-8")
+
+
 def _fixture(root: Path) -> tuple[Path, Path]:
     now = dt.datetime.now(dt.timezone.utc)
     chambers, convs = root / "chambers", root / "conversations"
@@ -153,6 +172,11 @@ def main():
         assert "Carla lives in Bern" in out and "Carla works at Globex" in out, out
         assert "Basel" not in out and "Acme" not in out, out   # corrected, superseded
         assert "Friday" not in out, out                         # expired
+
+        out = _run(recent, "Dora", "--source", "memory")
+        assert "Dora summary of notes" in out and "Dora member note" not in out, out
+        out = _run(recent, "Egon", "--source", "memory")
+        assert "Egon member note" in out and "Egon summary" not in out, out
 
         out = _run(recent, "brandle", "--source", "memory")     # unescaped, not mojibake
         assert "café C:\\users\\Brändle x" in out, out
