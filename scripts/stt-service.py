@@ -167,10 +167,17 @@ def _decode(audio_path: Path, hotwords: str | None, **overrides) -> tuple[str, o
     except Exception as exc:  # noqa: BLE001 - retry once without the optional VAD
         if not kwargs.pop("vad_filter", False):
             raise
+        # The failure may be the audio, not the VAD: a corrupt clip fails with the
+        # filter on or off. Only a retry that succeeds proves the VAD is at fault,
+        # so only then is it disabled for the process.
+        try:
+            segments, info = MODEL.transcribe(str(audio_path), **kwargs)
+            text = "".join(segment.text for segment in segments).strip()
+        except Exception:  # noqa: BLE001 - not the VAD; report the original error
+            raise exc from None
         print(f"[stt] VAD filter unusable ({exc}) — disabled for this process", flush=True)
         _VAD_ENABLED = False
-        segments, info = MODEL.transcribe(str(audio_path), **kwargs)
-        return "".join(segment.text for segment in segments).strip(), info
+        return text, info
 
 
 def _hotwords() -> str | None:

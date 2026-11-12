@@ -54,11 +54,17 @@ CACHE_TTL_EMPTY = 30.0   # a store that was unreachable deserves a retry soon
 # full of people a medication name would never reach the decoder at all.
 HOTWORD_SHARES = {1: 0.55, 2: 0.2, 3: 0.25}
 
+# The most names read per rank. The query orders by rank and then alphabet, so
+# the hotword budget (which has its own per-rank shares) must see every rank;
+# this only bounds memory for a store with an absurd number of names.
+RANK_ROW_CAP = 2000
+
 NAME_QUERY = """
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 SELECT DISTINCT ?rank ?name WHERE {
   VALUES (?cls ?rank) {
     (<http://www.w3.org/2006/vcard/ns#Individual> 1)
+    (<http://xmlns.com/foaf/0.1/Person> 1)
     (<http://schema.org/Person> 1)
     (<https://schema.org/Person> 1)
     (<http://schema.org/Organization> 2)
@@ -72,6 +78,7 @@ SELECT DISTINCT ?rank ?name WHERE {
     <http://www.w3.org/2006/vcard/ns#fn>
     <http://www.w3.org/2006/vcard/ns#family-name>
     <http://www.w3.org/2006/vcard/ns#organization-name>
+    <http://xmlns.com/foaf/0.1/name>
     <http://schema.org/name>
     <https://schema.org/name>
     <http://schema.org/legalName>
@@ -138,6 +145,27 @@ def hotword_string(ranked: list[tuple[int, str]], max_chars: int = HOTWORD_CHARS
     return " ".join(words)
 
 
+def _select_names(ranked: list[tuple[int, str]], limit: int) -> list[str]:
+    """At most `limit` whole names for the repair model, in `ranked` order.
+
+    The list is sorted by rank, so cutting its head would hand every slot to the
+    people in a large store and none to a medication. Each rank first gets its
+    share of the limit (HOTWORD_SHARES again); slots a rank leaves unused go to
+    whatever was cut, in order.
+    """
+    chosen: set[int] = set()
+    taken: dict[int, int] = {}
+    for i, (rank, _name) in enumerate(ranked):
+        if taken.get(rank, 0) < round(HOTWORD_SHARES.get(rank, 0.0) * limit):
+            chosen.add(i)
+            taken[rank] = taken.get(rank, 0) + 1
+    for i in range(len(ranked)):
+        if len(chosen) >= limit:
+            break
+        chosen.add(i)
+    return [name for i, (_rank, name) in enumerate(ranked) if i in chosen]
+
+
 def vocabulary(log_tag: str = "dictation") -> tuple[list[str], str]:
     """(name hints, hotword string) from the life store, cached with a TTL.
 
@@ -152,6 +180,7 @@ def vocabulary(log_tag: str = "dictation") -> tuple[list[str], str]:
         ranked: list[tuple[int, str]] = []
         try:
             seen: set[str] = set()
+            per_rank: dict[int, int] = {}
             for row in _bindings(NAME_QUERY):
                 name = " ".join((row.get("name", {}).get("value") or "").split())
                 key = name.casefold()
@@ -161,13 +190,17 @@ def vocabulary(log_tag: str = "dictation") -> tuple[list[str], str]:
                 rank = (row.get("rank", {}).get("value") or "").strip()
                 # The query always binds ?rank; a shape that doesn't is treated as
                 # top rank rather than dropped out of the hotword budget.
-                ranked.append((int(rank) if rank.isdigit() else 1, name))
-                if len(ranked) >= NAME_LIMIT:
-                    break
+                rank = int(rank) if rank.isdigit() else 1
+                if per_rank.get(rank, 0) >= RANK_ROW_CAP:
+                    continue
+                per_rank[rank] = per_rank.get(rank, 0) + 1
+                ranked.append((rank, name))
         except Exception as exc:  # noqa: BLE001 - hints are optional, never fatal
             print(f"[{log_tag}] vocabulary unavailable: {exc}", flush=True)
             ranked = []
-        names = [name for _rank, name in ranked]
+        # The hotwords enforce their own character budget over every rank; only
+        # the whole-name list for the repair model is capped by NAME_LIMIT.
+        names = _select_names(ranked, NAME_LIMIT)
         hotwords = hotword_string(ranked, HOTWORD_CHARS)
         _cache = (now + (CACHE_TTL if names else CACHE_TTL_EMPTY), names, hotwords)
         return names, hotwords

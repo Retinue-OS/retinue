@@ -124,6 +124,40 @@ def test_name_limit_caps_the_query_result():
     assert names == ["Name0", "Name1", "Name2"], names
 
 
+def test_a_large_store_does_not_starve_the_lower_ranks():
+    """The query is ordered by rank, then alphabet, so reading it only up to
+    NAME_LIMIT would fill every slot with people and leave no organisation or
+    medication word for the decoder -- or a name for the repair model."""
+    dv = _load_vocabulary()
+    assert dv.NAME_LIMIT == 200
+    rows = ([(1, f"Person{i:03d}x") for i in range(250)]
+            + [(2, "Northgate Laboratories"), (3, "Zolabin")])
+    dv._bindings = lambda q: _bindings(*rows)
+    names, hotwords = dv.vocabulary()
+    assert len(names) == 200, len(names)
+    assert "Northgate Laboratories" in names and "Zolabin" in names, names[-5:]
+    words = hotwords.split()
+    assert "Zolabin" in words and "Northgate" in words, hotwords
+    assert len(hotwords) <= dv.HOTWORD_CHARS, len(hotwords)
+
+
+def test_name_limit_hands_unused_rank_shares_to_the_rest():
+    dv = _load_vocabulary({"DICTATION_NAME_LIMIT": "10"})
+    dv._bindings = lambda q: _bindings(
+        *[(1, f"Person{i}") for i in range(30)], (3, "Zolabin"))
+    names, _ = dv.vocabulary()
+    assert len(names) == 10 and "Zolabin" in names, names
+    # Rank 2 has no rows, so its share goes to the people, not to nobody.
+    assert names[:-1] == [f"Person{i}" for i in range(9)], names
+
+
+def test_name_query_covers_foaf_contacts():
+    """The contact book accepts foaf:Person named by foaf:name (contacts.py)."""
+    dv = _load_vocabulary()
+    assert "<http://xmlns.com/foaf/0.1/Person> 1" in dv.NAME_QUERY
+    assert "<http://xmlns.com/foaf/0.1/name>" in dv.NAME_QUERY
+
+
 def test_endpoint_comes_from_the_environment():
     dv = _load_vocabulary({"QLEVER_LIFE_URL": "http://elsewhere:7001/"})
     assert dv.LIFE_URL == "http://elsewhere:7001", dv.LIFE_URL
@@ -259,6 +293,23 @@ def test_vad_failure_disables_it_for_the_process():
     assert len(stt.MODEL.calls) == 2, "second request decodes in one pass"
 
 
+def test_undecodable_audio_does_not_disable_vad():
+    """A corrupt clip fails with the filter on or off; that says nothing about
+    the VAD, so later requests must keep it."""
+    class _BadAudio(_FakeModel):
+        def _record(self, kwargs):
+            raise RuntimeError("invalid data found when processing input")
+
+    stt = _load_stt(_BadAudio)
+    try:
+        stt.transcribe(Path("/tmp/x.webm"))
+    except RuntimeError as exc:
+        assert "invalid data" in str(exc), exc
+    else:
+        raise AssertionError("the decode error must reach the caller")
+    assert stt._VAD_ENABLED is True, "bad input must not turn the VAD off"
+
+
 def test_vad_filter_can_be_switched_off():
     stt = _load_stt(_FakeModel, {"STT_VAD_FILTER": "0"})
     stt.transcribe(Path("/tmp/x.webm"))
@@ -343,12 +394,16 @@ def main():
     test_hotword_budget_is_respected()
     test_every_rank_gets_a_share_of_the_budget()
     test_name_limit_caps_the_query_result()
+    test_a_large_store_does_not_starve_the_lower_ranks()
+    test_name_limit_hands_unused_rank_shares_to_the_rest()
+    test_name_query_covers_foaf_contacts()
     test_endpoint_comes_from_the_environment()
     test_decode_uses_the_stores_hotwords_vad_and_no_conditioning()
     test_hotwords_can_be_switched_off()
     test_unreachable_store_still_transcribes()
     test_legacy_wheel_falls_back_to_initial_prompt()
     test_vad_failure_disables_it_for_the_process()
+    test_undecodable_audio_does_not_disable_vad()
     test_vad_filter_can_be_switched_off()
     test_forced_language_redecode_keeps_the_hotwords()
     test_languages_are_the_union_of_the_channels()
