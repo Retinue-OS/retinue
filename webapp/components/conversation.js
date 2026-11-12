@@ -131,7 +131,7 @@ import {
   isContinuous, setContinuous, touchContinuous, forgetContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
   chime, primeAudio,
 } from './continuous.js';
-import { setVoiceActive, hasKeyboard, keyboardOpen, onKeyboard } from './shell.js';
+import { setVoiceActive, hasKeyboard, keyboardOpen, onKeyboard, hasShellSettingsPage, openShellSettings } from './shell.js';
 import * as kbd from './shell-keyboard.js';
 import { loadDraft, saveDraft, loadFiles, saveFiles } from './drafts.js';
 import { transcribe, handOff, adopt } from './dictation.js';
@@ -1770,7 +1770,7 @@ class RetinueConversation extends HTMLElement {
       // What happened here this visit, else what the gateway kept.
       const out = this._kbdOutcome.get(a.id) || kbd.storedOutcome(a)
         || (kbd.isDone(a.id) ? { state: 'sent' } : null);
-      const [line, fixable] = kbd.describeOutcome(out, host);
+      const [line, fix] = kbd.describeOutcome(out, host);
       const running = out && (out.state === 'pending' || out.state === 'queued');
       const stop = running ? `<button type="button" class="kbd-link" data-kbd-stop>Stop</button>` : '';
       if (kbd.isPurged(a, m)) {
@@ -1794,7 +1794,11 @@ class RetinueConversation extends HTMLElement {
         `<button type="button" class="kbd-btn${secret ? ' kbd-secret' : ''}" data-kbd-run="${esc(a.id)}"${running ? ' disabled' : ''}>` +
         `<span aria-hidden="true">⌨️</span> ${esc(label)}</button>` +
         (line ? `<small class="kbd-note">${esc(line)}</small>` : '') + stop +
-        (fixable ? `<button type="button" class="kbd-link" data-kbd-open>Open keyboard</button>` : '') +
+        (fix === 'keyboard' ? `<button type="button" class="kbd-link" data-kbd-open>Open keyboard</button>` : '') +
+        // The app refuses its keyboard screen while this server may not
+        // type; its settings page holds that switch and the way there.
+        (fix === 'settings' && hasShellSettingsPage()
+          ? `<button type="button" class="kbd-link" data-kbd-settings>Open settings</button>` : '') +
         `</div>`;
     }).join('');
   }
@@ -1850,6 +1854,18 @@ class RetinueConversation extends HTMLElement {
     if (d.state === 'status') { this._threadSig = ''; this._partialUpdate(); return; }
     if (!d.id || !this._findShellAction(d.id)) return;
     this._setKbdOutcome(d.id, d);
+  }
+
+  // Stop on a row that still says "Typing…" of an action the module no
+  // longer runs or holds (its final event came while this view was away):
+  // nothing is left to stop, so the row says the app never answered and its
+  // Retype is free again.
+  _settleStaleKbd() {
+    for (const [id, out] of this._kbdOutcome) {
+      if (out && (out.state === 'pending' || out.state === 'queued') && !kbd.isActive(id)) {
+        this._setKbdOutcome(id, { state: 'unanswered' });
+      }
+    }
   }
 
   _setKbdOutcome(id, out) {
@@ -3160,7 +3176,8 @@ class RetinueConversation extends HTMLElement {
         const kb = e.target.closest('[data-kbd-run]');
         if (kb) { this._runShellAction(kb.getAttribute('data-kbd-run')); return; }
         if (e.target.closest('[data-kbd-open]')) { keyboardOpen(); return; }
-        if (e.target.closest('[data-kbd-stop]')) { kbd.cancel(); return; }
+        if (e.target.closest('[data-kbd-settings]')) { openShellSettings(); return; }
+        if (e.target.closest('[data-kbd-stop]')) { kbd.cancel(); this._settleStaleKbd(); return; }
         const sbtn = e.target.closest('.speak');
         if (sbtn) this._onSpeakButton(sbtn);
       });

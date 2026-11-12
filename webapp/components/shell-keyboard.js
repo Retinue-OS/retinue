@@ -39,7 +39,9 @@
 //     page's copy too (expireSensitive), offline or hidden included — and as
 //     soon as it is reported typed. A deleted text cannot be retyped.
 //   - Actions run one after another (the app refuses a second one while it
-//     types): the next starts on the previous one's final `keyboard` event.
+//     types): the next starts on the previous one's final `keyboard` event,
+//     or once the shell has not answered in time (watchdogMs; the row then
+//     says so rather than waiting on, and a late answer still counts).
 //     Stop (cancel) ends the current one — a typing text, or an open password
 //     dialog; never a password being typed — and drops the rest.
 //   - Every outcome goes back to the gateway (reportOutcome) from here, not
@@ -250,6 +252,17 @@ function callShell(a) {
   return false;
 }
 
+// The watchdog gave up on `entry`: the row is told so ('unanswered', a local
+// state the gateway never hears of, since nobody knows whether the device
+// took it), so it does not wait on with a Stop that has nothing to stop. The
+// entry stays in `started`: a final event that comes late still reaches the
+// row and the gateway.
+function giveUp(entry) {
+  if (current !== entry) return;
+  notify(entry, 'unanswered');
+  advance();
+}
+
 function start(entry) {
   if (isPurged(entry.action, entry.message)) {
     notify(entry, 'deleted');
@@ -260,7 +273,7 @@ function start(entry) {
     return false;
   }
   current = entry;
-  entry.timer = setTimeout(() => { if (current === entry) advance(); }, watchdogMs(entry.action));
+  entry.timer = setTimeout(() => giveUp(entry), watchdogMs(entry.action));
   started.set(entry.action.id, entry);
   while (started.size > STARTED_MAX) started.delete(started.keys().next().value);
   // `confirm`: the phone asks first, so the row says it waits for that.
@@ -277,7 +290,7 @@ function advance() {
 // Hand one action to the shell, or queue it behind the one running. `ctx`:
 // the thread it belongs to (for the outcome report), its message (for the
 // two-minute check) and `onState`, told 'queued' / 'pending' / 'unavailable'
-// / 'deleted' as they happen. False when it cannot run at all.
+// / 'deleted' / 'unanswered' as they happen. False when it cannot run at all.
 export function run(action, { threadId = '', message = null, onState = null, now = Date.now() } = {}) {
   if (!action || !KINDS.has(action.kind) || isPurged(action, message, now)) return false;
   if ((current && current.action.id === action.id) || queue.some((e) => e.action.id === action.id)) return true;
@@ -308,7 +321,7 @@ export function cancel() {
   if (current.action.kind === 'keyboard-secret') {
     const entry = current;
     clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => { if (current === entry) advance(); }, 5000);
+    entry.timer = setTimeout(() => giveUp(entry), 5000);
   }
   return keyboardCancel();
 }
@@ -316,6 +329,14 @@ export function cancel() {
 // Whether something is typing or waiting to.
 export function isRunning() {
   return !!current || queue.length > 0;
+}
+
+// Whether the action `id` is the one the shell works on or waits its turn —
+// what a row's "Typing…" and Stop stand for. A row that says so of an action
+// that is neither (its final event never reached a view that was away) is
+// stale, and the view settles it on Stop.
+export function isActive(id) {
+  return (!!current && current.action.id === id) || queue.some((e) => e.action.id === id);
 }
 
 // cb({id, ok, state, action, threadId}) once an outcome reached the gateway
@@ -409,7 +430,9 @@ export function keyName(k) {
 }
 
 const ERRORS = {
-  'not-enabled': 'the keyboard is off in the Ara app',
+  // The app's switch for this server ("may type on other devices"), or the
+  // keyboard itself: the wire tells them apart no more than this.
+  'not-enabled': 'typing is off in the Ara app (for this server, or the keyboard itself)',
   'not-connected': 'no device connected',
   'not-in-front': 'the Ara app was not in front',
   'too-long': 'the text is too long',
@@ -422,21 +445,27 @@ const ERRORS = {
 };
 
 // The outcome line for a `keyboard` event `d` (or a local state), '' for none.
-// Second value: whether the user can fix it in the shell's keyboard screen.
+// Second value: where in the Ara app the user can fix it — 'keyboard' (its
+// keyboard screen, to connect the device), 'settings' (its settings page,
+// which holds this server's switch and the way to the keyboard screen: the
+// app refuses keyboardOpen() itself while this server may not type), or ''.
 export function describeOutcome(d, host = '') {
-  if (!d) return ['', false];
+  if (!d) return ['', ''];
   const on = host ? ` on ${host}` : '';
-  if (d.state === 'queued') return ['Waiting for the one before…', false];
-  if (d.state === 'pending') return [d.confirm ? 'Waiting for confirmation on the phone…' : `Typing${on}…`, false];
-  if (d.state === 'typed') return [`Typed${on} ✓`, false];
-  if (d.state === 'deleted') return ['Text deleted', false];
-  if (d.state === 'secret-typed') return [`Password typed${on} ✓`, false];
-  if (d.state === 'secret-cancelled') return ['Password not typed: cancelled', false];
+  if (d.state === 'queued') return ['Waiting for the one before…', ''];
+  if (d.state === 'pending') return [d.confirm ? 'Waiting for confirmation on the phone…' : `Typing${on}…`, ''];
+  if (d.state === 'typed') return [`Typed${on} ✓`, ''];
+  if (d.state === 'deleted') return ['Text deleted', ''];
+  if (d.state === 'secret-typed') return [`Password typed${on} ✓`, ''];
+  if (d.state === 'secret-cancelled') return ['Password not typed: cancelled', ''];
   if (d.state === 'error') {
     const why = ERRORS[d.error] || (d.error ? String(d.error) : 'it failed');
-    const fixable = d.error === 'not-enabled' || d.error === 'not-connected';
-    return [`Not typed: ${why}`, fixable];
+    const fix = d.error === 'not-connected' ? 'keyboard' : d.error === 'not-enabled' ? 'settings' : '';
+    return [`Not typed: ${why}`, fix];
   }
-  if (d.state === 'unavailable') return ['Not typed: this Ara app cannot type on another device', false];
-  return ['', false];
+  if (d.state === 'unavailable') return ['Not typed: this Ara app cannot type on another device', ''];
+  // The watchdog's: the app never said what became of it. It may have typed,
+  // so the line does not say it did not.
+  if (d.state === 'unanswered') return ['No answer from the Ara app — check the device before you retype', ''];
+  return ['', ''];
 }

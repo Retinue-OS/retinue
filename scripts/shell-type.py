@@ -135,7 +135,15 @@ def main(argv: list[str] | None = None) -> int:
               "actions; this one was not added", file=sys.stderr)
         return 2
     # ASCII JSON, one action per line: nothing in the text can split a line.
-    with open(manifest, "a", encoding="utf-8") as fh:
+    # The manifest sits in the shared temp directory until the turn ends and
+    # may hold a sensitive text in clear, so it is created readable by this
+    # user only, and a symlink planted at its name is refused, not followed.
+    try:
+        fd = os.open(manifest, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        print(f"shell-type: cannot write the manifest: {exc.strerror}", file=sys.stderr)
+        return 2
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(action, ensure_ascii=True) + "\n")
     if action["kind"] == "keyboard-type":
         what = (("a sensitive text" if action.get("sensitive")

@@ -100,6 +100,22 @@ def test_sensitive(tmp: Path):
     assert _run(["--sensitive", "--key", "enter"], tmp / "m4").returncode == 2
     assert _run(["--sensitive", "--secret", "Wi-Fi"], tmp / "m4").returncode == 2
     assert not (tmp / "m4").exists()
+    # The manifest holds the text in clear until the turn ends, in the shared
+    # temp directory: nobody but its owner may read it, whatever the umask.
+    old_umask = os.umask(0o022)
+    try:
+        m5 = tmp / "m5"
+        assert _run(["--sensitive", "1234"], m5).returncode == 0
+    finally:
+        os.umask(old_umask)
+    assert m5.stat().st_mode & 0o077 == 0, oct(m5.stat().st_mode)
+    # Nor does it follow a symlink planted at the manifest's name.
+    target = tmp / "elsewhere"
+    target.write_text("")
+    (tmp / "m6").symlink_to(target)
+    r = _run(["--sensitive", "1234"], tmp / "m6")
+    assert r.returncode == 2 and "1234" not in r.stdout + r.stderr, r.stderr
+    assert target.read_text() == "", "a symlinked manifest must not be written through"
     # A plain action stays as it was: no `sensitive` key at all.
     assert "sensitive" not in sa.normalize({"kind": "keyboard-type", "id": "e" * 32, "text": "x"})
     print("ok: --sensitive marks a typing action, goes with TEXT only, is never echoed")

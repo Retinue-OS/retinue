@@ -238,11 +238,32 @@ def age_seconds(ts: object, now: float) -> float:
     return now - when
 
 
-def outcome_phrase(action: dict) -> str:
-    """What became of `action`, as the page reported it."""
-    o = action.get("outcome") if isinstance(action, dict) else None
-    state = o.get("state") if isinstance(o, dict) else None
-    if state in ("typed", "secret-typed"):
+# The outcomes that say the action was carried out on the device.
+TYPED_STATES = ("typed", "secret-typed")
+
+
+def record_outcome(action: dict, outcome: dict, at: str) -> None:
+    """Store `outcome` (normalize_outcome) on `action`, reported at `at`.
+
+    An action once typed stays typed: a later Retype that does not get
+    through (a confirmation on the phone declined or not answered, a device
+    gone) cannot undo what the first one did on the device, so it goes into
+    `last_attempt` and the stored `outcome` keeps saying typed. A later one
+    that types replaces both."""
+    new = dict(outcome, at=at)
+    stored = action.get("outcome")
+    if (isinstance(stored, dict) and stored.get("state") in TYPED_STATES
+            and outcome.get("state") not in TYPED_STATES):
+        action["last_attempt"] = new
+        return
+    action["outcome"] = new
+    action.pop("last_attempt", None)
+
+
+def _phrase(o: object) -> str:
+    """One stored outcome ({state, error?}) in words."""
+    state =o.get("state") if isinstance(o, dict) else None
+    if state in TYPED_STATES:
         return "typed"
     if state == "secret-cancelled":
         return "cancelled by the user"
@@ -258,6 +279,19 @@ def outcome_phrase(action: dict) -> str:
                     "confirmed in time on the phone")
         return f"not typed: {why}"
     return "no outcome reported yet"
+
+
+def outcome_phrase(action: dict) -> str:
+    """What became of `action`, as the page reported it — and, for one that
+    was typed, what a later Retype that did not type came to
+    (record_outcome)."""
+    if not isinstance(action, dict):
+        return _phrase(None)
+    phrase = _phrase(action.get("outcome"))
+    later = action.get("last_attempt")
+    if phrase == "typed" and isinstance(later, dict) and later.get("state") in OUTCOME_STATES:
+        return f"typed (a later retype: {_phrase(later)})"
+    return phrase
 
 
 def describe(action: dict) -> str:

@@ -343,6 +343,50 @@ def _http(base_url: str, method: str, path: str, body=None, headers=None):
         return exc.code, json.loads(exc.read() or b"{}")
 
 
+def test_a_typed_action_stays_typed(wg):
+    """Ara's 'git pull' + Enter was typed; a later Retype the user declines
+    on the phone (or does not confirm in time) ends as cancelled. The command
+    ran all the same, so the stored outcome stays typed and Ara is told so,
+    with the later attempt beside it; a Retype that types again replaces
+    both."""
+    act = {"kind": "keyboard-type", "id": "d" * 32, "text": "git pull", "enter": True}
+    conv = wg._new_conv("user", "reto", "t", "user", "pull please", via_edge=True)
+    cid = conv["id"]
+    wg._conv_add_message(cid, "assistant", "Typing it.", shell_actions_=[dict(act)])
+
+    def stored():
+        return wg._load_conv(cid)["messages"][1]["shell_actions"][0]
+
+    _, found = wg._conv_record_shell_outcome(cid, act["id"], {"state": "typed"})
+    assert found
+    first_at = stored()["outcome"]["at"]
+    _, found = wg._conv_record_shell_outcome(cid, act["id"],
+                                             {"state": "error", "error": "cancelled"})
+    assert found
+    a = stored()
+    # What the page reads after a reload (storedOutcome) is `outcome`: typed.
+    assert a["outcome"]["state"] == "typed" and a["outcome"]["at"] == first_at, a
+    assert a["last_attempt"]["state"] == "error" and a["last_attempt"]["error"] == "cancelled", a
+    line = wg.shell_actions.describe(a)
+    assert "(typed (a later retype: not typed: cancelled" in line, line
+    assert "(not typed" not in line, line
+    note = wg._conv_shell_outcome_note(wg._load_conv(cid)["messages"])
+    assert "typed (a later retype" in note, note
+    # A Retype that types again is the outcome; the failed attempt goes.
+    wg._conv_record_shell_outcome(cid, act["id"], {"state": "typed"})
+    a = stored()
+    assert a["outcome"]["state"] == "typed" and "last_attempt" not in a, a
+    assert wg.shell_actions.describe(a).endswith("(typed)"), wg.shell_actions.describe(a)
+    # An action never typed takes each outcome as it comes.
+    other = {"kind": "keyboard-key", "id": "c" * 32, "key": "enter"}
+    wg._conv_add_message(cid, "assistant", "And Enter.", shell_actions_=[dict(other)])
+    wg._conv_record_shell_outcome(cid, other["id"], {"state": "error", "error": "not-connected"})
+    wg._conv_record_shell_outcome(cid, other["id"], {"state": "error", "error": "cancelled"})
+    k = wg._load_conv(cid)["messages"][2]["shell_actions"][0]
+    assert k["outcome"]["error"] == "cancelled" and "last_attempt" not in k, k
+    print("ok: an action once typed stays typed; a later failed Retype is told beside it")
+
+
 def test_http_edge_outcome_and_redact(wg):
     """Over a real socket: a loopback caller is not the dashboard (no
     `via_edge`, no outcome report); through the configured reverse proxy it
@@ -420,6 +464,7 @@ def main():
         test_auto_needs_a_text_the_user_has_seen(wg)
         test_auto_counts_only_what_the_user_saw_before_the_turn(wg)
         test_auto_needs_a_whole_line_and_is_one_per_reply(wg)
+        test_a_typed_action_stays_typed(wg)
         test_http_edge_outcome_and_redact(wg)
         wg_tiered = base._load_gateway(tmp / "c", {"RETINUE_ROUTER_MODEL": "haiku",
                                                    "RETINUE_FRONTIER_MODEL": "opus"})

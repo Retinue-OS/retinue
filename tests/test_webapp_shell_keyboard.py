@@ -157,15 +157,15 @@ await ok('the phone confirms Enter, a line break, a tab and any key; the row say
   kbd.run({ ...typeA, text: 'ls', enter: true }, { threadId: tid, onState });
   assert.deepEqual(states.at(-1), { state: 'pending', confirm: true });
   assert.deepEqual(kbd.describeOutcome(states.at(-1), 'Quest 3'),
-    ['Waiting for confirmation on the phone…', false], 'an Enter text: the phone asks first');
+    ['Waiting for confirmation on the phone…', ''], 'an Enter text: the phone asks first');
   kbd._reset();
   kbd.run(keyB, { threadId: tid, onState });
   assert.deepEqual(kbd.describeOutcome(states.at(-1), 'Quest 3'),
-    ['Waiting for confirmation on the phone…', false], 'a key: the phone asks first');
+    ['Waiting for confirmation on the phone…', ''], 'a key: the phone asks first');
   kbd._reset();
   kbd.run(typeA, { threadId: tid, onState });
   assert.deepEqual(states.at(-1), { state: 'pending' });
-  assert.deepEqual(kbd.describeOutcome(states.at(-1), 'Quest 3'), ['Typing on Quest 3…', false],
+  assert.deepEqual(kbd.describeOutcome(states.at(-1), 'Quest 3'), ['Typing on Quest 3…', ''],
     'plain text types at once');
   assert.equal(calls.length, 3);
 });
@@ -227,6 +227,59 @@ await ok('Stop ends the one typing and drops the rest, reported as cancelled', a
   assert.deepEqual(heard.map((h) => h[0]).sort(), [keyTab.id, typeA.id].sort());
 });
 
+await ok('the watchdog settles a row the shell never answered; a late event still counts', async () => {
+  const calls = installShell();
+  // Fake timers: the watchdog fires when the test says.
+  const realSet = globalThis.setTimeout;
+  const realClear = globalThis.clearTimeout;
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+  globalThis.clearTimeout = () => {};
+  const rows = new Map();
+  const onState = (id) => (out) => rows.set(id, out);
+  const withEnter = { ...typeA, enter: true };
+  try {
+    kbd.run(withEnter, { threadId: tid, onState: onState(typeA.id) });
+    kbd.run(keyB, { threadId: tid, onState: onState(keyB.id) });
+    assert.equal(timers.length, 1);
+    assert.equal(timers[0].ms, 30000 + 100 * withEnter.text.length, 'room for the phone to ask (25 s) and type');
+    assert.equal(kbd.isActive(typeA.id), true);
+    assert.deepEqual(rows.get(typeA.id), { state: 'pending', confirm: true });
+    // The final event never comes: the row does not wait on with a dead Stop.
+    timers[0].fn();
+    assert.deepEqual(rows.get(typeA.id), { state: 'unanswered' });
+    assert.equal(kbd.isActive(typeA.id), false, 'nothing left for Stop to stop: Retype is free');
+    assert.notEqual(rows.get(typeA.id).state, 'pending');
+    assert.deepEqual(kbd.describeOutcome(rows.get(typeA.id)),
+      ['No answer from the Ara app — check the device before you retype', '']);
+    assert.deepEqual(calls.at(-1), ['key', 'enter', { id: keyB.id }], 'the next one starts');
+    assert.equal(timers[1].ms, 15000, 'a key: room for the phone to ask (12 s)');
+    // A watchdog that fires after its action ended changes nothing.
+    event('typed', keyB.id, { count: 1 });
+    timers[1].fn();
+    assert.equal(rows.get(keyB.id).state, 'pending', 'the view takes the final event itself');
+    assert.equal(kbd.isRunning(), false);
+    // A password dialog that does not answer Stop is given up on the same way.
+    kbd.run(secretC, { threadId: tid, onState: onState(secretC.id) });
+    kbd.cancel();
+    assert.equal(timers.at(-1).ms, 5000);
+    timers.at(-1).fn();
+    assert.deepEqual(rows.get(secretC.id), { state: 'unanswered' });
+    assert.equal(kbd.isRunning(), false);
+  } finally {
+    globalThis.setTimeout = realSet;
+    globalThis.clearTimeout = realClear;
+  }
+  // The shell's answer, late: it still reaches the gateway. A watchdog says
+  // nothing to the gateway itself — nobody knows what the device took.
+  event('typed', typeA.id, { count: 11 });
+  await tick();
+  assert.deepEqual(posted.map(([url, body]) => [url.split('/')[4], body]), [
+    [keyB.id, { state: 'typed' }],
+    [typeA.id, { state: 'typed' }],
+  ]);
+});
+
 await ok('a tap shows what it types: the text, and every Enter it presses', () => {
   assert.equal(kbd.visibleText({ ...typeA, text: 'ls -la\nrm x\tz' }), 'ls -la⏎\nrm x⇥z');
   assert.equal(kbd.visibleText({ ...typeA, sensitive: true }), null, 'never a sensitive text');
@@ -279,15 +332,22 @@ await ok('wording', () => {
   assert.equal(kbd.describeAction({ ...typeA, text: 'x', enter: true }), 'Type 1 character + Enter');
   assert.equal(kbd.describeAction(keyB), 'Press Enter');
   assert.equal(kbd.describeAction(secretC), 'Password from manager: Meta account');
-  assert.deepEqual(kbd.describeOutcome({ state: 'typed' }, 'Quest 3'), ['Typed on Quest 3 ✓', false]);
-  assert.deepEqual(kbd.describeOutcome({ state: 'queued' }), ['Waiting for the one before…', false]);
-  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'not-connected' }), ['Not typed: no device connected', true]);
-  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'not-in-front' }), ['Not typed: the Ara app was not in front', false]);
+  assert.deepEqual(kbd.describeOutcome({ state: 'typed' }, 'Quest 3'), ['Typed on Quest 3 ✓', '']);
+  assert.deepEqual(kbd.describeOutcome({ state: 'queued' }), ['Waiting for the one before…', '']);
+  // Each fix where it can be made: the keyboard screen connects a device;
+  // not-enabled may be this server's switch, which the app's settings page
+  // holds (it refuses its keyboard screen meanwhile), or the keyboard itself.
+  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'not-connected' }), ['Not typed: no device connected', 'keyboard']);
+  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'not-enabled' }),
+    ['Not typed: typing is off in the Ara app (for this server, or the keyboard itself)', 'settings']);
+  assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'not-in-front' }), ['Not typed: the Ara app was not in front', '']);
   // `cancelled` is also a confirmation on the phone declined or not answered in time.
   assert.deepEqual(kbd.describeOutcome({ state: 'error', error: 'cancelled' }),
-    ['Not typed: stopped, or not confirmed on the phone', false]);
-  assert.deepEqual(kbd.describeOutcome({ state: 'secret-cancelled' }), ['Password not typed: cancelled', false]);
-  assert.deepEqual(kbd.describeOutcome(null), ['', false]);
+    ['Not typed: stopped, or not confirmed on the phone', '']);
+  assert.deepEqual(kbd.describeOutcome({ state: 'secret-cancelled' }), ['Password not typed: cancelled', '']);
+  assert.deepEqual(kbd.describeOutcome(null), ['', '']);
+  assert.deepEqual(kbd.describeOutcome({ state: 'unanswered' }),
+    ['No answer from the Ara app — check the device before you retype', '']);
 });
 
 await ok('a sensitive text is masked, gone once purged, and gone from the page after two minutes', async () => {
@@ -306,7 +366,7 @@ await ok('a sensitive text is masked, gone once purged, and gone from the page a
   assert.equal(kbd.run(purged), false);
   assert.equal(kbd.shouldAutoRun(purged, fresh, { live: true, now }), false);
   assert.equal(kbd.describeAction({ ...typeA, text: null, purged: true }), 'Text deleted');
-  assert.deepEqual(kbd.describeOutcome({ state: 'deleted' }), ['Text deleted', false]);
+  assert.deepEqual(kbd.describeOutcome({ state: 'deleted' }), ['Text deleted', '']);
   // Past two minutes the page treats it as deleted, whatever the gateway has said yet.
   const old = { ts: new Date(now - kbd.SENSITIVE_TTL_MS - 1000).toISOString(), shell_actions: [{ ...sens }, { ...typeA }] };
   assert.equal(kbd.isPurged(old.shell_actions[0], old, now), true);

@@ -2305,8 +2305,10 @@ def _conv_record_shell_outcome(cid: str, action_id: str,
                                outcome: dict) -> tuple[dict | None, bool]:
     """Store `outcome` (shell_actions.normalize_outcome) on the shell action
     `action_id` of thread `cid`, and delete its text if it was a sensitive
-    one reported typed. Returns (thread, whether the action exists); the
-    thread is None when there is none."""
+    one reported typed. An action already typed keeps that outcome when a
+    later Retype does not type (shell_actions.record_outcome). Returns
+    (thread, whether the action exists); the thread is None when there is
+    none."""
     with _conversations_lock:
         conv = _load_conv_raw(cid)
         if conv is None:
@@ -2316,7 +2318,8 @@ def _conv_record_shell_outcome(cid: str, action_id: str,
         for m in conv.get("messages") or []:
             for a in (m.get("shell_actions") or []) if isinstance(m, dict) else []:
                 if isinstance(a, dict) and a.get("id") == action_id:
-                    a["outcome"] = dict(outcome, at=datetime.now(timezone.utc).isoformat())
+                    shell_actions.record_outcome(
+                        a, outcome, datetime.now(timezone.utc).isoformat())
                     found = True
         if not found:
             return conv, False
