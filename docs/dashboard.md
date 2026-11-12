@@ -143,6 +143,17 @@ settings page") and the file viewer's own `frame-src 'self'`. Inside the
 Android shell, the bridge the app injects (`window.RetinueShell`) and the
 scripts it evaluates are the app's, not governed by a page's policy.
 
+The policy decides what a page loads and runs, not where a link takes the
+user: following a link is a navigation, which none of its directives
+restricts (`form-action` covers only where a form is sent). So the call
+directive's tap-to-dial `tel:` link (see "Speech-to-text (the `stt` service)
+and voice input") and the `mailto:` links work in every mode. What keeps a
+link of another scheme out of the pages is the markup's own rules, not the
+policy: the dashboard's Markdown renderer makes links only of `http(s)`,
+`mailto:` and `tel:` URLs and of paths on this origin, and its call link only
+of a number it has checked (`webapp/components/markdown.js`). The one such
+scheme the policy does stop is `javascript:`, which `script-src` blocks.
+
 **Three modes**, `RETINUE_CSP`:
 
 - `report` (the default) sends `Content-Security-Policy-Report-Only`: the

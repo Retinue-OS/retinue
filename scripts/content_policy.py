@@ -103,7 +103,10 @@ DIRECTIVES = (
     ("object-src", ("'none'",)),
     ("base-uri", ("'self'",)),
     # The approval cards' Allow and Deny post to this origin, and so does
-    # every other form.
+    # every other form. Only forms: a link the user follows is a navigation,
+    # which no directive here restricts, so the call directive's tel: link
+    # and the mailto: links (webapp/components/markdown.js) work in every
+    # mode. Which schemes become links at all is the renderer's rule.
     ("form-action", ("'self'",)),
     # The service worker (sw.js).
     ("worker-src", ("'self'",)),
