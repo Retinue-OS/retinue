@@ -8353,8 +8353,9 @@ def _media_gateways(channel: str, account: str | None = None,
     stored them), else an account-derived stamp, else the channel's gateways
     in registry order. Control-mode gateways are left out — ledger media is
     inbox-only by construction, and the media handler refuses them anyway.
-    A channel with no gateway at all yields nothing, and the reference is then
-    passed through as it is: there is nobody to ask."""
+    A channel with no gateway at all yields nothing; a host-free reference
+    then gets no url (see :func:`_shape_chat_attachments`): there is nobody
+    to ask."""
     ranked: list = []
     seen: set = set()
 
