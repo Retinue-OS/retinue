@@ -59,7 +59,7 @@
 // composer — empty, or holding the text she was asked to rework — marked as
 // hers; the send press stays the user's.
 
-import { esc, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
+import { esc, webLink, WIDE_FRAME, deepActiveElement, onPressOutside, softKeyboard, visibleHeight } from './base.js';
 import { deviceGet, deviceSet } from './device-store.js';
 import { canRecord, micErrorText, recordingRowHtml, statusRowHtml, Waveform, VOICE_CSS } from './voice.js';
 import { pastedFiles, pastedText } from './clipboard.js';
@@ -92,6 +92,35 @@ const TITLE_BRAND = (() => {
     return (i < 0 ? t : t.slice(0, i)) || 'Retinue';
   } catch (_e) { return 'Retinue'; }
 })();
+// Where an attachment may be loaded from or lead to. Its url is the gateway's
+// media proxy (/chats/media/<slug>/<media-id>) for a file a gateway holds, or
+// an absolute http(s) URL (webLink); a reference that is neither is text from
+// outside and never becomes an href or a src, so such an attachment is shown
+// by its name alone. Two exceptions are taken, never for a link: this page's
+// own object URLs, with which the bubble it shows while a send is on its way
+// previews the user's staged images (only the attachments it built for that
+// bubble are in OWN_PREVIEWS), and a data: URL of a medium (DATA_MEDIA_RE
+// below), for the element of its own kind and an image's lightbox.
+const MEDIA_PROXY_RE = /^\/chats\/media\/[A-Za-z0-9_-][A-Za-z0-9._-]*\/[0-9a-f]{32}$/;
+const OWN_PREVIEWS = new WeakSet();
+
+// A data: URL carries its bytes in itself. Inside an <img>, <audio> or <video>
+// nothing in it runs, so the reference documents under data/chats/, which
+// use such URLs, still show their media. It is taken only for the element
+// its own kind picks (and, for an image, the lightbox, which shows it in an
+// <img> as well), never for a file row, whose link would open it as a
+// document.
+const DATA_MEDIA_RE = /^data:(image|audio|video)\/[a-z0-9.+-]+[;,]/;
+
+function attachmentUrl(a) {
+  const url = typeof a.url === 'string' ? a.url : '';
+  if (OWN_PREVIEWS.has(a) && url.startsWith('blob:')) return url;
+  if (MEDIA_PROXY_RE.test(url)) return url;
+  const data = DATA_MEDIA_RE.exec(url);
+  if (data) return String(a.type || '').startsWith(`${data[1]}/`) ? url : '';
+  return webLink(url);
+}
+
 // Splitter persistence, per device — same pattern as layout.js (STORE_KEY).
 const STORE_KEY = 'retinue.chatpage.v1';
 const MIN_COMP_PX = 280;      // keep in sync with .pane-companion min-width
@@ -1493,6 +1522,23 @@ class RetinueChatPage extends HTMLElement {
       `<span class="stamp">${esc(fmtTime(m.ts))}</span></div></div>`;
   }
 
+  // The attachment the bubble of a send on its way shows for one of the
+  // user's staged images: its preview's object URL, which this page created,
+  // so it is taken although it is neither the proxy's nor a web link
+  // (attachmentUrl).
+  _ownPreview(im, i) {
+    const att = {
+      id: `local-att-${this._localSeq}-${i}`,
+      url: im.url,
+      type: im.content_type,
+      width: im.width,
+      height: im.height,
+      name: im.name,
+    };
+    OWN_PREVIEWS.add(att);
+    return att;
+  }
+
   // One attachment inside a bubble, by type. Loading media must never shift
   // the thread's scroll position: when the record carries the intrinsic size
   // (sniffed at ingest; older records may lack it) the true box is reserved
@@ -1504,9 +1550,22 @@ class RetinueChatPage extends HTMLElement {
   // that link does is the media proxy's decision, not this page's: a PDF or
   // plain text opens in the browser, anything else is saved (docs/dashboard.md,
   // "Attachments"). The same holds for an image opened by itself: only the
-  // inline-safe types are shown, an SVG is a download.
+  // inline-safe types are shown, an SVG is a download. An attachment whose url
+  // is neither the proxy's nor a web link, nor one of the two exceptions
+  // attachmentUrl takes for media (the page's own previews, a data: URL of
+  // the attachment's kind), is its name as text, whatever its type: there is
+  // nothing it may be loaded from.
   _attachmentHtml(a) {
     const type = String(a.type || '');
+    const url = attachmentUrl(a);
+    if (!url) {
+      const size = fmtBytes(Number(a.size));
+      const label = a.name || (type.startsWith('image/') ? 'Image'
+        : type.startsWith('audio/') ? 'Voice message'
+          : type.startsWith('video/') ? 'Video' : 'Attachment');
+      return `<span class="att-file att-nolink">&#128206; <span class="att-name">` +
+        `${esc(label)}</span>${size ? ` <span class="att-size">${esc(size)}</span>` : ''}</span>`;
+    }
     const w = Number(a.width);
     const h = Number(a.height);
     const hasDims = w > 0 && h > 0;
@@ -1522,21 +1581,21 @@ class RetinueChatPage extends HTMLElement {
     const sized = (cap) => (hasDims
       ? ` style="aspect-ratio: ${w} / ${h}; width: min(${cap}px, ${w}px)"` : '');
     if (type.startsWith('image/')) {
-      return `<button type="button" class="att-imgbtn" data-lightbox="${esc(a.url)}" ` +
+      return `<button type="button" class="att-imgbtn" data-lightbox="${esc(url)}" ` +
         `data-alt="${esc(a.name || 'Image')}" aria-label="View image full screen">` +
-        `<img class="att-img${hasDims ? '' : ' no-dims'}" src="${esc(a.url)}" ` +
+        `<img class="att-img${hasDims ? '' : ' no-dims'}" src="${esc(url)}" ` +
         `alt="${esc(a.name || 'image')}"${dims}${sized(280)} loading="lazy"></button>`;
     }
     if (type.startsWith('audio/')) {
-      return `<audio class="att-audio" controls preload="none" src="${esc(a.url)}" ` +
+      return `<audio class="att-audio" controls preload="none" src="${esc(url)}" ` +
         `title="${esc(a.name || 'Voice message')}"></audio>`;
     }
     if (type.startsWith('video/')) {
       return `<video class="att-video${hasDims ? '' : ' no-dims'}" controls preload="metadata" ` +
-        `playsinline src="${esc(a.url)}"${dims}${sized(280)}></video>`;
+        `playsinline src="${esc(url)}"${dims}${sized(280)}></video>`;
     }
     const size = fmtBytes(Number(a.size));
-    return `<a class="att-file" href="${esc(a.url)}" target="_blank" rel="noopener" ` +
+    return `<a class="att-file" href="${esc(url)}" target="_blank" rel="noopener" ` +
       `title="${esc(a.name || 'Attachment')}">&#128206; <span class="att-name">` +
       `${esc(a.name || 'Attachment')}</span>${size ? ` <span class="att-size">${esc(size)}</span>` : ''}</a>`;
   }
@@ -2710,14 +2769,7 @@ class RetinueChatPage extends HTMLElement {
       ts: new Date().toISOString(),
     };
     if (images.length) {
-      local.attachments = images.map((im, i) => ({
-        id: `local-att-${this._localSeq}-${i}`,
-        url: im.url,
-        type: im.content_type,
-        width: im.width,
-        height: im.height,
-        name: im.name,
-      }));
+      local.attachments = images.map((im, i) => this._ownPreview(im, i));
     }
     this._messages.push(local);
     this._appendChatMessage(local);

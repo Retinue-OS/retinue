@@ -829,6 +829,48 @@ def test_rail_auth_and_notifications(base, wg):
     print("PASS test_rail_auth_and_notifications")
 
 
+def test_rail_references_that_are_no_media(base, wg):
+    """An attachment reference that names no blob is never handed on as a URL.
+
+    The rail keeps the references a caller posts, and the page puts an
+    attachment's url into an href or a src. So only a media reference becomes
+    the proxy's URL, an absolute http(s) URL is passed on as it is, and
+    anything else gives an attachment without a url (the page shows its
+    name)."""
+    rail = "/internal/chats/inbound"
+    mid = "cd" * 16
+    refs = [
+        f"urn:retinue:media:signal:{mid}",
+        "https://example.org/pic.jpg",
+        "javascript:alert(1)",
+        "data:text/html,<p>x</p>",
+        "/sends/default/1",
+        "//example.org/x",
+        "https:example.org",
+        "https://example.org/\nx",
+        {"url": "javascript:alert(1)"},
+        42,
+    ]
+    event = {"direction": "in", "channel": "signal", "chat": "+41790005577",
+             "sender": "+41790005577", "sender_name": "Nora", "group": False,
+             "message_id": "r1", "text": "see", "gateway": "127.0.0.1",
+             "attachments": refs, "gate": {"forward": False, "reason": "held"}}
+    status, body = _http(base, "POST", rail, event)
+    assert status == 200, body
+    status, body = _http(base, "GET", "/chats/" + _quote("signal:+41790005577") + "/messages")
+    assert status == 200, body
+    msg = next(m for m in body["messages"] if m["id"] == "r1")
+    atts = msg["attachments"]
+    urls = [a.get("url") for a in atts]
+    assert urls[0] == f"/chats/media/127.0.0.1/{mid}", urls
+    assert urls[1] == "https://example.org/pic.jpg", urls
+    assert len(atts) == 8 and urls[2:] == [None] * 6, urls
+    # The reference itself goes nowhere else in the attachment either.
+    for att, ref in zip(atts[2:], refs[2:]):
+        assert ref not in json.dumps(att), att
+    print("PASS test_rail_references_that_are_no_media")
+
+
 def test_send_user_direct(base, wg):
     # This rail event reports no account, so it deliberately stamps nothing:
     # routing rests on the channel having exactly one inbox account, which is
@@ -2574,6 +2616,7 @@ def main():
         test_draft_guard(base, wg)
         test_draft_undo_endpoint(base, wg)
         test_rail_auth_and_notifications(base, wg)
+        test_rail_references_that_are_no_media(base, wg)
         test_send_user_direct(base, wg)
         test_send_images(base, wg)
         test_send_under_verify_is_queued_then_approved(base, wg)

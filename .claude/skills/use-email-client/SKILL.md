@@ -57,7 +57,10 @@ python3 /workspace/scripts/email_client.py read --uid <UID> --raw
 # Mark as read
 python3 /workspace/scripts/email_client.py flag --uid <UID> --read
 
-# Download an attachment
+# Download an attachment. Without --out the file is saved in the working
+# directory under the base name of the attachment's own name (a path the sender
+# wrote into it is dropped), and an existing file is never overwritten — the
+# command fails instead, so pass --out.
 python3 /workspace/scripts/email_client.py fetch-attachment --uid <UID> --part 1 --out /tmp/file.pdf
 
 # Move a message

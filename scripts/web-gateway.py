@@ -1817,7 +1817,18 @@ _conversations_lock = threading.Lock()
 # rest of the document. Answers are model output that can quote untrusted text
 # (e-mail, messages), so this is also the XSS boundary for the log pages.
 _md = MarkdownIt("commonmark", {"html": False}).enable("table")
-_URL_RE = re.compile(r'https?://[^\s<]+')
+# A bare URL in an answer's text, as the session log page links it. It is
+# matched in the text as written (entities decoded), so an angle bracket ends
+# it like a blank does; trailing sentence punctuation is left outside.
+_URL_RE = re.compile(r'https?://[^\s<>]+')
+_URL_TAIL = '.,;:!?)"\''
+# A tag of markdown-it's output. With raw HTML off it writes only its own
+# tags, and it escapes every attribute value (& < > "), so a tag is a "<"
+# followed by everything up to the next ">".
+_MD_TAG_RE = re.compile(r'(<[^>]*>)')
+# Elements whose text is never linked: a link already is one, and code is
+# shown as written.
+_MD_NO_LINK_RE = re.compile(r'<(/?)(a|code|pre)\b', re.IGNORECASE)
 
 # ── Async job store ───────────────────────────────────────────────────────────
 # POST /message can request async handling; the request returns a job handle
@@ -1880,18 +1891,45 @@ def _run_job(job_id: str, message: str, display_question: str | None,
 
 
 def _render_answer(raw: str) -> str:
-    """Render Markdown to HTML; auto-link bare http/https URLs as <a href=URL>URL</a>."""
+    """Render Markdown to HTML; auto-link bare http/https URLs as <a href=URL>URL</a>.
+
+    The links are added to the rendered HTML, and only ever between its tags:
+    a URL inside a tag (an image's src, alt or title, a link's href) belongs
+    to that tag, and text inside a link, a code span or a code block is left
+    as it is. The answer is text from the model, which may quote anything, so
+    a URL is written back escaped, for the href attribute and for the text,
+    and nothing in it can become markup."""
     rendered = _md.render(raw)
-    # Split on existing <a> tags so we never double-link markdown-rendered links.
-    parts = re.split(r'(<a\b[^>]*>.*?</a>)', rendered, flags=re.DOTALL)
+    out: list[str] = []
+    depth = {"a": 0, "code": 0, "pre": 0}
+    for i, part in enumerate(_MD_TAG_RE.split(rendered)):
+        if i % 2:  # a tag
+            m = _MD_NO_LINK_RE.match(part)
+            if m and not part.endswith("/>"):
+                name = m.group(2).lower()
+                depth[name] = max(0, depth[name] + (-1 if m.group(1) else 1))
+            out.append(part)
+        elif not any(depth.values()) and _URL_RE.search(html.unescape(part)):
+            out.append(_linkify_text(html.unescape(part)))
+        else:
+            out.append(part)
+    return "".join(out)
 
-    def _linkify(text: str) -> str:
-        def _sub(m: re.Match) -> str:
-            url = m.group(0).rstrip('.,;:!?)')
-            return f'<a href="{url}">{url}</a>'
-        return _URL_RE.sub(_sub, text)
 
-    return ''.join(_linkify(p) if i % 2 == 0 else p for i, p in enumerate(parts))
+def _linkify_text(text: str) -> str:
+    """Plain ``text`` as HTML, its bare http(s) URLs as links."""
+    out: list[str] = []
+    pos = 0
+    for m in _URL_RE.finditer(text):
+        url = m.group(0).rstrip(_URL_TAIL)
+        if not url.split("://", 1)[1]:
+            continue
+        out.append(html.escape(text[pos:m.start()], quote=False))
+        out.append(f'<a href="{html.escape(url, quote=True)}">'
+                   f'{html.escape(url, quote=False)}</a>')
+        pos = m.start() + len(url)
+    out.append(html.escape(text[pos:], quote=False))
+    return "".join(out)
 
 
 def _now_ts() -> float:
@@ -2395,13 +2433,19 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
     (base64 payloads from the internal API and the composer) and
     _store_reply_files (files Ara attaches to her own reply) both end here, so
     naming, size cap and metadata shape cannot drift apart. An empty or
-    oversized blob is refused (None). An image's intrinsic ``width``/``height``
+    oversized blob is refused (None). The name is kept as a base name without
+    control characters (_attachment_name) and the type only as one media type
+    (_stated_media_type), application/octet-stream otherwise. An image's
+    intrinsic ``width``/``height``
     (sniffed by magic, the same parser the chat store uses) is recorded when
     found, so the dashboard reserves its inline preview's box before the bytes
     arrive."""
     if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
         return None
-    content_type = str(content_type or "application/octet-stream")
+    # Name and type come from whoever attached the file — a mail sender's
+    # attachment name, a messenger client's type — and are later written into
+    # the download's headers and the note of Ara's turn: kept as one line.
+    content_type = _stated_media_type(content_type)
     suffix = Path(os.path.basename(str(filename or ""))).suffix
     if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
         suffix = mimetypes.guess_extension(content_type) or ""
@@ -2409,7 +2453,7 @@ def _store_attachment_blob(cid: str, blob: bytes, filename, content_type) -> dic
     conv_dir = CONVERSATION_ATTACHMENTS_DIR / cid
     conv_dir.mkdir(parents=True, exist_ok=True)
     (conv_dir / f"{att_id}{suffix}").write_bytes(blob)
-    filename = os.path.basename(str(filename or "attachment")) or "attachment"
+    filename = _attachment_name(filename)
     meta = {
         "id": att_id,
         "filename": filename,
@@ -2563,8 +2607,10 @@ def _store_message_files(raw_files) -> list[dict]:
     MESSAGE_FILES_DIR with a server-generated name, so an untrusted filename
     never becomes a path component; only a plain short extension (derived from
     the filename, else the content type) survives, since a file extension is
-    what lets the reading session type the file. Malformed or oversized items
-    are skipped. Returns ``[{"path", "content_type", "size"}, ...]``."""
+    what lets the reading session type the file. The content type is kept as
+    its bare type/subtype (_media_essence), application/octet-stream when the
+    stated text is none. Malformed or oversized items are skipped. Returns
+    ``[{"path", "content_type", "size"}, ...]``."""
     stored: list[dict] = []
     if not isinstance(raw_files, list):
         return stored
@@ -2577,7 +2623,10 @@ def _store_message_files(raw_files) -> list[dict]:
             continue
         if not blob or len(blob) > MAX_ATTACHMENT_BYTES:
             continue
-        content_type = str(item.get("content_type") or "application/octet-stream")
+        # The type is what the sender's client declared, passed on by the
+        # messenger gateway as it came, and the note below puts it into the
+        # answering session's prompt: it is kept only as a bare type/subtype.
+        content_type = _media_essence(item.get("content_type"))
         suffix = Path(os.path.basename(str(item.get("filename") or ""))).suffix
         if not re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix):
             suffix = mimetypes.guess_extension(content_type) or ""
@@ -2593,7 +2642,11 @@ def _message_files_note(stored: list[dict]) -> str:
     """A note listing the files a /message request carried, with their on-disk
     paths — the counterpart of _conv_attachment_note for gateway-forwarded
     files. The untrusted original filename is deliberately absent: the reading
-    session needs only the server-named path, type and size."""
+    session needs only the server-named path, type and size. The note is part
+    of the session's prompt, so nothing from outside may reach it as text of
+    its own: the path is the server's, the type was reduced to its bare
+    type/subtype when the file was stored (_store_message_files), the size
+    is a number."""
     if not stored:
         return ""
     lines = [
@@ -2616,9 +2669,36 @@ _INLINE_SAFE_TYPES = frozenset({
 })
 
 
+# What never belongs in a file name that is shown or sent: the C0 and C1
+# control characters, line breaks among them, and Unicode's own line and
+# paragraph separators.
+_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def _attachment_name(filename) -> str:
+    """A thread attachment's name as it may be stored, shown and sent.
+
+    The name is whatever the file was called where it came from — for a mail
+    attachment, what its sender declared — and it is written into the
+    download's Content-Disposition and listed in the note of Ara's turn, each
+    one line. It is a base name: what stands before the last slash is a path
+    of the place it came from, and a backslash counts as a slash, since the
+    client that saves the download may take it for one (as
+    inbound_store.safe_file_name does for a messenger file). Control
+    characters are dropped; "attachment" when nothing usable is left. Applied
+    where a name is stored and again where it is used, so a name stored
+    before this keeps to it too."""
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = _NAME_CONTROL_RE.sub("", name).strip()
+    return "attachment" if name in ("", ".", "..") else name
+
+
 def _content_disposition(filename: str, inline: bool = False) -> str:
     """Build a Content-Disposition header that survives non-ASCII filenames
-    (RFC 6266: an ASCII fallback plus a UTF-8 ``filename*``)."""
+    (RFC 6266: an ASCII fallback plus a UTF-8 ``filename*``). The name goes
+    through _attachment_name first, so the header is one line of ASCII
+    whatever was stored."""
+    filename = _attachment_name(filename)
     ascii_name = filename.encode("ascii", "replace").decode("ascii").replace('"', "'")
     quoted = urllib.parse.quote(filename, safe="")
     kind = "inline" if inline else "attachment"
@@ -2725,6 +2805,29 @@ def _media_type_header(essence: str, params: dict) -> str:
             value = '"' + re.sub(r'([\\"])', r"\\\1", value) + '"'
         out += f"; {name}={value}"
     return out
+
+
+def _stated_media_type(stated) -> str:
+    """A stated content type as one media type, or application/octet-stream.
+
+    For a type that came from outside and is kept, shown or handed on as
+    text: read strictly (_parse_media_type) and written back from what was
+    read (_media_type_header), so the result is one line of a type's own
+    characters, whatever was declared."""
+    parsed = _parse_media_type(stated)
+    return _media_type_header(*parsed) if parsed else "application/octet-stream"
+
+
+def _media_essence(stated) -> str:
+    """A stated content type as its bare ``type/subtype``, or
+    application/octet-stream.
+
+    For a type that is written into a prompt. A parameter's quoted value may
+    hold any printable text, sentences included, so a prompt names only the
+    essence; the parameters kept by _stated_media_type belong in a
+    Content-Type header, where a browser reads them."""
+    parsed = _parse_media_type(stated)
+    return parsed[0] if parsed else "application/octet-stream"
 
 
 def _chat_media_headers(stated) -> dict:
@@ -3123,9 +3226,13 @@ def _conv_attachment_note(conv: dict, msg: dict) -> str:
     for att in atts:
         stored_name = str(att.get("id", "")) + str(att.get("suffix", ""))
         path = CONVERSATION_ATTACHMENTS_DIR / cid / stored_name
+        # Name and type as they are stored, read again: the note is part of
+        # the turn's prompt, and metadata stored before both were kept as one
+        # line may hold anything. The type is named by its essence alone; the
+        # parameters it is stored with are for the download's header.
         lines.append(
-            f"- {att.get('filename', 'attachment')} "
-            f"({att.get('content_type', 'application/octet-stream')}, "
+            f"- {_attachment_name(att.get('filename'))} "
+            f"({_media_essence(att.get('content_type'))}, "
             f"{att.get('size', 0)} bytes) — saved at {path}"
         )
     who = "The user" if msg.get("role") == "user" else "This message"
@@ -3288,7 +3395,11 @@ def _conv_chat_note(conv: dict) -> str:
             text = " ".join(str(m.get("text") or "").split())
             atts = m.get("attachments") or []
             if atts:
-                kinds = sorted({a.get("type") for a in atts if a.get("type")})
+                # The note is part of the prompt, so a type is named here
+                # only as the essence of one media type, whichever path
+                # handed the attachment on; anything else is left out.
+                parsed = (_parse_media_type(a.get("type")) for a in atts)
+                kinds = sorted({p[0] for p in parsed if p})
                 label = f"{len(atts)} attachment" + ("s" if len(atts) > 1 else "")
                 if kinds:
                     label += ": " + ", ".join(kinds)
@@ -6289,8 +6400,13 @@ def _chat_media_meta_lookup(references) -> dict:
         if not att:
             continue
         meta = out.setdefault(att, {})
-        if _bval(b, "ct"):
-            meta["type"] = _bval(b, "ct")
+        # The type is what the sender declared, and records written before
+        # the gateways cleaned it may hold any text. It goes to the page and,
+        # through the companion note, into a prompt, so it is kept only as
+        # the essence of one media type, and a type that is none is dropped.
+        parsed = _parse_media_type(_bval(b, "ct"))
+        if parsed:
+            meta["type"] = parsed[0]
         if _bval(b, "name"):
             meta["name"] = _bval(b, "name")
         for key, var in (("size", "size"), ("width", "w"), ("height", "h")):
@@ -6319,19 +6435,33 @@ def _shape_chat_attachments(urls: list[str], serving_slug: str | None = None,
     the channel's other gateways when the named one answers 404, so a wrong
     first guess costs a request, never the picture. Only a channel with no
     gateway at all leaves it None; a legacy record then falls back to the
-    service name it recorded, and a host-free one is passed through verbatim
-    and plainly fails to load — there is nobody to ask.
+    service name it recorded, and a host-free one gets no url — there is
+    nobody to ask, and the page shows the file by its name.
+
+    A reference that is no media reference is text from outside: the
+    gateways' ledger records and the notify rail carry what their callers
+    wrote, and the page puts an attachment's url into an href or a src. It
+    is passed on only when it is an absolute http(s) URL, by the rule news
+    links are held to (``news_store.web_link``); anything else, another
+    scheme or a reference into the dashboard itself among it, gives an
+    attachment without a url, and its id is a digest rather than the text.
 
     ``meta`` is what the gateways stated about the blobs
     (:func:`_chat_media_meta_lookup`), keyed by the reference as recorded."""
     out = []
     for url in urls:
-        if not url:
+        if not url or not isinstance(url, str):
             continue
         media_id, legacy_slug = _parse_media_reference(url)
         slug = serving_slug or legacy_slug
-        public = f"/chats/media/{slug}/{media_id}" if (media_id and slug) else url
-        att: dict = {"id": media_id or public, "url": public}
+        if media_id and slug:
+            public = f"/chats/media/{slug}/{media_id}"
+        else:
+            public = news_store.web_link(url)
+        att: dict = {"id": media_id or public
+                     or hashlib.sha256(url.encode("utf-8", "replace")).hexdigest()[:32]}
+        if public:
+            att["url"] = public
         stated = (meta or {}).get(url) or {}
         if stated.get("type"):
             att["type"] = stated["type"]
@@ -8337,8 +8467,9 @@ def _media_gateways(channel: str, account: str | None = None,
     stored them), else an account-derived stamp, else the channel's gateways
     in registry order. Control-mode gateways are left out — ledger media is
     inbox-only by construction, and the media handler refuses them anyway.
-    A channel with no gateway at all yields nothing, and the reference is then
-    passed through as it is: there is nobody to ask."""
+    A channel with no gateway at all yields nothing; a host-free reference
+    then gets no url (see :func:`_shape_chat_attachments`): there is nobody
+    to ask."""
     ranked: list = []
     seen: set = set()
 
@@ -9691,8 +9822,12 @@ class Handler(BaseHTTPRequestHandler):
         except (OSError, ValueError):
             self._send_json(404, {"error": "not found"})
             return
-        ctype = meta.get("content_type") or "application/octet-stream"
-        inline = inline and ctype.split(";", 1)[0].strip().lower() in _INLINE_SAFE_TYPES
+        # The stored type is read again, so metadata stored before it was
+        # kept as one media type is never written into a header as it is: a
+        # type that does not read as one is application/octet-stream, and so
+        # a download.
+        ctype = _stated_media_type(meta.get("content_type"))
+        inline = inline and ctype.split(";", 1)[0] in _INLINE_SAFE_TYPES
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -11132,7 +11267,10 @@ class Handler(BaseHTTPRequestHandler):
             "message_id": (str(payload.get("message_id") or "").strip() or None),
             "ts": ts,
             "text": str(payload.get("text") or ""),
-            "attachments": [u for u in (payload.get("attachments") or []) if u],
+            # References are text; what is not cannot name a blob and would
+            # only break the listing it is read back into.
+            "attachments": [u for u in (payload.get("attachments") or [])
+                            if u and isinstance(u, str)],
         }
         if _chat_record_erased(chat_id, message_id=entry["message_id"]):
             # A late or repeated event for a message the user just erased —

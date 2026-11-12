@@ -590,6 +590,18 @@ message bubble, served by `GET /conversations/<id>/attachments/<att-id>` behind
 the dashboard's own auth. Prefer this over pushing a document via Signal when
 the user is already working in the dashboard.
 
+A file's name and type are what it was given where it came from — for a mail
+attachment, what the sender declared — and they are written into the
+download's headers and into the note that hands the file to Ara's turn. So
+the stored name is a base name without control characters (`attachment` when
+nothing is left) and the stored type is one media type, read strictly and
+written back from what was read, or `application/octet-stream`. Both are read
+again in the same way where they are used, so metadata stored before this
+keeps to it too: a name or a type from outside never becomes a header line of
+its own, and a type that does not read as one media type is a download. The
+note to Ara's turn names the type by its `type/subtype` alone; the parameters
+kept with it go only into the download's `Content-Type`.
+
 A file row has two links: its name opens the file to view — in the
 dashboard's file viewer (below) or, for a PDF a frame would not show whole,
 as the bare file; either way the file is fetched with `?inline=1`, answered
@@ -716,6 +728,26 @@ gave the file, so a download is named after its URL and type
 (`<media-id>.docx`). The gateways' store keeps the stated type as one line of
 printable ASCII (`inbound_store.clean_content_type`), so it is exactly one
 header of their own `GET /media/<id>`, whatever was declared.
+
+An attachment's URL is the proxy's or a web link, never anything else. The
+references a chat's messages carry are text from outside as well: the
+gateways' ledger records and the notify rail (`POST /internal/chats/inbound`)
+keep what their callers wrote. The gateway makes a media reference
+(`urn:retinue:media:<channel>:<id>`, or the older
+`http://<service>:<port>/media/<id>`) into the proxy's URL, passes any other
+reference on only when it is an absolute `http(s)` URL with a host
+(`news_store.web_link`, the rule news links follow), and leaves the
+attachment without a URL otherwise (`_shape_chat_attachments`). The chat page
+holds to the same rule on its own: it renders a link, an image, a player or
+the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`)
+or a web link, and the file's name as plain text for anything else, so a
+reference from outside never becomes script or a link of another scheme. Two
+further kinds of URL are rendered, neither of them ever as a link: the bubble
+of a send on its way previews the user's staged images from object URLs the
+page created, and a `data:image/…`, `data:audio/…` or `data:video/…` URL (the
+reference documents under `data/chats/` use them) is taken for the `<img>`,
+`<audio>` or `<video>` of its own kind, and for an image's lightbox, when the
+attachment's type is of that kind as well.
 
 ## Push notifications
 

@@ -21,7 +21,7 @@
 // generalizes it into the profile on its next run (scripts/news-curate.py).
 
 import {
-  esc, fmtAge, isWideFrame, onFrameChange,
+  esc, fmtAge, isWideFrame, onFrameChange, webLink,
   viewPref, setViewPref, viewToggleHtml, VIEW_TOGGLE_CSS,
 } from './base.js';
 import { renderMarkdown, MD_CSS } from './markdown.js';
@@ -104,25 +104,14 @@ function ageLabel(item) {
   return age || '';
 }
 
-// An item's link as the page may use it: an absolute http(s) URL with a host,
-// or '' for none. A link is text that came from outside (a feed, a channel
-// post), and the headline leads wherever it says, so the page holds to the
-// rule the gateway files and serves items by (web_link in
-// scripts/news_store.py): a web link, or no link at all. Whatever else an
-// item carries as `url` is never put into an href, where a relative
-// reference would lead into the dashboard itself.
-const WEB_LINK_RE = /^https?:\/\/[^\s/?#\\]+(?:[/?#]|$)/i;
-const CONTROL_RE = /[\u0000-\u001f\u007f]/;
-
-export function webLink(url) {
-  const s = typeof url === 'string' ? url.trim() : '';
-  if (!WEB_LINK_RE.test(s) || CONTROL_RE.test(s)) return '';
-  try {
-    return new URL(s).host ? s : '';
-  } catch (_err) {
-    return '';
-  }
-}
+// An item's link is text that came from outside (a feed, a channel post), and
+// the headline leads wherever it says, so the page holds to the rule the
+// gateway files and serves items by (web_link in scripts/news_store.py): an
+// absolute http(s) URL with a host, or no link at all (webLink in base.js,
+// shared with the chat page's attachments). Whatever else an item carries as
+// `url` is never put into an href, where a relative reference would lead into
+// the dashboard itself.
+export { webLink };
 
 export function itemLi(item, opts) {
   const meta = [];
