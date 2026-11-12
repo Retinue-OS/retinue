@@ -111,9 +111,6 @@ NEEDED = {
     # git shim and python
     "GIT_SERIALIZE_LOCK_DIR": "/tmp/git-locks",
     "PYTHONPATH": "/workspace/scripts",
-    # Garmin stays until the fetch moves into a sidecar
-    "GARMIN_EMAIL": "you@example.com",
-    "GARMIN_PASSWORD": "garmin-pw",
 }
 
 # Non-secret configuration that only the daemons read: dropped too, because

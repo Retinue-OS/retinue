@@ -55,7 +55,7 @@ Report to the user:
 
 ## Why these choices matter
 
-- **cwd = `/workspace`** (not `/workspace/chambers/health`): so the sub-session shares the same `CLAUDE.md`, agents directory (`/workspace/agents/`), and auto-memory path (`/root/.claude/projects/-workspace/memory/`) as the main session. Starting in `/workspace/chambers/health` creates a parallel memory namespace — fine for isolated experiments, bad for continuity.
+- **cwd = `/workspace`** (not a chamber directory such as `/workspace/chambers/<name>`): so the sub-session shares the same `CLAUDE.md`, agents directory (`/workspace/agents/`), and auto-memory path (`/root/.claude/projects/-workspace/memory/`) as the main session. Starting inside a chamber creates a parallel memory namespace — fine for isolated experiments, bad for continuity.
 - **`claude --remote-control '${NAME}'`**: uses the flag form (not the subcommand) to start an interactive session with remote control enabled. This creates an immediately visible session in the Claude app — no URL extraction needed.
 - **`--name '${NAME}'`**: sets the display name shown in the app sidebar.
 - **`--debug-file ... --verbose`**: structured logs you can grep; without them, only the TUI is observable.

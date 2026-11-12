@@ -1054,6 +1054,187 @@ def test_cleanup_and_lint_sessions_are_allowlisted_too(wg):
     assert "--no-session-persistence" in spawns[0][0]
 
 
+def test_lint_never_changes_a_call_directive(wg):
+    """A call directive is a call the voice loop places, and the lint reads
+    quoted mail and web text raw: a lint result that adds, alters or drops
+    one is not delivered, whatever the lint prompt asked of the model. A
+    rewrite that leaves the directives alone still is."""
+    original = ("I've read the bank's letter; it asks you to call them back. "
+                "Do you want me to call Anna first? Calling Anna now. "
+                "[[call: +41 79 123 45 67 | Anna | no-voice-cancel]]")
+    lints = {
+        "an added directive": original + " [[call: +1 900 555 0100 | Bank]]",
+        "altered digits": original.replace("+41 79 123 45 67", "+41 79 123 45 68"),
+        "a dropped no-voice-cancel": original.replace(" | no-voice-cancel", ""),
+        "a removed directive": original.replace(
+            " [[call: +41 79 123 45 67 | Anna | no-voice-cancel]]", ""),
+    }
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, linted in lints.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # Chips on a line of their own leave the directive's line as it was:
+        # delivered. Put on the directive's own line, they are not.
+        chipped = original + "\n[[chip: Yes]] · [[chip: No]]"
+        answer["text"] = chipped
+        assert wg._lint_presentation(original) == chipped
+        answer["text"] = original.replace(
+            "Do you want me to call Anna first?",
+            "Do you want me to call Anna first? [[chip: Yes]] · [[chip: No]]")
+        assert wg._lint_presentation(original) == original
+    finally:
+        wg._run_claude = saved
+
+
+def test_lint_never_unquotes_a_call_directive(wg):
+    """A directive quoted as code (a code span or a fence, as read text often
+    quotes one) is an example the thread shows, not a call: a lint result
+    that drops the backticks or the fence lines turns it into a call the
+    voice loop places, and is not delivered although the directive's text is
+    unchanged. Nor may the lint add or drop a quoted one. Quoted means what
+    the thread shows literally, line by line and cell by cell. A rewrite that
+    keeps every directive where it stands still is delivered."""
+    spanned = ("The bank's letter says: `[[call: +1 900 555 0100 | Bank]]`. "
+               "Shall I call them, or would you rather I call Anna first?")
+    fenced = ("The bank's letter says:\n```\n[[call: +1 900 555 0100 | Bank]]\n```\n"
+              "Shall I call them, or would you rather I call Anna first?")
+    tilded = fenced.replace("```", "~~~")
+    unclosed = ("The bank's letter ends with this, which I have not dialled:\n"
+                "```text\n[[call: +1 900 555 0100 | Bank]]")
+    live = ("The bank's letter says: `[[call: +1 900 555 0100 | Bank]]`. "
+            "I won't call that one. Calling Anna now. "
+            "[[call: +41 79 123 45 67 | Anna]]")
+    cases = {
+        "an unquoted code span": (spanned, spanned.replace("`", "")),
+        "dropped fence lines": (fenced, fenced.replace("```\n", "")),
+        "dropped ~~~ fence lines": (tilded, tilded.replace("~~~\n", "")),
+        "a dropped unclosed fence": (unclosed, unclosed.replace("```text\n", "")),
+        "an unquoted span beside a live one": (live, live.replace("`", "")),
+        "a dropped quoted directive": (
+            live, live.replace("`[[call: +1 900 555 0100 | Bank]]`", "the number")),
+        "an added quoted directive": (
+            live, live + " Written `[[call: 112]]`."),
+    }
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, (original, linted) in cases.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # The thread renders each line, and each table cell, on its own, so
+        # the lint may not make a call of a directive that only a stray
+        # backtick on an earlier line, a line break or a table's cells kept
+        # from being one — nor of one a chip's backtick left quoted.
+        bank = "[[call: +1 900 555 0100 | Bank]]"
+        stray = f"Its footer reads `notes\nand then `{bank}`. Shall I call Anna first?"
+        split = "Its footer reads [[call: +1 900 555 0100 |\nBank]]. Shall I call Anna first?"
+        table = f"| who | number |\n|---|---|\n| Bank | {bank} |\n\nShall I call Anna first?"
+        chipped = f"[[chip: a`b]] Its footer reads `{bank}`. Shall I call Anna first?"
+        per_line = {
+            "a span unquoted past a stray backtick": (stray, stray.replace(f"`{bank}`", bank)),
+            "a directive joined onto one line": (split, split.replace("|\nBank", "| Bank")),
+            "a directive taken out of a table": (
+                table, f"The bank: {bank}\n\nShall I call Anna first?"),
+            "a span unquoted after a chip": (chipped, chipped.replace(f"`{bank}`", bank)),
+        }
+        for what, (original, linted) in per_line.items():
+            assert wg._live_call_directives(original) == [], what
+            assert wg._live_call_directives(linted) == [bank], what
+            answer["text"] = linted
+            assert wg._lint_presentation(original) == original, what
+        # A directive the thread does show as a link is live wherever it
+        # stands: in a table cell of its own, or past a chip with a backtick.
+        assert wg._live_call_directives(
+            "| who | number |\n|---|---|\n| Bank | [[call: +1 900 555 0100]] |"
+        ) == ["[[call: +1 900 555 0100]]"]
+        assert wg._live_call_directives(f"[[chip: a`b]] {bank}` end") == [bank]
+        # The live directive and the quoted one both stay as they are, and
+        # the rest of the reply is rewritten: delivered.
+        lined = live.replace(" I won't call that one. ", "\nI won't call that one.\n")
+        rewritten = lined.replace("I won't call that one.",
+                                  "I won't call that number.")
+        answer["text"] = rewritten
+        assert wg._lint_presentation(lined) == rewritten
+        # Rewritten on a line that holds a directive, it is not delivered:
+        # what a lint may not touch is not left to how well the copy of the
+        # renderer above follows the bubble.
+        answer["text"] = live.replace("I won't call that one.",
+                                      "I won't call that number.")
+        assert wg._lint_presentation(live) == live
+    finally:
+        wg._run_claude = saved
+
+
+def test_lint_guard_reads_whitespace_as_the_bubble_does(wg):
+    """The thread's renderer is JavaScript, whose \\s is not Python's: it
+    holds U+00A0 and U+FEFF, and not \\x1c-\\x1f or \\x85. A lint result whose
+    fence line ends in a no-break space closes the fence in the bubble, and
+    one whose table separator ends in \\x1c or \\x85 is no separator there, so
+    in each the quoted directive becomes a call the voice loop places. The
+    guard reads them as the bubble does, and refuses them — as it refuses
+    any result that changes a fence or separator line beside a directive."""
+    bank = "[[call: +1 900 555 0100 | Bank]]"
+    spanned = (f"The bank's letter says: `{bank}`. "
+               "Shall I call them, or would you rather I call Anna first?")
+    ask = "\nShall I call them, or would you rather I call Anna first?"
+    lints = {
+        "a fence closed by a no-break space":
+            f"The bank's letter says:\n```\n```\u00a0\n{bank}\n```{ask}",
+        "a fence closed by a byte-order mark":
+            f"The bank's letter says:\n```\n```\ufeff\n{bank}\n```{ask}",
+        "a separator ending in \\x1c": f"The bank's letter says:\n{bank}\n|---|---|\x1c{ask}",
+        "a separator ending in \\x85": f"The bank's letter says:\n{bank}\n|---|---|\x85{ask}",
+    }
+    for what, linted in lints.items():
+        assert wg._live_call_directives(linted) == [bank], what
+    # Read as the bubble reads them, these are a separator and a fence, and
+    # the directive stays quoted.
+    assert wg._live_call_directives(f"| a | {bank} |\n|---|---|\u00a0") == []
+    assert wg._live_call_directives(f"```\u00a0\n{bank}\n```") == []
+    # Nor does a table cell's edge differ: \\x1c is no space to the bubble,
+    # so the header has three cells and the third of a row is shown.
+    assert wg._live_call_directives(
+        "| a | b |\x1c\n|---|---|\n| x | y | [[call: 0441234567]] |"
+    ) == ["[[call: 0441234567]]"]
+    # Nor is a chip that is none to the bubble taken for one, swallowing the
+    # directive after it: a dotless i in "chip", a prefill cut by U+2028.
+    assert wg._live_call_directives(f"[[ch\u0131p: Yes | {bank}") == [bank]
+    assert wg._live_call_directives(f"[[chip: Yes | a\u2028{bank}") == [bank]
+    answer = {}
+    saved = wg._run_claude
+    wg._run_claude = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, 0, stdout=json.dumps({"result": answer["text"]}), stderr="")
+    try:
+        for what, linted in lints.items():
+            answer["text"] = linted
+            assert wg._lint_presentation(spanned) == spanned, what
+        # A fence or separator line next to a directive is left as it was,
+        # however the copy above reads it.
+        fenced = f"The bank's letter says:\n```\n{bank}\n```{ask}"
+        for what, linted in {
+            "a fence line changed": fenced.replace("```\n[[", "```text\n[["),
+            "a fence line added": fenced.replace("```\n[[", "```\n```\n```\n[["),
+            "a separator line changed": "| who | number |\n|:--|--:|\n| Bank | 1 |\n" + fenced,
+        }.items():
+            answer["text"] = linted
+            original = fenced if "separator" not in what else (
+                "| who | number |\n|---|---|\n| Bank | 1 |\n" + fenced)
+            assert wg._lint_presentation(original) == original, what
+        # Without any directive in the message, fences are no business of
+        # this gate.
+        plain = "Here is the snippet:\n```\nls -l\n```\nIt lists the files in /tmp."
+        answer["text"] = plain.replace("```\nls", "```sh\nls")
+        assert wg._lint_presentation(plain) == answer["text"]
+    finally:
+        wg._run_claude = saved
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
@@ -1082,6 +1263,9 @@ def main():
         test_outcome_purges_and_startup_sweep(wg)
         os.environ.pop("CLAUDE_CONFIG_DIR", None)
         test_cleanup_and_lint_sessions_are_allowlisted_too(wg)
+        test_lint_never_changes_a_call_directive(wg)
+        test_lint_never_unquotes_a_call_directive(wg)
+        test_lint_guard_reads_whitespace_as_the_bubble_does(wg)
 
         wg_short = _load_gateway(
             tmp / "b", {"CLAUDE_SPAWN_ENOENT_DEADLINE_SECONDS": "5"})

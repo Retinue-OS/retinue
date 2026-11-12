@@ -356,14 +356,44 @@ def test_media_references_resolve_through_the_chats_account():
             assert att["id"] == mid
 
         # No gateway to ask (a channel with none in the registry): a legacy
-        # record falls back to its recorded host, a host-free one passes
-        # through and plainly fails to load. Both are honest failures —
-        # there is nobody to ask. (An *ambiguous* account is not this case:
+        # record falls back to its recorded host, a host-free one has no URL
+        # at all and the page shows the file's name. Both are honest failures
+        # — there is nobody to ask. (An *ambiguous* account is not this case:
         # see test_two_inbox_accounts_still_serve_media.)
         assert wg._shape_chat_attachments([legacy])[0]["url"] == \
             f"/chats/media/signal-gateway/{mid}"
-        assert wg._shape_chat_attachments([urn])[0]["url"] == urn
+        bare = wg._shape_chat_attachments([urn])[0]
+        assert "url" not in bare and bare["id"] == mid
     print("PASS test_media_references_resolve_through_the_chats_account")
+
+
+def test_references_that_are_no_media_get_no_url():
+    """A reference that names no blob is passed on only as a web link.
+
+    The page puts an attachment's url into an href or a src, and the
+    references come from the ledger and from the notify rail as their callers
+    wrote them. An absolute http(s) URL (the rule of news_store.web_link) is
+    kept; anything else leaves the attachment without a url."""
+    with tempfile.TemporaryDirectory() as tmp:
+        wg = _load_gateway(Path(tmp))
+        kept = ["https://example.org/pic.jpg", "http://example.org/a?b=1"]
+        dropped = ["javascript:alert(1)", " JavaScript:alert(1)",
+                   "data:image/svg+xml,<svg/>", "vbscript:x", "file:///etc/hosts",
+                   "/sends/default/1", "../x", "//example.org/x", "https:example.org",
+                   "https://", "https://example.org/\nx", "urn:retinue:other:1",
+                   "mailto:a@example.org", "blob:https://example.org/1"]
+        for ref in kept:
+            att = wg._shape_chat_attachments([ref], serving_slug="signal-gateway")[0]
+            assert att["url"] == ref, (ref, att)
+        for ref in dropped:
+            att = wg._shape_chat_attachments([ref], serving_slug="signal-gateway",
+                                             meta={ref: {"name": "x.pdf"}})[0]
+            assert "url" not in att, (ref, att)
+            assert ref.strip() not in att["id"], (ref, att)
+            assert att["name"] == "x.pdf", "what the gateway stated still rides on it"
+        # What is not text at all is no reference.
+        assert wg._shape_chat_attachments([{"url": "https://x.example/"}, 42, None, ""]) == []
+    print("PASS test_references_that_are_no_media_get_no_url")
 
 
 def test_two_inbox_accounts_still_serve_media():
@@ -442,6 +472,7 @@ if __name__ == "__main__":
     test_unknown_mode_is_never_eligible()
     test_rail_attributes_by_account_not_self_slug()
     test_media_references_resolve_through_the_chats_account()
+    test_references_that_are_no_media_get_no_url()
     test_two_inbox_accounts_still_serve_media()
     test_channel_membership()
     print("all chat send-routing tests passed")

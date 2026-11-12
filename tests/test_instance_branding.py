@@ -17,6 +17,10 @@ What these pin down:
 - an invalid colour, and the stock colour itself, count as "no colour";
 - the signature moves with either variable, so the service-worker cache
   name moves too;
+- a colour gives the icons URLs of their own (…png?v=rrggbb) wherever the
+  shell names them — the manifest, the pages' icon links, the service worker
+  — because an installed app keeps the icon it fetched for a URL; the stock
+  colour and a name alone keep the plain URLs;
 - the dashboard's stored choices (Settings › Instance, RETINUE_INSTANCE_FILE)
   win over the variables while set, hand back to them when cleared, are
   validated (one short line; a real colour), written atomically and re-read
@@ -149,6 +153,40 @@ def test_signature_moves():
     c = ib.signature()
     assert len({a, b, c}) == 3
     print("ok: the signature moves with name and colour")
+
+
+def test_color_versions_the_icon_urls():
+    _env(color="#CB6CFE")
+    data = json.loads(ib.brand_manifest((WEBAPP / "manifest.webmanifest").read_bytes()))
+    srcs = [icon["src"] for icon in data["icons"]]
+    assert srcs == [f"/icons/{n}?v=cb6cfe" for n in ICONS], srcs
+    assert data["short_name"] == "Retinue", "a colour alone leaves the name alone"
+    for page in sorted(WEBAPP.glob("*.html")):
+        raw = page.read_text(encoding="utf-8")
+        out = ib.brand_html(raw.encode()).decode()
+        assert out.count("?v=cb6cfe") == raw.count("/icons/"), page.name
+        assert not ib._ICON_REF_RE.search(out), f"{page.name}: an unversioned icon is left"
+    sw = (WEBAPP / "sw.js").read_text(encoding="utf-8")
+    out = ib.brand_icon_refs(sw)
+    assert "'/icons/icon-192.png?v=cb6cfe'" in out and "'/icons/icon-512.png?v=cb6cfe'" in out
+    assert "icon: '/icons/icon-192.png?v=cb6cfe'" in out, "the notification icon too"
+    assert not ib._ICON_REF_RE.search(out)
+    # Versioning twice is versioning once; anything that is no stock icon is left alone.
+    assert ib.brand_icon_refs(out) == out
+    assert ib.icon_url("/styles.css") == "/styles.css"
+    assert ib.icon_url("https://example.org/icons/x.png") == "https://example.org/icons/x.png"
+    # Another colour, other URLs: an installed app sees new icons.
+    _env(color="#f59e0b")
+    assert ib.icon_url("/icons/icon-192.png") == "/icons/icon-192.png?v=f59e0b"
+    # The stock colour, and a name without a colour, keep the plain URLs.
+    for kw in ({"color": "#6ea8fe"}, {"name": "Admin"}):
+        _env(**kw)
+        assert ib.icon_version() == ""
+        data = json.loads(ib.brand_manifest((WEBAPP / "manifest.webmanifest").read_bytes()))
+        assert [icon["src"] for icon in data["icons"]] == [f"/icons/{n}" for n in ICONS], kw
+        assert ib.brand_icon_refs(sw) == sw, kw
+        assert "?v=" not in ib.brand_html((WEBAPP / "index.html").read_bytes()).decode(), kw
+    print("ok: a colour gives the icons URLs of their own, everywhere the shell names them")
 
 
 def test_stored_choices_win_over_the_variables():

@@ -171,6 +171,9 @@ def test_session_log_never_records_a_prompt(wg):
     msg = {"role": "user", "text": "", "attachments": [{"filename": "photo.jpg"}]}
     assert wg._conv_display_question(msg) == "[attachment: photo.jpg]"
     assert wg._conv_display_question({"role": "user", "text": "  hi "}) == "hi"
+    # A name stored before names were cleaned is read again, as at every use.
+    old = {"role": "user", "text": "", "attachments": [{"filename": "C:\\in\\a\nb.pdf"}]}
+    assert wg._conv_display_question(old) == "[attachment: ab.pdf]", wg._conv_display_question(old)
     conv = wg._new_conv("user", "reto", "t", "user", "my PIN is 4711, type it", via_edge=True)
     cid = conv["id"]
     wg._conv_add_message(cid, "assistant", "Typed.")
@@ -543,6 +546,17 @@ def test_http_edge_outcome_and_redact(wg):
                           {"message": "same origin"}, {"Sec-Fetch-Site": "Same-Origin"})
         assert status == 200 and wg._load_conv(cid)["messages"][-1].get("via_edge") is True
         assert started == [cid]
+        # A voice take that cancelled a call (the page's, or the service
+        # worker's for a page that was left: same-origin either way) keeps
+        # both marks: the user's own message, and the fixed note of the call.
+        status, _ = _http(url, "POST", f"/conversations/{cid}/messages",
+                          {"message": "wait", "cancelled_call": {"number": "+41791234567",
+                                                                 "name": "Anna"}},
+                          {"Sec-Fetch-Site": "same-origin"})
+        last = wg._load_conv(cid)["messages"][-1]
+        assert status == 200 and last.get("via_edge") is True, last
+        assert "cancelled the call to Anna (+41791234567)" in last.get("context", ""), last
+        assert started == [cid, cid]
         # And the marker itself never goes to a cross-site request, whatever
         # endpoint asks for it.
         fake = type("Req", (), {"client_address": ("127.0.0.1", 1),

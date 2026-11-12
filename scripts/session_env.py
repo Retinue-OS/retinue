@@ -83,7 +83,7 @@ SESSION_ENV_NAMES: frozenset[str] = frozenset({
     "MCP_TIMEOUT", "MCP_TOOL_TIMEOUT", "USE_BUILTIN_RIPGREP",
     "BASH_DEFAULT_TIMEOUT_MS", "BASH_MAX_TIMEOUT_MS", "BASH_MAX_OUTPUT_LENGTH",
     # Where the chambers are (scripts/memory.py, news-fetch.py, refresh.py,
-    # triage_policy.py, recurring-projects.py, sync-garmin.py).
+    # triage_policy.py, recurring-projects.py, chamber refresh commands).
     "CHAMBERS_DIR", "CHAMBERS_MANIFEST", "CHAMBERS_ROOT", "CHAMBER_DIR",
     # Capability tokens and the in-container service URLs they authorise
     # against. A token lets a session *ask* a framework service (send this
@@ -111,11 +111,9 @@ SESSION_ENV_NAMES: frozenset[str] = frozenset({
     # stay with the gateway's backend.
     "SENT_FOLDER", "EMAIL_PROCESSING_INTERVAL",
     "PROJECT_DEADLINE_LEAD_DAYS",
-    # Garmin stays for now: scripts/refresh.py --ensure runs sync-garmin.py
-    # synchronously inside the agent's own process, so the credential has to
-    # be where that process is. Moving the fetch into a sidecar is the
-    # separate epic; when it lands, these two lines go.
-    "GARMIN_EMAIL", "GARMIN_PASSWORD",
+    # No chamber's credentials here: a variable a chamber's own scripts read
+    # (a data source's login, say) is the deployment's to name in
+    # RETINUE_SESSION_ENV_EXTRA.
 })
 
 SESSION_ENV_PREFIXES: tuple[str, ...] = (

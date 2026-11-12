@@ -22,7 +22,7 @@ that way is readable by the agent, bypasses the isolation, and gives it direct
 SMTP/IMAP access — circumventing the send-control policy.
 
     EMAIL_USER        full address / login
-    EMAIL_FROM_NAME   optional display name (e.g. "Ari der Allerbeste")
+    EMAIL_FROM_NAME   optional display name (e.g. "Assistant of Your Name")
     EMAIL_PASS        app-password (never the normal account password)
     IMAP_HOST         e.g. imap.gmail.com / imap.zoho.eu
     IMAP_PORT         default 993 (implicit TLS)
@@ -709,9 +709,9 @@ def _imap_date(iso):
 def _search_sent_to(M, address, since_iso):
     """UIDs of messages sent to *address* (To, Cc or Bcc) on or after *since_iso*.
 
-    The second dedup signal, and the one that actually matters: Ari's runaway
-    replies to Mara carried no In-Reply-To at all, so a header-only test
-    declares her message unanswered and would answer it an 82nd time. A reply
+    The second dedup signal, and the one that actually matters: an agent's
+    runaway replies once carried no In-Reply-To at all, so a header-only test
+    declares the message unanswered and would answer it an 82nd time. A reply
     that does not thread is still a reply. All three recipient headers, since
     a reply-all that reaches the sender via Cc is no less an answer -- and
     `_reply_matches_anchor` checks the address exactly afterwards, so the
@@ -1160,6 +1160,26 @@ def cmd_read(cfg, args):
     print(json.dumps(out, ensure_ascii=False, indent=2))
 
 
+# Control characters (C0 and C1) have no place in a file name written here.
+_FILE_NAME_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+# Dots and whitespace at either end of a name, however they alternate.
+_FILE_NAME_EDGE_RE = re.compile(r"^[\s.]+|[\s.]+$")
+
+
+def _attachment_file_name(declared, part: int) -> str:
+    """The name fetch-attachment saves a part under when --out is not given.
+
+    ``declared`` is the attachment's file name as its sender wrote it, which
+    may name a path (``../..``, an absolute one, backslashes) or a hidden
+    file. What is kept is its base name without control characters and
+    without dots and whitespace at either end, so that it is never ``.`` or
+    ``..`` and never hidden; ``attachment-<part>`` when nothing is left."""
+    name = str(declared or "").replace("\\", "/")
+    name = _FILE_NAME_CONTROL_RE.sub("", os.path.basename(name))
+    name = _FILE_NAME_EDGE_RE.sub("", name)
+    return name or f"attachment-{part}"
+
+
 def cmd_fetch_attachment(cfg, args):
     M = imap_connect(cfg)
     imap_select(M, args.folder, readonly=True)
@@ -1176,9 +1196,20 @@ def cmd_fetch_attachment(cfg, args):
     if target is None:
         die(f"attachment part {args.part} not found on uid {args.uid}")
     payload = target.get_payload(decode=True) or b""
-    out_path = args.out or _decode(target.get_filename()) or f"attachment-{args.part}"
-    with open(out_path, "wb") as fh:
-        fh.write(payload)
+    if args.out:
+        # The operator's own choice of path, written as given.
+        out_path, mode = args.out, "wb"
+    else:
+        # The attachment's name is what the mail's sender declared, so it is
+        # only ever a base name in the working directory, and a file that is
+        # already there is never overwritten (exclusive create).
+        out_path = _attachment_file_name(_decode(target.get_filename()), args.part)
+        mode = "xb"
+    try:
+        with open(out_path, mode) as fh:
+            fh.write(payload)
+    except FileExistsError:
+        die(f"{out_path} already exists; not overwriting it (choose a path with --out)")
     M.logout()
     print(json.dumps({
         "saved": out_path,
@@ -1369,7 +1400,7 @@ def _uid_by_message_id(M, folder, message_id):
 #            the web interface — the CLI holds no approve command.
 #   trust  — sent directly only when the model passes --user-approved; otherwise
 #            it falls back to the verify flow.
-#   allow  — sent directly, no confirmation (e.g. Ari's own mailbox).
+#   allow  — sent directly, no confirmation (e.g. an agent persona's own mailbox).
 #
 # Addresses not listed fall back to the "*" wildcard entry, or — absent that — to
 # DEFAULT_SEND_CATEGORY ("verify", the fail-safe choice).
@@ -1948,7 +1979,8 @@ def main():
     sp.add_argument("--uid", required=True)
     sp.add_argument("--folder", default="INBOX")
     sp.add_argument("--part", type=int, required=True, help="attachment index from 'read' output")
-    sp.add_argument("--out", help="output path (default: original filename)")
+    sp.add_argument("--out", help="output path (default: the attachment's own base "
+                                  "name in the working directory, never overwriting a file)")
     sp.set_defaults(func=cmd_fetch_attachment)
 
     sp = sub.add_parser("move", help="move a message to another folder")

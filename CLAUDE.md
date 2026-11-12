@@ -196,9 +196,21 @@ agent. `RETINUE_MEMORY=0` disables the mechanism. **This store is the only
 memory**: Claude Code's built-in auto memory is disabled deployment-wide — do
 not create `MEMORY.md`-style files.
 
+**Look before you ask or write.** Memory holds what was stored, not the
+recent course of events. Before asking the user something about a person or
+subject, and before writing to someone — autonomous chats included — run
+
+```bash
+python3 /workspace/scripts/recent.py "<name or subject>" [--days 14]
+```
+
+(the last days of chats, dashboard threads, memory and project logs, matched
+by name and the contact's handles; e-mail: `email_client.py search --text`).
+Ask only what it leaves open, and never contradict what another thread said.
+
 ## Data refresh and scheduled tasks
 
-**Before accessing a time-sensitive data source** (e.g. Garmin), run
+**Before accessing a time-sensitive data source** (one a chamber's `.refresh.json` declares), run
 
 ```bash
 python3 /workspace/scripts/refresh.py --data-dir /workspace/chambers/<chamber> --ensure <source-id>
@@ -324,7 +336,7 @@ any item with `scripts/attention-set.py`. **Before composing any dashboard text,
 `dashboard-composing` skill** (chips for every option, no bare URLs, details
 chips, links for anything the user must do elsewhere). The gateway also runs a
 presentation lint over outbound thread messages — a net for form only, never a
-license to skip the skill. Two standing rules:
+license to skip the skill. Three standing rules:
 
 - **Archive-click ≠ "archive this".** The user's Archive button leaves the
   thread un-muted, so it returns when news arrives. When the user *tells* you
@@ -332,6 +344,11 @@ license to skip the skill. Two standing rules:
   --archive --mute`. `muted` is the only decidable signal of that intent.
 - Threads of kind `edit` (project command bar) get the change applied to the
   project file plus a one-sentence confirmation.
+- **"Switch off continuous conversation"** — the user asking, in any
+  language, to end the hands-free voice loop in this thread: run
+  `conversation-push.py --end-continuous` (the turn's own thread) and confirm
+  in one short sentence. It is an action, never a reason to ignore the
+  thread; every device leaves the mode on its next read.
 
 **Typing on the user's paired device.** The Ara Android app can act as a
 Bluetooth keyboard for a device that cannot run Retinue (a VR headset, a TV, a

@@ -10,16 +10,18 @@
 //     version, setVoiceActive(bool), openSettings(section?)}, from
 //     RetinueShell/2 the Health Connect members (healthConnectAvailable(),
 //     healthSync(), healthSyncStatus(), setHealthSyncInterval(minutes),
-//     setHealthAutoSync(bool)), and from RetinueShell/3 the endpoint members
-//     (endpoints(), selectEndpoint(id); openSettings takes a section);
+//     setHealthAutoSync(bool)), from RetinueShell/3 the endpoint members
+//     (endpoints(), selectEndpoint(id); openSettings takes a section), from
+//     RetinueShell/5 the keyboard members (keyboardStatus(),
+//     keyboardType(text, opts), keyboardKey(name, opts),
+//     keyboardSecret(opts), keyboardOpen(), keyboardCancel()), and from
+//     RetinueShell/6 placeCall(number);
 //   - the shell dispatches `retinue-shell` window events, detail.type `wake`
 //     (the wake phrase), `home` (a Home press while the shell is in front),
-//     `health-sync` (a Health Connect sync started, done, failed or skipped)
-//     or `endpoints` (the shell's endpoint list changed); from RetinueShell/5
-//     the keyboard members (keyboardStatus(), keyboardType(text, opts),
-//     keyboardKey(name, opts), keyboardSecret(opts), keyboardOpen(),
-//     keyboardCancel()) and its
-//     `keyboard` events.
+//     `health-sync` (a Health Connect sync started, done, failed or skipped),
+//     `endpoints` (the shell's endpoint list changed), `keyboard` (from
+//     RetinueShell/5: what became of a keyboard request) or `call` (what
+//     became of a placeCall).
 //
 // Every member is feature-detected: an older shell lacks the newer ones, and
 // a call that throws is treated as a shell without it.
@@ -317,6 +319,49 @@ export function onKeyboard(cb) {
   const listener = (e) => {
     const d = e && e.detail;
     if (d && d.type === 'keyboard') cb(d);
+  };
+  window.addEventListener('retinue-shell', listener);
+  return () => window.removeEventListener('retinue-shell', listener);
+}
+
+// ── Phone calls (RetinueShell/6) ────────────────────────────────────────────
+// The shell places a call without a tap only while a voice conversation is
+// engaged (setVoiceActive); outside one it refuses, so no page can dial
+// behind the user's back. The switch "Call directly by voice" is per
+// endpoint, in the app's settings under "This app with <endpoint>", then
+// "Phone calls", and off for a new endpoint: with it off, or without
+// Android's phone-call permission, the shell opens the dialer with the number
+// instead. It always does so for an emergency number (Android lets no app
+// call those directly) and for a service code (any number with * or #). The
+// shell normalises the number itself (separators, a leading tel: and the (0)
+// after a country code dropped) and refuses one that is not an optional +
+// followed by digits, * and #, with 3 to 20 digits and at most 32
+// characters. The outcome comes back as a `call` event.
+
+export function canPlaceCall() {
+  const s = typeof window !== 'undefined' ? window.RetinueShell : null;
+  return !!(s && typeof s.placeCall === 'function');
+}
+
+// Hand the shell a number to call; false when this shell cannot.
+export function placeCall(number) {
+  return shellInvoke('placeCall', String(number))[0];
+}
+
+// Subscribe to the shell's `call` events: cb(detail) with detail.state
+// `placed` (with number), `dialer` (the dialer opened with the number
+// instead; reason `emergency`, `service-code`, `disabled` or `no-permission`,
+// with number) or `refused` (reason `invalid-number`, `not-in-voice`,
+// `no-telephony`, or `failed` with number). An empty number is answered as
+// refused / invalid-number, while the bridge's placeCall() and
+// placeCall(null) get no answer at all; placeCall above always passes a
+// string, so it never waits for one that cannot come. Returns the
+// unsubscribe function.
+export function onCall(cb) {
+  if (typeof window === 'undefined') return () => {};
+  const listener = (e) => {
+    const d = e && e.detail;
+    if (d && d.type === 'call') cb(d);
   };
   window.addEventListener('retinue-shell', listener);
   return () => window.removeEventListener('retinue-shell', listener);

@@ -57,7 +57,10 @@ python3 /workspace/scripts/email_client.py read --uid <UID> --raw
 # Mark as read
 python3 /workspace/scripts/email_client.py flag --uid <UID> --read
 
-# Download an attachment
+# Download an attachment. Without --out the file is saved in the working
+# directory under the base name of the attachment's own name (a path the sender
+# wrote into it is dropped), and an existing file is never overwritten — the
+# command fails instead, so pass --out.
 python3 /workspace/scripts/email_client.py fetch-attachment --uid <UID> --part 1 --out /tmp/file.pdf
 
 # Move a message
@@ -97,7 +100,7 @@ category:
 
 | Category | Behaviour of `send` |
 |---|---|
-| `allow` | Sends directly, no confirmation (e.g. Ari's own mailbox). |
+| `allow` | Sends directly, no confirmation (e.g. an agent persona's own mailbox). |
 | `trust` | Sends directly **only** when you pass `--user-approved` (you assert the user approved this exact send). Without that flag it falls back to the `verify` flow. |
 | `verify` | **Never** sends directly. Saves the message as a pending draft and returns an `approval_url`; the user approves or denies it on the web gateway. |
 

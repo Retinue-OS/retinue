@@ -53,13 +53,13 @@ GROUP = "-100123"
 
 def test_email_exact_and_wildcard():
     addresses = {"alice@gmail.com"}
-    wildcards = {"*@factsmission.com", "*@*.epfl.ch"}
+    wildcards = {"*@owner.example", "*@*.epfl.ch"}
     # Exact match, case-insensitive.
     assert tp.email_whitelisted("Alice@Gmail.com", addresses, wildcards)
     # Freemail guarantee: another gmail address is NOT trusted by the exact entry.
     assert not tp.email_whitelisted("mallory@gmail.com", addresses, wildcards)
     # Plain domain wildcard.
-    assert tp.email_whitelisted("bob@factsmission.com", addresses, wildcards)
+    assert tp.email_whitelisted("bob@owner.example", addresses, wildcards)
     assert not tp.email_whitelisted("bob@evil.com", addresses, wildcards)
     # Subdomain wildcard covers both apex and any subdomain.
     assert tp.email_whitelisted("carol@epfl.ch", addresses, wildcards)
@@ -108,7 +108,7 @@ def test_email_policy_holds_both_classes():
         path = Path(tmp) / "email-whitelist.nt"
         pol = tp.EmailPolicy(
             addresses={"boss@work.com"},
-            wildcards={"*@factsmission.com"},
+            wildcards={"*@owner.example"},
             news={"bulletin@news.example"},
             news_wildcards={"*@substack.com"},
         )

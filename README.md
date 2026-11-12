@@ -415,7 +415,7 @@ sending account (E.164 number, `"*"` as a wildcard default):
 
 An account matching no entry and no `"*"` wildcard falls back to `verify`
 (fail-safe, same default as e-mail), so an undeclared account can never post
-autonomously. So: a dedicated agent number (say Ari's) can be `allow` while the
+autonomously. So: a dedicated agent number (an agent persona's own) can be `allow` while the
 user's own linked number stays `verify`.
 
 ```bash

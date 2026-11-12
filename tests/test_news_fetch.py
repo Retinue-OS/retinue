@@ -3,14 +3,20 @@
 
 No network: the feed documents are inline fixtures, one per syndication format
 this has to cope with (RSS 2.0, Atom, RSS 1.0/RDF), because "the source you were
-given publishes the other kind" is the normal case, not the exotic one.
+given publishes the other kind" is the normal case, not the exotic one. What an
+entry may carry as its link has checks of its own: a web link or none, and a
+link written relative to the feed read against the feed's URL (one of them
+fetches a fixture from a server on a local port, to follow a redirect).
 
     python3 tests/test_news_fetch.py
 """
+import hashlib
 import importlib.util
 import json
 import sys
 import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -104,7 +110,153 @@ def test_ids_are_stable_per_url(fetch):
     b = fetch.parse_feed(RSS2, {"id": "other-feed"})[0]
     assert a["id"] == b["id"], \
         "the same article syndicated twice must be one item, not two"
+    # And the id is that of the link as the feed published it: knowing where
+    # the feed lives must not change the link, or every item already in the
+    # store would come in a second time.
+    c = fetch.parse_feed(RSS2, {"id": "qv", "url": "https://Feed.invalid/rss.xml"})[0]
+    assert c["url"] == a["url"] == "https://example.invalid/fest"
+    assert c["id"] == a["id"] == hashlib.sha1(b"https://example.invalid/fest").hexdigest()[:16]
     print("ok: item ids derive from the URL, so re-syndication deduplicates")
+
+
+# An item's link is where its headline on the news page leads, and a feed puts
+# into a link whatever it likes. The three checks below cover the rule: a web
+# link or none, a relative link read as the feed means it, and the search
+# through an entry's candidates going on past one that is no web link.
+
+RELATIVE = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Links relative to the feed</title>
+  <item><title>Root-relative</title><link>/2026/fest</link></item>
+  <item><title>Path-relative</title><link> notes/42.html </link></item>
+  <item><title>Absolute</title><link>https://elsewhere.invalid/x</link></item>
+</channel></rss>
+"""
+
+ODD_LINKS_ATOM = """<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Odd links</title>
+  <entry>
+    <title>The next alternate link</title>
+    <link rel="alternate" href="javascript:void(0)"/>
+    <link rel="alternate" href="https://example.invalid/second"/>
+    <id>https://example.invalid/id-1</id>
+  </entry>
+  <entry>
+    <title>A link of another relation</title>
+    <link href="data:text/html,x"/>
+    <link rel="related" href="https://example.invalid/related"/>
+    <id>https://example.invalid/id-2</id>
+  </entry>
+  <entry>
+    <title>The id, when it is a web link</title>
+    <link href="mailto:editor@example.invalid"/>
+    <id>https://example.invalid/id-3</id>
+  </entry>
+  <entry>
+    <title>No web link anywhere</title>
+    <link href="javascript:alert(1)"/>
+    <link rel="enclosure" href="file:///srv/audio.mp3"/>
+    <id>urn:uuid:1225c695-cfb8-4ebb-aaaa-80da344efa6a</id>
+  </entry>
+</feed>
+"""
+
+ODD_LINKS_RSS = """<?xml version="1.0"?>
+<rss version="2.0"><channel>
+  <title>Odd links</title>
+  <item><title>The guid</title>
+    <link>javascript:alert(1)</link><guid>https://example.invalid/guid-1</guid></item>
+  <item><title>The second link element</title>
+    <link> </link><link>ftp://example.invalid/x</link><link>https://example.invalid/two</link></item>
+  <item><title>A guid is a name</title>
+    <link>intent://example.invalid/#Intent;scheme=https;end</link><guid>/not-a-link</guid></item>
+</channel></rss>
+"""
+
+
+def test_relative_links_resolve_against_the_feed(fetch):
+    feed = {"id": "rel", "url": "https://feed.invalid/blog/rss.xml"}
+    assert [i["url"] for i in fetch.parse_feed(RELATIVE, feed)] == [
+        "https://feed.invalid/2026/fest",
+        "https://feed.invalid/blog/notes/42.html",
+        "https://elsewhere.invalid/x"]
+    # Where the document was really read from (a redirect) is what counts.
+    moved = fetch.parse_feed(RELATIVE, feed, "https://moved.invalid/feeds/rss.xml")
+    assert [i["url"] for i in moved] == [
+        "https://moved.invalid/2026/fest",
+        "https://moved.invalid/feeds/notes/42.html",
+        "https://elsewhere.invalid/x"]
+    # With no address to read them against they are no links, and no items.
+    assert [i["url"] for i in fetch.parse_feed(RELATIVE, {"id": "rel"})] == [
+        "https://elsewhere.invalid/x"]
+    assert [i["url"] for i in fetch.parse_feed(
+        RELATIVE, {"id": "rel", "url": "file:///srv/rss.xml"})] == [
+        "https://elsewhere.invalid/x"]
+    print("ok: a link relative to the feed is resolved against the feed's URL")
+
+
+def test_a_fetched_feed_is_read_against_where_it_came_from(fetch):
+    """The one check that fetches, from a server on a local port: a feed that
+    has moved answers with a redirect, and its relative links then belong to
+    the place the document came from, not to the address in the manifest."""
+    class Feed(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def do_GET(self):
+            if self.path == "/rss.xml":
+                self.send_response(302)
+                self.send_header("Location", "/moved/rss.xml")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            body = RELATIVE.encode("utf-8")
+            self.send_response(200 if self.path == "/moved/rss.xml" else 404)
+            self.send_header("Content-Type", "application/rss+xml")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Feed)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    origin = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        items = fetch.fetch_feed({"id": "moved", "url": origin + "/rss.xml"})
+        direct = fetch.fetch_feed({"id": "direct", "url": origin + "/moved/rss.xml"})
+    finally:
+        server.shutdown()
+        server.server_close()
+    want = [origin + "/2026/fest", origin + "/moved/notes/42.html",
+            "https://elsewhere.invalid/x"]
+    assert [i["url"] for i in items] == want, items
+    assert [i["url"] for i in direct] == want, direct
+    print("ok: a fetched feed's relative links resolve against where it was read from")
+
+
+def test_a_link_that_is_no_web_link_is_passed_over(fetch):
+    feed = {"id": "odd", "url": "https://feed.invalid/atom.xml"}
+    atom = fetch.parse_feed(ODD_LINKS_ATOM, feed)
+    assert [(i["title"], i["url"]) for i in atom] == [
+        ("The next alternate link", "https://example.invalid/second"),
+        ("A link of another relation", "https://example.invalid/related"),
+        ("The id, when it is a web link", "https://example.invalid/id-3"),
+    ], atom
+    rss = fetch.parse_feed(ODD_LINKS_RSS, feed)
+    assert [(i["title"], i["url"]) for i in rss] == [
+        ("The guid", "https://example.invalid/guid-1"),
+        ("The second link element", "https://example.invalid/two"),
+    ], rss
+    print("ok: a candidate that is no web link is passed over; the search goes on")
+
+
+def test_every_item_carries_a_web_link(fetch):
+    feed = {"id": "all", "url": "https://feed.invalid/rss.xml"}
+    for doc in (RSS2, ATOM, RDF, RELATIVE, ODD_LINKS_ATOM, ODD_LINKS_RSS):
+        for it in fetch.parse_feed(doc, feed):
+            assert fetch.store.web_link(it["url"]) == it["url"], it
+            assert it["id"] == hashlib.sha1(it["url"].encode("utf-8")).hexdigest()[:16]
+    print("ok: what the fetcher files is a web link, and the id is the link's")
 
 
 # A feed response is untrusted input: the URL is owner-controlled chamber config,
