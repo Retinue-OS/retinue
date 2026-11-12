@@ -447,7 +447,13 @@ through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
 plus `retinue_label` still names a route; `retinue_picker: false` hides one.
-Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
+Plumbing routes (`retinue-claude`, wildcards) stay hidden. A **family pin**
+— `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`, the variable Claude Code resolves the bare
+`opus`/`sonnet`/`haiku`/`fable` aliases through — also retargets that family's
+picker entry to the pinned concrete id (label kept), so one setting moves both
+the agents and the dashboard to a new release; a thread that chose the
+family's previous id follows the pin. A pin the proxy does not route is
+ignored and logged once. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
 `RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials
