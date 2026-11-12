@@ -6210,19 +6210,33 @@ def _shape_chat_attachments(urls: list[str], serving_slug: str | None = None,
     the channel's other gateways when the named one answers 404, so a wrong
     first guess costs a request, never the picture. Only a channel with no
     gateway at all leaves it None; a legacy record then falls back to the
-    service name it recorded, and a host-free one is passed through verbatim
-    and plainly fails to load — there is nobody to ask.
+    service name it recorded, and a host-free one gets no url — there is
+    nobody to ask, and the page shows the file by its name.
+
+    A reference that is no media reference is text from outside: the
+    gateways' ledger records and the notify rail carry what their callers
+    wrote, and the page puts an attachment's url into an href or a src. It
+    is passed on only when it is an absolute http(s) URL, by the rule news
+    links are held to (``news_store.web_link``); anything else, another
+    scheme or a reference into the dashboard itself among it, gives an
+    attachment without a url, and its id is a digest rather than the text.
 
     ``meta`` is what the gateways stated about the blobs
     (:func:`_chat_media_meta_lookup`), keyed by the reference as recorded."""
     out = []
     for url in urls:
-        if not url:
+        if not url or not isinstance(url, str):
             continue
         media_id, legacy_slug = _parse_media_reference(url)
         slug = serving_slug or legacy_slug
-        public = f"/chats/media/{slug}/{media_id}" if (media_id and slug) else url
-        att: dict = {"id": media_id or public, "url": public}
+        if media_id and slug:
+            public = f"/chats/media/{slug}/{media_id}"
+        else:
+            public = news_store.web_link(url)
+        att: dict = {"id": media_id or public
+                     or hashlib.sha256(url.encode("utf-8", "replace")).hexdigest()[:32]}
+        if public:
+            att["url"] = public
         stated = (meta or {}).get(url) or {}
         if stated.get("type"):
             att["type"] = stated["type"]
@@ -11013,7 +11027,10 @@ class Handler(BaseHTTPRequestHandler):
             "message_id": (str(payload.get("message_id") or "").strip() or None),
             "ts": ts,
             "text": str(payload.get("text") or ""),
-            "attachments": [u for u in (payload.get("attachments") or []) if u],
+            # References are text; what is not cannot name a blob and would
+            # only break the listing it is read back into.
+            "attachments": [u for u in (payload.get("attachments") or [])
+                            if u and isinstance(u, str)],
         }
         if _chat_record_erased(chat_id, message_id=entry["message_id"]):
             # A late or repeated event for a message the user just erased —

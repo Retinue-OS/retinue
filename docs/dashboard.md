@@ -689,6 +689,22 @@ gave the file, so a download is named after its URL and type
 printable ASCII (`inbound_store.clean_content_type`), so it is exactly one
 header of their own `GET /media/<id>`, whatever was declared.
 
+An attachment's URL is the proxy's or a web link, never anything else. The
+references a chat's messages carry are text from outside as well: the
+gateways' ledger records and the notify rail (`POST /internal/chats/inbound`)
+keep what their callers wrote. The gateway makes a media reference
+(`urn:retinue:media:<channel>:<id>`, or the older
+`http://<service>:<port>/media/<id>`) into the proxy's URL, passes any other
+reference on only when it is an absolute `http(s)` URL with a host
+(`news_store.web_link`, the rule news links follow), and leaves the
+attachment without a URL otherwise (`_shape_chat_attachments`). The chat page
+holds to the same rule on its own: it renders a link, an image, a player or
+the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`)
+or a web link, and the file's name as plain text for anything else, so a
+reference from outside never becomes script or a link of another scheme. The
+one exception is the page's own: the bubble of a send on its way previews
+the user's staged images from object URLs the page created.
+
 ## Push notifications
 
 The unread badge only exists while the dashboard is

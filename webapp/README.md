@@ -407,11 +407,16 @@ The API, as the components consume it:
   `?before=<ISO ts>` pages older history (the page renders the newest page —
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
-  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
+  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url?,
   type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
   authenticated media proxy (`/chats/media/…`), which serves a file in place
   only as an inline-safe image, audio, video, PDF or plain text and as a
-  download otherwise (`docs/dashboard.md`, "Attachments"); type, size and name are what
+  download otherwise (`docs/dashboard.md`, "Attachments"). A reference that
+  names no blob is passed on as the `url` only when it is an absolute http(s)
+  URL, and the attachment has no `url` otherwise; the page renders a link, an
+  image, a player or the lightbox only for a proxy URL or an http(s) URL, and
+  the name as plain text for anything else, so a reference from outside never
+  becomes an `href` or a `src` of another kind. Type, size and name are what
   the storing gateway stated about the blob in its ledger record (absent on
   records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
@@ -506,7 +511,8 @@ corpus (the validation suite serves them as mocked `/chats*` responses). They
 are no longer a serving source. The corpus covers the media shapes: image
 attachments with intrinsic dimensions, a voice note (`audio/*` with the
 transcript as the message text) and a video (`video/*` with dimensions), all
-with playable `data:` URLs, and both companion states: one chat names an
+with `data:` URLs, which the page now shows by name only (a url there is the
+proxy's or an http(s) URL), and both companion states: one chat names an
 existing thread, the rest carry `companion: null`. Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
