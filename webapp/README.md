@@ -690,8 +690,12 @@ then leave the feed). There is no data file and no stored ordering: the feed
 changes because the clock moved. The service worker deliberately does **not**
 cache `/news`, only the `news.html` shell.
 
-Every headline links out to the source (`target=_blank`) — items are references,
-never copies. The three per-item buttons plus the page's free-text note are the
+A headline links out to the source (`target=_blank`) — items are references,
+never copies. An item's link is an absolute `http(s)` URL or the item has
+none: the gateway serves nothing else as `url`, and the page puts nothing else
+into an `href` (`webLink`, the rule of `news_store.web_link`; `docs/news.md`,
+"The item"). An item without a link, a channel post that carried none, shows
+its headline as text. The three per-item buttons plus the page's free-text note are the
 user's half of the learning loop:
 
 - `POST /news/feedback` — `{id?, signal, note?}` with signal

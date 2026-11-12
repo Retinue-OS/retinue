@@ -90,7 +90,9 @@ The life store (behind the dashboard's sign-in; read-only):
 News feed (dashboard news page; see scripts/news_store.py):
   GET  /news                          -> {"generated", "items": [...]} ranked at
                                          read time. ?scope=feed|read|hidden|all
-                                         (default feed), ?limit=<n>.
+                                         (default feed), ?limit=<n>. An item's
+                                         "url" is an absolute http(s) link, or
+                                         empty.
   GET  /news/preferences              -> {"markdown", "updated"} — the Herald's
                                          memory of what the user cares about.
   POST /news/preferences              -> replace it (body {markdown}); the user
@@ -5854,6 +5856,12 @@ MAX_PREFERENCES_BYTES = 64 * 1024
 
 def _news_payload(scope: str, limit: int | None) -> dict:
     items = news_store.ranked(scope=scope, limit=limit)
+    # An item's link is where its headline on the news page leads. Every
+    # producer files only a web link, and the same rule is applied on the way
+    # out, so an item that is already in the store with anything else — filed
+    # before the rule, or written by hand — leaves without a link.
+    for item in items:
+        item["url"] = news_store.web_link(item.get("url"))
     return {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "scope": scope,
@@ -10211,7 +10219,11 @@ class Handler(BaseHTTPRequestHandler):
         if not text or not source:
             self._send_json(400, {"error": "text and source are required"})
             return
-        url = (payload.get("url") or "").strip()
+        # The link is whatever the caller found in a message from outside, and
+        # this endpoint is open by default: only a web link is kept
+        # (news_store.web_link). Anything else is dropped and the item filed
+        # without a link, as a post that carries none is.
+        url = news_store.web_link(payload.get("url"))
         lang = (payload.get("lang") or None)
         channel = (payload.get("channel") or "").strip() or "messenger"
         # A broadcast message is not a titled article: derive a short title from

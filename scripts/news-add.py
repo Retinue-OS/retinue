@@ -20,7 +20,8 @@ date, then drops out of the feed in one step. Leave it off for undated items —
 they fade on the source's half-life instead.
 
 The item is a reference like every other: title, source, excerpt, link. Do not
-paste an article body in here.
+paste an article body in here. The link is a web link: a `--url` that is not an
+absolute http:// or https:// URL is refused (exit code 2) and nothing is filed.
 """
 
 from __future__ import annotations
@@ -37,7 +38,8 @@ import news_store as store  # noqa: E402
 def main() -> int:
     ap = argparse.ArgumentParser(description="Add one news item.")
     ap.add_argument("--title", required=True)
-    ap.add_argument("--url", required=True, help="where to read it — the item IS the link")
+    ap.add_argument("--url", required=True,
+                    help="where to read it — the item IS the link (http:// or https://)")
     ap.add_argument("--source", required=True, help="who broadcast it, as shown in the feed")
     ap.add_argument("--summary", default="", help="one or two sentences, not the article")
     ap.add_argument("--published", help="ISO 8601; defaults to now")
@@ -53,12 +55,19 @@ def main() -> int:
     if args.expires and expires is None:
         print(f"[news-add] --expires is not a date: {args.expires!r}", file=sys.stderr)
         return 2
+    # The item is its link, and the headline on the news page leads there: so
+    # it is a web link, or the item is not filed (news_store.web_link).
+    url = store.web_link(args.url)
+    if not url:
+        print("[news-add] --url is not a web link: it has to be an absolute "
+              f"http:// or https:// URL, got {args.url!r}", file=sys.stderr)
+        return 2
     now = store.now()
 
     item = {
         "id": hashlib.sha1(args.url.encode("utf-8")).hexdigest()[:16],
         "title": args.title.strip(),
-        "url": args.url.strip(),
+        "url": url,
         "summary": args.summary.strip(),
         "source": args.source.strip(),
         "source_id": "manual",
