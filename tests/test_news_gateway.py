@@ -203,6 +203,10 @@ def test_news_add_refuses_what_is_no_web_link(store):
     proc = run("https://t.me/quartier/1234")
     assert proc.returncode == 0, proc.stderr
     assert [i["url"] for i in store.load_items()] == ["https://t.me/quartier/1234"]
+    # The same link typed with blanks around it is the same item, not a second one.
+    proc = run("  https://t.me/quartier/1234 ")
+    assert proc.returncode == 0, proc.stderr
+    assert [i["url"] for i in store.load_items()] == ["https://t.me/quartier/1234"], store.load_items()
     print("ok: news-add.py refuses a --url that is no web link, with exit code 2")
 
 
