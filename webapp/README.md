@@ -51,6 +51,12 @@ a Progressive Web App on the phone home screen.
   refresh job regenerates them (write target = `DASHBOARD_DATA_DIR`).
 - **Offline:** `sw.js` caches the shell (cache-first) so the dashboard opens
   without connectivity. Data is network-first with cache fallback.
+- **No inline script.** Every page is served with a Content-Security-Policy
+  that runs scripts only from these files: no inline `<script>`, no handler
+  attributes (`onclick=` …) in pages or rendered markup, no `javascript:`
+  URLs, no `eval`. A page's script is a file of its own (`sw-register.js`,
+  `components/*-page.js`; `gateway/` for the pages the gateway builds). See
+  docs/dashboard.md, "The Content-Security-Policy".
 
 ## Serving
 
@@ -68,6 +74,9 @@ a Progressive Web App on the phone home screen.
                           docs/dashboard.md "Several instances")
 - `/inbox/…`            → the letterbox's WebDAV share (`scripts/webdav_share.py`),
                           not a page — see `docs/dashboard.md`
+- `/csp-report`         → POST: what browsers report of the pages'
+                          Content-Security-Policy; GET: the distinct reports
+                          kept (`scripts/content_policy.py`)
 - everything else       → `WEBAPP_DIR/<path>` (shell assets)
 
 `vendor/` is not committed: `scripts/vendor-yasgui.sh webapp/vendor/yasgui`
