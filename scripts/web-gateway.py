@@ -9456,11 +9456,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log noise
         pass
 
-    def _send_json(self, status: int, body: dict) -> None:
+    def _send_json(self, status: int, body: dict,
+                   headers: dict[str, str] | None = None) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -11194,7 +11197,9 @@ class Handler(BaseHTTPRequestHandler):
         inline-safe types, audio and video, PDF and plain text are served in
         place, anything else as a download, and nothing is left to sniffing.
         That holds for a relayed error as well: whatever a gateway answers
-        goes out under the same rule.
+        goes out under the same rule. The proxy's own refusals (an unknown or
+        control-mode gateway, none reachable) are JSON written here, and they
+        forbid sniffing too, so no answer of this route is left to it.
 
         The slug reaching here is inbox by construction — it comes from a
         ledger attachment reference (or the media resolver's first pick), and
@@ -11204,14 +11209,15 @@ class Handler(BaseHTTPRequestHandler):
         mode (an unreachable gateway) still serves, since this is a read of
         the user's own media behind the dashboard's own auth and blocking it
         would only break image rendering during a health blip."""
+        nosniff = {"X-Content-Type-Options": "nosniff"}
         _slug, gw = _channel_gateway(slug)
         if not gw:
-            self._send_json(404, {"error": "unknown gateway"})
+            self._send_json(404, {"error": "unknown gateway"}, nosniff)
             return
         if _gateway_identity(_slug, gw).get("mode") == "control":
             print(f"[web-gateway] refusing chat media from control-mode gateway "
                   f"{_slug!r}", flush=True)
-            self._send_json(404, {"error": "not found"})
+            self._send_json(404, {"error": "not found"}, nosniff)
             return
         # The named gateway first. A 404 from it is that gateway stating it does
         # not hold the blob — so its channel's other gateways are asked in turn
@@ -11243,7 +11249,8 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[web-gateway] chat media {media_id} not at {cand_slug}; "
                       f"asking {candidates[i + 1][0]}", flush=True)
         if not answered:
-            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"})
+            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"},
+                            nosniff)
             return
         self.send_response(status)
         # The type and what goes with it, from the gateway's statement and

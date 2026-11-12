@@ -2052,6 +2052,14 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
         assert asked(STATE["gw_requests"], MID_SIB) and not asked(STATE["sib_requests"], MID_SIB)
         assert media(sib_slug, MID_ATT)[0] == 404, "named control gateway refused outright"
         assert not asked(STATE["sib_requests"], MID_ATT)
+        # The proxy's own refusals forbid sniffing like a relayed answer: the
+        # control-mode gateway refused, and a gateway nobody knows.
+        status, headers, _ = _media_get(base, MID_ATT, slug=sib_slug)
+        assert status == 404, status
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
+        status, headers, _ = _media_get(base, MID_ATT, slug="no-such-gateway")
+        assert status == 404, status
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
 
         # The sibling being down is not a 404: the named gateway's answer
         # stands, and only when nobody could answer at all is it a 502.
@@ -2063,6 +2071,10 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
         wg._CHANNEL_GATEWAYS["127.0.0.1"] = dict(wg._CHANNEL_GATEWAYS["127.0.0.1"],
                                                 base_url="http://127.0.0.1:1")
         assert media("127.0.0.1", MID_ATT)[0] == 502
+        # The proxy's own answer when nobody could be asked forbids sniffing too.
+        status, headers, _ = _media_get(base, MID_ATT)
+        assert status == 502, status
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
     finally:
         wg._CHANNEL_GATEWAYS["127.0.0.1"] = dict(wg._CHANNEL_GATEWAYS["127.0.0.1"],
                                                 base_url=f"http://127.0.0.1:{STATE['gw_port']}")
