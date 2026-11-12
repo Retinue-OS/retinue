@@ -453,7 +453,8 @@ Plumbing routes (`retinue-claude`, wildcards) stay hidden. A **family pin**
 picker entry to the pinned concrete id (label kept), so one setting moves both
 the agents and the dashboard to a new release; a thread that chose the
 family's previous id follows the pin. A pin the proxy does not route is
-ignored and logged once. The list
+ignored and logged once, and a family with a `retinue_picker: false` route
+stays out of the picker despite its pin. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
 `RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials

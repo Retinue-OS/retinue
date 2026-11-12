@@ -785,6 +785,22 @@ def _proxy_serves(parsed: object, mid: str) -> bool:
     return False
 
 
+def _hidden_families(parsed: object) -> set[str]:
+    """Families with a route the operator hid with `retinue_picker: false`."""
+    if not isinstance(parsed, dict):
+        return set()
+    hidden = set()
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("model_info")
+        if isinstance(info, dict) and info.get(_LITELLM_PICKER_FLAG) is False:
+            fam = _model_family(_litellm_model_id(item))
+            if fam:
+                hidden.add(fam)
+    return hidden
+
+
 def _apply_family_pins(models: list[dict], parsed: object) -> list[dict]:
     """Retarget each pinned family's picker entry to its pin.
 
@@ -792,14 +808,19 @@ def _apply_family_pins(models: list[dict], parsed: object) -> list[dict]:
     further entries of that family collapse into it (they would otherwise all
     name the same model). A pinned family with no entry gets one, labelled by
     the family name. A pin the proxy does not serve changes nothing — the
-    picker must never offer a model that isn't routed — and is logged once."""
+    picker must never offer a model that isn't routed — and is logged once.
+    A family the operator hid with an explicit `retinue_picker: false` route
+    stays out of the picker: the pin moves what the family means, it does not
+    override a deliberate hide."""
     pins = _family_pins()
     if not pins:
         return models
+    hidden = _hidden_families(parsed)
     served = {}
     for fam, pin in pins.items():
-        served[fam] = _proxy_serves(parsed, pin)
-        if not served[fam] and pin not in _warned_unserved_pins:
+        routed = _proxy_serves(parsed, pin)
+        served[fam] = routed and fam not in hidden
+        if not routed and pin not in _warned_unserved_pins:
             _warned_unserved_pins.add(pin)
             print(f"[web-gateway] ANTHROPIC_DEFAULT_{fam.upper()}_MODEL={pin!r} "
                   "is not served by LiteLLM; the picker keeps its configured "

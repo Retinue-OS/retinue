@@ -373,6 +373,54 @@ def test_family_pin_retargets_picker_entry(wg):
     assert wg._apply_family_pins(listed, info) == listed
 
 
+def test_family_pin_respects_explicit_picker_hide(wg):
+    # retinue_picker: false is the operator's deliberate hide; a family pin must
+    # neither synthesize an entry for that family nor retarget one.
+    info = _model_info_response(
+        _route("claude-*"), _route("claude-haiku-4", picker=False))
+    listed = [{"id": "claude-opus-5-5", "label": "Opus"}]
+    os.environ["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = "claude-haiku-5-5"
+    try:
+        assert wg._apply_family_pins(listed, info) == listed
+        # Other families are unaffected by the hidden one.
+        os.environ["ANTHROPIC_DEFAULT_OPUS_MODEL"] = "claude-opus-5-6"
+        assert wg._apply_family_pins(listed, info) == [
+            {"id": "claude-opus-5-6", "label": "Opus"}]
+        # Without the hide the same pin does add the family.
+        visible = _model_info_response(_route("claude-*"))
+        assert {"id": "claude-haiku-5-5", "label": "Haiku"} in wg._apply_family_pins(
+            listed, visible)
+    finally:
+        os.environ.pop("ANTHROPIC_DEFAULT_HAIKU_MODEL", None)
+        os.environ.pop("ANTHROPIC_DEFAULT_OPUS_MODEL", None)
+
+
+def test_fetch_litellm_models_applies_pins_before_ollama_merge(wg):
+    # End to end through the real _fetch_litellm_models: the pin retargets the
+    # Fable entry from /model/info, and the host's Ollama tags still replace
+    # LiteLLM's ollama catalog afterwards.
+    bodies = {
+        "/model/info": _model_info_response(
+            _route("claude-*"),
+            _route("claude-fable-5-1", picker=True, label="Fable"),
+            _route("ollama/stale", picker=True, label="stale")),
+        "/v1/models": {"data": [{"id": "claude-fable-5-1"}]},
+    }
+    saved = (wg._fetch_litellm_json, wg._fetch_ollama_models)
+    wg._fetch_litellm_json = lambda path: bodies[path]
+    wg._fetch_ollama_models = lambda: [{"id": "ollama/qwen3.6", "label": "qwen3.6"}]
+    os.environ["ANTHROPIC_DEFAULT_FABLE_MODEL"] = "claude-fable-5-2"
+    try:
+        assert wg._fetch_litellm_models() == [
+            {"id": "claude-fable-5-2", "label": "Fable"},
+            {"id": "ollama/qwen3.6", "label": "qwen3.6"},
+        ]
+    finally:
+        wg._fetch_litellm_json, wg._fetch_ollama_models = saved
+        os.environ.pop("ANTHROPIC_DEFAULT_FABLE_MODEL", None)
+        wg._record_route_upstreams(_model_info_response())
+
+
 def test_stale_family_choice_follows_the_pin(wg):
     # A thread pinned to Fable 5.1 keeps running Fable once the pin moves to
     # 5.2, instead of dropping to the default; other stale ids still drop.
@@ -537,12 +585,14 @@ def main() -> None:
         test_last_good_survives_refresh_failure(wg)
         test_litellm_headers(wg)
         test_family_pin_retargets_picker_entry(wg)
+        test_family_pin_respects_explicit_picker_hide(wg)
         test_stale_family_choice_follows_the_pin(wg)
 
         wg = _load_gateway(tmp / "b", {
             "RETINUE_LITELLM_URL": "http://litellm:4000",
             "RETINUE_MODELS_CACHE_SECONDS": "3600",
         })
+        test_fetch_litellm_models_applies_pins_before_ollama_merge(wg)
         test_cache_ttl_and_forced_refresh(wg)
         test_fetch_does_not_block_cache_readers(wg)
 
