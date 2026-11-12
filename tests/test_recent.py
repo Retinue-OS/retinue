@@ -29,6 +29,49 @@ def _load(name):
     return mod
 
 
+def _entry(eid, content, recorded, *extra):
+    """The triples memory.py store writes for one entry (content as given)."""
+    subj = f"<urn:retinue:memory:{eid}>"
+    kb = "https://w3id.org/retinue/kb#"
+    lines = [f'{subj} <{kb}content> "{content}" .',
+             f'{subj} <{kb}recordedAt> "{recorded:%Y-%m-%dT%H:%M:%SZ}"'
+             f'^^<http://www.w3.org/2001/XMLSchema#dateTime> .']
+    lines += [f"{subj} <{kb}{p}> {o} ." for p, o in extra]
+    return "\n".join(lines) + "\n"
+
+
+def _memory_cases(mem: Path, now: dt.datetime) -> None:
+    """Memory files that are not named after one timestamp, and entries that
+    no longer stand."""
+    day = dt.timedelta(days=1)
+    stamp = lambda t: t.strftime("%Y%m%dT%H%M%SZ")
+    # A session-labelled file holds entries of several days.
+    (mem / "sess-1.nt").write_text(
+        _entry(f"{stamp(now - 30 * day)}-sess01", "Anna old session entry.", now - 30 * day)
+        + _entry(f"{stamp(now)}-sess02", "Anna new session entry.", now), encoding="utf-8")
+    # A compaction file's standing summary is a live entry too.
+    (mem / f"compaction-{stamp(now)}-c0ffee.nt").write_text(
+        _entry(f"{stamp(now)}-sum001", "Anna summary of older notes.", now), encoding="utf-8")
+    # Backslash-u together with non-ASCII text, and an escaped backslash.
+    (mem / "sess-2.nt").write_text(
+        _entry(f"{stamp(now)}-esc001", "Bob: café C:\\\\users\\\\Brändle\\tx", now), encoding="utf-8")
+    # Corrected, superseded and expired entries are not current.
+    a, b, c, d = (f"{stamp(now - day)}-{x}" for x in ("corr01", "sup001", "exp001", "new001"))
+    (mem / f"{a}.nt").write_text(
+        _entry(a, "Carla lives in Basel.", now - day,
+               ("correctedBy", f"<urn:retinue:memory:{stamp(now)}-corr02>")), encoding="utf-8")
+    (mem / f"{stamp(now)}-corr02.nt").write_text(
+        _entry(f"{stamp(now)}-corr02", "Carla lives in Bern.", now), encoding="utf-8")
+    (mem / f"{b}.nt").write_text(
+        _entry(b, "Carla works at Acme.", now - day,
+               ("supersededBy", f"<urn:retinue:memory:{d}>")), encoding="utf-8")
+    (mem / f"{d}.nt").write_text(_entry(d, "Carla works at Globex.", now), encoding="utf-8")
+    soon = (now - day).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (mem / f"{c}.nt").write_text(
+        _entry(c, "Carla visits on Friday.", now - 2 * day,
+               ("expires", f'"{soon}"^^<http://www.w3.org/2001/XMLSchema#dateTime>')), encoding="utf-8")
+
+
 def _fixture(root: Path) -> tuple[Path, Path]:
     now = dt.datetime.now(dt.timezone.utc)
     chambers, convs = root / "chambers", root / "conversations"
@@ -54,8 +97,12 @@ def _fixture(root: Path) -> tuple[Path, Path]:
     proj = chambers / "notes" / "projects"
     proj.mkdir(parents=True)
     (proj / "driving.md").write_text("- 2026-11-12 — new date with Roger Peng\n", encoding="utf-8")
+    _memory_cases(mem, now)
     contacts = chambers / "notes" / "contacts"
     contacts.mkdir(parents=True)
+    # A real contact, so the lookup of its handles through contacts.py is tested too.
+    _load("contacts").ContactBook(str(chambers), None).create(
+        "notes", "Roger Peng", [("whatsapp", "111222@lid")])
     convs.mkdir()
     (convs / "t1.json").write_text(json.dumps({
         "id": "t1", "title": "Companion: Fahrschule",
@@ -80,9 +127,7 @@ def main():
         os.environ["CHAMBERS_MANIFEST"] = str(Path(tmp) / "absent.json")
         os.environ.pop("TRIAGE_MESSENGER_DIR", None)
         recent = _load("recent")
-        # Contact handles are resolved via contacts.py; stub them for the fixture.
-        recent.contact_handles = lambda term, _d: (["Roger (Fahrschule)"], {"111222"}) \
-            if "roger" in term.lower() else ([], set())
+        assert recent.contact_handles("Roger", chambers) == (["Roger Peng"], {"111222"})
 
         out = _run(recent, "Roger")
         assert "Termin am 24.11." in out, out           # matched by handle, not text
@@ -96,6 +141,20 @@ def main():
         out = _run(recent, "eignungsabklarung", "--source", "chats")  # accent-insensitive
         assert "Eignungsabklärung ist verschoben" in out, out
         assert "## threads" not in out, out
+
+        out = _run(recent, "Anna", "--source", "memory")  # session-labelled and compaction files
+        assert "Anna new session entry" in out, out
+        assert "Anna summary of older notes" in out, out
+        assert "old session entry" not in out, out      # per-entry time, not the file's
+        assert "-sess02:" in out and "sess-1" not in out, out  # labelled with the entry id
+
+        out = _run(recent, "Carla", "--source", "memory")
+        assert "Carla lives in Bern" in out and "Carla works at Globex" in out, out
+        assert "Basel" not in out and "Acme" not in out, out   # corrected, superseded
+        assert "Friday" not in out, out                         # expired
+
+        out = _run(recent, "brandle", "--source", "memory")     # unescaped, not mojibake
+        assert "café C:\\users\\Brändle x" in out, out
 
         assert recent.fold("BRÄNDLE") == "brandle"
     print("ok")

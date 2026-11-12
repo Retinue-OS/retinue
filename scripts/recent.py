@@ -19,8 +19,9 @@ compact, prompt-ready lines, newest first per source.
 Sources: chats (gateway message stores), threads (dashboard conversations,
 including autonomous ones), memory (entries recorded in the window, read from
 the files so a fresh store is not needed), projects (project files changed in
-the window — the matching lines). E-mail is not covered: use
-email_client.py search --text for that.
+the window — the matching lines). Memory entries that were corrected,
+superseded, compacted away or have expired are left out. E-mail is not
+covered: use email_client.py search --text for that.
 """
 from __future__ import annotations
 
@@ -151,27 +152,60 @@ def scan_threads(root: Path, since: dt.datetime, needles: list[str], names: list
 
 
 _MEM_ID = re.compile(r"^(\d{8}T\d{6}Z)-")
-_CONTENT = re.compile(r'<https://w3id\.org/retinue/kb#content> "((?:[^"\\]|\\.)*)"')
 
 
 def scan_memory(root: Path, since: dt.datetime, needles: list[str], names: list[str]):
+    """Entries recorded in the window that mention a key and still stand.
+
+    Entries are read per subject from every file, not from the file name: a
+    session-labelled file (`sess-1.nt`) or a compaction file holds entries of
+    several days, and its name says nothing about when they were recorded.
+    An entry that was corrected, superseded, compacted into a standing
+    summary or has expired is left out, the liveness rule memory.py applies
+    to recall: reporting it as current would send a session into the very
+    mistake the correction fixed."""
     keys = needles + [fold(n) for n in names]
-    for path in root.glob("*.nt") if root.is_dir() else []:
-        m = _MEM_ID.match(path.name)
-        if not m:
-            continue
-        when = dt.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
-        if when < since:
-            continue
+    if not root.is_dir():
+        return
+    mem = _load("memory")
+    now = dt.datetime.now(dt.timezone.utc)
+    floor = since.timestamp()
+    entries: dict[str, dict] = {}
+    links: dict[str, dict[str, list[str]]] = {}
+    for path in sorted(root.glob("*.nt")):
+        # An entry recorded in the window sits in a file written in the
+        # window, and so does any link that retracts it afterwards.
         try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
+            if path.stat().st_mtime < floor:
+                continue
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
             continue
-        for content in _CONTENT.findall(raw):
-            text = content.encode().decode("unicode_escape", errors="replace") \
-                if "\\u" in content else content.replace('\\"', '"').replace("\\n", " ")
-            if any(k in fold(text) for k in keys):
-                yield when, f"memory {path.stem}: {excerpt(text, keys)}"
+        for line in lines:
+            ml = mem._LINK_LINE_RE.match(line)
+            if ml:
+                links.setdefault(ml.group(1), {}).setdefault(ml.group(2), []).append(ml.group(3))
+                continue
+            mt = mem._LITERAL_LINE_RE.match(line)
+            if mt:
+                entry_id, pred, raw = mt.groups()
+                entries.setdefault(entry_id, {})[pred] = mem._unescape_nt(raw)
+    for entry_id, rec in entries.items():
+        if "content" not in rec:
+            continue
+        when = mem._parse_datetime(rec["recordedAt"]) if "recordedAt" in rec else None
+        if when is None:
+            m = _MEM_ID.match(entry_id)
+            if not m:
+                continue
+            when = dt.datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+        expires = mem._parse_datetime(rec["expires"]) if "expires" in rec else None
+        if when < since or (expires is not None and expires < now) \
+                or mem._locally_dead(entry_id, links):
+            continue
+        text = " ".join(rec["content"].split())
+        if any(k in fold(text) for k in keys):
+            yield when, f"memory {entry_id}: {excerpt(text, keys)}"
 
 
 def scan_projects(root: Path, since: dt.datetime, needles: list[str], names: list[str]):
