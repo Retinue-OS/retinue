@@ -249,7 +249,7 @@ def test_projects_query_reads_source_graph_only(wg):
     triple -- its converted frontmatter file. The gateway's own attention emit
     (_generated/attention/items.nt) states currentActor for the same project
     IRI; read back unscoped, it handed a project a second actor, and the
-    humanized label it carries ("Reto") fed itself back as the actor on every
+    humanized label it carries (the owner's name) fed itself back as the actor on every
     emit. Checked structurally, as the CI has no SPARQL engine: the type
     triple and every OPTIONAL sit inside one GRAPH block."""
     q = wg._PROJECTS_SPARQL

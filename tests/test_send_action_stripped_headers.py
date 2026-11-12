@@ -135,7 +135,7 @@ def test_approved_email_lands_on_its_outcome_page(wg):
     approval returned instead of a 404, and leaves a still-pending request
     as the next one."""
     fake = _FakeSendHandler()
-    result = {"approved": "45", "sent": True, "from": "Ari <ari@example.org>",
+    result = {"approved": "45", "sent": True, "from": "Agent <agent@example.org>",
               "to": ["a@example.com"], "subject": "Lunch", "stripped_headers": []}
     with patch.object(wg.ec, "approve_pending_send", return_value=result):
         wg.Handler._handle_send_action(fake, "default", "45", "approve")

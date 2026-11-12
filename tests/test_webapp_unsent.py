@@ -23,6 +23,12 @@ pages of one device — one localStorage, one IndexedDB, one service worker
   second tab on the same place takes nothing that is not its own;
 - a worker that does not take a job up (an older version) leaves it to the
   page's own fetch, and the job never comes back twice;
+- a dictation the user sent (➤, or a loop take ended on a pause) whose page
+  is gone is posted into its thread by the worker, once: the page that
+  shows the thread afterwards reads it there; a send that failed or may have
+  gone is never repeated and waits in the box with a note; a worker that
+  takes nothing up leaves transcribing and sending to the page, which does
+  not send what the thread holds already;
 - a send still on the wire when the page goes is a keepalive request, kept
   in the draft and settled on the next page: dropped once the thread holds
   it, left in the box with a note when it does not — a first message, which
@@ -238,8 +244,12 @@ globalThis.requestAnimationFrame = () => 0;
 globalThis.cancelAnimationFrame = () => {};
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
+// Turns of the loop, and no less than a few seconds of the clock: on a runner
+// whose zero-delay timers come round faster than the fetches and messages a
+// page waits for, 400 turns alone can be over before the page has caught up.
 async function until(cond, what) {
-  for (let i = 0; i < 400 && !cond(); i++) await tick();
+  const end = Date.now() + 5000;
+  for (let i = 0; !cond() && (i < 400 || Date.now() < end); i++) await tick();
   assert.ok(cond(), what);
 }
 // The same against the clock, for what waits on a timer of its own.
@@ -306,10 +316,17 @@ const sandbox = {
   },
   caches: { open: async () => ({ addAll: async () => {}, match: async () => null, put: async () => {} }),
             keys: async () => [], match: async () => null, delete: async () => true },
-  indexedDB, Blob, AbortController, URL, console, setTimeout, clearTimeout,
+  // The worker's 30 s deadline on a send into a thread is made short; every
+  // other timer is as it is.
+  indexedDB, Blob, AbortController, URL, console, clearTimeout,
+  setTimeout: (fn, ms, ...rest) => setTimeout(fn, ms === 30000 ? 30 : ms, ...rest),
   location: { origin: 'http://dash' },
   fetch: (url, opts = {}) => new Promise((resolve, reject) => {
-    swFetches.push({ url, opts, answer: (text) => resolve({ ok: true, status: 200, json: async () => ({ text }) }), fail: () => reject(new Error('502')) });
+    // `answer` is a transcript; `respond` the status of a message the worker
+    // posts into a thread. A request with a signal is aborted with it.
+    swFetches.push({ url, opts, answer: (text) => resolve({ ok: true, status: 200, json: async () => ({ text }) }),
+      respond: (status) => resolve({ ok: status < 300, status, json: async () => ({}) }), fail: () => reject(new Error('502')) });
+    if (opts.signal) opts.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
   }),
 };
 vm.createContext(sandbox);
@@ -673,6 +690,168 @@ await ok("a project's command bar and its unsaved edit come back; the edit keeps
   location.search = '';
 });
 
+// ── A dictation the user sent (➤, or a loop take ended on a pause) ───────────
+// transcribe(key, blob, url, {send}) resolves to {text, sent, unsent, send};
+// a page gone before the transcript is in has it posted by the worker, into
+// the thread it was recorded in, exactly once.
+const sendTo = (id) => `/conversations/${id}/messages`;
+const speech = () => new Blob(['x'], { type: 'audio/webm' });
+const swSendsTo = (id) => swFetches.filter((f) => f.url === sendTo(id));
+const putJob = (id, key, extra) => {
+  idbs.get('retinue-dictation').stores.get('jobs').data.set(id, {
+    id, key, url: '/conversations/transcribe', blob: null, owner: '', origin: 'client-gone', send: '', state: 'done',
+    text: '', error: '', at: Date.now(), ...extra });
+};
+// A page records and sends a dictation, transcript in, and is gone while the
+// worker has the message on the wire. Resolves to that request.
+async function leftSent(name, id, words) {
+  page(name);
+  const d = await import(`./${name}/dictation.js`);
+  const n = swFetches.length;
+  d.transcribe(`conv:${id}`, speech(), `/conversations/transcribe?thread=${id}`, { send: sendTo(id) }).catch(() => {});
+  await until(() => swFetches.length === n + 1, 'transcribing');
+  leave(pages[name]);
+  await until(() => jobs().find((j) => j.key === `conv:${id}`)?.owner === '', 'released by the leaving page');
+  swFetches[n].answer(words);
+  await until(() => swSendsTo(id).length === 1, 'the worker posts the message');
+  return swSendsTo(id)[0];
+}
+page('adopter');
+const adopterDictation = await import('./adopter/dictation.js');
+page('live');
+const liveDictation = await import('./live/dictation.js');
+const R1 = '5'.repeat(32), R2 = '6'.repeat(32), R3 = '7'.repeat(32);
+const takeOutcome = (id) => {
+  const got = [];
+  page('adopter');
+  adopterDictation.adopt(`conv:${id}`, (job) => job.then((v) => got.push(v)), { outcome: true });
+  return got;
+};
+
+await ok('a sent dictation whose page went is posted by the worker, and the page that took it over hears it went', async () => {
+  const req = await leftSent('rec1', R1, 'Gesendet.');
+  assert.deepEqual(JSON.parse(req.opts.body), { message: 'Gesendet.' });
+  assert.equal(req.opts.method, 'POST');
+  const got = takeOutcome(R1);
+  await until(() => jobs().find((j) => j.key === `conv:${R1}`)?.owner === 'client-adopter', 'taken over while on the wire');
+  req.respond(200);
+  await until(() => got.length === 1, 'the outcome arrived');
+  assert.deepEqual({ ...got[0], at: 0 }, { text: 'Gesendet.', sent: true, unsent: '', send: true, at: 0 });
+  await until(() => !jobs().some((j) => j.key === `conv:${R1}`), 'nothing is left to hand out');
+});
+
+await ok('a send the thread refused comes back unsent, with its text, and is not posted again', async () => {
+  const req = await leftSent('rec2', R2, 'Abgelehnt.');
+  req.respond(500);
+  await until(() => jobs().find((j) => j.key === `conv:${R2}`)?.state === 'done', 'settled');
+  const got = takeOutcome(R2);
+  await until(() => got.length === 1, 'the outcome arrived');
+  assert.equal(got[0].unsent, 'failed'); assert.equal(got[0].sent, false); assert.equal(got[0].text, 'Abgelehnt.');
+  assert.equal(swSendsTo(R2).length, 1, 'never retried');
+});
+
+await ok('a send with no answer in time comes back as maybe sent, and is not posted again', async () => {
+  const req = await leftSent('rec3', R3, 'Keine Antwort.');
+  assert.ok(req.opts.signal, 'the request carries a deadline');
+  await until(() => jobs().find((j) => j.key === `conv:${R3}`)?.state === 'done', 'the deadline passed');
+  const got = takeOutcome(R3);
+  await until(() => got.length === 1, 'the outcome arrived');
+  assert.equal(got[0].unsent, 'maybe'); assert.equal(got[0].sent, false); assert.equal(got[0].text, 'Keine Antwort.');
+  assert.equal(swSendsTo(R3).length, 1, 'never retried');
+});
+
+await ok('a sent dictation whose page is still there is left to that page to send', async () => {
+  page('live');
+  const n = swFetches.length;
+  const p = liveDictation.transcribe('conv:alive', speech(), '/conversations/transcribe', { send: sendTo('alive') });
+  await until(() => swFetches.length === n + 1, 'running');
+  swFetches[n].answer('Selbst gesendet.');
+  const got = await p;
+  assert.deepEqual({ ...got, at: 0 }, { text: 'Selbst gesendet.', sent: false, unsent: '', send: true, at: 0 });
+  await until(() => !jobs().some((j) => j.key === 'conv:alive'), 'taken');
+  assert.equal(swFetches.length, n + 1, 'the worker posted nothing');
+});
+
+await ok("a worker that does not take a sent dictation up leaves transcribing and sending to the page, no second post", async () => {
+  page('live');
+  swIgnoresDictation = true;
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, ms, ...rest) => realSetTimeout(fn, ms === 4000 ? 5 : ms, ...rest);
+  try {
+    const n = pageTranscribes.length, f = swFetches.length, q = posts.length;
+    const got = await liveDictation.transcribe('conv:own', speech(), '/conversations/transcribe', { send: sendTo('own') });
+    assert.deepEqual({ ...got, at: 0 }, { text: 'Vom Seitenabruf.', sent: false, unsent: '', send: true, at: 0 });
+    assert.equal(pageTranscribes.length, n + 1, "the page's own fetch answered");
+    assert.equal(swFetches.length, f, 'the worker never heard of it');
+    assert.equal(posts.length, q, 'and nothing was posted by anyone yet: the page sends');
+    // A review dictation keeps its plain shape: the text.
+    assert.equal(await liveDictation.transcribe('conv:own', speech(), '/conversations/transcribe'), 'Vom Seitenabruf.');
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    swIgnoresDictation = false;
+  }
+});
+
+// The page that shows the thread afterwards (conversation.js, adoptDictations).
+const mountOn = async (name, id) => {
+  page(name);
+  await import(`./${name}/conversation.js`);
+  return mount(page(name), id);
+};
+const S4 = '8'.repeat(32), S5 = '9'.repeat(32), S6 = 'a1'.repeat(16), S7 = 'a2'.repeat(16), S8 = 'a3'.repeat(16);
+for (const id of [S4, S5, S6, S7, S8]) threads[id] = { id, title: 'T', pending: false, model: '', messages: [{ role: 'user', text: 'Earlier', ts: '2026-10-16T15:40:00Z' }] };
+const messagesTo = (id) => posts.filter((q) => q.url === sendTo(id));
+
+await ok('a thread open while the worker posts a sent dictation shows it, with nothing in the box', async () => {
+  const req = await leftSent('rec4', S4, 'Im Verlauf.');
+  const el = await mountOn('c1', S4);
+  await until(() => jobs().find((j) => j.key === `conv:${S4}`)?.owner === 'client-c1', 'the thread took the job');
+  threads[S4].messages.push({ role: 'user', text: 'Im Verlauf.', ts: new Date().toISOString() });
+  req.respond(200);
+  await until(() => el.thread.messages.some((m) => m.text === 'Im Verlauf.'), 'the thread was read again');
+  await until(() => !jobs().some((j) => j.key === `conv:${S4}`), 'taken');
+  assert.equal(draftText(el), '', 'nothing waits in the box');
+  assert.equal(stored(`conv:${S4}`), null);
+  assert.equal(messagesTo(S4).length, 0, 'and the page posted nothing itself');
+  el.disconnectedCallback();
+});
+
+await ok('a dictation the worker could not send is in the box with a note; one that may have gone, with a hedged one', async () => {
+  putJob('j-failed', `conv:${S5}`, { send: sendTo(S5), text: 'Nicht raus.', unsent: 'failed' });
+  const f = await mountOn('c2', S5);
+  await until(() => draftText(f) === 'Nicht raus.', 'its text is in the box');
+  assert.ok(f.shadowRoot.innerHTML.includes('send it again'), 'the note asks to send it again');
+  putJob('j-maybe', `conv:${S6}`, { send: sendTo(S6), text: 'Vielleicht raus.', unsent: 'maybe' });
+  const m = await mountOn('c3', S6);
+  await until(() => draftText(m) === 'Vielleicht raus.', 'its text is in the box');
+  assert.ok(m.shadowRoot.innerHTML.includes('no need to send it again'), 'the note says it may be there');
+  assert.equal(messagesTo(S5).length + messagesTo(S6).length, 0, 'neither is posted by the page');
+  f.disconnectedCallback(); m.disconnectedCallback();
+});
+
+await ok('a sent dictation its page left before it could send it is sent by the page that takes it over, once', async () => {
+  land = true; resolveSends = true;
+  putJob('j-adopt', `conv:${S7}`, { send: sendTo(S7), text: 'Noch zu senden.' });
+  const el = await mountOn('c4', S7);
+  await until(() => messagesTo(S7).length === 1, 'sent by this page');
+  assert.equal(messagesTo(S7)[0].body.message, 'Noch zu senden.');
+  await until(() => !jobs().some((j) => j.key === `conv:${S7}`), 'taken');
+  assert.equal(draftText(el), '', 'not left in the box as well');
+  land = false; resolveSends = false;
+  el.disconnectedCallback();
+});
+
+await ok('...unless the thread holds it already: a message is never sent twice', async () => {
+  putJob('j-dup', `conv:${S8}`, { send: sendTo(S8), text: 'Schon da.', at: Date.now() - 1000 });
+  threads[S8].messages.push({ role: 'user', text: 'Schon da.', ts: new Date().toISOString() });
+  const el = await mountOn('c5', S8);
+  await until(() => !jobs().some((j) => j.key === `conv:${S8}`), 'taken');
+  await tick(); await tick();
+  assert.equal(messagesTo(S8).length, 0, 'not posted again');
+  assert.equal(draftText(el), '', 'nor kept in the box');
+  el.disconnectedCallback();
+});
+
 console.log(`${passed} checks passed`);
 process.exit(0);
 """
@@ -686,7 +865,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         # One copy of the components per page: separate module instances, as
         # two page loads have, over the one device the harness provides.
-        for page in ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven"):
+        for page in ("one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven",
+                     "adopter", "live", "rec1", "rec2", "rec3", "rec4", "c1", "c2", "c3", "c4", "c5"):
             dst = os.path.join(tmp, page)
             os.makedirs(dst)
             for name in os.listdir(COMPONENTS):

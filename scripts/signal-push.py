@@ -10,7 +10,7 @@ pipeline, so the text body is delivered together with a spoken rendering of it
 
 Examples:
     # Simple text + voice alert to the default recipient
-    signal-push.py "Ari: failed to send reply to Mara — check scheduler.log"
+    signal-push.py "Agent: failed to send reply to Mara — check scheduler.log"
 
     # Daily briefing with a chart, to a specific number, German voice
     signal-push.py --lang de --image /tmp/glucose.png \\

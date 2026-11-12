@@ -14,7 +14,7 @@ Use the client script:
 
 ```bash
 # Text + spoken audio to the default recipient (the owner)
-python3 /workspace/scripts/signal-push.py "Ari: failed to send reply to Mara — check scheduler.log"
+python3 /workspace/scripts/signal-push.py "Agent: failed to send reply to Mara — check scheduler.log"
 
 # A briefing with a chart, German voice, to a specific number
 python3 /workspace/scripts/signal-push.py --lang de --image /tmp/glucose.png \
@@ -56,7 +56,7 @@ python3 /workspace/scripts/signal-contacts.py --all          # recent chats
 python3 /workspace/scripts/signal-contacts.py --groups
 ```
 
-**When an autonomous agent (e.g. Ari, Coach) hits an error that prevents it from
+**When an autonomous agent (a chamber subagent, a scheduled job) hits an error that prevents it from
 completing its task, it should call this script to alert the user** rather than
 only writing to a log. Routine success needs no push; problems do.
 
@@ -173,7 +173,7 @@ live only in that container, never in agent context, and there is no
 
 ```bash
 # Text to the default recipient
-python3 /workspace/scripts/whatsapp-push.py "Ari: reply to Mara failed — check scheduler.log"
+python3 /workspace/scripts/whatsapp-push.py "Agent: reply to Mara failed — check scheduler.log"
 
 # With an image, to a specific number
 python3 /workspace/scripts/whatsapp-push.py --recipient +15551234567 --image /tmp/chart.png "Summary"
@@ -206,7 +206,7 @@ thin CLI:
 
 ```bash
 # Text to the default recipient
-python3 /workspace/scripts/telegram-push.py "Ari: reply to Mara failed — check scheduler.log"
+python3 /workspace/scripts/telegram-push.py "Agent: reply to Mara failed — check scheduler.log"
 
 # With an image, to a specific chat (chat_id or @username)
 python3 /workspace/scripts/telegram-push.py --recipient @mara --image /tmp/chart.png "Summary"

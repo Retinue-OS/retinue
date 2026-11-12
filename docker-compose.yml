@@ -88,6 +88,14 @@ services:
       - ANTHROPIC_AUTH_TOKEN
       - ANTHROPIC_CUSTOM_HEADERS
       - ANTHROPIC_MODEL=${RETINUE_CLAUDE_MODEL}
+      # Family pins: Claude Code resolves the bare opus/sonnet/haiku/fable
+      # aliases through these, and the web gateway's model picker follows them
+      # (docs/dashboard.md). The container has no env_file, so they must be
+      # forwarded here or a pin in .env never reaches either.
+      - ANTHROPIC_DEFAULT_OPUS_MODEL
+      - ANTHROPIC_DEFAULT_SONNET_MODEL
+      - ANTHROPIC_DEFAULT_HAIKU_MODEL
+      - ANTHROPIC_DEFAULT_FABLE_MODEL
       - RETINUE_CLAUDE_MODEL
       - RETINUE_GATEWAY_USES_CLAUDE_OAUTH
       # Claude sign-in monitoring & browser re-login (docs/claude-auth.md):
@@ -457,11 +465,6 @@ services:
       - ARA_MCP_RATE_LIMIT
       - ARA_MCP_RATE_WINDOW
       - ARA_MCP_JOB_RETENTION
-      # Data refresh: Garmin (scripts/sync-garmin.py, run synchronously in the
-      # agent's own process by refresh.py --ensure, so this credential does
-      # reach sessions — until the fetch moves into a sidecar).
-      - GARMIN_EMAIL
-      - GARMIN_PASSWORD
       # News feed and triage tunables (scripts/news_store.py, news-fetch.py,
       # news-curate.py, triage-gate.py), the project-deadline lead
       # (scripts/recurring-projects.py), the self-update call timeout

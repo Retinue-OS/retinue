@@ -15,16 +15,33 @@
 //                               no speech was heard), rejects when it failed.
 //                               Should the page be left meanwhile, the job
 //                               goes on, and its text waits for the place.
+//   transcribe(key, blob, url, {send})  a dictation the user sent (➤, or a
+//                               take of the continuous loop ending on a
+//                               pause): `send` is the messages URL of the
+//                               thread it was recorded in. Resolves to
+//                               {text, sent, unsent} instead: should the page
+//                               be gone (or frozen) when the transcript is
+//                               in, the worker sends it into that thread
+//                               itself (sw.js, "Sent dictations") — `sent`
+//                               says it did; `unsent` ('failed' | 'maybe')
+//                               that it tried and it did not, or may not,
+//                               have gone. Neither: the page sends it.
 //   handOff(key, blob, url)     the page is going (pagehide) with the mic
 //                               live: the audio so far is sent off as it is,
 //                               and nothing waits here for the answer.
-//   adopt(key, onJob)           the place is on screen: every job left under
+//   adopt(key, onJob, {outcome}) the place is on screen: every job left under
 //                               it by a page that is gone is this one's now.
 //                               onJob(promise) is called once per job, with a
 //                               promise of its text as for transcribe(). Jobs
 //                               found later (a page restored from the
 //                               back-forward cache, a worker restarted under
-//                               a running job) arrive the same way.
+//                               a running job) arrive the same way. With
+//                               `outcome`, the promise resolves to {text,
+//                               sent, unsent, send} as for a sent
+//                               transcribe(); `send` with neither of the
+//                               others is a sent dictation whose page went
+//                               after it had the text but before it could
+//                               send it — the adopter's to send.
 //
 // A promise rejects with Error('elsewhere') when the job is gone from the
 // worker without this page having taken it: the page was frozen (the
@@ -55,7 +72,7 @@ const WAITING = new Map();   // job id -> {key, resolve, reject, timer, acked}
 // Jobs settled here: a resync answered before the worker heard they were
 // taken lists them still, and must not hand them out a second time.
 const SETTLED = new Set();
-const ADOPTERS = new Map();  // key -> onJob
+const ADOPTERS = new Map();  // key -> {onJob, outcome}
 let resyncTimer = null;
 let listening = false;
 let awaitingController = false;
@@ -97,12 +114,14 @@ async function fetchText(blob, url) {
 // Settle the job `id` this page waits on, and tell the worker it was taken —
 // a task later, once the host's continuation (which writes the text into the
 // draft, synchronously) has run.
-function settle(id, text, error) {
+function settle(id, text, error, sent, unsent, send, at) {
   const w = drop(id);
   if (!w) return;
   SETTLED.add(id);
+  const t = String(text || '').trim();
   if (error) w.reject(new Error(String(error)));
-  else w.resolve(String(text || '').trim());
+  else if (w.outcome) w.resolve({ text: t, sent: !!sent, unsent: String(unsent || ''), send: !!send, at: Number(at) || 0 });
+  else w.resolve(t);
   setTimeout(() => post({ type: 'dictation-taken', id }), 0);
 }
 
@@ -117,13 +136,13 @@ function drop(id) {
   return w;
 }
 
-function wait(id, key) {
+function wait(id, key, outcome = false) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       const w = drop(id);
       if (w) w.reject(new Error('timeout'));
     }, GIVE_UP_MS);
-    WAITING.set(id, { key, resolve, reject, timer, ackTimer: null, acked: false });
+    WAITING.set(id, { key, resolve, reject, timer, ackTimer: null, acked: false, outcome });
     startResync();
   });
 }
@@ -136,7 +155,7 @@ function listen() {
   c.addEventListener('message', (e) => {
     const d = e && e.data;
     if (!d) return;
-    if (d.type === 'dictation-done') settle(d.id, d.text, d.error);
+    if (d.type === 'dictation-done') settle(d.id, d.text, d.error, d.sent, d.unsent, d.send, d.at);
     else if (d.type === 'dictation-started' && WAITING.has(d.id)) WAITING.get(d.id).acked = true;
   });
   // Leaving: what this page owns is anybody's who shows the place next. A
@@ -207,23 +226,30 @@ async function resync() {
 function take(job) {
   if (!job || !job.id || SETTLED.has(job.id)) return;
   if (!WAITING.has(job.id)) {
-    const onJob = ADOPTERS.get(job.key);
-    if (!onJob) return;
-    const p = wait(job.id, job.key);
+    const adopter = ADOPTERS.get(job.key);
+    if (!adopter) return;
+    const onJob = adopter.onJob;
+    const p = wait(job.id, job.key, adopter.outcome);
     WAITING.get(job.id).acked = true;  // the worker has it: it said so
     try { onJob(p); } catch (_e) { /* the host's problem; the job still settles */ }
   }
-  if (job.state === 'done') settle(job.id, job.text, job.error);
+  if (job.state === 'done') settle(job.id, job.text, job.error, job.sent, job.unsent, job.send, job.at);
 }
 
-export function transcribe(key, blob, url) {
-  if (!sw()) return fetchText(blob, url);
+export function transcribe(key, blob, url, { send = '' } = {}) {
+  // The page's own fetch has no worker to send for it: the page sends.
+  const own = () => (send
+    ? fetchText(blob, url).then((text) => ({ text, sent: false, unsent: '', send: true, at: Date.now() }))
+    : fetchText(blob, url));
+  if (!sw()) return own();
   listen();
   const id = uid();
-  const p = wait(id, key);
-  if (!post({ type: 'dictation', id, key, url, blob })) {
+  const p = wait(id, key, !!send);
+  const msg = { type: 'dictation', id, key, url, blob };
+  if (send) msg.send = send;
+  if (!post(msg)) {
     drop(id);
-    return fetchText(blob, url);
+    return own();
   }
   // Not taken up in time: the page does it itself, and the worker is told to
   // forget the job should it get to it after all — one transcript, not two
@@ -234,7 +260,7 @@ export function transcribe(key, blob, url) {
     drop(id);
     SETTLED.add(id);
     post({ type: 'dictation-taken', id });
-    fetchText(blob, url).then(w.resolve, w.reject);
+    own().then(w.resolve, w.reject);
   }, ACK_MS);
   return p;
 }
@@ -259,12 +285,13 @@ export function handOff(key, blob, url) {
   return post({ type: 'dictation', id: uid(), key, url, blob, orphan: true });
 }
 
-export function adopt(key, onJob) {
+export function adopt(key, onJob, { outcome = false } = {}) {
   if (!key || typeof onJob !== 'function') return;
-  ADOPTERS.set(key, onJob);
+  const adopter = { onJob, outcome: !!outcome };
+  ADOPTERS.set(key, adopter);
   if (!sw()) { whenControlled(); return; }
   listen();
-  const mine = () => ADOPTERS.get(key) === onJob && sw();
+  const mine = () => ADOPTERS.get(key) === adopter && sw();
   const look = (retries) => ask([key]).then((jobs) => {
     if (jobs) jobs.forEach(take);
     else if (retries > 0) setTimeout(() => { if (mine()) look(retries - 1); }, ADOPT_RETRY_MS);

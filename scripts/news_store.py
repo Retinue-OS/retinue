@@ -3,11 +3,12 @@
 
 Design in one paragraph. A news item here is a *reference*, never a copy: a
 title, the source it came from, a short excerpt the feed itself published, and
-the URL to read it at. Ranking is deliberately one number per item — an
-`importance` the news agent (see `.claude/agents/herald.md`) assigns, decayed by
-the item's age with a per-item half-life, and pinned (no decay) while a dated
-item has not lapsed yet. That is the whole model: no keyframe curves, no
-interpolation, no second representation to keep in sync.
+the URL to read it at (a web link, or none: see `web_link`). Ranking is
+deliberately one number per item — an `importance` the news agent (see
+`.claude/agents/herald.md`) assigns, decayed by the item's age with a per-item
+half-life, and pinned (no decay) while a dated item has not lapsed yet. That is
+the whole model: no keyframe curves, no interpolation, no second representation
+to keep in sync.
 
 Why a plain JSON file rather than the life store: news is high-churn, disposable
 data with no long-term value — a few hundred rows rewritten every hour. Putting
@@ -30,7 +31,9 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import tempfile
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -153,6 +156,59 @@ def parse_time(value) -> datetime | None:
             continue
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     return None
+
+
+# ── links ────────────────────────────────────────────────────────────────────
+
+# No URL a source published has one of these in it.
+_LINK_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+# The part between "//" and the path names a host: no blank, no backslash.
+_LINK_AUTHORITY_RE = re.compile(r"[^\s\\]+")
+
+
+def _is_web_link(text: str) -> bool:
+    if _LINK_CONTROL_RE.search(text):
+        return False
+    try:
+        parts = urllib.parse.urlsplit(text)
+        parts.port  # raises for a port that is no number
+    except ValueError:
+        return False
+    return (parts.scheme in ("http", "https") and bool(parts.hostname)
+            and bool(_LINK_AUTHORITY_RE.fullmatch(parts.netloc)))
+
+
+def web_link(value, base: str = "") -> str:
+    """``value`` as a news item's link: an absolute http(s) URL, or "".
+
+    An item is a reference, and its link is where its headline on the news
+    page leads. What arrives as a link is text from outside — a feed's
+    ``<link>``, a ``url`` posted to the news rail, an argument — so every
+    producer passes it through here on the way into the store, and the
+    gateway on the way out. A link is an absolute ``http://`` or ``https://``
+    URL with a host; an item whose link is anything else has none. That way
+    a link from outside leads to a web page and to nothing else: never into
+    the dashboard itself, never to another kind of address.
+
+    ``base`` is for a feed that writes its links relative to itself
+    (``/2026/fest``): a value that is no web link as it stands is resolved
+    against it first, as a reader of the feed would. A web link comes back as
+    it was given, bar surrounding whitespace, because an item's id derives
+    from it."""
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or _LINK_CONTROL_RE.search(text):
+        return ""
+    if _is_web_link(text):
+        return text
+    if not base:
+        return ""
+    try:
+        resolved = urllib.parse.urljoin(base, text)
+    except ValueError:
+        return ""
+    return resolved if _is_web_link(resolved) else ""
 
 
 # ── items ────────────────────────────────────────────────────────────────────
@@ -301,7 +357,7 @@ def ranked(scope: str = "feed", limit: int | None = None,
 
 PREFERENCES_TEMPLATE = """# News preferences
 
-What Reto cares about, as learned from feedback on the news feed. Maintained by
+What the owner cares about, as learned from feedback on the news feed. Maintained by
 the Herald agent — every line here should be traceable to something the user
 did (a 👍, a 👎, a note), not to a guess.
 

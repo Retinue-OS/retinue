@@ -32,7 +32,21 @@ Two sources, dashboard over deployment, as for the agent models:
               shell hash, every client.
 
 Everything here works on the response only: the baked files under webapp/ are
-never mutated, exactly like the service worker's shell-hash substitution. The
+never mutated, exactly like the service worker's shell-hash substitution.
+
+A recoloured icon is also served under a URL of its own. Browsers treat an
+installed app's icon URLs as immutable: desktop Chrome, since 143 ("predictable
+app updating"), refreshes an installed PWA's icons — and with them the
+taskbar, dock and Start-menu shortcuts made from them at install — only when
+the manifest names different icon URLs, and keeps whatever it fetched before
+when only the bytes behind the same URL changed. So with a colour in force
+every icon reference the shell makes (the manifest's icons, each page's
+favicon and touch icon, the service worker's precache list and notification
+icon) carries the colour as a version, /icons/icon-192.png?v=cb6cfe. The
+gateway ignores the query and serves the colour in force; the version is
+there for caches, not for the server. The stock colour keeps the plain URLs.
+
+The
 icons are recoloured without an imaging library — they are plain 8-bit RGB
 PNGs of two colours (background and accent), and each pixel is re-projected
 onto the line from the background to the new accent, so anti-aliased edges
@@ -65,6 +79,11 @@ STOCK_ACCENT = (0x6E, 0xA8, 0xFE)
 STOCK_BACKGROUND = (0x0B, 0x0D, 0x12)
 
 _COLOR_RE = re.compile(r"#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})")
+# A stock icon's path, as a manifest's icon src (whole) or a quoted reference in
+# a page or the service worker (followed by its closing quote, so a reference
+# that already carries a query is left alone).
+_ICON_PATH_RE = re.compile(r"/icons/[A-Za-z0-9._-]+\.png")
+_ICON_REF_RE = re.compile(r"(/icons/[A-Za-z0-9._-]+\.png)(?=[\"'])")
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _TITLE_RE = re.compile(r"<title>Retinue")
 # The stock accent as the stylesheets spell it: the --accent definition in
@@ -256,25 +275,55 @@ def signature() -> str:
     return f"{instance_name()}|{'%02x%02x%02x' % rgb if rgb else ''}"
 
 
+def icon_version() -> str:
+    """The version the icon URLs carry: the accent in force as "rrggbb", or "" for the stock icons."""
+    return accent_hex().lstrip("#")
+
+
+def icon_url(src: str) -> str:
+    """[src], a stock icon's path, as this instance's icon URL: "/icons/icon-192.png?v=cb6cfe"
+    with a colour in force, [src] itself otherwise and for anything that is no stock icon."""
+    version = icon_version()
+    if not version or not _ICON_PATH_RE.fullmatch(src):
+        return src
+    return f"{src}?v={version}"
+
+
+def brand_icon_refs(text: str) -> str:
+    """Return [text] (a page, the service worker) with every quoted stock-icon path versioned (icon_url)."""
+    if not icon_version():
+        return text
+    return _ICON_REF_RE.sub(lambda m: icon_url(m.group(1)), text)
+
+
 def brand_manifest(raw: bytes) -> bytes:
-    """Return the web manifest with this instance's name in it."""
+    """Return the web manifest with this instance's name and icon URLs in it."""
     label = instance_name()
-    if not label:
+    version = icon_version()
+    if not label and not version:
         return raw
     data = json.loads(raw.decode("utf-8"))
-    data["name"] = display_name()
-    data["short_name"] = label
+    if label:
+        data["name"] = display_name()
+        data["short_name"] = label
+    if version:
+        for icon in data.get("icons") or []:
+            if isinstance(icon, dict) and isinstance(icon.get("src"), str):
+                icon["src"] = icon_url(icon["src"])
     return (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
 
 
 def brand_html(raw: bytes) -> bytes:
-    """Return a dashboard page whose <title> names this instance."""
-    if not instance_name():
+    """Return a dashboard page whose <title> names this instance and whose icon links name its colour."""
+    label = instance_name()
+    if not label and not icon_version():
         return raw
     text = raw.decode("utf-8")
-    # The label is configuration, not markup: escaped like any other text.
-    title = "<title>" + html.escape(display_name(), quote=False)
-    return _TITLE_RE.sub(lambda _m: title, text, count=1).encode("utf-8")
+    if label:
+        # The label is configuration, not markup: escaped like any other text.
+        title = "<title>" + html.escape(display_name(), quote=False)
+        text = _TITLE_RE.sub(lambda _m: title, text, count=1)
+    return brand_icon_refs(text).encode("utf-8")
 
 
 def brand_css(raw: bytes) -> bytes:

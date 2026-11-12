@@ -71,7 +71,13 @@ Projects (dashboard project pages):
                                          (either or both). Same token gate. The
                                          only way to set `muted`, which is what
                                          keeps a thread archived when new
-                                         messages are filed into it.
+                                         messages are filed into it. Also
+                                         {continuous_off: true}: the user asked
+                                         Ara (by voice) to end continuous
+                                         conversation; the thread is stamped
+                                         `continuous_off` (now, ISO) and every
+                                         device showing it in the mode leaves
+                                         it on its next read.
 
 The life store (behind the dashboard's sign-in; read-only):
   GET|POST /sparql                    -> SPARQL 1.1 Protocol: query=<SPARQL>
@@ -90,7 +96,9 @@ The life store (behind the dashboard's sign-in; read-only):
 News feed (dashboard news page; see scripts/news_store.py):
   GET  /news                          -> {"generated", "items": [...]} ranked at
                                          read time. ?scope=feed|read|hidden|all
-                                         (default feed), ?limit=<n>.
+                                         (default feed), ?limit=<n>. An item's
+                                         "url" is an absolute http(s) link, or
+                                         empty.
   GET  /news/preferences              -> {"markdown", "updated"} — the Herald's
                                          memory of what the user cares about.
   POST /news/preferences              -> replace it (body {markdown}); the user
@@ -197,6 +205,9 @@ Messenger chats (the deterministic chat mirror; see scripts/chat_state.py):
                                          entirely through /conversations/<id>.
   GET  /chats/media/<slug>/<media-id> -> authenticated proxy for ledger media
                                          (the gateways' token-gated /media/<id>).
+                                         Served in place only as an inline-safe
+                                         image, audio, video, PDF or plain
+                                         text; anything else is a download.
   POST /internal/chats/inbound        -> the gateways' notify rail: one message
                                          event (arrival or own-device echo).
                                          Feeds the overlay, keeps chat state,
@@ -253,6 +264,7 @@ Conversation log:
 
 import base64
 import binascii
+import fnmatch
 import hashlib
 import html
 import hmac
@@ -396,7 +408,7 @@ def _default_thread_model() -> str:
 # Each turn is its own `claude -p` process — a resumed one keeps the transcript,
 # not a model — so which model answers a thread is a free per-turn choice:
 # pickable at creation and switchable mid-thread, effective from the next turn. The picker governs Ara's OWN turn only: dispatched subagents (Coach,
-# Medic, Archivist, Ari) run on their own hard-wired models regardless.
+# Archivist, chamber subagents) run on their own hard-wired models regardless.
 #
 # The list of offered models comes from LiteLLM when the deployment routes
 # through it: the gateway reads GET <RETINUE_LITELLM_URL>/model/info (default:
@@ -411,6 +423,10 @@ def _default_thread_model() -> str:
 # through the same proxy that advertised the id, so the picker cannot offer a
 # model that isn't served. The list is cached for RETINUE_MODELS_CACHE_SECONDS
 # (default 60); on a failed refresh the last good list keeps serving.
+#
+# A family pin (ANTHROPIC_DEFAULT_<FAMILY>_MODEL, the variable Claude Code
+# resolves the bare `fable`/`opus`/… aliases through) retargets that family's
+# picker entry to the pinned concrete id — see _apply_family_pins.
 #
 # Deployments not routing through LiteLLM keep the static sources:
 # RETINUE_CONVERSATION_MODELS (an inline JSON array — an explicit override
@@ -731,6 +747,123 @@ def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) 
     return models
 
 
+# ── Family pins: one setting for agents and the picker ────────────────────────
+# Claude Code resolves the bare aliases `opus`/`sonnet`/`haiku`/`fable` (agent
+# files with `model: fable`, `--model sonnet`) through
+# ANTHROPIC_DEFAULT_<FAMILY>_MODEL. A deployment pins one to mean "the current
+# <family>" — typically a release newer than the baked CLI knows. The picker's
+# labelled entry for that family follows the same pin, so a new release is one
+# setting, not that setting plus a hand-edited route id in litellm/config.yaml.
+# The entry still carries the CONCRETE pinned id, never the alias: a thread
+# records the model it actually ran on, and a later pin change moves it only
+# because the thread's family pin moved (see _conv_model), not by reinterpreting
+# a stored name.
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+_warned_unserved_pins: set[str] = set()
+
+
+def _model_family(mid: str | None) -> str:
+    """The Claude family a model id belongs to (`claude-fable-5-2` -> fable), or ""."""
+    cid = _resolve_route_model(str(mid or "")).split("/")[-1].strip().lower()
+    for fam in _MODEL_FAMILIES:
+        if cid == f"claude-{fam}" or cid.startswith(f"claude-{fam}-"):
+            return fam
+    return ""
+
+
+def _family_pins() -> dict[str, str]:
+    """family -> pinned concrete id, from ANTHROPIC_DEFAULT_<FAMILY>_MODEL.
+
+    A pin naming a model outside its family (e.g. the sonnet alias pointed at
+    a local model) is not a "current <family>" statement and is ignored here."""
+    pins = {}
+    for fam in _MODEL_FAMILIES:
+        val = os.environ.get(f"ANTHROPIC_DEFAULT_{fam.upper()}_MODEL", "").strip()
+        if val and _model_family(val) == fam:
+            pins[fam] = val
+    return pins
+
+
+def _proxy_serves(parsed: object, mid: str) -> bool:
+    """Whether a /model/info body has a route for `mid` (by name or wildcard)."""
+    if not isinstance(parsed, dict):
+        return False
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        name = _litellm_model_id(item)
+        if name and (name == mid or ("*" in name and fnmatch.fnmatchcase(mid, name))):
+            return True
+    return False
+
+
+def _hidden_families(parsed: object) -> set[str]:
+    """Families with a route the operator hid with `retinue_picker: false`."""
+    if not isinstance(parsed, dict):
+        return set()
+    hidden = set()
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("model_info")
+        if isinstance(info, dict) and info.get(_LITELLM_PICKER_FLAG) is False:
+            fam = _model_family(_litellm_model_id(item))
+            if fam:
+                hidden.add(fam)
+    return hidden
+
+
+def _apply_family_pins(models: list[dict], parsed: object) -> list[dict]:
+    """Retarget each pinned family's picker entry to its pin.
+
+    The first entry of a pinned family keeps its label and takes the pinned id;
+    further entries of that family collapse into it (they would otherwise all
+    name the same model). A pinned family with no entry gets one, labelled by
+    the family name. A pin the proxy does not serve changes nothing — the
+    picker must never offer a model that isn't routed — and is logged once.
+    A family the operator hid with an explicit `retinue_picker: false` route
+    stays out of the picker: the pin moves what the family means, it does not
+    override a deliberate hide."""
+    pins = _family_pins()
+    if not pins:
+        return models
+    hidden = _hidden_families(parsed)
+    served = {}
+    for fam, pin in pins.items():
+        routed = _proxy_serves(parsed, pin)
+        served[fam] = routed and fam not in hidden
+        if not routed and pin not in _warned_unserved_pins:
+            _warned_unserved_pins.add(pin)
+            print(f"[web-gateway] ANTHROPIC_DEFAULT_{fam.upper()}_MODEL={pin!r} "
+                  "is not served by LiteLLM; the picker keeps its configured "
+                  f"{fam} entry", flush=True)
+    out, done = [], set()
+    for m in models:
+        fam = _model_family(m["id"])
+        if fam and served.get(fam):
+            if fam in done:
+                continue
+            done.add(fam)
+            m = {**m, "id": pins[fam]}
+        out.append(m)
+    for fam, pin in pins.items():
+        if served[fam] and fam not in done:
+            out.append({"id": pin, "label": fam.capitalize()})
+    return out
+
+
+def _family_pin_equivalent(mid: str | None) -> str | None:
+    """The offered pinned id for a stored choice of a pinned family, or None.
+
+    A thread pinned to `claude-fable-5-1` meant "Fable"; once the deployment
+    pins Fable to 5.2 the picker no longer offers 5.1, and without this the
+    thread would silently fall back to the default model (Opus)."""
+    pin = _family_pins().get(_model_family(mid))
+    if pin and _model_offered(pin):
+        return pin
+    return None
+
+
 def _fetch_litellm_json(path: str) -> object:
     url = _LITELLM_URL.rstrip("/") + path
     req = urllib.request.Request(
@@ -853,7 +986,7 @@ def _fetch_litellm_models() -> list[dict]:
     except (OSError, ValueError):
         # /v1/models is enrichment; /model/info alone still yields a list.
         listed = None
-    models = _coerce_litellm_models(info, listed)
+    models = _apply_family_pins(_coerce_litellm_models(info, listed), info)
     try:
         tags = _fetch_ollama_models()
     except (OSError, ValueError):
@@ -1385,6 +1518,9 @@ def _news_ingest_authorized(provided: str) -> bool:
 
 # Recoloured icons, keyed by (path, colour): the recolouring is a pure-Python
 # pixel pass, so it runs once per icon per configured colour, not per request.
+# The pages and the manifest name them with the colour as a version
+# (/icons/icon-192.png?v=cb6cfe); the query is not read here, the colour in
+# force is what is served.
 _BRANDED_ICON_CACHE: dict[tuple[str, str], bytes] = {}
 
 # Where the Android app serves its own settings page from (a reserved address
@@ -2489,6 +2625,135 @@ def _content_disposition(filename: str, inline: bool = False) -> str:
     return f"{kind}; filename=\"{ascii_name}\"; filename*=UTF-8''{quoted}"
 
 
+# ── What a messenger medium is served as ──────────────────────────────────────
+# A file a messenger contact sends is kept by the gateway that received it,
+# together with the content type the sender's client declared, and reaches the
+# browser through the media proxy (/chats/media/…) on the dashboard's own
+# origin. That type is input from outside, as the bytes are. So it is read
+# strictly, and it decides only whether the file is shown in place or handed
+# over as a download: a file from outside never becomes a page or a script of
+# the dashboard. The rule is the thread attachments' (_INLINE_SAFE_TYPES
+# above), widened by the two kinds the chat's players load:
+#
+#   in place   the types of _INLINE_SAFE_TYPES, and audio and video. The chat
+#              shows images through <img> and plays the others through <audio>
+#              and <video>; a PDF or a text file opens from its file row in
+#              the browser's own viewer.
+#   download   everything else: ``Content-Disposition: attachment`` and a
+#              sandboxing policy, the letterbox share's, as the second line
+#              for a client that renders the file anyway. The stated type
+#              stays. An image of another type (SVG, TIFF, …) is still shown
+#              by the chat's <img>, where nothing in it runs, and a document
+#              or an archive is saved under the extension, and opened by the
+#              app, that the browser and the Android shell derive from the
+#              type: as application/octet-stream a .docx would be saved as
+#              .bin.
+#
+# A stated type that does not read as exactly one media type says nothing
+# reliable and counts as application/octet-stream. Every answer forbids
+# sniffing, so the type sent is the type used.
+
+# The two names of a media type are RFC 6838 restricted names (4.2): a letter
+# or digit, then at most 126 more characters of a small set. Matched on the
+# lower-cased text.
+_MEDIA_NAME = r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}"
+_MEDIA_ESSENCE_RE = re.compile(_MEDIA_NAME + "/" + _MEDIA_NAME)
+# A parameter (RFC 9110, 5.6.6 and 8.3.1): ";", then nothing or name=value,
+# the value a token or a quoted string of printable ASCII. The only whitespace
+# allowed is blanks around the ";".
+_HTTP_TOKEN = r"[A-Za-z0-9!#$%&'*+.^_`|~-]+"
+_HTTP_TOKEN_RE = re.compile(_HTTP_TOKEN)
+_MEDIA_PARAM_RE = re.compile(
+    r" *; *(?:(" + _HTTP_TOKEN + r")=(?:(" + _HTTP_TOKEN
+    + r')|"((?:[ !#-\[\]-~]|\\[ -~])*)"))?')
+# Far longer than any type a client states.
+_MEDIA_TYPE_MAX_LEN = 1024
+# The parameters passed on: the two a browser reads to decode what it was
+# given. Whatever else a sender attached to the type stays behind.
+_MEDIA_PARAMS_KEPT = ("charset", "codecs")
+# What a download is answered with besides ``attachment``: should a client
+# render the file all the same, it does so without scripts, without this
+# origin and without loading anything (the letterbox share's policy,
+# scripts/webdav_share.py).
+_DOWNLOAD_CSP = "sandbox; default-src 'none'"
+
+
+def _parse_media_type(stated) -> tuple[str, dict] | None:
+    """Read one stated content type strictly: ``(type/subtype, parameters)``.
+
+    The essence comes back lower-cased, the parameters as ``{name: value}``
+    with lower-cased names and unquoted values, the first of a repeated name
+    winning. Blanks and tabs around the whole value are no part of it and are
+    dropped. None for anything that is not exactly one media type — an empty
+    value, a comma-separated list, a control character or a tab inside, a
+    character outside ASCII, a parameter without a value — so the caller
+    never has to guess what an odd value was meant to say."""
+    if not isinstance(stated, str) or len(stated) > _MEDIA_TYPE_MAX_LEN:
+        return None
+    text = stated.strip(" \t")
+    if not (text.isascii() and text.isprintable()):
+        return None
+    essence = _MEDIA_ESSENCE_RE.match(text.lower())
+    if not essence:
+        return None
+    params: dict = {}
+    pos = essence.end()
+    while pos < len(text):
+        param = _MEDIA_PARAM_RE.match(text, pos)
+        if not param:
+            return None
+        name, token, quoted = param.groups()
+        if name:
+            value = token if token is not None else re.sub(r"\\(.)", r"\1", quoted)
+            params.setdefault(name.lower(), value)
+        pos = param.end()
+    return essence.group(0), params
+
+
+def _media_type_header(essence: str, params: dict) -> str:
+    """A parsed media type written back as a ``Content-Type`` value.
+
+    Built from the parsed parts, never from the text that was received: the
+    essence, then the parameters of _MEDIA_PARAMS_KEPT that carry a value,
+    quoted where the value is not a token."""
+    out = essence
+    for name in _MEDIA_PARAMS_KEPT:
+        value = params.get(name)
+        if not value:
+            continue
+        if not _HTTP_TOKEN_RE.fullmatch(value):
+            value = '"' + re.sub(r'([\\"])', r"\\\1", value) + '"'
+        out += f"; {name}={value}"
+    return out
+
+
+def _chat_media_headers(stated) -> dict:
+    """The headers a relayed messenger blob is answered with.
+
+    ``stated`` is what the storing gateway's answer carried as Content-Type:
+    the list of its header values, None when it sent none. More than one is
+    not a statement of one type and is read like an unreadable one. See the
+    section comment above for the rule; an XML type under audio/ or video/
+    (a ``+xml`` subtype) is no medium a player loads, and a browser may take
+    any ``+xml`` type for an XML document, so it is a download like the rest.
+    The file name the sender gave is not known here (it is in the gateway's
+    store and in the ledger record), so a download goes out without one and
+    is named after the URL and the type."""
+    parsed = _parse_media_type(stated[0]) if stated and len(stated) == 1 else None
+    essence, params = parsed or ("application/octet-stream", {})
+    major, _, minor = essence.partition("/")
+    in_place = essence in _INLINE_SAFE_TYPES or (
+        major in ("audio", "video") and not minor.endswith("+xml"))
+    headers = {
+        "Content-Type": _media_type_header(essence, params),
+        "X-Content-Type-Options": "nosniff",
+    }
+    if not in_place:
+        headers["Content-Disposition"] = "attachment"
+        headers["Content-Security-Policy"] = _DOWNLOAD_CSP
+    return headers
+
+
 def _new_conv(initiator: str, owner: str, title: str | None,
               first_role: str, first_text: str,
               first_attachments=None, kind: str = "chat",
@@ -2763,8 +3028,12 @@ def _bind_conv_key(key: str, cid: str, ephemeral: bool = False) -> None:
 
 
 def _conv_model(conv: dict) -> str | None:
-    """The validated model a thread should run on, or None for the default."""
-    return _valid_model_id(conv.get("model"))
+    """The validated model a thread should run on, or None for the default.
+
+    A stored choice the picker no longer offers because its family's pin moved
+    on (Fable 5.1 -> 5.2) follows the pin rather than dropping to the default."""
+    stored = conv.get("model")
+    return _valid_model_id(stored) or _family_pin_equivalent(stored)
 
 
 # Threads that predate the model tiers carry no pin, because back then they
@@ -3508,7 +3777,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
     acc = html.escape(account)
     rid = html.escape(detail.get("request_id", ""))
     subj = html.escape(detail.get("subject") or "(no subject)")
-    # Which identity sends this mail (e.g. "Your Name <you@…>" vs Ari's mailbox).
+    # Which identity sends this mail (e.g. "Your Name <you@…>" vs an agent persona's own mailbox).
     # It matters whether a message goes out as the user's business address or as
     # an agent persona, so surface it prominently at the top of the approval card.
     frm = html.escape(detail.get("from") or account)
@@ -5245,7 +5514,7 @@ _OWNER_ACTOR = os.environ.get("RETINUE_OWNER_ACTOR", "").strip() or "urn:retinue
 # (chambers/_generated/attention/items.nt) states currentActor, importance,
 # sphere and tag for the same project IRI, derived from this very query; read
 # back, it gave a project two actors, the fold below kept whichever binding
-# came first, and a humanized label ("Reto") written out as an actor IRI
+# came first, and a humanized label (the owner's name) written out as an actor IRI
 # re-entered as the actor and was emitted again — a loop that pinned projects
 # to "waiting on" their own owner. agent-self-review.py scopes the same way.
 _PROJECTS_SPARQL = """
@@ -5696,6 +5965,12 @@ MAX_PREFERENCES_BYTES = 64 * 1024
 
 def _news_payload(scope: str, limit: int | None) -> dict:
     items = news_store.ranked(scope=scope, limit=limit)
+    # An item's link is where its headline on the news page leads. Every
+    # producer files only a web link, and the same rule is applied on the way
+    # out, so an item that is already in the store with anything else — filed
+    # before the rule, or written by hand — leaves without a link.
+    for item in items:
+        item["url"] = news_store.web_link(item.get("url"))
     return {
         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "scope": scope,
@@ -9205,10 +9480,13 @@ def _attention_day(focus: dict, day) -> dict:
 
 def _attention_mode_summary(focus: dict, now: datetime) -> dict:
     mode = attention_policy.mode_at(focus, now)
-    scheduled_id = attention_policy.scheduled_id(focus, now)
-    scheduled = focus["modes"][scheduled_id]
+    enabled = attention_policy.focus_enabled(focus)
+    # With focus off nothing is scheduled: the one mode is in force for good.
+    scheduled = focus["modes"][attention_policy.scheduled_id(focus, now)] if enabled else mode
     until = attention_policy.scheduled_until(focus, now)
+    manual = bool(attention_policy.manual_of(focus))
     return {
+        "enabled": enabled,
         "id": mode["id"], "name": mode["name"], "blurb": mode.get("blurb", ""),
         "threshold": mode["threshold"], "admits": list(mode["admits"]),
         "admit_tags": list(mode.get("admit_tags") or []),
@@ -9216,9 +9494,9 @@ def _attention_mode_summary(focus: dict, now: datetime) -> dict:
         "with_subject": bool(mode.get("with_subject")),
         "subject": mode.get("subject"),
         "label": attention_policy.mode_label(mode),
-        "manual": bool(focus.get("manual")),
-        "manual_until": focus.get("manual_until") if focus.get("manual") else None,
-        "breaks": [b for b in (focus.get("breaks") or []) if focus.get("manual")],
+        "manual": manual,
+        "manual_until": focus.get("manual_until") if manual else None,
+        "breaks": [b for b in (focus.get("breaks") or []) if manual],
         "scheduled": {"id": scheduled["id"], "name": scheduled["name"],
                       "until": until.isoformat() if until else None},
         "day": _attention_day(focus, now.date()),
@@ -9257,6 +9535,9 @@ def _attention_payload(items: list[dict], degraded: list[str], focus: dict, prof
         "now": now.isoformat(),
         "timezone": str(now.tzinfo),
         "mode": _attention_mode_summary(focus, now),
+        # Whether this instance follows focus modes at all (focus.json
+        # `enabled`): off, the home shows no mode chip and no menu.
+        "focus_enabled": attention_policy.focus_enabled(focus),
         "modes": [{"id": m["id"], "name": m["name"], "blurb": m.get("blurb", ""),
                    "threshold": m["threshold"], "admits": list(m["admits"]),
                    "admit_tags": list(m.get("admit_tags") or []),
@@ -9290,11 +9571,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log noise
         pass
 
-    def _send_json(self, status: int, body: dict) -> None:
+    def _send_json(self, status: int, body: dict,
+                   headers: dict[str, str] | None = None) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -9559,13 +9843,16 @@ class Handler(BaseHTTPRequestHandler):
         the browser to install the new worker and drop the stale cache. The file
         (baked, read-only) is never mutated on disk — the substitution is done on
         the response only. Served no-cache so the worker itself is always
-        revalidated."""
+        revalidated. With an instance colour in force, its icon paths (the
+        precache list, the notification icon) carry the colour like every
+        other icon reference (instance_branding.brand_icon_refs)."""
         sw = WEBAPP_DIR / "sw.js"
         try:
             text = sw.read_text(encoding="utf-8")
         except OSError:
             return False
-        body = text.replace("__SHELL_HASH__", _shell_hash()).encode("utf-8")
+        text = instance_branding.brand_icon_refs(text.replace("__SHELL_HASH__", _shell_hash()))
+        body = text.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/javascript; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -10053,7 +10340,11 @@ class Handler(BaseHTTPRequestHandler):
         if not text or not source:
             self._send_json(400, {"error": "text and source are required"})
             return
-        url = (payload.get("url") or "").strip()
+        # The link is whatever the caller found in a message from outside, and
+        # this endpoint is open by default: only a web link is kept
+        # (news_store.web_link). Anything else is dropped and the item filed
+        # without a link, as a post that carries none is.
+        url = news_store.web_link(payload.get("url"))
         lang = (payload.get("lang") or None)
         channel = (payload.get("channel") or "").strip() or "messenger"
         # A broadcast message is not a titled article: derive a short title from
@@ -10335,7 +10626,8 @@ class Handler(BaseHTTPRequestHandler):
                     learned += attention_policy.correct(item, profile, patch, now)
                     effect = attention_policy.reevaluate(item, focus, profile, now, "the contact card")
                 _attention_persist(item)
-            if name and payload.get("permit"):
+            if name and payload.get("permit") and attention_policy.focus_enabled(focus):
+                # With focus off there is no mode to hold a permit for.
                 mode_id = attention_policy.mode_at(focus, now)["id"]
                 if attention_policy.set_permit(profile, name, mode_id, True, now, focus["modes"]):
                     learned.append(f"{name} may interrupt in {focus['modes'][mode_id]['name']}")
@@ -11013,10 +11305,20 @@ class Handler(BaseHTTPRequestHandler):
         """Authenticated proxy for a ledger media blob.
 
         The gateways serve their media token-gated on the internal network;
-        this passes the registry token and relays bytes and Content-Type (the
+        this passes the registry token and relays the bytes (the
         /gateways/<slug>/qr proxy precedent), so chat bubbles render media
         with no gateway token in the browser. The route regex already pins the
         media id to 32 hex chars.
+
+        The type is not relayed as it comes. A gateway hands a blob back
+        under the content type its sender declared, so the answer's headers
+        are written by _chat_media_headers from that statement: images of the
+        inline-safe types, audio and video, PDF and plain text are served in
+        place, anything else as a download, and nothing is left to sniffing.
+        That holds for a relayed error as well: whatever a gateway answers
+        goes out under the same rule. The proxy's own refusals (an unknown or
+        control-mode gateway, none reachable) are JSON written here, and they
+        forbid sniffing too, so no answer of this route is left to it.
 
         The slug reaching here is inbox by construction — it comes from a
         ledger attachment reference (or the media resolver's first pick), and
@@ -11026,14 +11328,15 @@ class Handler(BaseHTTPRequestHandler):
         mode (an unreachable gateway) still serves, since this is a read of
         the user's own media behind the dashboard's own auth and blocking it
         would only break image rendering during a health blip."""
+        nosniff = {"X-Content-Type-Options": "nosniff"}
         _slug, gw = _channel_gateway(slug)
         if not gw:
-            self._send_json(404, {"error": "unknown gateway"})
+            self._send_json(404, {"error": "unknown gateway"}, nosniff)
             return
         if _gateway_identity(_slug, gw).get("mode") == "control":
             print(f"[web-gateway] refusing chat media from control-mode gateway "
                   f"{_slug!r}", flush=True)
-            self._send_json(404, {"error": "not found"})
+            self._send_json(404, {"error": "not found"}, nosniff)
             return
         # The named gateway first. A 404 from it is that gateway stating it does
         # not hold the blob — so its channel's other gateways are asked in turn
@@ -11043,17 +11346,17 @@ class Handler(BaseHTTPRequestHandler):
         channel = _slug_channel(_slug)
         candidates = [(_slug, gw)] + [
             (s, g) for s, g in _media_gateways(channel or "") if s != _slug]
-        data, content_type, status = b"", "application/json", 404
+        data, stated, status = b"", None, 404
         unreachable, answered = None, False
         for i, (cand_slug, cand_gw) in enumerate(candidates):
             try:
                 with _gateway_request(cand_gw, f"/media/{media_id}", CHAT_SEND_TIMEOUT) as resp:
                     data = resp.read()
-                    content_type = resp.headers.get("Content-Type", "application/octet-stream")
+                    stated = resp.headers.get_all("Content-Type")
                     status = resp.status
             except urllib.error.HTTPError as exc:
                 data = exc.read()
-                content_type = exc.headers.get("Content-Type", "application/json")
+                stated = exc.headers.get_all("Content-Type")
                 status = exc.code
             except Exception as exc:  # noqa: BLE001
                 unreachable = exc
@@ -11065,10 +11368,14 @@ class Handler(BaseHTTPRequestHandler):
                 print(f"[web-gateway] chat media {media_id} not at {cand_slug}; "
                       f"asking {candidates[i + 1][0]}", flush=True)
         if not answered:
-            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"})
+            self._send_json(502, {"error": f"gateway unreachable: {unreachable}"},
+                            nosniff)
             return
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
+        # The type and what goes with it, from the gateway's statement and
+        # never the statement itself (see _chat_media_headers).
+        for name, value in _chat_media_headers(stated).items():
+            self.send_header(name, value)
         self.send_header("Content-Length", str(len(data)))
         if status == 200:
             # Ledger media is immutable — cache privately so a re-opened chat
@@ -11233,6 +11540,9 @@ class Handler(BaseHTTPRequestHandler):
         digest goes out — except a switch into Focused: that holds on to
         what waits, and only what the focus lets through rings."""
         mode_id = payload.get("mode")
+        if mode_id and not attention_policy.focus_enabled(focus):
+            self._send_json(409, {"error": "focus is off on this instance — turn it on in Settings first"})
+            return
         if mode_id is not None and mode_id != "" and mode_id not in focus["modes"]:
             self._send_json(400, {"error": "unknown mode"})
             return
@@ -11280,11 +11590,16 @@ class Handler(BaseHTTPRequestHandler):
             items, degraded = _attention_items(profile, now)
         self._send_json(200, _attention_payload(items, degraded, focus, profile, now))
 
-    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str) -> list[str]:
-        """After a rule change, push what it releases; returns their ids."""
+    def _handle_reevaluate(self, focus: dict, profile: dict, now: datetime, why: str,
+                           skip: set | None = None) -> list[str]:
+        """After a rule change, push what it releases; returns their ids.
+        ``skip``: items a digest has just carried, which must not ring again
+        one by one."""
         items, _degraded = _attention_items(profile, now)
         pushed = []
         for item in items:
+            if skip and item["id"] in skip:
+                continue
             effect = attention_policy.reevaluate(item, focus, profile, now, why)
             if effect is None:
                 continue
@@ -11334,7 +11649,15 @@ class Handler(BaseHTTPRequestHandler):
         pushed: list[str] = []
         if changes:
             _ATTENTION.save_focus(focus)
-            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule")
+            if payload.get("enabled") is not None and any(c.startswith("focus modes ") for c in changes):
+                # Focus turned on or off is a change of mode like any other:
+                # a breakpoint, what was held arriving as one digest.
+                items, _degraded = _attention_items(profile, now)
+                digest = _attention_breakpoint(items, focus, now, "focus turned " + ("on" if payload["enabled"] else "off"))
+                carried = {i["id"] for i in (digest or {}).get("items") or []}
+            else:
+                carried = set()
+            pushed = self._handle_reevaluate(focus, profile, now, "the Focus rule", skip=carried)
         self._send_json(200, {"changed": changes, "mode": _attention_mode_summary(focus, now),
                               "focus": focus, "pushed": pushed})
 
@@ -11781,6 +12104,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         flags = {key: bool(payload[key])
                  for key in ("archived", "muted") if key in payload}
+        # Ending continuous conversation is an event, not a state: the stamp
+        # says when Ara was asked to, and a device leaves the mode if it was
+        # switched on before that moment (webapp/components/conversation.js,
+        # _contEndedByAra). Switching it on again later is the user's call.
+        if payload.get("continuous_off") is True:
+            flags["continuous_off"] = datetime.now(timezone.utc).isoformat()
         if not flags:
             self._send_json(400, {"error": "no flags given"})
             return

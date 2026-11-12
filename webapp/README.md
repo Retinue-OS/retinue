@@ -266,7 +266,21 @@ docstring). Pieces:
   and a standing instruction's report (its flags first) share a region capped
   at a fifth of the pane that scrolls inside and steps aside while the
   keyboard is up, and the field grows to at most 30% of the pane; the thread
-  gives way before the send row does. A draft longer than its box shows an
+  gives way before the send row does. A **grip** on the line between the
+  thread and the composer hands that split to the user: dragged up, the
+  composer takes the height it is given — the chips and the report stay in
+  view even with the keyboard up (snapping in once the drag is nearer the
+  composer with them than without), the field fills what is left, and the
+  thread keeps a strip of at least one message wherever the composer's own
+  contents leave room for it; dragged back down to the composer's own
+  height, or tapped twice (Enter from the keyboard, arrows to step), it is
+  the composer it was. The keyboard-up and keyboard-down frames each keep
+  their own position, per device beside the splitter's. A press on the grip
+  leaves the focus where it was, so the phone keyboard stays up through a
+  drag, and a press that dragged is never also a tap on whatever has moved
+  under the finger. The grip is a separator with a value (the composer's
+  share of the pane), stepped and reset from the keyboard as above. A draft
+  longer than its box shows an
   expand control in the field's top-right corner: the field then takes the
   whole pane at its full width (the thread and the chips step aside, the mic
   and send sit under its corners) until the control is pressed again, Escape
@@ -395,7 +409,9 @@ The API, as the components consume it:
   direction, author? (out: user|agent|device, plus agent name),
   sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
   type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
-  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  authenticated media proxy (`/chats/media/…`), which serves a file in place
+  only as an inline-safe image, audio, video, PDF or plain text and as a
+  download otherwise (`docs/dashboard.md`, "Attachments"); type, size and name are what
   the storing gateway stated about the blob in its ledger record (absent on
   records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
@@ -407,7 +423,8 @@ The API, as the components consume it:
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
   else (a document, an animated sticker) is a file row showing the stated
-  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
+  `name` and `size` that links the file: a PDF or plain text opens in a new
+  tab, anything else is saved, as the proxy serves it. Reactions and quoted replies (issue #130) will
   decorate these records later. The companion thread is not in this payload:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
@@ -578,9 +595,16 @@ load of this device and browser:
   jobs, and a second tab on the same place takes nothing that is not its own.
   Recorders run in 250 ms slices, so a page left with the mic live hands the
   worker everything said up to the last fraction of a second, and leaving acts
-  as **✓**: the transcript waits in the draft for review. A dictation sent
-  with **➤** whose page is gone before its transcript is in lands in the draft
-  too, unsent — the context a send needs left with that page. Without a
+  as **✓**: the transcript waits in the draft for review. A dictation the
+  user *sent* — **➤**, or a take of the continuous loop that ended on a pause
+  — is a message to the thread it was recorded in, as if typed there: should
+  its page be gone before the transcript is in, the worker posts it into that
+  thread itself (the thread fixed when recording started, never whatever is on
+  screen by then), and the next page showing the thread just reads it back.
+  A send the worker could not make, or may not have made (no answer, a worker
+  stopped in the middle), is never retried blindly: its text waits in the
+  draft with a note. A first message (no thread yet) waits in its composer's
+  draft, as before. Without a
   controlling worker (the very first load, a browser without one), and with
   an older worker that does not take the job up within 4 s, transcription is
   the page's own fetch, as before.
@@ -673,8 +697,12 @@ then leave the feed). There is no data file and no stored ordering: the feed
 changes because the clock moved. The service worker deliberately does **not**
 cache `/news`, only the `news.html` shell.
 
-Every headline links out to the source (`target=_blank`) — items are references,
-never copies. The three per-item buttons plus the page's free-text note are the
+A headline links out to the source (`target=_blank`) — items are references,
+never copies. An item's link is an absolute `http(s)` URL or the item has
+none: the gateway serves nothing else as `url`, and the page puts nothing else
+into an `href` (`webLink`, the rule of `news_store.web_link`; `docs/news.md`,
+"The item"). An item without a link, a channel post that carried none, shows
+its headline as text. The three per-item buttons plus the page's free-text note are the
 user's half of the learning loop:
 
 - `POST /news/feedback` — `{id?, signal, note?}` with signal
@@ -765,8 +793,12 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `wake` event), which reopens the thread used in the mode within the last
   15 minutes, else that voice composer. Both flags are dropped from the
   address once read and open the mic by themselves only inside the shell;
-  elsewhere the conversation offers a **Start talking** button. The pure parts — the detector's state machine and the wake's
-  choice of thread — are `components/continuous.js`
+  elsewhere the conversation offers a **Start talking** button. Closing it:
+  the toggle, or Ara — told by voice to switch the mode off, she stamps the
+  thread (`conversation-push.py --end-continuous` → `continuous_off`), and
+  every device showing it in the mode leaves it on its next read; a toggle
+  pressed after her stamp is the user's and stays on (docs/dashboard.md). The pure parts — the detector's state machine, the wake's
+  choice of thread and whether Ara's stamp ends the mode — are `components/continuous.js`
   (`tests/test_webapp_continuous.py`).
 
 ## Installing on Android
