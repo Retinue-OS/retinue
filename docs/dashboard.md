@@ -1096,10 +1096,12 @@ phone types it there.
   started, up to the message it answers — one of the user's messages sent
   from the dashboard (`via_edge`) or an earlier reply of Ara's
   (`_conv_text_was_shown`), so nothing Ara read meanwhile, nor a message the
-  turn itself posted, types by itself — and only the first such action of a
-  reply, so no text is put together from pieces. What plain characters do is
-  the device's affair: a letter can be an app's shortcut there, which is
-  why a piece of a line does not count — and, once the page reports
+  turn itself posted, types by itself — and only a reply's first action, so
+  no text is put together from pieces, and none is typed ahead of an earlier
+  action that waits for a tap (an Enter confirmed later would run a line the
+  user never saw; the page, too, runs no later one by itself). What plain
+  characters do is the device's affair: a letter can be an app's shortcut
+  there, which is why a piece of a line does not count — and, once the page reports
   it, `outcome` (`{state: typed | error | secret-typed | secret-cancelled,
   error?, at}`, `POST /conversations/<id>/shell-actions/<action id>/outcome`,
   through the reverse proxy only). An action once typed stays typed: a later

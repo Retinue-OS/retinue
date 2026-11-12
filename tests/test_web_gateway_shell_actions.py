@@ -337,8 +337,9 @@ def test_auto_counts_only_what_the_user_saw_before_the_turn(wg):
 def test_auto_needs_a_whole_line_and_is_one_per_reply(wg):
     """A text runs by itself only when it is a whole line the user has seen —
     not a piece of one, so no shortcut letter or command can be cut out of a
-    sentence — and only one per reply, so none can be put together from
-    several actions."""
+    sentence — and only as the reply's first action, so none can be put
+    together from several actions or typed ahead of one that waits for a
+    tap."""
     conv = wg._new_conv("user", "reto", "t", "user",
                         "what time is it in Lisbon?\n  Good evening, Lisbon  \nok", via_edge=True)
     cid = conv["id"]
@@ -354,10 +355,18 @@ def test_auto_needs_a_whole_line_and_is_one_per_reply(wg):
     marks = _auto_marks(wg, cid, [_plain(30, "ok"), _plain(31, "Good evening, Lisbon"),
                                   _plain(32, "ok")])
     assert marks == [True, False, False], marks
-    # One that waits for a tap anyway does not use up the reply's one.
+    # Only the reply's first action may: one after an action that waits for a
+    # tap would be typed at once, before it, so an Enter the user confirms
+    # later runs a line they never saw ('ok' + Enter after 'ok' is 'okok'),
+    # and a text meant for the field a Tab moves to lands in the one before.
     marks = _auto_marks(wg, cid, [dict(_plain(40, "ok"), enter=True), _plain(41, "ok")])
-    assert marks == [False, True], marks
-    print("ok: a text runs by itself only as a whole line seen before, one per reply")
+    assert marks == [False, False], marks
+    marks = _auto_marks(wg, cid, [{"kind": "keyboard-key", "id": f"{42:032x}", "key": "tab"},
+                                  _plain(43, "ok")])
+    assert marks == [False, False], marks
+    marks = _auto_marks(wg, cid, [_plain(44, "time is it"), _plain(45, "ok")])
+    assert marks == [False, False], "a first text that does not count still holds the rest"
+    print("ok: a text runs by itself only as a whole line seen before, and only first")
 
 
 def _http(base_url: str, method: str, path: str, body=None, headers=None):

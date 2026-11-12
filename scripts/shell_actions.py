@@ -170,8 +170,8 @@ def runs_by_itself(action: dict) -> bool:
     # presses a focused button too). What plain characters do on the device
     # is the device's: a letter can be an app's shortcut — which is why the
     # gateway also requires the text to be a whole line the user has already
-    # seen in the thread (_conv_text_was_shown), and marks at most one action
-    # per reply.
+    # seen in the thread (_conv_text_was_shown), and marks only a reply's
+    # first action.
     return (isinstance(text, str) and bool(text.strip()) and text.strip() == text
             and not action.get("enter") and not action.get("sensitive")
             and not re.search(r"[\r\n\t]", text))

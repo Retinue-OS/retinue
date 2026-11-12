@@ -45,9 +45,9 @@ Rules (CLAUDE.md, "Dashboard"):
   Android autofill fills, types it and forgets it.
 
 The app runs plain one-line text by itself when the reply arrives live in a
-chat the user opened (once, and only within a couple of minutes). Everything
-else waits for the user's tap: Enter (`--enter`, a line break, typed as
-Shift+Enter), a tab, any `--key`, a `--sensitive` text and a password-manager
+chat the user opened (once, only within a couple of minutes, and only as the
+reply's first action). Everything else waits for the user's tap: Enter
+(`--enter`, a line break, typed as Shift+Enter), a tab, any `--key`, a `--sensitive` text and a password-manager
 field. Your reply text should say what will be typed and where. Later turns
 see what became of each action (typed, not typed and why, cancelled), as the
 page reports it.
@@ -141,15 +141,25 @@ def _attach(args: argparse.Namespace) -> int:
             # The text comes from a file Ara wrote with her Write tool, so no
             # shell parses it: no quote, `$` or heredoc end marker inside it
             # can cut it short and run the rest as commands. Line ends are
-            # read untranslated, as written (normalize decides on them). A
-            # little more than MAX_TEXT is read, so an oversized file is
-            # refused below without being read whole.
+            # read untranslated, as written (normalize decides on them). An
+            # oversized file is refused without being read whole: normalize
+            # counts a CRLF as one character, so a text within MAX_TEXT can
+            # take up to twice as many raw characters (and a final line end
+            # that is dropped below). Whatever is longer is refused here, as
+            # reading only a part would type a text cut short; normalize
+            # judges the rest exactly.
+            limit = 2 * shell_actions.MAX_TEXT + 3
             try:
                 with open(args.file, encoding="utf-8", newline="") as fh:
-                    text = fh.read(shell_actions.MAX_TEXT + 3)
+                    text = fh.read(limit)
+                    longer = len(text) == limit and fh.read(1) != ""
             except (OSError, UnicodeDecodeError) as exc:
                 reason = exc.strerror if isinstance(exc, OSError) else "not UTF-8 text"
                 print(f"shell-type: cannot read {args.file}: {reason}", file=sys.stderr)
+                return 2
+            if longer:
+                print(f"shell-type: text is longer than {shell_actions.MAX_TEXT} characters",
+                      file=sys.stderr)
                 return 2
         else:
             text = args.text
@@ -205,9 +215,11 @@ def _attach(args: argparse.Namespace) -> int:
     else:
         what = (f"a secret field for {action['label']!r}"
                 + (" + Enter" if action["enter"] else ""))
+    # Only a reply's first action can run by itself (web-gateway.py marks no
+    # other), so one after it is said to wait for a tap.
     when = ("when the reply arrives (in a chat the user opened, if it is a whole "
-            "line they have already seen there and the reply's first such text; "
-            "otherwise once they tap it)" if shell_actions.runs_by_itself(action)
+            "line they have already seen there; otherwise once they tap it)"
+            if shell_actions.runs_by_itself(action) and already == 0
             else "once the user taps it")
     print(f"shell-type: {what} will ride on your reply; the Ara app types it on "
           f"the paired device {when}")

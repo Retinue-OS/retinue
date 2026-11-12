@@ -115,6 +115,20 @@ await ok('a secret never runs by itself', () => {
   assert.equal(kbd.shouldAutoRun({ ...secretC, auto: true }, fresh, { live: true, now }), false);
 });
 
+await ok("only a message's first action runs by itself, even if a later one is marked", () => {
+  store.clear();
+  installShell();
+  // A later text typed at once would land ahead of what waits for a tap:
+  // 'cd /tmp' + Enter confirmed afterwards would run 'rm -rf buildcd /tmp'.
+  const first = { kind: 'keyboard-type', id: 'e'.repeat(32), text: 'cd /tmp', enter: true, auto: false };
+  for (const before of [first, keyTab]) {
+    const m = { ...fresh, shell_actions: [before, typeA] };
+    assert.equal(kbd.shouldAutoRun(typeA, m, { live: true, now }), false, before.kind);
+  }
+  assert.equal(kbd.shouldAutoRun(typeA, { ...fresh, shell_actions: [typeA, keyTab] },
+    { live: true, now }), true, 'the first one does');
+});
+
 await ok('only plain one-line text the gateway marked auto runs by itself', () => {
   store.clear();
   installShell();

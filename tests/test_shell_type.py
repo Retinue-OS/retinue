@@ -369,6 +369,27 @@ def test_file_option(tmp: Path):
     assert _run(["--file", str(tmp / "empty.txt")], refused).returncode == 2
     (tmp / "long.txt").write_text("x" * (sa.MAX_TEXT + 1), encoding="utf-8")
     assert _run(["--file", str(tmp / "long.txt")], refused).returncode == 2
+    # CRLF line ends count once each, as normalize() counts them: a CRLF file
+    # over MAX_TEXT is refused, not cut short at a raw character count, and
+    # one within it is typed whole however many raw characters it has.
+    (tmp / "crlf-long.txt").write_bytes(b"line\r\n" * (sa.MAX_TEXT // 4))
+    r = _run(["--file", str(tmp / "crlf-long.txt")], refused)
+    assert r.returncode == 2 and "longer than" in r.stderr, (r.returncode, r.stderr)
+    (tmp / "crlf-all.txt").write_bytes(b"\r\n" * (sa.MAX_TEXT + 1) + b"x")
+    assert _run(["--file", str(tmp / "crlf-all.txt")], refused).returncode == 2
+    assert not refused.exists(), "a refused call must not write"
+    crlf = tmp / "m-crlf"
+    lines = sa.MAX_TEXT * 3 // 4 // 5
+    (tmp / "crlf.txt").write_bytes(b"line\r\n" * lines)
+    r = _run(["--file", str(tmp / "crlf.txt")], crlf)
+    assert r.returncode == 0, r.stderr
+    got = _lines(crlf)[0]["text"]
+    assert got == "\n".join(["line"] * lines), (len(got), got[-20:])
+    # Exactly MAX_TEXT once normalized, from the most raw characters it can have.
+    (tmp / "crlf-max.txt").write_bytes(b"\r\n" * (sa.MAX_TEXT - 1) + b"x\r\n")
+    r = _run(["--file", str(tmp / "crlf-max.txt")], crlf)
+    assert r.returncode == 0, r.stderr
+    assert _lines(crlf)[1]["text"] == "\n" * (sa.MAX_TEXT - 1) + "x"
     assert not refused.exists(), "a refused call must not write"
     assert f.exists(), "a refused call leaves the file"
     secret = tmp / "pin.txt"

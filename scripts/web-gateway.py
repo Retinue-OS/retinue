@@ -3880,17 +3880,18 @@ def _conv_worker(cid: str, session_key: str, *, arrival: str | None = None,
             # started, up to the message it answers: whatever the turn itself
             # posted meanwhile (a "user" message from inside the container, a
             # push) came out of what Ara read, not from the user's screen. And
-            # at most one action per reply runs by itself, so no text can be
-            # put together from pieces that each stand somewhere in the thread.
+            # only a reply's first action can run by itself, so no text can be
+            # put together from pieces that each stand somewhere in the
+            # thread, and none is typed ahead of an earlier action that waits
+            # for a tap: the device would take them in the wrong order, and an
+            # Enter the user confirms later would run a line they never saw.
             thread_auto = _conv_allows_auto_run(conv)
             upto = next((i for i, m in enumerate(messages) if m is target), -1)
             shown = messages[:upto + 1]
-            auto_left = 1
-            for action in reply_actions:
-                action["auto"] = bool(auto_left and thread_auto
+            for i, action in enumerate(reply_actions):
+                action["auto"] = bool(i == 0 and thread_auto
                                       and shell_actions.runs_by_itself(action)
                                       and _conv_text_was_shown(shown, action.get("text")))
-                auto_left -= action["auto"]
             if any(a.get("sensitive") for a in reply_actions):
                 # A title derived from the user's message may carry the very
                 # text typed; it reaches the thread list and every push.

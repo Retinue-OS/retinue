@@ -15,7 +15,7 @@
 //   - Only plain one-line text runs by itself, ONCE: only when the gateway
 //     marked it `auto` (shell_actions.runs_by_itself, in a chat the user
 //     opened, on a turn they started from the dashboard, a whole line they
-//     had seen there, at most one per reply), only when its
+//     had seen there, only a reply's first action), only when its
 //     message arrived live in the thread open and visible on this device
 //     (never on opening a thread, a reload, a history read, or coming back to
 //     a page that was hidden), only while it is younger than
@@ -148,6 +148,13 @@ export function phoneConfirms(a) {
 export function shouldAutoRun(action, message, { live = false, now = Date.now(), inShell = hasKeyboard() } = {}) {
   if (!inShell || !live || !action || action.auto !== true) return false;
   if (needsTap(action) || isPurged(action, message, now)) return false;
+  // Only the first action of its message, as the gateway marks only that
+  // one: a later one would be typed at once, ahead of the earlier ones that
+  // wait for a tap, and an Enter confirmed afterwards would run a line the
+  // user never saw. (A caller that passes only the message's time is not
+  // judged by this; conversation.js passes the message itself.)
+  const listed = actionsOf(message);
+  if (listed.length && listed[0].id !== action.id) return false;
   const ts = Date.parse(message && message.ts);
   if (!Number.isFinite(ts) || now - ts > AUTO_RUN_MAX_AGE_MS || now - ts < -AUTO_RUN_MAX_AGE_MS) return false;
   return !isDone(action.id);
