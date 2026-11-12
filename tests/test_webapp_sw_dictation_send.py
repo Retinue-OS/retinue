@@ -70,11 +70,17 @@ const CLIENTS = new Map();   // id -> {posted: []}
 const POSTS = [];            // message POSTs the worker made
 let sendStatus = 200;
 let transcript = 'hello thread';
+let hangSends = false;       // a message POST that never answers, until its signal aborts
 async function fetchMock(url, init = {}) {
   if (String(url).startsWith('/conversations/transcribe')) {
     return { ok: true, json: async () => ({ text: transcript }) };
   }
   POSTS.push({ url, body: JSON.parse(init.body) });
+  if (hangSends) {
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+    });
+  }
   return { ok: sendStatus < 400, status: sendStatus, json: async () => ({}) };
 }
 const listeners = {};
@@ -84,7 +90,9 @@ const self = {
              matchAll: async () => [], claim: async () => {} },
   registration: {}, skipWaiting: () => {},
 };
-const ctx = vm.createContext({ self, indexedDB, fetch: fetchMock, Blob, AbortController, setTimeout, clearTimeout,
+// The worker's 30 s send deadline is made short; every other timer is as it is.
+const shortTimeout = (fn, ms, ...rest) => setTimeout(fn, ms === 30000 ? 30 : ms, ...rest);
+const ctx = vm.createContext({ self, indexedDB, fetch: fetchMock, Blob, AbortController, setTimeout: shortTimeout, clearTimeout,
   console, Response: class {}, caches: {}, URL, structuredClone });
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
 
@@ -103,7 +111,7 @@ function adopt(keys, asker) {
 }
 const blob = new Blob(['audio'], { type: 'audio/webm' });
 const SEND = '/conversations/t1/messages';
-const reset = () => { DB.clear(); CLIENTS.clear(); POSTS.length = 0; sendStatus = 200; };
+const reset = () => { DB.clear(); CLIENTS.clear(); POSTS.length = 0; sendStatus = 200; hangSends = false; transcript = 'hello thread'; };
 
 // 1. ➤, page still there and owning the job: the worker does NOT send; the page hears send:true.
 reset(); CLIENTS.set('A', { posted: [] });
@@ -162,6 +170,32 @@ const run7 = message({ type: 'dictation', id: 'j8', key: 'conv:t1', url: '/conve
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run7;
 assert.equal(POSTS.length, 0);
+
+// 8. A send that gets no answer within its deadline is aborted and is 'maybe' (it may have
+//    reached the thread): kept for the draft, exactly one POST, never retried.
+reset(); CLIENTS.set('A', { posted: [] }); hangSends = true;
+const run8 = message({ type: 'dictation', id: 'j9', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND }, 'A');
+CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
+await run8;
+assert.equal(POSTS.length, 1, 'one POST');
+CLIENTS.set('C', { posted: [] });
+const jobs8 = await adopt(['conv:t1'], 'C');
+assert.equal(jobs8.length, 1);
+assert.equal(jobs8[0].unsent, 'maybe', 'a timeout may have gone through: not failed, not retried');
+assert.equal(jobs8[0].sent, false); assert.equal(jobs8[0].text, 'hello thread');
+assert.equal(POSTS.length, 1, 'never retried');
+
+// 9. A worker stopped while sending (record 'running' in phase 'sending', not in this worker's
+//    running set): adopting it does not send again; it becomes 'maybe' with its text kept.
+reset(); CLIENTS.set('C', { posted: [] });
+DB.set('j10', { id: 'j10', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob: null, owner: '', origin: 'A',
+                send: SEND, state: 'running', phase: 'sending', text: 'hello thread', error: '', at: Date.now() });
+const jobs9 = await adopt(['conv:t1'], 'C');
+assert.equal(jobs9.length, 1);
+assert.equal(jobs9[0].state, 'done'); assert.equal(jobs9[0].unsent, 'maybe'); assert.equal(jobs9[0].text, 'hello thread');
+assert.equal(POSTS.length, 0, 'a record stranded mid-send is never sent again');
+await new Promise((r) => setTimeout(r, 50));
+assert.equal(POSTS.length, 0, 'nor restarted afterwards');
 console.log('ok');
 """
 
