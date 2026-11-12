@@ -102,7 +102,7 @@ ok('the media proxy and web links render the element their type calls for', () =
 const NOT_URLS = [
   undefined, null, '', 42, { toString: () => 'https://example.org/' },
   'javascript:alert(1)', ' JavaScript:alert(1)', 'java\tscript:alert(1)',
-  'data:image/svg+xml,<svg/>', 'data:text/html,<p>x</p>', 'vbscript:x',
+  'data:text/html,<p>x</p>', 'data:application/pdf;base64,AAAA', 'vbscript:x',
   'file:///etc/hosts', 'blob:http://dash/0b6c', 'mailto:a@example.org',
   'urn:retinue:media:signal:' + MID, '/sends/default/1', 'sends', '../x', '#new',
   '//example.org/x', '/\\example.org/x', 'https:example.org', 'https://',
@@ -126,6 +126,28 @@ ok('anything else is the name as text: no href, no src, no lightbox', () => {
   assert.ok(el._attachmentHtml({ type: 'audio/ogg' }).includes('>Voice message</span>'));
   assert.ok(el._attachmentHtml({ type: 'video/mp4' }).includes('>Video</span>'));
   assert.ok(el._attachmentHtml({}).includes('>Attachment</span>'));
+});
+
+ok('a data: URL of a medium shows through the element of its own kind, and is never a link', () => {
+  const pic = 'data:image/svg+xml,<svg/>';
+  const img = el._attachmentHtml({ url: pic, type: 'image/svg+xml', name: 'p.svg' });
+  assert.ok(img.includes('<img class="att-img') && !/<a[\s>]/.test(img), img);
+  const audio = el._attachmentHtml({ url: 'data:audio/wav;base64,AAAA', type: 'audio/wav' });
+  assert.ok(audio.startsWith('<audio class="att-audio"') && !/<a[\s>]/.test(audio), audio);
+  const video = el._attachmentHtml({ url: 'data:video/webm;base64,AAAA', type: 'video/webm' });
+  assert.ok(video.startsWith('<video class="att-video') && !/<a[\s>]/.test(video), video);
+  // Not for a file row, not for an element of another kind, and no other data: type or spelling.
+  for (const [url, type] of [
+    [pic, 'application/pdf'], [pic, ''], [pic, undefined], [pic, 'audio/ogg'], [pic, 'video/mp4'],
+    ['data:audio/wav;base64,AAAA', 'image/png'], ['data:video/webm;base64,AAAA', 'audio/ogg'],
+    ['data:text/html,<p>x</p>', 'image/png'], ['data:text/html,<p>x</p>', 'text/html'],
+    ['data:image/svg+xml', 'image/svg+xml'], [' data:image/png,x', 'image/png'],
+    ['DATA:image/png,x', 'image/png'], ['data:image,x', 'image/png'], ['data:,x', 'image/png'],
+  ]) {
+    const html = el._attachmentHtml({ url, type, name: 'x' });
+    assert.deepEqual(urlsIn(html), [], `${JSON.stringify(url)} ${type}: ${html}`);
+    assert.ok(!/<(a|img|audio|video|button)[\s>]/.test(html), `${JSON.stringify(url)} ${type}: ${html}`);
+  }
 });
 
 ok("the bubble of a send on its way previews the user's own staged image", () => {

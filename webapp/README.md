@@ -511,8 +511,9 @@ corpus (the validation suite serves them as mocked `/chats*` responses). They
 are no longer a serving source. The corpus covers the media shapes: image
 attachments with intrinsic dimensions, a voice note (`audio/*` with the
 transcript as the message text) and a video (`video/*` with dimensions), all
-with `data:` URLs, which the page now shows by name only (a url there is the
-proxy's or an http(s) URL), and both companion states: one chat names an
+with `data:` URLs, which the page takes for an `<img>`, `<audio>` or `<video>`
+of the same kind and for nothing else (a link's url is the proxy's or an
+http(s) URL), and both companion states: one chat names an
 existing thread, the rest carry `companion: null`. Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.

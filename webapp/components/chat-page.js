@@ -103,10 +103,19 @@ const TITLE_BRAND = (() => {
 const MEDIA_PROXY_RE = /^\/chats\/media\/[A-Za-z0-9_-][A-Za-z0-9._-]*\/[0-9a-f]{32}$/;
 const OWN_PREVIEWS = new WeakSet();
 
+// A data: URL carries its bytes in itself. Inside an <img>, <audio> or <video>
+// nothing in it runs, so the reference documents under data/chats/, which
+// use such URLs, still show their media. It is taken only for the element
+// its own kind picks, never for a file row, whose link would open it as a
+// document.
+const DATA_MEDIA_RE = /^data:(image|audio|video)\/[a-z0-9.+-]+[;,]/;
+
 function attachmentUrl(a) {
   const url = typeof a.url === 'string' ? a.url : '';
   if (OWN_PREVIEWS.has(a) && url.startsWith('blob:')) return url;
   if (MEDIA_PROXY_RE.test(url)) return url;
+  const data = DATA_MEDIA_RE.exec(url);
+  if (data) return String(a.type || '').startsWith(`${data[1]}/`) ? url : '';
   return webLink(url);
 }
 
