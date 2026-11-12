@@ -244,8 +244,12 @@ globalThis.requestAnimationFrame = () => 0;
 globalThis.cancelAnimationFrame = () => {};
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
+// Turns of the loop, and no less than a few seconds of the clock: on a runner
+// whose zero-delay timers come round faster than the fetches and messages a
+// page waits for, 400 turns alone can be over before the page has caught up.
 async function until(cond, what) {
-  for (let i = 0; i < 400 && !cond(); i++) await tick();
+  const end = Date.now() + 5000;
+  for (let i = 0; !cond() && (i < 400 || Date.now() < end); i++) await tick();
   assert.ok(cond(), what);
 }
 // The same against the clock, for what waits on a timer of its own.
