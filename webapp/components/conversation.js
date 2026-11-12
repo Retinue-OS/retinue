@@ -616,8 +616,12 @@ function clearSent(d, text, files) {
 
 // Dictations an earlier page left under `key` are this page's once the
 // conversation is shown: the worker hands them over (dictation.js), each one
-// owns the input row as a job of this page's would, and its text goes into
-// the draft for review — the context a send would need left with that page.
+// owns the input row as a job of this page's would. One the user sent into
+// this thread (➤, or a take of the continuous loop ending on a pause) the
+// worker has sent by now (sw.js, "Sent dictations"): it is in the thread,
+// which is read again. Any other — kept for review (✓, leaving with the mic
+// live), or a send that failed or may have failed — goes into the draft for
+// review, a failed send with a note saying so.
 function adoptDictations(key) {
   if (ADOPTING.has(key)) return;
   ADOPTING.add(key);
@@ -625,9 +629,23 @@ function adoptDictations(key) {
     ADOPTED.set(key, (ADOPTED.get(key) || 0) + 1);
     const el = LIVE.get(key);
     if (el) el.render();
-    job.then((text) => {
-      if (text) { appendToDraft(key, text); VOICE_ERRORS.delete(key); }
-      else VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
+    job.then(async ({ text, sent, unsent, send, at }) => {
+      if (sent) { VOICE_ERRORS.delete(key); refreshSent(key); return; }
+      // A sent dictation whose page went after the transcript was in but
+      // before that page could send it: the send is this page's. Unless the
+      // thread holds it already — that page may have got it out just before
+      // it went — so a message is never sent twice.
+      if (send && text && !unsent) {
+        const el = LIVE.get(key);
+        const t = el && !isNewKey(key) ? await readThread(key) : null;
+        if (t && hasTurnSince(t, text, new Date(at || Date.now()).toISOString())) { refreshSent(key); return; }
+        if (t && el.isConnected) { VOICE_ERRORS.delete(key); await el._send(text, { fromDraft: false }); return; }
+      }
+      if (text) {
+        appendToDraft(key, text);
+        if (unsent) VOICE_ERRORS.set(key, unsentNote(unsent));
+        else VOICE_ERRORS.delete(key);
+      } else VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
     }, (err) => {
       if (err && err.message === 'elsewhere') refreshDraft(key);
       else VOICE_ERRORS.set(key, "Couldn't transcribe the recording. Please try again.");
@@ -637,7 +655,34 @@ function adoptDictations(key) {
       const now = LIVE.get(key);
       if (now) now.render();
     });
-  });
+  }, { outcome: true });
+}
+
+// Why a dictation the worker was to send is in the box after all.
+function unsentNote(why) {
+  return why === 'maybe'
+    ? 'This dictation was being sent when the page was left. It is in the box — '
+      + "if it turns up in the thread, there is no need to send it again."
+    : "This dictation couldn't be sent. It is in the box — send it again.";
+}
+
+// The worker sent a dictation into thread `key`: the thread on screen, if it
+// is, shows it (and Ara's answer as it comes) without waiting for the poll.
+function refreshSent(key) {
+  const el = LIVE.get(key);
+  if (!el || !el.isConnected) return;
+  el._load().then(() => {
+    if (!el.isConnected) return;
+    el._partialUpdate();
+    el._schedulePoll();
+  }, () => {});
+}
+
+// The messages URL a sent dictation recorded under `key` goes to should its
+// page be gone by the time the transcript is in: a thread's only — a first
+// message has no thread yet to go to, and waits in its composer's draft.
+function sendUrlFor(key) {
+  return isNewKey(key) ? '' : `/conversations/${encodeURIComponent(key)}/messages`;
 }
 // The connected element whose composer shows draft `d`, if any: the one
 // under the key the draft lives under by now — it may have moved to a
@@ -2485,14 +2530,24 @@ class RetinueConversation extends HTMLElement {
     const live = () => LIVE.get(key);
     if (live()) live().render();
     let toSend = '';
+    let sentByWorker = false;
     try {
       // The service worker transcribes (dictation.js): should this page be
-      // left meanwhile, the text still lands in this draft, for review.
-      const text = await transcribe(storeKey(key), blob, transcribeUrl(key));
-      if (text) {
+      // left meanwhile, a dictation kept for review lands in this draft, and
+      // one sent into a thread is sent there by the worker (sw.js, "Sent
+      // dictations") — the thread it was recorded in, whatever is on screen.
+      const send = intent === 'send' ? sendUrlFor(key) : '';
+      const got = await transcribe(storeKey(key), blob, transcribeUrl(key), send ? { send } : undefined);
+      const text = send ? got.text : got;
+      if (send && got.sent) {
+        // Frozen meanwhile (the back-forward cache) and back: it went.
+        sentByWorker = true;
+        VOICE_ERRORS.delete(key);
+      } else if (text) {
         appendToDraft(key, text);
+        if (send && got.unsent) VOICE_ERRORS.set(key, unsentNote(got.unsent));
         // Send the whole draft, so anything typed before dictating comes along.
-        if (intent === 'send') toSend = draftOf(key).text;
+        else if (intent === 'send') toSend = draftOf(key).text;
       } else {
         VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
       }
@@ -2568,6 +2623,7 @@ class RetinueConversation extends HTMLElement {
       }
     }
     VOICE_JOBS.delete(key);
+    if (sentByWorker) refreshSent(key);
     keepDraft(key);  // as after _send: no turn of this job's is on the wire now
     const el = adopted || live();
     // The loop's take did not get through (nothing heard, a failed
