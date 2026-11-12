@@ -33,40 +33,70 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 
 // ── A minimal in-memory IndexedDB: one database, one keyPath store ──────────
+// As a real one does, a transaction completes only once its last request has —
+// one made from another request's onsuccess included — and a request made on a
+// transaction that has completed throws. (Completing on a fixed timer instead
+// let a put made from a get's onsuccess land after `oncomplete` whenever the
+// event loop was held up: the worker's promise settled, the next check's
+// reset() cleared the store, and the late put brought the record back.)
 const DB = new Map();
 const later = (fn) => setTimeout(fn, 0);
-function request(run) {
-  const req = {};
-  later(() => { req.result = run(); if (req.onsuccess) req.onsuccess(); });
-  return req;
+let openTx = 0;              // transactions not yet complete
+let openConn = 0;            // connections opened and not yet closed: none may be left at a reset
+function transaction() {
+  const tx = { oncomplete: null, onerror: null, onabort: null };
+  let pending = 0;
+  let done = false;
+  openTx += 1;
+  const check = () => {
+    if (pending || done) return;
+    done = true;
+    later(() => { openTx -= 1; if (tx.oncomplete) tx.oncomplete(); });
+  };
+  const request = (run) => {
+    if (done) throw Object.assign(new Error('transaction has finished'), { name: 'TransactionInactiveError' });
+    const req = {};
+    pending += 1;
+    later(() => { req.result = run(); if (req.onsuccess) req.onsuccess(); pending -= 1; check(); });
+    return req;
+  };
+  const store = {
+    get: (id) => request(() => (DB.has(id) ? structuredClone(DB.get(id)) : undefined)),
+    getAll: () => request(() => [...DB.values()].map((v) => structuredClone(v))),
+    put: (v) => request(() => { DB.set(v.id, structuredClone(v)); }),
+    delete: (id) => request(() => { DB.delete(id); }),
+  };
+  tx.objectStore = () => store;
+  later(check);
+  return tx;
 }
 const indexedDB = {
   open() {
     const req = {};
+    openConn += 1;
     later(() => {
-      req.result = {
-        close() {}, createObjectStore() {},
-        transaction() {
-          const tx = {};
-          let pending = 0;
-          const track = (r) => { pending += 1; const s = r.onsuccess; return r; };
-          const store = {
-            get: (id) => { const r = request(() => (DB.has(id) ? structuredClone(DB.get(id)) : undefined)); return r; },
-            getAll: () => request(() => [...DB.values()].map((v) => structuredClone(v))),
-            put: (v) => request(() => { DB.set(v.id, structuredClone(v)); }),
-            delete: (id) => request(() => { DB.delete(id); }),
-          };
-          tx.objectStore = () => store;
-          setTimeout(() => tx.oncomplete && tx.oncomplete(), 5);
-          return tx;
-        },
-      };
+      let closed = false;
+      req.result = { close() { if (!closed) { closed = true; openConn -= 1; } }, createObjectStore() {}, transaction };
       if (req.onupgradeneeded) req.onupgradeneeded();
       if (req.onsuccess) req.onsuccess();
     });
     return req;
   },
 };
+// The fake keeps that order even when the event loop is held up between a request and its
+// answer, as a loaded machine does: the put made from the get's onsuccess lands before
+// `oncomplete`, and a request on the finished transaction is refused.
+{
+  const tx = transaction();
+  const s = tx.objectStore();
+  const g = s.get('probe');
+  g.onsuccess = () => { s.put({ id: 'probe' }); };
+  const end = Date.now() + 20; while (Date.now() < end) { /* the loop is held up */ }
+  await new Promise((resolve) => { tx.oncomplete = resolve; });
+  assert.ok(DB.has('probe'), 'a transaction completes after the put made from its get');
+  assert.throws(() => s.get('probe'), { name: 'TransactionInactiveError' });
+  DB.clear();
+}
 
 // ── Clients and network ─────────────────────────────────────────────────────
 const CLIENTS = new Map();   // id -> {posted: []}
@@ -95,8 +125,9 @@ const self = {
              matchAll: async () => [], claim: async () => {} },
   registration: {}, skipWaiting: () => {},
 };
-// The worker's 30 s send deadline is made short; every other timer is as it is.
-const shortTimeout = (fn, ms, ...rest) => setTimeout(fn, ms === 30000 ? 30 : ms, ...rest);
+// The worker's 30 s send deadline is made short for the check that waits it out (a send that
+// gets no answer, hangSends); every other timer is as it is.
+const shortTimeout = (fn, ms, ...rest) => setTimeout(fn, ms === 30000 && hangSends ? 30 : ms, ...rest);
 const ctx = vm.createContext({ self, indexedDB, fetch: fetchMock, Blob, AbortController, setTimeout: shortTimeout, clearTimeout,
   console, Response: class {}, caches: {}, URL, structuredClone });
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
@@ -121,18 +152,27 @@ function adopt(keys, asker) {
 }
 const blob = new Blob(['audio'], { type: 'audio/webm' });
 const SEND = '/conversations/t1/messages';
-const reset = () => { DB.clear(); CLIENTS.clear(); POSTS.length = 0; sendStatus = 200; hangSends = false; transcript = 'hello thread';
-                      onTranscribe = null; skew = 0; };
+// Between checks the store must be idle: every write a check's worker run made was done by the
+// time the promise the check awaited settled. Work still open here — a connection opened, or a
+// transaction not complete, one macrotask after that promise (time enough for any store work
+// queued behind it to open its connection, none for it to finish) — would be a worker write
+// landing after that, into the next check.
+const reset = async () => {
+  await new Promise((r) => later(r));
+  assert.equal(openConn + openTx, 0, 'no store work left open from the check before');
+  DB.clear(); CLIENTS.clear(); POSTS.length = 0; sendStatus = 200; hangSends = false; transcript = 'hello thread';
+  onTranscribe = null; skew = 0;
+};
 
 // 1. ➤, page still there and owning the job: the worker does NOT send; the page hears send:true.
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 await message({ type: 'dictation', id: 'j1', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND }, 'A');
 assert.equal(POSTS.length, 0, 'live recording page sends itself');
 const done1 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
 assert.equal(done1.text, 'hello thread'); assert.equal(done1.send, true); assert.equal(done1.sent, false);
 
 // 2. ➤, page gone (released) before the transcript: the worker sends into the RECORDED thread.
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 const run2 = message({ type: 'dictation', id: 'j2', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run2;
@@ -140,7 +180,7 @@ assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }]);
 assert.equal(DB.size, 0, 'sent with nobody to tell: the job is gone, nothing for a draft');
 
 // 3. Page gone, but another page now shows the thread and adopted the job mid-run: sent, and that page told sent:true.
-reset(); CLIENTS.set('A', { posted: [] }); CLIENTS.set('B', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] }); CLIENTS.set('B', { posted: [] });
 const run3 = message({ type: 'dictation', id: 'j3', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND }, 'A');
 CLIENTS.delete('A');
 await adopt(['conv:t1'], 'B');
@@ -150,7 +190,7 @@ const done3 = CLIENTS.get('B').posted.find((m) => m.type === 'dictation-done');
 assert.equal(done3.sent, true, 'the page showing the thread learns it went');
 
 // 4. Send refused: unsent 'failed', kept for the draft, not deleted, no retry.
-reset(); CLIENTS.set('A', { posted: [] }); sendStatus = 500;
+await reset(); CLIENTS.set('A', { posted: [] }); sendStatus = 500;
 const run4 = message({ type: 'dictation', id: 'j4', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run4;
@@ -161,7 +201,7 @@ assert.equal(jobs4.length, 1); assert.equal(jobs4[0].unsent, 'failed'); assert.e
 assert.equal(POSTS.length, 1, 'never retried');
 
 // 5. ✓ (review) or a handed-off recording: never sent by the worker.
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 const run5 = message({ type: 'dictation', id: 'j5', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run5;
@@ -169,14 +209,14 @@ await message({ type: 'dictation', id: 'j6', key: 'conv:t1', url: '/conversation
 assert.equal(POSTS.length, 0, 'review dictations stay drafts');
 
 // 6. Only the dashboard's own messages endpoint: a foreign target is ignored.
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 const run6 = message({ type: 'dictation', id: 'j7', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: 'https://evil.example/x' }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run6;
 assert.equal(POSTS.length, 0);
 
 // 7. No speech: nothing is sent.
-reset(); CLIENTS.set('A', { posted: [] }); transcript = '';
+await reset(); CLIENTS.set('A', { posted: [] }); transcript = '';
 const run7 = message({ type: 'dictation', id: 'j8', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run7;
@@ -184,7 +224,7 @@ assert.equal(POSTS.length, 0);
 
 // 8. A send that gets no answer within its deadline is aborted and is 'maybe' (it may have
 //    reached the thread): kept for the draft, exactly one POST, never retried.
-reset(); CLIENTS.set('A', { posted: [] }); hangSends = true;
+await reset(); CLIENTS.set('A', { posted: [] }); hangSends = true;
 const run8 = message({ type: 'dictation', id: 'j9', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run8;
@@ -198,7 +238,7 @@ assert.equal(POSTS.length, 1, 'never retried');
 
 // 9. A worker stopped while sending (record 'running' in phase 'sending', not in this worker's
 //    running set): adopting it does not send again; it becomes 'maybe' with its text kept.
-reset(); CLIENTS.set('C', { posted: [] });
+await reset(); CLIENTS.set('C', { posted: [] });
 DB.set('j10', { id: 'j10', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob: null, owner: '', origin: 'A',
                 send: SEND, state: 'running', phase: 'sending', text: 'hello thread', error: '', at: Date.now() });
 const jobs9 = await adopt(['conv:t1'], 'C');
@@ -212,22 +252,22 @@ assert.equal(POSTS.length, 0, 'nor restarted afterwards');
 //     CANCELLED_CALLS) and is sent by the worker carries the call as `cancelled_call`, as the
 //     page's own send would; a page showing the thread that has to send it gets it handed on;
 //     a call on a review dictation, or one not shaped as {number, name}, goes nowhere.
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 const CALL = { number: '+41 79 555 01 23', name: 'Anna' };
 const run10 = message({ type: 'dictation', id: 'j11', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run10;
 assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread', cancelled_call: CALL } }]);
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 await message({ type: 'dictation', id: 'j12', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
 const done10 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
 assert.deepEqual(done10.call, CALL, 'the page that sends it itself still knows the call');
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 const run11 = message({ type: 'dictation', id: 'j13', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: { number: 5 } }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run11;
 assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }], 'a malformed call is dropped');
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 await message({ type: 'dictation', id: 'j14', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, call: CALL }, 'A');
 const done11 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
 assert.equal(done11.call, null, 'a review dictation carries no call');
@@ -236,7 +276,7 @@ assert.equal(POSTS.length, 0);
 // 11. A cancelling take the worker was stopped in the middle of transcribing, restarted for a
 //     page that asks for its place long after it was recorded: it goes out as words alone —
 //     the call it cancelled is not put to Ara again.
-reset(); CLIENTS.set('C', { posted: [] });
+await reset(); CLIENTS.set('C', { posted: [] });
 DB.set('j15', { id: 'j15', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
                 send: SEND, state: 'running', text: '', error: '', at: Date.now() - 2 * 3600 * 1000, call: CALL });
 await adopt(['conv:t1'], 'C');
@@ -246,7 +286,7 @@ for (let i = 0; i < 100 && !CLIENTS.get('C').posted.some((m) => m.type === 'dict
 assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }], 'an old take carries no cancelled call');
 assert.equal(CLIENTS.get('C').posted.find((m) => m.type === 'dictation-done').sent, true, 'sent all the same');
 // The same restart within the window still carries it.
-reset(); CLIENTS.set('C', { posted: [] });
+await reset(); CLIENTS.set('C', { posted: [] });
 DB.set('j16', { id: 'j16', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
                 send: SEND, state: 'running', text: '', error: '', at: Date.now() - 5000, call: CALL });
 await adopt(['conv:t1'], 'C');
@@ -259,21 +299,21 @@ assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread', cancelled
 //     transcription (up to DICT_TIMEOUT_MS) of a cancelling take whose page went is sent the
 //     moment it is in, and still carries the call — and a page that adopts it right after
 //     hears the transcript's time with it.
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 onTranscribe = () => { skew += 100 * 1000; };
 const run12 = message({ type: 'dictation', id: 'j17', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
 CLIENTS.delete('A'); await message({ type: 'dictation-release' }, 'A');
 await run12;
 assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread', cancelled_call: CALL } }],
   'a slow transcript sent at once keeps its call');
-reset(); CLIENTS.set('A', { posted: [] });
+await reset(); CLIENTS.set('A', { posted: [] });
 onTranscribe = () => { skew += 100 * 1000; };
 await message({ type: 'dictation', id: 'j18', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, send: SEND, call: CALL }, 'A');
 const done12 = CLIENTS.get('A').posted.find((m) => m.type === 'dictation-done');
 assert.ok(done12.textAt - done12.at >= 100 * 1000, 'the page hears when the transcript came');
 // A restart's transcript is not the original run's: it sets no transcript time, so the window
 // stays measured from `at`, and a take recorded long ago goes out as words alone.
-reset(); CLIENTS.set('C', { posted: [] });
+await reset(); CLIENTS.set('C', { posted: [] });
 DB.set('j19', { id: 'j19', key: 'conv:t1', url: '/conversations/transcribe?thread=t1', blob, owner: '', origin: 'A',
                 send: SEND, state: 'running', text: '', error: '', at: Date.now() - 2 * 3600 * 1000, call: CALL });
 await adopt(['conv:t1'], 'C');
@@ -282,6 +322,7 @@ for (let i = 0; i < 100 && !CLIENTS.get('C').posted.some((m) => m.type === 'dict
 }
 assert.deepEqual(POSTS, [{ url: SEND, body: { message: 'hello thread' } }], 'a late restart still sends words alone');
 assert.ok(!CLIENTS.get('C').posted.find((m) => m.type === 'dictation-done').textAt, 'and gives no transcript time');
+await reset();
 console.log('ok');
 """
 
