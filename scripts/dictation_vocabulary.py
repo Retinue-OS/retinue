@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""The deployment's dictation vocabulary, read from the life store.
+
+The proper nouns a dictation contains — people, organisations, medications —
+are exactly the words an ASR model mangles, and they are all in the life store
+already: every chamber's RDF is indexed there, so asking the store reaches a
+doctor in a care-provider list as readily as a contact entry (a regex over one
+chamber's `contacts/*.ttl` saw neither).
+
+One query, two shapes, one module — because two processes need it:
+
+  * the **STT service** biases the decode with the names' words (Whisper
+    hotwords), for every client it serves: dashboard dictation and inbound
+    voice notes alike;
+  * the **web gateway** hands the whole names to the transcript-repair model as
+    spelling hints.
+
+Each process imports this module and keeps its own cache; the store is a
+sibling service on the same network, so neither needs the other to fetch it.
+
+Lean by construction (`docs/triple-stores.md`): the classes and name predicates
+are bounded by VALUES instead of matched by a wildcard pattern, which is what
+keeps QLever's planning cheap over ~100 graphs. The ranks order the vocabulary
+by how much a mishearing costs, so the caps below cut the least useful first.
+
+Configuration (environment)
+  QLEVER_LIFE_URL / SPARQL_ENDPOINT_LIFE   Life-store endpoint.
+  DICTATION_NAME_LIMIT                     Whole names kept (default 200).
+  DICTATION_HOTWORD_CHARS                  Hotword budget in characters
+                                           (default 600) — hotwords share
+                                           Whisper's 224-token prompt window,
+                                           so an unbounded list would crowd out
+                                           the audio's own context.
+"""
+import os
+import re
+import threading
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+
+LIFE_URL = (os.environ.get("QLEVER_LIFE_URL")
+            or os.environ.get("SPARQL_ENDPOINT_LIFE")
+            or "http://qlever-life:7001").rstrip("/")
+
+NAME_LIMIT = int(os.environ.get("DICTATION_NAME_LIMIT", "200"))
+HOTWORD_CHARS = int(os.environ.get("DICTATION_HOTWORD_CHARS", "600"))
+QUERY_TIMEOUT = float(os.environ.get("DICTATION_QUERY_TIMEOUT", "5"))
+CACHE_TTL = 300.0        # the store is cheap, but not per request
+CACHE_TTL_EMPTY = 30.0   # a store that was unreachable deserves a retry soon
+
+# Share of the hotword budget per rank. Ranks are spent in order, and an unused
+# share carries forward — but no rank may eat the whole window, or in a store
+# full of people a medication name would never reach the decoder at all.
+HOTWORD_SHARES = {1: 0.55, 2: 0.2, 3: 0.25}
+
+# The most names read per rank. The query orders by rank and then alphabet, so
+# the hotword budget (which has its own per-rank shares) must see every rank;
+# this only bounds memory for a store with an absurd number of names.
+RANK_ROW_CAP = 2000
+
+NAME_QUERY = """
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+SELECT DISTINCT ?rank ?name WHERE {
+  VALUES (?cls ?rank) {
+    (<http://www.w3.org/2006/vcard/ns#Individual> 1)
+    (<http://xmlns.com/foaf/0.1/Person> 1)
+    (<http://schema.org/Person> 1)
+    (<https://schema.org/Person> 1)
+    (<http://schema.org/Organization> 2)
+    (<https://schema.org/Organization> 2)
+    (<http://schema.org/MedicalOrganization> 2)
+    (<http://schema.org/MedicalClinicOrHospital> 2)
+    (<http://schema.org/Drug> 3)
+    (<http://schema.org/MedicalTherapy> 3)
+  }
+  VALUES ?np {
+    <http://www.w3.org/2006/vcard/ns#fn>
+    <http://www.w3.org/2006/vcard/ns#family-name>
+    <http://www.w3.org/2006/vcard/ns#organization-name>
+    <http://xmlns.com/foaf/0.1/name>
+    <http://schema.org/name>
+    <https://schema.org/name>
+    <http://schema.org/legalName>
+    <https://w3id.org/retinue/kb#name>
+    <https://w3id.org/retinue/kb#fullName>
+  }
+  ?s rdf:type ?cls ; ?np ?name .
+  FILTER(isLiteral(?name))
+  # Two characters are a whole name in Han, Kana and Hangul (see _IDEOGRAPHIC).
+  FILTER((STRLEN(STR(?name)) > 2 || REGEX(STR(?name), "[@IDEOGRAPHIC@]"))
+         && STRLEN(STR(?name)) < 60)
+  # Some vocabularies use a name predicate for a whole descriptive phrase; a
+  # label with that many words is not a proper noun anyone dictates.
+  FILTER(STRLEN(STR(?name)) - STRLEN(REPLACE(STR(?name), " ", "")) < 5)
+}
+ORDER BY ?rank ?name
+"""
+
+# Scripts in which one character carries a syllable or a whole word, so a name
+# of two characters (王芳, 田中) is ordinary where two Latin letters are not.
+# One class serves both the store query and the word extraction below, so a name
+# the query lets through is a name the extraction can use.
+_IDEOGRAPHIC = ("\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u31f0-\u31ff"
+                "\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
+                "\uff66-\uff9f")
+NAME_QUERY = NAME_QUERY.replace("@IDEOGRAPHIC@", _IDEOGRAPHIC)
+_IDEOGRAPHIC_RE = re.compile(f"[{_IDEOGRAPHIC}]")
+
+
+def _words(name: str) -> list[str]:
+    """The dictatable words of a name, in any script: runs of letters, with
+    numbers, punctuation and honorific stops ("Dr.") left behind. Whisper
+    matches hotwords as words, so word pieces are the right unit.
+
+    A run needs three letters, or two when it is Han, Kana or Hangul. Combining
+    marks belong to the run but do not count as letters: the vowel signs of
+    Devanagari or Thai (हिन्दी, สวัสดี) and a decomposed accent are marks, and
+    a pattern built on \\w would split the word at every one of them.
+    """
+    words: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        word = "".join(run)
+        run.clear()
+        letters = sum(unicodedata.category(c).startswith("L") for c in word)
+        if letters >= (2 if _IDEOGRAPHIC_RE.search(word) else 3):
+            words.append(word)
+
+    for char in name:
+        if unicodedata.category(char)[0] in "LM":
+            run.append(char)
+        elif run:
+            flush()
+    if run:
+        flush()
+    return words
+
+
+_cache: tuple[float, list[str], str] | None = None
+_lock = threading.Lock()
+
+
+def _bindings(query: str) -> list[dict]:
+    """POST a SPARQL query to the life store and return its result bindings."""
+    import json
+    data = urllib.parse.urlencode({"query": query}).encode("utf-8")
+    req = urllib.request.Request(
+        LIFE_URL,
+        data=data,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/sparql-results+json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=QUERY_TIMEOUT) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return payload.get("results", {}).get("bindings", [])
+
+
+def hotword_string(ranked: list[tuple[int, str]], max_chars: int = HOTWORD_CHARS) -> str:
+    """The distinct words of `ranked` names as a space-separated hotword string,
+    each rank spending at most its share of `max_chars` (see HOTWORD_SHARES)."""
+    words: list[str] = []
+    seen: set[str] = set()
+    used = 0
+    budget = 0
+    for rank in sorted({rank for rank, _ in ranked}):
+        share = HOTWORD_SHARES.get(rank, 0.0)
+        budget = min(max_chars, budget + round(share * max_chars))
+        for word in (w for r, name in ranked if r == rank
+                     for w in _words(name)):
+            key = word.casefold()
+            if key in seen:
+                continue
+            cost = len(word) + (1 if words else 0)
+            if used + cost > budget:
+                break  # this rank is full; the next one starts on its own share
+            seen.add(key)
+            used += cost
+            words.append(word)
+    return " ".join(words)
+
+
+def _select_names(ranked: list[tuple[int, str]], limit: int) -> list[str]:
+    """At most `limit` whole names for the repair model, in `ranked` order.
+
+    The list is sorted by rank, so cutting its head would hand every slot to the
+    people in a large store and none to a medication. Each rank first gets its
+    share of the limit (HOTWORD_SHARES again); slots a rank leaves unused go to
+    whatever was cut, in order.
+    """
+    chosen: set[int] = set()
+    taken: dict[int, int] = {}
+    for i, (rank, _name) in enumerate(ranked):
+        if taken.get(rank, 0) < round(HOTWORD_SHARES.get(rank, 0.0) * limit):
+            chosen.add(i)
+            taken[rank] = taken.get(rank, 0) + 1
+    for i in range(len(ranked)):
+        if len(chosen) >= limit:
+            break
+        chosen.add(i)
+    return [name for i, (_rank, name) in enumerate(ranked) if i in chosen]
+
+
+def vocabulary(log_tag: str = "dictation") -> tuple[list[str], str]:
+    """(name hints, hotword string) from the life store, cached with a TTL.
+
+    Fail-open: an unreachable or empty store yields `([], "")`, which only costs
+    the hints — dictation itself keeps working.
+    """
+    global _cache
+    with _lock:
+        now = time.monotonic()
+        if _cache and now < _cache[0]:
+            return _cache[1], _cache[2]
+        ranked: list[tuple[int, str]] = []
+        try:
+            seen: set[str] = set()
+            per_rank: dict[int, int] = {}
+            for row in _bindings(NAME_QUERY):
+                name = " ".join((row.get("name", {}).get("value") or "").split())
+                key = name.casefold()
+                if not name or key in seen:
+                    continue
+                seen.add(key)
+                rank = (row.get("rank", {}).get("value") or "").strip()
+                # The query always binds ?rank; a shape that doesn't is treated as
+                # top rank rather than dropped out of the hotword budget.
+                rank = int(rank) if rank.isdigit() else 1
+                if per_rank.get(rank, 0) >= RANK_ROW_CAP:
+                    continue
+                per_rank[rank] = per_rank.get(rank, 0) + 1
+                ranked.append((rank, name))
+        except Exception as exc:  # noqa: BLE001 - hints are optional, never fatal
+            print(f"[{log_tag}] vocabulary unavailable: {exc}", flush=True)
+            ranked = []
+        # The hotwords enforce their own character budget over every rank; only
+        # the whole-name list for the repair model is capped by NAME_LIMIT.
+        names = _select_names(ranked, NAME_LIMIT)
+        hotwords = hotword_string(ranked, HOTWORD_CHARS)
+        _cache = (now + (CACHE_TTL if names else CACHE_TTL_EMPTY), names, hotwords)
+        return names, hotwords
+
+
+if __name__ == "__main__":  # a quick look at what the store yields right now
+    started = time.monotonic()
+    _names, _hotwords = vocabulary()
+    print(f"{len(_names)} names in {time.monotonic() - started:.3f}s")
+    print(f"{len(_hotwords.split())} hotwords, {len(_hotwords)} chars")

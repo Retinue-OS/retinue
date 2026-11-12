@@ -466,7 +466,16 @@ through **LiteLLM** (the shipped default), the offered list is managed **in
 LiteLLM itself**: the gateway reads `GET /model/info` (and `GET /v1/models`)
 and offers the concrete models the proxy currently serves. `retinue_picker: true`
 plus `retinue_label` still names a route; `retinue_picker: false` hides one.
-Plumbing routes (`retinue-claude`, wildcards) stay hidden. The list
+Plumbing routes (`retinue-claude`, wildcards) stay hidden. A **family pin**
+— `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`, the variable Claude Code resolves the bare
+`opus`/`sonnet`/`haiku`/`fable` aliases through — also retargets that family's
+picker entry to the pinned concrete id (label kept), so one setting moves both
+the agents and the dashboard to a new release. Where the picker had several
+routes of that family, they become this one entry under the first one's
+label, since they would all name the same model. A thread that chose any
+other id of the family follows the pin. A pin the proxy does not route is
+ignored and logged once, and a family with a `retinue_picker: false` route
+stays out of the picker despite its pin. The list
 is cached briefly
 (`RETINUE_MODELS_CACHE_SECONDS`, default 60) and read from
 `RETINUE_LITELLM_URL` (default: `ANTHROPIC_BASE_URL`) with the credentials
@@ -930,11 +939,58 @@ The gateways are **clients** of it, so no ASR model is loaded anywhere else:
 - the **web-gateway** proxies dashboard voice input to it, exposing
   `POST /conversations/transcribe` to the PWA.
 
+### The dictation vocabulary
+
+The words an ASR model mangles are the proper nouns — people, practices,
+medications — and they are in the **life store** already, so that is where they
+are fetched from: one lean `VALUES`-bounded query for
+`vcard:Individual`/`schema:Person` names, then organisations, then drugs and
+therapies. Asking the store rather than one chamber's files is the point — a
+doctor in a care-provider list or a drug in a medication plan is as visible as a
+contact entry. The result is cached for five minutes, capped at 200 names
+(`DICTATION_NAME_LIMIT`), and **fail-open**: an unreachable store costs the
+hints, not the dictation.
+
+The query lives in `scripts/dictation_vocabulary.py` — a stdlib-only module that
+both processes needing the vocabulary import, each keeping its own cache:
+
+- the **STT service** turns the names into **Whisper hotwords** and biases every
+  decode with them, so the correction happens *before* the mishearing rather
+  than after it. It reads the store itself (`QLEVER_LIFE_URL`, same `agents`
+  network) instead of having the list pushed at it with each clip: the
+  vocabulary belongs to the deployment, not to one request, and this way an
+  inbound voice note gets the same bias as dashboard dictation — the messenger
+  gateways do not have to know the feature exists. `STT_HOTWORDS=0` turns it
+  off. Hotwords share Whisper's 224-token prompt window, so the list is capped
+  (`DICTATION_HOTWORD_CHARS`) and each rank gets a share of that budget
+  (`HOTWORD_SHARES`) — otherwise a store full of people would crowd the
+  medications out entirely. Only names' *words* are used (runs of three or more
+  letters in any script, two for Han, Kana and Hangul, where two characters are
+  a whole name; combining vowel signs as in Devanagari or Thai belong to the
+  word), since Whisper matches hotwords word-wise.
+- the **web gateway** hands the whole names to the cleanup pass below as
+  **spelling hints**.
+
+Hotwords bias, they don't constrain: a name the store knows in one spelling can
+still be heard as another name it also knows.
+
+Two decode settings in the service serve the same end. `vad_filter` (Silero,
+`STT_VAD_FILTER=0` to disable) drops non-speech — silence is what makes Whisper
+invent whole sentences, and decoding less audio is also faster; if the VAD model
+is unusable at runtime the service logs it once, disables it for the process and
+decodes on. `condition_on_previous_text=False` stops the repetition loops a
+window conditioned on the previous window's text can fall into. Which knobs the
+installed faster-whisper actually supports is probed from
+`MODEL.transcribe`'s signature — an older wheel biases through `initial_prompt`
+instead of `hotwords` — and the startup line reports what it resolved to.
+
+### The cleanup pass
+
 Dashboard voice input adds a **cleanup pass** on top: the raw transcript is run
 through a small model (`TRANSCRIPT_CLEANUP_MODEL`; unset it falls back to
 `RETINUE_CLAUDE_MODEL` — so a non-Anthropic deployment cleans up on its own
 backend — with `haiku` as the last resort) with the
-thread so far and the chambers' contact names as context, so what lands in the
+thread so far and the dictation vocabulary above as context, so what lands in the
 composer is already repaired. The messengers need none of this — there the agent reads
 the transcript and answers what was meant, while the dashboard is the one place
 that shows the user the raw text. Set `TRANSCRIPT_CLEANUP=0` to disable the pass
@@ -1001,10 +1057,14 @@ on a mode switched on before it (one minute of clock skew allowed), so a
 toggle the user presses afterwards stays on.
 
 Language handling (constrain detection to the languages the user speaks, and
-re-decode when a guess falls outside that set) lives entirely in the service via
-`STT_SUPPORTED_LANGUAGES`. An optional `STT_TOKEN` gates the endpoint
-(defence-in-depth; the service is not published to the host). Downloaded model
-weights persist in the `stt-models` volume.
+re-decode when a guess falls outside that set — carrying the same hotwords and
+settings into the second pass) lives entirely in the service.
+`STT_SUPPORTED_LANGUAGES` states the set outright; left unset it is the **union**
+of what the messenger channels declare (the `*_SUPPORTED_LANGUAGES` settings of
+Signal, WhatsApp and Telegram), because this one model transcribes for all of
+them and no single channel's setting speaks for the deployment. An optional
+`STT_TOKEN` gates the endpoint (defence-in-depth; the service is not published
+to the host). Downloaded model weights persist in the `stt-models` volume.
 
 ## Several instances: name and colour
 

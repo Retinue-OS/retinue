@@ -86,9 +86,11 @@ SIGNAL_POLL_INTERVAL = float(os.environ.get("SIGNAL_POLL_INTERVAL", "3"))
 # Restrict language detection to the languages the user actually speaks.
 # Comma-separated ISO 639-1 codes, e.g. "en,de,fr". When set, langdetect (text)
 # is constrained to this set, avoiding bogus guesses like Latin or Finnish that
-# produce unintelligible replies. Voice notes are constrained the same way by
-# the STT service (STT_SUPPORTED_LANGUAGES). The first
-# entry is used as the fallback when nothing in the set matches.
+# produce unintelligible replies. Voice notes are constrained by the STT
+# service, which folds this setting into the union of the channels' languages
+# (Signal, WhatsApp, Telegram) unless STT_SUPPORTED_LANGUAGES overrides it
+# (docs/dashboard.md). The first entry is used as the fallback when nothing in
+# the set matches.
 SUPPORTED_LANGUAGES = [
     code.strip().lower()
     for code in os.environ.get("SIGNAL_SUPPORTED_LANGUAGES", "").split(",")
@@ -802,7 +804,9 @@ def _transcribe(audio_path: Path) -> tuple[str, str]:
     """Transcribe a voice note via the shared STT service.
 
     The audio bytes are POSTed as the raw body; the STT service owns the Whisper
-    model and applies the same language constraints (STT_SUPPORTED_LANGUAGES).
+    model and applies the language constraint: the union of the channels'
+    SIGNAL_/WHATSAPP_/TELEGRAM_SUPPORTED_LANGUAGES, unless STT_SUPPORTED_LANGUAGES
+    overrides it (docs/dashboard.md).
     """
     data = Path(audio_path).read_bytes()
     headers = {"Content-Type": "application/octet-stream"}

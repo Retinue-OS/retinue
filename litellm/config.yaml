@@ -40,9 +40,12 @@ model_list:
     model_info:
       retinue_picker: true
       retinue_label: Haiku (fastest)
-  - model_name: claude-fable-5-1
+  # A deployment that sets ANTHROPIC_DEFAULT_<FAMILY>_MODEL (e.g. FABLE) has
+  # the web gateway retarget that family's entry to the pin, so these ids are
+  # only the fallback for deployments without one.
+  - model_name: claude-fable-5-2
     litellm_params:
-      model: anthropic/claude-fable-5-1
+      model: anthropic/claude-fable-5-2
     model_info:
       retinue_picker: true
       retinue_label: Fable

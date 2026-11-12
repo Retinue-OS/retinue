@@ -264,6 +264,7 @@ Conversation log:
 
 import base64
 import binascii
+import fnmatch
 import hashlib
 import html
 import hmac
@@ -297,6 +298,7 @@ import claude_auth
 import agent_models
 import chat_state as chat_state_mod
 import contacts as contacts_mod
+import dictation_vocabulary
 import email_client as ec
 import send_origin
 import inbound_store
@@ -421,6 +423,10 @@ def _default_thread_model() -> str:
 # through the same proxy that advertised the id, so the picker cannot offer a
 # model that isn't served. The list is cached for RETINUE_MODELS_CACHE_SECONDS
 # (default 60); on a failed refresh the last good list keeps serving.
+#
+# A family pin (ANTHROPIC_DEFAULT_<FAMILY>_MODEL, the variable Claude Code
+# resolves the bare `fable`/`opus`/… aliases through) retargets that family's
+# picker entry to the pinned concrete id — see _apply_family_pins.
 #
 # Deployments not routing through LiteLLM keep the static sources:
 # RETINUE_CONVERSATION_MODELS (an inline JSON array — an explicit override
@@ -741,6 +747,123 @@ def _coerce_litellm_models(parsed: object, listed_ids: list[str] | None = None) 
     return models
 
 
+# ── Family pins: one setting for agents and the picker ────────────────────────
+# Claude Code resolves the bare aliases `opus`/`sonnet`/`haiku`/`fable` (agent
+# files with `model: fable`, `--model sonnet`) through
+# ANTHROPIC_DEFAULT_<FAMILY>_MODEL. A deployment pins one to mean "the current
+# <family>" — typically a release newer than the baked CLI knows. The picker's
+# labelled entry for that family follows the same pin, so a new release is one
+# setting, not that setting plus a hand-edited route id in litellm/config.yaml.
+# The entry still carries the CONCRETE pinned id, never the alias: a thread
+# records the model it actually ran on, and a later pin change moves it only
+# because the thread's family pin moved (see _conv_model), not by reinterpreting
+# a stored name.
+_MODEL_FAMILIES = ("opus", "sonnet", "haiku", "fable")
+_warned_unserved_pins: set[str] = set()
+
+
+def _model_family(mid: str | None) -> str:
+    """The Claude family a model id belongs to (`claude-fable-5-2` -> fable), or ""."""
+    cid = _resolve_route_model(str(mid or "")).split("/")[-1].strip().lower()
+    for fam in _MODEL_FAMILIES:
+        if cid == f"claude-{fam}" or cid.startswith(f"claude-{fam}-"):
+            return fam
+    return ""
+
+
+def _family_pins() -> dict[str, str]:
+    """family -> pinned concrete id, from ANTHROPIC_DEFAULT_<FAMILY>_MODEL.
+
+    A pin naming a model outside its family (e.g. the sonnet alias pointed at
+    a local model) is not a "current <family>" statement and is ignored here."""
+    pins = {}
+    for fam in _MODEL_FAMILIES:
+        val = os.environ.get(f"ANTHROPIC_DEFAULT_{fam.upper()}_MODEL", "").strip()
+        if val and _model_family(val) == fam:
+            pins[fam] = val
+    return pins
+
+
+def _proxy_serves(parsed: object, mid: str) -> bool:
+    """Whether a /model/info body has a route for `mid` (by name or wildcard)."""
+    if not isinstance(parsed, dict):
+        return False
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        name = _litellm_model_id(item)
+        if name and (name == mid or ("*" in name and fnmatch.fnmatchcase(mid, name))):
+            return True
+    return False
+
+
+def _hidden_families(parsed: object) -> set[str]:
+    """Families with a route the operator hid with `retinue_picker: false`."""
+    if not isinstance(parsed, dict):
+        return set()
+    hidden = set()
+    for item in parsed.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        info = item.get("model_info")
+        if isinstance(info, dict) and info.get(_LITELLM_PICKER_FLAG) is False:
+            fam = _model_family(_litellm_model_id(item))
+            if fam:
+                hidden.add(fam)
+    return hidden
+
+
+def _apply_family_pins(models: list[dict], parsed: object) -> list[dict]:
+    """Retarget each pinned family's picker entry to its pin.
+
+    The first entry of a pinned family keeps its label and takes the pinned id;
+    further entries of that family collapse into it (they would otherwise all
+    name the same model). A pinned family with no entry gets one, labelled by
+    the family name. A pin the proxy does not serve changes nothing — the
+    picker must never offer a model that isn't routed — and is logged once.
+    A family the operator hid with an explicit `retinue_picker: false` route
+    stays out of the picker: the pin moves what the family means, it does not
+    override a deliberate hide."""
+    pins = _family_pins()
+    if not pins:
+        return models
+    hidden = _hidden_families(parsed)
+    served = {}
+    for fam, pin in pins.items():
+        routed = _proxy_serves(parsed, pin)
+        served[fam] = routed and fam not in hidden
+        if not routed and pin not in _warned_unserved_pins:
+            _warned_unserved_pins.add(pin)
+            print(f"[web-gateway] ANTHROPIC_DEFAULT_{fam.upper()}_MODEL={pin!r} "
+                  "is not served by LiteLLM; the picker keeps its configured "
+                  f"{fam} entry", flush=True)
+    out, done = [], set()
+    for m in models:
+        fam = _model_family(m["id"])
+        if fam and served.get(fam):
+            if fam in done:
+                continue
+            done.add(fam)
+            m = {**m, "id": pins[fam]}
+        out.append(m)
+    for fam, pin in pins.items():
+        if served[fam] and fam not in done:
+            out.append({"id": pin, "label": fam.capitalize()})
+    return out
+
+
+def _family_pin_equivalent(mid: str | None) -> str | None:
+    """The offered pinned id for a stored choice of a pinned family, or None.
+
+    A thread pinned to `claude-fable-5-1` meant "Fable"; once the deployment
+    pins Fable to 5.2 the picker no longer offers 5.1, and without this the
+    thread would silently fall back to the default model (Opus)."""
+    pin = _family_pins().get(_model_family(mid))
+    if pin and _model_offered(pin):
+        return pin
+    return None
+
+
 def _fetch_litellm_json(path: str) -> object:
     url = _LITELLM_URL.rstrip("/") + path
     req = urllib.request.Request(
@@ -863,7 +986,7 @@ def _fetch_litellm_models() -> list[dict]:
     except (OSError, ValueError):
         # /v1/models is enrichment; /model/info alone still yields a list.
         listed = None
-    models = _coerce_litellm_models(info, listed)
+    models = _apply_family_pins(_coerce_litellm_models(info, listed), info)
     try:
         tags = _fetch_ollama_models()
     except (OSError, ValueError):
@@ -1198,7 +1321,8 @@ TRANSCRIBE_TIMEOUT = float(os.environ.get("TRANSCRIBE_TIMEOUT", "120"))
 # the dashboard — unlike Signal, where the agent reads the transcript and answers
 # what was meant — every recognition error is the user's to repair by hand. We
 # run the transcript through a small model first, with the thread so far and the
-# user's contact names as context (that is what fixes mangled names). Best
+# dictation vocabulary (names from the life store: people, organisations,
+# medications) as context — that is what fixes mangled names. Best
 # effort: any failure returns the raw transcript unchanged.
 TRANSCRIPT_CLEANUP = os.environ.get("TRANSCRIPT_CLEANUP", "1").strip().lower() not in ("0", "false", "no")
 # An explicit TRANSCRIPT_CLEANUP_MODEL always wins; otherwise fall back to
@@ -3002,8 +3126,12 @@ def _bind_conv_key(key: str, cid: str, ephemeral: bool = False) -> None:
 
 
 def _conv_model(conv: dict) -> str | None:
-    """The validated model a thread should run on, or None for the default."""
-    return _valid_model_id(conv.get("model"))
+    """The validated model a thread should run on, or None for the default.
+
+    A stored choice the picker no longer offers because its family's pin moved
+    on (Fable 5.1 -> 5.2) follows the pin rather than dropping to the default."""
+    stored = conv.get("model")
+    return _valid_model_id(stored) or _family_pin_equivalent(stored)
 
 
 # Threads that predate the model tiers carry no pin, because back then they
@@ -5264,46 +5392,18 @@ def send_message(message: str, display_question: str | None = None,
             return out
 
 
+# ── Dictation vocabulary ──────────────────────────────────────────────────────
+
+# Whole names from the life store, as spelling hints for the transcript-repair
+# model. The same module biases the decoder itself inside the STT service, from
+# its own cache — see scripts/dictation_vocabulary.py.
+
+
+def _dictation_names() -> list[str]:
+    return dictation_vocabulary.vocabulary("web-gateway")[0]
+
+
 # ── Transcript cleanup ────────────────────────────────────────────────────────
-
-# The names in the address book — the people the user is likely to dictate
-# about, and the words Whisper most often mangles: every contact's name, plus
-# the literal objects of any *name predicate in a hand-kept Turtle file beside
-# them (`…name "X"` covers foaf/schema/kb spellings, `:fn "X"` the vCard one).
-# Cached against the source files' mtimes.
-_NAME_LITERAL_RE = re.compile(r'(?:[Nn]ame|:fn)\s+"([^"\n]{2,80})"')
-_contact_names_cache: tuple[float, list[str]] | None = None
-_contact_names_lock = threading.Lock()
-
-
-def _contact_names(limit: int = 200) -> list[str]:
-    global _contact_names_cache
-    try:
-        dirs = [loc["dir"] for loc in _CONTACTS.locations()]
-        turtle = sorted(p for d in dirs for p in d.glob("*.ttl"))
-        stamp = sum(p.stat().st_mtime for d in dirs for p in list(d.glob("*.nt")) + list(d.glob("*.ttl")))
-    except OSError:
-        return []
-    with _contact_names_lock:
-        if _contact_names_cache and _contact_names_cache[0] == stamp:
-            return _contact_names_cache[1]
-        names: list[str] = []
-        seen: set[str] = set()
-        found = [r["name"] for r in _CONTACTS.all() if r.get("name")]
-        for path in turtle:
-            try:
-                found += _NAME_LITERAL_RE.findall(path.read_text(encoding="utf-8", errors="replace"))
-            except OSError:
-                continue
-        for name in found:
-            key = name.casefold()
-            if key not in seen:
-                seen.add(key)
-                names.append(name)
-        names = names[:limit]
-        _contact_names_cache = (stamp, names)
-        return names
-
 
 _CLEANUP_SYSTEM_PROMPT = (
     "You repair speech-recognition transcripts. The user dictated a message; a "
@@ -5339,7 +5439,7 @@ def _cleanup_transcript(raw: str, thread_id: str = "") -> str:
     if not TRANSCRIPT_CLEANUP or not raw.strip():
         return raw
     parts = []
-    names = _contact_names()
+    names = _dictation_names()
     if names:
         parts.append("Names the user may have dictated (use the exact spelling):\n"
                      + ", ".join(names))
@@ -11925,7 +12025,13 @@ class Handler(BaseHTTPRequestHandler):
         composer, `raw_text` what Whisper actually heard. A `?thread=<id>` query
         param gives the cleanup pass the thread as context; `?cleanup=0` skips
         the pass. Access is the dashboard's own edge auth; the hop to the STT
-        service carries the shared Bearer token."""
+        service carries the shared Bearer token.
+
+        Nothing about the deployment's vocabulary travels on this hop: the STT
+        service reads the same life store this gateway does and biases its own
+        decode (scripts/dictation_vocabulary.py). Sending the names with every
+        clip would repeat a list that changes daily, and would leave the voice
+        notes the messenger gateways transcribe without any bias at all."""
         if not STT_SERVICE_URL:
             self._send_json(503, {"error": "transcription not configured"})
             return
