@@ -9650,8 +9650,8 @@ class Handler(BaseHTTPRequestHandler):
     # page's code, which could forget it. A response that is not a page needs
     # none: a policy governs the document it arrives with. A page of webapp/
     # that needs more than the others (content_policy.PAGE_SOURCES: /sparql,
-    # the chat page) is named by _serve_static_file, which serves it under
-    # each of its paths.
+    # the chat page, the file viewer) is named by _serve_static_file, which
+    # serves it under each of its paths.
 
     def send_header(self, keyword, value):
         if keyword.lower() == "content-type":

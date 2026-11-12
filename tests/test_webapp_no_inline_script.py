@@ -23,6 +23,10 @@ that way, everywhere a page comes from:
   pages): the string literals of each statement are joined first, so a tag
   split over adjacent literals or lines is read whole.
 
+A frame's srcdoc is a document of its own under the page's policy, so what
+one holds is checked as a page wherever the markup is (its entities read);
+a slash before a handler's name (`<img/onerror=…>`) counts as a blank does.
+
 A script a page loads must also be a file of the dashboard's own: a path on
 this origin to a file in webapp/, since script-src 'self' blocks one from
 elsewhere and a missing one leaves the page without it.
@@ -93,6 +97,14 @@ class _Scan(html.parser.HTMLParser):
         for name, value in attrs:
             if name.startswith("on"):
                 self.problems.append(f"handler attribute <{tag} {name}=…>")
+            # A frame's srcdoc is a document of its own, which the browser
+            # runs under this page's policy: an inline script or a handler in
+            # it is blocked as one in the page would be. The parser has read
+            # its entities already, so it is scanned as the page it becomes;
+            # its relative URLs resolve against this page's.
+            if name == "srcdoc" and value is not None:
+                self.problems.extend(f"in srcdoc: {problem}"
+                                     for problem in problems_in(value, self.page_dir))
             if name in URL_ATTRS and value is not None:
                 # A browser strips leading blanks and control characters, and
                 # tabs and newlines anywhere, before it reads the scheme.
@@ -191,8 +203,10 @@ def check_static_pages() -> list[str]:
 # A tag a template spreads over lines has its handler on a line that opens
 # none; the literals are therefore also read whole (literal_handler_lines),
 # where an unquoted value counts once a tag opens earlier in the same literal.
-HANDLER_IN_MARKUP = re.compile(r"""\son[a-z]{3,}\s*=\s*(?:["'`]|\\["']|\$\{)""")
-HANDLER_UNQUOTED = re.compile(r"""[\s"'`]on[a-z]{3,}\s*=\s*[^\s=>]""", re.I)
+# A slash between attributes separates them as a blank does
+# (`<img/onerror=…>`), so it may stand before the name too.
+HANDLER_IN_MARKUP = re.compile(r"""[\s/]on[a-z]{3,}\s*=\s*(?:["'`]|\\["']|\$\{)""")
+HANDLER_UNQUOTED = re.compile(r"""[\s/"'`]on[a-z]{3,}\s*=\s*[^\s=>]""", re.I)
 HANDLER_SET_ATTRIBUTE = re.compile(r"""setAttribute\(\s*['"`]on""")
 COMMENT_LINE = re.compile(r"^\s*(?://|/\*|\*)")
 
@@ -340,6 +354,22 @@ def literal_handler_lines(source: str) -> list[int]:
     return lines
 
 
+def literal_srcdoc_problems(source: str) -> list[tuple[int, str]]:
+    """(line, problem) for what a frame's srcdoc holds in the string and
+    template literals of a JavaScript source: each literal that names one is
+    read as markup (problems_in), and what its srcdoc documents hold counts,
+    since the browser runs them under the page's policy. Only those are
+    taken: the rest of a component's markup is checked by the searches
+    above, and a <script> that innerHTML writes is never run."""
+    out = []
+    for line, text in js_literals(source):
+        if "srcdoc" not in text.lower():
+            continue
+        out.extend((line, problem) for problem in problems_in(text)
+                   if problem.startswith("in srcdoc:"))
+    return out
+
+
 def check_component_sources() -> list[str]:
     failures = []
     sources = (sorted(WEBAPP.glob("*.js")) + sorted((WEBAPP / "components").glob("*.js"))
@@ -357,6 +387,9 @@ def check_component_sources() -> list[str]:
         try:
             for no in literal_handler_lines(text):
                 failures.append(f"{rel}:{no}: handler attribute in the markup of the literal "
+                                f"opened here")
+            for no, problem in literal_srcdoc_problems(text):
+                failures.append(f"{rel}:{no}: {problem}, in the markup of the literal "
                                 f"opened here")
         except ValueError as e:
             failures.append(f"{rel}: its literals cannot be read: {e}")
@@ -448,7 +481,7 @@ def check_gateway_pages(wg) -> list[str]:
 _FSTRING_MIDDLE = getattr(tokenize, "FSTRING_MIDDLE", None)
 _STRING_PREFIX = re.compile(r"""^[A-Za-z]*('{3}|"{3}|'|")(.*)\1$""", re.S)
 SOURCE_SCRIPT = re.compile(r"<script\b([^>]*)>?", re.I)
-SOURCE_HANDLER = re.compile(r"<[a-z][^<>]*?\son[a-z]{3,}\s*=", re.I)
+SOURCE_HANDLER = re.compile(r"<[a-z][^<>]*?[\s/]on[a-z]{3,}\s*=", re.I)
 # A browser drops blanks and control characters before it reads a URL's
 # scheme; the search lets them stand between any two letters of it.
 SOURCE_JAVASCRIPT_URL = re.compile("[\\x00-\\x20]*".join("javascript:"), re.I)
@@ -517,6 +550,14 @@ def gateway_source_problems(source: str, name: str = "scripts/web-gateway.py") -
             failures.append(f"{name}:{line_of(m.start())}: handler attribute in markup")
         for m in SOURCE_JAVASCRIPT_URL.finditer(text):
             failures.append(f"{name}:{line_of(m.start())}: javascript: URL")
+        # A frame's srcdoc holds a page of its own, its markup written as
+        # entities the searches above do not read: the statement is parsed
+        # as markup, and what its srcdoc documents hold counts.
+        at = text.lower().find("srcdoc")
+        if at >= 0:
+            for problem in problems_in(text, page_dir=None):
+                if problem.startswith("in srcdoc:"):
+                    failures.append(f"{name}:{line_of(at)}: {problem}")
     return failures
 
 
@@ -550,6 +591,15 @@ def check_the_checker() -> list[str]:
         '<a href=" JaVa\tScRiPt:alert(1)">x</a>': 1,
         '<a href="/javascript:ok">x</a>': 0,
         '<button onclick=go()>x</button>': 1,
+        # A slash separates attributes as a blank does.
+        '<img/onerror=alert(1) src=/x.png>': 1,
+        # A frame's srcdoc is a document of its own, under this page's
+        # policy: what it holds is read as a page, entities and all.
+        '<iframe srcdoc="<script>alert(1)</script>"></iframe>': 1,
+        '<iframe srcdoc="&lt;img src=x onerror=alert(1)&gt;"></iframe>': 1,
+        '<iframe srcdoc="<a href=&quot;javascript:x()&quot;>x</a>"></iframe>': 1,
+        '<iframe srcdoc="<iframe srcdoc=&quot;<script>x()</script>&quot;></iframe>"></iframe>': 1,
+        '<iframe srcdoc="<p>hello</p>"></iframe>': 0,
     }
     for markup, expected in cases.items():
         found = len(problems_in(markup))
@@ -557,7 +607,8 @@ def check_the_checker() -> list[str]:
             failures.append(f"checker: {markup!r} gave {found} problems, expected {expected}")
     for line in ('`<img src="${u}" onload="x()">`', "  `<button onclick=go()>x</button>`",
                  "  html += '<img src=x onerror=alert(1)>';", "`<div onMouseOver=${fn}>`",
-                 "  `<a href=\"/x\"`, ` onfocus=\"x()\">`", "el.setAttribute('onclick', 'x()');"):
+                 "  `<a href=\"/x\"`, ` onfocus=\"x()\">`", "el.setAttribute('onclick', 'x()');",
+                 "  `<img/onerror=\"x()\" src=\"/x.png\">`", "  html += '<img/onerror=x() src=/x.png>';"):
         if not handler_in_markup(line):
             failures.append(f"checker: missed a handler attribute in {line!r}")
     for line in ("    js.onload = () => resolve();", "    img.onerror = () => { this.x = 1; };",
@@ -598,6 +649,24 @@ def check_the_checker() -> list[str]:
             found = [f"unread: {e}"]
         if found:
             failures.append(f"checker: {source!r} gave {found}, expected none")
+    # A frame's srcdoc in a component's markup is a page of its own: an inline
+    # script there, or a handler or a javascript: URL in its entities, counts.
+    for source, line in (
+            ("f.innerHTML = `<iframe\n  srcdoc=\"<script>go()</script>\"></iframe>`;\n", 1),
+            ("x = 1;\nf.innerHTML = '<iframe srcdoc=\"&lt;img src=x onerror=go()&gt;\"></iframe>';\n",
+             2),
+            ("f.innerHTML = `<iframe srcdoc=\"&lt;a href=&quot;javascript:go()&quot;&gt;\">`;\n", 1)):
+        try:
+            found = [no for no, _ in literal_srcdoc_problems(source)]
+        except ValueError as e:
+            found = [f"unread: {e}"]
+        if found != [line]:
+            failures.append(f"checker: {source!r} gave {found}, expected line {line}")
+    for source in ("f.innerHTML = `<iframe srcdoc=\"<p>${esc(text)}</p>\"></iframe>`;\n",
+                   "const label = 'srcdoc';\n"):
+        found = literal_srcdoc_problems(source)
+        if found:
+            failures.append(f"checker: {source!r} gave {found}, expected none")
     for source in ("el.innerHTML = `<b>;\n", "s = '<b>;\n", "/* `<b onclick=x()>`\n"):
         try:
             literal_handler_lines(source)
@@ -614,6 +683,8 @@ def check_the_checker() -> list[str]:
             'self._send_html(403, H + "<body><a href=\\"javascript:alert(1)\\">x</a>")\n',
             'self._send_html(403, H + "<body><h1\\n"\n    "onclick=\\"x()\\">x</h1>")\n',
             'self._send_html(403, H + "<body><h1"\n    + " onclick=x()>" + y)\n',
+            'self._send_html(403, H + "<body><img/onerror=x() src=/x.png>")\n',
+            'self._send_html(403, H + \'<iframe srcdoc="&lt;script&gt;x()&lt;/script&gt;">\')\n',
             'self._send_html(403, H + f"<body><h1>{x}</h1><script>go()</script>")\n',
             'page = ("<a href=\\" java\\tscript:go()\\">"\n        "x</a>")\n'):
         found = gateway_source_problems(source, "source")

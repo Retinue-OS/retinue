@@ -84,17 +84,22 @@ DIRECTIVES = (
     # an image an answer names as a link or its alt text (web-gateway.py,
     # _image_as_link), as webapp/components/markdown.js does.
     ("img-src", ("'self'",)),
-    # Audio and video: this origin only (messenger media through the media
-    # proxy, the briefing card's audio).
-    ("media-src", ("'self'",)),
+    # Audio and video: none. Only the chat page plays any, and gets this
+    # origin for itself (PAGE_SOURCES). The briefing card would play audio on
+    # the start page, but index.html leaves it out (commented out until it is
+    # backed by real data); whoever brings it back gives index.html
+    # media-src 'self' here.
+    ("media-src", ("'none'",)),
     # No page loads a font: the dashboard uses the system's.
     ("font-src", ("'none'",)),
     # fetch() and the like go to this origin's API only; the dashboard makes
     # no third-party requests.
     ("connect-src", ("'self'",)),
-    # The file viewer (viewer.html) shows a thread attachment of this origin
-    # in a frame; no page frames anything else.
-    ("frame-src", ("'self'",)),
+    # Frames: none. Only the file viewer frames anything, and gets this origin
+    # for itself (PAGE_SOURCES). Were this 'self' on every page, markup that
+    # slipped into one could frame another page of this origin, an approval
+    # card say, under a click the user meant for something else.
+    ("frame-src", ("'none'",)),
     ("object-src", ("'none'",)),
     ("base-uri", ("'self'",)),
     # The approval cards' Allow and Deny post to this origin, and so does
@@ -107,13 +112,21 @@ DIRECTIVES = (
 
 # What a single page needs beyond DIRECTIVES, by the file of webapp/ it is,
 # for that page alone, so the others do not carry it. A source named here is
-# added to the directive's sources above.
+# added to the directive's sources above; where those are 'none', it takes
+# their place, since 'none' stands only alone (beside a source a browser
+# ignores it, and says so in the console).
 PAGE_SOURCES = {
     # The chat page (webapp/chat.html, components/chat-page.js): its previews
     # of the images the user is about to send (picked, pasted, or kept for an
     # unsent message across a reload) are object URLs the page makes itself
-    # of those files (URL.createObjectURL). No other page makes one.
-    "chat.html": {"img-src": ("blob:",)},
+    # of those files (URL.createObjectURL). No other page makes one. And it
+    # plays messenger media through the media proxy, in <audio> and <video>.
+    "chat.html": {"img-src": ("blob:",), "media-src": ("'self'",)},
+    # The file viewer (webapp/viewer.html, components/viewer-page.js): a
+    # thread attachment of this origin, in a frame. Its own <meta> policy
+    # says the same, so a link inside a PDF cannot load another site into the
+    # frame in off mode either.
+    "viewer.html": {"frame-src": ("'self'",)},
     # /sparql (webapp/sparql.html, also served as /sparql.html): the stylesheet
     # of the vendored YASGUI (scripts/vendor-yasgui.sh) carries its icons as
     # data: images.
@@ -140,11 +153,15 @@ def mode() -> str:
 def policy(page: str | None = None) -> str:
     """The policy as it is sent: the directives, then where reports go.
     ``page`` names a file of webapp/ (``"sparql.html"``); a page with an
-    entry in PAGE_SOURCES gets that entry's sources as well, any other page
-    (and None) the policy every page has."""
+    entry in PAGE_SOURCES gets that entry's sources as well (in place of
+    'none'), any other page (and None) the policy every page has."""
     extra = PAGE_SOURCES.get(page or "", {})
-    parts = [f"{name} {' '.join(sources + tuple(extra.get(name, ())))}"
-             for name, sources in DIRECTIVES]
+    parts = []
+    for name, sources in DIRECTIVES:
+        added = tuple(extra.get(name, ()))
+        if added and sources == ("'none'",):
+            sources = ()
+        parts.append(f"{name} {' '.join(sources + added)}")
     parts.append(f"report-uri {REPORT_PATH}")
     return "; ".join(parts)
 

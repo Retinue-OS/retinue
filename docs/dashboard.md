@@ -107,27 +107,36 @@ no code path can forget it. The policy is built in one place,
 
 ```
 default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
-img-src 'self'; media-src 'self'; font-src 'none';
-connect-src 'self'; frame-src 'self'; object-src 'none'; base-uri 'self';
+img-src 'self'; media-src 'none'; font-src 'none';
+connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self';
 form-action 'self'; worker-src 'self'; manifest-src 'self';
 report-uri /csp-report
 ```
 
 Scripts come from this origin only: no inline script, no handler attribute,
 no `javascript:` URL, no `eval`. Styles stay open (the components set style
-attributes; restricting styles is not the aim). Images and media come from
-this origin. No image or medium is loaded from another origin: the chat page
+attributes; restricting styles is not the aim). Images come from this
+origin. No image or medium is loaded from another origin: the chat page
 shows an attachment that is a web link as a link to open (see
 "Attachments"), and the session log shows an image an answer names (a web
 address or a `data:` URL) as a link to it, or as its alt text, never as an
-image, as the dashboard's Markdown renderer does. The one frame is the file
-viewer's; no page loads a font.
-Two pages get more, each for itself alone (`PAGE_SOURCES` in the module):
+image, as the dashboard's Markdown renderer does. Every page but one plays
+no audio or video, and every page but one frames nothing, so `media-src`
+and `frame-src` are `'none'`: markup that slipped into a page can then not
+frame another page of this origin either (an approval card, under a click
+meant for something else). No page loads a font.
+Three pages get more, each for itself alone (`PAGE_SOURCES` in the module;
+a source added to a directive that is `'none'` takes its place):
 the chat page (`/chat.html`) adds `blob:` to `img-src`, for its previews of
-the images about to be sent, which it makes itself as object URLs; no other
-page makes one. `/sparql` (also served as `/sparql.html`) adds `data:` to
-`img-src`, for the icons in YASGUI's stylesheet. It needs nothing else: the
-vendored YASGUI compiles no strings.
+the images about to be sent, which it makes itself as object URLs (no other
+page makes one), and gets `media-src 'self'`, for the messenger media it
+plays; it is the only page that plays any. (The briefing card would play
+audio on the start page, but `index.html` leaves it out for now; bringing it
+back means giving `index.html` `media-src 'self'` there.) The file viewer
+(`/viewer.html`) gets `frame-src 'self'`, for the attachment it shows in a
+frame; it is the only page that frames anything. `/sparql` (also served as
+`/sparql.html`) adds `data:` to `img-src`, for the icons in YASGUI's
+stylesheet. It needs nothing else: the vendored YASGUI compiles no strings.
 Two other policies stay as they were, separate and always enforced:
 `/settings-instance.html`'s `frame-ancestors` (who may frame it, see "The
 settings page") and the file viewer's own `frame-src 'self'`. Inside the
@@ -193,8 +202,8 @@ render: listeners are added in script. No `javascript:` URLs, no `eval`,
 `new Function` or string timers, nothing from another origin. A page that
 cannot work without more gets it for that page alone, stated in
 `PAGE_SOURCES` of `scripts/content_policy.py` (as the chat page's `blob:`
-images and `/sparql`'s `data:` images are), rather than a weaker policy for
-every page.
+images, `/sparql`'s `data:` images and the file viewer's frame are), rather
+than a weaker policy for every page.
 `tests/test_webapp_no_inline_script.py` checks the pages, the components'
 markup and every page the gateway builds (its builders rendered, and its
 source for the error pages it writes in place), and that every script a page
