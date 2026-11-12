@@ -31,6 +31,19 @@ behaviour, not a given operator's configuration:
   to prevent.
 - Authentication and path-traversal issues in the web gateway, including
   attachment and static-file serving.
+- Anything that lets content from outside become a page, a script or a link
+  of another scheme on the dashboard's origin. The gateway's escaping and its
+  media rules are the first line there; the second is the
+  Content-Security-Policy every page carries (docs/dashboard.md, "The
+  Content-Security-Policy"), which runs scripts only from the dashboard's own
+  files, together with the rule that no route serves bytes from outside under
+  a script type. A way around either is in scope. Note that the policy ships
+  in report mode (`RETINUE_CSP=report`): until the operator enforces it, it
+  reports and blocks nothing. The gateway's policy covers only what the
+  gateway answers; another service published on the dashboard's host shares
+  its origin and must carry a policy of its own. The egress log viewer, which
+  the deployment example can publish at `/egress` there, sends a fixed one
+  that runs no script, always enforced.
 
 ## Known limitations — please don't report these as vulnerabilities
 
@@ -93,6 +106,14 @@ Some of the security of a Retinue deployment is yours, not ours:
   `deploy/traefik/dynamic/retinue-client-ca.crt` is `.gitignore`d for this
   reason — whoever holds the CA private key can mint client certificates your
   gateway will accept.
+- **Enforce the dashboard's Content-Security-Policy.** It ships report-only;
+  after about a week of normal use, read `GET /csp-report` and set
+  `RETINUE_CSP=enforce` (docs/dashboard.md, "The Content-Security-Policy").
+- **Publish nothing on the dashboard's host that lacks a policy of its own.**
+  A service routed to a path of that host serves pages on the dashboard's
+  origin, where a script it lets run can do what the dashboard can. Give such
+  a service a host of its own unless it sends a Content-Security-Policy that
+  runs no script from outside, as the egress log viewer does.
 - **Set an explicit send policy per account.** Undeclared accounts fail safe to
   `verify`, but relying on the default is not the same as deciding.
 - **Keep `UPDATER_TOKEN` and gateway tokens out of any environment you don't

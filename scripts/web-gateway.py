@@ -306,6 +306,7 @@ import attention_store
 import build_stamp
 import claude_auth
 import agent_models
+import content_policy
 import chat_state as chat_state_mod
 import contacts as contacts_mod
 import dictation_vocabulary
@@ -1414,6 +1415,13 @@ _ATTENTION_POST_RE = re.compile(r"^/attention/(?:items/)?(mode|modes|permits|adm
 PUSH_DIR = Path(os.environ.get("PUSH_DIR", str(CONVERSATIONS_DIR.parent / "push")))
 push_notify.init(PUSH_DIR)
 
+# What the browsers report of the Content-Security-Policy (POST /csp-report,
+# scripts/content_policy.py): one small file beside the conversations, so it
+# is on the persistent volume and outlives a rebuild, and out of /data/, which
+# the agents write and the pages read.
+CSP_REPORTS_FILE = Path(os.environ.get("RETINUE_CSP_REPORTS_FILE")
+                        or str(CONVERSATIONS_DIR.parent / "csp-reports.json"))
+
 # ── Attention (the home screen's model) ────────────────────────────────────
 # What the dashboard shows first is no longer three cards but one list of what
 # wants attention — threads, chats and projects alike — each item with an
@@ -1594,6 +1602,11 @@ def _shell_hash() -> str:
     # Only when set, so an unbranded deployment keeps the hash it always had.
     if instance_branding.branded():
         entries.append(f"branding:{instance_branding.signature()}")
+    # So is the Content-Security-Policy: the worker serves the shell pages
+    # from its cache with the headers they were cached with, so a changed mode
+    # (RETINUE_CSP) or policy reaches an installed client only with a new
+    # worker, as a changed file does.
+    entries.append(f"csp:{content_policy.signature()}")
     signature = "\n".join(entries)
     cached = _SHELL_HASH_CACHE.get(signature)
     if cached is not None:
@@ -1633,6 +1646,13 @@ _STATIC_CONTENT_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+# What /data/ answers with. The directory holds what the deployment's agents
+# write (DASHBOARD_DATA_DIR) — content of the deployment, not of the shell —
+# and the cards read JSON from it, nothing else. So a page, a script, a
+# stylesheet or an SVG an agent left there is never served as one on the
+# dashboard's origin: any other file is application/octet-stream, as a
+# download.
+_DATA_CONTENT_TYPES = {".json": "application/json; charset=utf-8"}
 # Conversations are keyed by requester identity. Requests that carry no
 # "on-behalf-of" identity share this default key.
 DEFAULT_SESSION_KEY = "Web"
@@ -1843,6 +1863,49 @@ _MD_TAG_RE = re.compile(r'(<[^>]*>)')
 # Elements whose text is never linked: a link already is one, and code is
 # shown as written.
 _MD_NO_LINK_RE = re.compile(r'<(/?)(a|code|pre)\b', re.IGNORECASE)
+# An image of markdown-it's output, and its attributes (each value escaped by
+# markdown-it). An answer is model output, so an image in it would be fetched
+# from wherever the model pointed, and the page's Content-Security-Policy
+# (img-src, scripts/content_policy.py) blocks any image from another origin
+# or a data: URL anyway. The log shows an image as a link to it instead, as
+# the dashboard's own Markdown renderer does (webapp/components/markdown.js).
+_MD_IMG_RE = re.compile(r'<img\s')
+_MD_ATTR_RE = re.compile(r'([a-z]+)="([^"]*)"')
+# Where such a link may point: the web, or a path on this origin (a second
+# slash or a backslash would make it another origin), as markdown.js allows.
+_MD_IMG_LINK_RE = re.compile(r'(?i)(?:https?://|/(?![/\\]))')
+# Where an answer's own link may point: the web, a mail address, a telephone
+# number or a path on this origin, the rule of the dashboard's Markdown
+# renderer (markdown.js). markdown-it itself refuses only javascript:,
+# vbscript:, file: and data: other than an image, so without this a link of
+# any other scheme in model output, which can quote outside text, would be a
+# link on this origin; inside the Android shell some of them open another
+# app. The href is markdown-it's normalised one, in which a backslash is
+# already percent-encoded and so cannot make it another origin.
+_MD_LINK_RE = re.compile(r'(?i)(?:https?://|mailto:|tel:|/(?![/\\]))')
+
+
+def _md_refuse_links(state) -> None:
+    """Drop every link whose href ``_MD_LINK_RE`` refuses, keeping its
+    text: the text of a refused link reads as text, as an image whose URL is
+    refused reads as its alt text. A link never holds another link, but an
+    image inside one is a token of its own and is left to _image_as_link."""
+    for block in state.tokens:
+        if block.type != "inline" or not block.children:
+            continue
+        kept, refused = [], []
+        for tok in block.children:
+            if tok.type == "link_open":
+                refused.append(not _MD_LINK_RE.match(tok.attrGet("href") or ""))
+                if refused[-1]:
+                    continue
+            elif tok.type == "link_close" and refused and refused.pop():
+                continue
+            kept.append(tok)
+        block.children = kept
+
+
+_md.core.ruler.push("refuse_links", _md_refuse_links)
 
 # ── Async job store ───────────────────────────────────────────────────────────
 # POST /message can request async handling; the request returns a job handle
@@ -1917,7 +1980,9 @@ def _render_answer(raw: str) -> str:
     out: list[str] = []
     depth = {"a": 0, "code": 0, "pre": 0}
     for i, part in enumerate(_MD_TAG_RE.split(rendered)):
-        if i % 2:  # a tag
+        if i % 2 and _MD_IMG_RE.match(part):
+            out.append(_image_as_link(part, inside_link=depth["a"] > 0))
+        elif i % 2:  # a tag
             m = _MD_NO_LINK_RE.match(part)
             if m and not part.endswith("/>"):
                 name = m.group(2).lower()
@@ -1928,6 +1993,20 @@ def _render_answer(raw: str) -> str:
         else:
             out.append(part)
     return "".join(out)
+
+
+def _image_as_link(tag: str, inside_link: bool) -> str:
+    """markdown-it's <img> ``tag`` as a link to the image, its alt text (or
+    the URL) as the link's text; only the text inside another link, or where
+    the URL is neither a web address nor a path on this origin. The values
+    are markdown-it's, already escaped for an attribute and for text."""
+    attrs = dict(_MD_ATTR_RE.findall(tag))
+    src = attrs.get("src", "")
+    text = attrs.get("alt") or src
+    if inside_link or not _MD_IMG_LINK_RE.match(src):
+        return attrs.get("alt", "")
+    title = f' title="{attrs["title"]}"' if "title" in attrs else ""
+    return f'<a href="{src}"{title}>{text}</a>'
 
 
 def _linkify_text(text: str) -> str:
@@ -3152,6 +3231,35 @@ def _stated_media_type(stated) -> str:
     return _media_type_header(*parsed) if parsed else "application/octet-stream"
 
 
+# What a browser runs as a script or a worker: the JavaScript MIME types
+# (WHATWG MIME Sniffing, "JavaScript MIME type"). The page's
+# Content-Security-Policy (scripts/content_policy.py) lets scripts run from
+# this origin only, which is a boundary only while nothing on the origin
+# answers bytes chosen outside under one of these types: a <script src> or a
+# worker pointed at such an answer would run it as the dashboard's own. Under
+# nosniff, every answer here, no other type is run as a script, so a route
+# that serves bytes from outside (a thread attachment, a messenger file, a
+# store's result) answers these as application/octet-stream instead.
+_SCRIPT_MEDIA_TYPES = frozenset({
+    "application/ecmascript", "application/javascript", "application/x-ecmascript",
+    "application/x-javascript", "text/ecmascript", "text/javascript",
+    "text/javascript1.0", "text/javascript1.1", "text/javascript1.2",
+    "text/javascript1.3", "text/javascript1.4", "text/javascript1.5", "text/jscript",
+    "text/livescript", "text/x-ecmascript", "text/x-javascript",
+})
+
+
+def _served_media_type(stated) -> str:
+    """A content type from outside as a route of this origin may answer with
+    it: one media type, written back from what was read (_stated_media_type),
+    and never a script type (_SCRIPT_MEDIA_TYPES), which becomes
+    application/octet-stream."""
+    parsed = _parse_media_type(stated)
+    if not parsed or parsed[0] in _SCRIPT_MEDIA_TYPES:
+        return "application/octet-stream"
+    return _media_type_header(*parsed)
+
+
 def _media_essence(stated) -> str:
     """A stated content type as its bare ``type/subtype``, or
     application/octet-stream.
@@ -3175,8 +3283,12 @@ def _chat_media_headers(stated) -> dict:
     any ``+xml`` type for an XML document, so it is a download like the rest.
     The file name the sender gave is not known here (it is in the gateway's
     store and in the ledger record), so a download goes out without one and
-    is named after the URL and the type."""
+    is named after the URL and the type. A script type is never sent: such a
+    file is application/octet-stream (_SCRIPT_MEDIA_TYPES)."""
     parsed = _parse_media_type(stated[0]) if stated and len(stated) == 1 else None
+    if parsed and parsed[0] in _SCRIPT_MEDIA_TYPES:
+        # Never a script of this origin; a download, saved as bytes.
+        parsed = None
     essence, params = parsed or ("application/octet-stream", {})
     major, _, minor = essence.partition("/")
     in_place = essence in _INLINE_SAFE_TYPES or (
@@ -4638,41 +4750,20 @@ def _all_pending() -> list[dict]:
     return items
 
 
-# The way out of the /sends pages once nothing is left to decide: back to the
-# page the approval link was tapped on — the dashboard opens it in place
-# (#359), so that is the latest same-origin history entry that is not a
-# /sends page (Navigation API), however many approval and status pages
-# followed it. A page opened on its own (a link from another app, another
-# site before it in the tab) has none, so it closes; where the browser
-# refuses that, the dashboard — never the empty /sends list.
-_SENDS_LEAVE_JS = (
-    "  function closeOrHome(){\n"
-    "    window.close();\n"
-    "    setTimeout(function(){location.replace('/');},400);\n"
-    "  }\n"
-    "  function leave(){\n"
-    "    var nav=window.navigation;\n"
-    "    if(nav&&nav.currentEntry&&nav.entries){\n"
-    "      var entries=nav.entries();\n"
-    "      for(var i=nav.currentEntry.index-1;i>=0;i--){\n"
-    "        var u;\n"
-    "        try{u=new URL(entries[i].url);}catch(e){continue;}\n"
-    "        if(u.origin!==location.origin||/^\\/sends(\\/|$)/.test(u.pathname))continue;\n"
-    "        var t=nav.traverseTo(entries[i].key);\n"
-    "        if(t&&t.committed){t.committed.catch(closeOrHome);}\n"
-    "        return;\n"
-    "      }\n"
-    "    }\n"
-    "    closeOrHome();\n"
-    "  }\n"
-)
+# The script of the /sends pages (webapp/gateway/sends.js): the way out once
+# nothing is left to decide, the approval card's button lock and the status
+# page's polling. A file of the dashboard's own, never script in the page,
+# since the pages' Content-Security-Policy runs scripts only from such files
+# (docs/dashboard.md, "The Content-Security-Policy"); what a page needs to
+# know is written into its markup, which the script reads.
+_SENDS_SCRIPT = '<script src="/gateway/sends.js"></script>\n'
 
 
 def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
     """The list of pending sends. With `leave`, the empty list a decision lands
     on when nothing is left to decide goes straight back to where the approval
-    link was tapped (_SENDS_LEAVE_JS); the list itself is only what shows
-    without scripting."""
+    link was tapped (``data-sends-leave``, read by _SENDS_SCRIPT); the list
+    itself is only what shows without scripting."""
     if pending:
         rows = []
         for p in pending:
@@ -4697,12 +4788,11 @@ def _render_sends_index_html(pending: list[dict], leave: bool = False) -> str:
     return (
         _HTML_HEAD
         + "<title>Retinue — Pending Sends</title>\n"
-        + "<body>\n"
+        + ("<body data-sends-leave>\n" if leave else "<body>\n")
         + "<h1>Pending Sends</h1>\n"
         + f'<nav>{_NAV_HOME}<a href="/conversation">Session log</a></nav>\n'
         + body + "\n"
-        + ("<script>\n(function(){\n" + _SENDS_LEAVE_JS + "  leave();\n})();\n</script>\n"
-           if leave else "")
+        + (_SENDS_SCRIPT if leave else "")
         + "</body>\n</html>\n"
     )
 
@@ -4749,27 +4839,7 @@ def _render_send_single_html(detail: dict, account: str, next_url: str | None) -
           f'<button type="submit" id="btn-reject" class="btn btn-deny">Deny</button></form>\n'
         + f'  <a href="{skip}" id="btn-skip" class="btn btn-skip">Skip</a>\n'
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-          "  function lockButtons(activeLabel){\n"
-          "    ['btn-approve','btn-reject'].forEach(function(id){\n"
-          "      var btn=document.getElementById(id);\n"
-          "      if(!btn)return;\n"
-          "      btn.disabled=true;\n"
-          "      btn.style.opacity='0.5';\n"
-          "      btn.style.cursor='not-allowed';\n"
-          "    });\n"
-          "    var skip=document.getElementById('btn-skip');\n"
-          "    if(skip){skip.style.pointerEvents='none';skip.style.opacity='0.5';}\n"
-          "    var active=document.getElementById(activeLabel);\n"
-          "    if(active){active.textContent='Processing...';}\n"
-          "  }\n"
-          "  var fa=document.getElementById('form-approve');\n"
-          "  if(fa){fa.addEventListener('submit',function(){lockButtons('btn-approve');});}\n"
-          "  var fr=document.getElementById('form-reject');\n"
-          "  if(fr){fr.addEventListener('submit',function(){lockButtons('btn-reject');});}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -5243,62 +5313,25 @@ def _render_send_status_html(*, title: str, heading: str, meta_rows: list[str],
         + f'<nav>{_NAV_HOME}<a href="/sends">↑ All pending sends</a></nav>\n'
         + '<table class="answer">\n' + "\n".join(meta_rows) + "\n</table>\n"
         + body_html
-        + f'<div class="st-row"><div id="st-icon">{icon}</div>'
+        # What the script needs to know, for it to read (_SENDS_SCRIPT): the
+        # status, where to go next, where to poll, and the notes to show.
+        + '<div class="st-row" id="st-row"'
+        + "".join(f' {name}="{html.escape(value, quote=True)}"'
+                  for name, value in (("data-status", status),
+                                      ("data-next", next_url),
+                                      ("data-poll", poll_url),
+                                      ("data-note-done", notes["done"]),
+                                      ("data-note-rejected", notes["rejected"]),
+                                      ("data-note-retracted", notes["retracted"]),
+                                      ("data-note-error", notes["error"]))
+                  if value)
+        + f'><div id="st-icon">{icon}</div>'
         + f'<p id="st-note" class="meta">{html.escape(note)}</p></div>\n'
         + '<div class="actions">\n'
         + f'  <a id="st-next" href="{html.escape(next_url or "/sends")}" class="btn btn-skip"'
         + f' style="{"" if next_url else "display:none"}">Next pending send</a>\n'
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-        + f"  var status={json.dumps(status)};\n"
-        + f"  var nextUrl={json.dumps(next_url)};\n"
-        + f"  var pollUrl={json.dumps(poll_url)};\n"
-        + f"  var noteDone={json.dumps(notes['done'])};\n"
-        + f"  var noteRejected={json.dumps(notes['rejected'])};\n"
-        + f"  var noteRetracted={json.dumps(notes['retracted'])};\n"
-        + f"  var noteError={json.dumps(notes['error'])};\n"
-        + "  var icon=document.getElementById('st-icon');\n"
-          "  var note=document.getElementById('st-note');\n"
-          "  var nextBtn=document.getElementById('st-next');\n"
-          "  function showNext(){if(nextUrl&&nextBtn){nextBtn.href=nextUrl;nextBtn.style.display='';}}\n"
-          "  function advance(){\n"
-          "    if(nextUrl){location=nextUrl;return;}\n"
-          "    leave();\n"
-          "  }\n"
-        + _SENDS_LEAVE_JS
-        + "  function terminal(st,err){\n"
-          "    if(st==='approved'){\n"
-          "      icon.innerHTML='<div class=\"check\">✓</div>';\n"
-          "      note.textContent=noteDone;\n"
-          "      setTimeout(advance,1500);\n"
-          "    }else if(st==='rejected'){\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteRejected;\n"
-          "      showNext();\n"
-          "    }else if(st==='retracted'){\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteRetracted;\n"
-          "      showNext();\n"
-          "    }else{\n"
-          "      icon.innerHTML='<div class=\"cross\">✕</div>';\n"
-          "      note.textContent=noteError+(err||'unknown error');\n"
-          "      showNext();\n"
-          "    }\n"
-          "  }\n"
-          "  function poll(){\n"
-          "    fetch(pollUrl,{cache:'no-store'}).then(function(r){return r.json();}).then(function(b){\n"
-          "      if(b.status&&b.status!=='sending'&&b.status!=='pending'){\n"
-          "        if('next' in b){nextUrl=b.next;}\n"
-          "        terminal(b.status,b.error);\n"
-          "      }else{setTimeout(poll,1500);}\n"
-          "    }).catch(function(){setTimeout(poll,3000);});\n"
-          "  }\n"
-          "  if(status==='sending'){setTimeout(poll,1200);}\n"
-          "  else if(status==='approved'){setTimeout(advance,1500);}\n"
-          "  else{showNext();}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -5399,27 +5432,7 @@ def _render_channel_send_html(detail: dict, channel: str, request_id: str, next_
           f'<button type="submit" id="btn-reject" class="btn btn-deny">Deny</button></form>\n'
         + skip_btn
         + "</div>\n"
-        + "<script>\n"
-          "(function(){\n"
-          "  function lockButtons(activeLabel){\n"
-          "    ['btn-approve','btn-reject'].forEach(function(id){\n"
-          "      var btn=document.getElementById(id);\n"
-          "      if(!btn)return;\n"
-          "      btn.disabled=true;\n"
-          "      btn.style.opacity='0.5';\n"
-          "      btn.style.cursor='not-allowed';\n"
-          "    });\n"
-          "    var skip=document.getElementById('btn-skip');\n"
-          "    if(skip){skip.style.pointerEvents='none';skip.style.opacity='0.5';}\n"
-          "    var active=document.getElementById(activeLabel);\n"
-          "    if(active){active.textContent='Processing...';}\n"
-          "  }\n"
-          "  var fa=document.getElementById('form-approve');\n"
-          "  if(fa){fa.addEventListener('submit',function(){lockButtons('btn-approve');});}\n"
-          "  var fr=document.getElementById('form-reject');\n"
-          "  if(fr){fr.addEventListener('submit',function(){lockButtons('btn-reject');});}\n"
-          "})();\n"
-          "</script>\n"
+        + _SENDS_SCRIPT
         + "</body>\n</html>\n"
     )
 
@@ -5537,11 +5550,10 @@ def _render_gateways_html(statuses: list[dict]) -> str:
                 '<div class="qr-wrap">'
                 # Hidden until a refresh actually delivers an image: while the
                 # gateway is still generating the code, /qr answers JSON and a
-                # visible <img> would render as a broken-image icon.
+                # visible <img> would render as a broken-image icon. The page's
+                # script shows it once one loads (webapp/gateway/gateways.js).
                 f'<img class="qr" alt="pairing QR for {label_e}" src="/gateways/{slug}/qr" '
-                'style="display:none" '
-                "onload=\"this.style.display=''\" "
-                'onerror="this.style.display=\'none\'">'
+                'style="display:none">'
                 '<p class="qr-note meta">If no code shows yet, the gateway is still generating one — '
                 'this page refreshes automatically.</p>'
                 f"<p>{html.escape(_pairing_hint(slug))}</p>"
@@ -5565,18 +5577,12 @@ def _render_gateways_html(statuses: list[dict]) -> str:
         cards.append('<section class="gw-card">' + "\n".join(rows) + "</section>")
     if not cards:
         cards.append("<section><p>No messenger gateways are configured in this deployment.</p></section>")
-    refresh_js = (
-        "<script>\n"
-        "setInterval(function(){\n"
-        "  document.querySelectorAll('img.qr').forEach(function(img){\n"
-        "    var u=new URL(img.getAttribute('src'),location);\n"
-        "    u.searchParams.set('ts',Date.now());\n"
-        "    img.src=u.toString();\n"
-        "  });\n"
-        "}, 20000);\n"
-        "setTimeout(function(){location.reload();}, 60000);\n"
-        "</script>\n"
-    ) if any_qr else '<meta http-equiv="refresh" content="60">\n'
+    # With a code to scan, the page's script (a file of the dashboard's own:
+    # docs/dashboard.md, "The Content-Security-Policy") shows each code once
+    # it loads, fetches a fresh one every 20 s and reloads the page after a
+    # minute; without one, a plain refresh does.
+    refresh_js = ('<script src="/gateway/gateways.js"></script>\n' if any_qr
+                  else '<meta http-equiv="refresh" content="60">\n')
     return (
         _HTML_HEAD
         + "<title>Retinue — Messenger Gateways</title>\n"
@@ -5767,45 +5773,10 @@ def _render_claude_auth_html(status: dict) -> str:
         "from any shell in the container.</p></section>"
     )
 
-    flow_js = (
-        "<script>\n"
-        "var attempt=null;\n"
-        "function setResult(msg,bad){var el=document.getElementById('result');"
-        "if(!el)return;el.textContent=msg;el.style.color=bad?'var(--high)':'var(--ok)';}\n"
-        # Grace period before polling: the container needs a moment to go
-        # down, or the first poll still reaches the old gateway and reloads
-        # straight into the dying one.
-        "function pollBack(){setTimeout(function(){setInterval(function(){"
-        "fetch('/claude-auth/status',{cache:'no-store'}).then(function(r){"
-        "if(r.ok)location.reload();}).catch(function(){});},3000);},8000);}\n"
-        "var startBtn=document.getElementById('start');\n"
-        "if(startBtn)startBtn.onclick=function(){var b=this;b.disabled=true;"
-        "fetch('/claude-auth/login/start',{method:'POST'})"
-        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
-        ".then(function(x){if(!x.r.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
-        "attempt=x.d.attempt;document.getElementById('authlink').href=x.d.url;"
-        "document.getElementById('flow').style.display='';b.style.display='none';"
-        "setResult('');})"
-        ".catch(function(e){setResult('Could not start the sign-in: '+e.message,true);"
-        "b.disabled=false;});};\n"
-        "var finishBtn=document.getElementById('finish');\n"
-        "if(finishBtn)finishBtn.onclick=function(){var b=this;"
-        "var code=document.getElementById('code').value.trim();"
-        "if(!code){setResult('Paste the code first.',true);return;}\n"
-        "b.disabled=true;"
-        "fetch('/claude-auth/login/finish',{method:'POST',"
-        "headers:{'Content-Type':'application/json'},"
-        "body:JSON.stringify({attempt:attempt,code:code,"
-        "restart:document.getElementById('restart').checked})})"
-        ".then(function(r){return r.json().then(function(d){return{r:r,d:d};});})"
-        ".then(function(x){if(!x.r.ok||!x.d.ok)throw new Error(x.d.error||('HTTP '+x.r.status));"
-        "if(x.d.restarting){setResult('Signed in. Restarting the agent container — "
-        "this page reconnects automatically…');pollBack();}"
-        "else{setResult('Signed in. Reloading…');"
-        "setTimeout(function(){location.reload();},1200);}})"
-        ".catch(function(e){setResult('Sign-in failed: '+e.message,true);b.disabled=false;});};\n"
-        "</script>\n"
-    )
+    # The sign-in flow's script (webapp/gateway/claude-auth.js): a file of the
+    # dashboard's own, since the pages' Content-Security-Policy runs scripts
+    # only from such files (docs/dashboard.md, "The Content-Security-Policy").
+    flow_js = '<script src="/gateway/claude-auth.js"></script>\n'
 
     return (
         _HTML_HEAD
@@ -10767,13 +10738,43 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # suppress default access log noise
         pass
 
+    # ── The Content-Security-Policy on every HTML response ───────────────────
+    # Every answer that is a page (text/html) carries the policy of
+    # scripts/content_policy.py in the mode RETINUE_CSP names, whichever code
+    # path wrote it: the static pages, the pages the gateway builds, a
+    # download that happens to be HTML, and http.server's own error pages
+    # (send_error). So it is added where the headers end rather than by each
+    # page's code, which could forget it. A response that is not a page needs
+    # none: a policy governs the document it arrives with. A page of webapp/
+    # that needs more than the others (content_policy.PAGE_SOURCES: /sparql,
+    # the chat page, the file viewer) is named by _serve_static_file, which
+    # serves it under each of its paths.
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == "content-type":
+            self._csp_page = str(value).split(";", 1)[0].strip().lower() == "text/html"
+        super().send_header(keyword, value)
+
+    def end_headers(self):
+        page, self._csp_for = getattr(self, "_csp_for", None), None
+        if getattr(self, "_csp_page", False):
+            self._csp_page = False
+            for name, value in content_policy.headers(page):
+                super().send_header(name, value)
+        super().end_headers()
+
     def _send_json(self, status: int, body: dict,
                    headers: dict[str, str] | None = None) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode()
+        headers = dict(headers or {})
+        # The API's answers carry text from outside (messages, names, files'
+        # notes): sniffing would let a browser take one for something else,
+        # so the type sent is the type used.
+        headers.setdefault("X-Content-Type-Options", "nosniff")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
-        for name, value in (headers or {}).items():
+        for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
@@ -10806,12 +10807,18 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _serve_static_file(self, path: Path, base: Path, cache: str = "no-cache",
-                           transform=None, headers: dict | None = None) -> bool:
+                           transform=None, headers: dict | None = None,
+                           types: dict | None = None) -> bool:
         """Serve a file from within ``base``, guarding against path traversal.
 
         ``transform`` rewrites the bytes on the response only (the instance
         branding); the file on disk is never touched. ``headers`` are sent
-        as well (a page's framing policy).
+        as well (a page's framing policy). ``types`` maps the suffixes this
+        directory may answer with to their types, in place of
+        _STATIC_CONTENT_TYPES; a file of any other suffix is a download
+        (/data/, below). Every answer forbids sniffing, so the type sent is
+        the type a browser uses: a file is run as a script only where it is
+        served as one.
         Returns True if a file was sent, False otherwise (caller emits 404)."""
         try:
             full = path.resolve()
@@ -10825,12 +10832,23 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if transform is not None:
             data = transform(data)
-        ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
+        # Which page of webapp/ this is, for its policy (end_headers).
+        self._csp_for = full.name if full.parent == WEBAPP_DIR.resolve() else None
+        headers = dict(headers or {})
+        if types is None:
+            ctype = _STATIC_CONTENT_TYPES.get(full.suffix.lower(), "application/octet-stream")
+        else:
+            ctype = types.get(full.suffix.lower())
+            if ctype is None:
+                ctype = "application/octet-stream"
+                headers["Content-Disposition"] = "attachment"
+                headers["Content-Security-Policy"] = _DOWNLOAD_CSP
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", cache)
-        for name, value in (headers or {}).items():
+        self.send_header("X-Content-Type-Options", "nosniff")
+        for name, value in headers.items():
             self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
@@ -10890,8 +10908,9 @@ class Handler(BaseHTTPRequestHandler):
         # The stored type is read again, so metadata stored before it was
         # kept as one media type is never written into a header as it is: a
         # type that does not read as one is application/octet-stream, and so
-        # a download.
-        ctype = _stated_media_type(meta.get("content_type"))
+        # a download. So is a script type: the file is the sender's, never a
+        # script of this origin (_SCRIPT_MEDIA_TYPES).
+        ctype = _served_media_type(meta.get("content_type"))
         inline = inline and ctype.split(";", 1)[0] in _INLINE_SAFE_TYPES
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -10931,8 +10950,12 @@ class Handler(BaseHTTPRequestHandler):
                 transform=instance_branding.brand_html,
                 headers={"Content-Security-Policy": f"frame-ancestors 'self' {APP_SETTINGS_ORIGIN}"})
         if path.startswith("/data/"):
+            # What the deployment's agents wrote, for the cards to read: it is
+            # answered only as the passive type the dashboard reads from here,
+            # JSON, and anything else as a download (_DATA_CONTENT_TYPES).
             rel = path[len("/data/"):]
-            return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR, cache="no-store")
+            return self._serve_static_file(DASHBOARD_DATA_DIR / rel, DASHBOARD_DATA_DIR,
+                                           cache="no-store", types=_DATA_CONTENT_TYPES)
         rel = path.lstrip("/")
         if not rel:
             return False
@@ -11016,8 +11039,11 @@ class Handler(BaseHTTPRequestHandler):
         with resp:
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"
             # No result format is HTML; never let one render on this origin.
+            # Nor is one a script: a result holds whatever the chambers hold,
+            # so it is never answered as a type a browser would run.
             if "html" in ctype.lower():
                 ctype = "text/plain; charset=utf-8"
+            ctype = _served_media_type(ctype)
             self.send_response(resp.getcode())
             self.send_header("Content-Type", ctype)
             if resp.headers.get("Content-Length"):
@@ -11057,6 +11083,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/javascript; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-cache")
+        # As for every other file of the dashboard's own (_serve_static_file):
+        # this responder does not go through that one, so it says it itself.
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
         return True
@@ -11100,8 +11129,54 @@ class Handler(BaseHTTPRequestHandler):
         if not self._serve_inbox():
             self.send_error(501, "Unsupported method ('HEAD')")
 
+    def _handle_csp_report(self) -> None:
+        """POST /csp-report: what a browser reports of the
+        Content-Security-Policy (scripts/content_policy.py), in either of its
+        two formats. Behind the dashboard's sign-in like every path, and
+        nothing more: the browser sends it with the page's own credentials.
+
+        The answer says nothing of what was sent, only whether it was taken:
+        204, or a fixed error. A body is read only up to a small limit and
+        only with a Content-Length."""
+        if not content_policy.report_format(self.headers.get("Content-Type")):
+            self._send_json(415, {"error": "send application/csp-report or "
+                                           "application/reports+json"})
+            return
+        if self.headers.get("Transfer-Encoding"):
+            self._send_json(411, {"error": "send the report with a Content-Length"})
+            return
+        raw_length = (self.headers.get("Content-Length") or "").strip()
+        if not raw_length.isascii() or not raw_length.isdigit():
+            self._send_json(411, {"error": "send the report with a Content-Length"})
+            return
+        length = int(raw_length) if len(raw_length) <= 18 else content_policy.REPORT_MAX_BYTES + 1
+        if length > content_policy.REPORT_MAX_BYTES:
+            self._send_json(413, {"error": "too large for a report"})
+            return
+        violations = content_policy.parse_reports(self.headers.get("Content-Type"),
+                                                  self.rfile.read(length))
+        if violations is None:
+            self._send_json(400, {"error": "not a report"})
+            return
+        try:
+            new = content_policy.record(CSP_REPORTS_FILE, violations)
+        # ValueError as well: the fields are cleaned of what UTF-8 cannot
+        # encode, but should one slip through, the reports are lost, never
+        # the answer.
+        except (OSError, ValueError) as exc:
+            print(f"[web-gateway] CSP reports not kept: {exc}", flush=True)
+            new = []
+        for v in new:
+            print(content_policy.log_line(v), flush=True)
+        self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self):
         if self._serve_inbox():
+            return
+        if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
+            self._handle_csp_report()
             return
         if self.path.split("?", 1)[0] in ("/sparql", "/sparql/"):
             self._handle_sparql()
@@ -13727,6 +13802,12 @@ class Handler(BaseHTTPRequestHandler):
                 "build": build_stamp.build_info(),
             })
             return
+        if self.path.split("?", 1)[0] == content_policy.REPORT_PATH:
+            # What the browsers reported of the Content-Security-Policy: the
+            # page to read before switching RETINUE_CSP from report to enforce.
+            self._send_json(200, content_policy.summary(CSP_REPORTS_FILE),
+                            {"Cache-Control": "private, no-store"})
+            return
         job_match = _JOB_RE.match(self.path)
         if job_match:
             self._handle_job_status(job_match.group(1))
@@ -14135,9 +14216,10 @@ class Handler(BaseHTTPRequestHandler):
     def _handle_gateway_qr(self, slug: str) -> None:
         """Proxy a gateway's pairing QR (adding the token) to the /gateways page.
 
-        Passes the gateway's own response through verbatim — a PNG when a code
-        is ready, JSON progress/errors otherwise — so the page's <img> either
-        renders the code or falls back to its "not ready yet" note."""
+        Passes the gateway's own response through — a PNG when a code is
+        ready, JSON progress/errors otherwise — so the page's <img> either
+        renders the code or falls back to its "not ready yet" note; a type
+        that is neither goes out as application/octet-stream."""
         _slug, gw = _channel_gateway(slug)
         if not gw:
             self._send_json(404, {"error": "unknown gateway"})
@@ -14154,10 +14236,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._send_json(502, {"error": f"gateway unreachable: {exc}"})
             return
+        # The page shows the code through <img> and nothing else: the image,
+        # or the JSON progress the gateway answers before there is one. Any
+        # other type the gateway states is not passed on as a type of this
+        # origin, and nothing is left to sniffing.
+        content_type = _served_media_type(content_type)
+        if content_type.split(";", 1)[0] not in ("image/png", "application/json"):
+            content_type = "application/octet-stream"
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
 
@@ -14216,5 +14306,6 @@ if __name__ == "__main__":
         print(f"[web-gateway] stale shell-manifest sweep skipped: {exc}", flush=True)
     _warn_if_arrival_turns_are_open()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY})", flush=True)
+    print(f"[web-gateway] listening on port {PORT} (max concurrency {MAX_CONCURRENCY}; "
+          f"Content-Security-Policy: {content_policy.mode()})", flush=True)
     server.serve_forever()

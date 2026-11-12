@@ -172,7 +172,8 @@ def test_approved_email_lands_on_its_outcome_page(wg):
     status, body = page.html
     assert status == 200, page.html
     assert "<th>Subject</th><td>Lunch</td>" in body and 'class="check"' in body
-    assert 'var nextUrl="/sends/signal-gateway/bbb";' in body
+    # The status page's script reads where to go next from its markup.
+    assert 'data-next="/sends/signal-gateway/bbb"' in body
     # A request that was never approved here is still simply not found.
     missing = _FakeSendHandler()
     with patch.object(wg.ec, "get_pending_send", return_value=None):

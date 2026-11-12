@@ -29,7 +29,9 @@ lives in `webapp/` (baked into the image):
   scheduler-driven refresh job regenerates them. **Refreshing these is Ara's job**
   (currently mock data). The server serves them at `/data/` from
   `DASHBOARD_DATA_DIR` (default `webapp/data`), kept separate from the baked
-  shell so data can be written without rebuilding.
+  shell so data can be written without rebuilding. What agents write there
+  is answered as JSON only, the type the cards read; any other file is a
+  download (see "The Content-Security-Policy").
 - `webapp/sw.js` caches the shell so the dashboard opens with no
   connectivity.
 
@@ -87,6 +89,168 @@ or a text field is focused) and re-checks on every visibility change, so even
 an always-open window picks a deploy up within moments of being looked at. The
 settings page shows the running shell version with a manual "Check for
 updates" as fallback.
+
+## The Content-Security-Policy
+
+Content from outside — a message, a mail, a file somebody sent — must never
+become a page, a script or a link of another scheme on the dashboard's origin;
+the gateway's escaping and its media rules (#402, #404; "Attachments" and
+"Media in a messenger chat" below) see to that. The Content-Security-Policy is
+the second line behind them: should markup from outside reach a page all the
+same, it cannot run script there, because scripts run only from the
+dashboard's own files. Every HTML response of the gateway carries it — the
+pages of `webapp/`, the pages the gateway builds itself (`/sends`,
+`/gateways`, `/claude-auth`, the session log) and its error pages. It is
+added where the handler's headers end, for any answer of type `text/html`, so
+no code path can forget it. The policy is built in one place,
+`scripts/content_policy.py`, with the page that needs each source:
+
+```
+default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
+img-src 'self'; media-src 'none'; font-src 'none';
+connect-src 'self'; frame-src 'none'; object-src 'none'; base-uri 'self';
+form-action 'self'; worker-src 'self'; manifest-src 'self';
+report-uri /csp-report
+```
+
+Scripts come from this origin only: no inline script, no handler attribute,
+no `javascript:` URL, no `eval`. Styles stay open (the components set style
+attributes; restricting styles is not the aim). Images come from this
+origin. No image or medium is loaded from another origin: the chat page
+shows an attachment that is a web link as a link to open (see
+"Attachments"), and the session log shows an image an answer names (a web
+address or a `data:` URL) as a link to it, or as its alt text, never as an
+image, as the dashboard's Markdown renderer does. Every page but one plays
+no audio or video, and every page but one frames nothing, so `media-src`
+and `frame-src` are `'none'`: markup that slipped into a page can then not
+frame another page of this origin either (an approval card, under a click
+meant for something else). No page loads a font.
+Three pages get more, each for itself alone (`PAGE_SOURCES` in the module;
+a source added to a directive that is `'none'` takes its place):
+the chat page (`/chat.html`) adds `blob:` to `img-src`, for its previews of
+the images about to be sent, which it makes itself as object URLs (no other
+page makes one), and gets `media-src 'self'`, for the messenger media it
+plays; it is the only page that plays any. (The briefing card would play
+audio on the start page, but `index.html` leaves it out for now; bringing it
+back means giving `index.html` `media-src 'self'` there.) The file viewer
+(`/viewer.html`) gets `frame-src 'self'`, for the attachment it shows in a
+frame; it is the only page that frames anything. `/sparql` (also served as
+`/sparql.html`) adds `data:` to `img-src`, for the icons in YASGUI's
+stylesheet. It needs nothing else: the vendored YASGUI compiles no strings.
+Two other policies stay as they were, separate and always enforced:
+`/settings-instance.html`'s `frame-ancestors` (who may frame it, see "The
+settings page") and the file viewer's own `frame-src 'self'`. Inside the
+Android shell, the bridge the app injects (`window.RetinueShell`) and the
+scripts it evaluates are the app's, not governed by a page's policy.
+
+The policy decides what a page loads and runs, not where a link takes the
+user: following a link is a navigation, which none of its directives
+restricts (`form-action` covers only where a form is sent). So the call
+directive's tap-to-dial `tel:` link (see "Speech-to-text (the `stt` service)
+and voice input") and the `mailto:` links work in every mode. What keeps a
+link of another scheme out of the pages is the markup's own rules, not the
+policy, and both renderers keep the same one. The dashboard's Markdown
+renderer makes links only of `http(s)`, `mailto:` and `tel:` URLs and of
+paths on this origin, and its call link only of a number it has checked
+(`webapp/components/markdown.js`). The session log (`/conversation`,
+`/conversation/<date>`) renders answers with markdown-it in
+`scripts/web-gateway.py`, which by itself would link any scheme but
+`javascript:`, `vbscript:`, `file:` and `data:` other than an image; the
+gateway drops every other link there and leaves its text
+(`_md_refuse_links`). The one scheme the policy itself stops is
+`javascript:`, which `script-src` blocks, and only in `enforce` mode: in
+`report` mode it reports it and stops nothing.
+
+**Three modes**, `RETINUE_CSP`:
+
+- `report` (the default) sends `Content-Security-Policy-Report-Only`: the
+  browser blocks nothing and reports what the policy would have blocked;
+- `enforce` sends `Content-Security-Policy`: the browser blocks it, and still
+  reports it;
+- `off` sends neither — a rollback, not a setting to keep.
+
+An unknown value counts as `report` and is named in the log. The mode and the
+policy are part of the service worker's shell hash: the worker serves the
+shell pages from its cache with the headers they were cached with, so a change
+reaches installed clients as a new worker, like a changed file.
+
+**The reports.** The policy names the gateway's own endpoint with
+`report-uri`. Not with `report-to`: Chromium, and so the Android shell's
+WebView, ignores `report-uri` once a policy names a `report-to` group and
+leaves delivery to the Reporting API, which in a headless Chromium delivered
+nothing within a minute, while `report-uri` arrives at once.
+`POST /csp-report` takes both formats all the same (`application/csp-report`,
+`application/reports+json`), at most 64 KiB with a `Content-Length`, behind
+the dashboard's sign-in and nothing more, and answers `204` or a fixed error;
+it reflects nothing. Each report is read for the page (its path), the
+directive, the blocked URL and the source line, query strings and fragments
+cut off; the distinct violations (page, directive, blocked URL) are counted,
+with when each was first and last seen, in one JSON file beside the
+conversations (`RETINUE_CSP_REPORTS_FILE`, default
+`/root/.retinue/csp-reports.json`), at most 200 of them (past that only
+`not_kept` grows). A new one is logged once, as `[web-gateway] CSP report: …`
+from a report-only policy and as `[web-gateway] CSP enforce: …` from an
+enforced one: the word is the report's disposition as the browser states it
+(`report` when it states none), so search the log for `[web-gateway] CSP `
+to find both. `GET /csp-report` lists them, latest first, with the mode and
+the policy.
+
+**From report to enforce.** Leave the mode on `report` for about a week of
+normal use, on every device and in the Android shell, its settings page
+included. Then read `GET /csp-report`:
+
+- empty, or only entries that are not the dashboard's (a browser extension's
+  script, a `chrome-extension:` or `moz-extension:` source): set
+  `RETINUE_CSP=enforce` and recreate the container; installed clients take the
+  new worker on their next visit;
+- an entry on a dashboard page that the page needs (a script it runs, a kind
+  of image it shows): fix the page, or add the source to
+  `scripts/content_policy.py` with the page that needs it (to `PAGE_SOURCES`
+  when only that page needs it), deploy, and give it another few days.
+
+Keep reading it after the switch: in `enforce` mode the browser still reports
+what it blocked.
+
+**What a page author keeps to.** No inline `<script>`: a script is a file
+under `webapp/` (a classic one where the page needs it at once, a module
+otherwise), and what a page needs to know goes into its markup as data
+attributes, as the gateway's own pages do (`webapp/gateway/`). No handler
+attributes (`onclick=`, `onload=`, …) in pages or in what the components
+render: listeners are added in script. No `javascript:` URLs, no `eval`,
+`new Function` or string timers, nothing from another origin. A page that
+cannot work without more gets it for that page alone, stated in
+`PAGE_SOURCES` of `scripts/content_policy.py` (as the chat page's `blob:`
+images, `/sparql`'s `data:` images and the file viewer's frame are), rather
+than a weaker policy for every page.
+`tests/test_webapp_no_inline_script.py` checks the pages, the components'
+markup and every page the gateway builds (its builders rendered, and its
+source for the error pages it writes in place), and that every script a page
+loads is a file in `webapp/`; `tests/test_web_gateway_csp.py` the header on
+every page in each mode.
+
+**No route serves bytes from outside as a script.** `script-src 'self'` is a
+boundary only while nothing on the origin answers bytes someone outside chose
+under a type a browser runs as a script or a worker (the JavaScript MIME
+types; every such answer forbids sniffing, so no other type runs). Thread
+attachments, messenger media through `/chats/media`, the life store's results
+on `/sparql` and the pairing-code proxy answer a script type as
+`application/octet-stream` (`_served_media_type` in the gateway); the
+letterbox share serves every file as a download anyway; `/data/` answers JSON
+and any other file as a download. `tests/test_web_gateway_no_script_types.py`
+asks each of them for every script type a sender might state.
+
+**Other services on the dashboard's host.** The policy reaches what the
+gateway answers and nothing else. A service the proxy routes to a path of the
+dashboard's host serves its pages on the dashboard's origin, so a script that
+runs there can do anything the dashboard can, approving a send included.
+Every such service must carry a policy of its own that runs no script from
+outside, or be published on a host of its own. Of those in the deployment
+example (`docker-compose.override.example.yml`), the updater answers JSON
+only, and the egress log viewer (`/egress`) sends a fixed, enforced policy on
+every page (`default-src 'none'; style-src 'unsafe-inline'; form-action
+'self'; base-uri 'none'; frame-ancestors 'none'`: its pages use no script,
+only inline style), forbids sniffing on every answer, and escapes what it
+writes into an attribute; `tests/test_egress_log_viewer.py` checks both.
 
 ## The home: the attention list
 
@@ -717,7 +881,9 @@ the proxy reads it strictly and writes its own headers from it
   nothing in it, and is saved when opened by itself; an HTML or XML file, a
   script, an office document or an archive is a file row that saves it. Such
   a file keeps its stated type, because the browser and the Android shell
-  take the saved file's extension, and the app that opens it, from the type.
+  take the saved file's extension, and the app that opens it, from the type —
+  except a script type, which goes out as `application/octet-stream` (see
+  "The Content-Security-Policy").
 
 A stated type that does not read as exactly one media type counts as
 `application/octet-stream`. The type sent is written from what was read (lower
@@ -739,15 +905,20 @@ reference on only when it is an absolute `http(s)` URL with a host
 (`news_store.web_link`, the rule news links follow), and leaves the
 attachment without a URL otherwise (`_shape_chat_attachments`). The chat page
 holds to the same rule on its own: it renders a link, an image, a player or
-the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`)
-or a web link, and the file's name as plain text for anything else, so a
-reference from outside never becomes script or a link of another scheme. Two
-further kinds of URL are rendered, neither of them ever as a link: the bubble
-of a send on its way previews the user's staged images from object URLs the
-page created, and a `data:image/…`, `data:audio/…` or `data:video/…` URL (the
-reference documents under `data/chats/` use them) is taken for the `<img>`,
-`<audio>` or `<video>` of its own kind, and for an image's lightbox, when the
-attachment's type is of that kind as well.
+the lightbox only for a URL of the proxy (`/chats/media/<slug>/<media-id>`),
+a link for the proxy's URL or a web link, and the file's name as plain text
+for anything else, so a reference from outside never becomes script or a
+link of another scheme. A web link is only ever a link, whatever the
+attachment's type: an image, a voice note or a video there is a file row to
+open, never loaded into the page (the origin's Content-Security-Policy allows
+images and media from this origin only). Two further kinds of URL are
+rendered, neither of them ever as a link: the bubble of a send on its way
+previews the user's staged images from object URLs the page created, and a
+`data:image/…`, `data:audio/…` or `data:video/…` URL is taken for the
+`<img>`, `<audio>` or `<video>` of its own kind, and for an image's
+lightbox, when the attachment's type is of that kind as well. The gateway
+passes no `data:` URL on, and the policy allows none on the chat page; only
+the reference documents under `data/chats/`, a test corpus, use them.
 
 ## Push notifications
 

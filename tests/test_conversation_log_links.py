@@ -7,12 +7,16 @@ on the rendered HTML, so it must only ever touch text between tags: a URL in
 an attribute (an image's src, alt or title, a link's href) is part of the
 tag, and rewriting it there broke the tag apart. This pins:
 
-- an image whose src, alt or title holds a URL keeps exactly those
-  attributes, and the page gains no link from them;
+- an image is shown as a link to it, never loaded (the page's
+  Content-Security-Policy would block it), and a URL in its src, alt or
+  title gains no link of its own;
 - a bare URL in text is still linked, with the trailing punctuation of the
   sentence left outside the link, and the URL escaped for the attribute;
 - a URL inside a code span, a code block or a link is left alone;
-- the answer's own text never becomes markup.
+- the answer's own text never becomes markup;
+- an answer's link is a link only to the web, a mail address, a telephone
+  number or a path on this origin, as in the dashboard's Markdown renderer;
+  a link of any other scheme (intent:, sms:, market:, data:, ...) is text.
 
 Standalone:
 
@@ -79,16 +83,44 @@ def _parse(markup: str) -> _Tags:
     return p
 
 
-def test_image_attributes_stay_as_they_are(wg):
+def test_image_is_a_link_with_its_attributes(wg):
     out = wg._render_answer(
         '![a https://alt.example/x](https://img.example/p.png "see https://t.example")')
     p = _parse(out)
-    imgs = [a for t, a in p.tags if t == "img"]
-    assert imgs == [{"src": "https://img.example/p.png", "alt": "a https://alt.example/x",
-                     "title": "see https://t.example"}], (imgs, out)
-    assert p.links == [], out
-    assert [t for t, _ in p.tags] == ["p", "img"], out
-    print("PASS test_image_attributes_stay_as_they_are")
+    # The image is a link to it, carrying its URL and title exactly; the URLs
+    # in its alt text and title gain no link of their own.
+    assert [t for t, _ in p.tags] == ["p", "a"], out
+    assert p.tags[1][1] == {"href": "https://img.example/p.png",
+                            "title": "see https://t.example"}, out
+    assert p.links == [("https://img.example/p.png", "a https://alt.example/x")], out
+    print("PASS test_image_is_a_link_with_its_attributes")
+
+
+def test_no_image_is_loaded(wg):
+    """The session log page loads no image an answer names: its
+    Content-Security-Policy (img-src) would block one from another origin or
+    a data: URL, so the page shows a link to it instead, as the dashboard's
+    Markdown renderer does (webapp/components/markdown.js)."""
+    answer = ("![remote](https://example.org/x.png) "
+              "![](https://example.org/q.png?a=1&b=2) "
+              "![inline](data:image/png;base64,iVBORw0KGgo=) "
+              "![here](/data/x.png) ![other](//elsewhere.example/x.png) "
+              "[![nested](https://example.org/n.png)](https://target.example/)")
+    out = wg._render_answer(answer)
+    p = _parse(out)
+    assert not [a for t, a in p.tags if t == "img"], out
+    assert p.links == [("https://example.org/x.png", "remote"),
+                       ("https://example.org/q.png?a=1&b=2", "https://example.org/q.png?a=1&b=2"),
+                       ("/data/x.png", "here"),
+                       ("https://target.example/", "nested")], out
+    # A data: image and one on another origin's relative form are their alt text.
+    assert "inline" in out and "other" in out and "data:" not in out and "//elsewhere" not in out
+    # The whole page, as GET /conversation/<date> builds it.
+    page = wg._render_day_html(
+        [{"anchor": "a1", "timestamp": "2026-09-02T10:00:00", "question": "Show me",
+          "answer": answer}], "2026-09-02", ["2026-09-02"])
+    assert not [a for t, a in _parse(page).tags if t == "img"], page
+    print("PASS test_no_image_is_loaded")
 
 
 def test_bare_url_in_text_is_linked(wg):
@@ -134,11 +166,64 @@ def test_text_stays_text(wg):
     print("PASS test_text_stays_text")
 
 
+def test_link_of_another_scheme_is_text(wg):
+    """An answer's link is a link only to the web, to a mail address, to a
+    telephone number or to a path on this origin, the rule of the dashboard's
+    own Markdown renderer (webapp/components/markdown.js). markdown-it alone
+    refuses only javascript:, vbscript:, file: and data: other than an image,
+    so a link of any other scheme the model wrote, or quoted from outside
+    text, would be one on this origin, and inside the Android shell some
+    schemes open another app. Such a link is shown as its text."""
+    answer = ("[scan](intent://scan/#Intent;scheme=zxing;package=com.x;end) "
+              "[text](sms:+41790000000?body=hi) <market://details?id=x> "
+              "[d](data:image/png;base64,AAAA) [h](data:text/html,x) "
+              "[f](ftp://files.example/x) [j](javascript:alert(1)) "
+              "[rel](notes.md) [frag](#a1) [proto](//elsewhere.example/x) "
+              "[back](/\\elsewhere.example/x) [ref][r] "
+              "[![pic](https://example.org/n.png)](sms:+41790000000)\n\n"
+              "[r]: intent://x#Intent;end\n")
+    out = wg._render_answer(answer)
+    p = _parse(out)
+    # markdown-it percent-encodes the backslash, so that link is to a path
+    # on this origin; the image inside the refused link is a link to the
+    # image, as any image is (test_no_image_is_loaded). Nothing else is a link.
+    assert p.links == [("/%5Celsewhere.example/x", "back"),
+                       ("https://example.org/n.png", "pic")], out
+    for href in ("intent:", "sms:", "market:", "data:", "ftp:", "javascript:",
+                 "//elsewhere", "/\\", "notes.md", "#a1"):
+        assert f'href="{href}' not in out, (href, out)
+    # The text of each refused link stays, as text.
+    for label in ("scan", "text", "market://details?id=x", "d", "f", "rel",
+                  "frag", "proto", "ref"):
+        assert label in out, (label, out)
+    # What the dashboard's renderer links stays a link.
+    out = wg._render_answer(
+        "[web](https://a.example/x) [mail](mailto:a@b.example) "
+        "[call](tel:+41441234567) [send](/sends/default/752) "
+        "<http://b.example/> <mailto:c@d.example> [up](HTTPS://c.example/)")
+    assert [h for h, _ in _parse(out).links] == [
+        "https://a.example/x", "mailto:a@b.example", "tel:+41441234567",
+        "/sends/default/752", "http://b.example/", "mailto:c@d.example",
+        "HTTPS://c.example/"], out
+    # The whole page, as GET /conversation/<date> builds it: its own links
+    # are paths on this origin, and the answer adds only the image's and the
+    # one to a path.
+    page = wg._render_day_html(
+        [{"anchor": "a1", "timestamp": "2026-09-02T10:00:00", "question": "Open",
+          "answer": answer}], "2026-09-02", ["2026-09-02"])
+    hrefs = [a.get("href", "") for t, a in _parse(page).tags if t == "a"]
+    assert [h for h in hrefs if not h.startswith("/")] == [
+        "https://example.org/n.png"], hrefs
+    print("PASS test_link_of_another_scheme_is_text")
+
+
 if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as tmp:
         gw = _load_gateway(Path(tmp))
-        test_image_attributes_stay_as_they_are(gw)
+        test_image_is_a_link_with_its_attributes(gw)
+        test_no_image_is_loaded(gw)
         test_bare_url_in_text_is_linked(gw)
         test_code_and_links_are_left_alone(gw)
         test_text_stays_text(gw)
+        test_link_of_another_scheme_is_text(gw)
     print("all conversation log link tests passed")

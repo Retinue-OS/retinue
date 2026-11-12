@@ -198,7 +198,11 @@ services:
 
   # Optional: expose the egress-log-viewer on the same public host so you can
   # review outbound HTTP traffic from a browser. It is read-only and reuses the
-  # same client-cert/basic-auth middlewares as the main gateway.
+  # same client-cert/basic-auth middlewares as the main gateway. On this host
+  # its pages share the dashboard's origin, which is why they carry an
+  # enforced Content-Security-Policy of their own that runs no script; publish
+  # nothing here that lacks one (docs/dashboard.md, "Other services on the
+  # dashboard's host").
   # egress-log-viewer:
   #   networks:
   #     - agents
