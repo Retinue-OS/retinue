@@ -333,7 +333,30 @@ globalThis.RetinueShell = {
 let micFails = false;
 let micAsked = 0;
 const stream = { getTracks: () => [{ stop() {} }] };
+// A service worker (sw.js, "Sent dictations"), switched on by a test: it
+// takes each dictation, keeps what the page posted, and answers with the
+// transcript and, for a sent one, `swOutcome` — as if the page had been
+// frozen while the worker sent it ({sent: true}), or the send had failed.
+let swOn = false;
+let swOutcome = { sent: true };
+const swJobs = [];
+const swListeners = [];
+const SW = {
+  addEventListener(t, f) { if (t === 'message') swListeners.push(f); },
+  controller: {
+    postMessage(msg) {
+      if (msg.type !== 'dictation') return;
+      swJobs.push(msg);
+      const tell = (data, ms) => setTimeout(() => swListeners.forEach((f) => f({ data })), ms);
+      tell({ type: 'dictation-started', id: msg.id }, 0);
+      const out = msg.send ? swOutcome : {};
+      tell({ type: 'dictation-done', id: msg.id, key: msg.key, text: transcript, error: '', send: !!msg.send,
+             sent: !!out.sent, unsent: out.unsent || '', at: Date.now(), call: msg.call || null }, 20);
+    },
+  },
+};
 Object.defineProperty(globalThis, 'navigator', { value: {
+  get serviceWorker() { return swOn ? SW : undefined; },
   userAgent: 'node RetinueShell/6 (Android)',
   mediaDevices: { getUserMedia: async () => { micAsked += 1; if (micFails) throw Object.assign(new Error('busy'), { name: 'NotReadableError' }); return stream; } },
 }, configurable: true });
@@ -439,7 +462,8 @@ let passed = 0;
 async function ok(name, fn) {
   placed.length = 0; posts.length = 0; micFails = false; webAudio = true; level = 0; transcript = '';
   shellAnswer = { state: 'placed' }; speakMs = 30; said.length = 0; transcribing = null;
-  await fn();
+  swOn = false; swOutcome = { sent: true }; swJobs.length = 0;
+  try { await fn(); } finally { swOn = false; }
   passed += 1;
   console.log(`ok - ${name}`);
 }
@@ -704,6 +728,58 @@ await ok('the flag in place of the name is the flag, and never shown or read as 
 await ok("a directive in an agent's message places no call", async () => {
   const el = await spoken({ role: 'agent', text: 'Relayed: [[call: +41 79 123 45 67 | Anna Muster]]' });
   await wait(1000);
+  assert.ok(!el._calling && !callRow(el), 'no call row');
+  await wait(6000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok('a cancelling take the service worker sends carries the call there, and no later turn does', async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  swOn = true;
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  transcript = 'no, stop, call Ben instead';
+  el._finishRecording('send');
+  await until(() => swJobs.length === 1, 'the take goes to the worker');
+  assert.deepEqual(swJobs[0].call, CANCELLED, 'with the call it cancelled');
+  assert.ok(swJobs[0].send, 'as a sent dictation');
+  await wait(500);
+  assert.equal(posts.length, 0, 'the worker sent it, not the page as well');
+  swOn = false;
+  await el._send('One more thing');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].cancelled_call, undefined, 'the next turn carries no cancelled call');
+  await wait(6000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok('a cancelling take the service worker could not send waits in the box, and its call stays cancelled', async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA });
+  swOn = true;
+  swOutcome = { unsent: 'failed' };
+  await until(() => el._calling && el._recState === 'recording', 'the call waits with the mic open');
+  transcript = 'no, stop, call Ben instead';
+  el._finishRecording('send');
+  await until(() => swJobs.length === 1, 'the take goes to the worker');
+  await until(() => { el.render(); return el.shadowRoot.innerHTML.includes('be sent. It is in the box'); }, 'the note says so');
+  assert.equal(posts.length, 0, 'not sent by the page either');
+  swOn = false;
+  await el._send(transcript);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].cancelled_call, undefined, 'sent by hand later, it no longer cancels a call');
+  await wait(6000);
+  assert.equal(placed.length, 0, 'no call');
+  el.disconnectedCallback();
+});
+
+await ok('an answer that ends the mode places no call, though it ends in a directive', async () => {
+  const el = await spoken({ role: 'assistant', text: ANNA }, (e) => {
+    // Ara stamped the thread in the same turn (conversation-push.py --end-continuous).
+    threads[e.thread.id].continuous_off = new Date(Date.now() + 1000).toISOString();
+  });
+  await wait(1000);
+  assert.ok(!el._contOn(), 'the mode is off');
   assert.ok(!el._calling && !callRow(el), 'no call row');
   await wait(6000);
   assert.equal(placed.length, 0, 'no call');

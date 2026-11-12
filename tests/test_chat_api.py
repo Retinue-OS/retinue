@@ -9,6 +9,11 @@ direct user-send contract and serving token-gated media). Covers:
 - GET /chats and /chats/<id>/messages shaping against the fixture contract
   (webapp/README.md on the chats-ui branch), including ?before paging and the
   media-URL rewrite to the authenticated proxy;
+- the media proxy (GET /chats/media/<slug>/<id>): a blob is served by the
+  content type its sender declared, read strictly — the inline-safe images,
+  audio, video, PDF and plain text in place, everything else (and every type
+  that does not read as one) as a download, never sniffed, a relayed error
+  included — and a blob another account of the channel holds is still found;
 - the notify rail (POST /internal/chats/inbound): open-vs-token auth, the
   un-archive-unless-muted rule, held-gate and muted silence, a follow-up
   arrival pushing like the first, and echoes advancing the read watermark;
@@ -104,6 +109,10 @@ STATE: dict = {"fail": False, "queries": [], "gw_requests": [], "sent": [],
                # The blobs the mock gateway holds; anything else is a 404,
                # exactly as a real gateway answers for media it never stored.
                "gw_media": {MID_ATT, MID_ATT2, MID_ATT3},
+               # The Content-Type header values the mock gateway answers a
+               # blob with, by id: what its sender declared. image/jpeg for
+               # a blob not listed (see _stated_blob).
+               "gw_stated": {},
                # The second account's mock (mode, request log).
                "sib_mode": "inbox", "sib_requests": [],
                # When set, an approved send never leaves "sending" — the
@@ -300,12 +309,16 @@ class _MockGateway(BaseHTTPRequestHandler):
             if self.headers.get("Authorization", "") != "Bearer gw-secret":
                 self._json(401, {"error": "unauthorized"})
                 return
-            if self.path.rsplit("/", 1)[1] not in STATE["gw_media"]:
+            mid = self.path.rsplit("/", 1)[1]
+            if mid not in STATE["gw_media"]:
                 self._json(404, {"error": "not found"})
                 return
             data = b"JPEGBYTES"
             self.send_response(200)
-            self.send_header("Content-Type", "image/jpeg")
+            # A real gateway answers with the type the blob's sender declared;
+            # a test files one with _stated_blob, as one header per value.
+            for value in STATE["gw_stated"].get(mid, ["image/jpeg"]):
+                self.send_header("Content-Type", value)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -814,6 +827,48 @@ def test_rail_auth_and_notifications(base, wg):
     finally:
         wg.CHATS_INGEST_TOKEN = ""
     print("PASS test_rail_auth_and_notifications")
+
+
+def test_rail_references_that_are_no_media(base, wg):
+    """An attachment reference that names no blob is never handed on as a URL.
+
+    The rail keeps the references a caller posts, and the page puts an
+    attachment's url into an href or a src. So only a media reference becomes
+    the proxy's URL, an absolute http(s) URL is passed on as it is, and
+    anything else gives an attachment without a url (the page shows its
+    name)."""
+    rail = "/internal/chats/inbound"
+    mid = "cd" * 16
+    refs = [
+        f"urn:retinue:media:signal:{mid}",
+        "https://example.org/pic.jpg",
+        "javascript:alert(1)",
+        "data:text/html,<p>x</p>",
+        "/sends/default/1",
+        "//example.org/x",
+        "https:example.org",
+        "https://example.org/\nx",
+        {"url": "javascript:alert(1)"},
+        42,
+    ]
+    event = {"direction": "in", "channel": "signal", "chat": "+41790005577",
+             "sender": "+41790005577", "sender_name": "Nora", "group": False,
+             "message_id": "r1", "text": "see", "gateway": "127.0.0.1",
+             "attachments": refs, "gate": {"forward": False, "reason": "held"}}
+    status, body = _http(base, "POST", rail, event)
+    assert status == 200, body
+    status, body = _http(base, "GET", "/chats/" + _quote("signal:+41790005577") + "/messages")
+    assert status == 200, body
+    msg = next(m for m in body["messages"] if m["id"] == "r1")
+    atts = msg["attachments"]
+    urls = [a.get("url") for a in atts]
+    assert urls[0] == f"/chats/media/127.0.0.1/{mid}", urls
+    assert urls[1] == "https://example.org/pic.jpg", urls
+    assert len(atts) == 8 and urls[2:] == [None] * 6, urls
+    # The reference itself goes nowhere else in the attachment either.
+    for att, ref in zip(atts[2:], refs[2:]):
+        assert ref not in json.dumps(att), att
+    print("PASS test_rail_references_that_are_no_media")
 
 
 def test_send_user_direct(base, wg):
@@ -1764,6 +1819,200 @@ def test_media_proxy(base, wg):
     print("PASS test_media_proxy")
 
 
+# What the media proxy adds to a download, and to nothing else.
+DOWNLOAD_CSP = "sandbox; default-src 'none'"
+
+
+def _stated_blob(n, *stated):
+    """File blob number ``n`` in the mock gateway, to be answered with the
+    Content-Type header value(s) ``stated`` (no such header when there is
+    none), and return its id."""
+    mid = f"{0x57a7ed00 + n:032x}"
+    STATE["gw_media"].add(mid)
+    STATE["gw_stated"][mid] = list(stated)
+    return mid
+
+
+def _media_get(base, mid, slug="127.0.0.1"):
+    """GET a blob through the media proxy: (status, headers, body)."""
+    req = urllib.request.Request(base + f"/chats/media/{slug}/{mid}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+def _served_as(headers):
+    """How an answer of the media proxy is served: its one Content-Type, and
+    "in place" or "download" (anything else is named as it is)."""
+    disposition = headers.get_all("Content-Disposition")
+    policy = headers.get_all("Content-Security-Policy")
+    if disposition is None and policy is None:
+        how = "in place"
+    elif disposition == ["attachment"] and policy == [DOWNLOAD_CSP]:
+        how = "download"
+    else:
+        how = f"disposition {disposition}, policy {policy}"
+    types = headers.get_all("Content-Type") or []
+    return (types[0] if len(types) == 1 else types), how
+
+
+# The media proxy's rule, one stated type per row: what the storing gateway
+# answers a blob with (the type its sender declared), the Content-Type the
+# browser gets, and how. A tuple is several Content-Type headers at once.
+OCTET = "application/octet-stream"
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+MEDIA_RULE = [
+    # Shown in place, as before: the images the chat renders through <img>,
+    # what its players load, and a PDF or a text file from a file row.
+    ("image/jpeg", "image/jpeg", "in place"),
+    ("image/png", "image/png", "in place"),
+    ("image/gif", "image/gif", "in place"),
+    ("image/webp", "image/webp", "in place"),
+    ("image/avif", "image/avif", "in place"),
+    ("application/pdf", "application/pdf", "in place"),
+    ("text/plain", "text/plain", "in place"),
+    ("text/plain; charset=UTF-8", "text/plain; charset=UTF-8", "in place"),
+    ("audio/ogg", "audio/ogg", "in place"),
+    ("audio/ogg; codecs=opus", "audio/ogg; codecs=opus", "in place"),
+    ("audio/mpeg", "audio/mpeg", "in place"),
+    ("audio/mp4", "audio/mp4", "in place"),
+    ("video/mp4", "video/mp4", "in place"),
+    ('video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+     'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', "in place"),
+    ("video/webm;codecs=vp9", "video/webm; codecs=vp9", "in place"),
+    # The same types in odd spellings: read, then written afresh.
+    ("IMAGE/JPEG", "image/jpeg", "in place"),
+    ("image/png   ", "image/png", "in place"),
+    ("image/png \t", "image/png", "in place"),
+    ("image/png;", "image/png", "in place"),
+    ("Audio/OGG ; Codecs=opus", "audio/ogg; codecs=opus", "in place"),
+    ("text/plain; charset=utf-8; charset=utf-16", "text/plain; charset=utf-8", "in place"),
+    # A parameter with no meaning for the browser stays behind.
+    ('image/jpeg; name="holiday.jpg"', "image/jpeg", "in place"),
+    ("application/pdf; name=invoice.pdf", "application/pdf", "in place"),
+    # Any other image: the chat's <img> still shows it, a browser asked to
+    # open it gets a file.
+    ("image/svg+xml", "image/svg+xml", "download"),
+    ("IMAGE/SVG+XML", "image/svg+xml", "download"),
+    ("image/svg+xml; charset=utf-8", "image/svg+xml; charset=utf-8", "download"),
+    ("image/bmp", "image/bmp", "download"),
+    ("image/tiff", "image/tiff", "download"),
+    ("image/heic", "image/heic", "download"),
+    ("image/x-icon", "image/x-icon", "download"),
+    # Everything else is a file to save. The type stays, so the saved file
+    # gets its extension and its app.
+    ("text/html", "text/html", "download"),
+    ("TEXT/HTML; charset=utf-8", "text/html; charset=utf-8", "download"),
+    ("application/xhtml+xml", "application/xhtml+xml", "download"),
+    ("text/xml", "text/xml", "download"),
+    ("application/xml", "application/xml", "download"),
+    ("application/rss+xml", "application/rss+xml", "download"),
+    ("text/javascript", "text/javascript", "download"),
+    ("application/javascript", "application/javascript", "download"),
+    ("text/css", "text/css", "download"),
+    ("text/csv", "text/csv", "download"),
+    ("application/json", "application/json", "download"),
+    ("multipart/related", "multipart/related", "download"),
+    ("message/rfc822", "message/rfc822", "download"),
+    (DOCX, DOCX, "download"),
+    ("application/zip", "application/zip", "download"),
+    ("application/x-msdownload", "application/x-msdownload", "download"),
+    ("application/x-something-new", "application/x-something-new", "download"),
+    (OCTET, OCTET, "download"),
+    # An XML type is a document to a browser whatever it is filed under.
+    ("audio/example+xml", "audio/example+xml", "download"),
+    ("video/example+xml", "video/example+xml", "download"),
+    # Not exactly one media type: says nothing, so it is a file of no
+    # particular kind.
+    ("", OCTET, "download"),
+    ((), OCTET, "download"),
+    ("text/html, image/png", OCTET, "download"),
+    ("image/png, text/html", OCTET, "download"),
+    ("image/png,image/jpeg", OCTET, "download"),
+    (("image/png", "text/html"), OCTET, "download"),
+    (("image/png", "image/png"), OCTET, "download"),
+    ("image/png\ttext/html", OCTET, "download"),
+    ("image/png;\tcharset=utf-8", OCTET, "download"),
+    ("image/png text/html", OCTET, "download"),
+    ("image/png\x0b", OCTET, "download"),
+    ("image/png\x00", OCTET, "download"),
+    ("image/png\xa0", OCTET, "download"),
+    ("text/html\xe9", OCTET, "download"),
+    ("image", OCTET, "download"),
+    ("image/", OCTET, "download"),
+    ("/png", OCTET, "download"),
+    ("image/png/extra", OCTET, "download"),
+    ("*/*", OCTET, "download"),
+    ("image/*", OCTET, "download"),
+    ('"image/png"', OCTET, "download"),
+    ("image/png; charset", OCTET, "download"),
+    ("image/png; charset=", OCTET, "download"),
+    ("image/png; charset = utf-8", OCTET, "download"),
+    ('image/png; codecs="unterminated', OCTET, "download"),
+    ("image/png; codecs=a b", OCTET, "download"),
+    ("image/" + "p" * 128, OCTET, "download"),
+]
+
+
+def test_media_proxy_serves_by_stated_type(base, wg):
+    """A file from a contact is shown in place or handed over as a download.
+
+    The gateway that stored a blob answers with the content type its sender
+    declared; the proxy relays the bytes on the dashboard's own origin. So
+    the stated type is read strictly and only decides how the file is served:
+    the inline-safe images, audio, video, PDF and plain text in place, as the
+    chat page shows them; everything else as a download that a browser saves
+    and does not render. The type sent is written from what was read, with
+    the parameters a browser decodes by, and nothing is left to sniffing."""
+    wrong = []
+    for n, (stated, want_type, want_how) in enumerate(MEDIA_RULE):
+        values = stated if isinstance(stated, tuple) else (stated,)
+        status, headers, data = _media_get(base, _stated_blob(n, *values))
+        got_type, got_how = _served_as(headers)
+        row = (f"{stated!r}: {got_type!r}, {got_how}"
+               f" (expected {want_type!r}, {want_how})")
+        if (status, data) != (200, b"JPEGBYTES"):
+            wrong.append(f"{stated!r}: answered {status} with {data[:40]!r}")
+        elif (got_type, got_how) != (want_type, want_how):
+            wrong.append(row)
+        elif headers.get_all("X-Content-Type-Options") != ["nosniff"]:
+            wrong.append(f"{stated!r}: sniffing is not forbidden")
+        elif headers.get_all("Cache-Control") != ["private, max-age=86400"]:
+            wrong.append(f"{stated!r}: Cache-Control {headers.get_all('Cache-Control')}")
+    assert not wrong, "served otherwise than the rule says:\n  " + "\n  ".join(wrong)
+
+    # A miss is relayed as the gateway answered it, under the same rule: no
+    # sniffing, and nothing of it rendered or cached.
+    status, headers, data = _media_get(base, MID_NONE)
+    assert status == 404 and json.loads(data) == {"error": "not found"}, (status, data)
+    assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
+    assert _served_as(headers) == ("application/json", "download"), headers.items()
+    assert headers.get("Cache-Control") is None
+    # So is any other answer of a gateway, here its refusal of a bad token.
+    registry = wg._CHANNEL_GATEWAYS["127.0.0.1"]
+    wg._CHANNEL_GATEWAYS["127.0.0.1"] = dict(registry, token="not-the-token")
+    try:
+        status, headers, _ = _media_get(base, MID_ATT)
+    finally:
+        wg._CHANNEL_GATEWAYS["127.0.0.1"] = registry
+    assert status == 401, status
+    assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
+    assert _served_as(headers) == ("application/json", "download"), headers.items()
+
+    # What cannot cross a header line at all is read the same way: a line
+    # break, a value that is no text, one of absurd length.
+    for stated in (["image/png\r\nX-Other: 1"], ["image/png\n"], ["text/html\r"],
+                   [None], [b"image/png"], None, [],
+                   ['video/mp4; codecs="' + "a" * 2000 + '"']):
+        assert wg._chat_media_headers(stated) == {
+            "Content-Type": OCTET, "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "attachment",
+            "Content-Security-Policy": DOWNLOAD_CSP}, stated
+    print("PASS test_media_proxy_serves_by_stated_type")
+
+
 def test_media_is_asked_for_not_guessed(base, wg, sib_port):
     """Two inbox accounts on a channel: unsendable chats stay readable.
 
@@ -1815,6 +2064,11 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
         assert cache and "max-age" in cache
         assert asked(STATE["gw_requests"], MID_SIB) and asked(STATE["sib_requests"], MID_SIB)
         assert asked(STATE["sib_requests"], MID_SIB)[0][2] == "Bearer sib-secret"
+        # What the sibling holds goes out under the same rule as the rest,
+        # by the type the sibling stated: a voice note, in place.
+        _, headers, _ = _media_get(base, MID_SIB)
+        assert _served_as(headers) == ("audio/ogg", "in place"), headers.items()
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
         # And the other way round.
         STATE["gw_requests"].clear(); STATE["sib_requests"].clear()
         status, ctype, data, _ = media(sib_slug, MID_ATT)
@@ -1826,6 +2080,9 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
         status, _, _, cache = media("127.0.0.1", MID_NONE)
         assert status == 404 and not cache, (status, cache)
         assert asked(STATE["gw_requests"], MID_NONE) and asked(STATE["sib_requests"], MID_NONE)
+        status, headers, _ = _media_get(base, MID_NONE)
+        assert status == 404, status
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
 
         # A control-mode sibling is never asked: ledger media is inbox-only,
         # and a prompt channel is not a place to look for the user's pictures.
@@ -1837,6 +2094,14 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
         assert asked(STATE["gw_requests"], MID_SIB) and not asked(STATE["sib_requests"], MID_SIB)
         assert media(sib_slug, MID_ATT)[0] == 404, "named control gateway refused outright"
         assert not asked(STATE["sib_requests"], MID_ATT)
+        # The proxy's own refusals forbid sniffing like a relayed answer: the
+        # control-mode gateway refused, and a gateway nobody knows.
+        status, headers, _ = _media_get(base, MID_ATT, slug=sib_slug)
+        assert status == 404, status
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
+        status, headers, _ = _media_get(base, MID_ATT, slug="no-such-gateway")
+        assert status == 404, status
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
 
         # The sibling being down is not a 404: the named gateway's answer
         # stands, and only when nobody could answer at all is it a 502.
@@ -1848,6 +2113,10 @@ def test_media_is_asked_for_not_guessed(base, wg, sib_port):
         wg._CHANNEL_GATEWAYS["127.0.0.1"] = dict(wg._CHANNEL_GATEWAYS["127.0.0.1"],
                                                 base_url="http://127.0.0.1:1")
         assert media("127.0.0.1", MID_ATT)[0] == 502
+        # The proxy's own answer when nobody could be asked forbids sniffing too.
+        status, headers, _ = _media_get(base, MID_ATT)
+        assert status == 502, status
+        assert headers.get_all("X-Content-Type-Options") == ["nosniff"], headers.items()
     finally:
         wg._CHANNEL_GATEWAYS["127.0.0.1"] = dict(wg._CHANNEL_GATEWAYS["127.0.0.1"],
                                                 base_url=f"http://127.0.0.1:{STATE['gw_port']}")
@@ -2347,6 +2616,7 @@ def main():
         test_draft_guard(base, wg)
         test_draft_undo_endpoint(base, wg)
         test_rail_auth_and_notifications(base, wg)
+        test_rail_references_that_are_no_media(base, wg)
         test_send_user_direct(base, wg)
         test_send_images(base, wg)
         test_send_under_verify_is_queued_then_approved(base, wg)
@@ -2358,6 +2628,7 @@ def main():
         test_rail_attributes_by_account(base, wg)
         test_accounts_do_not_merge(base, wg)
         test_media_proxy(base, wg)
+        test_media_proxy_serves_by_stated_type(base, wg)
         test_media_is_asked_for_not_guessed(base, wg, sib.server_address[1])
         test_arrival_starts_a_companion_turn(base, wg)
         test_instructed_arrival(base, wg)

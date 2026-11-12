@@ -407,9 +407,19 @@ The API, as the components consume it:
   `?before=<ISO ts>` pages older history (the page renders the newest page —
   a load-older affordance is future work). A `Message` is `{id, chat,
   direction, author? (out: user|agent|device, plus agent name),
-  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url,
+  sender?/sender_name? (in), text, lang?, ts, attachments?: [{id, url?,
   type?, size?, width?, height?, name?}]}`. Attachment URLs are the web-gateway's
-  authenticated media proxy (`/chats/media/…`); type, size and name are what
+  authenticated media proxy (`/chats/media/…`), which serves a file in place
+  only as an inline-safe image, audio, video, PDF or plain text and as a
+  download otherwise (`docs/dashboard.md`, "Attachments"). A reference that
+  names no blob is passed on as the `url` only when it is an absolute http(s)
+  URL, and the attachment has no `url` otherwise; the page renders a link, an
+  image, a player or the lightbox only for a proxy URL or an http(s) URL, and
+  the name as plain text for anything else, so a reference from outside never
+  becomes an `href` or a `src` of another kind. The page also takes a
+  `data:image/…`, `data:audio/…` or `data:video/…` URL (the reference
+  documents' media), only for the `<img>`, `<audio>` or `<video>` of its own
+  kind (and an image's lightbox), never for a link. Type, size and name are what
   the storing gateway stated about the blob in its ledger record (absent on
   records older than that statement). `width`/`height` are the medium's real intrinsic size, sniffed
   at ingest — when present the client reserves the true aspect box before the
@@ -421,7 +431,8 @@ The API, as the components consume it:
   above the transcript, which is already the message `text`; `video/*` is an
   inline player (`preload=metadata`, box-reserved the same way); anything
   else (a document, an animated sticker) is a file row showing the stated
-  `name` and `size` that opens the file in a new tab. Reactions and quoted replies (issue #130) will
+  `name` and `size` that links the file: a PDF or plain text opens in a new
+  tab, anything else is saved, as the proxy serves it. Reactions and quoted replies (issue #130) will
   decorate these records later. The companion thread is not in this payload:
   it is an ordinary conversation, named by the summary's `companion` id and
   read through `/conversations`.
@@ -503,7 +514,9 @@ corpus (the validation suite serves them as mocked `/chats*` responses). They
 are no longer a serving source. The corpus covers the media shapes: image
 attachments with intrinsic dimensions, a voice note (`audio/*` with the
 transcript as the message text) and a video (`video/*` with dimensions), all
-with playable `data:` URLs, and both companion states: one chat names an
+with `data:` URLs, which the page takes only for an `<img>`, `<audio>` or
+`<video>` of the same kind and for an image's lightbox, never for a link (a
+link's url is the proxy's or an http(s) URL), and both companion states: one chat names an
 existing thread, the rest carry `companion: null`. Companion messages
 themselves are conversation documents, not chat ones, so the corpus holds
 none — the suite mocks `/conversations/<id>` for those.
@@ -592,9 +605,19 @@ load of this device and browser:
   jobs, and a second tab on the same place takes nothing that is not its own.
   Recorders run in 250 ms slices, so a page left with the mic live hands the
   worker everything said up to the last fraction of a second, and leaving acts
-  as **✓**: the transcript waits in the draft for review. A dictation sent
-  with **➤** whose page is gone before its transcript is in lands in the draft
-  too, unsent — the context a send needs left with that page. Without a
+  as **✓**: the transcript waits in the draft for review. A dictation the
+  user *sent* — **➤**, or a take of the continuous loop that ended on a pause
+  — is a message to the thread it was recorded in, as if typed there: should
+  its page be gone before the transcript is in, the worker posts it into that
+  thread itself (the thread fixed when recording started, never whatever is on
+  screen by then), and the next page showing the thread just reads it back.
+  A take that cancelled a call in the continuous loop carries that call to
+  the worker (`call`), whose send sends it along as `cancelled_call`, as the
+  page's own would (docs/dashboard.md, "Inside the Android shell").
+  A send the worker could not make, or may not have made (no answer, a worker
+  stopped in the middle), is never retried blindly: its text waits in the
+  draft with a note. A first message (no thread yet) waits in its composer's
+  draft, as before. Without a
   controlling worker (the very first load, a browser without one), and with
   an older worker that does not take the job up within 4 s, transcription is
   the page's own fetch, as before.
@@ -687,8 +710,12 @@ then leave the feed). There is no data file and no stored ordering: the feed
 changes because the clock moved. The service worker deliberately does **not**
 cache `/news`, only the `news.html` shell.
 
-Every headline links out to the source (`target=_blank`) — items are references,
-never copies. The three per-item buttons plus the page's free-text note are the
+A headline links out to the source (`target=_blank`) — items are references,
+never copies. An item's link is an absolute `http(s)` URL or the item has
+none: the gateway serves nothing else as `url`, and the page puts nothing else
+into an `href` (`webLink`, the rule of `news_store.web_link`; `docs/news.md`,
+"The item"). An item without a link, a channel post that carried none, shows
+its headline as text. The three per-item buttons plus the page's free-text note are the
 user's half of the learning loop:
 
 - `POST /news/feedback` — `{id?, signal, note?}` with signal
@@ -779,18 +806,23 @@ Threads can be spoken as well as typed, with no streaming and split by direction
   `wake` event), which reopens the thread used in the mode within the last
   15 minutes, else that voice composer. Both flags are dropped from the
   address once read and open the mic by themselves only inside the shell;
-  elsewhere the conversation offers a **Start talking** button. An answer
-  that ends in a call directive (`[[call: <number> | <name>]]`) places the
-  call instead of opening the mic, in a shell with `placeCall`: the name, the
-  number and a **Cancel** button for 5 s with the mic open — speech cancels,
-  and goes to Ara as the next turn with a `cancelled_call` note (to review
-  instead, like any take, when the box holds text or files), so she places the
-  call again when the words did not mean to stop it (no words at all: it goes
-  ahead at once); `| no-voice-cancel` keeps the mic shut, honoured only
-  on a second attempt at the number — then the shell dials on speaker
-  (docs/dashboard.md, "Inside the Android shell"); everywhere else the
-  directive is a tap-to-dial link. The pure parts — the detector's state machine and the wake's
-  choice of thread — are `components/continuous.js`
+  elsewhere the conversation offers a **Start talking** button. Closing it:
+  the toggle, or Ara — told by voice to switch the mode off, she stamps the
+  thread (`conversation-push.py --end-continuous` → `continuous_off`), and
+  every device showing it in the mode leaves it on its next read; a toggle
+  pressed after her stamp is the user's and stays on (docs/dashboard.md). An
+  answer that ends in a call directive (`[[call: <number> | <name>]]`) places
+  the call instead of opening the mic, in a shell with `placeCall`: the name,
+  the number and a **Cancel** button for 5 s with the mic open — speech
+  cancels, and goes to Ara as the next turn with a `cancelled_call` note (to
+  review instead, like any take, when the box holds text or files), so she
+  places the call again when the words did not mean to stop it (no words at
+  all: it goes ahead at once); `| no-voice-cancel` keeps the mic shut,
+  honoured only on a second attempt at the number — then the shell dials on
+  speaker (docs/dashboard.md, "Inside the Android shell"); everywhere else the
+  directive is a tap-to-dial link. The pure parts — the detector's state
+  machine, the wake's choice of thread and whether Ara's stamp ends the mode —
+  are `components/continuous.js`
   (`tests/test_webapp_continuous.py`).
 
 ## Installing on Android

@@ -129,6 +129,7 @@ import { openAttentionSheet } from './attention-sheet.js';
 import { shelf, goLive, takeRestore, threadFacts } from './shelf-store.js';
 import {
   isContinuous, setContinuous, touchContinuous, forgetContinuous, voiceTimeouts, Vad, VAD_DEFAULTS, LevelMeter,
+  modeEntries, endedByAra, noteAraOff,
   chime, primeAudio,
 } from './continuous.js';
 import { setVoiceActive, canPlaceCall, placeCall, onCall } from './shell.js';
@@ -633,8 +634,12 @@ function clearSent(d, text, files) {
 
 // Dictations an earlier page left under `key` are this page's once the
 // conversation is shown: the worker hands them over (dictation.js), each one
-// owns the input row as a job of this page's would, and its text goes into
-// the draft for review — the context a send would need left with that page.
+// owns the input row as a job of this page's would. One the user sent into
+// this thread (➤, or a take of the continuous loop ending on a pause) the
+// worker has sent by now (sw.js, "Sent dictations"): it is in the thread,
+// which is read again. Any other — kept for review (✓, leaving with the mic
+// live), or a send that failed or may have failed — goes into the draft for
+// review, a failed send with a note saying so.
 function adoptDictations(key) {
   if (ADOPTING.has(key)) return;
   ADOPTING.add(key);
@@ -642,9 +647,37 @@ function adoptDictations(key) {
     ADOPTED.set(key, (ADOPTED.get(key) || 0) + 1);
     const el = LIVE.get(key);
     if (el) el.render();
-    job.then((text) => {
-      if (text) { appendToDraft(key, text); VOICE_ERRORS.delete(key); }
-      else VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
+    job.then(async ({ text, sent, unsent, send, at, call }) => {
+      if (sent) { VOICE_ERRORS.delete(key); refreshSent(key); return; }
+      // A sent dictation whose page went after the transcript was in but
+      // before that page could send it: the send is this page's. Unless the
+      // thread holds it already — that page may have got it out just before
+      // it went — so a message is never sent twice.
+      if (send && text && !unsent) {
+        const el = LIVE.get(key);
+        const t = el && !isNewKey(key) ? await readThread(key) : null;
+        if (t && hasTurnSince(t, text, new Date(at || Date.now()).toISOString())) { refreshSent(key); return; }
+        if (t && el.isConnected) {
+          VOICE_ERRORS.delete(key);
+          // A take that cancelled a call tells Ara so from here too
+          // (sendMessage takes CANCELLED_CALLS for the turn it sends) — and
+          // only this turn: a send that did not get as far leaves no note
+          // behind for a later one.
+          const note = call && !CANCELLED_CALLS.has(key) ? { number: call.number, name: call.name } : null;
+          if (note) CANCELLED_CALLS.set(key, note);
+          try {
+            await el._send(text, { fromDraft: false });
+          } finally {
+            if (note && CANCELLED_CALLS.get(key) === note) CANCELLED_CALLS.delete(key);
+          }
+          return;
+        }
+      }
+      if (text) {
+        appendToDraft(key, text);
+        if (unsent) VOICE_ERRORS.set(key, unsentNote(unsent));
+        else VOICE_ERRORS.delete(key);
+      } else VOICE_ERRORS.set(key, 'No speech was detected in the recording.');
     }, (err) => {
       if (err && err.message === 'elsewhere') refreshDraft(key);
       else VOICE_ERRORS.set(key, "Couldn't transcribe the recording. Please try again.");
@@ -654,7 +687,34 @@ function adoptDictations(key) {
       const now = LIVE.get(key);
       if (now) now.render();
     });
-  });
+  }, { outcome: true });
+}
+
+// Why a dictation the worker was to send is in the box after all.
+function unsentNote(why) {
+  return why === 'maybe'
+    ? 'This dictation was being sent when the page was left. It is in the box — '
+      + "if it turns up in the thread, there is no need to send it again."
+    : "This dictation couldn't be sent. It is in the box — send it again.";
+}
+
+// The worker sent a dictation into thread `key`: the thread on screen, if it
+// is, shows it (and Ara's answer as it comes) without waiting for the poll.
+function refreshSent(key) {
+  const el = LIVE.get(key);
+  if (!el || !el.isConnected) return;
+  el._load().then(() => {
+    if (!el.isConnected) return;
+    el._partialUpdate();
+    el._schedulePoll();
+  }, () => {});
+}
+
+// The messages URL a sent dictation recorded under `key` goes to should its
+// page be gone by the time the transcript is in: a thread's only — a first
+// message has no thread yet to go to, and waits in its composer's draft.
+function sendUrlFor(key) {
+  return isNewKey(key) ? '' : `/conversations/${encodeURIComponent(key)}/messages`;
 }
 // The connected element whose composer shows draft `d`, if any: the one
 // under the key the draft lives under by now — it may have moved to a
@@ -1440,6 +1500,7 @@ class RetinueConversation extends HTMLElement {
       const wasPending = !!(this._thread && this._thread.pending);
       this._thread = t;
       this._missing = false;
+      this._contEndedByAra(t);
       this._shelfObserve(t);
       if (t.unread) this._markRead();
       this._maybeAutoplay(t);
@@ -1499,6 +1560,10 @@ class RetinueConversation extends HTMLElement {
     const root = this.shadowRoot;
     const t = this._thread;
     if (!root || !t) return;
+    // Ara ended the mode (_contEndedByAra): the bar's toggle and the input
+    // row change with it, so the frame is rebuilt — the user is not in the
+    // middle of a take any more, which is what a partial update protects.
+    if (this._contModeChanged) { this._contModeChanged = false; this.render(); return; }
     // A cold start renders the frame before the thread is read, so the
     // message container, or the reply row that waits for the first read,
     // may not exist yet — only a full render introduces them.
@@ -2515,14 +2580,37 @@ class RetinueConversation extends HTMLElement {
     const live = () => LIVE.get(key);
     if (live()) live().render();
     let toSend = '';
+    let sentByWorker = false;
     try {
       // The service worker transcribes (dictation.js): should this page be
-      // left meanwhile, the text still lands in this draft, for review.
-      const text = await transcribe(storeKey(key), blob, transcribeUrl(key));
-      if (text) {
+      // left meanwhile, a dictation kept for review lands in this draft, and
+      // one sent into a thread is sent there by the worker (sw.js, "Sent
+      // dictations") — the thread it was recorded in, whatever is on screen.
+      // A take that cancelled a call carries it there too, so Ara hears of
+      // the call whichever of the two sends it (sendMessage).
+      const send = intent === 'send' ? sendUrlFor(key) : '';
+      const cancelled = send ? CANCELLED_CALLS.get(key) : null;
+      const got = await transcribe(storeKey(key), blob, transcribeUrl(key),
+        send ? { send, ...(cancelled ? { call: cancelled } : {}) } : undefined);
+      const text = send ? got.text : got;
+      if (send && got.sent) {
+        // Frozen meanwhile (the back-forward cache) and back: it went, with
+        // the cancelled call, if any — no later turn may carry it again.
+        sentByWorker = true;
+        CANCELLED_CALLS.delete(key);
+        VOICE_ERRORS.delete(key);
+      } else if (text) {
         appendToDraft(key, text);
-        // Send the whole draft, so anything typed before dictating comes along.
-        if (intent === 'send') toSend = draftOf(key).text;
+        if (send && got.unsent) {
+          // The worker could not send it (or may have): it waits in the box
+          // for review, and like a take kept for review it tells nobody of
+          // the call, which stays cancelled.
+          CANCELLED_CALLS.delete(key);
+          VOICE_ERRORS.set(key, unsentNote(got.unsent));
+        } else if (intent === 'send') {
+          // Send the whole draft, so anything typed before dictating comes along.
+          toSend = draftOf(key).text;
+        }
       } else if (CANCELLED_CALLS.has(key)) {
         // What cancelled the call had no words in it: the call goes ahead,
         // now with Cancel by touch only (_contResumeCall).
@@ -2606,6 +2694,7 @@ class RetinueConversation extends HTMLElement {
       }
     }
     VOICE_JOBS.delete(key);
+    if (sentByWorker) refreshSent(key);
     keepDraft(key);  // as after _send: no turn of this job's is on the wire now
     const el = adopted || live();
     // The loop's take did not get through (nothing heard, a failed
@@ -2633,6 +2722,25 @@ class RetinueConversation extends HTMLElement {
   // ➤ end it early.
   _contOn() {
     return this._id ? isContinuous(this._id) : this._contNew;
+  }
+
+  // The user asked Ara to end the mode (by voice, in this thread): she
+  // stamps the thread (conversation-push.py --end-continuous), and the
+  // mode ends here as if the loop button had been tapped — the mic closes,
+  // a take in progress is dropped or kept for review as on leaving, and
+  // the shell's voice flag is released. Switched on again after the stamp,
+  // it stays on (endedByAra).
+  _contEndedByAra(t) {
+    if (!this._id || !t || !t.continuous_off) return;
+    const ends = endedByAra(modeEntries()[this._id], t.continuous_off);
+    if (ends) setContinuous(this._id, false);
+    noteAraOff(this._id, t.continuous_off);
+    if (!ends) return;
+    this._listenOnOpen = false;
+    this._contStopListening();
+    this._contDisengage();
+    this._contReady = false;
+    this._contModeChanged = true;
   }
 
   // What a host calls when a wake finds this conversation on screen: the

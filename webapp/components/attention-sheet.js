@@ -743,7 +743,9 @@ class RetinueAttentionSheet extends HTMLElement {
       const furtherBtns = spheres.filter((s) => s !== item.sphere && s !== 'unknown').map((s) =>
         `<button class="btn tiny${(item.tags || []).includes(s) ? ' on' : ''}" data-act="further" data-sphere="${esc(s)}"${busy}>${esc(s)}</button>`,
       ).join('');
-      const permitBtn = item.sender
+      // With focus off on this instance there are no Focus rules to change.
+      const focusOff = mode.enabled === false;
+      const permitBtn = item.sender && !focusOff
         ? `<button class="btn tiny${item.permit ? ' on' : ''}" data-act="permit"${busy}>${item.permit
           ? `Revoke ${esc(item.sender)}’s ${esc(mode.name)} permit`
           : `Let ${esc(item.sender)} interrupt in ${esc(mode.name)}`}</button>`
@@ -756,7 +758,9 @@ class RetinueAttentionSheet extends HTMLElement {
       // sphere added there would change nothing in the stint at hand.
       const adm = item.admission;
       let admitBtn = '';
-      if (adm && adm.by === 'tag') {
+      if (focusOff) {
+        admitBtn = '';
+      } else if (adm && adm.by === 'tag') {
         admitBtn = `<button class="btn tiny on" data-act="tag" data-tag="${esc(adm.what)}" data-on="0"${busy}>` +
           `Stop admitting ${esc(adm.what)} in ${esc(mode.name)}</button>`;
       } else if (adm && adm.via) {
@@ -818,7 +822,8 @@ class RetinueAttentionSheet extends HTMLElement {
         `<div class="f-ctl">${sphereSel}<span class="f-note">${item.sender ? `remembered for ${esc(item.sender)}` : 'this item'}</span></div>` +
         `<div class="f-ctl">${furtherBtns}<span class="f-note">further spheres — each counts for a mode like the first</span></div></div>` +
         `<div class="field"><div class="f-label">Delivery</div><div class="f-value">level <span class="lvl" style="color:${LEVEL_COLORS[lvl] || '#9aa5b1'}">${esc(lvl)}</span> · ${esc(item.delivery)}</div>` +
-        `<div class="f-ctl">${permitBtn}${admitBtn}<span class="f-note">a Focus rule of ${esc(mode.name)} — importance untouched</span></div></div>` +
+        (focusOff ? `<div class="f-ctl"><span class="f-note">focus is off on this instance — the level alone decides</span></div></div>`
+          : `<div class="f-ctl">${permitBtn}${admitBtn}<span class="f-note">a Focus rule of ${esc(mode.name)} — importance untouched</span></div></div>`) +
         this._expiryField(item, busy) +
         (item.unknown_sender || this._form ? '' : contactField) +
         `</div>${actions}${learned}${effect}` +
