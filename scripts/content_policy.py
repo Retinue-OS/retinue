@@ -200,6 +200,7 @@ REPORT_MAX_BYTES = 64 * 1024
 REPORTS_PER_DELIVERY = 50
 VIOLATIONS_LIMIT = 200
 _FIELD_MAX = 300
+_LINE_LIMIT = 10**7
 
 # Control characters and line separators would break the one-line log entry;
 # a lone surrogate (JSON's \u escapes can name half of a UTF-16 pair, and
@@ -243,8 +244,12 @@ def _violation(document, directive, blocked, disposition, source, line) -> dict 
         return None
     disposition = _text(disposition).lower()
     where = _without_query(_text(source))
-    if where and isinstance(line, int) and not isinstance(line, bool) and line > 0:
-        where = f"{where}:{line}"
+    # JSON allows a number of thousands of digits; one past _LINE_LIMIT is no
+    # source line, and appending it would make the kept entry and the log line
+    # as long as the number.
+    if (where and isinstance(line, int) and not isinstance(line, bool)
+            and 0 < line < _LINE_LIMIT):
+        where = f"{where}:{line}"[:_FIELD_MAX]
     return {"document": document, "directive": directive,
             "blocked": _without_query(_text(blocked)) or "(none)",
             "disposition": disposition if disposition in ("enforce", "report") else "",

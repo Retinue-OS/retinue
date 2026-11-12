@@ -16,18 +16,29 @@ that way, everywhere a page comes from:
   decided send, the messenger gateways with and without a pairing code, the
   Claude sign-in in both modes, the session log with an answer that quotes
   markup);
-- the gateway's own source, for an inline <script> or a handler attribute
-  in a page it writes outside those builders (an error page, say).
+- the gateway's own source, for an inline <script>, a handler attribute or a
+  javascript: URL in a page it writes outside those builders (its error
+  pages): the string literals of each statement are joined first, so a tag
+  split over adjacent literals or lines is read whole.
+
+A script a page loads must also be a file of the dashboard's own: a path on
+this origin to a file in webapp/, since script-src 'self' blocks one from
+elsewhere and a missing one leaves the page without it.
 
     python3 tests/test_webapp_no_inline_script.py
 """
+import ast
 import html.parser
 import importlib.util
+import io
 import os
+import posixpath
 import re
 import sys
 import tempfile
+import tokenize
 import types
+import urllib.parse
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -38,11 +49,37 @@ WEBAPP = REPO_ROOT / "webapp"
 URL_ATTRS = {"href", "src", "action", "formaction", "xlink:href", "data", "poster"}
 
 
-class _Scan(html.parser.HTMLParser):
-    """Collects what a policy without 'unsafe-inline' would refuse."""
+def src_problem(src: str, page_dir: str | None) -> str | None:
+    """Why a script's URL is not a file of the dashboard's own, or None.
 
-    def __init__(self):
+    page_dir is the directory of the page's own URL, which a relative URL is
+    resolved against; None for a page served under paths of its own (the
+    gateway's), whose scripts must be named from the root."""
+    value = src.strip()
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme or parts.netloc:
+        return f"loads {src!r} from another origin"
+    path = parts.path
+    if not path:
+        return f"loads {src!r}, which names no file"
+    if not path.startswith("/"):
+        if page_dir is None:
+            return f"loads {src!r} by a path relative to the page's URL"
+        path = posixpath.join(page_dir, path)
+    root = WEBAPP.resolve()
+    target = (root / posixpath.normpath(path).lstrip("/")).resolve()
+    if root not in target.parents or not target.is_file():
+        return f"loads {src!r}, which is not a file in webapp/"
+    return None
+
+
+class _Scan(html.parser.HTMLParser):
+    """Collects what a policy without 'unsafe-inline' would refuse, and the
+    scripts a page loads that are not files of the dashboard's own."""
+
+    def __init__(self, page_dir: str | None):
         super().__init__(convert_charrefs=True)
+        self.page_dir = page_dir
         self.problems: list[str] = []
         self._in_script = False
         self._script_has_src = False
@@ -59,12 +96,25 @@ class _Scan(html.parser.HTMLParser):
                 plain = re.sub(r"[\x00-\x20]", "", value).lower()
                 if plain.startswith("javascript:"):
                     self.problems.append(f"javascript: URL in <{tag} {name}>")
+        values = {name: value or "" for name, value in attrs}
+        rel = values.get("rel", "").lower().split()
+        if tag == "script" and "src" in names:
+            self._check_src(tag, values["src"])
+        if tag == "link" and "href" in names and (
+                "modulepreload" in rel
+                or ("preload" in rel and values.get("as", "").lower() in ("script", "worker"))):
+            self._check_src(tag, values["href"])
         if tag == "script":
             if "src" not in names:
                 self.problems.append("inline <script> (no src)")
             self._in_script = True
             self._script_has_src = "src" in names
             self._script_text = ""
+
+    def _check_src(self, tag, src):
+        problem = src_problem(src, self.page_dir)
+        if problem:
+            self.problems.append(f"<{tag}> {problem}")
 
     def handle_data(self, data):
         if self._in_script:
@@ -77,8 +127,8 @@ class _Scan(html.parser.HTMLParser):
             self._in_script = False
 
 
-def problems_in(markup: str) -> list[str]:
-    scan = _Scan()
+def problems_in(markup: str, page_dir: str | None = "/") -> list[str]:
+    scan = _Scan(page_dir)
     scan.feed(markup)
     scan.close()
     return scan.problems
@@ -238,32 +288,96 @@ def check_gateway_pages(wg) -> list[str]:
     pages = rendered_gateway_pages(wg)
     for name, markup in pages.items():
         assert markup.lstrip().startswith("<!DOCTYPE html>"), name
-        for problem in problems_in(markup):
+        # The pages that need a script load it as a file of the dashboard's
+        # own, named from the root: they are served under paths of their own.
+        for problem in problems_in(markup, page_dir=None):
             failures.append(f"gateway page '{name}': {problem}")
-    # The pages that need a script load it as a file of the dashboard's own,
-    # and the file exists.
-    for name, markup in pages.items():
-        for src in re.findall(r'<script src="([^"]+)"', markup):
-            if not (WEBAPP / src.lstrip("/")).is_file():
-                failures.append(f"gateway page '{name}' loads {src}, which is not in webapp/")
     print(f"ok: rendered {len(pages)} gateway pages")
     return failures
 
 
-def check_gateway_source() -> list[str]:
-    """A page the gateway writes outside the builders above is a string in its
-    source: no <script> there without a src, and no handler attribute."""
+_FSTRING_MIDDLE = getattr(tokenize, "FSTRING_MIDDLE", None)
+_STRING_PREFIX = re.compile(r"""^[A-Za-z]*('{3}|"{3}|'|")(.*)\1$""", re.S)
+SOURCE_SCRIPT = re.compile(r"<script\b([^>]*)>?", re.I)
+SOURCE_HANDLER = re.compile(r"<[a-z][^<>]*?\son[a-z]{3,}\s*=", re.I)
+# A browser drops blanks and control characters before it reads a URL's
+# scheme; the search lets them stand between any two letters of it.
+SOURCE_JAVASCRIPT_URL = re.compile("[\\x00-\\x20]*".join("javascript:"), re.I)
+
+
+def _literal(token: tokenize.TokenInfo) -> str:
+    """The text a string token stands for; for the parts of an f-string
+    (and, before Python 3.12, a whole one), its source text with the common
+    escapes read, which is all a search for markup needs."""
+    if token.type == tokenize.STRING:
+        try:
+            value = ast.literal_eval(token.string)
+            if isinstance(value, str):
+                return value
+            return value.decode("latin-1")
+        except (ValueError, SyntaxError):
+            m = _STRING_PREFIX.match(token.string)
+            text = m.group(2) if m else token.string
+    else:
+        text = token.string
+    return re.sub(r"\\(['\"])", r"\1", re.sub(r"\\[ntr]", " ", text))
+
+
+_NOT_CODE = {tokenize.NL, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT,
+             getattr(tokenize, "FSTRING_START", None), getattr(tokenize, "FSTRING_END", None)}
+
+
+def statement_strings(source: str):
+    """(text, line of) for each statement of a Python source that has a
+    string in it beside other code: text is its strings joined as they stand,
+    so a tag split over adjacent literals, or over literals and expressions
+    concatenated with +, is read as one; line_of(offset) is the source line
+    the text at that offset comes from. A statement that is a string alone (a
+    docstring) is never sent and is left out, as comments are."""
+    parts: list[tuple[int, str]] = []
+    code = False
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type in (tokenize.NEWLINE, tokenize.ENDMARKER):
+            if parts and code:
+                starts, lines, offset = [], [], 0
+                for line, text in parts:
+                    starts.append(offset)
+                    lines.append(line)
+                    offset += len(text)
+
+                def line_of(at, starts=starts, lines=lines):
+                    return lines[max(i for i, start in enumerate(starts) if start <= at)]
+
+                yield "".join(text for _, text in parts), line_of
+            parts, code = [], False
+        elif token.type in (tokenize.STRING, _FSTRING_MIDDLE):
+            parts.append((token.start[0], _literal(token)))
+        elif token.type not in _NOT_CODE:
+            code = True
+
+
+def gateway_source_problems(source: str, name: str = "scripts/web-gateway.py") -> list[str]:
+    """No <script> without a src, no handler attribute and no javascript: URL
+    in the markup a Python source writes."""
     failures = []
-    source = (SCRIPTS_DIR / "web-gateway.py").read_text(encoding="utf-8")
-    for no, line in enumerate(source.splitlines(), 1):
-        if line.lstrip().startswith("#"):
-            continue
-        for m in re.finditer(r"<script\b([^>]*)>?", line, re.I):
+    for text, line_of in statement_strings(source):
+        for m in SOURCE_SCRIPT.finditer(text):
             if "src=" not in m.group(1):
-                failures.append(f"scripts/web-gateway.py:{no}: <script> without src")
-        if re.search(r"""<[a-z][^<>]*\son[a-z]{3,}\s*=""", line, re.I):
-            failures.append(f"scripts/web-gateway.py:{no}: handler attribute in markup")
-    print("ok: searched the gateway's source for inline scripts and handler attributes")
+                failures.append(f"{name}:{line_of(m.start())}: <script> without src")
+        for m in SOURCE_HANDLER.finditer(text):
+            failures.append(f"{name}:{line_of(m.start())}: handler attribute in markup")
+        for m in SOURCE_JAVASCRIPT_URL.finditer(text):
+            failures.append(f"{name}:{line_of(m.start())}: javascript: URL")
+    return failures
+
+
+def check_gateway_source() -> list[str]:
+    """A page the gateway writes outside the builders above (an error page) is
+    strings in its source."""
+    source = (SCRIPTS_DIR / "web-gateway.py").read_text(encoding="utf-8")
+    failures = gateway_source_problems(source)
+    print("ok: searched the gateway's source for inline scripts, handler attributes "
+          "and javascript: URLs")
     return failures
 
 
@@ -273,7 +387,16 @@ def check_the_checker() -> list[str]:
     cases = {
         "<script>alert(1)</script>": 1,
         '<script type="module">import x from "/a.js"</script>': 1,
-        '<script src="/a.js"></script>': 0,
+        '<script src="/sw-register.js"></script>': 0,
+        '<script type="module" src="components/nav.js"></script>': 0,
+        '<link rel="modulepreload" href="/components/nav.js">': 0,
+        # A script from elsewhere is blocked by script-src 'self'; a missing
+        # one leaves the page without it.
+        '<script src="https://elsewhere.example/x.js"></script>': 1,
+        '<script src="//elsewhere.example/x.js"></script>': 1,
+        '<script type="module" src="/nonexistent.js"></script>': 1,
+        '<script src="/../scripts/web-gateway.py"></script>': 1,
+        '<link rel="modulepreload" href="https://elsewhere.example/x.js">': 1,
         '<img src="/x.png" onerror="alert(1)">': 1,
         '<a href=" JaVa\tScRiPt:alert(1)">x</a>': 1,
         '<a href="/javascript:ok">x</a>': 0,
@@ -293,7 +416,32 @@ def check_the_checker() -> list[str]:
                  "  if (a < b) img.onload = done;", "const ONTOLOGY = 'ontology';"):
         if handler_in_markup(line):
             failures.append(f"checker: took {line!r} for a handler attribute")
-    print("ok: the scan finds inline scripts, handler attributes and javascript: URLs")
+    # The gateway's own pages are served under paths of their own: a script
+    # there is named from the root.
+    if problems_in('<script src="gateway/x.js"></script>', page_dir=None) == []:
+        failures.append("checker: took a relative script URL on a gateway page")
+    # The gateway's source: a page written outside its builders. Each must
+    # find exactly one problem, among them a tag split over adjacent literals.
+    for source in (
+            'self._send_html(403, H + "<body><a href=\\"javascript:alert(1)\\">x</a>")\n',
+            'self._send_html(403, H + "<body><h1\\n"\n    "onclick=\\"x()\\">x</h1>")\n',
+            'self._send_html(403, H + "<body><h1"\n    + " onclick=x()>" + y)\n',
+            'self._send_html(403, H + f"<body><h1>{x}</h1><script>go()</script>")\n',
+            'page = ("<a href=\\" java\\tscript:go()\\">"\n        "x</a>")\n'):
+        found = gateway_source_problems(source, "source")
+        if len(found) != 1:
+            failures.append(f"checker: {source!r} gave {found}, expected one problem")
+    for source in (
+            '"""A docstring may name <button onclick="x()"> and javascript: URLs."""\n',
+            '# <script>x()</script> in a comment\nx = 1\n',
+            'self.send_header("Content-Type", "text/javascript; charset=utf-8")\n',
+            'self._send_html(200, H + \'<script src="/gateway/x.js"></script>\')\n',
+            'img.onload = done; page = "<p>" + x + "</p>"\n'):
+        found = gateway_source_problems(source, "source")
+        if found:
+            failures.append(f"checker: {source!r} gave {found}, expected none")
+    print("ok: the scan finds inline scripts, handler attributes, javascript: URLs and "
+          "scripts that are not the dashboard's own")
     return failures
 
 

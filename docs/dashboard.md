@@ -160,8 +160,12 @@ cut off; the distinct violations (page, directive, blocked URL) are counted,
 with when each was first and last seen, in one JSON file beside the
 conversations (`RETINUE_CSP_REPORTS_FILE`, default
 `/root/.retinue/csp-reports.json`), at most 200 of them (past that only
-`not_kept` grows). A new one is logged once (`[web-gateway] CSP report: …`).
-`GET /csp-report` lists them, latest first, with the mode and the policy.
+`not_kept` grows). A new one is logged once, as `[web-gateway] CSP report: …`
+from a report-only policy and as `[web-gateway] CSP enforce: …` from an
+enforced one: the word is the report's disposition as the browser states it
+(`report` when it states none), so search the log for `[web-gateway] CSP `
+to find both. `GET /csp-report` lists them, latest first, with the mode and
+the policy.
 
 **From report to enforce.** Leave the mode on `report` for about a week of
 normal use, on every device and in the Android shell, its settings page
@@ -190,8 +194,10 @@ cannot work without more gets it for that page alone, stated in
 `PAGE_SOURCES` of `scripts/content_policy.py` (as `/sparql`'s `data:`
 images are), rather than a weaker policy for every page.
 `tests/test_webapp_no_inline_script.py` checks the pages, the components'
-markup and every page the gateway builds; `tests/test_web_gateway_csp.py`
-the header on every page in each mode.
+markup and every page the gateway builds (its builders rendered, and its
+source for the error pages it writes in place), and that every script a page
+loads is a file in `webapp/`; `tests/test_web_gateway_csp.py` the header on
+every page in each mode.
 
 **No route serves bytes from outside as a script.** `script-src 'self'` is a
 boundary only while nothing on the origin answers bytes someone outside chose

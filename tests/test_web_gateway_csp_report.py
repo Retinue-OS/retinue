@@ -228,6 +228,20 @@ def main() -> int:
             row = next(v for v in client.kept()["violations"] if v["document"] == "/news.html")
             assert "\n" not in row["blocked"] and "\r" not in row["blocked"]
             assert " " not in row["blocked"] and len(row["blocked"]) <= 300, row
+            # A line number is a number of a few digits; one of thousands (JSON
+            # allows it, and it fits in the size cap) is not appended to the
+            # source, so neither the kept entry nor the log line grows with it.
+            with contextlib.redirect_stdout(log):
+                status, _, _ = client.post("application/csp-report", json.dumps(legacy(
+                    "https://dash.example/lines.html", "script-src-elem", "inline",
+                    **{"source-file": "https://dash.example/lines.html"})).replace(
+                        '"original-policy"', '"line-number": ' + "9" * 4000 + ', "original-policy"'
+                    ).encode())
+            assert status == 204, status
+            row = next(v for v in client.kept()["violations"] if v["document"] == "/lines.html")
+            assert row["source"] == "https://dash.example/lines.html", row["source"][:80]
+            lines = [line for line in log.getvalue().splitlines() if "/lines.html" in line]
+            assert len(lines) == 1 and len(lines[0]) < 400, [line[:80] for line in lines]
             print("ok: every field is kept as one short line")
 
             # ── A lone surrogate is no text: taken, dropped, the file still JSON ──
