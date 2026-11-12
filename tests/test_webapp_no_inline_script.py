@@ -10,7 +10,9 @@ that way, everywhere a page comes from:
 
 - the static pages, webapp/*.html;
 - what the components render: their markup is built in strings, so the
-  sources are searched for handler attributes and javascript: URLs;
+  sources are searched for handler attributes and javascript: URLs, line by
+  line and in each string and template literal read whole, so a tag spread
+  over the lines of a template is read as one;
 - every page the gateway builds itself, each builder rendered with the
   states it has (the pending sends, the approval cards, every status of a
   decided send, the messenger gateways with and without a pairing code, the
@@ -28,6 +30,7 @@ elsewhere and a missing one leaves the page without it.
     python3 tests/test_webapp_no_inline_script.py
 """
 import ast
+import bisect
 import html.parser
 import importlib.util
 import io
@@ -185,6 +188,9 @@ def check_static_pages() -> list[str]:
 # (`img.onload = () => …`) is no attribute and passes: it follows a dot, not a
 # blank or a quote, and an unquoted value is looked for only on a line that
 # opens a tag, so a local variable (`const onKey = (e) => …`) passes as well.
+# A tag a template spreads over lines has its handler on a line that opens
+# none; the literals are therefore also read whole (literal_handler_lines),
+# where an unquoted value counts once a tag opens earlier in the same literal.
 HANDLER_IN_MARKUP = re.compile(r"""\son[a-z]{3,}\s*=\s*(?:["'`]|\\["']|\$\{)""")
 HANDLER_UNQUOTED = re.compile(r"""[\s"'`]on[a-z]{3,}\s*=\s*[^\s=>]""", re.I)
 HANDLER_SET_ATTRIBUTE = re.compile(r"""setAttribute\(\s*['"`]on""")
@@ -198,19 +204,162 @@ def handler_in_markup(line: str) -> bool:
     return "<" in line and bool(HANDLER_UNQUOTED.search(line))
 
 
+# Words after which a `/` begins a regular expression rather than divides.
+_JS_OPERATOR_WORDS = {"return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+                      "throw", "case", "do", "else", "yield", "await"}
+_JS_WORD = re.compile(r"[A-Za-z0-9_$\u0080-\uffff]+")
+
+
+def js_literals(source: str) -> list[tuple[int, str]]:
+    """(line, text) for each string and template literal of a JavaScript
+    source, in the order they open: text is the literal as written, its
+    common escapes read, and a template's text is read whole, across its
+    lines, with "${}" where a substitution stands (a template inside a
+    substitution is a literal of its own). Comments and regular expressions
+    are skipped, so a quote in one does not open a literal. Raises ValueError
+    where a literal or comment is not closed: a source this cannot read is
+    no source it has checked."""
+    newlines = [i for i, c in enumerate(source) if c == "\n"]
+
+    def line_at(pos: int) -> int:
+        return bisect.bisect_right(newlines, pos - 1) + 1
+
+    def unescape(text: str) -> str:
+        return re.sub(r"\\(['\"`])", r"\1", re.sub(r"\\[ntr]", " ", text))
+
+    out: list[tuple[int, str]] = []
+    # The templates open around the code being read: where each began, its
+    # text so far, and the brace depth its current substitution opened at.
+    templates: list[dict] = []
+    braces = 0
+    regex_may_follow = True
+    n = len(source)
+    i = 0
+
+    def read_template(i: int) -> tuple[int, bool]:
+        """Reads template text from i; returns where code resumes and
+        whether the template ended (False: a substitution opened)."""
+        frame = templates[-1]
+        start = i
+        while i < n:
+            c = source[i]
+            if c == "\\":
+                i += 2
+            elif c == "`":
+                frame["pieces"].append(source[start:i])
+                out.append((line_at(frame["start"]), unescape("".join(frame["pieces"]))))
+                templates.pop()
+                return i + 1, True
+            elif c == "$" and source.startswith("${", i):
+                frame["pieces"].append(source[start:i] + "${}")
+                frame["depth"] = braces
+                return i + 2, False
+            else:
+                i += 1
+        raise ValueError(f"template from line {line_at(frame['start'])} is not closed")
+
+    while i < n:
+        c = source[i]
+        if c.isspace():
+            i += 1
+        elif source.startswith("//", i):
+            end = source.find("\n", i)
+            i = n if end < 0 else end
+        elif source.startswith("/*", i):
+            end = source.find("*/", i + 2)
+            if end < 0:
+                raise ValueError(f"comment from line {line_at(i)} is not closed")
+            i = end + 2
+        elif c == "/" and regex_may_follow:
+            j, in_class = i + 1, False
+            while j < n and (in_class or source[j] != "/"):
+                if source[j] == "\n":
+                    raise ValueError(f"regular expression on line {line_at(i)} is not closed")
+                if source[j] == "\\":
+                    j += 1
+                elif source[j] == "[":
+                    in_class = True
+                elif source[j] == "]":
+                    in_class = False
+                j += 1
+            i = j + 1
+            regex_may_follow = False
+        elif c in "'\"":
+            j = i + 1
+            while j < n and source[j] != c:
+                if source[j] == "\n":
+                    raise ValueError(f"string on line {line_at(i)} is not closed")
+                j += 2 if source[j] == "\\" else 1
+            if j >= n:
+                raise ValueError(f"string on line {line_at(i)} is not closed")
+            out.append((line_at(i), unescape(source[i + 1:j])))
+            i = j + 1
+            regex_may_follow = False
+        elif c == "`":
+            templates.append({"start": i, "pieces": [], "depth": None})
+            i, _ = read_template(i + 1)
+            regex_may_follow = False
+        elif c == "}" and templates and templates[-1]["depth"] == braces:
+            templates[-1]["depth"] = None
+            i, _ = read_template(i + 1)
+            regex_may_follow = False
+        elif c in "{}":
+            braces += 1 if c == "{" else -1
+            i += 1
+            regex_may_follow = True
+        elif c in ")]":
+            i += 1
+            regex_may_follow = False
+        else:
+            m = _JS_WORD.match(source, i)
+            if m:
+                i = m.end()
+                regex_may_follow = m.group() in _JS_OPERATOR_WORDS
+            else:
+                i += 1
+                regex_may_follow = True
+    if templates:
+        raise ValueError(f"template from line {line_at(templates[-1]['start'])} is not closed")
+    return out
+
+
+def literal_handler_lines(source: str) -> list[int]:
+    """The lines of the string and template literals of a JavaScript source
+    that write a handler attribute, each literal read whole: a quoted value,
+    or a substitution, after `on<event>=` anywhere in it, and an unquoted
+    value where a tag opens earlier in the same literal
+    (`<button\n  onclick=go()>`, a tag a line-by-line search cannot see
+    whole). Code outside literals is never searched here, so a property set
+    in code or a local variable named on… passes."""
+    lines = []
+    for line, text in js_literals(source):
+        found = HANDLER_IN_MARKUP.search(text) or any(
+            "<" in text[:m.start()] for m in HANDLER_UNQUOTED.finditer(text))
+        if found:
+            lines.append(line)
+    return lines
+
+
 def check_component_sources() -> list[str]:
     failures = []
     sources = (sorted(WEBAPP.glob("*.js")) + sorted((WEBAPP / "components").glob("*.js"))
                + sorted((WEBAPP / "gateway").glob("*.js")))
     for src in sources:
         rel = src.relative_to(REPO_ROOT)
-        for no, line in enumerate(src.read_text(encoding="utf-8").splitlines(), 1):
+        text = src.read_text(encoding="utf-8")
+        for no, line in enumerate(text.splitlines(), 1):
             if COMMENT_LINE.match(line):
                 continue
             if handler_in_markup(line):
                 failures.append(f"{rel}:{no}: handler attribute in rendered markup")
             if "javascript:" in line.lower():
                 failures.append(f"{rel}:{no}: javascript: URL")
+        try:
+            for no in literal_handler_lines(text):
+                failures.append(f"{rel}:{no}: handler attribute in the markup of the literal "
+                                f"opened here")
+        except ValueError as e:
+            failures.append(f"{rel}: its literals cannot be read: {e}")
     print(f"ok: checked {len(sources)} scripts for handler attributes and javascript: URLs")
     return failures
 
@@ -416,6 +565,45 @@ def check_the_checker() -> list[str]:
                  "  if (a < b) img.onload = done;", "const ONTOLOGY = 'ontology';"):
         if handler_in_markup(line):
             failures.append(f"checker: took {line!r} for a handler attribute")
+    # The literals of a component read whole: a tag spread over the lines of
+    # a template, or a value written on the line after its name, is one tag.
+    # Each source must find a handler on the line its literal opens on.
+    for source, line in (
+            ("el.innerHTML = `<button\n      onclick=go()\n      >x</button>`;\n", 1),
+            ("x = 1;\nel.innerHTML = `<a href=\"/x\"\n  onclick=\n  \"go()\">x</a>`;\n", 2),
+            # A template inside a substitution is a literal of its own.
+            ("ul.innerHTML = `<ul>${items.map((i) => `<li\n  onclick=pick(${i})>${i}</li>`)"
+             ".join('')}</ul>`;\n", 1),
+            ("html += '<img src=x\\nonerror=alert(1)>';\n", 1),
+            # A quote in a regular expression or a comment opens no literal,
+            # and a division is no regular expression.
+            ("const q = /'/g; // it's\nel.innerHTML = `<b\n onclick=x()>`;\n", 2),
+            ("const r = total / count;\nel.innerHTML = `<b\n onclick=x()>${r}</b>`;\n", 2)):
+        try:
+            found = literal_handler_lines(source)
+        except ValueError as e:
+            found = [f"unread: {e}"]
+        if found != [line]:
+            failures.append(f"checker: {source!r} gave {found}, expected line {line}")
+    for source in (
+            "img.onload = done;\nconst onKey = (e) => { if (e.key === 'Escape') close(); };\n",
+            "if (a < b) img.onload = done;\n",
+            "el.innerHTML = `<button data-go>x</button>`;\nel.querySelector('button').onclick = go;\n",
+            "t = `<p>${n < m ? 'once' : 'onset'}</p>`; s = 'turn onboarding off';\n",
+            "// `<b\n/* `<b\n onclick=x()>` */\nconst x = 1;\n",
+            "const re = /`<b onclick=x()>`/;\n"):
+        try:
+            found = literal_handler_lines(source)
+        except ValueError as e:
+            found = [f"unread: {e}"]
+        if found:
+            failures.append(f"checker: {source!r} gave {found}, expected none")
+    for source in ("el.innerHTML = `<b>;\n", "s = '<b>;\n", "/* `<b onclick=x()>`\n"):
+        try:
+            literal_handler_lines(source)
+            failures.append(f"checker: read {source!r}, which has a literal or comment unclosed")
+        except ValueError:
+            pass
     # The gateway's own pages are served under paths of their own: a script
     # there is named from the root.
     if problems_in('<script src="gateway/x.js"></script>', page_dir=None) == []:

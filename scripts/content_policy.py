@@ -71,18 +71,19 @@ DIRECTIVES = (
     # pages carry theirs inline.
     ("style-src", ("'self'", "'unsafe-inline'")),
     # Images: this origin (icons, thread attachments, messenger media through
-    # the media proxy, the pairing codes on /gateways); blob: for the chat
-    # page's previews of the images the user is about to send (object URLs
-    # the page makes itself). No data: here: /sparql alone needs it
-    # (PAGE_SOURCES). The chat page's records carry no data: URL: the
-    # gateway passes on the media proxy's URL, a web link or none
+    # the media proxy, the pairing codes on /gateways). No blob: here: the
+    # chat page alone makes object URLs of images (its previews of what the
+    # user is about to send), and gets them for itself (PAGE_SOURCES). No
+    # data: either: /sparql alone needs it (PAGE_SOURCES). The chat page's
+    # records carry no data: URL: the gateway passes on the media proxy's
+    # URL, a web link or none
     # (_shape_chat_attachments); the data: media of webapp/data/chats/ are a
     # test corpus, never served as records. Nor is a web link loaded: the
     # chat page shows a remote attachment as a link to open, never as an
     # image or a player (chat-page.js, mediaUrl), and the session log shows
     # an image an answer names as a link or its alt text (web-gateway.py,
     # _image_as_link), as webapp/components/markdown.js does.
-    ("img-src", ("'self'", "blob:")),
+    ("img-src", ("'self'",)),
     # Audio and video: this origin only (messenger media through the media
     # proxy, the briefing card's audio).
     ("media-src", ("'self'",)),
@@ -108,6 +109,11 @@ DIRECTIVES = (
 # for that page alone, so the others do not carry it. A source named here is
 # added to the directive's sources above.
 PAGE_SOURCES = {
+    # The chat page (webapp/chat.html, components/chat-page.js): its previews
+    # of the images the user is about to send (picked, pasted, or kept for an
+    # unsent message across a reload) are object URLs the page makes itself
+    # of those files (URL.createObjectURL). No other page makes one.
+    "chat.html": {"img-src": ("blob:",)},
     # /sparql (webapp/sparql.html, also served as /sparql.html): the stylesheet
     # of the vendored YASGUI (scripts/vendor-yasgui.sh) carries its icons as
     # data: images.

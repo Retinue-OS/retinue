@@ -18,8 +18,9 @@ and in every mode the instance settings page keeps its framing policy as a
 separate, enforced header, a response that is no page (JSON, a script, an
 image) carries no policy, and the policy itself is what the decision says:
 scripts from this origin only, no inline script, no eval, images and media
-from this origin (and the chat page's own blob: previews), with data: images
-on /sparql alone, which gets that policy under both its paths. A change of
+from this origin, with blob: images (its own previews) on the chat page
+alone and data: images on /sparql alone, each page getting its policy under
+each of its paths. A change of
 mode moves the service worker's shell hash, so installed clients pick it up.
 
     python3 tests/test_web_gateway_csp.py
@@ -135,7 +136,8 @@ NOT_PAGES = [
 
 # The pages that get more than the policy every page has, by path, with the
 # file of webapp/ that names their entry in content_policy.PAGE_SOURCES.
-PAGE_POLICY = {"/sparql": "sparql.html", "/sparql.html": "sparql.html"}
+PAGE_POLICY = {"/sparql": "sparql.html", "/sparql.html": "sparql.html",
+               "/chat.html": "chat.html"}
 
 
 def _directives(policy: str) -> dict:
@@ -171,22 +173,28 @@ def check_policy_text(cp) -> None:
     assert not any("eval" in s for v in directives.values() for s in v)
     assert "frame-ancestors" not in directives, "the framing policy is the embed page's own"
     print("ok: the policy runs scripts from this origin only, with no inline script and no eval")
-    # Images and media: what the pages load, and no more. No data: on any
-    # page but /sparql, and no remote media: the chat page links a remote
-    # attachment rather than load it.
-    assert directives["img-src"] == ["'self'", "blob:"], directives["img-src"]
+    # Images and media: what the pages load, and no more. No blob: on any
+    # page but the chat page, no data: on any page but /sparql, and no remote
+    # media: the chat page links a remote attachment rather than load it.
+    assert directives["img-src"] == ["'self'"], directives["img-src"]
     assert directives["media-src"] == ["'self'"], directives["media-src"]
     assert directives["font-src"] == ["'none'"]
     assert directives["connect-src"] == ["'self'"]
     assert directives["frame-src"] == ["'self'"]
-    assert cp.policy("chat.html") == cp.policy() == cp.policy(None)
+    assert cp.policy("index.html") == cp.policy() == cp.policy(None)
+    # The chat page: its previews of images about to be sent, blob: images,
+    # for that page alone.
+    chat = _directives(cp.policy("chat.html"))
+    assert chat.pop("img-src") == ["'self'", "blob:"], cp.policy("chat.html")
     # /sparql: YASGUI's stylesheet icons, data: images, for that page alone.
     sparql = _directives(cp.policy("sparql.html"))
-    assert sparql.pop("img-src") == ["'self'", "blob:", "data:"], cp.policy("sparql.html")
-    assert sparql.pop("report-uri") == ["/csp-report"]
+    assert sparql.pop("img-src") == ["'self'", "data:"], cp.policy("sparql.html")
+    assert sparql.pop("report-uri") == chat.pop("report-uri") == ["/csp-report"]
     directives.pop("img-src")
+    assert chat == directives, "the chat page's policy differs from the others in img-src alone"
     assert sparql == directives, "the /sparql policy differs from the others in img-src alone"
-    print("ok: data: images on /sparql alone, data: media and remote media nowhere")
+    print("ok: blob: images on the chat page alone, data: images on /sparql alone, "
+          "data: media and remote media nowhere")
 
 
 def main() -> int:
