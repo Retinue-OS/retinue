@@ -1684,7 +1684,18 @@ _conversations_lock = threading.Lock()
 # rest of the document. Answers are model output that can quote untrusted text
 # (e-mail, messages), so this is also the XSS boundary for the log pages.
 _md = MarkdownIt("commonmark", {"html": False}).enable("table")
-_URL_RE = re.compile(r'https?://[^\s<]+')
+# A bare URL in an answer's text, as the session log page links it. It is
+# matched in the text as written (entities decoded), so an angle bracket ends
+# it like a blank does; trailing sentence punctuation is left outside.
+_URL_RE = re.compile(r'https?://[^\s<>]+')
+_URL_TAIL = '.,;:!?)"\''
+# A tag of markdown-it's output. With raw HTML off it writes only its own
+# tags, and it escapes every attribute value (& < > "), so a tag is a "<"
+# followed by everything up to the next ">".
+_MD_TAG_RE = re.compile(r'(<[^>]*>)')
+# Elements whose text is never linked: a link already is one, and code is
+# shown as written.
+_MD_NO_LINK_RE = re.compile(r'<(/?)(a|code|pre)\b', re.IGNORECASE)
 
 # ── Async job store ───────────────────────────────────────────────────────────
 # POST /message can request async handling; the request returns a job handle
@@ -1747,18 +1758,45 @@ def _run_job(job_id: str, message: str, display_question: str | None,
 
 
 def _render_answer(raw: str) -> str:
-    """Render Markdown to HTML; auto-link bare http/https URLs as <a href=URL>URL</a>."""
+    """Render Markdown to HTML; auto-link bare http/https URLs as <a href=URL>URL</a>.
+
+    The links are added to the rendered HTML, and only ever between its tags:
+    a URL inside a tag (an image's src, alt or title, a link's href) belongs
+    to that tag, and text inside a link, a code span or a code block is left
+    as it is. The answer is text from the model, which may quote anything, so
+    a URL is written back escaped, for the href attribute and for the text,
+    and nothing in it can become markup."""
     rendered = _md.render(raw)
-    # Split on existing <a> tags so we never double-link markdown-rendered links.
-    parts = re.split(r'(<a\b[^>]*>.*?</a>)', rendered, flags=re.DOTALL)
+    out: list[str] = []
+    depth = {"a": 0, "code": 0, "pre": 0}
+    for i, part in enumerate(_MD_TAG_RE.split(rendered)):
+        if i % 2:  # a tag
+            m = _MD_NO_LINK_RE.match(part)
+            if m and not part.endswith("/>"):
+                name = m.group(2).lower()
+                depth[name] = max(0, depth[name] + (-1 if m.group(1) else 1))
+            out.append(part)
+        elif not any(depth.values()) and _URL_RE.search(html.unescape(part)):
+            out.append(_linkify_text(html.unescape(part)))
+        else:
+            out.append(part)
+    return "".join(out)
 
-    def _linkify(text: str) -> str:
-        def _sub(m: re.Match) -> str:
-            url = m.group(0).rstrip('.,;:!?)')
-            return f'<a href="{url}">{url}</a>'
-        return _URL_RE.sub(_sub, text)
 
-    return ''.join(_linkify(p) if i % 2 == 0 else p for i, p in enumerate(parts))
+def _linkify_text(text: str) -> str:
+    """Plain ``text`` as HTML, its bare http(s) URLs as links."""
+    out: list[str] = []
+    pos = 0
+    for m in _URL_RE.finditer(text):
+        url = m.group(0).rstrip(_URL_TAIL)
+        if not url.split("://", 1)[1]:
+            continue
+        out.append(html.escape(text[pos:m.start()], quote=False))
+        out.append(f'<a href="{html.escape(url, quote=True)}">'
+                   f'{html.escape(url, quote=False)}</a>')
+        pos = m.start() + len(url)
+    out.append(html.escape(text[pos:], quote=False))
+    return "".join(out)
 
 
 def _now_ts() -> float:
