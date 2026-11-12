@@ -6,7 +6,9 @@ deterministic N-Triples file on the gateway volume, and owns the `delivered`
 flag: `undelivered()` is the sole mutator, returning held messages and marking
 them delivered in one pass. This exercises the round-trip, determinism, the
 delivered semantics (drain once, never twice), the `since` filter, and the
-"persist but do not forward" path (delivered=True at write time).
+"persist but do not forward" path (delivered=True at write time). The media
+store beside it is covered for what it states about a blob, and for keeping
+the content type a sender declared as one clean line.
 
 Standalone, no third-party deps:
 
@@ -356,6 +358,129 @@ def test_backfill_states_metadata_on_older_records():
     print("PASS test_backfill_states_metadata_on_older_records")
 
 
+def test_stated_content_type_is_one_clean_line():
+    """A medium's content type is what its sender's client declared.
+
+    It is text from outside that the store keeps in a sidecar, states in the
+    record and hands to its gateway, which sends it as the Content-Type of
+    GET /media/<id>. So the store keeps it, and hands it back, as one line of
+    printable ASCII whatever was declared. A sidecar written before the store
+    did that is cleaned as it is read, and the startup backfill restates the
+    record."""
+    import http.client
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    generic = "application/octet-stream"
+    with tempfile.TemporaryDirectory() as tmp:
+        d = ist.media_dir(tmp)
+
+        def kept(stated):
+            """Store a blob under ``stated``; the type the store hands back,
+            which is also what its sidecar and its metadata say."""
+            mid = ist.store_media(tmp, b"x", stated)
+            data, ct = ist.load_media(tmp, mid)
+            assert data == b"x"
+            assert (d / (mid + ".type")).read_bytes() == ct.encode("ascii") + b"\n"
+            assert ist.media_meta(tmp, mid)["content_type"] == ct
+            return ct
+
+        # What clients really declare passes as it is.
+        for ct in ("image/jpeg", "audio/ogg; codecs=opus", "Application/PDF",
+                   'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+                   "application/vnd.openxmlformats-officedocument"
+                   ".wordprocessingml.document"):
+            assert kept(ct) == ct
+        # Nothing stated is the generic type.
+        for nothing in (None, "", "   ", "\r\n", "\t", "\x00"):
+            assert kept(nothing) == generic, repr(nothing)
+        # Anything else is reduced to one line: what is no printable ASCII
+        # becomes a blank, the ends are trimmed, overlong text is cut.
+        for stated, want in (
+                ("  image/jpeg \t", "image/jpeg"),
+                ("image/png\r\nX-Other: 1", "image/png X-Other: 1"),
+                ("image/png\nimage/svg+xml", "image/png image/svg+xml"),
+                ("text/html\r\n\r\n<p>", "text/html <p>"),
+                ("audio/ogg;\tcodecs=opus", "audio/ogg; codecs=opus"),
+                ("image/png\x00\x1f", "image/png"),
+                ("text/pl\x7fain", "text/pl ain"),
+                ("image/péng", "image/p ng"),
+                ("image/png text/html", "image/png text/html"),
+                ("image/png\ud800", "image/png"),
+                ("x" * 300, "x" * 255),
+        ):
+            got = kept(stated)
+            assert got == want, (stated, got)
+        # The property behind those rows, one character at a time.
+        for code in [*range(0x20), 0x7f, 0x85, 0xa0, 0x2028, 0x2029, 0xfeff, 0xdc00]:
+            ct = ist.clean_content_type("image/png" + chr(code) + "x")
+            assert ct.isascii() and ct.isprintable(), (hex(code), ct)
+
+        # A sidecar and a record from before: read as one line, and the
+        # record restated by the backfill, once.
+        mid = ist.store_media(tmp, b"x", "image/png")
+        ref = f"urn:retinue:media:signal:{mid}"
+        _subj, path = ist.write_message(tmp, channel="signal", sender="+4179", text="",
+                                        timestamp=1000.0, attachment_urls=[ref])
+        (d / (mid + ".type")).write_bytes(b"image/png\r\nX-Other: 1\n")
+        fields = ist._parse(path.read_text(encoding="utf-8"))
+        fields["attachment_meta"][ref]["content_type"] = "image/png\nX-Other: 1"
+        path.write_text(ist._render(fields), encoding="utf-8")
+        assert ist.load_media(tmp, mid) == (b"x", "image/png X-Other: 1")
+        assert ist.media_meta(tmp, mid)["content_type"] == "image/png X-Other: 1"
+        assert ist.backfill_media_meta(tmp) == 1
+        assert (f'<{ref}> <{ist.P_CONTENT_TYPE}> "image/png X-Other: 1" .'
+                in path.read_text(encoding="utf-8"))
+        assert ist.backfill_media_meta(tmp) == 0
+        # A sidecar that is no text at all, or gone, still leaves the blob
+        # servable.
+        (d / (mid + ".type")).write_bytes(b"\xff\xfe\x00image/png")
+        assert ist.load_media(tmp, mid) == (b"x", "image/png")
+        (d / (mid + ".type")).unlink()
+        assert ist.load_media(tmp, mid) == (b"x", generic)
+
+        # What the gateways do with the type (their _reply_raw): it is one
+        # header of the answer, and the answer arrives, whatever was declared
+        # and whether the sidecar is today's or an older one.
+        class Media(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                data, ct = ist.load_media(tmp, self.path.rsplit("/", 1)[1])
+                self.send_response(200)
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Media)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def answer(mid):
+            conn = http.client.HTTPConnection(*server.server_address, timeout=10)
+            try:
+                conn.request("GET", f"/media/{mid}")
+                resp = conn.getresponse()
+                return (resp.status, sorted(name.lower() for name, _ in resp.getheaders()),
+                        resp.read())
+            finally:
+                conn.close()
+
+        try:
+            for stated in ("image/png\r\nX-Other: 1", "image/png\nContent-Length: 0",
+                           "text/html\r\n\r\n<p>", "image/png€", "image/png\x0b\x85"):
+                mid = ist.store_media(tmp, b"x", stated)
+                want = (200, ["content-length", "content-type", "date", "server"], b"x")
+                assert answer(mid) == want, (stated, answer(mid))
+                (d / (mid + ".type")).write_text(stated + "\n", encoding="utf-8")
+                assert answer(mid) == want, (stated, answer(mid))
+        finally:
+            server.shutdown()
+            server.server_close()
+    print("PASS test_stated_content_type_is_one_clean_line")
+
+
 def test_missing_dir_is_empty():
     with tempfile.TemporaryDirectory() as tmp:
         assert ist.undelivered(Path(tmp) / "nope") == []
@@ -480,6 +605,7 @@ if __name__ == "__main__":
     test_write_without_media_has_no_media_predicate()
     test_attachment_metadata_is_stated_in_the_record()
     test_backfill_states_metadata_on_older_records()
+    test_stated_content_type_is_one_clean_line()
     test_missing_dir_is_empty()
     test_since_epoch_and_iso_equivalent()
     test_delete_chat_erases_exactly_one_chat()

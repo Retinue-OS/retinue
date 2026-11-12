@@ -113,7 +113,7 @@ export function setContinuous(id, on, now = Date.now()) {
   if (!id) return;
   const entries = modeEntries();
   const prev = entries[id] || {};
-  entries[id] = { on: !!on, at: on ? now : (Number(prev.at) || 0) };
+  entries[id] = { ...prev, on: !!on, at: on ? now : (Number(prev.at) || 0) };
   saveEntries(entries);
 }
 
@@ -127,13 +127,40 @@ export function forgetContinuous(id) {
   saveEntries(entries);
 }
 
+// Ara was asked to end the mode in this thread (the thread document's
+// `continuous_off`, an ISO time the gateway stamps). Each stamp is acted on
+// once per device (`offSeen` in the thread's entry): the mode ends here if
+// it was switched on — or last used — no later than that moment, give or
+// take a device clock running ahead of the server's (ARA_OFF_SKEW_MS; the
+// take that asked was sent well before Ara's stamp anyway). Once seen, the
+// stamp is spent: a toggle the user presses afterwards is theirs, and stays.
+// Pure, so it is testable.
+export const ARA_OFF_SKEW_MS = 60 * 1000;
+
+export function endedByAra(entry, stamp, skewMs = ARA_OFF_SKEW_MS) {
+  const at = Date.parse(stamp || '');
+  if (!Number.isFinite(at) || !entry || !entry.on) return false;
+  if (entry.offSeen === stamp) return false;
+  return (Number(entry.at) || 0) <= at + skewMs;
+}
+
+// Record that this device has acted on Ara's stamp for thread `id`.
+export function noteAraOff(id, stamp) {
+  if (!id || !stamp) return;
+  const entries = modeEntries();
+  const prev = entries[id];
+  if (!prev || prev.offSeen === stamp) return;
+  entries[id] = { ...prev, offSeen: stamp };
+  saveEntries(entries);
+}
+
 // The thread was used in the mode just now (the mic opened, a take went out).
 export function touchContinuous(id, now = Date.now()) {
   if (!id) return;
   const entries = modeEntries();
   const prev = entries[id];
   if (!prev || !prev.on) return;
-  entries[id] = { on: true, at: now };
+  entries[id] = { ...prev, on: true, at: now };
   saveEntries(entries);
 }
 
