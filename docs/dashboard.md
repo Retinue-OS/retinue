@@ -221,6 +221,19 @@ letterbox share serves every file as a download anyway; `/data/` answers JSON
 and any other file as a download. `tests/test_web_gateway_no_script_types.py`
 asks each of them for every script type a sender might state.
 
+**Other services on the dashboard's host.** The policy reaches what the
+gateway answers and nothing else. A service the proxy routes to a path of the
+dashboard's host serves its pages on the dashboard's origin, so a script that
+runs there can do anything the dashboard can, approving a send included.
+Every such service must carry a policy of its own that runs no script from
+outside, or be published on a host of its own. Of those in the deployment
+example (`docker-compose.override.example.yml`), the updater answers JSON
+only, and the egress log viewer (`/egress`) sends a fixed, enforced policy on
+every page (`default-src 'none'; style-src 'unsafe-inline'; form-action
+'self'; base-uri 'none'; frame-ancestors 'none'`: its pages use no script,
+only inline style), forbids sniffing on every answer, and escapes what it
+writes into an attribute; `tests/test_egress_log_viewer.py` checks both.
+
 ## The home: the attention list
 
 The home screen is **one list of what wants attention** — threads with Ara,
